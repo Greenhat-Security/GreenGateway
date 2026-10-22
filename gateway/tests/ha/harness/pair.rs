@@ -86,7 +86,7 @@ impl UpgradePair {
             .unwrap_or_else(|| {
                 panic!(
                     "{PAIR_DIR_VARIABLE} is unset, so the issue #426 pair rows have no binaries. \
-                     The ha-release-gate job builds them; locally, run `python \
+                     CI's ha-upgrade-pair job builds them; locally, run `python \
                      scripts/build_upgrade_pair.py --out <dir>` and point {PAIR_DIR_VARIABLE} at \
                      <dir>"
                 )

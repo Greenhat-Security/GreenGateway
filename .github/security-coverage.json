@@ -1,12 +1,12 @@
 {
-  "gateway/src/auth/jwt.rs": { "lines": 85, "branches": 80 },
-  "gateway/src/middleware/auth.rs": { "lines": 95, "branches": 88 },
-  "gateway/src/middleware/rbac.rs": { "lines": 94, "branches": 84 },
-  "gateway/src/middleware/csrf.rs": { "lines": 95, "branches": 88 },
-  "gateway/src/middleware/headers.rs": { "lines": 100, "branches": 85 },
-  "gateway/src/middleware/validate.rs": { "lines": 100, "branches": 100 },
-  "gateway/src/rbac/rule.rs": { "lines": 100, "branches": 100 },
-  "gateway/src/rbac/engine.rs": { "lines": 100, "branches": 100 },
-  "gateway/src/admin_authorization.rs": { "lines": 75, "branches": 75 },
-  "gateway/src/egress.rs": { "lines": 87, "branches": 74 }
+  "gateway/src/auth/jwt.rs": { "lines": 85, "branches": 80, "min_line_count": 467, "min_branch_count": 56 },
+  "gateway/src/middleware/auth.rs": { "lines": 95, "branches": 88, "min_line_count": 464, "min_branch_count": 64 },
+  "gateway/src/middleware/rbac.rs": { "lines": 94, "branches": 84, "min_line_count": 1270, "min_branch_count": 114 },
+  "gateway/src/middleware/csrf.rs": { "lines": 95, "branches": 88, "min_line_count": 166, "min_branch_count": 38 },
+  "gateway/src/middleware/headers.rs": { "lines": 100, "branches": 85, "min_line_count": 46, "min_branch_count": 8 },
+  "gateway/src/middleware/validate.rs": { "lines": 100, "branches": 100, "min_line_count": 196, "min_branch_count": 42 },
+  "gateway/src/rbac/rule.rs": { "lines": 100, "branches": 100, "min_line_count": 90, "min_branch_count": 18 },
+  "gateway/src/rbac/engine.rs": { "lines": 100, "branches": 100, "min_line_count": 42, "min_branch_count": 4 },
+  "gateway/src/admin_authorization.rs": { "lines": 75, "branches": 75, "min_line_count": 386, "min_branch_count": 46 },
+  "gateway/src/egress.rs": { "lines": 87, "branches": 74, "min_line_count": 1754, "min_branch_count": 230 }
 }

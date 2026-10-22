@@ -27,7 +27,8 @@ use crate::{
     connections::{
         caller_assertion::CallerAssertionError,
         http::{
-            ConnectionHttpError, ConnectionHttpRuntime, ConnectionHttpTarget, IssuedCallerAssertion,
+            ConnectionHttpError, ConnectionHttpRuntime, ConnectionHttpTarget,
+            IssuedCallerAssertion, IssuedSessionCallerAssertions,
         },
         mcp::McpConnectionCatalogRuntime,
         openapi::OpenApiConnectionCatalogRuntime,
@@ -1352,15 +1353,15 @@ impl ToolExecutor {
                         reason: "connection_runtime_unavailable",
                     })
                     .and_then(|runtime| {
-                        // A manual tool is the lane that signs a caller
-                        // assertion. A managed OpenAPI tool keeps refusing an
-                        // attesting Connection, as its catalog's discovery and
-                        // refresh do, so its registry binding and its calls
-                        // cannot disagree.
+                        // Both tool lanes sign a caller assertion. Each has its
+                        // own constructor, the one its registry binding is
+                        // validated with, so a binding and its calls cannot
+                        // disagree: a managed OpenAPI tool, unlike a manual
+                        // one, still refuses a delegated Connection.
                         if matches!(source, ToolSource::Manual) {
                             runtime.tool_call_target(connection_id, &request.path_and_query)
                         } else {
-                            runtime.target(connection_id, &request.path_and_query)
+                            runtime.openapi_tool_target(connection_id, &request.path_and_query)
                         }
                         .map_err(|error| connection_tool_error(&tool, error))
                     });
@@ -2486,9 +2487,12 @@ impl ToolExecutor {
         else {
             return Some(Err("catalog_stale"));
         };
+        // A tool call's session attests its caller when the Connection asks
+        // for it; discovery, which built the catalog, still refuses such a
+        // Connection.
         Some(
             runtime
-                .mcp_target(connection_id)
+                .mcp_tool_call_target(connection_id)
                 .map_err(|error| error.safe_reason())
                 .and_then(|target| {
                     if target.connection_etag() == expected_etag {
@@ -2845,6 +2849,9 @@ impl ToolExecutor {
             }
             _ => None,
         };
+        // The assertions the call's session carried, set once it is over
+        // whatever its outcome, so its audit names them.
+        let mut issued_assertions = None;
         let result = if let Some(connection_id) = managed_connection_id {
             let Some(connection_http) = self.connection_http.as_ref() else {
                 return self.mcp_proxy_preflight_error(
@@ -2869,13 +2876,31 @@ impl ToolExecutor {
                 }
             };
             debug_assert_eq!(target.connection_id().as_str(), connection_id);
-            mcp_upstream::call_connection_tool_at_target(
+            let authentication_kind = target.authentication_kind();
+            let result = mcp_upstream::call_connection_tool_at_target(
                 connection_http,
                 target,
                 &mapping.tool_name,
                 args,
+                mcp_upstream::McpToolCallAttestation {
+                    caller: context.caller.as_deref(),
+                    request_id: &context.request_id,
+                },
+                &mut issued_assertions,
             )
-            .await
+            .await;
+            if let Err(mcp_upstream::McpUpstreamCallError::CallerAssertion(error)) = &result {
+                if error.is_key_resolution_failure() {
+                    self.emit_secret_resolution_failed(
+                        context,
+                        tool,
+                        connection_id,
+                        authentication_kind,
+                        error.safe_reason(),
+                    );
+                }
+            }
+            result
         } else {
             let Some(server) = self.mcp_upstream_servers.get(&mapping.server_name) else {
                 return self.mcp_proxy_preflight_error(
@@ -2909,6 +2934,7 @@ impl ToolExecutor {
                         latency_ms,
                         reason: failed.then_some("mcp_tool_error"),
                     },
+                    issued_assertions.as_ref(),
                 );
                 self.emit_tool_observation(
                     context,
@@ -2937,6 +2963,7 @@ impl ToolExecutor {
                         latency_ms,
                         reason: Some(reason),
                     },
+                    issued_assertions.as_ref(),
                 );
                 self.emit_tool_observation(
                     context,
@@ -2974,6 +3001,7 @@ impl ToolExecutor {
                 latency_ms: 0,
                 reason: Some(reason),
             },
+            None,
         );
         self.emit_tool_observation(
             context,
@@ -3212,16 +3240,34 @@ impl ToolExecutor {
         target: &ConnectionHttpTarget,
         reason: &'static str,
     ) {
+        self.emit_secret_resolution_failed(
+            context,
+            tool,
+            target.connection_id().as_str(),
+            target.authentication_kind(),
+            reason,
+        );
+    }
+
+    fn emit_secret_resolution_failed(
+        &self,
+        context: &ToolInvocationContext,
+        tool: &ToolDefinition,
+        connection_id: &str,
+        authentication_kind: &'static str,
+        reason: &'static str,
+    ) {
         self.audit.emit(AuditEvent::new(
             audit::event::CONNECTION_SECRET_RESOLUTION_FAILED,
             &context.request_id,
             &context.source_ip,
             context.actor.clone(),
             json!({
-                "connection_id": target.connection_id(),
-                "auth_type": target.authentication_kind(),
+                "connection_id": connection_id,
+                "auth_type": authentication_kind,
                 "consumer_kind": match tool.source {
                     ToolSource::OpenApi { .. } => "openapi_tool",
+                    ToolSource::Mcp { .. } => "mcp_tool",
                     _ => "manual_tool",
                 },
                 "consumer_id": tool.name,
@@ -3232,12 +3278,16 @@ impl ToolExecutor {
         ));
     }
 
+    /// `caller_assertion` is what a managed MCP call's session signed: the
+    /// key, the request ID each request's `jti` extends, and how many
+    /// requests carried one. The attested caller is the event's actor.
     fn emit_mcp_upstream_audit(
         &self,
         context: &ToolInvocationContext,
         tool: &ToolDefinition,
         mapping: &McpProxyMapping,
         outcome: UpstreamAuditOutcome,
+        caller_assertion: Option<&IssuedSessionCallerAssertions>,
     ) {
         let mut payload = json!({
             "tool_name": tool.name,
@@ -3259,6 +3309,9 @@ impl ToolExecutor {
         }
         if let Some(reason) = outcome.reason {
             payload["reason"] = json!(reason);
+        }
+        if let Some(caller_assertion) = caller_assertion {
+            payload["caller_assertion"] = json!(caller_assertion);
         }
 
         self.audit.emit(AuditEvent::new(

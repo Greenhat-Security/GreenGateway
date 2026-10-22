@@ -23,8 +23,8 @@ use super::{
     control_plane::ConnectionControlPlane,
     model::{
         normalize_origin_relative_path, CallerAssertionSettings, ConnectionAuthentication,
-        ConnectionId, ConnectionKind, ConnectionTestProfile, ConnectionTimeouts, DiscoveryConfig,
-        OAuthClientAuthMethod, SubjectTokenSource, TlsProfile, MAX_CONNECTIONS,
+        ConnectionId, ConnectionKind, ConnectionTestProfile, ConnectionTimeouts, ConnectionWrite,
+        DiscoveryConfig, OAuthClientAuthMethod, SubjectTokenSource, TlsProfile, MAX_CONNECTIONS,
         MAX_EXPECTED_STATUSES, MAX_URL_BYTES,
     },
     oauth::{
@@ -35,8 +35,8 @@ use super::{
     status::ConnectionRevisions,
     store::{ConnectionDependencyKind, StoredConnection},
     token_exchange::{
-        DelegatedTokenBinding, DelegatedTokenError, DelegatedTokenLease, DelegatedTokenRuntime,
-        SubjectTokenSettings,
+        DelegatedTokenBinding, DelegatedTokenError, DelegatedTokenLease,
+        DelegatedTokenPurgeTrigger, DelegatedTokenRuntime, SubjectTokenSettings,
     },
 };
 
@@ -50,6 +50,19 @@ pub struct ConnectionHttpRuntime {
     delegated: DelegatedTokenRuntime,
     #[cfg(test)]
     additional_resolution_delay: Option<std::time::Duration>,
+}
+
+/// A validator's refusal of a revoked credential purges the principal's delegated tokens: whatever
+/// else that principal still holds, nothing exchanged for them before the revocation is served
+/// again without asking the issuer.
+impl crate::auth::RevokedCredentialObserver for ConnectionHttpRuntime {
+    fn credential_revoked(&self, issuer: &str, subject: &str) {
+        self.purge_delegated_tokens(
+            issuer,
+            subject,
+            DelegatedTokenPurgeTrigger::CredentialRevoked,
+        );
+    }
 }
 
 impl fmt::Debug for ConnectionHttpRuntime {
@@ -176,43 +189,206 @@ impl CallerAssertionSigner<'_> {
         body: &[u8],
     ) -> Result<SignedCallerAssertion, CallerAssertionError> {
         let caller = caller.ok_or(CallerAssertionError::NoPrincipal)?;
-        let binding = self.binding;
-        let request_binding = self.request_target.as_deref().map(|path| RequestBinding {
-            method: method.as_str(),
-            path,
-            body,
-        });
-        let config = CallerAssertionConfig {
-            issuer: &binding.issuer,
-            audience: &binding.audience,
-            token_type: &binding.token_type,
-            lifetime_seconds: binding.lifetime_seconds,
-            claims: &binding.claims,
-            bind_request: binding.bind_request,
-            // Validation refuses `bind_approval` on every Connection this
-            // target can be built for.
-            bind_approval: false,
-        };
-        let token = sign_caller_assertion(
+        sign_bound_request(
+            self.binding,
             &self.key,
-            &config,
-            Some(&caller.identity()),
+            self.request_target.as_deref(),
+            caller,
             request_id,
-            unix_now()?,
-            request_binding.as_ref(),
-            None,
+            method,
+            body,
+        )
+    }
+
+    /// Whether the assertion covers the request body, which a lane must then
+    /// hold in full before it signs: an assertion over part of a body is one
+    /// no upstream could verify.
+    pub fn binds_request_body(&self) -> bool {
+        self.request_target.is_some()
+    }
+
+    /// Keeps the loaded key for a call that sends several requests, each of
+    /// which carries its own assertion: a managed MCP tool call opens a
+    /// session, and every request of it -- initialization, the call itself,
+    /// the event stream and the closing `DELETE` -- names the caller.
+    ///
+    /// Each request is signed separately, with its own `jti`, so an upstream
+    /// that keeps a replay cache keyed on `sub` and `jti` accepts every one of
+    /// them, and with `bind_request` each covers its own method and body.
+    pub fn into_session(
+        self,
+        caller: &AttestedCaller,
+        request_id: &str,
+    ) -> SessionCallerAssertions {
+        SessionCallerAssertions {
+            inner: Arc::new(SessionCallerAssertionsInner {
+                binding: self.binding.clone(),
+                key: self.key,
+                request_target: self.request_target,
+                caller: caller.clone(),
+                jti_base: request_id.to_owned(),
+                state: Mutex::new(SessionAssertionState::default()),
+            }),
+        }
+    }
+}
+
+/// Signs one assertion for one request: the claims `binding` configures, for
+/// `caller`, with `jti` and, when `request_target` is set, the method, that
+/// target and the exact body bytes.
+fn sign_bound_request(
+    binding: &CallerAssertionBinding,
+    key: &AssertionSigningKey,
+    request_target: Option<&str>,
+    caller: &AttestedCaller,
+    jti: &str,
+    method: &Method,
+    body: &[u8],
+) -> Result<SignedCallerAssertion, CallerAssertionError> {
+    let request_binding = request_target.map(|path| RequestBinding {
+        method: method.as_str(),
+        path,
+        body,
+    });
+    let config = CallerAssertionConfig {
+        issuer: &binding.issuer,
+        audience: &binding.audience,
+        token_type: &binding.token_type,
+        lifetime_seconds: binding.lifetime_seconds,
+        claims: &binding.claims,
+        bind_request: binding.bind_request,
+        // Validation refuses `bind_approval` on every Connection this
+        // target can be built for.
+        bind_approval: false,
+    };
+    let token = sign_caller_assertion(
+        key,
+        &config,
+        Some(&caller.identity()),
+        jti,
+        unix_now()?,
+        request_binding.as_ref(),
+        None,
+    )?;
+    let mut value =
+        HeaderValue::from_str(&token).map_err(|_| CallerAssertionError::SignatureFailed)?;
+    value.set_sensitive(true);
+    Ok(SignedCallerAssertion {
+        header_name: binding.header_name.clone(),
+        value,
+        record: IssuedCallerAssertion {
+            kid: binding.kid.clone(),
+            jti: jti.to_owned(),
+        },
+    })
+}
+
+/// The assertions of one call that sends several requests, signed one per
+/// request; see [`CallerAssertionSigner::into_session`].
+///
+/// Cheap to clone: every clone signs from the same key and counts into the
+/// same sequence. The `n`th request signed carries `jti` `<request ID>.<n>`,
+/// counting from 1. [`Self::seal`] ends the sequence, so every assertion this
+/// gateway sent for the call is one the call's audit event counts.
+#[derive(Clone)]
+pub struct SessionCallerAssertions {
+    inner: Arc<SessionCallerAssertionsInner>,
+}
+
+struct SessionCallerAssertionsInner {
+    binding: CallerAssertionBinding,
+    key: AssertionSigningKey,
+    request_target: Option<String>,
+    caller: AttestedCaller,
+    jti_base: String,
+    state: Mutex<SessionAssertionState>,
+}
+
+#[derive(Default)]
+struct SessionAssertionState {
+    signed: u32,
+    sealed: bool,
+}
+
+/// What audit records about the assertions one call's requests carried: the
+/// key that signed them, the request ID their `jti`s extend, and how many
+/// were sent. Request `n` carried `jti` `<jti_base>.<n>`. Never a token.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct IssuedSessionCallerAssertions {
+    pub kid: String,
+    pub jti_base: String,
+    pub count: u32,
+}
+
+impl fmt::Debug for SessionCallerAssertions {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionCallerAssertions")
+            .field("kid", &self.inner.binding.kid)
+            .field("jti_base", &self.inner.jti_base)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SessionCallerAssertions {
+    /// The header every assertion of the session travels in.
+    pub fn header_name(&self) -> &HeaderName {
+        &self.inner.binding.header_name
+    }
+
+    /// Signs the assertion for the next request, once its method and body
+    /// are final. Refuses once the call has been sealed: a request sent
+    /// after the call's audit event was written would carry an assertion no
+    /// record names.
+    pub fn sign_next(
+        &self,
+        method: &Method,
+        body: &[u8],
+    ) -> Result<SignedCallerAssertion, CallerAssertionError> {
+        // Held while signing, which does no I/O: a request that fails to sign
+        // is never counted, and sealing waits for a signature in progress, so
+        // the count is exactly what was signed.
+        let mut state = self.state_guard();
+        if state.sealed {
+            return Err(CallerAssertionError::SignatureFailed);
+        }
+        let sequence = state
+            .signed
+            .checked_add(1)
+            .ok_or(CallerAssertionError::SignatureFailed)?;
+        let jti = format!("{}.{sequence}", self.inner.jti_base);
+        let signed = sign_bound_request(
+            &self.inner.binding,
+            &self.inner.key,
+            self.inner.request_target.as_deref(),
+            &self.inner.caller,
+            &jti,
+            method,
+            body,
         )?;
-        let mut value =
-            HeaderValue::from_str(&token).map_err(|_| CallerAssertionError::SignatureFailed)?;
-        value.set_sensitive(true);
-        Ok(SignedCallerAssertion {
-            header_name: binding.header_name.clone(),
-            value,
-            record: IssuedCallerAssertion {
-                kid: binding.kid.clone(),
-                jti: request_id.to_owned(),
-            },
+        state.signed = sequence;
+        Ok(signed)
+    }
+
+    /// Ends the session's sequence and says what it sent, or `None` when no
+    /// request was signed. Nothing signs after this.
+    pub fn seal(&self) -> Option<IssuedSessionCallerAssertions> {
+        let mut state = self.state_guard();
+        state.sealed = true;
+        (state.signed > 0).then(|| IssuedSessionCallerAssertions {
+            kid: self.inner.binding.kid.clone(),
+            jti_base: self.inner.jti_base.clone(),
+            count: state.signed,
         })
+    }
+
+    fn state_guard(&self) -> MutexGuard<'_, SessionAssertionState> {
+        // The state is a counter and a flag, each written whole under the
+        // lock, so a poisoned guard still holds a consistent value.
+        match self.inner.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
     }
 }
 
@@ -461,6 +637,19 @@ impl ConnectionHttpRuntime {
         self
     }
 
+    /// Purges every delegated token this process caches for the principal `issuer` and `subject`
+    /// name, under every `delegated_issuer_token` Connection, and revokes each at its issuer in
+    /// the background where the Connection names a `revocation_url`. Returns how many cache
+    /// entries were purged. Each replica holds its own cache, so this purges this process's only.
+    pub fn purge_delegated_tokens(
+        &self,
+        issuer: &str,
+        subject: &str,
+        trigger: DelegatedTokenPurgeTrigger,
+    ) -> usize {
+        self.delegated.purge_principal(issuer, subject, trigger)
+    }
+
     /// Replaces the delegated-token cache with one of `capacity` entries
     /// driven by `clock`, so a test can expire and evict tokens on purpose.
     #[cfg(test)]
@@ -523,16 +712,21 @@ impl ConnectionHttpRuntime {
         ))
     }
 
-    /// The target of one tool call, and the only constructor that serves a
-    /// Connection carrying a `caller_assertion`.
+    /// The target of one manual HTTP tool call. Like every attesting lane's
+    /// constructor it serves a Connection carrying a `caller_assertion`, and
+    /// it is the only one that serves a `delegated_issuer_token` Connection,
+    /// whose assertion is the subject token of its exchange.
     ///
-    /// A tool call is the one lane that has a validated principal to attest
-    /// and the exact bytes it sends in hand before it sends them. Every other
-    /// lane -- proxied requests, managed MCP sessions, discovery, enum and
-    /// label sources, stored tests -- builds its target elsewhere and keeps
-    /// refusing such a Connection with `caller_assertion_not_enforced`, as
-    /// does this constructor for a stored assertion that only the legacy
-    /// reading admits ([`ConnectionWrite::caller_assertion_enforceable`]).
+    /// A lane may attest its caller when it has a validated principal to
+    /// attest and the exact bytes it sends in hand before it sends them: tool
+    /// calls (this, [`Self::openapi_tool_target`] and
+    /// [`Self::mcp_tool_call_target`]) and proxied requests
+    /// ([`Self::proxy_route_target`]). Every other lane -- discovery, enum
+    /// and label sources, composite steps, stored tests -- builds its target
+    /// with a constructor that keeps refusing such a Connection with
+    /// `caller_assertion_not_enforced`, as do these for a stored assertion
+    /// that only the legacy reading admits
+    /// ([`ConnectionWrite::caller_assertion_enforceable`]).
     ///
     /// The returned target carries the assertion's settings. The caller must
     /// admit the call with [`Self::admit_caller_assertion`] before any I/O,
@@ -547,6 +741,42 @@ impl ConnectionHttpRuntime {
         connection_id: &str,
         path_and_query: &str,
     ) -> Result<ConnectionHttpTarget, ConnectionHttpError> {
+        self.attesting_http_target(connection_id, path_and_query, AttestingLane::ManualTool)
+    }
+
+    /// The target of one managed OpenAPI tool call, attested like a manual
+    /// tool's; see [`Self::tool_call_target`]. A `delegated_issuer_token`
+    /// Connection is refused with `caller_assertion_not_enforced`, as before
+    /// OpenAPI tools signed anything: only manual tools obtain the caller's
+    /// own token.
+    pub fn openapi_tool_target(
+        &self,
+        connection_id: &str,
+        path_and_query: &str,
+    ) -> Result<ConnectionHttpTarget, ConnectionHttpError> {
+        self.attesting_http_target(connection_id, path_and_query, AttestingLane::OpenApiTool)
+    }
+
+    /// The target of one request a connection-bound proxy route forwards,
+    /// attested like a tool call; see [`Self::tool_call_target`]. A
+    /// `delegated_issuer_token` Connection is refused with
+    /// `caller_assertion_not_enforced`, as before the proxy signed anything:
+    /// a proxied request is never served by a credential that belongs to the
+    /// caller.
+    pub fn proxy_route_target(
+        &self,
+        connection_id: &str,
+        path_and_query: &str,
+    ) -> Result<ConnectionHttpTarget, ConnectionHttpError> {
+        self.attesting_http_target(connection_id, path_and_query, AttestingLane::ProxyRoute)
+    }
+
+    fn attesting_http_target(
+        &self,
+        connection_id: &str,
+        path_and_query: &str,
+        lane: AttestingLane,
+    ) -> Result<ConnectionHttpTarget, ConnectionHttpError> {
         let connection_id = ConnectionId::parse(connection_id.to_owned())
             .map_err(|_| ConnectionHttpError::InvalidConnectionId)?;
         let snapshot = self.effective_snapshot();
@@ -554,16 +784,7 @@ impl ConnectionHttpRuntime {
             .managed()
             .get(&connection_id)
             .ok_or(ConnectionHttpError::ConnectionNotFound)?;
-        let caller_assertion = match record.write.caller_assertion.as_ref() {
-            None => None,
-            Some(_) if !record.write.caller_assertion_enforceable() => {
-                return Err(ConnectionHttpError::CallerAssertionNotEnforced);
-            }
-            Some(settings) => Some(CallerAssertionBinding::from_settings(
-                settings,
-                Arc::clone(&snapshot),
-            )?),
-        };
+        let caller_assertion = attesting_binding(record, &snapshot, lane)?;
         validate_http_connection(record)?;
         let url = connection_target_url(record, path_and_query)?;
         let client = self.client_for(record)?;
@@ -597,6 +818,15 @@ impl ConnectionHttpRuntime {
     /// is a binding a call can use.
     pub fn validate_tool_binding(&self, connection_id: &str) -> Result<(), ConnectionHttpError> {
         self.tool_call_target(connection_id, "/").map(|_| ())
+    }
+
+    /// Whether a managed OpenAPI catalog's tools may be bound to
+    /// `connection_id`: the checks [`Self::openapi_tool_target`] applies.
+    pub fn validate_openapi_tool_binding(
+        &self,
+        connection_id: &str,
+    ) -> Result<(), ConnectionHttpError> {
+        self.openapi_tool_target(connection_id, "/").map(|_| ())
     }
 
     /// Refuses, before any DNS lookup, credential read or upstream byte, a
@@ -710,6 +940,10 @@ impl ConnectionHttpRuntime {
         }))
     }
 
+    /// The target of a managed MCP session that discovers the Connection's
+    /// catalog. Discovery has no caller to attest, so a Connection carrying a
+    /// `caller_assertion` is refused with `caller_assertion_not_enforced`;
+    /// a tool call uses [`Self::mcp_tool_call_target`].
     pub fn mcp_target(
         &self,
         connection_id: &str,
@@ -718,6 +952,35 @@ impl ConnectionHttpRuntime {
             .map_err(|_| ConnectionHttpError::InvalidConnectionId)?;
         let snapshot = self.effective_snapshot();
         let record = managed_record(&snapshot, &connection_id)?;
+        self.mcp_session_target(connection_id, record)
+    }
+
+    /// The target of the session one managed MCP tool call opens, attested
+    /// like an HTTP tool call (see [`Self::tool_call_target`]): every request
+    /// of the session carries its own assertion, through
+    /// [`CallerAssertionSigner::into_session`].
+    pub fn mcp_tool_call_target(
+        &self,
+        connection_id: &str,
+    ) -> Result<ConnectionHttpTarget, ConnectionHttpError> {
+        let connection_id = ConnectionId::parse(connection_id.to_owned())
+            .map_err(|_| ConnectionHttpError::InvalidConnectionId)?;
+        let snapshot = self.effective_snapshot();
+        let record = snapshot
+            .managed()
+            .get(&connection_id)
+            .ok_or(ConnectionHttpError::ConnectionNotFound)?;
+        let caller_assertion = attesting_binding(record, &snapshot, AttestingLane::ManagedMcpTool)?;
+        let mut target = self.mcp_session_target(connection_id, record)?;
+        target.caller_assertion = caller_assertion;
+        Ok(target)
+    }
+
+    fn mcp_session_target(
+        &self,
+        connection_id: ConnectionId,
+        record: &StoredConnection,
+    ) -> Result<ConnectionHttpTarget, ConnectionHttpError> {
         let use_connection_authentication = validate_mcp_connection(record)?;
         let url = connection_target_url(record, "/")?;
         let client = self.client_for(record)?;
@@ -1169,6 +1432,7 @@ impl ConnectionHttpRuntime {
                 requested_scopes,
                 audience,
                 resource,
+                revocation_url,
                 subject_token_source: SubjectTokenSource::CallerAssertion,
             } => {
                 // Validation guarantees the block on every stored document;
@@ -1191,6 +1455,7 @@ impl ConnectionHttpRuntime {
                         requested_scopes: requested_scopes.clone(),
                         audience: audience.clone(),
                         resource: resource.clone(),
+                        revocation_url: revocation_url.clone(),
                         subject_token: SubjectTokenSettings {
                             signing_key_id: assertion.signing_key_id.clone(),
                             kid: assertion.kid.clone(),
@@ -1428,6 +1693,23 @@ impl ConnectionHttpTarget {
         self.caller_assertion
             .as_ref()
             .map(|binding| &binding.header_name)
+    }
+
+    /// Whether this target carries a caller assertion: a call on it must be
+    /// admitted with [`ConnectionHttpRuntime::admit_caller_assertion`], and
+    /// names its caller to the upstream or, on a delegated Connection, to
+    /// the token issuer.
+    pub fn attests_caller(&self) -> bool {
+        self.caller_assertion.is_some()
+    }
+
+    /// Whether a request to this target carries an assertion that covers the
+    /// exact body sent (`bind_request`), so a lane that streams bodies must
+    /// hold this one in full, within its size limit, before it signs.
+    pub fn caller_assertion_binds_request_body(&self) -> bool {
+        self.caller_assertion
+            .as_ref()
+            .is_some_and(|binding| binding.signs_upstream && binding.bind_request)
     }
 
     pub fn authentication_kind(&self) -> &'static str {
@@ -1718,8 +2000,10 @@ fn connection_tls_secret_error(error: SecretResolveError) -> ConnectionHttpError
 /// Looks up the managed record a target is built from, and refuses one this
 /// gateway cannot honour.
 ///
-/// Every target constructor goes through here, and a [`ConnectionHttpTarget`]
-/// is the only way any lane -- tool calls, the proxy, managed MCP sessions and
+/// Every constructor for a lane that does not attest its caller goes through
+/// here; the attesting lanes' constructors refuse what they cannot honour
+/// through [`attesting_binding`] instead. A [`ConnectionHttpTarget`] is the
+/// only way any lane -- tool calls, the proxy, managed MCP sessions and
 /// discovery, OpenAPI discovery, enum sources and Connection tests -- reaches
 /// an egress client, a TLS identity or a credential. A refusal here therefore
 /// lands before DNS, before any secret is read, before OAuth minting and before
@@ -1739,7 +2023,7 @@ fn managed_record<'a>(
 /// Refuses a Connection that asks for a signed caller assertion, on every lane
 /// that does not sign one.
 ///
-/// Only a tool call attests its caller (see
+/// Only an [`AttestingLane`] attests its caller (see
 /// [`ConnectionHttpRuntime::tool_call_target`]). Serving such a Connection on
 /// any other lane would be a silent fail-open: the operator configured "every
 /// call names its caller" and the upstream would receive a request naming
@@ -1752,6 +2036,62 @@ fn refuse_unenforced_caller_assertion(
         return Err(ConnectionHttpError::CallerAssertionNotEnforced);
     }
     Ok(())
+}
+
+/// A lane that signs a caller assertion on every request it sends for a
+/// caller, and so may serve a Connection carrying a `caller_assertion`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttestingLane {
+    /// A manual HTTP tool call. The one lane that also serves a
+    /// `delegated_issuer_token` Connection.
+    ManualTool,
+    /// A managed OpenAPI tool call.
+    OpenApiTool,
+    /// A request a connection-bound proxy route forwards.
+    ProxyRoute,
+    /// The session a managed MCP tool call opens.
+    ManagedMcpTool,
+}
+
+/// Whether `write` can be served on `lane` as far as its caller assertion is
+/// concerned: it carries none, or one `lane` signs.
+///
+/// A stored block only the legacy reading admits is served by no lane (see
+/// [`ConnectionWrite::caller_assertion_enforceable`]). A
+/// `delegated_issuer_token` Connection, whose assertion is the subject token
+/// of the caller's own credential, is served by manual tool calls alone:
+/// that is the only lane that obtains a caller's delegated token, so on every
+/// other lane the Connection stays refused exactly as it was before those
+/// lanes signed anything.
+///
+/// [`ConnectionWrite::caller_assertion_enforceable`]:
+///     super::model::ConnectionWrite::caller_assertion_enforceable
+pub fn caller_assertion_servable_on(write: &ConnectionWrite, lane: AttestingLane) -> bool {
+    if write.caller_assertion.is_none() {
+        return true;
+    }
+    write.caller_assertion_enforceable()
+        && (lane == AttestingLane::ManualTool
+            || !matches!(
+                write.authentication,
+                ConnectionAuthentication::DelegatedIssuerToken { .. }
+            ))
+}
+
+/// The caller assertion a target built for `lane` carries, or the refusal
+/// when `lane` cannot honour the block `record` carries.
+fn attesting_binding(
+    record: &StoredConnection,
+    snapshot: &Arc<super::control_plane::ConnectionRuntimeSnapshot>,
+    lane: AttestingLane,
+) -> Result<Option<CallerAssertionBinding>, ConnectionHttpError> {
+    let Some(settings) = record.write.caller_assertion.as_ref() else {
+        return Ok(None);
+    };
+    if !caller_assertion_servable_on(&record.write, lane) {
+        return Err(ConnectionHttpError::CallerAssertionNotEnforced);
+    }
+    CallerAssertionBinding::from_settings(settings, Arc::clone(snapshot)).map(Some)
 }
 
 fn validate_http_connection(record: &StoredConnection) -> Result<(), ConnectionHttpError> {
@@ -2840,8 +3180,8 @@ mod tests {
     }
 
     /// A caller assertion as an operator would configure one. Its signing key
-    /// is loaded when the Connection is saved; every target but a tool call's
-    /// must still refuse before anything would sign with it.
+    /// is loaded when the Connection is saved; every target but an attesting
+    /// lane's must still refuse before anything would sign with it.
     fn unenforced_caller_assertion() -> CallerAssertionSettings {
         CallerAssertionSettings {
             signing_key_id: crate::connections::test_support::ASSERTION_SIGNING_KEY_ALIAS
@@ -2880,9 +3220,9 @@ mod tests {
 
     #[tokio::test]
     async fn every_http_target_refuses_an_unenforced_caller_assertion_before_preparation() {
-        // Only a tool call signs the assertion, so serving this Connection on
-        // any other lane would send the upstream calls it cannot attribute
-        // while the operator believes every call names its caller.
+        // Only an attesting lane signs the assertion, so serving this
+        // Connection on any other lane would send the upstream calls it cannot
+        // attribute while the operator believes every call names its caller.
         let mut write = record("/v1").write;
         write.caller_assertion = Some(unenforced_caller_assertion());
         write.discovery = Some(DiscoveryConfig::ManagedOpenapi {
@@ -2900,12 +3240,11 @@ mod tests {
         let etag = stored.etag().to_string();
         let refused = Some(ConnectionHttpError::CallerAssertionNotEnforced);
 
-        // Managed OpenAPI tools, composite steps, enum sources and the proxy.
+        // Composite steps and enum sources.
         assert_eq!(
             temporary.runtime.target(connection_id, "/charges").err(),
             refused
         );
-        // OpenAPI tool and route binding validation.
         assert_eq!(
             temporary.runtime.validate_binding(connection_id).err(),
             refused
@@ -2972,7 +3311,7 @@ mod tests {
         let etag = stored.etag().to_string();
         let refused = Some(ConnectionHttpError::CallerAssertionNotEnforced);
 
-        // MCP tool calls and catalog discovery.
+        // MCP catalog discovery, which has no caller to attest.
         assert_eq!(temporary.runtime.mcp_target(connection_id).err(), refused);
         // MCP Connection tests.
         assert_eq!(
@@ -3000,6 +3339,31 @@ mod tests {
             ConnectionStatusReason::RequestFailed
         );
         assert_eq!(temporary.cached_client_count(), 0);
+
+        // A tool call's session is the one MCP target that carries it, even
+        // when the session does not use the Connection's own credential: the
+        // assertion is about the caller, not the credential.
+        let target = temporary
+            .runtime
+            .mcp_tool_call_target(connection_id)
+            .expect("a valid attested Connection serves MCP tool calls");
+        assert!(target.attests_caller());
+        assert!(target.is_credentialed());
+        assert!(target.credential_header_names().is_empty());
+        assert_eq!(
+            target
+                .caller_assertion_header_name()
+                .map(HeaderName::as_str),
+            Some("x-caller-assertion")
+        );
+        // An MCP Connection is never an HTTP lane's.
+        assert_eq!(
+            temporary
+                .runtime
+                .proxy_route_target(connection_id, "/")
+                .err(),
+            Some(ConnectionHttpError::WrongConnectionKind)
+        );
     }
 
     fn principal(auth_method: crate::auth::AuthMethod) -> crate::auth::Principal {
@@ -3015,9 +3379,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_manual_tool_call_is_the_one_target_that_carries_the_assertion() {
+    async fn the_attesting_lanes_carry_the_assertion_and_every_other_lane_refuses() {
         let mut write = record("/v1").write;
-        write.caller_assertion = Some(unenforced_caller_assertion());
+        let mut assertion = unenforced_caller_assertion();
+        assertion.bind_request = true;
+        write.caller_assertion = Some(assertion);
         let temporary = attested_runtime("caller-assertion-tool-target", write).await;
         let connection_id = temporary.connection_id.as_str();
 
@@ -3035,13 +3401,48 @@ mod tests {
         // not reflect it, and an upstream 401 is a rejection of it.
         assert!(target.is_credentialed());
         assert!(target.credential_header_names().is_empty());
+        assert!(target.attests_caller());
+        // With `bind_request` a lane that streams bodies must hold this one.
+        assert!(target.caller_assertion_binds_request_body());
         assert!(temporary
             .runtime
             .validate_tool_binding(connection_id)
             .is_ok());
-        // Every other lane still refuses the same Connection.
+        // Managed OpenAPI tools and proxied requests attest the same way.
+        for lane_target in [
+            temporary
+                .runtime
+                .openapi_tool_target(connection_id, "/charges")
+                .expect("a valid attested Connection serves OpenAPI tool calls"),
+            temporary
+                .runtime
+                .proxy_route_target(connection_id, "/charges")
+                .expect("a valid attested Connection serves proxied requests"),
+        ] {
+            assert_eq!(
+                lane_target
+                    .caller_assertion_header_name()
+                    .map(HeaderName::as_str),
+                Some("x-caller-assertion")
+            );
+            assert!(lane_target.is_credentialed());
+            assert!(lane_target.caller_assertion_binds_request_body());
+        }
+        assert!(temporary
+            .runtime
+            .validate_openapi_tool_binding(connection_id)
+            .is_ok());
+        // Every lane without a caller to attest still refuses the same
+        // Connection.
         assert_eq!(
             temporary.runtime.target(connection_id, "/charges").err(),
+            Some(ConnectionHttpError::CallerAssertionNotEnforced)
+        );
+        assert_eq!(
+            temporary
+                .runtime
+                .openapi_discovery_target(connection_id)
+                .err(),
             Some(ConnectionHttpError::CallerAssertionNotEnforced)
         );
 
@@ -3141,6 +3542,8 @@ mod tests {
             .tool_call_target(connection_id, "/charges")
             .expect("an unattested Connection serves tool calls");
         assert!(unattested.caller_assertion_header_name().is_none());
+        assert!(!unattested.attests_caller());
+        assert!(!unattested.caller_assertion_binds_request_body());
         assert_eq!(
             temporary
                 .runtime
@@ -3167,6 +3570,7 @@ mod tests {
             requested_scopes: vec!["mail.read".to_owned()],
             audience: Some("https://billing.example.test".to_owned()),
             resource: None,
+            revocation_url: None,
             subject_token_source: SubjectTokenSource::CallerAssertion,
         };
         let root = temporary_managed_root("delegated-tool-target");
@@ -3249,8 +3653,13 @@ mod tests {
             Ok(())
         );
 
+        // A delegated subject token is never a request binding.
+        assert!(!target.caller_assertion_binds_request_body());
+
         // Every other lane refuses it before preparing anything, because it
-        // carries the caller assertion its subject token is signed with.
+        // carries the caller assertion its subject token is signed with. That
+        // includes the lanes that attest their callers: only a manual tool
+        // obtains a caller's own delegated token.
         let refused = Some(ConnectionHttpError::CallerAssertionNotEnforced);
         assert_eq!(
             temporary.runtime.target(connection_id, "/messages").err(),
@@ -3260,6 +3669,35 @@ mod tests {
             temporary.runtime.validate_binding(connection_id).err(),
             refused
         );
+        assert_eq!(
+            temporary
+                .runtime
+                .openapi_tool_target(connection_id, "/messages")
+                .err(),
+            refused
+        );
+        assert_eq!(
+            temporary
+                .runtime
+                .validate_openapi_tool_binding(connection_id)
+                .err(),
+            refused
+        );
+        assert_eq!(
+            temporary
+                .runtime
+                .proxy_route_target(connection_id, "/messages")
+                .err(),
+            refused
+        );
+        assert!(!caller_assertion_servable_on(
+            &stored.write,
+            AttestingLane::OpenApiTool
+        ));
+        assert!(caller_assertion_servable_on(
+            &stored.write,
+            AttestingLane::ManualTool
+        ));
         assert_eq!(
             temporary.runtime.test_target(connection_id, &etag).err(),
             refused
@@ -3410,8 +3848,185 @@ mod tests {
                 temporary.runtime.validate_tool_binding(connection_id),
                 Err(ConnectionHttpError::CallerAssertionNotEnforced)
             );
+            // No attesting lane serves it either.
+            assert_eq!(
+                temporary
+                    .runtime
+                    .openapi_tool_target(connection_id, "/charges")
+                    .err(),
+                Some(ConnectionHttpError::CallerAssertionNotEnforced)
+            );
+            assert_eq!(
+                temporary
+                    .runtime
+                    .proxy_route_target(connection_id, "/charges")
+                    .err(),
+                Some(ConnectionHttpError::CallerAssertionNotEnforced)
+            );
+            assert_eq!(
+                temporary.runtime.mcp_tool_call_target(connection_id).err(),
+                Some(ConnectionHttpError::CallerAssertionNotEnforced)
+            );
         }
         assert_eq!(temporary.cached_client_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_session_signs_each_request_with_its_own_jti_and_nothing_once_sealed() {
+        let mut write = record("/mcp").write;
+        write.kind = ConnectionKind::McpStreamableHttp;
+        write.discovery = Some(DiscoveryConfig::ManagedMcp {
+            use_connection_authentication: false,
+        });
+        let mut assertion = unenforced_caller_assertion();
+        assertion.bind_request = true;
+        write.caller_assertion = Some(assertion);
+        let temporary = attested_runtime("caller-assertion-session", write).await;
+        let connection_id = temporary.connection_id.as_str();
+        let alice = AttestedCaller::from_principal(&principal(crate::auth::AuthMethod::Bearer))
+            .expect("a provider-vouched principal is attestable");
+        let target = temporary
+            .runtime
+            .mcp_tool_call_target(connection_id)
+            .expect("an attested MCP Connection serves tool calls");
+        let session = temporary
+            .runtime
+            .caller_assertion_signer(&target)
+            .await
+            .expect("the key loads")
+            .expect("an attested target signs")
+            .into_session(&alice, "request-7");
+        assert_eq!(
+            session.header_name().as_str(),
+            "x-caller-assertion",
+            "every request of the session uses the Connection's header"
+        );
+        assert!(
+            !format!("{session:?}").contains("BEGIN"),
+            "Debug names the kid and the request, never the key"
+        );
+
+        let jwks = temporary
+            .runtime
+            .control_plane
+            .caller_assertion_jwks()
+            .await
+            .expect("the signing key is published");
+        let set: jsonwebtoken::jwk::JwkSet =
+            serde_json::from_str(jwks.body()).expect("the JWKS is a JWK Set");
+        let verify = |signed: SignedCallerAssertion| {
+            let token = signed
+                .value
+                .to_str()
+                .expect("an assertion is visible ASCII")
+                .to_owned();
+            let key = jsonwebtoken::DecodingKey::from_jwk(
+                set.find("gw-test-1").expect("the signing key is published"),
+            )
+            .expect("the published key loads");
+            let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::ES256);
+            validation.set_issuer(&["https://gateway.example.test"]);
+            validation.set_audience(&["https://billing.example.test"]);
+            (
+                signed.issued().clone(),
+                jsonwebtoken::decode::<serde_json::Value>(&token, &key, &validation)
+                    .expect("each assertion verifies against the published set")
+                    .claims,
+            )
+        };
+        let initialize = br#"{"jsonrpc":"2.0","id":0,"method":"initialize"}"#;
+        let call = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call"}"#;
+        let (first, first_claims) = verify(
+            session
+                .sign_next(&Method::POST, initialize)
+                .expect("the first request signs"),
+        );
+        // A clone signs into the same sequence, as the transport's do.
+        let (second, second_claims) = verify(
+            session
+                .clone()
+                .sign_next(&Method::POST, call)
+                .expect("the second request signs"),
+        );
+        let (third, third_claims) = verify(
+            session
+                .sign_next(&Method::DELETE, b"")
+                .expect("the closing request signs"),
+        );
+        // Each request has its own `jti`, so a replay cache keyed on `sub`
+        // and `jti` accepts all of them, and each binds its own request.
+        assert_eq!(first.jti, "request-7.1");
+        assert_eq!(second.jti, "request-7.2");
+        assert_eq!(third.jti, "request-7.3");
+        for (claims, issued) in [
+            (&first_claims, &first),
+            (&second_claims, &second),
+            (&third_claims, &third),
+        ] {
+            assert_eq!(claims["jti"], json!(issued.jti));
+            assert_eq!(claims["sub"], json!("https://idp.example.test#alice"));
+            assert_eq!(claims["path"], json!("/mcp"));
+        }
+        assert_eq!(first_claims["method"], json!("POST"));
+        assert_eq!(third_claims["method"], json!("DELETE"));
+        assert_eq!(
+            first_claims["request_sha256"],
+            json!(crate::connections::caller_assertion::body_digest(
+                initialize
+            ))
+        );
+        assert_eq!(
+            second_claims["request_sha256"],
+            json!(crate::connections::caller_assertion::body_digest(call))
+        );
+        assert_eq!(
+            third_claims["request_sha256"],
+            json!(crate::connections::caller_assertion::body_digest(b""))
+        );
+
+        // Sealing says what was sent, and nothing signs after it.
+        assert_eq!(
+            session.seal(),
+            Some(IssuedSessionCallerAssertions {
+                kid: "gw-test-1".to_owned(),
+                jti_base: "request-7".to_owned(),
+                count: 3,
+            })
+        );
+        assert_eq!(
+            session.sign_next(&Method::DELETE, b"").err(),
+            Some(CallerAssertionError::SignatureFailed)
+        );
+        assert_eq!(
+            session.seal().map(|issued| issued.count),
+            Some(3),
+            "a refused request is not counted"
+        );
+
+        // A session that sent nothing has nothing to record.
+        let idle = temporary
+            .runtime
+            .caller_assertion_signer(&target)
+            .await
+            .expect("the key loads")
+            .expect("an attested target signs")
+            .into_session(&alice, "request-8");
+        assert_eq!(idle.seal(), None);
+
+        // A request that fails to sign is not counted: with its sequence
+        // suffix this request ID is longer than a `jti` may be.
+        let overlong = temporary
+            .runtime
+            .caller_assertion_signer(&target)
+            .await
+            .expect("the key loads")
+            .expect("an attested target signs")
+            .into_session(&alice, &"r".repeat(127));
+        assert_eq!(
+            overlong.sign_next(&Method::POST, initialize).err(),
+            Some(CallerAssertionError::InvalidClaim("jti"))
+        );
+        assert_eq!(overlong.seal(), None);
     }
 
     #[test]

@@ -166,6 +166,12 @@ impl HaFoundation {
 /// rolling change can finish and the gate re-evaluates on every
 /// heartbeat.
 ///
+/// The gate also carries the one membership fact that is final: the
+/// durable contract fence (issue #426, PR 3) excluding this binary. Once
+/// the membership heartbeat finds that, the gate answers `contract_fenced`
+/// ahead of every other cluster reason and never opens again, because the
+/// fence only moves forward.
+///
 /// Standalone mode has no membership and never constructs one; a `None`
 /// gate in the app state is "always agreed".
 ///
@@ -177,6 +183,8 @@ impl HaFoundation {
 #[derive(Debug)]
 pub struct ClusterReadiness {
     fingerprint_agreed: std::sync::atomic::AtomicBool,
+    /// The durable contract fence excludes this binary. One-way.
+    contract_fenced: std::sync::atomic::AtomicBool,
     /// When the membership heartbeat last wrote this replica's row.
     /// Seeded at construction, which is a truthful starting point: the
     /// boot row is written before the heartbeat task starts, and a boot
@@ -188,6 +196,7 @@ impl Default for ClusterReadiness {
     fn default() -> Self {
         Self {
             fingerprint_agreed: std::sync::atomic::AtomicBool::new(false),
+            contract_fenced: std::sync::atomic::AtomicBool::new(false),
             last_heartbeat_success: std::sync::Mutex::new(std::time::Instant::now()),
         }
     }
@@ -196,6 +205,10 @@ impl Default for ClusterReadiness {
 impl ClusterReadiness {
     /// The readiness reason a mismatched replica reports.
     pub const FINGERPRINT_MISMATCH: &'static str = "config_fingerprint_mismatch";
+
+    /// The readiness reason a replica the durable contract fence excludes
+    /// reports, for the rest of its life.
+    pub const CONTRACT_FENCED: &'static str = "contract_fenced";
 
     #[cfg_attr(not(feature = "postgres"), allow(dead_code))] // constructed by the cluster wiring only
     pub fn new() -> std::sync::Arc<Self> {
@@ -214,8 +227,30 @@ impl ClusterReadiness {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
-    /// Why this gate refuses readiness, or `None` when it does not.
+    /// Whether the durable contract fence has been found to exclude this
+    /// binary.
+    pub fn contract_fenced(&self) -> bool {
+        self.contract_fenced
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Record that the durable contract fence excludes this binary.
+    /// One-way, like the fence. Returns `true` only for the call that
+    /// recorded it, so the caller logs and audits the transition once.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))] // called by the membership heartbeat only
+    pub fn record_contract_fenced(&self) -> bool {
+        !self
+            .contract_fenced
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    /// Why this gate refuses readiness, or `None` when it does not. A
+    /// fenced replica says so before anything else: unlike a fingerprint
+    /// disagreement, nothing the rest of the deployment does can end it.
     pub fn blocked_reason(&self) -> Option<&'static str> {
+        if self.contract_fenced() {
+            return Some(Self::CONTRACT_FENCED);
+        }
         (!self.fingerprint_agreed()).then_some(Self::FINGERPRINT_MISMATCH)
     }
 
@@ -374,6 +409,26 @@ fn insert_public_and_cookie_settings(input: &mut BTreeMap<String, String>, confi
         "admin_login_pending_max_per_ip".into(),
         config.admin_login_pending_max_per_ip.to_string(),
     );
+    // A shared session store is one set of limits too. Absent while sessions
+    // are disabled, so enabling nothing changes no deployment's fingerprint.
+    if let Some(session) = &config.admin_session {
+        input.insert(
+            "admin_session_storage".into(),
+            session.storage.as_str().to_owned(),
+        );
+        input.insert(
+            "admin_session_ttl_secs".into(),
+            session.ttl.as_secs().to_string(),
+        );
+        input.insert(
+            "admin_session_idle_timeout_secs".into(),
+            session.idle_timeout.as_secs().to_string(),
+        );
+        input.insert(
+            "admin_session_max_entries".into(),
+            session.max_entries.to_string(),
+        );
+    }
     input.insert("auth_cookie_name".into(), config.auth_cookie_name.clone());
     input.insert("csrf_enabled".into(), config.csrf_enabled.to_string());
     input.insert("csrf_cookie_name".into(), config.csrf_cookie_name.clone());
@@ -1157,6 +1212,47 @@ mod tests {
             static_config_fingerprint(&base),
             static_config_fingerprint(&changed)
         );
+    }
+
+    #[test]
+    fn fingerprint_covers_admin_session_limits_only_while_sessions_are_enabled() {
+        let base = config_from(&[]);
+        let mut disabled = BTreeMap::new();
+        insert_public_and_cookie_settings(&mut disabled, &base);
+        assert!(
+            !disabled.keys().any(|key| key.starts_with("admin_session")),
+            "a deployment without sessions keeps its fingerprint"
+        );
+        let mut enabled = base.clone();
+        enabled.admin_session = Some(crate::auth::admin_session::AdminSessionConfig {
+            storage: crate::auth::admin_session::AdminSessionStorage::ClusterPostgres,
+            ttl: std::time::Duration::from_secs(3600),
+            idle_timeout: std::time::Duration::from_secs(3600),
+            max_entries: 1024,
+        });
+        assert_ne!(
+            static_config_fingerprint(&base),
+            static_config_fingerprint(&enabled)
+        );
+        let variants: [fn(&mut crate::auth::admin_session::AdminSessionConfig); 4] = [
+            |session| {
+                session.storage = crate::auth::admin_session::AdminSessionStorage::StandaloneMemory
+            },
+            |session| session.ttl = std::time::Duration::from_secs(1800),
+            |session| session.idle_timeout = std::time::Duration::from_secs(600),
+            |session| session.max_entries = 8,
+        ];
+        for change in variants {
+            let mut changed = enabled.clone();
+            if let Some(session) = changed.admin_session.as_mut() {
+                change(session);
+            }
+            assert_ne!(
+                static_config_fingerprint(&enabled),
+                static_config_fingerprint(&changed),
+                "every replica must enforce one set of session limits"
+            );
+        }
     }
 
     #[test]

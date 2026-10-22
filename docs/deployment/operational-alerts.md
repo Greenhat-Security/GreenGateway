@@ -145,6 +145,7 @@ condition may have been masked by the earlier one.
 | Reason, in evaluation order | Interpretation and action |
 | --- | --- |
 | `starting` / `draining` | Lifecycle phase; follow [Lifecycle](#lifecycle-stalls). |
+| `contract_fenced` | The durable contract fence excludes this build, and nothing will reopen it; replace the replica with an eligible build ([the durable contract fence](postgres.md#the-durable-contract-fence)). |
 | `config_fingerprint_mismatch` | Cluster static configuration has not agreed; follow the [rollout procedure](failover.md#gateway-replica-failure). |
 | `storage_unavailable` | Authority access failed or this replica's session is read-only. First distinguish replica-local pool, connectivity, grant or query failures using [Database capacity](#database-capacity); use [failover](failover.md#database-primary-failure) only after confirming primary loss or a read-only primary. |
 | `schema_incompatible` | Ledger integrity or binary/schema contract failed; follow [Cluster authority](#cluster-authority). |

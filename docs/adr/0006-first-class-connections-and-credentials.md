@@ -302,9 +302,10 @@ is explicit.
 - `token_exchange_url` follows the token-URL rule (HTTPS, no userinfo, query
   or fragment) and passes the token client's egress check before any key or
   secret is read.
-- Only the manual HTTP tool-call lane has a validated principal, so only it
-  serves such a Connection; every other lane refuses it through the
-  caller-assertion refusal. A call with no principal, or a service token's, is
+- Only the manual HTTP tool-call lane obtains a caller's own token, so only it
+  serves such a Connection; every other lane, the ones that attest an ordinary
+  Connection's caller included, refuses it through the caller-assertion
+  refusal. A call with no principal, or a service token's, is
   refused with `delegated_token_no_principal`. There is no fallback to a
   service identity.
 - The token cache reuses the OAuth cache's single flight and generation-bound
@@ -325,9 +326,22 @@ is explicit.
 The trust boundary moves to the issuer's grant store: whoever holds the
 client secret can obtain any user's upstream token. Operators keep that secret
 in an external provider, grant read-only scopes, and require the issuer to
-store grants encrypted and log every hand-out. Purging a disabled user's
-cached tokens immediately is a documented follow-up; until then the cache
-lifetime bounds it.
+store grants encrypted and log every hand-out.
+
+The gateway keeps no user records, so it does not learn by itself that a user
+was disabled. It purges a principal's cached tokens -- every entry for that
+issuer and subject, under every delegated Connection -- when told: by an
+operator through `POST /v1{ADMIN_PREFIX}/principal/delegated-tokens/revoke`
+(`admin:principals:write`, standalone only, because each replica caches its
+own tokens and no channel carries a purge between them), or by a JWT validator
+refusing one of the principal's tokens as revoked, which happens on whichever
+replica the token is presented to. Each purged token is then revoked once,
+best effort, at the issuer's RFC 7009 endpoint when the Connection names a
+`revocation_url`, and every purge and revocation is audited
+(`connection.delegated_token_purge`, `connection.delegated_token_revocation`).
+A purge stops the gateway serving tokens it obtained earlier; it does not stop
+a user whose credentials still validate and whose grant the issuer still
+holds.
 
 ### Secret trust and confidentiality
 

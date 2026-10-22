@@ -200,6 +200,13 @@ pub enum ConnectionAuthentication {
         audience: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resource: Option<String>,
+        /// The issuer's OAuth 2.0 token revocation endpoint (RFC 7009). When
+        /// set, a token purged from the cache -- because its user was
+        /// disabled, or one of their credentials was revoked -- is also
+        /// revoked there, best effort. Absent, a purged token is only
+        /// dropped, and stays valid at the issuer until it expires.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        revocation_url: Option<String>,
         subject_token_source: SubjectTokenSource,
     },
 }
@@ -1143,6 +1150,7 @@ fn validate_authentication(
             requested_scopes,
             audience,
             resource,
+            revocation_url,
             subject_token_source: SubjectTokenSource::CallerAssertion,
         } => {
             validate_bounded_bytes(
@@ -1165,6 +1173,14 @@ fn validate_authentication(
             match normalize_token_url("authentication.token_exchange_url", token_exchange_url) {
                 Ok(normalized) => *token_exchange_url = normalized,
                 Err(error) => errors.push(error),
+            }
+            // The same rule again: a revocation carries the client secret and
+            // the token being revoked.
+            if let Some(url) = revocation_url {
+                match normalize_token_url("authentication.revocation_url", url) {
+                    Ok(normalized) => *url = normalized,
+                    Err(error) => errors.push(error),
+                }
             }
             validate_scopes("authentication.requested_scopes", requested_scopes, errors);
             validate_optional_bounded_bytes(
@@ -2284,6 +2300,60 @@ newline"
                 "{url} must be refused: {errors:?}"
             );
             if url.starts_with("http://") {
+                assert!(connection_schema_validator().validate(&document).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn a_delegated_revocation_endpoint_is_optional_and_must_be_https() {
+        let document = delegated(json!({
+            "revocation_url": "https://issuer.example.test/oauth2/revoke"
+        }));
+        connection_schema_validator()
+            .validate(&document)
+            .expect("published schema should accept a revocation endpoint");
+        let validated = serde_json::from_value::<ConnectionWrite>(document)
+            .expect("should deserialize")
+            .validated()
+            .expect("should validate");
+        let ConnectionAuthentication::DelegatedIssuerToken { revocation_url, .. } =
+            &validated.authentication
+        else {
+            panic!("the delegated authentication is kept");
+        };
+        assert_eq!(
+            revocation_url.as_deref(),
+            Some("https://issuer.example.test/oauth2/revoke")
+        );
+
+        // Absent is not serialized, so a document written before the field
+        // existed keeps its bytes, and so its ETag.
+        let without = serde_json::from_value::<ConnectionWrite>(delegated(json!({})))
+            .expect("should deserialize")
+            .validated()
+            .expect("should validate");
+        assert!(serde_json::to_value(&without)
+            .expect("serializes")
+            .pointer("/authentication/revocation_url")
+            .is_none());
+
+        for url in [
+            "http://issuer.example.test/oauth2/revoke",
+            "https://issuer.example.test/revoke?tenant=a",
+            "https://issuer.example.test/revoke#fragment",
+            "https://user@issuer.example.test/revoke",
+            "",
+        ] {
+            let document = delegated(json!({ "revocation_url": url }));
+            let errors = delegated_errors(document.clone());
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.field == "authentication.revocation_url"),
+                "{url} must be refused: {errors:?}"
+            );
+            if url.starts_with("http://") || url.is_empty() {
                 assert!(connection_schema_validator().validate(&document).is_err());
             }
         }

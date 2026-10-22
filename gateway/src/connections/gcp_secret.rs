@@ -1321,6 +1321,7 @@ const fn purpose_code(purpose: SecretPurpose) -> u8 {
         SecretPurpose::TlsCaBundle => 6,
         SecretPurpose::AssertionSigningKey => 7,
         SecretPurpose::TokenExchangeClientSecret => 8,
+        SecretPurpose::AuthorityPseudonymKey => 9,
     }
 }
 

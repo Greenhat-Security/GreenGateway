@@ -28,15 +28,30 @@
 //!   the document format. Anything else is a refusal with a stable reason
 //!   ([`OperationRefusal`]); there is no best-effort write.
 //!
-//! What the gate is not: a durable fence. Liveness is judged on the
+//! The roster alone is not a durable fence. Liveness is judged on the
 //! database clock against `CLUSTER_MEMBER_STALE_MS`, so a member that lacks
 //! a capability can be stopped, swept, and started again after an operation
-//! was admitted. An operation whose data such a member would *misread*,
-//! rather than refuse, declares [`Activation::DurableFence`] and is refused
-//! outright until the contract-fencing slice of #426 provides that fence.
-//! Likewise there is no backfill state yet, so an operation that needs a
-//! completed backfill ([`Backfill::Required`]) is refused. Schema presence
-//! alone never enables an operation.
+//! was admitted, and a member paused past the window comes back with its
+//! next heartbeat. A stale row disappearing is not proof that the member
+//! retired. Two durable records outlive the roster (migration 20, issue
+//! #426 PR 3):
+//!
+//! - **The contract fence** ([`ContractFence`]): one forward-only row naming
+//!   the lowest schema a member's serving range must reach and the
+//!   capabilities it must implement. A gateway the fence excludes refuses
+//!   to start, writes no heartbeat (so it cannot rejoin the roster), and
+//!   admits nothing. An operation whose data a lacking member would
+//!   *misread*, rather than refuse, declares [`Activation::DurableFence`]:
+//!   admitting it raises the fence to the operation's requirement in the
+//!   same transaction that confirms every live member already meets it
+//!   (`PostgresMembershipStore::raise_contract_fence`), so a lacking member
+//!   that returns afterwards is refused at the door instead of misreading.
+//! - **The backfill ledger** ([`BackfillState`]): an operation that needs a
+//!   backfill ([`Backfill::Required`]) is admitted only once the named
+//!   backfill is recorded verified. Missing, running (including
+//!   interrupted) and failed backfills all refuse.
+//!
+//! Schema presence alone never enables an operation.
 //!
 //! The registry ([`OPERATION_REQUIREMENTS`]) holds one operation (issue
 //! #426, PR 2): committing a policy document in which a role carries a
@@ -47,13 +62,16 @@
 //! returns later fails closed on the document rather than misreading it.
 //! The approved-extension list in `migrations.rs` stays empty: the operation
 //! changes no schema, and no schema overlap has been qualified. Every other
-//! operation this binary performs belongs to the schema-18 contract, which
-//! every schema-18 member shares.
+//! operation this binary performs belongs to the schema-20 contract, which
+//! every schema-20 member shares. No shipped operation declares a durable
+//! fence or a backfill, so in this release nothing raises the fence and
+//! the backfill ledger is empty; both are checked everywhere they apply.
 
 use std::collections::BTreeSet;
 
 /// The most capability names one roster row may carry. Migration 17's
-/// check constraint enforces the same bound.
+/// check constraint enforces the same bound, and migration 20's enforces it
+/// on the contract fence.
 pub(crate) const MAX_ADVERTISED_CAPABILITIES: usize = 32;
 
 /// The longest capability name, in bytes. Names are lowercase ASCII
@@ -181,20 +199,18 @@ impl RecognizedCapabilities {
 
 #[cfg(feature = "postgres")]
 pub(crate) use gate::{
-    evaluate, BinaryContract, MemberAdvertisement, OperationAdmission, OperationRefusal,
+    evaluate, fence_target, Activation, Backfill, BackfillState, BinaryContract, ContractFence,
+    FenceExclusion, FenceTarget, MemberAdvertisement, OperationAdmission, OperationRefusal,
     OperationRequirement, OPERATION_REQUIREMENTS, POLICY_ROLE_DESCRIPTIONS,
 };
-// Named by registry entries and their tests.
-#[cfg(all(feature = "postgres", test))]
-pub(crate) use gate::{Activation, Backfill};
 
 #[cfg(feature = "postgres")]
 mod gate {
-    use std::fmt;
+    use std::{collections::BTreeSet, fmt};
 
     use uuid::Uuid;
 
-    use super::{Capability, RecognizedCapabilities};
+    use super::{advertisement, Capability, RecognizedCapabilities};
 
     /// Whether an operation depends on a backfill having completed.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -202,9 +218,8 @@ mod gate {
     pub(crate) enum Backfill {
         /// The operation reads nothing a backfill must first produce.
         NotRequired,
-        /// The operation needs the named backfill completed and verified.
-        /// No backfill state exists in this release, so the operation is
-        /// refused.
+        /// The operation needs the named backfill recorded verified in the
+        /// backfill ledger (`schema_backfills`, migration 20).
         Required { name: &'static str },
     }
 
@@ -217,9 +232,11 @@ mod gate {
         /// after the operation wrote refuses the data (fails closed)
         /// rather than misreading it.
         LiveMembers,
-        /// A lacking member that returned would misread the data, so the
-        /// operation needs a durable activation fence. None exists in this
-        /// release, so the operation is refused.
+        /// A lacking member that returned would misread the data, so
+        /// admitting the operation raises the durable contract fence to its
+        /// requirement first, in the transaction that confirms every live
+        /// member already meets it. From then on a gateway that lacks the
+        /// capability cannot start, rejoin, or admit anything.
         DurableFence,
     }
 
@@ -252,12 +269,12 @@ mod gate {
     /// `security_revision_not_compiled`, serving nothing under the policy it
     /// had; a starting one refuses to boot. That is failing closed, never a
     /// misreading, so live-roster agreement is enough
-    /// ([`Activation::LiveMembers`]) and no durable fence is needed. The
-    /// field lives inside the policy document, so the operation adds no
+    /// ([`Activation::LiveMembers`]) and the durable fence is not raised.
+    /// The field lives inside the policy document, so the operation adds no
     /// schema object and no migration, and the document format stays
     /// major 0. `minimum_schema` is 17 because that is the first schema
     /// whose members advertise capabilities at all; the policy tables it
-    /// writes are older. Every member that shares this binary's schema-18
+    /// writes are older. Every member that shares this binary's schema-20
     /// contract meets it, so among those the capability alone decides.
     pub(crate) const POLICY_ROLE_DESCRIPTIONS: OperationRequirement = OperationRequirement {
         operation: "policy.role_descriptions",
@@ -289,6 +306,173 @@ mod gate {
                 schema: crate::storage::migrations::schema_version_range(),
                 document: crate::cluster_membership::DOCUMENT_VERSION_RANGE,
                 capabilities: super::BINARY_CAPABILITIES,
+            }
+        }
+
+        /// Why `fence` excludes this binary, or `None` when it admits it.
+        pub(crate) fn fenced_by(&self, fence: &ContractFence) -> Option<FenceExclusion> {
+            fence.exclusion(self.schema.1, self.capabilities)
+        }
+    }
+
+    /// The durable contract fence (`contract_fence`, migration 20) as this
+    /// binary read it: one forward-only row every gateway sharing the
+    /// database checks at startup, on every heartbeat, and before every
+    /// gated write.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) struct ContractFence {
+        /// How many times the fence has been raised; `0` until the first
+        /// raise.
+        pub(crate) generation: i64,
+        /// The lowest schema version a gateway's serving range must reach.
+        pub(crate) minimum_schema: i32,
+        /// The capability names a gateway must implement, exactly as
+        /// stored. Only [`ContractFence::exclusion`] decides what they
+        /// demand.
+        pub(crate) capabilities: String,
+    }
+
+    impl ContractFence {
+        /// The fence migration 20 seeds: never raised, demanding nothing.
+        #[cfg(test)]
+        pub(crate) fn open() -> Self {
+            Self {
+                generation: 0,
+                minimum_schema: 0,
+                capabilities: String::new(),
+            }
+        }
+
+        /// Why this fence excludes a gateway that serves up to `schema_max`
+        /// and implements `implemented`, or `None` when it admits it.
+        ///
+        /// A fenced name the reader does not recognize is one it cannot show
+        /// it implements -- a newer gateway raised the fence for something
+        /// this build has never heard of -- so it excludes, and so does a
+        /// value outside the column's bounds. The heartbeat statement makes
+        /// the same decision in SQL (`postgres_membership.rs`): the fenced
+        /// names must be a subset of the names this build advertises.
+        pub(crate) fn exclusion(
+            &self,
+            schema_max: i32,
+            implemented: &[Capability],
+        ) -> Option<FenceExclusion> {
+            let required = RecognizedCapabilities::parse(&self.capabilities);
+            let missing_capabilities = required.unrecognized()
+                + required
+                    .known
+                    .iter()
+                    .filter(|capability| !implemented.contains(capability))
+                    .count();
+            (missing_capabilities > 0 || schema_max < self.minimum_schema).then_some(
+                FenceExclusion {
+                    generation: self.generation,
+                    minimum_schema: self.minimum_schema,
+                    schema_max,
+                    missing_capabilities,
+                },
+            )
+        }
+    }
+
+    /// Why the contract fence excludes a gateway. Counts and versions only:
+    /// the fenced names this build does not recognize are not echoed.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct FenceExclusion {
+        pub(crate) generation: i64,
+        pub(crate) minimum_schema: i32,
+        /// The highest schema the excluded gateway serves.
+        pub(crate) schema_max: i32,
+        /// Fenced capability names the excluded gateway does not implement,
+        /// unrecognized ones included.
+        pub(crate) missing_capabilities: usize,
+    }
+
+    impl fmt::Display for FenceExclusion {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                formatter,
+                "the deployment's contract fence (generation {}) requires a serving range reaching \
+                 schema {} and {} fenced capability name(s) this build does not implement; this \
+                 build serves up to schema {}",
+                self.generation, self.minimum_schema, self.missing_capabilities, self.schema_max
+            )
+        }
+    }
+
+    /// Where admitting a durable-fence operation leaves the fence.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) struct FenceTarget {
+        pub(crate) minimum_schema: i32,
+        /// The canonical advertisement of the raised capability set.
+        pub(crate) capabilities: String,
+    }
+
+    /// The fence after admitting `requirement` over `current`: the higher of
+    /// the two minimum schemas and the union of the two capability sets, so
+    /// a raise never lowers anything. `Ok(None)` when `current` already
+    /// demands all of it, so a repeat admission writes nothing.
+    ///
+    /// Called only once the gate has established that `current` admits this
+    /// binary, so every fenced name is one this build recognizes. A fence
+    /// that still carries a name it does not, or a union the column cannot
+    /// hold, is refused rather than rewritten without it.
+    pub(crate) fn fence_target(
+        current: &ContractFence,
+        requirement: &OperationRequirement,
+    ) -> Result<Option<FenceTarget>, OperationRefusal> {
+        let recognized = RecognizedCapabilities::parse(&current.capabilities);
+        if recognized.unrecognized() > 0 {
+            return Err(OperationRefusal::NotSupportedByThisBinary);
+        }
+        let mut capabilities: BTreeSet<Capability> = recognized.known;
+        let added = capabilities.insert(requirement.capability);
+        let minimum_schema = current.minimum_schema.max(requirement.minimum_schema);
+        if !added && minimum_schema == current.minimum_schema {
+            return Ok(None);
+        }
+        let set: Vec<Capability> = capabilities.into_iter().collect();
+        let capabilities = advertisement(&set).ok_or(OperationRefusal::NotSupportedByThisBinary)?;
+        Ok(Some(FenceTarget {
+            minimum_schema,
+            capabilities,
+        }))
+    }
+
+    /// One named backfill's state in the backfill ledger
+    /// (`schema_backfills`, migration 20).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum BackfillState {
+        /// No row: the backfill has not started against this database.
+        Missing,
+        /// Started and not finished: still running, or interrupted.
+        Running,
+        /// Finished, and its own verification found nothing left to
+        /// backfill. The only state that admits an operation.
+        Verified,
+        /// Finished without verifying.
+        Failed,
+    }
+
+    impl BackfillState {
+        /// The ledger's `state` column, or `None` for no row. A value the
+        /// column's check constraint does not admit is not a state.
+        pub(crate) fn from_column(state: Option<&str>) -> Option<Self> {
+            match state {
+                None => Some(Self::Missing),
+                Some("running") => Some(Self::Running),
+                Some("verified") => Some(Self::Verified),
+                Some("failed") => Some(Self::Failed),
+                Some(_) => None,
+            }
+        }
+
+        pub(crate) fn as_str(self) -> &'static str {
+            match self {
+                Self::Missing => "missing",
+                Self::Running => "running",
+                Self::Verified => "verified",
+                Self::Failed => "failed",
             }
         }
     }
@@ -324,6 +508,20 @@ mod gate {
                     major < self.document_version.0 || major > self.document_version.1
                 })
         }
+
+        /// Whether the member's advertisement falls short of the fence. A
+        /// member the fence excludes cannot heartbeat once it was raised,
+        /// so a live one is a row from before the raise; it is a lacking
+        /// member like any other, never evidence that the fence is met.
+        fn falls_short_of(&self, fence: &ContractFence) -> bool {
+            let required = RecognizedCapabilities::parse(&fence.capabilities);
+            required.unrecognized() > 0
+                || self.schema_version.1 < fence.minimum_schema
+                || required
+                    .known
+                    .iter()
+                    .any(|capability| !self.capabilities.contains(*capability))
+        }
     }
 
     /// An admitted operation.
@@ -342,11 +540,24 @@ mod gate {
         /// not advertise, a minimum schema its serving range does not
         /// reach, or a document format it does not read.
         NotSupportedByThisBinary,
-        /// The operation needs a durable activation fence, which this
-        /// release does not implement.
+        /// The durable contract fence could not be read or raised: the
+        /// database did not answer, or a lock wait or statement ran out of
+        /// its bound.
         ActivationFenceUnavailable,
-        /// The operation needs a backfill this release cannot verify.
-        BackfillUnverified { backfill: &'static str },
+        /// The durable contract fence excludes this binary.
+        ContractFenced(FenceExclusion),
+        /// A migrator holds the schema lock, so the fence is not raised
+        /// while the schema may be changing.
+        MigrationInProgress,
+        /// The schema ledger read under the fence lock is not one this
+        /// binary serves.
+        SchemaNotServed,
+        /// The operation needs a backfill the ledger does not record as
+        /// verified. `state` is `None` when the ledger could not be read.
+        BackfillUnverified {
+            backfill: &'static str,
+            state: Option<BackfillState>,
+        },
         /// The roster could not be read.
         RosterUnavailable,
         /// This replica's own row is missing from the live roster, so the
@@ -362,6 +573,9 @@ mod gate {
             match self {
                 Self::NotSupportedByThisBinary => "operation_not_supported",
                 Self::ActivationFenceUnavailable => "activation_fence_unavailable",
+                Self::ContractFenced(_) => "contract_fenced",
+                Self::MigrationInProgress => "migration_in_progress",
+                Self::SchemaNotServed => "schema_incompatible",
                 Self::BackfillUnverified { .. } => "backfill_unverified",
                 Self::RosterUnavailable => "roster_unavailable",
                 Self::RosterMissingThisReplica => "roster_missing_this_replica",
@@ -371,8 +585,10 @@ mod gate {
 
         /// The audit payload a caller records with the
         /// `cluster.operation_refused` event: the operation, the
-        /// requirement and the reason, plus member counts. Names and codes
-        /// only; no member identifiers, which the warning log carries.
+        /// requirement and the reason, plus member counts, the backfill's
+        /// state and the fence's generation where they decided it. Names,
+        /// codes and counts only; no member identifiers, which the warning
+        /// log carries.
         pub(crate) fn audit_payload(
             &self,
             requirement: &OperationRequirement,
@@ -383,6 +599,16 @@ mod gate {
                 }
                 _ => (None, None),
             };
+            let backfill_state = match self {
+                Self::BackfillUnverified { state, .. } => {
+                    Some(state.map_or("unreadable", BackfillState::as_str))
+                }
+                _ => None,
+            };
+            let fence_generation = match self {
+                Self::ContractFenced(exclusion) => Some(exclusion.generation),
+                _ => None,
+            };
             serde_json::json!({
                 "operation": requirement.operation,
                 "capability": requirement.capability.as_str(),
@@ -392,6 +618,8 @@ mod gate {
                 "reason": self.reason(),
                 "lacking_members": lacking,
                 "live_members": live,
+                "backfill_state": backfill_state,
+                "fence_generation": fence_generation,
             })
         }
     }
@@ -404,13 +632,39 @@ mod gate {
                      nothing was written",
                 ),
                 Self::ActivationFenceUnavailable => formatter.write_str(
-                    "the operation needs a durable activation fence, which this release does not \
-                     provide; nothing was written",
+                    "the durable contract fence could not be read or raised, so the operation \
+                     cannot be shown safe for every member that may return; nothing was written \
+                     — retry once the database answers",
                 ),
-                Self::BackfillUnverified { backfill } => write!(
+                Self::ContractFenced(exclusion) => write!(
                     formatter,
-                    "the operation needs the '{backfill}' backfill to be complete and verified, \
-                     which this release cannot establish; nothing was written"
+                    "this gateway build is excluded by the durable contract fence: {exclusion}; \
+                     nothing was written — a retired build cannot return once the deployment has \
+                     moved past it, so replace this replica with an eligible build"
+                ),
+                Self::MigrationInProgress => formatter.write_str(
+                    "a schema migration holds the migration lock, so the contract fence is not \
+                     raised while the schema may be changing; nothing was written — retry once \
+                     the migration has finished",
+                ),
+                Self::SchemaNotServed => formatter.write_str(
+                    "the schema ledger read under the contract fence is not one this gateway \
+                     build serves; nothing was written — the database was migrated by another \
+                     build",
+                ),
+                Self::BackfillUnverified { backfill, state } => write!(
+                    formatter,
+                    "the operation needs the '{backfill}' backfill recorded verified, and the \
+                     backfill ledger {}; nothing was written",
+                    match state {
+                        None => "could not be read",
+                        Some(BackfillState::Missing) => "has no record of it",
+                        Some(BackfillState::Running) => {
+                            "records it as still running or interrupted"
+                        }
+                        Some(BackfillState::Failed) => "records it as failed",
+                        Some(BackfillState::Verified) => "records it as verified",
+                    }
                 ),
                 Self::RosterUnavailable => formatter.write_str(
                     "the cluster roster could not be read, so no live member can be shown to \
@@ -434,17 +688,25 @@ mod gate {
 
     impl std::error::Error for OperationRefusal {}
 
-    /// The gate: admit `requirement` only if this binary meets it and every
-    /// live member of `members` advertises it. `own_instance` must be among
-    /// the live members.
+    /// The gate: admit `requirement` only if this binary meets it, the
+    /// durable contract fence admits this binary, the backfill it names (if
+    /// any) is recorded verified, and every live member of `members`
+    /// advertises it and meets the fence. `own_instance` must be among the
+    /// live members.
     ///
     /// Pure, so every refusal is unit-tested without a database; the
-    /// caller reads the roster immediately before the write.
+    /// caller reads the fence, the backfill and the roster immediately
+    /// before the write. For an [`Activation::DurableFence`] operation the
+    /// caller reads them under the fence's row lock and raises the fence to
+    /// [`fence_target`] in the same transaction (`ClusterMembership`); an
+    /// admission here alone never raises anything.
     pub(crate) fn evaluate(
         requirement: &OperationRequirement,
         binary: &BinaryContract,
         own_instance: Uuid,
         members: &[MemberAdvertisement],
+        fence: &ContractFence,
+        backfill: Option<BackfillState>,
     ) -> Result<OperationAdmission, OperationRefusal> {
         let supported_here = binary.capabilities.contains(&requirement.capability)
             && binary.schema.0 >= requirement.minimum_schema
@@ -454,11 +716,16 @@ mod gate {
         if !supported_here {
             return Err(OperationRefusal::NotSupportedByThisBinary);
         }
-        if requirement.activation == Activation::DurableFence {
-            return Err(OperationRefusal::ActivationFenceUnavailable);
+        if let Some(exclusion) = binary.fenced_by(fence) {
+            return Err(OperationRefusal::ContractFenced(exclusion));
         }
         if let Backfill::Required { name } = requirement.backfill {
-            return Err(OperationRefusal::BackfillUnverified { backfill: name });
+            if backfill != Some(BackfillState::Verified) {
+                return Err(OperationRefusal::BackfillUnverified {
+                    backfill: name,
+                    state: backfill,
+                });
+            }
         }
         let live: Vec<&MemberAdvertisement> = members.iter().filter(|member| member.live).collect();
         if !live.iter().any(|member| member.instance_id == own_instance) {
@@ -466,7 +733,7 @@ mod gate {
         }
         let lacking: Vec<Uuid> = live
             .iter()
-            .filter(|member| member.lacks(requirement))
+            .filter(|member| member.lacks(requirement) || member.falls_short_of(fence))
             .map(|member| member.instance_id)
             .collect();
         if !lacking.is_empty() {

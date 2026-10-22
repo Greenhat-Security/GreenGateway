@@ -77,6 +77,7 @@ pub(super) async fn admin_auth_login_endpoint(
                         Duration::from_secs(state.cookie_max_age),
                         &parts.headers,
                     )
+                    .await
                     .is_err()
                 {
                     state.record(
@@ -167,6 +168,10 @@ pub(super) async fn admin_auth_completion_endpoint(
     Json(params): Json<AdminAuthCompletionParams>,
 ) -> Response {
     record_request(ADMIN_AUTH_CALLBACK_ROUTE);
+    // The double-submit token a cookie completion binds its session to, and
+    // the CSRF cookie it sets again so the token lives as long as the
+    // session. Both are settled before anything is consumed or issued.
+    let mut session_csrf = None;
     if params.mode == AdminAuthCompletionMode::Cookie {
         let Some(sessions) = &state.sessions else {
             state.record(&parts, "session", "denied", "cookie_completion_unavailable");
@@ -176,9 +181,14 @@ pub(super) async fn admin_auth_completion_endpoint(
             )
                 .into_response();
         };
-        if !sessions.origin_matches(&parts.headers)
-            || !middleware::csrf::admin_session_csrf_matches(&state.csrf, &parts.headers)
-        {
+        session_csrf = middleware::csrf::admin_session_csrf_token(&state.csrf, &parts.headers)
+            .filter(|token| middleware::auth::safe_cookie_value(token))
+            .and_then(|token| {
+                middleware::csrf::session_bound_cookie(&state.csrf, token, sessions.ttl_seconds())
+                    .ok()
+                    .map(|cookie| (token.to_owned(), cookie))
+            });
+        if !sessions.origin_matches(&parts.headers) || session_csrf.is_none() {
             state.record(&parts, "session", "denied", "invalid_origin_or_csrf");
             return (
                 StatusCode::FORBIDDEN,
@@ -226,39 +236,40 @@ pub(super) async fn admin_auth_completion_endpoint(
         .await
     {
         Ok(exchange) => {
-            if params.mode == AdminAuthCompletionMode::Cookie {
-                match &state.sessions {
-                    Some(sessions) => match sessions
-                        .issue(exchange.access_token, &parts.headers, &binding)
-                        .await
-                    {
-                        Ok(issued) => {
-                            state.record(&parts, "session", "accepted", "session_issued");
-                            let mut response = Json(
-                                json!({"authenticated": true, "expires_in": issued.expires_in}),
-                            )
-                            .into_response();
-                            response
-                                .headers_mut()
-                                .append(header::SET_COOKIE, issued.cookie);
-                            response
-                        }
-                        Err(auth::AuthError::InvalidSession(_)) => {
-                            state.record(&parts, "session", "denied", "access_token_rejected");
-                            unauthorized()
-                        }
-                        Err(auth::AuthError::Upstream(_)) => {
-                            state.record(
-                                &parts,
-                                "session",
-                                "unavailable",
-                                "session_authority_unavailable",
-                            );
-                            service_unavailable("admin session authority is unavailable")
-                        }
-                    },
-                    None => service_unavailable("admin session authority is unavailable"),
+            if let (Some(sessions), Some((csrf, csrf_cookie))) = (&state.sessions, session_csrf) {
+                match sessions
+                    .issue(exchange.access_token, &parts.headers, &binding, &csrf)
+                    .await
+                {
+                    Ok(issued) => {
+                        state.record(&parts, "session", "accepted", "session_issued");
+                        let mut response =
+                            Json(json!({"authenticated": true, "expires_in": issued.expires_in}))
+                                .into_response();
+                        response
+                            .headers_mut()
+                            .append(header::SET_COOKIE, issued.cookie);
+                        response
+                            .headers_mut()
+                            .append(header::SET_COOKIE, csrf_cookie);
+                        response
+                    }
+                    Err(auth::AuthError::InvalidSession(_)) => {
+                        state.record(&parts, "session", "denied", "access_token_rejected");
+                        unauthorized()
+                    }
+                    Err(auth::AuthError::Upstream(_)) => {
+                        state.record(
+                            &parts,
+                            "session",
+                            "unavailable",
+                            "session_authority_unavailable",
+                        );
+                        service_unavailable("admin session authority is unavailable")
+                    }
                 }
+            } else if params.mode == AdminAuthCompletionMode::Cookie {
+                service_unavailable("admin session authority is unavailable")
             } else {
                 state.record(&parts, "completion", "accepted", "token_exchanged");
                 tracing::info!(outcome = "success", "admin OIDC completion exchanged");
@@ -320,6 +331,7 @@ pub(super) async fn admin_auth_logout_endpoint(
     let binding = state.browser_binding(&parts.headers);
     let response = sessions
         .revoke(&parts.headers, binding.as_deref())
+        .await
         .and_then(|()| sessions.expired_cookie());
     match response {
         Ok(cookie) => {
@@ -411,6 +423,7 @@ pub(super) async fn admin_capabilities_endpoint(
         ADMIN_TRAFFIC_READ_PERMISSION,
         ADMIN_TRAFFIC_WRITE_PERMISSION,
         ADMIN_PRINCIPALS_READ_PERMISSION,
+        ADMIN_PRINCIPALS_WRITE_PERMISSION,
     ]
     .into_iter()
     .filter(|permission| rbac.principal_has_permission(&principal, permission))

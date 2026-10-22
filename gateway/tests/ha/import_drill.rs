@@ -1243,7 +1243,7 @@ fn section_names(report: &Value) -> Vec<String> {
 /// checks against, and a drill that asked the import to define emptiness
 /// and then checked emptiness with the import's own definition would agree
 /// with itself no matter what fell off the list.
-const AUTHORITATIVE_TABLES: [&str; 41] = [
+const AUTHORITATIVE_TABLES: [&str; 42] = [
     "audit_events",
     "audit_stream",
     "policy_documents",
@@ -1285,6 +1285,7 @@ const AUTHORITATIVE_TABLES: [&str; 41] = [
     "connection_change_evidence",
     "service_token_change_evidence",
     "jwt_revocation_evidence",
+    "admin_session_evidence",
 ];
 
 /// The singleton counters migration seeds at zero. A moved counter is an

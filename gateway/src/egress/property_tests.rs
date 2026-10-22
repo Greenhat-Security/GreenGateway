@@ -1,6 +1,12 @@
 //! Pure egress properties: no resolver, client, runtime, or network is created.
+//! Answer sets are judged by the live static egress lane -- the shared
+//! evaluator and the adapter's translation of its answer -- under controls
+//! that admit the property host, so only the addresses decide.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::{
+    collections::HashSet,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+};
 
 use ipnet::IpNet;
 use proptest::{
@@ -12,9 +18,28 @@ use proptest::{
 };
 
 use super::{
-    checked_socket_addr, classify_nat64_address, extract_rfc6052_ipv4, host_glob_matches,
-    is_non_global_ip, EgressError, Nat64Address,
+    classify_nat64_address, extract_rfc6052_ipv4, host_glob_matches, is_non_global_ip,
+    tests::address_answer, EgressConfig, EgressError, Nat64Address,
 };
+
+/// Every generated answer is on the port the property URL names, so the
+/// lane's port check never decides and the address checks always run.
+const PROPERTY_PORT: u16 = 443;
+const PROPERTY_URL: &str = "https://property.example.test/";
+
+fn live_address_check(
+    sockets: &[SocketAddr],
+    deny_private_ips: bool,
+    cidrs: &[IpNet],
+) -> Result<SocketAddr, EgressError> {
+    let config = EgressConfig {
+        allowed_hosts: HashSet::from(["property.example.test".to_owned()]),
+        deny_private_ips,
+        private_ip_allow_cidrs: cidrs.to_vec(),
+        ..EgressConfig::default()
+    };
+    address_answer(&config, PROPERTY_URL, sockets)
+}
 
 // RFC 6052's byte placements are an independent fixture, not a copy of the
 // implementation's integer shifts. Every generated IPv4 visits all six layouts.
@@ -86,7 +111,7 @@ struct GeneratedAnswer {
 
 fn answer_strategy(include_unexempted: bool) -> impl Strategy<Value = GeneratedAnswer> {
     let kinds = if include_unexempted { 0_u8..7 } else { 0_u8..5 };
-    (kinds, any::<[u8; 16]>(), any::<u16>()).prop_map(|(kind, mut bytes, port)| {
+    (kinds, any::<[u8; 16]>()).prop_map(|(kind, mut bytes)| {
         let private = Ipv4Addr::new(10, bytes[0], bytes[1], bytes[2]);
         let loopback = Ipv4Addr::new(127, bytes[0], bytes[1], bytes[2]);
         // These expected classifications follow directly from the generated
@@ -111,7 +136,7 @@ fn answer_strategy(include_unexempted: bool) -> impl Strategy<Value = GeneratedA
             _ => (IpAddr::V6(loopback.to_ipv6_mapped()), true, None),
         };
         GeneratedAnswer {
-            socket: SocketAddr::new(ip, port),
+            socket: SocketAddr::new(ip, PROPERTY_PORT),
             non_global,
             exception,
         }
@@ -252,7 +277,7 @@ proptest! {
                 let exempted = answer.exception.is_some_and(|index| exceptions[index]);
                 (deny_private && answer.non_global && !exempted).then_some(answer.socket.ip())
             });
-            let result = checked_socket_addr("property.example.test", &sockets, deny_private, &[], &cidrs);
+            let result = live_address_check(&sockets, deny_private, &cidrs);
             let expected_admission = !sockets.is_empty() && first_blocked.is_none();
             prop_assert_eq!(result.is_ok(), expected_admission);
             if let Some(original) = original_admission {
@@ -262,7 +287,7 @@ proptest! {
             }
             match (sockets.first(), first_blocked, result) {
                 (None, _, Err(EgressError::DnsResolutionFailed(host))) => {
-                    prop_assert_eq!(host, "property.example.test");
+                    prop_assert_eq!(host, "property.example.test:443");
                 }
                 (Some(_), Some(expected), Err(EgressError::NonGlobalIpBlocked(actual))) => {
                     prop_assert_eq!(actual, expected);
@@ -280,7 +305,7 @@ proptest! {
         let cidrs = private_exceptions([true; 3]);
         let mut sockets: Vec<_> = answers.iter().map(|answer| answer.socket).collect();
         for _ in 0..sockets.len() {
-            let pinned = checked_socket_addr("property.example.test", &sockets, true, &[], &cidrs)
+            let pinned = live_address_check(&sockets, true, &cidrs)
                 .expect("all generated answers are public or explicitly exempted");
             prop_assert_eq!(pinned, sockets[0]);
             sockets.rotate_left(1);
@@ -290,25 +315,24 @@ proptest! {
     #[test]
     fn private_cidr_exceptions_respect_the_literal_address_family(
         octets in any::<[u8; 3]>(),
-        port in any::<u16>(),
     ) {
         let ipv4 = Ipv4Addr::new(10, octets[0], octets[1], octets[2]);
-        let v4_socket = SocketAddr::new(IpAddr::V4(ipv4), port);
-        let mapped_socket = SocketAddr::new(IpAddr::V6(ipv4.to_ipv6_mapped()), port);
+        let v4_socket = SocketAddr::new(IpAddr::V4(ipv4), PROPERTY_PORT);
+        let mapped_socket = SocketAddr::new(IpAddr::V6(ipv4.to_ipv6_mapped()), PROPERTY_PORT);
         for allow_v4 in [false, true] {
             for allow_mapped in [false, true] {
                 let cidrs = private_exceptions([allow_v4, allow_mapped, false]);
                 prop_assert_eq!(
-                    checked_socket_addr("property.example.test", &[v4_socket], true, &[], &cidrs).is_ok(),
+                    live_address_check(&[v4_socket], true, &cidrs).is_ok(),
                     allow_v4
                 );
                 prop_assert_eq!(
-                    checked_socket_addr("property.example.test", &[mapped_socket], true, &[], &cidrs).is_ok(),
+                    live_address_check(&[mapped_socket], true, &cidrs).is_ok(),
                     allow_mapped
                 );
                 for pair in [[v4_socket, mapped_socket], [mapped_socket, v4_socket]] {
                     prop_assert_eq!(
-                        checked_socket_addr("property.example.test", &pair, true, &[], &cidrs).is_ok(),
+                        live_address_check(&pair, true, &cidrs).is_ok(),
                         allow_v4 && allow_mapped
                     );
                 }

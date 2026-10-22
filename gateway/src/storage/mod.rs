@@ -19,7 +19,8 @@
 mod audit;
 /// Member capability advertisements and per-operation requirements
 /// (issue #426, PR 1): the closed vocabulary every build can recognize, and
-/// in cluster mode the gate a write of a registered operation passes first.
+/// in cluster mode the gate a write of a registered operation passes first,
+/// with the durable contract fence and backfill states it checks (PR 3).
 pub(crate) mod compatibility;
 /// Versioned migrations and the schema lifecycle (issue #241, PR 4), on the
 /// same `postgres` feature as the pool it runs on. A feature-off build
@@ -30,6 +31,8 @@ pub mod migrations;
 mod policy_history;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+#[cfg(feature = "postgres")]
+pub mod postgres_admin_sessions;
 #[cfg(feature = "postgres")]
 pub mod postgres_audit;
 #[cfg(feature = "postgres")]
@@ -82,8 +85,10 @@ pub use postgres_jwt_revocations::{JwtRevocationOutcome, PostgresJwtRevocationSt
 #[cfg(feature = "postgres")]
 pub use postgres_membership::JobOutcome;
 #[cfg(feature = "postgres")]
+pub(crate) use postgres_membership::{read_contract_fence, FenceDecision, FenceRaise};
+#[cfg(feature = "postgres")]
 pub use postgres_membership::{
-    ClusterMember, MaintenanceJobRecord, MemberRegistration, MemberRevisions,
+    ClusterMember, HeartbeatOutcome, MaintenanceJobRecord, MemberRegistration, MemberRevisions,
     PostgresMembershipStore,
 };
 #[cfg(feature = "postgres")]

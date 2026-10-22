@@ -14,7 +14,7 @@ measure every possible mutation or prove the gateway correct.
 
 ## Owned scope
 
-The registry names eight functions and seventeen source changes. Each
+The registry names eleven functions and twenty-one source changes. Each
 target records its file, fully qualified function name, unique source markers,
 function SHA-256, exact test names and exact replacement text. Missing or moved
 functions, changed source, ambiguous anchors and absent tests fail the campaign
@@ -34,6 +34,9 @@ that every selected test still exists, before merge; see
 | `policy_eval::CompiledPolicy::evaluate_tool` | Tool admission, previews and the rendered-HTTP rule | Admit a disabled tool; ignore a matching deny rule; never consult the rendered request's HTTP rule |
 | `policy_eval::tools::tool_principal_matches` | A tool entry's role, issuer and authentication-method constraints | Admit an anonymous caller to a constrained tool; ignore `allowed_roles` |
 | `policy_eval::tools::validate_rendered_http_path` | Rendered tool paths the HTTP rule is evaluated over | Accept a `..` segment |
+| `policy_eval::egress::CompiledEgressPolicy::evaluate` | That a destination the static egress checks refuse is refused before any name is resolved | Ask for resolution facts while a static refusal is pending |
+| `policy_eval::egress::CompiledEgressPolicy::admit_destination` | The static egress checks: URL shape, scheme, host and port allowlists | Let an exact host entry admit any host ending in it; ignore the policy port list |
+| `policy_eval::egress::CompiledEgressPolicy::check_answers` | The address checks over resolution facts | Judge only the answer that will be pinned |
 
 A target is a module-level function, or a method one indentation level into a
 module-level inherent `impl Type {` block. A method's registry name ends
@@ -51,21 +54,29 @@ its override through `CompiledPolicy::select_rate_lane`. The registry targets
 those evaluator functions, not the frozen pre-cutover consumers that remain
 only as test oracles. Executor rendering refuses a path with the evaluator's
 own `validate_rendered_http_path` before the rule is asked, so that guard is
-selected too. The cutovers retired no registered function. The static egress
-cutover and legacy retirement tracked by #422 are still open, so
-`egress::host_glob_matches` stays selected, and so do the shared path
-functions, which the evaluator and the HTTP lane still call. When ownership
-moves again, update the target, function hash and exact tests in the same
-reviewed change, remove the retired target, and remeasure.
+selected too. Since #422 PR 3b the static egress checks decide through
+`CompiledEgressPolicy::evaluate`: its static checks (`admit_destination`) and
+its address checks over resolution facts (`check_answers`). The cutovers
+retired no registered function. `egress::host_glob_matches` is the host-pattern
+predicate that lane calls, so it stays selected; its start marker now carries
+`pub(crate)` because the lane in `policy_eval` calls it. The shared path
+functions stay selected too, since the evaluator and the HTTP lane still call
+them. Legacy retirement tracked by #422 is still open. When ownership moves
+again, update the target, function hash and exact tests in the same reviewed
+change, remove the retired target, and remeasure.
 
 The tool-lane targets select tests that state the evaluator's answers
 outright. The live adapters ask this same evaluator, so a test that only
 compares the evaluator with them would compare it with itself and kill
 nothing. The rate-lane target compares each selection with the frozen
-pre-cutover selector.
+pre-cutover selector. The static egress targets select tests that state the
+lane's answers outright, and the named matrix that compares the live adapter
+with the frozen pre-cutover checks; the decision-order target also selects
+the harness whose resolver panics if a refused destination ever reaches it.
 
 Only these pure tests run during mutation execution. They need no DNS,
-credential provider, database, upstream server or third-party API. Dependency
+credential provider, database, upstream server or third-party API: the egress
+tests answer lookups from in-process resolvers and never open a connection. Dependency
 resolution and the normal embedded UI build can access package registries;
 this is build activity, not a security test exercising a third-party system.
 
@@ -256,14 +267,35 @@ as in the nightly reports, and each new mutant by the first test listed for
 it. Mutant rebuilds took 59–217 seconds on a shared workstation. This is
 review evidence, not a substitute for the controller's report.
 
+Issue #422 PR 3b moved the static egress checks onto the shared evaluator. It
+added the three `policy_eval::egress` targets above and four mutations, so the
+registry has 21; it retired no registered target. Before review, each new
+mutant was applied to a Windows working tree of the change, based on
+`198ab93` (the rebase onto `db4160f` changed no Rust source), and its selected
+tests were run with `--exact` under Rust CI 1.98.1 and a local build script
+that skipped the embedded UI build, without the controller's rlimits or
+process groups. All four were killed.
+`egress-static-evaluate/resolve-before-static-denial` failed
+`a_refused_destination_is_decided_without_resolution_facts` and, on its own,
+the refused-destination harness;
+`egress-static-admit/exact-host-admits-suffix` and
+`egress-static-admit/ignore-port-allowlist` failed the host and port tests
+selected for them respectively, and the named matrix; and
+`egress-static-answers/check-only-pinned-answer` failed
+`every_answer_is_judged_and_the_first_is_pinned` and the named matrix. Mutant
+rebuilds took 104–683 seconds on a shared workstation. This is review
+evidence, not a substitute for the controller's report.
+
 On GitHub-hosted runners, two nightly campaigns of the eight-mutant registry
 on `main`, on 2026-10-13 and 2026-10-20, took 1,358 and 2,232 seconds. Their
 baseline builds took 284 and 467 seconds, and mutant rebuilds 133–228
-seconds. At those rates 17 mutants take about 2,550–4,350 seconds, inside the
+seconds. At those rates 17 mutants take about 2,550–4,350 seconds, and the 21
+after the static egress adoption about 3,080–5,260 seconds, inside the
 7,200-second campaign bound and the 150-minute job. With a baseline like
-those, mutant rebuilds would have to average about 390 seconds to exceed the
-bound. The controller then fails the campaign as timed out rather than
-reporting a partial score. Re-measure before adding more mutations.
+those, rebuilds of 21 mutants would have to average about 320 seconds to
+exceed the bound, against about 390 for 17. The controller then fails the
+campaign as timed out rather than reporting a partial score. Re-measure before
+adding more mutations.
 
 ## Survivor review and baseline ownership
 

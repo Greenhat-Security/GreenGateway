@@ -15,6 +15,16 @@ pub const SERVICE_TOKEN_DELEGATION_REJECTED: &str = "service_token.delegation_re
 /// Cluster mode only: standalone mode has no roster to gate on.
 #[cfg(feature = "postgres")]
 pub const CLUSTER_OPERATION_REFUSED: &str = "cluster.operation_refused";
+/// Admitting an operation that declares a durable activation fence raised
+/// the deployment's contract fence (issue #426): from then on a gateway
+/// build without the operation's capability cannot start or rejoin.
+#[cfg(feature = "postgres")]
+pub const CLUSTER_CONTRACT_FENCE_RAISED: &str = "cluster.contract_fence_raised";
+/// A running replica's heartbeat found the durable contract fence excluding
+/// its build (issue #426): it writes nothing more to the roster and refuses
+/// readiness for good.
+#[cfg(feature = "postgres")]
+pub const CLUSTER_CONTRACT_FENCED: &str = "cluster.contract_fenced";
 pub const CONNECTION_CHANGED: &str = "connection.changed";
 pub const CONNECTION_CREDENTIAL_CHANGED: &str = "connection.credential_changed";
 pub const CONNECTION_SECRET_CHANGED: &str = "connection.secret_changed";
@@ -25,6 +35,18 @@ pub const CONNECTION_OAUTH_TOKEN_REFRESH: &str = "connection.oauth_token_refresh
 /// caller (issue #441): the actor it was made for, the outcome and the
 /// issuer's decision, never any token.
 pub const CONNECTION_DELEGATED_TOKEN_EXCHANGE: &str = "connection.delegated_token_exchange";
+/// One decision about the signed caller assertion of a request a
+/// connection-bound proxy route forwards (issue #463): the `kid` and `jti` of
+/// the assertion it carried, or the reason it was refused. The caller is the
+/// actor; the token and the key are never recorded. Tool calls record theirs
+/// on `tool.upstream_request` instead.
+pub const CONNECTION_CALLER_ASSERTION: &str = "connection.caller_assertion";
+/// A purge of one principal's cached delegated tokens (issue #441): what started it, whose tokens
+/// they were, and how many entries left the cache.
+pub const CONNECTION_DELEGATED_TOKEN_PURGE: &str = "connection.delegated_token_purge";
+/// One RFC 7009 revocation of a purged delegated token at its issuer (issue #441): the outcome and
+/// the issuer's answer, never the token.
+pub const CONNECTION_DELEGATED_TOKEN_REVOCATION: &str = "connection.delegated_token_revocation";
 pub const CONNECTION_SECRET_RESOLUTION_FAILED: &str = "connection.secret_resolution_failed";
 pub const CONNECTION_UNSAFE_METHOD_REJECTED: &str = "connection.unsafe_method_rejected";
 pub const GATEWAY_READY: &str = "gateway.ready";

@@ -4,7 +4,7 @@
 
 This is the orientation doc for anyone, human or AI agent, picking up an issue in this repository.
 
-[`CLAUDE.md`](CLAUDE.md) is its companion, not a competitor: this file stays canonical for conventions, commands, and guardrails, and `CLAUDE.md` adds what this file leaves out — the workspace shape including the `admin-ui` build coupling, the seven ADRs, and the `.env.example` drift test. Keep the two in step; when one changes a fact the other repeats, change both in the same commit.
+[`CLAUDE.md`](CLAUDE.md) is its companion, not a competitor: this file stays canonical for conventions, commands, and guardrails, and `CLAUDE.md` adds what this file leaves out — the workspace shape including the `admin-ui` build coupling, the nine ADRs (one still proposed), and the `.env.example` drift test. Keep the two in step; when one changes a fact the other repeats, change both in the same commit.
 
 ## Project Summary
 

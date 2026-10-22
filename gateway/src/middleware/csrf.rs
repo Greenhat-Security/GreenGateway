@@ -146,13 +146,41 @@ pub async fn csrf_middleware(
 /// Mandatory check for issued-session lifecycle endpoints, including when a
 /// caller sends an Authorization header. Configured names remain authoritative.
 pub(crate) fn admin_session_csrf_matches(config: &CsrfConfig, headers: &HeaderMap) -> bool {
+    admin_session_csrf_token(config, headers).is_some()
+}
+
+/// The double-submit token of a request that passes
+/// [`admin_session_csrf_matches`]: exactly one CSRF cookie and exactly one
+/// header carrying the same non-empty value. A cookie completion binds the
+/// session it issues to this token.
+pub(crate) fn admin_session_csrf_token<'a>(
+    config: &CsrfConfig,
+    headers: &'a HeaderMap,
+) -> Option<&'a str> {
     let cookies = all_cookie_values(headers, &config.cookie_name);
     let mut values = headers.get_all(config.header_name.as_str()).iter();
     let header = values.next().and_then(header_value_to_str);
-    config.enabled
+    let matches = config.enabled
         && cookies.len() == 1
         && values.next().is_none()
-        && csrf_token_matches(&cookies, header)
+        && csrf_token_matches(&cookies, header);
+    header.filter(|_| matches)
+}
+
+/// The configured CSRF cookie carrying `token` for `max_age` seconds. An
+/// issued admin session sets it again so the token the session is bound to
+/// lives as long as the session cookie. Name, domain and attributes are the
+/// minted cookie's, so a browser replaces that cookie rather than keeping a
+/// second one beside it.
+pub(crate) fn session_bound_cookie(
+    config: &CsrfConfig,
+    token: &str,
+    max_age: u64,
+) -> Result<HeaderValue, http::header::InvalidHeaderValue> {
+    HeaderValue::from_str(&format!(
+        "{}; Max-Age={max_age}",
+        cookie_text(config, token)
+    ))
 }
 
 fn csrf_token_matches(cookie_tokens: &[String], header_token: Option<&str>) -> bool {
@@ -219,6 +247,10 @@ fn set_cookie_header_value(
     config: &CsrfConfig,
     token: &str,
 ) -> Result<HeaderValue, http::header::InvalidHeaderValue> {
+    HeaderValue::from_str(&cookie_text(config, token))
+}
+
+fn cookie_text(config: &CsrfConfig, token: &str) -> String {
     let mut cookie = format!("{}={token}; Path=/; SameSite=Lax", config.cookie_name);
 
     if let Some(domain) = &config.cookie_domain {
@@ -227,7 +259,7 @@ fn set_cookie_header_value(
     }
 
     cookie.push_str("; Secure");
-    HeaderValue::from_str(&cookie)
+    cookie
 }
 
 #[cfg(test)]

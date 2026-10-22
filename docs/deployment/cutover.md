@@ -29,7 +29,7 @@ Three consequences you must plan around:
 
 The **principal directory is never imported**: cluster mode has no principal directory, so there is no destination for it — no migration creates the table, and `PRINCIPAL_SQLITE_PATH` is refused in cluster mode. It is a projection of authenticated traffic, and that traffic *is* imported, with the audit log. The report names the source file it left behind (`source.principal_file`, `source.principal_present`, `principal_directory_rows_imported: 0`) so you see it rather than discover it missing afterwards.
 
-The report's `not_imported` field lists everything else deliberately left out — `cluster_members`, `maintenance_jobs`, `execution_leases`, the two rate-limit tables, pending logins, JWT revocations — and the validation pass **proves** those tables empty rather than asserting it in prose. `security_outbox` is named there too, with a caveat worth reading once: the import writes no outbox row of its own, but the policy and tools sections run the ordinary reviewed control-plane commits, and a commit appends one. So that table holds two rows after an import. They describe this deployment's initialization, and they are the reason `security_outbox` is on the `not_imported` list but not on the list of tables proven empty.
+The report's `not_imported` field lists everything else deliberately left out — `cluster_members`, `maintenance_jobs`, `execution_leases`, the two rate-limit tables, pending logins, admin sessions and their pending cookie logins, JWT revocations — and the validation pass **proves** those tables empty rather than asserting it in prose. `security_outbox` is named there too, with a caveat worth reading once: the import writes no outbox row of its own, but the policy and tools sections run the ordinary reviewed control-plane commits, and a commit appends one. So that table holds two rows after an import. They describe this deployment's initialization, and they are the reason `security_outbox` is on the `not_imported` list but not on the list of tables proven empty.
 
 Standalone service-token change evidence — the `service_token_change_evidence` rows that name who rotated or revoked each token — is also left behind and named in `not_imported`. The import carries the token rows only, so that history stays in the `SERVICE_TOKEN_SQLITE_PATH` database; keep the file with the rest of the standalone deployment's records if you need it. The cluster's own evidence table starts empty and records its first rotate or revoke.
 
@@ -133,7 +133,7 @@ Expected output: pretty-printed JSON on stdout and exit `0`. The shape:
   "not_imported": [
     "cluster_members", "maintenance_jobs", "execution_leases",
     "rate_limit_buckets", "rate_limit_cardinality",
-    "admin_pending_logins", "jwt_revocations",
+    "admin_pending_logins", "admin_session_logins", "admin_sessions", "jwt_revocations",
     "security_outbox (the import announces nothing; a commit appends its own row)",
     "principal_directory (cluster mode has none; the audit log it projects from is imported)",
     "connection_local_secrets (the local-secret keyring stays with the standalone deployment; credential bindings cross as references and must be re-provisioned in the cluster's secret store)",
@@ -227,7 +227,7 @@ Expected output: `{"status":"ready"}` with HTTP `200`. A `503` carries a reason;
 gateway cluster-members
 ```
 
-Expected output: `members=1 live=1` and one `ready` line. (PR 14's cluster status API and UI have not landed on this branch; `gateway cluster-members` is the status surface available today. When PR 14 lands, this step becomes a call to the status endpoint and this runbook should be updated to name it.)
+Expected output: `members=1 live=1`, a `fence generation=0` line (the durable contract fence, never raised on a fresh deployment), and one `ready` line. (PR 14's cluster status API and UI have not landed on this branch; `gateway cluster-members` is the status surface available today. When PR 14 lands, this step becomes a call to the status endpoint and this runbook should be updated to name it.)
 
 Then check the imported state through the product, not through SQL:
 
@@ -273,7 +273,7 @@ docker compose -f docs/deployment/docker-compose.ha.yml up -d gateway-2 lb
 gateway cluster-members
 ```
 
-Expected output: `members=2 live=2`, two `ready` lines, identical `fingerprint=` values. Different fingerprints mean the two replicas' static configuration differs and the newcomer will sit at `503 config_fingerprint_mismatch` — fix the configuration, do not work around the gate.
+Expected output: `members=2 live=2`, the `fence` line, two `ready` lines, identical `fingerprint=` values. Different fingerprints mean the two replicas' static configuration differs and the newcomer will sit at `503 config_fingerprint_mismatch` — fix the configuration, do not work around the gate.
 
 ### 8. Close out
 

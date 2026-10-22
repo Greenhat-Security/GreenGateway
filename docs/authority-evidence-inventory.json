@@ -1,7 +1,7 @@
 {
   "version": 1,
   "issue": 425,
-  "reviewed_revision": "4a32d10e38d2ac36d6bcbee627443b1fbb80d059",
+  "reviewed_revision": "198ab93b92509e4355a937d874b63a117708824f",
   "storage_modes": [
     "postgres",
     "standalone"
@@ -1274,19 +1274,23 @@
           "anchor": "async fn admin_auth_logout_endpoint("
         }
       ],
-      "boundary": "Only with ADMIN_SESSION_MODE=standalone_memory. AdminSessions::issue validates the provider access token, then admits one capability-digest entry to a bounded process-local map under its mutex; an admitted replacement removes the browser's prior session in the same critical section. Withdrawal is logout (AdminSessions::revoke under the same mutex), expiry, an access token the provider now rejects, an identity change, or a process restart, which discards the whole map. No database or file transaction is involved.",
-      "record": "No durable record. The entry (cookie digest, server-held access token, expiry, subject and issuer, random session ID) exists in memory only. The handler emits an admin_login.transaction audit event (phase, outcome, reason) after a grant or logout through the optional bounded audit sinks; implicit withdrawals emit none.",
+      "boundary": "Only with ADMIN_SESSION_MODE=standalone_memory, which configuration accepts only with STATE_BACKEND=sqlite. AdminSessions::issue validates the provider access token, then MemoryAdminSessionStore::grant admits one capability-digest entry to a bounded process-local map under its mutex; an admitted replacement removes the browser's prior session in the same critical section. Withdrawal is logout (AdminSessions::revoke, then MemoryAdminSessionStore::withdraw under the same mutex), the absolute or idle deadline, an access token the provider now rejects, an identity change, or a process restart, which discards the whole map. No database or file transaction is involved.",
+      "record": "No durable record. The entry (cookie digest, server-held access token, CSRF-token digest, absolute and idle deadlines, subject and issuer, random session ID) exists in memory only. The handler emits an admin_login.transaction audit event (phase, outcome, reason) after a grant or logout through the optional bounded audit sinks; implicit withdrawals emit none.",
       "actor": "The granted principal's subject and issuer are held in memory only. The admin_login.transaction event carries no actor, session ID or principal, and logout is authentication-exempt and names no actor.",
       "identity": "A random per-session UUID, exposed to later requests as Principal.session_id; it is not persisted, not on the grant or logout event, and gone after restart. No operation, event or revision identity.",
       "delivery": "post_commit_telemetry",
       "disposition": [
         "unsupported_future_operation"
       ],
-      "follow_up": "#424: the shipped session authority is process-local memory by design, so no store exists that could own atomic evidence. Required-durability mode must refuse ADMIN_SESSION_MODE=standalone_memory rather than relabel the post-change audit event as durable. A durable session authority, if one ships, adds grant/withdrawal evidence in its own transaction, including a decision for implicit withdrawal by expiry or restart.",
+      "follow_up": "#425: the standalone session authority is process-local memory by design, so no store exists that could own atomic evidence. Required-durability mode must refuse ADMIN_SESSION_MODE=standalone_memory rather than relabel the post-change audit event as durable. Cluster mode's shared store records grant and withdrawal evidence in its own transactions (admin_session_postgres).",
       "sources": [
         {
           "path": "gateway/src/auth/admin_session.rs",
-          "anchor": "Opt-in, single-process admin sessions. There is deliberately no HA fallback."
+          "anchor": "The `standalone_memory` store: a bounded map in this process. There is"
+        },
+        {
+          "path": "gateway/src/auth/admin_session.rs",
+          "anchor": "impl AdminSessionStore for MemoryAdminSessionStore"
         },
         {
           "path": "gateway/src/auth/admin_session.rs",
@@ -1294,7 +1298,7 @@
         },
         {
           "path": "gateway/src/auth/admin_session.rs",
-          "anchor": "pub fn revoke(&self, headers: &HeaderMap"
+          "anchor": "pub async fn revoke("
         },
         {
           "path": "gateway/src/app_state.rs",
@@ -1302,6 +1306,10 @@
         }
       ],
       "tests": [
+        {
+          "path": "gateway/src/auth/admin_session_tests.rs",
+          "anchor": "async fn the_memory_store_satisfies_the_session_contract("
+        },
         {
           "path": "gateway/src/auth/admin_session_tests.rs",
           "anchor": "async fn admin_session_cookie_is_independent_and_authority_is_rechecked("
@@ -1313,6 +1321,10 @@
         {
           "path": "gateway/src/auth/admin_session_tests.rs",
           "anchor": "async fn admin_session_expiry_identity_change_and_restart_fail_closed("
+        },
+        {
+          "path": "gateway/src/auth/admin_session_tests.rs",
+          "anchor": "async fn admin_session_idle_deadline_moves_with_use_but_never_past_the_absolute_one("
         },
         {
           "path": "gateway/src/auth/admin_session_tests.rs",
@@ -1339,34 +1351,88 @@
       "modes": [
         "postgres"
       ],
-      "entrypoints": [],
-      "boundary": "Configuration refuses ADMIN_SESSION_MODE=standalone_memory with STATE_BACKEND=postgres, so no admin session is granted or withdrawn in this mode. Cookie completion answers cookie_session_unavailable; bearer completion returns the access token to the browser, and the server holds no session. The admin_pending_logins rows are the login transaction, not a session.",
-      "record": "No session authority or record in this mode.",
-      "actor": "Not applicable.",
-      "identity": "Not applicable.",
-      "delivery": "unsupported_no_delivery",
-      "disposition": [
-        "unsupported_future_operation"
+      "entrypoints": [
+        {
+          "path": "gateway/src/admin_identity.rs",
+          "anchor": "async fn admin_auth_completion_endpoint("
+        },
+        {
+          "path": "gateway/src/admin_identity.rs",
+          "anchor": "async fn admin_auth_logout_endpoint("
+        }
       ],
-      "follow_up": "#424: a shared session authority would be a new operation in this mode and must ship with grant/withdrawal evidence in its own transaction before any required-durability claim.",
+      "boundary": "Only with ADMIN_SESSION_MODE=cluster_postgres, which configuration accepts only with STATE_BACKEND=postgres (standalone_memory stays refused there). PostgresAdminSessionStore grant is one transaction: a transaction-scoped advisory lock, a bounded prune, the pending cookie login (live, unissued, FOR UPDATE), the capacity count, the replaced session's withdrawal with its evidence row, the session row (access token sealed under ADMIN_LOGIN_KEYRING) and its grant evidence row in one statement, then the login's issued marker; it commits once. Logout (withdraw), a provider rejection or identity change (reject) and expiry (the bounded prune, per admission and in the admin_session_prune maintenance job) each delete the session row and insert its withdrawal evidence row in one statement. A failed evidence insert rolls the change back and is answered 503.",
+      "record": "admin_sessions rows (cookie digest, sealed token, CSRF-token digest, subject and issuer, database-clock absolute and idle deadlines) are runtime state that every withdrawal deletes. admin_session_evidence (migration 19) has no foreign key and outlives them: event and operation UUIDs, the random session ID, the action, a reason (issued, logout, replaced, rejected, expired), subject and issuer, the absolute deadline and database-clock committed_at; never the cookie, CSRF token, login binding or access token. Moving the idle deadline on use writes no evidence, and an expiry is committed when the prune removes the row, not at the deadline.",
+      "actor": "The session's own principal (subject and issuer, as the provider validated them at issuance) on the grant and on its withdrawal. Logout is authentication-exempt and made by whoever presents the session cookie or the login binding; it names no other actor. A replaced withdrawal shares its operation_id with the replacement's grant. rejected and expired are system withdrawals on the provider's verdict and the database clock. No actor kind or auth mode is stored.",
+      "identity": "Generated event_id per row and operation_id per store call (a replacement's withdrawal and grant share one; a prune step uses one for its batch), the session's random UUID (Principal.session_id, never the cookie) and database-clock committed_at. UNIQUE (session_id, action) allows one grant and one withdrawal per session. No revision axis is stored, and operation_id is not bound to a client idempotency key.",
+      "delivery": "post_commit_telemetry",
+      "disposition": [
+        "missing_metadata",
+        "missing_delivery"
+      ],
+      "follow_up": "Actor kind and auth mode, a keyed safe actor reference and a session revision axis before any authority_event.v1 projection. PR3: dispatch these rows with a persisted cursor and own their retention so undelivered evidence is never erased.",
       "sources": [
+        {
+          "path": "gateway/src/storage/migrations/0019_admin_sessions.sql",
+          "anchor": "CREATE TABLE greengateway.admin_session_evidence ("
+        },
+        {
+          "path": "gateway/src/storage/postgres_admin_sessions.rs",
+          "anchor": "const GRANT_SQL: &str"
+        },
+        {
+          "path": "gateway/src/storage/postgres_admin_sessions.rs",
+          "anchor": "const WITHDRAW_SQL: &str"
+        },
+        {
+          "path": "gateway/src/storage/postgres_admin_sessions.rs",
+          "anchor": "const REJECT_SQL: &str"
+        },
+        {
+          "path": "gateway/src/storage/postgres_admin_sessions.rs",
+          "anchor": "const PRUNE_SESSIONS_SQL: &str"
+        },
         {
           "path": "gateway/src/config.rs",
           "anchor": "standalone_memory is unsupported with {STATE_BACKEND}=postgres"
         },
         {
-          "path": "gateway/src/admin_identity.rs",
-          "anchor": "\"cookie_completion_unavailable\""
+          "path": "gateway/src/config.rs",
+          "anchor": "cluster_postgres requires {STATE_BACKEND}=postgres"
         }
       ],
       "tests": [
         {
+          "path": "gateway/src/storage/postgres_admin_sessions_tests.rs",
+          "anchor": "async fn every_grant_and_withdrawal_leaves_one_evidence_row("
+        },
+        {
+          "path": "gateway/src/storage/postgres_admin_sessions_tests.rs",
+          "anchor": "async fn a_failed_evidence_insert_rolls_the_change_back("
+        },
+        {
+          "path": "gateway/src/storage/postgres_admin_sessions_tests.rs",
+          "anchor": "async fn postgres_admin_sessions_satisfy_the_session_contract("
+        },
+        {
+          "path": "gateway/src/storage/postgres_admin_sessions_tests.rs",
+          "anchor": "async fn concurrent_grants_never_exceed_the_shared_capacity("
+        },
+        {
+          "path": "gateway/src/storage/postgres_admin_sessions_tests.rs",
+          "anchor": "async fn sessions_expire_idle_and_absolute_on_the_database_clock("
+        },
+        {
+          "path": "gateway/src/storage/postgres_admin_sessions_tests.rs",
+          "anchor": "async fn nothing_the_browser_holds_is_stored_and_the_token_is_sealed("
+        },
+        {
           "path": "gateway/src/config_tests.rs",
-          "anchor": "fn admin_session_config_is_explicit_bounded_and_standalone_only("
+          "anchor": "fn admin_session_cluster_store_is_postgres_only_and_carries_its_limits("
         }
       ],
       "required_durability_supported": false,
-      "test_claim": "Existing configuration regression anchor only; it proves the mode is refused, not any evidence contract."
+      "test_claim": "PostgreSQL-gated regression anchors for the shared session contract and its transactional grant and withdrawal evidence. They do not certify the proposed authority-event contract, delivery or retention."
     },
     {
       "id": "configuration_activation",

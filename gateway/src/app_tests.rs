@@ -1814,6 +1814,10 @@ fn admin_routes_keep_default_api_prefix_and_remap_custom_api_under_v1() {
     );
     assert_eq!(default_routes.principals_route, PRINCIPALS_ADMIN_ROUTE);
     assert_eq!(default_routes.principal_detail_route, PRINCIPAL_ADMIN_ROUTE);
+    assert_eq!(
+        default_routes.principal_delegated_tokens_revoke_route,
+        PRINCIPAL_DELEGATED_TOKENS_REVOKE_ADMIN_ROUTE
+    );
 
     let custom_routes = AdminRoutes::from_prefix("/ops");
     assert_eq!(custom_routes.ui_prefix, "/ops");
@@ -1931,6 +1935,10 @@ fn admin_routes_keep_default_api_prefix_and_remap_custom_api_under_v1() {
     );
     assert_eq!(custom_routes.principals_route, "/v1/ops/principals");
     assert_eq!(custom_routes.principal_detail_route, "/v1/ops/principal");
+    assert_eq!(
+        custom_routes.principal_delegated_tokens_revoke_route,
+        "/v1/ops/principal/delegated-tokens/revoke"
+    );
 }
 
 #[test]
@@ -7220,6 +7228,129 @@ async fn principal_directory_admin_reports_not_configured() {
 }
 
 #[tokio::test]
+async fn principal_delegated_token_revocation_needs_principals_write_and_a_well_formed_principal() {
+    let capture = audit::sink::tests::CaptureSink::new();
+    let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+    let policy = TempPolicyFile::new(&principal_policy_document_string());
+    let recorder = PrometheusBuilder::new().build_recorder();
+    // No principal directory: the purge does not need one.
+    let router = app(
+        principal_admin_config(None, None, None, &policy),
+        recorder.handle(),
+        audit_log,
+        test_audit_event_sender(),
+    )
+    .expect("app should build");
+    let request = |principal: Option<auth::Principal>, body: &str| {
+        traffic_admin_json_request(
+            Method::POST,
+            PRINCIPAL_DELEGATED_TOKENS_REVOKE_ADMIN_ROUTE,
+            principal,
+            Some(body.to_owned()),
+        )
+    };
+    let body = json!({ "issuer": "https://idp.example.test/", "subject": "alice" }).to_string();
+
+    let unauthenticated = router
+        .clone()
+        .oneshot(request(None, &body))
+        .await
+        .expect("revocation request should complete");
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    let read_only = router
+        .clone()
+        .oneshot(request(Some(test_principal(&["principal-reader"])), &body))
+        .await
+        .expect("revocation request should complete");
+    assert_eq!(read_only.status(), StatusCode::FORBIDDEN);
+
+    let purged = router
+        .clone()
+        .oneshot(request(Some(test_principal(&["principal-writer"])), &body))
+        .await
+        .expect("revocation request should complete");
+    assert_eq!(purged.status(), StatusCode::OK);
+    assert_eq!(purged.headers()[header::CACHE_CONTROL], "no-store");
+    assert_eq!(json_body(purged).await, json!({ "purged_entries": 0 }));
+    // An operator's purge is audited even when it finds nothing, naming the
+    // operator and the canonical principal.
+    assert_eventually(Duration::from_secs(1), || {
+        capture
+            .events()
+            .iter()
+            .any(|event| event.event_type == audit::event::CONNECTION_DELEGATED_TOKEN_PURGE)
+    });
+    let purge = capture
+        .events()
+        .into_iter()
+        .find(|event| event.event_type == audit::event::CONNECTION_DELEGATED_TOKEN_PURGE)
+        .expect("the purge is audited");
+    assert_eq!(
+        purge.actor.as_ref().map(|actor| actor.user_id.as_str()),
+        Some("user-123")
+    );
+    assert_eq!(purge.payload["trigger"], json!("operator"));
+    assert_eq!(
+        purge.payload["principal"],
+        json!({ "issuer": "https://idp.example.test", "subject": "alice" })
+    );
+    assert_eq!(purge.payload["purged_entries"], json!(0));
+
+    for malformed in [
+        "not json".to_owned(),
+        json!({ "issuer": "https://idp.example.test" }).to_string(),
+        json!({ "issuer": "https://idp.example.test", "subject": "" }).to_string(),
+        json!({ "issuer": " / ", "subject": "alice" }).to_string(),
+        json!({ "issuer": "https://idp.example.test", "subject": "alice", "email": "a@b" })
+            .to_string(),
+        json!({ "issuer": "https://idp.example.test", "subject": "a".repeat(4097) }).to_string(),
+    ] {
+        let refused = router
+            .clone()
+            .oneshot(request(
+                Some(test_principal(&["principal-writer"])),
+                &malformed,
+            ))
+            .await
+            .expect("revocation request should complete");
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "{malformed}");
+    }
+}
+
+#[tokio::test]
+async fn principal_delegated_token_revocation_is_refused_where_replicas_cache_their_own() {
+    let policy = parse_policy_body(&Bytes::from(principal_policy_document_string()))
+        .expect("principal policy should parse");
+    let state = PrincipalAdminState {
+        directory: auth::PrincipalDirectory::disabled(),
+        audit_query_store: None,
+        discovery_store: None,
+        rbac_state: Some(middleware::rbac::RbacState::new(
+            policy,
+            Vec::new(),
+            false,
+            test_audit_log(),
+        )),
+        // What cluster mode builds.
+        delegated_tokens: None,
+        client_ip_policy: client_ip::ClientIpPolicy::from_config(&test_config(Vec::new())),
+        max_body_size: 1_024,
+    };
+    let response = principal_delegated_tokens_revoke_endpoint(
+        State(state),
+        traffic_admin_json_request(
+            Method::POST,
+            PRINCIPAL_DELEGATED_TOKENS_REVOKE_ADMIN_ROUTE,
+            Some(test_principal(&["principal-writer"])),
+            Some(json!({ "issuer": "https://idp.example.test", "subject": "alice" }).to_string()),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(body_string(response).await.contains("cluster mode"));
+}
+
+#[tokio::test]
 async fn principal_directory_detail_returns_404_for_missing_composite_key() {
     let principal_db = TempDb::new("principal-directory-detail-missing");
     create_principal_schema(&principal_db.path);
@@ -7815,6 +7946,48 @@ fn cluster_readiness_app(
     match app.http {
         GatewayApp::Unified(router) => router,
         GatewayApp::Split { .. } => panic!("test app should be unified"),
+    }
+}
+
+/// The durable contract fence (issue #426, PR 3): once the membership
+/// heartbeat finds that the fence excludes this build, `/readyz` answers
+/// `contract_fenced` ahead of every other cluster reason and never ready
+/// again, because the fence only moves forward. Liveness and startup are
+/// untouched, as for every readiness reason.
+#[tokio::test]
+async fn readiness_is_refused_for_good_once_the_contract_fence_excludes_this_build() {
+    let lifecycle = GatewayLifecycle::new();
+    let readiness = ha::ClusterReadiness::new();
+    readiness.record_fingerprint_agreement();
+    let router = cluster_readiness_app(&lifecycle, readiness.clone(), None);
+    lifecycle.mark_ready();
+    assert_eq!(readyz_answer(&router).await.0, StatusCode::OK);
+
+    assert!(readiness.record_contract_fenced());
+    assert_eq!(
+        readyz_answer(&router).await,
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"status":"not_ready","reason":"contract_fenced"}"#.to_owned()
+        )
+    );
+    readiness.record_fingerprint_agreement();
+    assert_eq!(
+        readyz_answer(&router).await.0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    for path in ["/livez", "/startupz"] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("probe request should complete");
+        assert_eq!(response.status(), StatusCode::OK, "{path} is not gated");
     }
 }
 
@@ -9093,6 +9266,67 @@ async fn proxy_observation_event_includes_upstream_latency_and_status() {
     assert_eq!(observed.payload["upstream_route_id"], json!("legacy"));
     assert_eq!(observed.payload["upstream_pool_id"], json!("legacy"));
     assert_eq!(observed.payload["upstream_endpoint_id"], json!("primary"));
+}
+
+#[tokio::test]
+async fn an_upstream_the_static_egress_checks_refuse_is_never_resolved_or_contacted() {
+    let (upstream_addr, mut captured) = spawn_capture_upstream().await;
+    let router_admitting_port = |port: u16| {
+        let policy = TempPolicyFile::new(&format!(
+            r#"{{
+                "schema_version": "0.1.0",
+                "default_action": "allow",
+                "roles": {{}},
+                "routes": [],
+                "egress": {{ "ports": [{port}] }}
+            }}"#
+        ));
+        let mut config = proxy_config(upstream_addr);
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        let (router, probe) =
+            proxy_router_with_work_probe(config, test_audit_log(), upstream_addr.ip());
+        (policy, router, probe)
+    };
+    let request = |path: &str| {
+        Request::builder()
+            .uri(path)
+            .body(Body::empty())
+            .expect("egress request should build")
+    };
+
+    // Control: the same policy shape listing the upstream's port is resolved
+    // and forwarded, so the refusal below is the port list's doing.
+    let (_admitting, router, probe) = router_admitting_port(upstream_addr.port());
+    let response = router
+        .oneshot(request("/egress-admitted"))
+        .await
+        .expect("egress-admitted request should complete");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert!(
+        probe.snapshot().resolver_calls > 0,
+        "an admitted destination is resolved"
+    );
+    let _ = next_proxied_request(&mut captured, "egress-admitted request").await;
+
+    // The policy admits egress to one port; the upstream listens on another.
+    let admitted_port = if upstream_addr.port() == 443 {
+        444
+    } else {
+        443
+    };
+    let (_refusing, router, probe) = router_admitting_port(admitted_port);
+    let response = router
+        .oneshot(request("/egress-refused"))
+        .await
+        .expect("egress-refused request should complete");
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        probe.snapshot().resolver_calls,
+        0,
+        "a destination the static egress checks refuse is never resolved"
+    );
+    assert_upstream_receives_no_request(&mut captured, "static egress refusal").await;
 }
 
 #[tokio::test]
@@ -12774,8 +13008,8 @@ async fn caller_assertion_refusals_are_conflicts_with_their_own_reason() {
 
 /// A caller assertion as an operator would send one. Saving it loads the key
 /// behind its alias, which [`attested_connection_admin_router`] provides;
-/// nothing these tests drive signs with it, because only a manual tool call
-/// does and every catalog lane refuses the Connection first.
+/// nothing these tests drive signs with it: a catalog operation makes no
+/// call for a caller, and the discovery ones refuse the Connection first.
 fn admin_caller_assertion_json() -> Value {
     json!({
         "signing_key_id": "assertion-signing-key",
@@ -12841,19 +13075,23 @@ async fn create_attested_connection(router: &Router, mut body: Value) -> (String
 }
 
 #[tokio::test]
-async fn attested_connection_catalog_operations_are_conflicts_over_http() {
-    // The refusal reaches an admin client as a 409 naming the reason, and the
-    // register and refresh failures are audited with it, through the real
-    // handlers rather than only the error mappers.
+async fn attested_connection_catalog_discovery_is_a_conflict_over_http() {
+    // A catalog registered from an uploaded specification is served on an
+    // attested Connection, because its tools sign the assertion. Discovery,
+    // which has no caller to attest, reaches an admin client as a 409 naming
+    // the reason and is audited with it, through the real handlers rather
+    // than only the error mappers.
     let connection_db = TempDb::new("connection-caller-assertion-catalogs");
     let policy = TempPolicyFile::new(&connection_policy_document_string());
     let capture = audit::sink::tests::CaptureSink::new();
     let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
     let router = attested_connection_admin_router(&connection_db, &policy, audit_log);
 
-    let openapi_body: Value =
+    let mut openapi_body: Value =
         serde_json::from_str(&managed_openapi_connection_body("Attested OpenAPI"))
             .expect("managed OpenAPI body should parse");
+    // A refresh fetches the specification from this path: discovery.
+    openapi_body["discovery"]["path"] = json!("/openapi.json");
     let (openapi_id, openapi_etag) = create_attested_connection(&router, openapi_body).await;
     let spec = widget_openapi_spec();
 
@@ -12869,14 +13107,22 @@ async fn attested_connection_catalog_operations_are_conflicts_over_http() {
         ))
         .await
         .expect("attested preview should complete");
-    assert_eq!(preview.status(), StatusCode::CONFLICT);
-    assert_eq!(
-        json_body(preview).await["reason"],
-        json!("caller_assertion_not_enforced")
-    );
+    assert_eq!(preview.status(), StatusCode::OK);
+    let preview = json_body(preview).await;
+    let selected_tool_name = preview["tools"][0]["name"]
+        .as_str()
+        .expect("preview should include a generated tool")
+        .to_owned();
+    let selected_security_confirmation = preview["security_confirmations"]
+        .as_array()
+        .and_then(|confirmations| {
+            confirmations.iter().find(|confirmation| {
+                confirmation["tool_name"].as_str() == Some(selected_tool_name.as_str())
+            })
+        })
+        .cloned()
+        .expect("selected tool should include an exact security confirmation");
 
-    // A correct digest and a non-empty selection, so only the refusal can
-    // stop the registration.
     let register = router
         .clone()
         .oneshot(connection_admin_request(
@@ -12886,11 +13132,11 @@ async fn attested_connection_catalog_operations_are_conflicts_over_http() {
             Some(
                 json!({
                     "spec": spec,
-                    "spec_digest": hex::encode(Sha256::digest(spec.as_bytes())),
-                    "expected_spec_revision": 0,
-                    "expected_catalog_revision": 0,
-                    "selected_tool_names": ["getWidget"],
-                    "security_confirmations": [],
+                    "spec_digest": preview["spec_digest"],
+                    "expected_spec_revision": preview["spec_revision"],
+                    "expected_catalog_revision": preview["catalog_revision"],
+                    "selected_tool_names": [selected_tool_name],
+                    "security_confirmations": [selected_security_confirmation],
                 })
                 .to_string(),
             ),
@@ -12899,11 +13145,8 @@ async fn attested_connection_catalog_operations_are_conflicts_over_http() {
         ))
         .await
         .expect("attested register should complete");
-    assert_eq!(register.status(), StatusCode::CONFLICT);
-    assert_eq!(
-        json_body(register).await["reason"],
-        json!("caller_assertion_not_enforced")
-    );
+    assert_eq!(register.status(), StatusCode::CREATED);
+    assert_eq!(json_body(register).await["total_count"], json!(1));
 
     let openapi_refresh = router
         .clone()
@@ -12966,17 +13209,16 @@ async fn attested_connection_catalog_operations_are_conflicts_over_http() {
     };
     assert_eventually(Duration::from_secs(1), || {
         let events = capture.events();
-        events.iter().any(|event| {
-            event.event_type == audit::event::TOOL_REGISTRY_CHANGED
-                && event.payload["action"] == json!("managed_openapi_catalog_registration_rejected")
-                && refused(event, openapi_id.as_str())
-        }) && [&openapi_id, &mcp_id].into_iter().all(|id| {
+        [&openapi_id, &mcp_id].into_iter().all(|id| {
             events.iter().any(|event| {
                 event.event_type == audit::event::CONNECTION_REFRESHED
                     && refused(event, id.as_str())
             })
         })
     });
+    assert!(capture.events().iter().all(|event| {
+        event.payload["action"] != json!("managed_openapi_catalog_registration_rejected")
+    }));
 }
 
 #[tokio::test]
@@ -24771,6 +25013,7 @@ async fn auth_validator_resolves_oidc_discovery_for_issuer_only_provider() {
         &discovered_oidc_jwks_urls,
         None,
         None,
+        None,
     )
     .expect("issuer-only provider should build")
     .expect("auth validator should be configured");
@@ -24784,6 +25027,103 @@ async fn auth_validator_resolves_oidc_discovery_for_issuer_only_provider() {
         .expect("token should validate through discovered JWKS URI");
 
     assert_eq!(principal.user_id, "oidc-user");
+    server
+        .join()
+        .expect("OIDC discovery test server should finish");
+}
+
+/// Startup hands every JWT validator that has a denylist the observer it
+/// passes in, so a JWT refused as revoked names its principal to the
+/// Connection runtime, which purges that principal's delegated tokens (issue
+/// #441).
+#[tokio::test]
+async fn a_denylisted_jwt_validator_reports_the_principal_of_a_revoked_token() {
+    struct DenyEveryJti;
+
+    #[async_trait::async_trait]
+    impl auth::RevocationStore for DenyEveryJti {
+        async fn is_revoked(&self, _jti: &str) -> Result<bool, auth::AuthError> {
+            Ok(true)
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingObserver(std::sync::Mutex<Vec<(String, String)>>);
+
+    impl auth::RevokedCredentialObserver for RecordingObserver {
+        fn credential_revoked(&self, issuer: &str, subject: &str) {
+            self.0
+                .lock()
+                .expect("observer lock")
+                .push((issuer.to_owned(), subject.to_owned()));
+        }
+    }
+
+    let (issuer, server) = spawn_oidc_jwks_server();
+    let issuer_claim = issuer.clone();
+    let mut config = test_config(Vec::new());
+    config.auth_providers = vec![config::AuthProviderConfig {
+        name: "oidc".to_owned(),
+        provider_type: config::AuthProviderType::Jwt,
+        jwks_url: None,
+        issuer: Some(issuer.clone()),
+        audience: None,
+        jwks_timeout_ms: 2000,
+        jwks_max_key_age_secs: 300,
+        require_jti: true,
+        roles_claim: "roles".to_owned(),
+        roles_claim_delimiter: None,
+        org_claim: None,
+        introspection_url: None,
+        introspection_timeout_ms: config::DEFAULT_COOKIE_SESSION_INTROSPECTION_TIMEOUT_MS,
+        cache_ttl_ms: config::DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
+        user_id_claim: None,
+        email_claim: None,
+        client_id: None,
+        client_secret: None,
+        redirect_uri: None,
+    }];
+    config.egress_deny_private_ips = false;
+    let egress_client = Arc::new(
+        egress::EgressClient::new(egress::EgressConfig::from_config(&config))
+            .expect("egress client should build"),
+    );
+    let discovered_oidc_jwks_urls =
+        discover_oidc_jwks_urls_from_config(&config, Arc::clone(&egress_client))
+            .expect("issuer-only provider should discover JWKS URI");
+    let denylist = |_issuer: &str| Arc::new(DenyEveryJti) as Arc<dyn auth::RevocationStore>;
+    let observer = Arc::new(RecordingObserver::default());
+
+    let validator = auth_validator_from_config(
+        &config,
+        egress_client,
+        None,
+        &discovered_oidc_jwks_urls,
+        Some(&denylist as JwtRevocationStoreFactory<'_>),
+        Some(Arc::clone(&observer) as Arc<dyn auth::RevokedCredentialObserver>),
+        None,
+    )
+    .expect("issuer-only provider should build")
+    .expect("auth validator should be configured");
+    let error = validator
+        .validate_session(&auth::SessionCredential::Bearer(signed_token_with_issuer(
+            "oidc-user",
+            &["member"],
+            &issuer_claim,
+        )))
+        .await
+        .expect_err("a denylisted jti is refused");
+
+    // The provider chain reports every provider's refusal alike, so the
+    // observer is what tells this one apart from a bad signature.
+    assert!(
+        matches!(&error, auth::AuthError::InvalidSession(_)),
+        "{error:?}"
+    );
+    assert_eq!(
+        *observer.0.lock().expect("observer lock"),
+        [(issuer, "oidc-user".to_owned())]
+    );
     server
         .join()
         .expect("OIDC discovery test server should finish");
@@ -24820,13 +25160,20 @@ async fn a_client_certificate_only_deployment_still_builds_an_auth_chain() {
             .expect("egress client should build"),
     );
 
-    let validator =
-        auth_validator_from_config(&config, egress_client, None, &HashMap::new(), None, None)
-            .expect("a certificate-only configuration should build")
-            .expect(
-                "a certificate-only configuration must produce a validator, not None; None \
+    let validator = auth_validator_from_config(
+        &config,
+        egress_client,
+        None,
+        &HashMap::new(),
+        None,
+        None,
+        None,
+    )
+    .expect("a certificate-only configuration should build")
+    .expect(
+        "a certificate-only configuration must produce a validator, not None; None \
                      makes the auth middleware fail closed on every request",
-            );
+    );
 
     assert!(
         validator.supports_client_certificate(),
@@ -26631,6 +26978,9 @@ fn principal_policy_document_string() -> String {
         "roles": {
             "principal-reader": {
                 "permissions": ["admin:principals:read"]
+            },
+            "principal-writer": {
+                "permissions": [ADMIN_PRINCIPALS_WRITE_PERMISSION]
             },
             "reader": {
                 "permissions": []

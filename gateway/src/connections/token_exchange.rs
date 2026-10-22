@@ -22,6 +22,14 @@
 //! is audited as [`audit::event::CONNECTION_DELEGATED_TOKEN_EXCHANGE`] with the caller as its
 //! actor. No token -- the subject token, the issued token, or anything the issuer answered with --
 //! reaches an error, a log line or an audit event.
+//!
+//! A principal's tokens can also be purged (see [`DelegatedTokenRuntime::purge_principal`]): when
+//! an operator says the user was disabled, or when a validator refuses one of the principal's
+//! credentials as revoked. Every token cached for that principal, under every delegated
+//! Connection, leaves the cache at once, and each is then revoked at its issuer by OAuth 2.0 token
+//! revocation (RFC 7009) when its Connection names a `revocation_url`. Revocation is best effort:
+//! it is attempted once, in the background, and audited as
+//! [`audit::event::CONNECTION_DELEGATED_TOKEN_REVOCATION`] whatever the issuer says.
 
 use std::{
     fmt,
@@ -38,6 +46,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     audit::{self, Actor, AuditEvent, AuditLog},
+    auth::principal::canonical_issuer,
     egress::{EgressClient, EgressError},
 };
 
@@ -50,9 +59,9 @@ use super::{
     model::ConnectionId,
     oauth::{
         duration_millis, is_json_content_type, token_request_headers, MintedOAuthToken,
-        OAuthTokenCache, OAuthTokenCacheKey, OAuthTokenLease, SecretString, SystemOAuthClock,
-        TokenCacheFailure, MAX_RESPONSE_SCOPE_BYTES, MAX_TOKEN_LIFETIME_SECS, MAX_TOKEN_TYPE_BYTES,
-        OAUTH_MAX_REQUEST_BYTES,
+        OAuthTokenCache, OAuthTokenCacheKey, OAuthTokenLease, RetiredTokenSlot, SecretString,
+        SystemOAuthClock, TokenCacheFailure, MAX_RESPONSE_SCOPE_BYTES, MAX_TOKEN_LIFETIME_SECS,
+        MAX_TOKEN_TYPE_BYTES, OAUTH_MAX_REQUEST_BYTES,
     },
     secret::{SecretPurpose, SecretResolveErrorKind, MAX_HTTP_CREDENTIAL_BYTES},
 };
@@ -78,6 +87,13 @@ const TOKEN_TYPE_ACCESS_TOKEN: &str = "urn:ietf:params:oauth:token-type:access_t
 /// operator joins to the issuer's own log.
 const EXCHANGE_AUDIT_REQUEST_ID: &str = "connection-delegated-token";
 
+/// The `request_id` of the audit events of a purge no request asked for: one a validator's refusal
+/// of a revoked credential started. Their `purge_id` joins them to each other.
+const PURGE_AUDIT_REQUEST_ID: &str = "connection-delegated-token-purge";
+
+/// RFC 7009 section 2.1: the hint that the token being revoked is an access token.
+const TOKEN_TYPE_HINT_ACCESS_TOKEN: &str = "access_token";
+
 /// The error codes RFC 6749 section 5.2 and RFC 8693 section 2.2.2 register for a token endpoint.
 /// An issuer's code is recorded only when it is one of these, so audit never carries text the
 /// issuer chose.
@@ -90,6 +106,18 @@ const REGISTERED_ERROR_CODES: &[&str] = &[
     "invalid_scope",
     "invalid_target",
     "access_denied",
+];
+
+/// The error codes a revocation endpoint may answer with: RFC 6749 section 5.2's, through RFC 7009
+/// section 2.2.1, and the one RFC 7009 adds.
+const REGISTERED_REVOCATION_ERROR_CODES: &[&str] = &[
+    "invalid_request",
+    "invalid_client",
+    "invalid_grant",
+    "unauthorized_client",
+    "unsupported_grant_type",
+    "invalid_scope",
+    "unsupported_token_type",
 ];
 
 /// Why a delegated token could not be obtained. Every variant refuses the call: nothing is sent
@@ -143,6 +171,8 @@ impl TokenCacheFailure for DelegatedTokenError {
     const CACHE_FULL: Self = Self::Unavailable;
     const MINT_PANICKED: Self = Self::ExchangeFailed;
     const INVALID_TOKEN: Self = Self::ExchangeFailed;
+    // The caller's own tokens were being purged as the call arrived.
+    const RETIRED: Self = Self::Unavailable;
 }
 
 /// One Connection's exchange, as a target built from one revision of it binds it.
@@ -156,6 +186,9 @@ pub(crate) struct DelegatedTokenBinding {
     pub requested_scopes: Vec<String>,
     pub audience: Option<String>,
     pub resource: Option<String>,
+    /// The issuer's RFC 7009 endpoint, when the Connection names one: where a purged token of this
+    /// revision is revoked, with the same client credentials and egress client as its exchange.
+    pub revocation_url: Option<String>,
     pub subject_token: SubjectTokenSettings,
     pub token_client: Arc<EgressClient>,
 }
@@ -176,12 +209,42 @@ pub(crate) struct SubjectTokenSettings {
 
 /// A delegated token one call holds: injected as `Authorization: Bearer`, and dropped from the
 /// cache by an upstream `401`.
-pub(crate) type DelegatedTokenLease = OAuthTokenLease<DelegatedTokenError>;
+pub(crate) type DelegatedTokenLease = OAuthTokenLease<DelegatedTokenError, DelegatedTokenBinding>;
+
+/// The delegated-token cache. Each entry keeps the binding of the revision it was exchanged under,
+/// so a purged token is revoked at the issuer that issued it, whatever the Connection says now.
+type DelegatedTokenCache = OAuthTokenCache<DelegatedTokenError, DelegatedTokenBinding>;
+
+type RetiredDelegatedToken = RetiredTokenSlot<DelegatedTokenError, DelegatedTokenBinding>;
+
+/// Why a principal's delegated tokens are purged.
+#[derive(Clone, Debug)]
+pub enum DelegatedTokenPurgeTrigger {
+    /// An operator asked, through the admin API: typically because the user was disabled at their
+    /// identity provider. The actor and request are the operator's.
+    Operator {
+        actor: Actor,
+        request_id: String,
+        source_ip: String,
+    },
+    /// A validator refused one of the principal's credentials because it is revoked. The
+    /// credential's signature was verified first, so the principal is the one its issuer named.
+    CredentialRevoked,
+}
+
+impl DelegatedTokenPurgeTrigger {
+    const fn label(&self) -> &'static str {
+        match self {
+            Self::Operator { .. } => "operator",
+            Self::CredentialRevoked => "credential_revoked",
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct DelegatedTokenRuntime {
     control_plane: ConnectionControlPlane,
-    cache: Arc<OAuthTokenCache<DelegatedTokenError>>,
+    cache: Arc<DelegatedTokenCache>,
     audit: Option<AuditLog>,
 }
 
@@ -236,10 +299,12 @@ impl DelegatedTokenRuntime {
         binding: &DelegatedTokenBinding,
         caller: &AttestedCaller,
     ) -> Result<DelegatedTokenLease, DelegatedTokenError> {
+        let identity = caller.identity();
         let key = OAuthTokenCacheKey {
             connection_id: binding.connection_id.to_string(),
             connection_etag: binding.connection_etag.clone(),
             subject: Some(subject_digest(caller)),
+            principal: Some(principal_digest(identity.issuer, identity.subject)),
             // Always `None` today. The encrypted local store's version is the
             // only one a rotation moves while the gateway runs, and that store
             // cannot hold this purpose; an operator alias or an external
@@ -256,13 +321,141 @@ impl DelegatedTokenRuntime {
             egress_generation: binding.token_client.configuration_generation(),
         };
         let runtime = self.clone();
-        let binding = binding.clone();
+        let exchanged_for = binding.clone();
         let caller = caller.clone();
         self.cache
-            .get_or_mint(key, move || async move {
-                runtime.exchange(&binding, &caller).await
-            })
+            .get_or_mint_with(
+                key,
+                || binding.clone(),
+                move || async move { runtime.exchange(&exchanged_for, &caller).await },
+            )
             .await
+    }
+
+    /// Drops every token cached for the principal `issuer` and `subject` name, under every
+    /// delegated Connection and whatever email or roles it carried, and returns how many entries
+    /// that was. Each token is then revoked at its issuer in the background, when the revision it
+    /// was exchanged under names a `revocation_url`.
+    ///
+    /// No later call is served a purged token: the principal's next call exchanges again, and the
+    /// issuer decides whether it still holds a grant. A call already holding its token finishes
+    /// with it. A call that arrives while the purge runs may be refused with
+    /// `delegated_token_unavailable`.
+    ///
+    /// An operator's purge is audited even when it finds nothing. One a revoked credential started
+    /// is audited only when it purged something, because the same refused credential can be
+    /// presented any number of times.
+    pub(crate) fn purge_principal(
+        &self,
+        issuer: &str,
+        subject: &str,
+        trigger: DelegatedTokenPurgeTrigger,
+    ) -> usize {
+        let Some(issuer) = canonical_issuer(issuer) else {
+            return 0;
+        };
+        let principal = principal_digest(&issuer, subject);
+        let retired = self
+            .cache
+            .retire_where(|key| key.principal == Some(principal));
+        let purged = retired.len();
+        if purged == 0 && matches!(trigger, DelegatedTokenPurgeTrigger::CredentialRevoked) {
+            return 0;
+        }
+        let purge = Arc::new(DelegatedTokenPurge {
+            audit: self.audit.clone(),
+            purge_id: uuid::Uuid::new_v4().to_string(),
+            trigger,
+            issuer,
+            subject: subject.to_owned(),
+        });
+        purge.emit(purged);
+        if !retired.is_empty() {
+            let runtime = self.clone();
+            // Detached, like an exchange: the request that asked for the purge may end before the
+            // issuers answer, and must not cancel their revocations or their audit.
+            tokio::spawn(async move { runtime.revoke_retired(&purge, retired).await });
+        }
+        purged
+    }
+
+    /// Revokes each retired token at its issuer, one after another, once any exchange still in
+    /// flight for it has finished.
+    async fn revoke_retired(
+        &self,
+        purge: &DelegatedTokenPurge,
+        retired: Vec<RetiredDelegatedToken>,
+    ) {
+        for slot in retired {
+            let Some(token) = slot.take_token().await else {
+                continue;
+            };
+            let binding = slot.context();
+            let mut attempt = RevocationAttempt::new(purge, binding);
+            let result = self.revoke(binding, &token, &mut attempt).await;
+            drop(token);
+            attempt.finish(&result);
+        }
+    }
+
+    /// One RFC 7009 request: the token, hinted as an access token, posted to the issuer's
+    /// revocation endpoint with the client credentials it was exchanged with. The endpoint passes
+    /// the egress policy before the client secret is read.
+    async fn revoke(
+        &self,
+        binding: &DelegatedTokenBinding,
+        token: &[u8],
+        attempt: &mut RevocationAttempt<'_>,
+    ) -> Result<(), RevocationError> {
+        let revocation_url = binding
+            .revocation_url
+            .as_deref()
+            .ok_or(RevocationError::NotConfigured)?;
+        let destination = binding
+            .token_client
+            .checked_destination(revocation_url)
+            .await
+            .map_err(|error| revocation_egress_error(&error))?;
+        let client_secret = self
+            .control_plane
+            .secret_resolver()
+            .resolve(
+                &binding.client_secret_id,
+                SecretPurpose::TokenExchangeClientSecret,
+            )
+            .await
+            .map_err(|error| revocation_credential_error(error.kind()))?;
+        let headers = token_request_headers(&binding.client_id, client_secret.expose())
+            .map_err(|_| RevocationError::CredentialInvalid)?;
+        drop(client_secret);
+        let body = revocation_request_body(token)?;
+
+        let response = binding
+            .token_client
+            .sensitive_request_with_headers_at_checked_destination(
+                &destination,
+                Method::POST,
+                revocation_url,
+                headers,
+                Some(body),
+            )
+            .await
+            .map_err(|error| revocation_egress_error(&error))?;
+        attempt.issuer_status = Some(response.status.as_u16());
+        // RFC 7009 section 2.2: `200` whether the token was revoked or was already invalid, and the
+        // body means nothing.
+        if response.status == StatusCode::OK {
+            return Ok(());
+        }
+        if is_json_content_type(response.headers.get(header::CONTENT_TYPE)) {
+            attempt.issuer_error =
+                registered_error_code(response.body.as_slice(), REGISTERED_REVOCATION_ERROR_CODES);
+        }
+        Err(if response.status == StatusCode::SERVICE_UNAVAILABLE {
+            RevocationError::Failed
+        } else {
+            RevocationError::Refused
+        })
     }
 
     async fn exchange(
@@ -325,7 +518,7 @@ impl DelegatedTokenRuntime {
         let json = is_json_content_type(response.headers.get(header::CONTENT_TYPE));
         if response.status != StatusCode::OK {
             let code = if json {
-                registered_error_code(response.body.as_slice())
+                registered_error_code(response.body.as_slice(), REGISTERED_ERROR_CODES)
             } else {
                 None
             };
@@ -396,6 +589,19 @@ fn cache_lifetime(expires_in: u64) -> Duration {
     Duration::from_secs(expires_in.min(MAX_DELEGATED_TOKEN_CACHE_SECONDS))
 }
 
+/// Whose tokens a purge drops: a digest of the attested issuer and subject alone, so it matches
+/// every token exchanged for that principal whatever email or roles it carried. Length-prefixed
+/// so no two principals share an encoding.
+fn principal_digest(issuer: &str, subject: &str) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"greengateway:delegated-token-principal:v1\0");
+    for part in [issuer, subject] {
+        digest.update((part.len() as u64).to_be_bytes());
+        digest.update(part.as_bytes());
+    }
+    digest.finalize().into()
+}
+
 /// Who a cached token belongs to: a digest of every attested field, so a caller whose email or
 /// roles changed at their provider is exchanged for again rather than served a token issued for
 /// claims that no longer hold. Length-prefixed so no two identities share an encoding.
@@ -448,6 +654,20 @@ fn exchange_request_body(
     Ok(body.as_bytes().to_vec())
 }
 
+/// An RFC 7009 request body: the token and the hint that it is an access token.
+fn revocation_request_body(token: &[u8]) -> Result<Vec<u8>, RevocationError> {
+    // The issuer handed the token out as a JSON string, so it is UTF-8.
+    let token = std::str::from_utf8(token).map_err(|_| RevocationError::Failed)?;
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    serializer.append_pair("token", token);
+    serializer.append_pair("token_type_hint", TOKEN_TYPE_HINT_ACCESS_TOKEN);
+    let body = Zeroizing::new(serializer.finish());
+    if body.len() > OAUTH_MAX_REQUEST_BYTES {
+        return Err(RevocationError::Failed);
+    }
+    Ok(body.as_bytes().to_vec())
+}
+
 /// The fields of an RFC 8693 response this reads. Anything else an issuer adds -- a refresh token,
 /// a session identifier -- is skipped unread rather than refused: issuers routinely add fields,
 /// and none of them is kept.
@@ -494,14 +714,14 @@ struct ExchangeErrorResponse {
     error: Option<String>,
 }
 
-/// The issuer's error code when it is a registered one, `unregistered` for any other, and `None`
-/// when the body names none.
-fn registered_error_code(body: &[u8]) -> Option<&'static str> {
+/// The issuer's error code when it is one of `registered`, `unregistered` for any other, and
+/// `None` when the body names none.
+fn registered_error_code(body: &[u8], registered: &[&'static str]) -> Option<&'static str> {
     let code = serde_json::from_slice::<ExchangeErrorResponse>(body)
         .ok()?
         .error?;
     Some(
-        REGISTERED_ERROR_CODES
+        registered
             .iter()
             .copied()
             .find(|registered| *registered == code)
@@ -556,6 +776,184 @@ fn exchange_egress_error(error: &EgressError) -> DelegatedTokenError {
         // `egress::grpc`. Named rather than wildcarded so a new transport cannot land here
         // silently.
         EgressError::Grpc(_) => DelegatedTokenError::ExchangeFailed,
+    }
+}
+
+/// Why a purged token was not revoked. Revocation is best effort: none of these is retried, and
+/// none of them puts the token back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RevocationError {
+    /// The revision the token was exchanged under names no `revocation_url`.
+    NotConfigured,
+    /// The egress policy refuses the revocation endpoint.
+    EgressDenied,
+    /// The client secret is unknown, refused by its source, or not valid for its purpose.
+    CredentialInvalid,
+    /// The client secret's source could not be read just now.
+    CredentialUnavailable,
+    /// The issuer answered with an error.
+    Refused,
+    /// The issuer could not be reached, timed out, or answered `503`.
+    Failed,
+}
+
+impl RevocationError {
+    const fn outcome_and_reason(self) -> (&'static str, &'static str) {
+        match self {
+            Self::NotConfigured => ("skipped", "revocation_not_configured"),
+            Self::EgressDenied => ("failure", "revocation_egress_denied"),
+            Self::CredentialInvalid => ("failure", "credential_invalid"),
+            Self::CredentialUnavailable => ("failure", "credential_unavailable"),
+            Self::Refused => ("failure", "revocation_refused"),
+            Self::Failed => ("failure", "revocation_failed"),
+        }
+    }
+}
+
+/// The revocation request travels exactly as the exchange does, so it is refused for exactly the
+/// same reasons.
+fn revocation_egress_error(error: &EgressError) -> RevocationError {
+    match exchange_egress_error(error) {
+        DelegatedTokenError::EgressDenied => RevocationError::EgressDenied,
+        DelegatedTokenError::NoPrincipal
+        | DelegatedTokenError::Denied
+        | DelegatedTokenError::ExchangeFailed
+        | DelegatedTokenError::Unavailable
+        | DelegatedTokenError::CredentialInvalid
+        | DelegatedTokenError::CredentialUnavailable => RevocationError::Failed,
+    }
+}
+
+fn revocation_credential_error(kind: SecretResolveErrorKind) -> RevocationError {
+    match credential_error(kind) {
+        DelegatedTokenError::CredentialUnavailable => RevocationError::CredentialUnavailable,
+        DelegatedTokenError::CredentialInvalid
+        | DelegatedTokenError::NoPrincipal
+        | DelegatedTokenError::EgressDenied
+        | DelegatedTokenError::Denied
+        | DelegatedTokenError::ExchangeFailed
+        | DelegatedTokenError::Unavailable => RevocationError::CredentialInvalid,
+    }
+}
+
+/// One purge, as its audit events name it.
+struct DelegatedTokenPurge {
+    audit: Option<AuditLog>,
+    purge_id: String,
+    trigger: DelegatedTokenPurgeTrigger,
+    issuer: String,
+    subject: String,
+}
+
+impl DelegatedTokenPurge {
+    fn emit(&self, purged: usize) {
+        metrics::counter!(
+            "connection_delegated_token_purge_total",
+            "trigger" => self.trigger.label()
+        )
+        .increment(1);
+        self.audit_event(
+            audit::event::CONNECTION_DELEGATED_TOKEN_PURGE,
+            json!({
+                "purge_id": self.purge_id,
+                "trigger": self.trigger.label(),
+                "principal": { "issuer": self.issuer, "subject": self.subject },
+                "purged_entries": purged,
+            }),
+        );
+    }
+
+    /// An event of this purge: the operator's actor and request when an operator asked for it,
+    /// none when a revoked credential did.
+    fn audit_event(&self, event_type: &str, payload: serde_json::Value) {
+        let Some(audit) = self.audit.as_ref() else {
+            return;
+        };
+        let event = match &self.trigger {
+            DelegatedTokenPurgeTrigger::Operator {
+                actor,
+                request_id,
+                source_ip,
+            } => AuditEvent::new(
+                event_type,
+                request_id.as_str(),
+                source_ip.as_str(),
+                Some(actor.clone()),
+                payload,
+            ),
+            DelegatedTokenPurgeTrigger::CredentialRevoked => AuditEvent::new(
+                event_type,
+                PURGE_AUDIT_REQUEST_ID,
+                "internal",
+                None,
+                payload,
+            ),
+        };
+        audit.emit(event);
+    }
+}
+
+/// The audit record of one revocation, emitted exactly once: when it finishes, or, should the task
+/// running it be dropped first, as cancelled.
+struct RevocationAttempt<'a> {
+    purge: &'a DelegatedTokenPurge,
+    connection_id: String,
+    started: Instant,
+    issuer_status: Option<u16>,
+    issuer_error: Option<&'static str>,
+    completed: bool,
+}
+
+impl<'a> RevocationAttempt<'a> {
+    fn new(purge: &'a DelegatedTokenPurge, binding: &DelegatedTokenBinding) -> Self {
+        Self {
+            purge,
+            connection_id: binding.connection_id.to_string(),
+            started: Instant::now(),
+            issuer_status: None,
+            issuer_error: None,
+            completed: false,
+        }
+    }
+
+    fn finish(&mut self, result: &Result<(), RevocationError>) {
+        let (outcome, reason) = match result {
+            Ok(()) => ("success", "revoked"),
+            Err(error) => error.outcome_and_reason(),
+        };
+        self.completed = true;
+        self.emit(outcome, reason);
+    }
+
+    fn emit(&self, outcome: &'static str, reason: &'static str) {
+        metrics::counter!(
+            "connection_delegated_token_revocation_total",
+            "result" => outcome,
+            "reason" => reason
+        )
+        .increment(1);
+        self.purge.audit_event(
+            audit::event::CONNECTION_DELEGATED_TOKEN_REVOCATION,
+            json!({
+                "purge_id": self.purge.purge_id,
+                "connection_id": self.connection_id,
+                "auth_type": "delegated_issuer_token",
+                "principal": { "issuer": self.purge.issuer, "subject": self.purge.subject },
+                "outcome": outcome,
+                "reason": reason,
+                "issuer_status": self.issuer_status,
+                "issuer_error": self.issuer_error,
+                "latency_ms": duration_millis(self.started.elapsed()),
+            }),
+        );
+    }
+}
+
+impl Drop for RevocationAttempt<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.emit("failure", "revocation_cancelled");
+        }
     }
 }
 

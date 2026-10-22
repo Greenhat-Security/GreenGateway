@@ -247,6 +247,7 @@ const BLANK_IS_UNSET: &[&str] = &[
     "ADMIN_LOGIN_PROVIDER",
     "ADMIN_SESSION_MODE",
     "ADMIN_SESSION_TTL_SECS",
+    "ADMIN_SESSION_IDLE_TIMEOUT_SECS",
     "ADMIN_SESSION_MAX_ENTRIES",
     "GATEWAY_PUBLIC_URL",
     "AUDIT_LOG_FILE",
@@ -644,7 +645,9 @@ fn admin_login_and_the_standalone_session_add_their_routes_under_a_custom_prefix
     assert_eq!(
         config.admin_session,
         Some(crate::auth::admin_session::AdminSessionConfig {
+            storage: crate::auth::admin_session::AdminSessionStorage::StandaloneMemory,
             ttl: std::time::Duration::from_secs(3_600),
+            idle_timeout: std::time::Duration::from_secs(3_600),
             max_entries: 1_024,
         })
     );
@@ -837,7 +840,7 @@ fn invalid_combinations_are_refused_with_their_legacy_messages() {
         ),
         (
             &[("ADMIN_SESSION_TTL_SECS", "600")][..],
-            &["ADMIN_SESSION_TTL_SECS and ADMIN_SESSION_MAX_ENTRIES require ADMIN_SESSION_MODE=standalone_memory"][..],
+            &["ADMIN_SESSION_TTL_SECS, ADMIN_SESSION_IDLE_TIMEOUT_SECS and ADMIN_SESSION_MAX_ENTRIES require ADMIN_SESSION_MODE=standalone_memory or cluster_postgres"][..],
         ),
     ] {
         assert_eq!(refused(fixture).problems, problems, "{fixture:?}");
@@ -1037,6 +1040,17 @@ fn accepted_configurations_request_every_inventoried_variable_and_nothing_else()
         ("ADMIN_PREFIX", "/operations"),
         ("ADMIN_SESSION_MODE", "standalone_memory"),
     ];
+    let mut cluster_session = postgres_fixture();
+    cluster_session.extend([
+        ("AUTH_PROVIDERS", admin_login_provider_document()),
+        ("ADMIN_LOGIN_PROVIDER", "primary"),
+        ("ADMIN_PREFIX", "/operations"),
+        (
+            "ADMIN_LOGIN_KEYRING",
+            r#"[{"id":"login-primary","file":"admin-login-key","role":"primary"}]"#,
+        ),
+        ("ADMIN_SESSION_MODE", "cluster_postgres"),
+    ]);
     let split_listeners = [
         ("LISTEN_ADDR", "0.0.0.0:8080"),
         ("ADMIN_LISTEN_ADDR", "127.0.0.1:9091"),
@@ -1046,7 +1060,12 @@ fn accepted_configurations_request_every_inventoried_variable_and_nothing_else()
     ];
 
     let inventoried: BTreeSet<&str> = inventory::CONFIG_INPUTS.iter().copied().collect();
-    for fixture in [&cluster[..], &standalone_session[..], &split_listeners[..]] {
+    for fixture in [
+        &cluster[..],
+        &standalone_session[..],
+        &cluster_session[..],
+        &split_listeners[..],
+    ] {
         let mut requested = BTreeSet::new();
         let parsed = Config::from_env_vars(|name| {
             requested.insert(name.to_owned());
@@ -1119,7 +1138,7 @@ fn a_problem_is_attributed_to_the_setting_it_begins_with() {
     let error = refused(&[("ADMIN_SESSION_MAX_ENTRIES", "10")]);
     assert_eq!(
         error.problems,
-        ["ADMIN_SESSION_TTL_SECS and ADMIN_SESSION_MAX_ENTRIES require ADMIN_SESSION_MODE=standalone_memory"]
+        ["ADMIN_SESSION_TTL_SECS, ADMIN_SESSION_IDLE_TIMEOUT_SECS and ADMIN_SESSION_MAX_ENTRIES require ADMIN_SESSION_MODE=standalone_memory or cluster_postgres"]
     );
     assert_eq!(
         error.diagnostics(),

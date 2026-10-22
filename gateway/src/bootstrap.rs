@@ -229,8 +229,9 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     // `gateway cluster-members`: one line per member row of the deployment
     // (issue #241, PR 13), liveness judged on the database clock against
-    // CLUSTER_MEMBER_STALE_MS. Read-only: the command is not a member and
-    // writes no row of its own. The status API/UI is PR 14.
+    // CLUSTER_MEMBER_STALE_MS, after a line for the durable contract fence
+    // (issue #426, PR 3). Read-only: the command is not a member and writes
+    // no row of its own. The status API/UI is PR 14.
     #[cfg(feature = "postgres")]
     if std::env::args_os()
         .nth(1)
@@ -260,11 +261,29 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let members = store.members(stale_window).await.map_err(|error| {
             Box::<dyn std::error::Error>::from(format!("cluster member listing failed: {error}"))
         })?;
+        let fence = store.contract_fence().await.map_err(|error| {
+            Box::<dyn std::error::Error>::from(format!("contract fence read failed: {error}"))
+        })?;
         let live = members.iter().filter(|member| member.live).count();
         println!(
             "deployment={deployment_id} members={} live={live} stale_window_ms={}",
             members.len(),
             stale_window.as_millis()
+        );
+        // The durable contract fence (issue #426, PR 3), redacted like the
+        // member rows below: recognized names only, plus a count of the rest.
+        let fenced = storage::compatibility::RecognizedCapabilities::parse(&fence.capabilities);
+        let fenced_names = fenced.names();
+        println!(
+            "fence generation={} minimum_schema={} capabilities={} unrecognized_capabilities={}",
+            fence.generation,
+            fence.minimum_schema,
+            if fenced_names.is_empty() {
+                "-".to_owned()
+            } else {
+                fenced_names.join(",")
+            },
+            fenced.unrecognized(),
         );
         for member in &members {
             let state = match (
@@ -1498,12 +1517,17 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
         .map(|factory| factory as JwtRevocationStoreFactory<'_>);
     #[cfg(not(feature = "postgres"))]
     let jwt_revocation: Option<JwtRevocationStoreFactory<'_>> = None;
+    // A JWT refused because its `jti` is on the shared denylist purges the
+    // principal's delegated tokens on this replica (issue #441).
+    let revoked_credentials =
+        Arc::new(connection_http_runtime.clone()) as Arc<dyn auth::RevokedCredentialObserver>;
     let validator = auth_validator_from_config(
         &config,
         Arc::clone(&egress_client),
         service_token_validator.clone(),
         &discovered_oidc.jwks_urls,
         jwt_revocation,
+        Some(Arc::clone(&revoked_credentials)),
         Some(&lifecycle),
     )?;
     #[cfg(feature = "postgres")]
@@ -1537,13 +1561,24 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
     )?;
     let admin_auth_state = if let Some(mut state) = admin_auth_state {
         if let Some(session_config) = config.admin_session.clone() {
-            if config.state_backend != config::StateBackend::Sqlite
+            // Each store is valid in exactly one state backend; there is no
+            // process-local fallback for cluster mode and no shared store in
+            // standalone mode.
+            let backend = match session_config.storage {
+                auth::admin_session::AdminSessionStorage::StandaloneMemory => {
+                    config::StateBackend::Sqlite
+                }
+                auth::admin_session::AdminSessionStorage::ClusterPostgres => {
+                    config::StateBackend::Postgres
+                }
+            };
+            if config.state_backend != backend
                 || !config.auth_enabled
                 || config.auth_mode != config::AuthMode::Required
                 || !config.csrf_enabled
             {
                 return Err(auth::AuthError::Upstream(
-                    "admin sessions require standalone mode, required authentication and CSRF"
+                    "admin sessions require their state backend's store, required authentication and CSRF"
                         .to_owned(),
                 )
                 .into());
@@ -1561,16 +1596,33 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
                 None,
                 &discovered_oidc.jwks_urls,
                 jwt_revocation,
+                Some(Arc::clone(&revoked_credentials)),
                 Some(&lifecycle),
             )?
             .ok_or_else(|| {
                 auth::AuthError::Upstream("admin session authority is not configured".to_owned())
             })?;
+            #[cfg(feature = "postgres")]
+            let cluster_store = build_overrides.pg_pending_logins.as_ref().map(|seed| {
+                Arc::new(
+                    storage::postgres_admin_sessions::PostgresAdminSessionStore::new(
+                        seed.pool.clone(),
+                        &seed.deployment_id,
+                        seed.keyring.clone(),
+                        session_config.clone(),
+                    ),
+                ) as Arc<dyn auth::admin_session::AdminSessionStore>
+            });
+            #[cfg(not(feature = "postgres"))]
+            let cluster_store: Option<Arc<dyn auth::admin_session::AdminSessionStore>> = None;
+            let store = admin_session_store(&session_config, cluster_store)?;
             let sessions = auth::admin_session::AdminSessions::new(
                 session_config,
                 authority,
+                store,
                 &config.admin_prefix,
                 state.login.redirect_origin(),
+                &config.csrf_header_name,
             )?;
             if sessions.cookie_name == config.auth_cookie_name
                 || sessions.cookie_name == config.csrf_cookie_name
@@ -1808,7 +1860,11 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
     #[cfg(feature = "postgres")]
     let cluster_readiness: Option<Arc<ha::ClusterReadiness>> =
         build_overrides.pg_membership.as_ref().map(|membership| {
-            membership.spawn_heartbeat(&lifecycle, cluster_security_runtime.clone());
+            membership.spawn_heartbeat(
+                &lifecycle,
+                cluster_security_runtime.clone(),
+                audit_log.clone(),
+            );
             membership.readiness()
         });
     #[cfg(not(feature = "postgres"))]
@@ -2184,6 +2240,10 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
         audit_query_store: audit_query_store.clone(),
         discovery_store: discovery_read_store.clone(),
         rbac_state: rbac_state.clone(),
+        delegated_tokens: (config.state_backend == config::StateBackend::Sqlite)
+            .then(|| connection_http_runtime.clone()),
+        client_ip_policy: client_ip_policy.clone(),
+        max_body_size: config.max_body_size,
     };
     let traffic_admin_state = TrafficAdminState {
         discovery_store: discovery_read_store,
@@ -2240,6 +2300,7 @@ pub(super) fn auth_validator_from_config(
     service_token_validator: Option<Arc<auth::ServiceTokenValidator>>,
     discovered_oidc_jwks_urls: &HashMap<String, String>,
     jwt_revocation: Option<JwtRevocationStoreFactory<'_>>,
+    revoked_credentials: Option<Arc<dyn auth::RevokedCredentialObserver>>,
     lifecycle: Option<&GatewayLifecycle>,
 ) -> Result<Option<Arc<dyn auth::SessionValidator>>, auth::AuthError> {
     let client_certificate_auth = config.client_certificate_auth_enabled();
@@ -2300,12 +2361,20 @@ pub(super) fn auth_validator_from_config(
                             &jwt_config,
                             &provider.name,
                         )?;
-                        auth::JwtValidator::new_for_provider_with_revocation(
+                        let validator = auth::JwtValidator::new_for_provider_with_revocation(
                             jwt_config,
                             &provider.name,
                             Arc::clone(&egress_client),
                             factory(&boundary),
-                        )?
+                        )?;
+                        // Only a denylist can refuse a token as revoked, so
+                        // only a validator with one has anything to report.
+                        match revoked_credentials.as_ref() {
+                            Some(observer) => {
+                                validator.with_revoked_credential_observer(Arc::clone(observer))
+                            }
+                            None => validator,
+                        }
                     }
                     None => auth::JwtValidator::new_for_provider(
                         jwt_config,
@@ -2335,6 +2404,27 @@ pub(super) fn auth_validator_from_config(
     Ok(Some(
         Arc::new(auth::ChainValidator::new(validators)) as Arc<dyn auth::SessionValidator>
     ))
+}
+
+/// The session store `config` selects. Cluster mode's store rides the
+/// pending-login seed (the pool, the deployment ID and the login keyring
+/// its access tokens are sealed under); without it there is no store, and
+/// startup fails rather than fall back to process memory.
+pub(super) fn admin_session_store(
+    config: &auth::admin_session::AdminSessionConfig,
+    cluster_store: Option<Arc<dyn auth::admin_session::AdminSessionStore>>,
+) -> Result<Arc<dyn auth::admin_session::AdminSessionStore>, auth::AuthError> {
+    match config.storage {
+        auth::admin_session::AdminSessionStorage::StandaloneMemory => Ok(Arc::new(
+            auth::admin_session::MemoryAdminSessionStore::new(config.clone()),
+        )),
+        auth::admin_session::AdminSessionStorage::ClusterPostgres => cluster_store.ok_or_else(|| {
+            auth::AuthError::Upstream(
+                "ADMIN_SESSION_MODE=cluster_postgres requires the PostgreSQL session store and ADMIN_LOGIN_KEYRING"
+                    .to_owned(),
+            )
+        }),
+    }
 }
 
 pub(super) fn admin_auth_state_from_config(
@@ -2450,8 +2540,8 @@ pub(super) fn validate_connection_bound_tools(
         match (&definition.source, definition.target.as_ref()) {
             (ToolSource::Manual, Some(ToolTarget::Http { connection_id, .. })) => {
                 // A manual tool may be bound to a Connection that attests its
-                // caller: its calls sign the assertion. Every other binding
-                // below keeps refusing one.
+                // caller, delegated ones included: its calls sign the
+                // assertion.
                 if let Err(error) = runtime.validate_tool_binding(connection_id) {
                     problems.push(format!(
                         "tool '{}' Connection target is unavailable: {}",
@@ -2490,7 +2580,10 @@ pub(super) fn validate_connection_bound_tools(
                     ));
                     continue;
                 }
-                if let Err(error) = runtime.validate_binding(target_connection_id) {
+                // Its calls sign a caller assertion as a manual tool's do, so
+                // an attesting Connection is accepted; a composite's steps
+                // still refuse one when they run.
+                if let Err(error) = runtime.validate_openapi_tool_binding(target_connection_id) {
                     problems.push(format!(
                         "OpenAPI tool '{}' Connection target is unavailable: {}",
                         definition.name,

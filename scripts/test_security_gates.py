@@ -1,6 +1,7 @@
 """Offline regressions for supply-chain, coverage and test-evidence gates."""
 import importlib.util
 import json
+import os
 from pathlib import Path
 import tempfile
 import struct
@@ -28,14 +29,61 @@ evidence = load('check-test-evidence')
 
 
 class CoverageGate(unittest.TestCase):
-    limits = {'gateway/src/auth/jwt.rs': {'lines': 80, 'branches': 70}}
+    limits = {'gateway/src/auth/jwt.rs': {'lines': 80, 'branches': 70, 'min_line_count': 10, 'min_branch_count': 10}}
 
-    def report(self, branches=8):
+    def report(self, branches=8, lines=(10, 9), branch_count=10):
         return {'data': [{'files': [{'filename': 'C:\\repo\\gateway\\src\\auth\\jwt.rs', 'summary': {
-            'lines': {'count': 10, 'covered': 9}, 'branches': {'count': 10, 'covered': branches}}}]}]}
+            'lines': {'count': lines[0], 'covered': lines[1]},
+            'branches': {'count': branch_count, 'covered': branches}}}]}]}
+
+    def limits_with(self, **changes):
+        limits = {**self.limits['gateway/src/auth/jwt.rs'], **changes}
+        return {'gateway/src/auth/jwt.rs': {key: value for key, value in limits.items() if value is not None}}
 
     def test_accepts_instrumented_windows_paths(self):
         self.assertEqual(coverage.check(self.report(), self.limits), [])
+
+    def test_a_grown_denominator_passes(self):
+        # New code in a file raises its counts; only a smaller count than recorded fails.
+        self.assertEqual(coverage.check(self.report(branches=10, lines=(14, 13), branch_count=12), self.limits), [])
+
+    def test_fewer_instrumented_lines_than_recorded_fail_even_at_full_coverage(self):
+        errors = coverage.check(self.report(lines=(9, 9)), self.limits)
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn('instrumented lines denominator shrank: 9 lines, below the recorded minimum of 10', errors[0])
+        self.assertIn('set "min_line_count" to 9 in .github/security-coverage.json', errors[0])
+        self.assertIn('code was really removed', errors[0])
+
+    def test_fewer_instrumented_branches_than_recorded_fail_even_at_full_coverage(self):
+        errors = coverage.check(self.report(branches=9, branch_count=9), self.limits)
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn('instrumented branches denominator shrank: 9 branches, below the recorded minimum of 10', errors[0])
+        self.assertIn('set "min_branch_count" to 9', errors[0])
+
+    def test_a_missing_or_invalid_recorded_minimum_fails(self):
+        for key in ('min_line_count', 'min_branch_count'):
+            for value in (None, 0, -1, True, 10.0, '10'):
+                with self.subTest(key=key, value=value):
+                    errors = coverage.check(self.report(), self.limits_with(**{key: value}))
+                    self.assertEqual(len(errors), 1, errors)
+                    self.assertIn(f'must record "{key}"', errors[0])
+
+    def test_a_missing_percentage_floor_fails(self):
+        for metric in ('lines', 'branches'):
+            with self.subTest(metric=metric):
+                errors = coverage.check(self.report(), self.limits_with(**{metric: None}))
+                self.assertEqual(len(errors), 1, errors)
+                self.assertIn(f'must give a {metric} floor', errors[0])
+
+    def test_committed_floors_record_every_denominator(self):
+        floors = json.loads((Path(__file__).resolve().parents[1] / '.github/security-coverage.json').read_text())
+        self.assertTrue(floors)
+        for path, limits in floors.items():
+            with self.subTest(path=path):
+                self.assertEqual(set(limits), {'lines', 'branches', 'min_line_count', 'min_branch_count'})
+                for key in ('min_line_count', 'min_branch_count'):
+                    self.assertIs(type(limits[key]), int)
+                    self.assertGreater(limits[key], 0)
 
     def test_accepts_repository_relative_paths(self):
         report = self.report()
@@ -665,6 +713,31 @@ class EvidenceWorkflowGate(unittest.TestCase):
             if 'upload-artifact@' in step.get('uses', ''):
                 self.assertNotIn('runner.temp', step['with']['path'])
 
+    def test_coverage_measures_the_same_run_and_only_compiles_the_crate_faster(self):
+        steps = self.ci['jobs']['security-coverage']['steps']
+        measure = next(step for step in steps if step.get('id') == 'coverage')
+        self.assertEqual(measure['run'], 'cargo llvm-cov --no-rustc-wrapper --branch --json --output-path '
+                         'target/security-coverage.json -p gateway --bin gateway --locked --jobs 4 -- '
+                         '--test-threads=8 --skip '
+                         'audit::sqlite_sink::tests::moderate_scale_batched_inserts_complete_quickly')
+        self.assertNotIn('env', measure)
+        self.assertNotIn('env', self.ci['jobs']['security-coverage'])
+        # The one build setting step: exactly these lines, for the gateway
+        # package only, before the measurement. Nothing that changes what is
+        # compiled (optimisation, assertions, overflow checks, features) may
+        # join them.
+        tuning = self.step('security-coverage', 'Compile the instrumented gateway crate faster')
+        self.assertEqual(tuning['shell'], 'pwsh')
+        lines = [line.strip().rstrip(',').strip("'") for line in tuning['run'].splitlines()]
+        start, end = lines.index('[unstable]'), lines.index(')')
+        self.assertEqual(lines[start:end], [
+            '[unstable]', 'profile-rustflags = true', '[profile.test.package.gateway]',
+            'debug = 0', 'rustflags = ["-Zthreads=4", "-Clinker=rust-lld"]'])
+        self.assertIn("$config = Join-Path $env:CARGO_HOME 'config.toml'", tuning['run'])
+        self.assertNotIn('if', tuning)
+        self.assertNotIn('continue-on-error', tuning)
+        self.assertLess(steps.index(tuning), steps.index(measure))
+
     def test_failed_or_skipped_producers_keep_optional_diagnostics(self):
         coverage_diagnostics = self.step('security-coverage', 'Preserve available coverage failure diagnostics')
         self.assertEqual(coverage_diagnostics['if'], "${{ always() && steps.coverage.outcome != 'success' }}")
@@ -732,6 +805,320 @@ class EvidenceWorkflowGate(unittest.TestCase):
         baseline = next(step for step in steps if step.get('name') == "Fetch the previous night's report")
         self.assertIn('runs?branch=main&event=schedule&status=success&per_page=1', baseline['run'])
         self.assertNotIn('continue-on-error', baseline)
+
+
+def run_bash(script, env, path_prefix=None):
+    environment = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), **env}
+    if path_prefix:
+        environment['PATH'] = str(path_prefix) + os.pathsep + environment['PATH']
+    return subprocess.run(['bash', '-c', script], env=environment, capture_output=True, text=True, timeout=30)
+
+
+class DependentRequiredJobGate(unittest.TestCase):
+    """A required check that waits on other jobs must fail, not vanish, when one of them did not succeed.
+
+    GitHub reports a job skipped because a dependency failed as passing a
+    required check, so every such job runs under `always()` and itself
+    requires `success` from each job it waits on.
+    """
+    SHARDS = ['postgres-foundation-pg', 'postgres-foundation-no-default', 'postgres-foundation-lint']
+    OUTCOMES = ['failure', 'skipped', 'cancelled', '']
+
+    def setUp(self):
+        self.root = Path(__file__).resolve().parents[1]
+        self.ci = yaml.load((self.root / '.github/workflows/ci.yml').read_text(), Loader=yaml.BaseLoader)
+        self.jobs = self.ci['jobs']
+        action = yaml.load((self.root / '.github/actions/gateway-image/action.yml').read_text(), Loader=yaml.BaseLoader)
+        self.load_steps = action['runs']['steps']
+
+    def test_every_pull_request_job_with_dependencies_runs_and_checks_them(self):
+        # Push-only publication jobs and the non-required PR preview scan are
+        # the only dependents that may be skipped.
+        exempt = {'promote-image', 'image-scan', 'image-verification', 'image-preview'}
+        dependents = {name for name, job in self.jobs.items() if 'needs' in job} - exempt
+        self.assertEqual(dependents, {'connections-acceptance', 'postgres-foundation',
+                                      'ha-compose-example', 'dev-traffic-smoke',
+                                      'ha-release-gate'})
+        for name in dependents:
+            with self.subTest(job=name):
+                job = self.jobs[name]
+                self.assertEqual(job['if'], '${{ always() }}')
+                self.assertNotIn('continue-on-error', job)
+                needs = job['needs'] if isinstance(job['needs'], list) else [job['needs']]
+                text = json.dumps(job['steps'])
+                for need in needs:
+                    self.assertIn('${{ needs.' + need + '.result }}', text)
+        for name in ('image-scan', 'image-verification'):
+            self.assertEqual(self.jobs[name]['if'], "github.event_name == 'push'")
+
+    def test_postgres_foundation_is_exactly_its_three_original_passes(self):
+        aggregator = self.jobs['postgres-foundation']
+        self.assertEqual(aggregator['needs'], self.SHARDS)
+        self.assertEqual(aggregator['name'], 'postgres-foundation')
+        commands = {
+            'postgres-foundation-pg': 'cargo test -p gateway --locked',
+            'postgres-foundation-no-default': 'cargo test -p gateway --locked --no-default-features',
+            'postgres-foundation-lint': 'cargo clippy -p gateway --locked --no-default-features --all-targets -- -D warnings',
+        }
+        for shard, command in commands.items():
+            with self.subTest(shard=shard):
+                job = self.jobs[shard]
+                for optional in ('if', 'needs', 'continue-on-error', 'strategy', 'env'):
+                    self.assertNotIn(optional, job)
+                runs = [step for step in job['steps'] if step.get('run') == command]
+                self.assertEqual(len(runs), 1)
+                self.assertNotIn('if', runs[0])
+                self.assertNotIn('continue-on-error', runs[0])
+                self.assertIn(shard, self.jobs['promote-image']['needs'])
+        pg = self.jobs['postgres-foundation-pg']
+        self.assertIn('postgres', pg['services'])
+        test = next(step for step in pg['steps'] if step.get('run') == commands['postgres-foundation-pg'])
+        self.assertEqual(test['env'], {
+            'GATEWAY_TEST_POSTGRES_URL_FILE': '${{ runner.temp }}/pg/database-url',
+            'GATEWAY_TEST_POSTGRES_NODDL_URL_FILE': '${{ runner.temp }}/pg/database-url-noddl',
+        })
+        names = [step.get('name') for step in pg['steps']]
+        self.assertLess(names.index('Create the no-DDL runtime role'), names.index('Test against a real PostgreSQL (feature on)'))
+
+    def aggregate(self, results):
+        step = next(step for step in self.jobs['postgres-foundation']['steps']
+                    if step.get('name') == 'Require every PostgreSQL foundation pass')
+        self.assertEqual(step['shell'], 'bash')
+        expected = {f'{key}': '${{ needs.' + shard + '.result }}' for key, shard in
+                    zip(('FEATURE_ON_RESULT', 'NO_DEFAULT_RESULT', 'LINT_RESULT'), self.SHARDS)}
+        self.assertEqual(step['env'], expected)
+        return run_bash(step['run'], dict(zip(expected, results)))
+
+    def test_the_aggregate_passes_only_when_every_shard_succeeded(self):
+        self.assertEqual(self.aggregate(['success'] * 3).returncode, 0)
+        for index in range(3):
+            for outcome in self.OUTCOMES:
+                with self.subTest(shard=self.SHARDS[index], outcome=outcome):
+                    results = ['success'] * 3
+                    results[index] = outcome
+                    result = self.aggregate(results)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(self.SHARDS[index], result.stdout)
+
+    def test_an_image_consumer_stops_unless_the_build_succeeded(self):
+        names = [step['name'] for step in self.load_steps]
+        self.assertEqual(names, ['Require the image build', 'Download this run\'s production image',
+                                 'Load and identify the production image'])
+        require = self.load_steps[0]
+        self.assertEqual(require['env'], {'PRODUCER_RESULT': '${{ inputs.producer-result }}'})
+        self.assertEqual(run_bash(require['run'], {'PRODUCER_RESULT': 'success'}).returncode, 0)
+        for outcome in self.OUTCOMES:
+            with self.subTest(outcome=outcome):
+                self.assertNotEqual(run_bash(require['run'], {'PRODUCER_RESULT': outcome}).returncode, 0)
+        for step in self.load_steps:
+            self.assertNotIn('if', step)
+            self.assertNotIn('continue-on-error', step)
+
+    def test_a_consumer_refuses_an_image_other_than_the_one_built(self):
+        load = self.load_steps[2]
+        built = 'sha256:' + 'a' * 64
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            log = directory / 'docker.log'
+            fake = directory / 'docker'
+            # Records every call; `image inspect` reports the ID in $LOADED_ID.
+            fake.write_text('#!/bin/sh\necho "$@" >> "$DOCKER_LOG"\n'
+                            'if [ "$1" = image ] && [ "$2" = inspect ]; then echo "$LOADED_ID"; fi\n')
+            fake.chmod(0o755)
+            def attempt(expected, loaded):
+                log.write_text('')
+                return run_bash(load['run'], {'EXPECTED_IMAGE_ID': expected, 'IMAGE_TAG': 'example:tag',
+                                              'LOADED_ID': loaded, 'DOCKER_LOG': str(log),
+                                              'RUNNER_TEMP': temporary}, path_prefix=directory)
+            accepted = attempt(built, built)
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            self.assertIn('tag greengateway:ci example:tag', log.read_text().splitlines())
+            for expected, loaded in [(built, 'sha256:' + 'b' * 64), ('', built), ('latest', 'latest')]:
+                with self.subTest(expected=expected, loaded=loaded):
+                    result = attempt(expected, loaded)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse([line for line in log.read_text().splitlines() if line.startswith('tag ')])
+
+    def test_the_dev_stack_runs_the_loaded_image_without_rebuilding(self):
+        smoke = next(step for step in self.jobs['dev-traffic-smoke']['steps'] if step.get('id') == 'dev-smoke')
+        self.assertIn('up -d --no-build', smoke['run'])
+        self.assertNotRegex(smoke['run'], r'\s--build\b')
+        load = next(step for step in self.jobs['dev-traffic-smoke']['steps']
+                    if step.get('uses') == './.github/actions/gateway-image')
+        # Compose names a built service image `<project>-<service>`.
+        self.assertIn('compose_files=(-p greengateway-dev ', smoke['run'])
+        self.assertEqual(load['with']['tag'], 'greengateway-dev-gateway')
+        steps = self.jobs['dev-traffic-smoke']['steps']
+        self.assertLess(steps.index(load), steps.index(smoke))
+
+
+class ReleaseGateBinariesGate(unittest.TestCase):
+    """The HA legs run executables built once per run, and only the verified ones.
+
+    Each leg used to build its suite with `cargo test -p gateway --test
+    <suite>`. ha-release-gate-build now runs that build for every leg and
+    ha-upgrade-pair builds the rolling-upgrade pair; a leg must refuse to run
+    when its producer did not succeed or the archive is not the one built.
+    """
+    OUTCOMES = ['failure', 'skipped', 'cancelled', '']
+    SHA = 'a' * 64
+
+    def setUp(self):
+        self.root = Path(__file__).resolve().parents[1]
+        self.ci = yaml.load((self.root / '.github/workflows/ci.yml').read_text(), Loader=yaml.BaseLoader)
+        self.jobs = self.ci['jobs']
+        self.leg = self.jobs['ha-release-gate']
+        self.suites = self.leg['strategy']['matrix']['suite']
+        action = yaml.load((self.root / '.github/actions/run-binaries/action.yml').read_text(),
+                           Loader=yaml.BaseLoader)
+        self.unpack_steps = action['runs']['steps']
+
+    def named(self, job, name):
+        return next(step for step in self.jobs[job]['steps'] if step.get('name') == name)
+
+    def test_the_producer_builds_exactly_every_leg_with_the_legs_own_build(self):
+        producer = self.jobs['ha-release-gate-build']
+        self.assertEqual(producer['env']['SUITES'].split(), self.suites)
+        self.assertEqual(len(set(self.suites)), len(self.suites))
+        for optional in ('if', 'needs', 'continue-on-error', 'strategy'):
+            self.assertNotIn(optional, producer)
+        self.assertEqual(set(producer['env']), {'SUITES'})
+        build = self.named('ha-release-gate-build', 'Build every release-gate suite and the gateway it spawns')
+        self.assertIn('cargo test -p gateway --locked --no-run "${targets[@]}"', build['run'])
+        self.assertIn('targets+=(--test "${suite}")', build['run'])
+        for flag in ('--release', '--profile', '--features', '--no-default-features', '--all-features', 'RUSTFLAGS'):
+            self.assertNotIn(flag, build['run'])
+        self.assertNotIn('env', build)
+        # One executable per suite and the gateway they spawn, at the path
+        # compiled into them, or the producer fails.
+        self.assertIn('expected one test executable for each of', build['run'])
+        self.assertIn('target" / "debug" / "gateway"', build['run'])
+        cache = next(step for step in producer['steps'] if step.get('uses', '').startswith('Swatinem/rust-cache@'))
+        self.assertEqual(cache['with']['shared-key'], 'postgres-foundation')
+        pack = next(step for step in producer['steps'] if step.get('id') == 'pack')
+        self.assertIn('tar --zstd -cf "${archive}" target/debug/gateway target/ha-release-gate', pack['run'])
+        self.assertEqual(producer['outputs']['archive-sha256'], '${{ steps.pack.outputs.sha256 }}')
+        upload = next(step for step in producer['steps'] if step.get('uses', '').startswith('actions/upload-artifact@'))
+        self.assertEqual(upload['with']['name'], 'ha-release-gate-binaries')
+        self.assertEqual(upload['with']['if-no-files-found'], 'error')
+        steps = producer['steps']
+        self.assertLess(steps.index(build), steps.index(pack))
+        self.assertLess(steps.index(pack), steps.index(upload))
+
+    def test_the_pair_producer_is_the_legs_former_pair_build(self):
+        producer = self.jobs['ha-upgrade-pair']
+        for optional in ('if', 'needs', 'continue-on-error', 'strategy', 'env'):
+            self.assertNotIn(optional, producer)
+        checkout = producer['steps'][0]
+        self.assertEqual(checkout['with']['fetch-depth'], '0')
+        build = self.named('ha-upgrade-pair', 'Build the pinned upgrade pair')
+        self.assertIn("python -m unittest discover -s scripts -p 'test_build_upgrade_pair.py' -v", build['run'])
+        self.assertIn('python scripts/build_upgrade_pair.py --out "${RUNNER_TEMP}/upgrade-pair"', build['run'])
+        self.assertIn('for role in prepared successor; do', build['run'])
+        self.assertNotIn('if', build)
+        # The pair is the build without dev-dependencies, so it starts from
+        # the dependency cache of the job that runs exactly that build, and
+        # never writes it: this job's target directory also holds the pair.
+        cache = next(step for step in producer['steps'] if step.get('uses', '').startswith('Swatinem/rust-cache@'))
+        self.assertEqual(cache['with'], {'shared-key': 'admin-ui', 'save-if': 'false'})
+        source = self.jobs[cache['with']['shared-key']]
+        self.assertIn('cargo build --locked -p gateway', [step.get('run') for step in source['steps']])
+        source_cache = next(step for step in source['steps'] if step.get('uses', '').startswith('Swatinem/rust-cache@'))
+        self.assertNotIn('shared-key', source_cache['with'])
+        self.assertNotIn('workspaces', source_cache['with'])
+        pack = next(step for step in producer['steps'] if step.get('id') == 'pack')
+        self.assertIn('-C "${RUNNER_TEMP}/upgrade-pair"', pack['run'])
+        self.assertIn('manifest.json evidence prepared successor', pack['run'])
+        upload = next(step for step in producer['steps'] if step.get('uses', '').startswith('actions/upload-artifact@'))
+        self.assertEqual(upload['with']['name'], 'ha-upgrade-pair')
+        self.assertEqual(upload['with']['if-no-files-found'], 'error')
+
+    def test_every_leg_unpacks_verified_executables_and_compiles_nothing(self):
+        self.assertEqual(self.leg['needs'], ['ha-release-gate-build', 'ha-upgrade-pair'])
+        self.assertEqual(self.leg['if'], '${{ always() }}')
+        setup = next(step for step in self.leg['steps'] if step.get('uses') == './.github/actions/build-tools')
+        self.assertEqual(setup['with'], {'rust': 'none', 'node': 'false'})
+        for step in self.leg['steps']:
+            self.assertNotIn('continue-on-error', step)
+            self.assertNotRegex(step.get('run', ''), r'\bcargo\b')
+            self.assertFalse(step.get('uses', '').startswith('Swatinem/rust-cache@'))
+        unpacks = [step for step in self.leg['steps'] if step.get('uses') == './.github/actions/run-binaries']
+        self.assertEqual([step['with'] for step in unpacks], [
+            {'producer': 'ha-release-gate-build',
+             'producer-result': '${{ needs.ha-release-gate-build.result }}',
+             'archive': 'ha-release-gate-binaries',
+             'sha256': '${{ needs.ha-release-gate-build.outputs.archive-sha256 }}',
+             'destination': '${{ github.workspace }}'},
+            {'producer': 'ha-upgrade-pair',
+             'producer-result': '${{ needs.ha-upgrade-pair.result }}',
+             'archive': 'ha-upgrade-pair',
+             'sha256': '${{ needs.ha-upgrade-pair.outputs.archive-sha256 }}',
+             'destination': '${{ runner.temp }}/upgrade-pair'},
+        ])
+        # Every leg needs the suites; only the rolling-upgrade leg needs the pair.
+        self.assertNotIn('if', unpacks[0])
+        self.assertEqual(unpacks[1]['if'], "${{ matrix.suite == 'ha_rolling_upgrade' }}")
+        run = self.named('ha-release-gate', 'Run the release-gate suite')
+        self.assertNotIn('if', run)
+        self.assertEqual(run['env']['SUITE'], '${{ matrix.suite }}')
+        self.assertEqual(run['env']['GATEWAY_TEST_HA_GATE'], '1')
+        self.assertEqual(run['env']['GATEWAY_TEST_UPGRADE_PAIR_DIR'], '${{ runner.temp }}/upgrade-pair')
+        self.assertIn('(cd gateway && "../target/ha-release-gate/${SUITE}" --test-threads=1) 2>&1 | tee gate.log',
+                      run['run'])
+        self.assertIn('"${producer_workspace}" != "${GITHUB_WORKSPACE}"', run['run'])
+        for guard in ('test result: ok. 0 passed', 'printed no test-result line', 'e < 1.0'):
+            self.assertIn(guard, run['run'])
+        steps = self.leg['steps']
+        locator = self.named('ha-release-gate', 'Check the locator resolves before trusting a pass')
+        for unpack in unpacks:
+            self.assertLess(steps.index(unpack), steps.index(run))
+        self.assertLess(steps.index(locator), steps.index(run))
+
+    def test_a_binary_consumer_stops_unless_the_producer_succeeded(self):
+        names = [step['name'] for step in self.unpack_steps]
+        self.assertEqual(names, ['Require the producer', "Download this run's archive", 'Verify and unpack the archive'])
+        require = self.unpack_steps[0]
+        self.assertEqual(require['env'], {'PRODUCER': '${{ inputs.producer }}',
+                                          'PRODUCER_RESULT': '${{ inputs.producer-result }}'})
+        self.assertEqual(run_bash(require['run'], {'PRODUCER': 'p', 'PRODUCER_RESULT': 'success'}).returncode, 0)
+        for outcome in self.OUTCOMES:
+            with self.subTest(outcome=outcome):
+                result = run_bash(require['run'], {'PRODUCER': 'p', 'PRODUCER_RESULT': outcome})
+                self.assertNotEqual(result.returncode, 0)
+        for step in self.unpack_steps:
+            self.assertNotIn('if', step)
+            self.assertNotIn('continue-on-error', step)
+
+    def test_a_binary_consumer_refuses_an_archive_other_than_the_one_built(self):
+        unpack = self.unpack_steps[2]
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            (directory / 'bin').mkdir()
+            archive = directory / 'example' / 'example.tar.zst'
+            archive.parent.mkdir()
+            archive.write_bytes(b'not really an archive')
+            built = subprocess.run(['sha256sum', str(archive)], capture_output=True, text=True,
+                                   check=True).stdout.split()[0]
+            log = directory / 'tar.log'
+            fake = directory / 'bin' / 'tar'
+            # Records every unpack instead of performing it.
+            fake.write_text('#!/bin/sh\necho "$@" >> "$TAR_LOG"\n')
+            fake.chmod(0o755)
+
+            def attempt(expected):
+                log.write_text('')
+                return run_bash(unpack['run'], {'ARCHIVE_NAME': 'example', 'EXPECTED_SHA256': expected,
+                                                'DESTINATION': str(directory / 'out'), 'TAR_LOG': str(log),
+                                                'RUNNER_TEMP': temporary}, path_prefix=directory / 'bin')
+            accepted = attempt(built)
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            self.assertEqual(log.read_text().splitlines(),
+                             [f'--zstd -xf {archive} -C {directory / "out"}'])
+            for expected in (self.SHA, '', 'latest', built.upper(), built + '0'):
+                with self.subTest(expected=expected):
+                    result = attempt(expected)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(log.read_text(), '')
 
 
 if __name__ == '__main__':

@@ -153,6 +153,8 @@ const NOT_IMPORTED: &[&str] = &[
     "rate_limit_buckets",
     "rate_limit_cardinality",
     "admin_pending_logins",
+    "admin_session_logins",
+    "admin_sessions",
     "jwt_revocations",
     "security_outbox (the import announces nothing; a commit appends its own row)",
     "principal_directory (cluster mode has none; the audit log it projects from is imported)",
@@ -699,6 +701,11 @@ fn foundation_refusal(error: crate::storage::postgres::PostgresFoundationError) 
         | Foundation::SchemaInvalid { .. }
         | Foundation::SchemaCheckFailed
         | Foundation::SchemaMigrationFailed => ImportError::TargetSchemaNotCurrent { detail },
+        // The durable contract fence is part of what the schema demands of
+        // the build that writes to it; the detail says which half failed.
+        Foundation::ContractFenced { .. } | Foundation::ContractFenceUnreadable => {
+            ImportError::TargetSchemaNotCurrent { detail }
+        }
         Foundation::NotConfigured => ImportError::TargetNotPostgres,
         // Everything left is the database not being reachable and usable:
         // the DSN, the TLS material, the pool, the connectivity budget.

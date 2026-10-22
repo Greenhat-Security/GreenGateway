@@ -25,7 +25,11 @@
 
 use crate::{
     import::{ImportError, ImportMode, SchemaReport},
-    storage::{migrations, postgres::read_deployment_binding, RepositoryError},
+    storage::{
+        migrations,
+        postgres::{read_deployment_binding, PostgresFoundationError},
+        RepositoryError,
+    },
 };
 
 /// The authoritative content tables. A row in any of them means the
@@ -84,6 +88,14 @@ const AUTHORITATIVE_TABLES: &[&str] = &[
     // evidence is history once written.
     "service_token_change_evidence",
     "jwt_revocation_evidence",
+    // 0019: admin session grant and withdrawal evidence. Sessions themselves
+    // are runtime state (standalone sessions live in process memory and are
+    // never imported); a grant row means an administrator already signed in
+    // to this cluster.
+    "admin_session_evidence",
+    // 0020's contract fence and backfill ledger are deliberately absent:
+    // they say which builds may serve the schema, not what the namespace
+    // holds. The fence is checked on its own in `verify_target`.
 ];
 
 /// The authoritative singleton counters and the column that carries them.
@@ -135,6 +147,12 @@ pub(super) async fn verify_target(
         }
     };
 
+    // The durable contract fence (issue #426, PR 3), READ where an apply's
+    // `start_if_selected` reads it -- after the schema, before the binding --
+    // and refused with the same code, so a dry run predicts the apply's
+    // refusal of a build the fence excludes.
+    contract_fence_admits_this_build(pool).await?;
+
     // The binding is READ, never written: claiming an unbound database for
     // this deployment is the first section's business (through the same
     // startup path every replica uses), not preflight's, and a dry run
@@ -158,6 +176,23 @@ pub(super) async fn verify_target(
         }
     }
     Ok(schema)
+}
+
+/// Refuse a build the durable contract fence excludes, or a fence that
+/// cannot be read, exactly as an apply's foundation does: through the same
+/// error and the same classification (`super::foundation_refusal`).
+async fn contract_fence_admits_this_build(
+    pool: &deadpool_postgres::Pool,
+) -> Result<(), ImportError> {
+    let fence = crate::storage::read_contract_fence(pool)
+        .await
+        .map_err(|_| super::foundation_refusal(PostgresFoundationError::ContractFenceUnreadable))?;
+    match crate::storage::compatibility::BinaryContract::shipped().fenced_by(&fence) {
+        Some(exclusion) => Err(super::foundation_refusal(
+            PostgresFoundationError::ContractFenced { exclusion },
+        )),
+        None => Ok(()),
+    }
 }
 
 /// The authoritative tables that hold rows and the counters that have

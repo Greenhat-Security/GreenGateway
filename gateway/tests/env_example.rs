@@ -69,11 +69,12 @@ fn env_example_exempt_paths_are_not_hardcoded() {
 /// `append_admin_login_exempt_paths` in gateway/src/config.rs runs
 /// unconditionally after the parse whenever `ADMIN_LOGIN_PROVIDER` is set, so
 /// `/v1{ADMIN_PREFIX}/auth/login` and `/v1{ADMIN_PREFIX}/auth/callback` stay
-/// exempt even for an operator who supplied an explicit list. Enabling
-/// `ADMIN_SESSION_MODE=standalone_memory` also appends `/v1{ADMIN_PREFIX}/auth/config`
-/// and `/v1{ADMIN_PREFIX}/auth/logout` for pre-login discovery and logout after
-/// session expiry. Logout still enforces its own exact-origin and CSRF checks.
-/// These deliberate exceptions must remain visible in the operator contract.
+/// exempt even for an operator who supplied an explicit list. Enabling either
+/// session mode (`ADMIN_SESSION_MODE=standalone_memory` or `cluster_postgres`)
+/// also appends `/v1{ADMIN_PREFIX}/auth/config` and `/v1{ADMIN_PREFIX}/auth/logout`
+/// for pre-login discovery and logout after session expiry. Logout still
+/// enforces its own exact-origin and CSRF checks. These deliberate exceptions
+/// must remain visible in the operator contract.
 #[test]
 fn exempt_path_replacement_claims_disclose_the_forced_admin_auth_routes() {
     const DISCLOSURE: &str = "remain exempt even when";
@@ -129,8 +130,10 @@ fn exempt_path_replacement_claims_disclose_the_forced_admin_auth_routes() {
             }
             assert!(
                 block.contains("ADMIN_LOGIN_PROVIDER")
-                    && block.contains("ADMIN_SESSION_MODE=standalone_memory")
-                    && block.contains("session routes are added only in that mode"),
+                    && block.contains("ADMIN_SESSION_MODE")
+                    && block.contains("standalone_memory")
+                    && block.contains("cluster_postgres")
+                    && block.contains("session routes are added only while sessions are enabled"),
                 "{} should disclose the provider condition and opt-in session condition:\n\n{block}",
                 path.display()
             );

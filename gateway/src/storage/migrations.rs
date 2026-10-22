@@ -72,6 +72,15 @@ static MIGRATION_LOCK_KEY: LazyLock<i64> = LazyLock::new(|| {
     i64::from_be_bytes(value)
 });
 
+/// The migrator's advisory-lock key, for the one other decision that must
+/// not interleave with a migration: raising the durable contract fence
+/// (`storage::postgres_membership`), which takes the same key as a
+/// transaction-level try-lock and refuses while a migrator holds it.
+#[cfg(feature = "postgres")]
+pub(crate) fn migration_lock_key() -> i64 {
+    *MIGRATION_LOCK_KEY
+}
+
 /// One embedded migration. Constructed only by [`MANIFEST`] (and by tests);
 /// the checksum is computed from the SQL at construction so a build and its
 /// ledger always agree on what a migration's bytes are.
@@ -252,6 +261,20 @@ static MANIFEST: LazyLock<Vec<Migration>> = LazyLock::new(|| {
         )
         .finalize()
         .with_pinned_checksum("717ae43889bebb583002601a8515e62d5b7d705b22faa195b6e9d760f2618cd0"),
+        Migration::new(
+            19,
+            "admin_sessions",
+            include_str!("migrations/0019_admin_sessions.sql"),
+        )
+        .finalize()
+        .with_pinned_checksum("07dee52102212e57dd2055bc7680e2c7bda1f8d17d2f647535a98f12a57be41c"),
+        Migration::new(
+            20,
+            "contract_fence",
+            include_str!("migrations/0020_contract_fence.sql"),
+        )
+        .finalize()
+        .with_pinned_checksum("9e8e98b32ce743e691a1767677223b5fa57e287067cc74e627c1c0ecaa84e538"),
     ]
 });
 
@@ -284,23 +307,27 @@ impl SchemaCompatibility {
     }
 }
 
-// No adjacent release pair has been qualified. Do not widen these bounds or
-// add an extension without the pinned SQL and two-binary gate in issue #426.
-// Moving the point from 17 to 18 (service-token and JWT revocation change
-// evidence, #425 PR 2b) is not an overlap: a schema-17 binary refuses
-// schema 18 and this binary refuses schema 17, so that upgrade is a
-// coordinated drain/migrate/restart, as the moves from 15 to 16 (#425) and
-// from 16 to 17 (member capability advertisements, #426 PR 1) were.
+// No adjacent release pair has been qualified across a schema change. Do
+// not widen these bounds or add an extension without the pinned SQL and
+// two-binary gate in issue #426. Moving the point from 19 to 20 (the
+// durable contract fence, #426 PR 3) is not an overlap: a schema-19 binary
+// refuses schema 20 and this binary refuses schema 19, so that upgrade is a
+// coordinated drain/migrate/restart, as the moves from 15 to 16 (#425),
+// from 16 to 17 (member capability advertisements, #426 PR 1), from 17 to
+// 18 (service-token and JWT revocation change evidence, #425 PR 2b) and
+// from 18 to 19 (shared admin sessions, #424) were. It is also what makes
+// the fence cover every binary that can serve this database: none that
+// predates the fence accepts its ledger.
 const BINARY_SCHEMA_COMPATIBILITY: SchemaCompatibility = SchemaCompatibility {
-    read: (18, 18),
-    write: (18, 18),
+    read: (20, 20),
+    write: (20, 20),
     approved_extensions: &[],
 };
 
 /// The intersection of the explicit read/write contracts, advertised to the
 /// roster. This is a summary, not proof of ledger integrity, permission to
 /// write a gated operation (`storage/compatibility.rs`), or permission to
-/// contract the schema. The shipped contract accepts only schema 18.
+/// contract the schema. The shipped contract accepts only schema 20.
 pub(crate) fn schema_version_range() -> (i32, i32) {
     BINARY_SCHEMA_COMPATIBILITY.serving_range()
 }
@@ -1080,12 +1107,12 @@ mod tests {
     fn the_shipped_contract_has_no_unproved_overlap() {
         assert_eq!(
             MANIFEST.len(),
-            18,
+            20,
             "review the compatibility contract when adding SQL"
         );
-        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.read, (18, 18));
-        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.write, (18, 18));
-        assert_eq!(schema_version_range(), (18, 18));
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.read, (20, 20));
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.write, (20, 20));
+        assert_eq!(schema_version_range(), (20, 20));
         assert!(BINARY_SCHEMA_COMPATIBILITY.approved_extensions.is_empty());
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len(), "")),
@@ -1096,7 +1123,7 @@ mod tests {
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 1, "")),
             Ok(SchemaStatus::NeedsUpgrade {
-                applied: 17,
+                applied: 19,
                 missing: 1
             })
         );
@@ -1105,15 +1132,29 @@ mod tests {
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 2, "")),
             Ok(SchemaStatus::NeedsUpgrade {
-                applied: 16,
+                applied: 18,
                 missing: 2
             })
         );
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 3, "")),
             Ok(SchemaStatus::NeedsUpgrade {
-                applied: 15,
+                applied: 17,
                 missing: 3
+            })
+        );
+        assert_eq!(
+            validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 4, "")),
+            Ok(SchemaStatus::NeedsUpgrade {
+                applied: 16,
+                missing: 4
+            })
+        );
+        assert_eq!(
+            validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 5, "")),
+            Ok(SchemaStatus::NeedsUpgrade {
+                applied: 15,
+                missing: 5
             })
         );
     }
@@ -1572,7 +1613,7 @@ mod tests {
         let authority = PostgresReadinessAuthority::new(foundation.pool().clone());
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::Writable { schema_version: 18 }
+            AuthorityObservation::Writable { schema_version: 20 }
         );
         let client = foundation.pool().get().await.expect("fixture client");
         client
@@ -1584,7 +1625,7 @@ mod tests {
             .expect("change fixture checksum without changing extent");
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::IncompatibleSchema { schema_version: 18 }
+            AuthorityObservation::IncompatibleSchema { schema_version: 20 }
         );
         client
             .execute(
@@ -1595,7 +1636,7 @@ mod tests {
             .expect("restore fixture checksum");
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::Writable { schema_version: 18 }
+            AuthorityObservation::Writable { schema_version: 20 }
         );
         client
             .execute(
@@ -1606,7 +1647,7 @@ mod tests {
             .expect("remove a fixture history row");
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::IncompatibleSchema { schema_version: 18 }
+            AuthorityObservation::IncompatibleSchema { schema_version: 20 }
         );
         drop(client);
         clean_database(foundation.pool()).await;
@@ -1871,6 +1912,12 @@ mod tests {
                  ALTER TABLE greengateway.cluster_members DROP COLUMN capabilities; \
                  DROP TABLE greengateway.service_token_change_evidence; \
                  DROP TABLE greengateway.jwt_revocation_evidence; \
+                 DROP TABLE greengateway.admin_session_evidence; \
+                 DROP TABLE greengateway.admin_sessions; \
+                 DROP TABLE greengateway.admin_session_logins; \
+                 DROP TABLE greengateway.contract_fence; \
+                 DROP TABLE greengateway.schema_backfills; \
+                 DROP FUNCTION greengateway.contract_fence_moves_forward(); \
                  DELETE FROM {LEDGER_TABLE} WHERE version >= 13;"
             ))
             .await
@@ -2177,6 +2224,272 @@ mod tests {
                 && evidence[0].contains("\"prior_version\":2")
                 && evidence[0].contains("\"new_version\":3"),
             "{evidence:?}"
+        );
+    }
+
+    /// Migration 20 seeds a contract fence that demands nothing, and the
+    /// database itself keeps it forward-only: a raise that advances the
+    /// generation and lowers nothing is accepted, and every write that would
+    /// lower it, keep its generation, remove it, or truncate it is refused,
+    /// whoever sends it. The backfill ledger starts empty and holds only the
+    /// three states, with a finish instant exactly when one finished.
+    #[tokio::test]
+    async fn migration_twenty_seeds_an_open_fence_that_only_moves_forward() {
+        let Some(dsn) = real_dsn() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = REAL_DATABASE.lock().await;
+        let dsn_file = write_dsn_file(&dsn);
+        let config = migration_config(&dsn_file);
+        let foundation = establish(&config).await;
+        clean_database(foundation.pool()).await;
+        apply_missing(foundation.pool(), &test_settings())
+            .await
+            .expect("migrate up");
+        let client = foundation.pool().get().await.expect("checkout");
+
+        let seeded = client
+            .query_one(
+                "SELECT generation, minimum_schema, capabilities,
+                        raised_at IS NULL AS never_raised, raised_by IS NULL AS unattributed,
+                        (SELECT count(*) FROM greengateway.contract_fence) AS rows,
+                        (SELECT count(*) FROM greengateway.schema_backfills) AS backfills
+                 FROM greengateway.contract_fence WHERE singleton",
+                &[],
+            )
+            .await
+            .expect("the fence is seeded");
+        assert_eq!(seeded.get::<_, i64>("generation"), 0);
+        assert_eq!(seeded.get::<_, i32>("minimum_schema"), 0);
+        assert_eq!(seeded.get::<_, String>("capabilities"), "");
+        assert!(seeded.get::<_, bool>("never_raised"));
+        assert!(seeded.get::<_, bool>("unattributed"));
+        assert_eq!(seeded.get::<_, i64>("rows"), 1);
+        assert_eq!(seeded.get::<_, i64>("backfills"), 0);
+
+        let raise = "UPDATE greengateway.contract_fence
+             SET generation = $1, minimum_schema = $2, capabilities = $3,
+                 raised_at = now(), raised_by = 'fixture.raise'
+             WHERE singleton";
+        for (generation, minimum, capabilities) in [
+            (1_i64, 19_i32, "operation_requirements"),
+            (2, 19, "operation_requirements,policy_role_descriptions"),
+            (3, 20, "operation_requirements,policy_role_descriptions"),
+        ] {
+            assert_eq!(
+                client
+                    .execute(raise, &[&generation, &minimum, &capabilities])
+                    .await
+                    .unwrap_or_else(|error| panic!(
+                        "generation {generation} moves forward: {error}"
+                    )),
+                1
+            );
+        }
+        for (generation, minimum, capabilities, what) in [
+            (
+                4_i64,
+                19_i32,
+                "operation_requirements,policy_role_descriptions",
+                "a lower minimum schema",
+            ),
+            (4, 20, "policy_role_descriptions", "a dropped capability"),
+            (4, 20, "", "every capability dropped"),
+            (
+                3,
+                20,
+                "operation_requirements,policy_role_descriptions",
+                "no new generation",
+            ),
+            (
+                2,
+                21,
+                "operation_requirements,policy_role_descriptions",
+                "an older generation",
+            ),
+        ] {
+            let error = client
+                .execute(raise, &[&generation, &minimum, &capabilities])
+                .await
+                .expect_err(what);
+            assert_eq!(
+                error.code().map(|state| state.code()),
+                Some("23001"),
+                "{what} must be refused by the trigger: {error}"
+            );
+        }
+        for statement in [
+            "DELETE FROM greengateway.contract_fence",
+            "TRUNCATE greengateway.contract_fence",
+        ] {
+            let error = client
+                .batch_execute(statement)
+                .await
+                .expect_err("the fence is never removed");
+            assert_eq!(
+                error.code().map(|state| state.code()),
+                Some("23001"),
+                "{statement}: {error}"
+            );
+        }
+        assert_eq!(
+            client
+                .execute(
+                    "INSERT INTO greengateway.contract_fence (singleton) VALUES (true)",
+                    &[],
+                )
+                .await
+                .expect_err("one fence per database")
+                .code()
+                .map(|state| state.code()),
+            Some("23505")
+        );
+        let kept = client
+            .query_one(
+                "SELECT generation, minimum_schema, capabilities FROM greengateway.contract_fence",
+                &[],
+            )
+            .await
+            .expect("the fence is still there");
+        assert_eq!(kept.get::<_, i64>(0), 3);
+        assert_eq!(kept.get::<_, i32>(1), 20);
+        assert_eq!(
+            kept.get::<_, String>(2),
+            "operation_requirements,policy_role_descriptions"
+        );
+        // The column bounds are the roster's. Each value keeps every fenced
+        // name, so the trigger lets it through to the check constraint.
+        for refused in [
+            "operation_requirements,,policy_role_descriptions",
+            "operation_requirements,policy_role_descriptions,Future",
+            "operation_requirements,policy_role_descriptions,a-b",
+        ] {
+            let error = client
+                .execute(raise, &[&4_i64, &20_i32, &refused])
+                .await
+                .expect_err("an out-of-bounds fence");
+            assert_eq!(
+                error.code().map(|state| state.code()),
+                Some("23514"),
+                "{refused:?}: {error}"
+            );
+        }
+
+        for (state, finished, accepted) in [
+            ("running", false, true),
+            ("verified", true, true),
+            ("failed", true, true),
+            ("running", true, false),
+            ("verified", false, false),
+            ("complete", true, false),
+        ] {
+            client
+                .execute("DELETE FROM greengateway.schema_backfills", &[])
+                .await
+                .expect("clear");
+            let inserted = client
+                .execute(
+                    "INSERT INTO greengateway.schema_backfills (name, state, finished_at)
+                     VALUES ('fixture_backfill', $1, CASE WHEN $2 THEN now() END)",
+                    &[&state, &finished],
+                )
+                .await;
+            assert_eq!(
+                inserted.is_ok(),
+                accepted,
+                "{state} finished={finished}: {inserted:?}"
+            );
+        }
+    }
+
+    /// Startup reads the contract fence before any other authority state:
+    /// a fence this build does not meet refuses it with the numbers and the
+    /// remedy, and a fence that cannot be read refuses it too.
+    #[tokio::test]
+    async fn startup_refuses_a_build_the_contract_fence_excludes() {
+        let Some(dsn) = real_dsn() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = REAL_DATABASE.lock().await;
+        let dsn_file = write_dsn_file(&dsn);
+        let config = migration_config(&dsn_file);
+        let foundation = establish(&config).await;
+        clean_database(foundation.pool()).await;
+        apply_missing(foundation.pool(), &test_settings())
+            .await
+            .expect("migrate up");
+        let started = super::super::postgres::PostgresFoundation::start_if_selected(&config)
+            .await
+            .expect("an open fence admits this build");
+        assert!(started.is_some());
+
+        let client = foundation.pool().get().await.expect("checkout");
+        client
+            .execute(
+                "UPDATE greengateway.contract_fence
+                 SET generation = 1, capabilities = 'future_capability',
+                     raised_at = now(), raised_by = 'fixture.newer_build'
+                 WHERE singleton",
+                &[],
+            )
+            .await
+            .expect("a newer build raises the fence");
+        let error = expect_startup_failure(
+            super::super::postgres::PostgresFoundation::start_if_selected(&config).await,
+        );
+        assert!(
+            matches!(
+                error,
+                super::super::postgres::PostgresFoundationError::ContractFenced { exclusion }
+                    if exclusion.generation == 1 && exclusion.missing_capabilities == 1
+            ),
+            "{error}"
+        );
+        let rendered = error.to_string();
+        assert!(rendered.contains("contract fence"), "{rendered}");
+        assert!(
+            !rendered.contains("future_capability"),
+            "an unrecognized name is counted, never echoed: {rendered}"
+        );
+        // The fence is read before the deployment binding is touched: an
+        // excluded build pointed at another deployment's database is
+        // refused by the fence, having written nothing.
+        let mut elsewhere = config.clone();
+        elsewhere.deployment_id = Some("deploy-elsewhere".to_owned());
+        let elsewhere_error = expect_startup_failure(
+            super::super::postgres::PostgresFoundation::start_if_selected(&elsewhere).await,
+        );
+        assert!(
+            matches!(
+                elsewhere_error,
+                super::super::postgres::PostgresFoundationError::ContractFenced { .. }
+            ),
+            "{elsewhere_error}"
+        );
+
+        client
+            .batch_execute(
+                "ALTER TABLE greengateway.contract_fence RENAME TO contract_fence_hidden",
+            )
+            .await
+            .expect("hide the fence");
+        let unreadable = expect_startup_failure(
+            super::super::postgres::PostgresFoundation::start_if_selected(&config).await,
+        );
+        client
+            .batch_execute(
+                "ALTER TABLE greengateway.contract_fence_hidden RENAME TO contract_fence",
+            )
+            .await
+            .expect("restore the fence");
+        assert!(
+            matches!(
+                unreadable,
+                super::super::postgres::PostgresFoundationError::ContractFenceUnreadable
+            ),
+            "{unreadable}"
         );
     }
 

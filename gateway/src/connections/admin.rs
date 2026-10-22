@@ -128,6 +128,10 @@ impl SafeSecretAliasView {
         dependency_count: usize,
     ) -> Self {
         let local = metadata.provider == SecretProviderKind::LocalEncrypted;
+        // Every purpose a Connection field can bind. The authority pseudonym
+        // key is deliberately absent: it is gateway-internal key material that
+        // no Connection resolves, and naming it here would advertise it as
+        // bindable.
         let compatible_purposes = metadata.purpose.map_or_else(
             || {
                 vec![
@@ -430,6 +434,8 @@ pub enum SafeConnectionAuthentication {
         audience: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         resource: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        revocation_url: Option<String>,
         subject_token_source: SubjectTokenSource,
         client_secret_configured: bool,
     },
@@ -473,6 +479,7 @@ impl SafeConnectionAuthentication {
                 requested_scopes,
                 audience,
                 resource,
+                revocation_url,
                 subject_token_source,
             } => Self::DelegatedIssuerToken {
                 token_exchange_url: token_exchange_url.clone(),
@@ -480,6 +487,7 @@ impl SafeConnectionAuthentication {
                 requested_scopes: requested_scopes.clone(),
                 audience: audience.clone(),
                 resource: resource.clone(),
+                revocation_url: revocation_url.clone(),
                 subject_token_source: *subject_token_source,
                 client_secret_configured: client_secret_id.is_some(),
             },
@@ -1050,5 +1058,30 @@ mod tests {
         assert!(!secrets_only_actions.can_bind_secret);
         assert!(secrets_only_actions.can_manage_secrets);
         assert!(!ConnectionActions::managed(secrets_only, &record, 0, false).can_manage_secrets);
+    }
+
+    #[test]
+    fn an_operator_alias_never_advertises_the_authority_pseudonym_key_purpose() {
+        // The admin UI rejects a secret inventory naming a purpose it does not
+        // know, and no Connection field resolves the pseudonym key, so an
+        // unpinned alias lists every Connection purpose and only those.
+        let view = SafeSecretAliasView::from_metadata(
+            SecretAliasMetadata {
+                id: "operator-alias".to_owned(),
+                label: "Operator alias".to_owned(),
+                provider: SecretProviderKind::OperatorEnvironment,
+                configured: true,
+                purpose: None,
+                pinned: false,
+                version: None,
+                rotated_at: None,
+            },
+            false,
+            0,
+        );
+        assert_eq!(view.compatible_purposes.len(), 8);
+        assert!(!view
+            .compatible_purposes
+            .contains(&SecretPurpose::AuthorityPseudonymKey));
     }
 }
