@@ -198,9 +198,10 @@ export function AuthenticationSection({
   onUpdate: (patch: Partial<ConnectionFormState>) => void;
   onAuthenticationTypeChange: (type: AuthenticationType) => void;
 }) {
-  const hasSecret = form.authenticationType !== 'none';
+  const hasSecret = authenticationPurpose(form.authenticationType) !== null;
   const typeLocked = authenticationTypeLocked(form);
   const delegated = form.authenticationType === 'delegated_issuer_token';
+  const google = form.authenticationType === 'google_domain_wide_delegation';
   const requestsToken =
     form.authenticationType === 'oauth2_client_credentials' || delegated;
   const scopesField = delegated
@@ -246,6 +247,9 @@ export function AuthenticationSection({
                 <option value="static_bearer">Static bearer</option>
                 <option value="oauth2_client_credentials">
                   OAuth 2 client credentials
+                </option>
+                <option value="google_domain_wide_delegation">
+                  Google domain-wide delegation (each caller&apos;s own)
                 </option>
               </>
             )}
@@ -430,7 +434,64 @@ export function AuthenticationSection({
             ) : null}
           </>
         ) : null}
+        {google ? (
+          <GoogleDomainWideDelegationFields
+            form={form}
+            errors={errors}
+            disabled={disabled}
+            onUpdate={onUpdate}
+          />
+        ) : null}
       </div>
+      {google ? (
+        <p id="connection-google-profile-help" className="capability-description">
+          The workload identity profile is the <code>id</code> of a{' '}
+          <code>CONNECTION_GCP_PROVIDER</code> profile in the gateway&apos;s
+          startup configuration: the federated identity that has Google sign
+          as the service account. It holds no key, and an enabled connection
+          can be saved only once the profile is configured.
+        </p>
+      ) : null}
+      {google ? (
+        <FormField
+          id="connection-google-subject-issuers"
+          label="Subject issuers (one per line)"
+          error={errors['authentication.subject_issuers']}
+        >
+          <textarea
+            id="connection-google-subject-issuers"
+            value={form.subjectIssuers}
+            disabled={disabled}
+            rows={2}
+            placeholder="https://idp.example.com"
+            autoComplete="off"
+            spellCheck={false}
+            aria-invalid={Boolean(errors['authentication.subject_issuers'])}
+            aria-describedby={
+              describedBy(
+                'connection-google-subject-issuers',
+                errors['authentication.subject_issuers'],
+              ) ?? 'connection-google-subject-issuers-help'
+            }
+            onChange={(event) =>
+              onUpdate({ subjectIssuers: event.target.value })
+            }
+          />
+        </FormField>
+      ) : null}
+      {google ? (
+        <p
+          id="connection-google-subject-issuers-help"
+          className="capability-description"
+        >
+          Each call acts as the Workspace user whose email the caller&apos;s
+          identity provider put in its token, so list only the provider
+          authoritative for the domain: any other could name any user. A
+          caller from an unlisted provider is refused. The subject claim is
+          always <code>email</code>.
+        </p>
+      ) : null}
+      {google ? <GoogleDomainWideDelegationNote /> : null}
       {typeLocked ? (
         <p
           id="connection-authentication-type-locked"
@@ -512,6 +573,127 @@ function DelegatedIssuerTokenNote() {
         Whoever holds the client secret can ask the issuer for any
         user&apos;s token. Keep it in an external provider, and request
         read-only scopes where the upstream allows it.
+      </p>
+    </div>
+  );
+}
+
+/**
+ * The fields of a Google domain-wide delegation, in the authentication grid.
+ * None is a secret: the account and the profile are names, and the profile
+ * resolves only from the gateway's own startup configuration.
+ */
+function GoogleDomainWideDelegationFields({
+  form,
+  errors,
+  disabled,
+  onUpdate,
+}: {
+  form: ConnectionFormState;
+  errors: FieldErrors;
+  disabled: boolean;
+  onUpdate: (patch: Partial<ConnectionFormState>) => void;
+}) {
+  return (
+    <>
+      <FormField
+        id="connection-google-service-account"
+        label="Delegated service account"
+        error={errors['authentication.service_account_email']}
+      >
+        <input
+          id="connection-google-service-account"
+          type="email"
+          value={form.serviceAccountEmail}
+          disabled={disabled}
+          placeholder="gateway-delegate@project-id.iam.gserviceaccount.com"
+          autoComplete="off"
+          spellCheck={false}
+          aria-invalid={Boolean(errors['authentication.service_account_email'])}
+          aria-describedby={describedBy(
+            'connection-google-service-account',
+            errors['authentication.service_account_email'],
+          )}
+          onChange={(event) =>
+            onUpdate({ serviceAccountEmail: event.target.value })
+          }
+        />
+      </FormField>
+      <FormField
+        id="connection-google-profile"
+        label="Workload identity profile"
+        error={errors['authentication.workload_identity_profile']}
+      >
+        <input
+          id="connection-google-profile"
+          value={form.workloadIdentityProfile}
+          disabled={disabled}
+          placeholder="gateway-wif"
+          autoComplete="off"
+          spellCheck={false}
+          aria-invalid={Boolean(
+            errors['authentication.workload_identity_profile'],
+          )}
+          aria-describedby={
+            describedBy(
+              'connection-google-profile',
+              errors['authentication.workload_identity_profile'],
+            ) ?? 'connection-google-profile-help'
+          }
+          onChange={(event) =>
+            onUpdate({ workloadIdentityProfile: event.target.value })
+          }
+        />
+      </FormField>
+      <FormField
+        id="connection-oauth-scopes"
+        label="Google scopes"
+        error={errors['authentication.scopes']}
+      >
+        <input
+          id="connection-oauth-scopes"
+          value={form.scopes}
+          disabled={disabled}
+          placeholder="https://www.googleapis.com/auth/gmail.readonly"
+          autoComplete="off"
+          spellCheck={false}
+          aria-invalid={Boolean(errors['authentication.scopes'])}
+          aria-describedby={describedBy(
+            'connection-oauth-scopes',
+            errors['authentication.scopes'],
+          )}
+          onChange={(event) => onUpdate({ scopes: event.target.value })}
+        />
+      </FormField>
+    </>
+  );
+}
+
+/**
+ * What a Google domain-wide delegation does and where its trust sits, beside
+ * the fields that configure it.
+ */
+function GoogleDomainWideDelegationNote() {
+  return (
+    <div className="alert warning" role="status">
+      <p>
+        <strong>Each caller reaches Google as themselves.</strong> For every
+        calling principal named by email by a listed subject issuer, Google
+        signs an assertion as the service account through IAM Credentials{' '}
+        <code>signJwt</code>, and the gateway exchanges it for that
+        user&apos;s own token, caches it for that principal only, and sends it
+        as the bearer token. No service account key is held anywhere in the
+        gateway. Only manual HTTP tool calls and stored tests are served, and a
+        call without a principal, such as a service token, is refused.
+      </p>
+      <p>
+        The service account can act as every user of the Workspace domain for
+        the scopes the Workspace administrator authorised for it. Use an
+        account dedicated to this connection, authorise read-only scopes only
+        and as few as the tools need, and keep these scopes within that list.
+        The egress allowlist must include <code>sts.googleapis.com</code>,{' '}
+        <code>iamcredentials.googleapis.com</code> and{' '}
+        <code>oauth2.googleapis.com</code>.
       </p>
     </div>
   );
@@ -736,6 +918,44 @@ export function CallerAssertionSection({
         </div>
         {problemAlert}
         <CallerAssertionSummary assertion={stored} subjectTokenOnly />
+      </section>
+    );
+  }
+
+  // A domain-wide delegation carries no block, so a stored one is removed by
+  // the save; see `effectiveCallerAssertionMode`. Another type keeps it.
+  if (form.authenticationType === 'google_domain_wide_delegation') {
+    return (
+      <section
+        className="connection-form-section"
+        aria-labelledby="connection-caller-assertion-heading"
+      >
+        <div className="section-heading">
+          <p className="eyebrow">Caller attestation</p>
+          <h3 id="connection-caller-assertion-heading">Caller assertion</h3>
+        </div>
+        {problemAlert}
+        {stored !== null ? (
+          <>
+            <div className="alert warning" role="status">
+              <p>
+                <strong>Removed when you save.</strong> A Google domain-wide
+                delegation sends the caller&apos;s own Google token, and Google
+                verifies no caller assertion of the gateway&apos;s, so the
+                gateway refuses the block on this credential. Its keys are
+                withdrawn from the published key set. Choose another
+                authentication type to keep it.
+              </p>
+            </div>
+            <CallerAssertionSummary assertion={stored} />
+          </>
+        ) : (
+          <p className="capability-description">
+            A Google domain-wide delegation carries no caller assertion: the
+            caller&apos;s own Google token already names them, and Google
+            verifies no assertion of the gateway&apos;s.
+          </p>
+        )}
       </section>
     );
   }

@@ -11,7 +11,8 @@ This guide covers production custody and day-two operations. See the
 [admin guide](admin-guide.md) for the browser workflow. The complete field and
 limit reference remains in [configuration.md](../configuration.md). Where
 trust sits when a Connection acts for the calling user, through a signed
-caller assertion or a delegated issuer token, is collected in the
+caller assertion, a delegated issuer token or a Google domain-wide delegation,
+is collected in the
 [per-caller credential trust boundary](per-caller-trust-boundary.md).
 
 ## Production Readiness Checklist
@@ -250,11 +251,14 @@ recovery method.
 ## Authentication Profiles
 
 Connections support `none`, a header API key, a static bearer token, OAuth
-2.0 client credentials, and a delegated issuer token, which calls the upstream
-as each caller with that caller's own token (see
-[Delegated issuer tokens](#delegated-issuer-tokens)). Every enabled
-secret-backed primary or additional binding requires a compatible configured
-alias. Authentication and TLS material require HTTPS.
+2.0 client credentials, a delegated issuer token, which calls the upstream as
+each caller with that caller's own token (see
+[Delegated issuer tokens](#delegated-issuer-tokens)), and a Google domain-wide
+delegation, which does the same for Google Workspace APIs without any grant
+store or service-account key (see
+[Google domain-wide delegation](#google-domain-wide-delegation)). Every
+enabled secret-backed primary or additional binding requires a compatible
+configured alias. Authentication and TLS material require HTTPS.
 
 For header API keys, choose a dedicated upstream header. GreenGateway rejects
 headers that it or HTTP owns, including `Authorization`, `Cookie`, `Host`,
@@ -1341,8 +1345,9 @@ security gate applies it before it serves another protected request:
   or the subject.
 - Every replica's gate sees the counter move on its next protected request, or
   within 250 ms from its background reconciler, and before it admits anything
-  at that revision it purges every token it holds for the principal and
-  revokes each one at its issuer. No replica serves a protected request -- and
+  at that revision it purges every token it holds for the principal --
+  delegated issuer tokens, each revoked at its issuer, and Google domain-wide
+  delegation tokens, which Google cannot revoke. No replica serves a protected request -- and
   so no delegated token -- at or past the purge's revision before it has
   applied the purge. The replica that recorded the purge applies it too, which
   takes anything its principal was exchanged for between its own purge and
@@ -1564,6 +1569,288 @@ The detail page shows every field but the client secret's alias, which
 appears only as configured or not, the revocation endpoint included, and the
 caller assertion as the subject token. A principal's tokens are purged through
 the admin API only.
+
+### Google domain-wide delegation
+
+A Connection with `google_domain_wide_delegation` authentication calls a
+Google Workspace API -- Gmail, Calendar, Drive, the Directory -- as the
+calling user, with a Google token minted for that user alone. Unlike a
+[delegated issuer token](#delegated-issuer-tokens) it needs no grant store and
+no per-user consent: a Workspace super-admin authorises one service account
+for a fixed list of scopes, and whoever can sign a JWT as that account can
+then obtain a token for any user of the domain by naming the user's email.
+The gateway never holds that account's key. Google signs each assertion
+itself, through the IAM Credentials `signJwt` method, for a gateway that
+authenticates as the federated identity of a
+[`CONNECTION_GCP_PROVIDER`](../configuration.md#connection_gcp_provider)
+workload identity profile.
+
+Use it for Google-only tenants that do not want a token broker. Slack,
+Microsoft 365 and Google accounts outside the Workspace domain need a
+delegated issuer token instead.
+
+```json
+"kind": "http_api",
+"endpoint": {
+  "base_url": "https://gmail.googleapis.com",
+  "base_path": "/gmail/v1"
+},
+"authentication": {
+  "type": "google_domain_wide_delegation",
+  "service_account_email": "gateway-delegate@example-project.iam.gserviceaccount.com",
+  "workload_identity_profile": "gateway-wif",
+  "scopes": ["https://www.googleapis.com/auth/gmail.readonly"],
+  "subject_claim": "email",
+  "subject_issuers": ["https://idp.example.com"]
+}
+```
+
+#### Setting it up
+
+1. **Create a dedicated service account** in a Google Cloud project, for this
+   Connection and nothing else, and **create no key for it**. The gateway
+   cannot use one, and a key would be a second, unaudited way to act as every
+   user of the domain. Enforce that with the
+   `iam.disableServiceAccountKeyCreation` organisation policy constraint where
+   you can.
+2. **Configure a workload identity profile** in `CONNECTION_GCP_PROVIDER`:
+   an `id`, the pool provider `audience` and the projected token file the
+   gateway's platform writes, exactly as for the GCP Secret Manager provider.
+   A profile used only for delegation may have no aliases:
+
+   ```json
+   {
+     "profiles": [
+       {
+         "id": "gateway-wif",
+         "audience": "//iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/gateway/providers/cluster",
+         "token_root": "/var/run/secrets/gcp",
+         "token_file": "token"
+       }
+     ]
+   }
+   ```
+
+   The Connection names this profile by its `id` only. The audience and the
+   token file stay in startup configuration, so nothing an admin API caller
+   writes can point the gateway at another identity.
+3. **Let the profile sign as the account, and nothing more.** Grant the
+   profile's identity -- the federated principal, or the profile's own
+   `service_account` when it impersonates one --
+   `roles/iam.serviceAccountTokenCreator` on the delegated service account
+   itself, never at project or folder scope. Grant the delegated account no
+   project roles: the Workspace scopes are all it needs.
+4. **Authorise the account in Workspace.** In the Google Admin console's
+   domain-wide delegation settings (Security, Access and data control, API
+   controls), add the service account's numeric client ID with the scopes the
+   Connection will ask for: read-only ones only, and as few as the bound tools
+   need. This list, not the Connection's `scopes`, is what Google enforces;
+   the Connection can only ask for the same or less. Review it whenever a
+   Connection's scopes change, and remove the scopes no Connection uses.
+5. **Check restricted scopes.** Google classifies some scopes as sensitive or
+   restricted -- most Gmail scopes and full Drive access among them -- and
+   requires apps that use restricted scopes for users outside their own
+   organisation to pass its verification. An internal app whose delegation
+   reaches only users of its own Workspace domain is normally exempt. Google
+   decides this, not the gateway: before relying on a restricted scope,
+   confirm in the Google Cloud project's OAuth configuration that the app is
+   internal to your organisation, and check Google's current policy for each
+   scope you authorise.
+6. **Allow the endpoints.** Add `sts.googleapis.com`,
+   `iamcredentials.googleapis.com` and `oauth2.googleapis.com`, and the
+   upstream API host (`gmail.googleapis.com` above), to `EGRESS_ALLOWED_HOSTS`.
+7. **List the identity provider that names your users** in `subject_issuers`,
+   with its issuer exactly as the principal directory and audit actors show
+   it (a trailing slash is ignored), and only the one authoritative for the
+   domain. Any configured provider can put any address in its tokens, and the
+   gateway copies `email` without checking `email_verified`, so a provider
+   that lets users choose or change an unverified address must not be listed.
+8. **Save the Connection disabled, test it as yourself** (below), bind its
+   tools, and enable it. An enabled save requires the profile to be
+   configured, and refuses an unknown one with
+   `authentication.workload_identity_profile` and `unresolvable_binding`.
+   Writing such a Connection is credential authority: it needs
+   `admin:connections:secrets:write`.
+
+#### What Google receives
+
+On a cache miss, for one caller, the gateway:
+
+1. Checks both fixed endpoints against the egress policy before anything is
+   read or signed.
+2. Builds the claim set below and asks Google to sign it as the service
+   account:
+   `POST https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/{service_account_email}:signJwt`,
+   with the profile's federated access token as the bearer. A `401` or `403`
+   earns exactly one retry, with a fresh federated token.
+3. Refuses a signed assertion whose claims are not exactly those it sent, so a
+   signer that answered for another user is never exchanged.
+4. Exchanges it at `https://oauth2.googleapis.com/token` with
+   `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer` (RFC 7523), and
+   sends the access token upstream as `Authorization: Bearer`.
+
+| Claim | Value |
+| --- | --- |
+| `iss` | `service_account_email` |
+| `sub` | The caller's email, from their validated principal. |
+| `scope` | `scopes`, sorted and space-separated. |
+| `aud` | `https://oauth2.googleapis.com/token` |
+| `iat`, `exp` | Now, and 300 seconds later. Google accepts at most an hour. |
+
+Both endpoints are fixed: the service account's address is the only value
+from the Connection that reaches a URL, and nothing a caller sends does.
+
+#### Which calls are served
+
+Manual HTTP tool calls, from `/mcp` or the admin playground, on `http_api`
+Connections without a `caller_assertion`. A stored test is also served, as the
+principal who runs it. Every other lane -- managed OpenAPI and composite
+tools, proxied requests, managed MCP, discovery, enum and label sources --
+answers `authentication_not_supported`. A save refuses kind
+`mcp_streamable_http` (`authentication.type`, `kind_mismatch`) and any
+`caller_assertion` block (`caller_assertion`, `unsupported`): Google verifies
+no assertion of the gateway's, and one sent there would be a statement about
+the caller handed to a third party.
+
+Only a caller the Connection can name is served. Before anything is read or
+sent, a call with no principal, a service token included, is refused with
+`delegated_token_no_principal`; a caller whose attested issuer is not in
+`subject_issuers`, with `google_delegation_issuer_not_trusted`; and a caller
+without a single plain email address, with `google_delegation_no_email`.
+
+Policy is unchanged: tool policy and `rules[]` apply per principal before any
+token is minted, so read-only deny rules and per-tool roles limit what a caller
+can do with their own token.
+
+#### Testing a delegation
+
+`POST /v1{ADMIN_PREFIX}/connections/{id}/test` runs as the administrator who
+sends it. Google mints a token for that administrator's own Workspace account,
+the saved `GET` or `HEAD` test request is sent with it, and the token is
+dropped: it is never cached, so a test never serves a later call and a cached
+token never makes a test pass. A passing test shows that the profile, its
+Token Creator grant, the Workspace authorisation, the egress policy and the
+upstream work for you; it says nothing about any other user. A disabled
+Connection can be tested.
+
+A test reports the delegated reasons the admin UI already explains:
+`delegated_token_no_principal` for a tester Google cannot be asked about (a
+service token, an unlisted issuer, no email), `delegated_token_denied` when
+Google refused your account, `delegated_token_egress_denied` for a refused
+endpoint and `delegated_token_exchange_failed` for every other failure. The
+mint's own audit event, below, names the step and Google's error code.
+
+#### The cache
+
+The same bounded cache as delegated issuer tokens: per Connection revision,
+per caller (issuer, subject and email, so a caller whose email changed is
+minted for again) and per egress policy, for at most 1,024 callers per
+replica, refreshed shortly before Google's `expires_in` and reused for at most
+900 seconds. An upstream `401` drops the token that request used. A save that
+changes the Connection, disabling it included, stops each replica serving the
+tokens it cached before, once that replica has applied the change. A
+[principal purge](#purging-a-principals-tokens) drops the principal's Google
+tokens too, counted in `purged_entries` and as `google_delegation_entries` on
+`connection.delegated_token_purge`, on every replica in cluster mode
+([Purges in cluster mode](#purges-in-cluster-mode)). Google offers no revocation for these
+tokens, so a dropped token stays valid at Google until it expires, about an
+hour after it was minted; suspending the user in Workspace stops new ones.
+Nothing is persisted.
+
+#### Failure reasons
+
+Each refusal is a fixed string in the `failure_reason` of
+`tool.invoke_failure` and the `reason` of `tool.upstream_request`, and no
+upstream request is made:
+
+| Reason | Meaning |
+| --- | --- |
+| `delegated_token_no_principal` | The call names nobody: anonymous, or a service token. |
+| `google_delegation_issuer_not_trusted` | The caller's identity provider is not in `subject_issuers`. |
+| `google_delegation_no_email` | The caller carries no single plain email address. |
+| `google_delegation_egress_denied` | The egress policy refuses `oauth2.googleapis.com`, `iamcredentials.googleapis.com` or an identity endpoint the profile needs. |
+| `google_delegation_identity_failed` | The profile is not configured, or could not obtain its federated token: its token file, Google STS or its own impersonation failed. |
+| `google_delegation_signing_failed` | `signJwt` refused or failed, usually because the profile's identity lacks Token Creator on the account, or returned an assertion other than the one asked for. |
+| `google_delegation_denied` | Google refused this user: `invalid_grant` or `access_denied`, or any `403`, from the token endpoint. Usually not a user of the domain, or suspended. |
+| `google_delegation_exchange_failed` | No usable token, for a reason no caller can fix. This includes `unauthorized_client`, Google's answer when the Workspace administrator has not authorised these scopes for the account. |
+| `google_delegation_unavailable` | Every cache entry is held by a call in flight, or the caller's tokens were being purged as the call arrived. |
+
+A failed mint is not cached: the caller's next call asks Google again.
+
+#### Audit and metrics
+
+Every mint emits `connection.google_delegation_token` with the caller as its
+`actor`. A call served from the cache emits no mint event; its
+`tool.upstream_request` carries the caller as usual.
+
+```json
+{
+  "connection_id": "gmail",
+  "auth_type": "google_domain_wide_delegation",
+  "outcome": "failure",
+  "reason": "google_delegation_exchange_failed",
+  "service_account": "gateway-delegate@example-project.iam.gserviceaccount.com",
+  "scopes": ["https://www.googleapis.com/auth/gmail.readonly"],
+  "stage": "exchange",
+  "identity_reason": null,
+  "google_status": 401,
+  "google_error": "unauthorized_client",
+  "latency_ms": 212
+}
+```
+
+`stage` is the last step attempted (`egress`, `identity`, `sign` or
+`exchange`), `identity_reason` the GCP provider's fixed reason when the
+federated identity failed, and `google_error` the token endpoint's error
+code, recorded only when RFC 6749 or RFC 8693 registers it and as
+`unregistered` otherwise. A mint the process stopped before it finished is
+recorded with `reason` `google_delegation_cancelled`.
+`connection_google_delegation_token_total`, labelled by `result` and `reason`,
+counts the same decisions. No federated token, assertion or access token, and
+nothing Google said beyond its status and that code, reaches a caller error, a
+log line, a metric or an audit event.
+
+Watch for a rising rate of `google_delegation_denied` and
+`google_delegation_exchange_failed`, and review changes to the domain-wide
+delegation list in the Google Workspace admin audit log beside the gateway's
+events.
+
+#### Trust boundary
+
+The [per-caller credential trust boundary](per-caller-trust-boundary.md#google-domain-wide-delegation-442)
+covers this credential in full. In short:
+
+- **The service account is the most sensitive identity in the deployment.**
+  Whoever can sign as it can act as every user of the domain for the
+  authorised scopes. Keep it dedicated, keyless and read-only, grant Token
+  Creator on it to the profile's identity alone, and keep the Workspace scope
+  list as short as the tools allow.
+- **`admin:connections:secrets:write` decides whom the gateway acts as**: it
+  chooses the account, the profile, the scopes and the issuers trusted to name
+  users. Grant it as narrowly as the profile itself.
+- **The listed issuers decide who is who.** List only the provider
+  authoritative for the domain, and one that asserts only addresses the
+  domain owns.
+- **Every mint is audited with the caller**, and tokens live only in the
+  bounded cache, never on disk.
+
+#### In the admin UI
+
+The editor creates and edits these Connections. Choose *Google domain-wide
+delegation* as the authentication type of an HTTP API Connection, then set
+the delegated service account, the workload identity profile's `id`, the
+Google scopes and the subject issuers, one per line. There is no secret to
+bind and no caller assertion to configure, and the subject claim is always
+`email`. Before anything is written, the editor refuses an account that is not
+a dedicated `name@project.iam.gserviceaccount.com` account, a profile ID that
+cannot name a profile, an empty or oversized scope list, and an issuer list
+that is empty, too long or names one issuer twice. Moving a Connection that
+carries a caller assertion to this type removes the block when you save, and
+the editor says so; choosing another type again keeps it. Writing the
+credential needs `admin:connections:secrets:write`, like every credential.
+
+The detail page shows every field, since none is a secret, explains how calls
+are served, and runs *Test connection* as you.
 
 ## TLS, Custom CAs, and Mutual TLS
 

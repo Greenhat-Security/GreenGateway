@@ -21,11 +21,15 @@ use super::{
         RequestBinding,
     },
     control_plane::ConnectionControlPlane,
+    google_delegation::{
+        GoogleDelegationBinding, GoogleDelegationError, GoogleDelegationLease,
+        GoogleDelegationRuntime,
+    },
     model::{
         normalize_origin_relative_path, CallerAssertionSettings, ConnectionAuthentication,
         ConnectionId, ConnectionKind, ConnectionTestProfile, ConnectionTimeouts, ConnectionWrite,
-        DiscoveryConfig, OAuthClientAuthMethod, SubjectTokenSource, TlsProfile, MAX_CONNECTIONS,
-        MAX_EXPECTED_STATUSES, MAX_URL_BYTES,
+        DiscoveryConfig, GoogleSubjectClaim, OAuthClientAuthMethod, SubjectTokenSource, TlsProfile,
+        MAX_CONNECTIONS, MAX_EXPECTED_STATUSES, MAX_URL_BYTES,
     },
     oauth::{
         OAuthBinding, OAuthClientCredentialsRuntime, OAuthError, OAuthTokenLease,
@@ -49,6 +53,7 @@ pub struct ConnectionHttpRuntime {
     clients: Arc<Mutex<HashMap<ConnectionClientCacheKey, Arc<EgressClient>>>>,
     oauth: OAuthClientCredentialsRuntime,
     delegated: DelegatedTokenRuntime,
+    google: GoogleDelegationRuntime,
     #[cfg(test)]
     additional_resolution_delay: Option<std::time::Duration>,
 }
@@ -75,6 +80,10 @@ impl fmt::Debug for ConnectionHttpRuntime {
             .field(
                 "delegated_token_cache_entries",
                 &self.delegated.cache_entry_count(),
+            )
+            .field(
+                "google_delegation_cache_entries",
+                &self.google.cache_entry_count(),
             )
             .finish_non_exhaustive()
     }
@@ -466,7 +475,8 @@ impl ConnectionHttpTarget {
             }
             HttpAuthenticationBinding::StaticBearer { .. }
             | HttpAuthenticationBinding::OAuth2ClientCredentials(_)
-            | HttpAuthenticationBinding::DelegatedIssuerToken(_) => {
+            | HttpAuthenticationBinding::DelegatedIssuerToken(_)
+            | HttpAuthenticationBinding::GoogleDomainWideDelegation(_) => {
                 credential_header_names.push(header::AUTHORIZATION);
             }
         }
@@ -528,6 +538,7 @@ enum HttpAuthenticationBinding {
     },
     OAuth2ClientCredentials(OAuthBinding),
     DelegatedIssuerToken(DelegatedTokenBinding),
+    GoogleDomainWideDelegation(GoogleDelegationBinding),
 }
 
 pub struct ResolvedConnectionCredential {
@@ -551,6 +562,8 @@ enum ResolvedCredentialMaterial {
     OAuthBearer(OAuthTokenLease),
     /// The caller's own token, from the Connection's token-exchange issuer.
     DelegatedBearer(DelegatedTokenLease),
+    /// The caller's own Google token, from a domain-wide delegation.
+    GoogleBearer(GoogleDelegationLease),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -588,6 +601,11 @@ pub enum ConnectionHttpError {
     DelegatedTokenExchangeFailed,
     /// Every cached delegated token is held by a call in flight.
     DelegatedTokenUnavailable,
+    /// A `google_domain_wide_delegation` Connection could not obtain the
+    /// caller's own Google token. A call that names nobody is
+    /// [`Self::DelegatedTokenNoPrincipal`] instead, as for any credential
+    /// that belongs to the caller.
+    GoogleDelegation(GoogleDelegationError),
     UpstreamAuthenticationRejected,
     TransportUnavailable,
 }
@@ -621,6 +639,7 @@ impl ConnectionHttpRuntime {
     ) -> Self {
         let oauth = OAuthClientCredentialsRuntime::new(control_plane.clone());
         let delegated = DelegatedTokenRuntime::new(control_plane.clone());
+        let google = GoogleDelegationRuntime::new();
         Self {
             control_plane,
             base_egress_config,
@@ -628,6 +647,7 @@ impl ConnectionHttpRuntime {
             clients: Arc::new(Mutex::new(HashMap::new())),
             oauth,
             delegated,
+            google,
             #[cfg(test)]
             additional_resolution_delay: None,
         }
@@ -635,7 +655,8 @@ impl ConnectionHttpRuntime {
 
     pub fn with_audit(mut self, audit: crate::audit::AuditLog) -> Self {
         self.oauth = self.oauth.with_audit(audit.clone());
-        self.delegated = self.delegated.with_audit(audit);
+        self.delegated = self.delegated.with_audit(audit.clone());
+        self.google = self.google.with_audit(audit);
         self
     }
 
@@ -653,16 +674,42 @@ impl ConnectionHttpRuntime {
 
     /// Purges every delegated token this process caches for the principal `issuer` and `subject`
     /// name, under every `delegated_issuer_token` Connection, and revokes each at its issuer in
-    /// the background where the Connection names a `revocation_url`. Returns how many cache
-    /// entries were purged. Each replica holds its own cache: in cluster mode the purge is also
-    /// recorded, in the background, for every other replica to apply.
+    /// the background where the Connection names a `revocation_url`. Every Google token cached
+    /// for the principal under a `google_domain_wide_delegation` Connection is dropped too, and
+    /// counted, though Google offers no revocation for it. Returns how many cache entries were
+    /// purged. Each replica holds its own caches: in cluster mode the purge is also recorded, in
+    /// the background, for every other replica to apply.
     pub fn purge_delegated_tokens(
         &self,
         issuer: &str,
         subject: &str,
         trigger: DelegatedTokenPurgeTrigger,
     ) -> usize {
-        self.delegated.purge_principal(issuer, subject, trigger)
+        let google_purged = self.google.purge_principal(issuer, subject);
+        self.delegated
+            .purge_principal(issuer, subject, trigger, google_purged)
+    }
+
+    /// Sends every Google request of every domain-wide delegation through `transport`, and keeps
+    /// at most `capacity` callers' tokens on `clock`, so a test can stand in for Google.
+    #[cfg(test)]
+    pub(crate) fn with_google_delegation_for_test(
+        mut self,
+        transport: Arc<dyn super::gcp_secret::GcpTransport>,
+        clock: Arc<super::token_exchange::ManualTokenClock>,
+        capacity: usize,
+    ) -> Self {
+        self.google = self
+            .google
+            .with_transport_for_test(transport)
+            .with_cache_for_test(clock, capacity);
+        self
+    }
+
+    /// How many callers' Google tokens are cached now.
+    #[cfg(test)]
+    pub(crate) fn google_delegation_cache_entries(&self) -> usize {
+        self.google.cache_entry_count()
     }
 
     /// [`Self::purge_delegated_tokens`] for an operator, who is told whether the purge was
@@ -673,19 +720,22 @@ impl ConnectionHttpRuntime {
         subject: &str,
         trigger: DelegatedTokenPurgeTrigger,
     ) -> Result<DelegatedTokenPurgeOutcome, DelegatedTokenPurgeFailure> {
+        let google_purged = self.google.purge_principal(issuer, subject);
         self.delegated
-            .purge_principal_everywhere(issuer, subject, trigger)
+            .purge_principal_everywhere(issuer, subject, trigger, google_purged)
             .await
     }
 
-    /// Applies purges recorded at the authority to this process's delegated-token cache (cluster
-    /// mode), and returns how many entries that took.
+    /// Applies purges recorded at the authority to this process's delegated-token and Google
+    /// domain-wide delegation caches (cluster mode), and returns how many entries that took.
     #[cfg_attr(not(any(test, feature = "postgres")), allow(dead_code))]
     pub(crate) fn apply_recorded_delegated_token_purges(
         &self,
         purges: &[RecordedPurge<'_>],
     ) -> usize {
-        self.delegated.apply_recorded_purges(purges)
+        self.delegated.apply_recorded_purges(purges, |matches| {
+            self.google.purge_principals_where(matches)
+        })
     }
 
     /// Replaces the delegated-token cache with one of `capacity` entries
@@ -856,6 +906,7 @@ impl ConnectionHttpRuntime {
             .get(&connection_id)
             .ok_or(ConnectionHttpError::ConnectionNotFound)?;
         let caller_assertion = attesting_binding(record, &snapshot, lane)?;
+        refuse_google_delegation_off_caller_lanes(record, Some(lane))?;
         validate_http_connection(record)?;
         let url = connection_target_url(record, path_and_query)?;
         let client = self.client_for(record)?;
@@ -1123,6 +1174,9 @@ impl ConnectionHttpRuntime {
     /// with [`Self::admit_caller_assertion`] before any I/O. Every other
     /// Connection carrying a `caller_assertion` is refused with
     /// `caller_assertion_not_enforced`; see [`caller_assertion_servable_on`].
+    /// A `google_domain_wide_delegation` Connection, which carries no
+    /// assertion, is tested as that principal too: its token is minted for
+    /// the principal's own email, inline and uncached.
     pub fn test_target(
         &self,
         connection_id: &str,
@@ -1136,6 +1190,7 @@ impl ConnectionHttpRuntime {
             .get(&connection_id)
             .ok_or(ConnectionHttpError::ConnectionNotFound)?;
         let caller_assertion = attesting_binding(record, &snapshot, AttestingLane::ConnectionTest)?;
+        refuse_google_delegation_off_caller_lanes(record, Some(AttestingLane::ConnectionTest))?;
         let connection_etag = record.etag();
         if connection_etag.as_str() != expected_connection_etag {
             return Ok(None);
@@ -1378,6 +1433,15 @@ impl ConnectionHttpRuntime {
                     .map_err(connection_delegated_error)?;
                 Some(ResolvedCredentialMaterial::DelegatedBearer(token))
             }
+            HttpAuthenticationBinding::GoogleDomainWideDelegation(binding) => {
+                let caller = caller.ok_or(ConnectionHttpError::DelegatedTokenNoPrincipal)?;
+                let token = self
+                    .google
+                    .access_token(binding, caller)
+                    .await
+                    .map_err(ConnectionHttpError::GoogleDelegation)?;
+                Some(ResolvedCredentialMaterial::GoogleBearer(token))
+            }
         };
         Ok(material)
     }
@@ -1570,6 +1634,24 @@ impl ConnectionHttpRuntime {
                     },
                 ))
             }
+            ConnectionAuthentication::GoogleDomainWideDelegation {
+                service_account_email,
+                workload_identity_profile,
+                scopes,
+                subject_claim: GoogleSubjectClaim::Email,
+                subject_issuers,
+            } => Ok(HttpAuthenticationBinding::GoogleDomainWideDelegation(
+                GoogleDelegationBinding {
+                    connection_id: record.id.clone(),
+                    connection_etag: record.etag().to_string(),
+                    service_account_email: service_account_email.clone(),
+                    workload_identity_profile: workload_identity_profile.clone(),
+                    scopes: scopes.clone(),
+                    subject_issuers: subject_issuers.clone(),
+                    token_client: self.oauth_client_for(record)?,
+                    identity: self.control_plane.google_workload_identity(),
+                },
+            )),
             ConnectionAuthentication::HeaderApiKey {
                 secret_id: None, ..
             }
@@ -1778,11 +1860,12 @@ impl ConnectionHttpTarget {
 
     /// Whether the primary credential is the caller's own rather than the
     /// Connection's, so resolving it needs the caller named
-    /// (`delegated_issuer_token`).
+    /// (`delegated_issuer_token`, `google_domain_wide_delegation`).
     pub fn credential_belongs_to_caller(&self) -> bool {
         matches!(
             self.authentication,
             HttpAuthenticationBinding::DelegatedIssuerToken(_)
+                | HttpAuthenticationBinding::GoogleDomainWideDelegation(_)
         )
     }
 
@@ -1819,6 +1902,9 @@ impl ConnectionHttpTarget {
             HttpAuthenticationBinding::StaticBearer { .. } => "static_bearer",
             HttpAuthenticationBinding::OAuth2ClientCredentials(_) => "oauth2_client_credentials",
             HttpAuthenticationBinding::DelegatedIssuerToken(_) => "delegated_issuer_token",
+            HttpAuthenticationBinding::GoogleDomainWideDelegation(_) => {
+                "google_domain_wide_delegation"
+            }
         }
     }
 
@@ -1829,6 +1915,9 @@ impl ConnectionHttpTarget {
             }
             HttpAuthenticationBinding::DelegatedIssuerToken(_) => {
                 ConnectionHttpError::DelegatedTokenExchangeFailed
+            }
+            HttpAuthenticationBinding::GoogleDomainWideDelegation(_) => {
+                ConnectionHttpError::GoogleDelegation(GoogleDelegationError::ExchangeFailed)
             }
             HttpAuthenticationBinding::None
             | HttpAuthenticationBinding::HeaderApiKey { .. }
@@ -1864,6 +1953,11 @@ impl ResolvedConnectionCredential {
             Some(ResolvedCredentialMaterial::DelegatedBearer(token)) => {
                 token.inject(headers).map_err(connection_delegated_error)?;
             }
+            Some(ResolvedCredentialMaterial::GoogleBearer(token)) => {
+                token
+                    .inject(headers)
+                    .map_err(ConnectionHttpError::GoogleDelegation)?;
+            }
         }
         for additional in &self.additional_headers {
             insert_sensitive_header(
@@ -1883,6 +1977,9 @@ impl ResolvedConnectionCredential {
             Some(ResolvedCredentialMaterial::DelegatedBearer(token)) => {
                 token.invalidate_after_unauthorized().await;
             }
+            Some(ResolvedCredentialMaterial::GoogleBearer(token)) => {
+                token.invalidate_after_unauthorized().await;
+            }
             Some(
                 ResolvedCredentialMaterial::HeaderApiKey { .. }
                 | ResolvedCredentialMaterial::StaticBearer { .. },
@@ -1893,14 +1990,15 @@ impl ResolvedConnectionCredential {
 
     /// Whether the primary credential is an OAuth access token this gateway
     /// obtained from a token endpoint and caches -- a client-credentials
-    /// token, or a caller's delegated one -- so that an upstream `401` must
-    /// drop it from the cache.
+    /// token, or a caller's delegated or Google one -- so that an upstream
+    /// `401` must drop it from the cache.
     pub fn is_oauth(&self) -> bool {
         matches!(
             self.material,
             Some(
                 ResolvedCredentialMaterial::OAuthBearer(_)
                     | ResolvedCredentialMaterial::DelegatedBearer(_)
+                    | ResolvedCredentialMaterial::GoogleBearer(_)
             )
         )
     }
@@ -1995,6 +2093,7 @@ impl ConnectionHttpError {
             Self::DelegatedTokenDenied => DelegatedTokenError::Denied.safe_reason(),
             Self::DelegatedTokenExchangeFailed => DelegatedTokenError::ExchangeFailed.safe_reason(),
             Self::DelegatedTokenUnavailable => DelegatedTokenError::Unavailable.safe_reason(),
+            Self::GoogleDelegation(error) => error.safe_reason(),
             Self::UpstreamAuthenticationRejected => "auth_failed",
             Self::TransportUnavailable => "transport_unavailable",
         }
@@ -2135,6 +2234,32 @@ fn refuse_unenforced_caller_assertion(
     if record.write.caller_assertion.is_some() {
         return Err(ConnectionHttpError::CallerAssertionNotEnforced);
     }
+    refuse_google_delegation_off_caller_lanes(record, None)
+}
+
+/// Refuses a `google_domain_wide_delegation` Connection, with
+/// `authentication_not_supported` and before anything is resolved, on every
+/// lane but the two that obtain a caller's own token: a manual tool call, and
+/// a stored test run as the principal who asked for it.
+///
+/// Those are exactly the lanes a `delegated_issuer_token` Connection is
+/// served on (see [`caller_assertion_servable_on`]). A delegated issuer token
+/// is kept off the others by the caller assertion it must carry; this
+/// Connection carries none, so the rule is stated here. `lane` is `None` for a
+/// lane that attests nobody.
+fn refuse_google_delegation_off_caller_lanes(
+    record: &StoredConnection,
+    lane: Option<AttestingLane>,
+) -> Result<(), ConnectionHttpError> {
+    if matches!(
+        record.write.authentication,
+        ConnectionAuthentication::GoogleDomainWideDelegation { .. }
+    ) && !matches!(
+        lane,
+        Some(AttestingLane::ManualTool | AttestingLane::ConnectionTest)
+    ) {
+        return Err(ConnectionHttpError::UnsupportedAuthentication);
+    }
     Ok(())
 }
 
@@ -2143,7 +2268,8 @@ fn refuse_unenforced_caller_assertion(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttestingLane {
     /// A manual HTTP tool call. The one tool lane that also serves a
-    /// `delegated_issuer_token` Connection.
+    /// `delegated_issuer_token` or `google_domain_wide_delegation`
+    /// Connection.
     ManualTool,
     /// A managed OpenAPI tool call.
     OpenApiTool,
@@ -2153,9 +2279,10 @@ pub enum AttestingLane {
     ProxyRoute,
     /// The session a managed MCP tool call opens.
     ManagedMcpTool,
-    /// A stored test of a `delegated_issuer_token` Connection, which exchanges
-    /// the token of the principal running the test. It sends no assertion
-    /// upstream and serves no other attested Connection.
+    /// A stored test. A `delegated_issuer_token` or
+    /// `google_domain_wide_delegation` Connection is tested with the token of
+    /// the principal running the test. It sends no assertion upstream and
+    /// serves no other attested Connection.
     ConnectionTest,
 }
 
@@ -2234,6 +2361,10 @@ fn validate_authentication(record: &StoredConnection) -> Result<(), ConnectionHt
         | ConnectionAuthentication::DelegatedIssuerToken {
             client_secret_id: Some(_),
             subject_token_source: SubjectTokenSource::CallerAssertion,
+            ..
+        }
+        | ConnectionAuthentication::GoogleDomainWideDelegation {
+            subject_claim: GoogleSubjectClaim::Email,
             ..
         } => Ok(()),
         ConnectionAuthentication::HeaderApiKey {

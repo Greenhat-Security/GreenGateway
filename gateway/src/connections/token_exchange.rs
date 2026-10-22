@@ -124,7 +124,7 @@ const TOKEN_TYPE_HINT_ACCESS_TOKEN: &str = "access_token";
 /// The error codes RFC 6749 section 5.2 and RFC 8693 section 2.2.2 register for a token endpoint.
 /// An issuer's code is recorded only when it is one of these, so audit never carries text the
 /// issuer chose.
-const REGISTERED_ERROR_CODES: &[&str] = &[
+pub(super) const REGISTERED_ERROR_CODES: &[&str] = &[
     "invalid_request",
     "invalid_client",
     "invalid_grant",
@@ -695,6 +695,12 @@ impl DelegatedTokenRuntime {
     /// is audited only when it purged something or was recorded for the other replicas, because
     /// the same refused credential can be presented any number of times.
     ///
+    /// `google_purged` is how many Google domain-wide delegation tokens the caller already dropped
+    /// for the same principal (see
+    /// [`super::google_delegation::GoogleDelegationRuntime::purge_principal`]): they count towards
+    /// the total and are named in the same audit event, so one purge has one record. Google
+    /// offers no revocation for them, so none is attempted.
+    ///
     /// In cluster mode the purge is also recorded for every other replica (see
     /// [`DelegatedTokenPurgeLedger`]), in the background: this returns once this replica's entries
     /// are gone. An operator's purge waits for the record instead, through
@@ -706,8 +712,9 @@ impl DelegatedTokenRuntime {
         issuer: &str,
         subject: &str,
         trigger: DelegatedTokenPurgeTrigger,
+        google_purged: usize,
     ) -> usize {
-        self.start_purge(issuer, subject, trigger)
+        self.start_purge(issuer, subject, trigger, google_purged)
             .map_or(0, |started| started.purged)
     }
 
@@ -723,8 +730,9 @@ impl DelegatedTokenRuntime {
         issuer: &str,
         subject: &str,
         trigger: DelegatedTokenPurgeTrigger,
+        google_purged: usize,
     ) -> Result<DelegatedTokenPurgeOutcome, DelegatedTokenPurgeFailure> {
-        let Some(started) = self.start_purge(issuer, subject, trigger) else {
+        let Some(started) = self.start_purge(issuer, subject, trigger, google_purged) else {
             // An issuer with no canonical form names nobody any replica could have cached.
             return Ok(DelegatedTokenPurgeOutcome {
                 purged_entries: 0,
@@ -761,13 +769,14 @@ impl DelegatedTokenRuntime {
         issuer: &str,
         subject: &str,
         trigger: DelegatedTokenPurgeTrigger,
+        google_purged: usize,
     ) -> Option<StartedPurge> {
         let issuer = canonical_issuer(issuer)?;
         let principal = principal_digest(&issuer, subject);
         let retired = self
             .cache
             .retire_where(|key| key.principal == Some(principal));
-        let purged = retired.len();
+        let purged = retired.len().saturating_add(google_purged);
         let revoked_credential = matches!(trigger, DelegatedTokenPurgeTrigger::CredentialRevoked);
         let pending = match self.cluster.as_ref() {
             None => Err(PurgeRecord::NotNeeded),
@@ -791,7 +800,7 @@ impl DelegatedTokenRuntime {
         let cluster = match pending {
             Ok(cluster) => cluster,
             Err(record) => {
-                purge.emit(purged, &record);
+                purge.emit(purged, google_purged, &record);
                 self.revoke_in_background(purge, retired);
                 return Some(StartedPurge {
                     purged,
@@ -811,7 +820,7 @@ impl DelegatedTokenRuntime {
             } else {
                 cluster.record(&principal, &purge.trigger).await
             };
-            purge.emit(purged, &PurgeRecord::from_result(&recorded));
+            purge.emit(purged, google_purged, &PurgeRecord::from_result(&recorded));
             // The operator may have stopped waiting; the outcome is in the audit either way.
             drop(answer.send(recorded));
             runtime.revoke_retired(&purge, retired).await;
@@ -822,16 +831,25 @@ impl DelegatedTokenRuntime {
         })
     }
 
-    /// Applies purges recorded at the authority (cluster mode) to this replica's cache, and returns
-    /// how many entries that took: every token cached for a principal a record names leaves the
-    /// cache and is revoked at its issuer, exactly as a purge started here. The replica that
-    /// recorded a purge applies it too, which takes whatever its principal was exchanged for
+    /// Applies purges recorded at the authority (cluster mode) to this replica's caches, and
+    /// returns how many entries that took: every token cached for a principal a record names
+    /// leaves the cache and is revoked at its issuer, exactly as a purge started here. The replica
+    /// that recorded a purge applies it too, which takes whatever its principal was exchanged for
     /// between its own purge and the record.
+    ///
+    /// `purge_google` drops the Google domain-wide delegation tokens of every principal the
+    /// predicate it is handed accepts, by principal digest, and names each entry's principal: they
+    /// count and are audited with the same principal's delegated tokens, as in a purge started
+    /// here.
     ///
     /// A record this build cannot read -- no key, or one of the wrong shape -- cannot be matched
     /// against anyone, so it purges every delegated token this replica caches rather than none.
     /// Each principal purged is audited once, with the latest record that named them.
-    pub(crate) fn apply_recorded_purges(&self, purges: &[RecordedPurge<'_>]) -> usize {
+    pub(crate) fn apply_recorded_purges(
+        &self,
+        purges: &[RecordedPurge<'_>],
+        purge_google: impl FnOnce(&dyn Fn(&[u8; 32]) -> bool) -> Vec<(String, String)>,
+    ) -> usize {
         let Some(cluster) = self.cluster.as_ref() else {
             return 0;
         };
@@ -857,22 +875,30 @@ impl DelegatedTokenRuntime {
         if named.is_empty() && unreadable.is_none() {
             return 0;
         }
+        let matches = |principal: &[u8; 32]| {
+            unreadable.is_some() || named.contains_key(cluster.purge_key(principal).as_str())
+        };
         let retired = self.cache.retire_where(|key| {
-            key.principal.is_some_and(|principal| {
-                unreadable.is_some() || named.contains_key(cluster.purge_key(&principal).as_str())
-            })
+            key.principal
+                .as_ref()
+                .is_some_and(|principal| matches(principal))
         });
-        let purged = retired.len();
-        let mut by_principal: BTreeMap<(String, String), Vec<RetiredDelegatedToken>> =
+        let google = purge_google(&matches);
+        let purged = retired.len().saturating_add(google.len());
+        let mut by_principal: BTreeMap<(String, String), (Vec<RetiredDelegatedToken>, usize)> =
             BTreeMap::new();
         for slot in retired {
             let context = slot.context();
             by_principal
                 .entry((context.issuer.clone(), context.subject.clone()))
                 .or_default()
+                .0
                 .push(slot);
         }
-        for ((issuer, subject), retired) in by_principal {
+        for principal in google {
+            by_principal.entry(principal).or_default().1 += 1;
+        }
+        for ((issuer, subject), (retired, google_purged)) in by_principal {
             let key = cluster.purge_key(&principal_digest(&issuer, &subject));
             let security_revision = named
                 .get(key.as_str())
@@ -886,7 +912,11 @@ impl DelegatedTokenRuntime {
                 issuer,
                 subject,
             };
-            purge.emit(retired.len(), &PurgeRecord::Applied(security_revision));
+            purge.emit(
+                retired.len().saturating_add(google_purged),
+                google_purged,
+                &PurgeRecord::Applied(security_revision),
+            );
             self.revoke_in_background(purge, retired);
         }
         purged
@@ -1120,7 +1150,7 @@ fn cache_lifetime(expires_in: u64) -> Duration {
 /// Whose tokens a purge drops: a digest of the attested issuer and subject alone, so it matches
 /// every token exchanged for that principal whatever email or roles it carried. Length-prefixed
 /// so no two principals share an encoding.
-fn principal_digest(issuer: &str, subject: &str) -> [u8; 32] {
+pub(super) fn principal_digest(issuer: &str, subject: &str) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(b"greengateway:delegated-token-principal:v1\0");
     for part in [issuer, subject] {
@@ -1244,7 +1274,10 @@ struct ExchangeErrorResponse {
 
 /// The issuer's error code when it is one of `registered`, `unregistered` for any other, and
 /// `None` when the body names none.
-fn registered_error_code(body: &[u8], registered: &[&'static str]) -> Option<&'static str> {
+pub(super) fn registered_error_code(
+    body: &[u8],
+    registered: &[&'static str],
+) -> Option<&'static str> {
     let code = serde_json::from_slice::<ExchangeErrorResponse>(body)
         .ok()?
         .error?;
@@ -1374,7 +1407,7 @@ struct DelegatedTokenPurge {
 }
 
 impl DelegatedTokenPurge {
-    fn emit(&self, purged: usize, replication: &PurgeRecord) {
+    fn emit(&self, purged: usize, google_purged: usize, replication: &PurgeRecord) {
         metrics::counter!(
             "connection_delegated_token_purge_total",
             "trigger" => self.trigger.label()
@@ -1387,6 +1420,7 @@ impl DelegatedTokenPurge {
                 "trigger": self.trigger.label(),
                 "principal": { "issuer": self.issuer, "subject": self.subject },
                 "purged_entries": purged,
+                "google_delegation_entries": google_purged,
                 "replication": replication.audit(),
             }),
         );

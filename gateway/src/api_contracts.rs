@@ -379,6 +379,37 @@ pub(super) struct PolicyInspectionResponse<'a> {
     pub(super) semantic_digest: Option<&'a str>,
 }
 
+/// `POST /policy/convert`: a 0.x document converted to policy v1, with what
+/// the conversion changed, or the diagnostics that refuse it.
+#[derive(Serialize)]
+pub(super) struct PolicyConversionResponse<'a> {
+    pub(super) converted: bool,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    pub(super) errors: &'a [String],
+    /// The source document's `schema_version` when it names a schema this
+    /// gateway implements.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) source_schema_version: Option<&'a str>,
+    /// `1.0.0` for a converted document.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) schema_version: Option<&'static str>,
+    pub(super) diagnostics: &'a [rbac::policy_document::PolicyDiagnostic],
+    /// The source digest of the 0.x bytes converted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) source_digest: Option<&'a str>,
+    /// The v1 semantic digest of the converted document.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) semantic_digest: Option<&'a str>,
+    /// `verified` for a converted document: it read back as the source's
+    /// policy apart from its version and ids.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) parity: Option<&'static str>,
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    pub(super) changes: &'a [rbac::policy_conversion::ConversionChange],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) policy: Option<rbac::policy_conversion::ConvertedDocument<'a>>,
+}
+
 #[derive(Deserialize)]
 pub(super) struct PolicyRulePreviewRequest {
     pub(super) rule: rbac::Rule,
