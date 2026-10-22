@@ -6401,7 +6401,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::routing::add_admin_api_routes#1",
-      "sha256": "41b110f21a026c1d22dc045e2577ad3a59057000d781ae6bf7729f80d09dd649",
+      "sha256": "075be2f42268caf6596e98050200f613e30b2089370425cff1c1a1dc20412c47",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
@@ -6732,6 +6732,26 @@
       ],
       "scope": "gateway::use admin_policy_test_runs :: *#1",
       "sha256": "fa6cd2e48a9cc10d258e091e44bf8f8211f2d602bd2d9c4e54552efc493f593d",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/admin_policy_simulations.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::admin_policy_simulations::use super :: *#1",
+      "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/main.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::use admin_policy_simulations :: *#1",
+      "sha256": "a6b33445074e02cb3fdd3aef5ba8a4cae0ab586a01896760641accd889546470",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },

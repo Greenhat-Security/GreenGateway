@@ -84,6 +84,8 @@ mod admin_responses;
 use admin_responses::*;
 mod admin_policy_test_runs;
 use admin_policy_test_runs::*;
+mod admin_policy_simulations;
+use admin_policy_simulations::*;
 
 mod audit;
 mod auth;
@@ -117,6 +119,7 @@ mod path_match;
 #[path = "../tests/support/policy_benchmark.rs"]
 mod policy_benchmark;
 mod policy_eval;
+mod policy_simulation;
 mod policy_testing;
 mod proxy;
 mod rbac;

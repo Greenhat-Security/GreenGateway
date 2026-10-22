@@ -10,6 +10,7 @@ It is intentionally small. Most routes cover GreenGateway's own control-plane su
 - `/v1/admin/policy`
 - `/v1/admin/policy/validate`
 - `/v1/admin/policy/tests/runs`
+- `/v1/admin/policy/simulations`
 - `/v1/admin/policy/rules`
 - `/v1/admin/traffic`
 
@@ -22,3 +23,5 @@ The RBAC policy rules for these routes are still evaluated before the handlers a
 Health, version, metrics, and `/admin` remain exempt through the compose environment, matching the gateway defaults.
 
 `POST /v1/admin/policy/tests/runs` runs a policy test suite (see `docs/policy-tests.md`). Its route grants `admin:policy:simulate`, listed before the catch-all `admin:policy:write` route for unsafe policy methods because a run writes nothing, and the handler additionally requires `admin:policy:read`.
+
+`POST /v1/admin/policy/simulations` simulates synthetic cases against the active policy and a candidate (see `docs/policy-simulation.md`). Its route grants `admin:policy:simulate` ahead of the same catch-all, for the same reason, and the handler additionally requires `admin:policy:read`.
