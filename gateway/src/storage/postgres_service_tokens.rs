@@ -697,7 +697,8 @@ struct ChangeEvidence<'a> {
 /// caller to roll back, so the change never commits without both -- and is
 /// never reported as `Conflict`, which on rotate means exactly "the token
 /// is revoked". A full journal is `Unavailable`: the change is refused
-/// rather than an accepted event evicted.
+/// rather than an accepted event evicted. A failed evidence insert is
+/// counted here, a failed or refused append by the journal.
 async fn record_change_evidence(
     client: &deadpool_postgres::Object,
     evidence: &ChangeEvidence<'_>,
@@ -725,6 +726,7 @@ async fn record_change_evidence(
         )
         .await
         .map_err(|error| {
+            super::postgres_authority_events::record_evidence_failure();
             let classified = classify_query(error, OPERATION_CHANGE_EVIDENCE);
             if classified.kind() == RepositoryErrorKind::Conflict {
                 RepositoryError::new(RepositoryErrorKind::Internal, OPERATION_CHANGE_EVIDENCE)
