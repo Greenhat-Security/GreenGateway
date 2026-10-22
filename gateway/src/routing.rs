@@ -388,6 +388,20 @@ pub(super) fn add_admin_api_routes(
                     routes.admin.policy_rules_order_route.as_str(),
                     put(policy_rules_order_put_endpoint),
                 )
+                .route(
+                    routes.admin.policy_drafts_route.as_str(),
+                    get(policy_drafts_list_endpoint).post(policy_draft_create_endpoint),
+                )
+                .route(
+                    routes.admin.policy_draft_route.as_str(),
+                    get(policy_draft_get_endpoint)
+                        .patch(policy_draft_patch_endpoint)
+                        .delete(policy_draft_delete_endpoint),
+                )
+                .route(
+                    routes.admin.policy_draft_publish_route.as_str(),
+                    post(policy_draft_publish_endpoint),
+                )
                 .with_state(admin_api_states.policy),
         )
         .merge(
