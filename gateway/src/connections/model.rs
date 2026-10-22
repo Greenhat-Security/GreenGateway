@@ -1445,12 +1445,13 @@ fn validate_delegated_issuer_token(
 /// The rules a `google_domain_wide_delegation` Connection adds beyond its own
 /// fields.
 ///
-/// Like a delegated issuer token, the credential is obtained for the caller
-/// of a manual HTTP tool call and nobody else (see
-/// `ConnectionHttpRuntime::tool_call_target`), so it is offered on `http_api`
-/// Connections only. A caller assertion is refused outright: the upstream is
-/// Google, which verifies no assertion of this gateway's, and one sent there
-/// would be a bearer statement about the caller handed to a third party.
+/// Like a delegated issuer token, the credential is obtained only for the
+/// caller of a manual HTTP tool call or the principal running a stored test
+/// (see `ConnectionHttpRuntime::tool_call_target` and `test_target`), so it
+/// is offered on `http_api` Connections only. A caller assertion is refused
+/// outright: the upstream is Google, which verifies no assertion of this
+/// gateway's, and one sent there would be a bearer statement about the caller
+/// handed to a third party.
 ///
 /// These apply to stored documents too: no earlier release wrote this type.
 fn validate_google_domain_wide_delegation(

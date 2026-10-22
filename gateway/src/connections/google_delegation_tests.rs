@@ -25,8 +25,8 @@ use crate::{
         gcp_secret::GcpProfileConfig,
         http::{ConnectionHttpError, ConnectionHttpRuntime},
         model::{
-            ConnectionAuthentication, ConnectionEndpoint, ConnectionKind, ConnectionWrite,
-            GoogleSubjectClaim, TlsProfile,
+            ConnectionAuthentication, ConnectionEndpoint, ConnectionKind, ConnectionTestProfile,
+            ConnectionWrite, GoogleSubjectClaim, TlsProfile,
         },
         token_exchange::{DelegatedTokenPurgeTrigger, ManualTokenClock},
     },
@@ -344,7 +344,11 @@ fn delegation_write() -> ConnectionWrite {
         tls: TlsProfile::default(),
         timeouts: None,
         discovery: None,
-        test_profile: None,
+        test_profile: Some(ConnectionTestProfile {
+            method: "GET".to_owned(),
+            path: "/users/me/profile".to_owned(),
+            expected_statuses: vec![200],
+        }),
     }
 }
 
@@ -834,7 +838,7 @@ async fn a_principal_purge_drops_their_google_tokens_and_counts_them() {
 }
 
 #[tokio::test]
-async fn a_domain_wide_delegation_serves_manual_tool_calls_and_no_other_lane() {
+async fn a_domain_wide_delegation_serves_its_callers_own_lanes_and_no_other() {
     let harness = Harness::new().await;
     let id = harness.connection_id.as_str();
     let target = harness
@@ -855,6 +859,10 @@ async fn a_domain_wide_delegation_serves_manual_tool_calls_and_no_other_lane() {
         harness.runtime.proxy_route_target(id, "/").err(),
         unsupported
     );
+    assert!(harness.google.requests().is_empty());
+
+    // A stored test is run as the principal who asked for it, with a token
+    // minted inline for that one request and cached nowhere.
     let etag = harness
         .control_plane
         .runtime_snapshot()
@@ -864,8 +872,38 @@ async fn a_domain_wide_delegation_serves_manual_tool_calls_and_no_other_lane() {
         .expect("the Connection is stored")
         .etag()
         .to_string();
-    assert_eq!(harness.runtime.test_target(id, &etag).err(), unsupported);
-    assert!(harness.google.requests().is_empty());
+    for expected in [
+        "Bearer google-alice@example.test-1",
+        "Bearer google-alice@example.test-2",
+    ] {
+        let test = harness
+            .runtime
+            .test_target(id, &etag)
+            .expect("a stored test is served")
+            .expect("the etag is current");
+        let credential = crate::connections::oauth::scope_connection_test_oauth_mints(
+            harness
+                .runtime
+                .resolve_credential(test.target(), Some(&alice())),
+        )
+        .await
+        .expect("the tester's own token")
+        .expect("a credential");
+        let mut headers = HeaderMap::new();
+        credential.inject(&mut headers).expect("injects");
+        assert_eq!(
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some(expected)
+        );
+    }
+    assert_eq!(harness.runtime.google_delegation_cache_entries(), 0);
+    assert_eq!(
+        harness.mint_events(2).await.len(),
+        2,
+        "a test's mint is audited"
+    );
 }
 
 #[tokio::test]

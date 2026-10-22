@@ -833,7 +833,7 @@ impl ConnectionHttpRuntime {
             .get(&connection_id)
             .ok_or(ConnectionHttpError::ConnectionNotFound)?;
         let caller_assertion = attesting_binding(record, &snapshot, lane)?;
-        refuse_google_delegation_off_manual_tools(record, Some(lane))?;
+        refuse_google_delegation_off_caller_lanes(record, Some(lane))?;
         validate_http_connection(record)?;
         let url = connection_target_url(record, path_and_query)?;
         let client = self.client_for(record)?;
@@ -1101,6 +1101,9 @@ impl ConnectionHttpRuntime {
     /// with [`Self::admit_caller_assertion`] before any I/O. Every other
     /// Connection carrying a `caller_assertion` is refused with
     /// `caller_assertion_not_enforced`; see [`caller_assertion_servable_on`].
+    /// A `google_domain_wide_delegation` Connection, which carries no
+    /// assertion, is tested as that principal too: its token is minted for
+    /// the principal's own email, inline and uncached.
     pub fn test_target(
         &self,
         connection_id: &str,
@@ -1114,6 +1117,7 @@ impl ConnectionHttpRuntime {
             .get(&connection_id)
             .ok_or(ConnectionHttpError::ConnectionNotFound)?;
         let caller_assertion = attesting_binding(record, &snapshot, AttestingLane::ConnectionTest)?;
+        refuse_google_delegation_off_caller_lanes(record, Some(AttestingLane::ConnectionTest))?;
         let connection_etag = record.etag();
         if connection_etag.as_str() != expected_connection_etag {
             return Ok(None);
@@ -2157,28 +2161,30 @@ fn refuse_unenforced_caller_assertion(
     if record.write.caller_assertion.is_some() {
         return Err(ConnectionHttpError::CallerAssertionNotEnforced);
     }
-    refuse_google_delegation_off_manual_tools(record, None)
+    refuse_google_delegation_off_caller_lanes(record, None)
 }
 
-/// Refuses a `google_domain_wide_delegation` Connection on every lane but a
-/// manual tool call, with `authentication_not_supported`, before anything is
-/// resolved.
+/// Refuses a `google_domain_wide_delegation` Connection, with
+/// `authentication_not_supported` and before anything is resolved, on every
+/// lane but the two that obtain a caller's own token: a manual tool call, and
+/// a stored test run as the principal who asked for it.
 ///
-/// Its credential is the caller's own Google token, which only the manual
-/// tool lane obtains, exactly as for a `delegated_issuer_token` Connection
-/// (see [`caller_assertion_servable_on`]). A delegated issuer token is kept
-/// off the other lanes by the caller assertion it must carry; this
-/// Connection carries none, so the rule is stated here. `lane` is `None` for
-/// a lane that attests nobody.
-fn refuse_google_delegation_off_manual_tools(
+/// Those are exactly the lanes a `delegated_issuer_token` Connection is
+/// served on (see [`caller_assertion_servable_on`]). A delegated issuer token
+/// is kept off the others by the caller assertion it must carry; this
+/// Connection carries none, so the rule is stated here. `lane` is `None` for a
+/// lane that attests nobody.
+fn refuse_google_delegation_off_caller_lanes(
     record: &StoredConnection,
     lane: Option<AttestingLane>,
 ) -> Result<(), ConnectionHttpError> {
     if matches!(
         record.write.authentication,
         ConnectionAuthentication::GoogleDomainWideDelegation { .. }
-    ) && lane != Some(AttestingLane::ManualTool)
-    {
+    ) && !matches!(
+        lane,
+        Some(AttestingLane::ManualTool | AttestingLane::ConnectionTest)
+    ) {
         return Err(ConnectionHttpError::UnsupportedAuthentication);
     }
     Ok(())
@@ -2189,7 +2195,8 @@ fn refuse_google_delegation_off_manual_tools(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttestingLane {
     /// A manual HTTP tool call. The one tool lane that also serves a
-    /// `delegated_issuer_token` Connection.
+    /// `delegated_issuer_token` or `google_domain_wide_delegation`
+    /// Connection.
     ManualTool,
     /// A managed OpenAPI tool call.
     OpenApiTool,
@@ -2197,9 +2204,10 @@ pub enum AttestingLane {
     ProxyRoute,
     /// The session a managed MCP tool call opens.
     ManagedMcpTool,
-    /// A stored test of a `delegated_issuer_token` Connection, which exchanges
-    /// the token of the principal running the test. It sends no assertion
-    /// upstream and serves no other attested Connection.
+    /// A stored test. A `delegated_issuer_token` or
+    /// `google_domain_wide_delegation` Connection is tested with the token of
+    /// the principal running the test. It sends no assertion upstream and
+    /// serves no other attested Connection.
     ConnectionTest,
 }
 

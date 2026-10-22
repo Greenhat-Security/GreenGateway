@@ -54,9 +54,10 @@ use super::{
     gcp_secret::{EgressGcpTransport, GcpHttpResponse, GcpTransport},
     model::ConnectionId,
     oauth::{
-        duration_millis, is_json_content_type, MintedOAuthToken, OAuthTokenCache,
-        OAuthTokenCacheKey, OAuthTokenLease, SecretString, SystemOAuthClock, TokenCacheFailure,
-        MAX_TOKEN_LIFETIME_SECS, MAX_TOKEN_TYPE_BYTES, OAUTH_MAX_REQUEST_BYTES,
+        connection_test_owns_token_requests, duration_millis, is_json_content_type,
+        MintedOAuthToken, OAuthTokenCache, OAuthTokenCacheKey, OAuthTokenLease, SecretString,
+        SystemOAuthClock, TokenCacheFailure, MAX_TOKEN_LIFETIME_SECS, MAX_TOKEN_TYPE_BYTES,
+        OAUTH_MAX_REQUEST_BYTES,
     },
     secret::MAX_HTTP_CREDENTIAL_BYTES,
     token_exchange::{
@@ -301,12 +302,22 @@ impl GoogleDelegationRuntime {
     /// A caller the Connection cannot act as is refused before anything is read or sent.
     /// Concurrent calls of one caller share one mint, and a mint outlives a call that stops
     /// waiting for it, so a cancelled call never cancels another caller's work or its audit.
+    ///
+    /// A Connection test is the exception, as for a delegated issuer token: it mints inline,
+    /// within its own deadline, for the principal running it, and neither reads nor fills the
+    /// cache, so a test never hands a later call a token, nor passes on one an earlier call
+    /// obtained.
     pub(crate) async fn access_token(
         &self,
         binding: &GoogleDelegationBinding,
         caller: &AttestedCaller,
     ) -> Result<GoogleDelegationLease, GoogleDelegationError> {
         let subject = delegated_subject(binding, caller)?.to_owned();
+        if connection_test_owns_token_requests() {
+            return Ok(OAuthTokenLease::uncached(
+                self.mint(binding, caller, &subject).await?,
+            ));
+        }
         let identity = caller.identity();
         let key = OAuthTokenCacheKey {
             connection_id: binding.connection_id.to_string(),

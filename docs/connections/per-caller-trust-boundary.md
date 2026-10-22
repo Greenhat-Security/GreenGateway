@@ -367,8 +367,11 @@ and exchanges it at Google's token endpoint.
   caller's email, `scope` the Connection's sorted scopes, `aud` the token
   endpoint, and `exp` 300 seconds after `iat`. A signed assertion whose claims
   differ from those sent is refused and never exchanged.
-- **Manual HTTP tool calls only**, on `http_api` Connections without a
-  `caller_assertion`; every other lane answers `authentication_not_supported`.
+- **Manual HTTP tool calls and stored tests only**, on `http_api` Connections
+  without a `caller_assertion`. A stored test runs as the principal who asks
+  for it, with a token minted for that one request and cached nowhere, as for
+  a delegated issuer token. Every other lane answers
+  `authentication_not_supported`.
 - **The same bounded, per-caller cache** as delegated tokens, keyed on the
   caller's issuer, subject and email: at most 1,024 callers per replica and
   900 seconds per token, dropped on an upstream `401`, a save of the
