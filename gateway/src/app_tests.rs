@@ -1,4 +1,6 @@
 use super::*;
+#[path = "admin_policy_drafts_tests.rs"]
+mod admin_policy_drafts_tests;
 #[path = "admin_session_app_tests.rs"]
 mod admin_session_app_tests;
 use crate::auth::TokenStore;
@@ -1749,6 +1751,15 @@ fn admin_routes_keep_default_api_prefix_and_remap_custom_api_under_v1() {
         default_routes.policy_rules_order_route,
         POLICY_RULES_ORDER_ADMIN_ROUTE
     );
+    assert_eq!(
+        default_routes.policy_drafts_route,
+        POLICY_DRAFTS_ADMIN_ROUTE
+    );
+    assert_eq!(default_routes.policy_draft_route, POLICY_DRAFT_ADMIN_ROUTE);
+    assert_eq!(
+        default_routes.policy_draft_publish_route,
+        POLICY_DRAFT_PUBLISH_ADMIN_ROUTE
+    );
     assert_eq!(default_routes.tokens_route, TOKENS_ADMIN_ROUTE);
     assert_eq!(default_routes.token_route, TOKEN_ADMIN_ROUTE);
     assert_eq!(default_routes.token_rotate_route, TOKEN_ROTATE_ADMIN_ROUTE);
@@ -1864,6 +1875,15 @@ fn admin_routes_keep_default_api_prefix_and_remap_custom_api_under_v1() {
     assert_eq!(
         custom_routes.policy_rules_order_route,
         "/v1/ops/policy/rules/order"
+    );
+    assert_eq!(custom_routes.policy_drafts_route, "/v1/ops/policy/drafts");
+    assert_eq!(
+        custom_routes.policy_draft_route,
+        "/v1/ops/policy/drafts/{id}"
+    );
+    assert_eq!(
+        custom_routes.policy_draft_publish_route,
+        "/v1/ops/policy/drafts/{id}/publish"
     );
     assert_eq!(custom_routes.tokens_route, "/v1/ops/tokens");
     assert_eq!(custom_routes.token_route, "/v1/ops/tokens/{id}");
@@ -24752,6 +24772,7 @@ async fn suggestions_admin_without_engine_answers_not_configured() {
                 policy_file: None,
                 rbac_state: Some(rbac_state.clone()),
                 history_store: None,
+                draft_store: None,
                 #[cfg(feature = "postgres")]
                 control_plane: None,
                 #[cfg(feature = "postgres")]
@@ -34431,10 +34452,27 @@ mod cluster_policy_tests {
             )
             .route(POLICY_HISTORY_ADMIN_ROUTE, get(policy_history_endpoint))
             .route(POLICY_ROLLBACK_ADMIN_ROUTE, post(policy_rollback_endpoint))
+            .route(
+                POLICY_DRAFTS_ADMIN_ROUTE,
+                get(policy_drafts_list_endpoint).post(policy_draft_create_endpoint),
+            )
+            .route(
+                POLICY_DRAFT_ADMIN_ROUTE,
+                get(policy_draft_get_endpoint)
+                    .patch(policy_draft_patch_endpoint)
+                    .delete(policy_draft_delete_endpoint),
+            )
+            .route(
+                POLICY_DRAFT_PUBLISH_ADMIN_ROUTE,
+                post(policy_draft_publish_endpoint),
+            )
             .with_state(PolicyAdminState {
                 policy_file: None,
                 rbac_state: Some(rbac_state.clone().with_revision_gate(gate.clone())),
                 history_store: Some(store.clone() as Arc<dyn storage::PolicyHistory>),
+                draft_store: Some(
+                    Arc::new(store.draft_store()) as Arc<dyn storage::PolicyDraftStore>
+                ),
                 control_plane: Some(store as Arc<dyn storage::PolicyControlPlane>),
                 membership,
                 event_store: None,
@@ -35087,6 +35125,133 @@ mod cluster_policy_tests {
             row.get(0)
         };
         assert_eq!(documents, 3, "two commits plus the rollback version");
+    }
+
+    /// Server-side drafts in cluster mode (issue #243, slice 9): a draft is
+    /// shared state in migration 22's table, saving one commits nothing, and
+    /// publishing one is exactly one control-plane commit, behind the draft
+    /// ETag and the live `If-Match` both. A second draft pinned to the same
+    /// base is then stale and is refused without a commit.
+    #[tokio::test]
+    async fn cluster_policy_drafts_publish_through_the_control_plane_transaction() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_policy_foundation(&database.dsn).await;
+        let active = initialize(&store, "draft-init").await;
+        let (router, rbac_state) = cluster_policy_router(store.clone());
+        rbac_state
+            .install_revision_snapshot(active.policy.clone(), active.security_revision)
+            .await
+            .expect("the authority's revision should install");
+        let versions_before = policy_version_count(&pool).await;
+
+        let draft_request = |method: Method, uri: &str, headers: &[(&str, &str)], body: &str| {
+            let mut builder = Request::builder().method(method).uri(uri);
+            for (name, value) in headers {
+                builder = builder.header(*name, *value);
+            }
+            let mut request = builder
+                .body(Body::from(body.to_owned()))
+                .expect("draft request should build");
+            request.extensions_mut().insert(admin_principal());
+            request
+        };
+        let mut drafts = Vec::new();
+        for id in ["draft-published", "draft-left-behind"] {
+            let candidate: Value =
+                serde_json::from_str(&cluster_policy_json(id)).expect("candidate JSON");
+            let created = router
+                .clone()
+                .oneshot(draft_request(
+                    Method::POST,
+                    POLICY_DRAFTS_ADMIN_ROUTE,
+                    &[("if-match", &active.etag)],
+                    &json!({ "policy": candidate }).to_string(),
+                ))
+                .await
+                .expect("create should complete");
+            assert_eq!(created.status(), StatusCode::CREATED);
+            let draft_etag = created
+                .headers()
+                .get(header::ETAG)
+                .and_then(|value| value.to_str().ok())
+                .expect("draft ETag")
+                .to_owned();
+            let (_, body) = refusal_of(created).await;
+            drafts.push((
+                body["draft_id"].as_str().expect("draft id").to_owned(),
+                draft_etag,
+            ));
+        }
+        assert_eq!(
+            policy_version_count(&pool).await,
+            versions_before,
+            "saving drafts commits no policy version"
+        );
+        assert_eq!(
+            rbac_state.snapshot_security_revision(),
+            active.security_revision
+        );
+
+        let publish = |draft: &(String, String), if_match: &str| {
+            draft_request(
+                Method::POST,
+                &format!("{POLICY_DRAFTS_ADMIN_ROUTE}/{}/publish", draft.0),
+                &[(POLICY_DRAFT_ETAG_HEADER, &draft.1), ("if-match", if_match)],
+                "",
+            )
+        };
+        let published = router
+            .clone()
+            .oneshot(publish(&drafts[0], &active.etag))
+            .await
+            .expect("publish should complete");
+        let new_etag = etag_of(published).await;
+        assert_eq!(policy_version_count(&pool).await, versions_before + 1);
+        let now_active = store
+            .active()
+            .await
+            .expect("active read")
+            .expect("active document");
+        assert_eq!(now_active.etag, new_etag);
+        assert_eq!(now_active.policy.id.as_deref(), Some("draft-published"));
+        assert_eq!(
+            rbac_state.snapshot_security_revision(),
+            active.security_revision + 1,
+            "publication installs the committed revision like any policy write"
+        );
+        let (status, frozen) = refusal_of(
+            router
+                .clone()
+                .oneshot(draft_request(
+                    Method::GET,
+                    &format!("{POLICY_DRAFTS_ADMIN_ROUTE}/{}", drafts[0].0),
+                    &[],
+                    "",
+                ))
+                .await
+                .expect("draft read should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(frozen["state"], "published");
+        assert_eq!(frozen["published_etag"], json!(new_etag));
+
+        // The other draft was pinned to the base that is no longer live.
+        let (status, body) = refusal_of(
+            router
+                .clone()
+                .oneshot(publish(&drafts[1], &new_etag))
+                .await
+                .expect("stale publish should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["reason"], "policy_draft_base_stale");
+        assert_eq!(policy_version_count(&pool).await, versions_before + 1);
     }
 
     #[tokio::test]
@@ -37285,6 +37450,7 @@ mod cluster_discovery_tests {
                     policy_file: None,
                     rbac_state: Some(rbac_state.clone()),
                     history_store: Some(policy_store.clone() as Arc<dyn storage::PolicyHistory>),
+                    draft_store: None,
                     control_plane: Some(
                         policy_store.clone() as Arc<dyn storage::PolicyControlPlane>
                     ),
