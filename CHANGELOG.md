@@ -283,6 +283,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Fixed
 
+- The scheduled security mutation campaign no longer fails before measuring anything (part of #420). Its clean-source check ran `git status` under the 64 KiB-plus-one-byte file-size limit of short commands, and on a fresh checkout `git status` refreshes stale stat data by rewriting `.git/index`. At `d403b75`, with 693 tracked files, the index is 73,041 bytes, so git was killed with `SIGXFSZ`, and the report stopped at phase `initializing` with reason `process_failure`. The controller's git commands now run as `git --no-optional-locks` and only read the repository; the file-size limit is unchanged. A regression test builds a repository whose index is larger than the limit and runs the campaign's git steps under the controller's own limits. See [the budgets](docs/testing/security-mutations.md#budgets-and-evidence).
+
 - Saving an MCP Connection in the admin UI no longer deletes its stored test profile. The editor hides the test-profile section for MCP Connections and dropped any profile the Connection had been saved with through the admin API. The profile is inert on an MCP Connection, but dropping it changed the stored record on an unrelated save, and on a credentialed Connection the changed test target made that save require secrets permission. Switching a Connection's kind to MCP in the editor still clears the profile.
 
 - Container release tags now depend on successful checks for the exact commit. CI builds a unique candidate, waits for all validation and secret-scanning jobs, and promotes its immutable digest without rebuilding. Pull-request builds cannot publish, and runs superseded before the final ref check leave their candidates unpromoted.
