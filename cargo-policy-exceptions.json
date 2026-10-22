@@ -9,7 +9,7 @@
       ],
       "owner": "GreenGateway maintainers",
       "expires": "2026-12-01",
-      "reason": "reqwest 0.13.5, pem 4 (via rcgen 0.14.10) and the gateway workspace pin use base64 0.23 while axum, hyper-util, jsonwebtoken, metrics-exporter-prometheus, pem 3, postgres-protocol and rmcp still require 0.22.",
+      "reason": "reqwest 0.13.5, pem 4 (via rcgen 0.14.10), rmcp 3.5.1 and the gateway workspace pin use base64 0.23 while axum, hyper-util, jsonwebtoken, metrics-exporter-prometheus, pem 3 and postgres-protocol still require 0.22.",
       "remediation": "Re-evaluate when the listed 0.22 parent dependencies update; remove the exception once their version requirements converge on 0.23.",
       "parents": {
         "0.22.1": [
@@ -18,13 +18,13 @@
           "jsonwebtoken@11.1.0",
           "metrics-exporter-prometheus@0.18.3",
           "pem@3.0.6",
-          "postgres-protocol@0.6.12",
-          "rmcp@2.2.0"
+          "postgres-protocol@0.6.12"
         ],
         "0.23.1": [
           "gateway@1.0.1",
           "pem@4.0.0",
-          "reqwest@0.13.5"
+          "reqwest@0.13.5",
+          "rmcp@3.5.1"
         ]
       }
     },
@@ -312,7 +312,7 @@
         "0.10.2": [
           "postgres-protocol@0.6.12",
           "quinn-proto@0.11.18",
-          "rmcp@2.2.0",
+          "rmcp@3.5.1",
           "tokio-postgres@0.7.18",
           "tungstenite@0.30.0"
         ]
@@ -382,13 +382,10 @@
         "2.0.119": [
           "asn1-rs-derive@0.6.0",
           "asn1-rs-impl@0.2.0",
-          "darling_core@0.23.0",
-          "darling_macro@0.23.0",
           "der_derive@0.7.3",
           "jni-macros@0.22.4",
           "jni-sys-macros@0.4.1",
           "jsonschema-macros-core@0.58.6",
-          "rmcp-macros@2.2.0",
           "rust-embed-impl@8.13.0",
           "strum_macros@0.28.0",
           "synstructure@0.13.2",

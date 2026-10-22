@@ -618,6 +618,114 @@ describe('ConnectionDetail', () => {
     expect(testRequest?.[1]?.body).toBeUndefined();
   });
 
+  it('tests a Google domain-wide delegation as the administrator and explains a refusal in Google terms', async () => {
+    const delegation = connectionDetail({
+      id: 'gmail-api',
+      authentication: 'google_domain_wide_delegation',
+      configuration: {
+        endpoint: {
+          base_url: 'https://gmail.googleapis.com',
+          base_path: '/gmail/v1',
+        },
+        authentication: {
+          type: 'google_domain_wide_delegation',
+          service_account_email:
+            'gateway-delegate@example-project.iam.gserviceaccount.com',
+          workload_identity_profile: 'gateway-wif',
+          scopes: ['https://www.googleapis.com/auth/gmail.readonly'],
+          subject_claim: 'email',
+          subject_issuers: ['https://idp.example.test'],
+        },
+        tls: {
+          ca_bundle_configured: false,
+          client_certificate_configured: false,
+          client_private_key_configured: false,
+        },
+        test_profile: {
+          method: 'GET',
+          path: '/users/me/profile',
+          expected_statuses: [200],
+        },
+      },
+    });
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input), 'http://localhost');
+      if (url.pathname === '/v1/admin/connections/gmail-api' && !init?.method) {
+        return Promise.resolve(
+          jsonResponse(200, delegation, { ETag: '"connection-v2"' }),
+        );
+      }
+      if (
+        url.pathname === '/v1/admin/connections/gmail-api/test' &&
+        init?.method === 'POST'
+      ) {
+        return Promise.resolve(
+          jsonResponse(
+            200,
+            {
+              ok: false,
+              state: 'unavailable',
+              tested_at: '2026-10-22T09:00:00Z',
+              latency_ms: 31,
+              stages: [
+                { name: 'egress_policy', outcome: 'success' },
+                {
+                  name: 'secret_available',
+                  outcome: 'failure',
+                  reason: 'delegated_token_denied',
+                },
+              ],
+            },
+            { ETag: '"connection-v2"' },
+          ),
+        );
+      }
+      return Promise.reject(
+        new Error(`unexpected fetch ${init?.method ?? 'GET'} ${url.pathname}`),
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderDetail('/connections/gmail-api');
+
+    expect(
+      await screen.findByText(/has Google mint a token for your own/),
+    ).toBeTruthy();
+    expect(screen.queryByText(/exchanges a token for your own account/)).toBeNull();
+    // Every setting is shown, since none is a secret.
+    const settings = screen
+      .getByRole('heading', { name: 'Google domain-wide delegation' })
+      .closest('section');
+    expect(settings?.textContent).toContain(
+      'gateway-delegate@example-project.iam.gserviceaccount.com',
+    );
+    expect(settings?.textContent).toContain('Workload identity profilegateway-wif');
+    expect(settings?.textContent).toContain(
+      'Scopeshttps://www.googleapis.com/auth/gmail.readonly',
+    );
+    expect(settings?.textContent).toContain('Subject claimemail');
+    expect(settings?.textContent).toContain(
+      'Subject issuershttps://idp.example.test',
+    );
+    expect(settings?.textContent).toContain(
+      'Each caller reaches Google as themselves.',
+    );
+    expect(settings?.textContent).toContain('connection.google_delegation_token');
+    fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
+
+    expect(await screen.findByText('Connection test failed')).toBeTruthy();
+    expect(screen.getByText('Delegated token denied')).toBeTruthy();
+    expect(
+      screen.getByText(/Google refused a token for your account/),
+    ).toBeTruthy();
+    expect(screen.queryByText(/The issuer refused your account/)).toBeNull();
+    const testRequest = fetchMock.mock.calls.find(([input, init]) => {
+      const url = new URL(String(input), 'http://localhost');
+      return url.pathname.endsWith('/test') && init?.method === 'POST';
+    });
+    expect(testRequest?.[1]?.body).toBeUndefined();
+  });
+
   it('says a disabled delegated issuer token connection is tested only once enabled', async () => {
     vi.stubGlobal(
       'fetch',

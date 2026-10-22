@@ -1,0 +1,187 @@
+{
+  "schema": 1,
+  "issue": 426,
+  "describes": "Which GreenGateway builds may share one PostgreSQL deployment, how a deployment moves between them, and what proves each row. The procedure is docs/deployment/postgres.md#upgrading-a-cluster. storage::migrations' tests check this_build and schema_steps against the binary, and scripts/upgrade_pair_evidence.py checks the pinned pair (gateway/tests/ha/rolling-upgrade-pair.json) against the evidence the ha-release-gate (ha_rolling_upgrade) leg records.",
+  "this_build": {
+    "manifest_versions": 22,
+    "read": [22, 22],
+    "write": [22, 22],
+    "approved_extensions": [],
+    "document_format": [0, 0],
+    "capabilities": ["openapi_swagger2_catalogs", "operation_requirements", "policy_role_descriptions"],
+    "operations": [
+      {
+        "operation": "policy.role_descriptions",
+        "capability": "policy_role_descriptions",
+        "minimum_schema": 17,
+        "document_format": 0,
+        "backfill": null,
+        "activation": "live_members"
+      },
+      {
+        "operation": "connections.openapi_swagger2_catalog",
+        "capability": "openapi_swagger2_catalogs",
+        "minimum_schema": 17,
+        "document_format": null,
+        "backfill": null,
+        "activation": "live_members"
+      }
+    ]
+  },
+  "schema_steps": [
+    { "from": 15, "to": 16, "migration": "connection_change_evidence", "procedure": "coordinated" },
+    { "from": 16, "to": 17, "migration": "cluster_member_capabilities", "procedure": "coordinated" },
+    { "from": 17, "to": 18, "migration": "service_token_and_jwt_evidence", "procedure": "coordinated" },
+    { "from": 18, "to": 19, "migration": "admin_sessions", "procedure": "coordinated" },
+    { "from": 19, "to": 20, "migration": "contract_fence", "procedure": "coordinated" },
+    { "from": 20, "to": 21, "migration": "authority_event_journal", "procedure": "coordinated" },
+    { "from": 21, "to": 22, "migration": "document_and_catalog_change_evidence", "procedure": "coordinated" }
+  ],
+  "released_cluster_binaries": [],
+  "qualified_pairs": [
+    {
+      "prepared": "b4c663ad128b4a8c1c8f3fac590cb43aed5c1254",
+      "successor": "cd5331ab03c46de73910289c4847052920c866f7",
+      "schema": 18,
+      "operation": "policy.role_descriptions",
+      "capability": "policy_role_descriptions",
+      "procedure": "rolling",
+      "rollback_cutoff": "the first committed policy document in which a role carries a description",
+      "evidence": {
+        "a_prepared_release_and_its_successor_serve_one_deployment": {
+          "schema": {
+            "ledger_versions": 18,
+            "ledger_max_version": 18,
+            "served": { "min": 18, "max": 18 },
+            "approved_extensions": [],
+            "unapproved_next_version": {
+              "version": 19,
+              "readiness": "schema_incompatible",
+              "migrate_check": [{ "binary": "prepared" }, { "binary": "successor" }]
+            }
+          },
+          "advertisements": {
+            "prepared": ["operation_requirements"],
+            "successor": ["operation_requirements", "policy_role_descriptions"],
+            "prepared_sees_successor_unrecognized": 1
+          },
+          "fingerprints": 1,
+          "conditional_writes": [
+            { "writer": "prepared", "status": 200 },
+            { "writer": "successor", "status": 200 },
+            { "writer": "prepared", "status": 200 },
+            { "writer": "successor", "status": 200 },
+            { "writer": "prepared", "status": 412, "precondition": "stale" },
+            { "writer": "successor", "status": 412, "precondition": "stale" }
+          ],
+          "revocations": [
+            { "revoked_by": "prepared", "refused_by": ["prepared", "successor"] },
+            { "revoked_by": "successor", "refused_by": ["prepared", "successor"] }
+          ],
+          "readiness": [
+            {
+              "step": "mixed",
+              "replicas": [
+                { "replica": "a", "binary": "prepared", "status": 200 },
+                { "replica": "b", "binary": "successor", "status": 200 }
+              ]
+            },
+            {
+              "step": "rolled back",
+              "replicas": [
+                { "replica": "a", "binary": "prepared" },
+                { "replica": "b", "binary": "prepared", "status": 200 }
+              ]
+            },
+            {
+              "step": "rolled forward",
+              "replicas": [
+                { "replica": "a", "binary": "prepared" },
+                { "replica": "b", "binary": "successor", "status": 200 }
+              ]
+            },
+            {
+              "step": "unapproved migration",
+              "replicas": [
+                { "replica": "a", "binary": "prepared", "status": 503, "reason": "schema_incompatible" },
+                { "replica": "b", "binary": "successor", "status": 503, "reason": "schema_incompatible" }
+              ]
+            },
+            {
+              "step": "migration removed",
+              "replicas": [
+                { "replica": "a", "binary": "prepared", "status": 200 },
+                { "replica": "b", "binary": "successor", "status": 200 }
+              ]
+            }
+          ]
+        },
+        "the_successors_new_operation_waits_for_every_prepared_member_to_leave": {
+          "operation_matrix": [
+            {
+              "operation": "policy.role_descriptions",
+              "writer": "successor",
+              "live_members": ["prepared", "successor"],
+              "status": 409,
+              "reason": "capability_not_advertised",
+              "outcome": "refused"
+            },
+            {
+              "operation": "policy.role_descriptions",
+              "writer": "prepared",
+              "live_members": ["prepared", "successor"],
+              "status": 400,
+              "outcome": "rejected_by_the_prepared_parser"
+            },
+            {
+              "operation": "policy.role_descriptions",
+              "writer": "successor",
+              "live_members": ["prepared (draining)", "successor"],
+              "status": 409,
+              "reason": "capability_not_advertised",
+              "outcome": "refused"
+            },
+            {
+              "operation": "policy.role_descriptions",
+              "writer": "successor",
+              "live_members": ["successor"],
+              "status": 200,
+              "outcome": "admitted"
+            },
+            {
+              "operation": "policy.role_descriptions",
+              "writer": "successor",
+              "live_members": ["prepared", "successor"],
+              "status": 409,
+              "reason": "capability_not_advertised",
+              "outcome": "refused"
+            }
+          ],
+          "readiness": [
+            {
+              "step": "mixed",
+              "replicas": [
+                { "replica": "a", "binary": "prepared", "status": 200 },
+                { "replica": "b", "binary": "successor", "status": 200 }
+              ]
+            },
+            {
+              "step": "prepared binary started after the operation",
+              "replicas": [
+                { "replica": "a", "binary": "prepared", "outcome": "refused to start" },
+                { "replica": "b", "binary": "successor", "status": 200 }
+              ]
+            },
+            {
+              "step": "recovered forward",
+              "replicas": [
+                { "replica": "a", "binary": "prepared", "status": 200 },
+                { "replica": "b", "binary": "successor" }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  ]
+}
