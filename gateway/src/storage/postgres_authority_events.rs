@@ -142,17 +142,24 @@ SELECT reserved.last_position, $1::text::uuid, $2 FROM reserved
 "#;
 
 /// Journal one evidence row inside the producer's transaction, which has
-/// already inserted the evidence row with `event_id`. A refusal is counted
-/// once here, so every producer reports capacity exhaustion the same way.
+/// already inserted the evidence row with `event_id`. A refusal or a failed
+/// statement is counted once here, so every producer reports both the same
+/// way.
 pub(crate) async fn append_to_journal(
     client: &tokio_postgres::Client,
     source: JournalSource,
     event_id: &str,
 ) -> Result<(), JournalAppendError> {
-    let appended = client
+    let appended = match client
         .execute(APPEND_SQL, &[&event_id, &source.table()])
         .await
-        .map_err(JournalAppendError::Store)?;
+    {
+        Ok(appended) => appended,
+        Err(error) => {
+            record_evidence_failure();
+            return Err(JournalAppendError::Store(error));
+        }
+    };
     if appended == 1 {
         return Ok(());
     }
@@ -167,6 +174,15 @@ pub(crate) async fn append_to_journal(
 /// Count one mutation refused because the journal was full.
 pub(crate) fn record_capacity_refusal() {
     ::metrics::counter!(crate::metrics::AUTHORITY_EVENT_CAPACITY_REFUSALS_TOTAL).increment(1);
+}
+
+/// Count one mutation refused because its evidence row or journal entry
+/// could not be written for a reason other than capacity. Called once per
+/// refused mutation, where the evidence statement failed: the journal
+/// append counts its own failures, each producer counts its evidence
+/// insert's.
+pub(crate) fn record_evidence_failure() {
+    ::metrics::counter!(crate::metrics::AUTHORITY_EVENT_EVIDENCE_FAILURES_TOTAL).increment(1);
 }
 
 /// One journal row and the evidence row it indexes, exactly as stored.

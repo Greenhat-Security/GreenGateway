@@ -416,10 +416,15 @@ migration 21; `gateway/src/storage/postgres_authority_events.rs` and
   secret reaches it.
 - **Signals.** `greengateway_authority_event_journal_retained` and `_capacity`,
   `_undelivered`, `_oldest_undelivered_age_seconds`, `_delivered_total`,
-  `_delivery_failures_total{kind}` and `_capacity_refusals_total`, every label from
-  a fixed vocabulary ([metrics](deployment/postgres.md#metrics)). No shipped alert
-  rule covers them yet; the [threshold inventory](deployment/postgres.md#alert-thresholds)
-  lists the conditions to alert on.
+  `_delivery_failures_total{kind}`, `_capacity_refusals_total` and
+  `_evidence_failures_total` (a change refused because the database refused its
+  evidence row or journal entry for any other reason), every label from a fixed
+  vocabulary ([metrics](deployment/postgres.md#metrics)). The
+  [operational rule pack](deployment/operational-alerts.md#alert-policy) pages on
+  either refusal counter and on a full journal, warns on a filling journal,
+  sustained delivery lag or dispatcher failures, and reports a journal no current
+  maintenance leader is observing. Its tests are synthetic; they do not show that a
+  downstream system received anything.
 
 Operator actions at capacity, in order of preference: restore delivery (fix the
 sink, or the dispatcher's key, so the cursor advances and retention can free
