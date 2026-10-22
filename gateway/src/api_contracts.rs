@@ -368,11 +368,20 @@ pub(super) struct PolicyRulePreviewRequest {
 pub(super) struct PolicyRulePreviewResponse {
     pub(super) match_count: u64,
     pub(super) scanned_event_count: u64,
+    /// Scanned observations the shared evaluator could not judge the rule
+    /// against. Each is neither a match nor a non-match.
+    pub(super) unevaluated_event_count: u64,
+    /// `unevaluated_event_count` by stable reason: a limitation code
+    /// (`missing_principal_fact`, `missing_dispatch_fact`) or
+    /// `malformed_observation`. Empty when every scanned observation was
+    /// judged.
+    pub(super) unevaluated_reasons: BTreeMap<&'static str, u64>,
     /// The window held more observations than the scan ceiling allowed, so
     /// `match_count` covers only the newest `scanned_event_count` of them.
     pub(super) scan_truncated: bool,
-    /// Every observation in the window was scanned. Never true for a
-    /// truncated scan: a partial count is not evidence of the whole window.
+    /// Every observation in the window was scanned and judged. Never true for
+    /// a truncated scan or one with an unevaluated observation: a partial
+    /// count is not evidence of the whole window.
     pub(super) complete: bool,
     pub(super) sample_strategy: &'static str,
     pub(super) samples: Vec<PolicyRulePreviewSample>,
@@ -545,6 +554,29 @@ pub(super) struct ManagedOpenApiPreviewResponse {
     pub(super) operation_id_fallbacks: Vec<OpenApiToolNameFallbackResponse>,
     pub(super) skipped_operations: Vec<OpenApiSkippedOperationResponse>,
     pub(super) overlay: ManagedOpenApiOverlayReportResponse,
+    /// Only for a document converted to OpenAPI 3.0 first (issue #443); an
+    /// OpenAPI 3.x preview keeps its previous shape exactly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) conversion: Option<OpenApiConversionReportResponse>,
+}
+
+#[derive(Serialize)]
+pub(super) struct OpenApiConversionReportResponse {
+    pub(super) source_format: &'static str,
+    pub(super) warnings: Vec<OpenApiConversionWarningResponse>,
+}
+
+#[derive(Serialize)]
+pub(super) struct OpenApiConversionWarningResponse {
+    pub(super) code: &'static str,
+    pub(super) message: &'static str,
+    pub(super) operation_omitted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) path_template: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) subject: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1106,6 +1138,12 @@ pub(super) struct GatewayAppBuildOverrides {
     pub(super) disable_proxy_health_checks: bool,
     #[cfg(test)]
     pub(super) stream_proxy_request_bodies: bool,
+    /// Test seam: gate converted managed OpenAPI catalogs as cluster mode
+    /// does, over a standalone Connection store, so the admin endpoints'
+    /// operation-gate path (issue #443) is reachable with or without a
+    /// PostgreSQL roster in `pg_membership`.
+    #[cfg(test)]
+    pub(super) gate_converted_openapi_catalogs: bool,
 }
 
 /// What `run()` proves about the policy authority before the app is built:

@@ -47,6 +47,7 @@ impl<'a> RuleDispatchContext<'a> {
         }
     }
 
+    #[allow(dead_code)]
     pub fn classified(
         route_host: Option<&'a str>,
         route_path_prefix: Option<&'a str>,

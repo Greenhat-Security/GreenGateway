@@ -43,6 +43,12 @@ use tracing_subscriber::{
 use url::Url;
 use zeroize::{Zeroize, Zeroizing};
 
+#[cfg(test)]
+#[path = "analysis_differential_tests.rs"]
+mod analysis_differential;
+#[cfg(test)]
+#[path = "analysis_legacy_tests.rs"]
+mod analysis_legacy;
 mod app_state;
 #[cfg(test)]
 #[path = "app_tests.rs"]
