@@ -6371,7 +6371,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::bootstrap::run#1",
-      "sha256": "87fd0b73e4f2c0a44c513007e2666db39386ef2391927c072778e8ca0e1fff18",
+      "sha256": "777e5cb6a2bf9f903a13e859ba23b3325b393e8be371cf4e102e094f4c5ad8c1",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },

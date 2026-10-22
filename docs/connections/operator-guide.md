@@ -1367,6 +1367,126 @@ registration. Subsequent refreshes preserve a surviving public tool name only
 when it still represents the same operation and safe mapping; a document
 cannot silently move an existing name to a different request.
 
+## Importing Swagger 2.0 Documents
+
+Managed OpenAPI Connections accept Swagger 2.0 documents, in JSON or YAML, in
+preview, registration and refresh, beside OpenAPI 3.x. A document is read as
+Swagger 2.0 when it has a `swagger` field and no `openapi` field, and its
+`swagger` value must be the string `"2.0"`: quote it in YAML, where an
+unquoted `2.0` is a number and is refused. A document that declares `openapi`
+is always read as OpenAPI 3.x, exactly as before. The legacy tools-file import
+(`/v1/admin/tools/openapi/preview` and `/register`) remains OpenAPI 3.x only.
+
+GreenGateway converts the document to the OpenAPI 3.0 document it describes
+and generates tools from that, so the tools, security alternatives and
+bindings are the ones a hand conversion would produce. The stored
+specification, its digest and the 2 MiB limit all apply to the document you
+submitted; registration stores it unchanged, and refresh and overlay edits
+convert it again.
+
+| Swagger 2.0 | Converted to |
+| --- | --- |
+| `definitions` | `components.schemas`; every `#/definitions/` reference is rewritten to `#/components/schemas/` |
+| `query`, `header` and `path` parameters | parameters with a `schema`; array `collectionFormat` `csv`, `multi`, `ssv` and `pipes` become explicit `style`/`explode` |
+| one `body` parameter | `requestBody`, one content entry per `consumes` media type |
+| `formData` parameters | a form `requestBody` (`application/x-www-form-urlencoded`, or `multipart/form-data` when the operation consumes it or has a `file` field) |
+| response `schema` | response content, one entry per `produces` media type |
+| `#/parameters/` and `#/responses/` references | inlined into each operation |
+| `securityDefinitions` | `components.securitySchemes`: `basic` becomes HTTP basic, `apiKey` keeps `in: header` or `in: query`, and the `oauth2` flows `implicit`, `password`, `application` and `accessCode` become `implicit`, `password`, `clientCredentials` and `authorizationCode` |
+| `host`, `basePath`, `schemes` | `servers`, which generated tools do not use |
+| `discriminator`, `type: file`, `x-nullable` | their OpenAPI 3.0 forms |
+
+Response headers, `examples`, `externalDocs` and vendor extensions outside
+schemas are documentation and are not carried over.
+
+Binding does not change. An `application` flow binds to an
+`oauth2_client_credentials` Connection with the same token URL and scopes, and
+`apiKey` in a header binds to `header_api_key`. The user-consent flows
+(`accessCode`, `implicit`, `password`), `basic` and query API keys are
+reported as incompatible, as their OpenAPI 3.0 forms are.
+
+The preview response of a converted document carries a `conversion` object
+with `source_format` `swagger_2_0` and a `warnings` list; an OpenAPI 3.x
+preview has no `conversion` field. Each warning has a `code`, a fixed
+`message`, an `operation_omitted` flag, and, where they apply, the `method`
+and `path_template` of the operation and a `subject` (the field, parameter,
+location, security definition or base path concerned, cut to 256 bytes).
+Review them before registering:
+
+- `base_path_not_in_paths`: generated tools call the Connection's endpoint
+  plus the operation path, and the document's `basePath` is not added. Put it
+  in the Connection's `base_path` (for an API with `basePath: /api`, set
+  `base_path` to `/api`).
+- `request_body_not_mapped`: the operation's request body has no JSON media
+  type, as with every `formData` body. Generated tools send JSON bodies only,
+  so its fields are not tool arguments and the tool sends no body, exactly as
+  for an OpenAPI 3.x form body. Leave such tools unselected unless the
+  upstream accepts the call without them.
+- `consumes_defaulted`, `produces_defaulted`: neither the operation nor the
+  document declares a media type, so body parameters or response schemas are
+  treated as `application/json`. Reported once per document.
+- `security_definition_not_converted`: the definition is incomplete (for
+  example an `oauth2` flow without its URLs or scopes) or has no OpenAPI 3.0
+  form. It is left out, so operations that require it bind as incompatible.
+- `unsupported_document_field`, `unsupported_path_item_field`: a field that
+  is not part of Swagger 2.0, such as an OpenAPI 3.x `servers` or a `trace`
+  operation, was ignored.
+- `warnings_truncated`: the list stopped at its bound; fix the reported
+  problems and preview again.
+
+These codes leave the operation out of the converted document, so no tool is
+generated for it, and set `operation_omitted`: `unsupported_operation_field`
+(for example an OpenAPI 3.x `requestBody` inside a Swagger operation),
+`invalid_parameter` (no usable name, location, body schema or items),
+`unsupported_parameter_location`, `unsupported_parameter_field` (for example
+an OpenAPI 3.x `schema` on a query parameter), `unsupported_collection_format`
+(`tsv`, a nested array format, or anything but `csv` on a path or header),
+`file_parameter_outside_form`, `multiple_body_parameters` and
+`body_and_form_parameters`. A problem in a path item's own `parameters` leaves
+out every operation of that path.
+
+The whole document is refused, and preview or registration fails as for any
+invalid specification, when `swagger` is not the string `"2.0"`, a structural
+field has the wrong type, a reference is remote, a local reference points
+anywhere but `#/definitions/`, `#/parameters/` or `#/responses/` (or a path
+item uses `$ref`), a `#/parameters/` or `#/responses/` reference names no
+component or points into one instead of at it, the document has more than
+4,096 operations, conversion would copy more than 262,144 nodes more than
+once (inlined references, path-level body fields, schemas repeated under
+several media types), or schemas nest deeper than 256 levels. A
+`#/definitions/` reference is rewritten without being resolved; the generator
+then treats a missing target exactly as it treats a missing
+`#/components/schemas/` target in an OpenAPI 3.x document.
+
+Registration publishes only the `selected_tool_names` you confirm. To keep a
+Connection to read operations, select only the tools whose
+`upstream.method` is `GET` or `HEAD` in the preview.
+
+Upgrade and rollback: releases before this one cannot generate tools from a
+Swagger 2.0 document. A replica on an earlier release keeps serving the tools
+already published for such a catalog, but cannot refresh it (it reports
+`degraded/catalog_stale`), and if the Connection also has an overlay it cannot
+rebuild the overlay's source plan from the stored document: it fails at
+startup, and a running one holds its Connection reconciliation unavailable.
+
+In cluster mode this is enforced: storing a catalog converted from a Swagger
+2.0 document (registering one, refreshing to one, or putting an overlay over
+one) is the gated operation `connections.openapi_swagger2_catalog`, admitted
+only while every live replica, draining ones included, advertises the
+`openapi_swagger2_catalogs` capability. While an earlier replica is live the
+write is refused with `409` and reason `capability_not_advertised`, nothing is
+stored, and the refusal is audited as `cluster.operation_refused`; finish the
+rollout, or wait for the earlier replicas' rows to go stale, and retry. A
+refresh learns that its document is Swagger 2.0 only after fetching it, so an
+admitted refresh fetches it again. Preview, OpenAPI 3.x documents and deleting
+an overlay never ask. See
+[operation gating](../deployment/postgres.md#membership-and-maintenance).
+
+In standalone mode there is no other replica to wait for. In either mode,
+before rolling back to an earlier release, re-register those Connections with
+an OpenAPI 3.x document (or delete their overlays first, so the earlier
+release can still start).
+
 ## OpenAPI Overlays
 
 An OpenAPI overlay is one versioned document stored beside a managed

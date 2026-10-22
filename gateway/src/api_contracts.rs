@@ -545,6 +545,29 @@ pub(super) struct ManagedOpenApiPreviewResponse {
     pub(super) operation_id_fallbacks: Vec<OpenApiToolNameFallbackResponse>,
     pub(super) skipped_operations: Vec<OpenApiSkippedOperationResponse>,
     pub(super) overlay: ManagedOpenApiOverlayReportResponse,
+    /// Only for a document converted to OpenAPI 3.0 first (issue #443); an
+    /// OpenAPI 3.x preview keeps its previous shape exactly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) conversion: Option<OpenApiConversionReportResponse>,
+}
+
+#[derive(Serialize)]
+pub(super) struct OpenApiConversionReportResponse {
+    pub(super) source_format: &'static str,
+    pub(super) warnings: Vec<OpenApiConversionWarningResponse>,
+}
+
+#[derive(Serialize)]
+pub(super) struct OpenApiConversionWarningResponse {
+    pub(super) code: &'static str,
+    pub(super) message: &'static str,
+    pub(super) operation_omitted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) path_template: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) subject: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1106,6 +1129,12 @@ pub(super) struct GatewayAppBuildOverrides {
     pub(super) disable_proxy_health_checks: bool,
     #[cfg(test)]
     pub(super) stream_proxy_request_bodies: bool,
+    /// Test seam: gate converted managed OpenAPI catalogs as cluster mode
+    /// does, over a standalone Connection store, so the admin endpoints'
+    /// operation-gate path (issue #443) is reachable with or without a
+    /// PostgreSQL roster in `pg_membership`.
+    #[cfg(test)]
+    pub(super) gate_converted_openapi_catalogs: bool,
 }
 
 /// What `run()` proves about the policy authority before the app is built:
