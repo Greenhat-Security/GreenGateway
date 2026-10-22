@@ -76,6 +76,8 @@ mod admin_events;
 use admin_events::*;
 mod admin_responses;
 use admin_responses::*;
+mod admin_policy_test_runs;
+use admin_policy_test_runs::*;
 
 mod audit;
 mod auth;
@@ -109,6 +111,7 @@ mod path_match;
 #[path = "../tests/support/policy_benchmark.rs"]
 mod policy_benchmark;
 mod policy_eval;
+mod policy_testing;
 mod proxy;
 mod rbac;
 mod request_bounds;

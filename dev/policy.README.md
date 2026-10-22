@@ -9,6 +9,7 @@ It is intentionally small. Most routes cover GreenGateway's own control-plane su
 - `/v1/admin/status`
 - `/v1/admin/policy`
 - `/v1/admin/policy/validate`
+- `/v1/admin/policy/tests/runs`
 - `/v1/admin/policy/rules`
 - `/v1/admin/traffic`
 
@@ -19,3 +20,5 @@ The `admin` role grants `"*"` for local demos. The `reader` role intentionally h
 The RBAC policy rules for these routes are still evaluated before the handlers and can emit `authz.allowed` or `authz.denied` audit events. Admin handlers also enforce dedicated live-policy permissions such as `admin:audit:read` for audit queries, `admin:audit:stream` for the audit event stream, `admin:status:read` for status, `admin:policy:read` for `GET /v1/admin/policy` and `POST /v1/admin/policy/validate`, and `admin:policy:write` for `PUT /v1/admin/policy`, `POST /v1/admin/policy/rules`, `PATCH /v1/admin/policy/rules/{id}`, `DELETE /v1/admin/policy/rules/{id}`, and `PUT /v1/admin/policy/rules/order`. Traffic inventory uses `admin:traffic:read` for list/detail reads and `admin:traffic:write` for marking or clearing endpoint review state. The seeded `admin` role grants `"*"` so it can exercise all of them locally. A `reader`-role token receives `403 Forbidden` for the admin routes.
 
 Health, version, metrics, and `/admin` remain exempt through the compose environment, matching the gateway defaults.
+
+`POST /v1/admin/policy/tests/runs` runs a policy test suite (see `docs/policy-tests.md`). Its route grants `admin:policy:simulate`, listed before the catch-all `admin:policy:write` route for unsafe policy methods because a run writes nothing, and the handler additionally requires `admin:policy:read`.

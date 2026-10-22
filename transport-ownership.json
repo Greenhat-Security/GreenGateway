@@ -6401,7 +6401,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::routing::add_admin_api_routes#1",
-      "sha256": "2dd31017b19c97cdf7e0ceabe597e8eb278c627ac321f2756163dec4c6941dd9",
+      "sha256": "41b110f21a026c1d22dc045e2577ad3a59057000d781ae6bf7729f80d09dd649",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
@@ -6712,6 +6712,26 @@
       ],
       "scope": "gateway::use admin_responses :: *#1",
       "sha256": "f53cc1ea96259993ea9f1eecc8b0046ea2a55cac44a32052f8d1fe78f6b0247c",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/admin_policy_test_runs.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::admin_policy_test_runs::use super :: *#1",
+      "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/main.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::use admin_policy_test_runs :: *#1",
+      "sha256": "fa6cd2e48a9cc10d258e091e44bf8f8211f2d602bd2d9c4e54552efc493f593d",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
@@ -10280,16 +10300,6 @@
       ],
       "scope": "gateway::policy_eval::input::parse#1",
       "sha256": "df14eedbc2edfbbfcec117515b763e6ae3ec6d32fa23fca8eb9f80e12ffcf03d",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the existing offline analysis or rate-selection contract pending its separate adapter. Replaces the policy evaluator module-wide allowance; no transport or process capability is introduced."
-    },
-    {
-      "file": "gateway/src/policy_eval/input.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::policy_eval::input::UniqueValue#1",
-      "sha256": "16897e5a293289e00a20698c95c9bcaf98e1315489262272851b013ee568f9bc",
       "owner": "GreenGateway maintainers",
       "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the existing offline analysis or rate-selection contract pending its separate adapter. Replaces the policy evaluator module-wide allowance; no transport or process capability is introduced."
     },

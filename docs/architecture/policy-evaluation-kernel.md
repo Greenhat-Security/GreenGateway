@@ -310,3 +310,19 @@ their values: the blocked answer is an ordinal, and the host, scheme, port and
 addresses stay out. `canonical_trace_bytes` and `reusable_for` remain offline.
 The frozen pre-cutover checks and the differential fixtures are described in
 [policy-evaluation-parity.md](policy-evaluation-parity.md).
+
+## Offline consumer: policy test suites (#243, slice 11)
+
+`policy_testing` is the first offline caller. It compiles the policy it judges
+with `from_validated_policy`, the constructor the live install paths use, and
+for each case builds the context a live adapter builds: `evaluate` with a
+`Contextless`, `McpAlias` or `ProxyDispatch` target and a host that is
+`Present` or `Absent` (a synthetic case states its facts, so never `Missing`);
+`evaluate_tool` for `Invocation`, `Visibility`, `PolicyEligibility` and
+`RenderedHttp`; and `select_rate_lane` with the rate adapter's own
+`HttpTarget::Missing` and `HostFact::Missing`. It never matches a rule itself.
+An evaluator error is the case's `error` outcome and an incomplete answer its
+`incomplete` outcome; neither can satisfy an expectation. Results carry the
+stable reason and limitation codes and the evaluator semantics and context
+versions, and no fixture value. The suite format and API are in
+[policy-tests.md](../policy-tests.md).
