@@ -1,5 +1,5 @@
-//! Server contract tests use the existing disposable OIDC/JWKS fixtures. They
-//! do not replace the real HTTPS browser/IdP acceptance still tracked in #424.
+//! Server contract tests use the existing disposable OIDC/JWKS fixtures. The
+//! real HTTPS browser/IdP acceptance is admin-ui/tests/admin-session-live.spec.ts.
 use super::*;
 use axum::body::to_bytes;
 

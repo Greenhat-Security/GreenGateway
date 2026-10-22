@@ -247,6 +247,174 @@ fn egress_config_for_host(host: &str) -> EgressConfig {
     }
 }
 
+/// The live static half for `url` under `config`'s controls -- the shared
+/// evaluator and the adapter's translation of its answer -- with no client or
+/// transport built. Returns the admitted host and port.
+pub(super) fn static_answer(
+    config: &EgressConfig,
+    url: &str,
+) -> Result<(String, u16), EgressError> {
+    let policy = CompiledEgressPolicy::new(config.static_egress_controls());
+    admit_destination(&policy, url).map(|admitted| (admitted.host, admitted.port))
+}
+
+/// The live static half, then the address half over `answers`: the address
+/// the adapter would pin.
+pub(super) fn address_answer(
+    config: &EgressConfig,
+    url: &str,
+    answers: &[SocketAddr],
+) -> Result<SocketAddr, EgressError> {
+    let policy = CompiledEgressPolicy::new(config.static_egress_controls());
+    let admitted = admit_destination(&policy, url)?;
+    admit_address(&policy, &admitted, answers)
+}
+
+#[test]
+fn each_refusal_is_translated_to_the_error_the_previous_checks_raised() {
+    let url = Url::parse("ftp://api.example.test:8443/resource").expect("URL should parse");
+    let facts = EgressDestination::from_url(&url);
+    let answers = [socket("93.184.216.34:8443"), socket("10.0.0.8:8443")];
+    for (denial, category, message) in [
+        (
+            EgressDenial::MissingHost,
+            "invalid_url",
+            "egress URL is invalid: missing host",
+        ),
+        (
+            EgressDenial::Userinfo,
+            "invalid_url",
+            "egress URL is invalid: URL userinfo is not allowed",
+        ),
+        (
+            EgressDenial::Fragment,
+            "invalid_url",
+            "egress URL is invalid: URL fragments are not allowed",
+        ),
+        (
+            EgressDenial::SchemeNotAllowed,
+            "scheme_not_allowed",
+            "egress URL scheme is not allowed: ftp",
+        ),
+        (
+            EgressDenial::HostNotAllowed,
+            "host_not_allowed",
+            "egress host is not allowed: api.example.test",
+        ),
+        // Unreachable from a URL: every scheme without a default port is
+        // refused first. Translated all the same.
+        (
+            EgressDenial::MissingPort,
+            "invalid_url",
+            "egress URL is invalid: missing port for URL scheme",
+        ),
+        (
+            EgressDenial::PortNotAllowed,
+            "port_not_allowed",
+            "egress port is not allowed: 8443",
+        ),
+        (
+            EgressDenial::EmptyResolution,
+            "dns_resolution_failed",
+            "egress DNS resolution failed for api.example.test:8443",
+        ),
+        (
+            EgressDenial::UnexpectedResolvedPort,
+            "dns_resolution_failed",
+            "egress DNS resolution failed for api.example.test:8443: resolver returned an unexpected port",
+        ),
+        (
+            EgressDenial::NonGlobalAddress { index: 1 },
+            "non_global_ip_blocked",
+            "egress non-global IP is blocked: 10.0.0.8",
+        ),
+    ] {
+        let error = static_egress_refusal(denial, &url, &facts, &answers);
+        assert_eq!(
+            (error.safe_category(), error.to_string().as_str()),
+            (category, message),
+            "{denial:?}"
+        );
+    }
+}
+
+#[test]
+fn every_answer_the_evaluator_cannot_give_fails_closed() {
+    let url = Url::parse("https://api.example.test/resource").expect("URL should parse");
+    let facts = EgressDestination::from_url(&url);
+    let answers = [socket("93.184.216.34:443")];
+    let refused = |error: EgressError| {
+        assert!(
+            matches!(&error, EgressError::InvalidPolicy(message) if message == "static egress evaluation did not answer"),
+            "{error}"
+        );
+        assert_eq!(error.safe_category(), "invalid_policy");
+        assert!(!error.is_retryable_transport_failure());
+        assert!(!error.is_passive_health_failure());
+    };
+
+    // The static question supplies no answers, so an allow cannot answer it,
+    // and a refused question admits nothing.
+    for answer in [
+        Ok(EgressOutcome::Allow { pinned: 0 }),
+        Err(EvaluationError::SnapshotMismatch),
+        Err(EvaluationError::UnsupportedContextVersion),
+        Err(EvaluationError::TraceEncoding),
+    ] {
+        refused(
+            admitted_from_answer(url.clone(), facts.clone(), answer)
+                .map(|_| ())
+                .expect_err("only a request for resolution admits"),
+        );
+    }
+    // A destination without a host or port cannot be admitted, whatever the
+    // evaluator says.
+    let hostless = Url::parse("data:text/plain,hello").expect("URL should parse");
+    refused(
+        admitted_from_answer(
+            hostless.clone(),
+            EgressDestination::from_url(&hostless),
+            Ok(EgressOutcome::Indeterminate(
+                EgressLimitation::MissingResolution,
+            )),
+        )
+        .map(|_| ())
+        .expect_err("a hostless destination is never admitted"),
+    );
+
+    let admitted = admitted_from_answer(
+        url,
+        facts,
+        Ok(EgressOutcome::Indeterminate(
+            EgressLimitation::MissingResolution,
+        )),
+    )
+    .map_err(|error| error.to_string())
+    .expect("a request for resolution admits");
+    // The address question supplies answers, so it cannot be indeterminate,
+    // and only an ordinal into those answers pins or names anything.
+    for answer in [
+        Ok(EgressOutcome::Indeterminate(
+            EgressLimitation::MissingResolution,
+        )),
+        Ok(EgressOutcome::Allow { pinned: 1 }),
+        Ok(EgressOutcome::Deny(EgressDenial::NonGlobalAddress {
+            index: 1,
+        })),
+        Err(EvaluationError::SnapshotMismatch),
+    ] {
+        refused(
+            address_from_answer(&admitted, &answers, answer)
+                .expect_err("no address is pinned without an answer naming it"),
+        );
+    }
+    assert_eq!(
+        address_from_answer(&admitted, &answers, Ok(EgressOutcome::Allow { pinned: 0 }))
+            .expect("an allow naming a supplied answer pins it"),
+        answers[0]
+    );
+}
+
 #[test]
 fn egress_generation_is_order_independent_and_change_sensitive() {
     let mut first = EgressConfig {
@@ -788,13 +956,19 @@ fn rejected_scheme_log_exposes_only_a_bounded_category() {
     // still under the lock, with our subscriber installed on this thread --
     // guarantees its cached interest reflects our subscriber rather than
     // whichever thread happened to reach it first.
-    let _ = client.checked_url("warmup-scheme://warmup.invalid/warmup");
+    let _ = admit_destination(
+        &client.static_policy,
+        "warmup-scheme://warmup.invalid/warmup",
+    );
     tracing::callsite::rebuild_interest_cache();
     logs.clear();
 
-    let error = client
-        .checked_url("secret-scheme://secret-host.example/private?token=secret-query")
-        .expect_err("unsupported URL scheme should fail closed");
+    let error = admit_destination(
+        &client.static_policy,
+        "secret-scheme://secret-host.example/private?token=secret-query",
+    )
+    .map(|_| ())
+    .expect_err("unsupported URL scheme should fail closed");
     assert!(matches!(error, EgressError::SchemeNotAllowed(_)));
     drop(_guard);
 
@@ -1517,21 +1691,21 @@ fn host_glob_matching_supports_exact_and_leading_wildcard_patterns() {
 
 #[test]
 fn policy_host_globs_extend_exact_env_allowlist() {
-    let allowed_hosts = HashSet::from(["api.example.test".to_owned()]);
-    let allowed_host_globs = vec!["*.svc.example.test".to_owned()];
+    let config = EgressConfig {
+        allowed_hosts: HashSet::from(["api.example.test".to_owned()]),
+        allowed_host_globs: vec!["*.svc.example.test".to_owned()],
+        ..EgressConfig::default()
+    };
 
     for url in [
         "https://api.example.test/resource",
         "https://worker.svc.example.test/resource",
         "https://v1.worker.svc.example.test/resource",
     ] {
-        let url = Url::parse(url).expect("URL should parse");
-        checked_host(&url, &allowed_hosts, &allowed_host_globs)
-            .expect("exact env host or policy glob should allow");
+        static_answer(&config, url).expect("exact env host or policy glob should allow");
     }
 
-    let url = Url::parse("https://svc.example.test/resource").expect("URL should parse");
-    let error = checked_host(&url, &allowed_hosts, &allowed_host_globs)
+    let error = static_answer(&config, "https://svc.example.test/resource")
         .expect_err("wildcard should not match the suffix itself");
 
     assert!(matches!(
@@ -1568,13 +1742,14 @@ fn cidr_matching_covers_ipv6_edges() {
 
 #[test]
 fn policy_ports_restrict_only_when_non_empty() {
-    checked_policy_port(8080, &HashSet::new())
+    let mut config = egress_config_for_host("api.example.test");
+    static_answer(&config, "https://api.example.test:8080/")
         .expect("empty policy port set should preserve prior behavior");
 
-    let allowed_ports = HashSet::from([443, 8443]);
-    checked_policy_port(443, &allowed_ports).expect("listed port should be allowed");
-    let error =
-        checked_policy_port(8080, &allowed_ports).expect_err("unlisted port should be denied");
+    config.allowed_ports = HashSet::from([443, 8443]);
+    static_answer(&config, "https://api.example.test/").expect("listed port should be allowed");
+    let error = static_answer(&config, "https://api.example.test:8080/")
+        .expect_err("unlisted port should be denied");
 
     assert!(matches!(error, EgressError::PortNotAllowed(8080)));
 }
@@ -1636,28 +1811,20 @@ async fn request_to_any_port_is_allowed_when_policy_ports_are_empty() {
 
 #[test]
 fn policy_cidr_exempts_only_matching_private_resolved_ips() {
-    let allowed_cidrs = vec!["10.0.0.0/8".parse().expect("CIDR should parse")];
+    let config = EgressConfig {
+        private_ip_allow_cidrs: vec!["10.0.0.0/8".parse().expect("CIDR should parse")],
+        ..egress_config_for_host("internal.example.test")
+    };
+    let url = "https://internal.example.test/";
     let resolved = vec![socket("10.1.2.3:443")];
-    let pinned = checked_socket_addr(
-        "internal.example.test",
-        &resolved,
-        true,
-        &[],
-        &allowed_cidrs,
-    )
-    .expect("private IP covered by policy CIDR should be allowed");
+    let pinned = address_answer(&config, url, &resolved)
+        .expect("private IP covered by policy CIDR should be allowed");
 
     assert_eq!(pinned, socket("10.1.2.3:443"));
 
     let resolved = vec![socket("192.168.1.10:443")];
-    let error = checked_socket_addr(
-        "internal.example.test",
-        &resolved,
-        true,
-        &[],
-        &allowed_cidrs,
-    )
-    .expect_err("private IP outside policy CIDR should still be blocked");
+    let error = address_answer(&config, url, &resolved)
+        .expect_err("private IP outside policy CIDR should still be blocked");
 
     assert!(matches!(
         error,
@@ -1745,16 +1912,10 @@ fn policy_egress_is_startup_snapshot_until_config_is_rebuilt() {
 #[test]
 fn empty_allowlist_denies_everything() {
     let client = EgressClient::new(EgressConfig::default()).expect("client should build");
-    let url = client
-        .checked_url("https://api.example.test/resource")
-        .expect("URL should parse");
 
-    let error = checked_host(
-        &url,
-        &client.config.allowed_hosts,
-        &client.config.allowed_host_globs,
-    )
-    .expect_err("empty allowlist should deny");
+    let error = admit_destination(&client.static_policy, "https://api.example.test/resource")
+        .map(|_| ())
+        .expect_err("empty allowlist should deny");
 
     assert!(matches!(
         error,
@@ -2017,10 +2178,9 @@ async fn auto_seeded_upstream_host_still_blocks_private_ips_by_default() {
 
 #[test]
 fn host_not_in_allowlist_is_denied() {
-    let allowed_hosts = HashSet::from(["api.example.test".to_owned()]);
-    let url = Url::parse("https://other.example.test/resource").expect("URL should parse");
-    let error =
-        checked_host(&url, &allowed_hosts, &[]).expect_err("non-allowlisted host should deny");
+    let config = egress_config_for_host("api.example.test");
+    let error = static_answer(&config, "https://other.example.test/resource")
+        .expect_err("non-allowlisted host should deny");
 
     assert!(matches!(
         error,
@@ -2030,9 +2190,7 @@ fn host_not_in_allowlist_is_denied() {
 
 #[test]
 fn scheme_other_than_http_or_https_is_denied() {
-    let client = EgressClient::new(EgressConfig::default()).expect("client should build");
-    let error = client
-        .checked_url("ftp://api.example.test/resource")
+    let error = static_answer(&EgressConfig::default(), "ftp://api.example.test/resource")
         .expect_err("ftp scheme should deny");
 
     assert!(matches!(
@@ -2043,9 +2201,7 @@ fn scheme_other_than_http_or_https_is_denied() {
 
 #[test]
 fn url_without_host_is_invalid() {
-    let client = EgressClient::new(EgressConfig::default()).expect("client should build");
-    let error = client
-        .checked_url("data:text/plain,hello")
+    let error = static_answer(&EgressConfig::default(), "data:text/plain,hello")
         .expect_err("URL without host should be invalid");
 
     assert!(matches!(error, EgressError::InvalidUrl(_)));
@@ -2053,13 +2209,11 @@ fn url_without_host_is_invalid() {
 
 #[test]
 fn url_userinfo_and_fragments_are_invalid() {
-    let client = EgressClient::new(EgressConfig::default()).expect("client should build");
     for unsafe_url in [
         "https://operator:credential-canary@api.example.test/resource",
         "https://api.example.test/resource#fragment",
     ] {
-        let error = client
-            .checked_url(unsafe_url)
+        let error = static_answer(&EgressConfig::default(), unsafe_url)
             .expect_err("unsafe URL components should be rejected");
         assert!(matches!(error, EgressError::InvalidUrl(_)));
         assert!(!error.to_string().contains("credential-canary"));
@@ -2079,6 +2233,8 @@ async fn ipv6_literal_url_is_denied() {
     assert!(result.is_err(), "IPv6 literal URL should be denied");
 }
 
+const ANSWERED_URL: &str = "https://api.example.test/resource";
+
 #[test]
 fn any_non_global_resolved_ip_blocks_the_host() {
     let resolved = vec![
@@ -2086,8 +2242,12 @@ fn any_non_global_resolved_ip_blocks_the_host() {
         socket("198.18.0.1:443"),
         socket("1.1.1.1:443"),
     ];
-    let error = checked_socket_addr("api.example.test", &resolved, true, &[], &[])
-        .expect_err("mixed public and non-global answers should deny");
+    let error = address_answer(
+        &egress_config_for_host("api.example.test"),
+        ANSWERED_URL,
+        &resolved,
+    )
+    .expect_err("mixed public and non-global answers should deny");
 
     assert!(matches!(
         error,
@@ -2097,16 +2257,19 @@ fn any_non_global_resolved_ip_blocks_the_host() {
 
 #[test]
 fn configured_nat64_prefix_is_applied_before_address_pinning() {
-    let prefixes = vec!["64:ff9b:1::/48"
-        .parse::<IpNet>()
-        .expect("test NAT64 prefix should parse")];
+    let config = EgressConfig {
+        nat64_prefixes: vec!["64:ff9b:1::/48"
+            .parse::<IpNet>()
+            .expect("test NAT64 prefix should parse")],
+        ..egress_config_for_host("api.example.test")
+    };
     let public = vec![socket("[64:ff9b:1:808:8:800::]:443")];
-    let pinned = checked_socket_addr("api.example.test", &public, true, &prefixes, &[])
+    let pinned = address_answer(&config, ANSWERED_URL, &public)
         .expect("public embedded IPv4 should be allowed");
     assert_eq!(pinned, public[0]);
 
     let private = vec![socket("[64:ff9b:1:a9fe:a9:fe00::]:443")];
-    let error = checked_socket_addr("api.example.test", &private, true, &prefixes, &[])
+    let error = address_answer(&config, ANSWERED_URL, &private)
         .expect_err("private embedded IPv4 should be blocked");
     assert!(matches!(
         error,
@@ -2118,16 +2281,24 @@ fn configured_nat64_prefix_is_applied_before_address_pinning() {
 #[test]
 fn all_public_resolved_ips_select_exact_pinned_addr() {
     let resolved = vec![socket("93.184.216.34:443"), socket("1.1.1.1:443")];
-    let pinned = checked_socket_addr("api.example.test", &resolved, true, &[], &[])
-        .expect("public resolved addresses should be allowed");
+    let pinned = address_answer(
+        &egress_config_for_host("api.example.test"),
+        ANSWERED_URL,
+        &resolved,
+    )
+    .expect("public resolved addresses should be allowed");
 
     assert_eq!(pinned, socket("93.184.216.34:443"));
 }
 
 #[test]
 fn private_resolved_ip_is_allowed_when_private_deny_is_disabled() {
+    let config = EgressConfig {
+        deny_private_ips: false,
+        ..egress_config_for_host("internal.example.test")
+    };
     let resolved = vec![socket("10.0.0.1:443")];
-    let pinned = checked_socket_addr("internal.example.test", &resolved, false, &[], &[])
+    let pinned = address_answer(&config, "https://internal.example.test/", &resolved)
         .expect("private address should be allowed when private deny is disabled");
 
     assert_eq!(pinned, socket("10.0.0.1:443"));
@@ -2135,12 +2306,16 @@ fn private_resolved_ip_is_allowed_when_private_deny_is_disabled() {
 
 #[test]
 fn empty_resolution_fails_closed() {
-    let error = checked_socket_addr("api.example.test", &[], true, &[], &[])
-        .expect_err("empty resolution should deny");
+    let error = address_answer(
+        &egress_config_for_host("api.example.test"),
+        ANSWERED_URL,
+        &[],
+    )
+    .expect_err("empty resolution should deny");
 
     assert!(matches!(
         error,
-        EgressError::DnsResolutionFailed(host) if host == "api.example.test"
+        EgressError::DnsResolutionFailed(host) if host == "api.example.test:443"
     ));
 }
 

@@ -9096,6 +9096,67 @@ async fn proxy_observation_event_includes_upstream_latency_and_status() {
 }
 
 #[tokio::test]
+async fn an_upstream_the_static_egress_checks_refuse_is_never_resolved_or_contacted() {
+    let (upstream_addr, mut captured) = spawn_capture_upstream().await;
+    let router_admitting_port = |port: u16| {
+        let policy = TempPolicyFile::new(&format!(
+            r#"{{
+                "schema_version": "0.1.0",
+                "default_action": "allow",
+                "roles": {{}},
+                "routes": [],
+                "egress": {{ "ports": [{port}] }}
+            }}"#
+        ));
+        let mut config = proxy_config(upstream_addr);
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        let (router, probe) =
+            proxy_router_with_work_probe(config, test_audit_log(), upstream_addr.ip());
+        (policy, router, probe)
+    };
+    let request = |path: &str| {
+        Request::builder()
+            .uri(path)
+            .body(Body::empty())
+            .expect("egress request should build")
+    };
+
+    // Control: the same policy shape listing the upstream's port is resolved
+    // and forwarded, so the refusal below is the port list's doing.
+    let (_admitting, router, probe) = router_admitting_port(upstream_addr.port());
+    let response = router
+        .oneshot(request("/egress-admitted"))
+        .await
+        .expect("egress-admitted request should complete");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert!(
+        probe.snapshot().resolver_calls > 0,
+        "an admitted destination is resolved"
+    );
+    let _ = next_proxied_request(&mut captured, "egress-admitted request").await;
+
+    // The policy admits egress to one port; the upstream listens on another.
+    let admitted_port = if upstream_addr.port() == 443 {
+        444
+    } else {
+        443
+    };
+    let (_refusing, router, probe) = router_admitting_port(admitted_port);
+    let response = router
+        .oneshot(request("/egress-refused"))
+        .await
+        .expect("egress-refused request should complete");
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        probe.snapshot().resolver_calls,
+        0,
+        "a destination the static egress checks refuse is never resolved"
+    );
+    assert_upstream_receives_no_request(&mut captured, "static egress refusal").await;
+}
+
+#[tokio::test]
 async fn every_pre_forward_denial_performs_zero_physical_proxy_work() {
     let (upstream_addr, mut captured) = spawn_capture_upstream().await;
     let upstream_ip = upstream_addr.ip();

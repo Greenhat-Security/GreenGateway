@@ -1,7 +1,7 @@
 //! Pure policy foundation for issue #421, used by the live HTTP/RBAC adapter,
-//! the live tool-lane adapters and the live rate-lane selector. The static
-//! egress cutover, and the analysis consumers and legacy retirement (#422 PR
-//! 4), are tracked in #422.
+//! the live tool-lane adapters, the live rate-lane selector and the live static
+//! egress checks ([`egress`]). The analysis consumers and legacy retirement
+//! (#422 PR 4) are tracked in #422.
 //!
 //! PR 1 supported contextless HTTP direct rules, ordinary permission routes and
 //! defaults. The routing lane added host-qualified routes and dispatch-scoped
@@ -76,6 +76,7 @@
 //! No runtime handle, store, audit sink, provider, resolver, or callback enters
 //! this API. Principal inputs contain only policy facts, never credentials.
 
+pub(crate) mod egress;
 mod input;
 #[cfg(test)]
 mod property_tests;
