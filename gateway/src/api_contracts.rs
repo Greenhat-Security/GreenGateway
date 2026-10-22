@@ -368,11 +368,20 @@ pub(super) struct PolicyRulePreviewRequest {
 pub(super) struct PolicyRulePreviewResponse {
     pub(super) match_count: u64,
     pub(super) scanned_event_count: u64,
+    /// Scanned observations the shared evaluator could not judge the rule
+    /// against. Each is neither a match nor a non-match.
+    pub(super) unevaluated_event_count: u64,
+    /// `unevaluated_event_count` by stable reason: a limitation code
+    /// (`missing_principal_fact`, `missing_dispatch_fact`) or
+    /// `malformed_observation`. Empty when every scanned observation was
+    /// judged.
+    pub(super) unevaluated_reasons: BTreeMap<&'static str, u64>,
     /// The window held more observations than the scan ceiling allowed, so
     /// `match_count` covers only the newest `scanned_event_count` of them.
     pub(super) scan_truncated: bool,
-    /// Every observation in the window was scanned. Never true for a
-    /// truncated scan: a partial count is not evidence of the whole window.
+    /// Every observation in the window was scanned and judged. Never true for
+    /// a truncated scan or one with an unevaluated observation: a partial
+    /// count is not evidence of the whole window.
     pub(super) complete: bool,
     pub(super) sample_strategy: &'static str,
     pub(super) samples: Vec<PolicyRulePreviewSample>,
