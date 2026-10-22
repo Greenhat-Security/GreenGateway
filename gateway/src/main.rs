@@ -141,9 +141,20 @@ use storage::PrincipalDirectoryStore;
 #[cfg(feature = "postgres")]
 use storage::ToolControlPlane;
 
+/// `run()`'s state machine, on the heap. `#[tokio::main]` polls the future it
+/// is given on the main thread's own stack, which is 1 MiB on Windows, and an
+/// unoptimized build of `run()` holds every startup sub-future inline. Built in
+/// a frame of its own, so no stack copy of it outlives this call.
+#[inline(never)]
+fn boxed_run() -> std::pin::Pin<Box<dyn std::future::Future<Output = RunResult>>> {
+    Box::pin(run())
+}
+
+type RunResult = Result<(), Box<dyn std::error::Error>>;
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    match run().await {
+    match boxed_run().await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
             // Rust's Termination impl prints the Debug form, which for a

@@ -300,6 +300,7 @@ pub fn static_config_fingerprint(config: &Config) -> StaticConfigFingerprint {
     insert_egress_restrictions(&mut input, config);
     insert_rate_limit_settings(&mut input, config);
     insert_secret_generation_ids(&mut input, config);
+    insert_authority_event_settings(&mut input, config);
 
     let mut hasher = Sha256::new();
     hasher.update(FINGERPRINT_DOMAIN.as_bytes());
@@ -313,6 +314,41 @@ pub fn static_config_fingerprint(config: &Config) -> StaticConfigFingerprint {
     hasher.update(&canonical);
     StaticConfigFingerprint {
         digest: hasher.finalize().into(),
+    }
+}
+
+fn insert_authority_event_settings(input: &mut BTreeMap<String, String>, config: &Config) {
+    // One journal and one cursor serve the whole deployment, so its
+    // capacity, its retention, where it is delivered and which keys name the
+    // references in it must be one set across replicas: a replica with
+    // another key would derive unrelated references for the same identity
+    // the moment it took the dispatcher lease. The aliases identify the
+    // keys; their material is never read here. The file path is a
+    // per-replica deployment detail, like every other local path.
+    let settings = &config.authority_events;
+    for (name, value) in [
+        ("authority_event_sink", settings.sink.kind().to_owned()),
+        (
+            "authority_pseudonym_key_alias",
+            settings.pseudonym_key_alias.clone().unwrap_or_default(),
+        ),
+        (
+            "authority_pseudonym_previous_key_alias",
+            settings
+                .previous_pseudonym_key_alias
+                .clone()
+                .unwrap_or_default(),
+        ),
+        (
+            "authority_event_journal_capacity",
+            settings.journal_capacity.to_string(),
+        ),
+        (
+            "authority_event_retention_hours",
+            settings.retention_hours.to_string(),
+        ),
+    ] {
+        input.insert(name.into(), value);
     }
 }
 
@@ -1398,6 +1434,65 @@ mod tests {
             static_config_fingerprint(&with_secret),
             static_config_fingerprint(&without_secret),
             "a provider that lost its client secret entirely must not match"
+        );
+    }
+
+    #[test]
+    fn fingerprint_covers_the_authority_event_settings_but_not_the_file_path() {
+        use crate::config::AuthorityEventSinkSetting;
+
+        let base = Config::test_defaults();
+        let fingerprint = |change: &dyn Fn(&mut Config)| {
+            let mut config = base.clone();
+            change(&mut config);
+            static_config_fingerprint(&config)
+        };
+        let unchanged = fingerprint(&|_| {});
+        type ConfigChange = Box<dyn Fn(&mut Config)>;
+        let changes: Vec<(&str, ConfigChange)> = vec![
+            (
+                "the sink kind",
+                Box::new(|config| config.authority_events.sink = AuthorityEventSinkSetting::Log),
+            ),
+            (
+                "the current key alias",
+                Box::new(|config| {
+                    config.authority_events.pseudonym_key_alias = Some("pseudonym-a".to_owned())
+                }),
+            ),
+            (
+                "the previous key alias",
+                Box::new(|config| {
+                    config.authority_events.previous_pseudonym_key_alias =
+                        Some("pseudonym-b".to_owned())
+                }),
+            ),
+            (
+                "the journal capacity",
+                Box::new(|config| config.authority_events.journal_capacity = 17),
+            ),
+            (
+                "the retention window",
+                Box::new(|config| config.authority_events.retention_hours = 1),
+            ),
+        ];
+        for (what, change) in &changes {
+            assert_ne!(
+                fingerprint(change.as_ref()),
+                unchanged,
+                "{what} must participate"
+            );
+        }
+        assert_eq!(
+            fingerprint(&|config| {
+                config.authority_events.sink =
+                    AuthorityEventSinkSetting::File("/var/lib/gateway-a/events.jsonl".to_owned())
+            }),
+            fingerprint(&|config| {
+                config.authority_events.sink =
+                    AuthorityEventSinkSetting::File("/var/lib/gateway-b/events.jsonl".to_owned())
+            }),
+            "the file sink's path is a per-replica detail"
         );
     }
 

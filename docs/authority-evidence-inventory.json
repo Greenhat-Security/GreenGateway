@@ -1,7 +1,7 @@
 {
   "version": 1,
   "issue": 425,
-  "reviewed_revision": "198ab93b92509e4355a937d874b63a117708824f",
+  "reviewed_revision": "146d5063801270fe23852fb6caa946862fb4390f",
   "storage_modes": [
     "postgres",
     "standalone"
@@ -44,6 +44,27 @@
         {
           "path": "gateway/src/config.rs",
           "anchor": "fn reject_local_authority_in_postgres_mode("
+        }
+      ]
+    },
+    "journaled_dispatch": {
+      "description": "Cluster mode (migration 21): the evidence row is journaled in authority_event_journal in its own transaction under its own event_id, reserving one unit of bounded capacity; a full journal refuses the mutation and evicts nothing. With AUTHORITY_EVENT_SINK=log or file, one leased dispatcher reads the journal after a fenced, persisted cursor in bounded batches, delivers authority_event_delivery.v1 records whose actor and resource are keyed safe references, and advances the cursor only after the sink accepted: at least once, deduplicated on (authority_id, event_id). Retention prunes only delivered rows past AUTHORITY_EVENT_RETENTION_HOURS and never an evidence row. With AUTHORITY_EVENT_SINK=none nothing is delivered. The delivered record is not the proposed authority_event.v1: the evidence does not record the actor's issuer or auth mode.",
+      "sources": [
+        {
+          "path": "gateway/src/storage/postgres_authority_events.rs",
+          "anchor": "pub(crate) async fn append_to_journal("
+        },
+        {
+          "path": "gateway/src/authority_events/dispatcher.rs",
+          "anchor": "pub(crate) async fn run_dispatcher("
+        },
+        {
+          "path": "gateway/src/authority_events/delivery.rs",
+          "anchor": "pub(crate) fn project("
+        },
+        {
+          "path": "gateway/src/cluster_maintenance.rs",
+          "anchor": "pub(crate) struct AuthorityEventRetention"
         }
       ]
     }
@@ -513,12 +534,11 @@
       "record": "Outbox tombstone unchanged; connection_documents and bindings cascade. connection_change_evidence (migration 16) has no foreign key, so it survives the cascade; it holds identifiers, revisions and the actor only. Stale ETag, dependency, missing record and lost race write no row.",
       "actor": "actor_user_id (the authenticated principal subject, 1 to 4096 bytes, the principal bound) committed with the delete and retained after it. Issuer, auth mode and a keyed safe actor reference are still absent.",
       "identity": "Generated event_id and operation_id UUIDs, Connection ID, prior version, shared security revision equal to the tombstone's revision, database-clock committed_at. operation_id is minted per store call, not bound to a client idempotency key; a lost response is reconciled by the Connection's evidence row, and a blind retry is NotFound.",
-      "delivery": "post_commit_telemetry",
+      "delivery": "journaled_dispatch",
       "disposition": [
-        "missing_metadata",
-        "missing_delivery"
+        "missing_metadata"
       ],
-      "follow_up": "PR2 follow-up: carry issuer/auth mode and a caller-bound operation identity to the store. PR3: dispatch these rows with a persisted cursor and own their retention so undelivered evidence is never erased. Keyed safe-reference derivation precedes any authority_event.v1 projection.",
+      "follow_up": "PR2 follow-up: carry issuer/auth mode and a caller-bound operation identity to the store, so the delivered record can become authority_event.v1. Delivery (PR3) journals each row in the delete's transaction and dispatches it as authority_event_delivery.v1 behind a persisted cursor; required-durability mode, which would make a configured sink mandatory, is still not implemented.",
       "sources": [
         {
           "path": "gateway/src/storage/migrations/0016_connection_change_evidence.sql",
@@ -535,6 +555,10 @@
         {
           "path": "gateway/src/connections/pg_store.rs",
           "anchor": "async fn record_change_evidence("
+        },
+        {
+          "path": "gateway/src/connections/pg_store.rs",
+          "anchor": "JournalSource::ConnectionChange"
         }
       ],
       "tests": [
@@ -561,10 +585,30 @@
         {
           "path": "gateway/src/storage/migrations.rs",
           "anchor": "async fn migrations_twelve_through_sixteen_preserve_existing_connection_state("
+        },
+        {
+          "path": "gateway/src/authority_events/dispatcher_tests.rs",
+          "anchor": "async fn committed_events_are_delivered_in_commit_order_under_their_evidence_ids("
+        },
+        {
+          "path": "gateway/src/authority_events/dispatcher_tests.rs",
+          "anchor": "async fn a_crash_between_acceptance_and_the_cursor_commit_redelivers_identical_records("
+        },
+        {
+          "path": "gateway/src/authority_events/dispatcher_tests.rs",
+          "anchor": "async fn retention_never_prunes_an_undelivered_event("
+        },
+        {
+          "path": "gateway/src/authority_events/dispatcher_tests.rs",
+          "anchor": "async fn capacity_exhaustion_refuses_the_mutation_and_commits_nothing("
+        },
+        {
+          "path": "gateway/src/storage/migrations.rs",
+          "anchor": "async fn migration_twenty_one_journals_existing_evidence_in_commit_order("
         }
       ],
       "required_durability_supported": false,
-      "test_claim": "PostgreSQL-gated regression anchors for the transactional deletion evidence. They do not certify the proposed authority-event contract, delivery or retention."
+      "test_claim": "PostgreSQL-gated regression anchors for the transactional deletion evidence and its journaled delivery: commit order, crash redelivery under the same event IDs, retention floors and capacity refusal. They do not certify the proposed authority_event.v1 contract."
     },
     {
       "id": "connection_delete_standalone",
@@ -1003,12 +1047,11 @@
       "record": "Outbox revision chain unchanged. service_token_change_evidence (migration 18) has no foreign key, so it survives removal of the token row and a restart; it holds the actor, action, event/operation UUIDs, prior/new row revision, shared revision and database-clock committed_at, never the plaintext, hash, display prefix or scopes. The token row still names only its creator.",
       "actor": "actor_user_id: the authenticated principal subject the admin endpoint passes through ServiceTokenStore (1 to 4096 bytes, the principal bound), committed with each rotate and revoke and retained after it. Issuer, auth mode and a keyed safe actor reference are still absent.",
       "identity": "Generated event_id and operation_id UUIDs per store call (not bound to a client idempotency key), token ID, from/to row revisions and shared revision equal to the outbox row, database-clock committed_at; the action distinguishes rotate from revoke. A lost revoke response is reconciled from the token's evidence, and the repeat revoke records nothing. A lost rotate response cannot return its plaintext: the evidence shows the rotation committed, and rotating again records a second row.",
-      "delivery": "post_commit_telemetry",
+      "delivery": "journaled_dispatch",
       "disposition": [
-        "missing_metadata",
-        "missing_delivery"
+        "missing_metadata"
       ],
-      "follow_up": "PR2 follow-up: carry issuer/auth mode and a caller-bound operation identity to the store; token issue still records only created_by. PR3: dispatch these rows with a persisted cursor and own their retention so undelivered evidence is never erased. Keyed safe-reference derivation precedes any authority_event.v1 projection.",
+      "follow_up": "PR2 follow-up: carry issuer/auth mode and a caller-bound operation identity to the store; token issue still records only created_by and is not journaled. Delivery (PR3) journals each row in the change's transaction and dispatches it as authority_event_delivery.v1 behind a persisted cursor; required-durability mode is still not implemented.",
       "sources": [
         {
           "path": "gateway/src/storage/migrations/0018_service_token_and_jwt_evidence.sql",
@@ -1037,6 +1080,10 @@
         {
           "path": "gateway/src/admin_tokens.rs",
           "anchor": "store.rotate(&token_id, &principal.user_id)"
+        },
+        {
+          "path": "gateway/src/storage/postgres_service_tokens.rs",
+          "anchor": "JournalSource::ServiceTokenChange"
         }
       ],
       "tests": [
@@ -1067,10 +1114,30 @@
         {
           "path": "gateway/src/storage/migrations.rs",
           "anchor": "async fn migration_eighteen_fabricates_no_evidence_for_existing_tokens_or_revocations("
+        },
+        {
+          "path": "gateway/src/authority_events/dispatcher_tests.rs",
+          "anchor": "async fn committed_events_are_delivered_in_commit_order_under_their_evidence_ids("
+        },
+        {
+          "path": "gateway/src/authority_events/dispatcher_tests.rs",
+          "anchor": "async fn a_crash_between_acceptance_and_the_cursor_commit_redelivers_identical_records("
+        },
+        {
+          "path": "gateway/src/authority_events/dispatcher_tests.rs",
+          "anchor": "async fn retention_never_prunes_an_undelivered_event("
+        },
+        {
+          "path": "gateway/src/authority_events/dispatcher_tests.rs",
+          "anchor": "async fn capacity_exhaustion_refuses_the_mutation_and_commits_nothing("
+        },
+        {
+          "path": "gateway/src/storage/migrations.rs",
+          "anchor": "async fn migration_twenty_one_journals_existing_evidence_in_commit_order("
         }
       ],
       "required_durability_supported": false,
-      "test_claim": "PostgreSQL-gated regression anchors for the transactional rotate/revoke evidence. They do not certify the proposed authority-event contract, delivery or retention."
+      "test_claim": "PostgreSQL-gated regression anchors for the transactional rotate/revoke evidence and its journaled delivery: commit order, crash redelivery under the same event IDs, retention floors and capacity refusal. They do not certify the proposed authority_event.v1 contract."
     },
     {
       "id": "token_change_standalone",
@@ -1165,12 +1232,11 @@
       "record": "Outbox keeps scoped JTI digest/revision. The revocation row's actor is still overwritten by an extension or reactivation and the row is deleted by expiry cleanup, but jwt_revocation_evidence (migration 18, no foreign key, never touched by cleanup) keeps one append-only row per effective revoke: actor, action, issuer, JTI digest, the expiry the row then carried, shared revision and database-clock committed_at. No raw JTI.",
       "actor": "The CLI records its literal system label operator:revoke-jwt on the row and in the evidence: system provenance, not an authenticated human identity. Each extension or reactivation keeps its own actor in its own evidence row. No actor kind, issuer or auth mode column yet.",
       "identity": "Deployment+issuer-scoped JTI digest, generated event_id/operation_id UUIDs and the committed shared revision, equal to the outbox row's; outbox to_version=1 is still not a per-JWT version chain. No caller-bound operation ID.",
-      "delivery": "operator_output",
+      "delivery": "journaled_dispatch",
       "disposition": [
-        "missing_metadata",
-        "missing_delivery"
+        "missing_metadata"
       ],
-      "follow_up": "PR2 follow-up: an explicit system/principal actor kind if an authenticated revoke path ships; do not pretend the CLI authenticates a named operator. PR3: dispatch the evidence and own its retention independently of denylist cleanup.",
+      "follow_up": "PR2 follow-up: an explicit system/principal actor kind if an authenticated revoke path ships; do not pretend the CLI authenticates a named operator. Delivery (PR3) journals each effective revoke in its transaction and dispatches it independently of denylist cleanup; required-durability mode is still not implemented.",
       "sources": [
         {
           "path": "gateway/src/bootstrap.rs",
@@ -1191,6 +1257,10 @@
         {
           "path": "gateway/src/storage/migrations/0018_service_token_and_jwt_evidence.sql",
           "anchor": "CREATE TABLE greengateway.jwt_revocation_evidence ("
+        },
+        {
+          "path": "gateway/src/storage/postgres_jwt_revocations.rs",
+          "anchor": "JournalSource::JwtRevocation"
         }
       ],
       "tests": [
@@ -1213,10 +1283,30 @@
         {
           "path": "gateway/src/storage/contract_tests.rs",
           "anchor": "async fn a_revoke_that_lapses_during_the_lock_wait_is_refused("
+        },
+        {
+          "path": "gateway/src/authority_events/dispatcher_tests.rs",
+          "anchor": "async fn committed_events_are_delivered_in_commit_order_under_their_evidence_ids("
+        },
+        {
+          "path": "gateway/src/authority_events/dispatcher_tests.rs",
+          "anchor": "async fn a_crash_between_acceptance_and_the_cursor_commit_redelivers_identical_records("
+        },
+        {
+          "path": "gateway/src/authority_events/dispatcher_tests.rs",
+          "anchor": "async fn retention_never_prunes_an_undelivered_event("
+        },
+        {
+          "path": "gateway/src/authority_events/dispatcher_tests.rs",
+          "anchor": "async fn capacity_exhaustion_refuses_the_mutation_and_commits_nothing("
+        },
+        {
+          "path": "gateway/src/storage/migrations.rs",
+          "anchor": "async fn migration_twenty_one_journals_existing_evidence_in_commit_order("
         }
       ],
       "required_durability_supported": false,
-      "test_claim": "PostgreSQL-gated regression anchors for the transactional JWT revocation evidence. They do not certify the proposed authority-event contract, delivery or retention."
+      "test_claim": "PostgreSQL-gated regression anchors for the transactional JWT revocation evidence and its journaled delivery: commit order, crash redelivery under the same event IDs, retention floors and capacity refusal. They do not certify the proposed authority_event.v1 contract."
     },
     {
       "id": "jwt_standalone",

@@ -205,6 +205,7 @@ fn test_config(cors_allow_origins: Vec<&str>) -> config::Config {
         readiness_probe_cache_ms: config::DEFAULT_READINESS_PROBE_CACHE_MS,
         cluster_status_expose_hostnames: false,
         audit_postgres_retention_days: None,
+        authority_events: Default::default(),
         tool_runtime_default_timeout_ms: config::DEFAULT_TOOL_RUNTIME_DEFAULT_TIMEOUT_MS,
         csrf_enabled: true,
         csrf_cookie_name: "csrf_token".to_owned(),
@@ -8603,6 +8604,13 @@ fn expected_ha_metric_names() -> Vec<&'static str> {
         metrics::AUDIT_STREAM_CONNECTIONS_TOTAL,
         metrics::AUDIT_STREAM_REPLAY_BACKLOG_EVENTS,
         metrics::AUDIT_STREAM_DUPLICATE_POSITIONS_TOTAL,
+        metrics::AUTHORITY_EVENT_JOURNAL_RETAINED,
+        metrics::AUTHORITY_EVENT_JOURNAL_CAPACITY,
+        metrics::AUTHORITY_EVENT_UNDELIVERED,
+        metrics::AUTHORITY_EVENT_OLDEST_UNDELIVERED_AGE_SECONDS,
+        metrics::AUTHORITY_EVENT_DELIVERED_TOTAL,
+        metrics::AUTHORITY_EVENT_DELIVERY_FAILURES_TOTAL,
+        metrics::AUTHORITY_EVENT_CAPACITY_REFUSALS_TOTAL,
     ]);
     names
 }
@@ -8648,6 +8656,11 @@ fn ha_label_vocabularies() -> Vec<(&'static str, &'static str, Vec<&'static str>
             metrics::DISCOVERY_PROJECTOR_ERRORS_TOTAL,
             "kind",
             discovery::projector::PROJECTOR_ERROR_KINDS.to_vec(),
+        ),
+        (
+            metrics::AUTHORITY_EVENT_DELIVERY_FAILURES_TOTAL,
+            "kind",
+            authority_events::dispatcher::FAILURE_KINDS.to_vec(),
         ),
         (
             metrics::AUDIT_STREAM_CONNECTIONS_TOTAL,
@@ -8902,6 +8915,25 @@ async fn synthetic_ha_run() {
         }
         record_audit_stream_replay_backlog(512);
         record_audit_stream_duplicates(1);
+
+        // Authority-event delivery: the journal gauges, every failure step,
+        // a delivered batch and a refused mutation. None names an event,
+        // an actor, a resource or a position.
+        authority_events::dispatcher::record_journal_stats(
+            &storage::postgres_authority_events::JournalStats {
+                retained: 7,
+                capacity: 1_000_000,
+                head: 41,
+                cursor: Some(38),
+                first_retained: Some(35),
+                oldest_undelivered_age_secs: Some(12.5),
+            },
+        );
+        for kind in authority_events::dispatcher::FAILURE_KINDS {
+            authority_events::dispatcher::record_failure(kind);
+        }
+        authority_events::dispatcher::record_delivered(3);
+        storage::postgres_authority_events::record_capacity_refusal();
     }
 }
 
