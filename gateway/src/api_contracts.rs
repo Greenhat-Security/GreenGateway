@@ -356,6 +356,24 @@ pub(super) struct PolicyValidationResponse {
     pub(super) errors: Vec<String>,
 }
 
+/// `POST /policy/validate`: the original `valid`/`errors` pair, plus the
+/// structured diagnostics and digests of the inspected document.
+#[derive(Serialize)]
+pub(super) struct PolicyInspectionResponse<'a> {
+    pub(super) valid: bool,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    pub(super) errors: &'a [String],
+    /// The document's `schema_version` when it names a schema this gateway
+    /// implements.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) schema_version: Option<&'a str>,
+    pub(super) diagnostics: &'a [rbac::policy_document::PolicyDiagnostic],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) source_digest: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) semantic_digest: Option<&'a str>,
+}
+
 #[derive(Deserialize)]
 pub(super) struct PolicyRulePreviewRequest {
     pub(super) rule: rbac::Rule,

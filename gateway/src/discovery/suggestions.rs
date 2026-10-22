@@ -2444,6 +2444,7 @@ mod tests {
             },
         );
         covered_policy.routes.push(crate::rbac::RouteRule {
+            id: None,
             methods: vec!["GET".to_owned()],
             hosts: vec!["api.example.test".to_owned()],
             path_prefix: "/invoices".to_owned(),

@@ -90,10 +90,11 @@ use crate::{
 };
 
 /// The policy/tools document schema range this binary enforces, in
-/// major versions. The policy document's `schema_version` must start
-/// with `0.` (`rbac/policy.rs`), and the tools document rides the same
-/// major; the range is advertised so a rolling window can tell a
-/// document-format change apart from a schema change.
+/// major versions. A cluster replica serves only a 0.x policy document
+/// (`rbac/policy_document.rs`; policy v1, format 1, is standalone-only
+/// until a capability lets every replica agree to read it), and the tools
+/// document rides the same major; the range is advertised so a rolling
+/// window can tell a document-format change apart from a schema change.
 pub(crate) const DOCUMENT_VERSION_RANGE: (i32, i32) = (0, 0);
 
 /// How long the draining stamp may take once the lifecycle cancels

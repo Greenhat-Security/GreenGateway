@@ -148,7 +148,10 @@ keys. Framing it as `semantic` would place a different value under the frame the
 real JCS digest will use, with nothing in the frame to tell them apart. Existing
 normalization and the ad hoc policy ETag are likewise not relabeled. A semantic
 digest requires the ADR's normalization and JCS contract across the other
-resource lanes.
+resource lanes. Policy v1 now defines that normalization for the policy document
+itself (`rbac/policy_document.rs`), and the policy validation API reports its
+JCS semantic digest; no kernel snapshot binds it yet, so the bindings above are
+unchanged.
 
 A standalone snapshot binds that source without inventing a persistent revision.
 A PostgreSQL snapshot additionally binds a nonnegative security watermark (zero
