@@ -933,7 +933,10 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => None,
     };
-    let metrics_handle = install_metrics_recorder()?;
+    // Seeds every counter a single-event alert reads at zero (the
+    // cluster-only ones in cluster mode), so the first event moves 0 -> 1.
+    let metrics_handle =
+        install_metrics_recorder(config.state_backend == config::StateBackend::Postgres)?;
     let listen_addr = config.listen_addr;
     let admin_listen_addr = config.admin_listen_addr;
     // Loaded before any listener binds. Certificate and key problems must abort

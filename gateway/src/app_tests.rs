@@ -9061,6 +9061,74 @@ fn the_ha_metric_registry_never_labels_by_a_caller_influenced_value() {
     }
 }
 
+/// Every counter series a single-event alert reads is exported at `0`
+/// right after the recorder is installed, so the first event after a
+/// process start moves it `0 -> 1` and `increase(...[5m]) > 0` sees it.
+///
+/// A series that first appears at `1` has no earlier sample to compare
+/// against, so before this a single refused authority change after a
+/// restart never paged (issue #440 review). The registry is built and
+/// registered exactly as `install_metrics_recorder` does, minus making it
+/// process-global. Each family exports exactly its emitters' vocabulary,
+/// cluster-only series only in cluster mode, and the dispatcher's failure
+/// counter stays lazy because its presence marks a configured sink.
+#[test]
+fn single_event_alert_counters_are_exported_at_zero_right_after_install() {
+    for cluster in [false, true] {
+        let recorder = metrics_recorder_builder().build_recorder();
+        let handle = recorder.handle();
+        ::metrics::with_local_recorder(&recorder, || register_metrics(cluster));
+        let rendered = handle.render();
+        let samples: Vec<&str> = rendered
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .collect();
+        let family = |name: &str| {
+            samples
+                .iter()
+                .copied()
+                .filter(|line| rendered_metric_name(line) == name)
+                .collect::<Vec<&str>>()
+        };
+        let cluster_seeded = cluster && cfg!(feature = "postgres");
+
+        let mut drop_reasons = audit::LOCAL_DROP_REASONS.to_vec();
+        if cluster_seeded {
+            drop_reasons.push("postgres");
+        }
+        let mut drops = family("audit_events_dropped_total");
+        drops.sort_unstable();
+        let mut expected_drops: Vec<String> = drop_reasons
+            .iter()
+            .map(|reason| format!("audit_events_dropped_total{{reason=\"{reason}\"}} 0"))
+            .collect();
+        expected_drops.sort_unstable();
+        assert_eq!(drops, expected_drops, "cluster={cluster}:\n{rendered}");
+        assert_eq!(
+            family("greengateway_audit_flush_total"),
+            ["greengateway_audit_flush_total{outcome=\"failure\"} 0"],
+            "cluster={cluster}:\n{rendered}"
+        );
+
+        for name in [
+            "greengateway_database_pool_timeouts_total",
+            "greengateway_authority_event_capacity_refusals_total",
+            "greengateway_authority_event_evidence_failures_total",
+        ] {
+            let expected = if cluster_seeded {
+                vec![format!("{name} 0")]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(family(name), expected, "cluster={cluster}:\n{rendered}");
+        }
+        assert!(
+            family("greengateway_authority_event_delivery_failures_total").is_empty(),
+            "a seeded dispatcher failure series would mark every replica as having a sink:\n{rendered}"
+        );
+    }
+}
+
 /// The pool-acquisition histogram's series are the product of two fixed
 /// lists and nothing more (issue #439).
 ///
