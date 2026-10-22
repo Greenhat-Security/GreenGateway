@@ -5,8 +5,9 @@ Results are meaningful only when the same revision, release build, machine
 class, container limits, network topology, and load command are recorded.
 
 The separate [pure-path microbenchmark gate](pure-path-benchmarks.md) compares
-allocation budgets for small request, path-pattern and static host predicates
-on each PR. Its wall-clock timings are informational, and it leaves the full
+allocation budgets for small request, path-pattern and static host predicates,
+and for the shared policy evaluator's HTTP, tool and rate-lane decisions, on
+each PR. Its wall-clock timings are informational, and it leaves the full
 proxy load and release qualification described here in place.
 
 ## Reproduce
@@ -36,6 +37,11 @@ The scripts write machine-readable JSON under
 evidence. Record `docker stats`, gateway `/proc/1/status`, descriptor count, and
 upstream accept evidence as described in the
 [deployment guide](../deployment/production-data-plane.md#load-and-soak-reproduction).
+
+These commands target the seeded development stack. Against a real deployment,
+`node scripts/run-load-suite.mjs --profile <file>` runs a representative route
+against explicit SLO targets instead; see
+[the qualification kit](../deployment/qualification.md#3-representative-load-and-slo).
 
 ## Comparison rules
 

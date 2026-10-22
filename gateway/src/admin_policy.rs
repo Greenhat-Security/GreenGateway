@@ -287,17 +287,50 @@ pub(super) async fn policy_validate_endpoint(
         Err(response) => return *response,
     };
 
-    match parse_policy_body(&body) {
-        Ok(policy) => match rbac_state.validate_proxy_dispatch_policy(&policy) {
-            Ok(()) => Json(PolicyValidationResponse {
-                valid: true,
-                errors: Vec::new(),
-            })
-            .into_response(),
-            Err(error) => policy_validation_failed(vec![policy_error_message(&error)]),
-        },
-        Err(errors) => policy_validation_failed(errors),
+    let mut inspection = rbac::policy_document::inspect_source(&body);
+    // What the document cannot show about itself: whether this deployment
+    // can enforce and commit it. The same checks refuse a replace.
+    let dispatch_error = inspection.policy().and_then(|policy| {
+        rbac_state
+            .validate_proxy_dispatch_policy(policy)
+            .err()
+            .map(|error| policy_error_message(&error))
+    });
+    if let Some(detail) = dispatch_error {
+        inspection.refuse(
+            rbac::policy_document::IssueCode::DispatchNotConfigured,
+            "/rules",
+            detail,
+        );
     }
+    let format_error = inspection
+        .policy()
+        .and_then(|policy| deployment_document_format_refusal(&state, policy));
+    if let Some(detail) = format_error {
+        inspection.refuse(
+            rbac::policy_document::IssueCode::DocumentFormatUnsupportedInCluster,
+            "/schema_version",
+            detail,
+        );
+    }
+
+    let status = if inspection.is_valid() {
+        StatusCode::OK
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    (
+        status,
+        Json(PolicyInspectionResponse {
+            valid: inspection.is_valid(),
+            errors: inspection.error_details(),
+            schema_version: inspection.schema_version(),
+            diagnostics: inspection.diagnostics(),
+            source_digest: inspection.source_digest(),
+            semantic_digest: inspection.semantic_digest(),
+        }),
+    )
+        .into_response()
 }
 
 pub(super) async fn policy_rule_post_endpoint(
@@ -696,7 +729,11 @@ pub(super) async fn policy_rule_hits_endpoint(
     let Some(query_store) = state.query_store.as_ref() else {
         return policy_evidence_unavailable("policy rule hit counts require an audit query store");
     };
-    let policy = rbac_state.current_policy();
+    // Recorded results, not an evaluation: each count is how many observed
+    // requests the gateway attributed to a rule id when it decided them. The
+    // ids come from the live snapshot's own attribution, the one that writes
+    // `matched_rule_id`, so the two cannot derive a rule's id differently.
+    let snapshot = rbac_state.live_policy_snapshot();
     let counts = match query_store.rule_hit_counts().await {
         Ok(counts) => counts,
         Err(err) => {
@@ -706,14 +743,12 @@ pub(super) async fn policy_rule_hits_endpoint(
     };
 
     Json(PolicyRuleHitsResponse {
-        rules: policy
-            .rules
+        rules: snapshot
+            .rule_ids()
             .iter()
-            .enumerate()
-            .map(|(rule_index, rule)| {
-                let rule_id = rule.id.clone().unwrap_or_else(|| rule_index.to_string());
-                let hits = counts.get(&rule_id).copied().unwrap_or(0);
-                PolicyRuleHitCount { rule_id, hits }
+            .map(|rule_id| PolicyRuleHitCount {
+                rule_id: rule_id.clone(),
+                hits: counts.get(rule_id).copied().unwrap_or(0),
             })
             .collect(),
     })
@@ -1247,11 +1282,11 @@ pub(super) fn parse_openapi_tools_register_body(
     })
 }
 
+/// A whole-policy request body, read from its bytes so a v1 document is
+/// held to its exact-source rules. A 0.x document reports its single error
+/// in the words it always has; a v1 document reports every structural one.
 pub(super) fn parse_policy_body(body: &Bytes) -> Result<rbac::Policy, Vec<String>> {
-    let value = serde_json::from_slice::<Value>(body)
-        .map_err(|err| vec![format!("invalid JSON: {err}")])?;
-
-    rbac::Policy::validate_json_value(value).map_err(|err| vec![policy_error_message(&err)])
+    rbac::policy_document::inspect_source(body).into_policy()
 }
 
 pub(super) fn parse_rule_body(body: &Bytes) -> Result<rbac::Rule, Vec<String>> {
@@ -1331,20 +1366,67 @@ pub(super) fn validate_rule_preview_request(
 pub(super) async fn preview_rule(
     query_store: &dyn storage::AuditEventStore,
     request: PolicyRulePreviewRequest,
-) -> Result<PolicyRulePreviewResponse, storage::RepositoryError> {
+) -> Result<PolicyRulePreviewResponse, RulePreviewError> {
     preview_rule_with_scan_limit(query_store, request, MAX_RULE_PREVIEW_SCAN_ROWS).await
+}
+
+/// Why a rule preview failed instead of answering.
+#[derive(Debug)]
+pub(super) enum RulePreviewError {
+    /// The audit store could not be read.
+    Storage(storage::RepositoryError),
+    /// The evaluator refused the question the preview built, rather than an
+    /// observation's facts. Only a preview bug can cause that, and ADR-0004
+    /// fails an analysis on it rather than counting around it.
+    Evaluation(policy_eval::EvaluationError),
+}
+
+impl std::fmt::Display for RulePreviewError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Storage(error) => write!(formatter, "audit store read failed: {error}"),
+            Self::Evaluation(error) => write!(formatter, "policy evaluation failed: {error:?}"),
+        }
+    }
+}
+
+impl From<storage::RepositoryError> for RulePreviewError {
+    fn from(error: storage::RepositoryError) -> Self {
+        Self::Storage(error)
+    }
+}
+
+/// The reason a preview reports for an observation whose recorded facts the
+/// evaluator refused: a method, path, principal or routing context no served
+/// request could have presented to the policy stage.
+pub(super) const PREVIEW_MALFORMED_OBSERVATION: &str = "malformed_observation";
+
+/// How the shared evaluator answered the candidate rule for one observation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PreviewObservationOutcome {
+    Matched,
+    NotMatched,
+    /// Neither: the evaluator could not judge the rule against this
+    /// observation, for this stable reason.
+    Unevaluated(&'static str),
 }
 
 /// Scan at most `max_scan_rows` observations, newest first, however wide the
 /// requested window is. A window holding more rows than that answers with
 /// `scan_truncated` and `complete: false`, so a count over the newest rows is
 /// never presented as a count over the whole window.
+///
+/// Each scanned observation is judged by the shared evaluator
+/// ([`policy_eval::CompiledPolicy::match_direct_rules`]) over the candidate
+/// rule alone. An observation it cannot judge is counted, by reason, in
+/// `unevaluated_reasons` rather than as a non-match, and makes the answer
+/// incomplete: a count that skipped it is a lower bound, not the count.
 pub(super) async fn preview_rule_with_scan_limit(
     query_store: &dyn storage::AuditEventStore,
     request: PolicyRulePreviewRequest,
     max_scan_rows: usize,
-) -> Result<PolicyRulePreviewResponse, storage::RepositoryError> {
-    let matcher = rbac::RuleMatcher::new(std::slice::from_ref(&request.rule));
+) -> Result<PolicyRulePreviewResponse, RulePreviewError> {
+    let candidate = policy_eval::CompiledPolicy::for_candidate_rule(request.rule.clone());
     let sample_limit = request
         .sample_limit
         .unwrap_or(DEFAULT_RULE_PREVIEW_SAMPLE_LIMIT)
@@ -1352,6 +1434,8 @@ pub(super) async fn preview_rule_with_scan_limit(
     let max_scan_rows = u64::try_from(max_scan_rows).unwrap_or(u64::MAX);
     let mut match_count = 0_u64;
     let mut scanned_event_count = 0_u64;
+    let mut unevaluated_event_count = 0_u64;
+    let mut unevaluated_reasons = BTreeMap::<&'static str, u64>::new();
     let mut scan_truncated = false;
     let mut samples = Vec::with_capacity(sample_limit);
 
@@ -1378,46 +1462,20 @@ pub(super) async fn preview_rule_with_scan_limit(
             }
             filters.before_id = Some(observation.id);
             scanned_event_count = scanned_event_count.saturating_add(1);
-            let principal = observation
-                .actor
-                .as_ref()
-                .and_then(principal_from_audit_actor);
-            let payload = serde_json::from_str::<Value>(&observation.payload_json).ok();
-            let payload_string = |key: &str| {
-                payload
-                    .as_ref()
-                    .and_then(|payload| payload.get(key))
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.trim().is_empty())
-            };
-            let dispatch_context = if payload
-                .as_ref()
-                .and_then(|payload| payload.get("routing_context_known"))
-                .and_then(Value::as_bool)
-                == Some(true)
+            match preview_observation_outcome(&candidate, &observation)
+                .map_err(RulePreviewError::Evaluation)?
             {
-                rbac::RuleDispatchContext::classified_with_route_id(
-                    payload_string("upstream_route_id"),
-                    payload_string("upstream_route_host"),
-                    payload_string("upstream_route_path_prefix"),
-                    payload_string("upstream_origin"),
-                )
-            } else {
-                rbac::RuleDispatchContext::unknown()
-            };
-
-            if matcher
-                .evaluate_with_dispatch(
-                    &observation.method,
-                    &observation.path,
-                    principal.as_ref(),
-                    dispatch_context,
-                )
-                .is_some()
-            {
-                match_count = match_count.saturating_add(1);
-                if samples.len() < sample_limit {
-                    samples.push(preview_sample(observation));
+                PreviewObservationOutcome::Matched => {
+                    match_count = match_count.saturating_add(1);
+                    if samples.len() < sample_limit {
+                        samples.push(preview_sample(observation));
+                    }
+                }
+                PreviewObservationOutcome::NotMatched => {}
+                PreviewObservationOutcome::Unevaluated(reason) => {
+                    unevaluated_event_count = unevaluated_event_count.saturating_add(1);
+                    let count = unevaluated_reasons.entry(reason).or_insert(0);
+                    *count = count.saturating_add(1);
                 }
             }
         }
@@ -1426,11 +1484,90 @@ pub(super) async fn preview_rule_with_scan_limit(
     Ok(PolicyRulePreviewResponse {
         match_count,
         scanned_event_count,
+        unevaluated_event_count,
+        unevaluated_reasons,
         scan_truncated,
-        complete: !scan_truncated,
+        complete: !scan_truncated && unevaluated_event_count == 0,
         sample_strategy: "newest_matches",
         samples,
     })
+}
+
+/// Ask the shared evaluator whether the candidate rule matches one retained
+/// observation, from the facts the observation recorded.
+///
+/// The facts are the ones the live HTTP adapter supplies, as the observation
+/// recorded them: the method and exact path, the actor as a principal, and the
+/// routing classification with its dispatch facts when `routing_context_known`
+/// is set. An actor whose authentication mode no principal can carry is a
+/// missing principal, not an anonymous one, and an unclassified observation a
+/// missing dispatch; the evaluator answers either only when the rule reads it.
+/// A fact the evaluator refuses -- a path no served request reaches the policy
+/// stage with, for one -- makes the observation unevaluated, as does a method
+/// that does not parse. Any other evaluator error is this function's own and
+/// is returned.
+pub(super) fn preview_observation_outcome(
+    candidate: &policy_eval::CompiledPolicy,
+    observation: &audit::query::RequestObservation,
+) -> Result<PreviewObservationOutcome, policy_eval::EvaluationError> {
+    let unevaluated = PreviewObservationOutcome::Unevaluated(PREVIEW_MALFORMED_OBSERVATION);
+    let Ok(method) = Method::from_bytes(observation.method.as_bytes()) else {
+        return Ok(unevaluated);
+    };
+    let payload = serde_json::from_str::<Value>(&observation.payload_json).ok();
+    let payload_string = |key: &str| {
+        payload
+            .as_ref()
+            .and_then(|payload| payload.get(key))
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+    };
+    let routing_context_known = payload
+        .as_ref()
+        .and_then(|payload| payload.get("routing_context_known"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    let (target, dispatch) = if routing_context_known {
+        match policy_eval::analysis::recorded_dispatch(
+            payload_string("upstream_route_id"),
+            payload_string("upstream_route_host"),
+            payload_string("upstream_route_path_prefix"),
+            payload_string("upstream_origin"),
+        ) {
+            Ok(recorded) => recorded,
+            Err(error) if error.rejects_supplied_facts() => return Ok(unevaluated),
+            Err(error) => return Err(error),
+        }
+    } else {
+        (policy_eval::HttpTarget::Missing, None)
+    };
+    let context = policy_eval::PolicyEvaluationContext {
+        version: policy_eval::CONTEXT_VERSION,
+        snapshot: candidate.snapshot(),
+        method: Some(method),
+        path: Some(observation.path.clone()),
+        principal: audit_actor_principal_fact(observation.actor.as_ref()),
+        target,
+        // The preview's question reads no host; an observation's recorded
+        // host is not offered as one.
+        request_host: policy_eval::HostFact::Missing,
+        dispatch,
+    };
+    match candidate.match_direct_rules(&context) {
+        Ok(answer) => Ok(match answer {
+            policy_eval::analysis::DirectRuleOutcome::Matched { .. } => {
+                PreviewObservationOutcome::Matched
+            }
+            policy_eval::analysis::DirectRuleOutcome::NoMatch => {
+                PreviewObservationOutcome::NotMatched
+            }
+            policy_eval::analysis::DirectRuleOutcome::Indeterminate(limitation) => {
+                PreviewObservationOutcome::Unevaluated(limitation.as_str())
+            }
+        }),
+        Err(error) if error.rejects_supplied_facts() => Ok(unevaluated),
+        Err(error) => Err(error),
+    }
 }
 
 pub(super) fn exact_preview_path_filter(pattern: &str) -> Option<String> {
@@ -1491,23 +1628,39 @@ pub(super) fn preview_path_filter(pattern: &str) -> PreviewPathFilter {
     }
 }
 
-pub(super) fn principal_from_audit_actor(actor: &audit::Actor) -> Option<auth::Principal> {
+/// The principal fact a retained observation's actor supplies.
+///
+/// No actor is an anonymous request. An actor is the principal the live
+/// adapter judged, projected to the policy facts the audit record keeps:
+/// subject, issuer, roles and the authentication mode, each of the four modes
+/// a principal can carry. A mode none of them names cannot be turned into a
+/// principal, so the fact is missing rather than guessed; before the cutover
+/// such an actor, and every client-certificate actor, was judged as
+/// anonymous.
+pub(super) fn audit_actor_principal_fact(
+    actor: Option<&audit::Actor>,
+) -> policy_eval::PrincipalFact {
+    let Some(actor) = actor else {
+        return policy_eval::PrincipalFact::Anonymous;
+    };
     let auth_method = match actor.auth_mode.as_str() {
         rbac::rule::AUTH_METHOD_BEARER_TOKEN => auth::AuthMethod::Bearer,
         rbac::rule::AUTH_METHOD_SESSION_COOKIE => auth::AuthMethod::Cookie,
         rbac::rule::AUTH_METHOD_SERVICE_TOKEN => auth::AuthMethod::ServiceToken,
-        _ => return None,
+        rbac::rule::AUTH_METHOD_CLIENT_CERTIFICATE => auth::AuthMethod::ClientCertificate,
+        _ => return policy_eval::PrincipalFact::Missing,
     };
-
-    Some(auth::Principal {
-        user_id: actor.user_id.clone(),
-        issuer: actor.issuer.clone(),
-        email: actor.email.clone(),
-        org_id: None,
-        roles: actor.roles.clone().unwrap_or_default(),
-        session_id: "audit-history".to_owned(),
-        auth_method,
-    })
+    policy_eval::PrincipalFact::Authenticated(policy_eval::PrincipalIdentity::from_principal(
+        &auth::Principal {
+            user_id: actor.user_id.clone(),
+            issuer: actor.issuer.clone(),
+            email: None,
+            org_id: None,
+            roles: actor.roles.clone().unwrap_or_default(),
+            session_id: String::new(),
+            auth_method,
+        },
+    ))
 }
 
 pub(super) fn preview_sample(
@@ -2010,6 +2163,12 @@ pub(super) async fn persist_policy_mutation(
 /// through [`persist_policy_mutation`] and a discovery suggestion's
 /// acceptance, which commits the whole document with the new rule in it. A
 /// control plane with no roster to read refuses rather than admits.
+///
+/// Before any of that, the document's format must be one every replica can
+/// read. This build advertises `cluster_membership::DOCUMENT_VERSION_RANGE`,
+/// and a policy v1 document lies outside it: a replica built before v1
+/// refuses the whole document, and no capability gates v1 yet, so the
+/// commit is refused here with a `400` and nothing is written.
 #[cfg(feature = "postgres")]
 pub(super) async fn admit_policy_document(
     state: &PolicyAdminState,
@@ -2017,6 +2176,9 @@ pub(super) async fn admit_policy_document(
     principal: &auth::Principal,
     candidate: &rbac::Policy,
 ) -> ResponseResult<()> {
+    if let Some(detail) = cluster_document_format_refusal(candidate) {
+        return Err(Box::new(policy_validation_failed(vec![detail])));
+    }
     if !candidate.uses_role_descriptions() {
         return Ok(());
     }
@@ -2044,6 +2206,39 @@ pub(super) async fn admit_policy_document(
         .await
         .map(|_| ())
         .map_err(|refusal| Box::new(operation_refused(&refusal)))
+}
+
+/// Why this deployment could not commit `policy`, if it could not. Only
+/// cluster mode restricts document formats; a standalone gateway commits
+/// every format it parses.
+pub(super) fn deployment_document_format_refusal(
+    state: &PolicyAdminState,
+    policy: &rbac::Policy,
+) -> Option<String> {
+    #[cfg(feature = "postgres")]
+    if state.control_plane.is_some() {
+        return cluster_document_format_refusal(policy);
+    }
+    #[cfg(not(feature = "postgres"))]
+    let _ = (state, policy);
+    None
+}
+
+/// Why cluster mode cannot commit `policy`, if it cannot: its document
+/// format major is outside the range every replica of this build
+/// advertises and reads.
+#[cfg(feature = "postgres")]
+pub(super) fn cluster_document_format_refusal(policy: &rbac::Policy) -> Option<String> {
+    if policy.cluster_serves_document_format() {
+        return None;
+    }
+    let (minimum, maximum) = cluster_membership::DOCUMENT_VERSION_RANGE;
+    Some(format!(
+        "policy schema_version '{}' cannot be committed in cluster mode: replicas of this build \
+         read only document formats {minimum} to {maximum}, and no capability yet lets them \
+         agree to read another",
+        policy.schema_version
+    ))
 }
 
 pub(super) async fn append_policy_version_after_commit(

@@ -7,9 +7,17 @@
 //! frozen `RbacState` helpers in `middleware::rbac::legacy`. The audit
 //! emission and limiter bookkeeping they share with the live path are the
 //! runtime's own, unchanged.
+//!
+//! `legacy_authorize_source_request` is the enum-source precheck's policy
+//! branch as it stood at ff33fbc, before the shared evaluator decided it
+//! (#422 legacy retirement): the enable bit read from the policy's tool
+//! entries and the deny rules matched by a `RuleMatcher` built per call.
 
 use super::*;
-use crate::middleware::rbac::legacy::{ToolAuthorizationSnapshot, ToolPolicySnapshot};
+use crate::{
+    middleware::rbac::legacy::{ToolAuthorizationSnapshot, ToolPolicySnapshot},
+    rbac::{RuleDispatchContext, RuleMatcher},
+};
 
 impl ToolRuntime {
     /// The live policy half of admission, for comparison: the admitted limits,
@@ -120,6 +128,68 @@ impl ToolRuntime {
         })
     }
 
+    /// The pre-cutover enum-source precheck over one policy snapshot.
+    pub(crate) fn legacy_authorize_source_request(
+        &self,
+        policy: &Policy,
+        connection_id: &ConnectionId,
+        source_id: &str,
+        tool: Option<&str>,
+        rendered_path_and_query: &str,
+        audit_path_template: &str,
+    ) -> Result<(), EnumSourceFailureReason> {
+        let rendered_path = rendered_path_and_query
+            .split_once('?')
+            .map_or(rendered_path_and_query, |(path, _)| path);
+        let audit_path = audit_path_template
+            .split_once('?')
+            .map_or(audit_path_template, |(path, _)| path);
+        if let Some(tool_name) = tool {
+            let enabled = policy
+                .tools
+                .get(tool_name)
+                .is_some_and(|entry| entry.enabled);
+            if !enabled {
+                self.emit_enum_source_denial(
+                    connection_id,
+                    source_id,
+                    tool,
+                    audit_path,
+                    "tool_disabled",
+                    None,
+                );
+                return Err(EnumSourceFailureReason::ToolDisabled);
+            }
+        }
+
+        let matched_rule_id = RuleMatcher::new(&policy.rules)
+            .evaluate_denies_with_dispatch(
+                "GET",
+                rendered_path,
+                None,
+                RuleDispatchContext::contextless(),
+            )
+            .map(|decision| {
+                policy
+                    .rules
+                    .get(decision.rule_index)
+                    .and_then(|rule| rule.id.clone())
+                    .unwrap_or_else(|| decision.rule_index.to_string())
+            });
+        if let Some(matched_rule_id) = matched_rule_id {
+            self.emit_enum_source_denial(
+                connection_id,
+                source_id,
+                tool,
+                audit_path,
+                "http_rule_denied",
+                Some(&matched_rule_id),
+            );
+            return Err(EnumSourceFailureReason::HttpRuleDenied);
+        }
+        Ok(())
+    }
+
     pub(crate) fn legacy_tool_visible_to_context(
         &self,
         tool_name: &str,
@@ -190,4 +260,8 @@ fn tool_visible_for_snapshot(
             .as_ref()
             .map(|decision| &decision.action),
     )
+}
+
+fn tool_rule_allows_visibility(rule_action: Option<&RuleAction>) -> bool {
+    !matches!(rule_action, Some(RuleAction::Deny))
 }

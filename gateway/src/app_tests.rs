@@ -205,6 +205,7 @@ fn test_config(cors_allow_origins: Vec<&str>) -> config::Config {
         readiness_probe_cache_ms: config::DEFAULT_READINESS_PROBE_CACHE_MS,
         cluster_status_expose_hostnames: false,
         audit_postgres_retention_days: None,
+        authority_events: Default::default(),
         tool_runtime_default_timeout_ms: config::DEFAULT_TOOL_RUNTIME_DEFAULT_TIMEOUT_MS,
         csrf_enabled: true,
         csrf_cookie_name: "csrf_token".to_owned(),
@@ -8603,6 +8604,13 @@ fn expected_ha_metric_names() -> Vec<&'static str> {
         metrics::AUDIT_STREAM_CONNECTIONS_TOTAL,
         metrics::AUDIT_STREAM_REPLAY_BACKLOG_EVENTS,
         metrics::AUDIT_STREAM_DUPLICATE_POSITIONS_TOTAL,
+        metrics::AUTHORITY_EVENT_JOURNAL_RETAINED,
+        metrics::AUTHORITY_EVENT_JOURNAL_CAPACITY,
+        metrics::AUTHORITY_EVENT_UNDELIVERED,
+        metrics::AUTHORITY_EVENT_OLDEST_UNDELIVERED_AGE_SECONDS,
+        metrics::AUTHORITY_EVENT_DELIVERED_TOTAL,
+        metrics::AUTHORITY_EVENT_DELIVERY_FAILURES_TOTAL,
+        metrics::AUTHORITY_EVENT_CAPACITY_REFUSALS_TOTAL,
     ]);
     names
 }
@@ -8648,6 +8656,11 @@ fn ha_label_vocabularies() -> Vec<(&'static str, &'static str, Vec<&'static str>
             metrics::DISCOVERY_PROJECTOR_ERRORS_TOTAL,
             "kind",
             discovery::projector::PROJECTOR_ERROR_KINDS.to_vec(),
+        ),
+        (
+            metrics::AUTHORITY_EVENT_DELIVERY_FAILURES_TOTAL,
+            "kind",
+            authority_events::dispatcher::FAILURE_KINDS.to_vec(),
         ),
         (
             metrics::AUDIT_STREAM_CONNECTIONS_TOTAL,
@@ -8902,6 +8915,25 @@ async fn synthetic_ha_run() {
         }
         record_audit_stream_replay_backlog(512);
         record_audit_stream_duplicates(1);
+
+        // Authority-event delivery: the journal gauges, every failure step,
+        // a delivered batch and a refused mutation. None names an event,
+        // an actor, a resource or a position.
+        authority_events::dispatcher::record_journal_stats(
+            &storage::postgres_authority_events::JournalStats {
+                retained: 7,
+                capacity: 1_000_000,
+                head: 41,
+                cursor: Some(38),
+                first_retained: Some(35),
+                oldest_undelivered_age_secs: Some(12.5),
+            },
+        );
+        for kind in authority_events::dispatcher::FAILURE_KINDS {
+            authority_events::dispatcher::record_failure(kind);
+        }
+        authority_events::dispatcher::record_delivered(3);
+        storage::postgres_authority_events::record_capacity_refusal();
     }
 }
 
@@ -10998,7 +11030,7 @@ async fn policy_put_with_invalid_policy_returns_errors_without_persisting_or_swa
             Method::PUT,
             POLICY_ADMIN_ROUTE,
             Some(test_principal(&["admin"])),
-            Some(r#"{ "schema_version": "1.0.0" }"#.to_owned()),
+            Some(r#"{ "schema_version": "2.0.0" }"#.to_owned()),
             Some(&current_etag),
         ))
         .await
@@ -11955,16 +11987,25 @@ fn explicit_hidden_binding_fields_are_secret_authority_intent() {
         json!({"tls": {"ca_bundle_alias": "ca"}}),
         json!({"tls": {"client_certificate_id": "certificate"}}),
         json!({"tls": {"client_private_key_id": null}}),
+        json!({"caller_assertion": {"signing_key_id": "alias"}}),
+        json!({"caller_assertion": {"published_keys": [{"signing_key_id": "alias"}]}}),
     ] {
         assert!(has_explicit_connection_binding_intent(&candidate));
     }
     assert!(!has_explicit_connection_binding_intent(&json!({
         "authentication": {"secret_configured": true},
+        "caller_assertion": {
+            "signing_key_configured": true,
+            "published_keys": [{"signing_key_configured": true}]
+        },
         "tls": {
             "ca_bundle_configured": true,
             "client_certificate_configured": true,
             "client_private_key_configured": true
         }
+    })));
+    assert!(!has_explicit_connection_binding_intent(&json!({
+        "caller_assertion": null
     })));
 }
 
@@ -12225,6 +12266,213 @@ fn replacement_keeps_an_omitted_caller_assertion_and_removes_it_only_on_null() {
     let plain = parse_connection_write_body(&Bytes::from(plain_edit.to_string()), &unattested)
         .expect("an edit of an unattested Connection should parse");
     assert!(plain.caller_assertion.is_none());
+}
+
+fn rotating_caller_assertion_connection() -> connections::model::ConnectionWrite {
+    let current: connections::model::ConnectionWrite = serde_json::from_value(json!({
+        "display_name": "Attested API",
+        "enabled": true,
+        "kind": "http_api",
+        "endpoint": {
+            "base_url": "https://billing.example.test",
+            "base_path": "/"
+        },
+        "authentication": {"type": "none"},
+        "caller_assertion": {
+            "signing_key_id": "assertion-key-current-canary",
+            "kid": "gw-test-1",
+            "algorithm": "es256",
+            "issuer": "https://gateway.example.test",
+            "audience": "https://billing.example.test",
+            "token_type": "caller-assertion+jwt",
+            "header_name": "x-caller-assertion",
+            "lifetime_seconds": 60,
+            "published_keys": [{
+                "signing_key_id": "assertion-key-next-canary",
+                "kid": "gw-test-2",
+                "algorithm": "rs256"
+            }]
+        },
+        "tls": {}
+    }))
+    .expect("attested Connection should deserialize");
+    current
+        .validated()
+        .expect("attested Connection should validate")
+}
+
+fn caller_assertion_edit(assertion: Value) -> Value {
+    json!({
+        "display_name": "Attested API",
+        "enabled": true,
+        "kind": "http_api",
+        "endpoint": {
+            "base_url": "https://billing.example.test",
+            "base_path": "/"
+        },
+        "authentication": {"type": "none"},
+        "caller_assertion": assertion,
+        "tls": {}
+    })
+}
+
+#[test]
+fn replacement_keeps_caller_assertion_key_aliases_by_kid_through_a_rotation() {
+    // The admin UI edits the block without ever seeing its aliases: it marks
+    // each key it keeps, and the gateway keeps the alias stored under that
+    // key's `kid` and algorithm.
+    let current = rotating_caller_assertion_connection();
+    let unchanged = caller_assertion_edit(json!({
+        "signing_key_configured": true,
+        "kid": "gw-test-1",
+        "algorithm": "es256",
+        "issuer": "https://gateway.example.test",
+        "audience": "https://billing.example.test",
+        "token_type": "caller-assertion+jwt",
+        "header_name": "X-Caller-Assertion",
+        "lifetime_seconds": 60,
+        "published_keys": [{
+            "signing_key_configured": true,
+            "kid": "gw-test-2",
+            "algorithm": "rs256"
+        }]
+    }));
+    assert!(!has_explicit_connection_binding_intent(&unchanged));
+    let kept = parse_connection_write_body(&Bytes::from(unchanged.to_string()), &current)
+        .expect("marked keys should keep their stored aliases");
+    assert_eq!(kept.caller_assertion, current.caller_assertion);
+    assert!(!current.requires_secrets_write_to_replace(&kept));
+
+    let mut longer = unchanged.clone();
+    longer["caller_assertion"]["lifetime_seconds"] = json!(120);
+    let longer = parse_connection_write_body(&Bytes::from(longer.to_string()), &current)
+        .expect("an edit of another field should keep both aliases");
+    let assertion = longer.caller_assertion.as_ref().expect("block kept");
+    assert_eq!(assertion.lifetime_seconds, 120);
+    assert_eq!(assertion.signing_key_id, "assertion-key-current-canary");
+    assert_eq!(
+        assertion.published_keys[0].signing_key_id,
+        "assertion-key-next-canary"
+    );
+    assert!(current.requires_secrets_write_to_replace(&longer));
+
+    // Rotation step 3: the next key signs and the previous one stays published.
+    let promoted = caller_assertion_edit(json!({
+        "signing_key_configured": true,
+        "kid": "gw-test-2",
+        "algorithm": "rs256",
+        "issuer": "https://gateway.example.test",
+        "audience": "https://billing.example.test",
+        "token_type": "caller-assertion+jwt",
+        "header_name": "x-caller-assertion",
+        "lifetime_seconds": 60,
+        "published_keys": [{
+            "signing_key_configured": true,
+            "kid": "gw-test-1",
+            "algorithm": "es256"
+        }]
+    }));
+    let promoted = parse_connection_write_body(&Bytes::from(promoted.to_string()), &current)
+        .expect("a promotion should move each alias with its kid");
+    let assertion = promoted.caller_assertion.as_ref().expect("block kept");
+    assert_eq!(assertion.kid, "gw-test-2");
+    assert_eq!(assertion.signing_key_id, "assertion-key-next-canary");
+    assert_eq!(assertion.published_keys[0].kid, "gw-test-1");
+    assert_eq!(
+        assertion.published_keys[0].signing_key_id,
+        "assertion-key-current-canary"
+    );
+
+    // A marked key next to a newly named one: only the new alias is explicit.
+    let mut added = unchanged.clone();
+    added["caller_assertion"]["published_keys"] = json!([{
+        "signing_key_id": "assertion-key-third",
+        "kid": "gw-test-3",
+        "algorithm": "es256"
+    }]);
+    assert!(has_explicit_connection_binding_intent(&added));
+    let added = parse_connection_write_body(&Bytes::from(added.to_string()), &current)
+        .expect("a newly named key should be accepted beside a marked one");
+    let assertion = added.caller_assertion.as_ref().expect("block kept");
+    assert_eq!(assertion.signing_key_id, "assertion-key-current-canary");
+    assert_eq!(
+        assertion.published_keys[0].signing_key_id,
+        "assertion-key-third"
+    );
+}
+
+#[test]
+fn caller_assertion_key_markers_that_match_no_stored_key_fail_closed() {
+    let current = rotating_caller_assertion_connection();
+    let signing = |overrides: Value| {
+        let mut assertion = json!({
+            "signing_key_configured": true,
+            "kid": "gw-test-1",
+            "algorithm": "es256",
+            "issuer": "https://gateway.example.test",
+            "audience": "https://billing.example.test",
+            "token_type": "caller-assertion+jwt",
+            "header_name": "x-caller-assertion",
+            "lifetime_seconds": 60
+        });
+        for (field, value) in overrides.as_object().expect("overrides are an object") {
+            assertion[field] = value.clone();
+        }
+        caller_assertion_edit(assertion)
+    };
+
+    for (invalid, reason) in [
+        (signing(json!({"kid": "gw-test-9"})), "a kid nothing stores"),
+        (
+            signing(json!({"algorithm": "rs256"})),
+            "a stored kid under the other algorithm",
+        ),
+        (
+            signing(json!({"signing_key_configured": false})),
+            "a cleared key",
+        ),
+        (
+            signing(json!({"signing_key_id": "assertion-key-guess"})),
+            "a marker beside an explicit alias",
+        ),
+        (
+            signing(json!({"signing_key_configured": "yes"})),
+            "a non-boolean marker",
+        ),
+        (
+            signing(json!({"published_keys": [{
+                "signing_key_configured": true,
+                "kid": "gw-test-2",
+                "algorithm": "es256"
+            }]})),
+            "a published key under the other algorithm",
+        ),
+        (
+            signing(json!({"published_keys": ["gw-test-2"]})),
+            "a published key that is not an object",
+        ),
+    ] {
+        let error = parse_connection_write_body(&Bytes::from(invalid.to_string()), &current)
+            .expect_err(reason);
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST, "{reason}");
+        let rendered = format!("{error:?}");
+        assert!(
+            !rendered.contains("assertion-key-current-canary"),
+            "{reason}"
+        );
+        assert!(!rendered.contains("assertion-key-next-canary"), "{reason}");
+    }
+
+    // With no stored block there is no alias to keep.
+    let mut unattested = current.clone();
+    unattested.caller_assertion = None;
+    let error =
+        parse_connection_write_body(&Bytes::from(signing(json!({})).to_string()), &unattested)
+            .expect_err("a marker with nothing stored must fail closed");
+    assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+
+    // A create never retains anything, so a marker is an unknown field there.
+    assert!(parse_connection_create_body(&Bytes::from(signing(json!({})).to_string())).is_err());
 }
 
 #[tokio::test]
@@ -19338,7 +19586,31 @@ async fn policy_validate_accepts_valid_candidate_without_changing_live_policy_or
         .expect("policy validate should complete");
 
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(json_body(response).await, json!({ "valid": true }));
+    let candidate = policy_document_string("validated-only", "test:new");
+    let body = json_body(response).await;
+    // A 0.x document: valid, a source digest over the bytes sent, no
+    // semantic digest (0.x defines no normalization), and the one stated
+    // limitation of a document whose routes carry no stable id.
+    assert_eq!(
+        body,
+        json!({
+            "valid": true,
+            "schema_version": "0.1.0",
+            "diagnostics": [{
+                "code": "stable_ids_unavailable",
+                "severity": "warning",
+                "pointer": "",
+                "message": rbac::policy_document::IssueCode::StableIdsUnavailable.message(),
+                "remediation": rbac::policy_document::IssueCode::StableIdsUnavailable.remediation(),
+                "blocks": { "simulation": false, "tests": false, "publication": false, "evidence": true }
+            }],
+            "source_digest": canonical_json::source_digest(
+                "application/json",
+                "0.1.0",
+                candidate.as_bytes()
+            ),
+        })
+    );
     assert_eq!(
         fs::read_to_string(&policy.path).expect("policy file should read"),
         before_contents
@@ -19374,7 +19646,7 @@ async fn policy_validate_invalid_candidate_returns_errors_without_changes() {
             Method::POST,
             POLICY_VALIDATE_ADMIN_ROUTE,
             Some(test_principal(&["policy-reader"])),
-            Some(r#"{ "schema_version": "1.0.0" }"#.to_owned()),
+            Some(r#"{ "schema_version": "2.0.0" }"#.to_owned()),
             None,
         ))
         .await
@@ -19445,6 +19717,238 @@ async fn policy_validate_rejects_relative_route_prefix_without_changes() {
     assert_eq!(json_body(after_get).await["id"], json!("initial-policy"));
 }
 
+/// The test policy as policy v1: the same members, `schema_version`
+/// `1.0.0`, and a stable id on every route.
+fn v1_policy_document(id: &str, test_permission: &str) -> Value {
+    let mut policy = policy_document(id, test_permission);
+    policy["schema_version"] = json!("1.0.0");
+    for (index, route) in policy["routes"]
+        .as_array_mut()
+        .expect("the test policy has routes")
+        .iter_mut()
+        .enumerate()
+    {
+        route["id"] = json!(format!("route-{index}"));
+    }
+    policy
+}
+
+#[tokio::test]
+async fn policy_validate_reports_v1_diagnostics_and_both_digests() {
+    let policy = TempPolicyFile::new(&policy_document_string("initial-policy", "test:old"));
+    let router = policy_admin_router(Some(&policy), test_audit_log());
+    let candidate = v1_policy_document("validated-v1", "test:new").to_string();
+
+    let response = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::POST,
+            POLICY_VALIDATE_ADMIN_ROUTE,
+            Some(test_principal(&["policy-reader"])),
+            Some(candidate.clone()),
+            None,
+        ))
+        .await
+        .expect("v1 validate should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["valid"], json!(true));
+    assert_eq!(body["schema_version"], json!("1.0.0"));
+    assert_eq!(body["diagnostics"], json!([]));
+    assert!(body.get("errors").is_none(), "{body}");
+    assert_eq!(
+        body["source_digest"],
+        json!(canonical_json::source_digest(
+            "application/json",
+            "1.0.0",
+            candidate.as_bytes()
+        ))
+    );
+    let semantic = body["semantic_digest"]
+        .as_str()
+        .expect("a v1 document has a semantic digest")
+        .to_owned();
+    assert!(
+        semantic.starts_with("sha256:") && semantic.len() == 71,
+        "{semantic}"
+    );
+
+    // The same policy respelled -- other whitespace and member order -- has
+    // another source digest and the same semantic one.
+    let respelled = serde_json::to_string_pretty(&v1_policy_document("validated-v1", "test:new"))
+        .expect("serialize");
+    let body = json_body(
+        router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::POST,
+                POLICY_VALIDATE_ADMIN_ROUTE,
+                Some(test_principal(&["policy-reader"])),
+                Some(respelled),
+                None,
+            ))
+            .await
+            .expect("respelled validate should complete"),
+    )
+    .await;
+    assert_eq!(body["semantic_digest"], json!(semantic));
+    assert_ne!(
+        body["source_digest"],
+        json!(canonical_json::source_digest(
+            "application/json",
+            "1.0.0",
+            candidate.as_bytes()
+        ))
+    );
+
+    // Every structural problem is reported, each with its pointer, and the
+    // errors list carries one detail per error diagnostic.
+    let mut broken = v1_policy_document("broken-v1", "test:new");
+    broken["routes"][1]["id"] = json!("route-0");
+    broken["routes"][2]
+        .as_object_mut()
+        .expect("route")
+        .remove("id");
+    broken["routes"][3]["weight"] = json!(1);
+    let response = router
+        .oneshot(policy_admin_request(
+            Method::POST,
+            POLICY_VALIDATE_ADMIN_ROUTE,
+            Some(test_principal(&["policy-reader"])),
+            Some(broken.to_string()),
+            None,
+        ))
+        .await
+        .expect("broken v1 validate should complete");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert_eq!(body["valid"], json!(false));
+    let found: Vec<(Value, Value)> = body["diagnostics"]
+        .as_array()
+        .expect("diagnostics")
+        .iter()
+        .map(|diagnostic| (diagnostic["code"].clone(), diagnostic["pointer"].clone()))
+        .collect();
+    assert_eq!(
+        found,
+        vec![
+            (json!("element_id_duplicate"), json!("/routes/1/id")),
+            (json!("element_id_missing"), json!("/routes/2/id")),
+            (json!("unknown_member"), json!("/routes/3/weight")),
+        ]
+    );
+    assert_eq!(body["diagnostics"][0]["element_id"], json!("route-0"));
+    assert_eq!(body["errors"].as_array().map(Vec::len), Some(3));
+    assert!(body.get("source_digest").is_none(), "{body}");
+    assert!(body.get("semantic_digest").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn policy_put_accepts_a_v1_document_and_keeps_its_stable_ids() {
+    let policy = TempPolicyFile::new(&policy_document_string("initial-policy", "test:old"));
+    let router = policy_admin_router(Some(&policy), test_audit_log());
+    let get_response = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::GET,
+            POLICY_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            None,
+            None,
+        ))
+        .await
+        .expect("policy GET should complete");
+    let etag = policy_etag_header(&get_response);
+
+    // A v1 document that repeats an id is refused with every problem named,
+    // and nothing is written.
+    let before_contents = fs::read_to_string(&policy.path).expect("policy file should read");
+    let mut duplicate = v1_policy_document("duplicate-ids", "test:new");
+    duplicate["routes"][5]["id"] = json!("route-4");
+    let response = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::PUT,
+            POLICY_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            Some(duplicate.to_string()),
+            Some(&etag),
+        ))
+        .await
+        .expect("duplicate-id PUT should complete");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert_eq!(body["valid"], json!(false));
+    assert!(
+        body["errors"][0]
+            .as_str()
+            .unwrap_or_default()
+            .contains("/routes/5/id"),
+        "{body}"
+    );
+    assert_eq!(
+        fs::read_to_string(&policy.path).expect("policy file should read"),
+        before_contents
+    );
+
+    let response = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::PUT,
+            POLICY_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            Some(v1_policy_document("v1-policy", "test:new").to_string()),
+            Some(&etag),
+        ))
+        .await
+        .expect("v1 PUT should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let etag = policy_etag_header(&response);
+    let body = json_body(response).await;
+    assert_eq!(body["schema_version"], json!("1.0.0"));
+    assert_eq!(body["routes"][5]["id"], json!("route-5"));
+
+    // Persisted with its ids, and enforced: the new reader is admitted by the
+    // route the v1 document now names.
+    let persisted: Value =
+        serde_json::from_str(&fs::read_to_string(&policy.path).expect("policy file should read"))
+            .expect("persisted policy is JSON");
+    assert_eq!(persisted["schema_version"], json!("1.0.0"));
+    assert_eq!(persisted["routes"][0]["id"], json!("route-0"));
+    let new_reader = router
+        .clone()
+        .oneshot(audit_query_request(
+            "/__test/principal",
+            Some(test_principal(&["new-reader"])),
+        ))
+        .await
+        .expect("new-reader request should complete");
+    assert_eq!(new_reader.status(), StatusCode::OK);
+
+    // A rule created through the API in a v1 policy is given the stable id
+    // v1 requires.
+    let response = router
+        .oneshot(policy_admin_request(
+            Method::POST,
+            POLICY_RULES_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            Some(json!({ "path": "/__test/blocked", "action": "deny" }).to_string()),
+            Some(&etag),
+        ))
+        .await
+        .expect("rule POST should complete");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let created = json_body(response).await;
+    let rule_id = created["id"].as_str().expect("an assigned id").to_owned();
+    assert!(
+        rbac::policy_document::is_valid_element_id(&rule_id),
+        "{rule_id}"
+    );
+    let reloaded = rbac::Policy::from_file(&policy.path).expect("the persisted v1 policy reloads");
+    assert_eq!(reloaded.rules[0].id.as_deref(), Some(rule_id.as_str()));
+}
+
 #[tokio::test]
 async fn policy_rule_preview_returns_matches_samples_and_does_not_mutate_policy() {
     let db = TempDb::new("rule-preview");
@@ -19509,6 +20013,8 @@ async fn policy_rule_preview_returns_matches_samples_and_does_not_mutate_policy(
     let body = json_body(response).await;
     assert_eq!(body["match_count"], json!(2));
     assert_eq!(body["scanned_event_count"], json!(3));
+    assert_eq!(body["unevaluated_event_count"], json!(0));
+    assert_eq!(body["unevaluated_reasons"], json!({}));
     assert_eq!(body["scan_truncated"], json!(false));
     assert_eq!(body["complete"], json!(true));
     assert_eq!(body["sample_strategy"], json!("newest_matches"));
@@ -19634,6 +20140,18 @@ async fn policy_rule_preview_contextless_binding_excludes_unclassified_history()
     let body = json_body(response).await;
     assert_eq!(body["match_count"], json!(1));
     assert_eq!(body["samples"][0]["event_id"], json!("match-new"));
+    // The other three scanned observations were never classified, and the
+    // rule is bound to a dispatch, so the evaluator cannot say whether it
+    // matches them. They are reported rather than counted as non-matches, and
+    // the count is a lower bound for the window.
+    assert_eq!(body["scanned_event_count"], json!(4));
+    assert_eq!(body["unevaluated_event_count"], json!(3));
+    assert_eq!(
+        body["unevaluated_reasons"],
+        json!({"missing_dispatch_fact": 3})
+    );
+    assert_eq!(body["scan_truncated"], json!(false));
+    assert_eq!(body["complete"], json!(false));
 }
 
 #[tokio::test]
@@ -23023,6 +23541,21 @@ async fn traffic_endpoint_lifecycle_flags_rule_coverage_and_hot_reload() {
             status_counts: &[(200, 2)],
         },
     );
+    // Classified traffic without a proxy dispatch, as the aggregator records
+    // it. Coverage is judged in that routing context; with none recorded at
+    // all the evaluator would be missing the dispatch fact.
+    for (endpoint_template, call_count) in [("/covered/{id}", 3), ("/open/{id}", 2)] {
+        insert_discovery_routing_context(
+            &discovery_db.path,
+            "GET",
+            endpoint_template,
+            "",
+            "",
+            "",
+            call_count,
+            1,
+        );
+    }
     let policy = TempPolicyFile::new(&traffic_policy_document_with_rules(json!([
         {
             "id": "cover-id-endpoint",
@@ -25320,15 +25853,34 @@ async fn suggestions_admin_dismiss_rejects_non_open_suggestion_without_overwriti
 
 #[test]
 fn endpoint_rule_coverage_without_rules_is_none() {
-    let policy: rbac::Policy = serde_json::from_value(json!({
-        "schema_version": "0.1.0",
-        "default_action": "deny",
-        "roles": {}
-    }))
-    .expect("policy should parse");
+    let policy = policy_eval::CompiledPolicy::for_analysis(
+        serde_json::from_value(json!({
+            "schema_version": "0.1.0",
+            "default_action": "deny",
+            "roles": {}
+        }))
+        .expect("policy should parse"),
+    );
+    let contextless = discovery::query::EndpointRoutingContext {
+        route_host: None,
+        route_path_prefix: None,
+        upstream_origin: None,
+        first_seen: "2024-06-01T12:00:00Z".to_owned(),
+        last_seen: "2024-06-01T12:00:00Z".to_owned(),
+        call_count: 1,
+        distinct_principal_count: 1,
+        covered_by_rule: false,
+        coverage_scope: discovery::query::EndpointCoverageScope::None,
+    };
+    assert_eq!(
+        endpoint_coverage_scope(&policy, "GET", "/anything/{id}", Some(&contextless)),
+        discovery::query::EndpointCoverageScope::None
+    );
+    // With no routing context recorded at all the evaluator is missing the
+    // dispatch fact, so coverage is unknown rather than none.
     assert_eq!(
         endpoint_coverage_scope(&policy, "GET", "/anything/{id}", None),
-        discovery::query::EndpointCoverageScope::None
+        discovery::query::EndpointCoverageScope::Unknown
     );
 }
 
@@ -34018,6 +34570,87 @@ mod cluster_policy_tests {
                 .any(|event| event.event_type == audit::event::POLICY_CHANGED),
             "the admitted commit is audited as the policy change it is"
         );
+    }
+
+    /// Policy v1 is document format 1, and no replica of this build
+    /// advertises it (`cluster_membership::DOCUMENT_VERSION_RANGE`), so the
+    /// policy API refuses to commit one with a `400` and writes nothing. The
+    /// store refuses the same candidate if a caller skips that check, and a
+    /// 0.x document on the same path is committed as before.
+    #[tokio::test]
+    async fn cluster_policy_refuses_to_commit_a_v1_document() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_policy_foundation(&database.dsn).await;
+        let active = initialize(&store, "v1-init").await;
+        let (router, rbac_state) = cluster_policy_router(store.clone());
+        rbac_state
+            .install_revision_snapshot(active.policy.clone(), active.security_revision)
+            .await
+            .expect("the authority's revision should install");
+        let v1 = r#"{
+            "schema_version": "1.0.0",
+            "id": "v1-held",
+            "default_action": "deny",
+            "roles": { "admin": { "permissions": ["admin:policy:read", "admin:policy:write"] } }
+        }"#;
+
+        let before = policy_version_count(&pool).await;
+        let (status, body) = refusal_of(
+            router
+                .clone()
+                .oneshot(admin_request(
+                    Method::PUT,
+                    POLICY_ADMIN_ROUTE,
+                    Some((&active.etag, v1)),
+                ))
+                .await
+                .expect("PUT should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["valid"], json!(false));
+        assert!(
+            body["errors"][0]
+                .as_str()
+                .unwrap_or_default()
+                .contains("cannot be committed in cluster mode"),
+            "{body}"
+        );
+        assert_eq!(policy_version_count(&pool).await, before);
+
+        let candidate = parse_policy_body(&Bytes::from(v1)).expect("a valid v1 document");
+        let refused = PolicyControlPlane::commit(
+            store.as_ref(),
+            PolicyCommitRequest {
+                precondition: PolicyCommitPrecondition::Expected {
+                    etag: active.etag.clone(),
+                },
+                candidate: &candidate,
+                actor_user_id: "test",
+                diff_summary: &DIFF,
+            },
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(storage::PolicyCommitError::Store(_))),
+            "the store must refuse a document no replica reads"
+        );
+        assert_eq!(policy_version_count(&pool).await, before);
+
+        let committed = router
+            .oneshot(admin_request(
+                Method::PUT,
+                POLICY_ADMIN_ROUTE,
+                Some((&active.etag, &cluster_policy_json("v0-after"))),
+            ))
+            .await
+            .expect("PUT should complete");
+        assert_eq!(committed.status(), StatusCode::OK);
+        assert_eq!(policy_version_count(&pool).await, before + 1);
     }
 
     /// Issue #443's registered operation through the managed OpenAPI

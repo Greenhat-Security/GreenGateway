@@ -356,6 +356,24 @@ pub(super) struct PolicyValidationResponse {
     pub(super) errors: Vec<String>,
 }
 
+/// `POST /policy/validate`: the original `valid`/`errors` pair, plus the
+/// structured diagnostics and digests of the inspected document.
+#[derive(Serialize)]
+pub(super) struct PolicyInspectionResponse<'a> {
+    pub(super) valid: bool,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    pub(super) errors: &'a [String],
+    /// The document's `schema_version` when it names a schema this gateway
+    /// implements.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) schema_version: Option<&'a str>,
+    pub(super) diagnostics: &'a [rbac::policy_document::PolicyDiagnostic],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) source_digest: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) semantic_digest: Option<&'a str>,
+}
+
 #[derive(Deserialize)]
 pub(super) struct PolicyRulePreviewRequest {
     pub(super) rule: rbac::Rule,
@@ -368,11 +386,20 @@ pub(super) struct PolicyRulePreviewRequest {
 pub(super) struct PolicyRulePreviewResponse {
     pub(super) match_count: u64,
     pub(super) scanned_event_count: u64,
+    /// Scanned observations the shared evaluator could not judge the rule
+    /// against. Each is neither a match nor a non-match.
+    pub(super) unevaluated_event_count: u64,
+    /// `unevaluated_event_count` by stable reason: a limitation code
+    /// (`missing_principal_fact`, `missing_dispatch_fact`) or
+    /// `malformed_observation`. Empty when every scanned observation was
+    /// judged.
+    pub(super) unevaluated_reasons: BTreeMap<&'static str, u64>,
     /// The window held more observations than the scan ceiling allowed, so
     /// `match_count` covers only the newest `scanned_event_count` of them.
     pub(super) scan_truncated: bool,
-    /// Every observation in the window was scanned. Never true for a
-    /// truncated scan: a partial count is not evidence of the whole window.
+    /// Every observation in the window was scanned and judged. Never true for
+    /// a truncated scan or one with an unevaluated observation: a partial
+    /// count is not evidence of the whole window.
     pub(super) complete: bool,
     pub(super) sample_strategy: &'static str,
     pub(super) samples: Vec<PolicyRulePreviewSample>,
@@ -1100,6 +1127,13 @@ pub(super) struct GatewayAppBuildOverrides {
     /// readiness gate into `/readyz`. None in standalone mode.
     #[cfg(feature = "postgres")]
     pub(super) pg_membership: Option<Arc<cluster_membership::ClusterMembership>>,
+    /// The authority-event journal's store (issue #425, PR 3), its capacity
+    /// already applied by `run()`. With a sink configured the builder hands
+    /// back the dispatcher's startup in `GatewayApps`. None in standalone
+    /// mode.
+    #[cfg(feature = "postgres")]
+    pub(super) pg_authority_events:
+        Option<Arc<storage::postgres_authority_events::PostgresAuthorityEventStore>>,
     /// Test seam: a readiness gate for `/readyz` without a membership
     /// store behind it, so the `config_fingerprint_mismatch` answer is
     /// testable without PostgreSQL.

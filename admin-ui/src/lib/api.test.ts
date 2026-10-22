@@ -231,6 +231,47 @@ describe('admin API transport', () => {
     );
   });
 
+  it('keeps the caller-assertion reason of a compensation the gateway could not sign', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() =>
+        Promise.resolve(
+          jsonResponse(502, {
+            error: 'tool execution failed',
+            request_id: 'request-composite-key',
+            reason: 'composite_failed_compensation_incomplete',
+            failed_step: 'attach',
+            failed_iteration: null,
+            compensation: 'incomplete',
+            orphans: [
+              'caller_assertion_key_unusable',
+              'caller_assertion_key_unavailable',
+              'caller_assertion_not_enforced',
+            ].map((reason) => ({
+              step: 'note',
+              tool: 'create_note',
+              certainty: 'confirmed',
+              reason,
+            })),
+          }),
+        ),
+      ),
+    );
+
+    const error = await adminFetchJson('/composite').catch(
+      (caught: unknown) => caught,
+    );
+
+    expect(error).toBeInstanceOf(AdminApiError);
+    expect(
+      (error as AdminApiError).details.orphans?.map((orphan) => orphan.reason),
+    ).toEqual([
+      'caller_assertion_key_unusable',
+      'caller_assertion_key_unavailable',
+      'caller_assertion_not_enforced',
+    ]);
+  });
+
   it('projects the bounded pending-compensation marker for interrupted composites', async () => {
     vi.stubGlobal(
       'fetch',
@@ -280,6 +321,19 @@ describe('admin API transport', () => {
             tool: 'create_note',
             certainty: 'confirmed',
             reason: 'upstream said credential=UNEXPECTED_ORPHAN_CANARY',
+          },
+        ],
+      },
+    },
+    {
+      label: 'caller-assertion lookalike orphan reason',
+      override: {
+        orphans: [
+          {
+            step: 'note',
+            tool: 'create_note',
+            certainty: 'confirmed',
+            reason: 'caller_assertion_UNEXPECTED_ORPHAN_CANARY',
           },
         ],
       },

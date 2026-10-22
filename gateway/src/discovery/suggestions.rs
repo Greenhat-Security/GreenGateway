@@ -25,10 +25,12 @@ use crate::{
         signals::{self, Signal, SignalLifecycleState, SignalListFilters},
     },
     metrics::LOCK_POISON_RECOVERIES_TOTAL,
-    rbac::{
-        Policy, PrincipalMatcher, Rule, RuleAction, RuleDispatchContext, RuleDispatchMatcher,
-        RuleMatcher,
+    policy_eval::{
+        analysis::{recorded_dispatch, DirectRuleOutcome},
+        CompiledPolicy, EvaluationError, HostFact, LogicalDecision, PolicyEvaluationContext,
+        PrincipalFact, PrincipalIdentity, RuleReference, CONTEXT_VERSION,
     },
+    rbac::{Policy, PrincipalMatcher, Rule, RuleAction, RuleDispatchKind, RuleDispatchMatcher},
     storage::{RepositoryError, RepositoryErrorKind},
 };
 
@@ -219,6 +221,9 @@ pub struct BaselineSuggestionRun {
     pub skipped_without_issuer_observations: u64,
     pub skipped_unsupported_auth_method_observations: u64,
     pub skipped_unknown_routing_context_observations: u64,
+    /// Candidates proposed although the shared evaluator could not judge
+    /// whether the policy already covers them.
+    pub coverage_unevaluated: usize,
     pub scanned_event_count: u64,
     pub scan_truncated: bool,
 }
@@ -239,6 +244,7 @@ impl Default for BaselineSuggestionRun {
             skipped_without_issuer_observations: 0,
             skipped_unsupported_auth_method_observations: 0,
             skipped_unknown_routing_context_observations: 0,
+            coverage_unevaluated: 0,
             scanned_event_count: 0,
             scan_truncated: false,
         }
@@ -254,6 +260,9 @@ pub struct AnomalySuggestionRun {
     pub skipped_path_routed: usize,
     pub skipped_ambiguous_routing: usize,
     pub skipped_unknown_routing_context: usize,
+    /// Candidates proposed although the shared evaluator could not judge
+    /// whether the policy already covers them.
+    pub coverage_unevaluated: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -474,7 +483,9 @@ pub(crate) const AUDIT_POSTGRES_EVIDENCE_SOURCE: &str = "audit_postgres";
 /// logic of its own, so the suggestion set for a given fixture is the same
 /// on both.
 pub(crate) struct SuggestionPlanner<'a> {
-    policy: &'a Policy,
+    /// The policy for the shared evaluator, compiled once per run, which
+    /// judges whether the policy already covers a candidate (#422 PR 4).
+    compiled: CompiledPolicy,
     config: RuleSuggestionConfig,
     configured_proxy_routes: &'a [ConfiguredProxyRoute],
     observed_endpoints: &'a [ObservedEndpoint],
@@ -488,7 +499,7 @@ impl<'a> SuggestionPlanner<'a> {
         observed_endpoints: &'a [ObservedEndpoint],
     ) -> Self {
         Self {
-            policy,
+            compiled: CompiledPolicy::for_analysis(policy.clone()),
             config,
             configured_proxy_routes,
             observed_endpoints,
@@ -516,7 +527,6 @@ impl<'a> SuggestionPlanner<'a> {
         evidence_source: &str,
         run: &mut BaselineSuggestionRun,
     ) -> Result<Vec<NewRuleSuggestion>, RuleSuggestionError> {
-        let policy = self.policy;
         run.observed_role_endpoint_count = matrix.observations.len();
         run.scanned_event_count = matrix.scanned_event_count;
         run.scan_truncated = matrix.scan_truncated;
@@ -537,23 +547,23 @@ impl<'a> SuggestionPlanner<'a> {
                 auth_methods: vec![observation.auth_method.clone()],
                 principal_ids: Vec::new(),
             };
-            if policy_has_covering_action(
-                policy,
+            let coverage = policy_coverage(
+                &self.compiled,
                 &observation.method,
                 &observation.endpoint_template,
                 &principal,
                 &[RuleAction::Allow, RuleAction::Shadow],
-                observation.route_host.as_deref(),
-                RuleDispatchContext::classified_with_route_id(
-                    observation
+                CoverageDispatch {
+                    route_id: observation
                         .upstream_origin
                         .as_deref()
                         .and_then(|origin| origin.strip_prefix("pool:")),
-                    observation.route_host.as_deref(),
-                    observation.route_path_prefix.as_deref(),
-                    observation.upstream_origin.as_deref(),
-                ),
-            ) {
+                    route_host: observation.route_host.as_deref(),
+                    route_path_prefix: observation.route_path_prefix.as_deref(),
+                    upstream_origin: observation.upstream_origin.as_deref(),
+                },
+            );
+            if coverage == PolicyCoverage::Covered {
                 run.skipped_policy_covered = run.skipped_policy_covered.saturating_add(1);
                 continue;
             }
@@ -586,6 +596,9 @@ impl<'a> SuggestionPlanner<'a> {
                 }
             };
 
+            if coverage == PolicyCoverage::Unevaluated {
+                run.coverage_unevaluated = run.coverage_unevaluated.saturating_add(1);
+            }
             let proposed_rule = rule_suggestion_for_endpoint(
                 &observation.method,
                 &observation.endpoint_template,
@@ -642,7 +655,6 @@ impl<'a> SuggestionPlanner<'a> {
         created_at: &str,
         run: &mut AnomalySuggestionRun,
     ) -> Result<Vec<NewRuleSuggestion>, RuleSuggestionError> {
-        let policy = self.policy;
         run.open_signal_count = signals.len();
         let mut suggestions = Vec::new();
 
@@ -673,17 +685,30 @@ impl<'a> SuggestionPlanner<'a> {
                         continue;
                     }
                 };
-            if policy_has_covering_action(
-                policy,
+            // Judged as traffic dispatched the way the suggestion would be
+            // bound. Before the cutover a route binding was judged as
+            // contextless traffic, a dispatch it never had.
+            let (route_id, upstream_origin) = coverage_dispatch_for_binding(&dispatch);
+            match policy_coverage(
+                &self.compiled,
                 &target.method,
                 &target.path_pattern,
                 &target.principal,
                 &[RuleAction::Deny, RuleAction::Shadow],
-                None,
-                RuleDispatchContext::classified(None, None, dispatch.upstream_origin.as_deref()),
+                CoverageDispatch {
+                    route_id: route_id.as_deref(),
+                    upstream_origin: upstream_origin.as_deref(),
+                    ..CoverageDispatch::default()
+                },
             ) {
-                run.skipped_policy_covered = run.skipped_policy_covered.saturating_add(1);
-                continue;
+                PolicyCoverage::Covered => {
+                    run.skipped_policy_covered = run.skipped_policy_covered.saturating_add(1);
+                    continue;
+                }
+                PolicyCoverage::NotCovered => {}
+                PolicyCoverage::Unevaluated => {
+                    run.coverage_unevaluated = run.coverage_unevaluated.saturating_add(1);
+                }
             }
 
             let proposed_rule = rule_suggestion_for_endpoint(
@@ -1624,67 +1649,171 @@ fn build_rule_suggestion_list_query(
     (sql, params)
 }
 
-fn policy_has_covering_action(
-    policy: &Policy,
+/// Whether the policy already decides a candidate the way the suggestion
+/// would, as the shared evaluator judges it (#422 PR 4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PolicyCoverage {
+    Covered,
+    NotCovered,
+    /// The evaluator could not judge the candidate's representative request.
+    /// The candidate is still proposed, as an uncovered one is, and counted
+    /// in the run's `coverage_unevaluated`; nothing here claims it is not
+    /// already covered.
+    Unevaluated,
+}
+
+/// The routing facts a candidate's evidence recorded, in the shape
+/// [`recorded_dispatch`] reads.
+#[derive(Clone, Copy, Debug, Default)]
+struct CoverageDispatch<'a> {
+    route_id: Option<&'a str>,
+    route_host: Option<&'a str>,
+    route_path_prefix: Option<&'a str>,
+    upstream_origin: Option<&'a str>,
+}
+
+/// Whether `policy` already decides `method path_pattern` for `principal`
+/// with one of `covering_actions`.
+///
+/// An HTTP candidate is a representative request -- the template with each
+/// capture filled in, the recorded dispatch, the matcher's representative
+/// principal -- put to the shared evaluator:
+///
+/// - Off a host-routed dispatch, the first direct rule whose predicates match
+///   it covers when its action is a covering one
+///   ([`CompiledPolicy::match_direct_rules`]: no route or default decides).
+/// - On a host-routed dispatch, which only baseline allow candidates carry,
+///   it is covered when [`CompiledPolicy::evaluate`] authorizes it through a
+///   host-bound route: the route's permission granted to a role the caller
+///   activates, and no direct deny matching first, as live evaluation decides
+///   it.
+///
+/// A tool-name candidate off a host-routed dispatch is judged by the tool
+/// rules alone, as before: the first tool-name rule whose predicates accept
+/// the representative principal covers when its action is a covering one
+/// ([`CompiledPolicy::match_tool_rules`]). That is not the tool lane's
+/// admission, which judges the entry, its enablement and its identity
+/// constraints before any tool rule; coverage asks only whether a rule
+/// already decides the call.
+fn policy_coverage(
+    compiled: &CompiledPolicy,
     method: &str,
     path_pattern: &str,
     principal: &PrincipalMatcher,
     covering_actions: &[RuleAction],
-    route_host: Option<&str>,
-    dispatch_context: RuleDispatchContext<'_>,
-) -> bool {
-    if let Some(route_host) = route_host {
-        return covering_actions
+    dispatch: CoverageDispatch<'_>,
+) -> PolicyCoverage {
+    let host_routed = dispatch.route_host.is_some();
+    // Only a route authorizes a host-routed request, so only an allow or a
+    // shadow suggestion can already be covered there.
+    if host_routed
+        && !covering_actions
             .iter()
             .any(|action| matches!(action, RuleAction::Allow | RuleAction::Shadow))
-            && host_route_covers_principal(policy, method, path_pattern, route_host, principal);
+    {
+        return PolicyCoverage::NotCovered;
     }
-    if policy.rules.is_empty() {
-        return false;
+    let principal = representative_principal_for_matcher(principal)
+        .map_or(PrincipalFact::Anonymous, |principal| {
+            PrincipalFact::Authenticated(PrincipalIdentity::from_principal(&principal))
+        });
+    if !host_routed {
+        if let Some(tool_name) = tool_name_from_mcp_endpoint(method, path_pattern) {
+            return covered_by_matched_rule(
+                compiled,
+                compiled.match_tool_rules(tool_name, &principal),
+                covering_actions,
+            );
+        }
     }
 
-    let matcher = RuleMatcher::new(&policy.rules);
-    let principal = representative_principal_for_matcher(principal);
+    let Ok(method) = http::Method::from_bytes(method.as_bytes()) else {
+        return PolicyCoverage::Unevaluated;
+    };
+    let Ok((target, dispatch_facts)) = recorded_dispatch(
+        dispatch.route_id,
+        dispatch.route_host,
+        dispatch.route_path_prefix,
+        dispatch.upstream_origin,
+    ) else {
+        return PolicyCoverage::Unevaluated;
+    };
+    let context = PolicyEvaluationContext {
+        version: CONTEXT_VERSION,
+        snapshot: compiled.snapshot(),
+        method: Some(method),
+        path: Some(representative_path_from_endpoint_template(path_pattern)),
+        principal,
+        target,
+        // A representative request carries no Host; a host-routed dispatch
+        // supplies the bound host through its facts.
+        request_host: HostFact::Absent,
+        dispatch: dispatch_facts,
+    };
 
-    if let Some(tool_name) = tool_name_from_mcp_endpoint(method, path_pattern) {
-        matcher
-            .evaluate_tool(tool_name, principal.as_ref())
-            .is_some_and(|decision| covering_actions.contains(&decision.action))
-    } else {
-        let path = representative_path_from_endpoint_template(path_pattern);
-        matcher
-            .evaluate_with_dispatch(method, &path, principal.as_ref(), dispatch_context)
-            .is_some_and(|decision| covering_actions.contains(&decision.action))
+    if host_routed {
+        return match compiled.evaluate(&context) {
+            Ok(evaluation) if evaluation.is_complete() => covered_if(
+                matches!(evaluation.matched(), Some(RuleReference::Route(_)))
+                    && evaluation.logical() == LogicalDecision::Allow,
+            ),
+            _ => PolicyCoverage::Unevaluated,
+        };
+    }
+
+    covered_by_matched_rule(
+        compiled,
+        compiled.match_direct_rules(&context),
+        covering_actions,
+    )
+}
+
+/// A candidate is covered when the first rule whose predicates match it has a
+/// covering action. A rule index is resolved on the instance that matched it.
+fn covered_by_matched_rule(
+    compiled: &CompiledPolicy,
+    outcome: Result<DirectRuleOutcome, EvaluationError>,
+    covering_actions: &[RuleAction],
+) -> PolicyCoverage {
+    match outcome {
+        Ok(DirectRuleOutcome::Matched { index }) => covered_if(
+            compiled
+                .direct_rules()
+                .get(index)
+                .is_some_and(|rule| covering_actions.contains(&rule.action)),
+        ),
+        Ok(DirectRuleOutcome::NoMatch) => PolicyCoverage::NotCovered,
+        Ok(DirectRuleOutcome::Indeterminate(_)) | Err(_) => PolicyCoverage::Unevaluated,
     }
 }
 
-fn host_route_covers_principal(
-    policy: &Policy,
-    method: &str,
-    path_pattern: &str,
-    route_host: &str,
-    principal: &PrincipalMatcher,
-) -> bool {
-    let path = representative_path_from_endpoint_template(path_pattern);
-    let Some(route) = policy.routes.iter().find(|route| {
-        crate::rbac::matcher::method_matches(&route.methods, method)
-            && crate::path_match::path_prefix_matches(&path, &route.path_prefix)
-            && route
-                .hosts
-                .iter()
-                .any(|host| host.eq_ignore_ascii_case(route_host))
-    }) else {
-        return false;
-    };
+fn covered_if(covered: bool) -> PolicyCoverage {
+    if covered {
+        PolicyCoverage::Covered
+    } else {
+        PolicyCoverage::NotCovered
+    }
+}
 
-    principal.roles.iter().any(|role| {
-        policy.roles.get(role).is_some_and(|entry| {
-            entry
-                .permissions
-                .iter()
-                .any(|permission| permission == "*" || permission == &route.permission)
-        })
-    })
+/// The dispatch a direct-rule suggestion will be bound to, as the routing
+/// facts a request dispatched that way records: an origin for a legacy
+/// binding, the pooled route's logical origin and its id for a route binding,
+/// and neither for a contextless one. A legacy route's id is not kept with
+/// the evidence, so it is not supplied.
+fn coverage_dispatch_for_binding(
+    binding: &RuleDispatchMatcher,
+) -> (Option<String>, Option<String>) {
+    match binding.kind {
+        RuleDispatchKind::Contextless => (None, None),
+        RuleDispatchKind::Legacy => (None, binding.upstream_origin.clone()),
+        RuleDispatchKind::Route => (
+            binding.route_id.clone(),
+            binding
+                .route_id
+                .as_deref()
+                .map(crate::proxy::logical_pool_origin),
+        ),
+    }
 }
 
 fn rule_suggestion_for_endpoint(
@@ -1979,6 +2108,14 @@ fn utc_timestamp_rfc3339() -> String {
         .format(&Rfc3339)
         .expect("current UTC timestamp should format as RFC 3339")
 }
+
+#[cfg(test)]
+#[path = "suggestions_legacy_tests.rs"]
+mod legacy;
+
+#[cfg(test)]
+#[path = "suggestions_differential_tests.rs"]
+mod coverage_differential;
 
 #[cfg(test)]
 mod tests {
@@ -2314,6 +2451,7 @@ mod tests {
             },
         );
         covered_policy.routes.push(crate::rbac::RouteRule {
+            id: None,
             methods: vec!["GET".to_owned()],
             hosts: vec!["api.example.test".to_owned()],
             path_prefix: "/invoices".to_owned(),
