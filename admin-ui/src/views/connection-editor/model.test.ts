@@ -40,11 +40,34 @@ const adminSchema = JSON.parse(
     'utf8',
   ),
 ) as {
-  $defs: Record<string, { properties: Record<string, unknown> }>;
+  $defs: Record<
+    string,
+    {
+      properties: Record<string, unknown>;
+      oneOf?: {
+        properties: Record<string, { const?: unknown }>;
+        required?: string[];
+      }[];
+    }
+  >;
 };
 
 function contractFields(definition: string): string[] {
   return Object.keys(adminSchema.$defs[definition].properties).sort();
+}
+
+/** The fields of the `type` alternative of a `oneOf` definition. */
+function contractAlternative(definition: string, type: string) {
+  const alternative = adminSchema.$defs[definition].oneOf?.find(
+    (candidate) => candidate.properties.type?.const === type,
+  );
+  if (alternative === undefined) {
+    throw new Error(`${definition} has no ${type} alternative`);
+  }
+  return {
+    fields: Object.keys(alternative.properties).sort(),
+    required: [...(alternative.required ?? [])].sort(),
+  };
 }
 
 describe('connection editor load and save', () => {
@@ -533,6 +556,149 @@ describe('connection editor load and save', () => {
     ]);
   });
 
+  it('loads and writes back a Google domain-wide delegation exactly as stored', async () => {
+    const stored = googleDelegationConnection();
+    const form = formFromDetail(await loadThroughClient(stored));
+    expect(form.authenticationType).toBe('google_domain_wide_delegation');
+    expect(form.subjectIssuers).toBe(
+      'https://idp.example.test\nhttps://login.example.test',
+    );
+    expect(validateForm(form)).toEqual({});
+
+    const write = writeFromForm(form);
+    expect(write.authentication).toStrictEqual(
+      stored.configuration.authentication,
+    );
+    // Every field the contract has, on a replacement and a create alike:
+    // nothing is a secret, so nothing is kept by marker.
+    for (const definition of ['MutationAuthentication', 'CreateAuthentication']) {
+      const contract = contractAlternative(
+        definition,
+        'google_domain_wide_delegation',
+      );
+      expect(Object.keys(write.authentication).sort()).toEqual(contract.fields);
+      expect(contract.required).toEqual(contract.fields);
+    }
+    expect(Object.hasOwn(write, 'caller_assertion')).toBe(false);
+    expect(Object.hasOwn(createWriteFromForm(form), 'caller_assertion')).toBe(
+      false,
+    );
+    // Any Connection may move to it, and it binds no secret.
+    expect(delegatedIssuerTokenOffered(form, false)).toBe(false);
+    expect(detailConfiguresCredentialAuthority(await loadThroughClient(stored))).toBe(
+      true,
+    );
+  });
+
+  it('refuses a Google delegation draft the gateway would refuse, naming the field', () => {
+    const errors = validateForm({
+      ...googleDraft(),
+      kind: 'mcp_streamable_http',
+      serviceAccountEmail: '123456-compute@developer.gserviceaccount.com',
+      workloadIdentityProfile: 'profile/one',
+      scopes: '',
+      subjectIssuers: 'https://idp.example.test/a b',
+    });
+    expect(Object.keys(errors).sort()).toEqual([
+      'authentication.scopes',
+      'authentication.service_account_email',
+      'authentication.subject_issuers',
+      'authentication.type',
+      'authentication.workload_identity_profile',
+    ]);
+
+    for (const [patch, field] of [
+      [{ serviceAccountEmail: 'someone@gmail.com' }, 'authentication.service_account_email'],
+      [{ workloadIdentityProfile: `p${'x'.repeat(128)}` }, 'authentication.workload_identity_profile'],
+      [
+        {
+          scopes: Array.from({ length: 17 }, (_, index) => `scope-${index}`).join(' '),
+        },
+        'authentication.scopes',
+      ],
+      [{ scopes: `s${'x'.repeat(128)}` }, 'authentication.scopes'],
+      [{ scopes: 'gmail.readonly gmail.readonly' }, 'authentication.scopes'],
+      [{ subjectIssuers: '\n  \n' }, 'authentication.subject_issuers'],
+      [
+        {
+          subjectIssuers: Array.from(
+            { length: 9 },
+            (_, index) => `https://idp-${index}.example.test`,
+          ).join('\n'),
+        },
+        'authentication.subject_issuers',
+      ],
+      [
+        { subjectIssuers: 'https://idp.example.test\nhttps://idp.example.test//' },
+        'authentication.subject_issuers',
+      ],
+      [{ subjectIssuers: '/' }, 'authentication.subject_issuers'],
+      [{ baseUrl: 'http://gmail.googleapis.com' }, 'endpoint.base_url'],
+    ] as const) {
+      expect(Object.keys(validateForm({ ...googleDraft(), ...patch }))).toEqual([
+        field,
+      ]);
+    }
+    // Trimmed, blank lines dropped, trailing slashes kept for the gateway to
+    // canonicalise.
+    expect(
+      writeFromForm({
+        ...googleDraft(),
+        subjectIssuers: '  https://idp.example.test/ \n\n',
+      }).authentication,
+    ).toMatchObject({ subject_issuers: ['https://idp.example.test/'] });
+  });
+
+  it('removes a stored caller assertion when a connection moves to Google delegation', async () => {
+    const form = formFromDetail(await loadThroughClient(storedConnection()));
+    const moved: ConnectionFormState = {
+      ...form,
+      ...googleFields(),
+      authenticationType: 'google_domain_wide_delegation',
+      // An edit begun under the old type does not survive the move either.
+      callerAssertionMode: 'edit',
+    };
+    expect(validateForm(moved)).toEqual({});
+    // Omitting it would keep the block, which the gateway refuses here.
+    expect(writeFromForm(moved).caller_assertion).toBeNull();
+    // Moving back keeps it as stored.
+    expect(
+      Object.hasOwn(
+        writeFromForm({ ...moved, authenticationType: 'header_api_key', callerAssertionMode: 'keep' }),
+        'caller_assertion',
+      ),
+    ).toBe(false);
+    // A create has nothing stored to remove.
+    expect(
+      Object.hasOwn(createWriteFromForm(googleDraft()), 'caller_assertion'),
+    ).toBe(false);
+  });
+
+  it('explains the gateway Google delegation problems with their codes', () => {
+    const errors = fieldErrorsFromProblems([
+      {
+        field: 'authentication.workload_identity_profile',
+        code: 'unresolvable_binding',
+      },
+      { field: 'authentication.subject_issuers', code: 'duplicate_issuer' },
+      { field: 'caller_assertion', code: 'unsupported' },
+      { field: 'authentication.scopes', code: 'required' },
+    ]);
+    expect(errors['authentication.workload_identity_profile']).toBe(
+      "No CONNECTION_GCP_PROVIDER profile with this ID is configured on the gateway. Configure it in the gateway's startup configuration, or save the connection disabled. (unresolvable_binding)",
+    );
+    expect(errors['authentication.subject_issuers']).toBe(
+      'List each issuer once; a trailing slash does not make it another one. (duplicate_issuer)',
+    );
+    expect(errors['authentication.scopes']).toBe('Required.');
+    // The block has no field on screen under this type, so its section lists
+    // the problem.
+    expect(callerAssertionSectionProblems(errors, false)).toEqual([
+      errors.caller_assertion,
+    ]);
+    expect(errors.caller_assertion).toContain('(unsupported)');
+  });
+
   it('keeps a caller-assertion problem on its field whichever section shows it', () => {
     const problems = [
       { field: 'caller_assertion.signing_key_id', code: 'invalid_signing_key' },
@@ -848,6 +1014,63 @@ function delegatedConnection() {
       },
       test_profile: stored.configuration.test_profile,
     },
+  };
+}
+
+/** A stored Google domain-wide delegation, as the safe read returns it. */
+function googleDelegationConnection() {
+  const stored = storedConnection();
+  return {
+    ...stored,
+    authentication: 'google_domain_wide_delegation',
+    configuration: {
+      endpoint: {
+        base_url: 'https://gmail.googleapis.com',
+        base_path: '/gmail/v1',
+      },
+      authentication: {
+        type: 'google_domain_wide_delegation',
+        service_account_email:
+          'gateway-delegate@example-project.iam.gserviceaccount.com',
+        workload_identity_profile: 'gateway-wif',
+        scopes: [
+          'https://www.googleapis.com/auth/calendar.readonly',
+          'https://www.googleapis.com/auth/gmail.readonly',
+        ],
+        subject_claim: 'email',
+        subject_issuers: ['https://idp.example.test', 'https://login.example.test'],
+      },
+      tls: {
+        ca_bundle_configured: false,
+        client_certificate_configured: false,
+        client_private_key_configured: false,
+      },
+      test_profile: stored.configuration.test_profile,
+    },
+  };
+}
+
+function googleFields(): Pick<
+  ConnectionFormState,
+  'serviceAccountEmail' | 'workloadIdentityProfile' | 'scopes' | 'subjectIssuers'
+> {
+  return {
+    serviceAccountEmail:
+      'gateway-delegate@example-project.iam.gserviceaccount.com',
+    workloadIdentityProfile: 'gateway-wif',
+    scopes: 'https://www.googleapis.com/auth/gmail.readonly',
+    subjectIssuers: 'https://idp.example.test',
+  };
+}
+
+/** A valid new Google domain-wide delegation draft. */
+function googleDraft(): ConnectionFormState {
+  return {
+    ...DEFAULT_FORM,
+    ...googleFields(),
+    displayName: 'Gmail',
+    baseUrl: 'https://gmail.googleapis.com',
+    authenticationType: 'google_domain_wide_delegation',
   };
 }
 

@@ -344,10 +344,10 @@ and exchanges it at Google's token endpoint.
   API caller writes can name another file or audience.
 - **The Workspace scope list for the account.** It, not the Connection's
   `scopes`, is what Google enforces: a Connection can only ask for less.
-- **`admin:connections:secrets:write`.** Writing such a Connection is
-  credential authority: it decides which service account, profile, scopes and
-  trusted issuers are used, and which tools then act as every user of the
-  domain.
+- **`admin:connections:secrets:write`.** Writing such a Connection, through
+  the admin API or the admin UI editor, is credential authority: it decides
+  which service account, profile, scopes and trusted issuers are used, and
+  which tools then act as every user of the domain.
 - **Any identity provider listed in `subject_issuers`.** It names the
   Workspace user by the `email` it puts in its tokens. The gateway copies
   `email` without checking `email_verified`, so a provider that lets a user
@@ -399,14 +399,25 @@ and exchanges it at Google's token endpoint.
 - **App verification for restricted scopes.** Google requires verification
   for restricted scopes (Gmail, Drive) used by external apps; an internal
   Workspace app is normally exempt. Check this before relying on such a scope.
+- **No key, ever.** Create no key for the delegated account, and forbid key
+  creation by organisation policy where possible: a key would be a second way
+  to act as every user that the gateway's audit never sees.
+- **Review the mint audit beside Google's.** The gateway records every token
+  it obtains; changes to the Workspace delegation list and to Token Creator
+  grants on the account are recorded only by Google.
+
+The [operator guide](operator-guide.md#google-domain-wide-delegation) walks
+through the setup step by step.
 
 ### Not covered
 
 - **Revocation at Google.** A purge or a save drops cached tokens, but Google
   is not asked to revoke them, so a dropped token stays valid there until it
   expires (about an hour). Suspending the user in Workspace stops new tokens.
-- **Editing in the admin UI.** The UI lists and names such a Connection but
-  its editor refuses to open one; write it through the admin API.
+- **Checking Google's side.** The gateway cannot see which scopes the
+  Workspace administrator authorised, who holds Token Creator on the account,
+  or whether a key exists for it. It learns of a missing scope or grant only
+  when a mint fails, and of a key never.
 
 ## Where it is enforced
 
