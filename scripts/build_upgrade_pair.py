@@ -18,9 +18,10 @@ one that does, so the compiled Rust is the pinned commit's. The pair rows
 exercise no admin UI. Without the substitution the pair would stop building
 the first time the repository's Node pin moved past a pinned commit's.
 
-Both builds share one target directory under the repository's `target/`,
-separate from the one `cargo test` uses, so neither pinned build can replace
-the binary the rest of the suite runs.
+Each build has its own target directory under the repository's
+`target/upgrade-pair/`, separate from the one `cargo test` uses and from each
+other's, so the two build concurrently and neither pinned build can replace a
+binary the other or the rest of the suite runs.
 """
 import argparse
 import hashlib
@@ -31,6 +32,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 
 ROOT = Path(__file__).resolve().parents[1]
 PIN = ROOT / "gateway" / "tests" / "ha" / "rolling-upgrade-pair.json"
@@ -110,7 +112,12 @@ def remove_worktree(path: Path) -> None:
     run("git", "worktree", "prune")
 
 
-def build_one(role: str, commit: str, out: Path, cargo: str) -> dict:
+def target_dir(role: str) -> Path:
+    """The role's own target directory: the two builds never share one."""
+    return TARGET_DIR / role
+
+
+def prepare(role: str, commit: str, out: Path) -> Path:
     try:
         run("git", "cat-file", "-e", f"{commit}^{{commit}}")
         run("git", "merge-base", "--is-ancestor", commit, "HEAD")
@@ -130,13 +137,47 @@ def build_one(role: str, commit: str, out: Path, cargo: str) -> dict:
     admin_ui = source / "admin-ui" / "dist"
     admin_ui.mkdir(parents=True, exist_ok=True)
     (admin_ui / "index.html").write_text(STUB_ADMIN_UI, encoding="utf-8", newline="\n")
-    print(f"building the {role} binary from {commit}", file=sys.stderr, flush=True)
-    subprocess.run([cargo, "build", "--locked", "-p", "gateway", "--bin", "gateway",
-                    "--target-dir", str(TARGET_DIR)], cwd=source, check=True)
+    return source
+
+
+def build_concurrently(builds: list, logs: Path) -> None:
+    """Run each (role, argv, cwd) build at the same time; fail naming every role that failed.
+
+    Each build writes its own log, printed once it finishes, so the two
+    builds' output never interleaves.
+    """
+    logs.mkdir(parents=True, exist_ok=True)
+    statuses = {}
+    lock = threading.Lock()
+
+    def build(role: str, argv: list, cwd: Path) -> None:
+        log = logs / f"{role}.log"
+        try:
+            with log.open("w", encoding="utf-8") as handle:
+                status = subprocess.run(argv, cwd=cwd, stdout=handle, stderr=subprocess.STDOUT).returncode
+        except OSError as error:
+            status = f"not started: {error}"
+        with lock:
+            statuses[role] = status
+            print(f"--- the {role} build ({' '.join(map(str, argv))}) ended with {status} ---",
+                  file=sys.stderr, flush=True)
+            print(log.read_text(encoding="utf-8", errors="replace"), file=sys.stderr, flush=True)
+
+    threads = [threading.Thread(target=build, args=build_args) for build_args in builds]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    failed = sorted(role for role, *_ in builds if statuses.get(role) != 0)
+    if failed:
+        raise PairError(f"the {' and '.join(failed)} build failed; see its log above")
+
+
+def collect(role: str, commit: str, out: Path) -> dict:
     executable = "gateway.exe" if os.name == "nt" else "gateway"
     destination = out / role / executable
     destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(TARGET_DIR / "debug" / executable, destination)
+    shutil.copy2(target_dir(role) / "debug" / executable, destination)
     return {"commit": commit, "binary": f"{role}/{executable}", "sha256": sha256(destination)}
 
 
@@ -150,7 +191,13 @@ def main() -> int:
     try:
         pin = load_pin(args.pin)
         out.mkdir(parents=True, exist_ok=True)
-        built = {role: build_one(role, pin[role]["commit"], out, cargo) for role in ROLES}
+        sources = {role: prepare(role, pin[role]["commit"], out) for role in ROLES}
+        build_concurrently([
+            (role, [cargo, "build", "--locked", "-p", "gateway", "--bin", "gateway",
+                    "--target-dir", str(target_dir(role))], sources[role])
+            for role in ROLES
+        ], out / "logs")
+        built = {role: collect(role, pin[role]["commit"], out) for role in ROLES}
         if built["prepared"]["sha256"] == built["successor"]["sha256"]:
             raise PairError("the two pinned builds produced identical binaries")
         (out / "evidence").mkdir(exist_ok=True)

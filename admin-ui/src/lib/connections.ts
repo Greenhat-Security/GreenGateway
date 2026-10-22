@@ -167,6 +167,8 @@ export type SafeDelegatedIssuerToken = {
   requested_scopes: string[];
   audience?: string;
   resource?: string;
+  /** RFC 7009 endpoint where a purged token is revoked; absent, it is only dropped. */
+  revocation_url?: string;
   subject_token_source: 'caller_assertion';
   client_secret_configured: boolean;
 };
@@ -1225,6 +1227,8 @@ function projectSafeConnectionAuthentication(
       typeof source.audience === 'string') &&
     (source.resource === undefined ||
       typeof source.resource === 'string') &&
+    (source.revocation_url === undefined ||
+      isSafeHttpsTokenUrl(source.revocation_url)) &&
     source.subject_token_source === 'caller_assertion' &&
     typeof source.client_secret_configured === 'boolean'
   ) {
@@ -1239,6 +1243,9 @@ function projectSafeConnectionAuthentication(
       ...(source.resource === undefined
         ? {}
         : { resource: source.resource }),
+      ...(source.revocation_url === undefined
+        ? {}
+        : { revocation_url: source.revocation_url }),
       subject_token_source: source.subject_token_source,
       client_secret_configured: source.client_secret_configured,
     };

@@ -252,6 +252,22 @@ pub(super) struct PrincipalDetailParams {
     pub(super) auth_method: Option<String>,
 }
 
+/// Whose delegated tokens to purge: the principal's issuer and subject,
+/// exactly as the principal directory and audit actors name them.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PrincipalDelegatedTokensRevokeRequest {
+    pub(super) issuer: String,
+    pub(super) subject: String,
+}
+
+#[derive(Serialize)]
+pub(super) struct PrincipalDelegatedTokensRevokeResponse {
+    /// Cache entries purged. Each one holding a token is then revoked at its
+    /// issuer in the background, and audited.
+    pub(super) purged_entries: usize,
+}
+
 #[derive(Deserialize)]
 pub(super) struct InferredSchemaParams {
     pub(super) method: Option<String>,
@@ -1280,11 +1296,14 @@ pub(super) struct ClusterDiscoverySeed {
 /// Why a cluster-mode boot could not register itself in the membership
 /// roster (issue #241, PR 13). The database was proven reachable a moment
 /// earlier, so a row that cannot be written is a fail-closed startup
-/// error, not a warning. A fingerprint disagreement is *not* an error:
-/// the replica boots unready and waits for agreement.
+/// error, not a warning, and so is a durable contract fence (issue #426,
+/// PR 3) that excludes this build. A fingerprint disagreement is *not* an
+/// error: the replica boots unready and waits for agreement.
 #[cfg(feature = "postgres")]
 #[derive(Debug)]
-pub(super) struct ClusterMembershipStartupError(pub(super) storage::RepositoryError);
+pub(super) struct ClusterMembershipStartupError(
+    pub(super) cluster_membership::BootRegistrationError,
+);
 
 #[cfg(feature = "postgres")]
 impl std::fmt::Display for ClusterMembershipStartupError {

@@ -638,6 +638,91 @@ async fn revoked_jti_is_rejected_and_noop_revocation_allows() {
     assert_eq!(principal.session_id, "session-123");
 }
 
+/// Every principal a validator reported as presenting a revoked credential.
+#[derive(Default)]
+struct RecordingRevokedCredentials(std::sync::Mutex<Vec<(String, String)>>);
+
+impl RevokedCredentialObserver for RecordingRevokedCredentials {
+    fn credential_revoked(&self, issuer: &str, subject: &str) {
+        self.0
+            .lock()
+            .expect("observer lock")
+            .push((issuer.to_owned(), subject.to_owned()));
+    }
+}
+
+impl RecordingRevokedCredentials {
+    fn reported(&self) -> Vec<(String, String)> {
+        self.0.lock().expect("observer lock").clone()
+    }
+}
+
+#[tokio::test]
+async fn a_revoked_jti_reports_the_principal_it_names_and_nothing_else_does() {
+    let mut cfg = default_cfg();
+    cfg.issuer = Some("https://issuer.example.test/".to_owned());
+    let observer = Arc::new(RecordingRevokedCredentials::default());
+    let revoked = Arc::new(StaticRevocationStore {
+        revoked: HashSet::from(["session-123".to_owned()]),
+    });
+    let refusing = validator(cfg, revoked.clone(), TEST_PUBLIC_KEY)
+        .with_revoked_credential_observer(observer.clone());
+    let mut claims = base_claims();
+    claims["iss"] = json!("https://issuer.example.test/");
+
+    let error = refusing
+        .validate_session(&SessionCredential::Bearer(signed_token(
+            claims.clone(),
+            TEST_PRIVATE_KEY,
+        )))
+        .await
+        .expect_err("a revoked jti is refused");
+    assert_invalid_session(error, "revoked_token");
+    // The validator's own issuer boundary, normalized, and the token's subject.
+    assert_eq!(
+        observer.reported(),
+        [(
+            "https://issuer.example.test".to_owned(),
+            "user-123".to_owned()
+        )]
+    );
+
+    // A token that is not on the denylist is accepted and reports nothing.
+    let mut current = claims.clone();
+    current["jti"] = json!("session-456");
+    refusing
+        .validate_session(&SessionCredential::Bearer(signed_token(
+            current,
+            TEST_PRIVATE_KEY,
+        )))
+        .await
+        .expect("a current token is accepted");
+    // Nor does a revoked jti under a signature the validator does not trust:
+    // it never reaches the denylist, so it can name nobody.
+    refusing
+        .validate_session(&SessionCredential::Bearer(signed_token(
+            claims,
+            SECOND_TEST_PRIVATE_KEY,
+        )))
+        .await
+        .expect_err("an untrusted signature is refused");
+    assert_eq!(observer.reported().len(), 1);
+
+    // Without a principal issuer a subject names nobody, so nothing is reported.
+    let boundless_observer = Arc::new(RecordingRevokedCredentials::default());
+    let boundless = validator(default_cfg(), revoked, TEST_PUBLIC_KEY)
+        .with_revoked_credential_observer(boundless_observer.clone());
+    let error = boundless
+        .validate_session(&SessionCredential::Bearer(signed_token(
+            base_claims(),
+            TEST_PRIVATE_KEY,
+        )))
+        .await
+        .expect_err("a revoked jti is refused");
+    assert_invalid_session(error, "revoked_token");
+    assert!(boundless_observer.reported().is_empty());
+}
+
 #[tokio::test]
 async fn jwt_validator_is_usable_as_dyn_session_validator() {
     let validator: Arc<dyn SessionValidator> = Arc::new(validator(

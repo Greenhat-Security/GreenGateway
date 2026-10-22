@@ -127,6 +127,19 @@ pub trait RevocationStore: Send + Sync {
     async fn is_revoked(&self, jti: &str) -> Result<bool, AuthError>;
 }
 
+/// Told about each JWT a validator refuses because its `jti` is on the denylist, with the
+/// principal the token names (issue #441): the validator's principal issuer and the token's
+/// `sub`. Gateway startup hands it the Connection runtime, which purges that principal's cached
+/// delegated tokens.
+///
+/// The token's signature, issuer, audience, expiry and principal bounds were checked first, so
+/// the principal is one its provider vouched for, never one a caller made up. It runs on the
+/// request that presented the token, which is refused whatever the observer does, so it must not
+/// block.
+pub trait RevokedCredentialObserver: Send + Sync {
+    fn credential_revoked(&self, issuer: &str, subject: &str);
+}
+
 /// Revocation store that never revokes a token.
 #[allow(dead_code)] // Used as the default until a durable revocation store lands.
 #[derive(Debug)]
@@ -151,6 +164,7 @@ pub struct JwtValidator {
     keys_fetched_at: Arc<RwLock<Option<Instant>>>,
     last_jwks_refresh: Arc<Mutex<Option<Instant>>>,
     revocation: Arc<dyn RevocationStore>,
+    revoked_credentials: Option<Arc<dyn RevokedCredentialObserver>>,
 }
 
 impl fmt::Debug for JwtValidator {
@@ -289,7 +303,18 @@ impl JwtValidator {
             keys_fetched_at: Arc::new(RwLock::new(seeded_at)),
             last_jwks_refresh: Arc::new(Mutex::new(None)),
             revocation,
+            revoked_credentials: None,
         })
+    }
+
+    /// Reports the principal of every token refused as revoked to `observer`. A validator without
+    /// a principal issuer reports nothing: a subject alone names nobody.
+    pub fn with_revoked_credential_observer(
+        mut self,
+        observer: Arc<dyn RevokedCredentialObserver>,
+    ) -> Self {
+        self.revoked_credentials = Some(observer);
+        self
     }
 
     /// Keep the key set fresh without waiting for a kid miss: refresh at
@@ -563,6 +588,12 @@ impl JwtValidator {
 
         if let Some(jti) = jti {
             if self.revocation.is_revoked(jti).await? {
+                if let (Some(observer), Some(issuer)) = (
+                    self.revoked_credentials.as_ref(),
+                    self.principal_issuer.as_deref(),
+                ) {
+                    observer.credential_revoked(issuer, user_id);
+                }
                 return Err(AuthError::InvalidSession("revoked_token".to_owned()));
             }
         }

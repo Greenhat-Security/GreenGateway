@@ -141,9 +141,32 @@ class WorkflowTests(unittest.TestCase):
         preview = self.ci["jobs"]["image-preview"]
         self.assertEqual(preview["if"], "github.event_name == 'pull_request'")
         self.assertEqual(preview["permissions"], {"contents": "read"})
-        build = next(step for step in preview["steps"] if step.get("uses", "").startswith("docker/build-push-action@"))
+        # The PR image is built once per run, by gateway-image, which can
+        # neither push nor log in to a registry; the preview scans that image.
+        shared = self.ci["jobs"]["gateway-image"]
+        self.assertNotIn("if", shared)
+        self.assertEqual(shared["permissions"], {"contents": "read"})
+        self.assertNotIn("secrets.", str(shared))
+        builds = [step for step in shared["steps"] if step.get("uses", "").startswith("docker/build-push-action@")]
+        self.assertEqual(len(builds), 1)
+        build = builds[0]
         self.assertEqual(build["with"]["push"], "false")
         self.assertEqual(build["with"]["load"], "true")
+        self.assertEqual((build["with"]["context"], build["with"]["file"]), (".", "./Dockerfile"))
+        self.assertNotIn("cache-to", build["with"])
+        for step in shared["steps"]:
+            self.assertNotIn("docker/login-action", step.get("uses", ""))
+            self.assertNotIn("docker push", step.get("run", ""))
+        self.assertEqual(preview["needs"], "gateway-image")
+        for job in ("image-preview", "ha-compose-example", "dev-traffic-smoke"):
+            with self.subTest(job=job):
+                steps = self.ci["jobs"][job]["steps"]
+                self.assertFalse(any(step.get("uses", "").startswith("docker/build-push-action@") for step in steps))
+                loads = [step for step in steps if step.get("uses") == "./.github/actions/gateway-image"]
+                self.assertEqual(len(loads), 1)
+                self.assertEqual(loads[0]["with"]["producer-result"], "${{ needs.gateway-image.result }}")
+                self.assertEqual(loads[0]["with"]["image-id"], "${{ needs.gateway-image.outputs.image-id }}")
+                self.assertNotIn("if", loads[0])
         self.assertTrue(any("--scan-preview" in step.get("run", "") for step in preview["steps"]))
         self.assertTrue(any("check-runtime-image.py" in step.get("run", "") for step in self.ci["jobs"]["image-scan"]["steps"]))
         promotion = self.ci["jobs"]["promote-image"]

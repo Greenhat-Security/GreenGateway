@@ -1321,6 +1321,59 @@ mod database {
         );
     }
 
+    /// The durable contract fence (issue #426, PR 3): a build the fence
+    /// excludes is refused by a dry run and by an apply with the same code,
+    /// before preflight reads the namespace, and nothing is written.
+    #[tokio::test]
+    async fn a_build_the_contract_fence_excludes_cannot_import() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (config, _dsn_file) = target_config(&database.dsn, "deploy-import-fenced");
+        let pool = migrate(&config).await;
+        let fixture = build_fixture("fenced", 1, 0);
+
+        // A newer build moved the deployment past this one's serving range.
+        let beyond = migrations::schema_version_range().1 + 1;
+        pool.get()
+            .await
+            .expect("checkout")
+            .execute(
+                "UPDATE greengateway.contract_fence
+                 SET generation = 1, minimum_schema = $1,
+                     raised_at = now(), raised_by = 'fixture.newer_build'
+                 WHERE singleton",
+                &[&beyond],
+            )
+            .await
+            .expect("a forward-only raise is accepted");
+
+        for mode in [ImportMode::DryRun, ImportMode::Apply] {
+            let Err(refused) = run(&request(&fixture, mode), &config).await else {
+                panic!("{mode:?}: a build the contract fence excludes must be refused");
+            };
+            assert_eq!(refused.code(), "target_schema_not_current", "{mode:?}");
+            assert!(
+                refused.to_string().contains("contract fence"),
+                "{mode:?}: the refusal says why: {refused}"
+            );
+        }
+        assert_eq!(
+            count_of(&pool, "SELECT count(*) FROM greengateway.policy_documents").await,
+            0,
+            "nothing was imported"
+        );
+        assert_eq!(
+            crate::storage::postgres::read_deployment_binding(&pool)
+                .await
+                .expect("the binding reads"),
+            None,
+            "the refused apply did not even bind the database"
+        );
+    }
+
     /// The namespace-empty refusal, falsified: a single row in ONE
     /// authoritative table is enough, and `--resume` is the only way past
     /// it.

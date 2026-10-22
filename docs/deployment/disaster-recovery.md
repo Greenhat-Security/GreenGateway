@@ -87,6 +87,7 @@ A `503` names its reason, and each reason points somewhere different:
 | Reason | Look at |
 | --- | --- |
 | `starting`, persisting | the replica's startup logs — cluster mode fails closed on schema, binding, and policy problems, and says which |
+| `contract_fenced` | the restored database's durable contract fence excludes this build; run the build the deployment ran when the backup was taken, never an older one ([the durable contract fence](postgres.md#the-durable-contract-fence)) |
 | `config_fingerprint_mismatch` | step 6; another replica is running with a different configuration |
 | `required_upstream_unavailable` | your upstreams, not the recovery |
 

@@ -35,8 +35,8 @@ use super::{
     status::ConnectionRevisions,
     store::{ConnectionDependencyKind, StoredConnection},
     token_exchange::{
-        DelegatedTokenBinding, DelegatedTokenError, DelegatedTokenLease, DelegatedTokenRuntime,
-        SubjectTokenSettings,
+        DelegatedTokenBinding, DelegatedTokenError, DelegatedTokenLease,
+        DelegatedTokenPurgeTrigger, DelegatedTokenRuntime, SubjectTokenSettings,
     },
 };
 
@@ -50,6 +50,19 @@ pub struct ConnectionHttpRuntime {
     delegated: DelegatedTokenRuntime,
     #[cfg(test)]
     additional_resolution_delay: Option<std::time::Duration>,
+}
+
+/// A validator's refusal of a revoked credential purges the principal's delegated tokens: whatever
+/// else that principal still holds, nothing exchanged for them before the revocation is served
+/// again without asking the issuer.
+impl crate::auth::RevokedCredentialObserver for ConnectionHttpRuntime {
+    fn credential_revoked(&self, issuer: &str, subject: &str) {
+        self.purge_delegated_tokens(
+            issuer,
+            subject,
+            DelegatedTokenPurgeTrigger::CredentialRevoked,
+        );
+    }
 }
 
 impl fmt::Debug for ConnectionHttpRuntime {
@@ -622,6 +635,19 @@ impl ConnectionHttpRuntime {
         self.oauth = self.oauth.with_audit(audit.clone());
         self.delegated = self.delegated.with_audit(audit);
         self
+    }
+
+    /// Purges every delegated token this process caches for the principal `issuer` and `subject`
+    /// name, under every `delegated_issuer_token` Connection, and revokes each at its issuer in
+    /// the background where the Connection names a `revocation_url`. Returns how many cache
+    /// entries were purged. Each replica holds its own cache, so this purges this process's only.
+    pub fn purge_delegated_tokens(
+        &self,
+        issuer: &str,
+        subject: &str,
+        trigger: DelegatedTokenPurgeTrigger,
+    ) -> usize {
+        self.delegated.purge_principal(issuer, subject, trigger)
     }
 
     /// Replaces the delegated-token cache with one of `capacity` entries
@@ -1406,6 +1432,7 @@ impl ConnectionHttpRuntime {
                 requested_scopes,
                 audience,
                 resource,
+                revocation_url,
                 subject_token_source: SubjectTokenSource::CallerAssertion,
             } => {
                 // Validation guarantees the block on every stored document;
@@ -1428,6 +1455,7 @@ impl ConnectionHttpRuntime {
                         requested_scopes: requested_scopes.clone(),
                         audience: audience.clone(),
                         resource: resource.clone(),
+                        revocation_url: revocation_url.clone(),
                         subject_token: SubjectTokenSettings {
                             signing_key_id: assertion.signing_key_id.clone(),
                             kid: assertion.kid.clone(),
@@ -3542,6 +3570,7 @@ mod tests {
             requested_scopes: vec!["mail.read".to_owned()],
             audience: Some("https://billing.example.test".to_owned()),
             resource: None,
+            revocation_url: None,
             subject_token_source: SubjectTokenSource::CallerAssertion,
         };
         let root = temporary_managed_root("delegated-tool-target");

@@ -30,6 +30,24 @@
 //!   column cannot hold is refused, because a cut list would claim less
 //!   than the replica does and a guessed one could claim more. The store
 //!   returns the column as written; recognition belongs to the reader.
+//! - **The durable contract fence** (`contract_fence`, migration 20, issue
+//!   #426 PR 3), which this store reads and raises but never lowers (the
+//!   table's trigger refuses that too). Every heartbeat takes `FOR SHARE` on
+//!   the fence row inside its own statement and writes the row only when the
+//!   fence admits this binary: a gateway the fence excludes can neither
+//!   boot into the roster nor rejoin it after its row went stale or was
+//!   swept, and the heartbeat reports [`HeartbeatOutcome::Fenced`] instead.
+//!   [`PostgresMembershipStore::raise_contract_fence`] is the only writer: one
+//!   transaction that takes the migrator's advisory lock as a try-lock,
+//!   locks the fence row `FOR UPDATE`, reads the ledger, the named backfill
+//!   and the roster under that lock, and raises the fence only if the
+//!   caller's decision admits it. A heartbeat therefore lands either before
+//!   the raise reads the roster, where it is counted, or after the raise
+//!   commits, where it is refused; there is no instant at which a member the
+//!   raise did not see can join behind it. The ready and draining stamps,
+//!   which also refresh `last_heartbeat_at`, make the same decision over
+//!   the row's own advertisement, so neither can turn the stale row of a
+//!   build the fence excludes live again.
 //! - **`maintenance_jobs`**: one row per singleton job with the lease
 //!   fence the current leader adopted it at. Every write of a job's
 //!   timestamps carries two predicates in one statement: `fence = $fence`
@@ -65,7 +83,7 @@ use uuid::Uuid;
 use crate::ha::InstanceIdentity;
 
 use super::{
-    compatibility::{self, Capability},
+    compatibility::{self, BackfillState, Capability, ContractFence, FenceTarget},
     log_classified,
     postgres::{classify_pool_error, timed_operation},
     RepositoryError, RepositoryErrorKind,
@@ -88,6 +106,31 @@ const OPERATION_JOB_ADOPT: &str = "maintenance_jobs_adopt";
 const OPERATION_JOB_START: &str = "maintenance_job_start";
 const OPERATION_JOB_OUTCOME: &str = "maintenance_job_outcome";
 const OPERATION_JOB_LIST: &str = "maintenance_jobs_list";
+const OPERATION_FENCE_READ: &str = "contract_fence_read";
+const OPERATION_FENCE_RAISE: &str = "contract_fence_raise";
+const OPERATION_BACKFILL_READ: &str = "schema_backfill_read";
+
+/// The fence row as every reader reads it.
+const FENCE_COLUMNS: &str = "SELECT generation, minimum_schema, capabilities
+     FROM greengateway.contract_fence
+     WHERE singleton";
+
+/// The fence row under `FOR SHARE`, as a stamp that refreshes
+/// `last_heartbeat_at` reads it in its own statement: a raise in flight is
+/// waited for, and one that committed first is seen.
+const FENCE_FOR_SHARE: &str = "SELECT minimum_schema, capabilities
+     FROM greengateway.contract_fence
+     WHERE singleton
+     FOR SHARE";
+
+/// The heartbeat's fence decision (`ContractFence::exclusion`) over a
+/// roster row `m` and the locked fence row `fence`: the row's serving
+/// maximum reaches the fence's minimum, and every fenced name is one the
+/// row advertises. The row's advertisement is the replica's own, written by
+/// its own heartbeat, so this is the decision that heartbeat made. A
+/// missing fence row joins nothing, so nothing is stamped.
+const FENCE_ADMITS_ROW: &str = "fence.minimum_schema <= m.schema_version_max
+     AND string_to_array(fence.capabilities, ',') <@ string_to_array(m.capabilities, ',')";
 
 /// The schema's bound on the short text columns (`binary_version`,
 /// `last_error_code`, `last_failure_code`); longer values are cut at a
@@ -132,6 +175,51 @@ pub struct MemberRegistration {
     /// The capabilities this binary implements
     /// (`compatibility::BINARY_CAPABILITIES`).
     pub capabilities: Vec<Capability>,
+}
+
+/// What one heartbeat did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HeartbeatOutcome {
+    /// The row was created or refreshed.
+    Written,
+    /// The durable contract fence excludes this binary, so nothing was
+    /// written: the replica is not, and cannot become, a live member. The
+    /// fence only moves forward, so no later heartbeat of this binary can
+    /// be written either.
+    Fenced,
+}
+
+/// What [`PostgresMembershipStore::raise_contract_fence`] read under the
+/// fence's row lock, for the caller's decision.
+pub(crate) struct FenceDecision<'a> {
+    pub(crate) fence: &'a ContractFence,
+    /// The ledger's `(version, checksum)` rows, bounded as the readiness
+    /// probe bounds them.
+    pub(crate) ledger: &'a [(i64, String)],
+    /// The named backfill's state; `None` when none was named or its row
+    /// could not be read.
+    pub(crate) backfill: Option<BackfillState>,
+    /// The roster, liveness judged on the database clock.
+    pub(crate) members: &'a [ClusterMember],
+}
+
+/// How a fence raise ended. Only `Raised` wrote anything.
+#[derive(Debug)]
+pub(crate) enum FenceRaise<T, E> {
+    /// A migrator holds the schema lock; nothing was read or decided.
+    MigrationInProgress,
+    /// The caller's decision refused.
+    Refused(E),
+    /// The decision admitted, and the fence already demanded everything it
+    /// asked for, so nothing was written.
+    Unchanged { decided: T },
+    /// The decision admitted, and the fence moved from `before` to `after`
+    /// in the same transaction.
+    Raised {
+        decided: T,
+        before: ContractFence,
+        after: ContractFence,
+    },
 }
 
 /// The security revisions a heartbeat carries: the watermark the replica
@@ -241,12 +329,19 @@ impl PostgresMembershipStore {
     /// row the singleton swept during a partition comes back with the
     /// replica's real `started_at` and `ready_at` instead of a fresh,
     /// unready boot; an existing row keeps its own.
+    ///
+    /// The write is conditional on the durable contract fence admitting
+    /// the registration -- its serving range reaches the fence's minimum
+    /// schema and it advertises every fenced capability -- decided in the
+    /// same statement under `FOR SHARE` on the fence row, so a raise that
+    /// committed first is seen and one in flight is waited for.
+    /// [`HeartbeatOutcome::Fenced`] means nothing was written.
     pub async fn heartbeat(
         &self,
         registration: &MemberRegistration,
         revisions: MemberRevisions,
         last_error_code: Option<&str>,
-    ) -> Result<(), RepositoryError> {
+    ) -> Result<HeartbeatOutcome, RepositoryError> {
         timed_operation(
             OPERATION_HEARTBEAT,
             self.heartbeat_inner(registration, revisions, last_error_code),
@@ -259,7 +354,7 @@ impl PostgresMembershipStore {
         registration: &MemberRegistration,
         revisions: MemberRevisions,
         last_error_code: Option<&str>,
-    ) -> Result<(), RepositoryError> {
+    ) -> Result<HeartbeatOutcome, RepositoryError> {
         if registration.fingerprint.len() != 64
             || !registration
                 .fingerprint
@@ -284,36 +379,59 @@ impl PostgresMembershipStore {
             (remembered.started_at.clone(), remembered.ready_at.clone())
         };
         let client = self.pool.get().await.map_err(classify_pool_error)?;
+        // The fence decision is the one `ContractFence::exclusion` makes:
+        // the serving maximum ($6) reaches the fence's minimum, and the
+        // fenced names are a subset of the names this binary advertises
+        // ($15). A missing fence row admits nothing. The outer SELECT
+        // always returns one row, so a fenced heartbeat is never mistaken
+        // for a written one, nor for an admitted write that matched a
+        // foreign deployment's row and so returned nothing.
         let row = client
-            .query_opt(
+            .query_one(
                 &format!(
-                    "INSERT INTO greengateway.cluster_members AS m
-                         (deployment_id, instance_id, boot_id, binary_version,
-                          schema_version_min, schema_version_max,
-                          document_version_min, document_version_max, fingerprint,
-                          started_at, last_heartbeat_at, ready_at,
-                          compiled_security_revision, observed_security_revision, last_error_code,
-                          capabilities)
-                     VALUES ($1, $2::text::uuid, $3::text::uuid, $4, $5, $6, $7, $8, $9,
-                             COALESCE($13::text::timestamptz, now()), now(), $14::text::timestamptz,
-                             $10, $11, $12, $15)
-                     ON CONFLICT (instance_id) DO UPDATE SET
-                         boot_id = EXCLUDED.boot_id,
-                         binary_version = EXCLUDED.binary_version,
-                         schema_version_min = EXCLUDED.schema_version_min,
-                         schema_version_max = EXCLUDED.schema_version_max,
-                         document_version_min = EXCLUDED.document_version_min,
-                         document_version_max = EXCLUDED.document_version_max,
-                         fingerprint = EXCLUDED.fingerprint,
-                         last_heartbeat_at = now(),
-                         ready_at = COALESCE(m.ready_at, EXCLUDED.ready_at),
-                         compiled_security_revision = EXCLUDED.compiled_security_revision,
-                         observed_security_revision = EXCLUDED.observed_security_revision,
-                         last_error_code = EXCLUDED.last_error_code,
-                         capabilities = EXCLUDED.capabilities
-                     WHERE m.deployment_id = EXCLUDED.deployment_id
-                     RETURNING to_char(m.started_at AT TIME ZONE 'UTC', {f}) AS started_at,
-                               to_char(m.ready_at AT TIME ZONE 'UTC', {f}) AS ready_at",
+                    "WITH fence AS (
+                         SELECT minimum_schema <= $6::integer
+                                AND string_to_array(capabilities, ',')
+                                    <@ string_to_array($15::text, ',') AS admits
+                         FROM greengateway.contract_fence
+                         WHERE singleton
+                         FOR SHARE
+                     ), written AS (
+                         INSERT INTO greengateway.cluster_members AS m
+                             (deployment_id, instance_id, boot_id, binary_version,
+                              schema_version_min, schema_version_max,
+                              document_version_min, document_version_max, fingerprint,
+                              started_at, last_heartbeat_at, ready_at,
+                              compiled_security_revision, observed_security_revision,
+                              last_error_code, capabilities)
+                         SELECT $1::text, $2::text::uuid, $3::text::uuid, $4::text,
+                                $5::integer, $6::integer, $7::integer, $8::integer, $9::text,
+                                COALESCE($13::text::timestamptz, now()), now(),
+                                $14::text::timestamptz,
+                                $10::bigint, $11::bigint, $12::text, $15::text
+                         FROM fence
+                         WHERE fence.admits
+                         ON CONFLICT (instance_id) DO UPDATE SET
+                             boot_id = EXCLUDED.boot_id,
+                             binary_version = EXCLUDED.binary_version,
+                             schema_version_min = EXCLUDED.schema_version_min,
+                             schema_version_max = EXCLUDED.schema_version_max,
+                             document_version_min = EXCLUDED.document_version_min,
+                             document_version_max = EXCLUDED.document_version_max,
+                             fingerprint = EXCLUDED.fingerprint,
+                             last_heartbeat_at = now(),
+                             ready_at = COALESCE(m.ready_at, EXCLUDED.ready_at),
+                             compiled_security_revision = EXCLUDED.compiled_security_revision,
+                             observed_security_revision = EXCLUDED.observed_security_revision,
+                             last_error_code = EXCLUDED.last_error_code,
+                             capabilities = EXCLUDED.capabilities
+                         WHERE m.deployment_id = EXCLUDED.deployment_id
+                         RETURNING to_char(m.started_at AT TIME ZONE 'UTC', {f}) AS started_at,
+                                   to_char(m.ready_at AT TIME ZONE 'UTC', {f}) AS ready_at
+                     )
+                     SELECT COALESCE((SELECT admits FROM fence), false) AS admitted,
+                            (SELECT started_at FROM written) AS started_at,
+                            (SELECT ready_at FROM written) AS ready_at",
                     f = TIMESTAMP_FORMAT
                 ),
                 &[
@@ -336,16 +454,20 @@ impl PostgresMembershipStore {
             )
             .await
             .map_err(|error| classify_query(error, OPERATION_HEARTBEAT))?;
-        if let Some(row) = row {
-            let started_at: String = column(&row, "started_at", OPERATION_HEARTBEAT)?;
-            let ready_at: Option<String> = column(&row, "ready_at", OPERATION_HEARTBEAT)?;
+        let admitted: bool = column(&row, "admitted", OPERATION_HEARTBEAT)?;
+        if !admitted {
+            return Ok(HeartbeatOutcome::Fenced);
+        }
+        let started_at: Option<String> = column(&row, "started_at", OPERATION_HEARTBEAT)?;
+        let ready_at: Option<String> = column(&row, "ready_at", OPERATION_HEARTBEAT)?;
+        if let Some(started_at) = started_at {
             let mut remembered = self.remembered();
             remembered.started_at = Some(started_at);
             if ready_at.is_some() {
                 remembered.ready_at = ready_at;
             }
         }
-        Ok(())
+        Ok(HeartbeatOutcome::Written)
     }
 
     /// Stamp `ready_at` (once; a repeat keeps the first instant) and count
@@ -353,6 +475,10 @@ impl PostgresMembershipStore {
     /// created here: readiness without a registration is not a state the
     /// replica can be in, so the caller heartbeats first. The instant is
     /// remembered so a later heartbeat can re-create a swept row with it.
+    ///
+    /// Like the heartbeat, the stamp is conditional on the durable contract
+    /// fence admitting what the row advertises ([`FENCE_ADMITS_ROW`]), so
+    /// it never refreshes the row of a build the fence excludes.
     pub async fn mark_ready(&self) -> Result<(), RepositoryError> {
         timed_operation(OPERATION_MARK_READY, self.mark_ready_inner()).await
     }
@@ -363,10 +489,13 @@ impl PostgresMembershipStore {
         let row = client
             .query_opt(
                 &format!(
-                    "UPDATE greengateway.cluster_members
-                     SET ready_at = COALESCE(ready_at, now()), last_heartbeat_at = now()
-                     WHERE deployment_id = $1 AND instance_id = $2::text::uuid
-                     RETURNING to_char(ready_at AT TIME ZONE 'UTC', {f}) AS ready_at",
+                    "WITH fence AS ({FENCE_FOR_SHARE})
+                     UPDATE greengateway.cluster_members AS m
+                     SET ready_at = COALESCE(m.ready_at, now()), last_heartbeat_at = now()
+                     FROM fence
+                     WHERE m.deployment_id = $1 AND m.instance_id = $2::text::uuid
+                       AND {FENCE_ADMITS_ROW}
+                     RETURNING to_char(m.ready_at AT TIME ZONE 'UTC', {f}) AS ready_at",
                     f = TIMESTAMP_FORMAT
                 ),
                 &[&self.deployment_id, &instance_id],
@@ -384,12 +513,21 @@ impl PostgresMembershipStore {
 
     /// Stamp `draining_at` (once) and count the write as a heartbeat, so a
     /// draining replica is visibly leaving rather than silently going
-    /// stale.
+    /// stale. Conditional on the durable contract fence exactly as
+    /// [`Self::mark_ready`] is: a replica that was paused past the stale
+    /// window while the fence moved past its build, and is stopped before
+    /// its next heartbeat finds out, must not reappear live (and lacking)
+    /// on its way out.
     pub async fn mark_draining(&self) -> Result<(), RepositoryError> {
         self.stamp(
-            "UPDATE greengateway.cluster_members
-             SET draining_at = COALESCE(draining_at, now()), last_heartbeat_at = now()
-             WHERE deployment_id = $1 AND instance_id = $2::text::uuid",
+            &format!(
+                "WITH fence AS ({FENCE_FOR_SHARE})
+                 UPDATE greengateway.cluster_members AS m
+                 SET draining_at = COALESCE(m.draining_at, now()), last_heartbeat_at = now()
+                 FROM fence
+                 WHERE m.deployment_id = $1 AND m.instance_id = $2::text::uuid
+                   AND {FENCE_ADMITS_ROW}"
+            ),
             OPERATION_MARK_DRAINING,
         )
         .await
@@ -439,31 +577,243 @@ impl PostgresMembershipStore {
     ) -> Result<Vec<ClusterMember>, RepositoryError> {
         let window_secs = stale_window.as_secs_f64();
         let rows = client
-            .query(
-                &format!(
-                    "SELECT instance_id::text AS instance_id, boot_id::text AS boot_id,
-                            binary_version, schema_version_min, schema_version_max,
-                            document_version_min, document_version_max, fingerprint,
-                            to_char(started_at AT TIME ZONE 'UTC', {f}) AS started_at,
-                            to_char(last_heartbeat_at AT TIME ZONE 'UTC', {f}) AS last_heartbeat_at,
-                            GREATEST(EXTRACT(EPOCH FROM (now() - last_heartbeat_at)), 0)::double precision
-                                AS heartbeat_age_secs,
-                            to_char(ready_at AT TIME ZONE 'UTC', {f}) AS ready_at,
-                            to_char(draining_at AT TIME ZONE 'UTC', {f}) AS draining_at,
-                            compiled_security_revision, observed_security_revision, last_error_code,
-                            capabilities,
-                            (last_heartbeat_at > now() - make_interval(secs => $2::double precision)) AS live
-                     FROM greengateway.cluster_members
-                     WHERE deployment_id = $1
-                     ORDER BY started_at ASC, instance_id ASC",
-                    f = TIMESTAMP_FORMAT
-                ),
-                &[&self.deployment_id, &window_secs],
-            )
+            .query(&members_statement(), &[&self.deployment_id, &window_secs])
             .await
             .map_err(|error| classify_query(error, OPERATION_LIST))?;
         rows.iter().map(member_from_row).collect()
     }
+
+    /// The durable contract fence, read without a lock: what the operation
+    /// gate compares this binary and the roster with. The heartbeat and the
+    /// raise make their own locked decisions.
+    pub(crate) async fn contract_fence(&self) -> Result<ContractFence, RepositoryError> {
+        read_contract_fence(&self.pool).await
+    }
+
+    /// The named backfill's state in the backfill ledger. A missing row is
+    /// [`BackfillState::Missing`]; a state outside the column's check is
+    /// invalid data.
+    pub(crate) async fn backfill_state(
+        &self,
+        name: &str,
+    ) -> Result<BackfillState, RepositoryError> {
+        timed_operation(OPERATION_BACKFILL_READ, async {
+            let client = self.pool.get().await.map_err(classify_pool_error)?;
+            let row = client
+                .query_opt(
+                    "SELECT state FROM greengateway.schema_backfills WHERE name = $1",
+                    &[&name],
+                )
+                .await
+                .map_err(|error| classify_query(error, OPERATION_BACKFILL_READ))?;
+            let state: Option<String> = row
+                .map(|row| column(&row, "state", OPERATION_BACKFILL_READ))
+                .transpose()?;
+            BackfillState::from_column(state.as_deref())
+                .ok_or_else(|| invalid_data(OPERATION_BACKFILL_READ))
+        })
+        .await
+    }
+
+    /// Raise the durable contract fence, or decide not to, in one
+    /// transaction (issue #426, PR 3).
+    ///
+    /// The migrator's advisory lock is taken first, as a transaction-level
+    /// try-lock: a migrator holding it means the schema may be changing
+    /// under the decision, so nothing is read and the raise answers
+    /// [`FenceRaise::MigrationInProgress`]; a migrator that starts later
+    /// waits for this transaction. Then the fence row is locked
+    /// `FOR UPDATE`, which every heartbeat's `FOR SHARE` waits behind, and
+    /// the ledger, the named backfill and the roster are read under it.
+    /// `decide` sees all of it and either refuses or names where the fence
+    /// must end up; the raise is written only when that differs from the
+    /// fence as read, and the trigger refuses anything that would lower it.
+    /// Every statement runs under the pooled session's statement and lock
+    /// timeouts, and the transaction rolls back if the future is dropped
+    /// mid-way, so an abandoned raise never leaves the fence row locked.
+    pub(crate) async fn raise_contract_fence<T, E, F>(
+        &self,
+        stale_window: Duration,
+        backfill: Option<&str>,
+        raised_by: &str,
+        decide: F,
+    ) -> Result<FenceRaise<T, E>, RepositoryError>
+    where
+        T: Send,
+        E: Send,
+        F: FnOnce(FenceDecision<'_>) -> Result<(T, Option<FenceTarget>), E> + Send,
+    {
+        timed_operation(OPERATION_FENCE_RAISE, async {
+            let mut client = self.pool.get().await.map_err(classify_pool_error)?;
+            // `Transaction`'s drop queues a ROLLBACK the moment the future
+            // is abandoned (a cancelled request), as the audit store's
+            // batch does: a bare BEGIN would go back to the pool still
+            // holding the fence row, and every heartbeat in the deployment
+            // would queue behind it.
+            let transaction = client
+                .transaction()
+                .await
+                .map_err(|error| classify_query(error, OPERATION_FENCE_RAISE))?;
+            let migration_lock_free: bool = transaction
+                .query_one(
+                    "SELECT pg_try_advisory_xact_lock($1) AS free",
+                    &[&super::migrations::migration_lock_key()],
+                )
+                .await
+                .map_err(|error| classify_query(error, OPERATION_FENCE_RAISE))
+                .and_then(|row| column(&row, "free", OPERATION_FENCE_RAISE))?;
+            if !migration_lock_free {
+                return Ok(FenceRaise::MigrationInProgress);
+            }
+            let fence = transaction
+                .query_opt(&format!("{FENCE_COLUMNS} FOR UPDATE"), &[])
+                .await
+                .map_err(|error| classify_query(error, OPERATION_FENCE_RAISE))?
+                .ok_or_else(|| invalid_data(OPERATION_FENCE_RAISE))
+                .and_then(|row| fence_from_row(&row, OPERATION_FENCE_RAISE))?;
+            let ledger_limit =
+                i64::try_from(super::migrations::runtime_ledger_row_limit()).unwrap_or(i64::MAX);
+            let ledger = transaction
+                .query(
+                    &format!(
+                        "SELECT version, left(checksum, 65) AS checksum FROM {}
+                         ORDER BY version LIMIT $1",
+                        super::migrations::LEDGER_TABLE
+                    ),
+                    &[&ledger_limit],
+                )
+                .await
+                .map_err(|error| classify_query(error, OPERATION_FENCE_RAISE))?
+                .iter()
+                .map(|row| {
+                    Ok((
+                        column(row, "version", OPERATION_FENCE_RAISE)?,
+                        column(row, "checksum", OPERATION_FENCE_RAISE)?,
+                    ))
+                })
+                .collect::<Result<Vec<(i64, String)>, RepositoryError>>()?;
+            let backfill = match backfill {
+                Some(name) => {
+                    let state: Option<String> = transaction
+                        .query_opt(
+                            "SELECT state FROM greengateway.schema_backfills WHERE name = $1",
+                            &[&name],
+                        )
+                        .await
+                        .map_err(|error| classify_query(error, OPERATION_FENCE_RAISE))?
+                        .map(|row| column(&row, "state", OPERATION_FENCE_RAISE))
+                        .transpose()?;
+                    BackfillState::from_column(state.as_deref())
+                }
+                None => None,
+            };
+            let window_secs = stale_window.as_secs_f64();
+            let members = transaction
+                .query(&members_statement(), &[&self.deployment_id, &window_secs])
+                .await
+                .map_err(|error| classify_query(error, OPERATION_FENCE_RAISE))?
+                .iter()
+                .map(member_from_row)
+                .collect::<Result<Vec<_>, _>>()?;
+            let (decided, target) = match decide(FenceDecision {
+                fence: &fence,
+                ledger: &ledger,
+                backfill,
+                members: &members,
+            }) {
+                Ok(decided) => decided,
+                Err(refusal) => return Ok(FenceRaise::Refused(refusal)),
+            };
+            let Some(target) = target else {
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|error| classify_query(error, OPERATION_FENCE_RAISE))?;
+                return Ok(FenceRaise::Unchanged { decided });
+            };
+            let after = transaction
+                .query_one(
+                    "UPDATE greengateway.contract_fence
+                     SET generation = generation + 1,
+                         minimum_schema = $1,
+                         capabilities = $2,
+                         raised_at = now(),
+                         raised_by = $3
+                     WHERE singleton
+                     RETURNING generation, minimum_schema, capabilities",
+                    &[&target.minimum_schema, &target.capabilities, &raised_by],
+                )
+                .await
+                .map_err(|error| classify_query(error, OPERATION_FENCE_RAISE))
+                .and_then(|row| fence_from_row(&row, OPERATION_FENCE_RAISE))?;
+            transaction
+                .commit()
+                .await
+                .map_err(|error| classify_query(error, OPERATION_FENCE_RAISE))?;
+            Ok(FenceRaise::Raised {
+                decided,
+                before: fence,
+                after,
+            })
+        })
+        .await
+    }
+}
+
+/// The roster read, shared by [`PostgresMembershipStore::members`] and the
+/// fence raise, which reads it inside its transaction. `$1` is the
+/// deployment, `$2` the stale window in seconds.
+fn members_statement() -> String {
+    format!(
+        "SELECT instance_id::text AS instance_id, boot_id::text AS boot_id,
+                binary_version, schema_version_min, schema_version_max,
+                document_version_min, document_version_max, fingerprint,
+                to_char(started_at AT TIME ZONE 'UTC', {f}) AS started_at,
+                to_char(last_heartbeat_at AT TIME ZONE 'UTC', {f}) AS last_heartbeat_at,
+                GREATEST(EXTRACT(EPOCH FROM (now() - last_heartbeat_at)), 0)::double precision
+                    AS heartbeat_age_secs,
+                to_char(ready_at AT TIME ZONE 'UTC', {f}) AS ready_at,
+                to_char(draining_at AT TIME ZONE 'UTC', {f}) AS draining_at,
+                compiled_security_revision, observed_security_revision, last_error_code,
+                capabilities,
+                (last_heartbeat_at > now() - make_interval(secs => $2::double precision)) AS live
+         FROM greengateway.cluster_members
+         WHERE deployment_id = $1
+         ORDER BY started_at ASC, instance_id ASC",
+        f = TIMESTAMP_FORMAT
+    )
+}
+
+/// Read the durable contract fence (migration 20) over `pool`. Startup
+/// calls this before it reads any other authority state, so a build the
+/// fence excludes refuses before it could misread anything; the membership
+/// store calls it for the operation gate. A missing row is invalid data:
+/// the migration seeds it and its trigger refuses removal, so its absence
+/// means the schema is not what this build expects.
+pub(crate) async fn read_contract_fence(
+    pool: &deadpool_postgres::Pool,
+) -> Result<ContractFence, RepositoryError> {
+    timed_operation(OPERATION_FENCE_READ, async {
+        let client = pool.get().await.map_err(classify_pool_error)?;
+        client
+            .query_opt(FENCE_COLUMNS, &[])
+            .await
+            .map_err(|error| classify_query(error, OPERATION_FENCE_READ))?
+            .ok_or_else(|| invalid_data(OPERATION_FENCE_READ))
+            .and_then(|row| fence_from_row(&row, OPERATION_FENCE_READ))
+    })
+    .await
+}
+
+fn fence_from_row(
+    row: &tokio_postgres::Row,
+    operation: &'static str,
+) -> Result<ContractFence, RepositoryError> {
+    Ok(ContractFence {
+        generation: column(row, "generation", operation)?,
+        minimum_schema: column(row, "minimum_schema", operation)?,
+        capabilities: column(row, "capabilities", operation)?,
+    })
 }
 
 /// The maintenance singleton's surface: the stale sweep and the fenced

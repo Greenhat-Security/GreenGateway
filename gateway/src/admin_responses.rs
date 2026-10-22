@@ -551,9 +551,11 @@ pub(super) fn egress_reload_unsupported() -> Response {
 /// written. A live member that does not advertise what the write needs is a
 /// conflict with the deployment's current membership -- finish the rollout,
 /// or wait for departed members to go stale -- so it is a `409`; every other
-/// refusal means the gate could not decide, so it is a `503`. The body
-/// carries the refusal's stable reason and its member counts, never a
-/// member identifier.
+/// refusal means the gate could not decide, or that this replica cannot
+/// perform the write right now (a backfill not yet verified, a migration in
+/// progress, a contract fence that excludes its build), so it is a `503`.
+/// The body carries the refusal's stable reason and its member counts,
+/// never a member identifier.
 #[cfg(feature = "postgres")]
 pub(super) fn operation_refused(refusal: &storage::compatibility::OperationRefusal) -> Response {
     let status = match refusal {

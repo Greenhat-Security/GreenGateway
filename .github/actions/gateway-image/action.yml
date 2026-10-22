@@ -1,0 +1,53 @@
+name: This run's production image
+description: >-
+  Load the production image the gateway-image job built for this run, after
+  requiring that job's success and before checking the loaded image's ID
+  against the one that job recorded.
+inputs:
+  producer-result:
+    description: needs.gateway-image.result of the calling job
+    required: true
+  image-id:
+    description: needs.gateway-image.outputs.image-id of the calling job
+    required: true
+  tag:
+    description: Local tag the calling job uses for the image
+    required: true
+runs:
+  using: composite
+  steps:
+    # A consumer runs under `always()`, so it reaches this step even when the
+    # build failed, was skipped or was cancelled; only `success` continues.
+    - name: Require the image build
+      shell: bash
+      env:
+        PRODUCER_RESULT: ${{ inputs.producer-result }}
+      run: |
+        if [ "${PRODUCER_RESULT}" != "success" ]; then
+          echo "::error::gateway-image completed with result '${PRODUCER_RESULT}'"
+          exit 1
+        fi
+    - name: Download this run's production image
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      with:
+        name: gateway-image
+        path: ${{ runner.temp }}/gateway-image
+    - name: Load and identify the production image
+      shell: bash
+      env:
+        EXPECTED_IMAGE_ID: ${{ inputs.image-id }}
+        IMAGE_TAG: ${{ inputs.tag }}
+      run: |
+        set -euo pipefail
+        if ! [[ "${EXPECTED_IMAGE_ID}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+          echo "::error::gateway-image recorded no image ID"
+          exit 1
+        fi
+        docker load --input "${RUNNER_TEMP}/gateway-image/gateway-image.tar"
+        actual="$(docker image inspect --format '{{.Id}}' greengateway:ci)"
+        if [ "${actual}" != "${EXPECTED_IMAGE_ID}" ]; then
+          echo "::error::loaded image ${actual} is not the ${EXPECTED_IMAGE_ID} gateway-image built"
+          exit 1
+        fi
+        docker tag greengateway:ci "${IMAGE_TAG}"
+        echo "Loaded ${actual} as ${IMAGE_TAG}"
