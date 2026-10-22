@@ -5,6 +5,15 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 pub const SCHEMA_VERSION: &str = "0.2.0";
 pub const POLICY_CHANGED: &str = "policy.changed";
 pub const POLICY_SHADOW_TRANSITION_REFUSED: &str = "policy.shadow_transition_refused";
+/// A server-side policy draft was created, changed or deleted (issue #243,
+/// slice 9). Drafts are inactive, so this records workspace activity, not an
+/// authorization change.
+pub const POLICY_DRAFT_CHANGED: &str = "policy.draft_changed";
+/// A draft was published: its candidate became the live policy. Emitted in
+/// addition to the `policy.changed` event of the commit itself.
+pub const POLICY_DRAFT_PUBLISHED: &str = "policy.draft_published";
+/// A publication of a draft its owner holds was refused without writing.
+pub const POLICY_DRAFT_PUBLISH_REFUSED: &str = "policy.draft_publish_refused";
 pub const SIGNAL_OPENED: &str = "signal.opened";
 pub const SIGNAL_LIFECYCLE_CHANGED: &str = "signal.lifecycle_changed";
 pub const SUGGESTION_LIFECYCLE_CHANGED: &str = "suggestion.lifecycle_changed";
