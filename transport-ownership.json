@@ -6320,7 +6320,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::bootstrap::run#1",
-      "sha256": "4705fe484f923cc6fcc98b4c81f3eb999b30a2390de5d2bedb0455a8150eab0c",
+      "sha256": "d1002bccde85efe7c9662e82eab8c35b44fc4255c5896792760a2d078e515145",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -6350,7 +6350,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::routing::add_admin_api_routes#1",
-      "sha256": "eeca1249fad603766176029da32151717761bd700e126d469e6d36d98ec3ae61",
+      "sha256": "31835aef5ae0088fe657e8c5c10ef9227336e02d7b7386cd7ae3d74a9d1c607e",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
@@ -6359,8 +6359,18 @@
       "reasons": [
         "unexpanded-macro"
       ],
-      "scope": "gateway::routing::install_metrics_recorder#1",
-      "sha256": "4579d46b05f6c52a1fe69f477bc34055f589c006995c6ace420373fa3efa3c1a",
+      "scope": "gateway::routing::register_metrics#1",
+      "sha256": "c1eeb7bfaa806a6504af052a457dc827686a0660bf8b03ebdbfe729c9a2cbe6b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway/src/routing.rs",
+      "reasons": [
+        "unexpanded-macro"
+      ],
+      "scope": "gateway::routing::seed_alerted_counters#1",
+      "sha256": "bf3b4e44a877038429a11b9d15c8afafc13b015488c5d93e330771cdab28857c",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
@@ -6481,6 +6491,26 @@
       ],
       "scope": "gateway::use admin_policy :: *#1",
       "sha256": "3a10239231820c61a5444640c36da28792d014609b52c009522e8431bc781a4a",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/admin_policy_drafts.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::admin_policy_drafts::use super :: *#1",
+      "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/main.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::use admin_policy_drafts :: *#1",
+      "sha256": "db8bd3d75145c296bd33d0b625dba7cc66d9b1e8db3f9a47ddbb0150bbbf714d",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
@@ -6830,7 +6860,7 @@
         "unexpanded-macro"
       ],
       "scope": "gateway::audit::sink::impl AuditSink StdoutSink::emit#1",
-      "sha256": "9079233c1a8a7acc63748d688c8fc1ebc5bb9db75ff58ed7bf20e9b2209beaee",
+      "sha256": "bee8496c1376fe79509b894cc4307a67a97af76b6f88f43e459da16ee9d66ff9",
       "owner": "GreenGateway maintainers",
       "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
     },
@@ -6850,7 +6880,7 @@
         "unexpanded-macro"
       ],
       "scope": "gateway::audit::sink::impl AuditSink FileSink::emit#1",
-      "sha256": "949a9885d721e397467d080b459cdf002dbbba21394a8d81f2efbfa5ab86855e",
+      "sha256": "119f14f5ebbe3363d5102e590f1f9d15b681a6c7274b442c08ae37080daf6fe7",
       "owner": "GreenGateway maintainers",
       "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
     },
@@ -6900,7 +6930,7 @@
         "unexpanded-macro"
       ],
       "scope": "gateway::audit::sqlite_sink::impl  SqliteSinkShared::flush_buffer#1",
-      "sha256": "9cbbeca4aadcc96e727597cce1a390cf5b6fea4d9d82634c84072f6f51463a94",
+      "sha256": "3b74751c8bed19f099656d42df1cdaedd45ada4343c984e57e5691a814666449",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed standalone reliability changes: process-local readiness state, fixed-label metrics and exact audit loss accounting. No new outbound transport authority; SQLite probes use configured local paths and observation filtering preserves security findings."
     },
@@ -10007,9 +10037,9 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::mcp::impl ServerHandler McpServer::list_tools#1",
-      "sha256": "d0b5b8ca18cd1751b1babd0d17141c1cc027a82d628a704784b7275661fedab4",
+      "sha256": "85e440b290581c3397f08f27825e82f3e522546312764867d3b27757c55e7bfd",
       "owner": "GreenGateway maintainers",
-      "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
+      "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review. Reviewed for #422: the listing now returns early without an executor and asks ToolExecutor::list_visible_tools, which reads the registry once and pins one policy snapshot for every visibility check; the item still names only rmcp's ListToolsResult, ErrorData and RequestContext and adds no network, process or transport capability."
     },
     {
       "file": "gateway/src/mcp.rs",
@@ -11177,6 +11207,26 @@
       "sha256": "e7c128e1f1b74466f4e240e5e96b5b27b54a4f8871494bc79aa41fe6f50bf41d",
       "owner": "GreenGateway maintainers",
       "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
+    },
+    {
+      "file": "gateway/src/storage/policy_drafts.rs",
+      "reasons": [
+        "unexpanded-macro"
+      ],
+      "scope": "gateway::storage::policy_drafts::impl  SqlitePolicyDraftStore::connection_guard#1",
+      "sha256": "b867136f0a36f67f6bb3350d981e9488f4446d6bc8cc633c0a8cbb3a034a42c3",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Lock-poison recovery counter for the standalone policy draft SQLite connection; metrics instrumentation only, no network, process or HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/policy_drafts.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::policy_drafts::summary_from_row#1",
+      "sha256": "9cd89ca573aa9bae93b82c4efe1852be2090e407d60cf70deafa8359fec5255d",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Decodes one standalone policy draft SQLite row; no network, process or HTTP authority."
     },
     {
       "file": "gateway/src/storage/postgres.rs",
@@ -12686,6 +12736,56 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_policy::classify_query#1",
+      "sha256": "b9618bf4127da4a3c48146f04769b3bf1026ac7481910dafc4f502dbfdacaf3b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_policy_drafts.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_policy_drafts::PostgresPolicyDraftStore#1",
+      "sha256": "0db1bfe6b934b8c11983d296122c21990c2bec1ef298d66c7f84b0126c78176d",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_policy_drafts.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_policy_drafts::impl  PostgresPolicyDraftStore::new#1",
+      "sha256": "2792784146e2c1d7c09a3e8d96c8e0a546da6ee7bf7c1b33e1d52d103470298e",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_policy_drafts.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_policy_drafts::summary_from_row#1",
+      "sha256": "a6432740af4cb693ad2d8ac4988bbcc7b3e2c6561b54487dc165c932aa5e56be",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_policy_drafts.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_policy_drafts::record_from_row#1",
+      "sha256": "ae843a09d2d9ddcc9681b74414416a3c6d2b283a4b75e5c98af5cac6a80b387c",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_policy_drafts.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_policy_drafts::classify_query#1",
       "sha256": "b9618bf4127da4a3c48146f04769b3bf1026ac7481910dafc4f502dbfdacaf3b",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."

@@ -305,34 +305,30 @@ impl ServerHandler for McpServer {
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
+        // Fail closed: without an executor there is no runtime to evaluate
+        // `enabled`, allowed_roles/issuers/auth_methods or tool deny rules
+        // against, so advertising the registry would publish tool names,
+        // descriptions and input schemas the policy conceals.
+        let Some(executor) = self.executor.as_ref() else {
+            return Ok(ListToolsResult::with_all_items(Vec::new()));
+        };
         let invocation_context = invocation_context_from_request(&context, &self.client_ip_policy);
         // rmcp serves this request from a task it spawned, which the snapshots
         // the revision gate pinned for the HTTP request do not reach. Re-enter
         // them so the registry and every visibility check read the admitted
-        // revision rather than the live lanes.
+        // revision rather than the live lanes. Without such pins (standalone
+        // mode) the executor still judges the whole listing by one policy
+        // snapshot and one registry read (#422).
         let request_extensions = context
             .extensions
             .get::<Parts>()
             .map(|parts| &parts.extensions);
         crate::middleware::rbac::with_request_pins(request_extensions, async {
-            let tools = self
-                .registry
-                .list()
-                .into_iter()
-                .filter(|definition| {
-                    // Fail closed: without an executor there is no runtime to evaluate
-                    // `enabled`, allowed_roles/issuers/auth_methods or tool deny rules
-                    // against, so advertising the registry would publish tool names,
-                    // descriptions and input schemas the policy conceals.
-                    self.executor.as_ref().is_some_and(|executor| {
-                        executor.can_list_tool(&definition.name, &invocation_context)
-                    })
-                })
+            let tools = executor
+                .list_visible_tools(&invocation_context)
+                .await
+                .iter()
                 .map(|definition| {
-                    let executor = self
-                        .executor
-                        .as_ref()
-                        .expect("the visibility filter retained a tool only with an executor");
                     let served = executor
                         .served_definition(definition.as_ref())
                         .map_err(|_| {
@@ -1846,6 +1842,182 @@ mod tests {
             json!("tool 'missing_tool' is not defined")
         );
         assert_eq!(body["error"]["data"]["tool_name"], json!("missing_tool"));
+    }
+
+    /// Standalone mode has no revision gate, so there are no request pins to
+    /// re-enter: the executor pins the listing itself (#422). The hook below
+    /// installs the next policy, through the file reload standalone serves,
+    /// and the next local registry lane right after the first tool's
+    /// visibility is decided, so the rest of the listing runs after both
+    /// installs. The first snapshot shows only `alpha`: it denies `beta`, and
+    /// its registry lists `gamma` as composite-only. The next shows only `beta`
+    /// and `gamma`: it denies `alpha` and lists `gamma`. A listing that asked
+    /// the live policy again would show `alpha` beside `beta`, and one that
+    /// read the registry again would show `alpha` beside `gamma`, which no
+    /// single snapshot shows together.
+    #[tokio::test]
+    async fn a_policy_installed_midway_through_a_standalone_listing_never_answers_part_of_it() {
+        let policy_denying = |tool_name: &str| {
+            json!({
+                "schema_version": "0.1.0",
+                "default_action": "allow",
+                "tools": {
+                    "alpha": { "timeout_ms": 5000, "max_concurrent": 2 },
+                    "beta": { "timeout_ms": 5000, "max_concurrent": 2 },
+                    "gamma": { "timeout_ms": 5000, "max_concurrent": 2 }
+                },
+                "rules": [{
+                    "id": format!("deny-{tool_name}"),
+                    "tool_name": tool_name,
+                    "action": "deny"
+                }]
+            })
+            .to_string()
+        };
+        let definitions = |gamma_visibility| {
+            let mut gamma = legacy_tool_definition("gamma");
+            gamma.visibility = gamma_visibility;
+            vec![
+                legacy_tool_definition("alpha"),
+                legacy_tool_definition("beta"),
+                gamma,
+            ]
+        };
+        let file = TempPolicyFile::new(&policy_denying("beta"));
+        let first_policy =
+            crate::rbac::Policy::from_file(&file.path).expect("the first policy should parse");
+        let audit = test_audit_log();
+        let rbac_state = crate::middleware::rbac::RbacState::new(
+            first_policy.clone(),
+            Vec::new(),
+            false,
+            audit.clone(),
+        );
+        let runtime = ToolRuntime::new_with_rbac_state(
+            ToolRuntimeConfig::from_policy(&first_policy)
+                .expect("the first policy should configure the runtime"),
+            audit.clone(),
+            Some(rbac_state.clone()),
+        );
+        let registry = ToolRegistry::disabled();
+        registry
+            .merge_definitions(definitions(
+                crate::tools::definitions::ToolVisibility::CompositeOnly,
+            ))
+            .expect("the first registry lane registers");
+
+        let checked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let installed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook: crate::tools::executor::ListingHook = {
+            let checked = Arc::clone(&checked);
+            let rbac_state = rbac_state.clone();
+            let registry = registry.clone();
+            let policy_path = file.path.clone();
+            let next_policy = policy_denying("alpha");
+            let next_definitions = definitions(crate::tools::definitions::ToolVisibility::Listed);
+            Arc::new(
+                move |tool_name: &str| -> crate::tools::executor::ListingHookFuture {
+                    checked
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(tool_name.to_owned());
+                    let install = (tool_name == "alpha"
+                        && !installed.swap(true, std::sync::atomic::Ordering::SeqCst))
+                    .then(|| {
+                        (
+                            rbac_state.clone(),
+                            registry.clone(),
+                            policy_path.clone(),
+                            next_policy.clone(),
+                            next_definitions.clone(),
+                        )
+                    });
+                    Box::pin(async move {
+                        let Some((
+                            rbac_state,
+                            registry,
+                            policy_path,
+                            next_policy,
+                            next_definitions,
+                        )) = install
+                        else {
+                            return;
+                        };
+                        std::fs::write(&policy_path, next_policy)
+                            .expect("the next policy should be written");
+                        crate::middleware::rbac::reload_policy_from_file(&rbac_state, &policy_path)
+                            .await
+                            .expect("the next policy installs midway through the listing");
+                        registry
+                            .install_local_definitions(next_definitions)
+                            .expect("the next registry lane installs midway through the listing");
+                    })
+                },
+            )
+        };
+        let egress_client = Arc::new(
+            egress::EgressClient::new(egress::EgressConfig::default())
+                .expect("test egress client should build"),
+        );
+        let executor = ToolExecutor::new(
+            registry.clone(),
+            runtime,
+            egress_client,
+            audit,
+            "https://upstream.invalid",
+        )
+        .expect("MCP executor should build")
+        .with_listing_hook_for_test(hook);
+        let state = McpState::new(
+            registry,
+            Some(executor),
+            client_ip::ClientIpPolicy::default(),
+            TEST_MAX_BODY_SIZE,
+        );
+
+        let listed = mcp_json_rpc(&state, 50, "tools/list", None).await;
+        assert_eq!(
+            listed_tool_names(&listed),
+            vec!["alpha".to_owned()],
+            "the whole listing is judged by the snapshots it started with: {listed}"
+        );
+        assert_eq!(
+            *checked
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec!["alpha".to_owned(), "beta".to_owned(), "gamma".to_owned()],
+            "the installs landed after the first tool and before the rest were judged"
+        );
+
+        let next = mcp_json_rpc(&state, 51, "tools/list", None).await;
+        assert_eq!(
+            listed_tool_names(&next),
+            vec!["beta".to_owned(), "gamma".to_owned()],
+            "the installs really moved the live lanes, and judge the next listing: {next}"
+        );
+    }
+
+    /// A policy file in the temp directory, removed when dropped.
+    struct TempPolicyFile {
+        path: std::path::PathBuf,
+    }
+
+    impl TempPolicyFile {
+        fn new(contents: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "greengateway-mcp-policy-test-{}.json",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::write(&path, contents)
+                .unwrap_or_else(|err| panic!("failed to write {}: {err}", path.display()));
+            Self { path }
+        }
+    }
+
+    impl Drop for TempPolicyFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 
     /// rmcp serves `/mcp` from tasks it spawns, which the revision gate's

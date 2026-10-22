@@ -33,6 +33,28 @@ pub type AuditEventSender = tokio::sync::broadcast::Sender<AuditEvent>;
 pub const AUDIT_EVENTS_DROPPED_TOTAL: &str = "audit_events_dropped_total";
 pub const AUDIT_SQLITE_FLUSH_ERRORS_TOTAL: &str = "audit_sqlite_flush_errors_total";
 
+/// The `reason` values of [`AUDIT_EVENTS_DROPPED_TOTAL`] this module and the
+/// local sinks emit; the PostgreSQL sink adds its own
+/// `POSTGRES_DROP_REASON`. Every emitter names one of these
+/// constants, so the list is the label's whole vocabulary, and the recorder
+/// seeds each at `0` on install: `GreenGatewayAuditLoss` pages on
+/// `increase(...) > 0`, which cannot see the first drop of a series that did
+/// not exist before it.
+pub(crate) const DROP_REASON_CLOSED: &str = "closed";
+pub(crate) const DROP_REASON_FULL: &str = "full";
+pub(crate) const DROP_REASON_CONTROL_FULL: &str = "control_full";
+pub(crate) const DROP_REASON_DISCONNECTED: &str = "disconnected";
+pub(crate) const DROP_REASON_SINK_ERROR: &str = "sink_error";
+pub(crate) const DROP_REASON_SQLITE: &str = "sqlite";
+pub(crate) const LOCAL_DROP_REASONS: [&str; 6] = [
+    DROP_REASON_CLOSED,
+    DROP_REASON_FULL,
+    DROP_REASON_CONTROL_FULL,
+    DROP_REASON_DISCONNECTED,
+    DROP_REASON_SINK_ERROR,
+    DROP_REASON_SQLITE,
+];
+
 /// The writer channel's bound; also the PostgreSQL sink's buffer bound, so
 /// the sink can hold at most what the queue feeding it can hold.
 pub(crate) const AUDIT_CHANNEL_CAPACITY: usize = 8192;
@@ -463,14 +485,14 @@ impl AuditLog {
     /// the caller counts.
     fn admit(&self, event: AuditEvent, ack: Option<DurableAck>) -> Result<(), &'static str> {
         if self.inner.closed.load(Ordering::Acquire) {
-            return Err("closed");
+            return Err(DROP_REASON_CLOSED);
         }
         let tx = self.inner.tx_guard();
         let Some(tx) = tx.as_ref() else {
-            return Err("closed");
+            return Err(DROP_REASON_CLOSED);
         };
         if self.inner.queued.load(Ordering::Acquire) >= AUDIT_NORMAL_CAPACITY {
-            return Err("full");
+            return Err(DROP_REASON_FULL);
         }
         self.inner.queued.fetch_add(1, Ordering::AcqRel);
         match tx.try_send(QueuedEvent {
@@ -481,11 +503,11 @@ impl AuditLog {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => {
                 self.inner.queued.fetch_sub(1, Ordering::AcqRel);
-                Err("full")
+                Err(DROP_REASON_FULL)
             }
             Err(TrySendError::Disconnected(_)) => {
                 self.inner.queued.fetch_sub(1, Ordering::AcqRel);
-                Err("disconnected")
+                Err(DROP_REASON_DISCONNECTED)
             }
         }
     }
@@ -496,12 +518,12 @@ impl AuditLog {
     /// durable completion acknowledgement.
     pub fn emit_control(&self, event: AuditEvent) -> Result<(), AuditControlError> {
         if self.inner.closed.load(Ordering::Acquire) {
-            self.note_dropped("closed");
+            self.note_dropped(DROP_REASON_CLOSED);
             return Err(AuditControlError::Closed);
         }
         let tx = self.inner.tx_guard();
         let Some(tx) = tx.as_ref() else {
-            self.note_dropped("closed");
+            self.note_dropped(DROP_REASON_CLOSED);
             return Err(AuditControlError::Closed);
         };
         self.inner.queued.fetch_add(1, Ordering::AcqRel);
@@ -513,12 +535,12 @@ impl AuditLog {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => {
                 self.inner.queued.fetch_sub(1, Ordering::AcqRel);
-                self.note_dropped("control_full");
+                self.note_dropped(DROP_REASON_CONTROL_FULL);
                 Err(AuditControlError::Full)
             }
             Err(TrySendError::Disconnected(_)) => {
                 self.inner.queued.fetch_sub(1, Ordering::AcqRel);
-                self.note_dropped("disconnected");
+                self.note_dropped(DROP_REASON_DISCONNECTED);
                 Err(AuditControlError::Disconnected)
             }
         }
