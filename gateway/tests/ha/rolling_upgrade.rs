@@ -27,7 +27,11 @@
 //! [`a_prepared_release_and_its_successor_serve_one_deployment`] and
 //! [`the_successors_new_operation_waits_for_every_prepared_member_to_leave`]
 //! run the two together against one database and write what they observed
-//! to the pair's `evidence/` directory. What they do *not* prove is listed
+//! to the pair's `evidence/` directory. The release gate then checks that
+//! evidence against the published support matrix
+//! (`docs/deployment/upgrade-support-matrix.json`, with
+//! `scripts/upgrade_pair_evidence.py`), so a change to what a row records
+//! or asserts changes the matrix with it. What they do *not* prove is listed
 //! in `docs/architecture/ha-state-model.md` section 7: this pair shares one
 //! schema point, so no schema overlap, backfill or contraction is
 //! exercised, and the gate they exercise judges live membership, not a

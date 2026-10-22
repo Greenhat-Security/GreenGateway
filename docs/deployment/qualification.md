@@ -315,7 +315,10 @@ the production database.
 ## 7. Upgrade
 
 Qualify the exact pair of releases you will run, by the procedure that pair
-allows; do not infer mixed-version or zero-downtime support from another pair.
+allows ([the supported upgrade matrix](postgres.md#the-supported-matrix) says
+which, and [Upgrading a cluster](postgres.md#upgrading-a-cluster) has both
+Kubernetes procedures); do not infer mixed-version or zero-downtime support
+from another pair.
 
 - **Is there a schema change?** If the newer release's changelog says
   *Coordinated upgrade required*, or its schema contract differs from the
