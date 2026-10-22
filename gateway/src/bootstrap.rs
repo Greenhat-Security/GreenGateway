@@ -1365,7 +1365,7 @@ async fn preflight_cluster_authority(
 }
 
 pub(super) fn production_tracing_filter() -> Targets {
-    // rmcp 2.1 emits peer metadata, raw transport errors, and session identifiers from its
+    // rmcp emits peer metadata, raw transport errors, and session identifiers from its
     // internal tracing calls. Keep the dependency disabled globally; GreenGateway emits its own
     // bounded MCP outcome categories at the integration boundary.
     Targets::new()
@@ -2407,6 +2407,7 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
         tool_registry.clone(),
         mcp_executor,
         client_ip_policy.clone(),
+        config.max_body_size,
     );
     let protected_resource_metadata =
         auth::protected_resource::ProtectedResourceMetadataConfig::from_config(&config);
