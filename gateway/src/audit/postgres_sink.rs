@@ -39,6 +39,15 @@
 //!   counts the buffer AND that batch as dropped. Nothing the sink accepted
 //!   can be lost uncounted; a batch that landed after being counted is
 //!   over-counted, which keeps `rows + dropped >= served` true.
+//! - A required record (`AUDIT_DURABILITY=required`, issue #425) arrives
+//!   through `emit_durable` with an acknowledgement a request is waiting
+//!   on. It joins the same buffer in the same order, but wakes the flusher
+//!   at once instead of waiting for a full batch or the interval, and its
+//!   acknowledgement is reported only when its batch resolves: `stored`
+//!   after the store call returned success, `not_stored` when the batch is
+//!   dropped, refused by the full buffer or shutdown, or stranded by a
+//!   drain. The waiter's own deadline bounds the wait; the sink never makes
+//!   the writer thread wait for it.
 //!
 //! Threading model. The SQLite sink runs its flusher on a thread of its own
 //! because rusqlite is synchronous: the I/O needs a thread the writer does
@@ -75,7 +84,7 @@ use std::{
 use tokio::{runtime::Handle, sync::Notify};
 
 use crate::{
-    audit::{record_flush_outcome, AuditEvent, AuditSink, AUDIT_EVENTS_DROPPED_TOTAL},
+    audit::{record_flush_outcome, AuditEvent, AuditSink, DurableAck, AUDIT_EVENTS_DROPPED_TOTAL},
     metrics::LOCK_POISON_RECOVERIES_TOTAL,
     storage::{postgres_audit::PostgresAuditEventStore, AuditEventStore as _},
 };
@@ -199,6 +208,7 @@ impl PostgresSink {
             flush_failure: Mutex::new(None),
             in_flight: AtomicU64::new(0),
             in_flight_since: Mutex::new(None),
+            in_flight_acks: Mutex::new(Vec::new()),
             dropped: AtomicU64::new(0),
             stored: AtomicU64::new(0),
         });
@@ -289,7 +299,7 @@ impl PostgresSink {
 impl AuditSink for PostgresSink {
     fn backlog(&self) -> crate::audit::sink::SinkBacklog {
         let buffer = self.shared.buffer_guard();
-        let buffered_since = buffer.front().map(|(since, _)| *since);
+        let buffered_since = buffer.front().map(|(since, _, _)| *since);
         let in_flight_since = *recover_lock(&self.shared.in_flight_since, "postgres_sink_age");
         let oldest = buffered_since.into_iter().chain(in_flight_since).min();
         crate::audit::sink::SinkBacklog {
@@ -306,8 +316,22 @@ impl AuditSink for PostgresSink {
         "postgres"
     }
 
+    fn is_durable(&self) -> bool {
+        true
+    }
+
     fn emit(&self, event: &AuditEvent) {
-        if self.shared.push_event(event) == Push::BatchReady {
+        if self.shared.push_event(event, None) == Push::BatchReady {
+            self.shared.wake.notify_one();
+        }
+    }
+
+    /// A request is waiting on this record, so the flusher is woken now
+    /// rather than at a full batch or the interval: whatever the buffer
+    /// holds by the time it runs goes into one store call, which is the
+    /// group commit that keeps one round trip per batch, not per request.
+    fn emit_durable(&self, event: &AuditEvent, ack: DurableAck) {
+        if self.shared.push_event(event, Some(ack)) != Push::Refused {
             self.shared.wake.notify_one();
         }
     }
@@ -355,7 +379,9 @@ enum Push {
 struct PostgresSinkShared {
     store: Arc<PostgresAuditEventStore>,
     settings: PostgresSinkSettings,
-    buffer: Mutex<VecDeque<(Instant, AuditEvent)>>,
+    /// Each event with the instant it arrived and, for a required record,
+    /// the acknowledgement its waiter is listening on.
+    buffer: Mutex<VecDeque<(Instant, AuditEvent, Option<DurableAck>)>>,
     wake: Notify,
     shutdown: AtomicBool,
     /// When the flusher must have finished, set by `begin_shutdown`; `None`
@@ -372,15 +398,23 @@ struct PostgresSinkShared {
     /// listening before the flusher reported (`count_stranded`).
     in_flight: AtomicU64,
     in_flight_since: Mutex<Option<Instant>>,
+    /// The acknowledgements of the required records in the batch the flusher
+    /// holds. Reported with that batch's outcome by whoever settles it --
+    /// the flusher on store or drop, or a waiter that counted it stranded --
+    /// and lock-ordered after `buffer`, never before it.
+    in_flight_acks: Mutex<Vec<DurableAck>>,
     dropped: AtomicU64,
     stored: AtomicU64,
 }
 
 impl PostgresSinkShared {
-    fn push_event(&self, event: &AuditEvent) -> Push {
+    fn push_event(&self, event: &AuditEvent, ack: Option<DurableAck>) -> Push {
         let mut buffer = self.buffer_guard();
         if self.shutdown.load(Ordering::Acquire) || buffer.len() >= self.settings.buffer_capacity {
             drop(buffer);
+            if let Some(ack) = ack {
+                ack.not_stored();
+            }
             self.note_dropped(1);
             if !self.overflowing.swap(true, Ordering::AcqRel) {
                 tracing::error!(
@@ -390,7 +424,7 @@ impl PostgresSinkShared {
             }
             return Push::Refused;
         }
-        buffer.push_back((Instant::now(), event.clone()));
+        buffer.push_back((Instant::now(), event.clone(), ack));
         if buffer.len() >= self.settings.batch_size {
             Push::BatchReady
         } else {
@@ -410,13 +444,22 @@ impl PostgresSinkShared {
             self.overflowing.store(false, Ordering::Release);
         }
         *recover_lock(&self.in_flight_since, "postgres_sink_age") =
-            buffer.front().map(|(since, _)| *since);
+            buffer.front().map(|(since, _, _)| *since);
         let mut seen = HashSet::with_capacity(take);
+        let mut acks = Vec::new();
         let batch: Vec<_> = buffer
             .drain(..take)
-            .map(|(_, event)| event)
-            .filter(|event| seen.insert(event.event_id.clone()))
+            .filter_map(|(_, event, ack)| {
+                // A duplicate id is left out of the batch, but its
+                // acknowledgement still rides with the batch's outcome: the
+                // row it names is the one this batch writes.
+                acks.extend(ack);
+                seen.insert(event.event_id.clone()).then_some(event)
+            })
             .collect();
+        if !acks.is_empty() {
+            recover_lock(&self.in_flight_acks, "postgres_sink_acks").append(&mut acks);
+        }
         // Publish the handoff before releasing the buffer lock, so status
         // cannot observe an empty buffer and no batch between these stages.
         self.in_flight.store(batch.len() as u64, Ordering::Release);
@@ -452,6 +495,7 @@ impl PostgresSinkShared {
                     let landed = self.in_flight.swap(0, Ordering::AcqRel);
                     self.stored.fetch_add(landed, Ordering::AcqRel);
                     *recover_lock(&self.in_flight_since, "postgres_sink_age") = None;
+                    self.settle_in_flight_acks(true);
                     return;
                 }
                 Ok(Err(error)) => error.to_string(),
@@ -486,6 +530,7 @@ impl PostgresSinkShared {
         if dropped > 0 {
             self.note_dropped(dropped);
         }
+        self.settle_in_flight_acks(false);
         self.record_failure(format!("PostgreSQL audit flush failed: {error}"));
         tracing::error!(
             event_count = count,
@@ -507,13 +552,37 @@ impl PostgresSinkShared {
     /// count returned. Taking the buffer here also ends the flusher's loop
     /// on its next turn, if it gets one.
     fn count_stranded(&self) -> u64 {
-        let buffered = self.buffer_guard().drain(..).count() as u64;
+        let drained: Vec<_> = self.buffer_guard().drain(..).collect();
+        let buffered = drained.len() as u64;
+        for (_, _, ack) in drained {
+            if let Some(ack) = ack {
+                ack.not_stored();
+            }
+        }
         let stranded = buffered + self.in_flight.swap(0, Ordering::AcqRel);
         *recover_lock(&self.in_flight_since, "postgres_sink_age") = None;
+        self.settle_in_flight_acks(false);
         if stranded > 0 {
             self.note_dropped(stranded);
         }
         stranded
+    }
+
+    /// Report the held batch's outcome to every request waiting on a record
+    /// in it. Taking the list makes this once-only: a batch settled by a
+    /// waiter's stranding has nothing left for the flusher to report.
+    fn settle_in_flight_acks(&self, stored: bool) {
+        let acks = std::mem::take(&mut *recover_lock(
+            &self.in_flight_acks,
+            "postgres_sink_acks",
+        ));
+        for ack in acks {
+            if stored {
+                ack.stored();
+            } else {
+                ack.not_stored();
+            }
+        }
     }
 
     /// Stop admission and give the flusher its deadline: the waiter's, less
@@ -560,7 +629,7 @@ impl PostgresSinkShared {
         self.failure_guard().clone().map_or(Ok(()), Err)
     }
 
-    fn buffer_guard(&self) -> MutexGuard<'_, VecDeque<(Instant, AuditEvent)>> {
+    fn buffer_guard(&self) -> MutexGuard<'_, VecDeque<(Instant, AuditEvent, Option<DurableAck>)>> {
         recover_lock(&self.buffer, "postgres_sink_buffer")
     }
 
@@ -788,6 +857,80 @@ mod tests {
             "buffer-to-batch handoff must not hide pending deliveries"
         );
         sink.shared.drop_batch(batch.len(), "test cleanup");
+    }
+
+    /// Required durability (issue #425): a record the bounded buffer cannot
+    /// take is reported not stored at once, so its request is refused now
+    /// rather than at its deadline.
+    #[tokio::test]
+    async fn a_required_record_refused_by_a_full_buffer_is_not_stored_at_once() {
+        use crate::audit::durable::DurableOutcome;
+
+        let (pool, _listener) = hanging_pool();
+        let store = Arc::new(PostgresAuditEventStore::new(pool, Some(identity())));
+        let capacity = 4;
+        let sink = PostgresSink::new_with_settings(
+            store,
+            test_settings(
+                100,
+                Duration::from_secs(3_600),
+                capacity,
+                Duration::from_millis(100),
+            ),
+        )
+        .expect("sink should build inside a runtime");
+        assert!(sink.is_durable());
+        for index in 0..capacity {
+            sink.emit(&test_event(index));
+        }
+
+        let (ack, mut outcome) = DurableAck::channel();
+        sink.emit_durable(&test_event(capacity), ack);
+
+        assert_eq!(outcome.try_recv(), Ok(DurableOutcome::NotStored));
+        assert_eq!(sink.dropped_total(), 1);
+    }
+
+    /// A drain that gives up on what the sink holds reports every waiting
+    /// record not stored -- the buffered ones and the ones in the batch the
+    /// flusher holds -- instead of leaving them to their deadlines.
+    #[tokio::test]
+    async fn a_drain_past_its_deadline_reports_its_required_records_not_stored() {
+        use crate::audit::durable::DurableOutcome;
+
+        let (pool, _listener) = hanging_pool();
+        let store = Arc::new(PostgresAuditEventStore::new(pool, Some(identity())));
+        let sink = Arc::new(
+            PostgresSink::new_with_settings(
+                store,
+                test_settings(
+                    1_000,
+                    Duration::from_secs(3_600),
+                    64,
+                    Duration::from_millis(300),
+                ),
+            )
+            .expect("sink should build"),
+        );
+        let mut outcomes = Vec::new();
+        for index in 0..3 {
+            let (ack, outcome) = DurableAck::channel();
+            sink.emit_durable(&test_event(index), ack);
+            outcomes.push(outcome);
+        }
+
+        flush_off_runtime(&sink)
+            .await
+            .expect_err("a drain that cannot land its batch must say so");
+
+        for outcome in outcomes {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), outcome)
+                    .await
+                    .expect("the outcome must be reported, not left to the waiter's deadline"),
+                Ok(DurableOutcome::NotStored)
+            );
+        }
     }
 
     #[test]
@@ -1051,6 +1194,91 @@ mod tests {
         assert_eq!(sink.dropped_total(), 300);
     }
 
+    /// Required durability against a real authority (issue #425): a record
+    /// wakes the flusher -- neither the batch size nor the interval could --
+    /// its acknowledgement arrives only once its row is in the store, and a
+    /// refusing authority is reported as not stored until it recovers.
+    #[tokio::test]
+    async fn a_required_record_is_acknowledged_once_its_row_lands_and_refused_while_the_authority_refuses(
+    ) {
+        use crate::audit::durable::DurableOutcome;
+
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_pool(&database).await;
+        let store = Arc::new(PostgresAuditEventStore::new(pool.clone(), Some(identity())));
+        let sink = Arc::new(
+            PostgresSink::new_with_settings(
+                store,
+                test_settings(
+                    1_000,
+                    Duration::from_secs(3_600),
+                    POSTGRES_BUFFER_CAPACITY,
+                    Duration::from_secs(5),
+                ),
+            )
+            .expect("sink should build"),
+        );
+
+        // Two ordinary events queued ahead, then the record: one store call
+        // carries all three, in order.
+        emit_from_writer_thread(&sink, (0..2).map(test_event).collect());
+        let (ack, outcome) = DurableAck::channel();
+        sink.emit_durable(&test_event(2), ack);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), outcome)
+                .await
+                .expect("the record should be acknowledged"),
+            Ok(DurableOutcome::Stored)
+        );
+        assert_eq!(
+            event_row_count(&pool).await,
+            3,
+            "an acknowledged record is already a row, with what was queued ahead of it"
+        );
+
+        pool.get()
+            .await
+            .expect("checkout")
+            .batch_execute(
+                "CREATE FUNCTION greengateway.refuse_audit() RETURNS trigger \
+                 LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'authority refuses'; END $$; \
+                 CREATE TRIGGER refuse_audit BEFORE INSERT ON greengateway.audit_events \
+                 FOR EACH STATEMENT EXECUTE FUNCTION greengateway.refuse_audit();",
+            )
+            .await
+            .expect("the refusing trigger should install");
+        let (ack, outcome) = DurableAck::channel();
+        sink.emit_durable(&test_event(3), ack);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), outcome)
+                .await
+                .expect("a refused record should be reported, not left to its deadline"),
+            Ok(DurableOutcome::NotStored)
+        );
+
+        pool.get()
+            .await
+            .expect("checkout")
+            .batch_execute("DROP TRIGGER refuse_audit ON greengateway.audit_events")
+            .await
+            .expect("the refusing trigger should uninstall");
+        let (ack, outcome) = DurableAck::channel();
+        sink.emit_durable(&test_event(4), ack);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), outcome)
+                .await
+                .expect("the recovered authority should acknowledge"),
+            Ok(DurableOutcome::Stored)
+        );
+        assert_eq!(event_row_count(&pool).await, 4);
+        assert_eq!(sink.dropped_total(), 1);
+    }
+
     #[tokio::test]
     async fn flush_lands_the_buffer_within_its_deadline() {
         let Some(admin_dsn) = locator() else {
@@ -1209,7 +1437,7 @@ mod tests {
         // still emitting, then park in I/O with the remaining events buffered.
         sink.shared
             .buffer_guard()
-            .extend((0..10).map(|index| (Instant::now(), test_event(index))));
+            .extend((0..10).map(|index| (Instant::now(), test_event(index), None)));
         let flushing = {
             let sink = Arc::clone(&sink);
             thread::spawn(move || sink.flush())

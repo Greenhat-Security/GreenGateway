@@ -1,6 +1,8 @@
 use super::*;
 #[path = "admin_session_app_tests.rs"]
 mod admin_session_app_tests;
+#[path = "audit_durability_app_tests.rs"]
+mod audit_durability_app_tests;
 use crate::auth::TokenStore;
 use axum::{body::Body, http::StatusCode};
 use futures_util::StreamExt;
@@ -119,6 +121,8 @@ fn test_config(cors_allow_origins: Vec<&str>) -> config::Config {
         shutdown_drain_delay_ms: config::DEFAULT_SHUTDOWN_DRAIN_DELAY_MS,
         shutdown_timeout_ms: config::DEFAULT_SHUTDOWN_TIMEOUT_MS,
         audit_drain_timeout_ms: config::DEFAULT_AUDIT_DRAIN_TIMEOUT_MS,
+        audit_durability: config::DEFAULT_AUDIT_DURABILITY,
+        audit_durability_timeout_ms: config::DEFAULT_AUDIT_DURABILITY_TIMEOUT_MS,
         discovery_sqlite_path: None,
         discovery_endpoint_limit: config::DEFAULT_DISCOVERY_ENDPOINT_LIMIT,
         discovery_projector_lease_ttl_ms: config::DEFAULT_DISCOVERY_PROJECTOR_LEASE_TTL_MS,
@@ -8577,6 +8581,7 @@ fn expected_ha_metric_names() -> Vec<&'static str> {
         metrics::AUDIT_QUEUE_CAPACITY,
         metrics::AUDIT_QUEUE_OLDEST_AGE_SECONDS,
         metrics::AUDIT_FLUSH_TOTAL,
+        metrics::AUDIT_DURABILITY_REFUSALS_TOTAL,
         metrics::EXECUTION_LEASE_FAILURES_TOTAL,
     ];
     #[cfg(feature = "postgres")]
@@ -8616,6 +8621,11 @@ fn ha_label_vocabularies() -> Vec<(&'static str, &'static str, Vec<&'static str>
             metrics::AUDIT_FLUSH_TOTAL,
             "outcome",
             audit::AUDIT_FLUSH_OUTCOMES.to_vec(),
+        ),
+        (
+            metrics::AUDIT_DURABILITY_REFUSALS_TOTAL,
+            "reason",
+            audit::durable::AUDIT_DURABILITY_REFUSAL_REASONS.to_vec(),
         ),
         (
             metrics::EXECUTION_LEASE_FAILURES_TOTAL,
@@ -8810,6 +8820,50 @@ async fn synthetic_ha_run() {
         .expect("hostile request should complete");
     // What it answered does not matter; that it was *observed* does.
     let _ = hostile.status();
+
+    // The same hostile request against a gateway that requires durable
+    // audit and whose store of record refuses every record (issue #425):
+    // it is refused `503`, and the refusal counter it moves must carry
+    // nothing of it but a fixed reason.
+    let refusing_store = audit::sink::tests::DurableCaptureSink::new();
+    refusing_store.set(audit::sink::tests::DurableBehaviour::Refuse);
+    let required_app = gateway_app_with_process_started_at_and_overrides(
+        test_config(Vec::new()),
+        recorder.handle(),
+        audit::AuditLog::new_required(
+            Arc::new(refusing_store) as Arc<dyn audit::AuditSink>,
+            Duration::from_secs(5),
+        ),
+        test_audit_event_sender(),
+        Instant::now(),
+        GatewayAppBuildOverrides {
+            disable_proxy_health_checks: true,
+            ..GatewayAppBuildOverrides::default()
+        },
+    )
+    .expect("required-durability gateway app should build");
+    let required_router = match required_app.http {
+        GatewayApp::Unified(router) => router,
+        GatewayApp::Split { .. } => panic!("test app should be unified"),
+    };
+    let refused = required_router
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("{CANARY_ROUTE}?{CANARY_QUERY}"))
+                .header(header::HOST, CANARY_HOST)
+                .header(header::AUTHORIZATION, format!("Bearer {CANARY_TOKEN_ID}"))
+                .header("x-forwarded-for", "10.11.12.13")
+                .body(Body::empty())
+                .expect("hostile request should build"),
+        )
+        .await
+        .expect("hostile request should complete");
+    assert_eq!(
+        refused.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a decision record the store refuses must refuse the request"
+    );
 
     // A scrape, which is what publishes the sampled gauges.
     let scrape = router
@@ -21183,6 +21237,9 @@ async fn audit_events_stream_delivers_signal_opened_events_from_discovery() {
         .rbac_exempt_paths
         .push("/signal-stream-opened".to_owned());
     let recorder = PrometheusBuilder::new().build_recorder();
+    // No audit store of record here: this test is not about durability,
+    // so it runs the explicit best-effort opt-out (issue #425).
+    config.audit_durability = config::AuditDurability::BestEffort;
     let (audit_log, audit_event_sender) =
         audit::AuditLog::from_config(&config).expect("audit log should build");
     // Keep a handle on the audit pipeline so the observation can be driven
@@ -22664,6 +22721,9 @@ paths:
     config
         .rbac_exempt_paths
         .push(TRAFFIC_ENDPOINT_DETAIL_ADMIN_ROUTE.to_owned());
+    // No audit store of record here: this test is not about durability,
+    // so it runs the explicit best-effort opt-out (issue #425).
+    config.audit_durability = config::AuditDurability::BestEffort;
     let (audit_log, audit_event_sender) =
         audit::AuditLog::from_config(&config).expect("audit log should build");
     let recorder = PrometheusBuilder::new().build_recorder();
@@ -29367,6 +29427,9 @@ async fn mcp_inventory_test_harness(
     config.egress_allowed_hosts = harness_config.egress_allowed_hosts;
     config.egress_deny_private_ips = false;
 
+    // No audit store of record here: this test is not about durability,
+    // so it runs the explicit best-effort opt-out (issue #425).
+    config.audit_durability = config::AuditDurability::BestEffort;
     let (sink, audit_event_sender) =
         audit::sink::build_sink_from_config(&config).expect("audit sink should build");
     let capture = audit::sink::tests::CaptureSink::new();

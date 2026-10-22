@@ -100,9 +100,12 @@ pub const DEFAULT_DISCOVERY_ENDPOINT_LIMIT: usize = 10_000;
 pub const DEFAULT_SHUTDOWN_DRAIN_DELAY_MS: u64 = 1_000;
 pub const DEFAULT_SHUTDOWN_TIMEOUT_MS: u64 = 30_000;
 pub const DEFAULT_AUDIT_DRAIN_TIMEOUT_MS: u64 = 5_000;
+pub const DEFAULT_AUDIT_DURABILITY: AuditDurability = AuditDurability::Required;
+pub const DEFAULT_AUDIT_DURABILITY_TIMEOUT_MS: u64 = 5_000;
 const MAX_SHUTDOWN_DRAIN_DELAY_MS: u64 = 30_000;
 const MAX_SHUTDOWN_TIMEOUT_MS: u64 = 300_000;
 const MAX_AUDIT_DRAIN_TIMEOUT_MS: u64 = 60_000;
+const MAX_AUDIT_DURABILITY_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_AUTH_MODE: AuthMode = AuthMode::Required;
 const DEFAULT_AUTH_COOKIE_NAME: &str = "session";
 pub const DEFAULT_ADMIN_PREFIX: &str = "/admin";
@@ -266,6 +269,8 @@ const AUDIT_SQLITE_PATH: &str = "AUDIT_SQLITE_PATH";
 const AUDIT_SQLITE_RETENTION_DAYS: &str = "AUDIT_SQLITE_RETENTION_DAYS";
 const AUDIT_SUCCESSFUL_PROBES_METRICS_ONLY: &str = "AUDIT_SUCCESSFUL_PROBES_METRICS_ONLY";
 const AUDIT_DRAIN_TIMEOUT_MS: &str = "AUDIT_DRAIN_TIMEOUT_MS";
+const AUDIT_DURABILITY: &str = "AUDIT_DURABILITY";
+const AUDIT_DURABILITY_TIMEOUT_MS: &str = "AUDIT_DURABILITY_TIMEOUT_MS";
 const AUTH_COOKIE_NAME: &str = "AUTH_COOKIE_NAME";
 const AUTH_ENABLED: &str = "AUTH_ENABLED";
 const AUTH_EXEMPT_PATHS: &str = "AUTH_EXEMPT_PATHS";
@@ -452,6 +457,12 @@ pub struct Config {
     pub shutdown_drain_delay_ms: u64,
     pub shutdown_timeout_ms: u64,
     pub audit_drain_timeout_ms: u64,
+    /// Whether a request-path security decision must be durably recorded
+    /// before the gateway acts on it (issue #425). See [`AuditDurability`].
+    pub audit_durability: AuditDurability,
+    /// How long a request may wait for its decision record to commit under
+    /// [`AuditDurability::Required`] before it is refused.
+    pub audit_durability_timeout_ms: u64,
     pub discovery_sqlite_path: Option<String>,
     pub discovery_endpoint_limit: usize,
     /// Cluster mode only (issue #241, PR 11): the discovery projector's
@@ -1525,6 +1536,34 @@ impl FromStr for AuthMode {
     }
 }
 
+/// How the request path treats an audit record it cannot durably store
+/// (`AUDIT_DURABILITY`, issue #425).
+///
+/// `Required`, the default, makes the authentication and authorization
+/// stages wait for their decision records to commit to the audit store of
+/// record -- the SQLite file in standalone mode, the shared PostgreSQL store
+/// in cluster mode -- before acting on them, and refuse the request with
+/// `503` when they cannot. A configuration with no such store is refused at
+/// startup. `BestEffort` is the explicit opt-out: decisions are queued and
+/// acted on at once, and a record that is later lost is only counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditDurability {
+    Required,
+    BestEffort,
+}
+
+impl FromStr for AuditDurability {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "required" => Ok(Self::Required),
+            "best_effort" => Ok(Self::BestEffort),
+            _ => Err("expected `required` or `best_effort`"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigError {
     problems: Vec<String>,
@@ -1652,6 +1691,26 @@ impl Config {
             ),
             MAX_AUDIT_DRAIN_TIMEOUT_MS,
             DEFAULT_AUDIT_DRAIN_TIMEOUT_MS,
+            &mut problems,
+        );
+        let audit_durability = parse_var(
+            AUDIT_DURABILITY,
+            get_var(AUDIT_DURABILITY),
+            DEFAULT_AUDIT_DURABILITY,
+            "audit durability mode",
+            &mut problems,
+        );
+        let audit_durability_timeout_ms = validate_positive_bounded_u64(
+            AUDIT_DURABILITY_TIMEOUT_MS,
+            parse_var(
+                AUDIT_DURABILITY_TIMEOUT_MS,
+                get_var(AUDIT_DURABILITY_TIMEOUT_MS),
+                DEFAULT_AUDIT_DURABILITY_TIMEOUT_MS,
+                "millisecond duration",
+                &mut problems,
+            ),
+            MAX_AUDIT_DURABILITY_TIMEOUT_MS,
+            DEFAULT_AUDIT_DURABILITY_TIMEOUT_MS,
             &mut problems,
         );
         let discovery_sqlite_path = parse_optional_string(
@@ -2747,6 +2806,8 @@ impl Config {
                 shutdown_drain_delay_ms,
                 shutdown_timeout_ms,
                 audit_drain_timeout_ms,
+                audit_durability,
+                audit_durability_timeout_ms,
                 discovery_sqlite_path,
                 discovery_endpoint_limit,
                 discovery_projector_lease_ttl_ms,

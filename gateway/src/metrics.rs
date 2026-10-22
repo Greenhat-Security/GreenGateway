@@ -150,6 +150,17 @@ pub const AUDIT_QUEUE_OLDEST_AGE_SECONDS: &str = "greengateway_audit_queue_oldes
 /// the error text is never a label.
 pub const AUDIT_FLUSH_TOTAL: &str = "greengateway_audit_flush_total";
 
+/// Requests refused because a decision record could not be confirmed
+/// durable under `AUDIT_DURABILITY=required` (issue #425), by `reason`
+/// (`admission`, `store`, `timeout`).
+///
+/// Every label value is a compile-time constant from
+/// [`crate::audit::durable::AUDIT_DURABILITY_REFUSAL_REASONS`]. A rising
+/// count is an outage of the audit store of record that the gateway is
+/// answering with `503` rather than serving without evidence; the cause is
+/// on the sink's flush metrics and in its log line, never in a label.
+pub const AUDIT_DURABILITY_REFUSALS_TOTAL: &str = "greengateway_audit_durability_refusals_total";
+
 /// Execution-lease failures by classified kind (`lost`, `renew_expired`,
 /// `release_failed`); issue #241, PR 14.
 ///

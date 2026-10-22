@@ -1,6 +1,11 @@
 //! Frozen pre-cutover middleware from 167cc5e, and the frozen pre-cutover tool
 //! lane from 05c295a, only for differential tests. Never compiled into the
 //! serving binary; do not update their decision semantics.
+//!
+//! The emit helpers they share with the live middleware now hand back an
+//! audit receipt (issue #425). The frozen copy predates required audit
+//! durability and discards it: the differential tests run it over a
+//! best-effort log, where every receipt is already settled.
 
 use super::*;
 use crate::{
@@ -196,7 +201,7 @@ pub(crate) async fn rbac_middleware(
     if is_unsafe_request_path(path) {
         let context = audit_context(&req, &state.client_ip_policy);
         let principal = req.extensions().get::<auth::Principal>().cloned();
-        emit_denied(&state, &context, principal.as_ref(), "unsafe_path", None);
+        let _ = emit_denied(&state, &context, principal.as_ref(), "unsafe_path", None);
         return with_policy_decision(
             forbidden(),
             PolicyDecision {
@@ -261,7 +266,7 @@ pub(crate) async fn rbac_middleware(
                 admitted_bundle = admission.bundle;
             }
             Err(error) => {
-                emit_revision_check_failed(&state, &context, principal.as_ref(), error);
+                let _ = emit_revision_check_failed(&state, &context, principal.as_ref(), error);
                 return with_policy_decision(
                     service_unavailable_response(),
                     PolicyDecision {
@@ -341,7 +346,8 @@ pub(crate) async fn rbac_middleware(
         if let Some(rule_decision) = first_direct_rule.as_ref() {
             if rule_decision.action == RuleAction::Shadow {
                 let matched_rule_id = policy.rule_id(rule_decision.rule_index);
-                emit_rule_would_deny(&state, &context, principal.as_ref(), &matched_rule_id);
+                let _ =
+                    emit_rule_would_deny(&state, &context, principal.as_ref(), &matched_rule_id);
             }
         }
     }
@@ -349,7 +355,7 @@ pub(crate) async fn rbac_middleware(
         let matched_rule_id = policy.rule_id(rule_decision.rule_index);
         return match rule_decision.action {
             RuleAction::Allow => {
-                emit_rule_allowed(&state, &context, principal.as_ref(), &matched_rule_id);
+                let _ = emit_rule_allowed(&state, &context, principal.as_ref(), &matched_rule_id);
                 let decision = decision_for_direct_rule(
                     PolicyDecisionOutcome::Allowed,
                     "matched_rule",
@@ -366,7 +372,7 @@ pub(crate) async fn rbac_middleware(
                 with_policy_decision(response, decision)
             }
             RuleAction::Deny => {
-                emit_rule_denied(&state, &context, principal.as_ref(), &matched_rule_id);
+                let _ = emit_rule_denied(&state, &context, principal.as_ref(), &matched_rule_id);
                 with_policy_decision(
                     forbidden(),
                     decision_for_direct_rule(
@@ -377,7 +383,8 @@ pub(crate) async fn rbac_middleware(
                 )
             }
             RuleAction::Shadow => {
-                emit_rule_would_deny(&state, &context, principal.as_ref(), &matched_rule_id);
+                let _ =
+                    emit_rule_would_deny(&state, &context, principal.as_ref(), &matched_rule_id);
                 let decision = decision_for_direct_rule(
                     PolicyDecisionOutcome::WouldDeny,
                     "matched_rule",
@@ -411,7 +418,7 @@ pub(crate) async fn rbac_middleware(
                 .engine
                 .principal_has_permission(principal, &rule.permission)
         }) {
-            emit_allowed(&state, &context, principal.as_ref(), Some(rule), None);
+            let _ = emit_allowed(&state, &context, principal.as_ref(), Some(rule), None);
             let decision = decision_for_rule(PolicyDecisionOutcome::Allowed, "matched_rule", rule);
             drop(policy);
             let response = run_pinned(
@@ -431,14 +438,14 @@ pub(crate) async fn rbac_middleware(
         };
         return match effective_enforcement_mode(&policy, rule) {
             EnforcementMode::Enforce => {
-                emit_denied(&state, &context, principal.as_ref(), reason, Some(rule));
+                let _ = emit_denied(&state, &context, principal.as_ref(), reason, Some(rule));
                 with_policy_decision(
                     forbidden(),
                     decision_for_rule(PolicyDecisionOutcome::Denied, reason, rule),
                 )
             }
             EnforcementMode::Shadow => {
-                emit_would_deny(&state, &context, principal.as_ref(), reason, Some(rule));
+                let _ = emit_would_deny(&state, &context, principal.as_ref(), reason, Some(rule));
                 let decision = decision_for_rule(PolicyDecisionOutcome::WouldDeny, reason, rule);
                 drop(policy);
                 let response = run_pinned(
@@ -454,7 +461,7 @@ pub(crate) async fn rbac_middleware(
     }
 
     if required_upstream_host.is_some() {
-        emit_host_policy_required(
+        let _ = emit_host_policy_required(
             &state,
             &context,
             principal.as_ref(),
@@ -487,7 +494,7 @@ pub(crate) async fn rbac_middleware(
                 path_prefix: None,
                 matched_rule_id: None,
             };
-            emit_allowed(
+            let _ = emit_allowed(
                 &state,
                 &context,
                 principal.as_ref(),
@@ -505,7 +512,7 @@ pub(crate) async fn rbac_middleware(
         }
         DefaultAction::Deny => match enforcement_mode {
             EnforcementMode::Enforce => {
-                emit_denied(&state, &context, principal.as_ref(), "default_deny", None);
+                let _ = emit_denied(&state, &context, principal.as_ref(), "default_deny", None);
                 with_policy_decision(
                     forbidden(),
                     PolicyDecision {
@@ -518,7 +525,7 @@ pub(crate) async fn rbac_middleware(
                 )
             }
             EnforcementMode::Shadow => {
-                emit_would_deny(&state, &context, principal.as_ref(), "default_deny", None);
+                let _ = emit_would_deny(&state, &context, principal.as_ref(), "default_deny", None);
                 let response = run_pinned(
                     pinned_connections.clone(),
                     admitted_bundle.clone(),
