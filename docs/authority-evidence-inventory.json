@@ -1444,7 +1444,7 @@
         "standalone"
       ],
       "entrypoints": [],
-      "boundary": "Config::from_env startup validation selects authorities; serving bootstrap assembles runtime state. PostgreSQL document seeding uses normal document commits but does not establish a revisioned whole-configuration authority.",
+      "boundary": "The configuration compiler validates the environment and selects authorities without I/O; serving bootstrap's preflight, activation and serving stages then assemble runtime state from that one compiled result. PostgreSQL document seeding uses normal document commits but does not establish a revisioned whole-configuration authority.",
       "record": "No common configuration activation manifest/event transaction. File/environment configuration remains operator-owned; revisioned policy/tools records cover only their own resources.",
       "actor": "Startup system process; no authenticated changing operator.",
       "identity": "No authoritative whole-configuration operation/revision identity.",
@@ -1461,6 +1461,10 @@
         {
           "path": "gateway/src/config.rs",
           "anchor": "pub fn from_env("
+        },
+        {
+          "path": "gateway/src/bootstrap.rs",
+          "anchor": "pub(super) async fn start_serving<"
         }
       ],
       "tests": [
@@ -1471,6 +1475,10 @@
         {
           "path": "gateway/src/config_tests.rs",
           "anchor": "fn the_env_example_boots_verbatim_in_standalone_mode("
+        },
+        {
+          "path": "gateway/src/bootstrap_tests.rs",
+          "anchor": "fn a_refused_configuration_stops_startup_before_any_stage("
         }
       ],
       "required_durability_supported": false,

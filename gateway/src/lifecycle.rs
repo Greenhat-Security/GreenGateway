@@ -353,6 +353,24 @@ pub(crate) struct GatewayApps {
     pub(crate) grpc: Option<GrpcApp>,
 }
 
+/// The data and admin listener addresses [`serve_gateway`] binds, read from
+/// the configuration when the gateway is activated. The admin address is
+/// set only when the admin surface has a listener of its own.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ListenAddresses {
+    pub(crate) data: SocketAddr,
+    pub(crate) admin: Option<SocketAddr>,
+}
+
+impl ListenAddresses {
+    pub(crate) fn from_config(config: &config::Config) -> Self {
+        Self {
+            data: config.listen_addr,
+            admin: config.admin_listen_addr,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // One parameter per independently configured concern.
 pub(crate) async fn serve_gateway(
     app: GatewayApp,

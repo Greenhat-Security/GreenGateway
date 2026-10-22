@@ -53,6 +53,11 @@ mod stage;
 mod stage_tests;
 mod storage;
 
+/// The configuration compiler (issue #433). Serving startup calls it
+/// directly and builds from the plan it returns (`bootstrap::start_serving`);
+/// the one-shot commands reach it through [`Config::from_env`].
+pub(crate) use plan::compile;
+
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:8080";
 static DEFAULT_LISTEN_SOCKET_ADDR: LazyLock<SocketAddr> = LazyLock::new(|| {
     DEFAULT_LISTEN_ADDR
@@ -1491,7 +1496,8 @@ impl Config {
 
     // pub(crate) so sibling modules' tests can build configurations from
     // environment maps without going through process environment mutation;
-    // production reaches it only through `from_env`.
+    // production reaches it only through `from_env`. Serving startup calls
+    // `compile` itself, which is this function without the conversion.
     //
     // The configuration compiler (issue #433) reads every input block where
     // the legacy parser read it, parses and validates each block from those
