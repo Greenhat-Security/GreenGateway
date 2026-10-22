@@ -115,9 +115,16 @@ export type ConnectionFormState = {
   tokenExchangeUrl: string;
   // A delegated issuer token's optional RFC 7009 endpoint.
   revocationUrl: string;
+  // Also a Google domain-wide delegation's scopes, which the gateway requires.
   scopes: string;
   audience: string;
   resource: string;
+  // A Google domain-wide delegation's account, the `CONNECTION_GCP_PROVIDER`
+  // profile it signs through, and the identity providers trusted to name its
+  // users, one per line. None of them is a secret.
+  serviceAccountEmail: string;
+  workloadIdentityProfile: string;
+  subjectIssuers: string;
   authenticationBinding: BindingDraft;
   additionalHeaders: AdditionalHeaderDraft[];
   // The block as stored, shown read only unless `callerAssertionMode` is
@@ -212,6 +219,9 @@ export const DEFAULT_FORM: ConnectionFormState = {
   scopes: '',
   audience: '',
   resource: '',
+  serviceAccountEmail: '',
+  workloadIdentityProfile: '',
+  subjectIssuers: '',
   authenticationBinding: emptyBinding(),
   additionalHeaders: [],
   callerAssertion: null,
@@ -264,6 +274,19 @@ const MAX_ASSERTION_KID_BYTES = 128;
 const MAX_ASSERTION_ISSUER_AUDIENCE_BYTES = 512;
 const MAX_ASSERTION_TOKEN_TYPE_BYTES = 128;
 
+// The gateway's bounds on a Google domain-wide delegation's fields.
+export const MAX_GOOGLE_SCOPES = 16;
+const MAX_GOOGLE_SCOPE_CHARS = 128;
+export const MAX_GOOGLE_SUBJECT_ISSUERS = 8;
+const MAX_GOOGLE_SUBJECT_ISSUER_BYTES = 512;
+const MAX_PROFILE_ID_BYTES = 128;
+// A dedicated `{name}@{project}.iam.gserviceaccount.com` account, exactly as
+// the gateway and the published schema accept it. Default accounts on other
+// domains, and user accounts, are refused.
+const GOOGLE_SERVICE_ACCOUNT_PATTERN =
+  /^[a-z][a-z0-9-]{2,30}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$/;
+const PROFILE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
 /**
  * Whether the authentication type of this form is fixed. A stored delegated
  * issuer token Connection keeps its type: its caller assertion stays through
@@ -300,22 +323,24 @@ export function subjectTokenDraftApplies(form: ConnectionFormState): boolean {
 }
 
 /**
- * Why the editor cannot open `detail`, or `null` when it can.
- *
- * A Google domain-wide delegation is shown read only: the editor has no form
- * for it, and saving through a form that cannot represent it would replace
- * the credential with whichever type the form defaulted to.
+ * The trusted issuers a form lists, one per line: trimmed, blank lines
+ * dropped. Lines are not split on other whitespace, so an issuer typed with a
+ * space inside is refused rather than silently turned into two.
  */
-export function editorUnsupportedReason(
-  detail: ConnectionDetail,
-): string | null {
-  if (
-    detail.configuration?.authentication.type ===
-    'google_domain_wide_delegation'
-  ) {
-    return 'This connection uses Google domain-wide delegation, which the editor cannot change yet. Change it through the admin API.';
-  }
-  return null;
+function subjectIssuerLines(value: string): string[] {
+  return value
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+/**
+ * An issuer as the gateway compares it with a caller's: trailing slashes
+ * removed. The gateway stores this form, so two entries that differ only by a
+ * trailing slash are one issuer listed twice.
+ */
+function canonicalSubjectIssuer(value: string): string {
+  return value.trim().replace(/\/+$/, '');
 }
 
 export function formFromDetail(detail: ConnectionDetail): ConnectionFormState {
@@ -331,11 +356,10 @@ export function formFromDetail(detail: ConnectionDetail): ConnectionFormState {
   }
 
   const authentication = configuration.authentication;
-  if (authentication.type === 'google_domain_wide_delegation') {
-    // The editor refuses such a connection before it builds a form; see
-    // `editorUnsupportedReason`.
-    throw new Error(editorUnsupportedReason(detail) ?? 'Unsupported connection');
-  }
+  const googleDelegation =
+    authentication.type === 'google_domain_wide_delegation'
+      ? authentication
+      : null;
   const authenticationConfigured =
     authentication.type === 'header_api_key' ||
       authentication.type === 'static_bearer'
@@ -392,9 +416,12 @@ export function formFromDetail(detail: ConnectionDetail): ConnectionFormState {
       authentication.type === 'delegated_issuer_token'
         ? authentication.revocation_url ?? ''
         : '',
-    scopes: tokenRequest?.scopes.join(' ') ?? '',
+    scopes: (tokenRequest?.scopes ?? googleDelegation?.scopes ?? []).join(' '),
     audience: tokenRequest?.audience ?? '',
     resource: tokenRequest?.resource ?? '',
+    serviceAccountEmail: googleDelegation?.service_account_email ?? '',
+    workloadIdentityProfile: googleDelegation?.workload_identity_profile ?? '',
+    subjectIssuers: googleDelegation?.subject_issuers.join('\n') ?? '',
     authenticationBinding: authenticationConfigured
       ? configuredBinding()
       : emptyBinding(),
@@ -658,6 +685,18 @@ export function authenticationFromForm(
         subject_token_source: 'caller_assertion',
         ...binding,
       };
+    case 'google_domain_wide_delegation':
+      // Binds no secret, so nothing here is a marker: a replacement writes
+      // every field, as a create does.
+      return {
+        type: 'google_domain_wide_delegation',
+        service_account_email: form.serviceAccountEmail.trim(),
+        workload_identity_profile: form.workloadIdentityProfile.trim(),
+        scopes: normalizeList(form.scopes),
+        // The only value: the validated principal's email becomes `sub`.
+        subject_claim: 'email',
+        subject_issuers: subjectIssuerLines(form.subjectIssuers),
+      };
   }
 }
 
@@ -828,6 +867,9 @@ export function validateForm(
         'Requested scopes must be unique.';
     }
   }
+  if (form.authenticationType === 'google_domain_wide_delegation') {
+    validateGoogleDomainWideDelegation(form, errors);
+  }
   if (draftsSubjectToken) {
     validateSubjectToken(form, secrets, errors);
   }
@@ -990,6 +1032,73 @@ export function validateForm(
     errors.form = 'Confirm activation before enabling this connection.';
   }
   return errors;
+}
+
+/**
+ * The gateway's rules for a Google domain-wide delegation, so a refusal names
+ * the field to change. Whether the profile is configured is checked by the
+ * gateway on an enabled save; whether Google lets it sign as the account, and
+ * for these scopes, only on the first mint.
+ */
+function validateGoogleDomainWideDelegation(
+  form: ConnectionFormState,
+  errors: FieldErrors,
+) {
+  if (form.kind !== 'http_api') {
+    errors['authentication.type'] =
+      'Google domain-wide delegation works only on an HTTP API connection.';
+  }
+  if (!GOOGLE_SERVICE_ACCOUNT_PATTERN.test(form.serviceAccountEmail.trim())) {
+    errors['authentication.service_account_email'] =
+      'Enter a dedicated service account of the form name@project.iam.gserviceaccount.com.';
+  }
+  const profile = form.workloadIdentityProfile.trim();
+  if (
+    !PROFILE_ID_PATTERN.test(profile) ||
+    new TextEncoder().encode(profile).length > MAX_PROFILE_ID_BYTES
+  ) {
+    errors['authentication.workload_identity_profile'] =
+      `Enter the ID of a CONNECTION_GCP_PROVIDER profile: 1 to ${MAX_PROFILE_ID_BYTES} letters, digits, dots, underscores or hyphens, starting with a letter or digit.`;
+  }
+  const scopes = normalizeList(form.scopes);
+  if (scopes.length === 0) {
+    errors['authentication.scopes'] =
+      'Enter at least one scope the Workspace administrator authorised for the service account.';
+  } else if (scopes.length > MAX_GOOGLE_SCOPES) {
+    errors['authentication.scopes'] =
+      `Enter no more than ${MAX_GOOGLE_SCOPES} scopes.`;
+  } else if (
+    scopes.some((scope) => [...scope].length > MAX_GOOGLE_SCOPE_CHARS)
+  ) {
+    errors['authentication.scopes'] =
+      `Enter scopes of at most ${MAX_GOOGLE_SCOPE_CHARS} characters each.`;
+  } else if (new Set(scopes).size !== scopes.length) {
+    errors['authentication.scopes'] = 'Scopes must be unique.';
+  }
+  const issuers = subjectIssuerLines(form.subjectIssuers);
+  const canonical = issuers.map(canonicalSubjectIssuer);
+  if (issuers.length === 0) {
+    errors['authentication.subject_issuers'] =
+      'Enter the identity provider trusted to name the Workspace users.';
+  } else if (issuers.length > MAX_GOOGLE_SUBJECT_ISSUERS) {
+    errors['authentication.subject_issuers'] =
+      `Enter no more than ${MAX_GOOGLE_SUBJECT_ISSUERS} subject issuers.`;
+  } else if (
+    canonical.some(
+      (issuer) =>
+        issuer.length === 0 ||
+        new TextEncoder().encode(issuer).length >
+          MAX_GOOGLE_SUBJECT_ISSUER_BYTES ||
+        // Whitespace, and Rust's `char::is_control`, which the gateway applies.
+        /[\s\u0000-\u001f\u007f-\u009f]/.test(issuer),
+    )
+  ) {
+    errors['authentication.subject_issuers'] =
+      `Enter one issuer per line, each 1 to ${MAX_GOOGLE_SUBJECT_ISSUER_BYTES} bytes with no spaces or control characters.`;
+  } else if (new Set(canonical).size !== canonical.length) {
+    errors['authentication.subject_issuers'] =
+      'List each issuer once; a trailing slash does not make it another one.';
+  }
 }
 
 /**
@@ -1225,14 +1334,22 @@ function assertionKeyBindingPayload(
  * What a save does with the caller assertion. A delegated issuer token
  * Connection's block is its subject token: a new one is drafted in
  * `subjectToken` and a stored one stays read only, so for that credential the
- * general block is always kept.
+ * general block is always kept. A Google domain-wide delegation carries none:
+ * Google verifies no assertion of the gateway's, and one sent there would be
+ * a statement about the caller handed to a third party, so the gateway
+ * refuses the block and a save removes a stored one.
  */
 export function effectiveCallerAssertionMode(
   form: ConnectionFormState,
 ): CallerAssertionMode {
-  return form.authenticationType === 'delegated_issuer_token'
-    ? 'keep'
-    : form.callerAssertionMode;
+  switch (form.authenticationType) {
+    case 'delegated_issuer_token':
+      return 'keep';
+    case 'google_domain_wide_delegation':
+      return 'remove';
+    default:
+      return form.callerAssertionMode;
+  }
 }
 
 /** Whether a save leaves the Connection carrying a caller assertion. */
@@ -1412,6 +1529,27 @@ const CALLER_ASSERTION_PROBLEMS: Record<string, string> = {
     'The key cannot sign with this algorithm: ES256 needs a P-256 key and RS256 an RSA key of at least 2048 bits.',
   secret_purpose_conflict:
     'This alias is bound as a delegated token-exchange client secret and cannot also hold an assertion key.',
+  unsupported:
+    'A Google domain-wide delegation sends the caller\'s own Google token, and Google verifies no caller assertion: remove the block to save this connection.',
+};
+
+// What the gateway's problem codes mean for the fields only a Google
+// domain-wide delegation has, keyed by field and code. The code is shown
+// beside the sentence, as for a caller assertion.
+const GOOGLE_DELEGATION_PROBLEMS: Record<string, string> = {
+  'authentication.service_account_email:invalid_service_account':
+    'Enter a dedicated service account of the form name@project.iam.gserviceaccount.com.',
+  'authentication.workload_identity_profile:invalid_profile_id':
+    'Enter the ID of a CONNECTION_GCP_PROVIDER profile, not a token file, audience or key.',
+  'authentication.workload_identity_profile:unresolvable_binding':
+    'No CONNECTION_GCP_PROVIDER profile with this ID is configured on the gateway. Configure it in the gateway\'s startup configuration, or save the connection disabled.',
+  'authentication.subject_issuers:required':
+    'Enter the identity provider trusted to name the Workspace users.',
+  'authentication.subject_issuers:too_many': `Enter no more than ${MAX_GOOGLE_SUBJECT_ISSUERS} subject issuers.`,
+  'authentication.subject_issuers:invalid_issuer':
+    'Enter one issuer per line, with no spaces or control characters.',
+  'authentication.subject_issuers:duplicate_issuer':
+    'List each issuer once; a trailing slash does not make it another one.',
 };
 
 export function callerAssertionProblemMessage(code: string): string {
@@ -1679,6 +1817,8 @@ export function authenticationPurpose(
       return 'oauth_client_secret';
     case 'delegated_issuer_token':
       return 'token_exchange_client_secret';
+    // Binds no secret: its profile is trusted startup configuration.
+    case 'google_domain_wide_delegation':
     case 'none':
       return null;
   }
@@ -1958,6 +2098,9 @@ export function focusFirstProblem(errors: FieldErrors) {
     'authentication.requested_scopes': 'connection-oauth-scopes',
     'authentication.audience': 'connection-oauth-audience',
     'authentication.resource': 'connection-oauth-resource',
+    'authentication.service_account_email': 'connection-google-service-account',
+    'authentication.workload_identity_profile': 'connection-google-profile',
+    'authentication.subject_issuers': 'connection-google-subject-issuers',
     'authentication.secret_id': 'connection-auth-secret',
     'authentication.client_secret_id': 'connection-auth-secret',
     'caller_assertion.signing_key_id': 'connection-subject-token-key',
@@ -2091,6 +2234,9 @@ export function fieldErrorsFromProblems(
     'authentication.requested_scopes',
     'authentication.audience',
     'authentication.resource',
+    'authentication.service_account_email',
+    'authentication.workload_identity_profile',
+    'authentication.subject_issuers',
     'authentication.secret_id',
     'authentication.client_secret_id',
     'additional_headers.header_name',
@@ -2122,7 +2268,12 @@ export function fieldErrorsFromProblems(
       );
       continue;
     }
-    const message = humanizeCode(problem.code);
+    const googleSentence =
+      GOOGLE_DELEGATION_PROBLEMS[`${problem.field}:${problem.code}`];
+    const message =
+      googleSentence === undefined
+        ? humanizeCode(problem.code)
+        : `${googleSentence} (${problem.code})`;
     if (problem.field === 'tls') {
       appendFieldError(errors, 'tls.client_certificate_id', message);
       appendFieldError(errors, 'tls.client_private_key_id', message);

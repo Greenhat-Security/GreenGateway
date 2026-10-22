@@ -160,7 +160,21 @@ pub struct ToolExecutor {
     mcp_upstream_servers: Arc<HashMap<String, McpUpstreamServerConfig>>,
     mcp_upstream_runtime_config: Arc<McpUpstreamRuntimeConfig>,
     validator_cache: Arc<Mutex<ValidatorCache>>,
+    /// Test seam: runs after each tool's visibility is decided in
+    /// [`ToolExecutor::list_visible_tools`], where a policy or registry
+    /// install can land between two tools of one listing.
+    #[cfg(test)]
+    listing_hook: Option<ListingHook>,
 }
+
+/// What [`ToolExecutor::with_listing_hook_for_test`] runs, given the name of
+/// the tool whose visibility was just decided. The listing awaits it before
+/// it judges the next tool.
+#[cfg(test)]
+pub(crate) type ListingHook = Arc<dyn Fn(&str) -> ListingHookFuture + Send + Sync>;
+
+#[cfg(test)]
+pub(crate) type ListingHookFuture = std::pin::Pin<Box<dyn Future<Output = ()> + Send>>;
 
 pub(crate) struct ServedToolDefinition<'a> {
     pub(crate) definition: Cow<'a, ToolDefinition>,
@@ -911,7 +925,15 @@ impl ToolExecutor {
             mcp_upstream_servers: Arc::new(backends.mcp_upstream_servers),
             mcp_upstream_runtime_config: Arc::new(backends.mcp_upstream_runtime_config),
             validator_cache: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            listing_hook: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_listing_hook_for_test(mut self, hook: ListingHook) -> Self {
+        self.listing_hook = Some(hook);
+        self
     }
 
     pub(crate) fn with_enum_source_runtime(
@@ -1088,11 +1110,42 @@ impl ToolExecutor {
         result
     }
 
-    pub(crate) fn can_list_tool(&self, tool_name: &str, context: &ToolInvocationContext) -> bool {
-        self.registry
-            .get(tool_name)
-            .is_some_and(|tool| tool.visibility.is_listed())
-            && self.runtime.tool_visible_to_context(tool_name, context)
+    /// The tools one `tools/list` listing advertises to `context`'s caller, in
+    /// registry order.
+    ///
+    /// A listing is judged as one set of facts (#422). The registry is read
+    /// once, and each listed definition's own visibility decides it, so no
+    /// tool is shown from one registry state by the visibility of another.
+    /// Every policy visibility check runs inside
+    /// [`ToolRuntime::with_request_policy_snapshot`], as an invocation does:
+    /// in cluster mode against the bundle the revision gate admitted the
+    /// request under, in standalone mode against the live lane read once when
+    /// the listing starts. A policy installed while the listing runs answers
+    /// the next listing, never part of this one, so a listing cannot show
+    /// together tools that no single snapshot shows together.
+    pub(crate) async fn list_visible_tools(
+        &self,
+        context: &ToolInvocationContext,
+    ) -> Vec<Arc<ToolDefinition>> {
+        self.runtime
+            .with_request_policy_snapshot(async {
+                let mut listed = Vec::new();
+                for definition in self.registry.list() {
+                    let visible = definition.visibility.is_listed()
+                        && self
+                            .runtime
+                            .tool_visible_to_context(&definition.name, context);
+                    #[cfg(test)]
+                    if let Some(hook) = self.listing_hook.as_ref() {
+                        hook(&definition.name).await;
+                    }
+                    if visible {
+                        listed.push(definition);
+                    }
+                }
+                listed
+            })
+            .await
     }
 
     pub(crate) fn record_unknown_tool_call(

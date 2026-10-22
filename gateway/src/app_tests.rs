@@ -1,4 +1,6 @@
 use super::*;
+#[path = "admin_policy_drafts_tests.rs"]
+mod admin_policy_drafts_tests;
 #[path = "admin_session_app_tests.rs"]
 mod admin_session_app_tests;
 use crate::auth::TokenStore;
@@ -7,11 +9,12 @@ use futures_util::StreamExt;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use rmcp::{
     model::{
-        CallToolRequestParams as RmcpCallToolRequestParams, CallToolResult as RmcpCallToolResult,
+        CallToolRequestParams as RmcpCallToolRequestParams,
+        CallToolResponse as RmcpCallToolResponse, CallToolResult as RmcpCallToolResult,
         ErrorData as RmcpErrorData, Implementation, JsonObject as RmcpJsonObject,
         ListToolsResult as RmcpListToolsResult,
         PaginatedRequestParams as RmcpPaginatedRequestParams,
-        ServerCapabilities as RmcpServerCapabilities, ServerInfo as RmcpServerInfo,
+        ServerCapabilities as RmcpServerCapabilities, ServerConfig as RmcpServerConfig,
         Tool as RmcpTool,
     },
     service::{RequestContext as RmcpRequestContext, RoleServer as RmcpRoleServer},
@@ -1748,6 +1751,15 @@ fn admin_routes_keep_default_api_prefix_and_remap_custom_api_under_v1() {
         default_routes.policy_rules_order_route,
         POLICY_RULES_ORDER_ADMIN_ROUTE
     );
+    assert_eq!(
+        default_routes.policy_drafts_route,
+        POLICY_DRAFTS_ADMIN_ROUTE
+    );
+    assert_eq!(default_routes.policy_draft_route, POLICY_DRAFT_ADMIN_ROUTE);
+    assert_eq!(
+        default_routes.policy_draft_publish_route,
+        POLICY_DRAFT_PUBLISH_ADMIN_ROUTE
+    );
     assert_eq!(default_routes.tokens_route, TOKENS_ADMIN_ROUTE);
     assert_eq!(default_routes.token_route, TOKEN_ADMIN_ROUTE);
     assert_eq!(default_routes.token_rotate_route, TOKEN_ROTATE_ADMIN_ROUTE);
@@ -1863,6 +1875,15 @@ fn admin_routes_keep_default_api_prefix_and_remap_custom_api_under_v1() {
     assert_eq!(
         custom_routes.policy_rules_order_route,
         "/v1/ops/policy/rules/order"
+    );
+    assert_eq!(custom_routes.policy_drafts_route, "/v1/ops/policy/drafts");
+    assert_eq!(
+        custom_routes.policy_draft_route,
+        "/v1/ops/policy/drafts/{id}"
+    );
+    assert_eq!(
+        custom_routes.policy_draft_publish_route,
+        "/v1/ops/policy/drafts/{id}/publish"
     );
     assert_eq!(custom_routes.tokens_route, "/v1/ops/tokens");
     assert_eq!(custom_routes.token_route, "/v1/ops/tokens/{id}");
@@ -9057,6 +9078,74 @@ fn the_ha_metric_registry_never_labels_by_a_caller_influenced_value() {
                 );
             }
         }
+    }
+}
+
+/// Every counter series a single-event alert reads is exported at `0`
+/// right after the recorder is installed, so the first event after a
+/// process start moves it `0 -> 1` and `increase(...[5m]) > 0` sees it.
+///
+/// A series that first appears at `1` has no earlier sample to compare
+/// against, so before this a single refused authority change after a
+/// restart never paged (issue #440 review). The registry is built and
+/// registered exactly as `install_metrics_recorder` does, minus making it
+/// process-global. Each family exports exactly its emitters' vocabulary,
+/// cluster-only series only in cluster mode, and the dispatcher's failure
+/// counter stays lazy because its presence marks a configured sink.
+#[test]
+fn single_event_alert_counters_are_exported_at_zero_right_after_install() {
+    for cluster in [false, true] {
+        let recorder = metrics_recorder_builder().build_recorder();
+        let handle = recorder.handle();
+        ::metrics::with_local_recorder(&recorder, || register_metrics(cluster));
+        let rendered = handle.render();
+        let samples: Vec<&str> = rendered
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .collect();
+        let family = |name: &str| {
+            samples
+                .iter()
+                .copied()
+                .filter(|line| rendered_metric_name(line) == name)
+                .collect::<Vec<&str>>()
+        };
+        let cluster_seeded = cluster && cfg!(feature = "postgres");
+
+        let mut drop_reasons = audit::LOCAL_DROP_REASONS.to_vec();
+        if cluster_seeded {
+            drop_reasons.push("postgres");
+        }
+        let mut drops = family("audit_events_dropped_total");
+        drops.sort_unstable();
+        let mut expected_drops: Vec<String> = drop_reasons
+            .iter()
+            .map(|reason| format!("audit_events_dropped_total{{reason=\"{reason}\"}} 0"))
+            .collect();
+        expected_drops.sort_unstable();
+        assert_eq!(drops, expected_drops, "cluster={cluster}:\n{rendered}");
+        assert_eq!(
+            family("greengateway_audit_flush_total"),
+            ["greengateway_audit_flush_total{outcome=\"failure\"} 0"],
+            "cluster={cluster}:\n{rendered}"
+        );
+
+        for name in [
+            "greengateway_database_pool_timeouts_total",
+            "greengateway_authority_event_capacity_refusals_total",
+            "greengateway_authority_event_evidence_failures_total",
+        ] {
+            let expected = if cluster_seeded {
+                vec![format!("{name} 0")]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(family(name), expected, "cluster={cluster}:\n{rendered}");
+        }
+        assert!(
+            family("greengateway_authority_event_delivery_failures_total").is_empty(),
+            "a seeded dispatcher failure series would mark every replica as having a sink:\n{rendered}"
+        );
     }
 }
 
@@ -24629,6 +24718,7 @@ async fn suggestions_admin_without_engine_answers_not_configured() {
                 policy_file: None,
                 rbac_state: Some(rbac_state.clone()),
                 history_store: None,
+                draft_store: None,
                 #[cfg(feature = "postgres")]
                 control_plane: None,
                 #[cfg(feature = "postgres")]
@@ -30653,8 +30743,8 @@ struct TestMcpUpstreamServer {
 }
 
 impl RmcpServerHandler for TestMcpUpstreamServer {
-    fn get_info(&self) -> RmcpServerInfo {
-        RmcpServerInfo::new(RmcpServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> RmcpServerConfig {
+        RmcpServerConfig::new(RmcpServerCapabilities::builder().enable_tools().build())
             .with_server_info(
                 Implementation::new("greengateway-test-upstream", "0.0.0")
                     .with_title("GreenGateway Test Upstream"),
@@ -30677,7 +30767,7 @@ impl RmcpServerHandler for TestMcpUpstreamServer {
         &self,
         request: RmcpCallToolRequestParams,
         _context: RmcpRequestContext<RmcpRoleServer>,
-    ) -> Result<RmcpCallToolResult, RmcpErrorData> {
+    ) -> Result<RmcpCallToolResponse, RmcpErrorData> {
         let arguments = request.arguments.unwrap_or_default();
         let call = json!({
             "name": request.name.to_string(),
@@ -30691,7 +30781,8 @@ impl RmcpServerHandler for TestMcpUpstreamServer {
         Ok(RmcpCallToolResult::structured(json!({
             "remote_tool": request.name.to_string(),
             "arguments": Value::Object(arguments),
-        })))
+        }))
+        .into())
     }
 }
 
@@ -30702,7 +30793,7 @@ async fn spawn_test_mcp_upstream(tool_name: &str) -> TestMcpUpstream {
         calls: Arc::clone(&calls),
     };
     let config = RmcpStreamableHttpServerConfig::default()
-        .with_stateful_mode(false)
+        .with_legacy_session_mode(false)
         .with_json_response(true)
         .disable_allowed_hosts();
     let service = RmcpStreamableHttpService::new(
@@ -34307,10 +34398,27 @@ mod cluster_policy_tests {
             )
             .route(POLICY_HISTORY_ADMIN_ROUTE, get(policy_history_endpoint))
             .route(POLICY_ROLLBACK_ADMIN_ROUTE, post(policy_rollback_endpoint))
+            .route(
+                POLICY_DRAFTS_ADMIN_ROUTE,
+                get(policy_drafts_list_endpoint).post(policy_draft_create_endpoint),
+            )
+            .route(
+                POLICY_DRAFT_ADMIN_ROUTE,
+                get(policy_draft_get_endpoint)
+                    .patch(policy_draft_patch_endpoint)
+                    .delete(policy_draft_delete_endpoint),
+            )
+            .route(
+                POLICY_DRAFT_PUBLISH_ADMIN_ROUTE,
+                post(policy_draft_publish_endpoint),
+            )
             .with_state(PolicyAdminState {
                 policy_file: None,
                 rbac_state: Some(rbac_state.clone().with_revision_gate(gate.clone())),
                 history_store: Some(store.clone() as Arc<dyn storage::PolicyHistory>),
+                draft_store: Some(
+                    Arc::new(store.draft_store()) as Arc<dyn storage::PolicyDraftStore>
+                ),
                 control_plane: Some(store as Arc<dyn storage::PolicyControlPlane>),
                 membership,
                 event_store: None,
@@ -34963,6 +35071,133 @@ mod cluster_policy_tests {
             row.get(0)
         };
         assert_eq!(documents, 3, "two commits plus the rollback version");
+    }
+
+    /// Server-side drafts in cluster mode (issue #243, slice 9): a draft is
+    /// shared state in migration 22's table, saving one commits nothing, and
+    /// publishing one is exactly one control-plane commit, behind the draft
+    /// ETag and the live `If-Match` both. A second draft pinned to the same
+    /// base is then stale and is refused without a commit.
+    #[tokio::test]
+    async fn cluster_policy_drafts_publish_through_the_control_plane_transaction() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_policy_foundation(&database.dsn).await;
+        let active = initialize(&store, "draft-init").await;
+        let (router, rbac_state) = cluster_policy_router(store.clone());
+        rbac_state
+            .install_revision_snapshot(active.policy.clone(), active.security_revision)
+            .await
+            .expect("the authority's revision should install");
+        let versions_before = policy_version_count(&pool).await;
+
+        let draft_request = |method: Method, uri: &str, headers: &[(&str, &str)], body: &str| {
+            let mut builder = Request::builder().method(method).uri(uri);
+            for (name, value) in headers {
+                builder = builder.header(*name, *value);
+            }
+            let mut request = builder
+                .body(Body::from(body.to_owned()))
+                .expect("draft request should build");
+            request.extensions_mut().insert(admin_principal());
+            request
+        };
+        let mut drafts = Vec::new();
+        for id in ["draft-published", "draft-left-behind"] {
+            let candidate: Value =
+                serde_json::from_str(&cluster_policy_json(id)).expect("candidate JSON");
+            let created = router
+                .clone()
+                .oneshot(draft_request(
+                    Method::POST,
+                    POLICY_DRAFTS_ADMIN_ROUTE,
+                    &[("if-match", &active.etag)],
+                    &json!({ "policy": candidate }).to_string(),
+                ))
+                .await
+                .expect("create should complete");
+            assert_eq!(created.status(), StatusCode::CREATED);
+            let draft_etag = created
+                .headers()
+                .get(header::ETAG)
+                .and_then(|value| value.to_str().ok())
+                .expect("draft ETag")
+                .to_owned();
+            let (_, body) = refusal_of(created).await;
+            drafts.push((
+                body["draft_id"].as_str().expect("draft id").to_owned(),
+                draft_etag,
+            ));
+        }
+        assert_eq!(
+            policy_version_count(&pool).await,
+            versions_before,
+            "saving drafts commits no policy version"
+        );
+        assert_eq!(
+            rbac_state.snapshot_security_revision(),
+            active.security_revision
+        );
+
+        let publish = |draft: &(String, String), if_match: &str| {
+            draft_request(
+                Method::POST,
+                &format!("{POLICY_DRAFTS_ADMIN_ROUTE}/{}/publish", draft.0),
+                &[(POLICY_DRAFT_ETAG_HEADER, &draft.1), ("if-match", if_match)],
+                "",
+            )
+        };
+        let published = router
+            .clone()
+            .oneshot(publish(&drafts[0], &active.etag))
+            .await
+            .expect("publish should complete");
+        let new_etag = etag_of(published).await;
+        assert_eq!(policy_version_count(&pool).await, versions_before + 1);
+        let now_active = store
+            .active()
+            .await
+            .expect("active read")
+            .expect("active document");
+        assert_eq!(now_active.etag, new_etag);
+        assert_eq!(now_active.policy.id.as_deref(), Some("draft-published"));
+        assert_eq!(
+            rbac_state.snapshot_security_revision(),
+            active.security_revision + 1,
+            "publication installs the committed revision like any policy write"
+        );
+        let (status, frozen) = refusal_of(
+            router
+                .clone()
+                .oneshot(draft_request(
+                    Method::GET,
+                    &format!("{POLICY_DRAFTS_ADMIN_ROUTE}/{}", drafts[0].0),
+                    &[],
+                    "",
+                ))
+                .await
+                .expect("draft read should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(frozen["state"], "published");
+        assert_eq!(frozen["published_etag"], json!(new_etag));
+
+        // The other draft was pinned to the base that is no longer live.
+        let (status, body) = refusal_of(
+            router
+                .clone()
+                .oneshot(publish(&drafts[1], &new_etag))
+                .await
+                .expect("stale publish should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["reason"], "policy_draft_base_stale");
+        assert_eq!(policy_version_count(&pool).await, versions_before + 1);
     }
 
     #[tokio::test]
@@ -36699,13 +36934,13 @@ mod cluster_discovery_tests {
         }
     }
 
-    const DEPLOYMENT_ID: &str = "deploy-cluster-discovery";
+    const CLUSTER_DISCOVERY_DEPLOYMENT_ID: &str = "deploy-cluster-discovery";
 
     async fn migrated_pool(dsn: &str) -> deadpool_postgres::Pool {
         let dsn_file = write_dsn_file(dsn);
         let mut config = test_config(Vec::new());
         config.state_backend = config::StateBackend::Postgres;
-        config.deployment_id = Some(DEPLOYMENT_ID.to_owned());
+        config.deployment_id = Some(CLUSTER_DISCOVERY_DEPLOYMENT_ID.to_owned());
         config.database.url_file = Some(dsn_file.path.clone());
         config.database.tls_mode = config::DatabaseTlsMode::LoopbackDev;
         let foundation = PostgresFoundation::establish(&config)
@@ -36797,7 +37032,7 @@ mod cluster_discovery_tests {
         let mut config = test_config(Vec::new());
         config.auth_enabled = false;
         config.state_backend = config::StateBackend::Postgres;
-        config.deployment_id = Some(DEPLOYMENT_ID.to_owned());
+        config.deployment_id = Some(CLUSTER_DISCOVERY_DEPLOYMENT_ID.to_owned());
         config
             .rbac_exempt_paths
             .extend([AUDIT_ADMIN_ROUTE.to_owned(), POLICY_ADMIN_ROUTE.to_owned()]);
@@ -36951,7 +37186,7 @@ mod cluster_discovery_tests {
         let lifecycle = GatewayLifecycle::new();
         let mut config = test_config(Vec::new());
         config.state_backend = config::StateBackend::Postgres;
-        config.deployment_id = Some(DEPLOYMENT_ID.to_owned());
+        config.deployment_id = Some(CLUSTER_DISCOVERY_DEPLOYMENT_ID.to_owned());
         config.discovery_projector_poll_ms = 50;
         let recorder = PrometheusBuilder::new().build_recorder();
         let app = gateway_app_with_process_started_at_and_overrides(
@@ -36965,7 +37200,7 @@ mod cluster_discovery_tests {
                 pg_audit: Some(audit_store.clone()),
                 pg_discovery: Some(ClusterDiscoverySeed {
                     pool: pool.clone(),
-                    deployment_id: DEPLOYMENT_ID.to_owned(),
+                    deployment_id: CLUSTER_DISCOVERY_DEPLOYMENT_ID.to_owned(),
                     instance_id,
                     audit: audit_store.clone(),
                 }),
@@ -37161,6 +37396,7 @@ mod cluster_discovery_tests {
                     policy_file: None,
                     rbac_state: Some(rbac_state.clone()),
                     history_store: Some(policy_store.clone() as Arc<dyn storage::PolicyHistory>),
+                    draft_store: None,
                     control_plane: Some(
                         policy_store.clone() as Arc<dyn storage::PolicyControlPlane>
                     ),
