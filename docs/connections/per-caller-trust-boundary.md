@@ -18,17 +18,22 @@ failure reasons and step-by-step procedures stay in the
 | The upstream receives | The Connection's own credential, if it has one, plus a short-lived JWT the gateway signs that names the caller | The caller's own access token, as `Authorization: Bearer` |
 | Who decides access upstream | The upstream, from the assertion's `caller_iss` and `caller_sub` | The issuer, by the grant it holds for the caller, then the upstream |
 | The gateway holds | A signing key, by alias | A signing key and a token-exchange client secret, by alias, and the issued tokens in a bounded memory cache |
-| Lanes that serve it | Manual HTTP tools, managed OpenAPI tools, managed MCP tool calls and connection-bound proxy routes; see [Which calls are attested](operator-guide.md#which-calls-are-attested) | Manual HTTP tool calls only; see [Which calls are served](operator-guide.md#which-calls-are-served) |
+| Lanes that serve it | Manual HTTP tools, managed OpenAPI tools, every leaf request of a composite tool, managed MCP tool calls and connection-bound proxy routes; see [Which calls are attested](operator-guide.md#which-calls-are-attested) | Manual HTTP tool calls, and a stored Connection test run as the administrator who asks for it; see [Which calls are served](operator-guide.md#which-calls-are-served) |
 | Reference | [Signed caller assertions](operator-guide.md#signed-caller-assertions) | [Delegated issuer tokens](operator-guide.md#delegated-issuer-tokens) |
 
 A delegated Connection always carries a `caller_assertion` block: the
 assertion is the subject token of the exchange and goes to the issuer only,
 never upstream.
 
-Two other Phase 8 items are open and not implemented: the
-`google_domain_wide_delegation` credential (#442) and Swagger 2.0 and Google
-Discovery import with user-consent OAuth scheme binding (#443). Nothing on
-this page applies to them yet; each must extend this page when it lands.
+Two other Phase 8 items are open. The `google_domain_wide_delegation`
+credential (#442) is not implemented. Of #443, only
+[Swagger 2.0 import](operator-guide.md#importing-swagger-20-documents) has
+landed: it binds an `application` flow to an `oauth2_client_credentials`
+Connection, one service identity for every caller, and reports the
+user-consent flows as incompatible, so it adds no per-caller credential.
+Google Discovery import and user-consent OAuth scheme binding are not
+implemented. Nothing on this page applies to them yet; each must extend this
+page when it lands.
 
 ## What each component can do in the wrong hands
 
@@ -55,17 +60,24 @@ From most to least sensitive:
   verifiers' caches of it expire.
 - **`admin:connections:secrets:write`.** It decides which keys the JWKS
   publishes, which aliases a Connection binds, and where a credential may be
-  sent: the endpoint, the token-exchange and revocation URLs, scopes,
-  audience and resource. Every verifier of the one gateway-wide JWKS trusts a
-  key such a principal binds.
+  sent: the endpoint, the stored test's method and path, the token-exchange
+  and revocation URLs, scopes, audience and resource. Every verifier of the
+  one gateway-wide JWKS trusts a key such a principal binds.
 - **`admin:tools:write`.** It decides which upstream operations a caller's own
   token is used for, by binding manual tools to a delegated Connection.
   HTTP direct rules and tool policy still apply to every call.
 - **`admin:principals:write`.** It purges a principal's cached tokens and
   revokes them at the issuer. That costs the user a fresh exchange on their
   next call; it cannot obtain a token.
+- **`admin:connections:test`.** On a delegated Connection it obtains the
+  tester's own token, never another user's: the test exchanges a subject
+  token naming the tester, sends the saved `GET` or `HEAD` test request with
+  the token and drops it. The test result carries stage outcomes only, never
+  the token or the upstream's body. The issuer still handed the token out,
+  and it stays valid there until it expires.
 - **A gateway replica's memory.** It holds up to 1,024 cached tokens, each for
-  at most 900 seconds, and resolved secrets while they are in use. As
+  at most 900 seconds, a running test's token for its one request, and
+  resolved secrets while they are in use. As
   ADR-0006's threat model records, process memory and privileged host
   inspection are trusted.
 
@@ -83,14 +95,17 @@ From most to least sensitive:
   the user.
 - Only a principal an identity provider vouched for is attested or exchanged
   for: a bearer JWT, a session cookie, a client certificate, or the admin
-  session that runs a tool in the playground. An anonymous call, a gateway
-  service token, and a principal without an issuer are refused
-  (`caller_assertion_no_principal`, `delegated_token_no_principal`) before any
-  DNS lookup, secret read or upstream request. There is no fallback to a
-  shared service identity.
+  session that runs a tool in the playground or a stored test of a delegated
+  Connection. An anonymous call, a gateway service token, and a principal
+  without an issuer are refused (`caller_assertion_no_principal`,
+  `delegated_token_no_principal`) before any DNS lookup, secret read or
+  upstream request; a composite tool is refused at its first leaf, so it sends
+  nothing. There is no fallback to a shared service identity.
 - A delegated token is cached for one caller only. The cache key digests the
   caller's issuer, subject, email and roles, so two callers never share a
-  token, and a caller whose claims changed is exchanged for again.
+  token, and a caller whose claims changed is exchanged for again. A stored
+  test neither reads nor fills the cache, so a test never serves a later call
+  and a cached token never makes a test pass.
 - Any value a caller sends under the assertion header or a Connection-owned
   credential header is removed before the gateway writes its own, and the
   assertion is written last. Neither mechanism sends the caller's inbound
@@ -118,7 +133,13 @@ From most to least sensitive:
   most 60 seconds; environment and file aliases are read each time.
 - No admin response, admin UI view, log line or audit event carries the
   material, and the Connection read model shows the client secret and each
-  signing key only as configured or not, without its alias.
+  signing key only as configured or not, without its alias. The admin UI
+  editor keeps a stored key by sending `"signing_key_configured": true`, and
+  the gateway keeps the alias of the stored key with the same `kid` and
+  algorithm. Naming any key alias in a `PUT`, the stored one included, needs
+  `admin:connections:secrets:write` (`403` without it), so a principal without
+  that permission cannot confirm a guessed alias by watching which save goes
+  through unchanged.
 - Binding, changing or removing a `caller_assertion` block or a delegated
   credential, and creating or deleting a Connection that carries one, needs
   `admin:connections:secrets:write` in addition to `admin:connections:write`.
@@ -128,8 +149,9 @@ From most to least sensitive:
 | What | Bound | Dropped or replaced when |
 | --- | --- | --- |
 | Delegated access tokens | 1,024 callers per replica across every delegated Connection. Each is reused for at most 900 seconds, whatever `expires_in` says; the issuer must state an `expires_in` of 1 second to 7 days. | Refreshed a fifth of its lifetime early (at most 30 seconds) plus up to 5 seconds of jitter. No longer served after a save that changes the Connection or an egress policy change, whose first call drops the idle tokens of the earlier configuration. Dropped on an upstream `401` for that token, a [purge](operator-guide.md#purging-a-principals-tokens), idle eviction when the cache is full, and a restart. |
+| A stored test's delegated token | Not cached: one exchange per test of a delegated Connection, inline and within the test's deadline. | Dropped when the test's one request ends. A purge cannot revoke it, since the gateway no longer holds it: it stays valid at the issuer until it expires. |
 | Subject tokens | Not cached: one per exchange, with a fresh `jti` and no request binding. | Each exchange signs a new one. |
-| Caller assertions | Not cached: one per request, and one per request of a managed MCP session. `lifetime_seconds` is 1 to 300; at most 8 KiB. | Each request signs a new one. |
+| Caller assertions | Not cached: one per request, one per request of a managed MCP session, and one per leaf request of a composite tool. `lifetime_seconds` is 1 to 300; at most 8 KiB. | Each request signs a new one. |
 | Signing key and client secret material | Not cached by the gateway; at most 60 seconds by an external provider. | Read again on the next use. |
 | Published JWKS | Public halves only. Rebuilt when the configured keys change, otherwise every 300 seconds; served with `max-age=300`. | A key that fails to read is left out of the set, not kept from an earlier read. |
 
@@ -164,7 +186,14 @@ asks the issuer for a token, and the upstream destination passes egress
 policy before any secret is read. A call the gateway's policy denies never
 reaches the issuer. The token-exchange and revocation endpoints must be in
 the egress allowlist and are checked before the client secret or the signing
-key is read; redirects are not followed.
+key is read; redirects are not followed. Each leaf request of a composite tool
+is admitted and signed on its own, just before it is sent.
+
+A stored test of a delegated Connection is not a tool call, so tool policy
+does not apply to it. It needs `admin:connections:test`, accepts no body or
+target override, sends only the saved `GET` or `HEAD` test request, and checks
+that request's destination against egress policy before it exchanges the
+tester's token.
 
 To keep callers to reads, request read-only scopes at the issuer (below) and,
 as a second layer at the gateway, register only read tools on a delegated
@@ -179,15 +208,19 @@ and enforces nothing.
 
 | Event | Emitted | Carries |
 | --- | --- | --- |
-| `connection.delegated_token_exchange` | On every exchange: each token the issuer hands out | The caller as `actor`, `connection_id`, outcome and reason, `subject_token.kid` and `subject_token.jti`, issuer status and registered error code. Its `request_id` is the fixed `connection-delegated-token`, because one token serves many calls. |
-| `tool.upstream_request` | On every tool request, cached token or not | The caller as `actor`, `connection_id`, tool, method and outcome; when the request carried an assertion upstream, its `kid` and `jti` (`jti_base` and `count` for a managed MCP session). |
+| `connection.delegated_token_exchange` | On every exchange: each token the issuer hands out, a stored test's included | The caller, or the tester, as `actor`, `connection_id`, outcome and reason, `subject_token.kid` and `subject_token.jti`, issuer status and registered error code. Its `request_id` is the fixed `connection-delegated-token`, because one token serves many calls. |
+| `tool.upstream_request` | On every tool request, each leaf request of a composite tool included, cached token or not | The caller as `actor`, `connection_id`, tool, method and outcome; when the request carried an assertion upstream, its `kid` and `jti` (`jti_base` and `count` for a managed MCP session). |
+| `connection.tested` | On every stored test | The tester as `actor`, `connection_id`, outcome and the stage outcomes. A delegated Connection's test also emits an exchange event of its own. |
 | `connection.caller_assertion` | On every proxied request on an attested route | The caller as `actor`, the route, outcome, and the `kid` and `jti` or the refusal reason. |
 | `connection.delegated_token_purge` and `connection.delegated_token_revocation` | On every operator purge, on every purge a revoked JWT started that dropped something, and on each token a purge revokes | `purge_id`, trigger, principal, entry count; per token, the revocation outcome and reason. |
 | `connection.secret_resolution_failed` | When a signing key or client secret cannot be read or loaded | The fixed reason, never the alias or the material. |
 
 A call served from the cache emits no exchange event. Join an exchange to the
 issuer's own log by `subject_token.jti`, to an upstream's log by the
-assertion's `jti`, and to the calls it served by `actor` and `connection_id`.
+assertion's `jti`, and to the calls it served by `actor` and `connection_id`;
+an exchange a test made pairs with that test's `connection.tested` by the same
+two fields. Each leaf of a composite tool has its own `jti`: the request ID, a
+dot and the leaf's number.
 `connection_delegated_token_exchange_total`,
 `connection_delegated_token_purge_total` and
 `connection_delegated_token_revocation_total` count the same decisions. See
@@ -229,7 +262,9 @@ When a user is disabled:
 A purge revokes each dropped token at the Connection's `revocation_url`
 ([RFC 7009](https://www.rfc-editor.org/rfc/rfc7009)) once, in the background
 and without retry. Without a `revocation_url` a purged token is only dropped.
-Give every delegated Connection one when the issuer supports it.
+Give every delegated Connection one when the issuer supports it. A token a
+stored test obtained is in no cache, so no purge drops or revokes it: it stays
+valid at the issuer until it expires.
 
 After an incident that may have exposed the client secret or the signing key:
 disable the Connection, revoke the grants at the issuer, rotate the client
@@ -281,7 +316,7 @@ provide:
   and the algorithm, keep a replay cache keyed on `sub` and `jti`, and with
   `bind_request` compare the method, request target and body digest; see
   [Verifying an assertion](operator-guide.md#verifying-an-assertion).
-- **Least privilege for the three permissions above**, and alerting on
+- **Least privilege for the four permissions above**, and alerting on
   `connection.credential_changed` for delegated and attested Connections.
 - **The egress allowlist names only** the upstream, the token-exchange
   endpoint and the revocation endpoint each delegated Connection needs.
@@ -303,15 +338,17 @@ provide:
   authorization-code, PKCE or device-code flow, and the gateway stores no
   upstream refresh token. Users connect their accounts at the issuer.
 - **Domain-wide delegation (#442)** and **user-consent OAuth scheme binding for
-  imported specifications (#443)** are not implemented.
+  imported specifications (#443)** are not implemented. An imported Swagger
+  2.0 or OpenAPI 3.x user-consent flow is reported as incompatible.
 - **Delegated tokens on other lanes.** Managed OpenAPI and composite tools,
-  proxied requests, managed MCP, discovery, enum and label sources and stored
-  Connection tests refuse a delegated Connection with
-  `caller_assertion_not_enforced`.
-- **Attesting every lane.** OpenAPI and MCP discovery, enum and label sources
-  and stored tests have no caller to attest, and each composite tool step
-  would need an assertion of its own; all of them refuse an attested
-  Connection rather than send a request without the assertion.
+  proxied requests, managed MCP, discovery, and enum and label sources refuse
+  a delegated Connection with `caller_assertion_not_enforced`. Only manual
+  HTTP tool calls and stored tests, run as the tester, are served.
+- **Attesting every lane.** OpenAPI and MCP discovery, enum and label sources,
+  and stored tests of an attested Connection that is not delegated have no
+  caller to attest; they refuse the Connection with
+  `caller_assertion_not_enforced` rather than send a request without the
+  assertion.
 - **Learning that a user was disabled**, for example through SCIM or an
   identity-provider webhook, and **carrying a purge between cluster replicas**.
 - **Verifying issued tokens**: no introspection, scope, audience or subject
@@ -327,7 +364,10 @@ provide:
 | Assertion claims, signing, key loading and the JWKS | `gateway/src/connections/caller_assertion.rs` |
 | Secret purposes and the local-store refusal | `gateway/src/connections/secret.rs` |
 | Write validation and the secrets-write rule | `gateway/src/connections/model.rs` |
+| Configured-key markers and alias naming as secret authority | `gateway/src/admin_connections.rs` |
 | Policy before credentials on tool calls | `gateway/src/tools/executor.rs` |
+| One assertion per composite leaf | `gateway/src/tools/executor.rs` (`prepare_composite_leaf`), `gateway/src/connections/http.rs` (`composite_leaf_target`) |
+| A stored test run as the tester, with an uncached exchange | `gateway/src/connections/test.rs`, `gateway/src/connections/http.rs` (`test_target`), `gateway/src/connections/token_exchange.rs` (`access_token`) |
 | Purge on a revoked JWT | `gateway/src/connections/http.rs` (`RevokedCredentialObserver`) |
 
 The regression `no_token_material_reaches_an_error_a_log_line_or_an_audit_event`
