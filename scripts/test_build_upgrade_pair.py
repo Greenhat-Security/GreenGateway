@@ -1,6 +1,7 @@
-"""Tests for the pin and build-script checks behind the issue #426 upgrade pair."""
+"""Tests for the pin, build-script and build checks behind the issue #426 upgrade pair."""
 import json
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 
@@ -68,6 +69,52 @@ class BuildScriptTests(unittest.TestCase):
     def test_a_manifest_naming_its_own_build_script_is_refused(self):
         with self.assertRaisesRegex(pair.PairError, "names its own build script"):
             pair.check_manifest('[package]\nname = "gateway"\nbuild = "generate.rs"\n')
+
+
+class ConcurrentBuildTests(unittest.TestCase):
+    def test_each_role_builds_into_its_own_target_directory(self):
+        directories = {pair.target_dir(role) for role in pair.ROLES}
+        self.assertEqual(len(directories), len(pair.ROLES))
+        for directory in directories:
+            self.assertEqual(directory.parent, pair.TARGET_DIR)
+        self.assertNotEqual(pair.TARGET_DIR, pair.ROOT / "target")
+
+    def builds(self, temporary: Path, statuses: dict) -> list:
+        # Each fake build waits until both have started, so the test fails
+        # (by timing out) if the builds ran one after the other.
+        script = ("import pathlib, sys, time\n"
+                  "here = pathlib.Path(sys.argv[1]); (here / sys.argv[2]).touch()\n"
+                  "deadline = time.monotonic() + 20\n"
+                  "while len(list(here.glob('*.started'))) < 2:\n"
+                  "    if time.monotonic() > deadline: sys.exit(99)\n"
+                  "    time.sleep(0.05)\n"
+                  "print('built', sys.argv[2]); sys.exit(int(sys.argv[3]))\n")
+        return [(role, [sys.executable, "-c", script, str(temporary), f"{role}.started", str(status)], temporary)
+                for role, status in statuses.items()]
+
+    def test_both_builds_run_at_once_and_their_logs_are_kept(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary = Path(temporary)
+            pair.build_concurrently(self.builds(temporary, {"prepared": 0, "successor": 0}), temporary / "logs")
+            for role in pair.ROLES:
+                self.assertEqual((temporary / "logs" / f"{role}.log").read_text(encoding="utf-8").strip(),
+                                 f"built {role}.started")
+
+    def test_a_failed_build_fails_the_pair_and_names_its_role(self):
+        for statuses, named in (({"prepared": 0, "successor": 101}, "successor"),
+                                ({"prepared": 1, "successor": 0}, "prepared"),
+                                ({"prepared": 1, "successor": 2}, "prepared and successor")):
+            with self.subTest(statuses=statuses), tempfile.TemporaryDirectory() as temporary:
+                temporary = Path(temporary)
+                with self.assertRaisesRegex(pair.PairError, f"the {named} build failed"):
+                    pair.build_concurrently(self.builds(temporary, statuses), temporary / "logs")
+
+    def test_a_build_that_cannot_start_fails_the_pair(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary = Path(temporary)
+            builds = [("prepared", [str(temporary / "no-such-cargo")], temporary)]
+            with self.assertRaisesRegex(pair.PairError, "the prepared build failed"):
+                pair.build_concurrently(builds, temporary / "logs")
 
 
 if __name__ == "__main__":

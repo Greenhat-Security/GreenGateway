@@ -103,10 +103,49 @@ toml_datetime and winnow although none of them is built
 (`cargo tree -p gateway --target all -i jsonschema-macros` prints nothing). The
 transport inventory and the syn 2 duplicate exception record them as resolved.
 
-Buildx is selected explicitly and its BuildKit daemon image is digest-pinned,
-including CI Compose builds. Action pins and the exact cargo-audit version
-remain separate declarations; cargo-audit installation retains checksum
-verification. Gitleaks retains its reviewed archive checksum. Rustup and the
+Pull requests do not write CI caches: in a workflow that pull requests trigger,
+caches are written only by pushes to `main`. `scripts/build_tools.py check`
+enforces this for every step of such a workflow and of every composite action
+`.github/actions/<name>/action.yml` (composite actions run inside pull request
+jobs too).
+It compares action names and input names in lower case, as GitHub resolves
+them, and rejects:
+
+- a `Swatinem/rust-cache` step whose `save-if` is absent (the action then
+  saves) or is anything other than exactly `${{ github.event_name == 'push' &&
+  github.ref == 'refs/heads/main' }}` or `false` (for a job that only restores
+  another job's dependency cache);
+- `actions/cache` and `actions/cache/save` (`actions/cache/restore` may be used);
+- a `cache` input other than `false` on any `actions/setup-*` action, whose
+  post step saves the cache it restored, and `actions/setup-go` without
+  `cache: false`, because it caches by default;
+- an image build cache export: a `cache-to` input or value on a `docker/*`
+  action, or `cache-to` anywhere in a `run` command or a step's environment
+  (`docker buildx build --cache-to`, `docker buildx bake --set *.cache-to=`);
+- two inputs of one step whose names differ only in case;
+- a job that calls a reusable workflow (job-level `uses:`) unless its `if` is
+  that push-to-`main` expression, or is `github.event_name == 'push'` and it
+  calls a workflow in `.github/workflows/` whose jobs pass these same rules, so
+  that a release-tag push cannot write a cache through it either.
+  `image-candidate` is the second case: tag pushes build release candidates.
+
+A pull request reads `main`'s caches but cannot write one that a later run would
+restore; Cargo still checks every restored artifact against its own fingerprint
+and rebuilds what differs. Workflows that only a schedule or a manual dispatch
+starts are outside this check: `nightly-performance.yml` and
+`security-corpus.yml` save their Rust caches.
+Within one run, the production image is built once by `gateway-image` and handed
+to its consumers as an artifact, and each consumer checks the loaded image ID
+against the one that job recorded before using it. The HA release-gate
+executables are built once by `ha-release-gate-build` and the rolling-upgrade
+pair by `ha-upgrade-pair` in the same way: each leg requires its producer's
+success and unpacks the archive only when its SHA-256 matches the one recorded.
+
+Buildx is selected explicitly and its BuildKit daemon image is digest-pinned
+for every CI image build, which `scripts/build_tools.py check` recognises by
+the build action or by a `docker build` or Compose build command. Action pins
+and the exact cargo-audit version remain separate declarations; cargo-audit
+installation retains checksum verification. Gitleaks retains its reviewed archive checksum. Rustup and the
 setup actions remain the pinned installation trust roots; npm lockfile integrity
 continues to authenticate dependency archives. Advisory databases still refresh.
 
