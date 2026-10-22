@@ -500,6 +500,14 @@
               "minLength": 1,
               "maxLength": 512
             },
+            "revocation_url": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2048,
+              "format": "uri",
+              "pattern": "^https://",
+              "description": "The issuer's RFC 7009 token revocation endpoint. HTTPS only, without userinfo, query or fragment, and egress-allowlisted. A token purged from the cache is revoked here once, best effort, with the same client credentials; absent, a purged token is only dropped."
+            },
             "subject_token_source": {
               "const": "caller_assertion"
             }
@@ -1055,6 +1063,10 @@
             },
             "resource": {
               "type": "string"
+            },
+            "revocation_url": {
+              "type": "string",
+              "format": "uri"
             },
             "subject_token_source": {
               "const": "caller_assertion"
@@ -5391,6 +5403,14 @@
               "type": "string",
               "minLength": 1,
               "maxLength": 512
+            },
+            "revocation_url": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2048,
+              "format": "uri",
+              "pattern": "^https://",
+              "description": "The issuer's RFC 7009 token revocation endpoint. HTTPS only, without userinfo, query or fragment, and egress-allowlisted. A token purged from the cache is revoked here once, best effort, with the same client credentials; absent, a purged token is only dropped."
             },
             "subject_token_source": {
               "const": "caller_assertion"

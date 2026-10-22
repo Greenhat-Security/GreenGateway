@@ -434,6 +434,8 @@ pub enum SafeConnectionAuthentication {
         audience: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         resource: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        revocation_url: Option<String>,
         subject_token_source: SubjectTokenSource,
         client_secret_configured: bool,
     },
@@ -477,6 +479,7 @@ impl SafeConnectionAuthentication {
                 requested_scopes,
                 audience,
                 resource,
+                revocation_url,
                 subject_token_source,
             } => Self::DelegatedIssuerToken {
                 token_exchange_url: token_exchange_url.clone(),
@@ -484,6 +487,7 @@ impl SafeConnectionAuthentication {
                 requested_scopes: requested_scopes.clone(),
                 audience: audience.clone(),
                 resource: resource.clone(),
+                revocation_url: revocation_url.clone(),
                 subject_token_source: *subject_token_source,
                 client_secret_configured: client_secret_id.is_some(),
             },

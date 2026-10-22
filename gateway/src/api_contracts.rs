@@ -252,6 +252,22 @@ pub(super) struct PrincipalDetailParams {
     pub(super) auth_method: Option<String>,
 }
 
+/// Whose delegated tokens to purge: the principal's issuer and subject,
+/// exactly as the principal directory and audit actors name them.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PrincipalDelegatedTokensRevokeRequest {
+    pub(super) issuer: String,
+    pub(super) subject: String,
+}
+
+#[derive(Serialize)]
+pub(super) struct PrincipalDelegatedTokensRevokeResponse {
+    /// Cache entries purged. Each one holding a token is then revoked at its
+    /// issuer in the background, and audited.
+    pub(super) purged_entries: usize,
+}
+
 #[derive(Deserialize)]
 pub(super) struct InferredSchemaParams {
     pub(super) method: Option<String>,

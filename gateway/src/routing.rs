@@ -481,6 +481,13 @@ pub(super) fn add_admin_api_routes(
                     routes.admin.principal_detail_route.as_str(),
                     get(principal_detail_endpoint),
                 )
+                .route(
+                    routes
+                        .admin
+                        .principal_delegated_tokens_revoke_route
+                        .as_str(),
+                    post(principal_delegated_tokens_revoke_endpoint),
+                )
                 .with_state(admin_api_states.principals),
         )
         .merge(

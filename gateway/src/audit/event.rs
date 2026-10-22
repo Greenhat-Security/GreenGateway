@@ -31,6 +31,12 @@ pub const CONNECTION_DELEGATED_TOKEN_EXCHANGE: &str = "connection.delegated_toke
 /// actor; the token and the key are never recorded. Tool calls record theirs
 /// on `tool.upstream_request` instead.
 pub const CONNECTION_CALLER_ASSERTION: &str = "connection.caller_assertion";
+/// A purge of one principal's cached delegated tokens (issue #441): what started it, whose tokens
+/// they were, and how many entries left the cache.
+pub const CONNECTION_DELEGATED_TOKEN_PURGE: &str = "connection.delegated_token_purge";
+/// One RFC 7009 revocation of a purged delegated token at its issuer (issue #441): the outcome and
+/// the issuer's answer, never the token.
+pub const CONNECTION_DELEGATED_TOKEN_REVOCATION: &str = "connection.delegated_token_revocation";
 pub const CONNECTION_SECRET_RESOLUTION_FAILED: &str = "connection.secret_resolution_failed";
 pub const CONNECTION_UNSAFE_METHOD_REJECTED: &str = "connection.unsafe_method_rejected";
 pub const GATEWAY_READY: &str = "gateway.ready";

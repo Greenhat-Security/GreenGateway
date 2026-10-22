@@ -423,6 +423,7 @@ pub(super) async fn admin_capabilities_endpoint(
         ADMIN_TRAFFIC_READ_PERMISSION,
         ADMIN_TRAFFIC_WRITE_PERMISSION,
         ADMIN_PRINCIPALS_READ_PERMISSION,
+        ADMIN_PRINCIPALS_WRITE_PERMISSION,
     ]
     .into_iter()
     .filter(|permission| rbac.principal_has_permission(&principal, permission))

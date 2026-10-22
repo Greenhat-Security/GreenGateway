@@ -3,7 +3,10 @@ use std::{
     fmt,
     future::Future,
     panic::AssertUnwindSafe,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, MutexGuard,
+    },
     time::{Duration, Instant},
 };
 
@@ -62,10 +65,11 @@ pub(crate) struct OAuthBinding {
 
 /// One caller's use of a cached token. `E` is the failure vocabulary of the
 /// runtime that minted it, so a delegated exchange is never reported in the
-/// client-credentials runtime's terms, nor the reverse.
-pub(crate) struct OAuthTokenLease<E = OAuthError> {
+/// client-credentials runtime's terms, nor the reverse; `C` is what that
+/// runtime keeps beside the token (see [`OAuthTokenCache`]).
+pub(crate) struct OAuthTokenLease<E = OAuthError, C = ()> {
     access_token: Zeroizing<Vec<u8>>,
-    slot: Option<Arc<OAuthTokenSlot<E>>>,
+    slot: Option<Arc<OAuthTokenSlot<E, C>>>,
     generation: u64,
 }
 
@@ -90,12 +94,17 @@ pub(crate) trait TokenCacheFailure: Copy + Send + Sync + 'static {
     const MINT_PANICKED: Self;
     /// A cached token could not be written as a header value.
     const INVALID_TOKEN: Self;
+    /// A purge took the slot out of the cache while the call was waiting for
+    /// it.
+    const RETIRED: Self;
 }
 
 impl TokenCacheFailure for OAuthError {
     const CACHE_FULL: Self = Self::TokenUnavailable;
     const MINT_PANICKED: Self = Self::TokenUnavailable;
     const INVALID_TOKEN: Self = Self::InvalidTokenResponse;
+    // Never purged: a client-credentials token belongs to no principal.
+    const RETIRED: Self = Self::TokenUnavailable;
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -106,6 +115,11 @@ pub(super) struct OAuthTokenCacheKey {
     /// caller. `None` for a client-credentials token, which serves every
     /// caller of its Connection alike.
     pub(super) subject: Option<[u8; 32]>,
+    /// The principal behind `subject`: a digest of its issuer and subject
+    /// alone, which a purge matches on whatever email or roles the principal
+    /// carried when the token was exchanged. `None` exactly when `subject`
+    /// is.
+    pub(super) principal: Option<[u8; 32]>,
     pub(super) secret_version: Option<u64>,
     pub(super) egress_generation: [u8; 32],
 }
@@ -121,14 +135,32 @@ impl OAuthTokenCacheKey {
     }
 }
 
-pub(super) struct OAuthTokenCache<E = OAuthError> {
-    slots: Mutex<HashMap<OAuthTokenCacheKey, Arc<OAuthTokenSlot<E>>>>,
+/// Tokens by key, single flight per key.
+///
+/// `C` is what the runtime minting into a slot keeps beside its tokens and
+/// reads back when the slot is retired: for a delegated token, where it can be
+/// revoked. It is fixed when the slot is created, because everything that
+/// could change it is part of the key.
+pub(super) struct OAuthTokenCache<E = OAuthError, C = ()> {
+    slots: Mutex<HashMap<OAuthTokenCacheKey, Arc<OAuthTokenSlot<E, C>>>>,
     clock: Arc<dyn OAuthClock>,
     capacity: usize,
 }
 
-struct OAuthTokenSlot<E> {
+struct OAuthTokenSlot<E, C> {
     state: AsyncMutex<OAuthTokenSlotState<E>>,
+    /// Set, under the cache lock, when a purge takes the slot out of the
+    /// cache. A call that looked the slot up just before then finds it set
+    /// once it holds the slot's state, and is refused rather than mint into a
+    /// slot whose tokens are being revoked.
+    retired: AtomicBool,
+    context: C,
+}
+
+/// A slot a purge took out of the cache: no later call is served from it, and
+/// what it holds is handed to whoever revokes it.
+pub(super) struct RetiredTokenSlot<E, C> {
+    slot: Arc<OAuthTokenSlot<E, C>>,
 }
 
 struct OAuthTokenSlotState<E> {
@@ -268,6 +300,7 @@ impl OAuthClientCredentialsRuntime {
             connection_id: binding.connection_id.to_string(),
             connection_etag: binding.connection_etag.clone(),
             subject: None,
+            principal: None,
             secret_version,
             egress_generation: binding.token_client.configuration_generation(),
         };
@@ -405,7 +438,7 @@ impl fmt::Debug for OAuthClientCredentialsRuntime {
     }
 }
 
-impl<E: TokenCacheFailure> OAuthTokenLease<E> {
+impl<E: TokenCacheFailure, C> OAuthTokenLease<E, C> {
     pub(crate) fn inject(&self, headers: &mut HeaderMap) -> Result<(), E> {
         let mut bearer = Zeroizing::new(Vec::with_capacity(
             "Bearer ".len() + self.access_token.len(),
@@ -434,7 +467,7 @@ impl<E: TokenCacheFailure> OAuthTokenLease<E> {
     }
 }
 
-impl<E> fmt::Debug for OAuthTokenLease<E> {
+impl<E, C> fmt::Debug for OAuthTokenLease<E, C> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("<redacted-oauth-token>")
     }
@@ -460,6 +493,20 @@ impl OAuthTokenCache {
 }
 
 impl<E: TokenCacheFailure> OAuthTokenCache<E> {
+    pub(super) async fn get_or_mint<F, Fut>(
+        &self,
+        key: OAuthTokenCacheKey,
+        mint: F,
+    ) -> Result<OAuthTokenLease<E>, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<MintedOAuthToken, E>> + Send + 'static,
+    {
+        self.get_or_mint_with(key, || (), mint).await
+    }
+}
+
+impl<E: TokenCacheFailure, C: Send + Sync + 'static> OAuthTokenCache<E, C> {
     /// A cache of at most `capacity` slots. A full cache evicts an idle slot
     /// to admit a new key, and refuses with [`TokenCacheFailure::CACHE_FULL`]
     /// only while every slot is held by a caller or by a mint in flight.
@@ -471,17 +518,28 @@ impl<E: TokenCacheFailure> OAuthTokenCache<E> {
         }
     }
 
-    pub(super) async fn get_or_mint<F, Fut>(
+    /// The token cached for `key`, or one `mint` produces, shared with every
+    /// concurrent caller of the same key. `context` is called only when the
+    /// key has no slot yet, and what it returns stays with the slot.
+    pub(super) async fn get_or_mint_with<F, Fut>(
         &self,
         key: OAuthTokenCacheKey,
+        context: impl Fn() -> C,
         mint: F,
-    ) -> Result<OAuthTokenLease<E>, E>
+    ) -> Result<OAuthTokenLease<E, C>, E>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<MintedOAuthToken, E>> + Send + 'static,
     {
-        let slot = self.slot_for(&key)?;
+        let slot = self.slot_for(&key, &context)?;
         let mut state = slot.state.lock().await;
+        // A purge that took the slot out of the cache between the lookup and
+        // the lock set this before it read the slot's token, which it does
+        // under this same lock. The call is refused rather than mint into a
+        // slot nothing will revoke, or be served what is being revoked.
+        if slot.retired.load(Ordering::Acquire) {
+            return Err(E::RETIRED);
+        }
         let now = self.clock.now();
         if let Some(cached) = state
             .cached
@@ -523,7 +581,11 @@ impl<E: TokenCacheFailure> OAuthTokenCache<E> {
         }
     }
 
-    fn slot_for(&self, key: &OAuthTokenCacheKey) -> Result<Arc<OAuthTokenSlot<E>>, E> {
+    fn slot_for(
+        &self,
+        key: &OAuthTokenCacheKey,
+        context: &impl Fn() -> C,
+    ) -> Result<Arc<OAuthTokenSlot<E, C>>, E> {
         let mut slots = self.slot_guard();
         if let Some(slot) = slots.get(key) {
             return Ok(Arc::clone(slot));
@@ -551,16 +613,41 @@ impl<E: TokenCacheFailure> OAuthTokenCache<E> {
         }
         let slot = Arc::new(OAuthTokenSlot {
             state: AsyncMutex::new(OAuthTokenSlotState::default()),
+            retired: AtomicBool::new(false),
+            context: context(),
         });
         slots.insert(key.clone(), Arc::clone(&slot));
         Ok(slot)
+    }
+
+    /// Takes every slot whose key `matches` out of the cache and hands it
+    /// back to be revoked, retired so that a call which looked one up just
+    /// before cannot mint into it or be served from it afterwards.
+    ///
+    /// Unlike the slots a configuration change or capacity pressure drops, a
+    /// slot a call or a mint still holds is taken too: what it holds must not
+    /// be served again. A call already holding its token keeps that copy.
+    pub(super) fn retire_where(
+        &self,
+        matches: impl Fn(&OAuthTokenCacheKey) -> bool,
+    ) -> Vec<RetiredTokenSlot<E, C>> {
+        let mut slots = self.slot_guard();
+        let keys: Vec<OAuthTokenCacheKey> =
+            slots.keys().filter(|key| matches(key)).cloned().collect();
+        keys.into_iter()
+            .filter_map(|key| {
+                let slot = slots.remove(&key)?;
+                slot.retired.store(true, Ordering::Release);
+                Some(RetiredTokenSlot { slot })
+            })
+            .collect()
     }
 
     pub(super) fn slot_count(&self) -> usize {
         self.slot_guard().len()
     }
 
-    fn slot_guard(&self) -> MutexGuard<'_, HashMap<OAuthTokenCacheKey, Arc<OAuthTokenSlot<E>>>> {
+    fn slot_guard(&self) -> MutexGuard<'_, HashMap<OAuthTokenCacheKey, Arc<OAuthTokenSlot<E, C>>>> {
         match self.slots.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
@@ -570,6 +657,29 @@ impl<E: TokenCacheFailure> OAuthTokenCache<E> {
                 guard
             }
         }
+    }
+}
+
+impl<E: TokenCacheFailure, C> RetiredTokenSlot<E, C> {
+    pub(super) fn context(&self) -> &C {
+        &self.slot.context
+    }
+
+    /// The token the slot holds once any mint in flight for it has finished,
+    /// taken out of it. `None` when it holds none: its last mint failed, or
+    /// an upstream `401` already dropped it.
+    pub(super) async fn take_token(&self) -> Option<Zeroizing<Vec<u8>>> {
+        let in_flight = self.slot.state.lock().await.in_flight.clone();
+        if let Some(flight) = in_flight {
+            drop(flight.wait().await);
+        }
+        self.slot
+            .state
+            .lock()
+            .await
+            .cached
+            .take()
+            .map(|cached| cached.access_token)
     }
 }
 
@@ -604,8 +714,8 @@ impl<E: TokenCacheFailure> OAuthMintFlight<E> {
     }
 }
 
-async fn complete_oauth_mint<E, Fut>(
-    slot: Arc<OAuthTokenSlot<E>>,
+async fn complete_oauth_mint<E, C, Fut>(
+    slot: Arc<OAuthTokenSlot<E, C>>,
     key: OAuthTokenCacheKey,
     clock: Arc<dyn OAuthClock>,
     flight: Arc<OAuthMintFlight<E>>,
@@ -662,10 +772,10 @@ async fn complete_oauth_mint<E, Fut>(
     }
 }
 
-fn lease_from_cached<E>(
-    slot: Arc<OAuthTokenSlot<E>>,
+fn lease_from_cached<E, C>(
+    slot: Arc<OAuthTokenSlot<E, C>>,
     cached: &CachedOAuthToken,
-) -> Result<OAuthTokenLease<E>, E> {
+) -> Result<OAuthTokenLease<E, C>, E> {
     Ok(OAuthTokenLease {
         access_token: Zeroizing::new(cached.access_token.to_vec()),
         slot: Some(slot),
@@ -872,6 +982,7 @@ mod tests {
             connection_id: "connection-1".to_owned(),
             connection_etag: format!("etag-{revision}"),
             subject: None,
+            principal: None,
             secret_version,
             egress_generation: [u8::try_from(revision).unwrap_or(u8::MAX); 32],
         }
@@ -1146,6 +1257,67 @@ mod tests {
             .await
             .expect("an idle slot should be safely replaceable");
         assert_eq!(cache.slot_guard().len(), TOKEN_CACHE_CAPACITY);
+    }
+
+    /// A purge that takes a slot out of the cache after a call looked it up,
+    /// and before the call holds its state, refuses that call rather than let
+    /// it mint into a slot nothing will revoke or serve what is being
+    /// revoked.
+    #[tokio::test]
+    async fn a_call_that_looked_up_a_slot_before_its_purge_is_refused() {
+        let cache = Arc::new(OAuthTokenCache::new(Arc::new(FakeClock::new())));
+        drop(
+            cache
+                .get_or_mint(key(1, None), || async {
+                    Ok(token("cached-token", Duration::from_secs(3_600)))
+                })
+                .await
+                .expect("the token mints"),
+        );
+        let slot = Arc::clone(
+            cache
+                .slot_guard()
+                .get(&key(1, None))
+                .expect("the slot is cached"),
+        );
+        let held_state = slot.state.lock().await;
+        let mints = Arc::new(AtomicUsize::new(0));
+        let call = {
+            let cache = Arc::clone(&cache);
+            let mints = Arc::clone(&mints);
+            tokio::spawn(async move {
+                cache
+                    .get_or_mint(key(1, None), move || async move {
+                        mints.fetch_add(1, Ordering::AcqRel);
+                        Ok(token("must-not-mint", Duration::from_secs(3_600)))
+                    })
+                    .await
+                    .map(drop)
+            })
+        };
+        // The cache, this test and the call each hold the slot once the call
+        // has looked it up and is waiting for its state.
+        for _ in 0..1_000 {
+            if Arc::strong_count(&slot) == 3 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(Arc::strong_count(&slot), 3);
+
+        let retired = cache.retire_where(|_| true);
+        assert_eq!(retired.len(), 1);
+        assert_eq!(cache.slot_count(), 0);
+        drop(held_state);
+        assert_eq!(
+            call.await.expect("the call completes"),
+            Err(OAuthError::TokenUnavailable)
+        );
+        assert_eq!(mints.load(Ordering::Acquire), 0);
+        assert_eq!(
+            retired[0].take_token().await.as_deref().map(Vec::as_slice),
+            Some(&b"cached-token"[..])
+        );
     }
 
     #[tokio::test]
