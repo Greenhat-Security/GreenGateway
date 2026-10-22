@@ -166,6 +166,12 @@ impl HaFoundation {
 /// rolling change can finish and the gate re-evaluates on every
 /// heartbeat.
 ///
+/// The gate also carries the one membership fact that is final: the
+/// durable contract fence (issue #426, PR 3) excluding this binary. Once
+/// the membership heartbeat finds that, the gate answers `contract_fenced`
+/// ahead of every other cluster reason and never opens again, because the
+/// fence only moves forward.
+///
 /// Standalone mode has no membership and never constructs one; a `None`
 /// gate in the app state is "always agreed".
 ///
@@ -177,6 +183,8 @@ impl HaFoundation {
 #[derive(Debug)]
 pub struct ClusterReadiness {
     fingerprint_agreed: std::sync::atomic::AtomicBool,
+    /// The durable contract fence excludes this binary. One-way.
+    contract_fenced: std::sync::atomic::AtomicBool,
     /// When the membership heartbeat last wrote this replica's row.
     /// Seeded at construction, which is a truthful starting point: the
     /// boot row is written before the heartbeat task starts, and a boot
@@ -188,6 +196,7 @@ impl Default for ClusterReadiness {
     fn default() -> Self {
         Self {
             fingerprint_agreed: std::sync::atomic::AtomicBool::new(false),
+            contract_fenced: std::sync::atomic::AtomicBool::new(false),
             last_heartbeat_success: std::sync::Mutex::new(std::time::Instant::now()),
         }
     }
@@ -196,6 +205,10 @@ impl Default for ClusterReadiness {
 impl ClusterReadiness {
     /// The readiness reason a mismatched replica reports.
     pub const FINGERPRINT_MISMATCH: &'static str = "config_fingerprint_mismatch";
+
+    /// The readiness reason a replica the durable contract fence excludes
+    /// reports, for the rest of its life.
+    pub const CONTRACT_FENCED: &'static str = "contract_fenced";
 
     #[cfg_attr(not(feature = "postgres"), allow(dead_code))] // constructed by the cluster wiring only
     pub fn new() -> std::sync::Arc<Self> {
@@ -214,8 +227,30 @@ impl ClusterReadiness {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
-    /// Why this gate refuses readiness, or `None` when it does not.
+    /// Whether the durable contract fence has been found to exclude this
+    /// binary.
+    pub fn contract_fenced(&self) -> bool {
+        self.contract_fenced
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Record that the durable contract fence excludes this binary.
+    /// One-way, like the fence. Returns `true` only for the call that
+    /// recorded it, so the caller logs and audits the transition once.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))] // called by the membership heartbeat only
+    pub fn record_contract_fenced(&self) -> bool {
+        !self
+            .contract_fenced
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    /// Why this gate refuses readiness, or `None` when it does not. A
+    /// fenced replica says so before anything else: unlike a fingerprint
+    /// disagreement, nothing the rest of the deployment does can end it.
     pub fn blocked_reason(&self) -> Option<&'static str> {
+        if self.contract_fenced() {
+            return Some(Self::CONTRACT_FENCED);
+        }
         (!self.fingerprint_agreed()).then_some(Self::FINGERPRINT_MISMATCH)
     }
 

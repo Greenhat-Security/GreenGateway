@@ -31,10 +31,16 @@ fn bob() -> AttestedCaller {
 }
 
 fn key_for(caller: &AttestedCaller, revision: u32) -> OAuthTokenCacheKey {
+    key_on("mail", caller, revision)
+}
+
+fn key_on(connection_id: &str, caller: &AttestedCaller, revision: u32) -> OAuthTokenCacheKey {
+    let identity = caller.identity();
     OAuthTokenCacheKey {
-        connection_id: "mail".to_owned(),
+        connection_id: connection_id.to_owned(),
         connection_etag: format!("etag-{revision}"),
         subject: Some(subject_digest(caller)),
+        principal: Some(principal_digest(identity.issuer, identity.subject)),
         secret_version: None,
         egress_generation: [7; 32],
     }
@@ -47,7 +53,7 @@ fn minted(value: &str, lifetime: Duration) -> MintedOAuthToken {
     }
 }
 
-fn bearer_of(lease: &DelegatedTokenLease) -> String {
+fn bearer_of<C>(lease: &OAuthTokenLease<DelegatedTokenError, C>) -> String {
     let mut headers = HeaderMap::new();
     lease.inject(&mut headers).expect("a cached token injects");
     let value = headers
@@ -67,7 +73,7 @@ async fn get(
     value: &'static str,
     lifetime: Duration,
     mints: &Arc<AtomicUsize>,
-) -> Result<DelegatedTokenLease, DelegatedTokenError> {
+) -> Result<OAuthTokenLease<DelegatedTokenError>, DelegatedTokenError> {
     let mints = Arc::clone(mints);
     cache
         .get_or_mint(key, move || async move {
@@ -275,6 +281,220 @@ fn the_cache_key_names_the_whole_attested_identity() {
     );
 }
 
+#[test]
+fn a_purge_matches_the_principal_whatever_claims_it_carried() {
+    let alice = alice();
+    let identity = alice.identity();
+    let digest = principal_digest(identity.issuer, identity.subject);
+    // Every claim change is a cache key of its own, and one principal.
+    let promoted = caller("alice", "https://idp.example.test", &["mail:admin"]);
+    assert_ne!(subject_digest(&alice), subject_digest(&promoted));
+    assert_eq!(
+        key_for(&alice, 1).principal,
+        key_for(&promoted, 1).principal
+    );
+    assert_eq!(key_for(&alice, 1).principal, Some(digest));
+    // Another subject, or the same subject from another provider, is another
+    // principal; length prefixes keep two of them from sharing an encoding.
+    assert_ne!(digest, principal_digest(identity.issuer, "bob"));
+    assert_ne!(
+        digest,
+        principal_digest("https://other-idp.example.test", "alice")
+    );
+    assert_ne!(
+        principal_digest("https://idp.example.test/a", "b"),
+        principal_digest("https://idp.example.test", "/ab")
+    );
+}
+
+#[tokio::test]
+async fn retiring_one_principal_takes_every_token_of_theirs_and_no_one_elses() {
+    let cache = OAuthTokenCache::with_capacity(Arc::new(ManualTokenClock::new()), 8);
+    let mints = Arc::new(AtomicUsize::new(0));
+    let hour = Duration::from_secs(3_600);
+    let promoted = caller("alice", "https://idp.example.test", &["mail:admin"]);
+
+    drop(get(&cache, key_for(&alice(), 1), "alice-mail", hour, &mints).await);
+    drop(get(&cache, key_for(&promoted, 1), "alice-admin", hour, &mints).await);
+    drop(
+        get(
+            &cache,
+            key_on("calendar", &alice(), 1),
+            "alice-cal",
+            hour,
+            &mints,
+        )
+        .await,
+    );
+    let held_bob = get(&cache, key_for(&bob(), 1), "bob-mail", hour, &mints)
+        .await
+        .expect("bob's token is exchanged");
+    // A token a call still holds is retired too: it must not serve again.
+    let held_alice = get(&cache, key_for(&alice(), 1), "unexpected", hour, &mints)
+        .await
+        .expect("alice's token is cached");
+    assert_eq!(cache.slot_count(), 4);
+
+    let identity = alice();
+    let identity = identity.identity();
+    let target = principal_digest(identity.issuer, identity.subject);
+    let retired = cache.retire_where(|key| key.principal == Some(target));
+    assert_eq!(retired.len(), 3);
+    assert_eq!(cache.slot_count(), 1, "only bob's entry is left");
+
+    let mut taken = Vec::new();
+    for slot in &retired {
+        let token = slot
+            .take_token()
+            .await
+            .expect("each retired slot held a token");
+        taken.push(String::from_utf8(token.to_vec()).expect("test tokens are UTF-8"));
+        assert!(slot.take_token().await.is_none(), "a token is taken once");
+    }
+    taken.sort();
+    assert_eq!(taken, ["alice-admin", "alice-cal", "alice-mail"]);
+    // The call already holding its copy finishes with it.
+    assert_eq!(bearer_of(&held_alice), "Bearer alice-mail");
+
+    // Alice is exchanged for again; bob keeps his token.
+    let again = get(&cache, key_for(&alice(), 1), "alice-fresh", hour, &mints)
+        .await
+        .expect("a purged principal is exchanged for again");
+    assert_eq!(bearer_of(&again), "Bearer alice-fresh");
+    let bob_again = get(&cache, key_for(&bob(), 1), "unexpected", hour, &mints)
+        .await
+        .expect("bob's token is still cached");
+    assert_eq!(bearer_of(&bob_again), "Bearer bob-mail");
+    assert_eq!(mints.load(Ordering::Acquire), 5);
+    drop(held_bob);
+}
+
+#[tokio::test]
+async fn an_exchange_in_flight_when_its_principal_is_purged_is_revoked_once_it_lands() {
+    let cache = Arc::new(OAuthTokenCache::<DelegatedTokenError>::with_capacity(
+        Arc::new(ManualTokenClock::new()),
+        8,
+    ));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let waiting = {
+        let cache = Arc::clone(&cache);
+        let started = Arc::clone(&started);
+        let release = Arc::clone(&release);
+        tokio::spawn(async move {
+            cache
+                .get_or_mint(key_for(&alice(), 1), move || async move {
+                    started.notify_one();
+                    release.notified().await;
+                    Ok(minted("in-flight", Duration::from_secs(3_600)))
+                })
+                .await
+                .map(|lease| bearer_of(&lease))
+        })
+    };
+    started.notified().await;
+
+    let identity = alice();
+    let identity = identity.identity();
+    let target = principal_digest(identity.issuer, identity.subject);
+    let retired = cache.retire_where(|key| key.principal == Some(target));
+    assert_eq!(retired.len(), 1);
+    assert_eq!(cache.slot_count(), 0);
+    let taking = tokio::spawn(async move { retired[0].take_token().await });
+    tokio::task::yield_now().await;
+    release.notify_one();
+
+    // The call that was already waiting gets what it waited for; the purge
+    // takes the same token to revoke it, and nothing keeps it in the cache.
+    assert_eq!(
+        waiting
+            .await
+            .expect("the waiting call completes")
+            .as_deref(),
+        Ok("Bearer in-flight")
+    );
+    let token = taking
+        .await
+        .expect("the purge completes")
+        .expect("the exchange's token is taken");
+    assert_eq!(token.as_slice(), b"in-flight");
+    let mints = Arc::new(AtomicUsize::new(0));
+    let fresh = get(
+        &cache,
+        key_for(&alice(), 1),
+        "fresh",
+        Duration::from_secs(60),
+        &mints,
+    )
+    .await
+    .expect("the next call exchanges again");
+    assert_eq!(bearer_of(&fresh), "Bearer fresh");
+    assert_eq!(mints.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn the_revocation_request_is_an_rfc_7009_access_token_revocation() {
+    let body = revocation_request_body(b"delegated-token+/=").expect("a bounded request builds");
+    let fields: Vec<(String, String)> = form_urlencoded::parse(&body)
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect();
+    assert_eq!(
+        fields,
+        vec![
+            ("token".to_owned(), "delegated-token+/=".to_owned()),
+            ("token_type_hint".to_owned(), "access_token".to_owned()),
+        ]
+    );
+    assert_eq!(
+        revocation_request_body(&[b'x'; OAUTH_MAX_REQUEST_BYTES]).err(),
+        Some(RevocationError::Failed)
+    );
+    assert_eq!(
+        revocation_request_body(&[0xff, 0xfe]).err(),
+        Some(RevocationError::Failed)
+    );
+}
+
+#[test]
+fn every_revocation_outcome_has_a_fixed_reason_and_an_issuers_code_is_recorded_only_if_registered()
+{
+    let reasons = [
+        RevocationError::NotConfigured,
+        RevocationError::EgressDenied,
+        RevocationError::CredentialInvalid,
+        RevocationError::CredentialUnavailable,
+        RevocationError::Refused,
+        RevocationError::Failed,
+    ]
+    .map(|error| error.outcome_and_reason());
+    let unique: std::collections::BTreeSet<_> = reasons.iter().map(|(_, reason)| reason).collect();
+    assert_eq!(unique.len(), reasons.len());
+    assert_eq!(
+        RevocationError::NotConfigured.outcome_and_reason(),
+        ("skipped", "revocation_not_configured")
+    );
+    assert!(reasons[1..]
+        .iter()
+        .all(|(outcome, _)| *outcome == "failure"));
+
+    let code =
+        |body: &str| registered_error_code(body.as_bytes(), REGISTERED_REVOCATION_ERROR_CODES);
+    assert_eq!(
+        code(r#"{"error":"unsupported_token_type"}"#),
+        Some("unsupported_token_type")
+    );
+    assert_eq!(
+        code(r#"{"error":"invalid_client"}"#),
+        Some("invalid_client")
+    );
+    // Token exchange's own codes are not a revocation endpoint's.
+    assert_eq!(code(r#"{"error":"invalid_target"}"#), Some("unregistered"));
+    assert_eq!(
+        code(r#"{"error":"token_already_gone_for_alice"}"#),
+        Some("unregistered")
+    );
+}
+
 fn binding_for_body() -> DelegatedTokenBinding {
     let egress = crate::egress::EgressConfig::default();
     DelegatedTokenBinding {
@@ -286,6 +506,7 @@ fn binding_for_body() -> DelegatedTokenBinding {
         requested_scopes: vec!["calendar.read".to_owned(), "mail.read".to_owned()],
         audience: Some("https://mail.example.test".to_owned()),
         resource: Some("https://mail.example.test/api".to_owned()),
+        revocation_url: Some("https://issuer.example.test/oauth2/revoke".to_owned()),
         subject_token: SubjectTokenSettings {
             signing_key_id: "assertion-signing-key".to_owned(),
             kid: "gw-test-1".to_owned(),
@@ -380,7 +601,7 @@ fn only_a_bounded_bearer_access_token_is_accepted() {
 
 #[test]
 fn an_issuer_refusal_is_a_denial_only_when_the_issuer_says_so() {
-    let code = |body: &str| registered_error_code(body.as_bytes());
+    let code = |body: &str| registered_error_code(body.as_bytes(), REGISTERED_ERROR_CODES);
     assert_eq!(
         code(r#"{"error":"invalid_grant","error_description":"no grant for alice"}"#),
         Some("invalid_grant")

@@ -483,6 +483,9 @@ describe('ConnectionDetail', () => {
     expect(specValue('Client secret')).toBe('Configured');
     expect(specValue('Requested scopes')).toBe('mail.read');
     expect(specValue('Resource')).toBe('Not set');
+    expect(specValue('Revocation URL')).toBe(
+      'Not set: a purged token is only dropped',
+    );
     expect(specValue('Subject token')).toBe(
       'Caller assertion signed by the gateway',
     );

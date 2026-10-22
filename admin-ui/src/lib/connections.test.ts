@@ -261,6 +261,7 @@ describe('connections API client', () => {
       client_id: 'greengateway',
       requested_scopes: ['mail.read'],
       audience: 'https://mail.example.test',
+      revocation_url: 'https://issuer.example.test/oauth2/revoke',
       subject_token_source: 'caller_assertion',
       client_secret_configured: true,
     };
@@ -292,6 +293,8 @@ describe('connections API client', () => {
 
     for (const malformed of [
       { ...stored, token_exchange_url: 'http://issuer.example.test/token' },
+      { ...stored, revocation_url: 'http://issuer.example.test/revoke' },
+      { ...stored, revocation_url: 42 },
       { ...stored, subject_token_source: 'caller_bearer' },
       { ...stored, requested_scopes: 'mail.read' },
       { ...stored, client_secret_configured: 'yes' },

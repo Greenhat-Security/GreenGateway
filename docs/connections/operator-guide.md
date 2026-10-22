@@ -993,6 +993,7 @@ answer for that caller only, and sends it upstream as
   "client_secret_id": "issuer-exchange-secret",
   "requested_scopes": ["https://www.googleapis.com/auth/gmail.readonly"],
   "audience": "https://gmail.googleapis.com",
+  "revocation_url": "https://issuer.example/oauth2/revoke",
   "subject_token_source": "caller_assertion"
 },
 "caller_assertion": {
@@ -1060,6 +1061,13 @@ a `refresh_token` included, are skipped unread and never kept.
 - Its host must be in the egress allowlist. Every exchange checks it before
   the signing key or the client secret is read, and a refused host fails the
   call with `delegated_token_egress_denied`. Redirects are not followed.
+- `revocation_url` is optional: the issuer's OAuth 2.0 token revocation
+  endpoint ([RFC 7009](https://www.rfc-editor.org/rfc/rfc7009)), where a
+  purged token is revoked (see
+  [Purging a principal's tokens](#purging-a-principals-tokens)). It follows
+  the same rules -- `https://`, no userinfo, query or fragment, refused on
+  write with `authentication.revocation_url` -- and its host must be in the
+  egress allowlist too, checked before the client secret is read.
 - `client_secret_id` is resolved with the `token_exchange_client_secret`
   purpose. As with a signing key, the encrypted local store cannot hold one:
   provision it through an operator alias or an external secret provider. A
@@ -1121,7 +1129,97 @@ call with no principal, or a service token's, is refused with
   re-enable the Connection.
 - An upstream `401` drops the token that request used, so the caller's next
   call exchanges again. The rejected call is not replayed.
+- A purge drops every token of one principal at once; see the next section.
 - Nothing is persisted. A restart starts with an empty cache.
+
+#### Purging a principal's tokens
+
+A purge drops every token the gateway caches for one principal -- an issuer
+and a subject -- under every delegated Connection and whatever email or roles
+the principal carried, and then revokes each of them at its issuer. Two things
+start one:
+
+- **An operator, after disabling the user** at their identity provider:
+  `POST /v1{ADMIN_PREFIX}/principal/delegated-tokens/revoke` with
+  `{"issuer": "https://idp.example", "subject": "alice"}`, the issuer and
+  subject the principal directory and audit actors show. It needs
+  `admin:principals:write` and answers `200` with `{"purged_entries": N}` once
+  the entries are gone, before any issuer answers; the principal directory need
+  not be configured. A body that is not exactly those two non-empty strings is
+  refused with `400`. In cluster mode it is refused with `409`: each replica
+  caches its own tokens and nothing would carry the purge to the others, so
+  disable the Connection there instead.
+- **A revoked credential.** When a JWT validator refuses a token because its
+  `jti` is on the denylist (`gateway revoke-jwt`, cluster mode), it purges the
+  principal the token names -- the validator's issuer and the token's `sub`,
+  after its signature has been verified. Every replica that refuses the token
+  purges its own cache. The same refused token presented again finds nothing
+  more to purge.
+
+After a purge:
+
+- No call is served a purged token. The principal's next call exchanges again,
+  and the issuer decides: the purge does not stop a user whose credentials
+  still validate and whose grant the issuer still holds. Disable the user at
+  the identity provider and the grant at the issuer for that.
+- A call that already holds its token finishes with it, as do calls already
+  waiting on an exchange in flight. A call arriving while the purge runs may be
+  refused with `delegated_token_unavailable`.
+- Each purged token is revoked once, in the background: the gateway POSTs
+  `token=<the token>&token_type_hint=access_token` to the `revocation_url` of
+  the Connection revision it was exchanged under, with `client_secret_basic`
+  and the same client credentials, through the same egress client as the
+  exchange. Revocation is best effort and is not retried. RFC 7009 says an
+  issuer answers `200` whether it revoked the token or the token was already
+  invalid; the gateway records `revoked` for either.
+- Without a `revocation_url` a purged token is only dropped: the gateway never
+  uses it again, but it stays valid at the issuer and the upstream until its
+  own expiry, which the issuer chose.
+
+Each purge emits `connection.delegated_token_purge` and each token revocation
+`connection.delegated_token_revocation`, joined by `purge_id`. An operator's
+purge carries the operator as `actor` and the admin request's `request_id`; a
+purge a revoked credential started has no actor and the `request_id`
+`connection-delegated-token-purge`, and is emitted only when it purged
+something. An operator's purge is emitted even when it found nothing.
+
+```json
+{
+  "purge_id": "6b0f3d1e-...",
+  "trigger": "operator",
+  "principal": { "issuer": "https://idp.example", "subject": "alice" },
+  "purged_entries": 2
+}
+```
+
+```json
+{
+  "purge_id": "6b0f3d1e-...",
+  "connection_id": "mail",
+  "auth_type": "delegated_issuer_token",
+  "principal": { "issuer": "https://idp.example", "subject": "alice" },
+  "outcome": "failure",
+  "reason": "revocation_refused",
+  "issuer_status": 400,
+  "issuer_error": "unsupported_token_type",
+  "latency_ms": 37
+}
+```
+
+| `outcome` | `reason` | Meaning |
+| --- | --- | --- |
+| `success` | `revoked` | The issuer answered `200`. |
+| `skipped` | `revocation_not_configured` | The revision the token came from names no `revocation_url`. Nothing was read or sent. |
+| `failure` | `revocation_egress_denied` | The egress policy refuses the revocation endpoint. The client secret was not read. |
+| `failure` | `credential_invalid`, `credential_unavailable` | The client secret could not be resolved. |
+| `failure` | `revocation_refused` | The issuer answered with another status; `issuer_error` is its error code when RFC 6749 or RFC 7009 registers it, `unregistered` otherwise. |
+| `failure` | `revocation_failed` | The issuer could not be reached, timed out or answered `503`. |
+| `failure` | `revocation_cancelled` | The process stopped before the issuer answered. |
+
+`connection_delegated_token_purge_total`, labelled by `trigger`, counts purges
+that were audited, and `connection_delegated_token_revocation_total`, labelled
+by `result` and `reason`, counts revocations. Neither the token nor anything
+the issuer said in an error body reaches an event, a metric or a log line.
 
 #### Failure reasons
 
@@ -1135,7 +1233,7 @@ upstream request is made:
 | `delegated_token_egress_denied` | The egress policy refuses `token_exchange_url`. |
 | `delegated_token_denied` | The issuer refused this caller: `invalid_grant` or `access_denied` on a `4xx`, or any `403`. Usually the user has not connected the upstream at the issuer, or the grant was revoked; reconnecting there fixes it. |
 | `delegated_token_exchange_failed` | No usable token came back for a reason no caller can fix: the issuer was unreachable or failed, rejected the gateway's client authentication (`invalid_client`) or request, or answered with something other than a bounded bearer access token. |
-| `delegated_token_unavailable` | Every cache entry is held by a call in flight. |
+| `delegated_token_unavailable` | Every cache entry is held by a call in flight, or the caller's tokens were being [purged](#purging-a-principals-tokens) as the call arrived; their next call exchanges again. |
 | `credential_invalid`, `credential_unavailable` | The client secret or the signing key could not be resolved or loaded. Also raises `connection.secret_resolution_failed`. |
 
 A failed exchange is not cached: the caller's next call asks the issuer again.
@@ -1192,16 +1290,21 @@ the trust sits:
   the client secret stands between that upstream and the caller's grant.
 - **The gateway keeps tokens only in the bounded cache above**, never on disk,
   and for at most 900 seconds.
-- **Revocation on user disable is not automatic yet.** A disabled user cannot
-  call the gateway once their sign-in no longer validates, and a token the
-  issuer revokes stops being used here within the cache lifetime. Purging a
-  user's cached tokens the moment they are disabled, and audited revocation
-  at the issuer, are follow-ups. Until then, revoke the grant at the issuer and,
-  for an immediate stop, disable the Connection (or make any other real change
-  to it): that moves its cache key, so no token cached before it is served.
-  Saving it unchanged is a no-op and keeps them. In cluster mode each replica
-  holds its own cache and stops using the old tokens only once it has applied
-  the change, at its next reconcile; until then it keeps serving them.
+- **Disabling a user is not something the gateway learns by itself.** A
+  disabled user cannot call the gateway once their sign-in no longer validates,
+  but a bearer token issued before keeps validating until it expires unless its
+  `jti` is revoked. When you disable a user, also
+  [purge their tokens](#purging-a-principals-tokens) (standalone), or revoke
+  their outstanding JWTs, which purges on each replica the next time one is
+  presented (cluster), and revoke the grant at the issuer. Give the Connection
+  a `revocation_url` so a purge also revokes the tokens at the issuer;
+  without one they stay valid there until they expire.
+- **For an immediate stop on every replica, disable the Connection** (or make
+  any other real change to it): that moves its cache key, so no token cached
+  before it is served, though none is revoked at the issuer. Saving it
+  unchanged is a no-op and keeps them. In cluster mode each replica holds its
+  own cache and stops using the old tokens only once it has applied the
+  change, at its next reconcile; until then it keeps serving them.
 - Policy is unchanged: tool policy and `rules[]` apply per principal before any
   exchange, so read-only deny rules and per-tool roles limit what a caller can
   do with their own token.
@@ -1209,10 +1312,12 @@ the trust sits:
 #### In the admin UI
 
 The Connection detail page shows this credential read only -- every field but
-the client secret's alias, which appears only as configured or not -- and the
-caller assertion as its subject token. The editor does not open such a
-Connection, because saving through a form that cannot represent the credential
-would replace it; create and change it through the admin API.
+the client secret's alias, which appears only as configured or not, the
+revocation endpoint included -- and the caller assertion as its subject
+token. The editor does not open such a Connection, because saving through a
+form that cannot represent the credential would replace it; create and change
+it through the admin API. A principal's tokens are purged through the admin
+API only.
 
 ## TLS, Custom CAs, and Mutual TLS
 

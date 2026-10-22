@@ -6371,7 +6371,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::bootstrap::run#1",
-      "sha256": "bcb0cdac3e011fce7b321439220c88cf091200fc82b1fb3fbf1e1ca926056a19",
+      "sha256": "87fd0b73e4f2c0a44c513007e2666db39386ef2391927c072778e8ca0e1fff18",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -6401,7 +6401,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::routing::add_admin_api_routes#1",
-      "sha256": "c5531737ab83e460a1658274ea67bc95e53de53e31fc5ce069f356682d7c89da",
+      "sha256": "2dd31017b19c97cdf7e0ceabe597e8eb278c627ac321f2756163dec4c6941dd9",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
@@ -9266,6 +9266,16 @@
       "reasons": [
         "unexpanded-attribute"
       ],
+      "scope": "gateway::ha::impl  ClusterReadiness::record_contract_fenced#1",
+      "sha256": "4dc9fa21fb3f11387bacef1de3f7190b8279dbb5b316b08aeb5b8d688792e957",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway/src/ha.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
       "scope": "gateway::ha::impl  ClusterReadiness::record_heartbeat_success#1",
       "sha256": "166040cbb77d6455ac89dc196007d5debcc0b7e1ea49959332118b675ebc6240",
       "owner": "GreenGateway maintainers",
@@ -9357,9 +9367,19 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::import::preflight::verify_target#1",
-      "sha256": "2414f717bf5b1d5097ea21ba51f6dea888350c6d99f3550e38296dcf09a96508",
+      "sha256": "443b5865450024d8b74db97d2b66ca50656eeb15b5cea3907a4ad5d5e011636f",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
+    },
+    {
+      "file": "gateway/src/import/preflight.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::import::preflight::contract_fence_admits_this_build#1",
+      "sha256": "5ad02da962fcb575734a84f12095893588b94885042f61c1157572d30d593e6a",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
     {
       "file": "gateway/src/import/preflight.rs",
@@ -9607,7 +9627,7 @@
         "capability-import-or-glob"
       ],
       "scope": "gateway::import::foundation_refusal#1",
-      "sha256": "6c6d819b542af9bbc85ec93f1f95e34fa4672ecaea0bca24a6d0adf1a655ce9f",
+      "sha256": "5cb8c017a8b35c687db73c13559739264b44901ea5f1ba871e195ea3a701957a",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
@@ -12397,7 +12417,27 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_membership::impl  PostgresMembershipStore::members_with_inner#1",
-      "sha256": "2a11ef04abeb129092ce291325dac0538d320eb46d622a83bc697fa4bffd3dc8",
+      "sha256": "3e16a41c5ec67ff9ba394d349aba4eb5521515442bd914d21b663380bb87a2bb",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_membership.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_membership::read_contract_fence#1",
+      "sha256": "476bc14dac8d5763e8b7800377be069ca0d20ddde5eda62cd0e031ea806f954c",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_membership.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_membership::fence_from_row#1",
+      "sha256": "de85346e5eda2d2b0c629f257049bc4f4974b53fbab01f6c1a22e4e9e816cc8c",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },

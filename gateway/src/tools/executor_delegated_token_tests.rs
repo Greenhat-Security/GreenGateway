@@ -1,10 +1,12 @@
 //! Delegated issuer tokens on the tool-call lane (#441): a Connection that calls its upstream as
-//! the calling user, with that user's own token from an RFC 8693 issuer.
+//! the calling user, with that user's own token from an RFC 8693 issuer, and the purge that drops
+//! a principal's tokens and revokes them at that issuer (RFC 7009).
 //!
 //! One in-process TLS server plays both parts. On the token-exchange path it is the issuer: it
-//! hands each caller named by the subject token a token of their own, or refuses, or fails. On
-//! every other path it is the upstream, and answers with the mailbox of whoever the bearer token
-//! belongs to. No real identity provider is involved, and every key is generated per test.
+//! hands each caller named by the subject token a token of their own, or refuses, or fails; on the
+//! revocation path it records what it is asked to revoke. On every other path it is the upstream,
+//! and answers with the mailbox of whoever the bearer token belongs to. No real identity provider
+//! is involved, and every key is generated per test.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use jsonwebtoken::{
@@ -15,9 +17,13 @@ use jsonwebtoken::{
 use tokio_util::sync::CancellationToken as StopSignal;
 
 use super::*;
-use crate::connections::{model::SubjectTokenSource, token_exchange::ManualTokenClock};
+use crate::connections::{
+    model::SubjectTokenSource,
+    token_exchange::{DelegatedTokenPurgeTrigger, ManualTokenClock},
+};
 
 const EXCHANGE_PATH: &str = "/oauth2/token-exchange";
+const REVOCATION_PATH: &str = "/oauth2/revoke";
 const CLIENT_SECRET_ALIAS: &str = "issuer-exchange-secret";
 /// The client secret the stub issuer expects. Low-entropy and obviously fake.
 const CLIENT_SECRET: &str = "issuer-exchange-value";
@@ -36,12 +42,21 @@ enum Issuer {
     Fail,
 }
 
+/// What the stub issuer's revocation endpoint answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Revoker {
+    Accept,
+    Refuse,
+    Unavailable,
+}
+
 /// The stub issuer and upstream behind one TLS listener.
 struct StubDeployment {
     addr: SocketAddr,
     ca_pem: String,
     requests: Arc<Mutex<Vec<CapturedRequest>>>,
     issuer: Arc<Mutex<Issuer>>,
+    revoker: Arc<Mutex<Revoker>>,
     /// When set, the upstream answers its next request `401`, as it would a
     /// token its provider revoked, and clears the flag.
     reject_next_upstream: Arc<AtomicBool>,
@@ -100,12 +115,14 @@ impl StubDeployment {
 
         let requests = Arc::new(Mutex::new(Vec::new()));
         let issuer = Arc::new(Mutex::new(issuer));
+        let revoker = Arc::new(Mutex::new(Revoker::Accept));
         let issued = Arc::new(AtomicUsize::new(0));
         let reject_next_upstream = Arc::new(AtomicBool::new(false));
         let stop = StopSignal::new();
-        let (server_requests, server_issuer, server_reject, server_stop) = (
+        let (server_requests, server_issuer, server_revoker, server_reject, server_stop) = (
             Arc::clone(&requests),
             Arc::clone(&issuer),
+            Arc::clone(&revoker),
             Arc::clone(&reject_next_upstream),
             stop.clone(),
         );
@@ -121,6 +138,7 @@ impl StubDeployment {
                 let acceptor = acceptor.clone();
                 let requests = Arc::clone(&server_requests);
                 let issuer = Arc::clone(&server_issuer);
+                let revoker = Arc::clone(&server_revoker);
                 let issued = Arc::clone(&issued);
                 let reject = Arc::clone(&server_reject);
                 tokio::spawn(async move {
@@ -131,6 +149,8 @@ impl StubDeployment {
                     let (status, content_type, body) = if request.target == EXCHANGE_PATH {
                         let behaviour = *issuer.lock().expect("issuer lock");
                         answer_as_issuer(&request, behaviour, &issued)
+                    } else if request.target == REVOCATION_PATH {
+                        answer_as_revoker(*revoker.lock().expect("revoker lock"))
                     } else if reject.swap(false, Ordering::AcqRel) {
                         (StatusCode::UNAUTHORIZED, "application/json", b"{}".to_vec())
                     } else {
@@ -155,9 +175,23 @@ impl StubDeployment {
             ca_pem: ca.pem(),
             requests,
             issuer,
+            revoker,
             reject_next_upstream,
             stop,
         }
+    }
+
+    fn set_revoker(&self, revoker: Revoker) {
+        *self.revoker.lock().expect("revoker lock") = revoker;
+    }
+
+    fn revocation_count(&self) -> usize {
+        self.with_requests(|requests| {
+            requests
+                .iter()
+                .filter(|request| request.target == REVOCATION_PATH)
+                .count()
+        })
     }
 
     fn reject_next_upstream_request(&self) {
@@ -181,7 +215,9 @@ impl StubDeployment {
         self.with_requests(|requests| {
             requests
                 .iter()
-                .filter(|request| request.target != EXCHANGE_PATH)
+                .filter(|request| {
+                    request.target != EXCHANGE_PATH && request.target != REVOCATION_PATH
+                })
                 .count()
         })
     }
@@ -262,6 +298,27 @@ fn answer_as_issuer(
     }
 }
 
+/// RFC 7009: `200` for a revoked token, an error object for a refusal, `503` to say try later.
+fn answer_as_revoker(behaviour: Revoker) -> (StatusCode, &'static str, Vec<u8>) {
+    match behaviour {
+        Revoker::Accept => (StatusCode::OK, "application/json", b"{}".to_vec()),
+        Revoker::Refuse => (
+            StatusCode::BAD_REQUEST,
+            "application/json",
+            serde_json::to_vec(&json!({
+                "error": "unsupported_token_type",
+                "error_description": DENIAL_DESCRIPTION_CANARY,
+            }))
+            .expect("refusal serializes"),
+        ),
+        Revoker::Unavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "text/plain",
+            ISSUER_FAILURE_CANARY.as_bytes().to_vec(),
+        ),
+    }
+}
+
 /// The upstream knows its users only by their own tokens.
 fn answer_as_upstream(request: &CapturedRequest) -> (StatusCode, &'static str, Vec<u8>) {
     let mailbox = request
@@ -297,6 +354,7 @@ async fn delegated_connection(
     signing_key: &str,
     audit: &AuditLog,
     exchange_host: &str,
+    revocation_host: Option<&str>,
     customize: impl FnOnce(ConnectionHttpRuntime) -> ConnectionHttpRuntime,
 ) -> (TemporaryStaticAuthRuntime, Arc<CountingSecretProvider>) {
     let root = std::env::temp_dir().join(format!(
@@ -342,6 +400,8 @@ async fn delegated_connection(
             requested_scopes: vec!["mail.read".to_owned()],
             audience: Some("https://mail.example.test".to_owned()),
             resource: None,
+            revocation_url: revocation_host
+                .map(|host| format!("https://{host}:{port}{REVOCATION_PATH}")),
             subject_token_source: SubjectTokenSource::CallerAssertion,
         },
         caller_assertion: Some(subject_token_settings()),
@@ -432,12 +492,36 @@ async fn harness_with(
     exchange_host: &str,
     customize: impl FnOnce(ConnectionHttpRuntime) -> ConnectionHttpRuntime,
 ) -> Harness {
+    build_harness(issuer, exchange_host, None, customize).await
+}
+
+/// A harness whose Connection names a revocation endpoint on `revocation_host`.
+async fn harness_revoking(issuer: Issuer, revocation_host: &str) -> Harness {
+    build_harness(issuer, "127.0.0.1", Some(revocation_host), |runtime| {
+        runtime
+    })
+    .await
+}
+
+async fn build_harness(
+    issuer: Issuer,
+    exchange_host: &str,
+    revocation_host: Option<&str>,
+    customize: impl FnOnce(ConnectionHttpRuntime) -> ConnectionHttpRuntime,
+) -> Harness {
     let deployment = StubDeployment::start(issuer).await;
     let signing_key = generated_es256_pem();
     let capture = CaptureSink::new();
     let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
-    let (connection, secrets) =
-        delegated_connection(&deployment, &signing_key, &audit, exchange_host, customize).await;
+    let (connection, secrets) = delegated_connection(
+        &deployment,
+        &signing_key,
+        &audit,
+        exchange_host,
+        revocation_host,
+        customize,
+    )
+    .await;
     let runtime = ToolRuntime::new(
         runtime_config([("read_mail", enabled_tool(5_000, 4))], 8, 4, 1_000),
         audit.clone(),
@@ -1087,4 +1171,296 @@ async fn an_upstream_401_drops_the_callers_token_and_the_next_call_exchanges_aga
             ]
         );
     });
+}
+
+/// What an operator does after disabling a user at their identity provider.
+fn operator_purge() -> DelegatedTokenPurgeTrigger {
+    DelegatedTokenPurgeTrigger::Operator {
+        actor: actor_from_principal(&bearer("operator", &["admin"])),
+        request_id: "request-purge".to_owned(),
+        source_ip: "203.0.113.20".to_owned(),
+    }
+}
+
+#[tokio::test]
+async fn purging_a_principal_drops_and_revokes_every_token_of_theirs_and_no_one_elses() {
+    let (logs, _logs_guard) = capture_all_logs();
+    let harness = harness_revoking(Issuer::Grant { expires_in: 3_600 }, "127.0.0.1").await;
+    let alice = bearer("alice", &["mail:read"]);
+    // The same principal with other claims is a cache entry of its own.
+    let promoted = bearer("alice", &["mail:read", "mail:admin"]);
+    let bob = bearer("bob", &["mail:read"]);
+    for (caller, request_id) in [
+        (&alice, "request-alice"),
+        (&promoted, "request-alice-admin"),
+        (&bob, "request-bob"),
+    ] {
+        harness
+            .call(caller, request_id)
+            .await
+            .expect("a delegated call succeeds");
+    }
+    assert_eq!(harness.deployment.exchange_count(), 3);
+    let saved = harness.secrets.resolutions();
+
+    // The principal is named as the directory and audit name it; the issuer
+    // is matched in canonical form.
+    let purged = harness.connection.runtime.purge_delegated_tokens(
+        "https://idp.example.test/",
+        "alice",
+        operator_purge(),
+    );
+    assert_eq!(purged, 2);
+    assert_eq!(
+        harness.connection.runtime.delegated_token_cache_entries(),
+        1,
+        "only bob's token is left"
+    );
+
+    harness
+        .wait_for(audit::event::CONNECTION_DELEGATED_TOKEN_REVOCATION, 2)
+        .await;
+    // Each revocation read the client secret once, and nothing else.
+    assert_eq!(harness.secrets.resolutions(), saved + 2);
+    let mut revoked = Vec::new();
+    harness.deployment.with_requests(|requests| {
+        for request in requests
+            .iter()
+            .filter(|request| request.target == REVOCATION_PATH)
+        {
+            assert_eq!(request.method, "POST");
+            assert_eq!(
+                request.header("authorization"),
+                Some(
+                    format!(
+                        "Basic {}",
+                        base64::engine::general_purpose::STANDARD
+                            .encode(format!("greengateway:{CLIENT_SECRET}"))
+                    )
+                    .as_str()
+                )
+            );
+            assert_eq!(
+                request.header("content-type"),
+                Some("application/x-www-form-urlencoded")
+            );
+            let fields = form_fields(request);
+            assert_eq!(fields.len(), 2, "{fields:?}");
+            assert_eq!(form_field(&fields, "token_type_hint"), Some("access_token"));
+            revoked.push(
+                form_field(&fields, "token")
+                    .expect("the token is named")
+                    .to_owned(),
+            );
+        }
+    });
+    revoked.sort();
+    assert_eq!(revoked, ["delegated-alice-1", "delegated-alice-2"]);
+
+    let purges = harness.events_of(audit::event::CONNECTION_DELEGATED_TOKEN_PURGE);
+    assert_eq!(purges.len(), 1);
+    let purge = &purges[0];
+    assert_eq!(purge.request_id, "request-purge");
+    assert_eq!(purge.source_ip, "203.0.113.20");
+    assert_eq!(
+        purge.actor.as_ref().map(|actor| actor.user_id.as_str()),
+        Some("operator")
+    );
+    let principal = json!({ "issuer": "https://idp.example.test", "subject": "alice" });
+    assert_eq!(purge.payload["trigger"], json!("operator"));
+    assert_eq!(purge.payload["principal"], principal);
+    assert_eq!(purge.payload["purged_entries"], json!(2));
+    for revocation in harness.events_of(audit::event::CONNECTION_DELEGATED_TOKEN_REVOCATION) {
+        assert_eq!(revocation.payload["purge_id"], purge.payload["purge_id"]);
+        assert_eq!(
+            revocation.payload["connection_id"],
+            json!(harness.connection.connection_id)
+        );
+        assert_eq!(revocation.payload["principal"], principal);
+        assert_eq!(revocation.payload["outcome"], json!("success"));
+        assert_eq!(revocation.payload["reason"], json!("revoked"));
+        assert_eq!(revocation.payload["issuer_status"], json!(200));
+        assert_eq!(revocation.payload["issuer_error"], Value::Null);
+        assert_eq!(revocation.request_id, "request-purge");
+        assert_eq!(
+            revocation
+                .actor
+                .as_ref()
+                .map(|actor| actor.user_id.as_str()),
+            Some("operator")
+        );
+    }
+
+    // Alice's next call asks the issuer again; bob is still served from the
+    // cache.
+    let mailbox = harness
+        .call(&alice, "request-alice-again")
+        .await
+        .expect("a purged principal is exchanged for again");
+    assert_eq!(mailbox, json!({ "mailbox": "alice" }));
+    harness
+        .call(&bob, "request-bob-again")
+        .await
+        .expect("bob's call");
+    assert_eq!(harness.deployment.exchange_count(), 4);
+    harness.deployment.with_requests(|requests| {
+        let bearers: Vec<_> = requests
+            .iter()
+            .filter(|request| request.target != EXCHANGE_PATH && request.target != REVOCATION_PATH)
+            .filter_map(|request| request.header("authorization"))
+            .collect();
+        assert_eq!(
+            bearers,
+            [
+                "Bearer delegated-alice-1",
+                "Bearer delegated-alice-2",
+                "Bearer delegated-bob-3",
+                "Bearer delegated-alice-4",
+                "Bearer delegated-bob-3",
+            ]
+        );
+    });
+
+    let rendered_audit =
+        serde_json::to_string(&harness.capture.events()).expect("audit serializes");
+    let rendered_logs = logs.contents();
+    for canary in harness.secrets_on_the_wire() {
+        assert!(!rendered_audit.contains(&canary), "audit leaked {canary:?}");
+        assert!(!rendered_logs.contains(&canary), "logs leaked {canary:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_revoked_credential_purges_on_its_own_and_without_an_endpoint_a_token_is_only_dropped() {
+    let harness = harness(Issuer::Grant { expires_in: 3_600 }).await;
+    let alice = bearer("alice", &["mail:read"]);
+    harness.call(&alice, "request-1").await.expect("first call");
+    let saved = harness.secrets.resolutions();
+
+    // What a JWT validator does when the denylist refuses one of alice's
+    // tokens.
+    let observer: &dyn crate::auth::RevokedCredentialObserver = &harness.connection.runtime;
+    observer.credential_revoked("https://idp.example.test", "alice");
+    assert_eq!(
+        harness.connection.runtime.delegated_token_cache_entries(),
+        0
+    );
+
+    harness
+        .wait_for(audit::event::CONNECTION_DELEGATED_TOKEN_REVOCATION, 1)
+        .await;
+    let revocation = &harness.events_of(audit::event::CONNECTION_DELEGATED_TOKEN_REVOCATION)[0];
+    assert_eq!(revocation.payload["outcome"], json!("skipped"));
+    assert_eq!(
+        revocation.payload["reason"],
+        json!("revocation_not_configured")
+    );
+    assert_eq!(revocation.payload["issuer_status"], Value::Null);
+    // No operator asked: the purge has no actor and no request of its own.
+    assert!(revocation.actor.is_none());
+    assert_eq!(revocation.request_id, "connection-delegated-token-purge");
+    let purges = harness.events_of(audit::event::CONNECTION_DELEGATED_TOKEN_PURGE);
+    assert_eq!(purges.len(), 1);
+    assert_eq!(purges[0].payload["trigger"], json!("credential_revoked"));
+    assert_eq!(purges[0].payload["purged_entries"], json!(1));
+    assert!(purges[0].actor.is_none());
+    // Nothing was read or sent for a token with nowhere to be revoked.
+    assert_eq!(harness.secrets.resolutions(), saved);
+    assert_eq!(harness.deployment.revocation_count(), 0);
+
+    // The same refused credential presented again finds nothing to purge and
+    // records nothing; alice's next call simply exchanges again.
+    observer.credential_revoked("https://idp.example.test", "alice");
+    harness
+        .call(&alice, "request-2")
+        .await
+        .expect("a purged principal is exchanged for again");
+    harness
+        .wait_for(audit::event::CONNECTION_DELEGATED_TOKEN_EXCHANGE, 2)
+        .await;
+    assert_eq!(
+        harness
+            .events_of(audit::event::CONNECTION_DELEGATED_TOKEN_PURGE)
+            .len(),
+        1
+    );
+    // Another principal is never touched.
+    observer.credential_revoked("https://idp.example.test", "bob");
+    assert_eq!(
+        harness.connection.runtime.delegated_token_cache_entries(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_refused_unavailable_or_disallowed_revocation_is_audited_once_and_never_retried() {
+    let harness = harness_revoking(Issuer::Grant { expires_in: 3_600 }, "127.0.0.1").await;
+    let alice = bearer("alice", &["mail:read"]);
+    let observer: &dyn crate::auth::RevokedCredentialObserver = &harness.connection.runtime;
+
+    harness.deployment.set_revoker(Revoker::Refuse);
+    harness.call(&alice, "request-1").await.expect("call");
+    observer.credential_revoked("https://idp.example.test", "alice");
+    harness
+        .wait_for(audit::event::CONNECTION_DELEGATED_TOKEN_REVOCATION, 1)
+        .await;
+
+    harness.deployment.set_revoker(Revoker::Unavailable);
+    harness.call(&alice, "request-2").await.expect("call");
+    observer.credential_revoked("https://idp.example.test", "alice");
+    harness
+        .wait_for(audit::event::CONNECTION_DELEGATED_TOKEN_REVOCATION, 2)
+        .await;
+
+    let revocations = harness.events_of(audit::event::CONNECTION_DELEGATED_TOKEN_REVOCATION);
+    assert_eq!(revocations[0].payload["outcome"], json!("failure"));
+    assert_eq!(
+        revocations[0].payload["reason"],
+        json!("revocation_refused")
+    );
+    assert_eq!(revocations[0].payload["issuer_status"], json!(400));
+    assert_eq!(
+        revocations[0].payload["issuer_error"],
+        json!("unsupported_token_type")
+    );
+    assert_eq!(revocations[1].payload["outcome"], json!("failure"));
+    assert_eq!(revocations[1].payload["reason"], json!("revocation_failed"));
+    assert_eq!(revocations[1].payload["issuer_status"], json!(503));
+    assert_eq!(revocations[1].payload["issuer_error"], Value::Null);
+    // One request each: a failed revocation is not retried, and the token
+    // stays out of the cache either way.
+    assert_eq!(harness.deployment.revocation_count(), 2);
+    assert_eq!(
+        harness.connection.runtime.delegated_token_cache_entries(),
+        0
+    );
+    let rendered_audit =
+        serde_json::to_string(&harness.capture.events()).expect("audit serializes");
+    for canary in harness.secrets_on_the_wire() {
+        assert!(!rendered_audit.contains(&canary), "audit leaked {canary:?}");
+    }
+
+    // A revocation endpoint outside the egress allowlist is never contacted,
+    // and the client secret is not read for it.
+    let disallowed =
+        harness_revoking(Issuer::Grant { expires_in: 3_600 }, "issuer.example.test").await;
+    disallowed.call(&alice, "request-3").await.expect("call");
+    let saved = disallowed.secrets.resolutions();
+    disallowed.connection.runtime.purge_delegated_tokens(
+        "https://idp.example.test",
+        "alice",
+        operator_purge(),
+    );
+    disallowed
+        .wait_for(audit::event::CONNECTION_DELEGATED_TOKEN_REVOCATION, 1)
+        .await;
+    let revocation = &disallowed.events_of(audit::event::CONNECTION_DELEGATED_TOKEN_REVOCATION)[0];
+    assert_eq!(revocation.payload["outcome"], json!("failure"));
+    assert_eq!(
+        revocation.payload["reason"],
+        json!("revocation_egress_denied")
+    );
+    assert_eq!(revocation.payload["issuer_status"], Value::Null);
+    assert_eq!(disallowed.secrets.resolutions(), saved);
+    assert_eq!(disallowed.deployment.revocation_count(), 0);
 }

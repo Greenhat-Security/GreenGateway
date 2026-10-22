@@ -34,12 +34,17 @@
 //!
 //! That check runs in one direction only — it catches a word that should
 //! not exist, not a word that exists and cannot be produced — so the other
-//! direction is covered row by row. Four of the eight reasons are produced
+//! direction is covered row by row. Four of the nine reasons are produced
 //! by the authority rows below, `required_upstream_unavailable` by
 //! [`an_unhealthy_required_upstream_is_required_upstream_unavailable_and_recovers`],
-//! and the remaining three (`draining`, `starting`,
+//! and three more (`draining`, `starting`,
 //! `config_fingerprint_mismatch`) are named absences with `#[ignore]`d rows
-//! at the foot of this file or, for `starting`, covered in-crate.
+//! at the foot of this file or, for `starting`, covered in-crate. The ninth,
+//! `contract_fenced` (issue #426, PR 3), is produced only in-crate
+//! (`app_tests::readiness_is_refused_for_good_once_the_contract_fence_excludes_this_build`
+//! and `storage::contract_tests::a_build_the_contract_fence_excludes_can_neither_boot_nor_rejoin`):
+//! no shipped build raises the durable contract fence, so no row here can
+//! reach it without writing the fence by hand.
 //!
 //! ## What is injectable here, and what is not
 //!
@@ -124,15 +129,17 @@ use harness::{
 /// Every reason string `/readyz` is allowed to answer with, and the only
 /// ones this suite will accept from it.
 ///
-/// Four come from `main.rs::readiness_blocked_reason`'s own arms
-/// (`draining`, `starting`, `required_upstream_unavailable`, and PR 13's
-/// `config_fingerprint_mismatch` through `ClusterReadiness`), and four
-/// from `ha_status`'s constants. A reason outside this list reaching a
-/// probe is a widened public contract, and
-/// [`assert_reason_is_in_the_vocabulary`] fails the row that produced it.
-const REASON_VOCABULARY: [&str; 8] = [
+/// Five come from `main.rs::readiness_blocked_reason`'s own arms
+/// (`draining`, `starting`, `required_upstream_unavailable`, and, through
+/// `ClusterReadiness`, PR 13's `config_fingerprint_mismatch` and issue
+/// #426's `contract_fenced`), and four from `ha_status`'s constants. A
+/// reason outside this list reaching a probe is a widened public contract,
+/// and [`assert_reason_is_in_the_vocabulary`] fails the row that produced
+/// it.
+const REASON_VOCABULARY: [&str; 9] = [
     "draining",
     "starting",
+    "contract_fenced",
     "config_fingerprint_mismatch",
     "storage_unavailable",
     "schema_incompatible",
@@ -1768,7 +1775,7 @@ async fn a_paused_replica_stops_answering_while_the_deployment_holds_its_roster(
 ///
 /// It exists because [`REASON_VOCABULARY`] is checked in one direction
 /// only: every row proves a reason it produces is in the list, and nothing
-/// proved that a word *in* the list is producible at all. Four of the eight
+/// proved that a word *in* the list is producible at all. Four of the nine
 /// are named absences with `#[ignore]`d rows below; this one was neither
 /// produced nor named, so a broken rung here would have failed no row. It
 /// is cheap to produce for real — the fake upstream simply stops answering
