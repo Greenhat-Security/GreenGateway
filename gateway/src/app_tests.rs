@@ -12467,6 +12467,412 @@ async fn managed_openapi_preview_and_register_enforce_permissions_and_revisions(
     assert_eq!(cleared["removed_count"], json!(1));
 }
 
+/// Create a managed OpenAPI Connection with no authentication; returns its
+/// ID and ETag.
+async fn create_managed_openapi_connection(
+    router: &Router,
+    display_name: &str,
+) -> (String, String) {
+    let list = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::GET,
+            CONNECTIONS_ADMIN_ROUTE,
+            Some(test_principal(&["connections-reader"])),
+            None,
+            None,
+            false,
+        ))
+        .await
+        .expect("connection list should complete");
+    let collection_etag = list
+        .headers()
+        .get(CONNECTION_COLLECTION_ETAG_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .expect("connection list should include collection ETag")
+        .to_owned();
+    let created = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::POST,
+            CONNECTIONS_ADMIN_ROUTE,
+            Some(test_principal(&["connections-editor"])),
+            Some(managed_openapi_connection_body(display_name)),
+            Some(&collection_etag),
+            true,
+        ))
+        .await
+        .expect("managed OpenAPI connection create should complete");
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let connection_etag = created
+        .headers()
+        .get(header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .expect("created connection should include ETag")
+        .to_owned();
+    let connection_id = json_body(created).await["id"]
+        .as_str()
+        .expect("created connection should include ID")
+        .to_owned();
+    (connection_id, connection_etag)
+}
+
+/// Preview `spec` on a managed OpenAPI Connection and register `selected`
+/// from exactly that preview; returns the registration response.
+async fn preview_and_register_managed_openapi(
+    router: &Router,
+    connection_id: &str,
+    connection_etag: &str,
+    spec: &str,
+    selected: &[&str],
+) -> Response {
+    let preview = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::POST,
+            &format!("{CONNECTIONS_ADMIN_ROUTE}/{connection_id}/openapi/preview"),
+            Some(test_principal(&["openapi-tools-reader"])),
+            Some(json!({ "spec": spec }).to_string()),
+            None,
+            true,
+        ))
+        .await
+        .expect("managed OpenAPI preview should complete");
+    assert_eq!(preview.status(), StatusCode::OK);
+    let preview = json_body(preview).await;
+    let confirmations = preview["security_confirmations"]
+        .as_array()
+        .expect("preview should list security confirmations")
+        .iter()
+        .filter(|confirmation| {
+            selected
+                .iter()
+                .any(|name| confirmation["tool_name"] == json!(name))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::POST,
+            &format!("{CONNECTIONS_ADMIN_ROUTE}/{connection_id}/openapi/register"),
+            Some(test_principal(&["openapi-tools-writer"])),
+            Some(
+                json!({
+                    "spec": spec,
+                    "spec_digest": preview["spec_digest"],
+                    "expected_spec_revision": preview["spec_revision"],
+                    "expected_catalog_revision": preview["catalog_revision"],
+                    "selected_tool_names": selected,
+                    "security_confirmations": confirmations,
+                })
+                .to_string(),
+            ),
+            Some(connection_etag),
+            true,
+        ))
+        .await
+        .expect("managed OpenAPI registration should complete")
+}
+
+/// The connection admin router, gating converted managed OpenAPI catalogs
+/// as cluster mode does (issue #443); `overrides` may supply the roster.
+fn gated_connection_admin_router(
+    connection_db: &TempDb,
+    policy: &TempPolicyFile,
+    audit_log: audit::AuditLog,
+    overrides: GatewayAppBuildOverrides,
+) -> Router {
+    let config = connection_admin_config(connection_db, policy, config::DEFAULT_ADMIN_PREFIX);
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let app = gateway_app_with_process_started_at_and_overrides(
+        config,
+        recorder.handle(),
+        audit_log,
+        test_audit_event_sender(),
+        Instant::now(),
+        GatewayAppBuildOverrides {
+            gate_converted_openapi_catalogs: true,
+            ..overrides
+        },
+    )
+    .expect("gated connection admin app should build");
+    match app.http {
+        GatewayApp::Unified(router) => router,
+        GatewayApp::Split { .. } => panic!("gated connection admin app should be unified"),
+    }
+}
+
+#[tokio::test]
+async fn managed_openapi_preview_reports_swagger2_conversion_and_registers_converted_tools() {
+    let connection_db = TempDb::new("connection-openapi-swagger2-preview");
+    let policy = TempPolicyFile::new(&connection_policy_document_string());
+    let router = connection_admin_router(&connection_db, &policy, test_audit_log());
+    let (connection_id, connection_etag) =
+        create_managed_openapi_connection(&router, "Managed Swagger").await;
+    let preview_uri = format!("{CONNECTIONS_ADMIN_ROUTE}/{connection_id}/openapi/preview");
+    let register_uri = format!("{CONNECTIONS_ADMIN_ROUTE}/{connection_id}/openapi/register");
+
+    let openapi_preview = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::POST,
+            &preview_uri,
+            Some(test_principal(&["openapi-tools-reader"])),
+            Some(json!({ "spec": widget_openapi_spec() }).to_string()),
+            None,
+            true,
+        ))
+        .await
+        .expect("OpenAPI 3.x preview should complete");
+    assert_eq!(openapi_preview.status(), StatusCode::OK);
+    assert!(
+        json_body(openapi_preview).await.get("conversion").is_none(),
+        "an OpenAPI 3.x preview keeps its previous shape"
+    );
+
+    let swagger_spec = json!({
+        "swagger": "2.0",
+        "info": { "title": "Widget API", "version": "1.0.0" },
+        "basePath": "/v1",
+        "paths": {
+            "/widgets/{widgetId}": {
+                "get": {
+                    "operationId": "getWidget",
+                    "summary": "Fetch a widget",
+                    "parameters": [
+                        { "name": "widgetId", "in": "path", "required": true, "type": "string" }
+                    ]
+                }
+            },
+            "/widgets": {
+                "post": {
+                    "operationId": "createWidgets",
+                    "parameters": [
+                        { "name": "a", "in": "body", "schema": { "type": "object" } },
+                        { "name": "b", "in": "body", "schema": { "type": "object" } }
+                    ]
+                }
+            }
+        }
+    })
+    .to_string();
+    let preview = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::POST,
+            &preview_uri,
+            Some(test_principal(&["openapi-tools-reader"])),
+            Some(json!({ "spec": swagger_spec }).to_string()),
+            None,
+            true,
+        ))
+        .await
+        .expect("Swagger 2.0 preview should complete");
+    assert_eq!(preview.status(), StatusCode::OK);
+    let preview = json_body(preview).await;
+    assert_eq!(
+        preview["conversion"],
+        json!({
+            "source_format": "swagger_2_0",
+            "warnings": [
+                {
+                    "code": "base_path_not_in_paths",
+                    "message": "basePath is not part of generated path templates; include it in the Connection base path",
+                    "operation_omitted": false,
+                    "subject": "/v1"
+                },
+                {
+                    "code": "multiple_body_parameters",
+                    "message": "the operation has more than one body parameter; it was left out",
+                    "operation_omitted": true,
+                    "method": "POST",
+                    "path_template": "/widgets"
+                }
+            ]
+        })
+    );
+    assert_eq!(
+        preview["tools"]
+            .as_array()
+            .expect("preview should list tools")
+            .iter()
+            .map(|tool| tool["name"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!("getWidget")],
+        "the omitted operation generates no tool"
+    );
+
+    let registered = router
+        .oneshot(connection_admin_request(
+            Method::POST,
+            &register_uri,
+            Some(test_principal(&["openapi-tools-writer"])),
+            Some(
+                json!({
+                    "spec": swagger_spec,
+                    "spec_digest": preview["spec_digest"],
+                    "expected_spec_revision": preview["spec_revision"],
+                    "expected_catalog_revision": preview["catalog_revision"],
+                    "selected_tool_names": ["getWidget"],
+                    "security_confirmations": preview["security_confirmations"],
+                })
+                .to_string(),
+            ),
+            Some(&connection_etag),
+            true,
+        ))
+        .await
+        .expect("Swagger 2.0 registration should complete");
+    assert_eq!(registered.status(), StatusCode::CREATED);
+    let registered = json_body(registered).await;
+    assert_eq!(registered["registered_tool_names"], json!(["getWidget"]));
+}
+
+/// Converted managed OpenAPI catalogs gated as cluster mode gates them
+/// (issue #443), with no roster to ask: every write that would store one --
+/// registering it, an overlay over it, refreshing to it -- is refused with
+/// `503 roster_unavailable` and changes nothing, while preview and an
+/// OpenAPI 3.x registration never ask.
+#[tokio::test]
+async fn managed_openapi_gated_swagger2_writes_fail_closed_without_a_roster() {
+    let connection_db = TempDb::new("connection-openapi-swagger2-gated");
+    let policy = TempPolicyFile::new(&connection_policy_document_string());
+    let swagger_spec = json!({
+        "swagger": "2.0",
+        "info": { "title": "Widget API", "version": "1.0.0" },
+        "paths": {
+            "/widgets": {
+                "get": {
+                    "operationId": "listWidgets",
+                    "responses": { "200": { "description": "Widgets" } }
+                }
+            }
+        }
+    })
+    .to_string();
+
+    // A replica that does not gate stores the converted catalog first.
+    let ungated = connection_admin_router(&connection_db, &policy, test_audit_log());
+    let (connection_id, connection_etag) =
+        create_managed_openapi_connection(&ungated, "Gated Swagger").await;
+    let registered = preview_and_register_managed_openapi(
+        &ungated,
+        &connection_id,
+        &connection_etag,
+        &swagger_spec,
+        &["listWidgets"],
+    )
+    .await;
+    assert_eq!(registered.status(), StatusCode::CREATED);
+    let catalog_revision = json_body(registered).await["catalog_revision"]
+        .as_u64()
+        .expect("registration should return the catalog revision");
+    drop(ungated);
+
+    let router = gated_connection_admin_router(
+        &connection_db,
+        &policy,
+        test_audit_log(),
+        GatewayAppBuildOverrides::default(),
+    );
+    let assert_refused = |status: StatusCode, body: &Value, write: &str| {
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{write}: {body}");
+        assert_eq!(
+            body["reason"],
+            json!("roster_unavailable"),
+            "{write}: {body}"
+        );
+    };
+
+    let refused = preview_and_register_managed_openapi(
+        &router,
+        &connection_id,
+        &connection_etag,
+        &swagger_spec,
+        &["listWidgets"],
+    )
+    .await;
+    let status = refused.status();
+    assert_refused(status, &json_body(refused).await, "registration");
+
+    let overlay_uri = format!("{CONNECTIONS_ADMIN_ROUTE}/{connection_id}/overlay");
+    let overlay_etag = format!("\"overlay:{connection_id}:c1:r{catalog_revision}:o0\"");
+    let refused = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::PUT,
+            &overlay_uri,
+            Some(test_principal(&["connections-editor"])),
+            Some(
+                json!({
+                    "schema_version": "0.1.0",
+                    "tools": { "listWidgets": { "description": "List every widget" } }
+                })
+                .to_string(),
+            ),
+            Some(&overlay_etag),
+            true,
+        ))
+        .await
+        .expect("overlay PUT should complete");
+    let status = refused.status();
+    assert_refused(status, &json_body(refused).await, "overlay");
+
+    let refused = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::POST,
+            &format!("{CONNECTIONS_ADMIN_ROUTE}/{connection_id}/refresh"),
+            Some(test_principal(&["connections-refresher"])),
+            None,
+            Some(&connection_etag),
+            true,
+        ))
+        .await
+        .expect("refresh should complete");
+    let status = refused.status();
+    assert_refused(status, &json_body(refused).await, "refresh");
+
+    // Nothing was written: the overlay is still absent at the catalog
+    // revision the ungated replica registered.
+    let current = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::GET,
+            &overlay_uri,
+            Some(test_principal(&["connections-reader"])),
+            None,
+            None,
+            false,
+        ))
+        .await
+        .expect("overlay read should complete");
+    assert_eq!(current.status(), StatusCode::OK);
+    assert_eq!(
+        current
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok()),
+        Some(overlay_etag.as_str())
+    );
+    assert_eq!(json_body(current).await["document"], Value::Null);
+
+    let openapi = preview_and_register_managed_openapi(
+        &router,
+        &connection_id,
+        &connection_etag,
+        widget_openapi_spec(),
+        &["createWidget"],
+    )
+    .await;
+    assert_eq!(
+        openapi.status(),
+        StatusCode::CREATED,
+        "an OpenAPI 3.x document never asks the gate"
+    );
+}
+
 #[test]
 fn stored_overlay_source_response_projects_only_a_strict_typed_envelope() {
     let mut reports = connections::store::StoredOpenApiSourceReports::empty();
@@ -33817,6 +34223,180 @@ mod cluster_policy_tests {
             .expect("PUT should complete");
         assert_eq!(committed.status(), StatusCode::OK);
         assert_eq!(policy_version_count(&pool).await, before + 1);
+    }
+
+    /// Issue #443's registered operation through the managed OpenAPI
+    /// register endpoint, against a real roster: storing a catalog
+    /// converted from a Swagger 2.0 document waits for every live member to
+    /// advertise `openapi_swagger2_catalogs`. A refusal is a `409` with the
+    /// stable reason, stores nothing and is audited; an OpenAPI 3.x
+    /// registration never asks; and once the lacking member goes stale the
+    /// same registration is admitted.
+    #[tokio::test]
+    async fn cluster_swagger2_catalogs_wait_for_every_live_member() {
+        use crate::storage::{MemberRegistration, PostgresMembershipStore};
+
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (_, pool) = migrated_policy_foundation(&database.dsn).await;
+        let deployment = "deploy-cluster-swagger2";
+        let membership = cluster_membership::ClusterMembership::new(
+            PostgresMembershipStore::new(
+                pool.clone(),
+                deployment,
+                crate::ha::InstanceIdentity::generate(),
+            ),
+            MemberRegistration {
+                binary_version: env!("CARGO_PKG_VERSION").to_owned(),
+                schema_version: migrations::schema_version_range(),
+                document_version: cluster_membership::DOCUMENT_VERSION_RANGE,
+                fingerprint: "b".repeat(64),
+                capabilities: storage::compatibility::BINARY_CAPABILITIES.to_vec(),
+            },
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+        );
+        membership.register_boot().await.expect("boot row");
+        // A member built before Swagger 2.0 import advertises what issue
+        // #426's successor does, and nothing newer.
+        let earlier = uuid::Uuid::new_v4();
+        pool.get()
+            .await
+            .expect("client")
+            .execute(
+                "INSERT INTO greengateway.cluster_members
+                     (deployment_id, instance_id, boot_id, binary_version,
+                      schema_version_min, schema_version_max,
+                      document_version_min, document_version_max, fingerprint,
+                      capabilities)
+                 VALUES ($1, $2::text::uuid, $3::text::uuid, '1.0.1', 18, 18, 0, 0,
+                         repeat('b', 64), 'operation_requirements,policy_role_descriptions')",
+                &[
+                    &deployment,
+                    &earlier.to_string(),
+                    &uuid::Uuid::new_v4().to_string(),
+                ],
+            )
+            .await
+            .expect("an earlier member row inserts");
+
+        let connection_db = TempDb::new("cluster-openapi-swagger2-gate");
+        let policy = TempPolicyFile::new(&connection_policy_document_string());
+        let capture = audit::sink::tests::CaptureSink::new();
+        let router = gated_connection_admin_router(
+            &connection_db,
+            &policy,
+            audit::AuditLog::new(Arc::new(capture.clone())),
+            GatewayAppBuildOverrides {
+                pg_membership: Some(membership),
+                ..GatewayAppBuildOverrides::default()
+            },
+        );
+        let (connection_id, connection_etag) =
+            create_managed_openapi_connection(&router, "Cluster Swagger").await;
+        let swagger_spec = json!({
+            "swagger": "2.0",
+            "info": { "title": "Widget API", "version": "1.0.0" },
+            "paths": {
+                "/widgets": {
+                    "get": {
+                        "operationId": "listWidgets",
+                        "responses": { "200": { "description": "Widgets" } }
+                    }
+                }
+            }
+        })
+        .to_string();
+        let refusals = || {
+            capture
+                .events()
+                .into_iter()
+                .filter(|event| event.event_type == "cluster.operation_refused")
+                .collect::<Vec<_>>()
+        };
+
+        let (status, body) = refusal_of(
+            preview_and_register_managed_openapi(
+                &router,
+                &connection_id,
+                &connection_etag,
+                &swagger_spec,
+                &["listWidgets"],
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["reason"], "capability_not_advertised");
+        assert!(
+            !body.to_string().contains(&earlier.to_string()),
+            "a refusal names no member: {body}"
+        );
+        let started = std::time::Instant::now();
+        while refusals().is_empty() && started.elapsed() < Duration::from_secs(5) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let refused = refusals();
+        assert_eq!(refused.len(), 1, "one refusal, one gate audit event");
+        assert_eq!(
+            refused[0].payload["operation"],
+            "connections.openapi_swagger2_catalog"
+        );
+        assert_eq!(
+            refused[0].payload["capability"],
+            "openapi_swagger2_catalogs"
+        );
+        assert_eq!(refused[0].payload["lacking_members"], 1);
+        assert_eq!(refused[0].payload["live_members"], 2);
+
+        let openapi = preview_and_register_managed_openapi(
+            &router,
+            &connection_id,
+            &connection_etag,
+            widget_openapi_spec(),
+            &["createWidget"],
+        )
+        .await;
+        assert_eq!(
+            openapi.status(),
+            StatusCode::CREATED,
+            "an OpenAPI 3.x document never asks the gate"
+        );
+
+        // The earlier member's row goes stale on the database clock: the
+        // same registration is admitted.
+        pool.get()
+            .await
+            .expect("client")
+            .execute(
+                "UPDATE greengateway.cluster_members
+                 SET last_heartbeat_at = now() - interval '60 seconds'
+                 WHERE instance_id = $1::text::uuid",
+                &[&earlier.to_string()],
+            )
+            .await
+            .expect("backdate the earlier member");
+        let admitted = preview_and_register_managed_openapi(
+            &router,
+            &connection_id,
+            &connection_etag,
+            &swagger_spec,
+            &["listWidgets"],
+        )
+        .await;
+        assert_eq!(admitted.status(), StatusCode::CREATED);
+        assert_eq!(
+            json_body(admitted).await["registered_tool_names"],
+            json!(["listWidgets"])
+        );
+        assert_eq!(
+            refusals().len(),
+            1,
+            "an admission is not audited as a refusal"
+        );
     }
 
     #[tokio::test]

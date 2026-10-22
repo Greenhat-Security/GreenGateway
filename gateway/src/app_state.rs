@@ -459,6 +459,12 @@ pub(super) struct ConnectionAdminState {
     // Serializes the HTTP precondition snapshot with its mutation. This is
     // intentionally distinct from the control plane's secret/activation lock.
     pub(super) secret_precondition_lock: Arc<Mutex<()>>,
+    /// Cluster mode's roster, for the operation gate a managed OpenAPI
+    /// write asks before storing a catalog generated from a Swagger 2.0
+    /// document (issue #443). When the catalog service gates such writes
+    /// and this is absent, every one of them is refused.
+    #[cfg(feature = "postgres")]
+    pub(super) membership: Option<Arc<cluster_membership::ClusterMembership>>,
 }
 
 #[derive(Clone)]

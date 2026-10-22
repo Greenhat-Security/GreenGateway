@@ -494,9 +494,11 @@ pub(super) fn openapi_catalog_error_response(
         OpenApiCatalogError::InvalidSpec
         | OpenApiCatalogError::InvalidSelection
         | OpenApiCatalogError::AuthenticationMismatch => StatusCode::BAD_REQUEST,
-        OpenApiCatalogError::StoreUnavailable | OpenApiCatalogError::StorageUnavailable => {
-            StatusCode::SERVICE_UNAVAILABLE
-        }
+        // The endpoints ask the operation gate on this answer and never
+        // return it; reaching here means nothing asked, so nothing is stored.
+        OpenApiCatalogError::StoreUnavailable
+        | OpenApiCatalogError::StorageUnavailable
+        | OpenApiCatalogError::ConvertedCatalogNeedsAdmission => StatusCode::SERVICE_UNAVAILABLE,
         OpenApiCatalogError::EgressDenied
         | OpenApiCatalogError::SecretUnavailable
         | OpenApiCatalogError::AuthenticationFailed

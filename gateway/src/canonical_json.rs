@@ -67,7 +67,7 @@ pub(crate) fn semantic_digest(
 ) -> Result<String, CanonicalJsonError> {
     let payload = canonical_json_bytes(value)?;
     Ok(framed_digest(
-        "semantic",
+        b"semantic",
         media_type,
         schema_version,
         &payload,
@@ -76,16 +76,21 @@ pub(crate) fn semantic_digest(
 
 /// `sha256:<hex>` over the ADR-0004 frame of a source payload: the exact
 /// accepted source-document bytes, neither parsed nor normalized, labelled
-/// the same way a semantic payload is.
-pub(crate) fn source_digest(media_type: &str, schema_version: &str, source: &[u8]) -> String {
-    framed_digest("source", media_type, schema_version, source)
+/// with the media type and exact schema version that define them.
+///
+/// ```text
+/// "GGDIGEST" 0x00 || u64be(len) "source" || u64be(len) media_type
+///   || u64be(len) schema_version || u64be(len) payload
+/// ```
+pub(crate) fn source_digest(media_type: &str, schema_version: &str, payload: &[u8]) -> String {
+    framed_digest(b"source", media_type, schema_version, payload)
 }
 
-fn framed_digest(kind: &str, media_type: &str, schema_version: &str, payload: &[u8]) -> String {
+fn framed_digest(kind: &[u8], media_type: &str, schema_version: &str, payload: &[u8]) -> String {
     let mut digest = Sha256::new();
     digest.update(b"GGDIGEST\0");
     for part in [
-        kind.as_bytes(),
+        kind,
         media_type.as_bytes(),
         schema_version.as_bytes(),
         payload,
@@ -509,7 +514,7 @@ mod tests {
         //   + framed(schema version) + framed(b'{"b":"x", "a":1}')).
         let digest = source_digest("application/json", "0.1.0", br#"{"b":"x", "a":1}"#);
 
-        assert_eq!(digest, SOURCE_DIGEST_VECTOR);
+        assert_eq!(digest, JSON_SOURCE_DIGEST_VECTOR);
         // The bytes are hashed as given: other whitespace is another digest,
         // and so is the semantic frame over the same canonical bytes.
         assert_ne!(
@@ -522,8 +527,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn source_digest_frames_the_exact_payload_bytes() {
+        // Computed independently from the ADR-0004 frame definition:
+        // SHA-256(b"GGDIGEST\0" + framed("source") + framed(media type)
+        //   + framed(schema version) + framed(b"a: 1\n")).
+        let digest = source_digest(
+            "application/vnd.greengateway.bundle+yaml",
+            "greengateway.dev/v1alpha1",
+            b"a: 1\n",
+        );
+
+        assert_eq!(digest, SOURCE_DIGEST_VECTOR);
+        // Formatting is significant to a source digest, unlike a semantic one.
+        assert_ne!(
+            digest,
+            source_digest(
+                "application/vnd.greengateway.bundle+yaml",
+                "greengateway.dev/v1alpha1",
+                b"a:  1\n",
+            )
+        );
+    }
+
     const SEMANTIC_DIGEST_VECTOR: &str =
         "sha256:124516292c7c3fd03616bc36b37cb73344539155601465c400929d4ab5ca6184";
-    const SOURCE_DIGEST_VECTOR: &str =
+    const JSON_SOURCE_DIGEST_VECTOR: &str =
         "sha256:e6c6b953a0920d9d98079cbf0a70bed945601726e770b7f4b5bf914710cee3eb";
+    const SOURCE_DIGEST_VECTOR: &str =
+        "sha256:f617734214f1fe485e45f01f36000685233f8e82c0c327cc1099d8cdf1d89c6f";
 }
