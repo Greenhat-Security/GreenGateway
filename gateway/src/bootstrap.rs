@@ -570,7 +570,7 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // compiler refuses is printed as it reports it, before any stage runs;
     // a stage's failure goes back to `main` like every other startup error.
     let mut stages = ProcessStartup { process_started_at };
-    match start_serving(&mut stages, |name| std::env::var(name)).await {
+    match start_serving(&mut stages, config::process_environment).await {
         Ok(()) => Ok(()),
         Err(StartupFailure::Configuration(err)) => {
             eprintln!("{err}");
@@ -636,7 +636,8 @@ pub(super) trait StartupStages {
     /// Withdraw what preflight published, after activation failed.
     async fn withdraw(&mut self, published: Self::Published);
 
-    async fn serve(&mut self, activated: Self::Activated) -> Result<(), Box<dyn std::error::Error>>;
+    async fn serve(&mut self, activated: Self::Activated)
+        -> Result<(), Box<dyn std::error::Error>>;
 }
 
 /// Serving startup: the configuration compiler, then the stages.
@@ -671,10 +672,7 @@ pub(super) async fn start_serving<S: StartupStages>(
             return Err(StartupFailure::Stage(error));
         }
     };
-    stages
-        .serve(activated)
-        .await
-        .map_err(StartupFailure::Stage)
+    stages.serve(activated).await.map_err(StartupFailure::Stage)
 }
 
 /// The gateway process's startup stages.
@@ -886,7 +884,10 @@ impl StartupStages for ProcessStartup {
         let ProcessPublication {} = published;
     }
 
-    async fn serve(&mut self, activated: ActivatedGateway) -> Result<(), Box<dyn std::error::Error>> {
+    async fn serve(
+        &mut self,
+        activated: ActivatedGateway,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let ActivatedGateway {
             apps,
             listen,

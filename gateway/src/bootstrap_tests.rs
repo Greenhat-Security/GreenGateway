@@ -281,10 +281,8 @@ fn a_serving_failure_is_returned_as_it_is() {
 /// scan in `config/stage_tests.rs` holds that it reaches for none.
 #[test]
 fn compiling_touches_nothing_the_configuration_names() {
-    let root = std::env::temp_dir().join(format!(
-        "greengateway-433-startup-{}",
-        uuid::Uuid::new_v4()
-    ));
+    let root =
+        std::env::temp_dir().join(format!("greengateway-433-startup-{}", uuid::Uuid::new_v4()));
     assert!(!root.exists(), "{} should not exist", root.display());
     let path = |file: &str| root.join(file).to_string_lossy().into_owned();
     let (secrets, database_url) = (path("secrets"), path("secrets/database-url"));

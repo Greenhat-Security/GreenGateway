@@ -9265,6 +9265,66 @@ pub(crate) mod postgres_audit_tests {
         );
     }
 
+    /// A boot whose startup fails after its row is written withdraws the
+    /// row (issue #433, PR 3): it is stamped draining at once, never ready,
+    /// so a newcomer on another fingerprint is not held at the door by a
+    /// replica that will never serve. Withdrawing a boot whose row was
+    /// never written writes none.
+    #[tokio::test]
+    async fn an_unserved_boot_withdraws_its_row_and_stops_holding_agreement() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let heartbeat = Duration::from_secs(1);
+        let window = Duration::from_secs(30);
+
+        let unserved_store = member_store(&pool);
+        let unserved_id = unserved_store.instance_id();
+        let unserved = ClusterMembership::new(unserved_store, registration('a'), heartbeat, window);
+        assert_eq!(
+            unserved.register_boot().await.expect("boot"),
+            FingerprintAgreement::Agreed
+        );
+        let newcomer =
+            ClusterMembership::new(member_store(&pool), registration('b'), heartbeat, window);
+        assert_eq!(
+            newcomer.register_boot().await.expect("boot"),
+            FingerprintAgreement::Disagreeing(vec![unserved_id]),
+            "the starting row holds the newcomer at the door"
+        );
+
+        unserved.withdraw_unserved_boot().await;
+        let members = unserved.store().members(window).await.expect("members");
+        let row = members
+            .iter()
+            .find(|member| member.instance_id == unserved_id)
+            .expect("the row stays until the maintenance sweep");
+        assert!(row.draining_at.is_some(), "the unserved boot is draining");
+        assert!(row.ready_at.is_none(), "and was never ready");
+        assert_eq!(
+            newcomer.check_fingerprint_agreement().await.expect("check"),
+            FingerprintAgreement::Agreed,
+            "a withdrawn boot no longer holds agreement"
+        );
+
+        let unwritten_store = member_store(&pool);
+        let unwritten_id = unwritten_store.instance_id();
+        let unwritten =
+            ClusterMembership::new(unwritten_store, registration('c'), heartbeat, window);
+        unwritten.withdraw_unserved_boot().await;
+        assert!(unserved
+            .store()
+            .members(window)
+            .await
+            .expect("members")
+            .iter()
+            .all(|member| member.instance_id != unwritten_id));
+    }
+
     /// Write a roster row the way a gateway that predates migration 17
     /// does: its heartbeat names no capabilities, so the row advertises
     /// nothing. Returns the row's instance ID.

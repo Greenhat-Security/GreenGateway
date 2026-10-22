@@ -736,10 +736,12 @@ fn a_refusal_reports_no_secret_or_locator() {
             "AUTH_PROVIDERS",
             r#"[{"name":"primary","type":"jwt","client_secret":"zqcanary"}]"#,
         )][..],
-        // A secrets root that is not absolute.
+        // A file alias with no secrets root to read it beneath.
         &[
-            ("CONNECTIONS_SQLITE_PATH", "/var/lib/greengateway/connections.sqlite"),
-            ("CONNECTION_SECRETS_ROOT", "zqcanary"),
+            (
+                "CONNECTIONS_SQLITE_PATH",
+                "/var/lib/greengateway/connections.sqlite",
+            ),
             (
                 "CONNECTION_SECRET_ALIASES",
                 r#"[{"id":"billing","label":"Billing","source":{"type":"file","key":"zqcanary-ledger"}}]"#,

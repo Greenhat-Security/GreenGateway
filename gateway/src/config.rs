@@ -59,6 +59,13 @@ mod storage;
 /// the one-shot commands reach it through [`Config::from_env`].
 pub(crate) use plan::compile;
 
+/// The process environment as the configuration compiler reads it. Serving
+/// startup and [`Config::from_env`] both read their configuration inputs
+/// through this one reader.
+pub(crate) fn process_environment(name: &str) -> Result<String, VarError> {
+    env::var(name)
+}
+
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:8080";
 static DEFAULT_LISTEN_SOCKET_ADDR: LazyLock<SocketAddr> = LazyLock::new(|| {
     DEFAULT_LISTEN_ADDR
@@ -1486,7 +1493,7 @@ pub struct ConfigError {
 
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
-        Self::from_env_vars(|name| env::var(name))
+        Self::from_env_vars(process_environment)
     }
 
     #[cfg(test)]
