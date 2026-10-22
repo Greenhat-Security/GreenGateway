@@ -6687,16 +6687,6 @@
     {
       "file": "gateway/src/audit/postgres_sink.rs",
       "reasons": [
-        "capability-import-or-glob"
-      ],
-      "scope": "gateway::audit::postgres_sink::use crate :: { audit :: { record_flush_outcome , AuditEvent , AuditSink , DurableAck , AUDIT_EVENTS_DROPPED_TOTAL } , metrics :: LOCK_POISON_RECOVERIES_TOTAL , storage :: { postgres_audit :: PostgresAuditEventStore , AuditEventStore as _ } , }#1",
-      "sha256": "492022a3c0f104059f690ae08b8e418fcc95cd8b3e4a0bb73d8b4a1c87c8088a",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
-    },
-    {
-      "file": "gateway/src/audit/postgres_sink.rs",
-      "reasons": [
         "unexpanded-macro"
       ],
       "scope": "gateway::audit::postgres_sink::impl  PostgresSink::completion_guard#1",
@@ -6730,7 +6720,7 @@
         "capability-in-macro-input"
       ],
       "scope": "gateway::audit::postgres_sink::flusher_loop#1",
-      "sha256": "9741912e7dffff5cc3afce6af62126506916cbba5ad9b257ebf7d728fb791915",
+      "sha256": "da578a603b7e9fde39187979da47ec62757a463010024dfd55d5cbf658a9ebf6",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -11677,6 +11667,26 @@
       ],
       "scope": "gateway::storage::postgres_audit::classify_query#1",
       "sha256": "a3ae50a4c225309e969e2992b81a42ffc30aa9b18ade0e67684a1f44b7243573",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_audit.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_audit::impl  PostgresAuditEventStore::checkout_for_insert#1",
+      "sha256": "3cfd0ebcb24656e1bda0153175f546c269551be778ad716ea358b05f78ad24a0",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_audit.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_audit::impl  PostgresAuditEventStore::insert_events_on#1",
+      "sha256": "ab8664706cc498fa5bec3bb785019d1cf324ad07405b2ef73540545c2f7bf95a",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },

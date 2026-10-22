@@ -6,8 +6,9 @@
 //! in-process broadcast, and `greengateway.audit_events` was written only by
 //! `gateway import-standalone`. This sink puts every replica's events into
 //! the shared store through the ONE batch write path the store already has,
-//! [`PostgresAuditEventStore::insert_events`] -- the same call the import
-//! runs -- so a request-path batch gets exactly what an imported one gets:
+//! [`PostgresAuditEventStore::insert_events_on`] -- the transaction the
+//! import's `insert_events` runs -- so a request-path batch gets exactly
+//! what an imported one gets:
 //! `ON CONFLICT (event_id) DO NOTHING` for the events, and the stream append
 //! in presentation order under the transaction-scoped advisory lock, which
 //! is what makes positions contiguous and commit-ordered whichever replica
@@ -42,12 +43,31 @@
 //! - A required record (`AUDIT_DURABILITY=required`, issue #425) arrives
 //!   through `emit_durable` with an acknowledgement a request is waiting
 //!   on. It joins the same buffer in the same order, but wakes the flusher
-//!   at once instead of waiting for a full batch or the interval, and its
+//!   instead of waiting for a full batch or the interval, and its
 //!   acknowledgement is reported only when its batch resolves: `stored`
 //!   after the store call returned success, `not_stored` when the batch is
 //!   dropped, refused by the full buffer or shutdown, or stranded by a
 //!   drain. The waiter's own deadline bounds the wait; the sink never makes
 //!   the writer thread wait for it.
+//! - Required records are group-committed, and only they are urgent. A
+//!   batch is due when the buffer holds a required record, a full batch,
+//!   or an event that has waited [`POSTGRES_FLUSH_INTERVAL`], or when
+//!   shutdown began; anything else waits for one of those, so the events
+//!   written after a decision (the request's observation, its upstream
+//!   attempt) ride the next required commit or the interval exactly as
+//!   they do under `best_effort`, instead of costing a commit of their own
+//!   behind every required one. Records that arrive while a batch is in
+//!   flight ride the next one. A record that wakes an idle flusher commits
+//!   at once when it is alone, but while required records are arriving
+//!   concurrently -- two are waiting, or the last batch that answered a
+//!   waiter answered several within the last second -- it first waits a
+//!   short window, the last store call's duration capped at
+//!   [`POSTGRES_GROUP_COMMIT_MAX_WAIT`], for the records arriving behind
+//!   it. Every commit ends in a WAL flush that every other writer of the
+//!   database queues behind (the shared rate-limit bucket commits once per
+//!   request), so a commit per arriving record would slow the very request
+//!   path it is meant to evidence. Nothing is acknowledged before the
+//!   commit that carries it.
 //!
 //! Threading model. The SQLite sink runs its flusher on a thread of its own
 //! because rusqlite is synchronous: the I/O needs a thread the writer does
@@ -86,7 +106,7 @@ use tokio::{runtime::Handle, sync::Notify};
 use crate::{
     audit::{record_flush_outcome, AuditEvent, AuditSink, DurableAck, AUDIT_EVENTS_DROPPED_TOTAL},
     metrics::LOCK_POISON_RECOVERIES_TOTAL,
-    storage::{postgres_audit::PostgresAuditEventStore, AuditEventStore as _},
+    storage::postgres_audit::PostgresAuditEventStore,
 };
 
 #[cfg(doc)]
@@ -115,6 +135,16 @@ const POSTGRES_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 /// The pool's acquire and connect timeouts are inside it; this is the bound
 /// on a statement that hangs.
 const POSTGRES_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The longest an idle flusher holds a required record back so the records
+/// arriving behind it share its commit (see the module docs). The window
+/// is the last store call's own duration -- one commit is what waiting
+/// saves the database -- and this caps what it can add to a request.
+const POSTGRES_GROUP_COMMIT_MAX_WAIT: Duration = Duration::from_millis(25);
+
+/// How long a batch that answered several waiters counts as evidence that
+/// required records are still arriving concurrently.
+const POSTGRES_GROUP_COMMIT_EVIDENCE: Duration = Duration::from_secs(1);
 
 /// How much before the waiter's deadline the flusher must have finished:
 /// the flusher gives up at the deadline less this, and the slack is for it
@@ -148,6 +178,7 @@ struct PostgresSinkSettings {
     retry_backoff: Duration,
     attempt_timeout: Duration,
     flush_deadline: Duration,
+    group_commit_max_wait: Duration,
 }
 
 #[derive(Debug)]
@@ -188,6 +219,7 @@ impl PostgresSink {
                 retry_backoff: POSTGRES_RETRY_BACKOFF,
                 attempt_timeout: POSTGRES_ATTEMPT_TIMEOUT,
                 flush_deadline: config.flush_deadline,
+                group_commit_max_wait: POSTGRES_GROUP_COMMIT_MAX_WAIT,
             },
         )
     }
@@ -211,6 +243,9 @@ impl PostgresSink {
             in_flight_acks: Mutex::new(Vec::new()),
             dropped: AtomicU64::new(0),
             stored: AtomicU64::new(0),
+            group_commit: Mutex::new(GroupCommitEvidence::default()),
+            #[cfg(test)]
+            store_calls: AtomicU64::new(0),
         });
         let (completion_tx, completion_rx) = mpsc::channel();
         handle.spawn(flusher_loop(Arc::clone(&shared), completion_tx));
@@ -405,6 +440,34 @@ struct PostgresSinkShared {
     in_flight_acks: Mutex<Vec<DurableAck>>,
     dropped: AtomicU64,
     stored: AtomicU64,
+    /// What recent store calls say about the load, for the group commit:
+    /// read by an idle flusher deciding whether to wait.
+    group_commit: Mutex<GroupCommitEvidence>,
+    /// Successful store calls since boot, so tests can count commits.
+    #[cfg(test)]
+    store_calls: AtomicU64,
+}
+
+/// What recent store calls say about the load: how long the last one took,
+/// and how many required records the last batch that answered any waiter
+/// acknowledged, and when.
+#[derive(Clone, Copy, Debug, Default)]
+struct GroupCommitEvidence {
+    store_call: Duration,
+    acknowledged: usize,
+    acknowledged_at: Option<Instant>,
+}
+
+/// Whether the buffer holds a batch that must be written now.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Due {
+    /// Nothing is buffered.
+    Empty,
+    /// A required record is waiting, the batch is full, the oldest event
+    /// has waited the interval, or shutdown began.
+    Now,
+    /// Only events nobody waits on, the oldest due after this long.
+    After(Duration),
 }
 
 impl PostgresSinkShared {
@@ -466,30 +529,56 @@ impl PostgresSinkShared {
         batch
     }
 
-    /// One batch through the store's single write path, retried within the
-    /// budget, then dropped and counted.
+    /// The next batch through the store's single write path, retried within
+    /// the budget, then dropped and counted.
+    ///
+    /// The batch is taken from the buffer once the first attempt holds a
+    /// connection, not before: under load the wait for the pool is the long
+    /// part, and every record that arrives during it rides this commit
+    /// rather than the next. An attempt that fails before it has one takes
+    /// the batch anyway, so the retry budget and the drop count apply to a
+    /// definite set of events, as they always have.
     ///
     /// The timeout around each attempt drops the store's future mid-
     /// transaction, and that is safe only because the store's transaction
     /// rolls itself back when dropped (`postgres_audit.rs`); a hand-driven
     /// `BEGIN` would leave the stream lock held on a pooled connection.
-    async fn write_batch(&self, batch: Vec<AuditEvent>) {
-        let count = batch.len();
+    async fn write_next_batch(&self) {
+        let mut batch: Option<Vec<AuditEvent>> = None;
         let mut attempt = 0_u32;
         loop {
             attempt += 1;
             let remaining = self.remaining_budget();
             if remaining.is_some_and(|left| left.is_zero()) {
-                self.drop_batch(count, "the flush deadline passed");
+                let count = batch.get_or_insert_with(|| self.take_batch()).len();
+                if count > 0 {
+                    self.drop_batch(count, "the flush deadline passed");
+                }
                 return;
             }
             let budget = remaining.map_or(self.settings.attempt_timeout, |left| {
                 left.min(self.settings.attempt_timeout)
             });
-            let failure = match tokio::time::timeout(budget, self.store.insert_events(&batch)).await
-            {
+            let started = Instant::now();
+            let attempt_result = tokio::time::timeout(budget, async {
+                let client = self.store.checkout_for_insert().await;
+                let events = batch.get_or_insert_with(|| self.take_batch());
+                let mut client = client?;
+                self.store.insert_events_on(&mut client, events).await
+            })
+            .await;
+            // An attempt cancelled while it waited for the pool formed no
+            // batch; this one is what the retries and the drop count are for.
+            let count = batch.get_or_insert_with(|| self.take_batch()).len();
+            if count == 0 {
+                // A stranding drain emptied the buffer before a connection
+                // came: there is no batch to account for.
+                return;
+            }
+            let failure = match attempt_result {
                 Ok(Ok(())) => {
                     record_flush_outcome(true);
+                    self.note_group_commit(started.elapsed());
                     // Zero if a waiter already counted this batch as lost;
                     // the rows are there regardless.
                     let landed = self.in_flight.swap(0, Ordering::AcqRel);
@@ -566,6 +655,101 @@ impl PostgresSinkShared {
             self.note_dropped(stranded);
         }
         stranded
+    }
+
+    /// Remember what the batch that just landed says about the load: its
+    /// store call's duration, and how many waiting requests it answers.
+    /// Read before the acknowledgements are settled, which takes them.
+    fn note_group_commit(&self, store_call: Duration) {
+        let acknowledged = recover_lock(&self.in_flight_acks, "postgres_sink_acks").len();
+        let mut evidence = recover_lock(&self.group_commit, "postgres_sink_group_commit");
+        evidence.store_call = store_call;
+        if acknowledged > 0 {
+            evidence.acknowledged = acknowledged;
+            evidence.acknowledged_at = Some(Instant::now());
+        }
+        #[cfg(test)]
+        self.store_calls.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Whether to write a batch now; see the module docs for the rule.
+    /// The scan for a required record runs only below a full batch, so it
+    /// is bounded by the batch size.
+    fn due(&self) -> Due {
+        let buffer = self.buffer_guard();
+        let Some((oldest, _, _)) = buffer.front() else {
+            return Due::Empty;
+        };
+        if self.shutdown.load(Ordering::Acquire)
+            || buffer.len() >= self.settings.batch_size
+            || buffer.iter().any(|(_, _, ack)| ack.is_some())
+        {
+            return Due::Now;
+        }
+        match self.settings.flush_interval.checked_sub(oldest.elapsed()) {
+            Some(left) if !left.is_zero() => Due::After(left),
+            _ => Due::Now,
+        }
+    }
+
+    /// How long an idle flusher should hold its next batch back so the
+    /// required records arriving behind the one that woke it share its
+    /// commit, or `None` to take the batch now.
+    ///
+    /// Only while required records are waiting and are not alone: either
+    /// the buffer already holds two, or the last batch that answered any
+    /// waiter answered two or more within [`POSTGRES_GROUP_COMMIT_EVIDENCE`],
+    /// which is a burst still arriving. A lone request commits at once. The
+    /// window is the last store call's duration, the cost a second commit
+    /// would put on the database, capped by the setting. Never once
+    /// shutdown began, and never for a full batch.
+    fn group_commit_window(&self) -> Option<Duration> {
+        if self.shutdown.load(Ordering::Acquire) {
+            return None;
+        }
+        let waiting = {
+            let buffer = self.buffer_guard();
+            if buffer.len() >= self.settings.batch_size {
+                return None;
+            }
+            buffer.iter().filter(|(_, _, ack)| ack.is_some()).count()
+        };
+        if waiting == 0 {
+            return None;
+        }
+        let evidence = *recover_lock(&self.group_commit, "postgres_sink_group_commit");
+        let concurrent = evidence.acknowledged >= 2
+            && evidence
+                .acknowledged_at
+                .is_some_and(|at| at.elapsed() < POSTGRES_GROUP_COMMIT_EVIDENCE);
+        if waiting < 2 && !concurrent {
+            return None;
+        }
+        let window = evidence.store_call.min(self.settings.group_commit_max_wait);
+        (!window.is_zero()).then_some(window)
+    }
+
+    /// Hold the next batch back for the group-commit window, ending early
+    /// when the batch fills or shutdown begins. Every required record and
+    /// every full batch notifies, so each arrival re-checks both.
+    async fn gather_group_commit(&self) {
+        let Some(window) = self.group_commit_window() else {
+            return;
+        };
+        let deadline = tokio::time::Instant::now() + window;
+        loop {
+            if self.shutdown.load(Ordering::Acquire)
+                || self.buffer_guard().len() >= self.settings.batch_size
+            {
+                return;
+            }
+            if tokio::time::timeout_at(deadline, self.wake.notified())
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
     }
 
     /// Report the held batch's outcome to every request waiting on a record
@@ -661,23 +845,40 @@ fn recover_lock<'a, T>(mutex: &'a Mutex<T>, lock_name: &'static str) -> MutexGua
     }
 }
 
-/// The flusher: batches until the buffer is empty, then waits for a
-/// batch-size wakeup or the interval; after shutdown it drains what is left
+/// The flusher: writes batches while one is due (see the module docs),
+/// otherwise waits for a batch-size, required-record or shutdown wakeup or
+/// for the oldest event to come due; after shutdown it drains what is left
 /// (each batch bounded by the deadline) and reports completion.
+///
+/// Woken from idle, it first gives a burst of required records its
+/// group-commit window. Straight after a batch it does not: whatever
+/// arrived meanwhile has already waited one commit, and goes now.
 async fn flusher_loop(shared: Arc<PostgresSinkShared>, completion: Sender<()>) {
+    let mut idle = true;
     loop {
-        let batch = shared.take_batch();
-        if batch.is_empty() {
-            if shared.is_drained_after_shutdown() {
-                break;
+        let wait = match shared.due() {
+            Due::Now => None,
+            Due::After(left) => Some(left),
+            Due::Empty => {
+                if shared.is_drained_after_shutdown() {
+                    break;
+                }
+                Some(shared.settings.flush_interval)
             }
+        };
+        if let Some(wait) = wait {
             tokio::select! {
                 () = shared.wake.notified() => {}
-                () = tokio::time::sleep(shared.settings.flush_interval) => {}
+                () = tokio::time::sleep(wait) => {}
             }
+            idle = true;
             continue;
         }
-        shared.write_batch(batch).await;
+        if idle {
+            shared.gather_group_commit().await;
+        }
+        shared.write_next_batch().await;
+        idle = false;
     }
     let _ = completion.send(());
 }
@@ -715,6 +916,7 @@ mod tests {
             retry_backoff: Duration::from_millis(20),
             attempt_timeout: Duration::from_secs(5),
             flush_deadline,
+            group_commit_max_wait: POSTGRES_GROUP_COMMIT_MAX_WAIT,
         }
     }
 
@@ -758,6 +960,21 @@ mod tests {
         })
         .join()
         .expect("the writer thread should not panic")
+    }
+
+    async fn wait_until_async<F, Fut>(timeout: Duration, mut condition: F) -> bool
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if condition().await {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        condition().await
     }
 
     async fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
@@ -966,6 +1183,45 @@ mod tests {
             .await
             .expect("the audit schema should migrate");
         foundation.pool().clone()
+    }
+
+    /// A second pool on an already migrated database, `pool_max` wide, for
+    /// the sink under test: the tests that starve the sink of connections
+    /// cannot share the pool the migration and their own reads need.
+    async fn sized_pool(database: &TestDatabase, pool_max: usize) -> deadpool_postgres::Pool {
+        let mut config = crate::config::Config::test_defaults();
+        config.state_backend = crate::config::StateBackend::Postgres;
+        config.deployment_id = Some("deploy-audit-sink".to_owned());
+        let dsn_file = write_dsn_file(&database.dsn);
+        config.database.url_file = Some(dsn_file.path.clone());
+        config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+        config.database.pool_max = pool_max;
+        PostgresFoundation::establish(&config)
+            .await
+            .expect("the sized pool should establish")
+            .pool()
+            .clone()
+    }
+
+    /// Sessions of this database waiting on a lock inside a statement that
+    /// names `greengateway.audit_events`: the sink's batch, wedged.
+    async fn blocked_audit_writers(pool: &deadpool_postgres::Pool) -> i64 {
+        pool.get()
+            .await
+            .expect("checkout")
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity \
+                 WHERE datname = current_database() AND wait_event_type = 'Lock' \
+                   AND query ILIKE '%greengateway.audit_events%'",
+                &[],
+            )
+            .await
+            .expect("pg_stat_activity should query")
+            .get(0)
+    }
+
+    fn store_calls(sink: &PostgresSink) -> u64 {
+        sink.shared.store_calls.load(Ordering::Acquire)
     }
 
     /// Every stream row joined to its event: position, event id, and the
@@ -1192,6 +1448,234 @@ mod tests {
         assert_eq!(sink.stored_total(), 5);
         assert_eq!(event_row_count(&pool).await, 5);
         assert_eq!(sink.dropped_total(), 300);
+    }
+
+    /// Required durability under contention (issue #425): a flusher that
+    /// has to wait for a pooled connection takes its batch only once it has
+    /// one, so the records that arrived during the wait share that commit
+    /// instead of each paying for another WAL flush -- and none of them is
+    /// acknowledged before the commit lands.
+    #[tokio::test]
+    async fn required_records_arriving_while_the_flusher_waits_for_the_pool_share_its_commit() {
+        use crate::audit::durable::DurableOutcome;
+
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_pool(&database).await;
+        let sink_pool = sized_pool(&database, 1).await;
+        let held = sink_pool
+            .get()
+            .await
+            .expect("the test holds the sink's only connection");
+        let store = Arc::new(PostgresAuditEventStore::new(
+            sink_pool.clone(),
+            Some(identity()),
+        ));
+        let sink = Arc::new(
+            PostgresSink::new_with_settings(
+                store,
+                test_settings(
+                    1_000,
+                    Duration::from_secs(3_600),
+                    POSTGRES_BUFFER_CAPACITY,
+                    Duration::from_secs(5),
+                ),
+            )
+            .expect("sink should build"),
+        );
+
+        let mut outcomes = Vec::new();
+        for index in 0..3 {
+            let (ack, outcome) = DurableAck::channel();
+            sink.emit_durable(&test_event(index), ack);
+            outcomes.push(outcome);
+            // The first record sends the flusher to the pool, where it waits.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(event_row_count(&pool).await, 0);
+        for outcome in &mut outcomes {
+            assert!(
+                outcome.try_recv().is_err(),
+                "no record may be acknowledged before the commit that carries it"
+            );
+        }
+
+        drop(held);
+        for outcome in outcomes {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(10), outcome)
+                    .await
+                    .expect("every record should be acknowledged"),
+                Ok(DurableOutcome::Stored)
+            );
+        }
+        assert_eq!(event_row_count(&pool).await, 3);
+        assert_eq!(
+            store_calls(&sink),
+            1,
+            "the records that queued behind the pool must share one commit"
+        );
+    }
+
+    /// Only required records are urgent (issue #425). Events nobody waits
+    /// on -- a request's observation, its upstream attempt -- that arrive
+    /// while a required commit is in flight are not given a commit of their
+    /// own the moment it lands; they wait for the interval, or ride the next
+    /// required commit, exactly as they would under `best_effort`.
+    #[tokio::test]
+    async fn events_nobody_waits_on_ride_the_next_required_commit_instead_of_their_own() {
+        use crate::audit::durable::DurableOutcome;
+
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_pool(&database).await;
+        let store = Arc::new(PostgresAuditEventStore::new(pool.clone(), Some(identity())));
+        let sink = Arc::new(
+            PostgresSink::new_with_settings(
+                store,
+                test_settings(
+                    1_000,
+                    Duration::from_secs(3_600),
+                    POSTGRES_BUFFER_CAPACITY,
+                    Duration::from_secs(5),
+                ),
+            )
+            .expect("sink should build"),
+        );
+
+        // Wedge the first required commit behind a table lock, so the other
+        // events arrive while it is in flight.
+        let locker = pool.get().await.expect("checkout");
+        locker
+            .batch_execute("BEGIN; LOCK TABLE greengateway.audit_events IN ACCESS EXCLUSIVE MODE")
+            .await
+            .expect("the audit table should lock");
+        let (ack, first) = DurableAck::channel();
+        sink.emit_durable(&test_event(0), ack);
+        assert!(
+            wait_until_async(Duration::from_secs(10), || async {
+                blocked_audit_writers(&pool).await >= 1
+            })
+            .await,
+            "the required commit should be in flight behind the lock"
+        );
+        sink.emit(&test_event(1));
+        sink.emit(&test_event(2));
+        locker
+            .batch_execute("ROLLBACK")
+            .await
+            .expect("the lock should release");
+        drop(locker);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), first)
+                .await
+                .expect("the first record should be acknowledged"),
+            Ok(DurableOutcome::Stored)
+        );
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            (store_calls(&sink), event_row_count(&pool).await),
+            (1, 1),
+            "events nobody waits on must not get a commit of their own behind a required one"
+        );
+
+        let (ack, second) = DurableAck::channel();
+        sink.emit_durable(&test_event(3), ack);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), second)
+                .await
+                .expect("the second record should be acknowledged"),
+            Ok(DurableOutcome::Stored)
+        );
+        assert_eq!(
+            (store_calls(&sink), event_row_count(&pool).await),
+            (2, 4),
+            "the waiting events ride the next required commit"
+        );
+    }
+
+    /// The group-commit window (issue #425): once a batch has answered
+    /// several waiters, a required record that wakes an idle flusher waits
+    /// the last store call's duration for the records arriving behind it,
+    /// and they share its commit.
+    #[tokio::test]
+    async fn a_burst_of_required_records_shares_a_commit_within_the_window() {
+        use crate::audit::durable::DurableOutcome;
+
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_pool(&database).await;
+        let sink_pool = sized_pool(&database, 1).await;
+        let store = Arc::new(PostgresAuditEventStore::new(
+            sink_pool.clone(),
+            Some(identity()),
+        ));
+        let mut settings = test_settings(
+            1_000,
+            Duration::from_secs(3_600),
+            POSTGRES_BUFFER_CAPACITY,
+            Duration::from_secs(5),
+        );
+        // The window is then the last store call's duration, uncapped.
+        settings.group_commit_max_wait = Duration::from_secs(5);
+        let sink =
+            Arc::new(PostgresSink::new_with_settings(store, settings).expect("sink should build"));
+
+        // Evidence of a burst: two records that queue behind the pool and
+        // land together, in a store call that took at least the hold.
+        let held = sink_pool.get().await.expect("checkout");
+        let mut outcomes = Vec::new();
+        for index in 0..2 {
+            let (ack, outcome) = DurableAck::channel();
+            sink.emit_durable(&test_event(index), ack);
+            outcomes.push(outcome);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        drop(held);
+        for outcome in outcomes.drain(..) {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(10), outcome)
+                    .await
+                    .expect("the burst should be acknowledged"),
+                Ok(DurableOutcome::Stored)
+            );
+        }
+        assert_eq!(store_calls(&sink), 1);
+
+        // The next record waits the window; the one behind it joins.
+        for index in 2..4 {
+            let (ack, outcome) = DurableAck::channel();
+            sink.emit_durable(&test_event(index), ack);
+            outcomes.push(outcome);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        for outcome in outcomes {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(10), outcome)
+                    .await
+                    .expect("the burst should be acknowledged"),
+                Ok(DurableOutcome::Stored)
+            );
+        }
+        assert_eq!(event_row_count(&pool).await, 4);
+        assert_eq!(
+            store_calls(&sink),
+            2,
+            "a record that arrives inside the window shares the commit"
+        );
     }
 
     /// Required durability against a real authority (issue #425): a record
