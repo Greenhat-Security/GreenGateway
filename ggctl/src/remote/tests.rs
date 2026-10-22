@@ -461,9 +461,15 @@ fn pki(san: IpAddr) -> Pki {
     let ca_key = rcgen::KeyPair::generate().expect("CA key");
     let ca = ca_params.self_signed(&ca_key).expect("CA certificate");
     let mut server_params = rcgen::CertificateParams::default();
+    server_params.distinguished_name = rcgen::DistinguishedName::new();
+    server_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "ggctl test server");
     server_params
         .subject_alt_names
         .push(rcgen::SanType::IpAddress(san));
+    // macOS requires the server-authentication purpose on a TLS leaf.
+    server_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
     let server_key = rcgen::KeyPair::generate().expect("server key");
     let server = server_params
         .signed_by(

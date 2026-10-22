@@ -27,7 +27,7 @@ ggctl help [COMMAND]
 ggctl --help | --version
 ```
 
-`ggctl help COMMAND` and `ggctl COMMAND --help` print a command's options. Help and the completion scripts are generated from the same command table the parser uses, so they cannot drift.
+`ggctl help COMMAND` and `ggctl COMMAND --help` print a command's options. Help and the completion scripts are generated from the same command table the parser uses, so they cannot drift. Man pages, which ADR-0008 also generates from that table, arrive with packaging (#242 PR 18).
 
 ### `version`
 

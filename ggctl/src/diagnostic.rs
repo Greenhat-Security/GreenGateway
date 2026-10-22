@@ -548,7 +548,7 @@ mod tests {
     fn the_reference_documents_every_code_in_its_family_with_its_exit() {
         let document = reference();
         for family in FAMILIES {
-            let mut heading = family.to_owned();
+            let mut heading = (*family).to_owned();
             heading[..1].make_ascii_uppercase();
             let section = section(&document, &format!("{heading} diagnostics"));
             let documented: Vec<_> = section

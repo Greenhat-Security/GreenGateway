@@ -336,14 +336,26 @@ fn an_unreachable_server_is_retryable_and_names_nothing_about_it() {
 }
 
 fn tls_config() -> (String, Arc<rustls::ServerConfig>) {
+    // Distinct subject names: a leaf whose subject equals its issuer's looks
+    // self-issued, and platform verifiers refuse to chain it.
     let mut ca_params = rcgen::CertificateParams::default();
+    ca_params.distinguished_name = rcgen::DistinguishedName::new();
+    ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "ggctl test CA");
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     let ca_key = rcgen::KeyPair::generate().expect("CA key");
     let ca = ca_params.self_signed(&ca_key).expect("CA");
     let mut server_params = rcgen::CertificateParams::default();
+    server_params.distinguished_name = rcgen::DistinguishedName::new();
+    server_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "ggctl test server");
     server_params
         .subject_alt_names
         .push(rcgen::SanType::IpAddress(Ipv4Addr::LOCALHOST.into()));
+    // macOS requires the server-authentication purpose on a TLS leaf.
+    server_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
     let server_key = rcgen::KeyPair::generate().expect("server key");
     let server = server_params
         .signed_by(
