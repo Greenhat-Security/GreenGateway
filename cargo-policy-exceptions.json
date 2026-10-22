@@ -400,13 +400,10 @@
         ],
         "3.0.6": [
           "async-trait@0.1.92",
-          "darling_core@0.24.1",
-          "darling_macro@0.24.1",
           "displaydoc@0.2.7",
           "futures-macro@0.3.34",
           "gateway@1.0.1",
           "ref-cast-impl@1.0.27",
-          "rmcp-macros@3.5.1",
           "schemars_derive@1.2.2",
           "serde_derive@1.0.229",
           "serde_derive_internals@0.30.0",

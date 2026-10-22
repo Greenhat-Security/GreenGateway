@@ -1,4 +1,4 @@
-use std::{borrow::Cow, future::Future, pin::Pin, sync::Arc, time::Instant};
+use std::{borrow::Cow, fmt, future::Future, pin::Pin, sync::Arc, time::Instant};
 
 use axum::{
     body::Body,
@@ -18,7 +18,10 @@ use rmcp::{
     },
     ServerHandler,
 };
-use serde::{de::IgnoredAny, Deserialize};
+use serde::{
+    de::{IgnoredAny, MapAccess, Visitor},
+    Deserialize,
+};
 use serde_json::{json, Map, Value};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
@@ -120,30 +123,151 @@ pub(crate) async fn mcp_endpoint(
 #[derive(Clone, Copy, Debug)]
 struct TaskAugmentedToolCall;
 
-#[derive(Deserialize)]
-struct JsonRpcRequestProbe<'a> {
-    #[serde(borrow, default)]
-    method: Option<Cow<'a, str>>,
-    #[serde(default)]
-    params: Option<ToolCallParamsProbe>,
-}
-
-#[derive(Deserialize)]
-struct ToolCallParamsProbe {
-    #[serde(default)]
-    task: Option<IgnoredAny>,
-}
-
 /// Whether `body` is a `tools/call` request with a non-null `params.task`.
 ///
 /// Any non-null value counts, including one rmcp 2 could not parse as task
-/// metadata: such a call is refused, never run. A body that is not a single
-/// JSON-RPC object is left to rmcp, which rejects what it cannot parse.
+/// metadata: such a call is refused, never run. Repeated members are all
+/// read, because rmcp ignores the `task` member it no longer knows however
+/// often it occurs: a call any copy of which asks for a task is refused. A
+/// body this cannot read counts as well. rmcp rejects such a body before any
+/// tool runs, and a call it did accept would still be refused, not run.
 fn is_task_augmented_tool_call(body: &[u8]) -> bool {
-    serde_json::from_slice::<JsonRpcRequestProbe<'_>>(body).is_ok_and(|probe| {
-        probe.method.as_deref() == Some("tools/call")
-            && probe.params.is_some_and(|params| params.task.is_some())
-    })
+    serde_json::from_slice::<TaskCallProbe>(body)
+        .map_or(true, |probe| probe.names_tools_call && probe.carries_task)
+}
+
+/// The members of a JSON-RPC request `is_task_augmented_tool_call` reads,
+/// collected without materializing the body.
+#[derive(Default)]
+struct TaskCallProbe {
+    /// Some `method` member is `"tools/call"`.
+    names_tools_call: bool,
+    /// Some `params` member has a non-null `task`.
+    carries_task: bool,
+}
+
+impl<'de> Deserialize<'de> for TaskCallProbe {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(TaskCallProbeVisitor)
+    }
+}
+
+struct TaskCallProbeVisitor;
+
+impl<'de> Visitor<'de> for TaskCallProbeVisitor {
+    type Value = TaskCallProbe;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON-RPC request object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut probe = TaskCallProbe::default();
+        while let Some(member) = map.next_key::<ProbeWord>()? {
+            match member {
+                ProbeWord::Method => {
+                    probe.names_tools_call |=
+                        map.next_value::<ProbeWord>()? == ProbeWord::ToolsCall;
+                }
+                ProbeWord::Params => {
+                    let params = map.next_value::<Option<TaskParamsProbe>>()?;
+                    probe.carries_task |= params.is_some_and(|params| params.carries_task);
+                }
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(probe)
+    }
+}
+
+/// Whether some `task` member of a `params` object is non-null.
+struct TaskParamsProbe {
+    carries_task: bool,
+}
+
+impl<'de> Deserialize<'de> for TaskParamsProbe {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(TaskParamsProbeVisitor)
+    }
+}
+
+struct TaskParamsProbeVisitor;
+
+impl<'de> Visitor<'de> for TaskParamsProbeVisitor {
+    type Value = TaskParamsProbe;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON-RPC params object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut carries_task = false;
+        while let Some(member) = map.next_key::<ProbeWord>()? {
+            if member == ProbeWord::Task {
+                carries_task |= map.next_value::<Option<IgnoredAny>>()?.is_some();
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(TaskParamsProbe { carries_task })
+    }
+}
+
+/// A member name or `method` value the probes look for, compared unescaped
+/// as rmcp reads it. Other strings are not kept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProbeWord {
+    Method,
+    Params,
+    Task,
+    ToolsCall,
+    Other,
+}
+
+impl<'de> Deserialize<'de> for ProbeWord {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_str(ProbeWordVisitor)
+    }
+}
+
+struct ProbeWordVisitor;
+
+impl Visitor<'_> for ProbeWordVisitor {
+    type Value = ProbeWord;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a string")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(match value {
+            "method" => ProbeWord::Method,
+            "params" => ProbeWord::Params,
+            "task" => ProbeWord::Task,
+            "tools/call" => ProbeWord::ToolsCall,
+            _ => ProbeWord::Other,
+        })
+    }
 }
 
 fn is_task_augmented_request(context: &RequestContext<RoleServer>) -> bool {
@@ -925,6 +1049,8 @@ pub(crate) fn mcp_executor_from_config(
 mod tests {
     use std::{net::SocketAddr, time::Duration};
 
+    use rmcp::model::{ClientJsonRpcMessage, ClientRequest};
+
     use super::*;
     use crate::{
         audit::{self, AuditSink},
@@ -1573,26 +1699,62 @@ mod tests {
                 "{body}"
             );
         }
-        assert!(is_task_augmented_tool_call(
-            br#"{"jsonrpc":"2.0","id":1,"method":"tools\/call","params":{"name":"echo","task":{}}}"#
-        ));
+        // Escaped names and values are read as rmcp reads them, and every
+        // copy of a repeated member counts. rmcp ignores `task` however often
+        // it occurs, so it would run these calls as ordinary ones.
+        for body in [
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools\/call","params":{"name":"echo","task":{}}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","t\u0061sk":{}}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","task":{},"task":null}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","task":null,"task":{}}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","task":{},"task":{}}}"#,
+        ] {
+            assert!(is_task_augmented_tool_call(body.as_bytes()), "{body}");
+            assert!(
+                matches!(
+                    serde_json::from_str::<ClientJsonRpcMessage>(body),
+                    Ok(ClientJsonRpcMessage::Request(request))
+                        if matches!(request.request, ClientRequest::CallToolRequest(_))
+                ),
+                "rmcp should route {body} as a tools/call"
+            );
+        }
 
         for body in [
             json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                    "params": {"name": "echo", "arguments": {"task": {}}}}),
             json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                    "params": {"name": "echo", "task": null}}),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "echo", "_meta": {"task": {}}}}),
             json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list",
                    "params": {"task": {}}}),
-            json!([{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                    "params": {"name": "echo", "task": {}}}]),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "task": {},
+                   "params": {"name": "echo"}}),
         ] {
             assert!(
                 !is_task_augmented_tool_call(body.to_string().as_bytes()),
                 "{body}"
             );
         }
-        assert!(!is_task_augmented_tool_call(b"not json"));
+
+        // A body the probe cannot read counts as a task call. rmcp rejects
+        // each of these before any tool runs.
+        for body in [
+            "not json".to_owned(),
+            json!([{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": "echo"}}])
+            .to_string(),
+            json!({"jsonrpc": "2.0", "id": 1, "method": 7, "params": {"name": "echo"}}).to_string(),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": ["echo"]})
+                .to_string(),
+        ] {
+            assert!(is_task_augmented_tool_call(body.as_bytes()), "{body}");
+            assert!(
+                serde_json::from_str::<ClientJsonRpcMessage>(&body).is_err(),
+                "rmcp should reject {body}"
+            );
+        }
     }
 
     #[tokio::test]
