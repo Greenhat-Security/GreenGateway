@@ -49,7 +49,9 @@ async fn admin_session_oidc_contract_preserves_csrf_origins_prefix_and_listener_
         let mut config = admin_oidc_login_config(&oidc.issuer);
         config.admin_prefix = "/operations".to_owned();
         config.admin_session = Some(auth::admin_session::AdminSessionConfig {
+            storage: auth::admin_session::AdminSessionStorage::StandaloneMemory,
             ttl: Duration::from_secs(60),
+            idle_timeout: Duration::from_secs(60),
             max_entries: 8,
         });
         config.auth_providers[0].jwks_url =
@@ -201,6 +203,22 @@ async fn admin_session_oidc_contract_preserves_csrf_origins_prefix_and_listener_
         for attribute in ["__Host-", "HttpOnly", "Secure", "SameSite=Lax", "Path=/"] {
             assert!(session_cookie.contains(attribute));
         }
+        // The CSRF token the session is bound to is set again with the
+        // session's lifetime and the minted cookie's attributes, still
+        // readable by page script.
+        let csrf_cookies: Vec<_> = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|cookie| cookie.to_str().unwrap().to_owned())
+            .filter(|cookie| cookie.starts_with("ops_csrf="))
+            .collect();
+        assert_eq!(
+            csrf_cookies,
+            [format!(
+                "ops_csrf={csrf}; Path=/; SameSite=Lax; Secure; Max-Age=60"
+            )]
+        );
         let cookies = format!(
             "{}; ops_csrf={csrf}",
             session_cookie.split(';').next().unwrap()
@@ -245,6 +263,50 @@ async fn admin_session_oidc_contract_preserves_csrf_origins_prefix_and_listener_
                 .unwrap();
             assert_eq!(response.status(), expected);
         }
+        // A pair that agrees with itself, but is not the one the session was
+        // issued with, is refused as a CSRF failure before the handler.
+        let unbound_cookies = format!(
+            "{}; ops_csrf=unbound-fixture-token",
+            session_cookie.split(';').next().unwrap()
+        );
+        let unbound = admin
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                &format!("{PREFIX}/policy/validate"),
+                &unbound_cookies,
+                Some("unbound-fixture-token"),
+                Some(ORIGIN),
+                policy_body.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unbound.status(), StatusCode::FORBIDDEN);
+        let unbound: Value =
+            serde_json::from_slice(&to_bytes(unbound.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(unbound, json!({"error": "csrf token missing or invalid"}));
+        assert_eventually(Duration::from_secs(1), || {
+            capture.events().iter().any(|event| {
+                event.event_type == "auth.failure"
+                    && event.payload["reason"] == "admin_session_csrf_unbound"
+            })
+        });
+        // Reading needs no CSRF token, so the session still reads under the
+        // other cookie.
+        let read = admin
+            .clone()
+            .oneshot(request(
+                Method::GET,
+                &format!("{PREFIX}/status"),
+                &unbound_cookies,
+                None,
+                None,
+                Value::Null,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(read.status(), StatusCode::OK);
         for path in ["/mcp", "/v1/operations/unregistered"] {
             let response = admin
                 .clone()
@@ -450,4 +512,24 @@ async fn admin_session_discovery_is_absent_when_mode_is_disabled() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     oidc.finish();
+}
+
+/// Cluster mode's store rides the PostgreSQL pending-login seed. Without it
+/// startup fails; it never falls back to a process-local map.
+#[test]
+fn the_cluster_session_store_never_falls_back_to_process_memory() {
+    let mut config = auth::admin_session::AdminSessionConfig {
+        storage: auth::admin_session::AdminSessionStorage::ClusterPostgres,
+        ttl: Duration::from_secs(60),
+        idle_timeout: Duration::from_secs(60),
+        max_entries: 8,
+    };
+    let refused = admin_session_store(&config, None)
+        .err()
+        .expect("no cluster store without the PostgreSQL seed");
+    assert!(refused
+        .to_string()
+        .contains("cluster_postgres requires the PostgreSQL session store"));
+    config.storage = auth::admin_session::AdminSessionStorage::StandaloneMemory;
+    assert!(admin_session_store(&config, None).is_ok());
 }

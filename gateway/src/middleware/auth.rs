@@ -21,8 +21,10 @@ use serde_json::json;
 use crate::{
     audit::{AuditEvent, AuditLog},
     auth::{
-        actor_from_principal, protected_resource, AuthError, Principal, PrincipalDirectory,
-        SessionCredential, SessionValidator, VerifiedClientIdentity,
+        actor_from_principal,
+        admin_session::{self, SessionRefusal},
+        protected_resource, AuthError, Principal, PrincipalDirectory, SessionCredential,
+        SessionValidator, VerifiedClientIdentity,
     },
     client_ip::{canonical_client_ip, request_id, ClientIpPolicy},
     config::{AuthMode, Config},
@@ -183,11 +185,7 @@ pub async fn auth_middleware(
                 .map(|value| (Arc::clone(sessions), value))
         });
     if let Some((sessions, _)) = &admin_session {
-        if !matches!(
-            *req.method(),
-            http::Method::GET | http::Method::HEAD | http::Method::OPTIONS
-        ) && !sessions.origin_matches(req.headers())
-        {
+        if !admin_session::is_safe_method(req.method()) && !sessions.origin_matches(req.headers()) {
             emit_failure(&state, &audit, "admin_session_origin_mismatch");
             return (
                 StatusCode::FORBIDDEN,
@@ -213,62 +211,82 @@ pub async fn auth_middleware(
     };
 
     let is_admin_session = admin_session.is_some();
-    let validator = admin_session
-        .map(|(sessions, _)| sessions as Arc<dyn SessionValidator>)
-        .or_else(|| state.validator.as_ref().map(Arc::clone));
-    let Some(validator) = validator else {
-        return auth_failure_response(
-            &state,
-            &audit,
-            AuthFailureKind::Rejected,
-            "no_validator_configured",
-            req,
-            next,
-        )
-        .await;
+    let validation = if let Some((sessions, value)) = admin_session {
+        // A gateway-issued session is judged only by its own store and the
+        // login provider, never by the global chain.
+        match sessions
+            .authenticate(&value, req.method(), req.headers())
+            .await
+        {
+            Ok(principal) => Ok(principal),
+            Err(SessionRefusal::Auth(error)) => Err(error),
+            Err(SessionRefusal::CsrfUnbound) => {
+                // The double-submit pair agreed with itself, but it is not
+                // the token this session was issued with.
+                emit_failure(&state, &audit, "admin_session_csrf_unbound");
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({"error": "csrf token missing or invalid"})),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        let Some(validator) = state.validator.as_ref().map(Arc::clone) else {
+            return auth_failure_response(
+                &state,
+                &audit,
+                AuthFailureKind::Rejected,
+                "no_validator_configured",
+                req,
+                next,
+            )
+            .await;
+        };
+
+        match &credential {
+            SessionCredential::Cookie(_) if !validator.supports_cookie() => {
+                return auth_failure_response(
+                    &state,
+                    &audit,
+                    AuthFailureKind::Rejected,
+                    "cookie_auth_unsupported",
+                    req,
+                    next,
+                )
+                .await;
+            }
+            SessionCredential::Bearer(_) if !validator.supports_bearer() => {
+                return auth_failure_response(
+                    &state,
+                    &audit,
+                    AuthFailureKind::Rejected,
+                    "bearer_auth_unsupported",
+                    req,
+                    next,
+                )
+                .await;
+            }
+            SessionCredential::ClientCertificate(_) if !validator.supports_client_certificate() => {
+                return auth_failure_response(
+                    &state,
+                    &audit,
+                    AuthFailureKind::Rejected,
+                    "client_certificate_auth_unsupported",
+                    req,
+                    next,
+                )
+                .await;
+            }
+            _ => {}
+        }
+
+        validator
+            .validate_session_for_resource(&credential, resource.as_deref())
+            .await
     };
 
-    match &credential {
-        SessionCredential::Cookie(_) if !validator.supports_cookie() => {
-            return auth_failure_response(
-                &state,
-                &audit,
-                AuthFailureKind::Rejected,
-                "cookie_auth_unsupported",
-                req,
-                next,
-            )
-            .await;
-        }
-        SessionCredential::Bearer(_) if !validator.supports_bearer() => {
-            return auth_failure_response(
-                &state,
-                &audit,
-                AuthFailureKind::Rejected,
-                "bearer_auth_unsupported",
-                req,
-                next,
-            )
-            .await;
-        }
-        SessionCredential::ClientCertificate(_) if !validator.supports_client_certificate() => {
-            return auth_failure_response(
-                &state,
-                &audit,
-                AuthFailureKind::Rejected,
-                "client_certificate_auth_unsupported",
-                req,
-                next,
-            )
-            .await;
-        }
-        _ => {}
-    }
-
-    match validator
-        .validate_session_for_resource(&credential, resource.as_deref())
-        .await
-    {
+    match validation {
         Ok(principal) => {
             emit_success(&state, &audit, &credential, &principal);
             if !is_admin_session {

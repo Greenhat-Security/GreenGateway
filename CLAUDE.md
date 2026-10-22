@@ -37,7 +37,8 @@ Design decisions live in `docs/adr/` — eight ADRs, not two. `0001` (HTTP upstr
 stack, Policy Studio authority and evidence, the production proxy data plane, first-class
 connections and credentials, and shared state / HA modes with the PostgreSQL trust boundary.
 `0008` (setup, `ggctl` and configuration bundles, issue #242) is still **Proposed**: read it as
-the design under review, not as shipped behavior. Read them before proposing a design; new
+the design under review, not as shipped behavior. `0009` covers shared admin sessions in
+cluster mode. Read them before proposing a design; new
 scope of that shape needs a new ADR.
 
 `docs/architecture.md` is the authoritative request-lifecycle design and has landed, despite

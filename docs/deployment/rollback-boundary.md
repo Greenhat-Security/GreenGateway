@@ -108,6 +108,8 @@ Expected output in zone 1: no rows at all. In zone 2: `gateway.ready` and traffi
 
 A non-zero `admin_pending_logins` count means a login is **in flight**, not that one was admitted — the row is deleted when the callback consumes it. Treat it as a warning that crossing 2 is about to happen and go and stop the administrator.
 
+With `ADMIN_SESSION_MODE=cluster_postgres`, an admitted cookie sign-in also leaves a durable mark that no consumption deletes: `SELECT count(*) FROM greengateway.admin_session_evidence WHERE action = 'admin_session.grant';` returns non-zero once crossing 2 has happened, whether or not the session is still live. A bearer sign-in writes no such row, so a zero count does not rule crossing 2 out; the audit query above still decides.
+
 ## Rolling back from zone 1 or zone 2
 
 1. **Stop every gateway replica.** All of them, before anything else. A replica still serving is still crossing the boundary while you work.
