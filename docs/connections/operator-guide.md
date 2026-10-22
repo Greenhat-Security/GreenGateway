@@ -9,7 +9,10 @@ before GreenGateway resolves its protected material or contacts an upstream.
 This guide covers production custody and day-two operations. See the
 [migration guide](migration.md) for moving legacy settings and the
 [admin guide](admin-guide.md) for the browser workflow. The complete field and
-limit reference remains in [configuration.md](../configuration.md).
+limit reference remains in [configuration.md](../configuration.md). Where
+trust sits when a Connection acts for the calling user, through a signed
+caller assertion or a delegated issuer token, is collected in the
+[per-caller credential trust boundary](per-caller-trust-boundary.md).
 
 ## Production Readiness Checklist
 
@@ -370,6 +373,9 @@ the gateway's published key set (see [The published JWKS](#the-published-jwks))
 and can then apply its own per-user ownership and entitlement checks, which a
 single shared credential makes impossible. It is the same shape as Google IAP's
 `X-Goog-IAP-JWT-Assertion` and Cloudflare Access's `Cf-Access-Jwt-Assertion`.
+What the signing key can do in the wrong hands, and what a verifier must
+check, is summarized in the
+[per-caller credential trust boundary](per-caller-trust-boundary.md).
 
 #### Which calls are attested
 
@@ -1311,12 +1317,17 @@ error, a log line, a metric or an audit event.
 #### Trust boundary
 
 Phase 8 moves per-user systems behind the gateway; this credential is where
-the trust sits:
+the trust sits. The
+[per-caller credential trust boundary](per-caller-trust-boundary.md) covers
+it together with signed caller assertions: what each component can do in the
+wrong hands, the bounded caches, the audit of every hand-out, what the issuer
+must enforce because the gateway cannot, and what is out of scope. In short:
 
 - **The issuer's grant store is the most sensitive component in the
-  deployment.** Whoever holds this Connection's client secret can ask the
-  issuer for any user's upstream token, so one leaked secret unlocks every
-  stored grant. Keep the secret in an external provider, restrict the issuer
+  deployment.** Whoever holds this Connection's client secret can exchange
+  any subject token the issuer accepts for that user's upstream token, and
+  with the signing key as well, any user's, so one leaked secret can unlock
+  every stored grant. Keep the secret in an external provider, restrict the issuer
   to this client's subject tokens and audience, have it store grants
   encrypted, grant read-only scopes wherever the upstream allows it, and
   have it log every hand-out.
