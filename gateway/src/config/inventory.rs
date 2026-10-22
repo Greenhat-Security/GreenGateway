@@ -13,14 +13,15 @@
 //! days for either audit store is accepted as "no pruning" and logged as a
 //! warning. It logs nothing else, opens no file and calls no store, secret
 //! provider or network, which a source scan in the stage tests holds the
-//! configuration modules to. For the domains the compiler has extracted so
-//! far -- the listeners, the identity settings and the proxy, see `stage` --
-//! the parse and validate stages are also given values rather than a reader.
+//! configuration modules to. Every input is read in a block, and the parse and
+//! validate stages are given that block's values rather than a reader; see
+//! `stage` and `plan`.
 //!
-//! Three variables are requested twice -- `DISCOVERY_PROJECTOR_LEASE_TTL_MS`,
-//! `DISCOVERY_PROJECTOR_POLL_MS` and `DISCOVERY_PROJECTOR_BATCH`, once to
-//! learn whether they were set and once to parse them -- and none is
-//! requested conditionally. `ADMIN_SESSION_IDLE_TIMEOUT_SECS` and
+//! Every variable is requested exactly once, and none conditionally.
+//! `DISCOVERY_PROJECTOR_LEASE_TTL_MS`, `DISCOVERY_PROJECTOR_POLL_MS` and
+//! `DISCOVERY_PROJECTOR_BATCH` used to be requested twice, once to learn
+//! whether they were set and once to parse them; the check and the parse now
+//! share the one value requested. `ADMIN_SESSION_IDLE_TIMEOUT_SECS` and
 //! `ADMIN_SESSION_MAX_ENTRIES` used to be skipped when `ADMIN_SESSION_MODE`
 //! enabled no session store and `ADMIN_SESSION_TTL_SECS` was set, because the
 //! check that read them short-circuited. The admin surface's inputs are now
@@ -505,20 +506,10 @@ mod tests {
             "the inventory lists the variables in the order from_env_vars first requests them"
         );
 
-        let mut counts = BTreeMap::<&str, usize>::new();
-        for name in &requested {
-            *counts.entry(name.as_str()).or_default() += 1;
-        }
-        let repeated: Vec<(&str, usize)> =
-            counts.into_iter().filter(|(_, count)| *count > 1).collect();
         assert_eq!(
-            repeated,
-            [
-                (DISCOVERY_PROJECTOR_BATCH, 2),
-                (DISCOVERY_PROJECTOR_LEASE_TTL_MS, 2),
-                (DISCOVERY_PROJECTOR_POLL_MS, 2),
-            ],
-            "the module documentation names every variable requested more than once"
+            requested.len(),
+            CONFIG_INPUTS.len(),
+            "from_env_vars requests every variable exactly once, as the module documentation says"
         );
     }
 

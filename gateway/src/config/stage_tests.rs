@@ -1,29 +1,39 @@
-//! The configuration compiler's extracted stages, run on their own (issue
-//! #433, PR 2).
+//! The configuration compiler's stages, run on their own (issue #433, PR 2).
 //!
 //! The parity tests hold `Config::from_env_vars` to its legacy behaviour.
 //! These hold the stages it is now built from: that each block asks for its
-//! inputs once, in the inventory's order; that the stages, run alone against
-//! values, report what the parser reports for those inputs and produce the
-//! values it builds its `Config` from; that provenance names a source and
-//! never a value; that no plan prints a secret or a secret locator; and that
-//! nothing a stage does opens a file or reaches the network.
+//! inputs once and together the blocks read the inventory in order; that
+//! `from_env_vars` is exactly the compiled plan; that provenance names a
+//! source and never a value; that no plan prints a secret or a secret
+//! locator; and that nothing a stage does opens a file or reaches the
+//! network.
 
-use std::{collections::BTreeSet, env::VarError, fs, path::Path, time::Duration};
+use std::{env::VarError, fs, path::Path, time::Duration};
 
 use super::{
-    diagnostic::{ConfigDiagnosticCode, ConfigRule, Rules},
+    connections::ConnectionInputs,
+    diagnostic::{ConfigDiagnosticCode, ConfigRule, Report},
+    egress::EgressInputs,
     identity::{
-        self, AdminSurfaceInputs, AuthenticationInputs, IdentityPlan, ProviderAndCsrfInputs,
-        RbacExemptionInputs,
+        AdminSurfaceInputs, AuthenticationInputs, ProviderAndCsrfInputs, RbacExemptionInputs,
     },
     inventory,
-    listeners::{self, ListenerInputs, ListenerPlan},
-    proxy::{self, ProxyPlan, RoutingInputs, TrustedProxyInputs},
+    listeners::ListenerInputs,
+    plan::{self, ConfigPlan},
+    proxy::{RoutingInputs, TrustedProxyInputs},
+    runtime::{
+        ContentTypeInputs, RequestBoundInputs, ShutdownInputs, SignalInputs, ToolRuntimeInputs,
+        ToolTimeoutInputs,
+    },
     stage::{Provenance, SecretLocator, Source},
-    Config,
+    storage::{
+        AuditStoreInputs, ClusterInputs, DiscoveryStoreInputs, DocumentInputs, StateBackendInputs,
+    },
+    Config, StateBackend,
 };
-use crate::auth::admin_session::AdminSessionStorage;
+use crate::{
+    auth::admin_session::AdminSessionStorage, connections::secret::OperatorSecretAliasSource,
+};
 
 fn fixture_value(fixture: &[(&str, &str)], name: &str) -> Result<String, VarError> {
     fixture
@@ -33,83 +43,35 @@ fn fixture_value(fixture: &[(&str, &str)], name: &str) -> Result<String, VarErro
         .ok_or(VarError::NotPresent)
 }
 
-/// What the extracted stages make of a fixture when they run alone, in the
-/// order `from_env_vars` runs them and with nothing between them.
-struct Staged {
-    listeners: ListenerPlan,
-    identity: IdentityPlan,
-    proxy: ProxyPlan,
-    problems: Vec<String>,
-    rules: Rules,
+/// What the stages make of a fixture: the plan, built even when it is
+/// refused, and the report.
+fn compiled(fixture: &[(&str, &str)]) -> (ConfigPlan, Report) {
+    plan::compile_blocks(|name| fixture_value(fixture, name))
 }
 
-impl Staged {
-    fn rules(&self) -> Vec<Option<ConfigRule>> {
-        (0..self.problems.len())
-            .map(|index| self.rules.rule(index))
-            .collect()
-    }
-
-    fn provenance(&self) -> Vec<Provenance> {
-        let mut provenance = self.listeners.provenance.clone();
-        provenance.extend_from_slice(&self.identity.provenance);
-        provenance.extend_from_slice(&self.proxy.provenance);
-        provenance
-    }
-
-    fn source_of(&self, setting: &str) -> Source {
-        self.provenance()
-            .into_iter()
-            .find(|provenance| provenance.setting == setting)
-            .unwrap_or_else(|| panic!("{setting} has no provenance"))
-            .source
-    }
+fn source_of(plan: &ConfigPlan, setting: &str) -> Source {
+    plan.provenance()
+        .into_iter()
+        .find(|provenance| provenance.setting == setting)
+        .unwrap_or_else(|| panic!("{setting} has no provenance"))
+        .source
 }
 
-fn staged(fixture: &[(&str, &str)]) -> Staged {
-    let read = |name: &str| fixture_value(fixture, name);
-    let policy_file_configured = fixture_value(fixture, "POLICY_FILE").is_ok();
-    let mut problems = Vec::new();
-    let mut rules = Rules::default();
-
-    let listeners =
-        listeners::compile(ListenerInputs::read(read)).report(&mut problems, &mut rules);
-    let surface = identity::compile_admin_surface(AdminSurfaceInputs::read(read))
-        .report(&mut problems, &mut rules);
-    let trusted = proxy::compile_trusted_proxy(TrustedProxyInputs::read(read))
-        .report(&mut problems, &mut rules);
-    let rbac = identity::compile_rbac_exemptions(RbacExemptionInputs::read(read), &surface)
-        .report(&mut problems, &mut rules);
-    let authentication =
-        identity::compile_authentication(AuthenticationInputs::read(read), &surface)
-            .report(&mut problems, &mut rules);
-    let identity = identity::compile(
-        ProviderAndCsrfInputs::read(read),
-        surface,
-        rbac,
-        authentication,
-    )
-    .report(&mut problems, &mut rules);
-    let proxy = proxy::compile(
-        RoutingInputs::read(read),
-        trusted,
-        &identity,
-        policy_file_configured,
-    )
-    .report(&mut problems, &mut rules);
-
-    Staged {
-        listeners,
-        identity,
-        proxy,
-        problems,
-        rules,
-    }
+/// The plan each block's inputs belong to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Domain {
+    Listeners,
+    Identity,
+    Proxy,
+    Storage,
+    Connections,
+    Egress,
+    Runtime,
 }
 
-/// Every input the extracted stages read, block by block, in the order they
-/// read them.
-fn extracted_blocks() -> Vec<Vec<String>> {
+/// Every block, in the order `compile_blocks` reads them, with the inputs it
+/// reads, in the order it reads them.
+fn blocks() -> Vec<(Domain, Vec<String>)> {
     fn recorded(
         read: impl FnOnce(&mut dyn FnMut(&str) -> Result<String, VarError>),
     ) -> Vec<String> {
@@ -122,33 +84,127 @@ fn extracted_blocks() -> Vec<Vec<String>> {
     }
 
     vec![
-        recorded(|get| {
-            ListenerInputs::read(get);
-        }),
-        recorded(|get| {
-            AdminSurfaceInputs::read(get);
-        }),
-        recorded(|get| {
-            TrustedProxyInputs::read(get);
-        }),
-        recorded(|get| {
-            RbacExemptionInputs::read(get);
-        }),
-        recorded(|get| {
-            AuthenticationInputs::read(get);
-        }),
-        recorded(|get| {
-            ProviderAndCsrfInputs::read(get);
-        }),
-        recorded(|get| {
-            RoutingInputs::read(get);
-        }),
+        (
+            Domain::Listeners,
+            recorded(|get| {
+                ListenerInputs::read(get);
+            }),
+        ),
+        (
+            Domain::Identity,
+            recorded(|get| {
+                AdminSurfaceInputs::read(get);
+            }),
+        ),
+        (
+            Domain::Storage,
+            recorded(|get| {
+                AuditStoreInputs::read(get);
+            }),
+        ),
+        (
+            Domain::Runtime,
+            recorded(|get| {
+                ShutdownInputs::read(get);
+            }),
+        ),
+        (
+            Domain::Storage,
+            recorded(|get| {
+                DiscoveryStoreInputs::read(get);
+            }),
+        ),
+        (
+            Domain::Connections,
+            recorded(|get| {
+                ConnectionInputs::read(get);
+            }),
+        ),
+        (
+            Domain::Runtime,
+            recorded(|get| {
+                SignalInputs::read(get);
+            }),
+        ),
+        (
+            Domain::Storage,
+            recorded(|get| {
+                DocumentInputs::read(get);
+            }),
+        ),
+        (
+            Domain::Runtime,
+            recorded(|get| {
+                RequestBoundInputs::read(get);
+            }),
+        ),
+        (
+            Domain::Proxy,
+            recorded(|get| {
+                TrustedProxyInputs::read(get);
+            }),
+        ),
+        (
+            Domain::Identity,
+            recorded(|get| {
+                RbacExemptionInputs::read(get);
+            }),
+        ),
+        (
+            Domain::Runtime,
+            recorded(|get| {
+                ContentTypeInputs::read(get);
+            }),
+        ),
+        (
+            Domain::Identity,
+            recorded(|get| {
+                AuthenticationInputs::read(get);
+            }),
+        ),
+        (
+            Domain::Runtime,
+            recorded(|get| {
+                ToolRuntimeInputs::read(get);
+            }),
+        ),
+        (
+            Domain::Storage,
+            recorded(|get| {
+                ClusterInputs::read(get);
+            }),
+        ),
+        (
+            Domain::Runtime,
+            recorded(|get| {
+                ToolTimeoutInputs::read(get);
+            }),
+        ),
+        (
+            Domain::Identity,
+            recorded(|get| {
+                ProviderAndCsrfInputs::read(get);
+            }),
+        ),
+        (
+            Domain::Proxy,
+            recorded(|get| {
+                RoutingInputs::read(get);
+            }),
+        ),
+        (
+            Domain::Egress,
+            recorded(|get| {
+                EgressInputs::read(get);
+            }),
+        ),
+        (
+            Domain::Storage,
+            recorded(|get| {
+                StateBackendInputs::read(get);
+            }),
+        ),
     ]
-}
-
-/// Every input an extracted stage reads.
-pub(super) fn extracted_inputs() -> BTreeSet<String> {
-    extracted_blocks().into_iter().flatten().collect()
 }
 
 /// An identity provider the admin login accepts, under the `/operations`
@@ -158,21 +214,47 @@ const ADMIN_LOGIN_PROVIDER_DOCUMENT: &str = r#"[{"name":"primary","type":"jwt","
 /// A route that delegates the gateway's cookie session upstream.
 const COOKIE_SESSION_ROUTE: &str = r#"[{"id":"pm-session","path_prefix":"/api/exponential","upstream_url":"https://pm-backend.example.test","forward_cookie_session":true}]"#;
 
+/// An operator secret alias read from an environment variable.
+const ENVIRONMENT_ALIAS: &str =
+    r#"[{"id":"billing","label":"Billing","source":{"type":"environment","key":"BILLING_TOKEN"}}]"#;
+
+/// An operator secret alias read from a file beneath the secrets root.
+const FILE_ALIAS: &str =
+    r#"[{"id":"billing","label":"Billing","source":{"type":"file","key":"billing-file"}}]"#;
+
+/// A keyring of one primary key.
+const KEYRING: &str = r#"[{"id":"primary","file":"local-key","role":"primary"}]"#;
+
+/// A Google Cloud secret provider whose one alias is `billing`.
+const GCP_BILLING_PROVIDER: &str = r#"{"profiles":[{"id":"primary","audience":"//iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/gateway-pool/providers/gateway-provider","token_root":"/var/run/secrets/tokens","token_file":"gcp-token"}],"aliases":[{"id":"billing","label":"Billing","profile":"primary","project":"billing-project","secret":"billing-credential"}]}"#;
+
+/// A complete cluster-mode configuration.
+const POSTGRES: [(&str, &str); 5] = [
+    ("STATE_BACKEND", "postgres"),
+    ("DEPLOYMENT_ID", "deploy-prod-eu"),
+    (
+        "DATABASE_URL_FILE",
+        "/run/secrets/greengateway/database-url",
+    ),
+    ("CONNECTION_SECRETS_ROOT", "/run/secrets/greengateway"),
+    (
+        "RATE_LIMIT_KEYRING",
+        r#"[{"id":"rl-primary","file":"rate-limit-key","role":"primary"}]"#,
+    ),
+];
+
 #[test]
-fn each_block_requests_its_inputs_once_and_in_the_inventory_order() {
-    let mut seen = BTreeSet::new();
-    for block in extracted_blocks() {
-        assert!(!block.is_empty());
-        let first = inventory::position(&block[0]);
-        for (offset, name) in block.iter().enumerate() {
-            assert!(seen.insert(name.clone()), "{name} is read twice");
-            assert_eq!(
-                inventory::CONFIG_INPUTS.get(first + offset).copied(),
-                Some(name.as_str()),
-                "a block reads a run of the inventory, in its order: {block:?}"
-            );
-        }
+fn each_block_requests_its_inputs_once_and_the_blocks_read_the_inventory_in_order() {
+    let blocks = blocks();
+    for (domain, names) in &blocks {
+        assert!(!names.is_empty(), "{domain:?}");
     }
+    let read: Vec<String> = blocks.into_iter().flat_map(|(_, names)| names).collect();
+    assert_eq!(
+        read,
+        inventory::CONFIG_INPUTS,
+        "the blocks, in the order they are read, read every inventoried input once and in order"
+    );
 }
 
 #[test]
@@ -183,32 +265,56 @@ fn each_plan_records_the_provenance_of_its_blocks_inputs_in_read_order() {
             .map(|provenance| provenance.setting.to_owned())
             .collect()
     }
+    fn read_by(domain: Domain) -> Vec<String> {
+        blocks()
+            .into_iter()
+            .filter(|(owner, _)| *owner == domain)
+            .flat_map(|(_, names)| names)
+            .collect()
+    }
 
-    let staged = staged(&[]);
-    let blocks = extracted_blocks();
-    let [listeners, admin_surface, trusted_proxy, rbac, authentication, providers_and_csrf, routing] =
-        <[Vec<String>; 7]>::try_from(blocks).expect("seven extracted blocks");
-    assert_eq!(settings(&staged.listeners.provenance), listeners);
-    assert_eq!(
-        settings(&staged.identity.provenance),
-        [admin_surface, rbac, authentication, providers_and_csrf].concat()
-    );
-    assert_eq!(
-        settings(&staged.proxy.provenance),
-        [trusted_proxy, routing].concat()
-    );
+    let (plan, report) = compiled(&[]);
+    assert!(report.is_empty(), "{:?}", report.problems());
+    for (domain, provenance) in [
+        (Domain::Listeners, &plan.listeners.provenance),
+        (Domain::Identity, &plan.identity.provenance),
+        (Domain::Proxy, &plan.proxy.provenance),
+        (Domain::Storage, &plan.storage.provenance),
+        (Domain::Connections, &plan.connections.provenance),
+        (Domain::Egress, &plan.egress.provenance),
+        (Domain::Runtime, &plan.runtime.provenance),
+    ] {
+        assert_eq!(settings(provenance), read_by(domain), "{domain:?}");
+    }
 
-    // An empty environment takes every default.
-    for provenance in staged.provenance() {
+    // Together they describe every input exactly once, and an empty
+    // environment takes every default.
+    assert_eq!(settings(&plan.provenance()), inventory::CONFIG_INPUTS);
+    for provenance in plan.provenance() {
         assert_eq!(provenance.source, Source::Default, "{}", provenance.setting);
     }
 }
 
-/// For fixtures that set only extracted inputs, the stages run alone report
-/// exactly what `from_env_vars` reports, and an accepted configuration is
-/// built from exactly the stages' values.
+/// `from_env_vars` is the compiled plan: an accepted configuration is exactly
+/// the plan's `Config`, and a refused one reports exactly the stages'
+/// problems, each with its rule.
 #[test]
-fn the_stages_alone_report_and_build_what_from_env_vars_does() {
+fn from_env_vars_builds_the_compiled_plan_and_reports_its_problems() {
+    let postgres_session: Vec<(&str, &str)> = POSTGRES
+        .into_iter()
+        .chain([
+            ("AUTH_PROVIDERS", ADMIN_LOGIN_PROVIDER_DOCUMENT),
+            ("ADMIN_LOGIN_PROVIDER", "primary"),
+            ("ADMIN_PREFIX", "/operations"),
+            ("ADMIN_SESSION_MODE", "cluster_postgres"),
+            ("ADMIN_LOGIN_KEYRING", KEYRING),
+            ("CLUSTER_HEARTBEAT_MS", "2000"),
+            ("READINESS_PROBE_CACHE_MS", "2500"),
+            ("AUDIT_POSTGRES_RETENTION_DAYS", "90"),
+            ("DATABASE_POOL_MAX", "32"),
+            ("DATABASE_TLS_CA_FILE", "/run/tls/database-ca.pem"),
+        ])
+        .collect();
     let fixtures: &[&[(&str, &str)]] = &[
         &[],
         &[
@@ -222,9 +328,6 @@ fn the_stages_alone_report_and_build_what_from_env_vars_does() {
             ("CLIENT_CERT_MODE", "required"),
             ("CLIENT_CERT_CA_FILE", "/run/tls/clients.pem"),
             ("CLIENT_CERT_IDENTITY_SOURCE", "spiffe"),
-            ("ADMIN_CLIENT_CERT_MODE", "optional"),
-            ("ADMIN_CLIENT_CERT_CA_FILE", "/run/tls/admins.pem"),
-            ("ADMIN_CLIENT_CERT_CRL_FILE", "/run/tls/admins.crl"),
             ("TLS_MIN_VERSION", "1.3"),
         ],
         &[
@@ -232,216 +335,108 @@ fn the_stages_alone_report_and_build_what_from_env_vars_does() {
             ("ADMIN_LOGIN_PROVIDER", "primary"),
             ("ADMIN_PREFIX", "/operations"),
             ("ADMIN_SESSION_MODE", "standalone_memory"),
-            ("ADMIN_SESSION_IDLE_TIMEOUT_SECS", "900"),
             ("GATEWAY_PUBLIC_URL", "https://management.example.test"),
-            ("CSRF_HEADER_NAME", "X-CSRF-Token"),
-            ("CSRF_COOKIE_DOMAIN", ".example.test"),
-        ],
-        &[
-            (
-                "JWT_JWKS_URL",
-                "https://issuer.example.test/.well-known/jwks.json",
-            ),
-            ("JWT_ISSUER", "https://issuer.example.test/"),
-            ("JWT_AUDIENCE", "gateway"),
-            ("ROLES_CLAIM", "groups"),
-            ("AUTH_EXEMPT_PATHS", ""),
             ("TRUST_PROXY_HEADERS", "true"),
             ("TRUSTED_PROXY_CIDRS", "10.0.0.0/8, 192.0.2.0/24"),
             ("UPSTREAM_ROUTES", COOKIE_SESSION_ROUTE),
-            (
-                "MCP_UPSTREAM_SERVERS",
-                r#"[{"name":"docs","url":"https://mcp.example.test/mcp"}]"#,
-            ),
             ("UPSTREAM_TIMEOUT_MS", "5000"),
         ],
-        // Refused, with problems from every extracted domain.
+        // Standalone stores, Connections and egress.
+        &[
+            ("AUDIT_LOG_FILE", "/var/log/greengateway/audit.jsonl"),
+            ("AUDIT_SQLITE_PATH", "/var/lib/greengateway/audit.sqlite"),
+            ("AUDIT_SQLITE_RETENTION_DAYS", "30"),
+            (
+                "DISCOVERY_SQLITE_PATH",
+                "/var/lib/greengateway/discovery.sqlite",
+            ),
+            ("PAYLOAD_CAPTURE_ENABLED", "true"),
+            ("PAYLOAD_CAPTURE_SAMPLE_RATE", "0.25"),
+            ("POLICY_FILE", "/etc/greengateway/policy.json"),
+            ("TOOLS_FILE", "/etc/greengateway/tools.json"),
+            (
+                "CONNECTIONS_SQLITE_PATH",
+                "/var/lib/greengateway/connections.sqlite",
+            ),
+            ("CONNECTION_SECRETS_ROOT", "/run/secrets/greengateway"),
+            ("CONNECTION_SECRET_ALIASES", FILE_ALIAS),
+            ("CONNECTION_LOCAL_SECRET_KEYRING", KEYRING),
+            ("RATE_LIMIT_READ_RPS", "12.5"),
+            ("VALIDATION_ALLOWED_CONTENT_TYPES", ""),
+            ("TOOL_RUNTIME_DEFAULT_TIMEOUT_MS", "45000"),
+            (
+                "EGRESS_ALLOWED_HOSTS",
+                "API.Example.Test, hooks.example.test",
+            ),
+            ("EGRESS_NAT64_PREFIXES", "64:ff9b:1::/48"),
+            ("EGRESS_DENY_PRIVATE_IPS", "false"),
+        ],
+        &POSTGRES,
+        &postgres_session,
+        // Refused, with problems from every domain.
         &[
             ("LISTEN_ADDR", "127.0.0.1:9090"),
             ("ADMIN_LISTEN_ADDR", "127.0.0.1:9090"),
-            ("GRPC_MAX_CONCURRENT_STREAMS", "0"),
-            ("TLS_KEY_FILE", "/run/tls/data.key"),
-            ("CLIENT_CERT_IDENTITY_SOURCE", "dns"),
             ("ADMIN_SESSION_TTL_SECS", "600"),
-            ("ADMIN_LOGIN_PENDING_TTL_SECS", "0"),
-            ("ADMIN_LOGIN_PROVIDER", "missing"),
+            ("AUDIT_SQLITE_RETENTION_DAYS", "36501"),
+            ("SHUTDOWN_TIMEOUT_MS", "0"),
+            ("DISCOVERY_PROJECTOR_POLL_MS", "10"),
+            ("CONNECTION_SECRET_ALIASES", FILE_ALIAS),
+            ("PAYLOAD_CAPTURE_ENABLED", "true"),
+            ("CORS_ALLOW_ORIGINS", "*"),
             ("TRUST_PROXY_HEADERS", "true"),
-            ("AUTH_ENABLED", "false"),
-            ("CSRF_ENABLED", "maybe"),
+            ("TOOL_LEASE_TTL_MS", "10"),
+            ("CLUSTER_MEMBER_STALE_MS", "1000"),
             ("UPSTREAM_URL", "https://legacy.example.test"),
             ("UPSTREAM_ROUTES", COOKIE_SESSION_ROUTE),
-            ("MCP_UPSTREAM_SERVERS", "{}"),
-            ("UPSTREAM_CONNECT_TIMEOUT_MS", "0"),
+            ("EGRESS_NAT64_PREFIXES", "192.0.2.0/24"),
+            ("DATABASE_AUTO_MIGRATE", "true"),
+        ],
+        &[
+            ("STATE_BACKEND", "postgres"),
+            ("ADMIN_SESSION_MODE", "standalone_memory"),
+            ("ADMIN_LOGIN_PROVIDER", "primary"),
+            ("AUTH_PROVIDERS", ADMIN_LOGIN_PROVIDER_DOCUMENT),
+            ("ADMIN_PREFIX", "/operations"),
+            (
+                "POLICY_HISTORY_SQLITE_PATH",
+                "/var/lib/greengateway/history.sqlite",
+            ),
+            (
+                "SERVICE_TOKEN_SQLITE_PATH",
+                "/var/lib/greengateway/tokens.sqlite",
+            ),
+            ("CONNECTION_LOCAL_SECRET_KEYRING", KEYRING),
+            ("DEPLOYMENT_ID", "-not-a-deployment"),
         ],
     ];
 
     for fixture in fixtures {
-        let staged = staged(fixture);
+        let (plan, report) = compiled(fixture);
         match Config::from_env_vars(|name| fixture_value(fixture, name)) {
             Ok(config) => {
-                assert!(
-                    staged.problems.is_empty(),
-                    "{fixture:?}: {:?}",
-                    staged.problems
-                );
-                assert_config_is_built_from(&config, &staged);
+                assert!(report.is_empty(), "{fixture:?}: {:?}", report.problems());
+                assert_eq!(config, plan.into_config(), "{fixture:?}");
             }
             Err(error) => {
-                assert!(!staged.problems.is_empty(), "{fixture:?}");
-                assert_eq!(error.problems(), staged.problems, "{fixture:?}");
-                let rules: Vec<Option<ConfigRule>> = error
+                assert!(!report.is_empty(), "{fixture:?}");
+                assert_eq!(error.problems(), report.problems(), "{fixture:?}");
+                let rules: Vec<ConfigRule> = error
                     .diagnostics()
                     .iter()
                     .map(|diagnostic| diagnostic.rule)
                     .collect();
-                assert_eq!(rules, staged.rules(), "{fixture:?}");
+                assert_eq!(rules, report.rules(), "{fixture:?}");
             }
         }
     }
 }
 
-fn assert_config_is_built_from(config: &Config, staged: &Staged) {
-    let ListenerPlan {
-        listen_addr,
-        admin_listen_addr,
-        grpc_listen_addr,
-        grpc_max_concurrent_streams,
-        grpc_max_metadata_bytes,
-        data_tls,
-        admin_tls,
-        tls_min_version,
-        tls_handshake_timeout_ms,
-        tls_max_concurrent_handshakes,
-        client_cert_auth,
-        admin_client_cert_auth,
-        provenance: _,
-    } = staged.listeners.clone();
-    assert_eq!(config.listen_addr, listen_addr);
-    assert_eq!(config.admin_listen_addr, admin_listen_addr);
-    assert_eq!(config.grpc_listen_addr, grpc_listen_addr);
-    assert_eq!(
-        config.grpc_max_concurrent_streams,
-        grpc_max_concurrent_streams
-    );
-    assert_eq!(config.grpc_max_metadata_bytes, grpc_max_metadata_bytes);
-    let (tls_cert_files, tls_key_files) = data_tls.map(listeners::TlsMaterial::into_files).unzip();
-    assert_eq!(config.tls_cert_files, tls_cert_files);
-    assert_eq!(config.tls_key_files, tls_key_files);
-    let (admin_tls_cert_files, admin_tls_key_files) =
-        admin_tls.map(listeners::TlsMaterial::into_files).unzip();
-    assert_eq!(config.admin_tls_cert_files, admin_tls_cert_files);
-    assert_eq!(config.admin_tls_key_files, admin_tls_key_files);
-    assert_eq!(config.tls_min_version, tls_min_version);
-    assert_eq!(config.tls_handshake_timeout_ms, tls_handshake_timeout_ms);
-    assert_eq!(
-        config.tls_max_concurrent_handshakes,
-        tls_max_concurrent_handshakes
-    );
-    assert_eq!(config.client_cert_auth, client_cert_auth);
-    assert_eq!(config.admin_client_cert_auth, admin_client_cert_auth);
-
-    let IdentityPlan {
-        admin_prefix,
-        admin_login_provider,
-        admin_session,
-        admin_login_pending_ttl_secs,
-        admin_login_pending_max_entries,
-        admin_login_pending_max_per_ip,
-        gateway_public_url,
-        rbac_exempt_paths,
-        auth_enabled,
-        auth_mode,
-        auth_cookie_name,
-        auth_exempt_paths,
-        auth_providers,
-        jwt_jwks_url,
-        jwt_issuer,
-        jwt_audience,
-        jwt_jwks_timeout_ms,
-        jwt_jwks_max_key_age_secs,
-        jwt_require_jti,
-        roles_claim,
-        service_token_sqlite_path,
-        service_token_cache_ttl_ms,
-        csrf_enabled,
-        csrf_cookie_name,
-        csrf_header_name,
-        csrf_cookie_domain,
-        csrf_exempt_paths,
-        provenance: _,
-    } = staged.identity.clone();
-    assert_eq!(config.admin_prefix, admin_prefix);
-    assert_eq!(config.admin_login_provider, admin_login_provider);
-    assert_eq!(config.admin_session, admin_session);
-    assert_eq!(
-        config.admin_login_pending_ttl_secs,
-        admin_login_pending_ttl_secs
-    );
-    assert_eq!(
-        config.admin_login_pending_max_entries,
-        admin_login_pending_max_entries
-    );
-    assert_eq!(
-        config.admin_login_pending_max_per_ip,
-        admin_login_pending_max_per_ip
-    );
-    assert_eq!(config.gateway_public_url, gateway_public_url);
-    assert_eq!(config.rbac_exempt_paths, rbac_exempt_paths);
-    assert_eq!(config.auth_enabled, auth_enabled);
-    assert_eq!(config.auth_mode, auth_mode);
-    assert_eq!(config.auth_cookie_name, auth_cookie_name);
-    assert_eq!(config.auth_exempt_paths, auth_exempt_paths);
-    assert_eq!(config.auth_providers, auth_providers);
-    assert_eq!(config.jwt_jwks_url, jwt_jwks_url);
-    assert_eq!(config.jwt_issuer, jwt_issuer);
-    assert_eq!(config.jwt_audience, jwt_audience);
-    assert_eq!(config.jwt_jwks_timeout_ms, jwt_jwks_timeout_ms);
-    assert_eq!(config.jwt_jwks_max_key_age_secs, jwt_jwks_max_key_age_secs);
-    assert_eq!(config.jwt_require_jti, jwt_require_jti);
-    assert_eq!(config.roles_claim, roles_claim);
-    assert_eq!(config.service_token_sqlite_path, service_token_sqlite_path);
-    assert_eq!(
-        config.service_token_cache_ttl_ms,
-        service_token_cache_ttl_ms
-    );
-    assert_eq!(config.csrf_enabled, csrf_enabled);
-    assert_eq!(config.csrf_cookie_name, csrf_cookie_name);
-    assert_eq!(config.csrf_header_name, csrf_header_name);
-    assert_eq!(config.csrf_cookie_domain, csrf_cookie_domain);
-    assert_eq!(config.csrf_exempt_paths, csrf_exempt_paths);
-
-    let ProxyPlan {
-        trust_proxy_headers,
-        trusted_proxy_cidrs,
-        upstream_url,
-        upstream_routes,
-        mcp_upstream_servers,
-        upstream_timeout_ms,
-        upstream_response_idle_timeout_ms,
-        upstream_connect_timeout_ms,
-        provenance: _,
-    } = staged.proxy.clone();
-    assert_eq!(config.trust_proxy_headers, trust_proxy_headers);
-    assert_eq!(config.trusted_proxy_cidrs, trusted_proxy_cidrs);
-    assert_eq!(config.upstream_url, upstream_url);
-    assert_eq!(config.upstream_routes, upstream_routes);
-    assert_eq!(config.mcp_upstream_servers, mcp_upstream_servers);
-    assert_eq!(config.upstream_timeout_ms, upstream_timeout_ms);
-    assert_eq!(
-        config.upstream_response_idle_timeout_ms,
-        upstream_response_idle_timeout_ms
-    );
-    assert_eq!(
-        config.upstream_connect_timeout_ms,
-        upstream_connect_timeout_ms
-    );
-}
-
 /// The identity stage accepts either session store on its own terms. Whether
-/// the state backend can host the store is a storage rule, which the legacy
-/// parser still checks once the storage settings are read.
+/// the state backend can host the store is a storage rule, checked once the
+/// backend is read.
 #[test]
-fn a_session_stores_backend_is_left_to_the_storage_rules() {
+fn the_storage_stage_pairs_the_admin_session_store_with_the_state_backend() {
     let fixture = [
         ("AUTH_PROVIDERS", ADMIN_LOGIN_PROVIDER_DOCUMENT),
         ("ADMIN_LOGIN_PROVIDER", "primary"),
@@ -449,44 +444,62 @@ fn a_session_stores_backend_is_left_to_the_storage_rules() {
         ("ADMIN_SESSION_MODE", "cluster_postgres"),
         ("ADMIN_SESSION_IDLE_TIMEOUT_SECS", "900"),
     ];
-    let staged = staged(&fixture);
-    assert!(staged.problems.is_empty(), "{:?}", staged.problems);
-    let session = staged
+    let (plan, report) = compiled(&fixture);
+    let session = plan
         .identity
         .admin_session
         .as_ref()
-        .expect("a session store is enabled");
+        .expect("the identity stage enables the session store");
     assert_eq!(session.storage, AdminSessionStorage::ClusterPostgres);
     assert_eq!(session.ttl, Duration::from_secs(3_600));
     assert_eq!(session.idle_timeout, Duration::from_secs(900));
     for route in ["logout", "config"] {
         let path = format!("/v1/operations/auth/{route}");
-        assert!(staged.identity.auth_exempt_paths.contains(&path), "{path}");
-        assert!(staged.identity.rbac_exempt_paths.contains(&path), "{path}");
+        assert!(plan.identity.auth_exempt_paths.contains(&path), "{path}");
+        assert!(plan.identity.rbac_exempt_paths.contains(&path), "{path}");
     }
-
-    let error = Config::from_env_vars(|name| fixture_value(&fixture, name))
-        .expect_err("standalone mode has no PostgreSQL session store");
+    assert_eq!(plan.storage.state_backend, StateBackend::Sqlite);
     assert_eq!(
-        error.problems(),
+        report.problems(),
         ["ADMIN_SESSION_MODE=cluster_postgres requires STATE_BACKEND=postgres; standalone mode keeps admin sessions in process memory (standalone_memory)"]
     );
-    assert_eq!(error.diagnostics()[0].rule, None);
+    assert_eq!(report.rules(), [ConfigRule::AdminSessionStoreBackend]);
+
+    // In cluster mode, with its login keyring, the same store is accepted.
+    let cluster: Vec<(&str, &str)> = POSTGRES
+        .into_iter()
+        .chain(fixture)
+        .chain([("ADMIN_LOGIN_KEYRING", KEYRING)])
+        .collect();
+    let (plan, report) = compiled(&cluster);
+    assert!(report.is_empty(), "{:?}", report.problems());
+    assert_eq!(plan.storage.state_backend, StateBackend::Postgres);
+    assert_eq!(plan.connections.admin_login_keyring.len(), 1);
 }
 
 #[test]
 fn provenance_says_where_a_value_came_from_and_never_what_it_is() {
-    let staged = staged(&[
-        ("LISTEN_ADDR", "127.0.0.1:9090"),
-        ("ADMIN_LISTEN_ADDR", "  "),
-        ("TLS_CERT_FILE", "/run/tls/zqcanary.crt"),
-        ("TLS_KEY_FILE", "/run/tls/zqcanary.key"),
-        ("ADMIN_PREFIX", "/zqcanary"),
-        ("AUTH_EXEMPT_PATHS", ""),
-        ("CSRF_EXEMPT_PATHS", " "),
-        ("UPSTREAM_URL", "https://zqcanary.example.test"),
-    ]);
-    assert!(staged.problems.is_empty(), "{:?}", staged.problems);
+    let fixture: Vec<(&str, &str)> = POSTGRES
+        .into_iter()
+        .chain([
+            ("LISTEN_ADDR", "127.0.0.1:9090"),
+            ("ADMIN_LISTEN_ADDR", "  "),
+            ("TLS_CERT_FILE", "/run/tls/zqcanary.crt"),
+            ("TLS_KEY_FILE", "/run/tls/zqcanary.key"),
+            ("ADMIN_PREFIX", "/zqcanary"),
+            ("AUTH_EXEMPT_PATHS", ""),
+            ("CSRF_EXEMPT_PATHS", " "),
+            ("VALIDATION_ALLOWED_CONTENT_TYPES", ""),
+            ("UPSTREAM_URL", "https://zqcanary.example.test"),
+            ("CLUSTER_HEARTBEAT_MS", " "),
+            ("CLUSTER_MEMBER_STALE_MS", "60000"),
+            ("EGRESS_ALLOWED_HOSTS", "zqcanary.example.test"),
+            ("CORS_ALLOW_ORIGINS", "https://zqcanary.example.test"),
+            ("DATABASE_URL_FILE", "/run/secrets/zqcanary-database-url"),
+        ])
+        .collect();
+    let (plan, report) = compiled(&fixture);
+    assert!(report.is_empty(), "{:?}", report.problems());
 
     for (setting, source) in [
         ("LISTEN_ADDR", Source::Environment),
@@ -498,14 +511,27 @@ fn provenance_says_where_a_value_came_from_and_never_what_it_is() {
         // ... and a value for a list that replaces its default.
         ("AUTH_EXEMPT_PATHS", Source::Environment),
         ("CSRF_EXEMPT_PATHS", Source::Environment),
+        ("VALIDATION_ALLOWED_CONTENT_TYPES", Source::Environment),
         ("RBAC_EXEMPT_PATHS", Source::Default),
         ("UPSTREAM_URL", Source::Environment),
         ("UPSTREAM_ROUTES", Source::Default),
         ("AUTH_PROVIDERS", Source::Default),
+        // A blank cluster-only setting is absent.
+        ("CLUSTER_HEARTBEAT_MS", Source::Default),
+        ("CLUSTER_MEMBER_STALE_MS", Source::Environment),
+        ("STATE_BACKEND", Source::Environment),
+        ("DATABASE_URL_FILE", Source::Environment),
+        ("DATABASE_POOL_MAX", Source::Default),
+        ("CONNECTION_SECRETS_ROOT", Source::Environment),
+        ("CONNECTION_SECRET_ALIASES", Source::Default),
+        ("EGRESS_ALLOWED_HOSTS", Source::Environment),
+        ("EGRESS_TIMEOUT_MS", Source::Default),
+        ("CORS_ALLOW_ORIGINS", Source::Environment),
+        ("TOOL_RUNTIME_DEFAULT_TIMEOUT_MS", Source::Default),
     ] {
-        assert_eq!(staged.source_of(setting), source, "{setting}");
+        assert_eq!(source_of(&plan, setting), source, "{setting}");
     }
-    let rendered = format!("{:?}", staged.provenance()).to_ascii_lowercase();
+    let rendered = format!("{:?}", plan.provenance()).to_ascii_lowercase();
     assert!(!rendered.contains("zqcanary"), "{rendered}");
 }
 
@@ -516,8 +542,8 @@ fn provenance_says_where_a_value_came_from_and_never_what_it_is() {
 fn a_blank_input_is_attributed_by_what_the_parser_does_with_it() {
     let defaults = Config::from_env_vars(|_| Err(VarError::NotPresent))
         .expect("an empty environment is accepted");
-    for name in extracted_inputs() {
-        let fixture = [(name.as_str(), " ")];
+    for name in inventory::CONFIG_INPUTS {
+        let fixture = [(*name, " ")];
         let Ok(config) = Config::from_env_vars(|requested| fixture_value(&fixture, requested))
         else {
             // A refused blank builds no plan, so it has no provenance to
@@ -529,13 +555,14 @@ fn a_blank_input_is_attributed_by_what_the_parser_does_with_it() {
         } else {
             Source::Environment
         };
-        assert_eq!(staged(&fixture).source_of(&name), expected, "{name}");
+        let (plan, _) = compiled(&fixture);
+        assert_eq!(source_of(&plan, name), expected, "{name}");
     }
 }
 
 #[test]
 fn no_plan_prints_a_secret_or_a_secret_locator() {
-    let staged = staged(&[
+    let standalone = [
         ("TLS_CERT_FILE", "/run/tls/data.crt"),
         ("TLS_KEY_FILE", "/run/secrets/zqcanary-data.key"),
         ("ADMIN_LISTEN_ADDR", "127.0.0.1:9091"),
@@ -553,41 +580,114 @@ fn no_plan_prints_a_secret_or_a_secret_locator() {
             "MCP_UPSTREAM_SERVERS",
             r#"[{"name":"docs","url":"https://mcp.example.test/mcp?label=zqcanary"}]"#,
         ),
-    ]);
-    assert!(staged.problems.is_empty(), "{:?}", staged.problems);
+        (
+            "CONNECTIONS_SQLITE_PATH",
+            "/var/lib/greengateway/connections.sqlite",
+        ),
+        ("CONNECTION_SECRETS_ROOT", "/run/secrets/zqcanary"),
+        (
+            "CONNECTION_SECRET_ALIASES",
+            r#"[{"id":"billing","label":"Billing","source":{"type":"environment","key":"ZQCANARY_TOKEN"}},{"id":"ledger","label":"Ledger","source":{"type":"file","key":"zqcanary-ledger"}}]"#,
+        ),
+        (
+            "CONNECTION_LOCAL_SECRET_KEYRING",
+            r#"[{"id":"zqcanary-local","file":"zqcanary-local-key","role":"primary"}]"#,
+        ),
+        (
+            "CONNECTION_GCP_PROVIDER",
+            r#"{"profiles":[{"id":"primary","audience":"//iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/gateway-pool/providers/gateway-provider","token_root":"/run/secrets/zqcanary-tokens","token_file":"zqcanary-token"}],"aliases":[{"id":"gcp-ledger","label":"Ledger","profile":"primary","project":"zqcanary-project","secret":"zqcanary-secret"}]}"#,
+        ),
+    ];
+    let cluster = [
+        ("STATE_BACKEND", "postgres"),
+        ("DEPLOYMENT_ID", "deploy-prod-eu"),
+        ("DATABASE_URL_FILE", "/run/secrets/zqcanary-database-url"),
+        ("CONNECTION_SECRETS_ROOT", "/run/secrets/zqcanary"),
+        (
+            "RATE_LIMIT_KEYRING",
+            r#"[{"id":"zqcanary-rate","file":"zqcanary-rate-key","role":"primary"}]"#,
+        ),
+        (
+            "ADMIN_LOGIN_KEYRING",
+            r#"[{"id":"zqcanary-login","file":"zqcanary-login-key","role":"primary"}]"#,
+        ),
+    ];
+
+    let (standalone, report) = compiled(&standalone);
+    assert!(report.is_empty(), "{:?}", report.problems());
+    let (cluster, report) = compiled(&cluster);
+    assert!(report.is_empty(), "{:?}", report.problems());
 
     // The values reached the plans ...
-    let data_tls = staged
+    let data_tls = standalone
         .listeners
         .data_tls
         .clone()
         .expect("data TLS is paired");
     assert_eq!(data_tls.into_files().1, ["/run/secrets/zqcanary-data.key"]);
     assert_eq!(
-        staged.identity.auth_providers[0].client_secret.as_deref(),
+        standalone.identity.auth_providers[0]
+            .client_secret
+            .as_deref(),
         Some("zqcanary")
     );
     assert_eq!(
-        staged.proxy.upstream_routes[0]
+        standalone.proxy.upstream_routes[0]
             .add_request_headers
             .get("x-route-label")
             .map(String::as_str),
         Some("zqcanary")
     );
+    let root = standalone
+        .connections
+        .connection_secrets_root
+        .as_ref()
+        .expect("a secrets root is configured");
+    assert_eq!(root.as_path(), Path::new("/run/secrets/zqcanary"));
+    assert!(matches!(
+        &standalone.connections.connection_secret_aliases[0].source,
+        OperatorSecretAliasSource::Environment { key } if key == "ZQCANARY_TOKEN"
+    ));
+    assert_eq!(
+        standalone.connections.connection_local_secret_keyring[0].file,
+        "zqcanary-local-key"
+    );
+    assert_eq!(
+        standalone.connections.connection_gcp_provider.profiles[0].token_root,
+        "/run/secrets/zqcanary-tokens"
+    );
+    assert_eq!(
+        cluster.storage.database.url_file,
+        Some(SecretLocator::new(
+            "/run/secrets/zqcanary-database-url".to_owned()
+        ))
+    );
+    assert_eq!(
+        cluster.connections.rate_limit_keyring[0].file,
+        "zqcanary-rate-key"
+    );
 
-    // ... and none of them is printed.
-    for rendered in [
-        format!("{:?}", staged.listeners),
-        format!("{:?}", staged.identity),
-        format!("{:?}", staged.proxy),
-    ] {
-        assert!(!rendered.contains("zqcanary"), "{rendered}");
+    // ... and none of them is printed, by any plan or by the whole.
+    for plan in [&standalone, &cluster] {
+        for rendered in [
+            format!("{:?}", plan.listeners),
+            format!("{:?}", plan.identity),
+            format!("{:?}", plan.proxy),
+            format!("{:?}", plan.storage),
+            format!("{:?}", plan.connections),
+            format!("{:?}", plan.egress),
+            format!("{:?}", plan.runtime),
+            format!("{plan:?}"),
+        ] {
+            let rendered = rendered.to_ascii_lowercase();
+            assert!(!rendered.contains("zqcanary"), "{rendered}");
+        }
     }
 }
 
 /// The stages carry locators and destinations without touching them: files
-/// that do not exist and hosts that cannot resolve are accepted, because
-/// opening and connecting are activation's work.
+/// and directories that do not exist and hosts that cannot resolve are
+/// accepted, because opening and connecting are activation's work.
 #[test]
 fn the_stages_carry_locators_and_destinations_without_touching_them() {
     let missing = Path::new("greengateway-433-stage-tests-absent");
@@ -599,7 +699,15 @@ fn the_stages_carry_locators_and_destinations_without_touching_them() {
         path("clients.pem"),
         path("clients.crl"),
     );
-    let staged = staged(&[
+    let (policy, tools, openapi, audit, connections, secrets) = (
+        path("policy.json"),
+        path("tools.json"),
+        path("openapi.json"),
+        path("audit.sqlite"),
+        path("connections.sqlite"),
+        path("secrets"),
+    );
+    let (plan, report) = compiled(&[
         ("TLS_CERT_FILE", &certificate),
         ("TLS_KEY_FILE", &key),
         ("CLIENT_CERT_MODE", "required"),
@@ -612,27 +720,71 @@ fn the_stages_carry_locators_and_destinations_without_touching_them() {
             r#"[{"name":"corp","type":"jwt","issuer":"https://issuer.invalid","jwks_url":"https://issuer.invalid/jwks.json"}]"#,
         ),
         ("UPSTREAM_URL", "https://upstream.invalid"),
+        ("POLICY_FILE", &policy),
+        ("TOOLS_FILE", &tools),
+        ("OPENAPI_SPEC_PATH", &openapi),
+        ("AUDIT_SQLITE_PATH", &audit),
+        ("CONNECTIONS_SQLITE_PATH", &connections),
+        ("CONNECTION_SECRETS_ROOT", &secrets),
+        ("CONNECTION_SECRET_ALIASES", FILE_ALIAS),
+        ("CONNECTION_LOCAL_SECRET_KEYRING", KEYRING),
+        ("EGRESS_ALLOWED_HOSTS", "egress.invalid"),
     ]);
-    assert!(staged.problems.is_empty(), "{:?}", staged.problems);
+    assert!(report.is_empty(), "{:?}", report.problems());
     assert!(!missing.exists());
 
-    let data_tls = staged.listeners.data_tls.expect("data TLS is paired");
+    let data_tls = plan.listeners.data_tls.expect("data TLS is paired");
     assert_eq!(data_tls.certificate_files, [certificate]);
     assert_eq!(data_tls.private_key_files, [SecretLocator::new(key)]);
-    let client_cert_auth = staged
+    let client_cert_auth = plan
         .listeners
         .client_cert_auth
         .expect("client certificates are required");
     assert_eq!(client_cert_auth.ca_file, clients);
     assert_eq!(client_cert_auth.crl_file, Some(revoked));
     assert_eq!(
-        staged.identity.auth_providers[0].jwks_url.as_deref(),
+        plan.identity.auth_providers[0].jwks_url.as_deref(),
         Some("https://issuer.invalid/jwks.json")
     );
     assert_eq!(
-        staged.proxy.upstream_url.as_deref(),
+        plan.proxy.upstream_url.as_deref(),
         Some("https://upstream.invalid")
     );
+    assert_eq!(plan.storage.policy_file, Some(policy));
+    assert_eq!(plan.storage.tools_file, Some(tools));
+    assert_eq!(
+        plan.storage.openapi_spec_path.as_deref(),
+        Some(Path::new(&openapi))
+    );
+    assert_eq!(plan.storage.audit_sqlite_path, Some(audit));
+    assert_eq!(plan.connections.connections_sqlite_path, Some(connections));
+    assert_eq!(
+        plan.connections
+            .connection_secrets_root
+            .as_ref()
+            .map(|root| root.as_path()),
+        Some(Path::new(&secrets))
+    );
+    assert_eq!(plan.egress.egress_allowed_hosts, ["egress.invalid"]);
+
+    // Cluster mode's database URL file and CA bundle, and its keyrings'
+    // root, are carried the same way.
+    let (database_url, database_ca) = (path("database-url"), path("database-ca.pem"));
+    let (plan, report) = compiled(&[
+        ("STATE_BACKEND", "postgres"),
+        ("DEPLOYMENT_ID", "deploy-prod-eu"),
+        ("DATABASE_URL_FILE", &database_url),
+        ("DATABASE_TLS_CA_FILE", &database_ca),
+        ("CONNECTION_SECRETS_ROOT", &secrets),
+        ("RATE_LIMIT_KEYRING", KEYRING),
+    ]);
+    assert!(report.is_empty(), "{:?}", report.problems());
+    assert!(!missing.exists());
+    assert_eq!(
+        plan.storage.database.url_file,
+        Some(SecretLocator::new(database_url))
+    );
+    assert_eq!(plan.storage.database.tls_ca_file, Some(database_ca));
 }
 
 /// The configuration modules' code names no file, network, process or store
@@ -640,9 +792,10 @@ fn the_stages_carry_locators_and_destinations_without_touching_them() {
 ///
 /// A scan of the source text outside comments, so it holds what these files
 /// call directly; it does not follow a call into another module. The ones the
-/// extracted stages reach -- path matching, cookie-token and issuer
-/// canonicalization, route and Connection ID shapes, header-name parsing --
-/// are functions of their arguments alone.
+/// stages reach -- path matching, cookie-token and issuer canonicalization,
+/// route and Connection ID shapes, header-name parsing, and the Connections
+/// validators that check alias, keyring and provider documents -- are
+/// functions of their arguments alone.
 ///
 /// The outbound HTTP client is not listed: `scripts/check-egress-only.sh`
 /// already refuses it by name anywhere but `gateway/src/egress.rs`, these
@@ -667,16 +820,22 @@ fn the_configuration_modules_name_no_input_or_output_api() {
         "tokio_postgres",
         "deadpool",
         "sqlx",
+        "canonicalize",
     ];
     let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
     for (file, logging) in [
         // The audit-retention warning for a `0`-day window.
         ("src/config.rs", 1),
+        ("src/config/connections.rs", 0),
         ("src/config/diagnostic.rs", 0),
+        ("src/config/egress.rs", 0),
         ("src/config/identity.rs", 0),
         ("src/config/listeners.rs", 0),
+        ("src/config/plan.rs", 0),
         ("src/config/proxy.rs", 0),
+        ("src/config/runtime.rs", 0),
         ("src/config/stage.rs", 0),
+        ("src/config/storage.rs", 0),
     ] {
         let source = fs::read_to_string(crate_root.join(file))
             .unwrap_or_else(|error| panic!("failed to read {file}: {error}"));
@@ -700,7 +859,7 @@ fn the_configuration_modules_name_no_input_or_output_api() {
     }
 }
 
-/// One fixture per rule, and the diagnostic each produces.
+/// One fixture per rule, and the variable its one diagnostic names.
 fn rule_fixture(rule: ConfigRule) -> (&'static [(&'static str, &'static str)], &'static str) {
     match rule {
         ConfigRule::Value => (&[("LISTEN_ADDR", "not-a-socket")], "LISTEN_ADDR"),
@@ -788,10 +947,71 @@ fn rule_fixture(rule: ConfigRule) -> (&'static [(&'static str, &'static str)], &
             )],
             "UPSTREAM_ROUTES",
         ),
+        ConfigRule::SecretsRootRequired => (
+            &[("CONNECTION_SECRET_ALIASES", FILE_ALIAS)],
+            "CONNECTION_SECRET_ALIASES",
+        ),
+        ConfigRule::LocalKeyringRequiresConnectionsStore => (
+            &[
+                ("CONNECTION_SECRETS_ROOT", "/run/secrets/greengateway"),
+                ("CONNECTION_LOCAL_SECRET_KEYRING", KEYRING),
+            ],
+            "CONNECTION_LOCAL_SECRET_KEYRING",
+        ),
+        ConfigRule::SecretAliasIdReserved => (
+            &[
+                ("CONNECTION_SECRET_ALIASES", ENVIRONMENT_ALIAS),
+                ("CONNECTION_GCP_PROVIDER", GCP_BILLING_PROVIDER),
+            ],
+            "CONNECTION_GCP_PROVIDER",
+        ),
+        ConfigRule::ClusterMemberStaleWindow => (
+            &[
+                POSTGRES[0],
+                POSTGRES[1],
+                POSTGRES[2],
+                POSTGRES[3],
+                POSTGRES[4],
+                ("CLUSTER_MEMBER_STALE_MS", "10000"),
+            ],
+            "CLUSTER_MEMBER_STALE_MS",
+        ),
+        // Every requirement but the deployment ID is met.
+        ConfigRule::ClusterModeRequirements => (
+            &[POSTGRES[0], POSTGRES[2], POSTGRES[3], POSTGRES[4]],
+            "DEPLOYMENT_ID",
+        ),
+        ConfigRule::LocalAuthorityInClusterMode => (
+            &[
+                POSTGRES[0],
+                POSTGRES[1],
+                POSTGRES[2],
+                POSTGRES[3],
+                POSTGRES[4],
+                ("POLICY_FILE", "/etc/greengateway/policy.json"),
+            ],
+            "POLICY_FILE",
+        ),
+        ConfigRule::AdminSessionStoreBackend => (
+            &[
+                ("AUTH_PROVIDERS", ADMIN_LOGIN_PROVIDER_DOCUMENT),
+                ("ADMIN_LOGIN_PROVIDER", "primary"),
+                ("ADMIN_PREFIX", "/operations"),
+                ("ADMIN_SESSION_MODE", "cluster_postgres"),
+            ],
+            "ADMIN_SESSION_MODE",
+        ),
+        ConfigRule::ClusterSettingInStandaloneMode => {
+            (&[("CLUSTER_HEARTBEAT_MS", "5000")], "CLUSTER_HEARTBEAT_MS")
+        }
+        ConfigRule::PayloadCaptureDestination => (
+            &[("PAYLOAD_CAPTURE_ENABLED", "true")],
+            "PAYLOAD_CAPTURE_ENABLED",
+        ),
     }
 }
 
-const EVERY_RULE: [ConfigRule; 16] = [
+const EVERY_RULE: [ConfigRule; 25] = [
     ConfigRule::Value,
     ConfigRule::AdminListenerCollision,
     ConfigRule::GrpcListenerCollision,
@@ -808,6 +1028,15 @@ const EVERY_RULE: [ConfigRule; 16] = [
     ConfigRule::CookieSessionDelegation,
     ConfigRule::UpstreamRoutingSourcesExclusive,
     ConfigRule::HostRoutesRequirePolicy,
+    ConfigRule::SecretsRootRequired,
+    ConfigRule::LocalKeyringRequiresConnectionsStore,
+    ConfigRule::SecretAliasIdReserved,
+    ConfigRule::ClusterMemberStaleWindow,
+    ConfigRule::ClusterModeRequirements,
+    ConfigRule::LocalAuthorityInClusterMode,
+    ConfigRule::AdminSessionStoreBackend,
+    ConfigRule::ClusterSettingInStandaloneMode,
+    ConfigRule::PayloadCaptureDestination,
 ];
 
 /// Every rule is reachable, and a refusal under it is reported as a
@@ -821,7 +1050,7 @@ fn every_rule_is_reported_by_name_in_the_diagnostics() {
             .expect_err("each rule fixture is refused");
         assert_eq!(error.diagnostics().len(), 1, "{rule:?}: {error}");
         let diagnostic = &error.diagnostics()[0];
-        assert_eq!(diagnostic.rule, Some(rule), "{rule:?}: {error}");
+        assert_eq!(diagnostic.rule, rule, "{rule:?}: {error}");
         assert_eq!(diagnostic.variable, Some(variable), "{rule:?}: {error}");
         let code = if fixture_value(fixture, variable).is_ok() {
             ConfigDiagnosticCode::Refused
