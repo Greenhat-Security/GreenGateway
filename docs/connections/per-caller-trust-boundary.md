@@ -335,7 +335,8 @@ and exchanges it at Google's token endpoint.
 
 ### What it can do in the wrong hands
 
-- **The workload identity profile's federated identity**, with
+- **The workload identity profile's federated identity** (or the
+  `service_account` the profile impersonates), with
   `roles/iam.serviceAccountTokenCreator` on the delegated account, signs as
   that account, and so obtains any domain user's token for the authorised
   scopes. It is the most sensitive part of this mechanism. It is read from a
