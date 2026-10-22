@@ -725,17 +725,48 @@ clock; if the two clocks can drift apart, allow a few seconds of leeway
 
 #### The block in the admin UI
 
-The admin UI shows the block read only, on the Connection detail page and in
-the editor: every field except the key aliases, which appear only as
-configured or not, with a note on which calls are attested. The UI has no
-controls for the block and never sends it. A replacement (`PUT`) that omits
-`caller_assertion` keeps the current block, so a save in the UI leaves it
-exactly as stored and cannot put the Connection back into service unattested.
-The gateway revalidates the kept block on every save, so the editor refuses a
-primary or additional header name that matches the assertion header before it
-writes, and a block stored with `bind_approval: true` has to be removed before
-the Connection can be saved again. To stop attesting, remove the block
-deliberately: send `"caller_assertion": null` in a `PUT` through the admin API.
+The Connection detail page shows the block read only: every field except the
+key aliases, which appear only as configured or not, with a note on which
+calls are attested and any `key_problem`. The editor shows it the same way
+until the operator chooses **Add caller assertion**, **Edit caller assertion**
+or **Remove caller assertion**:
+
+- A save that does none of these leaves `caller_assertion` out of the `PUT`.
+  A replacement that omits the block keeps it exactly as stored, so a rename,
+  a disable or a credential rotation cannot change it or put the Connection
+  back into service unattested. The gateway still revalidates the kept block
+  on every save, so the editor refuses a primary or additional header name
+  that matches the assertion header before it writes, and a block stored with
+  `bind_approval: true` must be edited, which turns approval binding off, or
+  removed before the Connection can be saved again.
+- Editing sends the whole block. Each key's alias is picked from the aliases
+  whose compatible purposes include `assertion_signing_key`: operator aliases
+  and external providers, never the encrypted local store. A key the editor
+  keeps is sent as `"signing_key_configured": true` instead of its alias,
+  which the editor never sees, and the gateway keeps the alias of the stored
+  key with the same `kid` and algorithm. Changing a kept key's `kid` or
+  algorithm therefore drops its binding until an alias is picked again.
+  **Make published key N the signing key** swaps that key with the signing
+  key, each with its binding, which is rotation step 3 below.
+- Removing sends `"caller_assertion": null`.
+
+A `delegated_issuer_token` Connection's block is its subject token, which the
+editor drafts only when it creates the Connection; once it exists the block is
+shown read only there (see [In the admin UI](#in-the-admin-ui)).
+
+Each of these needs `admin:connections:secrets:write`; without it the
+section's controls are disabled, and so are the endpoint and test target of a
+Connection that carries the block. A save the gateway refuses shows each
+problem's code beside what it means, on the field that configures it, or in
+the section when that field is not on screen. The gateway names a published
+key's field without its index, so such a problem is shown beside the list.
+
+A marker on a `PUT` that names no stored key, under that `kid` and algorithm,
+is refused with `400`, as are `"signing_key_configured": false` and a marker
+beside a `signing_key_id`; a create has nothing to keep and accepts no
+marker. Naming any key alias in a `PUT`, even the stored one, needs the
+secrets-write permission, so a principal without it cannot test guesses
+against a hidden alias.
 
 New and replacement writes reject `bind_approval: true`, because no approval
 subsystem exists for a mutation to be bound to, an assertion `header_name` that
@@ -932,7 +963,10 @@ signed has expired:
    honours it has fetched the next key before it signs anything. Wait longer if
    a verifier caches the set for longer.
 3. In one `PUT`, make the next key the signing key (`signing_key_id`, `kid` and
-   `algorithm`) and move the previous signing key into `published_keys`.
+   `algorithm`) and move the previous signing key into `published_keys`. A
+   key can keep its alias through the move with `"signing_key_configured":
+   true`, which the gateway resolves by `kid` and algorithm; in the admin UI,
+   this is **Make published key N the signing key**.
 4. Keep the previous key published for at least `lifetime_seconds` plus the
    verifiers' cache time, 300 seconds for one that honours `max-age`, so every
    assertion it signed has expired before a verifier drops it. Then remove it
@@ -1447,10 +1481,12 @@ The editor creates and edits delegated Connections:
 - **Edit.** Every credential field above can change, and the client secret can
   be kept, replaced or cleared. The credential type cannot: the stored
   `caller_assertion` is kept through every save, and under any other type the
-  gateway would start sending it upstream. A replacement never sends the
-  block, so it is shown read only; change it, or rotate its key, through the
-  admin API. For the same reason the editor does not offer the delegated
-  type on a Connection created with another one.
+  gateway would start sending it upstream. The editor never sends a
+  delegated Connection's block, so it is shown read only; change it, or
+  rotate its key, through the admin API, where a `PUT` can keep each key's
+  alias by marker (see [The block in the admin UI](#the-block-in-the-admin-ui)).
+  The editor does not offer the delegated type on a Connection created with
+  another one, whose block names that Connection's upstream as its audience.
 - **Test.** *Test connection* runs as you; see
   [Testing a delegated Connection](#testing-a-delegated-connection). The page
   explains each refusal, for example that the issuer has no grant for your

@@ -49,6 +49,58 @@
         "algorithm": { "enum": ["es256", "rs256"] }
       }
     },
+    "MutationCallerAssertion": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "A caller assertion in a replacement (PUT). The same block as CallerAssertion, except that each key may name its alias with signing_key_id or keep the stored one with signing_key_configured. Any change to the block is a secrets write, and so is naming any key alias, even the one already stored.",
+      "required": [
+        "kid",
+        "algorithm",
+        "issuer",
+        "audience",
+        "token_type",
+        "header_name",
+        "lifetime_seconds"
+      ],
+      "properties": {
+        "signing_key_id": { "type": "string", "minLength": 1, "maxLength": 128, "description": "Secret alias holding the signing key, as in CallerAssertion." },
+        "signing_key_configured": { "const": true, "description": "PUT-only redaction marker: keeps the alias of the stored key, the signing key or a published one, with the same kid and algorithm, so a rotation can move a key between signing_key_id and published_keys without naming its alias. A marker that matches no stored key, false, and a marker beside signing_key_id are refused with 400." },
+        "kid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "algorithm": { "enum": ["es256", "rs256"] },
+        "issuer": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "audience": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "token_type": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "header_name": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "lifetime_seconds": { "type": "integer", "minimum": 1, "maximum": 300 },
+        "claims": { "type": "array", "maxItems": 2, "uniqueItems": true, "items": { "enum": ["email", "roles"] } },
+        "bind_request": { "type": "boolean" },
+        "bind_approval": { "type": "boolean", "const": false },
+        "published_keys": {
+          "type": "array",
+          "maxItems": 4,
+          "items": { "$ref": "#/$defs/MutationCallerAssertionPublishedKey" }
+        }
+      },
+      "oneOf": [
+        { "required": ["signing_key_id"] },
+        { "required": ["signing_key_configured"] }
+      ]
+    },
+    "MutationCallerAssertionPublishedKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kid", "algorithm"],
+      "properties": {
+        "signing_key_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "signing_key_configured": { "const": true, "description": "PUT-only redaction marker, matched like the signing key's." },
+        "kid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "algorithm": { "enum": ["es256", "rs256"] }
+      },
+      "oneOf": [
+        { "required": ["signing_key_id"] },
+        { "required": ["signing_key_configured"] }
+      ]
+    },
     "SafeCallerAssertion": {
       "type": "object",
       "additionalProperties": false,
@@ -792,10 +844,10 @@
         },
         "caller_assertion": {
           "oneOf": [
-            { "$ref": "#/$defs/CallerAssertion" },
+            { "$ref": "#/$defs/MutationCallerAssertion" },
             { "type": "null" }
           ],
-          "description": "Omitted keeps the current block; null removes it. A safe read cannot be sent back, so the admin UI, which shows the block read only, always omits it."
+          "description": "Omitted keeps the current block exactly as stored; null removes it. The admin UI omits it unless the operator edits or removes the block, and sends an edited block with signing_key_configured for every key it keeps."
         },
         "authentication": {
           "$ref": "#/$defs/MutationAuthentication"
