@@ -108,6 +108,10 @@
         {
           "path": "gateway/src/admin_policy.rs",
           "anchor": "async fn policy_rules_order_put_endpoint("
+        },
+        {
+          "path": "gateway/src/admin_policy_drafts.rs",
+          "anchor": "async fn policy_draft_publish_endpoint("
         }
       ],
       "boundary": "persist_policy_mutation -> PolicyControlPlane::commit -> commit_policy_in / postgres_documents::commit_in; active row lock and expected ETag guard; document/history, shared revision, active pointer and security_outbox commit together. Discovery acceptance invokes commit_policy_in inside its suggestion transaction.",
@@ -189,6 +193,10 @@
         {
           "path": "gateway/src/admin_policy.rs",
           "anchor": "async fn policy_rules_order_put_endpoint("
+        },
+        {
+          "path": "gateway/src/admin_policy_drafts.rs",
+          "anchor": "async fn policy_draft_publish_endpoint("
         }
       ],
       "boundary": "persist_to_file writes temporary file and renames; reload swaps runtime; append_policy_version_after_commit writes a separately configured SQLite history database afterward.",

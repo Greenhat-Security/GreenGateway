@@ -7320,7 +7320,10 @@ pub(crate) fn expected_bindings<'a>(
         | ConnectionAuthentication::DelegatedIssuerToken {
             client_secret_id: None,
             ..
-        } => {}
+        }
+        // Binds no secret: its workload identity profile is startup
+        // configuration.
+        | ConnectionAuthentication::GoogleDomainWideDelegation { .. } => {}
     }
     for header in &write.additional_headers {
         if let Some(secret_id) = header.secret_id.as_deref() {
@@ -7358,7 +7361,8 @@ pub(crate) fn binding_count(write: &ConnectionWrite) -> usize {
         | ConnectionAuthentication::DelegatedIssuerToken {
             client_secret_id: None,
             ..
-        } => 0,
+        }
+        | ConnectionAuthentication::GoogleDomainWideDelegation { .. } => 0,
         ConnectionAuthentication::HeaderApiKey {
             secret_id: Some(_), ..
         }
@@ -7582,6 +7586,9 @@ fn safe_authentication_kind(authentication: &ConnectionAuthentication) -> SafeAu
         }
         ConnectionAuthentication::DelegatedIssuerToken { .. } => {
             SafeAuthenticationKind::DelegatedIssuerToken
+        }
+        ConnectionAuthentication::GoogleDomainWideDelegation { .. } => {
+            SafeAuthenticationKind::GoogleDomainWideDelegation
         }
     }
 }

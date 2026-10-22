@@ -1,4 +1,6 @@
 use super::*;
+#[path = "admin_policy_drafts_tests.rs"]
+mod admin_policy_drafts_tests;
 #[path = "admin_session_app_tests.rs"]
 mod admin_session_app_tests;
 use crate::auth::TokenStore;
@@ -7,11 +9,12 @@ use futures_util::StreamExt;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use rmcp::{
     model::{
-        CallToolRequestParams as RmcpCallToolRequestParams, CallToolResult as RmcpCallToolResult,
+        CallToolRequestParams as RmcpCallToolRequestParams,
+        CallToolResponse as RmcpCallToolResponse, CallToolResult as RmcpCallToolResult,
         ErrorData as RmcpErrorData, Implementation, JsonObject as RmcpJsonObject,
         ListToolsResult as RmcpListToolsResult,
         PaginatedRequestParams as RmcpPaginatedRequestParams,
-        ServerCapabilities as RmcpServerCapabilities, ServerInfo as RmcpServerInfo,
+        ServerCapabilities as RmcpServerCapabilities, ServerConfig as RmcpServerConfig,
         Tool as RmcpTool,
     },
     service::{RequestContext as RmcpRequestContext, RoleServer as RmcpRoleServer},
@@ -1738,11 +1741,24 @@ fn admin_routes_keep_default_api_prefix_and_remap_custom_api_under_v1() {
         default_routes.policy_validate_route,
         POLICY_VALIDATE_ADMIN_ROUTE
     );
+    assert_eq!(
+        default_routes.policy_convert_route,
+        POLICY_CONVERT_ADMIN_ROUTE
+    );
     assert_eq!(default_routes.policy_rules_route, POLICY_RULES_ADMIN_ROUTE);
     assert_eq!(default_routes.policy_rule_route, POLICY_RULE_ADMIN_ROUTE);
     assert_eq!(
         default_routes.policy_rules_order_route,
         POLICY_RULES_ORDER_ADMIN_ROUTE
+    );
+    assert_eq!(
+        default_routes.policy_drafts_route,
+        POLICY_DRAFTS_ADMIN_ROUTE
+    );
+    assert_eq!(default_routes.policy_draft_route, POLICY_DRAFT_ADMIN_ROUTE);
+    assert_eq!(
+        default_routes.policy_draft_publish_route,
+        POLICY_DRAFT_PUBLISH_ADMIN_ROUTE
     );
     assert_eq!(default_routes.tokens_route, TOKENS_ADMIN_ROUTE);
     assert_eq!(default_routes.token_route, TOKEN_ADMIN_ROUTE);
@@ -1853,11 +1869,21 @@ fn admin_routes_keep_default_api_prefix_and_remap_custom_api_under_v1() {
         custom_routes.policy_validate_route,
         "/v1/ops/policy/validate"
     );
+    assert_eq!(custom_routes.policy_convert_route, "/v1/ops/policy/convert");
     assert_eq!(custom_routes.policy_rules_route, "/v1/ops/policy/rules");
     assert_eq!(custom_routes.policy_rule_route, "/v1/ops/policy/rules/{id}");
     assert_eq!(
         custom_routes.policy_rules_order_route,
         "/v1/ops/policy/rules/order"
+    );
+    assert_eq!(custom_routes.policy_drafts_route, "/v1/ops/policy/drafts");
+    assert_eq!(
+        custom_routes.policy_draft_route,
+        "/v1/ops/policy/drafts/{id}"
+    );
+    assert_eq!(
+        custom_routes.policy_draft_publish_route,
+        "/v1/ops/policy/drafts/{id}/publish"
     );
     assert_eq!(custom_routes.tokens_route, "/v1/ops/tokens");
     assert_eq!(custom_routes.token_route, "/v1/ops/tokens/{id}");
@@ -19757,6 +19783,201 @@ async fn policy_validate_reports_v1_diagnostics_and_both_digests() {
 }
 
 #[tokio::test]
+async fn policy_convert_returns_the_v1_document_without_changing_the_live_policy() {
+    let policy = TempPolicyFile::new(&policy_document_string("initial-policy", "test:old"));
+    let capture = audit::sink::tests::CaptureSink::new();
+    let router = policy_admin_router(
+        Some(&policy),
+        audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>),
+    );
+    let before_contents = fs::read_to_string(&policy.path).expect("policy file should read");
+    let get_response = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::GET,
+            POLICY_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            None,
+            None,
+        ))
+        .await
+        .expect("policy GET should complete");
+    let etag = policy_etag_header(&get_response);
+    let candidate = policy_document_string("converted", "test:new");
+
+    let response = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::POST,
+            POLICY_CONVERT_ADMIN_ROUTE,
+            Some(test_principal(&["policy-reader"])),
+            Some(candidate.clone()),
+            None,
+        ))
+        .await
+        .expect("policy convert should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["converted"], json!(true));
+    assert_eq!(body["source_schema_version"], json!("0.1.0"));
+    assert_eq!(body["schema_version"], json!("1.0.0"));
+    assert_eq!(body["parity"], json!("verified"));
+    assert_eq!(body["diagnostics"], json!([]));
+    assert!(body.get("errors").is_none(), "{body}");
+    assert_eq!(
+        body["source_digest"],
+        json!(canonical_json::source_digest(
+            "application/json",
+            "0.1.0",
+            candidate.as_bytes()
+        ))
+    );
+    // The test policy has routes and no rules or rate overrides: every route
+    // gets `route-N`, and each assignment is listed after the version.
+    let converted = body["policy"].clone();
+    assert_eq!(converted["schema_version"], json!("1.0.0"));
+    assert_eq!(converted["id"], json!("converted"));
+    let routes = converted["routes"].as_array().expect("routes");
+    let changes = body["changes"].as_array().expect("changes");
+    assert_eq!(changes.len(), routes.len() + 1);
+    assert_eq!(changes[0]["code"], json!("schema_version_set"));
+    for (index, route) in routes.iter().enumerate() {
+        assert_eq!(route["id"], json!(format!("route-{index}")));
+        assert_eq!(
+            changes[index + 1],
+            json!({
+                "code": "element_id_assigned",
+                "pointer": format!("/routes/{index}/id"),
+                "element_id": format!("route-{index}"),
+                "message": rbac::policy_conversion::ChangeCode::ElementIdAssigned.message(),
+            })
+        );
+    }
+
+    // Converting changed nothing: same file, same ETag, no policy.changed.
+    assert_eq!(
+        fs::read_to_string(&policy.path).expect("policy file should read"),
+        before_contents
+    );
+    assert!(!capture
+        .events()
+        .iter()
+        .any(|event| event.event_type == audit::event::POLICY_CHANGED));
+
+    // The converted document validates, with the semantic digest the
+    // conversion reported, and can replace the live policy.
+    let validated = json_body(
+        router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::POST,
+                POLICY_VALIDATE_ADMIN_ROUTE,
+                Some(test_principal(&["policy-reader"])),
+                Some(serde_json::to_string_pretty(&converted).expect("serialize")),
+                None,
+            ))
+            .await
+            .expect("validate should complete"),
+    )
+    .await;
+    assert_eq!(validated["valid"], json!(true), "{validated}");
+    assert_eq!(validated["semantic_digest"], body["semantic_digest"]);
+    let put = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::PUT,
+            POLICY_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            Some(converted.to_string()),
+            Some(&etag),
+        ))
+        .await
+        .expect("PUT should complete");
+    assert_eq!(put.status(), StatusCode::OK);
+    let live = json_body(
+        router
+            .oneshot(policy_admin_request(
+                Method::GET,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("policy GET should complete"),
+    )
+    .await;
+    assert_eq!(live["schema_version"], json!("1.0.0"));
+    assert_eq!(live["routes"], converted["routes"]);
+}
+
+#[tokio::test]
+async fn policy_convert_refuses_without_permission_or_a_convertible_document() {
+    let policy = TempPolicyFile::new(&policy_document_string("initial-policy", "test:old"));
+    let router = policy_admin_router(Some(&policy), test_audit_log());
+    let convert = |principal: Option<auth::Principal>, body: String| {
+        router.clone().oneshot(policy_admin_request(
+            Method::POST,
+            POLICY_CONVERT_ADMIN_ROUTE,
+            principal,
+            Some(body),
+            None,
+        ))
+    };
+    let candidate = policy_document_string("converted", "test:new");
+
+    let unauthenticated = convert(None, candidate.clone())
+        .await
+        .expect("convert should complete");
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    let forbidden = convert(Some(test_principal(&["reader"])), candidate)
+        .await
+        .expect("convert should complete");
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+    // A v1 document is not converted again.
+    let response = convert(
+        Some(test_principal(&["policy-reader"])),
+        v1_policy_document("already-v1", "test:new").to_string(),
+    )
+    .await
+    .expect("convert should complete");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert_eq!(body["converted"], json!(false));
+    assert_eq!(body["source_schema_version"], json!("1.0.0"));
+    assert_eq!(
+        body["diagnostics"][0]["code"],
+        json!("conversion_requires_v0")
+    );
+    assert_eq!(body["diagnostics"][0]["pointer"], json!("/schema_version"));
+    assert_eq!(body["errors"].as_array().map(Vec::len), Some(1));
+    assert!(body.get("policy").is_none(), "{body}");
+
+    // An invalid 0.x document is refused in validation's own words.
+    let mut invalid = policy_document("relative-route", "test:new");
+    invalid["routes"][5]["path_prefix"] = json!("__test");
+    let body = json_body(
+        convert(
+            Some(test_principal(&["policy-reader"])),
+            invalid.to_string(),
+        )
+        .await
+        .expect("convert should complete"),
+    )
+    .await;
+    assert_eq!(body["converted"], json!(false));
+    assert_eq!(body["diagnostics"][0]["code"], json!("path_not_absolute"));
+    assert!(
+        body["errors"][0]
+            .as_str()
+            .unwrap_or_default()
+            .contains("routes[5].path_prefix must start with '/'"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
 async fn policy_put_accepts_a_v1_document_and_keeps_its_stable_ids() {
     let policy = TempPolicyFile::new(&policy_document_string("initial-policy", "test:old"));
     let router = policy_admin_router(Some(&policy), test_audit_log());
@@ -24519,6 +24740,7 @@ async fn suggestions_admin_without_engine_answers_not_configured() {
                 policy_file: None,
                 rbac_state: Some(rbac_state.clone()),
                 history_store: None,
+                draft_store: None,
                 #[cfg(feature = "postgres")]
                 control_plane: None,
                 #[cfg(feature = "postgres")]
@@ -30543,8 +30765,8 @@ struct TestMcpUpstreamServer {
 }
 
 impl RmcpServerHandler for TestMcpUpstreamServer {
-    fn get_info(&self) -> RmcpServerInfo {
-        RmcpServerInfo::new(RmcpServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> RmcpServerConfig {
+        RmcpServerConfig::new(RmcpServerCapabilities::builder().enable_tools().build())
             .with_server_info(
                 Implementation::new("greengateway-test-upstream", "0.0.0")
                     .with_title("GreenGateway Test Upstream"),
@@ -30567,7 +30789,7 @@ impl RmcpServerHandler for TestMcpUpstreamServer {
         &self,
         request: RmcpCallToolRequestParams,
         _context: RmcpRequestContext<RmcpRoleServer>,
-    ) -> Result<RmcpCallToolResult, RmcpErrorData> {
+    ) -> Result<RmcpCallToolResponse, RmcpErrorData> {
         let arguments = request.arguments.unwrap_or_default();
         let call = json!({
             "name": request.name.to_string(),
@@ -30581,7 +30803,8 @@ impl RmcpServerHandler for TestMcpUpstreamServer {
         Ok(RmcpCallToolResult::structured(json!({
             "remote_tool": request.name.to_string(),
             "arguments": Value::Object(arguments),
-        })))
+        }))
+        .into())
     }
 }
 
@@ -30592,7 +30815,7 @@ async fn spawn_test_mcp_upstream(tool_name: &str) -> TestMcpUpstream {
         calls: Arc::clone(&calls),
     };
     let config = RmcpStreamableHttpServerConfig::default()
-        .with_stateful_mode(false)
+        .with_legacy_session_mode(false)
         .with_json_response(true)
         .disable_allowed_hosts();
     let service = RmcpStreamableHttpService::new(
@@ -34197,10 +34420,27 @@ mod cluster_policy_tests {
             )
             .route(POLICY_HISTORY_ADMIN_ROUTE, get(policy_history_endpoint))
             .route(POLICY_ROLLBACK_ADMIN_ROUTE, post(policy_rollback_endpoint))
+            .route(
+                POLICY_DRAFTS_ADMIN_ROUTE,
+                get(policy_drafts_list_endpoint).post(policy_draft_create_endpoint),
+            )
+            .route(
+                POLICY_DRAFT_ADMIN_ROUTE,
+                get(policy_draft_get_endpoint)
+                    .patch(policy_draft_patch_endpoint)
+                    .delete(policy_draft_delete_endpoint),
+            )
+            .route(
+                POLICY_DRAFT_PUBLISH_ADMIN_ROUTE,
+                post(policy_draft_publish_endpoint),
+            )
             .with_state(PolicyAdminState {
                 policy_file: None,
                 rbac_state: Some(rbac_state.clone().with_revision_gate(gate.clone())),
                 history_store: Some(store.clone() as Arc<dyn storage::PolicyHistory>),
+                draft_store: Some(
+                    Arc::new(store.draft_store()) as Arc<dyn storage::PolicyDraftStore>
+                ),
                 control_plane: Some(store as Arc<dyn storage::PolicyControlPlane>),
                 membership,
                 event_store: None,
@@ -34853,6 +35093,133 @@ mod cluster_policy_tests {
             row.get(0)
         };
         assert_eq!(documents, 3, "two commits plus the rollback version");
+    }
+
+    /// Server-side drafts in cluster mode (issue #243, slice 9): a draft is
+    /// shared state in migration 22's table, saving one commits nothing, and
+    /// publishing one is exactly one control-plane commit, behind the draft
+    /// ETag and the live `If-Match` both. A second draft pinned to the same
+    /// base is then stale and is refused without a commit.
+    #[tokio::test]
+    async fn cluster_policy_drafts_publish_through_the_control_plane_transaction() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_policy_foundation(&database.dsn).await;
+        let active = initialize(&store, "draft-init").await;
+        let (router, rbac_state) = cluster_policy_router(store.clone());
+        rbac_state
+            .install_revision_snapshot(active.policy.clone(), active.security_revision)
+            .await
+            .expect("the authority's revision should install");
+        let versions_before = policy_version_count(&pool).await;
+
+        let draft_request = |method: Method, uri: &str, headers: &[(&str, &str)], body: &str| {
+            let mut builder = Request::builder().method(method).uri(uri);
+            for (name, value) in headers {
+                builder = builder.header(*name, *value);
+            }
+            let mut request = builder
+                .body(Body::from(body.to_owned()))
+                .expect("draft request should build");
+            request.extensions_mut().insert(admin_principal());
+            request
+        };
+        let mut drafts = Vec::new();
+        for id in ["draft-published", "draft-left-behind"] {
+            let candidate: Value =
+                serde_json::from_str(&cluster_policy_json(id)).expect("candidate JSON");
+            let created = router
+                .clone()
+                .oneshot(draft_request(
+                    Method::POST,
+                    POLICY_DRAFTS_ADMIN_ROUTE,
+                    &[("if-match", &active.etag)],
+                    &json!({ "policy": candidate }).to_string(),
+                ))
+                .await
+                .expect("create should complete");
+            assert_eq!(created.status(), StatusCode::CREATED);
+            let draft_etag = created
+                .headers()
+                .get(header::ETAG)
+                .and_then(|value| value.to_str().ok())
+                .expect("draft ETag")
+                .to_owned();
+            let (_, body) = refusal_of(created).await;
+            drafts.push((
+                body["draft_id"].as_str().expect("draft id").to_owned(),
+                draft_etag,
+            ));
+        }
+        assert_eq!(
+            policy_version_count(&pool).await,
+            versions_before,
+            "saving drafts commits no policy version"
+        );
+        assert_eq!(
+            rbac_state.snapshot_security_revision(),
+            active.security_revision
+        );
+
+        let publish = |draft: &(String, String), if_match: &str| {
+            draft_request(
+                Method::POST,
+                &format!("{POLICY_DRAFTS_ADMIN_ROUTE}/{}/publish", draft.0),
+                &[(POLICY_DRAFT_ETAG_HEADER, &draft.1), ("if-match", if_match)],
+                "",
+            )
+        };
+        let published = router
+            .clone()
+            .oneshot(publish(&drafts[0], &active.etag))
+            .await
+            .expect("publish should complete");
+        let new_etag = etag_of(published).await;
+        assert_eq!(policy_version_count(&pool).await, versions_before + 1);
+        let now_active = store
+            .active()
+            .await
+            .expect("active read")
+            .expect("active document");
+        assert_eq!(now_active.etag, new_etag);
+        assert_eq!(now_active.policy.id.as_deref(), Some("draft-published"));
+        assert_eq!(
+            rbac_state.snapshot_security_revision(),
+            active.security_revision + 1,
+            "publication installs the committed revision like any policy write"
+        );
+        let (status, frozen) = refusal_of(
+            router
+                .clone()
+                .oneshot(draft_request(
+                    Method::GET,
+                    &format!("{POLICY_DRAFTS_ADMIN_ROUTE}/{}", drafts[0].0),
+                    &[],
+                    "",
+                ))
+                .await
+                .expect("draft read should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(frozen["state"], "published");
+        assert_eq!(frozen["published_etag"], json!(new_etag));
+
+        // The other draft was pinned to the base that is no longer live.
+        let (status, body) = refusal_of(
+            router
+                .clone()
+                .oneshot(publish(&drafts[1], &new_etag))
+                .await
+                .expect("stale publish should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["reason"], "policy_draft_base_stale");
+        assert_eq!(policy_version_count(&pool).await, versions_before + 1);
     }
 
     #[tokio::test]
@@ -37051,6 +37418,7 @@ mod cluster_discovery_tests {
                     policy_file: None,
                     rbac_state: Some(rbac_state.clone()),
                     history_store: Some(policy_store.clone() as Arc<dyn storage::PolicyHistory>),
+                    draft_store: None,
                     control_plane: Some(
                         policy_store.clone() as Arc<dyn storage::PolicyControlPlane>
                     ),
