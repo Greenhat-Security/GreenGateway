@@ -4049,6 +4049,21 @@ mod tests {
             .collect()
     }
 
+    /// Audit delivery is asynchronous, so wait for the events before counting them.
+    async fn wait_for_caller_assertion_events(
+        sink: &CaptureSink,
+        count: usize,
+    ) -> Vec<audit::AuditEvent> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while caller_assertion_events(sink).len() < count {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the expected caller-assertion audit events should be recorded");
+        caller_assertion_events(sink)
+    }
+
     #[tokio::test]
     async fn an_attested_route_names_each_caller_and_never_forwards_a_supplied_assertion() {
         let (addr, ca_pem, requests, upstream) = spawn_capturing_tls_upstream().await;
@@ -4114,7 +4129,7 @@ mod tests {
             assert_eq!(subjects, vec!["alice".to_owned(), "bob".to_owned()]);
         }
 
-        let events = caller_assertion_events(&sink);
+        let events = wait_for_caller_assertion_events(&sink, 2).await;
         assert_eq!(events.len(), 2);
         for (subject, request_id) in callers {
             let event = events
@@ -4309,7 +4324,7 @@ mod tests {
                 json!(hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b"")))
             );
         }
-        let events = caller_assertion_events(&sink);
+        let events = wait_for_caller_assertion_events(&sink, 1).await;
         assert_eq!(events.len(), 1, "one assertion was issued for the request");
         assert_eq!(events[0].payload["outcome"], json!("success"));
         upstream.abort();
@@ -4368,7 +4383,7 @@ mod tests {
             );
         }
 
-        let events = caller_assertion_events(&sink);
+        let events = wait_for_caller_assertion_events(&sink, 3).await;
         assert_eq!(events.len(), 3);
         for event in &events {
             assert_eq!(event.payload["outcome"], json!("failure"));
