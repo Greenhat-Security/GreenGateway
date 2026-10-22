@@ -1282,7 +1282,7 @@
       "disposition": [
         "unsupported_future_operation"
       ],
-      "follow_up": "#424: the standalone session authority is process-local memory by design, so no store exists that could own atomic evidence. Required-durability mode must refuse ADMIN_SESSION_MODE=standalone_memory rather than relabel the post-change audit event as durable. Cluster mode's shared store records grant and withdrawal evidence in its own transactions (admin_session_postgres).",
+      "follow_up": "#425: the standalone session authority is process-local memory by design, so no store exists that could own atomic evidence. Required-durability mode must refuse ADMIN_SESSION_MODE=standalone_memory rather than relabel the post-change audit event as durable. Cluster mode's shared store records grant and withdrawal evidence in its own transactions (admin_session_postgres).",
       "sources": [
         {
           "path": "gateway/src/auth/admin_session.rs",
