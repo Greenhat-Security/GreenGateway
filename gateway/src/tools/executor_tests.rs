@@ -54,7 +54,7 @@ use crate::{
         signals::{DEFAULT_SCHEMA_MISMATCH_SIGNAL_THRESHOLD, SCHEMA_MISMATCH_SIGNAL_TYPE},
     },
     egress::EgressConfig,
-    rbac::{Policy, PrincipalMatcher, Rule, RuleAction},
+    rbac::Policy,
     tools::{
         definitions::{EnumBinding, HttpToolMapping, ToolVisibility},
         overlay::{
@@ -845,24 +845,35 @@ async fn composite_step_http_deny_blocks_rendered_path_before_member_io() {
         "delete_attachment",
         "delete_note",
     ];
-    let mut config = runtime_config(
+    let config = runtime_config(
         tool_names.map(|name| (name, enabled_tool(5_000, 1))),
         2,
         1,
         100,
     );
-    config.rules.push(Rule {
-        id: Some("deny-rendered-attachment".to_owned()),
-        enabled: true,
-        methods: vec!["POST".to_owned()],
-        path: "/attachments/blocked".to_owned(),
-        tool_name: None,
-        dispatch: None,
-        principal: PrincipalMatcher::default(),
-        action: RuleAction::Deny,
-    });
-    let (executor, _capture) =
-        executor_for_composite_definitions_with_config(definitions, &connection, config);
+    // A rendered-HTTP rule judges a member only through the policy's
+    // `RbacState`, the one place a policy's rules apply.
+    let policy = Policy::validate_json_value(json!({
+        "schema_version": "0.1.0",
+        "tools": tool_names
+            .iter()
+            .map(|name| ((*name).to_owned(), json!({"timeout_ms": 5_000, "max_concurrent": 1})))
+            .collect::<serde_json::Map<_, _>>(),
+        "rules": [{
+            "id": "deny-rendered-attachment",
+            "methods": ["POST"],
+            "path": "/attachments/blocked",
+            "action": "deny"
+        }]
+    }))
+    .expect("the composite member policy should validate");
+    let (executor, _capture) = executor_for_composite_definitions_with_config_and_leases(
+        definitions,
+        &connection,
+        config,
+        Some(policy),
+        None,
+    );
 
     let error = executor
         .execute(
@@ -1135,6 +1146,7 @@ async fn composite_lease_loss_sends_no_compensation_tail_after_runtime_returns()
         definitions,
         &connection,
         config,
+        None,
         Some(leases),
     );
     let running = tokio::spawn({
@@ -2285,85 +2297,6 @@ async fn connection_tool_with_caller_assertion_refuses_a_call_without_a_principa
             .await
             .is_err(),
         "the refusal must happen before the upstream receives a request"
-    );
-}
-
-#[tokio::test]
-async fn composite_leaf_on_unenforced_caller_assertion_is_refused_before_member_io() {
-    // A composite reports its own `composite_failed`; the leaf's reason has to
-    // survive into the caller's details so the operator can see why.
-    let (addr, ca_pem, server) = scripted_tls_server(Vec::new()).await;
-    let (connection, secrets) = TemporaryStaticAuthRuntime::header_api_key_with_caller_assertion(
-        addr,
-        &ca_pem,
-        b"composite-key",
-        crate::connections::test_support::generated_es256_pem().as_bytes(),
-    )
-    .await;
-    let saved = secrets.resolutions();
-    assert_eq!(saved, 2, "saving the Connection reads each secret once");
-    let definitions = composite_note_definitions(&connection.connection_id);
-    let (executor, capture) = executor_for_composite_definitions(
-        definitions,
-        &connection,
-        [
-            "create_note_for_records",
-            "create_note",
-            "attach_note",
-            "delete_attachment",
-            "delete_note",
-        ],
-    );
-
-    let error = executor
-        .execute(
-            "create_note_for_records",
-            json!({"title":"hello","targets":["a"]}),
-            invocation_context(),
-            CancellationToken::new(),
-        )
-        .await
-        .expect_err("a composite leaf on a refused Connection must fail closed");
-    let ToolRuntimeError::WorkFailed {
-        reason,
-        details: Some(details),
-        ..
-    } = error
-    else {
-        panic!("the refusal should remain a structured composite failure");
-    };
-    assert_eq!(reason.as_deref(), Some("composite_failed"));
-    assert_eq!(details["failed_step"], json!("note"));
-    assert_eq!(
-        details["failure_reason"],
-        json!("caller_assertion_not_enforced")
-    );
-    assert_eq!(details["orphans"], json!([]));
-
-    wait_until(Duration::from_secs(1), || {
-        capture
-            .events()
-            .iter()
-            .any(|event| event.event_type == audit::event::TOOL_INVOKE_FAILURE)
-    })
-    .await;
-    let events = capture.events();
-    let failure = events
-        .iter()
-        .find(|event| event.event_type == audit::event::TOOL_INVOKE_FAILURE)
-        .expect("the composite refusal should be audited");
-    assert_eq!(failure.payload["failure_reason"], json!("composite_failed"));
-    assert_eq!(
-        secrets.resolutions(),
-        saved,
-        "a refused composite leaf must not consult a secret provider"
-    );
-    assert!(
-        server
-            .await
-            .expect("zero-response test server should stop")
-            .is_empty(),
-        "the refusal must happen before composite member I/O"
     );
 }
 
@@ -5196,13 +5129,17 @@ fn executor_for_composite_definitions_with_config(
         connection,
         runtime_config,
         None,
+        None,
     )
 }
 
+/// `policy`, when given, decides through the `RbacState` built from it;
+/// otherwise the runtime's own entries decide and no rule applies.
 fn executor_for_composite_definitions_with_config_and_leases(
     definitions: Vec<ToolDefinition>,
     connection: &TemporaryStaticAuthRuntime,
     runtime_config: ToolRuntimeConfig,
+    policy: Option<Policy>,
     leases: Option<Arc<dyn crate::tools::lease::ExecutionLeaseStore>>,
 ) -> (ToolExecutor, CaptureSink) {
     let record = connection
@@ -5255,8 +5192,15 @@ fn executor_for_composite_definitions_with_config_and_leases(
         .expect("composite definitions should publish");
     let capture = CaptureSink::new();
     let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
-    let runtime =
-        ToolRuntime::new_with_rbac_state_and_leases(runtime_config, audit.clone(), None, leases);
+    let rbac_state = policy.map(|policy| {
+        crate::middleware::rbac::RbacState::new(policy, Vec::new(), false, audit.clone())
+    });
+    let runtime = ToolRuntime::new_with_rbac_state_and_leases(
+        runtime_config,
+        audit.clone(),
+        rbac_state,
+        leases,
+    );
     let executor = ToolExecutor::new_inner(
         registry,
         runtime,
@@ -5519,7 +5463,6 @@ fn runtime_config<const N: usize>(
         max_concurrent_global,
         default_policy: DefaultToolPolicy::Deny,
         default_timeout: Duration::from_millis(500),
-        rules: Vec::new(),
         tools: tools
             .into_iter()
             .map(|(name, config)| (name.to_owned(), config))
@@ -5534,7 +5477,6 @@ fn runtime_config_without_tools(default_policy: DefaultToolPolicy) -> ToolRuntim
         max_concurrent_global: 1,
         default_policy,
         default_timeout: Duration::from_millis(500),
-        rules: Vec::new(),
         tools: HashMap::new(),
     }
 }

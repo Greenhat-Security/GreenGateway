@@ -767,13 +767,14 @@ impl ConnectionHttpRuntime {
     /// A lane may attest its caller when it has a validated principal to
     /// attest and the exact bytes it sends in hand before it sends them: tool
     /// calls (this, [`Self::openapi_tool_target`] and
-    /// [`Self::mcp_tool_call_target`]) and proxied requests
+    /// [`Self::mcp_tool_call_target`]), the leaf requests of a composite tool
+    /// ([`Self::composite_leaf_target`]) and proxied requests
     /// ([`Self::proxy_route_target`]). A stored test attests the principal
     /// running it, for a delegated Connection only ([`Self::test_target`]).
-    /// Every other lane -- discovery, enum and label sources, composite
-    /// steps -- builds its target with a constructor that keeps refusing such
-    /// a Connection with `caller_assertion_not_enforced`, as do these for a
-    /// stored assertion that only the legacy reading admits
+    /// Every other lane -- discovery, enum and label sources -- builds its
+    /// target with a constructor that keeps refusing such a Connection with
+    /// `caller_assertion_not_enforced`, as do these for a stored assertion
+    /// that only the legacy reading admits
     /// ([`ConnectionWrite::caller_assertion_enforceable`]).
     ///
     /// The returned target carries the assertion's settings. The caller must
@@ -803,6 +804,23 @@ impl ConnectionHttpRuntime {
         path_and_query: &str,
     ) -> Result<ConnectionHttpTarget, ConnectionHttpError> {
         self.attesting_http_target(connection_id, path_and_query, AttestingLane::OpenApiTool)
+    }
+
+    /// The target of one leaf request of a composite tool: a forward step,
+    /// one iteration of a fan-out, or a compensation. Each leaf calls one of
+    /// the managed OpenAPI tools the composite is built from, so it is
+    /// attested like one (see [`Self::openapi_tool_target`]), with an
+    /// assertion of its own: the composite gives every leaf a distinct `jti`,
+    /// so an upstream that refuses a `jti` it has already seen accepts every
+    /// request of the call. A `delegated_issuer_token` Connection is refused
+    /// with `caller_assertion_not_enforced`, as before composite steps signed
+    /// anything.
+    pub fn composite_leaf_target(
+        &self,
+        connection_id: &str,
+        path_and_query: &str,
+    ) -> Result<ConnectionHttpTarget, ConnectionHttpError> {
+        self.attesting_http_target(connection_id, path_and_query, AttestingLane::CompositeLeaf)
     }
 
     /// The target of one request a connection-bound proxy route forwards,
@@ -2200,6 +2218,8 @@ pub enum AttestingLane {
     ManualTool,
     /// A managed OpenAPI tool call.
     OpenApiTool,
+    /// One leaf request of a composite tool, each signed separately.
+    CompositeLeaf,
     /// A request a connection-bound proxy route forwards.
     ProxyRoute,
     /// The session a managed MCP tool call opens.
@@ -2239,6 +2259,7 @@ pub fn caller_assertion_servable_on(write: &ConnectionWrite, lane: AttestingLane
             AttestingLane::ManualTool => true,
             AttestingLane::ConnectionTest => delegated,
             AttestingLane::OpenApiTool
+            | AttestingLane::CompositeLeaf
             | AttestingLane::ProxyRoute
             | AttestingLane::ManagedMcpTool => !delegated,
         }
@@ -3410,7 +3431,7 @@ mod tests {
         let etag = stored.etag().to_string();
         let refused = Some(ConnectionHttpError::CallerAssertionNotEnforced);
 
-        // Composite steps and enum sources.
+        // Enum and label sources.
         assert_eq!(
             temporary.runtime.target(connection_id, "/charges").err(),
             refused
@@ -3578,12 +3599,17 @@ mod tests {
             .runtime
             .validate_tool_binding(connection_id)
             .is_ok());
-        // Managed OpenAPI tools and proxied requests attest the same way.
+        // Managed OpenAPI tools, composite leaves and proxied requests attest
+        // the same way.
         for lane_target in [
             temporary
                 .runtime
                 .openapi_tool_target(connection_id, "/charges")
                 .expect("a valid attested Connection serves OpenAPI tool calls"),
+            temporary
+                .runtime
+                .composite_leaf_target(connection_id, "/charges")
+                .expect("a valid attested Connection serves composite leaves"),
             temporary
                 .runtime
                 .proxy_route_target(connection_id, "/charges")
@@ -3856,14 +3882,25 @@ mod tests {
         assert_eq!(
             temporary
                 .runtime
+                .composite_leaf_target(connection_id, "/messages")
+                .err(),
+            refused
+        );
+        assert_eq!(
+            temporary
+                .runtime
                 .proxy_route_target(connection_id, "/messages")
                 .err(),
             refused
         );
-        assert!(!caller_assertion_servable_on(
-            &stored.write,
-            AttestingLane::OpenApiTool
-        ));
+        for lane in [
+            AttestingLane::OpenApiTool,
+            AttestingLane::CompositeLeaf,
+            AttestingLane::ProxyRoute,
+            AttestingLane::ManagedMcpTool,
+        ] {
+            assert!(!caller_assertion_servable_on(&stored.write, lane));
+        }
         assert!(caller_assertion_servable_on(
             &stored.write,
             AttestingLane::ManualTool
@@ -4135,6 +4172,13 @@ mod tests {
                 temporary
                     .runtime
                     .openapi_tool_target(connection_id, "/charges")
+                    .err(),
+                Some(ConnectionHttpError::CallerAssertionNotEnforced)
+            );
+            assert_eq!(
+                temporary
+                    .runtime
+                    .composite_leaf_target(connection_id, "/charges")
                     .err(),
                 Some(ConnectionHttpError::CallerAssertionNotEnforced)
             );

@@ -293,11 +293,8 @@ export type CallerAssertionKeyProblem = {
 
 /**
  * A Connection's caller assertion as the safe read returns it: every field
- * except the signing key alias, which is reduced to `signing_key_configured`.
- *
- * This UI displays a stored block and never changes it. See
- * `ConnectionWrite.caller_assertion` for why a replacement never sends it,
- * and `CallerAssertionWrite` for the one block this UI writes.
+ * except the key aliases, each reduced to `signing_key_configured`. See
+ * `ConnectionWrite.caller_assertion` for how a save sends it back.
  */
 export type SafeCallerAssertion = {
   signing_key_configured: boolean;
@@ -316,6 +313,45 @@ export type SafeCallerAssertion = {
   key_problem?: CallerAssertionKeyProblem;
 };
 
+/**
+ * How a write names a caller-assertion key: `signing_key_id`, an explicit
+ * alias, or, on a replacement only, `signing_key_configured: true`, which
+ * keeps the alias of the stored key with the same `kid` and algorithm. The
+ * gateway refuses a write with both, with neither, or with a marker that
+ * matches no stored key.
+ */
+export type CallerAssertionKeyBinding = {
+  signing_key_id?: string;
+  signing_key_configured?: true;
+};
+
+export type PublishedAssertionKeyWrite = CallerAssertionKeyBinding & {
+  kid: string;
+  algorithm: CallerAssertionAlgorithm;
+};
+
+/**
+ * A caller assertion as this UI writes it: in full whenever the operator
+ * edits a block, and when it creates a `delegated_issuer_token` Connection,
+ * whose subject tokens the block signs. That create leaves `bind_request`
+ * and `bind_approval` to their default, `false`, which a delegated
+ * Connection requires, and configures no published keys.
+ */
+export type CallerAssertionWrite = CallerAssertionKeyBinding & {
+  kid: string;
+  algorithm: CallerAssertionAlgorithm;
+  issuer: string;
+  audience: string;
+  token_type: string;
+  header_name: string;
+  lifetime_seconds: number;
+  claims?: CallerAssertionClaim[];
+  bind_request?: boolean;
+  /** The gateway refuses `true` on every write: nothing can satisfy it yet. */
+  bind_approval?: false;
+  published_keys?: PublishedAssertionKeyWrite[];
+};
+
 export type ConnectionWrite = {
   display_name: string;
   description?: string;
@@ -325,15 +361,11 @@ export type ConnectionWrite = {
   authentication: ConnectionAuthentication;
   additional_headers?: ConnectionAdditionalHeader[];
   /**
-   * Never sent on a replacement. A replacement that omits `caller_assertion`
-   * keeps the stored block, and `null` removes it. The safe read hides the
-   * block's signing key alias, so this UI cannot send the block back, and
-   * anything it could send would at best remove or replace the block, which
-   * changes whom the Connection attests and with which key. The type rules
-   * the key out so no replacement can include it; only a create may carry a
-   * block (see `ConnectionCreateWrite`).
+   * Sent only when the operator changes the block. A replacement that omits
+   * `caller_assertion` keeps the stored block exactly as it is, which is how
+   * every other save leaves it alone, and `null` removes it.
    */
-  caller_assertion?: never;
+  caller_assertion?: CallerAssertionWrite | null;
   tls: TlsProfile;
   timeouts?: ConnectionTimeouts;
   discovery?: DiscoveryConfig;
@@ -341,25 +373,10 @@ export type ConnectionWrite = {
 };
 
 /**
- * The caller assertion a new `delegated_issuer_token` Connection signs its
- * subject tokens with: the one block this UI writes, and only when it creates
- * the Connection. `bind_request` and `bind_approval` are left to their
- * default, `false`, which a delegated Connection requires, and no published
- * keys are configured; rotation goes through the admin API.
+ * A create: a `ConnectionWrite` whose caller assertion, if any, is new. There
+ * is nothing to remove, and a create names every key alias: it accepts no
+ * `signing_key_configured` marker.
  */
-export type CallerAssertionWrite = {
-  signing_key_id: string;
-  kid: string;
-  algorithm: CallerAssertionAlgorithm;
-  issuer: string;
-  audience: string;
-  token_type: string;
-  header_name: string;
-  lifetime_seconds: number;
-  claims?: CallerAssertionClaim[];
-};
-
-/** A create: a `ConnectionWrite` that may also carry a new caller assertion. */
 export type ConnectionCreateWrite = Omit<ConnectionWrite, 'caller_assertion'> & {
   caller_assertion?: CallerAssertionWrite;
 };
@@ -1119,7 +1136,7 @@ function projectSafeCallerAssertion(value: unknown): SafeCallerAssertion {
 }
 
 // The gateway publishes at most this many keys beside a signing key.
-const MAX_PUBLISHED_ASSERTION_KEYS = 4;
+export const MAX_PUBLISHED_ASSERTION_KEYS = 4;
 
 function isSafePublishedAssertionKeyList(
   value: unknown,

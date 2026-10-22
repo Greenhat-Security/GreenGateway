@@ -1,7 +1,8 @@
 # Pure-path microbenchmark budgets
 
 Part of #437. The required `microbench` CI job compares deterministic allocation
-counts for a small set of pure production predicates. Wall-clock timings remain
+counts for a small set of pure production predicates and for the shared policy
+evaluator's HTTP, tool and rate-lane decisions. Wall-clock timings remain
 informational. The existing nightly, HA, failover, load and release workflows
 remain in place; these microbenchmarks do not establish a production SLO.
 
@@ -46,12 +47,15 @@ The request target counts its two independent boolean decisions separately.
 The egress target measures static host matching; it does not measure URL
 classification, resolution, address policy, HTTP or network transport.
 
-The shared evaluator exists, but live adapter migration remains tracked by
-#422. This slice does not claim an authoritative end-to-end policy benchmark.
-Issue #437 PR 3 remains deferred until that authority boundary is established;
-retired predicates must receive equivalent authoritative coverage before their
-benchmarks are removed. Cached JWT work is also deferred: this harness has no
-JWT verification, keys, cache or cache-lifetime model.
+These four targets measure predicates, not policy decisions. The shared
+evaluator's HTTP, tool and rate decisions have kernel targets of their own,
+described from [the HTTP policy decision](#authoritative-http-policy-decision)
+on. Every predicate measured here is still called by production code; the
+static egress lane, for example, matches host patterns with
+`host_glob_matches`. None has been retired, so none of these targets is
+removed; a predicate retired later needs equivalent authoritative coverage
+before its benchmark goes. Cached JWT work is deferred: this harness has no JWT
+verification, keys, cache or cache-lifetime model.
 
 All inputs are public synthetic fixtures. Host cases use reserved test names;
 there are no tokens, real upstream hostnames or external network dependencies.
@@ -88,15 +92,19 @@ an extraction or compilation failure, a crashed benchmark, a timeout and an
 incomplete target set fail the comparison. A timing improvement cannot offset
 an allocation regression.
 
-A comparison whose total elapsed time exceeds 120 seconds cannot pass. The
-controller checks that acceptance budget before child processes and again at
-completion. Compiler processes have a 30-second limit, benchmark processes a
-15-second limit, and Git lookups their own ten-second timeout. Python source
-projection is not forcibly interrupted, so 120 seconds is not a hard kill
-deadline for the entire controller. CI imposes a separate ten-minute job
-timeout, including checkout, pinned tool setup, fixture tests and artifact
-upload. The [hosted CI record](#hosted-ci-record) shows GitHub-hosted jobs
-finishing well inside both limits.
+The pure-path stage must finish within 120 seconds of the controller's start,
+and the whole comparison, including the two gateway test-binary builds the
+kernel targets below need, within 480 seconds. Exceeding either budget fails
+the comparison. The controller checks the applicable budget before each child
+process and again at completion. Compiler processes have a 30-second limit,
+benchmark processes a 15-second limit, each gateway build 300 seconds, other
+Cargo and test-binary processes and Git archives 60 seconds, and Git lookups
+their own ten-second timeout. Source projection and tree extraction are not
+forcibly interrupted, so neither budget is a hard kill deadline for the entire
+controller. CI imposes a separate ten-minute job timeout, including checkout,
+pinned tool setup, fixture tests and artifact upload. The
+[hosted CI record](#hosted-ci-record) shows the pure-path stage finishing well
+inside its budget and the gateway builds taking most of the total.
 
 ## Reproduce a comparison
 
@@ -196,6 +204,21 @@ Pull-request mode has also run on a hosted runner. In run 37221295106, the
 `5b753edaf10e3d9568f4c5bf95ed035a9af97c31` with `pull_request.base.sha`
 `9a48f0e2731920a4ee49cad4896d5f88dce75382` and passed in 27 seconds.
 
+Since the `http_policy` harness landed (#586, 2026-10-20), every comparison
+also builds two gateway test binaries, and the comparison step dominates the
+job. The 37 `microbench` jobs of the pull-request and main-push CI runs
+created from 2026-10-21 07:05 to 2026-10-22 07:06 UTC all passed. Their
+comparison steps took 258 to 469 seconds, 36 of them under 410, and the jobs
+took 299 to 519 seconds. In the four runs whose head carried the lane
+benchmarks, from main-push run 39737047860, which landed them, to
+pull-request run 39738214098, the step took 283 to 469 seconds. Each lane
+test finished in under a second in the
+[lane measurement record](#lane-measurement-record), so the lanes add little
+to a step bound by the two builds. The slowest step, in run 39738214098,
+finished about 11 seconds inside the 480-second comparison budget. That margin
+is the job's main timing risk, and it comes from build time, not from the
+measured decisions.
+
 These are durations on shared hosted runners, not a timing qualification. The
 evidence artifacts have 30-day retention, so this record keeps run and commit
 identifiers rather than relying on the artifacts. The scheduled
@@ -286,9 +309,57 @@ one more step first, because declaring the child module changes the enforced
    `proposed` against its schema-2 base. Every later comparison whose base
    carries schema 3 is `enforced`, and a head budget cannot retire the lanes.
 
-Steps 1 and 2 have landed; until step 3 lands, these targets are measured and
-reported but do not block. After it, a lane harness change follows the
-two-hash procedure below for `lane_harness_sha256`.
+All three steps have landed: f6728d2 pre-approved the declaring harness,
+870ad67 added the lane benchmarks, and the budget step moved
+`microbench-budget.json` to schema 3, running `proposed` against its schema-2
+base. Every comparison whose base carries schema 3 enforces both lanes as it
+enforces `http_policy`. Any increase in either target's allocation count or
+allocated bytes fails the job. So does a lane benchmark that is missing,
+undiscovered, crashed, timed out or reporting another dataset, and a head
+budget cannot retire the lanes. A timing change cannot offset an allocation
+regression. The same budget stopped approving
+`f10830a181046792488b7749f2c367276756027eee7b31a9f7157e446d634936`, the
+`http_policy` harness from before the declaration: a revision carrying it
+lacks the lanes, so it cannot pass against a schema-3 base anyway. A lane
+dataset or harness change now follows the two-hash procedure below for
+`lane_harness_sha256`. A change to the `http_policy` harness, including its
+declaration of the lane module, follows it for `kernel_harness_sha256`.
+
+The static egress lane, `CompiledEgressPolicy::evaluate`, has no kernel target
+yet. Only its host-pattern predicate is measured, as `egress_host`.
+
+### Lane measurement record
+
+On 2026-10-22, before the budget step, the two lane tests were run directly
+from a gateway test binary built from main
+`120f5571947b80368fc8495a2ce8094dd6c7406e` with Rust 1.98.1 and Cargo's
+default test profile. The host was Windows 11 x86-64 with 16 logical CPUs and
+other builds running: an uncontrolled development host, not a qualified
+runner. The build differed from the controller's in three ways. It kept debug
+info and incremental compilation, it set `-D warnings`, and `gateway/build.rs`
+was replaced by a script that skips the admin UI build, which requires the
+pinned Node. The measured decisions never read the UI bundle. Each target ran
+in three separate processes and once more with the regression fixture switch;
+each test finished in under a second.
+
+| Target | Allocation calls | Requested bytes | Median timing range (ms) | Largest within-run spread | Fixture growth (calls / bytes) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `tool_policy` | 9,000 | 1,007,400 | 34.7–55.6 | 39.3% | 2,700 / 172,800 |
+| `rate_lane` | 19,600 | 909,800 | 25.1–26.6 | 54.8% | 1,400 / 89,600 |
+
+Counts are per sample of 100 dataset passes. Timing ranges span the three
+runs' medians, and the spread column is the largest within-run
+`(max - min) / median`, not a confidence interval. All 27 samples of each
+target had identical counts, equal to those captured from a separate build
+when the harness was added (`LANE_ROWS` in `scripts/test_microbench.py`).
+Compared with `compare_kernel_results` under the schema-3 budget, each pair of
+neutral runs passed and each fixture run failed, by exactly one 64-byte
+allocation per decision. The stable counts support the zero-growth budget; the
+timing spread on unchanged source again supports leaving time informational.
+On this host the controller's `run` command passed its pure-path stage and
+then refused the kernel stage, because building the real gateway needs the
+pinned Node; `self-test` needs it too. The processes above shared one binary,
+so an independent rebuild of the same revision is what `self-test` adds.
 
 ## Base ownership and reviewed updates
 

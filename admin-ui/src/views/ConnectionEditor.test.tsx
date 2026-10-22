@@ -386,9 +386,11 @@ describe('ConnectionEditor', () => {
           !init?.method
         ) {
           return Promise.resolve(
-            jsonResponse(200, managedDetail({ callerAssertion: stored }), {
-              ETag: '"record-7"',
-            }),
+            jsonResponse(
+              200,
+              managedDetail({ authentication: 'none', callerAssertion: stored }),
+              { ETag: '"record-7"' },
+            ),
           );
         }
         if (
@@ -401,6 +403,7 @@ describe('ConnectionEditor', () => {
             jsonResponse(
               200,
               managedDetail({
+                authentication: 'none',
                 displayName: 'Billing API renamed',
                 callerAssertion: stored,
               }),
@@ -423,10 +426,24 @@ describe('ConnectionEditor', () => {
     expect(section?.textContent).toContain('gw-2026-09');
     expect(section?.textContent).toContain('x-caller-assertion');
     expect(section?.textContent).toContain('sub, email');
-    // Read only: nothing in the section can change the block.
+    // Read only: without secrets-write permission nothing in the section can
+    // change the block, and it says why.
+    expect(section?.querySelectorAll('input, select, textarea')).toHaveLength(
+      0,
+    );
+    const buttons = Array.from(section?.querySelectorAll('button') ?? []);
+    expect(buttons.map((button) => button.textContent)).toEqual([
+      'Edit caller assertion',
+      'Remove caller assertion',
+    ]);
+    expect(buttons.every((button) => button.disabled)).toBe(true);
+    expect(section?.textContent).toContain(
+      'Changing the caller assertion needs secrets-write permission',
+    );
+    // The block alone is credential authority, so the endpoint is locked too.
     expect(
-      section?.querySelectorAll('input, select, textarea, button'),
-    ).toHaveLength(0);
+      (screen.getByLabelText('Base URL') as HTMLInputElement).disabled,
+    ).toBe(true);
 
     fireEvent.change(name, { target: { value: 'Billing API renamed' } });
     fireEvent.click(screen.getByRole('button', { name: 'Save connection' }));
@@ -498,6 +515,359 @@ describe('ConnectionEditor', () => {
     expect(
       fetchMock.mock.calls.some(([, init]) => init?.method === 'PUT'),
     ).toBe(false);
+  });
+
+  it('edits a stored caller assertion, keeping each key by marker and naming a new one', async () => {
+    const puts: RequestInit[] = [];
+    const stored = storedAssertion({
+      published_keys: [
+        { signing_key_configured: true, kid: 'gw-2026-10', algorithm: 'rs256' },
+      ],
+    });
+    vi.stubGlobal(
+      'fetch',
+      attestedConnectionFetch({
+        detail: managedDetail({ canBindSecret: true, callerAssertion: stored }),
+        secrets: assertionAliases(),
+        onPut: (init) => {
+          puts.push(init);
+          return jsonResponse(
+            200,
+            managedDetail({ canBindSecret: true, callerAssertion: stored }),
+            { ETag: '"record-8"' },
+          );
+        },
+      }),
+    );
+
+    renderEditor('/connections/billing/edit');
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'Edit caller assertion' }),
+    );
+    const signingKey = screen.getByLabelText(
+      'Signing key secret alias',
+    ) as HTMLSelectElement;
+    expect(signingKey.value).toBe('intent:preserve');
+    await waitFor(() =>
+      expect(optionValues(signingKey)).toEqual([
+        'intent:preserve',
+        'secret:assertion-key-next',
+        'secret:assertion-key-spare',
+      ]),
+    );
+    // A key cannot be unbound, and a local-store alias cannot hold one.
+    expect(optionValues(signingKey)).not.toContain('intent:clear');
+    expect(optionValues(signingKey)).not.toContain('secret:local-bearer');
+
+    fireEvent.change(screen.getByLabelText('Lifetime (seconds)'), {
+      target: { value: '120' },
+    });
+    fireEvent.click(screen.getByLabelText('Roles (roles)'));
+    fireEvent.click(screen.getByRole('button', { name: 'Add published key' }));
+    fireEvent.change(screen.getByLabelText('Published key 2 ID (kid)'), {
+      target: { value: 'gw-2026-11' },
+    });
+    fireEvent.change(screen.getByLabelText('Published key 2 secret alias'), {
+      target: { value: 'secret:assertion-key-spare' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save connection' }));
+
+    expect(await screen.findByText('Connection detail route')).toBeTruthy();
+    expect(headerValue(puts[0]?.headers, 'If-Match')).toBe('"record-7"');
+    const body = JSON.parse(String(puts[0]?.body)) as Record<string, unknown>;
+    expect(body.caller_assertion).toStrictEqual({
+      signing_key_configured: true,
+      kid: 'gw-2026-09',
+      algorithm: 'es256',
+      issuer: 'https://gateway.example.test',
+      audience: 'https://billing.example.test/api',
+      token_type: 'caller-assertion+jwt',
+      header_name: 'x-caller-assertion',
+      lifetime_seconds: 120,
+      claims: ['email', 'roles'],
+      bind_request: true,
+      bind_approval: false,
+      published_keys: [
+        { signing_key_configured: true, kid: 'gw-2026-10', algorithm: 'rs256' },
+        {
+          signing_key_id: 'assertion-key-spare',
+          kid: 'gw-2026-11',
+          algorithm: 'es256',
+        },
+      ],
+    });
+  });
+
+  it('rotates by promoting a published key, which takes its kept binding with it', async () => {
+    const puts: RequestInit[] = [];
+    const stored = storedAssertion({
+      published_keys: [
+        { signing_key_configured: true, kid: 'gw-2026-10', algorithm: 'rs256' },
+      ],
+    });
+    vi.stubGlobal(
+      'fetch',
+      attestedConnectionFetch({
+        detail: managedDetail({ canBindSecret: true, callerAssertion: stored }),
+        secrets: assertionAliases(),
+        onPut: (init) => {
+          puts.push(init);
+          return jsonResponse(
+            200,
+            managedDetail({ canBindSecret: true, callerAssertion: stored }),
+            { ETag: '"record-8"' },
+          );
+        },
+      }),
+    );
+
+    renderEditor('/connections/billing/edit');
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'Edit caller assertion' }),
+    );
+    fireEvent.click(
+      screen.getByRole('button', {
+        name: 'Make published key 1 the signing key',
+      }),
+    );
+    expect(
+      (screen.getByLabelText('Signing key ID (kid)') as HTMLInputElement).value,
+    ).toBe('gw-2026-10');
+    expect(
+      (screen.getByLabelText('Published key 1 ID (kid)') as HTMLInputElement)
+        .value,
+    ).toBe('gw-2026-09');
+
+    // Renaming the kept key drops its binding, since the gateway keeps an
+    // alias by kid, and renaming it back restores it.
+    const publishedKid = screen.getByLabelText('Published key 1 ID (kid)');
+    const publishedSecret = screen.getByLabelText(
+      'Published key 1 secret alias',
+    ) as HTMLSelectElement;
+    fireEvent.change(publishedKid, { target: { value: 'gw-2026-12' } });
+    expect(publishedSecret.value).toBe('intent:none');
+    fireEvent.change(publishedKid, { target: { value: 'gw-2026-09' } });
+    expect(publishedSecret.value).toBe('intent:preserve');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save connection' }));
+    expect(await screen.findByText('Connection detail route')).toBeTruthy();
+    const body = JSON.parse(String(puts[0]?.body)) as {
+      caller_assertion: Record<string, unknown>;
+    };
+    expect(body.caller_assertion).toMatchObject({
+      signing_key_configured: true,
+      kid: 'gw-2026-10',
+      algorithm: 'rs256',
+      published_keys: [
+        { signing_key_configured: true, kid: 'gw-2026-09', algorithm: 'es256' },
+      ],
+    });
+    expect(String(puts[0]?.body)).not.toContain('signing_key_id');
+  });
+
+  it('adds a caller assertion to a new connection from an operator alias', async () => {
+    const posts: RequestInit[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = requestUrl(input);
+        if (url.pathname === '/v1/admin/connections' && !init?.method) {
+          return Promise.resolve(
+            jsonResponse(200, connectionList(true), {
+              ETag: '"connections"',
+              'X-GreenGateway-Connections-ETag': '"connections-collection"',
+            }),
+          );
+        }
+        if (
+          url.pathname === '/v1/admin/connection-secrets' &&
+          !init?.method
+        ) {
+          return Promise.resolve(
+            jsonResponse(200, secretList({ secrets: assertionAliases() }), {
+              ETag: '"secrets"',
+              'X-GreenGateway-Connection-Secrets-ETag': '"secret-collection"',
+            }),
+          );
+        }
+        if (url.pathname === '/v1/admin/connections' && init?.method === 'POST') {
+          posts.push(init);
+          return Promise.resolve(
+            jsonResponse(
+              201,
+              managedDetail({ callerAssertion: storedAssertion() }),
+              {
+                ETag: '"record-1"',
+                'X-GreenGateway-Connections-ETag': '"connections-collection-2"',
+              },
+            ),
+          );
+        }
+        return Promise.reject(new Error(`unexpected request: ${url.pathname}`));
+      }),
+    );
+
+    renderEditor('/connections/new');
+    fireEvent.change(await screen.findByLabelText('Display name'), {
+      target: { value: 'Attested API' },
+    });
+    const baseUrl = screen.getByLabelText('Base URL');
+    fireEvent.change(baseUrl, {
+      target: { value: 'http://attested.example.test' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Add caller assertion' }));
+    const signingKey = screen.getByLabelText(
+      'Signing key secret alias',
+    ) as HTMLSelectElement;
+    await waitFor(() =>
+      expect(optionValues(signingKey)).toContain('secret:assertion-key-next'),
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save disabled draft' }));
+    expect(
+      await screen.findByText('Select the secret alias that holds this key.'),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(
+        'Connections with a caller assertion must use an HTTPS origin.',
+      ),
+    ).toBeTruthy();
+    expect(posts).toHaveLength(0);
+
+    fireEvent.change(baseUrl, {
+      target: { value: 'https://attested.example.test' },
+    });
+    fireEvent.change(signingKey, {
+      target: { value: 'secret:assertion-key-next' },
+    });
+    fireEvent.change(screen.getByLabelText('Signing key ID (kid)'), {
+      target: { value: 'gw-1' },
+    });
+    fireEvent.change(screen.getByLabelText('Signing key algorithm'), {
+      target: { value: 'rs256' },
+    });
+    fireEvent.change(screen.getByLabelText('Issuer (iss)'), {
+      target: { value: 'https://gateway.example.test' },
+    });
+    fireEvent.change(screen.getByLabelText('Audience (aud)'), {
+      target: { value: 'https://attested.example.test' },
+    });
+    fireEvent.change(screen.getByLabelText('Token type (typ)'), {
+      target: { value: 'caller-assertion+jwt' },
+    });
+    fireEvent.click(
+      screen.getByLabelText(
+        'Bind the request: method, request target and SHA-256 of the exact body sent (bind_request)',
+      ),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Save disabled draft' }));
+
+    expect(await screen.findByText('Connection detail route')).toBeTruthy();
+    const body = JSON.parse(String(posts[0]?.body)) as Record<string, unknown>;
+    expect(body.caller_assertion).toStrictEqual({
+      signing_key_id: 'assertion-key-next',
+      kid: 'gw-1',
+      algorithm: 'rs256',
+      issuer: 'https://gateway.example.test',
+      audience: 'https://attested.example.test',
+      token_type: 'caller-assertion+jwt',
+      header_name: 'X-Caller-Assertion',
+      lifetime_seconds: 60,
+      bind_request: true,
+      bind_approval: false,
+    });
+    // A create never carries a redaction marker.
+    expect(String(posts[0]?.body)).not.toContain('_configured');
+  });
+
+  it('removes a stored caller assertion only with an explicit null, and can undo it', async () => {
+    const puts: RequestInit[] = [];
+    vi.stubGlobal(
+      'fetch',
+      attestedConnectionFetch({
+        detail: managedDetail({
+          canBindSecret: true,
+          callerAssertion: storedAssertion(),
+        }),
+        secrets: assertionAliases(),
+        onPut: (init) => {
+          puts.push(init);
+          return jsonResponse(200, managedDetail({ canBindSecret: true }), {
+            ETag: '"record-8"',
+          });
+        },
+      }),
+    );
+
+    renderEditor('/connections/billing/edit');
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'Remove caller assertion' }),
+    );
+    expect(screen.getByText('Removed when you save.')).toBeTruthy();
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Keep caller assertion' }),
+    );
+    expect(screen.queryByText('Removed when you save.')).toBeNull();
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Remove caller assertion' }),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Save connection' }));
+
+    expect(await screen.findByText('Connection detail route')).toBeTruthy();
+    const body = JSON.parse(String(puts[0]?.body)) as Record<string, unknown>;
+    expect(Object.hasOwn(body, 'caller_assertion')).toBe(true);
+    expect(body.caller_assertion).toBeNull();
+  });
+
+  it('shows gateway caller-assertion problems with their codes and focuses them', async () => {
+    let putCount = 0;
+    vi.stubGlobal(
+      'fetch',
+      attestedConnectionFetch({
+        detail: managedDetail({
+          canBindSecret: true,
+          callerAssertion: storedAssertion(),
+        }),
+        secrets: assertionAliases(),
+        onPut: () => {
+          putCount += 1;
+          return jsonResponse(422, {
+            error: 'connection validation failed',
+            problems: [
+              {
+                field: 'caller_assertion.signing_key_id',
+                code: 'unusable_signing_key',
+              },
+            ],
+          });
+        },
+      }),
+    );
+
+    renderEditor('/connections/billing/edit');
+    // Kept read only, the problem is listed in the section.
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'Save connection' }),
+    );
+    const message =
+      'The key cannot sign with this algorithm: ES256 needs a P-256 key and RS256 an RSA key of at least 2048 bits. (unusable_signing_key)';
+    const alert = (await screen.findByText(message)).closest(
+      '#connection-caller-assertion-problems',
+    );
+    expect(alert).toBeTruthy();
+    await waitFor(() => expect(document.activeElement).toBe(alert));
+
+    // While editing, it sits on the field that configures the key.
+    fireEvent.click(screen.getByRole('button', { name: 'Edit caller assertion' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Save connection' }));
+    const signingKey = screen.getByLabelText('Signing key secret alias');
+    await waitFor(() => expect(document.activeElement).toBe(signingKey));
+    expect(signingKey.getAttribute('aria-invalid')).toBe('true');
+    expect(
+      document.getElementById('connection-caller-assertion-signing-key-error')
+        ?.textContent,
+    ).toBe(message);
+    expect(putCount).toBe(2);
   });
 
   it('creates an ordered, four-row-bounded additional header list from header secret aliases', async () => {
@@ -3005,6 +3375,98 @@ function localSecret(
     actions: { can_rotate: true, can_delete: true },
     ...overrides,
   };
+}
+
+function storedAssertion(
+  overrides: Partial<SafeCallerAssertion> = {},
+): SafeCallerAssertion {
+  return {
+    signing_key_configured: true,
+    kid: 'gw-2026-09',
+    algorithm: 'es256',
+    issuer: 'https://gateway.example.test',
+    audience: 'https://billing.example.test/api',
+    token_type: 'caller-assertion+jwt',
+    header_name: 'x-caller-assertion',
+    lifetime_seconds: 60,
+    claims: ['email'],
+    bind_request: true,
+    bind_approval: false,
+    ...overrides,
+  };
+}
+
+// Operator aliases carry no purpose of their own, so they can hold an
+// assertion key; a local-store alias has exactly one purpose and never this
+// one.
+function assertionAliases(): ConnectionSecretMetadata[] {
+  return [
+    localSecret({
+      id: 'local-bearer',
+      label: 'Local bearer',
+    }),
+    localSecret({
+      id: 'assertion-key-next',
+      label: 'Assertion key next',
+      provider: 'operator_file',
+      compatible_purposes: [
+        'header_api_key',
+        'static_bearer',
+        'oauth_client_secret',
+        'tls_private_key',
+        'tls_certificate',
+        'tls_ca_bundle',
+        'assertion_signing_key',
+        'token_exchange_client_secret',
+      ],
+      actions: { can_rotate: false, can_delete: false },
+    }),
+    localSecret({
+      id: 'assertion-key-spare',
+      label: 'Assertion key spare',
+      provider: 'vault_kv_v2',
+      compatible_purposes: ['assertion_signing_key'],
+      actions: { can_rotate: false, can_delete: false },
+    }),
+  ];
+}
+
+function attestedConnectionFetch({
+  detail,
+  secrets,
+  onPut,
+}: {
+  detail: ConnectionDetail;
+  secrets: ConnectionSecretMetadata[];
+  onPut: (init: RequestInit) => Response;
+}) {
+  return vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    const url = requestUrl(input);
+    if (url.pathname === '/v1/admin/connections/billing' && !init?.method) {
+      return Promise.resolve(
+        jsonResponse(200, detail, { ETag: '"record-7"' }),
+      );
+    }
+    if (url.pathname === '/v1/admin/connection-secrets' && !init?.method) {
+      return Promise.resolve(
+        jsonResponse(200, secretList({ secrets }), {
+          ETag: '"secret-entity"',
+          'X-GreenGateway-Connection-Secrets-ETag': '"secret-collection"',
+        }),
+      );
+    }
+    if (
+      url.pathname === '/v1/admin/connections/billing' &&
+      init?.method === 'PUT'
+    ) {
+      return Promise.resolve(onPut(init));
+    }
+    return Promise.reject(new Error(`unexpected request: ${url.pathname}`));
+  });
+}
+
+function optionValues(select: HTMLSelectElement): string[] {
+  return Array.from(select.options).map((option) => option.value);
 }
 
 function requestUrl(input: RequestInfo | URL): URL {
