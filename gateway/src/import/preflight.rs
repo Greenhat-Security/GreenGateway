@@ -102,6 +102,10 @@ const AUTHORITATIVE_TABLES: &[&str] = &[
     // before anything has happened, and its position is covered by the
     // journal's own counter below.
     "authority_event_journal",
+    // 0022's policy drafts are absent: they are owner-scoped working
+    // state, never authority or history, and a draft needs a live policy to
+    // be pinned to, which an empty namespace does not have. The validation
+    // proves the import left the table empty (`EXCLUDED_RUNTIME_TABLES`).
 ];
 
 /// The authoritative singleton counters and the column that carries them.
