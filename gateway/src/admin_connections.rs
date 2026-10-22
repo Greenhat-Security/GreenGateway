@@ -1381,9 +1381,18 @@ pub(super) async fn connection_test_endpoint(
         );
     }
 
+    // The test runs as the principal who asked for it: a delegated Connection
+    // is tested with that principal's own token, exactly as the admin tool
+    // playground calls tools as them. Every other credential ignores it.
+    let tester = connections::caller_assertion::AttestedCaller::from_principal(&principal);
     let execution = state
         .tests
-        .execute_before(record, current_etag.as_str(), probe_deadline)
+        .execute_before(
+            record,
+            current_etag.as_str(),
+            tester.as_ref(),
+            probe_deadline,
+        )
         .await;
     let persistence = state
         .control_plane

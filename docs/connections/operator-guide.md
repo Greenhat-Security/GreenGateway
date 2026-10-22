@@ -395,8 +395,8 @@ own, and every lane when the stored block is one only an earlier release
 accepted (see [HTTPS only](#https-only) and
 [Failure reasons](#failure-reasons)). A `delegated_issuer_token` Connection,
 whose assertion is the subject token of the caller's own credential, is
-served by manual HTTP tools only; see
-[Which calls are served](#which-calls-are-served).
+served by manual HTTP tools only, and its stored test runs as the principal
+who asks for it; see [Which calls are served](#which-calls-are-served).
 
 On the refused lanes the reason appears as follows:
 
@@ -587,7 +587,7 @@ Each refusal is a fixed string in the `failure_reason` of `tool.invoke_failure`
 | `caller_assertion_claim_invalid` | A value would not survive as a claim: a subject longer than 256 bytes, an issuer longer than 512 bytes or containing `#`, a role longer than 128 bytes, an email longer than 320 bytes, a request ID (a `jti`, with a managed MCP session's sequence suffix) longer than 128 bytes or missing, with `bind_request` a request target longer than 2048 bytes or a method longer than 16 bytes, or any of them containing a control character. |
 | `caller_assertion_header_conflict` | Another header source had already set the assertion header. |
 | `caller_assertion_signature_failed`, `caller_assertion_token_too_long` | Signing failed, including on a host whose clock reads before 1970 and a managed MCP session asked to sign after its call ended, or the assertion would exceed 8 KiB. |
-| `caller_assertion_not_enforced` | The lane has no caller to attest (discovery, enum and label sources, stored tests), is a composite tool's step, serves a `delegated_issuer_token` Connection other than through a manual tool, or the stored block is one only an earlier release accepted: `bind_approval: true`, an assertion header that matches an additional header, or a plain HTTP endpoint. |
+| `caller_assertion_not_enforced` | The lane has no caller to attest (discovery, enum and label sources, stored tests), is a composite tool's step, serves a `delegated_issuer_token` Connection other than through a manual tool or a stored test, or the stored block is one only an earlier release accepted: `bind_approval: true`, an assertion header that matches an additional header, or a plain HTTP endpoint. |
 
 A signing key that cannot be read or loaded at call time also raises
 `connection.secret_resolution_failed` with the same reason. A proxied request
@@ -1089,13 +1089,53 @@ a `refresh_token` included, are skipped unread and never kept.
 #### Which calls are served
 
 Only manual HTTP tool calls, whether from `/mcp` or the admin playground: they
-are the one lane that obtains a caller's own token. Every other lane --
-managed OpenAPI and composite tools, proxied requests, discovery, enum and
-label sources and stored Connection tests -- is refused with
-`caller_assertion_not_enforced`, including the lanes that attest the caller of
-an ordinary attested Connection. There is no service-principal fallback: a
-call with no principal, or a service token's, is refused with
-`delegated_token_no_principal` before anything is read or sent.
+are the one tool lane that obtains a caller's own token. A stored Connection
+test is also served, as the principal who runs it; see
+[Testing a delegated Connection](#testing-a-delegated-connection). Every other
+lane -- managed OpenAPI and composite tools, proxied requests, discovery, enum
+and label sources -- is refused with `caller_assertion_not_enforced`,
+including the lanes that attest the caller of an ordinary attested Connection.
+There is no service-principal fallback: a call with no principal, or a service
+token's, is refused with `delegated_token_no_principal` before anything is
+read or sent.
+
+#### Testing a delegated Connection
+
+`POST /v1{ADMIN_PREFIX}/connections/{id}/test` on a delegated Connection runs
+as the administrator who sends it, exactly as the admin playground calls tools
+as them. The gateway signs a subject token naming that principal, exchanges it
+at `token_exchange_url` for the administrator's own access token, and sends the
+saved `GET` or `HEAD` test request with it. So a passing test shows that the
+issuer, the client secret, the signing key, the egress policy and the
+upstream work for the tester's own grant; it says nothing about any other
+user's.
+
+- The exchange runs inline, within the test's own deadline, and its token is
+  used for the one test request and then dropped. It is never cached: a test
+  never serves a later call, and a later call's cached token never makes a test
+  pass. The issuer still sees an ordinary exchange, and the token it issued stays
+  valid there until it expires: a purge never revokes it, since the gateway no
+  longer holds it.
+- A tester with no principal an issuer could look up -- a service token, or a
+  session without an identity-provider issuer -- is refused with
+  `delegated_token_no_principal` in the `secret_available` stage before any
+  DNS lookup, secret read or request.
+- A disabled Connection is refused with `caller_assertion_key_not_published`
+  in the `authenticated` stage, before any I/O: the published JWKS carries
+  only enabled Connections' keys, so the issuer could not verify the subject
+  token. Enable the Connection (with no tool bound to it yet, nothing calls it)
+  to test it. The same reason refuses an enabled Connection whose keys this
+  replica leaves out of the JWKS.
+- An issuer refusal is reported as `delegated_token_denied`, an egress refusal
+  of the issuer host as `delegated_token_egress_denied` (in the
+  `egress_policy` stage), any other failed exchange as
+  `delegated_token_exchange_failed`, and a client secret or signing key that
+  cannot be resolved as `credential_invalid` or `credential_unavailable`, in
+  the `secret_available` stage, with nothing sent upstream. These are the
+  reasons a tool call reports.
+- The exchange emits `connection.delegated_token_exchange` with the tester as
+  its `actor`, and the test emits `connection.tested` as usual. The status the
+  test records on the Connection reflects the tester's grant.
 
 #### The cache
 
@@ -1289,7 +1329,8 @@ the trust sits:
   Connection's upstream is also a subject token the issuer accepts, and only
   the client secret stands between that upstream and the caller's grant.
 - **The gateway keeps tokens only in the bounded cache above**, never on disk,
-  and for at most 900 seconds.
+  and for at most 900 seconds; a Connection test's token only for its one
+  request.
 - **Disabling a user is not something the gateway learns by itself.** A
   disabled user cannot call the gateway once their sign-in no longer validates,
   but a bearer token issued before keeps validating until it expires unless its
@@ -1311,13 +1352,36 @@ the trust sits:
 
 #### In the admin UI
 
-The Connection detail page shows this credential read only -- every field but
-the client secret's alias, which appears only as configured or not, the
-revocation endpoint included -- and the caller assertion as its subject
-token. The editor does not open such a Connection, because saving through a
-form that cannot represent the credential would replace it; create and change
-it through the admin API. A principal's tokens are purged through the admin
-API only.
+The editor creates and edits delegated Connections:
+
+- **Create.** Choose *Delegated issuer token* on an HTTP API Connection, then
+  set the client ID, token exchange URL, requested scopes, audience,
+  resource and optional revocation URL, and select the client secret from the
+  aliases whose compatible purposes include `token_exchange_client_secret`. The *Subject token* section
+  configures the `caller_assertion` block the subject token is signed with:
+  the signing key (an alias compatible with `assertion_signing_key`), `kid`,
+  algorithm, `iss`, `aud`, `typ`, lifetime, the `email` and `roles` claims, and
+  the reserved header name, which carries nothing on a delegated Connection.
+  It never sets `bind_request`, `bind_approval` or `published_keys`. Both
+  aliases come from operator aliases or external providers; the encrypted local
+  store holds neither. Creating such a Connection binds a caller assertion, so
+  it needs `admin:connections:secrets:write`.
+- **Edit.** Every credential field above can change, and the client secret can
+  be kept, replaced or cleared. The credential type cannot: the stored
+  `caller_assertion` is kept through every save, and under any other type the
+  gateway would start sending it upstream. A replacement never sends the
+  block, so it is shown read only; change it, or rotate its key, through the
+  admin API. For the same reason the editor does not offer the delegated
+  type on a Connection created with another one.
+- **Test.** *Test connection* runs as you; see
+  [Testing a delegated Connection](#testing-a-delegated-connection). The page
+  explains each refusal, for example that the issuer has no grant for your
+  account.
+
+The detail page shows every field but the client secret's alias, which
+appears only as configured or not, the revocation endpoint included, and the
+caller assertion as the subject token. A principal's tokens are purged through
+the admin API only.
 
 ## TLS, Custom CAs, and Mutual TLS
 
@@ -1346,6 +1410,10 @@ client. It accepts no URL, method, path, header, body, credential, TLS, timeout,
 or egress override. HTTP tests use only the saved `GET` or `HEAD` profile and
 expected status set. MCP tests perform a bounded protocol check and do not call
 a tool, read a resource, or publish a catalog.
+
+A delegated issuer token Connection is tested as the administrator who runs
+the test, with their own exchanged token; see
+[Testing a delegated Connection](#testing-a-delegated-connection).
 
 Run Test after:
 
