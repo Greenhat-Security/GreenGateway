@@ -463,6 +463,110 @@ impl CompiledPolicy {
     }
 }
 
+/// An enum-source refresh request, as the tool runtime's precheck states it
+/// before any DNS, credential or transport work (#422).
+///
+/// A source request has no caller and no inbound route. The refresher runs
+/// outside any request, and an admin overlay install resolves its sources for
+/// the catalog rather than for the administrator. So no principal and no
+/// dispatch are supplied, and none is asked for.
+#[derive(Clone)]
+pub(crate) struct SourceRequestContext {
+    pub(crate) version: u16,
+    pub(crate) snapshot: ResourceSnapshot,
+    /// The served name of the tool the source is derived from, or `None` for
+    /// a source that names a path. Unlike [`ToolEvaluationContext::tool_name`]
+    /// this is never an uncaptured fact: every source plan says which it is.
+    pub(crate) tool_name: Option<String>,
+    /// The rendered origin-relative path, its query already removed. Percent
+    /// escapes are the rendered arguments' own, as for
+    /// [`ToolOperation::RenderedHttp`].
+    pub(crate) path: String,
+}
+
+impl fmt::Debug for SourceRequestContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SourceRequestContext")
+            .finish_non_exhaustive()
+    }
+}
+
+/// The enum-source precheck's answer.
+///
+/// It carries no input binding. Nothing retains or reuses one: the precheck
+/// acts on the answer at once and the refresh that follows is not a policy
+/// decision. A consumer that retains these must bind them first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SourceRequestDecision {
+    Allowed,
+    /// The named tool has no policy entry, or its entry is disabled.
+    ToolDisabled,
+    /// A direct deny rule matched the request.
+    Denied {
+        /// Source ordinal of the rule, including disabled and tool-name rules.
+        index: usize,
+    },
+}
+
+impl CompiledPolicy {
+    /// Decide an enum-source refresh request: the named tool's enable bit,
+    /// then the direct deny rules alone, as an anonymous contextless `GET` of
+    /// the rendered path.
+    ///
+    /// Only a deny refuses. Allow and shadow rules are not consulted, so an
+    /// allow earlier in source order does not suppress a later deny, and no
+    /// rule grants a source authority it would not otherwise have. Routes and
+    /// the default do not decide, and a tool-name rule never matches a path.
+    /// An absent tool entry refuses as a disabled one does.
+    ///
+    /// The path is held to the rendered-HTTP bounds. A source plan's path has
+    /// already passed the stricter origin-relative check when its overlay was
+    /// compiled, so a served source is never refused here as malformed.
+    pub(crate) fn evaluate_source_request(
+        &self,
+        context: &SourceRequestContext,
+    ) -> Result<SourceRequestDecision, EvaluationError> {
+        if context.version != TOOL_CONTEXT_VERSION {
+            return Err(EvaluationError::UnsupportedContextVersion);
+        }
+        if context.snapshot != self.snapshot() {
+            return Err(EvaluationError::SnapshotMismatch);
+        }
+        if context
+            .tool_name
+            .as_ref()
+            .is_some_and(|name| name.len() > MAX_TOOL_NAME_BYTES)
+        {
+            return Err(EvaluationError::ContextTooLarge);
+        }
+        validate_rendered_http_path(&context.path)?;
+        if let Some(name) = &context.tool_name {
+            if !self
+                .tool_entries()
+                .get(name)
+                .is_some_and(|tool| tool.enabled)
+            {
+                return Ok(SourceRequestDecision::ToolDisabled);
+            }
+        }
+        Ok(
+            match self.match_direct(
+                "GET",
+                &context.path,
+                None,
+                None,
+                RuleDispatchContext::contextless(),
+                true,
+            ) {
+                Some(decision) => SourceRequestDecision::Denied {
+                    index: decision.rule_index,
+                },
+                None => SourceRequestDecision::Allowed,
+            },
+        )
+    }
+}
+
 fn tool_principal_matches(
     tool: &crate::rbac::policy::ToolPolicyEntry,
     principal: Option<&Principal>,

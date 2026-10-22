@@ -1,0 +1,521 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://greengateway.dev/schemas/policy.v1.schema.json",
+  "title": "GreenGateway RBAC Policy v1",
+  "description": "Draft 2020-12 JSON Schema for policy v1, the GreenGateway RBAC policy document whose schema_version is exactly \"1.0.0\". Policy v1 has the semantics of the 0.x document with the same members and adds identity and strictness: every object rejects members it does not define, no member is null, every direct rule, route and rate override carries a stable id, and every number is within the I-JSON safe range so the document has one RFC 8785 canonical form. The gateway also enforces what JSON Schema cannot express here: ids are unique across rules, routes and rate_limits together, no object repeats a member name, and the semantic checks the 0.x schema describes still apply. Cluster mode (STATE_BACKEND=postgres) does not yet commit or serve a v1 document.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0.0",
+      "description": "Exactly \"1.0.0\". The gateway accepts no other 1.x string; a later revision of v1 has an exact version of its own."
+    },
+    "id": {
+      "type": "string"
+    },
+    "default_action": {
+      "enum": [
+        "allow",
+        "deny"
+      ]
+    },
+    "enforcement_mode": {
+      "$ref": "#/$defs/enforcement_mode"
+    },
+    "roles": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/role_entry"
+      }
+    },
+    "routes": {
+      "type": "array",
+      "description": "Ordered route-to-permission rules. Rules are evaluated in array order, and the first matching rule wins. Each carries an id unique across rules, routes and rate_limits.",
+      "items": {
+        "$ref": "#/$defs/route_rule"
+      }
+    },
+    "rules": {
+      "type": "array",
+      "description": "Ordered direct firewall rules for HTTP paths or exact MCP tool names. Rules are evaluated in array order within their target type, and the first matching rule wins. HTTP path rules apply to inbound requests and to fully rendered local/OpenAPI tool HTTP operations before upstream egress; they are additive alongside routes and tool policy. Remote MCP proxy tools have no local HTTP path and remain governed by tool-name policy. MCP tool-name rules are an additional restriction layer alongside policy.tools.*.allowed_roles. Each carries an id unique across rules, routes and rate_limits.",
+      "items": {
+        "$ref": "#/$defs/rule"
+      }
+    },
+    "egress": {
+      "$ref": "#/$defs/egress_policy",
+      "description": "Policy-driven outbound egress rules layered on top of EGRESS_ALLOWED_HOSTS and auto-seeded infrastructure endpoint hosts. Host patterns are additive. CIDRs explicitly allow matching non-global resolved IPs through EGRESS_DENY_PRIVATE_IPS=true; non-global IPs outside listed CIDRs remain blocked. If ports is non-empty, the destination port must be listed."
+    },
+    "rate_limits": {
+      "type": "array",
+      "description": "Ordered rate-limit override rules. Rules are evaluated in array order, and the first matching rule wins. This is an additional constraint layered on top of the always-enforced, pre-authentication RATE_LIMIT_READ_*/RATE_LIMIT_WRITE_* lanes, not a replacement for them: a matching rule applies only to authenticated requests with a validated principal, and the global lanes still apply to every request regardless of whether a rule matches. Each carries an id unique across rules, routes and rate_limits.",
+      "items": {
+        "$ref": "#/$defs/rate_limit_rule"
+      }
+    },
+    "tools": {
+      "type": "object",
+      "description": "Optional per-tool runtime policy for generic MCP tool invocation admission. Each key is a tool name of at most 4096 UTF-8 bytes; the gateway refuses a longer one. JSON Schema counts characters, so propertyNames.maxLength enforces only the looser character bound. Tool implementations and registry wiring are configured separately; this section controls generic enablement, role admission, timeout, and per-tool concurrency.",
+      "propertyNames": {
+        "maxLength": 4096
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/tool_policy_entry"
+      }
+    }
+  },
+  "$defs": {
+    "element_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+      "description": "Stable identifier: 1 to 64 ASCII letters, digits, \".\", \"_\" or \"-\", starting with a letter or digit (the syntax of UPSTREAM_ROUTES[].id). Unique across rules, routes and rate_limits; the gateway enforces the uniqueness. It names the element in diagnostics, audit attribution and evidence, so it survives reordering."
+    },
+    "enforcement_mode": {
+      "enum": [
+        "enforce",
+        "shadow"
+      ]
+    },
+    "role_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "permissions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "issuers": {
+          "type": "array",
+          "description": "Exact issuer or provider:<name> boundary values allowed to activate this role's permissions. Empty or omitted means any issuer.",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "auth_methods": {
+          "type": "array",
+          "description": "Authentication methods allowed to activate this role's permissions. Empty or omitted means any authentication method.",
+          "items": {
+            "enum": [
+              "bearer_token",
+              "session_cookie",
+              "service_token",
+              "client_certificate"
+            ]
+          }
+        },
+        "description": {
+          "type": "string",
+          "description": "What the role is for, for the people who maintain the policy. It grants and restricts nothing. At most 512 UTF-8 bytes, not blank, and no control characters; JSON Schema counts characters, so maxLength enforces only the looser character bound. Every gateway that reads policy v1 reads this field.",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "^[^\u0000-\u001f\u007f-\u009f]*$"
+        }
+      }
+    },
+    "route_rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "path_prefix",
+        "permission"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/element_id"
+        },
+        "methods": {
+          "type": "array",
+          "description": "HTTP methods this rule matches. Empty or [\"*\"] means any method.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "hosts": {
+          "type": "array",
+          "description": "Exact request hostnames this route rule matches, without ports. Host-qualified upstream routes require an explicit matching host. Empty or omitted matches only upstream routes that are not host-qualified.",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$"
+          }
+        },
+        "path_prefix": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Path prefix matched with starts_with, such as /admin or /v1/."
+        },
+        "permission": {
+          "type": "string",
+          "description": "Permission required to access a matching route."
+        },
+        "enforcement_mode": {
+          "$ref": "#/$defs/enforcement_mode",
+          "description": "Optional rule-level override for whether deny decisions block or emit authz.would_deny and forward."
+        }
+      }
+    },
+    "principal_matcher": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Optional principal constraints for a rule. Non-empty fields are ANDed together: roles AND issuers AND auth_methods AND principal_ids must all match when configured. Within each field, any listed value matches. An empty object or omitted principal matcher means any principal, authenticated or not.",
+      "properties": {
+        "roles": {
+          "type": "array",
+          "description": "Role names this rule matches. Empty or omitted means any role set.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "issuers": {
+          "type": "array",
+          "description": "Exact issuer or provider:<name> boundary values this rule matches. Empty or omitted means any issuer.",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "auth_methods": {
+          "type": "array",
+          "description": "Authentication methods this rule matches. Empty or omitted means any authentication method.",
+          "items": {
+            "enum": [
+              "bearer_token",
+              "session_cookie",
+              "service_token",
+              "client_certificate"
+            ]
+          }
+        },
+        "principal_ids": {
+          "type": "array",
+          "description": "Exact principal user_id values this rule matches. Empty or omitted means any principal id.",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "rule_action": {
+      "description": "For HTTP path rules, direct rules normally run before, and take precedence over, the routes/permission model: the first matching path rule is the sole authority for the request. Host-qualified proxy fallback is the exception: direct allow and shadow rules cannot authorize a selected virtual upstream, the first matching deny still blocks, a first-matching shadow still records policy-authoring telemetry, and authorization must come from a matching host-bound route rule. For MCP tool-name rules, direct rules are an additional restriction layered after per-tool allowed_roles; allow and shadow do not override a failed allowed_roles check. Deny blocks, while shadow permits the rule layer but records a would-deny observation event for policy-authoring dry runs.",
+      "enum": [
+        "allow",
+        "deny",
+        "shadow"
+      ]
+    },
+    "rule_dispatch_matcher": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind"
+      ],
+      "description": "Optional immutable proxy-dispatch provenance for an HTTP path rule. contextless matches classified requests without proxy dispatch. legacy matches only the configured fallback upstream and excludes host/path routes, even at the same origin. route matches one stable logical proxy route ID without binding policy to a physical endpoint. Omitting dispatch preserves globally scoped matching.",
+      "properties": {
+        "kind": {
+          "enum": [
+            "contextless",
+            "legacy",
+            "route"
+          ]
+        },
+        "upstream_origin": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https?://[^/?#@]+$",
+          "description": "HTTP(S) fallback origin selected before RBAC, including a non-default port when configured. Host spelling and default ports are normalized for matching. Paths, queries, fragments, and credentials are not allowed."
+        },
+        "route_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+          "description": "Stable logical proxy route ID selected from validated configuration before RBAC. Physical endpoint selection, health, and weights do not affect this identity."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "contextless"
+              }
+            }
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "upstream_origin"
+                  ]
+                },
+                {
+                  "required": [
+                    "route_id"
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "legacy"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "upstream_origin"
+            ],
+            "not": {
+              "required": [
+                "route_id"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "route"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "route_id"
+            ],
+            "not": {
+              "required": [
+                "upstream_origin"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "action"
+      ],
+      "oneOf": [
+        {
+          "required": [
+            "path"
+          ],
+          "not": {
+            "required": [
+              "tool_name"
+            ]
+          }
+        },
+        {
+          "required": [
+            "tool_name"
+          ],
+          "properties": {
+            "methods": {
+              "maxItems": 0
+            }
+          },
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "path"
+                ]
+              },
+              {
+                "required": [
+                  "dispatch"
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/element_id"
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether this direct firewall rule participates in live request evaluation. Omitted rules default to true for backward compatibility. A false rule is skipped entirely as if it were absent, so evaluation falls through to the next rule or the policy default."
+        },
+        "methods": {
+          "type": "array",
+          "description": "HTTP methods this rule matches. Empty or [\"*\"] means any method.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute HTTP path pattern matched against the whole inbound request path and fully rendered local/OpenAPI tool HTTP operations before upstream egress. Exactly one of path or tool_name must be set. Syntax is segment-based and anchored, never substring-based. Literal segments match exactly and case-sensitively. * matches exactly one non-empty path segment. ** matches zero or more complete path segments. {name} matches exactly one non-empty segment and names the capture for future rule-preview/discovery UI; capture names use ASCII letters, digits, and _, and must start with a letter or _."
+        },
+        "tool_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096,
+          "pattern": "\\S",
+          "description": "Exact MCP tool name matched by this rule, at most 4096 UTF-8 bytes; the gateway refuses a longer one. JSON Schema counts characters, so maxLength enforces only the looser character bound. Tool-name rules apply only to MCP tool calls and never to HTTP requests. Exactly one of path or tool_name must be set."
+        },
+        "dispatch": {
+          "$ref": "#/$defs/rule_dispatch_matcher"
+        },
+        "principal": {
+          "$ref": "#/$defs/principal_matcher"
+        },
+        "action": {
+          "$ref": "#/$defs/rule_action"
+        }
+      }
+    },
+    "egress_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "hosts": {
+          "type": "array",
+          "description": "Case-insensitive hostname patterns allowed for outbound egress. A pattern without * matches exactly. A wildcard is only valid as the entire leftmost label in a *. prefix, such as *.example.com; it matches any non-empty DNS label prefix ending in .example.com, including foo.example.com and bar.baz.example.com, but not example.com.",
+          "items": {
+            "type": "string",
+            "pattern": "^(?:\\*\\.)?(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$"
+          }
+        },
+        "cidrs": {
+          "type": "array",
+          "description": "IPv4 or IPv6 CIDR ranges that explicitly allow matching non-global resolved destination IPs through the non-global-IP block. These are exceptions to EGRESS_DENY_PRIVATE_IPS, not a global replacement for it.",
+          "items": {
+            "type": "string",
+            "pattern": "^(?:(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})/(?:[0-9]|[12][0-9]|3[0-2])|(?:[0-9A-Fa-f]*:)+[0-9A-Fa-f:.]*/(?:[0-9]|[1-9][0-9]|1[01][0-9]|12[0-8]))$"
+          }
+        },
+        "ports": {
+          "type": "array",
+          "description": "Allowed outbound destination ports. Empty or absent means no policy-level port restriction.",
+          "items": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          }
+        }
+      }
+    },
+    "rate_limit_rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "requests_per_second",
+        "burst"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/element_id"
+        },
+        "principal": {
+          "$ref": "#/$defs/principal_matcher",
+          "description": "Optional principal constraints. Empty or omitted means any principal, authenticated or not."
+        },
+        "methods": {
+          "type": "array",
+          "description": "HTTP methods this override matches. Empty or [\"*\"] means any method.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Optional absolute path pattern matched against the whole request path. When omitted, any path matches. Syntax is segment-based and anchored, never substring-based. Literal segments match exactly and case-sensitively. * matches exactly one non-empty path segment. ** matches zero or more complete path segments. {name} matches exactly one non-empty segment and names the capture for future rule-preview/discovery UI; capture names use ASCII letters, digits, and _, and must start with a letter or _."
+        },
+        "requests_per_second": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Positive finite token refill rate for matching requests, in requests per second, at most 9007199254740991 (the I-JSON safe range).",
+          "maximum": 9007199254740991
+        },
+        "burst": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "description": "Positive token bucket burst size for matching requests."
+        }
+      }
+    },
+    "tool_policy_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether this tool is available for invocation. Omitted values default to true."
+        },
+        "allowed_roles": {
+          "type": "array",
+          "default": [],
+          "description": "Role names allowed to invoke this tool. Empty or omitted means no role constraint beyond enabled.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "issuers": {
+          "type": "array",
+          "default": [],
+          "description": "Exact issuer or provider:<name> boundary values allowed to invoke this tool. Empty or omitted means any issuer.",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "auth_methods": {
+          "type": "array",
+          "default": [],
+          "description": "Authentication methods allowed to invoke this tool. Empty or omitted means any authentication method.",
+          "items": {
+            "enum": [
+              "bearer_token",
+              "session_cookie",
+              "service_token",
+              "client_certificate"
+            ]
+          }
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 30000,
+          "description": "Maximum execution time for one tool invocation, in milliseconds, at most 9007199254740991 (the I-JSON safe range).",
+          "maximum": 9007199254740991
+        },
+        "max_concurrent": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 8,
+          "description": "Maximum concurrent executions for this tool. A configured value of 0 is treated by the runtime as 1 to avoid a zero-permit semaphore."
+        }
+      }
+    }
+  }
+}
