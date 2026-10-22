@@ -18,7 +18,7 @@ use super::legacy::{
     legacy_representative_principal_for_matcher,
 };
 use super::*;
-use crate::rbac::{PolicyEngine, RuleDispatchContext};
+use crate::rbac::{PolicyEngine, RuleDispatchContext, RuleMatcher};
 
 const ISSUER: &str = "https://issuer.example";
 const OTHER_ISSUER: &str = "https://other-issuer.example";
@@ -258,7 +258,6 @@ proptest! {
         let policy = policy.expect("checked above");
         let compiled = CompiledPolicy::for_analysis(policy.clone());
         let live = policy_coverage(
-            &policy,
             &compiled,
             method,
             path_pattern,
@@ -355,7 +354,6 @@ fn a_host_routed_candidate_is_covered_only_by_a_role_it_can_activate() {
         );
         assert_eq!(
             policy_coverage(
-                &policy,
                 &compiled,
                 "POST",
                 "/pay/{id}",
@@ -391,7 +389,6 @@ fn a_host_routed_candidate_a_direct_deny_decides_is_not_covered_by_an_allow() {
     ));
     assert_eq!(
         policy_coverage(
-            &policy,
             &compiled,
             "POST",
             "/pay/{id}",
@@ -466,7 +463,6 @@ fn a_signal_candidate_is_judged_as_traffic_dispatched_the_way_it_would_be_bound(
         );
         assert_eq!(
             policy_coverage(
-                &policy,
                 &compiled,
                 "POST",
                 "/pay/{id}",
