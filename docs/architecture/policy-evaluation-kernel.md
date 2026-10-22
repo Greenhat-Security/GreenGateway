@@ -321,38 +321,6 @@ addresses stay out. `canonical_trace_bytes` and `reusable_for` remain offline.
 The frozen pre-cutover checks and the differential fixtures are described in
 [policy-evaluation-parity.md](policy-evaluation-parity.md).
 
-## Stage trace and synthetic simulation (#243, slice 10)
-
-An admin explanation of an HTTP decision has to say which stages ran and what
-each found, and the only honest source of that is the evaluator itself: a second
-walk over the policy that re-derived the stages would be the approximate second
-implementation ADR-0004 forbids, and would drift the first time the order
-changed. So `CompiledPolicy::evaluate` is now `evaluate_with_stages` with a sink
-that keeps nothing (`policy_eval::stages::NoStages`), and the evaluator reports
-each stage it runs -- the facts, the host routes are matched against, the first
-direct rule, the deny-only narrowing of a selected virtual upstream, the route
-and its permission check, the host-policy refusal or the default -- to the
-`StageSink` it is given. Every live adapter keeps calling `evaluate`, so it runs
-exactly the decision code it ran before; the `NoStages` sink compiles away and
-allocates nothing, which the `http_policy` microbench budget enforces. A stage
-carries enums, source-order positions and the enforcement mode that applied,
-never an authored string or a context value, and each is recorded at most once
-(`MAX_HTTP_STAGES`). A stage the evaluator did not reach is not recorded; the
-consumer reads "decided earlier" or "unknown" from the evaluation's own outcome.
-A test pins the recorded stages to the decision `evaluate` returns for every
-branch, and the traced and untraced decisions to each other.
-
-`policy_simulation` is the second offline caller, behind
-`POST /v1{ADMIN_PREFIX}/policy/simulations`. It shares the test runner's case
-parser and context builders, compiles the base and each candidate with
-`from_validated_policy` (the base keeps the authority it was read under, a
-candidate is `Standalone`), and asks `evaluate_with_stages`, `evaluate_tool` and
-`select_rate_lane`. Its `enforce_all_shadow` projection is a `Policy` value with
-every shadow made enforcing, compiled for the run; the kernel has no shadow
-switch of its own. Edits are applied to the JSON of the pinned base and the
-result is validated as a policy write would be before anything compiles it. The
-format and API are in [policy-simulation.md](../policy-simulation.md).
-
 ## Analysis consumers (#422, PR 4)
 
 Three admin consumers used to judge policy beside the evaluator: the
@@ -393,18 +361,54 @@ alias identity. The frozen pre-cutover consumers, the differential fixtures and
 every documented difference are in
 [policy-evaluation-parity.md](policy-evaluation-parity.md).
 
-## Offline consumer: policy test suites (#243, slice 11)
+## Synthetic policy tests (#243, slice 11)
 
-`policy_testing` is the first offline caller. It compiles the policy it judges
-with `from_validated_policy`, the constructor the live install paths use, and
-for each case builds the context a live adapter builds: `evaluate` with a
-`Contextless`, `McpAlias` or `ProxyDispatch` target and a host that is
-`Present` or `Absent` (a synthetic case states its facts, so never `Missing`);
-`evaluate_tool` for `Invocation`, `Visibility`, `PolicyEligibility` and
-`RenderedHttp`; and `select_rate_lane` with the rate adapter's own
-`HttpTarget::Missing` and `HostFact::Missing`. It never matches a rule itself.
-An evaluator error is the case's `error` outcome and an incomplete answer its
-`incomplete` outcome; neither can satisfy an expectation. Results carry the
-stable reason and limitation codes and the evaluator semantics and context
-versions, and no fixture value. The suite format and API are in
-[policy-tests.md](../policy-tests.md).
+`policy_testing` decides operator-authored synthetic cases rather than the
+representative requests and retained observations of the analysis consumers.
+Unlike them it compiles the policy it judges with `from_validated_policy`, the
+constructor the live install paths use, bound to the authority the policy was
+read at (in cluster mode the active document's security watermark), not with
+`for_analysis`. For each case it builds the context a live adapter builds:
+`evaluate` with a `Contextless`, `McpAlias` or `ProxyDispatch` target and a
+host that is `Present` or `Absent` (a synthetic case states its facts, so never
+`Missing`); `evaluate_tool` for `Invocation`, `Visibility`, `PolicyEligibility`
+and `RenderedHttp`; and `select_rate_lane` with the rate adapter's own
+`HttpTarget::Missing` and `HostFact::Missing`. It never matches a rule itself
+and never asks `match_direct_rules`: a case asks what the policy decides, not
+whether one rule's predicates match. An evaluator error is the case's `error`
+outcome and an incomplete answer its `incomplete` outcome; neither can satisfy
+an expectation. Results carry the stable reason and limitation codes and the
+evaluator semantics and context versions, and no fixture value. The suite
+format and API are in [policy-tests.md](../policy-tests.md).
+
+## Stage trace and synthetic simulation (#243, slice 10)
+
+An admin explanation of an HTTP decision has to say which stages ran and what
+each found, and the only honest source of that is the evaluator itself: a second
+walk over the policy that re-derived the stages would be the approximate second
+implementation ADR-0004 forbids, and would drift the first time the order
+changed. So `CompiledPolicy::evaluate` is now `evaluate_with_stages` with a sink
+that keeps nothing (`policy_eval::stages::NoStages`), and the evaluator reports
+each stage it runs -- the facts, the host routes are matched against, the first
+direct rule, the deny-only narrowing of a selected virtual upstream, the route
+and its permission check, the host-policy refusal or the default -- to the
+`StageSink` it is given. Every live adapter keeps calling `evaluate`, so it runs
+exactly the decision code it ran before; the `NoStages` sink compiles away and
+allocates nothing, which the `http_policy` microbench budget enforces. A stage
+carries enums, source-order positions and the enforcement mode that applied,
+never an authored string or a context value, and each is recorded at most once
+(`MAX_HTTP_STAGES`). A stage the evaluator did not reach is not recorded; the
+consumer reads "decided earlier" or "unknown" from the evaluation's own outcome.
+A test pins the recorded stages to the decision `evaluate` returns for every
+branch, and the traced and untraced decisions to each other.
+
+`policy_simulation` is the second offline caller, behind
+`POST /v1{ADMIN_PREFIX}/policy/simulations`. It shares the test runner's case
+parser and context builders, compiles the base and each candidate with
+`from_validated_policy` (the base keeps the authority it was read under, a
+candidate is `Standalone`), and asks `evaluate_with_stages`, `evaluate_tool` and
+`select_rate_lane`. Its `enforce_all_shadow` projection is a `Policy` value with
+every shadow made enforcing, compiled for the run; the kernel has no shadow
+switch of its own. Edits are applied to the JSON of the pinned base and the
+result is validated as a policy write would be before anything compiles it. The
+format and API are in [policy-simulation.md](../policy-simulation.md).

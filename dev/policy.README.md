@@ -9,9 +9,9 @@ It is intentionally small. Most routes cover GreenGateway's own control-plane su
 - `/v1/admin/status`
 - `/v1/admin/policy`
 - `/v1/admin/policy/validate`
+- `/v1/admin/policy/convert`
 - `/v1/admin/policy/tests/runs`
 - `/v1/admin/policy/simulations`
-- `/v1/admin/policy/convert`
 - `/v1/admin/policy/rules`
 - `/v1/admin/policy/drafts`
 - `/v1/admin/traffic`

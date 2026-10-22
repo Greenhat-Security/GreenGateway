@@ -53,6 +53,11 @@
     },
     {
       "methods": ["POST"],
+      "path_prefix": "/v1/admin/policy/convert",
+      "permission": "admin:policy:read"
+    },
+    {
+      "methods": ["POST"],
       "path_prefix": "/v1/admin/policy/tests/runs",
       "permission": "admin:policy:simulate"
     },
@@ -60,11 +65,6 @@
       "methods": ["POST"],
       "path_prefix": "/v1/admin/policy/simulations",
       "permission": "admin:policy:simulate"
-    },
-    {
-      "methods": ["POST"],
-      "path_prefix": "/v1/admin/policy/convert",
-      "permission": "admin:policy:read"
     },
     {
       "methods": ["PUT", "POST", "PATCH", "DELETE"],
