@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -662,6 +663,71 @@ class ExecutionAndEvidenceTests(unittest.TestCase):
             actual = root / "extract/scripts/check"
             self.assertEqual(b"safe", actual.read_bytes())
             self.assertTrue(actual.stat().st_mode & 0o100)
+
+
+PINS = {"rust_ci": "1.0.0", "node": "1.0.0", "npm": "1.0.0", "python": "1.0.0"}
+STATUS = ["status", "--porcelain", "--untracked-files=no"]
+
+
+class ReadOnlyGitTests(unittest.TestCase):
+    """The campaign's git steps run under a short command's file-size limit and must never write .git/index."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name) / "checkout"
+        self.report = Path(self.temporary.name) / "report.json"
+        # No inherited repository, developer or runner configuration shapes the fixture's index.
+        self.env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")} | {
+            "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_AUTHOR_NAME": "fixture", "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
+            "GIT_COMMITTER_NAME": "fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid"}
+        files = {"source.rs": SOURCE, "security-mutations.json": json.dumps(manifest_fixture()).encode(),
+                 "build-tools.json": json.dumps(PINS).encode(), "Cargo.lock": b"version = 4\n"}
+        # Enough tracked paths for an index larger than any file a short command may write.
+        files |= {f"tracked/entry-{index:04}.txt": b"fixture\n" for index in range(1500)}
+        for relative, data in files.items():
+            (self.root / relative).parent.mkdir(parents=True, exist_ok=True)
+            (self.root / relative).write_bytes(data)
+        for command in (["init", "-q"], ["add", "-A"], ["commit", "-q", "-m", "fixture"]):
+            subprocess.run(["git", *command], cwd=self.root, env=self.env, check=True, capture_output=True)
+        self.head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.root, env=self.env, check=True,
+                                   capture_output=True).stdout.decode().strip()
+        # Stale stat data, like the racily clean entries of a fresh CI checkout,
+        # makes a plain `git status` rewrite the whole index.
+        stamp = time.time() - 3600
+        for relative in files:
+            os.utime(self.root / relative, (stamp, stamp))
+        self.index = self.root / ".git/index"
+        self.assertGreater(self.index.stat().st_size, mutations.MAX_TEST_OUTPUT + 1)
+
+    def status(self, command):
+        return mutations.run_process(command, self.root, self.env, wall_seconds=30, cpu_seconds=20, memory_mib=2048)
+
+    def test_fixture_reproduces_the_index_rewrite_the_file_limit_kills(self):
+        before = self.index.read_bytes()
+        self.assertEqual(-signal.SIGXFSZ, self.status(["git", *STATUS]).returncode)
+        result = self.status([*mutations.GIT, *STATUS])
+        self.assertEqual((0, b""), (result.returncode, result.stdout))
+        self.assertEqual(before, self.index.read_bytes())
+
+    def test_campaign_reads_an_index_larger_than_its_file_limit_without_rewriting_it(self):
+        before = self.index.read_bytes()
+        with mock.patch.object(mutations, "pin_environment", return_value=(PINS, dict(self.env))), \
+                mock.patch.object(mutations, "BUILD_COMMAND", [sys.executable, "-c", "raise SystemExit(1)"]), \
+                mock.patch.object(mutations, "run_process", wraps=mutations.run_process) as spy, \
+                mock.patch("builtins.print"):
+            code = mutations.main(["--root", str(self.root), "--report", str(self.report)])
+        report = json.loads(self.report.read_text())
+        # Every git step passed and the clean HEAD was archived: only the stand-in baseline build failed.
+        self.assertEqual((1, "baseline_build", "baseline_build_harness_error"), (code, report["phase"], report["reason"]))
+        self.assertEqual((self.head, "tracked_clean_head_archive"), (report["base_commit"], report["source_state"]))
+        self.assertIn("source_archive_sha256", report)
+        git = [call.args[0] for call in spy.call_args_list if call.args[0][0] == "git"]
+        self.assertEqual(["status", "rev-parse", "ls-files", "archive"], [command[2] for command in git])
+        self.assertEqual([mutations.GIT] * len(git), [command[:2] for command in git])
+        self.assertEqual(["git", "--no-optional-locks"], mutations.GIT)
+        self.assertEqual(before, self.index.read_bytes())
 
 
 if __name__ == "__main__":

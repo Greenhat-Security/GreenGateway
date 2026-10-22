@@ -230,6 +230,7 @@ Current MCP capabilities include:
 - MCP `initialize`
 - `tools/list`
 - `tools/call`
+- Protocol revisions 2024-11-05 through 2025-11-25, on `/mcp` and toward upstream MCP servers
 - Dynamic tool registry
 - JSON Schema validation
 - Upstream MCP server proxying

@@ -41,6 +41,10 @@ TEST = re.compile(r"[A-Za-z_][A-Za-z0-9_:]{0,255}\Z")
 SHA = re.compile(r"[0-9a-f]{64}\Z")
 OUTCOMES = ("killed", "survived", "unviable", "timed_out", "harness_error")
 BUILD_COMMAND = ["cargo", "test", "-p", "gateway", "--bin", "gateway", "--locked", "--no-run", "--message-format=json"]
+# Every git command the campaign runs only reads repository state. A plain
+# `git status` refreshes stale stat data by rewriting .git/index, a write the
+# per-file limit of short commands cuts off once the tree's index outgrows it.
+GIT = ["git", "--no-optional-locks"]
 
 
 class HarnessError(Exception):
@@ -572,11 +576,11 @@ def campaign(args: argparse.Namespace, report: dict) -> None:
 
     pins, env = pin_environment(root, call)
     report["toolchain"] = pins
-    status = call(["git", "status", "--porcelain", "--untracked-files=no"], root, env)
+    status = call([*GIT, "status", "--porcelain", "--untracked-files=no"], root, env)
     require_process(status)
     if status.stdout.strip():
         raise HarnessError("dirty_tracked_source")
-    head = call(["git", "rev-parse", "HEAD"], root, env)
+    head = call([*GIT, "rev-parse", "HEAD"], root, env)
     require_process(head)
     commit = head.stdout.decode().strip()
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
@@ -584,7 +588,7 @@ def campaign(args: argparse.Namespace, report: dict) -> None:
     report["base_commit"] = commit
     report["source_state"] = "tracked_clean_head_archive"
     relative_manifest = repository_manifest(root, args.manifest)
-    tracked = call(["git", "ls-files", "--error-unmatch", "--", relative_manifest], root, env)
+    tracked = call([*GIT, "ls-files", "--error-unmatch", "--", relative_manifest], root, env)
     require_process(tracked)
     regular_file(root, relative_manifest, MAX_MANIFEST)
     target_dir = args.target_dir.resolve()
@@ -595,7 +599,7 @@ def campaign(args: argparse.Namespace, report: dict) -> None:
     with tempfile.TemporaryDirectory(prefix="greengateway-security-mutations-") as temporary:
         work = Path(temporary)
         archive = work / "source.tar"
-        archived = call(["git", "archive", "--format=tar", "--output=" + str(archive), commit], root, env, archive=True)
+        archived = call([*GIT, "archive", "--format=tar", "--output=" + str(archive), commit], root, env, archive=True)
         require_process(archived)
         snapshot = work / "source"
         snapshot.mkdir()
