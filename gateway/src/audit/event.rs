@@ -34,6 +34,11 @@ pub const CLUSTER_CONTRACT_FENCE_RAISED: &str = "cluster.contract_fence_raised";
 /// readiness for good.
 #[cfg(feature = "postgres")]
 pub const CLUSTER_CONTRACT_FENCED: &str = "cluster.contract_fenced";
+/// A cluster replica resolved the authority pseudonym keyring its delivered
+/// authority events are referenced under (issue #425): the authority ID, the
+/// current and previous key IDs and the sink kind, never key material.
+#[cfg(feature = "postgres")]
+pub const AUTHORITY_EVENT_KEYRING_LOADED: &str = "authority_event.keyring_loaded";
 pub const CONNECTION_CHANGED: &str = "connection.changed";
 pub const CONNECTION_CREDENTIAL_CHANGED: &str = "connection.credential_changed";
 pub const CONNECTION_SECRET_CHANGED: &str = "connection.secret_changed";

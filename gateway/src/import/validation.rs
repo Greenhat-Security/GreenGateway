@@ -99,7 +99,7 @@ pub(super) const EXCLUDED_RUNTIME_TABLES: &[&str] = &[
     "admin_session_logins",
     "admin_sessions",
     "jwt_revocations",
-    // 0021: owner-scoped, expiring policy drafts are working state, not
+    // 0022: owner-scoped, expiring policy drafts are working state, not
     // authority or history. The import leaves the standalone ones behind and
     // writes none; an owner recreates any it still needs against the
     // imported policy.

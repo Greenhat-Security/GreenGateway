@@ -438,7 +438,7 @@ pub(super) struct PolicyAdminState {
     pub(super) rbac_state: Option<middleware::rbac::RbacState>,
     pub(super) history_store: Option<Arc<dyn storage::PolicyHistory>>,
     /// Server-side policy drafts (issue #243, slice 9): the SQLite table in
-    /// the policy history database standalone, migration 21's table in
+    /// the policy history database standalone, migration 22's table in
     /// cluster mode. `None` leaves the draft routes answering `503`.
     pub(super) draft_store: Option<Arc<dyn storage::PolicyDraftStore>>,
     /// Cluster mode's authoritative control plane. Present exactly when

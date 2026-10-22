@@ -238,6 +238,67 @@ fn a_standalone_configuration_without_a_policy_file_is_refused() {
     let _ = std::fs::remove_dir_all(&directory);
 }
 
+/// Standalone mode serves policy v1, but no cluster replica of this build
+/// does: they advertise document format `0..0`. An import that carried a v1
+/// document across -- as the live policy or as any version in its history
+/// -- would leave every replica refusing the policy it was handed, so the
+/// load refuses it before anything is written, and says how to proceed.
+#[test]
+fn a_standalone_policy_v1_document_is_refused_live_or_in_history() {
+    let v1 = r#"{"schema_version":"1.0.0","id":"v1-live","default_action":"deny"}"#;
+    let v0 = r#"{"schema_version":"0.1.0","id":"v0-live","default_action":"deny"}"#;
+
+    // The live document.
+    let directory = temp_directory("source-v1-live");
+    let policy_file = directory.join("policy.json");
+    std::fs::write(&policy_file, v1).expect("the policy file should write");
+    let path = directory.join("standalone.env");
+    std::fs::write(&path, format!("POLICY_FILE={}\n", policy_file.display()))
+        .expect("the environment file should write");
+    let Err(error) = StandaloneSource::load(&path) else {
+        panic!("a v1 standalone policy must be refused");
+    };
+    assert_eq!(error.code(), "source_document_unparseable", "{error}");
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("'1.0.0'") && rendered.contains("0.x document"),
+        "the operator must learn which format and what to do: {rendered}"
+    );
+    let _ = std::fs::remove_dir_all(&directory);
+
+    // A 0.x live document whose history holds a v1 version.
+    let directory = temp_directory("source-v1-history");
+    let policy_file = directory.join("policy.json");
+    std::fs::write(&policy_file, v0).expect("the policy file should write");
+    let history_file = PathBuf::from(format!("{}.history.sqlite", policy_file.display()));
+    let store = crate::rbac::policy_history::PolicyHistoryStore::open(&history_file)
+        .expect("history store should open");
+    let historical = crate::rbac::Policy::validate_json_value(
+        serde_json::from_str(v1).expect("the v1 fixture is JSON"),
+    )
+    .expect("the v1 fixture is a valid standalone policy");
+    store
+        .append_version(
+            "admin",
+            &serde_json::json!({ "action": "test" }),
+            &historical,
+        )
+        .expect("history version should append");
+    drop(store);
+    let path = directory.join("standalone.env");
+    std::fs::write(&path, format!("POLICY_FILE={}\n", policy_file.display()))
+        .expect("the environment file should write");
+    let Err(error) = StandaloneSource::load(&path) else {
+        panic!("a v1 version in the standalone history must be refused");
+    };
+    assert_eq!(error.code(), "source_document_unparseable", "{error}");
+    assert!(
+        error.to_string().contains("policy history"),
+        "the refusal names the history, not the live policy: {error}"
+    );
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
 /// A `--from` file that selects cluster mode is the operator pointing the
 /// import at its own destination.
 #[test]

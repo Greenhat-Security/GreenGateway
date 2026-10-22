@@ -38,6 +38,10 @@ pub mod postgres;
 pub mod postgres_admin_sessions;
 #[cfg(feature = "postgres")]
 pub mod postgres_audit;
+/// The authority-event journal and the dispatcher's durable cursor
+/// (issue #425, PR 3).
+#[cfg(feature = "postgres")]
+pub mod postgres_authority_events;
 #[cfg(feature = "postgres")]
 pub mod postgres_discovery;
 #[cfg(feature = "postgres")]

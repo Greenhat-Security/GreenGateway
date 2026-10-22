@@ -1,4 +1,4 @@
--- Migration 21: server-side policy drafts (issue #243, slice 9).
+-- Migration 22: server-side policy drafts (issue #243, slice 9).
 --
 -- A draft is an owner-scoped, expiring candidate policy pinned to the live
 -- policy ETag it was edited from. It is a workspace, not authority: no

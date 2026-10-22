@@ -5,12 +5,16 @@ uses it for live decisions**, including routes, host qualification, dispatch
 constraints and raw/canonical MCP HTTP identities (#422, PR 1), and so do tool
 admission (#422, PR 2), policy rate-lane selection (#422, PR 3a), the static
 egress checks (#422, PR 3b) and the admin analysis consumers: the historical
-rule preview, endpoint coverage and suggestion coverage (#422, PR 4). This does
-not complete #422 or add Policy Studio simulation/replay endpoints.
+rule preview, endpoint coverage and suggestion coverage (#422, PR 4). With the
+legacy retirement the enum-source precheck and the tool-name coverage check ask
+it too, and it holds the only serving `RuleMatcher`: no serving path matches a
+policy rule beside it. This does not add Policy Studio simulation/replay
+endpoints.
 
 It now covers contextless HTTP direct rules and permission routes, host-qualified
 routes and dispatch-scoped direct rules, MCP alias identities, and rate-lane
-selection, plus five policy-backed tool operations and the static egress lane.
+selection, plus five policy-backed tool operations, the enum-source precheck
+and the static egress lane.
 [policy-evaluation-parity.md](policy-evaluation-parity.md) is the per-lane
 inventory: legacy entry point, normalization, default, trace reason, authority.
 
@@ -52,7 +56,8 @@ freshness or perform a live cluster-revision check.
 | Rate lane selection | `policy_rate_limit_request` guard, `RateLimitPolicyState::matching_limiter` | First matching override; anonymous reaches none, reproducing the live early return; live since #422 PR 3a, with buckets, capacity and enforcement left to the limiter |
 | Policy-backed tools | `ToolRuntime` invocation, visibility, composite enablement, rendered HTTP rules; `RbacState::tool_policy_eligibility` | Separate pure operations preserve each consumer's precedence and shadow behavior; live since #422 PR 2 |
 | Static egress | `EgressClient::checked_destination`, `rebind_checked_destination`, `revalidated_destination` | URL shape, scheme, host and port allowlists before any name is resolved, then the address checks over supplied answers; live since #422 PR 3b, with DNS, redirects, TLS and transport left to `crate::egress` |
-| Analysis consumers | Rule preview, endpoint coverage and suggestion coverage, each with its own `RuleMatcher` call and route check | `evaluate` over representative requests, and `match_direct_rules` for a candidate rule's own predicates; since #422 PR 4, with unanswerable facts reported rather than counted |
+| Analysis consumers | Rule preview, endpoint coverage and suggestion coverage, each with its own `RuleMatcher` call and route check | `evaluate` over representative requests, and `match_direct_rules` for a candidate rule's own predicates; since #422 PR 4, with unanswerable facts reported rather than counted. `match_tool_rules` answers the tool-name coverage check since the legacy retirement |
+| Enum-source precheck | `SourceAuthorizer::authorize` for `ToolRuntime`, with a `RuleMatcher` built per call | `evaluate_source_request`: the named tool's enable bit, then direct denies alone for an anonymous contextless `GET` of the rendered path, on the live lane's installed snapshot; since the #422 legacy retirement |
 
 Every target is evaluated, so there is no `unsupported_target` limitation and no
 `unsupported_routing_policy`; both are gone. What remains is facts: each missing
@@ -148,7 +153,10 @@ keys. Framing it as `semantic` would place a different value under the frame the
 real JCS digest will use, with nothing in the frame to tell them apart. Existing
 normalization and the ad hoc policy ETag are likewise not relabeled. A semantic
 digest requires the ADR's normalization and JCS contract across the other
-resource lanes.
+resource lanes. Policy v1 now defines that normalization for the policy document
+itself (`rbac/policy_document.rs`), and the policy validation API reports its
+JCS semantic digest; no kernel snapshot binds it yet, so the bindings above are
+unchanged.
 
 A standalone snapshot binds that source without inventing a persistent revision.
 A PostgreSQL snapshot additionally binds a nonnegative security watermark (zero

@@ -44,9 +44,12 @@
 //!   revocations, idle rate-limit buckets, expired pending logins, expired
 //!   admin sessions and their pending cookie logins, stale
 //!   member rows, audit events past `AUDIT_POSTGRES_RETENTION_DAYS` (never
-//!   past the retention floor, see [`AuditRetentionFloor`]), and lease rows
-//!   expired for more than one TTL. A failing job is logged, recorded in the
-//!   ledger with its classified code, and never blocks the next one.
+//!   past the retention floor, see [`AuditRetentionFloor`]), delivered
+//!   authority-event journal rows past `AUTHORITY_EVENT_RETENTION_HOURS`
+//!   (never above the dispatcher's cursor, see [`AuthorityEventRetention`]),
+//!   and lease rows expired for more than one TTL. A failing job is logged,
+//!   recorded in the ledger with its classified code, and never blocks the
+//!   next one.
 //!
 //! Metrics: `cluster_maintenance_leader` (1 while this replica leads),
 //! `cluster_maintenance_job_runs_total{job,outcome}`, and
@@ -73,10 +76,11 @@ use crate::{
     },
     storage::{
         postgres_admin_sessions::PostgresAdminSessionStore,
-        postgres_audit::PostgresAuditEventStore, postgres_session::advisory_lock_key,
-        DedicatedSession, JobOutcome, PostgresExecutionLeaseStore, PostgresJwtRevocationStore,
-        PostgresMembershipStore, PostgresPendingLoginStore, PostgresRateLimitStore,
-        RepositoryError, RepositoryErrorKind,
+        postgres_audit::PostgresAuditEventStore,
+        postgres_authority_events::PostgresAuthorityEventStore,
+        postgres_session::advisory_lock_key, DedicatedSession, JobOutcome,
+        PostgresExecutionLeaseStore, PostgresJwtRevocationStore, PostgresMembershipStore,
+        PostgresPendingLoginStore, PostgresRateLimitStore, RepositoryError, RepositoryErrorKind,
     },
     tools::{
         lease::{ExecutionLease, ExecutionLeaseStore, LeaseAttempt},
@@ -115,6 +119,7 @@ pub(crate) const JOB_PENDING_LOGIN_PRUNE: &str = "pending_login_prune";
 pub(crate) const JOB_ADMIN_SESSION_PRUNE: &str = "admin_session_prune";
 pub(crate) const JOB_STALE_MEMBER_SWEEP: &str = "stale_member_sweep";
 pub(crate) const JOB_AUDIT_RETENTION: &str = "audit_retention";
+pub(crate) const JOB_AUTHORITY_EVENT_RETENTION: &str = "authority_event_retention";
 pub(crate) const JOB_EXECUTION_LEASE_REAPER: &str = "execution_lease_reaper";
 
 /// Every singleton job name, which is the whole vocabulary of the `job`
@@ -124,13 +129,14 @@ pub(crate) const JOB_EXECUTION_LEASE_REAPER: &str = "execution_lease_reaper";
 /// `the_leader_task_vocabulary_is_the_singletons_job_names` in
 /// `cluster_status.rs` already keeps the status view's copy of this list
 /// in step; the registry label audit uses this one.
-pub(crate) const JOB_NAMES: [&str; 7] = [
+pub(crate) const JOB_NAMES: [&str; 8] = [
     JOB_JWT_REVOCATION_CLEANUP,
     JOB_RATE_LIMIT_IDLE_SWEEP,
     JOB_PENDING_LOGIN_PRUNE,
     JOB_ADMIN_SESSION_PRUNE,
     JOB_STALE_MEMBER_SWEEP,
     JOB_AUDIT_RETENTION,
+    JOB_AUTHORITY_EVENT_RETENTION,
     JOB_EXECUTION_LEASE_REAPER,
 ];
 
@@ -141,7 +147,7 @@ pub(crate) const JOB_NAMES: [&str; 7] = [
 /// `job` column is *database data*, and a database this gateway shares
 /// with a newer one -- or that somebody edited -- can carry a name it has
 /// never heard of. Recognising the name and using the *recognised
-/// constant* as the label means the label can only ever be one of six
+/// constant* as the label means the label can only ever be one of eight
 /// values, whatever the row said.
 pub(crate) fn known_job_name(job: &str) -> Option<&'static str> {
     JOB_NAMES.into_iter().find(|name| *name == job)
@@ -359,6 +365,41 @@ impl MaintenanceJob for AuditRetention {
     }
 }
 
+/// Delete authority-event journal rows the dispatcher has delivered and that
+/// are older than the retention window
+/// (`PostgresAuthorityEventStore::prune_with`), then publish the journal
+/// gauges from the same session.
+///
+/// The cursor is the floor: a row above it is undelivered and stays, however
+/// old, holding its unit of capacity. Only before any dispatcher has claimed
+/// the cursor -- when no consumer is required -- does age alone decide. The
+/// evidence tables the journal indexes are never touched. Publishing the
+/// gauges here means a deployment with no sink configured, where no
+/// dispatcher runs, still sees its journal fill toward capacity.
+pub(crate) struct AuthorityEventRetention {
+    pub(crate) retention: Duration,
+    pub(crate) limit: u32,
+}
+
+#[async_trait]
+impl MaintenanceJob for AuthorityEventRetention {
+    fn name(&self) -> &'static str {
+        JOB_AUTHORITY_EVENT_RETENTION
+    }
+
+    async fn run_step(&self, client: &tokio_postgres::Client) -> Result<u64, RepositoryError> {
+        let removed =
+            PostgresAuthorityEventStore::prune_with(client, self.retention, self.limit).await?;
+        match PostgresAuthorityEventStore::stats_with(client).await {
+            Ok(stats) => crate::authority_events::dispatcher::record_journal_stats(&stats),
+            Err(error) => {
+                tracing::debug!(error = %error, "authority event journal stats unavailable");
+            }
+        }
+        Ok(removed)
+    }
+}
+
 /// Delete lease rows expired for longer than one TTL
 /// (`PostgresExecutionLeaseStore::reap_expired`). Defensive: acquisition
 /// already reclaims expired slots in place.
@@ -395,6 +436,8 @@ pub(crate) struct StandardJobSources {
     pub(crate) audit: Option<Arc<PostgresAuditEventStore>>,
     pub(crate) audit_retention: Option<Duration>,
     pub(crate) audit_floor: Option<Arc<dyn AuditRetentionFloor>>,
+    /// How long a delivered authority event stays in the journal.
+    pub(crate) authority_event_retention: Duration,
     /// The reaper's own lease store identity and the tool lease TTL (its
     /// grace).
     pub(crate) lease_holder: Uuid,
@@ -444,6 +487,10 @@ pub(crate) fn standard_jobs(sources: StandardJobSources) -> Vec<Arc<dyn Maintena
             limit: JOB_STEP_LIMIT,
         }));
     }
+    jobs.push(Arc::new(AuthorityEventRetention {
+        retention: sources.authority_event_retention,
+        limit: JOB_STEP_LIMIT,
+    }));
     jobs.push(Arc::new(ExecutionLeaseReaper {
         store: PostgresExecutionLeaseStore::new(
             sources.pool,
@@ -941,6 +988,7 @@ mod tests {
             JOB_ADMIN_SESSION_PRUNE,
             JOB_STALE_MEMBER_SWEEP,
             JOB_AUDIT_RETENTION,
+            JOB_AUTHORITY_EVENT_RETENTION,
             JOB_EXECUTION_LEASE_REAPER,
         ]
         .into_iter()

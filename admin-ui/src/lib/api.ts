@@ -15,6 +15,22 @@ const MAX_COMPOSITE_STEP_ID_BYTES = 64;
 const MAX_TOOL_NAME_BYTES = 128;
 const MAX_TRANSFORM_PROBLEMS = 32;
 const MAX_TRANSFORM_PROBLEM_FIELD_BYTES = 1_024;
+// The fixed reasons the gateway refuses to attest a caller with. A
+// compensation refused for one of them sent nothing, and the write it would
+// have undone is reported as an orphan with that reason.
+const CALLER_ASSERTION_REFUSAL_REASONS: ReadonlySet<string> = new Set([
+  'caller_assertion_no_principal',
+  'caller_assertion_claim_invalid',
+  'caller_assertion_lifetime_invalid',
+  'caller_assertion_key_unusable',
+  'caller_assertion_key_unavailable',
+  'caller_assertion_key_not_published',
+  'caller_assertion_header_conflict',
+  'caller_assertion_approval_required',
+  'caller_assertion_signature_failed',
+  'caller_assertion_token_too_long',
+  'caller_assertion_not_enforced',
+]);
 
 export type AdminValidationProblem = {
   field: string;
@@ -462,7 +478,8 @@ function isCompositeOrphanReason(value: unknown): value is string {
     value === 'tool_disabled' ||
     value === 'http_rule_denied' ||
     value === 'transport_ambiguous' ||
-    value === 'timeout_ambiguous'
+    value === 'timeout_ambiguous' ||
+    CALLER_ASSERTION_REFUSAL_REASONS.has(value)
   ) {
     return true;
   }

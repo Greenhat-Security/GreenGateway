@@ -391,6 +391,7 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
             audit_floor: Some(Arc::new(
                 storage::postgres_discovery::PostgresDiscoveryStore::new(pool.clone()),
             )),
+            authority_event_retention: config.authority_events.retention(),
             lease_holder: identity.instance_id(),
             tool_lease_ttl: config.tool_lease_ttl(),
         });
@@ -905,6 +906,33 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => None,
     };
+    // The authority-event journal (issue #425, PR 3) rides the same pool.
+    // Every replica applies the configured capacity before serving; the
+    // value is fingerprinted, so agreeing replicas write the same number.
+    // A journal that cannot be configured refuses startup: every authority
+    // mutation reserves capacity in it.
+    #[cfg(feature = "postgres")]
+    let pg_authority_events_store = match &_database_foundation {
+        Some(foundation) => {
+            let store = Arc::new(
+                storage::postgres_authority_events::PostgresAuthorityEventStore::new(
+                    foundation.pool().clone(),
+                ),
+            );
+            // Boxed, as is the delivery startup below: `run()`'s future is
+            // held on the main thread's stack, which a debug build on
+            // Windows (1 MiB) has no room left on for inline sub-futures.
+            Box::pin(store.configure_capacity(config.authority_events.journal_capacity))
+                .await
+                .map_err(|error| {
+                    Box::<dyn std::error::Error>::from(format!(
+                        "the authority event journal could not be configured: {error}"
+                    ))
+                })?;
+            Some(store)
+        }
+        None => None,
+    };
     let metrics_handle = install_metrics_recorder()?;
     let listen_addr = config.listen_addr;
     let admin_listen_addr = config.admin_listen_addr;
@@ -967,6 +995,8 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
             pg_discovery: pg_discovery_seed,
             #[cfg(feature = "postgres")]
             pg_membership: pg_membership_seed,
+            #[cfg(feature = "postgres")]
+            pg_authority_events: pg_authority_events_store,
             #[cfg(test)]
             cluster_readiness: None,
             #[cfg(test)]
@@ -988,6 +1018,16 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
     let background_lifecycle = lifecycle.clone();
+    // Delivery needs the keyring, and the keyring may sit behind a network
+    // secret provider the builder only just activated, so it is resolved
+    // here, after the build and before any listener binds. Any failure
+    // refuses startup.
+    #[cfg(feature = "postgres")]
+    if let Some(startup) = app.authority_events {
+        Box::pin(startup.start(&lifecycle, &audit_log))
+            .await
+            .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
+    }
 
     serve_gateway(
         app.http,
@@ -1337,7 +1377,7 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
             .transpose()?
             .map(|store| Arc::new(store) as Arc<dyn storage::PolicyHistory>);
     // Policy drafts (issue #243, slice 9) live beside the history they will
-    // join once published: migration 21's table in cluster mode, and a
+    // join once published: migration 22's table in cluster mode, and a
     // `policy_drafts` table in the same SQLite database as `policy_versions`
     // in standalone mode. A database that cannot be opened fails startup,
     // exactly as the history store does.
@@ -1433,6 +1473,13 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
         &build_overrides,
     )?);
     connection_control_plane.activate_network_secret_providers(&egress_client)?;
+    // Cluster mode with an authority-event sink: everything the dispatcher's
+    // startup needs, finished by `run()` once it can await the keyring. The
+    // control plane's resolver is the one that knows the operator aliases
+    // and the network providers just activated.
+    #[cfg(feature = "postgres")]
+    let authority_event_startup =
+        authority_event_startup(&config, &build_overrides, &connection_control_plane);
     let connection_http_runtime = connections::http::ConnectionHttpRuntime::new(
         connection_control_plane.clone(),
         egress_config,
@@ -1971,6 +2018,7 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
             audit_floor: Some(Arc::new(
                 storage::postgres_discovery::PostgresDiscoveryStore::new(seed.pool.clone()),
             )),
+            authority_event_retention: config.authority_events.retention(),
             lease_holder: seed.instance_id,
             tool_lease_ttl: config.tool_lease_ttl(),
         });
@@ -2331,7 +2379,41 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
         ))
     };
 
-    Ok(GatewayApps { http, grpc })
+    Ok(GatewayApps {
+        http,
+        grpc,
+        #[cfg(feature = "postgres")]
+        authority_events: authority_event_startup,
+    })
+}
+
+/// What `run()` needs to start authority-event delivery, when this is a
+/// cluster replica with a sink configured. Kept out of the app builder, whose
+/// unoptimized stack frame already sits close to the main thread's limit.
+#[cfg(feature = "postgres")]
+#[inline(never)]
+fn authority_event_startup(
+    config: &config::Config,
+    build_overrides: &GatewayAppBuildOverrides,
+    connection_control_plane: &connections::control_plane::ConnectionControlPlane,
+) -> Option<authority_events::startup::AuthorityEventStartup> {
+    if config.authority_events.sink == config::AuthorityEventSinkSetting::None {
+        return None;
+    }
+    let store = build_overrides.pg_authority_events.as_ref()?;
+    let seed = build_overrides.pg_limits.as_ref()?;
+    Some(authority_events::startup::AuthorityEventStartup {
+        store: Arc::clone(store),
+        resolver: connection_control_plane.secret_resolver_handle(),
+        settings: config.authority_events.clone(),
+        leases: Arc::new(storage::PostgresExecutionLeaseStore::new(
+            seed.pool.clone(),
+            &seed.deployment_id,
+            seed.instance_id,
+            authority_events::dispatcher::DISPATCHER_LEASE_TTL,
+        )) as Arc<dyn tools::lease::ExecutionLeaseStore>,
+        holder: seed.instance_id,
+    })
 }
 
 pub(super) fn auth_validator_from_config(

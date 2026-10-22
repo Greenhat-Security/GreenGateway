@@ -6454,7 +6454,7 @@ pub(crate) mod postgres_audit_tests {
         assert_eq!(count_rows(&pool, "security_outbox").await, 0);
     }
 
-    /// Migration 21's constraints refuse rows no gateway path writes, so a
+    /// Migration 22's constraints refuse rows no gateway path writes, so a
     /// store defect or an out-of-band edit cannot plant one.
     #[tokio::test]
     async fn policy_drafts_table_refuses_rows_the_store_never_writes() {

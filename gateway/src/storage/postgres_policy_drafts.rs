@@ -1,6 +1,6 @@
 //! PostgreSQL policy draft store (issue #243, slice 9).
 //!
-//! Implements [`PolicyDraftStore`] against migration 21's
+//! Implements [`PolicyDraftStore`] against migration 22's
 //! `greengateway.policy_drafts`, so every replica of a cluster serves the
 //! same drafts. The contract is the one the standalone SQLite store
 //! satisfies (`storage::policy_drafts`); what differs is where the clock and
