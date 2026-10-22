@@ -78,7 +78,7 @@
 
 pub(crate) mod analysis;
 pub(crate) mod egress;
-mod input;
+pub(crate) mod input;
 #[cfg(test)]
 mod property_tests;
 #[cfg(test)]
@@ -1236,7 +1236,7 @@ impl Evaluation {
 ///
 /// Shared by every path identity in a context. A check that covered only the
 /// first one would be a check the others are missing, and each of them decides.
-fn validate_path(path: &str) -> Result<(), EvaluationError> {
+pub(crate) fn validate_path(path: &str) -> Result<(), EvaluationError> {
     if path.len() > MAX_REQUEST_PATH_BYTES {
         return Err(EvaluationError::ContextTooLarge);
     }

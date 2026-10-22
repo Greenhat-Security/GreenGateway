@@ -23,7 +23,7 @@ use serde::Serialize;
 use std::{collections::HashMap, fmt};
 
 pub(crate) const TOOL_CONTEXT_VERSION: u16 = 1;
-const TOOL_SEMANTICS_VERSION: &str = "gg-tool-policy-v1";
+pub(crate) const TOOL_SEMANTICS_VERSION: &str = "gg-tool-policy-v1";
 const TOOL_DOMAIN: &str = "tool_policy_v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]

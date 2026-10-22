@@ -38657,3 +38657,6 @@ fn every_mcp_route_path_is_gateway_owned_so_an_alias_is_never_a_classified_dispa
         }
     }
 }
+
+#[path = "admin_policy_test_runs_tests.rs"]
+mod admin_policy_test_runs_tests;

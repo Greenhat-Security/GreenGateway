@@ -360,3 +360,23 @@ they lack: a route id outside a pooled route, the request host, and an MCP
 alias identity. The frozen pre-cutover consumers, the differential fixtures and
 every documented difference are in
 [policy-evaluation-parity.md](policy-evaluation-parity.md).
+
+## Synthetic policy tests (#243, slice 11)
+
+`policy_testing` decides operator-authored synthetic cases rather than the
+representative requests and retained observations of the analysis consumers.
+Unlike them it compiles the policy it judges with `from_validated_policy`, the
+constructor the live install paths use, bound to the authority the policy was
+read at (in cluster mode the active document's security watermark), not with
+`for_analysis`. For each case it builds the context a live adapter builds:
+`evaluate` with a `Contextless`, `McpAlias` or `ProxyDispatch` target and a
+host that is `Present` or `Absent` (a synthetic case states its facts, so never
+`Missing`); `evaluate_tool` for `Invocation`, `Visibility`, `PolicyEligibility`
+and `RenderedHttp`; and `select_rate_lane` with the rate adapter's own
+`HttpTarget::Missing` and `HostFact::Missing`. It never matches a rule itself
+and never asks `match_direct_rules`: a case asks what the policy decides, not
+whether one rule's predicates match. An evaluator error is the case's `error`
+outcome and an incomplete answer its `incomplete` outcome; neither can satisfy
+an expectation. Results carry the stable reason and limitation codes and the
+evaluator semantics and context versions, and no fixture value. The suite
+format and API are in [policy-tests.md](../policy-tests.md).
