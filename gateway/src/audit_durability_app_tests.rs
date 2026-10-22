@@ -8,7 +8,8 @@
 //! capture sink. The decision records a request waits on reach the store
 //! before the request is forwarded, and while the store cannot commit,
 //! the request is refused with `503 audit_unavailable` and the upstream sees
-//! nothing. And the records those producers write carry none of the
+//! nothing. And the records those producers write -- and the metrics the
+//! same run registers, the refusal counter included -- carry none of the
 //! material the request handled: the caller's token, cookie, headers and
 //! query, the Connection's secret value, its ciphertext and nonce, or where
 //! the key that sealed it lives. Every marker is generated per run, so no
@@ -68,9 +69,46 @@ async fn wait_for_rows(
     }
 }
 
-#[tokio::test]
-async fn required_durability_forwards_only_durably_recorded_decisions_and_keeps_secrets_out_of_them(
-) {
+/// The scenario runs on a current-thread runtime inside a local Prometheus
+/// recorder's scope, so every metric the request path registers -- the
+/// refusal counter among them -- lands in a registry this test can render
+/// and search, not in the process-global one.
+#[test]
+fn required_durability_forwards_only_durably_recorded_decisions_and_keeps_secrets_out_of_them() {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime should build");
+    let forbidden = ::metrics::with_local_recorder(&recorder, || {
+        runtime.block_on(required_durability_scenario(handle.clone()))
+    });
+    let rendered = handle.render();
+
+    // Not vacuous: the stalled request's refusal was registered here, under
+    // its fixed reason and nothing else.
+    assert!(
+        rendered.lines().any(|line| {
+            rendered_metric_name(line) == metrics::AUDIT_DURABILITY_REFUSALS_TOTAL
+                && line.contains("reason=\"timeout\"")
+        }),
+        "the stalled request's refusal must be counted under reason=\"timeout\":\n{rendered}"
+    );
+    for (what, value) in &forbidden {
+        assert!(
+            !rendered.contains(value.as_str()),
+            "{what} reached the metrics registry:\n{rendered}"
+        );
+    }
+}
+
+/// Serve, stall and recover one protected request under the default
+/// required durability, asserting against the stored rows as it goes, and
+/// return every value no record or metric may contain.
+async fn required_durability_scenario(
+    metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
+) -> Vec<(&'static str, String)> {
     let jwks_addr = spawn_test_jwks_server().await;
     // A credentialed Connection must use HTTPS, so the upstream terminates
     // TLS under a CA generated for this run.
@@ -217,8 +255,7 @@ async fn required_durability_forwards_only_durably_recorded_decisions_and_keeps_
 
     let (audit_log, audit_event_sender) =
         audit::AuditLog::from_config(&config).expect("required durability over SQLite builds");
-    let recorder = PrometheusBuilder::new().build_recorder();
-    let router = app(config, recorder.handle(), audit_log, audit_event_sender)
+    let router = app(config, metrics_handle, audit_log, audit_event_sender)
         .expect("the required-durability app should build");
 
     let token = signed_token("durable-billing-reader", &["billing-reader"]);
@@ -276,7 +313,7 @@ async fn required_durability_forwards_only_durably_recorded_decisions_and_keeps_
         .next()
         .expect("a JWT has a signature segment")
         .to_owned();
-    let forbidden = [
+    let forbidden = vec![
         ("the caller's bearer token", token.clone()),
         ("the caller's token signature", signature),
         ("the caller's cookie", cookie_secret.clone()),
@@ -350,4 +387,22 @@ async fn required_durability_forwards_only_durably_recorded_decisions_and_keeps_
         .expect("the recovered request should complete");
     assert_eq!(response.status(), StatusCode::CREATED);
     next_proxied_request(&mut captured, "the recovered request").await;
+
+    // The refused request's late record and the recovered request's own
+    // records are rows now too, and no more of them may carry the material.
+    let rows = wait_for_rows(
+        &audit_db.path,
+        &["auth.success", "authz.allowed", "http.request_observed"],
+        "the recovered request",
+    )
+    .await;
+    for (_, row) in &rows {
+        for (what, value) in &forbidden {
+            assert!(
+                !row.contains(value.as_str()),
+                "{what} reached an audit record: {row}"
+            );
+        }
+    }
+    forbidden
 }
