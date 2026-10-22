@@ -81,6 +81,7 @@ pub(crate) mod egress;
 pub(crate) mod input;
 #[cfg(test)]
 mod property_tests;
+pub(crate) mod stages;
 #[cfg(test)]
 mod tests;
 pub(crate) mod tools;
@@ -106,6 +107,11 @@ use crate::{
         MAX_REQUEST_PATH_BYTES,
     },
     upstream_route::is_bare_host,
+};
+
+use stages::{
+    DefaultMatch, DirectAction, DirectMatch, HostUse, HttpStage, NoStages, PermissionCheck,
+    RouteMatch, StageSink, UpstreamBinding,
 };
 
 /// Each lane that adds a required fact bumps this, so a context built for an
@@ -511,6 +517,19 @@ impl CompiledPolicy {
         &self,
         context: &PolicyEvaluationContext,
     ) -> Result<Evaluation, EvaluationError> {
+        self.evaluate_with_stages(context, &mut NoStages)
+    }
+
+    /// [`Self::evaluate`], reporting each stage it runs to `stages`.
+    ///
+    /// This is the decision code, not a copy of it: `evaluate` is this
+    /// function with a sink that keeps nothing, so a stage trace can only ever
+    /// describe the decision production makes. See [`stages`].
+    pub(crate) fn evaluate_with_stages<S: StageSink>(
+        &self,
+        context: &PolicyEvaluationContext,
+        stages: &mut S,
+    ) -> Result<Evaluation, EvaluationError> {
         context.validate(self.snapshot)?;
         let binding = context.binding()?;
         let missing = if context.method.is_none() {
@@ -529,6 +548,7 @@ impl CompiledPolicy {
                 HttpTarget::ProxyDispatch => None,
             }
         };
+        stages.record(HttpStage::Facts(missing));
         if let Some(limitation) = missing {
             return Ok(Evaluation::indeterminate(binding, limitation));
         }
@@ -550,17 +570,28 @@ impl CompiledPolicy {
         // The host routes are matched against: the selected upstream's when one
         // was chosen, otherwise the request's own.
         let effective_host = match (required_host, &context.request_host) {
-            (Some(host), _) => Some(host),
-            (None, HostFact::Present(host)) => Some(host.as_str()),
-            (None, HostFact::Absent) => None,
+            (Some(host), _) => {
+                stages.record(HttpStage::RequestHost(HostUse::SelectedUpstream));
+                Some(host)
+            }
+            (None, HostFact::Present(host)) => {
+                stages.record(HttpStage::RequestHost(HostUse::Request));
+                Some(host.as_str())
+            }
+            (None, HostFact::Absent) => {
+                stages.record(HttpStage::RequestHost(HostUse::Absent));
+                None
+            }
             (None, HostFact::Missing) => {
                 // Only unanswerable when a route could actually turn on it.
                 if self.host_qualified_routes {
+                    stages.record(HttpStage::RequestHost(HostUse::Missing));
                     return Ok(Evaluation::indeterminate(
                         binding,
                         Limitation::MissingHostFact,
                     ));
                 }
+                stages.record(HttpStage::RequestHost(HostUse::NotRequired));
                 None
             }
         };
@@ -597,20 +628,31 @@ impl CompiledPolicy {
             dispatch_context,
             false,
         );
+        stages.record(HttpStage::DirectRules(first_direct.as_ref().map(
+            |decision| DirectMatch {
+                rule: decision.rule_index,
+                action: DirectAction::from(&decision.action),
+            },
+        )));
         let observation = first_direct.as_ref().and_then(|decision| {
             (host_binding_required && decision.action == RuleAction::Shadow)
                 .then_some(RuleReference::Direct(decision.rule_index))
         });
         let deciding_direct = if host_binding_required {
-            self.match_direct(
+            let deny = self.match_direct(
                 method.as_str(),
                 path,
                 canonical_path,
                 principal,
                 dispatch_context,
                 true,
-            )
+            );
+            stages.record(HttpStage::UpstreamBinding(UpstreamBinding::DenyOnly(
+                deny.as_ref().map(|decision| decision.rule_index),
+            )));
+            deny
         } else {
+            stages.record(HttpStage::UpstreamBinding(UpstreamBinding::NotSelected));
             first_direct
         };
         if let Some(decision) = deciding_direct {
@@ -647,6 +689,19 @@ impl CompiledPolicy {
             } else {
                 Reason::MissingPrincipal
             };
+            let mode = route.enforcement_mode.unwrap_or(policy.enforcement_mode);
+            stages.record(HttpStage::Routes(Some(RouteMatch {
+                route: index,
+                permission: if allowed {
+                    PermissionCheck::Granted
+                } else if principal.is_some() {
+                    PermissionCheck::Missing
+                } else {
+                    PermissionCheck::NoPrincipal
+                },
+                mode,
+                mode_inherited: route.enforcement_mode.is_none(),
+            })));
             return Ok(Evaluation::complete(
                 binding,
                 if allowed {
@@ -654,21 +709,20 @@ impl CompiledPolicy {
                 } else {
                     LogicalDecision::Deny
                 },
-                effect(
-                    allowed,
-                    route.enforcement_mode.unwrap_or(policy.enforcement_mode),
-                ),
+                effect(allowed, mode),
                 reason,
                 Some(RuleReference::Route(index)),
                 observation,
             ));
         }
+        stages.record(HttpStage::Routes(None));
         // A selected upstream that no host-bound route authorizes is refused
         // outright. The policy default does not apply and shadow enforcement
         // does not soften it: `default_action: allow` must not become blanket
         // authorization for every virtual host the gateway can reach, and a
         // gateway in shadow mode must not forward to one on that basis.
         if host_binding_required {
+            stages.record(HttpStage::HostPolicyRequired);
             return Ok(Evaluation::complete(
                 binding,
                 LogicalDecision::Deny,
@@ -679,6 +733,10 @@ impl CompiledPolicy {
             ));
         }
         let allowed = policy.default_action == DefaultAction::Allow;
+        stages.record(HttpStage::Default(DefaultMatch {
+            allow: allowed,
+            mode: policy.enforcement_mode,
+        }));
         Ok(Evaluation::complete(
             binding,
             if allowed {

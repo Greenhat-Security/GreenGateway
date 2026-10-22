@@ -103,14 +103,14 @@ pub(crate) struct Diagnostics {
 }
 
 impl Diagnostics {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             diagnostics: Vec::new(),
             truncated: false,
         }
     }
 
-    fn push(&mut self, code: &'static str, pointer: &str, message: impl Into<String>) {
+    pub(crate) fn push(&mut self, code: &'static str, pointer: &str, message: impl Into<String>) {
         if self.diagnostics.len() < MAX_DIAGNOSTICS {
             self.diagnostics.push(Diagnostic {
                 code,
@@ -122,7 +122,7 @@ impl Diagnostics {
         }
     }
 
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.diagnostics.is_empty() && !self.truncated
     }
 }
@@ -305,37 +305,18 @@ pub(crate) fn parse_suite(value: &Value) -> Result<Suite, Diagnostics> {
             &mut diagnostics,
         );
     }
-    let mut cases = Vec::new();
-    match root.get("cases") {
-        None => diagnostics.push("missing_field", "/cases", "cases is required"),
-        Some(Value::Array(items)) if items.is_empty() => diagnostics.push(
+    let cases = parse_case_list(
+        root.get("cases"),
+        "/cases",
+        MAX_CASES,
+        (
             "empty_suite",
-            "/cases",
             "a suite needs at least one case; an empty suite proves nothing",
         ),
-        Some(Value::Array(items)) if items.len() > MAX_CASES => diagnostics.push(
-            "too_many_cases",
-            "/cases",
-            format!("a suite may declare at most {MAX_CASES} cases"),
-        ),
-        Some(Value::Array(items)) => {
-            let mut seen = std::collections::HashSet::new();
-            for (index, item) in items.iter().enumerate() {
-                let pointer = format!("/cases/{index}");
-                if let Some(case) = parse_case(item, &pointer, &mut diagnostics) {
-                    if !seen.insert(case.id.clone()) {
-                        diagnostics.push(
-                            "duplicate_case_id",
-                            &format!("{pointer}/id"),
-                            "case ids must be unique within a suite",
-                        );
-                    }
-                    cases.push(case);
-                }
-            }
-        }
-        Some(_) => diagnostics.push("invalid_type", "/cases", "cases must be an array"),
-    }
+        parse_case,
+        |case| &case.id,
+        &mut diagnostics,
+    );
     if !diagnostics.is_empty() {
         return Err(diagnostics);
     }
@@ -354,9 +335,230 @@ pub(crate) fn parse_suite(value: &Value) -> Result<Suite, Diagnostics> {
     }
 }
 
-fn parse_case(value: &Value, pointer: &str, diagnostics: &mut Diagnostics) -> Option<Case> {
-    let map = object(value, pointer, diagnostics)?;
+/// A synthetic input with no expectation: what a simulation evaluates
+/// (issue #243, slice 10). It is parsed by exactly the functions a test case
+/// is, so a simulation and a test can never disagree about what a case means.
+pub(crate) struct SyntheticCase {
+    pub(crate) id: String,
+    /// The JSON Pointer of the case in the submitted document, for results.
+    pub(crate) pointer: String,
+    pub(crate) context: CaseContext,
+}
+
+/// What a case asks, per lane, without what it expects.
+pub(crate) enum CaseContext {
+    Http {
+        request: HttpRequest,
+        principal: SyntheticPrincipal,
+    },
+    Tool {
+        operation: ToolOperation,
+        tool_name: String,
+        principal: SyntheticPrincipal,
+    },
+    ToolHttp {
+        tool_name: String,
+        method: Method,
+        path: String,
+        principal: SyntheticPrincipal,
+    },
+    Rate {
+        method: Method,
+        path: String,
+        principal: SyntheticPrincipal,
+    },
+}
+
+impl CaseContext {
+    pub(crate) fn kind(&self) -> CaseKind {
+        match self {
+            Self::Http { .. } => CaseKind::Http,
+            Self::Tool { .. } => CaseKind::Tool,
+            Self::ToolHttp { .. } => CaseKind::ToolHttp,
+            Self::Rate { .. } => CaseKind::Rate,
+        }
+    }
+}
+
+/// What a case expects, per lane.
+enum CaseExpectation {
+    Http(DecisionExpectation<Reason>),
+    Tool(DecisionExpectation<crate::policy_eval::tools::ToolReason>),
+    Rate(RateExpectation),
+}
+
+/// Parse a list of cases at `pointer`: present, an array, non-empty, within
+/// `max_cases`, and with unique ids. Shared by a test suite and a simulation,
+/// so both bound and identify their cases the same way.
+pub(crate) fn parse_case_list<T>(
+    value: Option<&Value>,
+    pointer: &str,
+    max_cases: usize,
+    (empty_code, empty_message): (&'static str, &'static str),
+    parse_one: fn(&Value, &str, &mut Diagnostics) -> Option<T>,
+    id_of: fn(&T) -> &str,
+    diagnostics: &mut Diagnostics,
+) -> Vec<T> {
+    let mut cases = Vec::new();
+    match value {
+        None => diagnostics.push(
+            "missing_field",
+            pointer,
+            format!("{} is required", pointer.trim_start_matches('/')),
+        ),
+        Some(Value::Array(items)) if items.is_empty() => {
+            diagnostics.push(empty_code, pointer, empty_message)
+        }
+        Some(Value::Array(items)) if items.len() > max_cases => diagnostics.push(
+            "too_many_cases",
+            pointer,
+            format!("at most {max_cases} cases may be declared"),
+        ),
+        Some(Value::Array(items)) => {
+            let mut seen = std::collections::HashSet::new();
+            for (index, item) in items.iter().enumerate() {
+                let case_pointer = format!("{pointer}/{index}");
+                if let Some(case) = parse_one(item, &case_pointer, diagnostics) {
+                    if !seen.insert(id_of(&case).to_owned()) {
+                        diagnostics.push(
+                            "duplicate_case_id",
+                            &format!("{case_pointer}/id"),
+                            "case ids must be unique",
+                        );
+                    }
+                    cases.push(case);
+                }
+            }
+        }
+        Some(_) => diagnostics.push("invalid_type", pointer, "cases must be an array"),
+    }
+    cases
+}
+
+/// One simulation case: a test case's members less `expect`, which is refused
+/// as an unknown member because a simulation asserts nothing.
+pub(crate) fn parse_synthetic_case(
+    value: &Value,
+    pointer: &str,
+    diagnostics: &mut Diagnostics,
+) -> Option<SyntheticCase> {
     let before = diagnostics.diagnostics.len();
+    let (map, id, kind) = parse_case_header(value, pointer, false, diagnostics)?;
+    let context = parse_case_context(map, pointer, kind, diagnostics);
+    if diagnostics.diagnostics.len() != before || diagnostics.truncated {
+        return None;
+    }
+    Some(SyntheticCase {
+        id: id?,
+        pointer: pointer.to_owned(),
+        context: context?,
+    })
+}
+
+fn parse_case(value: &Value, pointer: &str, diagnostics: &mut Diagnostics) -> Option<Case> {
+    let before = diagnostics.diagnostics.len();
+    let (map, id, kind) = parse_case_header(value, pointer, true, diagnostics)?;
+    let context = parse_case_context(map, pointer, kind, diagnostics);
+    let expect_pointer = format!("{pointer}/expect");
+    let expect = required(map, "expect", pointer, diagnostics).and_then(|value| match kind {
+        CaseKind::Http => {
+            parse_decision_expectation(value, &expect_pointer, parse_http_reason, true, diagnostics)
+                .map(CaseExpectation::Http)
+        }
+        CaseKind::Tool | CaseKind::ToolHttp => parse_decision_expectation(
+            value,
+            &expect_pointer,
+            parse_tool_reason,
+            false,
+            diagnostics,
+        )
+        .map(CaseExpectation::Tool),
+        CaseKind::Rate => {
+            parse_rate_expectation(value, &expect_pointer, diagnostics).map(CaseExpectation::Rate)
+        }
+    });
+    if diagnostics.diagnostics.len() != before || diagnostics.truncated {
+        return None;
+    }
+    let input = match (context?, expect?) {
+        (CaseContext::Http { request, principal }, CaseExpectation::Http(expect)) => {
+            CaseInput::Http {
+                request,
+                principal,
+                expect,
+            }
+        }
+        (
+            CaseContext::Tool {
+                operation,
+                tool_name,
+                principal,
+            },
+            CaseExpectation::Tool(expect),
+        ) => CaseInput::Tool {
+            operation,
+            tool_name,
+            principal,
+            expect,
+        },
+        (
+            CaseContext::ToolHttp {
+                tool_name,
+                method,
+                path,
+                principal,
+            },
+            CaseExpectation::Tool(expect),
+        ) => CaseInput::ToolHttp {
+            tool_name,
+            method,
+            path,
+            principal,
+            expect,
+        },
+        (
+            CaseContext::Rate {
+                method,
+                path,
+                principal,
+            },
+            CaseExpectation::Rate(expect),
+        ) => CaseInput::Rate {
+            method,
+            path,
+            principal,
+            expect,
+        },
+        // Both halves are parsed for the one kind read above, so they always
+        // pair. Refused with a diagnostic rather than dropped, because a case
+        // that vanished without one would leave a suite that runs fewer cases
+        // than its author wrote.
+        _ => {
+            diagnostics.push(
+                "inconsistent_case",
+                pointer,
+                "the case's input and expectation are for different kinds",
+            );
+            return None;
+        }
+    };
+    Some(Case {
+        id: id?,
+        pointer: pointer.to_owned(),
+        input,
+    })
+}
+
+/// A case's id, description and kind, and the member check for that kind:
+/// the members both a test case and a simulation case carry, plus `expect`
+/// when `expectation` is set.
+fn parse_case_header<'a>(
+    value: &'a Value,
+    pointer: &str,
+    expectation: bool,
+    diagnostics: &mut Diagnostics,
+) -> Option<(&'a Map<String, Value>, Option<String>, CaseKind)> {
+    let map = object(value, pointer, diagnostics)?;
     let id = required(map, "id", pointer, diagnostics).and_then(|value| {
         let pointer = format!("{pointer}/id");
         let id = bounded_string(value, &pointer, MAX_CASE_ID_BYTES, diagnostics)?;
@@ -395,108 +597,66 @@ fn parse_case(value: &Value, pointer: &str, diagnostics: &mut Diagnostics) -> Op
         }
         kind
     });
-    let Some(kind) = kind else {
+    let mut members: Vec<&str> = match kind {
         // Without a kind the other members have no defined meaning; report
         // only what is wrong regardless of kind.
-        check_members(
-            map,
-            pointer,
-            &[
-                "id",
-                "description",
-                "kind",
-                "principal",
-                "request",
-                "tool",
-                "expect",
-            ],
-            diagnostics,
-        );
-        return None;
+        None => vec!["id", "description", "kind", "principal", "request", "tool"],
+        Some(CaseKind::Http | CaseKind::Rate) => {
+            vec!["id", "description", "kind", "principal", "request"]
+        }
+        Some(CaseKind::Tool) => vec!["id", "description", "kind", "principal", "tool"],
+        Some(CaseKind::ToolHttp) => {
+            vec!["id", "description", "kind", "principal", "tool", "request"]
+        }
     };
-    let members: &[&str] = match kind {
-        CaseKind::Http | CaseKind::Rate => &[
-            "id",
-            "description",
-            "kind",
-            "principal",
-            "request",
-            "expect",
-        ],
-        CaseKind::Tool => &["id", "description", "kind", "principal", "tool", "expect"],
-        CaseKind::ToolHttp => &[
-            "id",
-            "description",
-            "kind",
-            "principal",
-            "tool",
-            "request",
-            "expect",
-        ],
-    };
-    check_members(map, pointer, members, diagnostics);
+    if expectation {
+        members.push("expect");
+    }
+    check_members(map, pointer, &members, diagnostics);
+    Some((map, id, kind?))
+}
+
+/// The typed input of a case of `kind`.
+fn parse_case_context(
+    map: &Map<String, Value>,
+    pointer: &str,
+    kind: CaseKind,
+    diagnostics: &mut Diagnostics,
+) -> Option<CaseContext> {
     let principal = required(map, "principal", pointer, diagnostics)
         .and_then(|value| parse_principal(value, &format!("{pointer}/principal"), diagnostics));
-    let expect_pointer = format!("{pointer}/expect");
-    let input = match kind {
+    match kind {
         CaseKind::Http => {
             let request = required(map, "request", pointer, diagnostics).and_then(|value| {
                 parse_http_request(value, &format!("{pointer}/request"), diagnostics)
             });
-            let expect = required(map, "expect", pointer, diagnostics).and_then(|value| {
-                parse_decision_expectation(
-                    value,
-                    &expect_pointer,
-                    parse_http_reason,
-                    true,
-                    diagnostics,
-                )
-            });
-            match (request, principal, expect) {
-                (Some(request), Some(principal), Some(expect)) => Some(CaseInput::Http {
-                    request,
-                    principal,
-                    expect,
-                }),
-                _ => None,
-            }
+            Some(CaseContext::Http {
+                request: request?,
+                principal: principal?,
+            })
         }
         CaseKind::Tool => {
             let tool = required(map, "tool", pointer, diagnostics)
                 .and_then(|value| parse_tool(value, &format!("{pointer}/tool"), true, diagnostics));
-            let expect = required(map, "expect", pointer, diagnostics).and_then(|value| {
-                parse_decision_expectation(
-                    value,
-                    &expect_pointer,
-                    parse_tool_reason,
-                    false,
-                    diagnostics,
-                )
-            });
-            if let (Some((operation, _)), Some(SyntheticPrincipal::Anonymous)) = (&tool, &principal)
+            let (operation, tool_name) = tool?;
+            let principal = principal?;
+            // The inventory API that eligibility mirrors is
+            // authenticated-only; the evaluator refuses the combination.
+            if operation == ToolOperation::PolicyEligibility
+                && matches!(principal, SyntheticPrincipal::Anonymous)
             {
-                // The inventory API that eligibility mirrors is
-                // authenticated-only; the evaluator refuses the combination.
-                if *operation == ToolOperation::PolicyEligibility {
-                    diagnostics.push(
-                        "inconsistent_case",
-                        &format!("{pointer}/principal"),
-                        "tool eligibility is only defined for an authenticated principal",
-                    );
-                    return None;
-                }
+                diagnostics.push(
+                    "inconsistent_case",
+                    &format!("{pointer}/principal"),
+                    "tool eligibility is only defined for an authenticated principal",
+                );
+                return None;
             }
-            match (tool, principal, expect) {
-                (Some((operation, tool_name)), Some(principal), Some(expect)) => {
-                    Some(CaseInput::Tool {
-                        operation,
-                        tool_name,
-                        principal,
-                        expect,
-                    })
-                }
-                _ => None,
-            }
+            Some(CaseContext::Tool {
+                operation,
+                tool_name,
+                principal,
+            })
         }
         CaseKind::ToolHttp => {
             let tool = required(map, "tool", pointer, diagnostics).and_then(|value| {
@@ -510,27 +670,13 @@ fn parse_case(value: &Value, pointer: &str, diagnostics: &mut Diagnostics) -> Op
                     diagnostics,
                 )
             });
-            let expect = required(map, "expect", pointer, diagnostics).and_then(|value| {
-                parse_decision_expectation(
-                    value,
-                    &expect_pointer,
-                    parse_tool_reason,
-                    false,
-                    diagnostics,
-                )
-            });
-            match (tool, request, principal, expect) {
-                (Some((_, tool_name)), Some((method, path)), Some(principal), Some(expect)) => {
-                    Some(CaseInput::ToolHttp {
-                        tool_name,
-                        method,
-                        path,
-                        principal,
-                        expect,
-                    })
-                }
-                _ => None,
-            }
+            let ((_, tool_name), (method, path)) = (tool?, request?);
+            Some(CaseContext::ToolHttp {
+                tool_name,
+                method,
+                path,
+                principal: principal?,
+            })
         }
         CaseKind::Rate => {
             let request = required(map, "request", pointer, diagnostics).and_then(|value| {
@@ -541,27 +687,14 @@ fn parse_case(value: &Value, pointer: &str, diagnostics: &mut Diagnostics) -> Op
                     diagnostics,
                 )
             });
-            let expect = required(map, "expect", pointer, diagnostics)
-                .and_then(|value| parse_rate_expectation(value, &expect_pointer, diagnostics));
-            match (request, principal, expect) {
-                (Some((method, path)), Some(principal), Some(expect)) => Some(CaseInput::Rate {
-                    method,
-                    path,
-                    principal,
-                    expect,
-                }),
-                _ => None,
-            }
+            let (method, path) = request?;
+            Some(CaseContext::Rate {
+                method,
+                path,
+                principal: principal?,
+            })
         }
-    };
-    if diagnostics.diagnostics.len() != before || diagnostics.truncated {
-        return None;
     }
-    Some(Case {
-        id: id?,
-        pointer: pointer.to_owned(),
-        input: input?,
-    })
 }
 
 fn valid_case_id(id: &str) -> bool {
@@ -1138,7 +1271,7 @@ fn parse_rate_expectation(
     }
 }
 
-fn index(value: &Value, pointer: &str, diagnostics: &mut Diagnostics) -> Option<usize> {
+pub(crate) fn index(value: &Value, pointer: &str, diagnostics: &mut Diagnostics) -> Option<usize> {
     match value
         .as_u64()
         .filter(|index| *index <= MAX_EXPECTED_INDEX)
@@ -1187,7 +1320,7 @@ pub(crate) fn parse_tool_reason(code: &str) -> Option<crate::policy_eval::tools:
     }
 }
 
-fn object<'a>(
+pub(crate) fn object<'a>(
     value: &'a Value,
     pointer: &str,
     diagnostics: &mut Diagnostics,
@@ -1201,7 +1334,7 @@ fn object<'a>(
     }
 }
 
-fn required<'a>(
+pub(crate) fn required<'a>(
     map: &'a Map<String, Value>,
     key: &str,
     pointer: &str,
@@ -1220,7 +1353,7 @@ fn required<'a>(
 
 /// Refuse every member not in `allowed`, naming a credential-shaped one
 /// separately. The member's value is never read.
-fn check_members(
+pub(crate) fn check_members(
     map: &Map<String, Value>,
     pointer: &str,
     allowed: &[&str],
@@ -1235,7 +1368,7 @@ fn check_members(
             diagnostics.push(
                 "forbidden_field",
                 &member_pointer,
-                "a policy test never carries credentials, tokens, cookies or headers; describe the identity with principal facts instead",
+                "a synthetic case never carries credentials, tokens, cookies or headers; describe the identity with principal facts instead",
             );
         } else {
             diagnostics.push("unknown_field", &member_pointer, "unknown member");
@@ -1252,7 +1385,11 @@ fn member_pointer(pointer: &str, key: &str) -> String {
     format!("{pointer}/{}", key.replace('~', "~0").replace('/', "~1"))
 }
 
-fn string(value: &Value, pointer: &str, diagnostics: &mut Diagnostics) -> Option<String> {
+pub(crate) fn string(
+    value: &Value,
+    pointer: &str,
+    diagnostics: &mut Diagnostics,
+) -> Option<String> {
     match value {
         Value::String(text) if !text.is_empty() => Some(text.clone()),
         Value::String(_) => {
@@ -1266,7 +1403,7 @@ fn string(value: &Value, pointer: &str, diagnostics: &mut Diagnostics) -> Option
     }
 }
 
-fn bounded_string(
+pub(crate) fn bounded_string(
     value: &Value,
     pointer: &str,
     max_bytes: usize,

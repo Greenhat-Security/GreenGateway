@@ -35,6 +35,9 @@ pub(super) const POLICY_VALIDATE_ADMIN_ROUTE: &str = "/v1/admin/policy/validate"
 pub(super) const POLICY_CONVERT_ADMIN_ROUTE: &str = "/v1/admin/policy/convert";
 /// Run a `policy-tests.v1` suite (issue #243, slice 11).
 pub(super) const POLICY_TEST_RUNS_ADMIN_ROUTE: &str = "/v1/admin/policy/tests/runs";
+/// Simulate synthetic cases against the active policy and a candidate
+/// (issue #243, slice 10).
+pub(super) const POLICY_SIMULATIONS_ADMIN_ROUTE: &str = "/v1/admin/policy/simulations";
 pub(super) const POLICY_RULES_ADMIN_ROUTE: &str = "/v1/admin/policy/rules";
 pub(super) const POLICY_RULE_ADMIN_ROUTE: &str = "/v1/admin/policy/rules/{id}";
 pub(super) const POLICY_RULES_ORDER_ADMIN_ROUTE: &str = "/v1/admin/policy/rules/order";
@@ -235,6 +238,7 @@ pub(super) struct AdminRoutes {
     pub(super) policy_validate_route: String,
     pub(super) policy_convert_route: String,
     pub(super) policy_test_runs_route: String,
+    pub(super) policy_simulations_route: String,
     pub(super) policy_rules_route: String,
     pub(super) policy_rule_route: String,
     pub(super) policy_rules_order_route: String,
@@ -344,6 +348,7 @@ impl AdminRoutes {
             policy_validate_route: format!("{api_prefix}/policy/validate"),
             policy_convert_route: format!("{api_prefix}/policy/convert"),
             policy_test_runs_route: format!("{api_prefix}/policy/tests/runs"),
+            policy_simulations_route: format!("{api_prefix}/policy/simulations"),
             policy_rules_route: format!("{api_prefix}/policy/rules"),
             policy_rule_route: format!("{api_prefix}/policy/rules/{{id}}"),
             policy_rules_order_route: format!("{api_prefix}/policy/rules/order"),
