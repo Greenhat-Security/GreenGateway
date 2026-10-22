@@ -96,6 +96,8 @@ pub(super) const EXCLUDED_RUNTIME_TABLES: &[&str] = &[
     "rate_limit_buckets",
     "rate_limit_cardinality",
     "admin_pending_logins",
+    "admin_session_logins",
+    "admin_sessions",
     "jwt_revocations",
 ];
 
@@ -768,7 +770,7 @@ async fn checkpoint_at_stream_head(
 
 /// The runtime tables are empty: the import elected no leader, ran no
 /// maintenance job, took no lease, accumulated no rate-limit state, and
-/// carried across no pending login or JWT revocation.
+/// carried across no pending login, admin session or JWT revocation.
 async fn runtime_tables_empty(
     pool: &deadpool_postgres::Pool,
 ) -> Result<ValidationCheck, ImportError> {

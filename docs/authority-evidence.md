@@ -54,7 +54,7 @@ or unconfigured individual stores.
 | Service-token issue | Token row with creator, row/shared revisions and outbox | Creation retains only `created_by`; no issue evidence row, operation identity or delivery |
 | Service-token rotate/revoke | Token change, row/shared revisions and outbox, plus a non-cascading `service_token_change_evidence` row (actor, action, event/operation UUIDs, prior/new row revision, the outbox row's shared revision, database-clock time) in the same transaction; repeated revoke and refused rotate write none. Standalone writes the same evidence in the token database's own transaction | Issuer/auth mode, caller-bound operation identity, safe-reference projection, durable delivery and retention |
 | JWT revocation | Scoped JTI digest, actor row, shared revision and outbox, plus one non-cascading `jwt_revocation_evidence` row per effective revoke (actor, JTI digest, resulting expiry, shared revision) that extension, reactivation and expiry cleanup never rewrite | CLI actor is system provenance, not a named human; no actor kind, issuer/auth mode or delivery |
-| Admin session grant/withdrawal (#424) | Not shipped in this mode: configuration refuses `ADMIN_SESSION_MODE=standalone_memory` | Standalone sessions are process-local memory with no durable record; both modes stay `unsupported_future_operation` |
+| Admin session grant/withdrawal (#424) | With `ADMIN_SESSION_MODE=cluster_postgres`, the session row and one non-cascading `admin_session_evidence` row (event/operation UUIDs, session ID, action, reason, subject and issuer, absolute deadline, database-clock time) commit together for each grant and each withdrawal; a replacement's withdrawal and grant share one operation ID | Actor kind/auth mode, keyed safe actor reference, a session revision axis, durable delivery and retention. Standalone sessions are process-local memory with no durable record and stay `unsupported_future_operation` |
 
 These foundations are already sufficient for their **existing atomic change-record
 purpose**. The inventory uses `missing_metadata` and `missing_delivery` for
@@ -101,16 +101,28 @@ affect evidence retention. The inventory includes JWT expiry and Connection
 cascade consequences explicitly.
 
 Admin sessions (#424) are in the matrix as `admin_session.grant` and
-`admin_session.withdraw`. The shipped authority, `ADMIN_SESSION_MODE=standalone_memory`,
+`admin_session.withdraw`. In standalone mode, `ADMIN_SESSION_MODE=standalone_memory`
 keeps each session in a bounded process-local map: a grant follows a successful
-cookie completion, and withdrawal is logout, expiry, a rejected access token, an
-identity change or a restart. Nothing about it is durable, and the
-`admin_login.transaction` event the handler emits after a grant or logout carries
-no actor or session identity; implicit withdrawals emit nothing. Cluster mode
-refuses the setting, so no session authority exists there. Both rows are
-`unsupported_future_operation`: required-durability mode must refuse in-memory
-sessions rather than relabel that event durable, and a durable session authority
-must ship with its own transactional evidence.
+cookie completion, and withdrawal is logout, the absolute or idle deadline, a
+rejected access token, an identity change or a restart. Nothing about it is
+durable, and the `admin_login.transaction` event the handler emits after a grant
+or logout carries no actor or session identity; implicit withdrawals emit
+nothing. That row stays `unsupported_future_operation`: required-durability mode
+must refuse in-memory sessions rather than relabel that event durable.
+
+In cluster mode, `ADMIN_SESSION_MODE=cluster_postgres` ([ADR-0009](adr/0009-shared-admin-sessions.md))
+is the durable session authority, and it ships with its own transactional
+evidence (migration 19). Every grant writes the session row and an
+`admin_session_evidence` row in one statement inside the grant's transaction;
+every withdrawal (logout by cookie or login binding, replacement by a new
+sign-in, a provider rejection or identity change, and expiry when the bounded
+prune removes the row) deletes the row and inserts its evidence in one
+statement. An evidence failure rolls the change back and answers `503`. The
+rows carry the session's random ID, never the cookie, CSRF token, binding or
+access token, and an expiry's commit time is the prune's, not the deadline's.
+The row is `missing_metadata` and `missing_delivery`: it has no actor kind or
+auth mode, no keyed safe actor reference and no session revision axis, and
+nothing dispatches the rows yet.
 
 ## Proposed authority event v1
 
@@ -118,9 +130,9 @@ must ship with its own transactional evidence.
 define a **proposed** safe projection. Current `security_outbox` rows,
 `connection_change_evidence` rows and `audit_event.v0` events do not already
 satisfy this schema, and neither do migration 18's `service_token_change_evidence`
-and `jwt_revocation_evidence` rows or the standalone token evidence rows: the
-evidence rows hold the internal actor ID, not a keyed safe reference, and no
-`authority_id`. The keyed reference derivation exists (see
+and `jwt_revocation_evidence` rows, migration 19's `admin_session_evidence` rows or
+the standalone token evidence rows: the evidence rows hold the internal actor
+ID, not a keyed safe reference, and no `authority_id`. The keyed reference derivation exists (see
 [Keyed safe references](#keyed-safe-references)) but nothing calls it yet; runtime
 producer and dispatcher integration belong to later slices.
 

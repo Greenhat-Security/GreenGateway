@@ -2541,7 +2541,7 @@ fn admin_session_config_is_explicit_bounded_and_standalone_only() {
         (
             "ADMIN_SESSION_MODE",
             "shared",
-            "shared HA sessions are not supported",
+            "must be disabled, standalone_memory or cluster_postgres",
         ),
         ("AUTH_ENABLED", "false", "requires ADMIN_LOGIN_PROVIDER"),
         ("AUTH_MODE", "observe", "requires ADMIN_LOGIN_PROVIDER"),
@@ -2552,6 +2552,16 @@ fn admin_session_config_is_explicit_bounded_and_standalone_only() {
             "cannot exempt admin API routes",
         ),
         ("ADMIN_SESSION_TTL_SECS", "86401", "ADMIN_SESSION_TTL_SECS"),
+        (
+            "ADMIN_SESSION_IDLE_TIMEOUT_SECS",
+            "3601",
+            "ADMIN_SESSION_IDLE_TIMEOUT_SECS must be between 1 and 3600",
+        ),
+        (
+            "ADMIN_SESSION_IDLE_TIMEOUT_SECS",
+            "0",
+            "ADMIN_SESSION_IDLE_TIMEOUT_SECS must be between 1 and 3600",
+        ),
         (
             "ADMIN_SESSION_MAX_ENTRIES",
             "0",
@@ -2571,6 +2581,108 @@ fn admin_session_config_is_explicit_bounded_and_standalone_only() {
         .unwrap_err()
         .to_string()
         .contains("requires an HTTPS"));
+}
+
+#[test]
+fn admin_session_cluster_store_is_postgres_only_and_carries_its_limits() {
+    let provider = r#"[{"name":"primary","type":"jwt","issuer":"https://issuer.example.test","client_id":"admin-ui","client_secret":"generated-fixture-placeholder","redirect_uri":"https://management.example.test/v1/operations/auth/callback"}]"#;
+    let keyring = r#"[{"id":"login-primary","file":"admin-login-key","role":"primary"}]"#;
+    let session = [
+        ("ADMIN_LOGIN_PROVIDER", "primary"),
+        ("AUTH_PROVIDERS", provider),
+        ("ADMIN_PREFIX", "/operations"),
+        ("ADMIN_LOGIN_KEYRING", keyring),
+        ("ADMIN_SESSION_MODE", "cluster_postgres"),
+        ("ADMIN_SESSION_TTL_SECS", "1800"),
+        ("ADMIN_SESSION_IDLE_TIMEOUT_SECS", "600"),
+        ("ADMIN_SESSION_MAX_ENTRIES", "64"),
+    ];
+    let config = Config::from_env_vars(postgres_mode_vars(&session))
+        .expect("a cluster session store in postgres mode should validate");
+    assert_eq!(
+        config.admin_session,
+        Some(crate::auth::admin_session::AdminSessionConfig {
+            storage: crate::auth::admin_session::AdminSessionStorage::ClusterPostgres,
+            ttl: std::time::Duration::from_secs(1800),
+            idle_timeout: std::time::Duration::from_secs(600),
+            max_entries: 64,
+        })
+    );
+    for route in ["logout", "config"] {
+        let path = format!("/v1/operations/auth/{route}");
+        assert!(config.auth_exempt_paths.contains(&path));
+        assert!(config.rbac_exempt_paths.contains(&path));
+    }
+    assert!(!config
+        .csrf_exempt_paths
+        .iter()
+        .any(|path| path.starts_with("/v1/operations")));
+
+    // Standalone mode has no shared store to put the sessions in, and
+    // cluster mode keeps refusing the process-local one.
+    let error = Config::from_env_vars(|name| {
+        session
+            .iter()
+            .filter(|(key, _)| *key != "ADMIN_LOGIN_KEYRING")
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| (*value).to_owned())
+            .ok_or(VarError::NotPresent)
+    })
+    .expect_err("standalone mode refuses the cluster store");
+    assert!(error
+        .to_string()
+        .contains("ADMIN_SESSION_MODE=cluster_postgres requires STATE_BACKEND=postgres"));
+    let mut memory = session.to_vec();
+    memory.insert(0, ("ADMIN_SESSION_MODE", "standalone_memory"));
+    let error = Config::from_env_vars(postgres_mode_vars(&memory))
+        .expect_err("postgres mode refuses the memory store");
+    assert!(error.to_string().contains("no process-local HA fallback"));
+
+    // The prerequisites are the standalone store's, plus the login keyring
+    // the access tokens are sealed under.
+    for (key, value, expected) in [
+        (
+            "AUTH_MODE",
+            "observe",
+            "ADMIN_SESSION_MODE=cluster_postgres requires ADMIN_LOGIN_PROVIDER",
+        ),
+        (
+            "CSRF_ENABLED",
+            "false",
+            "ADMIN_SESSION_MODE=cluster_postgres requires ADMIN_LOGIN_PROVIDER",
+        ),
+        (
+            "CSRF_EXEMPT_PATHS",
+            "/v1/operations/tokens",
+            "while ADMIN_SESSION_MODE=cluster_postgres",
+        ),
+        (
+            "ADMIN_SESSION_IDLE_TIMEOUT_SECS",
+            "1801",
+            "ADMIN_SESSION_IDLE_TIMEOUT_SECS must be between 1 and 1800",
+        ),
+    ] {
+        let mut changed = session.to_vec();
+        changed.insert(0, (key, value));
+        let error = Config::from_env_vars(postgres_mode_vars(&changed)).unwrap_err();
+        assert!(error.to_string().contains(expected), "{key}: {error}");
+    }
+    let insecure = provider.replace("https://management", "http://management");
+    let mut changed: Vec<(&str, &str)> = session.to_vec();
+    changed.insert(0, ("AUTH_PROVIDERS", insecure.as_str()));
+    assert!(Config::from_env_vars(postgres_mode_vars(&changed))
+        .unwrap_err()
+        .to_string()
+        .contains("ADMIN_SESSION_MODE=cluster_postgres requires an HTTPS"));
+    let without_keyring: Vec<_> = session
+        .iter()
+        .copied()
+        .filter(|(key, _)| *key != "ADMIN_LOGIN_KEYRING")
+        .collect();
+    assert!(Config::from_env_vars(postgres_mode_vars(&without_keyring))
+        .unwrap_err()
+        .to_string()
+        .contains("ADMIN_LOGIN_KEYRING is required"));
 }
 
 #[test]

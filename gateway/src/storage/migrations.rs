@@ -252,6 +252,13 @@ static MANIFEST: LazyLock<Vec<Migration>> = LazyLock::new(|| {
         )
         .finalize()
         .with_pinned_checksum("717ae43889bebb583002601a8515e62d5b7d705b22faa195b6e9d760f2618cd0"),
+        Migration::new(
+            19,
+            "admin_sessions",
+            include_str!("migrations/0019_admin_sessions.sql"),
+        )
+        .finalize()
+        .with_pinned_checksum("07dee52102212e57dd2055bc7680e2c7bda1f8d17d2f647535a98f12a57be41c"),
     ]
 });
 
@@ -286,21 +293,22 @@ impl SchemaCompatibility {
 
 // No adjacent release pair has been qualified. Do not widen these bounds or
 // add an extension without the pinned SQL and two-binary gate in issue #426.
-// Moving the point from 17 to 18 (service-token and JWT revocation change
-// evidence, #425 PR 2b) is not an overlap: a schema-17 binary refuses
-// schema 18 and this binary refuses schema 17, so that upgrade is a
-// coordinated drain/migrate/restart, as the moves from 15 to 16 (#425) and
-// from 16 to 17 (member capability advertisements, #426 PR 1) were.
+// Moving the point from 18 to 19 (shared admin sessions, #424) is not an
+// overlap: a schema-18 binary refuses schema 19 and this binary refuses
+// schema 18, so that upgrade is a coordinated drain/migrate/restart, as the
+// moves from 15 to 16 (#425), from 16 to 17 (member capability
+// advertisements, #426 PR 1) and from 17 to 18 (service-token and JWT
+// revocation change evidence, #425 PR 2b) were.
 const BINARY_SCHEMA_COMPATIBILITY: SchemaCompatibility = SchemaCompatibility {
-    read: (18, 18),
-    write: (18, 18),
+    read: (19, 19),
+    write: (19, 19),
     approved_extensions: &[],
 };
 
 /// The intersection of the explicit read/write contracts, advertised to the
 /// roster. This is a summary, not proof of ledger integrity, permission to
 /// write a gated operation (`storage/compatibility.rs`), or permission to
-/// contract the schema. The shipped contract accepts only schema 18.
+/// contract the schema. The shipped contract accepts only schema 19.
 pub(crate) fn schema_version_range() -> (i32, i32) {
     BINARY_SCHEMA_COMPATIBILITY.serving_range()
 }
@@ -1080,12 +1088,12 @@ mod tests {
     fn the_shipped_contract_has_no_unproved_overlap() {
         assert_eq!(
             MANIFEST.len(),
-            18,
+            19,
             "review the compatibility contract when adding SQL"
         );
-        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.read, (18, 18));
-        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.write, (18, 18));
-        assert_eq!(schema_version_range(), (18, 18));
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.read, (19, 19));
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.write, (19, 19));
+        assert_eq!(schema_version_range(), (19, 19));
         assert!(BINARY_SCHEMA_COMPATIBILITY.approved_extensions.is_empty());
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len(), "")),
@@ -1096,7 +1104,7 @@ mod tests {
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 1, "")),
             Ok(SchemaStatus::NeedsUpgrade {
-                applied: 17,
+                applied: 18,
                 missing: 1
             })
         );
@@ -1105,15 +1113,22 @@ mod tests {
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 2, "")),
             Ok(SchemaStatus::NeedsUpgrade {
-                applied: 16,
+                applied: 17,
                 missing: 2
             })
         );
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 3, "")),
             Ok(SchemaStatus::NeedsUpgrade {
-                applied: 15,
+                applied: 16,
                 missing: 3
+            })
+        );
+        assert_eq!(
+            validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 4, "")),
+            Ok(SchemaStatus::NeedsUpgrade {
+                applied: 15,
+                missing: 4
             })
         );
     }
@@ -1572,7 +1587,7 @@ mod tests {
         let authority = PostgresReadinessAuthority::new(foundation.pool().clone());
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::Writable { schema_version: 18 }
+            AuthorityObservation::Writable { schema_version: 19 }
         );
         let client = foundation.pool().get().await.expect("fixture client");
         client
@@ -1584,7 +1599,7 @@ mod tests {
             .expect("change fixture checksum without changing extent");
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::IncompatibleSchema { schema_version: 18 }
+            AuthorityObservation::IncompatibleSchema { schema_version: 19 }
         );
         client
             .execute(
@@ -1595,7 +1610,7 @@ mod tests {
             .expect("restore fixture checksum");
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::Writable { schema_version: 18 }
+            AuthorityObservation::Writable { schema_version: 19 }
         );
         client
             .execute(
@@ -1606,7 +1621,7 @@ mod tests {
             .expect("remove a fixture history row");
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::IncompatibleSchema { schema_version: 18 }
+            AuthorityObservation::IncompatibleSchema { schema_version: 19 }
         );
         drop(client);
         clean_database(foundation.pool()).await;
@@ -1871,6 +1886,9 @@ mod tests {
                  ALTER TABLE greengateway.cluster_members DROP COLUMN capabilities; \
                  DROP TABLE greengateway.service_token_change_evidence; \
                  DROP TABLE greengateway.jwt_revocation_evidence; \
+                 DROP TABLE greengateway.admin_session_evidence; \
+                 DROP TABLE greengateway.admin_sessions; \
+                 DROP TABLE greengateway.admin_session_logins; \
                  DELETE FROM {LEDGER_TABLE} WHERE version >= 13;"
             ))
             .await
