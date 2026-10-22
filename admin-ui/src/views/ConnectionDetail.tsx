@@ -16,6 +16,7 @@ import {
 } from '../lib/connections';
 import { CallerAssertionSummary } from './CallerAssertionSummary';
 import { DelegatedIssuerTokenSummary } from './DelegatedIssuerTokenSummary';
+import { GoogleDomainWideDelegationSummary } from './GoogleDomainWideDelegationSummary';
 
 type MutationKind = 'test' | 'refresh' | 'delete';
 
@@ -553,6 +554,17 @@ function ConnectionConfiguration({
                 Delegated issuer token
               </h4>
               <DelegatedIssuerTokenSummary
+                authentication={configuration.authentication}
+              />
+            </section>
+          ) : null}
+          {configuration.authentication.type ===
+          'google_domain_wide_delegation' ? (
+            <section aria-labelledby="connection-google-delegation-heading">
+              <h4 id="connection-google-delegation-heading">
+                Google domain-wide delegation
+              </h4>
+              <GoogleDomainWideDelegationSummary
                 authentication={configuration.authentication}
               />
             </section>

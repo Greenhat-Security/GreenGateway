@@ -938,7 +938,7 @@
             { "$ref": "#/$defs/MutationCallerAssertion" },
             { "type": "null" }
           ],
-          "description": "Omitted keeps the current block exactly as stored; null removes it. The admin UI omits it unless the operator edits or removes the block, and sends an edited block with signing_key_configured for every key it keeps."
+          "description": "Omitted keeps the current block exactly as stored; null removes it. The admin UI omits it unless the operator edits or removes the block, or moves the Connection to google_domain_wide_delegation, which carries none and so sends null, and sends an edited block with signing_key_configured for every key it keeps."
         },
         "authentication": {
           "$ref": "#/$defs/MutationAuthentication"
