@@ -1142,6 +1142,7 @@ async fn e2e_03_oauth_single_flight_expiry_and_secret_rotation_workflow() {
                     FIRST_SECRET.as_bytes().to_vec(),
                 )
                 .expect("first OAuth secret should validate"),
+                "test-admin",
             )
             .expect("first OAuth secret should create")
     });
@@ -1219,6 +1220,7 @@ async fn e2e_03_oauth_single_flight_expiry_and_secret_rotation_workflow() {
                     ROTATED_SECRET.as_bytes().to_vec(),
                 )
                 .expect("rotated OAuth secret should validate"),
+                "test-admin",
             )
             .expect("OAuth client secret should rotate");
     });

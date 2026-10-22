@@ -245,10 +245,11 @@ impl ManagedConnectionStore {
     ) -> Result<StoredConnection, ConnectionStoreError> {
         match self {
             Self::Sqlite(store) => {
-                let _ = (actor, collection);
+                let _ = collection;
                 let store = store.clone();
+                let actor = actor.to_owned();
                 blocking("connection create", move || {
-                    ConnectionStore::create(&store, candidate)
+                    ConnectionStore::create(&store, candidate, &actor)
                 })
                 .await
             }
@@ -266,12 +267,12 @@ impl ManagedConnectionStore {
     ) -> Result<StoredConnection, ConnectionStoreError> {
         match self {
             Self::Sqlite(store) => {
-                let _ = actor;
                 let store = store.clone();
                 let id = id.clone();
                 let expected = expected.clone();
+                let actor = actor.to_owned();
                 blocking("connection replace", move || {
-                    ConnectionStore::replace(&store, &id, &expected, candidate)
+                    ConnectionStore::replace(&store, &id, &expected, candidate, &actor)
                 })
                 .await
             }
@@ -288,12 +289,12 @@ impl ManagedConnectionStore {
     ) -> Result<(), ConnectionStoreError> {
         match self {
             Self::Sqlite(store) => {
-                let _ = actor;
                 let store = store.clone();
                 let id = id.clone();
                 let expected = expected.clone();
+                let actor = actor.to_owned();
                 blocking("connection delete", move || {
-                    ConnectionStore::delete(&store, &id, &expected)
+                    ConnectionStore::delete(&store, &id, &expected, &actor)
                 })
                 .await
             }

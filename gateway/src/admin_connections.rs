@@ -157,6 +157,7 @@ pub(super) async fn connection_secret_create_endpoint(
         let lock = Arc::clone(&state.secret_precondition_lock);
         let control_plane = state.control_plane.clone();
         let current_collection_etag = current_collection_etag.clone();
+        let actor_user_id = principal.user_id.clone();
         match tokio::task::spawn_blocking(move || -> ResponseResult<_> {
             let mutation_guard = match lock_connection_secret_mutations(&lock) {
                 Ok(guard) => guard,
@@ -181,7 +182,7 @@ pub(super) async fn connection_secret_create_endpoint(
                     return Err(Box::new(connection_secret_store_not_configured()));
                 }
             };
-            match manager.create(&label, secret) {
+            match manager.create(&label, secret, &actor_user_id) {
                 Ok(created) => {
                     let new_collection_etag = connections::admin::secret_collection_etag(
                         &control_plane.secret_alias_metadata(),
@@ -313,6 +314,7 @@ pub(super) async fn connection_secret_rotate_endpoint(
         let control_plane = state.control_plane.clone();
         let raw_id_for_mutation = raw_id.clone();
         let current_etag_for_mutation = current_etag.clone();
+        let actor_user_id = principal.user_id.clone();
         match tokio::task::spawn_blocking(move || -> ResponseResult<_> {
             let mutation_guard = match lock_connection_secret_mutations(&lock) {
                 Ok(guard) => guard,
@@ -348,7 +350,7 @@ pub(super) async fn connection_secret_rotate_endpoint(
                     return Err(Box::new(connection_secret_store_not_configured()));
                 }
             };
-            match manager.rotate(&raw_id_for_mutation, replacement) {
+            match manager.rotate(&raw_id_for_mutation, replacement, &actor_user_id) {
                 Ok(rotated) => {
                     let dependency_count =
                         connection_secret_dependency_counts(&control_plane.runtime_snapshot())
@@ -475,6 +477,7 @@ pub(super) async fn connection_secret_delete_endpoint(
         let control_plane = state.control_plane.clone();
         let raw_id_for_mutation = raw_id.clone();
         let current_etag_for_mutation = current_etag.clone();
+        let actor_user_id = principal.user_id.clone();
         tokio::task::spawn_blocking(move || -> ResponseResult<String> {
             let mutation_guard = match lock_connection_secret_mutations(&lock) {
                 Ok(guard) => guard,
@@ -510,7 +513,7 @@ pub(super) async fn connection_secret_delete_endpoint(
                     return Err(Box::new(connection_secret_store_not_configured()));
                 }
             };
-            if let Err(error) = manager.delete(&raw_id_for_mutation) {
+            if let Err(error) = manager.delete(&raw_id_for_mutation, &actor_user_id) {
                 return Err(Box::new(connection_secret_error_response(error)));
             }
             let new_collection_etag =

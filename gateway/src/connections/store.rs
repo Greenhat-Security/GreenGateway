@@ -745,6 +745,130 @@ CREATE INDEX idx_connection_status_latest
 ON connection_status_history(connection_id, status_revision DESC);
 "#;
 
+// Migration 12: change evidence for Connections and encrypted local secrets
+// (issue #425, PR 4). Both authorities live in this database, so their
+// evidence does too: one append-only row per committed change, written in
+// the SAME immediate transaction as the change it describes and naming who
+// made it. A change whose evidence cannot be inserted rolls back with it; a
+// refused change -- stale ETag, dependency conflict, missing record, an
+// identical replace, nothing to re-encrypt -- writes nothing.
+//
+// - No foreign key to connection_records or connection_local_secrets: the
+//   evidence must outlive the deletion it records, so it can neither
+//   cascade with the row nor restrict its removal.
+// - Identifiers, revisions and the actor only. No specification, endpoint,
+//   label, credential binding, bound secret ID, ciphertext, nonce or key ID
+//   is stored. A local secret is named by the gateway-minted UUID this file
+//   already keeps beside its envelope.
+// - actor_user_id is the authenticated principal's subject, or a command's
+//   fixed operator label, bounded by the principal subject bound
+//   (MAX_CHANGE_EVIDENCE_ACTOR_BYTES).
+// - event_id identifies the row and operation_id the store call that wrote
+//   it. An operation records each action at most once, so a replace that
+//   also changes credential authority writes a connection.replace row and a
+//   credential.binding_change row under one operation_id.
+// - prior_version/new_version follow each action's revision axis: the
+//   Connection's connection_revision for connection.*, its
+//   credential_revision for credential.binding_change, and the secret's
+//   version for secret.*. A deletion keeps the prior value and no
+//   successor; re-encryption changes no semantic revision and records how
+//   many envelopes it rewrote instead.
+// - sequence is commit order: every writer holds this database's write
+//   lock and AUTOINCREMENT never reuses a value. committed_at is the
+//   change's own process-clock timestamp; a standalone store has no
+//   database clock and no shared security revision.
+// - action uses the proposed authority-event operation codes
+//   (docs/schemas/authority_event.v1.schema.json), as PostgreSQL
+//   migration 16 does. No gateway path updates or deletes these rows.
+//
+// Every comparison in a row CHECK is guarded by IS NOT NULL, because
+// SQLite passes a CHECK whose expression is NULL.
+const MIGRATION_12_SQL: &str = r#"
+CREATE TABLE connection_change_evidence (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL UNIQUE CHECK (length(event_id) = 36),
+    operation_id TEXT NOT NULL CHECK (length(operation_id) = 36),
+    actor_user_id TEXT NOT NULL CHECK (
+        length(CAST(actor_user_id AS BLOB)) BETWEEN 1 AND 4096
+    ),
+    action TEXT NOT NULL CHECK (
+        action IN (
+            'connection.create', 'connection.replace', 'credential.binding_change',
+            'connection.delete'
+        )
+    ),
+    connection_id TEXT NOT NULL CHECK (
+        length(CAST(connection_id AS BLOB)) BETWEEN 1 AND 128
+    ),
+    prior_version INTEGER CHECK (prior_version IS NULL OR prior_version >= 0),
+    new_version INTEGER CHECK (new_version IS NULL OR new_version >= 1),
+    committed_at TEXT NOT NULL CHECK (length(CAST(committed_at AS BLOB)) BETWEEN 1 AND 64),
+    UNIQUE (operation_id, action),
+    CHECK (
+        (
+            action = 'connection.create'
+            AND prior_version IS NULL
+            AND new_version IS NOT NULL AND new_version = 1
+        ) OR (
+            action IN ('connection.replace', 'credential.binding_change')
+            AND prior_version IS NOT NULL AND new_version IS NOT NULL
+            AND new_version > prior_version
+        ) OR (
+            action = 'connection.delete'
+            AND prior_version IS NOT NULL AND prior_version >= 1
+            AND new_version IS NULL
+        )
+    )
+);
+
+CREATE INDEX idx_connection_change_evidence_connection
+ON connection_change_evidence(connection_id, sequence);
+
+CREATE TABLE connection_local_secret_change_evidence (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL UNIQUE CHECK (length(event_id) = 36),
+    operation_id TEXT NOT NULL CHECK (length(operation_id) = 36),
+    actor_user_id TEXT NOT NULL CHECK (
+        length(CAST(actor_user_id AS BLOB)) BETWEEN 1 AND 4096
+    ),
+    action TEXT NOT NULL CHECK (
+        action IN ('secret.create', 'secret.rotate', 'secret.delete', 'secret.reencrypt')
+    ),
+    secret_id TEXT CHECK (secret_id IS NULL OR length(secret_id) = 36),
+    prior_version INTEGER CHECK (prior_version IS NULL OR prior_version >= 1),
+    new_version INTEGER CHECK (new_version IS NULL OR new_version >= 1),
+    reencrypted_count INTEGER CHECK (
+        reencrypted_count IS NULL OR reencrypted_count BETWEEN 1 AND 64
+    ),
+    committed_at TEXT NOT NULL CHECK (length(CAST(committed_at AS BLOB)) BETWEEN 1 AND 64),
+    UNIQUE (operation_id, action),
+    CHECK (
+        (
+            action = 'secret.create'
+            AND secret_id IS NOT NULL AND reencrypted_count IS NULL
+            AND prior_version IS NULL
+            AND new_version IS NOT NULL AND new_version = 1
+        ) OR (
+            action = 'secret.rotate'
+            AND secret_id IS NOT NULL AND reencrypted_count IS NULL
+            AND prior_version IS NOT NULL AND new_version IS NOT NULL
+            AND new_version = prior_version + 1
+        ) OR (
+            action = 'secret.delete'
+            AND secret_id IS NOT NULL AND reencrypted_count IS NULL
+            AND prior_version IS NOT NULL AND new_version IS NULL
+        ) OR (
+            action = 'secret.reencrypt'
+            AND secret_id IS NULL AND reencrypted_count IS NOT NULL
+            AND prior_version IS NULL AND new_version IS NULL
+        )
+    )
+);
+
+CREATE INDEX idx_connection_local_secret_change_evidence_secret
+ON connection_local_secret_change_evidence(secret_id, sequence);
+"#;
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -790,6 +914,10 @@ const MIGRATIONS: &[Migration] = &[
         version: 11,
         sql: MIGRATION_11_SQL,
     },
+    Migration {
+        version: 12,
+        sql: MIGRATION_12_SQL,
+    },
 ];
 
 pub(crate) const SOURCE_MANAGED: &str = "managed";
@@ -829,6 +957,23 @@ const MAX_OPENAPI_SECURITY_SCHEME_NAME_CHARS: usize = 128;
 const MAX_OPENAPI_SECURITY_SCHEMES_JSON_BYTES: usize = 16_384;
 const SHA256_HEX_CHARS: usize = 64;
 
+/// The closed action vocabulary of `connection_change_evidence` (migration
+/// 12). Values are the proposed authority-event operation codes, the ones
+/// PostgreSQL migration 16 uses too; the table's CHECK refuses anything
+/// else.
+const EVIDENCE_ACTION_CREATE: &str = "connection.create";
+const EVIDENCE_ACTION_REPLACE: &str = "connection.replace";
+const EVIDENCE_ACTION_CREDENTIAL_CHANGE: &str = "credential.binding_change";
+const EVIDENCE_ACTION_DELETE: &str = "connection.delete";
+
+/// The longest actor either evidence table of migration 12 records. It is
+/// exactly the principal subject bound authentication enforces, so evidence
+/// never refuses a principal a validator produced; the assertion keeps the
+/// SQL bounds and the Rust bound from drifting apart silently.
+pub(crate) const MAX_CHANGE_EVIDENCE_ACTOR_BYTES: usize = 4096;
+const _: () =
+    assert!(MAX_CHANGE_EVIDENCE_ACTOR_BYTES == crate::auth::principal::MAX_PRINCIPAL_SUBJECT_BYTES);
+
 #[derive(Clone, Copy)]
 struct Migration {
     version: u32,
@@ -842,21 +987,33 @@ pub struct SqliteConnectionStore {
     maximum_connections: usize,
 }
 
+/// The standalone record surface. Create, replace and delete are told who is
+/// acting: each committed change records `actor_user_id` as its evidence in
+/// the change's own transaction (migration 12), and a change that names no
+/// actor, or one longer than [`MAX_CHANGE_EVIDENCE_ACTOR_BYTES`], is refused
+/// before anything is written.
 pub trait ConnectionStore: Send + Sync {
     fn count(&self) -> Result<usize, ConnectionStoreError>;
     fn list(&self) -> Result<Vec<StoredConnection>, ConnectionStoreError>;
     fn get(&self, id: &ConnectionId) -> Result<Option<StoredConnection>, ConnectionStoreError>;
-    fn create(&self, candidate: ConnectionWrite) -> Result<StoredConnection, ConnectionStoreError>;
+    fn create(
+        &self,
+        candidate: ConnectionWrite,
+        actor_user_id: &str,
+    ) -> Result<StoredConnection, ConnectionStoreError>;
+    /// An identical replacement changes nothing and records nothing.
     fn replace(
         &self,
         id: &ConnectionId,
         expected: &ConnectionEtag,
         candidate: ConnectionWrite,
+        actor_user_id: &str,
     ) -> Result<StoredConnection, ConnectionStoreError>;
     fn delete(
         &self,
         id: &ConnectionId,
         expected: &ConnectionEtag,
+        actor_user_id: &str,
     ) -> Result<(), ConnectionStoreError>;
 }
 
@@ -3375,7 +3532,12 @@ impl ConnectionStore for SqliteConnectionStore {
         Ok(record)
     }
 
-    fn create(&self, candidate: ConnectionWrite) -> Result<StoredConnection, ConnectionStoreError> {
+    fn create(
+        &self,
+        candidate: ConnectionWrite,
+        actor_user_id: &str,
+    ) -> Result<StoredConnection, ConnectionStoreError> {
+        validate_change_actor(actor_user_id)?;
         let candidate = validate_candidate(candidate)?;
         let spec_json =
             serde_json::to_string(&candidate).map_err(|source| ConnectionStoreError::Json {
@@ -3427,6 +3589,19 @@ impl ConnectionStore for SqliteConnectionStore {
             )
             .map_err(|source| sqlite_error(&self.path, "create insert", source))?;
         replace_bindings(&transaction, &self.path, &id, &candidate, &revisions, &now)?;
+        record_change_evidence(
+            &transaction,
+            &self.path,
+            &ConnectionChangeEvidence {
+                operation_id: &Uuid::new_v4().to_string(),
+                action: EVIDENCE_ACTION_CREATE,
+                id: &id,
+                prior_version: None,
+                new_version: Some(revisions.connection),
+                committed_at: &now,
+                actor_user_id,
+            },
+        )?;
         transaction
             .commit()
             .map_err(|source| sqlite_error(&self.path, "create commit", source))?;
@@ -3445,7 +3620,9 @@ impl ConnectionStore for SqliteConnectionStore {
         id: &ConnectionId,
         expected: &ConnectionEtag,
         candidate: ConnectionWrite,
+        actor_user_id: &str,
     ) -> Result<StoredConnection, ConnectionStoreError> {
+        validate_change_actor(actor_user_id)?;
         let candidate = validate_candidate(candidate)?;
         let spec_json =
             serde_json::to_string(&candidate).map_err(|source| ConnectionStoreError::Json {
@@ -3563,6 +3740,39 @@ impl ConnectionStore for SqliteConnectionStore {
                 sqlite_error(&self.path, "stale current status invalidation", source)
             })?;
         replace_bindings(&transaction, &self.path, id, &candidate, &revisions, &now)?;
+        // One operation, minted once for this call. A replacement that also
+        // advanced the credential axis records that change too, on its own
+        // axis, so the binding change is attributable without its rows,
+        // which hold secret IDs, entering the evidence.
+        let operation_id = Uuid::new_v4().to_string();
+        record_change_evidence(
+            &transaction,
+            &self.path,
+            &ConnectionChangeEvidence {
+                operation_id: &operation_id,
+                action: EVIDENCE_ACTION_REPLACE,
+                id,
+                prior_version: Some(current.revisions.connection),
+                new_version: Some(revisions.connection),
+                committed_at: &now,
+                actor_user_id,
+            },
+        )?;
+        if revisions.credential != current.revisions.credential {
+            record_change_evidence(
+                &transaction,
+                &self.path,
+                &ConnectionChangeEvidence {
+                    operation_id: &operation_id,
+                    action: EVIDENCE_ACTION_CREDENTIAL_CHANGE,
+                    id,
+                    prior_version: Some(current.revisions.credential),
+                    new_version: Some(revisions.credential),
+                    committed_at: &now,
+                    actor_user_id,
+                },
+            )?;
+        }
         transaction
             .commit()
             .map_err(|source| sqlite_error(&self.path, "replace commit", source))?;
@@ -3580,7 +3790,10 @@ impl ConnectionStore for SqliteConnectionStore {
         &self,
         id: &ConnectionId,
         expected: &ConnectionEtag,
+        actor_user_id: &str,
     ) -> Result<(), ConnectionStoreError> {
+        validate_change_actor(actor_user_id)?;
+        let now = utc_timestamp()?;
         let mut connection = self.connection_guard();
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -3603,6 +3816,23 @@ impl ConnectionStore for SqliteConnectionStore {
                 count: usize::try_from(dependency_count).unwrap_or(usize::MAX),
             });
         }
+        // The record's bindings, catalogs and status cascade with it; its
+        // evidence row has no foreign key and outlives it, which is what
+        // lets a lost delete response be reconciled after the record is
+        // gone. Both commit together or not at all.
+        record_change_evidence(
+            &transaction,
+            &self.path,
+            &ConnectionChangeEvidence {
+                operation_id: &Uuid::new_v4().to_string(),
+                action: EVIDENCE_ACTION_DELETE,
+                id,
+                prior_version: Some(current.revisions.connection),
+                new_version: None,
+                committed_at: &now,
+                actor_user_id,
+            },
+        )?;
         transaction
             .execute(
                 "DELETE FROM connection_records WHERE id = ?1",
@@ -3614,6 +3844,82 @@ impl ConnectionStore for SqliteConnectionStore {
             .map_err(|source| sqlite_error(&self.path, "delete commit", source))?;
         Ok(())
     }
+}
+
+/// An unattributable change has no evidence to record, so the stores of
+/// this database refuse it before they change anything rather than commit
+/// it anonymously. An authenticated principal always satisfies this; the
+/// CHECK constraints of migration 12 are the backstop.
+pub(crate) fn is_valid_change_actor(actor_user_id: &str) -> bool {
+    !actor_user_id.is_empty() && actor_user_id.len() <= MAX_CHANGE_EVIDENCE_ACTOR_BYTES
+}
+
+/// The Connection-store form of [`is_valid_change_actor`], refusing the way
+/// the PostgreSQL store does.
+fn validate_change_actor(actor_user_id: &str) -> Result<(), ConnectionStoreError> {
+    if is_valid_change_actor(actor_user_id) {
+        return Ok(());
+    }
+    Err(ConnectionStoreError::Validation {
+        problems: vec![format!(
+            "the change actor must be between 1 and {MAX_CHANGE_EVIDENCE_ACTOR_BYTES} bytes"
+        )],
+    })
+}
+
+/// One committed Connection change's evidence: identifiers, one revision
+/// axis and the actor, never specification, endpoint, binding or secret
+/// material.
+struct ConnectionChangeEvidence<'a> {
+    operation_id: &'a str,
+    action: &'static str,
+    id: &'a ConnectionId,
+    prior_version: Option<u64>,
+    new_version: Option<u64>,
+    committed_at: &'a str,
+    actor_user_id: &'a str,
+}
+
+/// Append one evidence row inside the caller's transaction. Its event ID is
+/// minted here, once. Any failure is returned for the caller to roll back,
+/// so the change it describes never commits without it, and it is reported
+/// as a store failure under its own operation label rather than as the
+/// constraint class SQLite gave it: a change whose evidence failed is never
+/// a validation problem or a conflict.
+fn record_change_evidence(
+    transaction: &Transaction<'_>,
+    path: &Path,
+    evidence: &ConnectionChangeEvidence<'_>,
+) -> Result<(), ConnectionStoreError> {
+    let prior_version = evidence
+        .prior_version
+        .map(|value| u64_to_i64(evidence.id, value))
+        .transpose()?;
+    let new_version = evidence
+        .new_version
+        .map(|value| u64_to_i64(evidence.id, value))
+        .transpose()?;
+    transaction
+        .execute(
+            r#"
+            INSERT INTO connection_change_evidence (
+                event_id, operation_id, actor_user_id, action, connection_id,
+                prior_version, new_version, committed_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "#,
+            params![
+                Uuid::new_v4().to_string(),
+                evidence.operation_id,
+                evidence.actor_user_id,
+                evidence.action,
+                evidence.id.as_str(),
+                prior_version,
+                new_version,
+                evidence.committed_at,
+            ],
+        )
+        .map_err(|source| sqlite_error(path, "change evidence append", source))?;
+    Ok(())
 }
 
 fn run_migrations(
@@ -3692,6 +3998,8 @@ fn validate_schema(connection: &Connection, path: &Path) -> Result<(), Connectio
         "SELECT connection_id, tool_name, operation_id, selected_scheme_names_json, definition_json, ordinal FROM connection_openapi_catalog_entries LIMIT 0",
         "SELECT connection_id, schema_version, overlay_revision, overlay_json, source_reports_json, actor_user_id, updated_at FROM connection_openapi_overlays LIMIT 0",
         "SELECT connection_id, source_id, overlay_revision, source_digest, values_revision, connection_revision, credential_revision, credential_generation_digest, values_json, resolved_at FROM connection_enum_source_values LIMIT 0",
+        "SELECT sequence, event_id, operation_id, actor_user_id, action, connection_id, prior_version, new_version, committed_at FROM connection_change_evidence LIMIT 0",
+        "SELECT sequence, event_id, operation_id, actor_user_id, action, secret_id, prior_version, new_version, reencrypted_count, committed_at FROM connection_local_secret_change_evidence LIMIT 0",
     ] {
         connection
             .prepare(query)

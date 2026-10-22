@@ -785,7 +785,7 @@ mod database {
         let store =
             SqliteConnectionStore::open(&connections_file).expect("connections store should open");
         let http = store
-            .create(http_connection())
+            .create(http_connection(), "test-admin")
             .expect("the HTTP fixture Connection should create");
         store
             .add_dependency(
@@ -808,7 +808,7 @@ mod database {
             )
             .expect("the status observation should append");
         let mcp = store
-            .create(mcp_connection())
+            .create(mcp_connection(), "test-admin")
             .expect("the MCP fixture Connection should create");
         store
             .replace_mcp_catalog(
@@ -820,7 +820,7 @@ mod database {
             )
             .expect("the MCP catalog should publish");
         let openapi = store
-            .create(openapi_connection())
+            .create(openapi_connection(), "test-admin")
             .expect("the OpenAPI fixture Connection should create");
         store
             .replace_openapi_catalog_with_overlay(

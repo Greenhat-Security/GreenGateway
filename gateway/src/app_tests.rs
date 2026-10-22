@@ -15166,6 +15166,35 @@ async fn connection_admin_crud_enforces_etags_secret_authority_and_redaction() {
     assert!(!serialized_events.contains("credential-material-value-canary"));
     assert!(!serialized_events.contains("credentialed.example.test"));
     assert!(!serialized_events.contains("/credentialed-health"));
+
+    // Every committed change recorded the authenticated subject as its actor
+    // in the Connections database's own transaction (issue #425), and no
+    // binding ID, material or destination reached a row.
+    let (changes, stored) =
+        standalone_change_evidence(&connection_db.path, "connection_change_evidence");
+    assert!(
+        changes.iter().all(|(_, actor)| actor == "user-123"),
+        "{changes:?}"
+    );
+    for action in [
+        "connection.create",
+        "connection.replace",
+        "connection.delete",
+    ] {
+        assert!(
+            changes.iter().any(|(recorded, _)| recorded == action),
+            "{action} was not recorded: {changes:?}"
+        );
+    }
+    for canary in [
+        "credential-secret-id-canary",
+        "different-secret-id-canary",
+        "credential-material-value-canary",
+        "credentialed.example.test",
+        "/credentialed-health",
+    ] {
+        assert!(!stored.contains(canary), "{canary} reached the evidence");
+    }
 }
 
 #[tokio::test]
@@ -15874,6 +15903,67 @@ async fn connection_secret_admin_crud_is_safe_permissioned_and_preconditioned() 
             "secret audit events must not contain {forbidden_value}"
         );
     }
+
+    // Every committed secret change recorded the authenticated subject in
+    // the Connections database's own transaction (issue #425), and no
+    // material or label reached a row.
+    let (changes, stored) = standalone_change_evidence(
+        &connection_db.path,
+        "connection_local_secret_change_evidence",
+    );
+    assert!(
+        changes.iter().all(|(_, actor)| actor == "user-123"),
+        "{changes:?}"
+    );
+    for action in ["secret.create", "secret.rotate", "secret.delete"] {
+        assert!(
+            changes.iter().any(|(recorded, _)| recorded == action),
+            "{action} was not recorded: {changes:?}"
+        );
+    }
+    for forbidden_value in [
+        "created-secret-value-canary",
+        "rotated-secret-value-canary",
+        "Webhook bearer",
+        "local-master-key",
+    ] {
+        assert!(
+            !stored.contains(forbidden_value),
+            "{forbidden_value} reached the evidence"
+        );
+    }
+}
+
+/// The `(action, actor)` pairs of one standalone change-evidence table in
+/// commit order, and every stored value rendered as text for canary checks.
+fn standalone_change_evidence(path: &FsPath, table: &str) -> (Vec<(String, String)>, String) {
+    let connection = rusqlite::Connection::open(path).expect("Connections database should open");
+    let mut statement = connection
+        .prepare(&format!("SELECT * FROM {table} ORDER BY sequence"))
+        .expect("evidence query should prepare");
+    let action = statement
+        .column_index("action")
+        .expect("evidence should have an action");
+    let actor = statement
+        .column_index("actor_user_id")
+        .expect("evidence should have an actor");
+    let columns = statement.column_count();
+    let mut changes = Vec::new();
+    let mut stored = String::new();
+    let mut rows = statement.query([]).expect("evidence query should run");
+    while let Some(row) = rows.next().expect("evidence row should read") {
+        changes.push((
+            row.get(action).expect("action should read"),
+            row.get(actor).expect("actor should read"),
+        ));
+        for index in 0..columns {
+            stored.push_str(&format!(
+                "{:?}|",
+                row.get_ref(index).expect("column should read")
+            ));
+        }
+    }
+    (changes, stored)
 }
 
 #[test]

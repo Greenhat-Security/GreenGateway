@@ -3274,9 +3274,10 @@ impl LocalSecretManager for CoordinatedLocalSecretManager {
         &self,
         label: &str,
         secret: ResolvedSecret,
+        actor_user_id: &str,
     ) -> Result<SecretAliasMetadata, LocalSecretError> {
         let _guard = self.mutation_guard();
-        let metadata = self.provider.create(label, secret)?;
+        let metadata = self.provider.create(label, secret, actor_user_id)?;
         self.publish_version(&metadata);
         Ok(metadata)
     }
@@ -3285,6 +3286,7 @@ impl LocalSecretManager for CoordinatedLocalSecretManager {
         &self,
         id: &str,
         replacement: ResolvedSecret,
+        actor_user_id: &str,
     ) -> Result<SecretAliasMetadata, LocalSecretError> {
         let _guard = self.mutation_guard();
         let snapshot = self.runtime.load_full();
@@ -3297,14 +3299,14 @@ impl LocalSecretManager for CoordinatedLocalSecretManager {
                     BindingActivationError::Unavailable => LocalSecretError::StorageFailure,
                 })?;
         }
-        let metadata = self.provider.rotate(id, replacement)?;
+        let metadata = self.provider.rotate(id, replacement, actor_user_id)?;
         self.publish_version(&metadata);
         Ok(metadata)
     }
 
-    fn delete(&self, id: &str) -> Result<(), LocalSecretError> {
+    fn delete(&self, id: &str, actor_user_id: &str) -> Result<(), LocalSecretError> {
         let _guard = self.mutation_guard();
-        self.provider.delete(id)?;
+        self.provider.delete(id, actor_user_id)?;
         self.remove_version(id);
         Ok(())
     }
@@ -3316,9 +3318,11 @@ impl LocalSecretManager for CoordinatedLocalSecretManager {
     fn reencrypt_master_key_batch(
         &self,
         maximum_records: usize,
+        actor_user_id: &str,
     ) -> Result<MasterKeyRotationProgress, LocalSecretError> {
         let _guard = self.mutation_guard();
-        self.provider.reencrypt_master_key_batch(maximum_records)
+        self.provider
+            .reencrypt_master_key_batch(maximum_records, actor_user_id)
     }
 
     fn ensure_key_unused(&self, key_id: &str) -> Result<(), LocalSecretError> {
@@ -3667,6 +3671,7 @@ mod tests {
                     key.serialize_pem().into_bytes(),
                 )
                 .expect("private-key secret should validate"),
+                "test-admin",
             )
         })
         .expect("private-key secret should create");
@@ -4339,6 +4344,7 @@ mod tests {
                 "Local token",
                 ResolvedSecret::new(SecretPurpose::StaticBearer, canary.to_vec())
                     .expect("test secret should validate"),
+                "test-admin",
             )
         })
         .expect("local secret should create");
@@ -4381,6 +4387,7 @@ mod tests {
                     b"oauth-client-secret-v1".to_vec(),
                 )
                 .expect("test secret should validate"),
+                "test-admin",
             )
             .expect("local secret should create");
         assert_eq!(
@@ -4407,6 +4414,7 @@ mod tests {
                     b"oauth-client-secret-v2".to_vec(),
                 )
                 .expect("replacement secret should validate"),
+                "test-admin",
             )
             .expect("local secret should rotate");
         assert_eq!(
@@ -4417,7 +4425,7 @@ mod tests {
         control_plane
             .local_secret_manager()
             .expect("local secret manager should be enabled")
-            .delete(&created.id)
+            .delete(&created.id, "test-admin")
             .expect("unused local secret should delete");
         assert_eq!(control_plane.local_secret_version(&created.id), None);
     }
@@ -4448,6 +4456,7 @@ mod tests {
                         b"alpha-proxy-token-v1".to_vec(),
                     )
                     .expect("alpha header secret should validate"),
+                    "test-admin",
                 )
             })
             .expect("alpha header secret should create");
@@ -4459,6 +4468,7 @@ mod tests {
                         b"zeta-proxy-token-v1".to_vec(),
                     )
                     .expect("zeta header secret should validate"),
+                    "test-admin",
                 )
             })
             .expect("zeta header secret should create");
@@ -4521,6 +4531,7 @@ mod tests {
                         b"alpha-proxy-token-v2".to_vec(),
                     )
                     .expect("rotated header secret should validate"),
+                    "test-admin",
                 )
         })
         .expect("additional header secret should rotate");
@@ -4567,6 +4578,7 @@ mod tests {
                     b"restart-local-secret-canary".to_vec(),
                 )
                 .expect("test secret should validate"),
+                "test-admin",
             )
             .expect("local secret should create");
         drop(control_plane);
@@ -4602,6 +4614,7 @@ mod tests {
                     b"collision-local-secret-canary".to_vec(),
                 )
                 .expect("test secret should validate"),
+                "test-admin",
             )
             .expect("local secret should create");
         drop(control_plane);
@@ -4648,7 +4661,7 @@ mod tests {
         }))
         .expect("candidate should deserialize");
         let created = store
-            .create(candidate)
+            .create(candidate, "test-admin")
             .expect("fixture should persist directly");
         drop(store);
 
@@ -4672,6 +4685,7 @@ mod tests {
                     "Header-only secret",
                     ResolvedSecret::new(SecretPurpose::HeaderApiKey, b"header-canary".to_vec())
                         .expect("fixture secret should validate"),
+                    "test-admin",
                 )
         })
         .expect("fixture secret should create");
@@ -4707,6 +4721,7 @@ mod tests {
                     "Bearer-only secret",
                     ResolvedSecret::new(SecretPurpose::StaticBearer, b"bearer-canary".to_vec())
                         .expect("fixture secret should validate"),
+                    "test-admin",
                 )
         })
         .expect("fixture secret should create");
@@ -4785,6 +4800,7 @@ mod tests {
                 "Access client ID",
                 ResolvedSecret::new(SecretPurpose::HeaderApiKey, original.clone())
                     .expect("header secret should validate"),
+                "test-admin",
             )
         })
         .expect("header secret should create");
@@ -4809,6 +4825,7 @@ mod tests {
                     b"wrong-purpose-replacement".to_vec(),
                 )
                 .expect("bounded replacement should construct"),
+                "test-admin",
             )),
             Err(LocalSecretError::InvalidSecret)
         );
@@ -4914,6 +4931,7 @@ mod tests {
                             .to_vec(),
                     )
                     .expect("bounded invalid-DER PEM fixture should validate"),
+                    "test-admin",
                 )
         })
         .expect("fixture secret should create");
@@ -4962,6 +4980,7 @@ mod tests {
                 "CA bundle",
                 ResolvedSecret::new(SecretPurpose::TlsCaBundle, valid_ca_pem.clone())
                     .expect("valid CA secret should construct"),
+                "test-admin",
             )
         })
         .expect("valid CA secret should create");
@@ -4982,6 +5001,7 @@ mod tests {
                 &ca_secret.id,
                 ResolvedSecret::new(SecretPurpose::TlsCaBundle, mixed_bundle)
                     .expect("bounded mixed CA fixture should construct"),
+                "test-admin",
             )),
             Err(LocalSecretError::InvalidSecret)
         );
@@ -5024,6 +5044,7 @@ mod tests {
                 "Client certificate",
                 ResolvedSecret::new(SecretPurpose::TlsCertificate, certificate_pem.clone())
                     .expect("certificate secret should validate"),
+                "test-admin",
             )
         })
         .expect("certificate secret should create");
@@ -5032,6 +5053,7 @@ mod tests {
                 "Client private key",
                 ResolvedSecret::new(SecretPurpose::TlsPrivateKey, private_key_pem.clone())
                     .expect("private-key secret should validate"),
+                "test-admin",
             )
         })
         .expect("private-key secret should create");
@@ -5052,6 +5074,7 @@ mod tests {
                     b"malformed-certificate-canary".to_vec(),
                 )
                 .expect("bounded malformed fixture should construct"),
+                "test-admin",
             )),
             Err(LocalSecretError::InvalidSecret)
         );
@@ -5065,6 +5088,7 @@ mod tests {
                     mismatched_key.serialize_pem().into_bytes(),
                 )
                 .expect("mismatched key fixture should construct"),
+                "test-admin",
             )),
             Err(LocalSecretError::InvalidSecret)
         );
@@ -5121,7 +5145,7 @@ mod tests {
             secret_id: Some(alias_id),
         };
         let created = store
-            .create(candidate)
+            .create(candidate, "test-admin")
             .expect("fixture should persist directly");
         drop(store);
 
@@ -5154,6 +5178,7 @@ mod tests {
                             format!("race-token-{iteration}").into_bytes(),
                         )
                         .expect("fixture secret should validate"),
+                        "test-admin",
                     )
             })
             .expect("fixture secret should create");
@@ -5178,7 +5203,7 @@ mod tests {
                 delete_control_plane
                     .local_secret_manager()
                     .expect("local manager should exist")
-                    .delete(&secret_id)
+                    .delete(&secret_id, "test-admin")
             });
             create_barrier.wait();
             let create_result = create_control_plane
@@ -5197,7 +5222,7 @@ mod tests {
                         control_plane
                             .local_secret_manager()
                             .expect("local manager should exist")
-                            .delete(&secret.id)
+                            .delete(&secret.id, "test-admin")
                     })
                     .expect("fixture secret should delete after dependency removal");
                 }

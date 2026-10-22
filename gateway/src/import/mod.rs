@@ -146,6 +146,13 @@ pub(crate) const IMPORT_ACTOR: &str = "import-standalone";
 ///   section carries token rows only, so that history stays in the
 ///   standalone database: the cluster's own evidence table starts empty and
 ///   records the cluster's first change.
+/// - `connection_change_evidence` and `connection_local_secret_change_evidence`
+///   are the standalone Connections database's records of who created,
+///   replaced and deleted each Connection and who changed each local secret
+///   (issue #425, that store's migration 12). The Connections section carries
+///   records and bindings only, so that history stays in the standalone
+///   database: the cluster's own Connection evidence table starts empty (it
+///   records deletions today), and cluster mode has no local secrets.
 const NOT_IMPORTED: &[&str] = &[
     "cluster_members",
     "maintenance_jobs",
@@ -163,6 +170,10 @@ const NOT_IMPORTED: &[&str] = &[
      secret store)",
     "service_token_change_evidence (standalone rotate/revoke evidence stays in the standalone \
      token database; the cluster records its own from its first change)",
+    "connection_change_evidence (standalone Connection change evidence stays in the standalone \
+     Connections database; the cluster's own evidence table starts empty)",
+    "connection_local_secret_change_evidence (standalone local-secret change evidence stays with \
+     the local-secret keyring in the standalone Connections database)",
 ];
 
 /// The command line, after `import-standalone`.

@@ -31,7 +31,7 @@ The **principal directory is never imported**: cluster mode has no principal dir
 
 The report's `not_imported` field lists everything else deliberately left out — `cluster_members`, `maintenance_jobs`, `execution_leases`, the two rate-limit tables, pending logins, admin sessions and their pending cookie logins, JWT revocations — and the validation pass **proves** those tables empty rather than asserting it in prose. `security_outbox` is named there too, with a caveat worth reading once: the import writes no outbox row of its own, but the policy and tools sections run the ordinary reviewed control-plane commits, and a commit appends one. So that table holds two rows after an import. They describe this deployment's initialization, and they are the reason `security_outbox` is on the `not_imported` list but not on the list of tables proven empty.
 
-Standalone service-token change evidence — the `service_token_change_evidence` rows that name who rotated or revoked each token — is also left behind and named in `not_imported`. The import carries the token rows only, so that history stays in the `SERVICE_TOKEN_SQLITE_PATH` database; keep the file with the rest of the standalone deployment's records if you need it. The cluster's own evidence table starts empty and records its first rotate or revoke.
+Standalone service-token change evidence — the `service_token_change_evidence` rows that name who rotated or revoked each token — is also left behind and named in `not_imported`. The import carries the token rows only, so that history stays in the `SERVICE_TOKEN_SQLITE_PATH` database; keep the file with the rest of the standalone deployment's records if you need it. The cluster's own evidence table starts empty and records its first rotate or revoke. The same holds for the standalone Connections database's `connection_change_evidence` and `connection_local_secret_change_evidence` rows, which name who created, replaced and deleted each Connection and who changed each encrypted local secret: both are named in `not_imported` and stay in the `CONNECTIONS_SQLITE_PATH` database, and the cluster's own `greengateway.connection_change_evidence` starts empty.
 
 The command also never moves secret material. Credential bindings are imported as references; the secrets stay in your secret store, and local-secret keyring material is not touched. A cluster deployment binds credentials through an external secret provider — `CONNECTION_LOCAL_SECRET_KEYRING` is rejected in cluster mode.
 
@@ -137,7 +137,9 @@ Expected output: pretty-printed JSON on stdout and exit `0`. The shape:
     "security_outbox (the import announces nothing; a commit appends its own row)",
     "principal_directory (cluster mode has none; the audit log it projects from is imported)",
     "connection_local_secrets (the local-secret keyring stays with the standalone deployment; credential bindings cross as references and must be re-provisioned in the cluster's secret store)",
-    "service_token_change_evidence (standalone rotate/revoke evidence stays in the standalone token database; the cluster records its own from its first change)"
+    "service_token_change_evidence (standalone rotate/revoke evidence stays in the standalone token database; the cluster records its own from its first change)",
+    "connection_change_evidence (standalone Connection change evidence stays in the standalone Connections database; the cluster's own evidence table starts empty)",
+    "connection_local_secret_change_evidence (standalone local-secret change evidence stays with the local-secret keyring in the standalone Connections database)"
   ],
   "duration_ms": 8590
 }
