@@ -5,10 +5,10 @@ import {
 } from 'react';
 
 import {
+  MAX_PUBLISHED_ASSERTION_KEYS,
   type CallerAssertionAlgorithm,
   type CallerAssertionClaim,
-  type ConnectionKind,
-  type SafeCallerAssertion
+  type ConnectionKind
 } from '../../lib/connections';
 import {
   createConnectionSecret,
@@ -24,26 +24,38 @@ import {
   AdditionalHeaderDraft,
   additionalHeaderFieldError,
   ALL_SECRET_PURPOSES,
+  AssertionKeyDraft,
+  assertionKeyWithPatch,
   authenticationPurpose,
   AuthenticationType,
   authenticationTypeLocked,
   BindingDraft,
   BindingIntent,
+  CALLER_ASSERTION_PROBLEMS_ID,
+  CallerAssertionDraft,
+  callerAssertionDraftFromStored,
+  callerAssertionDraftWithPromotedKey,
+  CallerAssertionMode,
+  callerAssertionSectionProblems,
   ConnectionFormState,
   describedBy,
   DiscoveryType,
+  effectiveCallerAssertionMode,
+  emptyAssertionKey,
   FieldErrors,
   formatSecretProvider,
   formatSecretPurpose,
   isTlsSecretPurpose,
   MAX_ADDITIONAL_HEADERS,
   MAX_CALLER_ASSERTION_LIFETIME_SECONDS,
+  newCallerAssertionDraft,
   secretErrorRequiresReload,
   SecretInventoryState,
   secretMaxLength,
   secretMutationError,
   secretMutationReloadRequired,
   SubjectTokenDraft,
+  subjectTokenDraftApplies,
 } from './model';
 export function ConnectionIdentitySection({
   form,
@@ -186,9 +198,10 @@ export function AuthenticationSection({
   onUpdate: (patch: Partial<ConnectionFormState>) => void;
   onAuthenticationTypeChange: (type: AuthenticationType) => void;
 }) {
-  const hasSecret = form.authenticationType !== 'none';
+  const hasSecret = authenticationPurpose(form.authenticationType) !== null;
   const typeLocked = authenticationTypeLocked(form);
   const delegated = form.authenticationType === 'delegated_issuer_token';
+  const google = form.authenticationType === 'google_domain_wide_delegation';
   const requestsToken =
     form.authenticationType === 'oauth2_client_credentials' || delegated;
   const scopesField = delegated
@@ -234,6 +247,9 @@ export function AuthenticationSection({
                 <option value="static_bearer">Static bearer</option>
                 <option value="oauth2_client_credentials">
                   OAuth 2 client credentials
+                </option>
+                <option value="google_domain_wide_delegation">
+                  Google domain-wide delegation (each caller&apos;s own)
                 </option>
               </>
             )}
@@ -418,7 +434,64 @@ export function AuthenticationSection({
             ) : null}
           </>
         ) : null}
+        {google ? (
+          <GoogleDomainWideDelegationFields
+            form={form}
+            errors={errors}
+            disabled={disabled}
+            onUpdate={onUpdate}
+          />
+        ) : null}
       </div>
+      {google ? (
+        <p id="connection-google-profile-help" className="capability-description">
+          The workload identity profile is the <code>id</code> of a{' '}
+          <code>CONNECTION_GCP_PROVIDER</code> profile in the gateway&apos;s
+          startup configuration: the federated identity that has Google sign
+          as the service account. It holds no key, and an enabled connection
+          can be saved only once the profile is configured.
+        </p>
+      ) : null}
+      {google ? (
+        <FormField
+          id="connection-google-subject-issuers"
+          label="Subject issuers (one per line)"
+          error={errors['authentication.subject_issuers']}
+        >
+          <textarea
+            id="connection-google-subject-issuers"
+            value={form.subjectIssuers}
+            disabled={disabled}
+            rows={2}
+            placeholder="https://idp.example.com"
+            autoComplete="off"
+            spellCheck={false}
+            aria-invalid={Boolean(errors['authentication.subject_issuers'])}
+            aria-describedby={
+              describedBy(
+                'connection-google-subject-issuers',
+                errors['authentication.subject_issuers'],
+              ) ?? 'connection-google-subject-issuers-help'
+            }
+            onChange={(event) =>
+              onUpdate({ subjectIssuers: event.target.value })
+            }
+          />
+        </FormField>
+      ) : null}
+      {google ? (
+        <p
+          id="connection-google-subject-issuers-help"
+          className="capability-description"
+        >
+          Each call acts as the Workspace user whose email the caller&apos;s
+          identity provider put in its token, so list only the provider
+          authoritative for the domain: any other could name any user. A
+          caller from an unlisted provider is refused. The subject claim is
+          always <code>email</code>.
+        </p>
+      ) : null}
+      {google ? <GoogleDomainWideDelegationNote /> : null}
       {typeLocked ? (
         <p
           id="connection-authentication-type-locked"
@@ -500,6 +573,127 @@ function DelegatedIssuerTokenNote() {
         Whoever holds the client secret can ask the issuer for any
         user&apos;s token. Keep it in an external provider, and request
         read-only scopes where the upstream allows it.
+      </p>
+    </div>
+  );
+}
+
+/**
+ * The fields of a Google domain-wide delegation, in the authentication grid.
+ * None is a secret: the account and the profile are names, and the profile
+ * resolves only from the gateway's own startup configuration.
+ */
+function GoogleDomainWideDelegationFields({
+  form,
+  errors,
+  disabled,
+  onUpdate,
+}: {
+  form: ConnectionFormState;
+  errors: FieldErrors;
+  disabled: boolean;
+  onUpdate: (patch: Partial<ConnectionFormState>) => void;
+}) {
+  return (
+    <>
+      <FormField
+        id="connection-google-service-account"
+        label="Delegated service account"
+        error={errors['authentication.service_account_email']}
+      >
+        <input
+          id="connection-google-service-account"
+          type="email"
+          value={form.serviceAccountEmail}
+          disabled={disabled}
+          placeholder="gateway-delegate@project-id.iam.gserviceaccount.com"
+          autoComplete="off"
+          spellCheck={false}
+          aria-invalid={Boolean(errors['authentication.service_account_email'])}
+          aria-describedby={describedBy(
+            'connection-google-service-account',
+            errors['authentication.service_account_email'],
+          )}
+          onChange={(event) =>
+            onUpdate({ serviceAccountEmail: event.target.value })
+          }
+        />
+      </FormField>
+      <FormField
+        id="connection-google-profile"
+        label="Workload identity profile"
+        error={errors['authentication.workload_identity_profile']}
+      >
+        <input
+          id="connection-google-profile"
+          value={form.workloadIdentityProfile}
+          disabled={disabled}
+          placeholder="gateway-wif"
+          autoComplete="off"
+          spellCheck={false}
+          aria-invalid={Boolean(
+            errors['authentication.workload_identity_profile'],
+          )}
+          aria-describedby={
+            describedBy(
+              'connection-google-profile',
+              errors['authentication.workload_identity_profile'],
+            ) ?? 'connection-google-profile-help'
+          }
+          onChange={(event) =>
+            onUpdate({ workloadIdentityProfile: event.target.value })
+          }
+        />
+      </FormField>
+      <FormField
+        id="connection-oauth-scopes"
+        label="Google scopes"
+        error={errors['authentication.scopes']}
+      >
+        <input
+          id="connection-oauth-scopes"
+          value={form.scopes}
+          disabled={disabled}
+          placeholder="https://www.googleapis.com/auth/gmail.readonly"
+          autoComplete="off"
+          spellCheck={false}
+          aria-invalid={Boolean(errors['authentication.scopes'])}
+          aria-describedby={describedBy(
+            'connection-oauth-scopes',
+            errors['authentication.scopes'],
+          )}
+          onChange={(event) => onUpdate({ scopes: event.target.value })}
+        />
+      </FormField>
+    </>
+  );
+}
+
+/**
+ * What a Google domain-wide delegation does and where its trust sits, beside
+ * the fields that configure it.
+ */
+function GoogleDomainWideDelegationNote() {
+  return (
+    <div className="alert warning" role="status">
+      <p>
+        <strong>Each caller reaches Google as themselves.</strong> For every
+        calling principal named by email by a listed subject issuer, Google
+        signs an assertion as the service account through IAM Credentials{' '}
+        <code>signJwt</code>, and the gateway exchanges it for that
+        user&apos;s own token, caches it for that principal only, and sends it
+        as the bearer token. No service account key is held anywhere in the
+        gateway. Only manual HTTP tool calls and stored tests are served, and a
+        call without a principal, such as a service token, is refused.
+      </p>
+      <p>
+        The service account can act as every user of the Workspace domain for
+        the scopes the Workspace administrator authorised for it. Use an
+        account dedicated to this connection, authorise read-only scopes only
+        and as few as the tools need, and keep these scopes within that list.
+        The egress allowlist must include <code>sts.googleapis.com</code>,{' '}
+        <code>iamcredentials.googleapis.com</code> and{' '}
+        <code>oauth2.googleapis.com</code>.
       </p>
     </div>
   );
@@ -630,18 +824,140 @@ export function AdditionalHeadersSection({
 }
 
 /**
- * The stored caller assertion, read only. The editor has no controls for it,
- * and a save leaves it exactly as stored.
+ * The caller assertion: the stored block read only until the operator chooses
+ * to edit or remove it, or a new block. A save that does neither leaves the
+ * stored block out of the write, so the gateway keeps it exactly as stored.
+ * A delegated issuer token Connection's block is its subject token instead:
+ * read only once it exists, and drafted by `SubjectTokenSection` before.
+ *
+ * `disabled` is set without the secrets-write permission: binding, changing
+ * or removing the block is secret authority.
  */
 export function CallerAssertionSection({
-  assertion,
-  subjectTokenOnly = false,
+  form,
+  errors,
+  secrets,
+  canBindSecret,
+  secretsWriteAllowed,
+  disabled,
+  onUpdate,
 }: {
-  assertion: SafeCallerAssertion | null;
-  subjectTokenOnly?: boolean;
+  form: ConnectionFormState;
+  errors: FieldErrors;
+  secrets: ConnectionSecretMetadata[];
+  // Whether the alias pickers can bind: the permission and a loaded inventory.
+  canBindSecret: boolean;
+  secretsWriteAllowed: boolean;
+  disabled: boolean;
+  onUpdate: (
+    update: (current: ConnectionFormState) => ConnectionFormState,
+  ) => void;
 }) {
-  if (assertion === null) {
-    return null;
+  const stored = form.callerAssertion;
+  const mode = effectiveCallerAssertionMode(form);
+  // A delegated issuer token Connection's block is its subject token: drafted
+  // by the subject-token section while the Connection is new, and read only
+  // once it exists.
+  const subjectToken = form.authenticationType === 'delegated_issuer_token';
+  const problems = callerAssertionSectionProblems(
+    errors,
+    mode === 'edit' || subjectTokenDraftApplies(form),
+  );
+
+  function setMode(next: CallerAssertionMode) {
+    onUpdate((current) => ({
+      ...current,
+      callerAssertionMode: next,
+      ...(next === 'edit'
+        ? {
+          callerAssertionDraft:
+            current.callerAssertion === null
+              ? newCallerAssertionDraft()
+              : callerAssertionDraftFromStored(current.callerAssertion),
+        }
+        : {}),
+    }));
+  }
+
+  function updateDraft(
+    update: (draft: CallerAssertionDraft) => CallerAssertionDraft,
+  ) {
+    onUpdate((current) => ({
+      ...current,
+      callerAssertionDraft: update(current.callerAssertionDraft),
+    }));
+  }
+
+  const problemAlert =
+    problems.length > 0 ? (
+      <div
+        className="error-panel alert warning"
+        role="alert"
+        id={CALLER_ASSERTION_PROBLEMS_ID}
+        tabIndex={-1}
+      >
+        <h3>Review the caller assertion</h3>
+        {problems.map((problem) => (
+          <p key={problem}>{problem}</p>
+        ))}
+      </div>
+    ) : null;
+
+  if (subjectToken) {
+    if (stored === null) {
+      return problemAlert;
+    }
+    return (
+      <section
+        className="connection-form-section"
+        aria-labelledby="connection-caller-assertion-heading"
+      >
+        <div className="section-heading">
+          <p className="eyebrow">Caller attestation</p>
+          <h3 id="connection-caller-assertion-heading">Subject token</h3>
+        </div>
+        {problemAlert}
+        <CallerAssertionSummary assertion={stored} subjectTokenOnly />
+      </section>
+    );
+  }
+
+  // A domain-wide delegation carries no block, so a stored one is removed by
+  // the save; see `effectiveCallerAssertionMode`. Another type keeps it.
+  if (form.authenticationType === 'google_domain_wide_delegation') {
+    return (
+      <section
+        className="connection-form-section"
+        aria-labelledby="connection-caller-assertion-heading"
+      >
+        <div className="section-heading">
+          <p className="eyebrow">Caller attestation</p>
+          <h3 id="connection-caller-assertion-heading">Caller assertion</h3>
+        </div>
+        {problemAlert}
+        {stored !== null ? (
+          <>
+            <div className="alert warning" role="status">
+              <p>
+                <strong>Removed when you save.</strong> A Google domain-wide
+                delegation sends the caller&apos;s own Google token, and Google
+                verifies no caller assertion of the gateway&apos;s, so the
+                gateway refuses the block on this credential. Its keys are
+                withdrawn from the published key set. Choose another
+                authentication type to keep it.
+              </p>
+            </div>
+            <CallerAssertionSummary assertion={stored} />
+          </>
+        ) : (
+          <p className="capability-description">
+            A Google domain-wide delegation carries no caller assertion: the
+            caller&apos;s own Google token already names them, and Google
+            verifies no assertion of the gateway&apos;s.
+          </p>
+        )}
+      </section>
+    );
   }
 
   return (
@@ -651,15 +967,473 @@ export function CallerAssertionSection({
     >
       <div className="section-heading">
         <p className="eyebrow">Caller attestation</p>
-        <h3 id="connection-caller-assertion-heading">
-          {subjectTokenOnly ? 'Subject token' : 'Caller assertion'}
-        </h3>
+        <h3 id="connection-caller-assertion-heading">Caller assertion</h3>
       </div>
-      <CallerAssertionSummary
-        assertion={assertion}
-        subjectTokenOnly={subjectTokenOnly}
-      />
+      {problemAlert}
+      {mode === 'edit' ? (
+        <CallerAssertionEditor
+          draft={form.callerAssertionDraft}
+          errors={errors}
+          secrets={secrets}
+          canBindSecret={canBindSecret}
+          disabled={disabled}
+          onUpdate={updateDraft}
+        />
+      ) : null}
+      {mode === 'remove' && stored !== null ? (
+        <div className="alert warning" role="status">
+          <p>
+            <strong>Removed when you save.</strong> Requests on this
+            connection then reach the upstream without an assertion of the
+            caller, and its keys are withdrawn from the published key set.
+          </p>
+        </div>
+      ) : null}
+      {mode !== 'edit' && stored !== null ? (
+        <CallerAssertionSummary assertion={stored} />
+      ) : null}
+      {mode !== 'edit' && stored === null ? (
+        <p className="capability-description">
+          No caller assertion. Add one to send the upstream a short-lived JWT,
+          signed by the gateway, that names the calling principal on the
+          requests this connection makes for a caller.
+        </p>
+      ) : null}
+      <div className="form-actions">
+        {mode === 'keep' ? (
+          <button
+            type="button"
+            className="secondary-button"
+            disabled={disabled}
+            onClick={() => setMode('edit')}
+          >
+            {stored === null ? 'Add caller assertion' : 'Edit caller assertion'}
+          </button>
+        ) : null}
+        {mode === 'keep' && stored !== null ? (
+          <button
+            type="button"
+            className="secondary-button"
+            disabled={disabled}
+            onClick={() => setMode('remove')}
+          >
+            Remove caller assertion
+          </button>
+        ) : null}
+        {mode !== 'keep' ? (
+          <button
+            type="button"
+            className="secondary-button"
+            disabled={disabled}
+            onClick={() => setMode('keep')}
+          >
+            {stored === null
+              ? 'Discard new caller assertion'
+              : mode === 'remove'
+                ? 'Keep caller assertion'
+                : 'Discard caller assertion changes'}
+          </button>
+        ) : null}
+        {!secretsWriteAllowed ? (
+          <span className="badge neutral">
+            Changing the caller assertion needs secrets-write permission
+          </span>
+        ) : null}
+      </div>
     </section>
+  );
+}
+
+function CallerAssertionEditor({
+  draft,
+  errors,
+  secrets,
+  canBindSecret,
+  disabled,
+  onUpdate,
+}: {
+  draft: CallerAssertionDraft;
+  errors: FieldErrors;
+  secrets: ConnectionSecretMetadata[];
+  canBindSecret: boolean;
+  disabled: boolean;
+  onUpdate: (
+    update: (draft: CallerAssertionDraft) => CallerAssertionDraft,
+  ) => void;
+}) {
+  const hasKeyAlias = secrets.some(
+    (secret) =>
+      secret.configured &&
+      secret.compatible_purposes.includes('assertion_signing_key'),
+  );
+
+  function patchDraft(patch: Partial<CallerAssertionDraft>) {
+    onUpdate((current) => ({ ...current, ...patch }));
+  }
+
+  function patchSigningKey(
+    patch: Partial<Pick<AssertionKeyDraft, 'kid' | 'algorithm' | 'binding'>>,
+  ) {
+    onUpdate((current) => ({
+      ...current,
+      signingKey: assertionKeyWithPatch(current.signingKey, patch),
+    }));
+  }
+
+  function patchPublishedKey(
+    index: number,
+    patch: Partial<Pick<AssertionKeyDraft, 'kid' | 'algorithm' | 'binding'>>,
+  ) {
+    onUpdate((current) => ({
+      ...current,
+      publishedKeys: current.publishedKeys.map((key, position) =>
+        position === index ? assertionKeyWithPatch(key, patch) : key,
+      ),
+    }));
+  }
+
+  function toggleClaim(claim: CallerAssertionClaim, included: boolean) {
+    onUpdate((current) => ({
+      ...current,
+      // Appended or removed in place, so the stored order survives.
+      claims: included
+        ? current.claims.includes(claim)
+          ? current.claims
+          : [...current.claims, claim]
+        : current.claims.filter((existing) => existing !== claim),
+    }));
+  }
+
+  return (
+    <>
+      <p className="capability-description">
+        Requests this connection makes for a caller carry a JWT naming that
+        caller in the assertion header, signed with the signing key. The
+        upstream verifies it against{' '}
+        <code>/.well-known/caller-assertion-jwks.json</code> and pins the
+        issuer, audience, token type and algorithm. A call with no principal
+        to name, such as a service token, is refused. Saving an enabled
+        connection loads every key, and a key that cannot be used refuses
+        the save.
+      </p>
+      {canBindSecret && !hasKeyAlias ? (
+        <div className="alert info" role="status">
+          No configured secret alias can hold a signing key. A key must sit
+          behind an operator alias or an external secret provider; the
+          encrypted local store cannot hold one.
+        </div>
+      ) : null}
+      <div className="filter-grid connection-form-grid">
+        <AssertionKeyFields
+          idPrefix="connection-caller-assertion"
+          secretFieldId="connection-caller-assertion-signing-key"
+          keyDraft={draft.signingKey}
+          label="Signing key"
+          kidError={errors['caller_assertion.kid']}
+          secretError={errors['caller_assertion.signing_key_id']}
+          secrets={secrets}
+          canBindSecret={canBindSecret}
+          disabled={disabled}
+          onChange={patchSigningKey}
+        />
+        <AssertionTextField
+          id="connection-caller-assertion-issuer"
+          label="Issuer (iss)"
+          value={draft.issuer}
+          placeholder="https://gateway.example"
+          error={errors['caller_assertion.issuer']}
+          disabled={disabled}
+          onChange={(issuer) => patchDraft({ issuer })}
+        />
+        <AssertionTextField
+          id="connection-caller-assertion-audience"
+          label="Audience (aud)"
+          value={draft.audience}
+          placeholder="https://internal.example/api"
+          error={errors['caller_assertion.audience']}
+          disabled={disabled}
+          onChange={(audience) => patchDraft({ audience })}
+        />
+        <AssertionTextField
+          id="connection-caller-assertion-token-type"
+          label="Token type (typ)"
+          value={draft.tokenType}
+          placeholder="caller-assertion+jwt"
+          error={errors['caller_assertion.token_type']}
+          disabled={disabled}
+          onChange={(tokenType) => patchDraft({ tokenType })}
+        />
+        <AssertionTextField
+          id="connection-caller-assertion-header-name"
+          label="Assertion header"
+          value={draft.headerName}
+          maxLength={64}
+          error={errors['caller_assertion.header_name']}
+          disabled={disabled}
+          onChange={(headerName) => patchDraft({ headerName })}
+        />
+        <FormField
+          id="connection-caller-assertion-lifetime"
+          label="Lifetime (seconds)"
+          error={errors['caller_assertion.lifetime_seconds']}
+        >
+          <input
+            id="connection-caller-assertion-lifetime"
+            type="number"
+            min={1}
+            max={MAX_CALLER_ASSERTION_LIFETIME_SECONDS}
+            value={draft.lifetimeSeconds}
+            disabled={disabled}
+            aria-invalid={Boolean(errors['caller_assertion.lifetime_seconds'])}
+            aria-describedby={describedBy(
+              'connection-caller-assertion-lifetime',
+              errors['caller_assertion.lifetime_seconds'],
+            )}
+            onChange={(event) =>
+              patchDraft({ lifetimeSeconds: event.target.value })
+            }
+          />
+        </FormField>
+      </div>
+      <fieldset className="connection-caller-assertion-options">
+        <legend>Claims beyond sub</legend>
+        {(['email', 'roles'] as const).map((claim) => (
+          <label className="rule-check-row" key={claim}>
+            <input
+              type="checkbox"
+              id={`connection-caller-assertion-claim-${claim}`}
+              checked={draft.claims.includes(claim)}
+              disabled={disabled}
+              onChange={(event) => toggleClaim(claim, event.target.checked)}
+            />
+            {claim === 'email'
+              ? 'Email (email), advisory: the identity provider may not have verified it'
+              : 'Roles (roles)'}
+          </label>
+        ))}
+        <label className="rule-check-row">
+          <input
+            type="checkbox"
+            id="connection-caller-assertion-bind-request"
+            checked={draft.bindRequest}
+            disabled={disabled}
+            onChange={(event) =>
+              patchDraft({ bindRequest: event.target.checked })
+            }
+          />
+          Bind the request: method, request target and SHA-256 of the exact
+          body sent (bind_request)
+        </label>
+      </fieldset>
+      <div className="section-heading connection-additional-headers-heading">
+        <div>
+          <h4>Published keys</h4>
+          <p className="capability-description">
+            Keys the JWKS publishes beside the signing key that never sign:
+            the next key, published before it signs, and the previous one,
+            kept until what it signed has expired. Make a published key the
+            signing key to rotate.
+          </p>
+        </div>
+        <button
+          type="button"
+          className="secondary-button"
+          disabled={
+            disabled ||
+            draft.publishedKeys.length >= MAX_PUBLISHED_ASSERTION_KEYS
+          }
+          onClick={() =>
+            onUpdate((current) =>
+              current.publishedKeys.length >= MAX_PUBLISHED_ASSERTION_KEYS
+                ? current
+                : {
+                  ...current,
+                  publishedKeys: [
+                    ...current.publishedKeys,
+                    emptyAssertionKey(),
+                  ],
+                },
+            )
+          }
+        >
+          Add published key
+        </button>
+      </div>
+      {draft.publishedKeys.length > 0 ? (
+        <div className="connection-additional-header-list">
+          {draft.publishedKeys.map((key, index) => {
+            const number = index + 1;
+            return (
+              <div
+                className="connection-additional-header-row"
+                key={key.draftId}
+              >
+                <div className="filter-grid connection-form-grid">
+                  <AssertionKeyFields
+                    idPrefix={`connection-caller-assertion-published-key-${index}`}
+                    secretFieldId={`connection-caller-assertion-published-key-${index}-secret`}
+                    keyDraft={key}
+                    label={`Published key ${number}`}
+                    kidError={
+                      errors[`caller_assertion.published_keys.${index}.kid`]
+                    }
+                    secretError={
+                      errors[
+                      `caller_assertion.published_keys.${index}.signing_key_id`
+                      ]
+                    }
+                    secrets={secrets}
+                    canBindSecret={canBindSecret}
+                    disabled={disabled}
+                    onChange={(patch) => patchPublishedKey(index, patch)}
+                  />
+                </div>
+                <div className="form-actions">
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    disabled={disabled}
+                    onClick={() =>
+                      onUpdate((current) =>
+                        callerAssertionDraftWithPromotedKey(current, index),
+                      )
+                    }
+                  >
+                    Make published key {number} the signing key
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    disabled={disabled}
+                    onClick={() =>
+                      onUpdate((current) => ({
+                        ...current,
+                        publishedKeys: current.publishedKeys.filter(
+                          (_key, position) => position !== index,
+                        ),
+                      }))
+                    }
+                  >
+                    Remove published key {number}
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        <p className="capability-description">No published keys.</p>
+      )}
+    </>
+  );
+}
+
+/**
+ * One key's `kid`, algorithm and secret alias. The alias picker lists only
+ * aliases that can hold an assertion signing key, which leaves out the
+ * encrypted local store.
+ */
+function AssertionKeyFields({
+  idPrefix,
+  secretFieldId,
+  keyDraft,
+  label,
+  kidError,
+  secretError,
+  secrets,
+  canBindSecret,
+  disabled,
+  onChange,
+}: {
+  idPrefix: string;
+  secretFieldId: string;
+  keyDraft: AssertionKeyDraft;
+  label: string;
+  kidError?: string;
+  secretError?: string;
+  secrets: ConnectionSecretMetadata[];
+  canBindSecret: boolean;
+  disabled: boolean;
+  onChange: (
+    patch: Partial<Pick<AssertionKeyDraft, 'kid' | 'algorithm' | 'binding'>>,
+  ) => void;
+}) {
+  return (
+    <>
+      <BindingControl
+        id={secretFieldId}
+        label={`${label} secret alias`}
+        binding={keyDraft.binding}
+        purpose="assertion_signing_key"
+        secrets={secrets}
+        canBindSecret={canBindSecret}
+        disabled={disabled}
+        error={secretError}
+        allowClear={false}
+        onChange={(binding) => onChange({ binding })}
+      />
+      <AssertionTextField
+        id={`${idPrefix}-kid`}
+        label={`${label} ID (kid)`}
+        value={keyDraft.kid}
+        error={kidError}
+        disabled={disabled}
+        onChange={(kid) => onChange({ kid })}
+      />
+      <label htmlFor={`${idPrefix}-algorithm`}>
+        {label} algorithm
+        <select
+          id={`${idPrefix}-algorithm`}
+          value={keyDraft.algorithm}
+          disabled={disabled}
+          onChange={(event) =>
+            onChange({
+              algorithm: event.target.value as CallerAssertionAlgorithm,
+            })
+          }
+        >
+          <option value="es256">ES256 (P-256 key)</option>
+          <option value="rs256">RS256 (RSA key, 2048 bits or more)</option>
+        </select>
+      </label>
+    </>
+  );
+}
+
+function AssertionTextField({
+  id,
+  label,
+  value,
+  placeholder,
+  maxLength,
+  error,
+  disabled,
+  onChange,
+}: {
+  id: string;
+  label: string;
+  value: string;
+  placeholder?: string;
+  maxLength?: number;
+  error?: string;
+  disabled: boolean;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <FormField id={id} label={label} error={error}>
+      <input
+        id={id}
+        value={value}
+        disabled={disabled}
+        placeholder={placeholder}
+        maxLength={maxLength}
+        autoComplete="off"
+        spellCheck={false}
+        aria-invalid={Boolean(error)}
+        aria-describedby={describedBy(id, error)}
+        onChange={(event) => onChange(event.target.value)}
+      />
+    </FormField>
   );
 }
 
@@ -934,6 +1708,7 @@ export function BindingControl({
   canBindSecret,
   disabled,
   error,
+  allowClear = true,
   onChange,
 }: {
   id: string;
@@ -944,6 +1719,8 @@ export function BindingControl({
   canBindSecret: boolean;
   disabled: boolean;
   error?: string;
+  // A caller-assertion key cannot be unbound, only replaced or left out.
+  allowClear?: boolean;
   onChange: (binding: BindingDraft) => void;
 }) {
   const compatibleSecrets =
@@ -996,7 +1773,7 @@ export function BindingControl({
               {secret.label} ({formatSecretProvider(secret.provider)})
             </option>
           ))}
-          {binding.configured ? (
+          {binding.configured && allowClear ? (
             <option value="intent:clear">Clear binding</option>
           ) : null}
         </select>

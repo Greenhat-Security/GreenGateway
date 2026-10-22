@@ -8,12 +8,19 @@ import {
   type ConnectionDetail,
   type ConnectionWrite,
 } from '../../lib/connections';
+import type { ConnectionSecretMetadata } from '../../lib/secrets';
 import {
+  assertionKeyWithPatch,
+  callerAssertionDraftFromStored,
+  callerAssertionDraftWithPromotedKey,
+  callerAssertionSectionProblems,
   createWriteFromForm,
   DEFAULT_FORM,
   delegatedIssuerTokenOffered,
+  detailConfiguresCredentialAuthority,
   fieldErrorsFromProblems,
   formFromDetail,
+  newCallerAssertionDraft,
   validateForm,
   writeFromForm,
   type ConnectionFormState,
@@ -33,11 +40,34 @@ const adminSchema = JSON.parse(
     'utf8',
   ),
 ) as {
-  $defs: Record<string, { properties: Record<string, unknown> }>;
+  $defs: Record<
+    string,
+    {
+      properties: Record<string, unknown>;
+      oneOf?: {
+        properties: Record<string, { const?: unknown }>;
+        required?: string[];
+      }[];
+    }
+  >;
 };
 
 function contractFields(definition: string): string[] {
   return Object.keys(adminSchema.$defs[definition].properties).sort();
+}
+
+/** The fields of the `type` alternative of a `oneOf` definition. */
+function contractAlternative(definition: string, type: string) {
+  const alternative = adminSchema.$defs[definition].oneOf?.find(
+    (candidate) => candidate.properties.type?.const === type,
+  );
+  if (alternative === undefined) {
+    throw new Error(`${definition} has no ${type} alternative`);
+  }
+  return {
+    fields: Object.keys(alternative.properties).sort(),
+    required: [...(alternative.required ?? [])].sort(),
+  };
 }
 
 describe('connection editor load and save', () => {
@@ -103,15 +133,292 @@ describe('connection editor load and save', () => {
     }
   });
 
-  it('cannot express a caller assertion in a write', () => {
-    // Checked by `tsc`: the write type rules the key out, `null` included,
-    // because anything the UI could send would at best remove the block.
-    const write: ConnectionWrite = {
-      ...writeFromForm(formFromDetail(projectedPlainConnection())),
-      // @ts-expect-error The admin UI never sends a caller assertion.
-      caller_assertion: null,
+  it('writes an edited block back with every kept key as a marker', async () => {
+    const stored = storedConnection();
+    const form = formFromDetail(await loadThroughClient(stored));
+    const editing = {
+      ...form,
+      callerAssertionMode: 'edit' as const,
+      callerAssertionDraft: callerAssertionDraftFromStored(
+        form.callerAssertion!,
+      ),
     };
-    expect(write.display_name).toBe('Plain API');
+
+    const write = writeFromForm(editing);
+    expect(write.caller_assertion).toStrictEqual({
+      signing_key_configured: true,
+      kid: 'gw-2026-09',
+      algorithm: 'es256',
+      issuer: 'https://gateway.example.test',
+      audience: 'https://billing.example.test/api',
+      token_type: 'at+jwt',
+      header_name: 'x-caller-assertion',
+      lifetime_seconds: 60,
+      claims: ['email', 'roles'],
+      bind_request: true,
+      bind_approval: false,
+      published_keys: [
+        { signing_key_configured: true, kid: 'gw-2026-10', algorithm: 'rs256' },
+      ],
+    });
+    // Every field the replacement contract accepts for the block, and only
+    // those: the safe read's `key_problem` is never sent back.
+    expect(Object.keys(write.caller_assertion!).sort()).toEqual(
+      contractFields('MutationCallerAssertion').filter(
+        (field) => field !== 'signing_key_id',
+      ),
+    );
+    expect(
+      Object.keys(write.caller_assertion!.published_keys![0]).sort(),
+    ).toEqual(
+      contractFields('MutationCallerAssertionPublishedKey').filter(
+        (field) => field !== 'signing_key_id',
+      ),
+    );
+    expect(validateForm(editing)).toEqual({});
+
+    // A newly bound key names its alias instead.
+    const rebound = writeFromForm({
+      ...editing,
+      callerAssertionDraft: {
+        ...editing.callerAssertionDraft,
+        signingKey: assertionKeyWithPatch(
+          editing.callerAssertionDraft.signingKey,
+          {
+            binding: {
+              configured: true,
+              intent: 'replace',
+              secretId: 'assertion-key-next',
+            },
+          },
+        ),
+      },
+    });
+    expect(rebound.caller_assertion).toMatchObject({
+      signing_key_id: 'assertion-key-next',
+    });
+    expect(Object.hasOwn(rebound.caller_assertion!, 'signing_key_configured')).toBe(
+      false,
+    );
+  });
+
+  it('removes the stored block only with an explicit null', async () => {
+    const form = formFromDetail(await loadThroughClient(storedConnection()));
+
+    const removed = writeFromForm({ ...form, callerAssertionMode: 'remove' });
+    expect(Object.hasOwn(removed, 'caller_assertion')).toBe(true);
+    expect(removed.caller_assertion).toBeNull();
+
+    // With nothing stored there is nothing to remove, and nothing is sent.
+    const plain = formFromDetail(projectedPlainConnection());
+    const write: ConnectionWrite = writeFromForm({
+      ...plain,
+      callerAssertionMode: 'remove',
+    });
+    expect(Object.hasOwn(write, 'caller_assertion')).toBe(false);
+  });
+
+  it('drops a kept key binding when its kid or algorithm no longer names the stored key', async () => {
+    const form = formFromDetail(await loadThroughClient(storedConnection()));
+    const draft = callerAssertionDraftFromStored(form.callerAssertion!);
+    const kept = draft.signingKey;
+    expect(kept.binding.intent).toBe('preserve');
+
+    const renamed = assertionKeyWithPatch(kept, { kid: 'gw-2026-11' });
+    expect(renamed.binding.intent).toBe('none');
+    expect(assertionKeyWithPatch(renamed, { kid: 'gw-2026-09' }).binding).toEqual(
+      kept.binding,
+    );
+
+    const otherAlgorithm = assertionKeyWithPatch(kept, { algorithm: 'rs256' });
+    expect(otherAlgorithm.binding.intent).toBe('none');
+    expect(
+      validateForm({
+        ...form,
+        callerAssertionMode: 'edit',
+        callerAssertionDraft: { ...draft, signingKey: otherAlgorithm },
+      })['caller_assertion.signing_key_id'],
+    ).toBe('Select the secret alias that holds this key.');
+  });
+
+  it('promotes a published key to signing key with its kept binding', async () => {
+    const form = formFromDetail(await loadThroughClient(storedConnection()));
+    const draft = callerAssertionDraftWithPromotedKey(
+      callerAssertionDraftFromStored(form.callerAssertion!),
+      0,
+    );
+
+    const write = writeFromForm({
+      ...form,
+      callerAssertionMode: 'edit',
+      callerAssertionDraft: draft,
+    });
+    expect(write.caller_assertion).toMatchObject({
+      signing_key_configured: true,
+      kid: 'gw-2026-10',
+      algorithm: 'rs256',
+      published_keys: [
+        { signing_key_configured: true, kid: 'gw-2026-09', algorithm: 'es256' },
+      ],
+    });
+  });
+
+  it('validates a new caller assertion before writing it', () => {
+    const plain = formFromDetail(projectedPlainConnection());
+    const adding = {
+      ...plain,
+      callerAssertionMode: 'edit' as const,
+      callerAssertionDraft: newCallerAssertionDraft(),
+    };
+
+    expect(validateForm(adding)).toEqual({
+      'caller_assertion.signing_key_id':
+        'Select the secret alias that holds this key.',
+      'caller_assertion.kid':
+        'Enter a key ID of 1 to 128 bytes with no control characters.',
+      'caller_assertion.issuer':
+        'Enter an issuer of 1 to 512 bytes with no control characters.',
+      'caller_assertion.audience':
+        'Enter an audience of 1 to 512 bytes with no control characters.',
+      'caller_assertion.token_type':
+        'Enter a token type of 1 to 128 bytes with no control characters.',
+    });
+
+    const secrets = [
+      secretMetadata('assertion-key', ['assertion_signing_key']),
+      secretMetadata('next-key', ['assertion_signing_key']),
+      secretMetadata('bearer-only', ['static_bearer']),
+    ];
+    const complete = {
+      ...adding,
+      callerAssertionDraft: {
+        ...adding.callerAssertionDraft,
+        signingKey: {
+          ...adding.callerAssertionDraft.signingKey,
+          kid: 'gw-1',
+          binding: replaceBinding('assertion-key'),
+        },
+        issuer: 'https://gateway.example.test',
+        audience: 'https://plain.example.test',
+        tokenType: 'caller-assertion+jwt',
+      },
+    };
+    expect(validateForm(complete, secrets)).toEqual({});
+    expect(writeFromForm(complete).caller_assertion).toStrictEqual({
+      signing_key_id: 'assertion-key',
+      kid: 'gw-1',
+      algorithm: 'es256',
+      issuer: 'https://gateway.example.test',
+      audience: 'https://plain.example.test',
+      token_type: 'caller-assertion+jwt',
+      header_name: 'X-Caller-Assertion',
+      lifetime_seconds: 60,
+      bind_request: false,
+      bind_approval: false,
+    });
+
+    const withDraft = (
+      patch: Partial<typeof complete.callerAssertionDraft>,
+      form: Partial<typeof complete> = {},
+    ) =>
+      validateForm(
+        {
+          ...complete,
+          ...form,
+          callerAssertionDraft: { ...complete.callerAssertionDraft, ...patch },
+        },
+        secrets,
+      );
+
+    // A local-store alias cannot hold a key, so the picker's purpose rules
+    // it out and so does validation.
+    expect(
+      withDraft({
+        signingKey: {
+          ...complete.callerAssertionDraft.signingKey,
+          binding: replaceBinding('bearer-only'),
+        },
+      })['caller_assertion.signing_key_id'],
+    ).toBe(
+      'Select a configured secret alias that can hold an assertion signing key.',
+    );
+    for (const lifetimeSeconds of ['0', '301', '1.5', '']) {
+      expect(
+        withDraft({ lifetimeSeconds })['caller_assertion.lifetime_seconds'],
+      ).toBe('Enter a whole number of seconds from 1 to 300.');
+    }
+    expect(
+      withDraft({ headerName: 'Authorization' })['caller_assertion.header_name'],
+    ).toBe('Enter a valid, non-reserved HTTP header name of at most 64 bytes.');
+    expect(
+      withDraft(
+        { headerName: 'X-Api-Key' },
+        { authenticationType: 'header_api_key', headerName: 'x-api-key' },
+      )['caller_assertion.header_name'],
+    ).toBe('The assertion header must differ from the API key header.');
+    expect(
+      withDraft({ issuer: 'https://gateway.example.test\u0085' })[
+        'caller_assertion.issuer'
+      ],
+    ).toBe('Enter an issuer of 1 to 512 bytes with no control characters.');
+
+    const published = withDraft({
+      publishedKeys: [
+        {
+          ...complete.callerAssertionDraft.signingKey,
+          draftId: 900,
+          binding: replaceBinding('next-key'),
+        },
+        {
+          ...complete.callerAssertionDraft.signingKey,
+          draftId: 901,
+          kid: 'gw-3',
+          binding: replaceBinding('assertion-key'),
+        },
+      ],
+    });
+    expect(published['caller_assertion.published_keys.0.kid']).toMatch(
+      /needs its own key ID/,
+    );
+    expect(published['caller_assertion.published_keys.1.signing_key_id']).toBe(
+      'Each secret alias may be published once.',
+    );
+
+    // An attested connection must use HTTPS.
+    expect(
+      validateForm({ ...complete, baseUrl: 'http://plain.example.test' }, secrets)[
+        'endpoint.base_url'
+      ],
+    ).toBe('Connections with a caller assertion must use an HTTPS origin.');
+  });
+
+  it('shows the gateway caller-assertion codes beside what they mean', () => {
+    const errors = fieldErrorsFromProblems([
+      { field: 'caller_assertion.signing_key_id', code: 'algorithm_mismatch' },
+      { field: 'caller_assertion.published_keys.kid', code: 'duplicate_kid' },
+      {
+        field: 'caller_assertion.signing_key_id',
+        code: 'secret_purpose_conflict',
+      },
+      { field: 'caller_assertion.claims', code: 'something_new' },
+    ]);
+
+    expect(errors['caller_assertion.signing_key_id']).toBe(
+      'The key is for the other algorithm. (algorithm_mismatch) This alias is bound as a delegated token-exchange client secret and cannot also hold an assertion key. (secret_purpose_conflict)',
+    );
+    expect(errors['caller_assertion.published_keys']).toBe(
+      'Another key, on this connection or on another enabled one, is published under this key ID. (duplicate_kid)',
+    );
+    expect(errors['caller_assertion.claims']).toBe('Something new.');
+    expect(errors.form).toBeUndefined();
+
+    // Kept read only, every problem is listed in the section; while editing,
+    // only those with no field of their own.
+    expect(callerAssertionSectionProblems(errors, false)).toHaveLength(3);
+    expect(callerAssertionSectionProblems(errors, true)).toEqual([
+      errors['caller_assertion.published_keys'],
+      errors['caller_assertion.claims'],
+    ]);
   });
 
   it('loads and writes back a delegated issuer token without its caller assertion', async () => {
@@ -249,20 +556,166 @@ describe('connection editor load and save', () => {
     ]);
   });
 
-  it('shows a problem with the stored caller assertion form-wide', () => {
+  it('loads and writes back a Google domain-wide delegation exactly as stored', async () => {
+    const stored = googleDelegationConnection();
+    const form = formFromDetail(await loadThroughClient(stored));
+    expect(form.authenticationType).toBe('google_domain_wide_delegation');
+    expect(form.subjectIssuers).toBe(
+      'https://idp.example.test\nhttps://login.example.test',
+    );
+    expect(validateForm(form)).toEqual({});
+
+    const write = writeFromForm(form);
+    expect(write.authentication).toStrictEqual(
+      stored.configuration.authentication,
+    );
+    // Every field the contract has, on a replacement and a create alike:
+    // nothing is a secret, so nothing is kept by marker.
+    for (const definition of ['MutationAuthentication', 'CreateAuthentication']) {
+      const contract = contractAlternative(
+        definition,
+        'google_domain_wide_delegation',
+      );
+      expect(Object.keys(write.authentication).sort()).toEqual(contract.fields);
+      expect(contract.required).toEqual(contract.fields);
+    }
+    expect(Object.hasOwn(write, 'caller_assertion')).toBe(false);
+    expect(Object.hasOwn(createWriteFromForm(form), 'caller_assertion')).toBe(
+      false,
+    );
+    // Any Connection may move to it, and it binds no secret.
+    expect(delegatedIssuerTokenOffered(form, false)).toBe(false);
+    expect(detailConfiguresCredentialAuthority(await loadThroughClient(stored))).toBe(
+      true,
+    );
+  });
+
+  it('refuses a Google delegation draft the gateway would refuse, naming the field', () => {
+    const errors = validateForm({
+      ...googleDraft(),
+      kind: 'mcp_streamable_http',
+      serviceAccountEmail: '123456-compute@developer.gserviceaccount.com',
+      workloadIdentityProfile: 'profile/one',
+      scopes: '',
+      subjectIssuers: 'https://idp.example.test/a b',
+    });
+    expect(Object.keys(errors).sort()).toEqual([
+      'authentication.scopes',
+      'authentication.service_account_email',
+      'authentication.subject_issuers',
+      'authentication.type',
+      'authentication.workload_identity_profile',
+    ]);
+
+    for (const [patch, field] of [
+      [{ serviceAccountEmail: 'someone@gmail.com' }, 'authentication.service_account_email'],
+      [{ workloadIdentityProfile: `p${'x'.repeat(128)}` }, 'authentication.workload_identity_profile'],
+      [
+        {
+          scopes: Array.from({ length: 17 }, (_, index) => `scope-${index}`).join(' '),
+        },
+        'authentication.scopes',
+      ],
+      [{ scopes: `s${'x'.repeat(128)}` }, 'authentication.scopes'],
+      [{ scopes: 'gmail.readonly gmail.readonly' }, 'authentication.scopes'],
+      [{ subjectIssuers: '\n  \n' }, 'authentication.subject_issuers'],
+      [
+        {
+          subjectIssuers: Array.from(
+            { length: 9 },
+            (_, index) => `https://idp-${index}.example.test`,
+          ).join('\n'),
+        },
+        'authentication.subject_issuers',
+      ],
+      [
+        { subjectIssuers: 'https://idp.example.test\nhttps://idp.example.test//' },
+        'authentication.subject_issuers',
+      ],
+      [{ subjectIssuers: '/' }, 'authentication.subject_issuers'],
+      [{ baseUrl: 'http://gmail.googleapis.com' }, 'endpoint.base_url'],
+    ] as const) {
+      expect(Object.keys(validateForm({ ...googleDraft(), ...patch }))).toEqual([
+        field,
+      ]);
+    }
+    // Trimmed, blank lines dropped, trailing slashes kept for the gateway to
+    // canonicalise.
+    expect(
+      writeFromForm({
+        ...googleDraft(),
+        subjectIssuers: '  https://idp.example.test/ \n\n',
+      }).authentication,
+    ).toMatchObject({ subject_issuers: ['https://idp.example.test/'] });
+  });
+
+  it('removes a stored caller assertion when a connection moves to Google delegation', async () => {
+    const form = formFromDetail(await loadThroughClient(storedConnection()));
+    const moved: ConnectionFormState = {
+      ...form,
+      ...googleFields(),
+      authenticationType: 'google_domain_wide_delegation',
+      // An edit begun under the old type does not survive the move either.
+      callerAssertionMode: 'edit',
+    };
+    expect(validateForm(moved)).toEqual({});
+    // Omitting it would keep the block, which the gateway refuses here.
+    expect(writeFromForm(moved).caller_assertion).toBeNull();
+    // Moving back keeps it as stored.
+    expect(
+      Object.hasOwn(
+        writeFromForm({ ...moved, authenticationType: 'header_api_key', callerAssertionMode: 'keep' }),
+        'caller_assertion',
+      ),
+    ).toBe(false);
+    // A create has nothing stored to remove.
+    expect(
+      Object.hasOwn(createWriteFromForm(googleDraft()), 'caller_assertion'),
+    ).toBe(false);
+  });
+
+  it('explains the gateway Google delegation problems with their codes', () => {
+    const errors = fieldErrorsFromProblems([
+      {
+        field: 'authentication.workload_identity_profile',
+        code: 'unresolvable_binding',
+      },
+      { field: 'authentication.subject_issuers', code: 'duplicate_issuer' },
+      { field: 'caller_assertion', code: 'unsupported' },
+      { field: 'authentication.scopes', code: 'required' },
+    ]);
+    expect(errors['authentication.workload_identity_profile']).toBe(
+      "No CONNECTION_GCP_PROVIDER profile with this ID is configured on the gateway. Configure it in the gateway's startup configuration, or save the connection disabled. (unresolvable_binding)",
+    );
+    expect(errors['authentication.subject_issuers']).toBe(
+      'List each issuer once; a trailing slash does not make it another one. (duplicate_issuer)',
+    );
+    expect(errors['authentication.scopes']).toBe('Required.');
+    // The block has no field on screen under this type, so its section lists
+    // the problem.
+    expect(callerAssertionSectionProblems(errors, false)).toEqual([
+      errors.caller_assertion,
+    ]);
+    expect(errors.caller_assertion).toContain('(unsupported)');
+  });
+
+  it('keeps a caller-assertion problem on its field whichever section shows it', () => {
     const problems = [
       { field: 'caller_assertion.signing_key_id', code: 'invalid_signing_key' },
       { field: 'authentication.token_exchange_url', code: 'invalid_token_url' },
     ];
-    expect(fieldErrorsFromProblems(problems, true)).toEqual({
-      'caller_assertion.signing_key_id': 'Invalid signing key.',
+    const errors = fieldErrorsFromProblems(problems);
+    expect(errors).toEqual({
+      'caller_assertion.signing_key_id':
+        'The alias does not hold exactly one PKCS#8 private key (BEGIN PRIVATE KEY). (invalid_signing_key)',
       'authentication.token_exchange_url': 'Invalid token url.',
     });
-    // Without the draft's fields the stored block has no control to show it.
-    expect(fieldErrorsFromProblems(problems)).toEqual({
-      form: 'Invalid signing key.',
-      'authentication.token_exchange_url': 'Invalid token url.',
-    });
+    // A new delegated Connection's subject-token section shows it on its
+    // field; a stored block, read only, lists it in its section.
+    expect(callerAssertionSectionProblems(errors, true)).toEqual([]);
+    expect(callerAssertionSectionProblems(errors, false)).toEqual([
+      errors['caller_assertion.signing_key_id'],
+    ]);
   });
 
   it('keeps a test profile an MCP connection was loaded with', async () => {
@@ -327,13 +780,89 @@ describe('connection editor load and save', () => {
       },
     };
 
-    const errors = validateForm(
-      formFromDetail(await loadThroughClient(legacy)),
-    );
+    const form = formFromDetail(await loadThroughClient(legacy));
+    const errors = validateForm(form);
 
     expect(errors.form).toMatch(/asks for approval binding/);
+
+    // Editing the block turns approval binding off, and removing it is
+    // always possible.
+    const edited = {
+      ...form,
+      callerAssertionMode: 'edit' as const,
+      callerAssertionDraft: callerAssertionDraftFromStored(
+        form.callerAssertion!,
+      ),
+    };
+    expect(validateForm(edited)).toEqual({});
+    expect(writeFromForm(edited).caller_assertion?.bind_approval).toBe(false);
+    expect(
+      validateForm({ ...form, callerAssertionMode: 'remove' }),
+    ).toEqual({});
+  });
+
+  it('reports a header clash on the edited block rather than on the other header', async () => {
+    const form = formFromDetail(await loadThroughClient(storedConnection()));
+    const errors = validateForm({
+      ...form,
+      callerAssertionMode: 'edit',
+      callerAssertionDraft: {
+        ...callerAssertionDraftFromStored(form.callerAssertion!),
+        headerName: 'CF-Access-Client-Id',
+      },
+    });
+
+    expect(errors).toEqual({
+      'caller_assertion.header_name':
+        'The assertion header must differ from every additional header.',
+    });
+  });
+
+  it('treats a stored caller assertion as credential authority', async () => {
+    const stored = storedConnection();
+    const onlyAssertion = {
+      ...stored,
+      authentication: 'none',
+      configuration: {
+        ...stored.configuration,
+        authentication: { type: 'none' },
+        additional_headers: [],
+        tls: {
+          ca_bundle_configured: false,
+          client_certificate_configured: false,
+          client_private_key_configured: false,
+        },
+      },
+    };
+    const detail = await loadThroughClient(onlyAssertion);
+    expect(detailConfiguresCredentialAuthority(detail)).toBe(true);
+    expect(
+      detailConfiguresCredentialAuthority(projectedPlainConnection()),
+    ).toBe(false);
   });
 });
+
+function replaceBinding(secretId: string) {
+  return { configured: false, intent: 'replace' as const, secretId };
+}
+
+function secretMetadata(
+  id: string,
+  compatible_purposes: ConnectionSecretMetadata['compatible_purposes'],
+): ConnectionSecretMetadata {
+  return {
+    id,
+    etag: `"${id}"`,
+    label: id,
+    provider: compatible_purposes.includes('assertion_signing_key')
+      ? 'operator_file'
+      : 'local_encrypted',
+    configured: true,
+    compatible_purposes,
+    dependency_count: 0,
+    actions: { can_rotate: false, can_delete: false },
+  };
+}
 
 async function loadThroughClient(
   stored: Record<string, unknown>,
@@ -485,6 +1014,63 @@ function delegatedConnection() {
       },
       test_profile: stored.configuration.test_profile,
     },
+  };
+}
+
+/** A stored Google domain-wide delegation, as the safe read returns it. */
+function googleDelegationConnection() {
+  const stored = storedConnection();
+  return {
+    ...stored,
+    authentication: 'google_domain_wide_delegation',
+    configuration: {
+      endpoint: {
+        base_url: 'https://gmail.googleapis.com',
+        base_path: '/gmail/v1',
+      },
+      authentication: {
+        type: 'google_domain_wide_delegation',
+        service_account_email:
+          'gateway-delegate@example-project.iam.gserviceaccount.com',
+        workload_identity_profile: 'gateway-wif',
+        scopes: [
+          'https://www.googleapis.com/auth/calendar.readonly',
+          'https://www.googleapis.com/auth/gmail.readonly',
+        ],
+        subject_claim: 'email',
+        subject_issuers: ['https://idp.example.test', 'https://login.example.test'],
+      },
+      tls: {
+        ca_bundle_configured: false,
+        client_certificate_configured: false,
+        client_private_key_configured: false,
+      },
+      test_profile: stored.configuration.test_profile,
+    },
+  };
+}
+
+function googleFields(): Pick<
+  ConnectionFormState,
+  'serviceAccountEmail' | 'workloadIdentityProfile' | 'scopes' | 'subjectIssuers'
+> {
+  return {
+    serviceAccountEmail:
+      'gateway-delegate@example-project.iam.gserviceaccount.com',
+    workloadIdentityProfile: 'gateway-wif',
+    scopes: 'https://www.googleapis.com/auth/gmail.readonly',
+    subjectIssuers: 'https://idp.example.test',
+  };
+}
+
+/** A valid new Google domain-wide delegation draft. */
+function googleDraft(): ConnectionFormState {
+  return {
+    ...DEFAULT_FORM,
+    ...googleFields(),
+    displayName: 'Gmail',
+    baseUrl: 'https://gmail.googleapis.com',
+    authenticationType: 'google_domain_wide_delegation',
   };
 }
 

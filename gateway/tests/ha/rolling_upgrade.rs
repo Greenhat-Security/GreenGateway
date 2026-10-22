@@ -27,7 +27,11 @@
 //! [`a_prepared_release_and_its_successor_serve_one_deployment`] and
 //! [`the_successors_new_operation_waits_for_every_prepared_member_to_leave`]
 //! run the two together against one database and write what they observed
-//! to the pair's `evidence/` directory. What they do *not* prove is listed
+//! to the pair's `evidence/` directory. The release gate then checks that
+//! evidence against the published support matrix
+//! (`docs/deployment/upgrade-support-matrix.json`, with
+//! `scripts/upgrade_pair_evidence.py`), so a change to what a row records
+//! or asserts changes the matrix with it. What they do *not* prove is listed
 //! in `docs/architecture/ha-state-model.md` section 7: this pair shares one
 //! schema point, so no schema overlap, backfill or contraction is
 //! exercised, and the gate they exercise judges live membership, not a
@@ -72,10 +76,13 @@
 //!    A configuration change completes only after the old set has drained,
 //!    which is the parent contract's "cannot complete with zero
 //!    unavailability", made executable.
-//! 3. **The document version.** The policy document's `schema_version`
-//!    must start with `0.` (`rbac/policy.rs::validate`), and the roster
-//!    advertises the accepted range as
-//!    `cluster_membership::DOCUMENT_VERSION_RANGE = (0, 0)`. A document a
+//! 3. **The document version.** A cluster replica serves only the policy
+//!    document formats the roster advertises,
+//!    `cluster_membership::DOCUMENT_VERSION_RANGE = (0, 0)`: a `0.x`
+//!    `schema_version`. Policy v1 (`1.0.0`) parses in standalone mode but is
+//!    outside that range, so `storage/postgres_policy.rs` refuses to serve it
+//!    and the commit paths refuse to write it, exactly as a build that
+//!    predates v1 refuses it. A document a
 //!    replica cannot parse is never compiled and never served — the
 //!    replica goes to `security_revision_not_compiled` rather than
 //!    continuing under the allow state it had
@@ -225,12 +232,13 @@ fn policy_document(marker: Option<&str>) -> String {
     .to_string()
 }
 
-/// The same document at a `schema_version` this binary does not accept.
+/// The same document at a `schema_version` this binary does not serve.
 ///
-/// `Policy::validate` refuses anything whose `schema_version` does not
-/// start with `0.`, and the roster advertises that as
-/// `document_version_max = 0`. This is what a *newer* replica's commit
-/// would look like to this one.
+/// `1.0.0` is policy v1, document format 1. A cluster replica of this
+/// binary serves only the formats its roster row advertises,
+/// `document_version_max = 0`, so it refuses the document on read and on
+/// write. This is what a *newer* replica's commit would look like to this
+/// one.
 fn unsupported_document() -> String {
     json!({
         "default_action": "allow",

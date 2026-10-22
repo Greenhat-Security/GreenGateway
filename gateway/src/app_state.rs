@@ -31,6 +31,7 @@ pub(super) const POLICY_RULE_HITS_ADMIN_ROUTE: &str = "/v1/admin/policy/rules/hi
 pub(super) const POLICY_RULE_SHADOW_REVIEW_ADMIN_ROUTE: &str =
     "/v1/admin/policy/rules/shadow-review";
 pub(super) const POLICY_VALIDATE_ADMIN_ROUTE: &str = "/v1/admin/policy/validate";
+pub(super) const POLICY_CONVERT_ADMIN_ROUTE: &str = "/v1/admin/policy/convert";
 /// Run a `policy-tests.v1` suite (issue #243, slice 11).
 pub(super) const POLICY_TEST_RUNS_ADMIN_ROUTE: &str = "/v1/admin/policy/tests/runs";
 pub(super) const POLICY_RULES_ADMIN_ROUTE: &str = "/v1/admin/policy/rules";
@@ -212,6 +213,7 @@ pub(super) struct AdminRoutes {
     pub(super) policy_rule_hits_route: String,
     pub(super) policy_rule_shadow_review_route: String,
     pub(super) policy_validate_route: String,
+    pub(super) policy_convert_route: String,
     pub(super) policy_test_runs_route: String,
     pub(super) policy_rules_route: String,
     pub(super) policy_rule_route: String,
@@ -316,6 +318,7 @@ impl AdminRoutes {
             policy_rule_hits_route: format!("{api_prefix}/policy/rules/hits"),
             policy_rule_shadow_review_route: format!("{api_prefix}/policy/rules/shadow-review"),
             policy_validate_route: format!("{api_prefix}/policy/validate"),
+            policy_convert_route: format!("{api_prefix}/policy/convert"),
             policy_test_runs_route: format!("{api_prefix}/policy/tests/runs"),
             policy_rules_route: format!("{api_prefix}/policy/rules"),
             policy_rule_route: format!("{api_prefix}/policy/rules/{{id}}"),
@@ -467,6 +470,12 @@ pub(super) struct ConnectionAdminState {
     // Serializes the HTTP precondition snapshot with its mutation. This is
     // intentionally distinct from the control plane's secret/activation lock.
     pub(super) secret_precondition_lock: Arc<Mutex<()>>,
+    /// Cluster mode's roster, for the operation gate a managed OpenAPI
+    /// write asks before storing a catalog generated from a Swagger 2.0
+    /// document (issue #443). When the catalog service gates such writes
+    /// and this is absent, every one of them is refused.
+    #[cfg(feature = "postgres")]
+    pub(super) membership: Option<Arc<cluster_membership::ClusterMembership>>,
 }
 
 #[derive(Clone)]

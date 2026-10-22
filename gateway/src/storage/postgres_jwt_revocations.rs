@@ -40,9 +40,10 @@
 //!   operation IDs, the key (issuer and digest, never the raw `jti`), the
 //!   expiry the row now carries, its shared revision and the database
 //!   clock's commit time. An extension or reactivation is a second row, not
-//!   an overwrite, and cleanup never touches the table. If the evidence
-//!   cannot be written, the revoke rolls back; a repeat that changes nothing
-//!   writes none.
+//!   an overwrite, and cleanup never touches the table. The same transaction
+//!   journals the row for delivery (migration 21). If the evidence or its
+//!   journal row cannot be written, or the journal is full, the revoke rolls
+//!   back; a repeat that changes nothing writes none.
 //!
 //! Failure classification on the read path: a store that cannot be
 //! consulted is `AuthError::Upstream`, which the middleware answers with
@@ -325,15 +326,29 @@ impl PostgresJwtRevocationStore {
                     ],
                 )
                 .await
-                .map_err(|error| evidence_failure(error, OPERATION_EVIDENCE))?;
+                .map_err(|error| {
+                    super::postgres_authority_events::record_evidence_failure();
+                    evidence_failure(error, OPERATION_EVIDENCE)
+                })?;
             // Exactly the one row written above. Anything else means the
             // evidence does not describe this revoke, and nothing commits.
             if recorded != 1 {
+                super::postgres_authority_events::record_evidence_failure();
                 return Err(RepositoryError::new(
                     RepositoryErrorKind::Internal,
                     OPERATION_EVIDENCE,
                 ));
             }
+            // Journaled for delivery under the same event ID (migration
+            // 21). A full journal refuses the revoke rather than evict an
+            // accepted event; the reserved revision rolls back with it.
+            super::postgres_authority_events::append_to_journal(
+                &client,
+                super::postgres_authority_events::JournalSource::JwtRevocation,
+                &event_id,
+            )
+            .await
+            .map_err(journal_failure)?;
             Ok(JwtRevocationOutcome::Revoked { security_revision })
         }
         .await;
@@ -458,6 +473,18 @@ fn evidence_failure(error: tokio_postgres::Error, operation: &'static str) -> Re
         RepositoryError::new(RepositoryErrorKind::Internal, operation)
     } else {
         classified
+    }
+}
+
+/// A full journal is `Unavailable`; a failed append is classified like the
+/// evidence insert, never `Conflict`.
+fn journal_failure(error: super::postgres_authority_events::JournalAppendError) -> RepositoryError {
+    use super::postgres_authority_events::{JournalAppendError, OPERATION_JOURNAL_APPEND};
+    match error {
+        JournalAppendError::CapacityExhausted => {
+            RepositoryError::new(RepositoryErrorKind::Unavailable, OPERATION_JOURNAL_APPEND)
+        }
+        JournalAppendError::Store(error) => evidence_failure(error, OPERATION_JOURNAL_APPEND),
     }
 }
 

@@ -4,6 +4,13 @@ use super::rule::{PrincipalMatcher, Rule, RuleAction, RuleDispatchKind, RuleDisp
 use url::Url;
 
 /// Precompiled first-match-wins evaluator for direct firewall rules.
+///
+/// The shared policy evaluator (`policy_eval::CompiledPolicy`) is its only
+/// serving consumer: every live decision and analysis question that matches a
+/// direct or tool-name rule asks the evaluator, which holds one of these per
+/// compiled snapshot (#422). Other construction is confined to tests and the
+/// frozen pre-cutover oracles they compare against; see
+/// `docs/architecture/policy-evaluation-parity.md`.
 #[derive(Debug, Clone)]
 pub struct RuleMatcher {
     rules: Vec<CompiledRule>,
@@ -47,6 +54,7 @@ impl<'a> RuleDispatchContext<'a> {
         }
     }
 
+    #[cfg(test)]
     pub fn classified(
         route_host: Option<&'a str>,
         route_path_prefix: Option<&'a str>,
@@ -78,7 +86,6 @@ impl<'a> RuleDispatchContext<'a> {
 }
 
 impl RuleMatcher {
-    #[allow(dead_code)]
     pub fn new(rules: &[Rule]) -> Self {
         Self {
             rules: rules
@@ -89,7 +96,7 @@ impl RuleMatcher {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn evaluate(
         &self,
         method: &str,
@@ -116,9 +123,9 @@ impl RuleMatcher {
             })
     }
 
-    /// Returns the first matching deny while ignoring allow and shadow rules.
-    /// Host-qualified upstream authorization uses this as an additional guard.
-    #[allow(dead_code)]
+    /// Returns the first matching deny while ignoring allow and shadow rules,
+    /// contextless.
+    #[cfg(test)]
     pub fn evaluate_denies(
         &self,
         method: &str,
@@ -206,7 +213,6 @@ impl RuleMatcher {
         })
     }
 
-    #[allow(dead_code)]
     pub fn evaluate_tool(
         &self,
         tool_name: &str,

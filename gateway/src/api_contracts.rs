@@ -356,6 +356,55 @@ pub(super) struct PolicyValidationResponse {
     pub(super) errors: Vec<String>,
 }
 
+/// `POST /policy/validate`: the original `valid`/`errors` pair, plus the
+/// structured diagnostics and digests of the inspected document.
+#[derive(Serialize)]
+pub(super) struct PolicyInspectionResponse<'a> {
+    pub(super) valid: bool,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    pub(super) errors: &'a [String],
+    /// The document's `schema_version` when it names a schema this gateway
+    /// implements.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) schema_version: Option<&'a str>,
+    pub(super) diagnostics: &'a [rbac::policy_document::PolicyDiagnostic],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) source_digest: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) semantic_digest: Option<&'a str>,
+}
+
+/// `POST /policy/convert`: a 0.x document converted to policy v1, with what
+/// the conversion changed, or the diagnostics that refuse it.
+#[derive(Serialize)]
+pub(super) struct PolicyConversionResponse<'a> {
+    pub(super) converted: bool,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    pub(super) errors: &'a [String],
+    /// The source document's `schema_version` when it names a schema this
+    /// gateway implements.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) source_schema_version: Option<&'a str>,
+    /// `1.0.0` for a converted document.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) schema_version: Option<&'static str>,
+    pub(super) diagnostics: &'a [rbac::policy_document::PolicyDiagnostic],
+    /// The source digest of the 0.x bytes converted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) source_digest: Option<&'a str>,
+    /// The v1 semantic digest of the converted document.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) semantic_digest: Option<&'a str>,
+    /// `verified` for a converted document: it read back as the source's
+    /// policy apart from its version and ids.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) parity: Option<&'static str>,
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    pub(super) changes: &'a [rbac::policy_conversion::ConversionChange],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) policy: Option<rbac::policy_conversion::ConvertedDocument<'a>>,
+}
+
 #[derive(Deserialize)]
 pub(super) struct PolicyRulePreviewRequest {
     pub(super) rule: rbac::Rule,
@@ -368,11 +417,20 @@ pub(super) struct PolicyRulePreviewRequest {
 pub(super) struct PolicyRulePreviewResponse {
     pub(super) match_count: u64,
     pub(super) scanned_event_count: u64,
+    /// Scanned observations the shared evaluator could not judge the rule
+    /// against. Each is neither a match nor a non-match.
+    pub(super) unevaluated_event_count: u64,
+    /// `unevaluated_event_count` by stable reason: a limitation code
+    /// (`missing_principal_fact`, `missing_dispatch_fact`) or
+    /// `malformed_observation`. Empty when every scanned observation was
+    /// judged.
+    pub(super) unevaluated_reasons: BTreeMap<&'static str, u64>,
     /// The window held more observations than the scan ceiling allowed, so
     /// `match_count` covers only the newest `scanned_event_count` of them.
     pub(super) scan_truncated: bool,
-    /// Every observation in the window was scanned. Never true for a
-    /// truncated scan: a partial count is not evidence of the whole window.
+    /// Every observation in the window was scanned and judged. Never true for
+    /// a truncated scan or one with an unevaluated observation: a partial
+    /// count is not evidence of the whole window.
     pub(super) complete: bool,
     pub(super) sample_strategy: &'static str,
     pub(super) samples: Vec<PolicyRulePreviewSample>,
@@ -545,6 +603,29 @@ pub(super) struct ManagedOpenApiPreviewResponse {
     pub(super) operation_id_fallbacks: Vec<OpenApiToolNameFallbackResponse>,
     pub(super) skipped_operations: Vec<OpenApiSkippedOperationResponse>,
     pub(super) overlay: ManagedOpenApiOverlayReportResponse,
+    /// Only for a document converted to OpenAPI 3.0 first (issue #443); an
+    /// OpenAPI 3.x preview keeps its previous shape exactly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) conversion: Option<OpenApiConversionReportResponse>,
+}
+
+#[derive(Serialize)]
+pub(super) struct OpenApiConversionReportResponse {
+    pub(super) source_format: &'static str,
+    pub(super) warnings: Vec<OpenApiConversionWarningResponse>,
+}
+
+#[derive(Serialize)]
+pub(super) struct OpenApiConversionWarningResponse {
+    pub(super) code: &'static str,
+    pub(super) message: &'static str,
+    pub(super) operation_omitted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) path_template: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) subject: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1077,6 +1158,13 @@ pub(super) struct GatewayAppBuildOverrides {
     /// readiness gate into `/readyz`. None in standalone mode.
     #[cfg(feature = "postgres")]
     pub(super) pg_membership: Option<Arc<cluster_membership::ClusterMembership>>,
+    /// The authority-event journal's store (issue #425, PR 3), its capacity
+    /// already applied by `run()`. With a sink configured the builder hands
+    /// back the dispatcher's startup in `GatewayApps`. None in standalone
+    /// mode.
+    #[cfg(feature = "postgres")]
+    pub(super) pg_authority_events:
+        Option<Arc<storage::postgres_authority_events::PostgresAuthorityEventStore>>,
     /// Test seam: a readiness gate for `/readyz` without a membership
     /// store behind it, so the `config_fingerprint_mismatch` answer is
     /// testable without PostgreSQL.
@@ -1106,6 +1194,12 @@ pub(super) struct GatewayAppBuildOverrides {
     pub(super) disable_proxy_health_checks: bool,
     #[cfg(test)]
     pub(super) stream_proxy_request_bodies: bool,
+    /// Test seam: gate converted managed OpenAPI catalogs as cluster mode
+    /// does, over a standalone Connection store, so the admin endpoints'
+    /// operation-gate path (issue #443) is reachable with or without a
+    /// PostgreSQL roster in `pg_membership`.
+    #[cfg(test)]
+    pub(super) gate_converted_openapi_catalogs: bool,
 }
 
 /// What `run()` proves about the policy authority before the app is built:

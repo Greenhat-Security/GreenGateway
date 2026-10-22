@@ -209,6 +209,36 @@ pub enum ConnectionAuthentication {
         revocation_url: Option<String>,
         subject_token_source: SubjectTokenSource,
     },
+    /// The calling user's own Google Workspace token, obtained by domain-wide
+    /// delegation rather than from any per-user grant.
+    ///
+    /// For each caller the gateway builds a JWT naming the service account as
+    /// `iss` and the caller's email as `sub`, has Google sign it with the
+    /// service account's key through the IAM Credentials `signJwt` method --
+    /// authenticated as the federated identity `workload_identity_profile`
+    /// names, so no private key is ever held here -- and exchanges it at
+    /// Google's token endpoint with the JWT bearer grant (RFC 7523). A call
+    /// whose principal is missing, carries no email, or was attested by an
+    /// issuer outside `subject_issuers` is refused; there is no fallback to a
+    /// shared identity.
+    GoogleDomainWideDelegation {
+        /// The delegated service account: a dedicated
+        /// `{name}@{project}.iam.gserviceaccount.com` account a Workspace
+        /// super-admin authorised for `scopes`.
+        service_account_email: String,
+        /// The `id` of a `CONNECTION_GCP_PROVIDER` profile: the workload
+        /// identity that signs as the service account. A reference to trusted
+        /// startup configuration, never a token file, audience or key.
+        workload_identity_profile: String,
+        scopes: Vec<String>,
+        /// Which attested claim becomes the assertion's `sub`.
+        subject_claim: GoogleSubjectClaim,
+        /// The identity providers trusted to name a Workspace user by that
+        /// claim, in canonical form. An email is only as good as the provider
+        /// that vouched for it, and any configured provider can put any
+        /// address in its tokens.
+        subject_issuers: Vec<String>,
+    },
 }
 
 impl ConnectionAuthentication {
@@ -216,6 +246,26 @@ impl ConnectionAuthentication {
         !matches!(self, Self::None)
     }
 }
+
+/// Which attested claim names the Workspace user a domain-wide delegation
+/// acts as.
+///
+/// Closed, with one member: Google's `sub` is the user's primary email, and
+/// the gateway attests no other claim Google would accept there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoogleSubjectClaim {
+    /// The validated principal's `email`, normalised to lowercase by the
+    /// validator that accepted it.
+    Email,
+}
+
+/// Most identity providers one domain-wide delegation may trust to name its
+/// users.
+pub const MAX_GOOGLE_SUBJECT_ISSUERS: usize = 8;
+/// Longest trusted issuer, in bytes: the bound a caller assertion's own
+/// `issuer` has.
+pub const MAX_GOOGLE_SUBJECT_ISSUER_BYTES: usize = 512;
 
 /// What a delegated token exchange presents to the issuer as the subject
 /// token: the evidence of who the caller is.
@@ -587,6 +637,12 @@ impl ConnectionWrite {
             self.caller_assertion.as_ref(),
             &mut errors,
         );
+        validate_google_domain_wide_delegation(
+            self.kind,
+            &self.authentication,
+            self.caller_assertion.as_ref(),
+            &mut errors,
+        );
         validate_additional_headers(
             &mut self.additional_headers,
             &self.authentication,
@@ -757,7 +813,11 @@ impl ConnectionWrite {
             | ConnectionAuthentication::DelegatedIssuerToken {
                 client_secret_id: None,
                 ..
-            } => {}
+            }
+            // Binds no secret: the profile it names is trusted startup
+            // configuration, checked by the control plane on every enabled
+            // save and at startup.
+            | ConnectionAuthentication::GoogleDomainWideDelegation { .. } => {}
         }
         if self
             .additional_headers
@@ -811,7 +871,10 @@ impl ConnectionWrite {
     pub(crate) fn bound_secret_aliases(&self) -> Vec<BoundSecretAlias<'_>> {
         let mut bound = Vec::new();
         let (field, alias, token_exchange_client_secret) = match &self.authentication {
-            ConnectionAuthentication::None => ("authentication", None, false),
+            ConnectionAuthentication::None
+            | ConnectionAuthentication::GoogleDomainWideDelegation { .. } => {
+                ("authentication", None, false)
+            }
             ConnectionAuthentication::HeaderApiKey { secret_id, .. }
             | ConnectionAuthentication::StaticBearer { secret_id } => {
                 ("authentication.secret_id", secret_id.as_deref(), false)
@@ -1196,7 +1259,101 @@ fn validate_authentication(
                 errors,
             );
         }
+        ConnectionAuthentication::GoogleDomainWideDelegation {
+            service_account_email,
+            workload_identity_profile,
+            scopes,
+            subject_claim: GoogleSubjectClaim::Email,
+            subject_issuers,
+        } => {
+            // The account is interpolated into the fixed `signJwt` URL path,
+            // so it is held to exactly the rule the GCP provider holds an
+            // impersonation target to: a dedicated account, never a default
+            // one on another domain.
+            if !super::gcp_secret::is_valid_gcp_service_account(service_account_email) {
+                errors.push(ConnectionValidationError::new(
+                    "authentication.service_account_email",
+                    "invalid_service_account",
+                    "must be a dedicated service account of the form name@project.iam.gserviceaccount.com",
+                ));
+            }
+            if !is_valid_stable_id(workload_identity_profile, MAX_SECRET_ID_BYTES) {
+                errors.push(ConnectionValidationError::new(
+                    "authentication.workload_identity_profile",
+                    "invalid_profile_id",
+                    format!(
+                        "must be the opaque ID, 1-{MAX_SECRET_ID_BYTES} URL-safe bytes, of a CONNECTION_GCP_PROVIDER profile"
+                    ),
+                ));
+            }
+            // Google refuses a delegation that asks for nothing, and an empty
+            // list would leave what the token can do to whatever the
+            // administrator authorised.
+            if scopes.is_empty() {
+                errors.push(ConnectionValidationError::new(
+                    "authentication.scopes",
+                    "required",
+                    "must name at least one scope the Workspace administrator authorised for the service account",
+                ));
+            }
+            validate_scopes("authentication.scopes", scopes, errors);
+            validate_subject_issuers(subject_issuers, errors);
+        }
     }
+}
+
+/// The identity providers a domain-wide delegation trusts to name its users:
+/// at least one, at most [`MAX_GOOGLE_SUBJECT_ISSUERS`], each stored in the
+/// canonical form a principal's issuer is compared in, unique and sorted.
+fn validate_subject_issuers(
+    issuers: &mut Vec<String>,
+    errors: &mut Vec<ConnectionValidationError>,
+) {
+    const FIELD: &str = "authentication.subject_issuers";
+    if issuers.is_empty() {
+        errors.push(ConnectionValidationError::new(
+            FIELD,
+            "required",
+            "must name at least one identity provider trusted to name Workspace users",
+        ));
+    }
+    if issuers.len() > MAX_GOOGLE_SUBJECT_ISSUERS {
+        errors.push(ConnectionValidationError::new(
+            FIELD,
+            "too_many",
+            format!("must contain at most {MAX_GOOGLE_SUBJECT_ISSUERS} entries"),
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for issuer in issuers.iter_mut() {
+        let canonical =
+            crate::auth::principal::canonical_issuer(issuer.as_str()).filter(|canonical| {
+                canonical.len() <= MAX_GOOGLE_SUBJECT_ISSUER_BYTES
+                    && !canonical
+                        .chars()
+                        .any(|character| character.is_control() || character.is_whitespace())
+            });
+        let Some(canonical) = canonical else {
+            errors.push(ConnectionValidationError::new(
+                FIELD,
+                "invalid_issuer",
+                format!(
+                    "each entry must be 1 to {MAX_GOOGLE_SUBJECT_ISSUER_BYTES} bytes without whitespace or control characters"
+                ),
+            ));
+            continue;
+        };
+        if !seen.insert(canonical.clone()) {
+            errors.push(ConnectionValidationError::new(
+                FIELD,
+                "duplicate_issuer",
+                "each identity provider may be listed once",
+            ));
+        }
+        *issuer = canonical;
+    }
+    issuers.sort();
+    issuers.dedup();
 }
 
 /// Scope lists are bounded, unique, whitespace-free and stored sorted, so two
@@ -1285,6 +1442,46 @@ fn validate_delegated_issuer_token(
     }
 }
 
+/// The rules a `google_domain_wide_delegation` Connection adds beyond its own
+/// fields.
+///
+/// Like a delegated issuer token, the credential is obtained only for the
+/// caller of a manual HTTP tool call or the principal running a stored test
+/// (see `ConnectionHttpRuntime::tool_call_target` and `test_target`), so it
+/// is offered on `http_api` Connections only. A caller assertion is refused
+/// outright: the upstream is Google, which verifies no assertion of this
+/// gateway's, and one sent there would be a bearer statement about the caller
+/// handed to a third party.
+///
+/// These apply to stored documents too: no earlier release wrote this type.
+fn validate_google_domain_wide_delegation(
+    kind: ConnectionKind,
+    authentication: &ConnectionAuthentication,
+    caller_assertion: Option<&CallerAssertionSettings>,
+    errors: &mut Vec<ConnectionValidationError>,
+) {
+    if !matches!(
+        authentication,
+        ConnectionAuthentication::GoogleDomainWideDelegation { .. }
+    ) {
+        return;
+    }
+    if kind != ConnectionKind::HttpApi {
+        errors.push(ConnectionValidationError::new(
+            "authentication.type",
+            "kind_mismatch",
+            "google_domain_wide_delegation requires kind http_api",
+        ));
+    }
+    if caller_assertion.is_some() {
+        errors.push(ConnectionValidationError::new(
+            "caller_assertion",
+            "unsupported",
+            "a google_domain_wide_delegation Connection sends the caller's own Google token, and Google verifies no caller assertion; omit caller_assertion",
+        ));
+    }
+}
+
 /// Every additional header must be a header the gateway is willing to let a
 /// Connection own (the same reserved set as the primary API-key header, which
 /// keeps `Authorization` out), must not collide with the primary credential's
@@ -1310,7 +1507,8 @@ fn validate_additional_headers(
         ConnectionAuthentication::None
         | ConnectionAuthentication::StaticBearer { .. }
         | ConnectionAuthentication::OAuth2ClientCredentials { .. }
-        | ConnectionAuthentication::DelegatedIssuerToken { .. } => None,
+        | ConnectionAuthentication::DelegatedIssuerToken { .. }
+        | ConnectionAuthentication::GoogleDomainWideDelegation { .. } => None,
     };
     let mut seen = std::collections::BTreeSet::new();
     for header in headers.iter_mut() {
@@ -2451,6 +2649,199 @@ newline"
         let unresolved =
             validated.unresolved_enabled_binding_fields(|id| id != "issuer-exchange-secret");
         assert_eq!(unresolved, vec!["authentication.client_secret_id"]);
+    }
+
+    /// A `google_domain_wide_delegation` Connection to Gmail; `overrides`
+    /// replace authentication fields.
+    fn google_delegation(overrides: Value) -> Value {
+        let mut connection = example();
+        let object = connection.as_object_mut().expect("connection object");
+        object.remove("tls");
+        object.remove("discovery");
+        object.remove("test_profile");
+        connection["endpoint"] = json!({
+            "base_url": "https://gmail.googleapis.com",
+            "base_path": "/gmail/v1"
+        });
+        let mut authentication = json!({
+            "type": "google_domain_wide_delegation",
+            "service_account_email": "gateway-delegate@example-project.iam.gserviceaccount.com",
+            "workload_identity_profile": "gateway-wif",
+            "scopes": [
+                "https://www.googleapis.com/auth/gmail.readonly",
+                "https://www.googleapis.com/auth/calendar.readonly"
+            ],
+            "subject_claim": "email",
+            "subject_issuers": ["https://idp.example.test/"]
+        });
+        for (key, value) in overrides.as_object().expect("overrides object") {
+            authentication[key] = value.clone();
+        }
+        connection["authentication"] = authentication;
+        connection
+    }
+
+    fn google_delegation_errors(document: Value) -> Vec<ConnectionValidationError> {
+        serde_json::from_value::<ConnectionWrite>(document)
+            .expect("candidate should deserialize")
+            .validated()
+            .expect_err("candidate should be rejected")
+    }
+
+    #[test]
+    fn a_google_domain_wide_delegation_matches_schema_and_rust_model() {
+        let document = google_delegation(json!({}));
+        connection_schema_validator()
+            .validate(&document)
+            .expect("published schema should accept a domain-wide delegation");
+        let mut enabled = document.clone();
+        enabled["enabled"] = json!(true);
+        connection_schema_validator()
+            .validate(&enabled)
+            .expect("an enabled delegation binds no secret");
+
+        let validated = serde_json::from_value::<ConnectionWrite>(enabled)
+            .expect("should deserialize")
+            .validated()
+            .expect("should validate");
+        let ConnectionAuthentication::GoogleDomainWideDelegation {
+            scopes,
+            subject_claim,
+            subject_issuers,
+            ..
+        } = &validated.authentication
+        else {
+            panic!("the delegation is kept");
+        };
+        // Stored sorted, so equal requests compare equal, and the issuers in
+        // the canonical form a principal's issuer is compared in.
+        assert_eq!(
+            scopes,
+            &[
+                "https://www.googleapis.com/auth/calendar.readonly",
+                "https://www.googleapis.com/auth/gmail.readonly"
+            ]
+        );
+        assert_eq!(subject_issuers, &["https://idp.example.test"]);
+        assert_eq!(*subject_claim, GoogleSubjectClaim::Email);
+        // Credential authority, so writing one needs the secrets permission,
+        // though it binds no secret an enabled save would have to resolve.
+        assert!(validated.configures_credential_authority());
+        assert!(validated.sends_credentials());
+        assert!(validated.bound_secret_aliases().is_empty());
+        assert!(validated
+            .unresolved_enabled_binding_fields(|_| false)
+            .is_empty());
+    }
+
+    #[test]
+    fn a_google_delegation_refuses_what_could_name_the_wrong_account_or_user() {
+        for (overrides, field, code, schema_refuses) in [
+            (
+                json!({"service_account_email": "someone@gmail.com"}),
+                "authentication.service_account_email",
+                "invalid_service_account",
+                true,
+            ),
+            (
+                json!({"service_account_email": "123456-compute@developer.gserviceaccount.com"}),
+                "authentication.service_account_email",
+                "invalid_service_account",
+                true,
+            ),
+            (
+                json!({"workload_identity_profile": "../profile"}),
+                "authentication.workload_identity_profile",
+                "invalid_profile_id",
+                true,
+            ),
+            (
+                json!({"scopes": []}),
+                "authentication.scopes",
+                "required",
+                true,
+            ),
+            (
+                json!({"scopes": ["https://mail.google.com/ extra"]}),
+                "authentication.scopes",
+                "invalid_scope",
+                true,
+            ),
+            (
+                json!({"subject_issuers": []}),
+                "authentication.subject_issuers",
+                "required",
+                true,
+            ),
+            (
+                json!({"subject_issuers": ["https://idp.example.test", "https://idp.example.test/"]}),
+                "authentication.subject_issuers",
+                "duplicate_issuer",
+                false,
+            ),
+            (
+                json!({"subject_issuers": ["https://idp.example.test/a b"]}),
+                "authentication.subject_issuers",
+                "invalid_issuer",
+                true,
+            ),
+            (
+                json!({"subject_issuers": (0..=MAX_GOOGLE_SUBJECT_ISSUERS)
+                    .map(|index| format!("https://idp-{index}.example.test"))
+                    .collect::<Vec<_>>()}),
+                "authentication.subject_issuers",
+                "too_many",
+                true,
+            ),
+        ] {
+            let document = google_delegation(overrides);
+            let errors = google_delegation_errors(document.clone());
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.field == field && error.code == code),
+                "{field} {code}: {errors:?}"
+            );
+            assert_eq!(
+                connection_schema_validator().validate(&document).is_err(),
+                schema_refuses,
+                "{field} {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_google_delegation_is_an_http_api_that_attests_nothing_to_google() {
+        let mut mcp = google_delegation(json!({}));
+        mcp["kind"] = json!("mcp_streamable_http");
+        mcp["discovery"] = json!({
+            "type": "managed_mcp",
+            "use_connection_authentication": true
+        });
+        assert!(connection_schema_validator().validate(&mcp).is_err());
+        assert!(google_delegation_errors(mcp)
+            .iter()
+            .any(|error| error.field == "authentication.type" && error.code == "kind_mismatch"));
+
+        let mut attested = with_caller_assertion(json!({}));
+        attested["authentication"] = google_delegation(json!({}))["authentication"].clone();
+        attested["endpoint"] = google_delegation(json!({}))["endpoint"].clone();
+        assert!(connection_schema_validator().validate(&attested).is_err());
+        assert!(google_delegation_errors(attested.clone())
+            .iter()
+            .any(|error| error.field == "caller_assertion" && error.code == "unsupported"));
+        // No earlier release wrote this type, so a stored document is held to
+        // the same rules.
+        assert!(write(attested).validated_persisted_v0().is_err());
+    }
+
+    #[test]
+    fn the_google_subject_claim_is_closed_to_the_email() {
+        for claim in ["sub", "preferred_username", ""] {
+            let document = google_delegation(json!({ "subject_claim": claim }));
+            assert!(connection_schema_validator().validate(&document).is_err());
+            assert!(serde_json::from_value::<ConnectionWrite>(document).is_err());
+        }
     }
 
     fn write(document: Value) -> ConnectionWrite {

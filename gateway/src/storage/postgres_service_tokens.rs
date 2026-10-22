@@ -25,9 +25,11 @@
 //!   (migration 18): actor, action, generated event and operation IDs, the
 //!   token's row revision before and after, the shared revision the change
 //!   took and the database clock's commit time. It has no foreign key, so
-//!   it outlives the token row, and it holds no token material. If it
-//!   cannot be written, the change rolls back; a repeat revoke or a refused
-//!   rotate writes none.
+//!   it outlives the token row, and it holds no token material. The same
+//!   transaction journals it for delivery (migration 21,
+//!   `postgres_authority_events`), reserving journal capacity. If either
+//!   cannot be written, or the journal is full, the change rolls back; a
+//!   repeat revoke or a refused rotate writes none.
 //!
 //! Lock order, identical in every mutating path so no two paths can
 //! deadlock: (1) `service_token_state_revision` `FOR UPDATE`, which
@@ -35,7 +37,8 @@
 //! `FOR UPDATE`; (3) `security_revision_state`, always last. No transaction
 //! in the tree takes another store's singleton after this one, so the
 //! order composes with the connection store's. The evidence insert comes
-//! after all three and locks no shared row.
+//! after all three and locks no shared row; the journal append after it
+//! takes the authority-event state row, which is every producer's last lock.
 //!
 //! Errors carry a classification and a static operation label only -- no
 //! SQL, no values, no token material. The plaintext token exists in one
@@ -688,10 +691,14 @@ struct ChangeEvidence<'a> {
 }
 
 /// Append one evidence row inside the caller's transaction, after its
-/// outbox row. The row's `event_id` is minted here, once; `committed_at`
-/// is the database clock's. Any failure is returned for the caller to roll
-/// back, so the change never commits without it -- and is never reported
-/// as `Conflict`, which on rotate means exactly "the token is revoked".
+/// outbox row, and journal it for delivery (migration 21). The row's
+/// `event_id` is minted here, once, and the journal carries the same one;
+/// `committed_at` is the database clock's. Any failure is returned for the
+/// caller to roll back, so the change never commits without both -- and is
+/// never reported as `Conflict`, which on rotate means exactly "the token
+/// is revoked". A full journal is `Unavailable`: the change is refused
+/// rather than an accepted event evicted. A failed evidence insert is
+/// counted here, a failed or refused append by the journal.
 async fn record_change_evidence(
     client: &deadpool_postgres::Object,
     evidence: &ChangeEvidence<'_>,
@@ -719,6 +726,7 @@ async fn record_change_evidence(
         )
         .await
         .map_err(|error| {
+            super::postgres_authority_events::record_evidence_failure();
             let classified = classify_query(error, OPERATION_CHANGE_EVIDENCE);
             if classified.kind() == RepositoryErrorKind::Conflict {
                 RepositoryError::new(RepositoryErrorKind::Internal, OPERATION_CHANGE_EVIDENCE)
@@ -726,7 +734,32 @@ async fn record_change_evidence(
                 classified
             }
         })?;
-    Ok(())
+    super::postgres_authority_events::append_to_journal(
+        client,
+        super::postgres_authority_events::JournalSource::ServiceTokenChange,
+        &event_id,
+    )
+    .await
+    .map_err(journal_failure)
+}
+
+/// Classify a refused or failed journal append the way the evidence insert
+/// is classified: never `Conflict`.
+fn journal_failure(error: super::postgres_authority_events::JournalAppendError) -> RepositoryError {
+    use super::postgres_authority_events::{JournalAppendError, OPERATION_JOURNAL_APPEND};
+    match error {
+        JournalAppendError::CapacityExhausted => {
+            RepositoryError::new(RepositoryErrorKind::Unavailable, OPERATION_JOURNAL_APPEND)
+        }
+        JournalAppendError::Store(error) => {
+            let classified = classify_query(error, OPERATION_JOURNAL_APPEND);
+            if classified.kind() == RepositoryErrorKind::Conflict {
+                RepositoryError::new(RepositoryErrorKind::Internal, OPERATION_JOURNAL_APPEND)
+            } else {
+                classified
+            }
+        }
+    }
 }
 
 /// COMMIT on success, ROLLBACK on failure. A future dropped between BEGIN

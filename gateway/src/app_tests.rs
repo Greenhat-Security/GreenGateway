@@ -7,11 +7,12 @@ use futures_util::StreamExt;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use rmcp::{
     model::{
-        CallToolRequestParams as RmcpCallToolRequestParams, CallToolResult as RmcpCallToolResult,
+        CallToolRequestParams as RmcpCallToolRequestParams,
+        CallToolResponse as RmcpCallToolResponse, CallToolResult as RmcpCallToolResult,
         ErrorData as RmcpErrorData, Implementation, JsonObject as RmcpJsonObject,
         ListToolsResult as RmcpListToolsResult,
         PaginatedRequestParams as RmcpPaginatedRequestParams,
-        ServerCapabilities as RmcpServerCapabilities, ServerInfo as RmcpServerInfo,
+        ServerCapabilities as RmcpServerCapabilities, ServerConfig as RmcpServerConfig,
         Tool as RmcpTool,
     },
     service::{RequestContext as RmcpRequestContext, RoleServer as RmcpRoleServer},
@@ -205,6 +206,7 @@ fn test_config(cors_allow_origins: Vec<&str>) -> config::Config {
         readiness_probe_cache_ms: config::DEFAULT_READINESS_PROBE_CACHE_MS,
         cluster_status_expose_hostnames: false,
         audit_postgres_retention_days: None,
+        authority_events: Default::default(),
         tool_runtime_default_timeout_ms: config::DEFAULT_TOOL_RUNTIME_DEFAULT_TIMEOUT_MS,
         csrf_enabled: true,
         csrf_cookie_name: "csrf_token".to_owned(),
@@ -1737,6 +1739,10 @@ fn admin_routes_keep_default_api_prefix_and_remap_custom_api_under_v1() {
         default_routes.policy_validate_route,
         POLICY_VALIDATE_ADMIN_ROUTE
     );
+    assert_eq!(
+        default_routes.policy_convert_route,
+        POLICY_CONVERT_ADMIN_ROUTE
+    );
     assert_eq!(default_routes.policy_rules_route, POLICY_RULES_ADMIN_ROUTE);
     assert_eq!(default_routes.policy_rule_route, POLICY_RULE_ADMIN_ROUTE);
     assert_eq!(
@@ -1852,6 +1858,7 @@ fn admin_routes_keep_default_api_prefix_and_remap_custom_api_under_v1() {
         custom_routes.policy_validate_route,
         "/v1/ops/policy/validate"
     );
+    assert_eq!(custom_routes.policy_convert_route, "/v1/ops/policy/convert");
     assert_eq!(custom_routes.policy_rules_route, "/v1/ops/policy/rules");
     assert_eq!(custom_routes.policy_rule_route, "/v1/ops/policy/rules/{id}");
     assert_eq!(
@@ -8603,6 +8610,14 @@ fn expected_ha_metric_names() -> Vec<&'static str> {
         metrics::AUDIT_STREAM_CONNECTIONS_TOTAL,
         metrics::AUDIT_STREAM_REPLAY_BACKLOG_EVENTS,
         metrics::AUDIT_STREAM_DUPLICATE_POSITIONS_TOTAL,
+        metrics::AUTHORITY_EVENT_JOURNAL_RETAINED,
+        metrics::AUTHORITY_EVENT_JOURNAL_CAPACITY,
+        metrics::AUTHORITY_EVENT_UNDELIVERED,
+        metrics::AUTHORITY_EVENT_OLDEST_UNDELIVERED_AGE_SECONDS,
+        metrics::AUTHORITY_EVENT_DELIVERED_TOTAL,
+        metrics::AUTHORITY_EVENT_DELIVERY_FAILURES_TOTAL,
+        metrics::AUTHORITY_EVENT_CAPACITY_REFUSALS_TOTAL,
+        metrics::AUTHORITY_EVENT_EVIDENCE_FAILURES_TOTAL,
     ]);
     names
 }
@@ -8648,6 +8663,11 @@ fn ha_label_vocabularies() -> Vec<(&'static str, &'static str, Vec<&'static str>
             metrics::DISCOVERY_PROJECTOR_ERRORS_TOTAL,
             "kind",
             discovery::projector::PROJECTOR_ERROR_KINDS.to_vec(),
+        ),
+        (
+            metrics::AUTHORITY_EVENT_DELIVERY_FAILURES_TOTAL,
+            "kind",
+            authority_events::dispatcher::FAILURE_KINDS.to_vec(),
         ),
         (
             metrics::AUDIT_STREAM_CONNECTIONS_TOTAL,
@@ -8902,6 +8922,26 @@ async fn synthetic_ha_run() {
         }
         record_audit_stream_replay_backlog(512);
         record_audit_stream_duplicates(1);
+
+        // Authority-event delivery: the journal gauges, every failure step,
+        // a delivered batch and both kinds of refused mutation. None names
+        // an event, an actor, a resource or a position.
+        authority_events::dispatcher::record_journal_stats(
+            &storage::postgres_authority_events::JournalStats {
+                retained: 7,
+                capacity: 1_000_000,
+                head: 41,
+                cursor: Some(38),
+                first_retained: Some(35),
+                oldest_undelivered_age_secs: Some(12.5),
+            },
+        );
+        for kind in authority_events::dispatcher::FAILURE_KINDS {
+            authority_events::dispatcher::record_failure(kind);
+        }
+        authority_events::dispatcher::record_delivered(3);
+        storage::postgres_authority_events::record_capacity_refusal();
+        storage::postgres_authority_events::record_evidence_failure();
     }
 }
 
@@ -10998,7 +11038,7 @@ async fn policy_put_with_invalid_policy_returns_errors_without_persisting_or_swa
             Method::PUT,
             POLICY_ADMIN_ROUTE,
             Some(test_principal(&["admin"])),
-            Some(r#"{ "schema_version": "1.0.0" }"#.to_owned()),
+            Some(r#"{ "schema_version": "2.0.0" }"#.to_owned()),
             Some(&current_etag),
         ))
         .await
@@ -11955,16 +11995,25 @@ fn explicit_hidden_binding_fields_are_secret_authority_intent() {
         json!({"tls": {"ca_bundle_alias": "ca"}}),
         json!({"tls": {"client_certificate_id": "certificate"}}),
         json!({"tls": {"client_private_key_id": null}}),
+        json!({"caller_assertion": {"signing_key_id": "alias"}}),
+        json!({"caller_assertion": {"published_keys": [{"signing_key_id": "alias"}]}}),
     ] {
         assert!(has_explicit_connection_binding_intent(&candidate));
     }
     assert!(!has_explicit_connection_binding_intent(&json!({
         "authentication": {"secret_configured": true},
+        "caller_assertion": {
+            "signing_key_configured": true,
+            "published_keys": [{"signing_key_configured": true}]
+        },
         "tls": {
             "ca_bundle_configured": true,
             "client_certificate_configured": true,
             "client_private_key_configured": true
         }
+    })));
+    assert!(!has_explicit_connection_binding_intent(&json!({
+        "caller_assertion": null
     })));
 }
 
@@ -12227,6 +12276,213 @@ fn replacement_keeps_an_omitted_caller_assertion_and_removes_it_only_on_null() {
     assert!(plain.caller_assertion.is_none());
 }
 
+fn rotating_caller_assertion_connection() -> connections::model::ConnectionWrite {
+    let current: connections::model::ConnectionWrite = serde_json::from_value(json!({
+        "display_name": "Attested API",
+        "enabled": true,
+        "kind": "http_api",
+        "endpoint": {
+            "base_url": "https://billing.example.test",
+            "base_path": "/"
+        },
+        "authentication": {"type": "none"},
+        "caller_assertion": {
+            "signing_key_id": "assertion-key-current-canary",
+            "kid": "gw-test-1",
+            "algorithm": "es256",
+            "issuer": "https://gateway.example.test",
+            "audience": "https://billing.example.test",
+            "token_type": "caller-assertion+jwt",
+            "header_name": "x-caller-assertion",
+            "lifetime_seconds": 60,
+            "published_keys": [{
+                "signing_key_id": "assertion-key-next-canary",
+                "kid": "gw-test-2",
+                "algorithm": "rs256"
+            }]
+        },
+        "tls": {}
+    }))
+    .expect("attested Connection should deserialize");
+    current
+        .validated()
+        .expect("attested Connection should validate")
+}
+
+fn caller_assertion_edit(assertion: Value) -> Value {
+    json!({
+        "display_name": "Attested API",
+        "enabled": true,
+        "kind": "http_api",
+        "endpoint": {
+            "base_url": "https://billing.example.test",
+            "base_path": "/"
+        },
+        "authentication": {"type": "none"},
+        "caller_assertion": assertion,
+        "tls": {}
+    })
+}
+
+#[test]
+fn replacement_keeps_caller_assertion_key_aliases_by_kid_through_a_rotation() {
+    // The admin UI edits the block without ever seeing its aliases: it marks
+    // each key it keeps, and the gateway keeps the alias stored under that
+    // key's `kid` and algorithm.
+    let current = rotating_caller_assertion_connection();
+    let unchanged = caller_assertion_edit(json!({
+        "signing_key_configured": true,
+        "kid": "gw-test-1",
+        "algorithm": "es256",
+        "issuer": "https://gateway.example.test",
+        "audience": "https://billing.example.test",
+        "token_type": "caller-assertion+jwt",
+        "header_name": "X-Caller-Assertion",
+        "lifetime_seconds": 60,
+        "published_keys": [{
+            "signing_key_configured": true,
+            "kid": "gw-test-2",
+            "algorithm": "rs256"
+        }]
+    }));
+    assert!(!has_explicit_connection_binding_intent(&unchanged));
+    let kept = parse_connection_write_body(&Bytes::from(unchanged.to_string()), &current)
+        .expect("marked keys should keep their stored aliases");
+    assert_eq!(kept.caller_assertion, current.caller_assertion);
+    assert!(!current.requires_secrets_write_to_replace(&kept));
+
+    let mut longer = unchanged.clone();
+    longer["caller_assertion"]["lifetime_seconds"] = json!(120);
+    let longer = parse_connection_write_body(&Bytes::from(longer.to_string()), &current)
+        .expect("an edit of another field should keep both aliases");
+    let assertion = longer.caller_assertion.as_ref().expect("block kept");
+    assert_eq!(assertion.lifetime_seconds, 120);
+    assert_eq!(assertion.signing_key_id, "assertion-key-current-canary");
+    assert_eq!(
+        assertion.published_keys[0].signing_key_id,
+        "assertion-key-next-canary"
+    );
+    assert!(current.requires_secrets_write_to_replace(&longer));
+
+    // Rotation step 3: the next key signs and the previous one stays published.
+    let promoted = caller_assertion_edit(json!({
+        "signing_key_configured": true,
+        "kid": "gw-test-2",
+        "algorithm": "rs256",
+        "issuer": "https://gateway.example.test",
+        "audience": "https://billing.example.test",
+        "token_type": "caller-assertion+jwt",
+        "header_name": "x-caller-assertion",
+        "lifetime_seconds": 60,
+        "published_keys": [{
+            "signing_key_configured": true,
+            "kid": "gw-test-1",
+            "algorithm": "es256"
+        }]
+    }));
+    let promoted = parse_connection_write_body(&Bytes::from(promoted.to_string()), &current)
+        .expect("a promotion should move each alias with its kid");
+    let assertion = promoted.caller_assertion.as_ref().expect("block kept");
+    assert_eq!(assertion.kid, "gw-test-2");
+    assert_eq!(assertion.signing_key_id, "assertion-key-next-canary");
+    assert_eq!(assertion.published_keys[0].kid, "gw-test-1");
+    assert_eq!(
+        assertion.published_keys[0].signing_key_id,
+        "assertion-key-current-canary"
+    );
+
+    // A marked key next to a newly named one: only the new alias is explicit.
+    let mut added = unchanged.clone();
+    added["caller_assertion"]["published_keys"] = json!([{
+        "signing_key_id": "assertion-key-third",
+        "kid": "gw-test-3",
+        "algorithm": "es256"
+    }]);
+    assert!(has_explicit_connection_binding_intent(&added));
+    let added = parse_connection_write_body(&Bytes::from(added.to_string()), &current)
+        .expect("a newly named key should be accepted beside a marked one");
+    let assertion = added.caller_assertion.as_ref().expect("block kept");
+    assert_eq!(assertion.signing_key_id, "assertion-key-current-canary");
+    assert_eq!(
+        assertion.published_keys[0].signing_key_id,
+        "assertion-key-third"
+    );
+}
+
+#[test]
+fn caller_assertion_key_markers_that_match_no_stored_key_fail_closed() {
+    let current = rotating_caller_assertion_connection();
+    let signing = |overrides: Value| {
+        let mut assertion = json!({
+            "signing_key_configured": true,
+            "kid": "gw-test-1",
+            "algorithm": "es256",
+            "issuer": "https://gateway.example.test",
+            "audience": "https://billing.example.test",
+            "token_type": "caller-assertion+jwt",
+            "header_name": "x-caller-assertion",
+            "lifetime_seconds": 60
+        });
+        for (field, value) in overrides.as_object().expect("overrides are an object") {
+            assertion[field] = value.clone();
+        }
+        caller_assertion_edit(assertion)
+    };
+
+    for (invalid, reason) in [
+        (signing(json!({"kid": "gw-test-9"})), "a kid nothing stores"),
+        (
+            signing(json!({"algorithm": "rs256"})),
+            "a stored kid under the other algorithm",
+        ),
+        (
+            signing(json!({"signing_key_configured": false})),
+            "a cleared key",
+        ),
+        (
+            signing(json!({"signing_key_id": "assertion-key-guess"})),
+            "a marker beside an explicit alias",
+        ),
+        (
+            signing(json!({"signing_key_configured": "yes"})),
+            "a non-boolean marker",
+        ),
+        (
+            signing(json!({"published_keys": [{
+                "signing_key_configured": true,
+                "kid": "gw-test-2",
+                "algorithm": "es256"
+            }]})),
+            "a published key under the other algorithm",
+        ),
+        (
+            signing(json!({"published_keys": ["gw-test-2"]})),
+            "a published key that is not an object",
+        ),
+    ] {
+        let error = parse_connection_write_body(&Bytes::from(invalid.to_string()), &current)
+            .expect_err(reason);
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST, "{reason}");
+        let rendered = format!("{error:?}");
+        assert!(
+            !rendered.contains("assertion-key-current-canary"),
+            "{reason}"
+        );
+        assert!(!rendered.contains("assertion-key-next-canary"), "{reason}");
+    }
+
+    // With no stored block there is no alias to keep.
+    let mut unattested = current.clone();
+    unattested.caller_assertion = None;
+    let error =
+        parse_connection_write_body(&Bytes::from(signing(json!({})).to_string()), &unattested)
+            .expect_err("a marker with nothing stored must fail closed");
+    assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+
+    // A create never retains anything, so a marker is an unknown field there.
+    assert!(parse_connection_create_body(&Bytes::from(signing(json!({})).to_string())).is_err());
+}
+
 #[tokio::test]
 async fn managed_openapi_preview_and_register_enforce_permissions_and_revisions() {
     let connection_db = TempDb::new("connection-openapi-admin-guards");
@@ -12465,6 +12721,412 @@ async fn managed_openapi_preview_and_register_enforce_permissions_and_revisions(
     assert_eq!(cleared["registered_tool_names"], json!([]));
     assert_eq!(cleared["total_count"], json!(0));
     assert_eq!(cleared["removed_count"], json!(1));
+}
+
+/// Create a managed OpenAPI Connection with no authentication; returns its
+/// ID and ETag.
+async fn create_managed_openapi_connection(
+    router: &Router,
+    display_name: &str,
+) -> (String, String) {
+    let list = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::GET,
+            CONNECTIONS_ADMIN_ROUTE,
+            Some(test_principal(&["connections-reader"])),
+            None,
+            None,
+            false,
+        ))
+        .await
+        .expect("connection list should complete");
+    let collection_etag = list
+        .headers()
+        .get(CONNECTION_COLLECTION_ETAG_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .expect("connection list should include collection ETag")
+        .to_owned();
+    let created = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::POST,
+            CONNECTIONS_ADMIN_ROUTE,
+            Some(test_principal(&["connections-editor"])),
+            Some(managed_openapi_connection_body(display_name)),
+            Some(&collection_etag),
+            true,
+        ))
+        .await
+        .expect("managed OpenAPI connection create should complete");
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let connection_etag = created
+        .headers()
+        .get(header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .expect("created connection should include ETag")
+        .to_owned();
+    let connection_id = json_body(created).await["id"]
+        .as_str()
+        .expect("created connection should include ID")
+        .to_owned();
+    (connection_id, connection_etag)
+}
+
+/// Preview `spec` on a managed OpenAPI Connection and register `selected`
+/// from exactly that preview; returns the registration response.
+async fn preview_and_register_managed_openapi(
+    router: &Router,
+    connection_id: &str,
+    connection_etag: &str,
+    spec: &str,
+    selected: &[&str],
+) -> Response {
+    let preview = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::POST,
+            &format!("{CONNECTIONS_ADMIN_ROUTE}/{connection_id}/openapi/preview"),
+            Some(test_principal(&["openapi-tools-reader"])),
+            Some(json!({ "spec": spec }).to_string()),
+            None,
+            true,
+        ))
+        .await
+        .expect("managed OpenAPI preview should complete");
+    assert_eq!(preview.status(), StatusCode::OK);
+    let preview = json_body(preview).await;
+    let confirmations = preview["security_confirmations"]
+        .as_array()
+        .expect("preview should list security confirmations")
+        .iter()
+        .filter(|confirmation| {
+            selected
+                .iter()
+                .any(|name| confirmation["tool_name"] == json!(name))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::POST,
+            &format!("{CONNECTIONS_ADMIN_ROUTE}/{connection_id}/openapi/register"),
+            Some(test_principal(&["openapi-tools-writer"])),
+            Some(
+                json!({
+                    "spec": spec,
+                    "spec_digest": preview["spec_digest"],
+                    "expected_spec_revision": preview["spec_revision"],
+                    "expected_catalog_revision": preview["catalog_revision"],
+                    "selected_tool_names": selected,
+                    "security_confirmations": confirmations,
+                })
+                .to_string(),
+            ),
+            Some(connection_etag),
+            true,
+        ))
+        .await
+        .expect("managed OpenAPI registration should complete")
+}
+
+/// The connection admin router, gating converted managed OpenAPI catalogs
+/// as cluster mode does (issue #443); `overrides` may supply the roster.
+fn gated_connection_admin_router(
+    connection_db: &TempDb,
+    policy: &TempPolicyFile,
+    audit_log: audit::AuditLog,
+    overrides: GatewayAppBuildOverrides,
+) -> Router {
+    let config = connection_admin_config(connection_db, policy, config::DEFAULT_ADMIN_PREFIX);
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let app = gateway_app_with_process_started_at_and_overrides(
+        config,
+        recorder.handle(),
+        audit_log,
+        test_audit_event_sender(),
+        Instant::now(),
+        GatewayAppBuildOverrides {
+            gate_converted_openapi_catalogs: true,
+            ..overrides
+        },
+    )
+    .expect("gated connection admin app should build");
+    match app.http {
+        GatewayApp::Unified(router) => router,
+        GatewayApp::Split { .. } => panic!("gated connection admin app should be unified"),
+    }
+}
+
+#[tokio::test]
+async fn managed_openapi_preview_reports_swagger2_conversion_and_registers_converted_tools() {
+    let connection_db = TempDb::new("connection-openapi-swagger2-preview");
+    let policy = TempPolicyFile::new(&connection_policy_document_string());
+    let router = connection_admin_router(&connection_db, &policy, test_audit_log());
+    let (connection_id, connection_etag) =
+        create_managed_openapi_connection(&router, "Managed Swagger").await;
+    let preview_uri = format!("{CONNECTIONS_ADMIN_ROUTE}/{connection_id}/openapi/preview");
+    let register_uri = format!("{CONNECTIONS_ADMIN_ROUTE}/{connection_id}/openapi/register");
+
+    let openapi_preview = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::POST,
+            &preview_uri,
+            Some(test_principal(&["openapi-tools-reader"])),
+            Some(json!({ "spec": widget_openapi_spec() }).to_string()),
+            None,
+            true,
+        ))
+        .await
+        .expect("OpenAPI 3.x preview should complete");
+    assert_eq!(openapi_preview.status(), StatusCode::OK);
+    assert!(
+        json_body(openapi_preview).await.get("conversion").is_none(),
+        "an OpenAPI 3.x preview keeps its previous shape"
+    );
+
+    let swagger_spec = json!({
+        "swagger": "2.0",
+        "info": { "title": "Widget API", "version": "1.0.0" },
+        "basePath": "/v1",
+        "paths": {
+            "/widgets/{widgetId}": {
+                "get": {
+                    "operationId": "getWidget",
+                    "summary": "Fetch a widget",
+                    "parameters": [
+                        { "name": "widgetId", "in": "path", "required": true, "type": "string" }
+                    ]
+                }
+            },
+            "/widgets": {
+                "post": {
+                    "operationId": "createWidgets",
+                    "parameters": [
+                        { "name": "a", "in": "body", "schema": { "type": "object" } },
+                        { "name": "b", "in": "body", "schema": { "type": "object" } }
+                    ]
+                }
+            }
+        }
+    })
+    .to_string();
+    let preview = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::POST,
+            &preview_uri,
+            Some(test_principal(&["openapi-tools-reader"])),
+            Some(json!({ "spec": swagger_spec }).to_string()),
+            None,
+            true,
+        ))
+        .await
+        .expect("Swagger 2.0 preview should complete");
+    assert_eq!(preview.status(), StatusCode::OK);
+    let preview = json_body(preview).await;
+    assert_eq!(
+        preview["conversion"],
+        json!({
+            "source_format": "swagger_2_0",
+            "warnings": [
+                {
+                    "code": "base_path_not_in_paths",
+                    "message": "basePath is not part of generated path templates; include it in the Connection base path",
+                    "operation_omitted": false,
+                    "subject": "/v1"
+                },
+                {
+                    "code": "multiple_body_parameters",
+                    "message": "the operation has more than one body parameter; it was left out",
+                    "operation_omitted": true,
+                    "method": "POST",
+                    "path_template": "/widgets"
+                }
+            ]
+        })
+    );
+    assert_eq!(
+        preview["tools"]
+            .as_array()
+            .expect("preview should list tools")
+            .iter()
+            .map(|tool| tool["name"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!("getWidget")],
+        "the omitted operation generates no tool"
+    );
+
+    let registered = router
+        .oneshot(connection_admin_request(
+            Method::POST,
+            &register_uri,
+            Some(test_principal(&["openapi-tools-writer"])),
+            Some(
+                json!({
+                    "spec": swagger_spec,
+                    "spec_digest": preview["spec_digest"],
+                    "expected_spec_revision": preview["spec_revision"],
+                    "expected_catalog_revision": preview["catalog_revision"],
+                    "selected_tool_names": ["getWidget"],
+                    "security_confirmations": preview["security_confirmations"],
+                })
+                .to_string(),
+            ),
+            Some(&connection_etag),
+            true,
+        ))
+        .await
+        .expect("Swagger 2.0 registration should complete");
+    assert_eq!(registered.status(), StatusCode::CREATED);
+    let registered = json_body(registered).await;
+    assert_eq!(registered["registered_tool_names"], json!(["getWidget"]));
+}
+
+/// Converted managed OpenAPI catalogs gated as cluster mode gates them
+/// (issue #443), with no roster to ask: every write that would store one --
+/// registering it, an overlay over it, refreshing to it -- is refused with
+/// `503 roster_unavailable` and changes nothing, while preview and an
+/// OpenAPI 3.x registration never ask.
+#[tokio::test]
+async fn managed_openapi_gated_swagger2_writes_fail_closed_without_a_roster() {
+    let connection_db = TempDb::new("connection-openapi-swagger2-gated");
+    let policy = TempPolicyFile::new(&connection_policy_document_string());
+    let swagger_spec = json!({
+        "swagger": "2.0",
+        "info": { "title": "Widget API", "version": "1.0.0" },
+        "paths": {
+            "/widgets": {
+                "get": {
+                    "operationId": "listWidgets",
+                    "responses": { "200": { "description": "Widgets" } }
+                }
+            }
+        }
+    })
+    .to_string();
+
+    // A replica that does not gate stores the converted catalog first.
+    let ungated = connection_admin_router(&connection_db, &policy, test_audit_log());
+    let (connection_id, connection_etag) =
+        create_managed_openapi_connection(&ungated, "Gated Swagger").await;
+    let registered = preview_and_register_managed_openapi(
+        &ungated,
+        &connection_id,
+        &connection_etag,
+        &swagger_spec,
+        &["listWidgets"],
+    )
+    .await;
+    assert_eq!(registered.status(), StatusCode::CREATED);
+    let catalog_revision = json_body(registered).await["catalog_revision"]
+        .as_u64()
+        .expect("registration should return the catalog revision");
+    drop(ungated);
+
+    let router = gated_connection_admin_router(
+        &connection_db,
+        &policy,
+        test_audit_log(),
+        GatewayAppBuildOverrides::default(),
+    );
+    let assert_refused = |status: StatusCode, body: &Value, write: &str| {
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{write}: {body}");
+        assert_eq!(
+            body["reason"],
+            json!("roster_unavailable"),
+            "{write}: {body}"
+        );
+    };
+
+    let refused = preview_and_register_managed_openapi(
+        &router,
+        &connection_id,
+        &connection_etag,
+        &swagger_spec,
+        &["listWidgets"],
+    )
+    .await;
+    let status = refused.status();
+    assert_refused(status, &json_body(refused).await, "registration");
+
+    let overlay_uri = format!("{CONNECTIONS_ADMIN_ROUTE}/{connection_id}/overlay");
+    let overlay_etag = format!("\"overlay:{connection_id}:c1:r{catalog_revision}:o0\"");
+    let refused = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::PUT,
+            &overlay_uri,
+            Some(test_principal(&["connections-editor"])),
+            Some(
+                json!({
+                    "schema_version": "0.1.0",
+                    "tools": { "listWidgets": { "description": "List every widget" } }
+                })
+                .to_string(),
+            ),
+            Some(&overlay_etag),
+            true,
+        ))
+        .await
+        .expect("overlay PUT should complete");
+    let status = refused.status();
+    assert_refused(status, &json_body(refused).await, "overlay");
+
+    let refused = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::POST,
+            &format!("{CONNECTIONS_ADMIN_ROUTE}/{connection_id}/refresh"),
+            Some(test_principal(&["connections-refresher"])),
+            None,
+            Some(&connection_etag),
+            true,
+        ))
+        .await
+        .expect("refresh should complete");
+    let status = refused.status();
+    assert_refused(status, &json_body(refused).await, "refresh");
+
+    // Nothing was written: the overlay is still absent at the catalog
+    // revision the ungated replica registered.
+    let current = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::GET,
+            &overlay_uri,
+            Some(test_principal(&["connections-reader"])),
+            None,
+            None,
+            false,
+        ))
+        .await
+        .expect("overlay read should complete");
+    assert_eq!(current.status(), StatusCode::OK);
+    assert_eq!(
+        current
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok()),
+        Some(overlay_etag.as_str())
+    );
+    assert_eq!(json_body(current).await["document"], Value::Null);
+
+    let openapi = preview_and_register_managed_openapi(
+        &router,
+        &connection_id,
+        &connection_etag,
+        widget_openapi_spec(),
+        &["createWidget"],
+    )
+    .await;
+    assert_eq!(
+        openapi.status(),
+        StatusCode::CREATED,
+        "an OpenAPI 3.x document never asks the gate"
+    );
 }
 
 #[test]
@@ -18752,7 +19414,31 @@ async fn policy_validate_accepts_valid_candidate_without_changing_live_policy_or
         .expect("policy validate should complete");
 
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(json_body(response).await, json!({ "valid": true }));
+    let candidate = policy_document_string("validated-only", "test:new");
+    let body = json_body(response).await;
+    // A 0.x document: valid, a source digest over the bytes sent, no
+    // semantic digest (0.x defines no normalization), and the one stated
+    // limitation of a document whose routes carry no stable id.
+    assert_eq!(
+        body,
+        json!({
+            "valid": true,
+            "schema_version": "0.1.0",
+            "diagnostics": [{
+                "code": "stable_ids_unavailable",
+                "severity": "warning",
+                "pointer": "",
+                "message": rbac::policy_document::IssueCode::StableIdsUnavailable.message(),
+                "remediation": rbac::policy_document::IssueCode::StableIdsUnavailable.remediation(),
+                "blocks": { "simulation": false, "tests": false, "publication": false, "evidence": true }
+            }],
+            "source_digest": canonical_json::source_digest(
+                "application/json",
+                "0.1.0",
+                candidate.as_bytes()
+            ),
+        })
+    );
     assert_eq!(
         fs::read_to_string(&policy.path).expect("policy file should read"),
         before_contents
@@ -18788,7 +19474,7 @@ async fn policy_validate_invalid_candidate_returns_errors_without_changes() {
             Method::POST,
             POLICY_VALIDATE_ADMIN_ROUTE,
             Some(test_principal(&["policy-reader"])),
-            Some(r#"{ "schema_version": "1.0.0" }"#.to_owned()),
+            Some(r#"{ "schema_version": "2.0.0" }"#.to_owned()),
             None,
         ))
         .await
@@ -18859,6 +19545,433 @@ async fn policy_validate_rejects_relative_route_prefix_without_changes() {
     assert_eq!(json_body(after_get).await["id"], json!("initial-policy"));
 }
 
+/// The test policy as policy v1: the same members, `schema_version`
+/// `1.0.0`, and a stable id on every route.
+fn v1_policy_document(id: &str, test_permission: &str) -> Value {
+    let mut policy = policy_document(id, test_permission);
+    policy["schema_version"] = json!("1.0.0");
+    for (index, route) in policy["routes"]
+        .as_array_mut()
+        .expect("the test policy has routes")
+        .iter_mut()
+        .enumerate()
+    {
+        route["id"] = json!(format!("route-{index}"));
+    }
+    policy
+}
+
+#[tokio::test]
+async fn policy_validate_reports_v1_diagnostics_and_both_digests() {
+    let policy = TempPolicyFile::new(&policy_document_string("initial-policy", "test:old"));
+    let router = policy_admin_router(Some(&policy), test_audit_log());
+    let candidate = v1_policy_document("validated-v1", "test:new").to_string();
+
+    let response = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::POST,
+            POLICY_VALIDATE_ADMIN_ROUTE,
+            Some(test_principal(&["policy-reader"])),
+            Some(candidate.clone()),
+            None,
+        ))
+        .await
+        .expect("v1 validate should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["valid"], json!(true));
+    assert_eq!(body["schema_version"], json!("1.0.0"));
+    assert_eq!(body["diagnostics"], json!([]));
+    assert!(body.get("errors").is_none(), "{body}");
+    assert_eq!(
+        body["source_digest"],
+        json!(canonical_json::source_digest(
+            "application/json",
+            "1.0.0",
+            candidate.as_bytes()
+        ))
+    );
+    let semantic = body["semantic_digest"]
+        .as_str()
+        .expect("a v1 document has a semantic digest")
+        .to_owned();
+    assert!(
+        semantic.starts_with("sha256:") && semantic.len() == 71,
+        "{semantic}"
+    );
+
+    // The same policy respelled -- other whitespace and member order -- has
+    // another source digest and the same semantic one.
+    let respelled = serde_json::to_string_pretty(&v1_policy_document("validated-v1", "test:new"))
+        .expect("serialize");
+    let body = json_body(
+        router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::POST,
+                POLICY_VALIDATE_ADMIN_ROUTE,
+                Some(test_principal(&["policy-reader"])),
+                Some(respelled),
+                None,
+            ))
+            .await
+            .expect("respelled validate should complete"),
+    )
+    .await;
+    assert_eq!(body["semantic_digest"], json!(semantic));
+    assert_ne!(
+        body["source_digest"],
+        json!(canonical_json::source_digest(
+            "application/json",
+            "1.0.0",
+            candidate.as_bytes()
+        ))
+    );
+
+    // Every structural problem is reported, each with its pointer, and the
+    // errors list carries one detail per error diagnostic.
+    let mut broken = v1_policy_document("broken-v1", "test:new");
+    broken["routes"][1]["id"] = json!("route-0");
+    broken["routes"][2]
+        .as_object_mut()
+        .expect("route")
+        .remove("id");
+    broken["routes"][3]["weight"] = json!(1);
+    let response = router
+        .oneshot(policy_admin_request(
+            Method::POST,
+            POLICY_VALIDATE_ADMIN_ROUTE,
+            Some(test_principal(&["policy-reader"])),
+            Some(broken.to_string()),
+            None,
+        ))
+        .await
+        .expect("broken v1 validate should complete");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert_eq!(body["valid"], json!(false));
+    let found: Vec<(Value, Value)> = body["diagnostics"]
+        .as_array()
+        .expect("diagnostics")
+        .iter()
+        .map(|diagnostic| (diagnostic["code"].clone(), diagnostic["pointer"].clone()))
+        .collect();
+    assert_eq!(
+        found,
+        vec![
+            (json!("element_id_duplicate"), json!("/routes/1/id")),
+            (json!("element_id_missing"), json!("/routes/2/id")),
+            (json!("unknown_member"), json!("/routes/3/weight")),
+        ]
+    );
+    assert_eq!(body["diagnostics"][0]["element_id"], json!("route-0"));
+    assert_eq!(body["errors"].as_array().map(Vec::len), Some(3));
+    assert!(body.get("source_digest").is_none(), "{body}");
+    assert!(body.get("semantic_digest").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn policy_convert_returns_the_v1_document_without_changing_the_live_policy() {
+    let policy = TempPolicyFile::new(&policy_document_string("initial-policy", "test:old"));
+    let capture = audit::sink::tests::CaptureSink::new();
+    let router = policy_admin_router(
+        Some(&policy),
+        audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>),
+    );
+    let before_contents = fs::read_to_string(&policy.path).expect("policy file should read");
+    let get_response = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::GET,
+            POLICY_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            None,
+            None,
+        ))
+        .await
+        .expect("policy GET should complete");
+    let etag = policy_etag_header(&get_response);
+    let candidate = policy_document_string("converted", "test:new");
+
+    let response = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::POST,
+            POLICY_CONVERT_ADMIN_ROUTE,
+            Some(test_principal(&["policy-reader"])),
+            Some(candidate.clone()),
+            None,
+        ))
+        .await
+        .expect("policy convert should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["converted"], json!(true));
+    assert_eq!(body["source_schema_version"], json!("0.1.0"));
+    assert_eq!(body["schema_version"], json!("1.0.0"));
+    assert_eq!(body["parity"], json!("verified"));
+    assert_eq!(body["diagnostics"], json!([]));
+    assert!(body.get("errors").is_none(), "{body}");
+    assert_eq!(
+        body["source_digest"],
+        json!(canonical_json::source_digest(
+            "application/json",
+            "0.1.0",
+            candidate.as_bytes()
+        ))
+    );
+    // The test policy has routes and no rules or rate overrides: every route
+    // gets `route-N`, and each assignment is listed after the version.
+    let converted = body["policy"].clone();
+    assert_eq!(converted["schema_version"], json!("1.0.0"));
+    assert_eq!(converted["id"], json!("converted"));
+    let routes = converted["routes"].as_array().expect("routes");
+    let changes = body["changes"].as_array().expect("changes");
+    assert_eq!(changes.len(), routes.len() + 1);
+    assert_eq!(changes[0]["code"], json!("schema_version_set"));
+    for (index, route) in routes.iter().enumerate() {
+        assert_eq!(route["id"], json!(format!("route-{index}")));
+        assert_eq!(
+            changes[index + 1],
+            json!({
+                "code": "element_id_assigned",
+                "pointer": format!("/routes/{index}/id"),
+                "element_id": format!("route-{index}"),
+                "message": rbac::policy_conversion::ChangeCode::ElementIdAssigned.message(),
+            })
+        );
+    }
+
+    // Converting changed nothing: same file, same ETag, no policy.changed.
+    assert_eq!(
+        fs::read_to_string(&policy.path).expect("policy file should read"),
+        before_contents
+    );
+    assert!(!capture
+        .events()
+        .iter()
+        .any(|event| event.event_type == audit::event::POLICY_CHANGED));
+
+    // The converted document validates, with the semantic digest the
+    // conversion reported, and can replace the live policy.
+    let validated = json_body(
+        router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::POST,
+                POLICY_VALIDATE_ADMIN_ROUTE,
+                Some(test_principal(&["policy-reader"])),
+                Some(serde_json::to_string_pretty(&converted).expect("serialize")),
+                None,
+            ))
+            .await
+            .expect("validate should complete"),
+    )
+    .await;
+    assert_eq!(validated["valid"], json!(true), "{validated}");
+    assert_eq!(validated["semantic_digest"], body["semantic_digest"]);
+    let put = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::PUT,
+            POLICY_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            Some(converted.to_string()),
+            Some(&etag),
+        ))
+        .await
+        .expect("PUT should complete");
+    assert_eq!(put.status(), StatusCode::OK);
+    let live = json_body(
+        router
+            .oneshot(policy_admin_request(
+                Method::GET,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("policy GET should complete"),
+    )
+    .await;
+    assert_eq!(live["schema_version"], json!("1.0.0"));
+    assert_eq!(live["routes"], converted["routes"]);
+}
+
+#[tokio::test]
+async fn policy_convert_refuses_without_permission_or_a_convertible_document() {
+    let policy = TempPolicyFile::new(&policy_document_string("initial-policy", "test:old"));
+    let router = policy_admin_router(Some(&policy), test_audit_log());
+    let convert = |principal: Option<auth::Principal>, body: String| {
+        router.clone().oneshot(policy_admin_request(
+            Method::POST,
+            POLICY_CONVERT_ADMIN_ROUTE,
+            principal,
+            Some(body),
+            None,
+        ))
+    };
+    let candidate = policy_document_string("converted", "test:new");
+
+    let unauthenticated = convert(None, candidate.clone())
+        .await
+        .expect("convert should complete");
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    let forbidden = convert(Some(test_principal(&["reader"])), candidate)
+        .await
+        .expect("convert should complete");
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+    // A v1 document is not converted again.
+    let response = convert(
+        Some(test_principal(&["policy-reader"])),
+        v1_policy_document("already-v1", "test:new").to_string(),
+    )
+    .await
+    .expect("convert should complete");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert_eq!(body["converted"], json!(false));
+    assert_eq!(body["source_schema_version"], json!("1.0.0"));
+    assert_eq!(
+        body["diagnostics"][0]["code"],
+        json!("conversion_requires_v0")
+    );
+    assert_eq!(body["diagnostics"][0]["pointer"], json!("/schema_version"));
+    assert_eq!(body["errors"].as_array().map(Vec::len), Some(1));
+    assert!(body.get("policy").is_none(), "{body}");
+
+    // An invalid 0.x document is refused in validation's own words.
+    let mut invalid = policy_document("relative-route", "test:new");
+    invalid["routes"][5]["path_prefix"] = json!("__test");
+    let body = json_body(
+        convert(
+            Some(test_principal(&["policy-reader"])),
+            invalid.to_string(),
+        )
+        .await
+        .expect("convert should complete"),
+    )
+    .await;
+    assert_eq!(body["converted"], json!(false));
+    assert_eq!(body["diagnostics"][0]["code"], json!("path_not_absolute"));
+    assert!(
+        body["errors"][0]
+            .as_str()
+            .unwrap_or_default()
+            .contains("routes[5].path_prefix must start with '/'"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn policy_put_accepts_a_v1_document_and_keeps_its_stable_ids() {
+    let policy = TempPolicyFile::new(&policy_document_string("initial-policy", "test:old"));
+    let router = policy_admin_router(Some(&policy), test_audit_log());
+    let get_response = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::GET,
+            POLICY_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            None,
+            None,
+        ))
+        .await
+        .expect("policy GET should complete");
+    let etag = policy_etag_header(&get_response);
+
+    // A v1 document that repeats an id is refused with every problem named,
+    // and nothing is written.
+    let before_contents = fs::read_to_string(&policy.path).expect("policy file should read");
+    let mut duplicate = v1_policy_document("duplicate-ids", "test:new");
+    duplicate["routes"][5]["id"] = json!("route-4");
+    let response = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::PUT,
+            POLICY_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            Some(duplicate.to_string()),
+            Some(&etag),
+        ))
+        .await
+        .expect("duplicate-id PUT should complete");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert_eq!(body["valid"], json!(false));
+    assert!(
+        body["errors"][0]
+            .as_str()
+            .unwrap_or_default()
+            .contains("/routes/5/id"),
+        "{body}"
+    );
+    assert_eq!(
+        fs::read_to_string(&policy.path).expect("policy file should read"),
+        before_contents
+    );
+
+    let response = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::PUT,
+            POLICY_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            Some(v1_policy_document("v1-policy", "test:new").to_string()),
+            Some(&etag),
+        ))
+        .await
+        .expect("v1 PUT should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let etag = policy_etag_header(&response);
+    let body = json_body(response).await;
+    assert_eq!(body["schema_version"], json!("1.0.0"));
+    assert_eq!(body["routes"][5]["id"], json!("route-5"));
+
+    // Persisted with its ids, and enforced: the new reader is admitted by the
+    // route the v1 document now names.
+    let persisted: Value =
+        serde_json::from_str(&fs::read_to_string(&policy.path).expect("policy file should read"))
+            .expect("persisted policy is JSON");
+    assert_eq!(persisted["schema_version"], json!("1.0.0"));
+    assert_eq!(persisted["routes"][0]["id"], json!("route-0"));
+    let new_reader = router
+        .clone()
+        .oneshot(audit_query_request(
+            "/__test/principal",
+            Some(test_principal(&["new-reader"])),
+        ))
+        .await
+        .expect("new-reader request should complete");
+    assert_eq!(new_reader.status(), StatusCode::OK);
+
+    // A rule created through the API in a v1 policy is given the stable id
+    // v1 requires.
+    let response = router
+        .oneshot(policy_admin_request(
+            Method::POST,
+            POLICY_RULES_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            Some(json!({ "path": "/__test/blocked", "action": "deny" }).to_string()),
+            Some(&etag),
+        ))
+        .await
+        .expect("rule POST should complete");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let created = json_body(response).await;
+    let rule_id = created["id"].as_str().expect("an assigned id").to_owned();
+    assert!(
+        rbac::policy_document::is_valid_element_id(&rule_id),
+        "{rule_id}"
+    );
+    let reloaded = rbac::Policy::from_file(&policy.path).expect("the persisted v1 policy reloads");
+    assert_eq!(reloaded.rules[0].id.as_deref(), Some(rule_id.as_str()));
+}
+
 #[tokio::test]
 async fn policy_rule_preview_returns_matches_samples_and_does_not_mutate_policy() {
     let db = TempDb::new("rule-preview");
@@ -18923,6 +20036,8 @@ async fn policy_rule_preview_returns_matches_samples_and_does_not_mutate_policy(
     let body = json_body(response).await;
     assert_eq!(body["match_count"], json!(2));
     assert_eq!(body["scanned_event_count"], json!(3));
+    assert_eq!(body["unevaluated_event_count"], json!(0));
+    assert_eq!(body["unevaluated_reasons"], json!({}));
     assert_eq!(body["scan_truncated"], json!(false));
     assert_eq!(body["complete"], json!(true));
     assert_eq!(body["sample_strategy"], json!("newest_matches"));
@@ -19048,6 +20163,18 @@ async fn policy_rule_preview_contextless_binding_excludes_unclassified_history()
     let body = json_body(response).await;
     assert_eq!(body["match_count"], json!(1));
     assert_eq!(body["samples"][0]["event_id"], json!("match-new"));
+    // The other three scanned observations were never classified, and the
+    // rule is bound to a dispatch, so the evaluator cannot say whether it
+    // matches them. They are reported rather than counted as non-matches, and
+    // the count is a lower bound for the window.
+    assert_eq!(body["scanned_event_count"], json!(4));
+    assert_eq!(body["unevaluated_event_count"], json!(3));
+    assert_eq!(
+        body["unevaluated_reasons"],
+        json!({"missing_dispatch_fact": 3})
+    );
+    assert_eq!(body["scan_truncated"], json!(false));
+    assert_eq!(body["complete"], json!(false));
 }
 
 #[tokio::test]
@@ -22437,6 +23564,21 @@ async fn traffic_endpoint_lifecycle_flags_rule_coverage_and_hot_reload() {
             status_counts: &[(200, 2)],
         },
     );
+    // Classified traffic without a proxy dispatch, as the aggregator records
+    // it. Coverage is judged in that routing context; with none recorded at
+    // all the evaluator would be missing the dispatch fact.
+    for (endpoint_template, call_count) in [("/covered/{id}", 3), ("/open/{id}", 2)] {
+        insert_discovery_routing_context(
+            &discovery_db.path,
+            "GET",
+            endpoint_template,
+            "",
+            "",
+            "",
+            call_count,
+            1,
+        );
+    }
     let policy = TempPolicyFile::new(&traffic_policy_document_with_rules(json!([
         {
             "id": "cover-id-endpoint",
@@ -24734,15 +25876,34 @@ async fn suggestions_admin_dismiss_rejects_non_open_suggestion_without_overwriti
 
 #[test]
 fn endpoint_rule_coverage_without_rules_is_none() {
-    let policy: rbac::Policy = serde_json::from_value(json!({
-        "schema_version": "0.1.0",
-        "default_action": "deny",
-        "roles": {}
-    }))
-    .expect("policy should parse");
+    let policy = policy_eval::CompiledPolicy::for_analysis(
+        serde_json::from_value(json!({
+            "schema_version": "0.1.0",
+            "default_action": "deny",
+            "roles": {}
+        }))
+        .expect("policy should parse"),
+    );
+    let contextless = discovery::query::EndpointRoutingContext {
+        route_host: None,
+        route_path_prefix: None,
+        upstream_origin: None,
+        first_seen: "2024-06-01T12:00:00Z".to_owned(),
+        last_seen: "2024-06-01T12:00:00Z".to_owned(),
+        call_count: 1,
+        distinct_principal_count: 1,
+        covered_by_rule: false,
+        coverage_scope: discovery::query::EndpointCoverageScope::None,
+    };
+    assert_eq!(
+        endpoint_coverage_scope(&policy, "GET", "/anything/{id}", Some(&contextless)),
+        discovery::query::EndpointCoverageScope::None
+    );
+    // With no routing context recorded at all the evaluator is missing the
+    // dispatch fact, so coverage is unknown rather than none.
     assert_eq!(
         endpoint_coverage_scope(&policy, "GET", "/anything/{id}", None),
-        discovery::query::EndpointCoverageScope::None
+        discovery::query::EndpointCoverageScope::Unknown
     );
 }
 
@@ -29493,8 +30654,8 @@ struct TestMcpUpstreamServer {
 }
 
 impl RmcpServerHandler for TestMcpUpstreamServer {
-    fn get_info(&self) -> RmcpServerInfo {
-        RmcpServerInfo::new(RmcpServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> RmcpServerConfig {
+        RmcpServerConfig::new(RmcpServerCapabilities::builder().enable_tools().build())
             .with_server_info(
                 Implementation::new("greengateway-test-upstream", "0.0.0")
                     .with_title("GreenGateway Test Upstream"),
@@ -29517,7 +30678,7 @@ impl RmcpServerHandler for TestMcpUpstreamServer {
         &self,
         request: RmcpCallToolRequestParams,
         _context: RmcpRequestContext<RmcpRoleServer>,
-    ) -> Result<RmcpCallToolResult, RmcpErrorData> {
+    ) -> Result<RmcpCallToolResponse, RmcpErrorData> {
         let arguments = request.arguments.unwrap_or_default();
         let call = json!({
             "name": request.name.to_string(),
@@ -29531,7 +30692,8 @@ impl RmcpServerHandler for TestMcpUpstreamServer {
         Ok(RmcpCallToolResult::structured(json!({
             "remote_tool": request.name.to_string(),
             "arguments": Value::Object(arguments),
-        })))
+        }))
+        .into())
     }
 }
 
@@ -29542,7 +30704,7 @@ async fn spawn_test_mcp_upstream(tool_name: &str) -> TestMcpUpstream {
         calls: Arc::clone(&calls),
     };
     let config = RmcpStreamableHttpServerConfig::default()
-        .with_stateful_mode(false)
+        .with_legacy_session_mode(false)
         .with_json_response(true)
         .disable_allowed_hosts();
     let service = RmcpStreamableHttpService::new(
@@ -33431,6 +34593,261 @@ mod cluster_policy_tests {
                 .iter()
                 .any(|event| event.event_type == audit::event::POLICY_CHANGED),
             "the admitted commit is audited as the policy change it is"
+        );
+    }
+
+    /// Policy v1 is document format 1, and no replica of this build
+    /// advertises it (`cluster_membership::DOCUMENT_VERSION_RANGE`), so the
+    /// policy API refuses to commit one with a `400` and writes nothing. The
+    /// store refuses the same candidate if a caller skips that check, and a
+    /// 0.x document on the same path is committed as before.
+    #[tokio::test]
+    async fn cluster_policy_refuses_to_commit_a_v1_document() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_policy_foundation(&database.dsn).await;
+        let active = initialize(&store, "v1-init").await;
+        let (router, rbac_state) = cluster_policy_router(store.clone());
+        rbac_state
+            .install_revision_snapshot(active.policy.clone(), active.security_revision)
+            .await
+            .expect("the authority's revision should install");
+        let v1 = r#"{
+            "schema_version": "1.0.0",
+            "id": "v1-held",
+            "default_action": "deny",
+            "roles": { "admin": { "permissions": ["admin:policy:read", "admin:policy:write"] } }
+        }"#;
+
+        let before = policy_version_count(&pool).await;
+        let (status, body) = refusal_of(
+            router
+                .clone()
+                .oneshot(admin_request(
+                    Method::PUT,
+                    POLICY_ADMIN_ROUTE,
+                    Some((&active.etag, v1)),
+                ))
+                .await
+                .expect("PUT should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["valid"], json!(false));
+        assert!(
+            body["errors"][0]
+                .as_str()
+                .unwrap_or_default()
+                .contains("cannot be committed in cluster mode"),
+            "{body}"
+        );
+        assert_eq!(policy_version_count(&pool).await, before);
+
+        let candidate = parse_policy_body(&Bytes::from(v1)).expect("a valid v1 document");
+        let refused = PolicyControlPlane::commit(
+            store.as_ref(),
+            PolicyCommitRequest {
+                precondition: PolicyCommitPrecondition::Expected {
+                    etag: active.etag.clone(),
+                },
+                candidate: &candidate,
+                actor_user_id: "test",
+                diff_summary: &DIFF,
+            },
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(storage::PolicyCommitError::Store(_))),
+            "the store must refuse a document no replica reads"
+        );
+        assert_eq!(policy_version_count(&pool).await, before);
+
+        let committed = router
+            .oneshot(admin_request(
+                Method::PUT,
+                POLICY_ADMIN_ROUTE,
+                Some((&active.etag, &cluster_policy_json("v0-after"))),
+            ))
+            .await
+            .expect("PUT should complete");
+        assert_eq!(committed.status(), StatusCode::OK);
+        assert_eq!(policy_version_count(&pool).await, before + 1);
+    }
+
+    /// Issue #443's registered operation through the managed OpenAPI
+    /// register endpoint, against a real roster: storing a catalog
+    /// converted from a Swagger 2.0 document waits for every live member to
+    /// advertise `openapi_swagger2_catalogs`. A refusal is a `409` with the
+    /// stable reason, stores nothing and is audited; an OpenAPI 3.x
+    /// registration never asks; and once the lacking member goes stale the
+    /// same registration is admitted.
+    #[tokio::test]
+    async fn cluster_swagger2_catalogs_wait_for_every_live_member() {
+        use crate::storage::{MemberRegistration, PostgresMembershipStore};
+
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (_, pool) = migrated_policy_foundation(&database.dsn).await;
+        let deployment = "deploy-cluster-swagger2";
+        let membership = cluster_membership::ClusterMembership::new(
+            PostgresMembershipStore::new(
+                pool.clone(),
+                deployment,
+                crate::ha::InstanceIdentity::generate(),
+            ),
+            MemberRegistration {
+                binary_version: env!("CARGO_PKG_VERSION").to_owned(),
+                schema_version: migrations::schema_version_range(),
+                document_version: cluster_membership::DOCUMENT_VERSION_RANGE,
+                fingerprint: "b".repeat(64),
+                capabilities: storage::compatibility::BINARY_CAPABILITIES.to_vec(),
+            },
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+        );
+        membership.register_boot().await.expect("boot row");
+        // A member built before Swagger 2.0 import advertises what issue
+        // #426's successor does, and nothing newer.
+        let earlier = uuid::Uuid::new_v4();
+        pool.get()
+            .await
+            .expect("client")
+            .execute(
+                "INSERT INTO greengateway.cluster_members
+                     (deployment_id, instance_id, boot_id, binary_version,
+                      schema_version_min, schema_version_max,
+                      document_version_min, document_version_max, fingerprint,
+                      capabilities)
+                 VALUES ($1, $2::text::uuid, $3::text::uuid, '1.0.1', 18, 18, 0, 0,
+                         repeat('b', 64), 'operation_requirements,policy_role_descriptions')",
+                &[
+                    &deployment,
+                    &earlier.to_string(),
+                    &uuid::Uuid::new_v4().to_string(),
+                ],
+            )
+            .await
+            .expect("an earlier member row inserts");
+
+        let connection_db = TempDb::new("cluster-openapi-swagger2-gate");
+        let policy = TempPolicyFile::new(&connection_policy_document_string());
+        let capture = audit::sink::tests::CaptureSink::new();
+        let router = gated_connection_admin_router(
+            &connection_db,
+            &policy,
+            audit::AuditLog::new(Arc::new(capture.clone())),
+            GatewayAppBuildOverrides {
+                pg_membership: Some(membership),
+                ..GatewayAppBuildOverrides::default()
+            },
+        );
+        let (connection_id, connection_etag) =
+            create_managed_openapi_connection(&router, "Cluster Swagger").await;
+        let swagger_spec = json!({
+            "swagger": "2.0",
+            "info": { "title": "Widget API", "version": "1.0.0" },
+            "paths": {
+                "/widgets": {
+                    "get": {
+                        "operationId": "listWidgets",
+                        "responses": { "200": { "description": "Widgets" } }
+                    }
+                }
+            }
+        })
+        .to_string();
+        let refusals = || {
+            capture
+                .events()
+                .into_iter()
+                .filter(|event| event.event_type == "cluster.operation_refused")
+                .collect::<Vec<_>>()
+        };
+
+        let (status, body) = refusal_of(
+            preview_and_register_managed_openapi(
+                &router,
+                &connection_id,
+                &connection_etag,
+                &swagger_spec,
+                &["listWidgets"],
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["reason"], "capability_not_advertised");
+        assert!(
+            !body.to_string().contains(&earlier.to_string()),
+            "a refusal names no member: {body}"
+        );
+        let started = std::time::Instant::now();
+        while refusals().is_empty() && started.elapsed() < Duration::from_secs(5) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let refused = refusals();
+        assert_eq!(refused.len(), 1, "one refusal, one gate audit event");
+        assert_eq!(
+            refused[0].payload["operation"],
+            "connections.openapi_swagger2_catalog"
+        );
+        assert_eq!(
+            refused[0].payload["capability"],
+            "openapi_swagger2_catalogs"
+        );
+        assert_eq!(refused[0].payload["lacking_members"], 1);
+        assert_eq!(refused[0].payload["live_members"], 2);
+
+        let openapi = preview_and_register_managed_openapi(
+            &router,
+            &connection_id,
+            &connection_etag,
+            widget_openapi_spec(),
+            &["createWidget"],
+        )
+        .await;
+        assert_eq!(
+            openapi.status(),
+            StatusCode::CREATED,
+            "an OpenAPI 3.x document never asks the gate"
+        );
+
+        // The earlier member's row goes stale on the database clock: the
+        // same registration is admitted.
+        pool.get()
+            .await
+            .expect("client")
+            .execute(
+                "UPDATE greengateway.cluster_members
+                 SET last_heartbeat_at = now() - interval '60 seconds'
+                 WHERE instance_id = $1::text::uuid",
+                &[&earlier.to_string()],
+            )
+            .await
+            .expect("backdate the earlier member");
+        let admitted = preview_and_register_managed_openapi(
+            &router,
+            &connection_id,
+            &connection_etag,
+            &swagger_spec,
+            &["listWidgets"],
+        )
+        .await;
+        assert_eq!(admitted.status(), StatusCode::CREATED);
+        assert_eq!(
+            json_body(admitted).await["registered_tool_names"],
+            json!(["listWidgets"])
+        );
+        assert_eq!(
+            refusals().len(),
+            1,
+            "an admission is not audited as a refusal"
         );
     }
 

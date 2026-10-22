@@ -275,6 +275,13 @@ static MANIFEST: LazyLock<Vec<Migration>> = LazyLock::new(|| {
         )
         .finalize()
         .with_pinned_checksum("9e8e98b32ce743e691a1767677223b5fa57e287067cc74e627c1c0ecaa84e538"),
+        Migration::new(
+            21,
+            "authority_event_journal",
+            include_str!("migrations/0021_authority_event_journal.sql"),
+        )
+        .finalize()
+        .with_pinned_checksum("336ccd5be1bf7995b19b94d73d8f480dc66a1c0bb730b651931d84a01e59e468"),
     ]
 });
 
@@ -309,25 +316,27 @@ impl SchemaCompatibility {
 
 // No adjacent release pair has been qualified across a schema change. Do
 // not widen these bounds or add an extension without the pinned SQL and
-// two-binary gate in issue #426. Moving the point from 19 to 20 (the
-// durable contract fence, #426 PR 3) is not an overlap: a schema-19 binary
-// refuses schema 20 and this binary refuses schema 19, so that upgrade is a
+// two-binary gate in issue #426. Moving the point from 20 to 21 (the
+// authority-event journal, #425 PR 3) is not an overlap: a schema-20 binary
+// refuses schema 21 and this binary refuses schema 20, so that upgrade is a
 // coordinated drain/migrate/restart, as the moves from 15 to 16 (#425),
 // from 16 to 17 (member capability advertisements, #426 PR 1), from 17 to
-// 18 (service-token and JWT revocation change evidence, #425 PR 2b) and
-// from 18 to 19 (shared admin sessions, #424) were. It is also what makes
-// the fence cover every binary that can serve this database: none that
-// predates the fence accepts its ledger.
+// 18 (service-token and JWT revocation change evidence, #425 PR 2b), from
+// 18 to 19 (shared admin sessions, #424) and from 19 to 20 (the durable
+// contract fence, #426 PR 3) were. A schema-20 binary must not keep writing
+// evidence after migration 21: its rows would never be journaled. The move
+// to 20 is also what makes the fence cover every binary that can serve this
+// database: none that predates the fence accepts its ledger.
 const BINARY_SCHEMA_COMPATIBILITY: SchemaCompatibility = SchemaCompatibility {
-    read: (20, 20),
-    write: (20, 20),
+    read: (21, 21),
+    write: (21, 21),
     approved_extensions: &[],
 };
 
 /// The intersection of the explicit read/write contracts, advertised to the
 /// roster. This is a summary, not proof of ledger integrity, permission to
 /// write a gated operation (`storage/compatibility.rs`), or permission to
-/// contract the schema. The shipped contract accepts only schema 20.
+/// contract the schema. The shipped contract accepts only schema 21.
 pub(crate) fn schema_version_range() -> (i32, i32) {
     BINARY_SCHEMA_COMPATIBILITY.serving_range()
 }
@@ -1107,12 +1116,12 @@ mod tests {
     fn the_shipped_contract_has_no_unproved_overlap() {
         assert_eq!(
             MANIFEST.len(),
-            20,
+            21,
             "review the compatibility contract when adding SQL"
         );
-        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.read, (20, 20));
-        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.write, (20, 20));
-        assert_eq!(schema_version_range(), (20, 20));
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.read, (21, 21));
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.write, (21, 21));
+        assert_eq!(schema_version_range(), (21, 21));
         assert!(BINARY_SCHEMA_COMPATIBILITY.approved_extensions.is_empty());
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len(), "")),
@@ -1123,7 +1132,7 @@ mod tests {
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 1, "")),
             Ok(SchemaStatus::NeedsUpgrade {
-                applied: 19,
+                applied: 20,
                 missing: 1
             })
         );
@@ -1132,30 +1141,175 @@ mod tests {
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 2, "")),
             Ok(SchemaStatus::NeedsUpgrade {
-                applied: 18,
+                applied: 19,
                 missing: 2
             })
         );
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 3, "")),
             Ok(SchemaStatus::NeedsUpgrade {
-                applied: 17,
+                applied: 18,
                 missing: 3
             })
         );
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 4, "")),
             Ok(SchemaStatus::NeedsUpgrade {
-                applied: 16,
+                applied: 17,
                 missing: 4
             })
         );
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 5, "")),
             Ok(SchemaStatus::NeedsUpgrade {
-                applied: 15,
+                applied: 16,
                 missing: 5
             })
+        );
+        assert_eq!(
+            validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 6, "")),
+            Ok(SchemaStatus::NeedsUpgrade {
+                applied: 15,
+                missing: 6
+            })
+        );
+    }
+
+    /// The published support matrix (`docs/deployment/upgrade-support-matrix.json`,
+    /// issue #426 PR 4) describes this binary: its read/write contracts, its
+    /// manifest, its document format, what it advertises and every operation
+    /// it gates, plus one coordinated step per schema point the deployment
+    /// guide documents, ending at this binary's. A migration, a capability or
+    /// a gated operation that leaves the published matrix behind fails here,
+    /// in the pull request that adds it. The pinned qualified pair is checked
+    /// against its evidence by `scripts/upgrade_pair_evidence.py`.
+    #[test]
+    fn the_published_upgrade_matrix_describes_this_binary() {
+        use crate::storage::compatibility::{
+            Activation, Backfill, BINARY_CAPABILITIES, OPERATION_REQUIREMENTS,
+        };
+        use serde_json::{json, Value};
+
+        let matrix: Value = serde_json::from_str(include_str!(
+            "../../../docs/deployment/upgrade-support-matrix.json"
+        ))
+        .expect("the published support matrix is JSON");
+        let guide = include_str!("../../../docs/deployment/postgres.md").replace("\r\n", "\n");
+        let published = &matrix["this_build"];
+        let contract = &BINARY_SCHEMA_COMPATIBILITY;
+        let stale = "docs/deployment/upgrade-support-matrix.json no longer describes this binary; \
+                     update this_build and the deployment guide's upgrade matrix together";
+
+        assert_eq!(matrix["schema"], 1);
+        assert_eq!(
+            published["manifest_versions"],
+            json!(MANIFEST.len()),
+            "{stale}"
+        );
+        assert_eq!(
+            published["read"],
+            json!([contract.read.0, contract.read.1]),
+            "{stale}"
+        );
+        assert_eq!(
+            published["write"],
+            json!([contract.write.0, contract.write.1]),
+            "{stale}"
+        );
+        let extensions: Vec<Value> = contract
+            .approved_extensions
+            .iter()
+            .map(
+                |extension| json!({ "version": extension.version, "checksum": extension.checksum }),
+            )
+            .collect();
+        assert_eq!(
+            published["approved_extensions"],
+            Value::Array(extensions),
+            "{stale}"
+        );
+        let document = crate::cluster_membership::DOCUMENT_VERSION_RANGE;
+        assert_eq!(
+            published["document_format"],
+            json!([document.0, document.1]),
+            "{stale}"
+        );
+        let capabilities: Vec<&str> = BINARY_CAPABILITIES
+            .iter()
+            .map(|capability| capability.as_str())
+            .collect();
+        assert_eq!(published["capabilities"], json!(capabilities), "{stale}");
+        let operations: Vec<Value> = OPERATION_REQUIREMENTS
+            .iter()
+            .map(|requirement| {
+                json!({
+                    "operation": requirement.operation,
+                    "capability": requirement.capability.as_str(),
+                    "minimum_schema": requirement.minimum_schema,
+                    "document_format": requirement.document_format,
+                    "backfill": match requirement.backfill {
+                        Backfill::NotRequired => Value::Null,
+                        Backfill::Required { name } => json!(name),
+                    },
+                    "activation": match requirement.activation {
+                        Activation::LiveMembers => "live_members",
+                        Activation::DurableFence => "durable_fence",
+                    },
+                })
+            })
+            .collect();
+        assert_eq!(published["operations"], Value::Array(operations), "{stale}");
+
+        // Until an extension is approved, every schema step is a coordinated
+        // drain, migrate, restart, and the guide must say how to perform it.
+        // An approved extension is the first step that could roll, and it
+        // changes what this test has to check.
+        assert!(
+            contract.approved_extensions.is_empty(),
+            "publish the first approved extension's expand step and its qualified pair in the \
+             matrix's schema_steps, then teach this test what that step must say"
+        );
+        let steps = matrix["schema_steps"]
+            .as_array()
+            .expect("the matrix lists its schema steps");
+        let mut expected_from = steps
+            .first()
+            .and_then(|step| step["from"].as_i64())
+            .expect("the matrix lists at least one schema step");
+        for step in steps {
+            let (from, to) = (step["from"].as_i64(), step["to"].as_i64());
+            assert_eq!(
+                (from, to),
+                (Some(expected_from), Some(expected_from + 1)),
+                "schema steps are contiguous, one migration each: {step}"
+            );
+            let version = expected_from + 1;
+            let migration = MANIFEST
+                .iter()
+                .find(|migration| migration.version == version)
+                .unwrap_or_else(|| {
+                    panic!("the matrix names schema {version}, which is not in the manifest")
+                });
+            assert_eq!(step["migration"], json!(migration.name), "{step}");
+            assert_eq!(step["procedure"], "coordinated", "{step}");
+            let heading =
+                format!("\n### Coordinated upgrade: schema {expected_from} to {version}\n");
+            assert!(
+                guide.contains(&heading),
+                "docs/deployment/postgres.md must document the coordinated upgrade the matrix \
+                 publishes: {heading:?}"
+            );
+            expected_from = version;
+        }
+        assert_eq!(
+            i64::try_from(MANIFEST.len()).ok(),
+            Some(expected_from),
+            "the matrix's last schema step must reach this binary's schema; add a coordinated \
+             step for every new migration, with its section in the deployment guide"
+        );
+        assert!(
+            guide.contains("\n## Upgrading a cluster\n"),
+            "the deployment guide carries the procedure the matrix names"
         );
     }
 
@@ -1613,7 +1767,7 @@ mod tests {
         let authority = PostgresReadinessAuthority::new(foundation.pool().clone());
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::Writable { schema_version: 20 }
+            AuthorityObservation::Writable { schema_version: 21 }
         );
         let client = foundation.pool().get().await.expect("fixture client");
         client
@@ -1625,7 +1779,7 @@ mod tests {
             .expect("change fixture checksum without changing extent");
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::IncompatibleSchema { schema_version: 20 }
+            AuthorityObservation::IncompatibleSchema { schema_version: 21 }
         );
         client
             .execute(
@@ -1636,7 +1790,7 @@ mod tests {
             .expect("restore fixture checksum");
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::Writable { schema_version: 20 }
+            AuthorityObservation::Writable { schema_version: 21 }
         );
         client
             .execute(
@@ -1647,7 +1801,7 @@ mod tests {
             .expect("remove a fixture history row");
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::IncompatibleSchema { schema_version: 20 }
+            AuthorityObservation::IncompatibleSchema { schema_version: 21 }
         );
         drop(client);
         clean_database(foundation.pool()).await;
@@ -1918,6 +2072,9 @@ mod tests {
                  DROP TABLE greengateway.contract_fence; \
                  DROP TABLE greengateway.schema_backfills; \
                  DROP FUNCTION greengateway.contract_fence_moves_forward(); \
+                 DROP TABLE greengateway.authority_event_cursors; \
+                 DROP TABLE greengateway.authority_event_journal; \
+                 DROP TABLE greengateway.authority_event_state; \
                  DELETE FROM {LEDGER_TABLE} WHERE version >= 13;"
             ))
             .await
@@ -2491,6 +2648,204 @@ mod tests {
             ),
             "{unreadable}"
         );
+    }
+
+    /// Migration 21 journals the evidence committed before it, in commit
+    /// order (shared revision first, whatever the evidence table), under each
+    /// row's own event ID and commit time, and changes no evidence row. The
+    /// first change after it is journaled at the next position.
+    #[tokio::test]
+    async fn migration_twenty_one_journals_existing_evidence_in_commit_order() {
+        use crate::storage::ServiceTokenStore;
+
+        let Some(dsn) = real_dsn() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = REAL_DATABASE.lock().await;
+        let dsn_file = write_dsn_file(&dsn);
+        let config = migration_config(&dsn_file);
+        let foundation = establish(&config).await;
+        clean_database(foundation.pool()).await;
+        let client = foundation.pool().get().await.expect("checkout");
+        bootstrap_ledger(&client)
+            .await
+            .expect("migration ledger should bootstrap");
+        let through_v20 = MANIFEST
+            .iter()
+            .take_while(|migration| migration.version <= 20)
+            .count();
+        for migration in &MANIFEST[..through_v20] {
+            apply_one(&client, migration, &test_settings())
+                .await
+                .expect("migrations through 20 should apply");
+        }
+
+        // Evidence a schema-20 gateway committed, written out of table
+        // order: the JWT revocation took revision 3, the token rotate
+        // revision 4 and the Connection delete revision 5.
+        let connection_event = uuid::Uuid::new_v4().to_string();
+        let token_event = uuid::Uuid::new_v4().to_string();
+        let jwt_event = uuid::Uuid::new_v4().to_string();
+        client
+            .execute(
+                "INSERT INTO greengateway.connection_change_evidence \
+                     (event_id, operation_id, actor_user_id, action, connection_id, \
+                      prior_version, security_revision, committed_at) \
+                 VALUES ($1::text::uuid, gen_random_uuid(), 'schema-20-admin', \
+                         'connection.delete', gen_random_uuid(), 2, 5, \
+                         '2026-10-01T00:00:05Z')",
+                &[&connection_event],
+            )
+            .await
+            .expect("a schema-20 Connection delete");
+        client
+            .execute(
+                "INSERT INTO greengateway.service_token_change_evidence \
+                     (event_id, operation_id, actor_user_id, action, token_id, \
+                      prior_version, new_version, security_revision, committed_at) \
+                 VALUES ($1::text::uuid, gen_random_uuid(), 'schema-20-admin', \
+                         'service_token.rotate', 'tok-schema-20', 1, 2, 4, \
+                         '2026-10-01T00:00:04Z')",
+                &[&token_event],
+            )
+            .await
+            .expect("a schema-20 token rotate");
+        client
+            .execute(
+                "INSERT INTO greengateway.jwt_revocation_evidence \
+                     (event_id, operation_id, actor_user_id, action, issuer, jti_hash, \
+                      security_revision, committed_at) \
+                 VALUES ($1::text::uuid, gen_random_uuid(), 'operator:revoke-jwt', \
+                         'jwt.revoke', 'https://issuer.example', repeat('c', 64), 3, \
+                         '2026-10-01T00:00:03Z')",
+                &[&jwt_event],
+            )
+            .await
+            .expect("a schema-20 JWT revocation");
+        let evidence_snapshot = || async {
+            let mut rows = Vec::new();
+            for table in [
+                "connection_change_evidence",
+                "service_token_change_evidence",
+                "jwt_revocation_evidence",
+            ] {
+                rows.extend(
+                    client
+                        .query(
+                            &format!("SELECT row_to_json(t)::text FROM greengateway.{table} t"),
+                            &[],
+                        )
+                        .await
+                        .expect("evidence snapshot")
+                        .iter()
+                        .map(|row| row.get::<_, String>(0)),
+                );
+            }
+            rows
+        };
+        let evidence_before = evidence_snapshot().await;
+
+        assert_eq!(
+            apply_missing(foundation.pool(), &test_settings())
+                .await
+                .expect("migration 21 should apply"),
+            MigrateOutput::Applied {
+                applied: MANIFEST.len() - through_v20
+            }
+        );
+        assert_eq!(evidence_snapshot().await, evidence_before);
+
+        // Commit order, each row journaled at its own commit time (the
+        // fixture committed revision N at second N).
+        let journal: Vec<(i64, String, String, bool)> = client
+            .query(
+                "SELECT position, event_id::text, source, \
+                        journaled_at = '2026-10-01T00:00:00Z'::timestamptz \
+                            + make_interval(secs => position + 2) \
+                 FROM greengateway.authority_event_journal ORDER BY position",
+                &[],
+            )
+            .await
+            .expect("the journal reads")
+            .iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+            .collect();
+        assert_eq!(
+            journal,
+            [
+                (1, jwt_event, "jwt_revocation_evidence".to_owned(), true),
+                (
+                    2,
+                    token_event,
+                    "service_token_change_evidence".to_owned(),
+                    true
+                ),
+                (
+                    3,
+                    connection_event,
+                    "connection_change_evidence".to_owned(),
+                    true
+                ),
+            ]
+        );
+        let state = client
+            .query_one(
+                "SELECT last_position, retained_events, capacity, authority_id IS NULL \
+                 FROM greengateway.authority_event_state WHERE singleton",
+                &[],
+            )
+            .await
+            .expect("the state row exists");
+        assert_eq!(
+            (
+                state.get::<_, i64>(0),
+                state.get::<_, i64>(1),
+                state.get::<_, i64>(2),
+                state.get::<_, bool>(3)
+            ),
+            (3, 3, 1_000_000, true)
+        );
+        let cursors: i64 = client
+            .query_one(
+                "SELECT count(*) FROM greengateway.authority_event_cursors",
+                &[],
+            )
+            .await
+            .expect("the cursor table exists")
+            .get(0);
+        assert_eq!(cursors, 0, "no consumer exists until a dispatcher claims");
+        drop(client);
+
+        let store = crate::storage::postgres_service_tokens::PostgresServiceTokenStore::new(
+            foundation.pool().clone(),
+        );
+        let token = store
+            .create(crate::auth::tokens::CreateTokenRequest {
+                scopes: vec!["admin:tokens:read".to_owned()],
+                created_by: "schema-21-admin".to_owned(),
+                expires_at: None,
+            })
+            .await
+            .expect("a token creates");
+        store
+            .revoke(&token.record.id, "schema-21-admin")
+            .await
+            .expect("the revoke commits")
+            .expect("the token exists");
+        let head: Option<i64> = foundation
+            .pool()
+            .get()
+            .await
+            .expect("checkout")
+            .query_one(
+                "SELECT max(position) FROM greengateway.authority_event_journal",
+                &[],
+            )
+            .await
+            .expect("the journal reads")
+            .get(0);
+        assert_eq!(head, Some(4));
     }
 
     #[tokio::test]

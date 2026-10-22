@@ -9,7 +9,11 @@ before GreenGateway resolves its protected material or contacts an upstream.
 This guide covers production custody and day-two operations. See the
 [migration guide](migration.md) for moving legacy settings and the
 [admin guide](admin-guide.md) for the browser workflow. The complete field and
-limit reference remains in [configuration.md](../configuration.md).
+limit reference remains in [configuration.md](../configuration.md). Where
+trust sits when a Connection acts for the calling user, through a signed
+caller assertion, a delegated issuer token or a Google domain-wide delegation,
+is collected in the
+[per-caller credential trust boundary](per-caller-trust-boundary.md).
 
 ## Production Readiness Checklist
 
@@ -247,11 +251,14 @@ recovery method.
 ## Authentication Profiles
 
 Connections support `none`, a header API key, a static bearer token, OAuth
-2.0 client credentials, and a delegated issuer token, which calls the upstream
-as each caller with that caller's own token (see
-[Delegated issuer tokens](#delegated-issuer-tokens)). Every enabled
-secret-backed primary or additional binding requires a compatible configured
-alias. Authentication and TLS material require HTTPS.
+2.0 client credentials, a delegated issuer token, which calls the upstream as
+each caller with that caller's own token (see
+[Delegated issuer tokens](#delegated-issuer-tokens)), and a Google domain-wide
+delegation, which does the same for Google Workspace APIs without any grant
+store or service-account key (see
+[Google domain-wide delegation](#google-domain-wide-delegation)). Every
+enabled secret-backed primary or additional binding requires a compatible
+configured alias. Authentication and TLS material require HTTPS.
 
 For header API keys, choose a dedicated upstream header. GreenGateway rejects
 headers that it or HTTP owns, including `Authorization`, `Cookie`, `Host`,
@@ -370,6 +377,9 @@ the gateway's published key set (see [The published JWKS](#the-published-jwks))
 and can then apply its own per-user ownership and entitlement checks, which a
 single shared credential makes impossible. It is the same shape as Google IAP's
 `X-Goog-IAP-JWT-Assertion` and Cloudflare Access's `Cf-Access-Jwt-Assertion`.
+What the signing key can do in the wrong hands, and what a verifier must
+check, is summarized in the
+[per-caller credential trust boundary](per-caller-trust-boundary.md).
 
 #### Which calls are attested
 
@@ -382,6 +392,9 @@ request before it sends it, attests that caller:
 - Managed MCP tool calls. A call opens a session of its own, and every request
   of that session carries its own assertion; see
   [Managed MCP tool calls](#managed-mcp-tool-calls).
+- Composite tools. Every request a composite sends, each forward step, each
+  iteration of a fan-out and each compensation, carries its own assertion; see
+  [Composite tool leaves](#composite-tool-leaves).
 - Requests a connection-bound proxy route forwards; see
   [Proxied requests](#proxied-requests).
 
@@ -389,14 +402,13 @@ The lanes that have no calling principal to attest are refused with
 `caller_assertion_not_enforced` before any DNS lookup, secret read, OAuth mint
 or upstream request, rather than sent without the assertion: fetching an
 OpenAPI specification from the upstream on a refresh, MCP catalog refresh,
-enum and label source fetches, and stored Connection tests. So are the steps
-of a composite tool, which would each need an assertion with a `jti` of its
-own, and every lane when the stored block is one only an earlier release
-accepted (see [HTTPS only](#https-only) and
-[Failure reasons](#failure-reasons)). A `delegated_issuer_token` Connection,
-whose assertion is the subject token of the caller's own credential, is
-served by manual HTTP tools only, and its stored test runs as the principal
-who asks for it; see [Which calls are served](#which-calls-are-served).
+enum and label source fetches, and stored Connection tests. So is every lane
+when the stored block is one only an earlier release accepted (see
+[HTTPS only](#https-only) and [Failure reasons](#failure-reasons)). A
+`delegated_issuer_token` Connection, whose assertion is the subject token of
+the caller's own credential, is served by manual HTTP tools only, and its
+stored test runs as the principal who asks for it; see
+[Which calls are served](#which-calls-are-served).
 
 On the refused lanes the reason appears as follows:
 
@@ -405,7 +417,9 @@ On the refused lanes the reason appears as follows:
   `tool.invoke_failure` and the `reason` of `tool.upstream_request`. A
   composite tool reports at the tool level: its `failure_reason` is
   `composite_failed`, and the failing step's `caller_assertion_not_enforced` is
-  only in the error details returned to the caller, not in any audit event.
+  only in the error details returned to the caller, because the step is
+  refused before it makes a request; see
+  [Composite tool leaves](#composite-tool-leaves).
 - Stored Connection test: the `authenticated` stage reason.
 - OpenAPI refresh of a catalog whose discovery has a `path`, and MCP catalog
   refresh: the `reason` of a `409 Conflict` response, also audited as
@@ -449,7 +463,7 @@ The JOSE header carries `alg` (`ES256` or `RS256`, from `algorithm`), `kid`
 | `sub` | The caller's identity provider issuer, `#`, then the provider's subject, for example `https://idp.example#alice`. The provider issuer scopes the subject because two providers can issue the same subject for different people. |
 | `caller_iss`, `caller_sub` | The two halves of `sub`, unscoped. An upstream that matches its own user records reads these and never parses `sub`. |
 | `iat`, `exp` | Signing time and `iat` plus `lifetime_seconds`. |
-| `jti` | The gateway request ID of the call (`X-Request-Id`), the same ID its audit events carry. |
+| `jti` | The gateway request ID of the call (`X-Request-Id`), the same ID its audit events carry. A call that sends several requests gives each its own: a managed MCP session's requests and a composite tool's leaves add `.` and a sequence number. |
 | `email` | With `email` in `claims`, the principal's email, when it has one. Copied from the principal as its identity provider gave it; see the note below the table. |
 | `roles` | With `roles` in `claims`, the principal's roles, as an array. |
 | `method`, `path`, `request_sha256` | With `bind_request: true`: the request method, the request target exactly as it appears on the request line (path, then `?` and the query when there is one), and the lowercase hexadecimal SHA-256 of the exact body bytes sent, which is the hash of empty input for a request without a body. |
@@ -551,6 +565,43 @@ the stored catalog stale, so a Connection that gains the block cannot serve
 its MCP tools until discovery can run on it. Attesting discovery itself is not
 supported yet.
 
+#### Composite tool leaves
+
+A [composite tool](#composite-tools) sends one request per leaf: each forward
+step, each iteration of a `for_each` fan-out, and each compensation. Every
+leaf is signed separately, just before it is sent, exactly as a managed
+OpenAPI tool call is: the same admission, key load and header rules.
+
+- The `jti` of the `n`th leaf that carries an assertion is the call's request
+  ID, a dot, and `n`, counting from 1 in the order the leaves are sent,
+  forward steps and compensations alike (`6f1c2a4e-....1`, `6f1c2a4e-....2`,
+  ...). A replay cache keyed on `sub` and `jti` therefore accepts every leaf of
+  the call, including the compensations that undo earlier leaves. A leaf that
+  was refused takes no number.
+- With `bind_request`, each assertion covers its own leaf's method, request
+  target and exact body.
+- Each leaf's `tool.upstream_request` records `"caller_assertion": {"kid",
+  "jti"}` for the assertion it sent, so an upstream's log line joins the
+  leaf that sent it. The composite itself is recorded on
+  `tool.composite_completed`, which carries no assertion.
+- A composite that names nobody, a service token included, is refused at its
+  first leaf with `caller_assertion_no_principal`, before any DNS lookup,
+  secret read or upstream request, so nothing needs to be undone.
+
+A composite reports a refused leaf through its own failure, as for any failed
+step: `tool.invoke_failure` has the `failure_reason` `composite_failed`, the
+error details returned to the caller name the failed step and carry the leaf's
+reason as `failure_reason` (`caller_assertion_no_principal`,
+`caller_assertion_key_unavailable`, and so on), and the refused leaf's
+`tool.upstream_request` has the reason too. A leaf refused before it makes a
+request, such as `caller_assertion_not_enforced` for a block only an earlier
+release accepted, has no `tool.upstream_request`. A compensation refused for
+any of these reasons sends nothing: `tool.composite_completed` records it as
+`skipped` with the reason, and the write it would have undone is returned as a
+`confirmed` orphan with the same reason, rather than as
+`compensation_transport_error`. Fix what the reason names, then undo the write
+by hand.
+
 #### Which callers can be attested
 
 A principal that an identity provider vouched for can be attested: a bearer
@@ -584,10 +635,10 @@ Each refusal is a fixed string in the `failure_reason` of `tool.invoke_failure`
 | `caller_assertion_key_not_published` | This replica leaves the Connection's keys out of the published JWKS, so no upstream that fetched it could verify what the Connection signed: one of its keys, the signing key or a published key, did not resolve or load at the last check, or another enabled Connection publishes a different key under one of its `kid`s. See [Stored Connections whose keys cannot be used](#stored-connections-whose-keys-cannot-be-used). |
 | `caller_assertion_key_unusable` | At call time, the signing key's alias is unknown or refused, or holds material that is not a usable key for `algorithm`. |
 | `caller_assertion_key_unavailable` | At call time, the signing key's source could not be read. |
-| `caller_assertion_claim_invalid` | A value would not survive as a claim: a subject longer than 256 bytes, an issuer longer than 512 bytes or containing `#`, a role longer than 128 bytes, an email longer than 320 bytes, a request ID (a `jti`, with a managed MCP session's sequence suffix) longer than 128 bytes or missing, with `bind_request` a request target longer than 2048 bytes or a method longer than 16 bytes, or any of them containing a control character. |
+| `caller_assertion_claim_invalid` | A value would not survive as a claim: a subject longer than 256 bytes, an issuer longer than 512 bytes or containing `#`, a role longer than 128 bytes, an email longer than 320 bytes, a request ID (a `jti`, with the sequence suffix of a managed MCP session's request or a composite tool's leaf) longer than 128 bytes or missing, with `bind_request` a request target longer than 2048 bytes or a method longer than 16 bytes, or any of them containing a control character. |
 | `caller_assertion_header_conflict` | Another header source had already set the assertion header. |
 | `caller_assertion_signature_failed`, `caller_assertion_token_too_long` | Signing failed, including on a host whose clock reads before 1970 and a managed MCP session asked to sign after its call ended, or the assertion would exceed 8 KiB. |
-| `caller_assertion_not_enforced` | The lane has no caller to attest (discovery, enum and label sources, stored tests), is a composite tool's step, serves a `delegated_issuer_token` Connection other than through a manual tool or a stored test, or the stored block is one only an earlier release accepted: `bind_approval: true`, an assertion header that matches an additional header, or a plain HTTP endpoint. |
+| `caller_assertion_not_enforced` | The lane has no caller to attest (discovery, enum and label sources, stored tests), serves a `delegated_issuer_token` Connection other than through a manual tool or a stored test, or the stored block is one only an earlier release accepted: `bind_approval: true`, an assertion header that matches an additional header, or a plain HTTP endpoint. |
 
 A signing key that cannot be read or loaded at call time also raises
 `connection.secret_resolution_failed` with the same reason. A proxied request
@@ -617,14 +668,15 @@ records which key signed it and its `jti`, whatever the outcome:
 "caller_assertion": { "kid": "gw-2026-09", "jti": "6f1c2a4e-..." }
 ```
 
-A managed MCP tool call records its session's assertions as `kid`,
-`jti_base` and `count` (see
-[Managed MCP tool calls](#managed-mcp-tool-calls)), and a proxied request
-records its assertion on `connection.caller_assertion` (see
+Each leaf of a composite tool has a `tool.upstream_request` of its own, with
+its own `jti` (see [Composite tool leaves](#composite-tool-leaves)). A managed
+MCP tool call records its session's assertions as `kid`, `jti_base` and
+`count` (see [Managed MCP tool calls](#managed-mcp-tool-calls)), and a proxied
+request records its assertion on `connection.caller_assertion` (see
 [Proxied requests](#proxied-requests)). The attested caller is the event's
 `actor`. To find the gateway's record of a request an upstream logged, search
-the audit for its `jti`, or for its request ID without the MCP sequence
-suffix.
+the audit for its `jti`, or for its request ID without the sequence suffix of
+a managed MCP session or a composite.
 
 #### Verifying an assertion
 
@@ -677,17 +729,48 @@ clock; if the two clocks can drift apart, allow a few seconds of leeway
 
 #### The block in the admin UI
 
-The admin UI shows the block read only, on the Connection detail page and in
-the editor: every field except the key aliases, which appear only as
-configured or not, with a note on which calls are attested. The UI has no
-controls for the block and never sends it. A replacement (`PUT`) that omits
-`caller_assertion` keeps the current block, so a save in the UI leaves it
-exactly as stored and cannot put the Connection back into service unattested.
-The gateway revalidates the kept block on every save, so the editor refuses a
-primary or additional header name that matches the assertion header before it
-writes, and a block stored with `bind_approval: true` has to be removed before
-the Connection can be saved again. To stop attesting, remove the block
-deliberately: send `"caller_assertion": null` in a `PUT` through the admin API.
+The Connection detail page shows the block read only: every field except the
+key aliases, which appear only as configured or not, with a note on which
+calls are attested and any `key_problem`. The editor shows it the same way
+until the operator chooses **Add caller assertion**, **Edit caller assertion**
+or **Remove caller assertion**:
+
+- A save that does none of these leaves `caller_assertion` out of the `PUT`.
+  A replacement that omits the block keeps it exactly as stored, so a rename,
+  a disable or a credential rotation cannot change it or put the Connection
+  back into service unattested. The gateway still revalidates the kept block
+  on every save, so the editor refuses a primary or additional header name
+  that matches the assertion header before it writes, and a block stored with
+  `bind_approval: true` must be edited, which turns approval binding off, or
+  removed before the Connection can be saved again.
+- Editing sends the whole block. Each key's alias is picked from the aliases
+  whose compatible purposes include `assertion_signing_key`: operator aliases
+  and external providers, never the encrypted local store. A key the editor
+  keeps is sent as `"signing_key_configured": true` instead of its alias,
+  which the editor never sees, and the gateway keeps the alias of the stored
+  key with the same `kid` and algorithm. Changing a kept key's `kid` or
+  algorithm therefore drops its binding until an alias is picked again.
+  **Make published key N the signing key** swaps that key with the signing
+  key, each with its binding, which is rotation step 3 below.
+- Removing sends `"caller_assertion": null`.
+
+A `delegated_issuer_token` Connection's block is its subject token, which the
+editor drafts only when it creates the Connection; once it exists the block is
+shown read only there (see [In the admin UI](#in-the-admin-ui)).
+
+Each of these needs `admin:connections:secrets:write`; without it the
+section's controls are disabled, and so are the endpoint and test target of a
+Connection that carries the block. A save the gateway refuses shows each
+problem's code beside what it means, on the field that configures it, or in
+the section when that field is not on screen. The gateway names a published
+key's field without its index, so such a problem is shown beside the list.
+
+A marker on a `PUT` that names no stored key, under that `kid` and algorithm,
+is refused with `400`, as are `"signing_key_configured": false` and a marker
+beside a `signing_key_id`; a create has nothing to keep and accepts no
+marker. Naming any key alias in a `PUT`, even the stored one, needs the
+secrets-write permission, so a principal without it cannot test guesses
+against a hidden alias.
 
 New and replacement writes reject `bind_approval: true`, because no approval
 subsystem exists for a mutation to be bound to, an assertion `header_name` that
@@ -884,7 +967,10 @@ signed has expired:
    honours it has fetched the next key before it signs anything. Wait longer if
    a verifier caches the set for longer.
 3. In one `PUT`, make the next key the signing key (`signing_key_id`, `kid` and
-   `algorithm`) and move the previous signing key into `published_keys`.
+   `algorithm`) and move the previous signing key into `published_keys`. A
+   key can keep its alias through the move with `"signing_key_configured":
+   true`, which the gateway resolves by `kid` and algorithm; in the admin UI,
+   this is **Make published key N the signing key**.
 4. Keep the previous key published for at least `lifetime_seconds` plus the
    verifiers' cache time, 300 seconds for one that honours `max-age`, so every
    assertion it signed has expired before a verifier drops it. Then remove it
@@ -935,8 +1021,9 @@ Before upgrading, check every enabled Connection that carries the block:
   remove the block with `"caller_assertion": null` before upgrading.
 
 Managed OpenAPI tools, managed MCP tool calls and proxied requests followed in
-a later release; see the next note. Composite tools, discovery, enum and label
-sources and stored tests on such a Connection stay refused, as before.
+a later release, and composite tools after them; see the next notes.
+Discovery, enum and label sources and stored tests on such a Connection stay
+refused, as before.
 
 #### Upgrade note: OpenAPI tools, MCP tool calls and proxied requests
 
@@ -963,10 +1050,34 @@ the block:
   Connection, and cannot be refreshed while the block is present; see
   [Managed MCP tool calls](#managed-mcp-tool-calls).
 - Delegated Connections, composite tools, discovery, enum and label sources
-  and stored tests are unchanged.
+  and stored tests are unchanged. Composite tools followed; see the next note.
 
 To keep one of these lanes refused until its upstream is ready, disable the
 Connection or remove the block with `"caller_assertion": null` before
+upgrading.
+
+#### Upgrade note: composite tools
+
+From this release, a composite tool on an attested Connection is served
+instead of failing at its first step with `caller_assertion_not_enforced`,
+and every leaf request it sends, compensations included, carries its own
+signed assertion; see [Composite tool leaves](#composite-tool-leaves). Before
+upgrading, check every enabled Connection that carries the block and has
+composite tools in its managed OpenAPI catalog:
+
+- Its upstream accepts a `jti` it has not seen for every leaf, including the
+  compensations, and the extra header on each.
+- Its composites are called by principals an identity provider vouched for:
+  a composite called anonymously or with a service token is now refused at its
+  first leaf with `caller_assertion_no_principal`, inside the
+  `composite_failed` error details, instead of
+  `caller_assertion_not_enforced`.
+- A client or dashboard that reads a composite's orphan reasons can now see a
+  `caller_assertion_*` reason on a compensation that could not be signed.
+
+Delegated Connections, discovery, enum and label sources and stored tests are
+unchanged. To keep composites refused until the upstream is ready, disable
+the Connection or remove the block with `"caller_assertion": null` before
 upgrading.
 
 ### Delegated issuer tokens
@@ -1311,12 +1422,17 @@ error, a log line, a metric or an audit event.
 #### Trust boundary
 
 Phase 8 moves per-user systems behind the gateway; this credential is where
-the trust sits:
+the trust sits. The
+[per-caller credential trust boundary](per-caller-trust-boundary.md) covers
+it together with signed caller assertions: what each component can do in the
+wrong hands, the bounded caches, the audit of every hand-out, what the issuer
+must enforce because the gateway cannot, and what is out of scope. In short:
 
 - **The issuer's grant store is the most sensitive component in the
-  deployment.** Whoever holds this Connection's client secret can ask the
-  issuer for any user's upstream token, so one leaked secret unlocks every
-  stored grant. Keep the secret in an external provider, restrict the issuer
+  deployment.** Whoever holds this Connection's client secret can exchange
+  any subject token the issuer accepts for that user's upstream token, and
+  with the signing key as well, any user's, so one leaked secret can unlock
+  every stored grant. Keep the secret in an external provider, restrict the issuer
   to this client's subject tokens and audience, have it store grants
   encrypted, grant read-only scopes wherever the upstream allows it, and
   have it log every hand-out.
@@ -1369,10 +1485,12 @@ The editor creates and edits delegated Connections:
 - **Edit.** Every credential field above can change, and the client secret can
   be kept, replaced or cleared. The credential type cannot: the stored
   `caller_assertion` is kept through every save, and under any other type the
-  gateway would start sending it upstream. A replacement never sends the
-  block, so it is shown read only; change it, or rotate its key, through the
-  admin API. For the same reason the editor does not offer the delegated
-  type on a Connection created with another one.
+  gateway would start sending it upstream. The editor never sends a
+  delegated Connection's block, so it is shown read only; change it, or
+  rotate its key, through the admin API, where a `PUT` can keep each key's
+  alias by marker (see [The block in the admin UI](#the-block-in-the-admin-ui)).
+  The editor does not offer the delegated type on a Connection created with
+  another one, whose block names that Connection's upstream as its audience.
 - **Test.** *Test connection* runs as you; see
   [Testing a delegated Connection](#testing-a-delegated-connection). The page
   explains each refusal, for example that the issuer has no grant for your
@@ -1382,6 +1500,287 @@ The detail page shows every field but the client secret's alias, which
 appears only as configured or not, the revocation endpoint included, and the
 caller assertion as the subject token. A principal's tokens are purged through
 the admin API only.
+
+### Google domain-wide delegation
+
+A Connection with `google_domain_wide_delegation` authentication calls a
+Google Workspace API -- Gmail, Calendar, Drive, the Directory -- as the
+calling user, with a Google token minted for that user alone. Unlike a
+[delegated issuer token](#delegated-issuer-tokens) it needs no grant store and
+no per-user consent: a Workspace super-admin authorises one service account
+for a fixed list of scopes, and whoever can sign a JWT as that account can
+then obtain a token for any user of the domain by naming the user's email.
+The gateway never holds that account's key. Google signs each assertion
+itself, through the IAM Credentials `signJwt` method, for a gateway that
+authenticates as the federated identity of a
+[`CONNECTION_GCP_PROVIDER`](../configuration.md#connection_gcp_provider)
+workload identity profile.
+
+Use it for Google-only tenants that do not want a token broker. Slack,
+Microsoft 365 and Google accounts outside the Workspace domain need a
+delegated issuer token instead.
+
+```json
+"kind": "http_api",
+"endpoint": {
+  "base_url": "https://gmail.googleapis.com",
+  "base_path": "/gmail/v1"
+},
+"authentication": {
+  "type": "google_domain_wide_delegation",
+  "service_account_email": "gateway-delegate@example-project.iam.gserviceaccount.com",
+  "workload_identity_profile": "gateway-wif",
+  "scopes": ["https://www.googleapis.com/auth/gmail.readonly"],
+  "subject_claim": "email",
+  "subject_issuers": ["https://idp.example.com"]
+}
+```
+
+#### Setting it up
+
+1. **Create a dedicated service account** in a Google Cloud project, for this
+   Connection and nothing else, and **create no key for it**. The gateway
+   cannot use one, and a key would be a second, unaudited way to act as every
+   user of the domain. Enforce that with the
+   `iam.disableServiceAccountKeyCreation` organisation policy constraint where
+   you can.
+2. **Configure a workload identity profile** in `CONNECTION_GCP_PROVIDER`:
+   an `id`, the pool provider `audience` and the projected token file the
+   gateway's platform writes, exactly as for the GCP Secret Manager provider.
+   A profile used only for delegation may have no aliases:
+
+   ```json
+   {
+     "profiles": [
+       {
+         "id": "gateway-wif",
+         "audience": "//iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/gateway/providers/cluster",
+         "token_root": "/var/run/secrets/gcp",
+         "token_file": "token"
+       }
+     ]
+   }
+   ```
+
+   The Connection names this profile by its `id` only. The audience and the
+   token file stay in startup configuration, so nothing an admin API caller
+   writes can point the gateway at another identity.
+3. **Let the profile sign as the account, and nothing more.** Grant the
+   profile's identity -- the federated principal, or the profile's own
+   `service_account` when it impersonates one --
+   `roles/iam.serviceAccountTokenCreator` on the delegated service account
+   itself, never at project or folder scope. Grant the delegated account no
+   project roles: the Workspace scopes are all it needs.
+4. **Authorise the account in Workspace.** In the Google Admin console's
+   domain-wide delegation settings (Security, Access and data control, API
+   controls), add the service account's numeric client ID with the scopes the
+   Connection will ask for: read-only ones only, and as few as the bound tools
+   need. This list, not the Connection's `scopes`, is what Google enforces;
+   the Connection can only ask for the same or less. Review it whenever a
+   Connection's scopes change, and remove the scopes no Connection uses.
+5. **Check restricted scopes.** Google classifies some scopes as sensitive or
+   restricted -- most Gmail scopes and full Drive access among them -- and
+   requires apps that use restricted scopes for users outside their own
+   organisation to pass its verification. An internal app whose delegation
+   reaches only users of its own Workspace domain is normally exempt. Google
+   decides this, not the gateway: before relying on a restricted scope,
+   confirm in the Google Cloud project's OAuth configuration that the app is
+   internal to your organisation, and check Google's current policy for each
+   scope you authorise.
+6. **Allow the endpoints.** Add `sts.googleapis.com`,
+   `iamcredentials.googleapis.com` and `oauth2.googleapis.com`, and the
+   upstream API host (`gmail.googleapis.com` above), to `EGRESS_ALLOWED_HOSTS`.
+7. **List the identity provider that names your users** in `subject_issuers`,
+   with its issuer exactly as the principal directory and audit actors show
+   it (a trailing slash is ignored), and only the one authoritative for the
+   domain. Any configured provider can put any address in its tokens, and the
+   gateway copies `email` without checking `email_verified`, so a provider
+   that lets users choose or change an unverified address must not be listed.
+8. **Save the Connection disabled, test it as yourself** (below), bind its
+   tools, and enable it. An enabled save requires the profile to be
+   configured, and refuses an unknown one with
+   `authentication.workload_identity_profile` and `unresolvable_binding`.
+   Writing such a Connection is credential authority: it needs
+   `admin:connections:secrets:write`.
+
+#### What Google receives
+
+On a cache miss, for one caller, the gateway:
+
+1. Checks both fixed endpoints against the egress policy before anything is
+   read or signed.
+2. Builds the claim set below and asks Google to sign it as the service
+   account:
+   `POST https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/{service_account_email}:signJwt`,
+   with the profile's federated access token as the bearer. A `401` or `403`
+   earns exactly one retry, with a fresh federated token.
+3. Refuses a signed assertion whose claims are not exactly those it sent, so a
+   signer that answered for another user is never exchanged.
+4. Exchanges it at `https://oauth2.googleapis.com/token` with
+   `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer` (RFC 7523), and
+   sends the access token upstream as `Authorization: Bearer`.
+
+| Claim | Value |
+| --- | --- |
+| `iss` | `service_account_email` |
+| `sub` | The caller's email, from their validated principal. |
+| `scope` | `scopes`, sorted and space-separated. |
+| `aud` | `https://oauth2.googleapis.com/token` |
+| `iat`, `exp` | Now, and 300 seconds later. Google accepts at most an hour. |
+
+Both endpoints are fixed: the service account's address is the only value
+from the Connection that reaches a URL, and nothing a caller sends does.
+
+#### Which calls are served
+
+Manual HTTP tool calls, from `/mcp` or the admin playground, on `http_api`
+Connections without a `caller_assertion`. A stored test is also served, as the
+principal who runs it. Every other lane -- managed OpenAPI and composite
+tools, proxied requests, managed MCP, discovery, enum and label sources --
+answers `authentication_not_supported`. A save refuses kind
+`mcp_streamable_http` (`authentication.type`, `kind_mismatch`) and any
+`caller_assertion` block (`caller_assertion`, `unsupported`): Google verifies
+no assertion of the gateway's, and one sent there would be a statement about
+the caller handed to a third party.
+
+Only a caller the Connection can name is served. Before anything is read or
+sent, a call with no principal, a service token included, is refused with
+`delegated_token_no_principal`; a caller whose attested issuer is not in
+`subject_issuers`, with `google_delegation_issuer_not_trusted`; and a caller
+without a single plain email address, with `google_delegation_no_email`.
+
+Policy is unchanged: tool policy and `rules[]` apply per principal before any
+token is minted, so read-only deny rules and per-tool roles limit what a caller
+can do with their own token.
+
+#### Testing a delegation
+
+`POST /v1{ADMIN_PREFIX}/connections/{id}/test` runs as the administrator who
+sends it. Google mints a token for that administrator's own Workspace account,
+the saved `GET` or `HEAD` test request is sent with it, and the token is
+dropped: it is never cached, so a test never serves a later call and a cached
+token never makes a test pass. A passing test shows that the profile, its
+Token Creator grant, the Workspace authorisation, the egress policy and the
+upstream work for you; it says nothing about any other user. A disabled
+Connection can be tested.
+
+A test reports the delegated reasons the admin UI already explains:
+`delegated_token_no_principal` for a tester Google cannot be asked about (a
+service token, an unlisted issuer, no email), `delegated_token_denied` when
+Google refused your account, `delegated_token_egress_denied` for a refused
+endpoint and `delegated_token_exchange_failed` for every other failure. The
+mint's own audit event, below, names the step and Google's error code.
+
+#### The cache
+
+The same bounded cache as delegated issuer tokens: per Connection revision,
+per caller (issuer, subject and email, so a caller whose email changed is
+minted for again) and per egress policy, for at most 1,024 callers per
+replica, refreshed shortly before Google's `expires_in` and reused for at most
+900 seconds. An upstream `401` drops the token that request used. A save that
+changes the Connection, disabling it included, stops each replica serving the
+tokens it cached before, once that replica has applied the change. A
+[principal purge](#purging-a-principals-tokens) drops the principal's Google
+tokens too, counted in `purged_entries` and as `google_delegation_entries` on
+`connection.delegated_token_purge`. Google offers no revocation for these
+tokens, so a dropped token stays valid at Google until it expires, about an
+hour after it was minted; suspending the user in Workspace stops new ones.
+Nothing is persisted.
+
+#### Failure reasons
+
+Each refusal is a fixed string in the `failure_reason` of
+`tool.invoke_failure` and the `reason` of `tool.upstream_request`, and no
+upstream request is made:
+
+| Reason | Meaning |
+| --- | --- |
+| `delegated_token_no_principal` | The call names nobody: anonymous, or a service token. |
+| `google_delegation_issuer_not_trusted` | The caller's identity provider is not in `subject_issuers`. |
+| `google_delegation_no_email` | The caller carries no single plain email address. |
+| `google_delegation_egress_denied` | The egress policy refuses `oauth2.googleapis.com`, `iamcredentials.googleapis.com` or an identity endpoint the profile needs. |
+| `google_delegation_identity_failed` | The profile is not configured, or could not obtain its federated token: its token file, Google STS or its own impersonation failed. |
+| `google_delegation_signing_failed` | `signJwt` refused or failed, usually because the profile's identity lacks Token Creator on the account, or returned an assertion other than the one asked for. |
+| `google_delegation_denied` | Google refused this user: `invalid_grant` or `access_denied`, or any `403`, from the token endpoint. Usually not a user of the domain, or suspended. |
+| `google_delegation_exchange_failed` | No usable token, for a reason no caller can fix. This includes `unauthorized_client`, Google's answer when the Workspace administrator has not authorised these scopes for the account. |
+| `google_delegation_unavailable` | Every cache entry is held by a call in flight, or the caller's tokens were being purged as the call arrived. |
+
+A failed mint is not cached: the caller's next call asks Google again.
+
+#### Audit and metrics
+
+Every mint emits `connection.google_delegation_token` with the caller as its
+`actor`. A call served from the cache emits no mint event; its
+`tool.upstream_request` carries the caller as usual.
+
+```json
+{
+  "connection_id": "gmail",
+  "auth_type": "google_domain_wide_delegation",
+  "outcome": "failure",
+  "reason": "google_delegation_exchange_failed",
+  "service_account": "gateway-delegate@example-project.iam.gserviceaccount.com",
+  "scopes": ["https://www.googleapis.com/auth/gmail.readonly"],
+  "stage": "exchange",
+  "identity_reason": null,
+  "google_status": 401,
+  "google_error": "unauthorized_client",
+  "latency_ms": 212
+}
+```
+
+`stage` is the last step attempted (`egress`, `identity`, `sign` or
+`exchange`), `identity_reason` the GCP provider's fixed reason when the
+federated identity failed, and `google_error` the token endpoint's error
+code, recorded only when RFC 6749 or RFC 8693 registers it and as
+`unregistered` otherwise. A mint the process stopped before it finished is
+recorded with `reason` `google_delegation_cancelled`.
+`connection_google_delegation_token_total`, labelled by `result` and `reason`,
+counts the same decisions. No federated token, assertion or access token, and
+nothing Google said beyond its status and that code, reaches a caller error, a
+log line, a metric or an audit event.
+
+Watch for a rising rate of `google_delegation_denied` and
+`google_delegation_exchange_failed`, and review changes to the domain-wide
+delegation list in the Google Workspace admin audit log beside the gateway's
+events.
+
+#### Trust boundary
+
+The [per-caller credential trust boundary](per-caller-trust-boundary.md#google-domain-wide-delegation-442)
+covers this credential in full. In short:
+
+- **The service account is the most sensitive identity in the deployment.**
+  Whoever can sign as it can act as every user of the domain for the
+  authorised scopes. Keep it dedicated, keyless and read-only, grant Token
+  Creator on it to the profile's identity alone, and keep the Workspace scope
+  list as short as the tools allow.
+- **`admin:connections:secrets:write` decides whom the gateway acts as**: it
+  chooses the account, the profile, the scopes and the issuers trusted to name
+  users. Grant it as narrowly as the profile itself.
+- **The listed issuers decide who is who.** List only the provider
+  authoritative for the domain, and one that asserts only addresses the
+  domain owns.
+- **Every mint is audited with the caller**, and tokens live only in the
+  bounded cache, never on disk.
+
+#### In the admin UI
+
+The editor creates and edits these Connections. Choose *Google domain-wide
+delegation* as the authentication type of an HTTP API Connection, then set
+the delegated service account, the workload identity profile's `id`, the
+Google scopes and the subject issuers, one per line. There is no secret to
+bind and no caller assertion to configure, and the subject claim is always
+`email`. Before anything is written, the editor refuses an account that is not
+a dedicated `name@project.iam.gserviceaccount.com` account, a profile ID that
+cannot name a profile, an empty or oversized scope list, and an issuer list
+that is empty, too long or names one issuer twice. Moving a Connection that
+carries a caller assertion to this type removes the block when you save, and
+the editor says so; choosing another type again keeps it. Writing the
+credential needs `admin:connections:secrets:write`, like every credential.
+
+The detail page shows every field, since none is a secret, explains how calls
+are served, and runs *Test connection* as you.
 
 ## TLS, Custom CAs, and Mutual TLS
 
@@ -1434,6 +1833,126 @@ For OpenAPI, preview and confirm the selected generated tools before the first
 registration. Subsequent refreshes preserve a surviving public tool name only
 when it still represents the same operation and safe mapping; a document
 cannot silently move an existing name to a different request.
+
+## Importing Swagger 2.0 Documents
+
+Managed OpenAPI Connections accept Swagger 2.0 documents, in JSON or YAML, in
+preview, registration and refresh, beside OpenAPI 3.x. A document is read as
+Swagger 2.0 when it has a `swagger` field and no `openapi` field, and its
+`swagger` value must be the string `"2.0"`: quote it in YAML, where an
+unquoted `2.0` is a number and is refused. A document that declares `openapi`
+is always read as OpenAPI 3.x, exactly as before. The legacy tools-file import
+(`/v1/admin/tools/openapi/preview` and `/register`) remains OpenAPI 3.x only.
+
+GreenGateway converts the document to the OpenAPI 3.0 document it describes
+and generates tools from that, so the tools, security alternatives and
+bindings are the ones a hand conversion would produce. The stored
+specification, its digest and the 2 MiB limit all apply to the document you
+submitted; registration stores it unchanged, and refresh and overlay edits
+convert it again.
+
+| Swagger 2.0 | Converted to |
+| --- | --- |
+| `definitions` | `components.schemas`; every `#/definitions/` reference is rewritten to `#/components/schemas/` |
+| `query`, `header` and `path` parameters | parameters with a `schema`; array `collectionFormat` `csv`, `multi`, `ssv` and `pipes` become explicit `style`/`explode` |
+| one `body` parameter | `requestBody`, one content entry per `consumes` media type |
+| `formData` parameters | a form `requestBody` (`application/x-www-form-urlencoded`, or `multipart/form-data` when the operation consumes it or has a `file` field) |
+| response `schema` | response content, one entry per `produces` media type |
+| `#/parameters/` and `#/responses/` references | inlined into each operation |
+| `securityDefinitions` | `components.securitySchemes`: `basic` becomes HTTP basic, `apiKey` keeps `in: header` or `in: query`, and the `oauth2` flows `implicit`, `password`, `application` and `accessCode` become `implicit`, `password`, `clientCredentials` and `authorizationCode` |
+| `host`, `basePath`, `schemes` | `servers`, which generated tools do not use |
+| `discriminator`, `type: file`, `x-nullable` | their OpenAPI 3.0 forms |
+
+Response headers, `examples`, `externalDocs` and vendor extensions outside
+schemas are documentation and are not carried over.
+
+Binding does not change. An `application` flow binds to an
+`oauth2_client_credentials` Connection with the same token URL and scopes, and
+`apiKey` in a header binds to `header_api_key`. The user-consent flows
+(`accessCode`, `implicit`, `password`), `basic` and query API keys are
+reported as incompatible, as their OpenAPI 3.0 forms are.
+
+The preview response of a converted document carries a `conversion` object
+with `source_format` `swagger_2_0` and a `warnings` list; an OpenAPI 3.x
+preview has no `conversion` field. Each warning has a `code`, a fixed
+`message`, an `operation_omitted` flag, and, where they apply, the `method`
+and `path_template` of the operation and a `subject` (the field, parameter,
+location, security definition or base path concerned, cut to 256 bytes).
+Review them before registering:
+
+- `base_path_not_in_paths`: generated tools call the Connection's endpoint
+  plus the operation path, and the document's `basePath` is not added. Put it
+  in the Connection's `base_path` (for an API with `basePath: /api`, set
+  `base_path` to `/api`).
+- `request_body_not_mapped`: the operation's request body has no JSON media
+  type, as with every `formData` body. Generated tools send JSON bodies only,
+  so its fields are not tool arguments and the tool sends no body, exactly as
+  for an OpenAPI 3.x form body. Leave such tools unselected unless the
+  upstream accepts the call without them.
+- `consumes_defaulted`, `produces_defaulted`: neither the operation nor the
+  document declares a media type, so body parameters or response schemas are
+  treated as `application/json`. Reported once per document.
+- `security_definition_not_converted`: the definition is incomplete (for
+  example an `oauth2` flow without its URLs or scopes) or has no OpenAPI 3.0
+  form. It is left out, so operations that require it bind as incompatible.
+- `unsupported_document_field`, `unsupported_path_item_field`: a field that
+  is not part of Swagger 2.0, such as an OpenAPI 3.x `servers` or a `trace`
+  operation, was ignored.
+- `warnings_truncated`: the list stopped at its bound; fix the reported
+  problems and preview again.
+
+These codes leave the operation out of the converted document, so no tool is
+generated for it, and set `operation_omitted`: `unsupported_operation_field`
+(for example an OpenAPI 3.x `requestBody` inside a Swagger operation),
+`invalid_parameter` (no usable name, location, body schema or items),
+`unsupported_parameter_location`, `unsupported_parameter_field` (for example
+an OpenAPI 3.x `schema` on a query parameter), `unsupported_collection_format`
+(`tsv`, a nested array format, or anything but `csv` on a path or header),
+`file_parameter_outside_form`, `multiple_body_parameters` and
+`body_and_form_parameters`. A problem in a path item's own `parameters` leaves
+out every operation of that path.
+
+The whole document is refused, and preview or registration fails as for any
+invalid specification, when `swagger` is not the string `"2.0"`, a structural
+field has the wrong type, a reference is remote, a local reference points
+anywhere but `#/definitions/`, `#/parameters/` or `#/responses/` (or a path
+item uses `$ref`), a `#/parameters/` or `#/responses/` reference names no
+component or points into one instead of at it, the document has more than
+4,096 operations, conversion would copy more than 262,144 nodes more than
+once (inlined references, path-level body fields, schemas repeated under
+several media types), or schemas nest deeper than 256 levels. A
+`#/definitions/` reference is rewritten without being resolved; the generator
+then treats a missing target exactly as it treats a missing
+`#/components/schemas/` target in an OpenAPI 3.x document.
+
+Registration publishes only the `selected_tool_names` you confirm. To keep a
+Connection to read operations, select only the tools whose
+`upstream.method` is `GET` or `HEAD` in the preview.
+
+Upgrade and rollback: releases before this one cannot generate tools from a
+Swagger 2.0 document. A replica on an earlier release keeps serving the tools
+already published for such a catalog, but cannot refresh it (it reports
+`degraded/catalog_stale`), and if the Connection also has an overlay it cannot
+rebuild the overlay's source plan from the stored document: it fails at
+startup, and a running one holds its Connection reconciliation unavailable.
+
+In cluster mode this is enforced: storing a catalog converted from a Swagger
+2.0 document (registering one, refreshing to one, or putting an overlay over
+one) is the gated operation `connections.openapi_swagger2_catalog`, admitted
+only while every live replica, draining ones included, advertises the
+`openapi_swagger2_catalogs` capability. While an earlier replica is live the
+write is refused with `409` and reason `capability_not_advertised`, nothing is
+stored, and the refusal is audited as `cluster.operation_refused`; finish the
+rollout, or wait for the earlier replicas' rows to go stale, and retry. A
+refresh learns that its document is Swagger 2.0 only after fetching it, so an
+admitted refresh fetches it again. Preview, OpenAPI 3.x documents and deleting
+an overlay never ask. See
+[operation gating](../deployment/postgres.md#membership-and-maintenance).
+
+In standalone mode there is no other replica to wait for. In either mode,
+before rolling back to an earlier release, re-register those Connections with
+an OpenAPI 3.x document (or delete their overlays first, so the earlier
+release can still start).
 
 ## OpenAPI Overlays
 
@@ -1645,7 +2164,9 @@ A composite is one agent-facing tool whose sequential steps name generated
 tools from the same managed OpenAPI catalog. It cannot introduce a method or
 path. Each real forward or compensation request still uses the Connection's
 credential and additional headers, passes the Connection egress policy, and is
-checked against HTTP deny rules on its rendered path.
+checked against HTTP deny rules on its rendered path. On a Connection with a
+`caller_assertion`, each also carries a signed assertion of its own; see
+[Composite tool leaves](#composite-tool-leaves).
 
 Composite input properties can use
 `composites.<name>.parameters.<property>.enum_source` to share the same dynamic

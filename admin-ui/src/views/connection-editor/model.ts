@@ -1,8 +1,10 @@
 
 import { AdminApiError } from '../../lib/api';
 import {
+  MAX_PUBLISHED_ASSERTION_KEYS,
   type CallerAssertionAlgorithm,
   type CallerAssertionClaim,
+  type CallerAssertionKeyBinding,
   type CallerAssertionWrite,
   type ConnectionAuthentication,
   type ConnectionCreateWrite,
@@ -54,6 +56,46 @@ export type SubjectTokenDraft = {
   claims: CallerAssertionClaim[];
 };
 
+/**
+ * What a save does with the caller assertion. `keep` leaves the block out of
+ * the write, so the gateway keeps the stored block exactly as it is (or, with
+ * none stored, adds none); `edit` writes `callerAssertionDraft` in full; and
+ * `remove` writes `null`, which removes the stored block.
+ */
+export type CallerAssertionMode = 'keep' | 'edit' | 'remove';
+
+/** The signing key or one published key of a caller assertion being edited. */
+export type AssertionKeyDraft = {
+  draftId: number;
+  kid: string;
+  algorithm: CallerAssertionAlgorithm;
+  /**
+   * The stored key this draft was loaded as. A kept binding is sent as a
+   * marker, and the gateway keeps the alias of the stored key with the same
+   * `kid` and algorithm, so changing either drops the kept binding and
+   * changing both back restores it.
+   */
+  stored?: {
+    kid: string;
+    algorithm: CallerAssertionAlgorithm;
+    configured: boolean;
+  };
+  binding: BindingDraft;
+};
+
+export type CallerAssertionDraft = {
+  signingKey: AssertionKeyDraft;
+  issuer: string;
+  audience: string;
+  tokenType: string;
+  headerName: string;
+  lifetimeSeconds: string;
+  // In the stored order, so an unchanged block writes back identical.
+  claims: CallerAssertionClaim[];
+  bindRequest: boolean;
+  publishedKeys: AssertionKeyDraft[];
+};
+
 export type ConnectionFormState = {
   displayName: string;
   description: string;
@@ -73,13 +115,24 @@ export type ConnectionFormState = {
   tokenExchangeUrl: string;
   // A delegated issuer token's optional RFC 7009 endpoint.
   revocationUrl: string;
+  // Also a Google domain-wide delegation's scopes, which the gateway requires.
   scopes: string;
   audience: string;
   resource: string;
+  // A Google domain-wide delegation's account, the `CONNECTION_GCP_PROVIDER`
+  // profile it signs through, and the identity providers trusted to name its
+  // users, one per line. None of them is a secret.
+  serviceAccountEmail: string;
+  workloadIdentityProfile: string;
+  subjectIssuers: string;
   authenticationBinding: BindingDraft;
   additionalHeaders: AdditionalHeaderDraft[];
-  // The stored block: shown read only and never written; see `writeFromForm`.
+  // The block as stored, shown read only unless `callerAssertionMode` is
+  // `edit`.
   callerAssertion: SafeCallerAssertion | null;
+  callerAssertionMode: CallerAssertionMode;
+  // Written only in `edit` mode; see `writeFromForm`.
+  callerAssertionDraft: CallerAssertionDraft;
   // A new delegated Connection's block, used only while `callerAssertion` is
   // null; see `subjectTokenDraftApplies`.
   subjectToken: SubjectTokenDraft;
@@ -144,6 +197,9 @@ export type SecretInventoryState =
     tone: 'warning' | 'error';
   };
 
+// Declared before `DEFAULT_FORM`, whose draft takes the first ID.
+let nextAssertionKeyDraftId = 1;
+
 export const DEFAULT_FORM: ConnectionFormState = {
   displayName: '',
   description: '',
@@ -163,9 +219,14 @@ export const DEFAULT_FORM: ConnectionFormState = {
   scopes: '',
   audience: '',
   resource: '',
+  serviceAccountEmail: '',
+  workloadIdentityProfile: '',
+  subjectIssuers: '',
   authenticationBinding: emptyBinding(),
   additionalHeaders: [],
   callerAssertion: null,
+  callerAssertionMode: 'keep',
+  callerAssertionDraft: newCallerAssertionDraft(),
   subjectToken: {
     signingKeyBinding: emptyBinding(),
     kid: '',
@@ -213,6 +274,19 @@ const MAX_ASSERTION_KID_BYTES = 128;
 const MAX_ASSERTION_ISSUER_AUDIENCE_BYTES = 512;
 const MAX_ASSERTION_TOKEN_TYPE_BYTES = 128;
 
+// The gateway's bounds on a Google domain-wide delegation's fields.
+export const MAX_GOOGLE_SCOPES = 16;
+const MAX_GOOGLE_SCOPE_CHARS = 128;
+export const MAX_GOOGLE_SUBJECT_ISSUERS = 8;
+const MAX_GOOGLE_SUBJECT_ISSUER_BYTES = 512;
+const MAX_PROFILE_ID_BYTES = 128;
+// A dedicated `{name}@{project}.iam.gserviceaccount.com` account, exactly as
+// the gateway and the published schema accept it. Default accounts on other
+// domains, and user accounts, are refused.
+const GOOGLE_SERVICE_ACCOUNT_PATTERN =
+  /^[a-z][a-z0-9-]{2,30}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$/;
+const PROFILE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
 /**
  * Whether the authentication type of this form is fixed. A stored delegated
  * issuer token Connection keeps its type: its caller assertion stays through
@@ -225,10 +299,10 @@ export function authenticationTypeLocked(form: ConnectionFormState): boolean {
 
 /**
  * Whether the delegated issuer token is offered: when creating a Connection,
- * and on a stored one that already uses it. A replacement never sends a
- * caller assertion (see `ConnectionWrite`), so an existing Connection cannot
- * gain the block this credential needs, nor turn a block it already has,
- * whose audience names its upstream, into a subject token.
+ * and on a stored one that already uses it. The editor drafts the subject
+ * token only on a create, so an existing Connection cannot turn a caller
+ * assertion it already has, whose audience names its upstream, into a
+ * subject token, nor gain one through this credential.
  */
 export function delegatedIssuerTokenOffered(
   form: ConnectionFormState,
@@ -248,6 +322,27 @@ export function subjectTokenDraftApplies(form: ConnectionFormState): boolean {
   );
 }
 
+/**
+ * The trusted issuers a form lists, one per line: trimmed, blank lines
+ * dropped. Lines are not split on other whitespace, so an issuer typed with a
+ * space inside is refused rather than silently turned into two.
+ */
+function subjectIssuerLines(value: string): string[] {
+  return value
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+/**
+ * An issuer as the gateway compares it with a caller's: trailing slashes
+ * removed. The gateway stores this form, so two entries that differ only by a
+ * trailing slash are one issuer listed twice.
+ */
+function canonicalSubjectIssuer(value: string): string {
+  return value.trim().replace(/\/+$/, '');
+}
+
 export function formFromDetail(detail: ConnectionDetail): ConnectionFormState {
   const configuration = detail.configuration;
   if (configuration === undefined) {
@@ -261,6 +356,10 @@ export function formFromDetail(detail: ConnectionDetail): ConnectionFormState {
   }
 
   const authentication = configuration.authentication;
+  const googleDelegation =
+    authentication.type === 'google_domain_wide_delegation'
+      ? authentication
+      : null;
   const authenticationConfigured =
     authentication.type === 'header_api_key' ||
       authentication.type === 'static_bearer'
@@ -317,9 +416,12 @@ export function formFromDetail(detail: ConnectionDetail): ConnectionFormState {
       authentication.type === 'delegated_issuer_token'
         ? authentication.revocation_url ?? ''
         : '',
-    scopes: tokenRequest?.scopes.join(' ') ?? '',
+    scopes: (tokenRequest?.scopes ?? googleDelegation?.scopes ?? []).join(' '),
     audience: tokenRequest?.audience ?? '',
     resource: tokenRequest?.resource ?? '',
+    serviceAccountEmail: googleDelegation?.service_account_email ?? '',
+    workloadIdentityProfile: googleDelegation?.workload_identity_profile ?? '',
+    subjectIssuers: googleDelegation?.subject_issuers.join('\n') ?? '',
     authenticationBinding: authenticationConfigured
       ? configuredBinding()
       : emptyBinding(),
@@ -333,6 +435,8 @@ export function formFromDetail(detail: ConnectionDetail): ConnectionFormState {
       }),
     ),
     callerAssertion: configuration.caller_assertion ?? null,
+    callerAssertionMode: 'keep',
+    callerAssertionDraft: newCallerAssertionDraft(),
     subjectToken: DEFAULT_FORM.subjectToken,
     caBundleBinding: bindingFromMarker(
       configuration.tls.ca_bundle_configured,
@@ -370,9 +474,13 @@ export function detailConfiguresCredentialAuthority(
   }
   const authenticationConfigured =
     configuration.authentication.type !== 'none';
+  // A caller assertion binds private keys, so the gateway treats it as
+  // credential authority too: changing the endpoint or test target of a
+  // Connection that carries one needs the secrets-write permission.
   return (
     authenticationConfigured ||
     (configuration.additional_headers?.length ?? 0) > 0 ||
+    configuration.caller_assertion !== undefined ||
     configuration.tls.ca_bundle_configured ||
     configuration.tls.client_certificate_configured ||
     configuration.tls.client_private_key_configured
@@ -417,12 +525,17 @@ export function writeFromForm(form: ConnectionFormState): ConnectionWrite {
         }
         : undefined;
 
-  // `form.callerAssertion` is deliberately not written. The replace contract
-  // keeps an omitted block, and the safe read hides its signing key alias, so
-  // leaving the key out is the only way this UI can keep the block exactly as
-  // stored. Anything it sent instead, `null` included, could only remove or
-  // replace the block. A new Connection's block is added by
-  // `createWriteFromForm`.
+  // The stored block is written only when the operator edits or removes it.
+  // The replace contract keeps an omitted block exactly as stored, so every
+  // other save, a rename or a credential rotation, cannot change it. A new
+  // delegated Connection's block is added by `createWriteFromForm`.
+  const mode = effectiveCallerAssertionMode(form);
+  const callerAssertion =
+    mode === 'edit'
+      ? { caller_assertion: callerAssertionWrite(form.callerAssertionDraft) }
+      : mode === 'remove' && form.callerAssertion !== null
+        ? { caller_assertion: null }
+        : {};
   return {
     display_name: form.displayName.trim(),
     ...(description ? { description } : {}),
@@ -445,6 +558,7 @@ export function writeFromForm(form: ConnectionFormState): ConnectionWrite {
         })),
       }
       : {}),
+    ...callerAssertion,
     tls,
     ...(form.customTimeouts
       ? {
@@ -475,19 +589,22 @@ export function writeFromForm(form: ConnectionFormState): ConnectionWrite {
 }
 
 /**
- * The body of a create: `writeFromForm`, plus the caller assertion a new
- * delegated issuer token Connection signs its subject tokens with. That block
- * is the only one this UI ever writes, and only here: a replacement never
- * carries one.
+ * The body of a create: `writeFromForm`, with the caller assertion a new
+ * delegated issuer token Connection signs its subject tokens with in place of
+ * the general block, which that credential never edits. A create has nothing
+ * stored to remove.
  */
 export function createWriteFromForm(
   form: ConnectionFormState,
 ): ConnectionCreateWrite {
-  const write: ConnectionCreateWrite = writeFromForm(form);
-  if (!subjectTokenDraftApplies(form)) {
-    return write;
+  const { caller_assertion: callerAssertion, ...write } = writeFromForm(form);
+  if (subjectTokenDraftApplies(form)) {
+    return {
+      ...write,
+      caller_assertion: subjectTokenFromForm(form.subjectToken),
+    };
   }
-  return { ...write, caller_assertion: subjectTokenFromForm(form.subjectToken) };
+  return callerAssertion ? { ...write, caller_assertion: callerAssertion } : write;
 }
 
 export function subjectTokenFromForm(
@@ -568,6 +685,18 @@ export function authenticationFromForm(
         subject_token_source: 'caller_assertion',
         ...binding,
       };
+    case 'google_domain_wide_delegation':
+      // Binds no secret, so nothing here is a marker: a replacement writes
+      // every field, as a create does.
+      return {
+        type: 'google_domain_wide_delegation',
+        service_account_email: form.serviceAccountEmail.trim(),
+        workload_identity_profile: form.workloadIdentityProfile.trim(),
+        scopes: normalizeList(form.scopes),
+        // The only value: the validated principal's email becomes `sub`.
+        subject_claim: 'email',
+        subject_issuers: subjectIssuerLines(form.subjectIssuers),
+      };
   }
 }
 
@@ -619,14 +748,19 @@ export function validateForm(
   ) {
     errors['authentication.header_name'] = 'Enter the API key header name.';
   }
-  // A save keeps the stored caller assertion, and the gateway revalidates it
-  // against the headers being saved, so these would be refused anyway; saying
-  // so here names the field to change instead of a form-wide error. A new
-  // delegated Connection's block is checked the same way.
+  // A save that keeps the stored caller assertion has the gateway revalidate
+  // it against the headers being saved, so these would be refused anyway;
+  // saying so here names the field to change instead of a form-wide error. A
+  // new delegated Connection's block is checked the same way. An edited block
+  // reports a clash on its own header field instead; see
+  // `validateCallerAssertion`.
   const draftsSubjectToken = subjectTokenDraftApplies(form);
+  const callerAssertionMode = effectiveCallerAssertionMode(form);
   const callerAssertionHeaderName = draftsSubjectToken
     ? form.subjectToken.headerName.trim().toLowerCase() || null
-    : form.callerAssertion?.header_name.toLowerCase() ?? null;
+    : callerAssertionMode === 'keep'
+      ? form.callerAssertion?.header_name.toLowerCase() ?? null
+      : null;
   if (
     callerAssertionHeaderName !== null &&
     form.authenticationType === 'header_api_key' &&
@@ -635,9 +769,15 @@ export function validateForm(
     errors['authentication.header_name'] =
       'The API key header cannot use the caller assertion header name.';
   }
-  if (form.callerAssertion?.bind_approval === true) {
+  if (
+    callerAssertionMode === 'keep' &&
+    form.callerAssertion?.bind_approval === true
+  ) {
     errors.form =
-      'This connection was saved with a caller assertion that asks for approval binding, which the gateway no longer accepts. Remove the caller assertion through the admin API before saving this connection.';
+      'This connection was saved with a caller assertion that asks for approval binding, which the gateway no longer accepts. Edit the caller assertion, which turns approval binding off, or remove it before saving this connection.';
+  }
+  if (callerAssertionMode === 'edit') {
+    validateCallerAssertion(form, secrets, errors);
   }
   if (form.additionalHeaders.length > MAX_ADDITIONAL_HEADERS) {
     errors.form = `Configure no more than ${MAX_ADDITIONAL_HEADERS} additional headers.`;
@@ -726,6 +866,9 @@ export function validateForm(
       errors['authentication.requested_scopes'] =
         'Requested scopes must be unique.';
     }
+  }
+  if (form.authenticationType === 'google_domain_wide_delegation') {
+    validateGoogleDomainWideDelegation(form, errors);
   }
   if (draftsSubjectToken) {
     validateSubjectToken(form, secrets, errors);
@@ -823,6 +966,16 @@ export function validateForm(
     errors['endpoint.base_url'] =
       'Credentialed connections and TLS profiles must use an HTTPS origin.';
   }
+  // The gateway refuses `https_required` for a kept block too: an assertion
+  // read off the wire can be presented as the caller until it expires.
+  if (
+    savesCallerAssertion(form) &&
+    errors['endpoint.base_url'] === undefined &&
+    !isHttpsOrigin(form.baseUrl)
+  ) {
+    errors['endpoint.base_url'] =
+      'Connections with a caller assertion must use an HTTPS origin.';
+  }
   if (form.customTimeouts) {
     validateTimeout(
       form.connectTimeoutMs,
@@ -879,6 +1032,73 @@ export function validateForm(
     errors.form = 'Confirm activation before enabling this connection.';
   }
   return errors;
+}
+
+/**
+ * The gateway's rules for a Google domain-wide delegation, so a refusal names
+ * the field to change. Whether the profile is configured is checked by the
+ * gateway on an enabled save; whether Google lets it sign as the account, and
+ * for these scopes, only on the first mint.
+ */
+function validateGoogleDomainWideDelegation(
+  form: ConnectionFormState,
+  errors: FieldErrors,
+) {
+  if (form.kind !== 'http_api') {
+    errors['authentication.type'] =
+      'Google domain-wide delegation works only on an HTTP API connection.';
+  }
+  if (!GOOGLE_SERVICE_ACCOUNT_PATTERN.test(form.serviceAccountEmail.trim())) {
+    errors['authentication.service_account_email'] =
+      'Enter a dedicated service account of the form name@project.iam.gserviceaccount.com.';
+  }
+  const profile = form.workloadIdentityProfile.trim();
+  if (
+    !PROFILE_ID_PATTERN.test(profile) ||
+    new TextEncoder().encode(profile).length > MAX_PROFILE_ID_BYTES
+  ) {
+    errors['authentication.workload_identity_profile'] =
+      `Enter the ID of a CONNECTION_GCP_PROVIDER profile: 1 to ${MAX_PROFILE_ID_BYTES} letters, digits, dots, underscores or hyphens, starting with a letter or digit.`;
+  }
+  const scopes = normalizeList(form.scopes);
+  if (scopes.length === 0) {
+    errors['authentication.scopes'] =
+      'Enter at least one scope the Workspace administrator authorised for the service account.';
+  } else if (scopes.length > MAX_GOOGLE_SCOPES) {
+    errors['authentication.scopes'] =
+      `Enter no more than ${MAX_GOOGLE_SCOPES} scopes.`;
+  } else if (
+    scopes.some((scope) => [...scope].length > MAX_GOOGLE_SCOPE_CHARS)
+  ) {
+    errors['authentication.scopes'] =
+      `Enter scopes of at most ${MAX_GOOGLE_SCOPE_CHARS} characters each.`;
+  } else if (new Set(scopes).size !== scopes.length) {
+    errors['authentication.scopes'] = 'Scopes must be unique.';
+  }
+  const issuers = subjectIssuerLines(form.subjectIssuers);
+  const canonical = issuers.map(canonicalSubjectIssuer);
+  if (issuers.length === 0) {
+    errors['authentication.subject_issuers'] =
+      'Enter the identity provider trusted to name the Workspace users.';
+  } else if (issuers.length > MAX_GOOGLE_SUBJECT_ISSUERS) {
+    errors['authentication.subject_issuers'] =
+      `Enter no more than ${MAX_GOOGLE_SUBJECT_ISSUERS} subject issuers.`;
+  } else if (
+    canonical.some(
+      (issuer) =>
+        issuer.length === 0 ||
+        new TextEncoder().encode(issuer).length >
+          MAX_GOOGLE_SUBJECT_ISSUER_BYTES ||
+        // Whitespace, and Rust's `char::is_control`, which the gateway applies.
+        /[\s\u0000-\u001f\u007f-\u009f]/.test(issuer),
+    )
+  ) {
+    errors['authentication.subject_issuers'] =
+      `Enter one issuer per line, each 1 to ${MAX_GOOGLE_SUBJECT_ISSUER_BYTES} bytes with no spaces or control characters.`;
+  } else if (new Set(canonical).size !== canonical.length) {
+    errors['authentication.subject_issuers'] =
+      'List each issuer once; a trailing slash does not make it another one.';
+  }
 }
 
 /**
@@ -948,6 +1168,395 @@ function validateSubjectToken(
     errors['caller_assertion.lifetime_seconds'] =
       `Enter a whole number of seconds from 1 to ${MAX_CALLER_ASSERTION_LIFETIME_SECONDS}.`;
   }
+}
+
+export function newCallerAssertionDraft(): CallerAssertionDraft {
+  return {
+    signingKey: emptyAssertionKey(),
+    issuer: '',
+    audience: '',
+    tokenType: '',
+    headerName: 'X-Caller-Assertion',
+    lifetimeSeconds: '60',
+    claims: [],
+    bindRequest: false,
+    publishedKeys: [],
+  };
+}
+
+export function emptyAssertionKey(): AssertionKeyDraft {
+  return {
+    draftId: nextAssertionKeyDraftId++,
+    kid: '',
+    algorithm: 'es256',
+    binding: emptyBinding(),
+  };
+}
+
+function storedAssertionKey(
+  kid: string,
+  algorithm: CallerAssertionAlgorithm,
+  configured: boolean,
+): AssertionKeyDraft {
+  return {
+    draftId: nextAssertionKeyDraftId++,
+    kid,
+    algorithm,
+    stored: { kid, algorithm, configured },
+    binding: bindingFromMarker(configured),
+  };
+}
+
+/**
+ * The stored block as a draft that writes it back unchanged: every key kept
+ * by marker, approval binding off. A block an earlier release stored with
+ * approval binding cannot be saved as it is, and editing it is how the
+ * operator turns that off.
+ */
+export function callerAssertionDraftFromStored(
+  stored: SafeCallerAssertion,
+): CallerAssertionDraft {
+  return {
+    signingKey: storedAssertionKey(
+      stored.kid,
+      stored.algorithm,
+      stored.signing_key_configured,
+    ),
+    issuer: stored.issuer,
+    audience: stored.audience,
+    tokenType: stored.token_type,
+    headerName: stored.header_name,
+    lifetimeSeconds: String(stored.lifetime_seconds),
+    claims: [...(stored.claims ?? [])],
+    bindRequest: stored.bind_request,
+    publishedKeys: (stored.published_keys ?? []).map((key) =>
+      storedAssertionKey(key.kid, key.algorithm, key.signing_key_configured),
+    ),
+  };
+}
+
+/**
+ * Applies an edit to one key. Like an additional header renamed away from its
+ * stored binding, a key whose `kid` or algorithm no longer names the stored
+ * key it was loaded as loses its kept binding, because the gateway would
+ * refuse the marker; changing both back restores it.
+ */
+export function assertionKeyWithPatch(
+  key: AssertionKeyDraft,
+  patch: Partial<Pick<AssertionKeyDraft, 'kid' | 'algorithm' | 'binding'>>,
+): AssertionKeyDraft {
+  const next = { ...key, ...patch };
+  if (
+    key.stored === undefined ||
+    !key.stored.configured ||
+    patch.binding !== undefined
+  ) {
+    return next;
+  }
+  const namesStoredKey =
+    next.kid === key.stored.kid && next.algorithm === key.stored.algorithm;
+  if (!namesStoredKey && next.binding.intent === 'preserve') {
+    return { ...next, binding: emptyBinding() };
+  }
+  if (namesStoredKey && next.binding.intent === 'none') {
+    return { ...next, binding: configuredBinding() };
+  }
+  return next;
+}
+
+/**
+ * Rotation step 3 in one action: the published key at `index` becomes the
+ * signing key and the signing key takes its place in `published_keys`. Each
+ * key keeps its `kid`, algorithm and binding, so a kept alias moves with it.
+ */
+export function callerAssertionDraftWithPromotedKey(
+  draft: CallerAssertionDraft,
+  index: number,
+): CallerAssertionDraft {
+  const promoted = draft.publishedKeys[index];
+  if (promoted === undefined) {
+    return draft;
+  }
+  return {
+    ...draft,
+    signingKey: promoted,
+    publishedKeys: draft.publishedKeys.map((key, position) =>
+      position === index ? draft.signingKey : key,
+    ),
+  };
+}
+
+export function callerAssertionWrite(
+  draft: CallerAssertionDraft,
+): CallerAssertionWrite {
+  return {
+    ...assertionKeyBindingPayload(draft.signingKey.binding),
+    kid: draft.signingKey.kid,
+    algorithm: draft.signingKey.algorithm,
+    issuer: draft.issuer,
+    audience: draft.audience,
+    token_type: draft.tokenType,
+    header_name: draft.headerName.trim(),
+    lifetime_seconds: Number(draft.lifetimeSeconds),
+    ...(draft.claims.length > 0 ? { claims: [...draft.claims] } : {}),
+    bind_request: draft.bindRequest,
+    bind_approval: false,
+    ...(draft.publishedKeys.length > 0
+      ? {
+        published_keys: draft.publishedKeys.map((key) => ({
+          ...assertionKeyBindingPayload(key.binding),
+          kid: key.kid,
+          algorithm: key.algorithm,
+        })),
+      }
+      : {}),
+  };
+}
+
+/**
+ * A replaced binding names its alias; a kept one is the marker the gateway
+ * resolves by `kid`. An unbound key writes neither, which `validateForm`
+ * refuses before any save.
+ */
+function assertionKeyBindingPayload(
+  binding: BindingDraft,
+): CallerAssertionKeyBinding {
+  if (binding.intent === 'replace') {
+    return { signing_key_id: binding.secretId.trim() };
+  }
+  if (binding.intent === 'preserve' && binding.configured) {
+    return { signing_key_configured: true };
+  }
+  return {};
+}
+
+/**
+ * What a save does with the caller assertion. A delegated issuer token
+ * Connection's block is its subject token: a new one is drafted in
+ * `subjectToken` and a stored one stays read only, so for that credential the
+ * general block is always kept. A Google domain-wide delegation carries none:
+ * Google verifies no assertion of the gateway's, and one sent there would be
+ * a statement about the caller handed to a third party, so the gateway
+ * refuses the block and a save removes a stored one.
+ */
+export function effectiveCallerAssertionMode(
+  form: ConnectionFormState,
+): CallerAssertionMode {
+  switch (form.authenticationType) {
+    case 'delegated_issuer_token':
+      return 'keep';
+    case 'google_domain_wide_delegation':
+      return 'remove';
+    default:
+      return form.callerAssertionMode;
+  }
+}
+
+/** Whether a save leaves the Connection carrying a caller assertion. */
+export function savesCallerAssertion(form: ConnectionFormState): boolean {
+  const mode = effectiveCallerAssertionMode(form);
+  return (
+    subjectTokenDraftApplies(form) ||
+    mode === 'edit' ||
+    (mode === 'keep' && form.callerAssertion !== null)
+  );
+}
+
+function validateCallerAssertion(
+  form: ConnectionFormState,
+  secrets: ConnectionSecretMetadata[],
+  errors: FieldErrors,
+) {
+  const draft = form.callerAssertionDraft;
+  validateAssertionKeyBinding(
+    draft.signingKey.binding,
+    'caller_assertion.signing_key_id',
+    secrets,
+    errors,
+  );
+  for (const [value, field, maxBytes, label] of [
+    [
+      draft.signingKey.kid,
+      'caller_assertion.kid',
+      MAX_ASSERTION_KID_BYTES,
+      'a key ID',
+    ],
+    [
+      draft.issuer,
+      'caller_assertion.issuer',
+      MAX_ASSERTION_ISSUER_AUDIENCE_BYTES,
+      'an issuer',
+    ],
+    [
+      draft.audience,
+      'caller_assertion.audience',
+      MAX_ASSERTION_ISSUER_AUDIENCE_BYTES,
+      'an audience',
+    ],
+    [
+      draft.tokenType,
+      'caller_assertion.token_type',
+      MAX_ASSERTION_TOKEN_TYPE_BYTES,
+      'a token type',
+    ],
+  ] as const) {
+    if (!validAssertionText(value, maxBytes)) {
+      errors[field] =
+        `Enter ${label} of 1 to ${maxBytes} bytes with no control characters.`;
+    }
+  }
+
+  const headerName = draft.headerName.trim();
+  const normalizedHeaderName = headerName.toLowerCase();
+  if (!validCredentialHeaderName(headerName)) {
+    errors['caller_assertion.header_name'] =
+      'Enter a valid, non-reserved HTTP header name of at most 64 bytes.';
+  } else if (
+    form.authenticationType === 'header_api_key' &&
+    form.headerName.trim().toLowerCase() === normalizedHeaderName
+  ) {
+    errors['caller_assertion.header_name'] =
+      'The assertion header must differ from the API key header.';
+  } else if (
+    form.additionalHeaders.some(
+      (header) =>
+        header.headerName.trim().toLowerCase() === normalizedHeaderName,
+    )
+  ) {
+    errors['caller_assertion.header_name'] =
+      'The assertion header must differ from every additional header.';
+  }
+
+  const lifetime = Number(draft.lifetimeSeconds);
+  if (
+    !/^\d+$/.test(draft.lifetimeSeconds.trim()) ||
+    lifetime < 1 ||
+    lifetime > MAX_CALLER_ASSERTION_LIFETIME_SECONDS
+  ) {
+    errors['caller_assertion.lifetime_seconds'] =
+      `Enter a whole number of seconds from 1 to ${MAX_CALLER_ASSERTION_LIFETIME_SECONDS}.`;
+  }
+
+  if (draft.publishedKeys.length > MAX_PUBLISHED_ASSERTION_KEYS) {
+    errors['caller_assertion.published_keys'] =
+      `Publish no more than ${MAX_PUBLISHED_ASSERTION_KEYS} keys beside the signing key.`;
+  }
+  // A verifier selects a key by `kid`, so each names one key, and one alias
+  // is never published under two names.
+  const kids = new Set([draft.signingKey.kid]);
+  const aliases = new Set(
+    draft.signingKey.binding.intent === 'replace'
+      ? [draft.signingKey.binding.secretId.trim()]
+      : [],
+  );
+  for (const [index, key] of draft.publishedKeys.entries()) {
+    const kidField = `caller_assertion.published_keys.${index}.kid`;
+    const secretField = `caller_assertion.published_keys.${index}.signing_key_id`;
+    if (!validAssertionText(key.kid, MAX_ASSERTION_KID_BYTES)) {
+      errors[kidField] =
+        'Enter a key ID of 1 to 128 bytes with no control characters.';
+    } else if (kids.has(key.kid)) {
+      errors[kidField] =
+        'Every published key needs its own key ID, distinct from the signing key and every other published key.';
+    }
+    kids.add(key.kid);
+    validateAssertionKeyBinding(key.binding, secretField, secrets, errors);
+    if (key.binding.intent === 'replace') {
+      const alias = key.binding.secretId.trim();
+      if (errors[secretField] === undefined && aliases.has(alias)) {
+        errors[secretField] = 'Each secret alias may be published once.';
+      }
+      aliases.add(alias);
+    }
+  }
+}
+
+function validateAssertionKeyBinding(
+  binding: BindingDraft,
+  field: string,
+  secrets: ConnectionSecretMetadata[],
+  errors: FieldErrors,
+) {
+  if (binding.intent === 'preserve' && binding.configured) {
+    return;
+  }
+  if (
+    binding.intent === 'replace' &&
+    bindingHasCompatibleSecret(binding, 'assertion_signing_key', secrets)
+  ) {
+    return;
+  }
+  errors[field] =
+    binding.intent === 'replace'
+      ? 'Select a configured secret alias that can hold an assertion signing key.'
+      : 'Select the secret alias that holds this key.';
+}
+
+function validAssertionText(value: string, maxBytes: number): boolean {
+  return (
+    value.length > 0 &&
+    new TextEncoder().encode(value).length <= maxBytes &&
+    // Rust's `char::is_control`, which the gateway applies.
+    !/[\u0000-\u001f\u007f-\u009f]/.test(value)
+  );
+}
+
+// What the gateway's caller-assertion problem codes mean, for the fields of
+// this block. The code is shown beside the sentence so an operator can find it
+// in the operator guide.
+const CALLER_ASSERTION_PROBLEMS: Record<string, string> = {
+  required: 'This connection needs a caller assertion.',
+  invalid_value: 'Enter a value with no control characters, within the length limit.',
+  invalid_header_name:
+    'Enter a valid, non-reserved HTTP header name of at most 64 bytes.',
+  duplicate_header_name:
+    'The assertion header must differ from the API key header and every additional header.',
+  invalid_lifetime: `Enter 1 to ${MAX_CALLER_ASSERTION_LIFETIME_SECONDS} seconds.`,
+  duplicate_claim: 'List each claim once.',
+  unsupported_binding: 'This binding is not supported here.',
+  too_many_keys: `Publish no more than ${MAX_PUBLISHED_ASSERTION_KEYS} keys beside the signing key.`,
+  duplicate_kid:
+    'Another key, on this connection or on another enabled one, is published under this key ID.',
+  duplicate_signing_key: 'Each secret alias may be published once.',
+  unresolvable_binding:
+    'The alias is not configured, is unknown to its source, or does not hold a key.',
+  binding_unavailable:
+    'The secret source could not be read. Retry once it is available.',
+  invalid_signing_key:
+    'The alias does not hold exactly one PKCS#8 private key (BEGIN PRIVATE KEY).',
+  algorithm_mismatch: 'The key is for the other algorithm.',
+  unusable_signing_key:
+    'The key cannot sign with this algorithm: ES256 needs a P-256 key and RS256 an RSA key of at least 2048 bits.',
+  secret_purpose_conflict:
+    'This alias is bound as a delegated token-exchange client secret and cannot also hold an assertion key.',
+  unsupported:
+    'A Google domain-wide delegation sends the caller\'s own Google token, and Google verifies no caller assertion: remove the block to save this connection.',
+};
+
+// What the gateway's problem codes mean for the fields only a Google
+// domain-wide delegation has, keyed by field and code. The code is shown
+// beside the sentence, as for a caller assertion.
+const GOOGLE_DELEGATION_PROBLEMS: Record<string, string> = {
+  'authentication.service_account_email:invalid_service_account':
+    'Enter a dedicated service account of the form name@project.iam.gserviceaccount.com.',
+  'authentication.workload_identity_profile:invalid_profile_id':
+    'Enter the ID of a CONNECTION_GCP_PROVIDER profile, not a token file, audience or key.',
+  'authentication.workload_identity_profile:unresolvable_binding':
+    'No CONNECTION_GCP_PROVIDER profile with this ID is configured on the gateway. Configure it in the gateway\'s startup configuration, or save the connection disabled.',
+  'authentication.subject_issuers:required':
+    'Enter the identity provider trusted to name the Workspace users.',
+  'authentication.subject_issuers:too_many': `Enter no more than ${MAX_GOOGLE_SUBJECT_ISSUERS} subject issuers.`,
+  'authentication.subject_issuers:invalid_issuer':
+    'Enter one issuer per line, with no spaces or control characters.',
+  'authentication.subject_issuers:duplicate_issuer':
+    'List each issuer once; a trailing slash does not make it another one.',
+};
+
+export function callerAssertionProblemMessage(code: string): string {
+  const sentence = CALLER_ASSERTION_PROBLEMS[code];
+  return sentence === undefined
+    ? humanizeCode(code)
+    : `${sentence} (${code})`;
 }
 
 export function bindingHasCompatibleSecret(
@@ -1208,6 +1817,8 @@ export function authenticationPurpose(
       return 'oauth_client_secret';
     case 'delegated_issuer_token':
       return 'token_exchange_client_secret';
+    // Binds no secret: its profile is trusted startup configuration.
+    case 'google_domain_wide_delegation':
     case 'none':
       return null;
   }
@@ -1487,6 +2098,9 @@ export function focusFirstProblem(errors: FieldErrors) {
     'authentication.requested_scopes': 'connection-oauth-scopes',
     'authentication.audience': 'connection-oauth-audience',
     'authentication.resource': 'connection-oauth-resource',
+    'authentication.service_account_email': 'connection-google-service-account',
+    'authentication.workload_identity_profile': 'connection-google-profile',
+    'authentication.subject_issuers': 'connection-google-subject-issuers',
     'authentication.secret_id': 'connection-auth-secret',
     'authentication.client_secret_id': 'connection-auth-secret',
     'caller_assertion.signing_key_id': 'connection-subject-token-key',
@@ -1508,33 +2122,103 @@ export function focusFirstProblem(errors: FieldErrors) {
     'test_profile.path': 'connection-test-path',
     'test_profile.expected_statuses': 'connection-expected-statuses',
   };
-  const target = Object.keys(errors)
-    .map((field) => {
+  // The same caller-assertion field is drafted by the subject-token section
+  // of a new delegated Connection or by the caller-assertion editor; when
+  // neither shows it, its problem is listed in the caller-assertion section.
+  const callerAssertionEditorIds: Record<string, string> = {
+    'caller_assertion.signing_key_id': 'connection-caller-assertion-signing-key',
+    'caller_assertion.kid': 'connection-caller-assertion-kid',
+    'caller_assertion.issuer': 'connection-caller-assertion-issuer',
+    'caller_assertion.audience': 'connection-caller-assertion-audience',
+    'caller_assertion.token_type': 'connection-caller-assertion-token-type',
+    'caller_assertion.header_name': 'connection-caller-assertion-header-name',
+    'caller_assertion.lifetime_seconds': 'connection-caller-assertion-lifetime',
+  };
+  const candidates = Object.keys(errors)
+    .map((field): string[] | undefined => {
+      if (field === 'caller_assertion' || field.startsWith('caller_assertion.')) {
+        const indexedPublishedKey =
+          /^caller_assertion\.published_keys\.(\d+)\.(kid|signing_key_id)$/.exec(
+            field,
+          );
+        return [
+          fieldToId[field],
+          callerAssertionEditorIds[field],
+          indexedPublishedKey
+            ? `connection-caller-assertion-published-key-${indexedPublishedKey[1]}-${indexedPublishedKey[2] === 'kid' ? 'kid' : 'secret'
+            }`
+            : undefined,
+          CALLER_ASSERTION_PROBLEMS_ID,
+        ].filter((id): id is string => id !== undefined);
+      }
       if (fieldToId[field]) {
-        return fieldToId[field];
+        return [fieldToId[field]];
       }
       const indexedAdditionalHeader =
         /^additional_headers\.(\d+)\.(header_name|secret_id)$/.exec(field);
       return indexedAdditionalHeader
-        ? `connection-additional-header-${indexedAdditionalHeader[1]}-${indexedAdditionalHeader[2] === 'header_name' ? 'name' : 'secret'
-        }`
+        ? [
+          `connection-additional-header-${indexedAdditionalHeader[1]}-${indexedAdditionalHeader[2] === 'header_name' ? 'name' : 'secret'
+          }`,
+        ]
         : undefined;
     })
-    .find((id) => id !== undefined);
-  if (target) {
-    queueMicrotask(() => document.getElementById(target)?.focus());
+    .find((ids) => ids !== undefined);
+  if (candidates) {
+    queueMicrotask(() =>
+      candidates
+        .map((id) => document.getElementById(id))
+        .find((element) => element !== null)
+        ?.focus(),
+    );
   }
 }
 
+export const CALLER_ASSERTION_PROBLEMS_ID = 'connection-caller-assertion-problems';
+
 /**
- * The gateway's field problems as editor field errors. `subjectTokenFields`
- * says whether the form shows the caller assertion's fields (a new delegated
- * Connection); otherwise a problem with the stored block is shown form-wide,
- * since the editor has no control for it.
+ * The caller-assertion problems that have no field of their own on screen:
+ * the block's own, and those of fields no section shows. While a stored block
+ * is kept or removed it is shown read only, so all of them; while it is
+ * edited, or a new delegated Connection drafts it as its subject token, those
+ * of the block's own fields are shown on the fields.
+ */
+export function callerAssertionSectionProblems(
+  errors: FieldErrors,
+  fieldsShown: boolean,
+): string[] {
+  return Object.entries(errors)
+    .filter(
+      ([field]) =>
+        field === 'caller_assertion' ||
+        (field.startsWith('caller_assertion.') &&
+          !(fieldsShown && CALLER_ASSERTION_DRAFT_FIELDS.has(field)) &&
+          !(
+            fieldsShown &&
+            /^caller_assertion\.published_keys\.\d+\./.test(field)
+          )),
+    )
+    .map(([, message]) => message);
+}
+
+const CALLER_ASSERTION_DRAFT_FIELDS = new Set([
+  'caller_assertion.signing_key_id',
+  'caller_assertion.kid',
+  'caller_assertion.issuer',
+  'caller_assertion.audience',
+  'caller_assertion.token_type',
+  'caller_assertion.header_name',
+  'caller_assertion.lifetime_seconds',
+]);
+
+/**
+ * The gateway's field problems as editor field errors. A caller-assertion
+ * problem keeps its field and shows its code beside what it means; the
+ * section shows it wherever no field does (see
+ * `callerAssertionSectionProblems`).
  */
 export function fieldErrorsFromProblems(
   problems: readonly { field: string; code: string }[],
-  subjectTokenFields = false,
 ): FieldErrors {
   const knownFields = new Set([
     'display_name',
@@ -1550,19 +2234,11 @@ export function fieldErrorsFromProblems(
     'authentication.requested_scopes',
     'authentication.audience',
     'authentication.resource',
+    'authentication.service_account_email',
+    'authentication.workload_identity_profile',
+    'authentication.subject_issuers',
     'authentication.secret_id',
     'authentication.client_secret_id',
-    ...(subjectTokenFields
-      ? [
-        'caller_assertion.signing_key_id',
-        'caller_assertion.kid',
-        'caller_assertion.issuer',
-        'caller_assertion.audience',
-        'caller_assertion.token_type',
-        'caller_assertion.header_name',
-        'caller_assertion.lifetime_seconds',
-      ]
-      : []),
     'additional_headers.header_name',
     'additional_headers.secret_id',
     'tls.ca_bundle_alias',
@@ -1577,7 +2253,27 @@ export function fieldErrorsFromProblems(
   ]);
   const errors: FieldErrors = {};
   for (const problem of problems) {
-    const message = humanizeCode(problem.code);
+    if (
+      problem.field === 'caller_assertion' ||
+      problem.field.startsWith('caller_assertion.')
+    ) {
+      // The gateway names a published key's field without its index, so its
+      // problem is shown beside the list rather than on one row.
+      appendFieldError(
+        errors,
+        problem.field.startsWith('caller_assertion.published_keys')
+          ? 'caller_assertion.published_keys'
+          : problem.field,
+        callerAssertionProblemMessage(problem.code),
+      );
+      continue;
+    }
+    const googleSentence =
+      GOOGLE_DELEGATION_PROBLEMS[`${problem.field}:${problem.code}`];
+    const message =
+      googleSentence === undefined
+        ? humanizeCode(problem.code)
+        : `${googleSentence} (${problem.code})`;
     if (problem.field === 'tls') {
       appendFieldError(errors, 'tls.client_certificate_id', message);
       appendFieldError(errors, 'tls.client_private_key_id', message);

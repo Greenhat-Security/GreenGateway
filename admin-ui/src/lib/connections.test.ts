@@ -319,6 +319,65 @@ describe('connections API client', () => {
     }
   });
 
+  it('projects a Google domain-wide delegation exactly as stored, and refuses a malformed one', async () => {
+    const canary = 'UNEXPECTED_GOOGLE_DELEGATION_TOKEN_CANARY';
+    const stored = {
+      type: 'google_domain_wide_delegation',
+      service_account_email:
+        'gateway-delegate@example-project.iam.gserviceaccount.com',
+      workload_identity_profile: 'gateway-wif',
+      scopes: ['https://www.googleapis.com/auth/gmail.readonly'],
+      subject_claim: 'email',
+      subject_issuers: ['https://idp.example.test'],
+    };
+    const detail = connectionDetail();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() =>
+        Promise.resolve(
+          jsonResponse(200, {
+            ...detail,
+            authentication: 'google_domain_wide_delegation',
+            configuration: {
+              ...detail.configuration,
+              authentication: { ...stored, access_token: canary },
+            },
+          }),
+        ),
+      ),
+    );
+
+    const { value } = await getConnection('connection/one');
+    expect(value.authentication).toBe('google_domain_wide_delegation');
+    expect(value.configuration?.authentication).toEqual(stored);
+    expect(JSON.stringify(value)).not.toContain(canary);
+
+    for (const malformed of [
+      { ...stored, subject_claim: 'sub' },
+      { ...stored, scopes: 'https://www.googleapis.com/auth/gmail.readonly' },
+      { ...stored, subject_issuers: [42] },
+      { ...stored, workload_identity_profile: undefined },
+    ]) {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(() =>
+          Promise.resolve(
+            jsonResponse(200, {
+              ...detail,
+              configuration: {
+                ...detail.configuration,
+                authentication: malformed,
+              },
+            }),
+          ),
+        ),
+      );
+      await expect(getConnection('connection/one')).rejects.toMatchObject({
+        name: ConnectionContractError.name,
+      });
+    }
+  });
+
   it('projects a caller assertion exactly as stored and drops anything else', async () => {
     const canary = 'UNEXPECTED_CALLER_ASSERTION_SECRET_CANARY';
     const withClaims = callerAssertion();
@@ -1002,7 +1061,9 @@ describe('connections API client', () => {
   });
 });
 
-function connectionWrite(): ConnectionWrite {
+// Without a caller assertion, so it is both a valid create and a valid
+// replacement.
+function connectionWrite(): Omit<ConnectionWrite, 'caller_assertion'> {
   return {
     display_name: 'Billing API',
     enabled: false,

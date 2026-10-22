@@ -913,6 +913,19 @@ jobs:
         with:
           rust: none
           node: 'true'
+      # Static checks of the production qualification kit
+      # (docs/deployment/qualification.md): its fixtures, the shipped example
+      # manifests it judges, the example load profile and the evidence
+      # template. Offline and loopback only; no cluster and no image needed.
+      - name: Check the production qualification kit
+        shell: bash
+        run: |
+          set -eu
+          python -m unittest discover -s scripts -p test_qualification.py -v
+          node scripts/run-load-suite.mjs --profile docs/deployment/qualification/load-profile.example.json --validate-only
+          python scripts/qualification.py netpol --cases docs/deployment/qualification/netpol-cases.example.json --plan > /dev/null
+          python scripts/qualification.py evidence docs/deployment/qualification/evidence-template.json
+
       # Compose names the gateway service's image `<project>-gateway`; the
       # project is pinned below so that name is fixed, and `--no-build` runs
       # exactly this run's production image (Compose's build of the same
@@ -1404,9 +1417,25 @@ jobs:
           fi
           echo "${{ matrix.suite }} did real work: ${elapsed}s"
 
+      - name: Verify the upgrade-pair evidence against the published matrix
+        # Issue #426 PR 4. A pair row writes its evidence only after every
+        # one of its assertions passed, so evidence that is missing means a
+        # row that failed, or was removed, renamed or ignored -- which the
+        # pass count and the elapsed-time floor above cannot see while the
+        # other rows still run. This refuses that, a pin that
+        # docs/deployment/upgrade-support-matrix.json does not list, and any
+        # observation the matrix does not publish, then writes summary.json.
+        # Its own tests run first, so a broken check cannot pass the leg.
+        if: ${{ matrix.suite == 'ha_rolling_upgrade' }}
+        run: |
+          set -euo pipefail
+          python -m unittest discover -s scripts -p 'test_upgrade_pair_evidence.py' -v
+          python scripts/upgrade_pair_evidence.py --pair-dir "${RUNNER_TEMP}/upgrade-pair" --gate-commit "${GITHUB_SHA}"
+
       - name: Retain the upgrade-pair evidence
         # Both binaries' commits and hashes, the schema state, the operation
-        # matrix and the readiness each pair row observed.
+        # matrix and the readiness each pair row observed, and the summary
+        # the check above wrote once it found all of it as published.
         if: ${{ always() && matrix.suite == 'ha_rolling_upgrade' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -1414,6 +1443,7 @@ jobs:
           path: |
             ${{ runner.temp }}/upgrade-pair/manifest.json
             ${{ runner.temp }}/upgrade-pair/evidence
+            ${{ runner.temp }}/upgrade-pair/summary.json
           if-no-files-found: warn
           retention-days: 30
 

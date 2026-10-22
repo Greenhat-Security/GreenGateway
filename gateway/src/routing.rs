@@ -373,6 +373,10 @@ pub(super) fn add_admin_api_routes(
                     post(policy_validate_endpoint),
                 )
                 .route(
+                    routes.admin.policy_convert_route.as_str(),
+                    post(policy_convert_endpoint),
+                )
+                .route(
                     routes.admin.policy_test_runs_route.as_str(),
                     post(policy_test_runs_endpoint),
                 )

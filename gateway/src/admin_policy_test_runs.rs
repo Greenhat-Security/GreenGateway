@@ -160,6 +160,13 @@ async fn policy_under_test(
         if let Err(error) = rbac_state.validate_proxy_dispatch_policy(&candidate) {
             return Err(Box::new(policy_candidate_invalid(&error)));
         }
+        // `POST /policy/validate` also refuses a document format this
+        // deployment cannot commit (cluster mode and policy v1), so a run
+        // refuses it too rather than judge a candidate the gateway would not
+        // accept.
+        if let Some(detail) = deployment_document_format_refusal(state, &candidate) {
+            return Err(Box::new(policy_candidate_refused(vec![detail])));
+        }
         let etag = match policy_etag(&candidate) {
             Ok(etag) => etag,
             Err(error) => {
@@ -251,12 +258,16 @@ fn check_policy_test_if_match(headers: &HeaderMap, current_etag: &str) -> Respon
 }
 
 fn policy_candidate_invalid(error: &rbac::policy::PolicyError) -> Response {
+    policy_candidate_refused(vec![policy_error_message(error)])
+}
+
+fn policy_candidate_refused(errors: Vec<String>) -> Response {
     (
         StatusCode::UNPROCESSABLE_ENTITY,
         Json(json!({
             "error": "candidate policy is invalid",
             "reason": "policy_candidate_invalid",
-            "errors": [policy_error_message(error)],
+            "errors": errors,
         })),
     )
         .into_response()

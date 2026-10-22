@@ -235,6 +235,7 @@ impl StandaloneSource {
                 detail: error.to_string(),
             }
         })?;
+        ensure_cluster_document_format(&policy, "policy")?;
 
         let policy_history_file = crate::policy_history_sqlite_path(&config)
             .unwrap_or_else(|| PathBuf::from(format!("{}.history.sqlite", policy_file.display())));
@@ -472,6 +473,27 @@ fn open_read_only(setting: &'static str, path: &Path) -> Result<(), ImportError>
         })
 }
 
+/// Standalone mode reads policy v1, but a cluster replica serves only the
+/// document formats it advertises (`cluster_membership::DOCUMENT_VERSION_RANGE`),
+/// so an import that wrote a v1 document -- active or historical -- would
+/// leave every replica refusing it. Refused here instead, before anything is
+/// written.
+fn ensure_cluster_document_format(policy: &Policy, kind: &'static str) -> Result<(), ImportError> {
+    if policy.cluster_serves_document_format() {
+        return Ok(());
+    }
+    let (minimum, maximum) = crate::cluster_membership::DOCUMENT_VERSION_RANGE;
+    Err(ImportError::SourceDocumentUnparseable {
+        kind,
+        detail: format!(
+            "schema_version '{}' is a document format cluster replicas of this build do not \
+             serve (they read {minimum} to {maximum}); keep the standalone policy on a 0.x \
+             document to import it",
+            policy.schema_version
+        ),
+    })
+}
+
 /// The standalone policy history, oldest-first, read through the store's
 /// own paging contract (newest-first pages walked with its version
 /// cursor) rather than a query of our own.
@@ -494,6 +516,11 @@ fn read_history(path: &Path) -> Result<Vec<PolicyVersion>, ImportError> {
                 kind: "policy history",
                 detail: error.to_string(),
             })?;
+        for version in &page.versions {
+            if let Some(policy) = version.policy.as_ref() {
+                ensure_cluster_document_format(policy, "policy history")?;
+            }
+        }
         versions.extend(page.versions);
         match page.next_cursor {
             Some(next) => cursor = Some(next),

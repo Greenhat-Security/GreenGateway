@@ -278,6 +278,16 @@ fn cloudflare_forwarding_matches_supported_gateway_env_vars() {
         "CLUSTER_MAINTENANCE_INTERVAL_MS",
         "CLUSTER_MAINTENANCE_LEASE_TTL_MS",
         "AUDIT_POSTGRES_RETENTION_DAYS",
+        // Authority-event delivery (issue #425, PR 3): the dispatcher's
+        // sink and its file, the pseudonym key aliases, and the journal's
+        // capacity and retention. Cluster mode only, rejected in standalone
+        // mode, so never honoured here.
+        "AUTHORITY_EVENT_SINK",
+        "AUTHORITY_EVENT_FILE",
+        "AUTHORITY_PSEUDONYM_KEY_ALIAS",
+        "AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS",
+        "AUTHORITY_EVENT_JOURNAL_CAPACITY",
+        "AUTHORITY_EVENT_RETENTION_HOURS",
         // The readiness probe's cache window (issue #241, PR 14): it
         // bounds how often `/readyz` consults the shared authority, and
         // standalone readiness consults none, so the setting is rejected

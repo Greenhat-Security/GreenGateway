@@ -74,10 +74,28 @@ pub struct OpenApiConnectionCatalogService {
     enum_source_runtime: Option<EnumSourceRuntime>,
     source_authorizer: Arc<OnceLock<Arc<dyn SourceAuthorizer>>>,
     rbac: Option<RbacState>,
+    /// Cluster mode: storing a catalog generated from a converted (Swagger
+    /// 2.0) document needs the operation gate's admission first, because a
+    /// replica built before the conversion cannot regenerate from it (issue
+    /// #443, gated as `connections.openapi_swagger2_catalog`). Standalone
+    /// mode has no other reader and leaves it off.
+    gate_converted_catalogs: bool,
     /// Test seam: runs between the authority commit and the registry
     /// install, where another lane can move underneath a publish.
     #[cfg(test)]
     install_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+/// Whether the caller already holds the operation gate's admission to store
+/// a catalog generated from a converted document. Only the admin endpoints
+/// ask the gate; they call once with [`Self::NotAsked`], and only when the
+/// service answers [`OpenApiCatalogError::ConvertedCatalogNeedsAdmission`]
+/// do they ask the gate and call again with [`Self::Admitted`]. An OpenAPI
+/// 3.x document, and every call in standalone mode, never needs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConvertedCatalogAdmission {
+    NotAsked,
+    Admitted,
 }
 
 struct OpenApiPublishCandidate<'a> {
@@ -263,6 +281,11 @@ pub enum OpenApiCatalogError {
     RequestFailed,
     InvalidResponse,
     StorageUnavailable,
+    /// The write would store a catalog generated from a converted document
+    /// and the caller has not been admitted by the cluster's operation
+    /// gate. Nothing was written or recorded; see
+    /// [`ConvertedCatalogAdmission`].
+    ConvertedCatalogNeedsAdmission,
 }
 
 impl OpenApiCatalogError {
@@ -290,6 +313,7 @@ impl OpenApiCatalogError {
             Self::RequestFailed => "request_failed",
             Self::InvalidResponse => "invalid_response",
             Self::StorageUnavailable => "storage_unavailable",
+            Self::ConvertedCatalogNeedsAdmission => "operation_gate_required",
         }
     }
 }
@@ -547,6 +571,7 @@ impl OpenApiConnectionCatalogService {
             enum_source_runtime,
             source_authorizer: Arc::new(OnceLock::new()),
             rbac: None,
+            gate_converted_catalogs: false,
             #[cfg(test)]
             install_hook: None,
         };
@@ -560,6 +585,31 @@ impl OpenApiConnectionCatalogService {
     pub fn with_rbac_state(mut self, rbac: Option<RbacState>) -> Self {
         self.rbac = rbac;
         self
+    }
+
+    /// Cluster mode: hold every write that would store a catalog generated
+    /// from a converted document until the caller is admitted by the
+    /// operation gate. See [`ConvertedCatalogAdmission`].
+    pub fn with_converted_catalog_gate(mut self) -> Self {
+        self.gate_converted_catalogs = true;
+        self
+    }
+
+    /// Refuse, before anything is written or recorded, a write that would
+    /// store a catalog generated from a converted document without the
+    /// operation gate's admission.
+    fn require_converted_catalog_admission(
+        &self,
+        generation: &openapi::OpenApiToolGeneration,
+        admission: ConvertedCatalogAdmission,
+    ) -> Result<(), OpenApiCatalogError> {
+        if self.gate_converted_catalogs
+            && generation.conversion.is_some()
+            && admission != ConvertedCatalogAdmission::Admitted
+        {
+            return Err(OpenApiCatalogError::ConvertedCatalogNeedsAdmission);
+        }
+        Ok(())
     }
 
     pub fn set_source_authorizer(&self, authorizer: Arc<dyn SourceAuthorizer>) {
@@ -915,11 +965,13 @@ impl OpenApiConnectionCatalogService {
             document,
             allow_unresolved_enum_sources,
             true,
+            ConvertedCatalogAdmission::NotAsked,
             actor,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn put_overlay_with_authorization(
         &self,
         raw_connection_id: &str,
@@ -927,6 +979,7 @@ impl OpenApiConnectionCatalogService {
         document: &Value,
         allow_unresolved_enum_sources: bool,
         secrets_write_authorized: bool,
+        converted_catalog: ConvertedCatalogAdmission,
         actor: &str,
     ) -> Result<OpenApiOverlayMutationResult, OpenApiOverlayOperationError> {
         let connection_id = ConnectionId::parse(raw_connection_id.to_owned())
@@ -972,9 +1025,15 @@ impl OpenApiConnectionCatalogService {
         let encoded_document = serde_json::to_string(&document)
             .map_err(|_| OpenApiOverlayOperationError::Catalog(OpenApiCatalogError::InvalidSpec))?;
         let prior_document = decode_stored_overlay(stored_overlay.as_ref())?;
-        let generation =
-            openapi::generate_tools_from_openapi_str("managed-openapi-overlay-put", &prior.spec)
-                .map_err(|_| OpenApiCatalogError::InvalidSpec)?;
+        let generation = openapi::generate_tools_from_api_document_str(
+            "managed-openapi-overlay-put",
+            &prior.spec,
+        )
+        .map_err(|_| OpenApiCatalogError::InvalidSpec)?;
+        // An overlay over a converted catalog is what makes a replica built
+        // before the conversion fail to rebuild its source plan, so it asks
+        // the gate before any source is resolved or anything is written.
+        self.require_converted_catalog_admission(&generation, converted_catalog)?;
         let (selected_tool_names, confirmations) =
             surviving_refresh_selection(&prior, &generation, prior_document.as_ref())?;
         let binding = bind_selected_tools(
@@ -1128,9 +1187,13 @@ impl OpenApiConnectionCatalogService {
             return Err(OpenApiCatalogError::StalePreview.into());
         }
         let prior_document = decode_stored_overlay(stored_overlay.as_ref())?;
-        let generation =
-            openapi::generate_tools_from_openapi_str("managed-openapi-overlay-delete", &prior.spec)
-                .map_err(|_| OpenApiCatalogError::InvalidSpec)?;
+        // Not gated, even over a converted catalog: deleting the overlay
+        // removes what makes a replica built before the conversion fail.
+        let generation = openapi::generate_tools_from_api_document_str(
+            "managed-openapi-overlay-delete",
+            &prior.spec,
+        )
+        .map_err(|_| OpenApiCatalogError::InvalidSpec)?;
         let (selected_tool_names, confirmations) =
             surviving_refresh_selection(&prior, &generation, prior_document.as_ref())?;
         let binding = bind_selected_tools(
@@ -1229,8 +1292,9 @@ impl OpenApiConnectionCatalogService {
             .map_err(|_| OpenApiCatalogError::StorageUnavailable)?;
         validate_catalog_overlay_pair(prior.as_ref(), stored_overlay.as_ref())
             .map_err(|_| OpenApiCatalogError::StorageUnavailable)?;
-        let generation = openapi::generate_tools_from_openapi_str("managed-openapi-preview", spec)
-            .map_err(|_| OpenApiCatalogError::InvalidSpec)?;
+        let generation =
+            openapi::generate_tools_from_api_document_str("managed-openapi-preview", spec)
+                .map_err(|_| OpenApiCatalogError::InvalidSpec)?;
         let mut binding = openapi::bind_generated_openapi_tools(
             &generation,
             &connection_id,
@@ -1313,6 +1377,37 @@ impl OpenApiConnectionCatalogService {
         confirmations: &[OpenApiToolSecuritySelection],
         actor: &str,
     ) -> Result<OpenApiCatalogPublishResult, OpenApiCatalogError> {
+        self.register_with_admission(
+            raw_connection_id,
+            expected_connection_etag,
+            expected_spec_revision,
+            expected_catalog_revision,
+            expected_spec_digest,
+            spec,
+            selected_tool_names,
+            confirmations,
+            ConvertedCatalogAdmission::NotAsked,
+            actor,
+        )
+        .await
+    }
+
+    /// [`Self::register`] for a caller that may hold the operation gate's
+    /// admission to store a catalog generated from a converted document.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn register_with_admission(
+        &self,
+        raw_connection_id: &str,
+        expected_connection_etag: &str,
+        expected_spec_revision: u64,
+        expected_catalog_revision: u64,
+        expected_spec_digest: &str,
+        spec: &str,
+        selected_tool_names: &[String],
+        confirmations: &[OpenApiToolSecuritySelection],
+        converted_catalog: ConvertedCatalogAdmission,
+        actor: &str,
+    ) -> Result<OpenApiCatalogPublishResult, OpenApiCatalogError> {
         validate_spec_size(spec)?;
         if spec_digest(spec) != expected_spec_digest {
             return Err(OpenApiCatalogError::StalePreview);
@@ -1328,8 +1423,10 @@ impl OpenApiConnectionCatalogService {
         } else {
             self.managed_openapi_record(raw_connection_id, Some(expected_connection_etag))?
         };
-        let generation = openapi::generate_tools_from_openapi_str("managed-openapi-register", spec)
-            .map_err(|_| OpenApiCatalogError::InvalidSpec)?;
+        let generation =
+            openapi::generate_tools_from_api_document_str("managed-openapi-register", spec)
+                .map_err(|_| OpenApiCatalogError::InvalidSpec)?;
+        self.require_converted_catalog_admission(&generation, converted_catalog)?;
         let store = self
             .control_plane
             .managed_store()
@@ -1420,6 +1517,28 @@ impl OpenApiConnectionCatalogService {
         expected_connection_etag: &str,
         actor: &str,
     ) -> Result<OpenApiCatalogPublishResult, OpenApiCatalogError> {
+        self.refresh_with_admission(
+            raw_connection_id,
+            expected_connection_etag,
+            ConvertedCatalogAdmission::NotAsked,
+            actor,
+        )
+        .await
+    }
+
+    /// [`Self::refresh`] for a caller that may hold the operation gate's
+    /// admission to store a catalog generated from a converted document.
+    /// Whether the refreshed document is converted is known only once it
+    /// is fetched, so a caller without admission learns it from
+    /// [`OpenApiCatalogError::ConvertedCatalogNeedsAdmission`] and, once
+    /// admitted, refreshes again.
+    pub async fn refresh_with_admission(
+        &self,
+        raw_connection_id: &str,
+        expected_connection_etag: &str,
+        converted_catalog: ConvertedCatalogAdmission,
+        actor: &str,
+    ) -> Result<OpenApiCatalogPublishResult, OpenApiCatalogError> {
         let connection_id = ConnectionId::parse(raw_connection_id.to_owned())
             .map_err(|_| OpenApiCatalogError::InvalidConnectionId)?;
         let _active = self
@@ -1467,7 +1586,7 @@ impl OpenApiConnectionCatalogService {
             _ => return Err(OpenApiCatalogError::DiscoveryNotConfigured),
         };
         let generation =
-            match openapi::generate_tools_from_openapi_str("managed-openapi-refresh", &spec) {
+            match openapi::generate_tools_from_api_document_str("managed-openapi-refresh", &spec) {
                 Ok(generation) => generation,
                 Err(_) => {
                     self.record_failed_status(
@@ -1481,6 +1600,9 @@ impl OpenApiConnectionCatalogService {
                     return Err(OpenApiCatalogError::InvalidSpec);
                 }
             };
+        // Not a refresh failure: no status is recorded, so the caller can
+        // ask the gate and refresh again.
+        self.require_converted_catalog_admission(&generation, converted_catalog)?;
         if validate_catalog_overlay_pair(Some(&prior), stored_overlay.as_ref()).is_err() {
             let error = OpenApiCatalogError::StorageUnavailable;
             self.record_failed_status(
@@ -2263,7 +2385,7 @@ fn stored_source_plan(
     stored_overlay: &StoredOpenApiOverlay,
 ) -> Result<OverlaySourcePlan, ConnectionStoreError> {
     let document = parse_stored_overlay(stored_overlay)?;
-    let generation = openapi::generate_tools_from_openapi_str(
+    let generation = openapi::generate_tools_from_api_document_str(
         "managed-openapi-source-plan-replay",
         &catalog.spec,
     )
@@ -2883,6 +3005,15 @@ fn connection_http_error(error: ConnectionHttpError) -> OpenApiCatalogError {
         ConnectionHttpError::DelegatedTokenDenied
         | ConnectionHttpError::DelegatedTokenExchangeFailed
         | ConnectionHttpError::DelegatedTokenUnavailable => OpenApiCatalogError::SecretUnavailable,
+        // Unreachable: discovery refuses a domain-wide delegation before it
+        // resolves anything, as it has no caller to act as.
+        ConnectionHttpError::GoogleDelegation(error) if error.is_egress_denial() => {
+            OpenApiCatalogError::EgressDenied
+        }
+        ConnectionHttpError::GoogleDelegation(error) if error.is_caller_refusal() => {
+            OpenApiCatalogError::AuthenticationMismatch
+        }
+        ConnectionHttpError::GoogleDelegation(_) => OpenApiCatalogError::SecretUnavailable,
         ConnectionHttpError::UpstreamAuthenticationRejected => {
             OpenApiCatalogError::AuthenticationFailed
         }
@@ -3926,6 +4057,400 @@ paths:
     }
 
     #[tokio::test]
+    async fn swagger2_catalog_registers_and_rebuilds_from_the_stored_document() {
+        let database = TemporaryDatabase::new();
+        let mut config = Config::test_defaults();
+        config.connections_sqlite_path = Some(database.0.display().to_string());
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let snapshot = control_plane.runtime_snapshot();
+        let candidate: ConnectionWrite = serde_json::from_value(json!({
+            "display_name": "Managed Swagger Billing",
+            "enabled": true,
+            "kind": "http_api",
+            "endpoint": {
+                "base_url": "https://billing.example.test",
+                "base_path": "/v1"
+            },
+            "authentication": {"type": "none"},
+            "tls": {},
+            "timeouts": {
+                "connect_timeout_ms": 1000,
+                "request_timeout_ms": 3000,
+                "response_idle_timeout_ms": 1000
+            },
+            "discovery": {
+                "type": "managed_openapi",
+                "use_connection_authentication": false
+            }
+        }))
+        .expect("managed OpenAPI Connection should deserialize");
+        let record = control_plane
+            .create_managed(snapshot.collection_etag(), candidate, "test-admin")
+            .await
+            .expect("managed OpenAPI Connection should create");
+        let egress_config = EgressConfig::from_config(&config);
+        let egress_client =
+            Arc::new(EgressClient::new(egress_config.clone()).expect("egress should build"));
+        let http = ConnectionHttpRuntime::new(control_plane.clone(), egress_config, egress_client);
+        let registry = ToolRegistry::disabled();
+        let service = OpenApiConnectionCatalogService::load(
+            control_plane.clone(),
+            http.clone(),
+            registry.clone(),
+        )
+        .expect("managed OpenAPI service should load");
+        let spec = r#"
+swagger: "2.0"
+info: { title: Billing, version: 1.0.0 }
+basePath: /v1
+produces: [application/json]
+definitions:
+  Invoice:
+    type: object
+    properties:
+      total: { type: integer }
+paths:
+  /invoices/{invoice_id}:
+    parameters:
+      - { name: invoice_id, in: path, required: true, type: string }
+    get:
+      operationId: get_invoice
+      summary: Read one invoice
+      responses:
+        "200": { description: One invoice, schema: { $ref: '#/definitions/Invoice' } }
+    post:
+      operationId: annotate_invoice
+      consumes: [application/x-www-form-urlencoded]
+      parameters:
+        - { name: note, in: formData, type: string }
+"#;
+
+        let preview = service
+            .preview(record.id.as_str(), spec)
+            .await
+            .expect("a Swagger 2.0 document should preview");
+        assert_eq!(preview.spec_digest, spec_digest(spec));
+        let conversion = preview
+            .generation
+            .conversion
+            .as_ref()
+            .expect("the preview should report its conversion");
+        assert_eq!(
+            conversion
+                .warnings
+                .iter()
+                .map(|warning| warning.code.as_str())
+                .collect::<Vec<_>>(),
+            vec!["base_path_not_in_paths", "request_body_not_mapped"]
+        );
+        let selected = vec!["get_invoice".to_owned()];
+        let confirmations = preview
+            .registration_security_selections
+            .iter()
+            .filter(|selection| selection.tool_name == "get_invoice")
+            .cloned()
+            .collect::<Vec<_>>();
+        service
+            .register(
+                record.id.as_str(),
+                record.etag().as_str(),
+                preview.spec_revision,
+                preview.catalog_revision,
+                &preview.spec_digest,
+                spec,
+                &selected,
+                &confirmations,
+                "test-admin",
+            )
+            .await
+            .expect("the selected converted tool should publish");
+        let published = registry
+            .get("get_invoice")
+            .expect("the converted tool should be served");
+        assert_eq!(published.upstream.path_template, "/invoices/{invoice_id}");
+        assert!(registry.get("annotate_invoice").is_none());
+
+        let overlay = json!({
+            "schema_version": "0.1.0",
+            "tools": {
+                "get_invoice": {
+                    "rename": "read_invoice",
+                    "description": "Read one billing invoice"
+                }
+            }
+        });
+        service
+            .put_overlay(
+                record.id.as_str(),
+                &OverlayEtag::for_revisions(record.id.as_str(), record.revisions.connection, 1, 0)
+                    .to_string(),
+                &overlay,
+                "test-admin",
+            )
+            .await
+            .expect("an overlay recompiles the stored Swagger 2.0 document");
+        assert!(registry.get("read_invoice").is_some());
+
+        let store = control_plane
+            .managed_store()
+            .expect("managed store should exist");
+        let (catalog, stored_overlay) = store
+            .openapi_catalog_with_overlay(&record.id)
+            .await
+            .expect("catalog/overlay pair should read");
+        let catalog = catalog.expect("catalog should exist");
+        let stored_overlay = stored_overlay.expect("overlay should exist");
+        assert_eq!(
+            catalog.spec, spec,
+            "the submitted document is stored, not its conversion"
+        );
+        stored_source_plan(&catalog, &stored_overlay)
+            .expect("the stored Swagger 2.0 document should rebuild its source plan");
+
+        let refreshed = service
+            .refresh(record.id.as_str(), record.etag().as_str(), "test-admin")
+            .await
+            .expect("refresh should convert the stored document again");
+        assert_eq!(refreshed.changed_count, 0);
+        assert_eq!(refreshed.removed_count, 0);
+        assert!(registry.get("read_invoice").is_some());
+
+        let restarted_registry = ToolRegistry::disabled();
+        let enum_runtime = EnumSourceRuntime::new(
+            control_plane.clone(),
+            http.clone(),
+            AuditLog::new(Arc::new(CaptureSink::new()) as Arc<dyn AuditSink>),
+            Vec::new(),
+        );
+        OpenApiConnectionCatalogService::load_with_enum_sources(
+            control_plane.clone(),
+            http,
+            restarted_registry.clone(),
+            crate::tools::definitions::LaneConflicts::Refuse,
+            Some(enum_runtime),
+        )
+        .expect("boot should replay a Swagger 2.0 catalog with an overlay");
+        assert_eq!(
+            restarted_registry
+                .get("read_invoice")
+                .expect("the overlaid tool should replay after restart")
+                .description,
+            "Read one billing invoice"
+        );
+    }
+
+    /// Cluster mode gates every write that would store a catalog generated
+    /// from a converted document (issue #443): without the operation gate's
+    /// admission the service refuses it before writing or recording
+    /// anything. An OpenAPI 3.x document never asks, preview writes nothing
+    /// and is never gated, and deleting an overlay is not gated.
+    #[tokio::test]
+    async fn gated_service_holds_converted_catalog_writes_until_admitted() {
+        let database = TemporaryDatabase::new();
+        let mut config = Config::test_defaults();
+        config.connections_sqlite_path = Some(database.0.display().to_string());
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let snapshot = control_plane.runtime_snapshot();
+        let candidate: ConnectionWrite = serde_json::from_value(json!({
+            "display_name": "Gated Swagger Billing",
+            "enabled": true,
+            "kind": "http_api",
+            "endpoint": { "base_url": "https://billing.example.test", "base_path": "/v1" },
+            "authentication": {"type": "none"},
+            "tls": {},
+            "timeouts": {
+                "connect_timeout_ms": 1000,
+                "request_timeout_ms": 3000,
+                "response_idle_timeout_ms": 1000
+            },
+            "discovery": {
+                "type": "managed_openapi",
+                "use_connection_authentication": false
+            }
+        }))
+        .expect("managed OpenAPI Connection should deserialize");
+        let record = control_plane
+            .create_managed(snapshot.collection_etag(), candidate, "test-admin")
+            .await
+            .expect("managed OpenAPI Connection should create");
+        let egress_config = EgressConfig::from_config(&config);
+        let egress_client =
+            Arc::new(EgressClient::new(egress_config.clone()).expect("egress should build"));
+        let http = ConnectionHttpRuntime::new(control_plane.clone(), egress_config, egress_client);
+        let registry = ToolRegistry::disabled();
+        let service =
+            OpenApiConnectionCatalogService::load(control_plane.clone(), http, registry.clone())
+                .expect("managed OpenAPI service should load")
+                .with_converted_catalog_gate();
+        let store = control_plane
+            .managed_store()
+            .expect("managed store should exist");
+        let selected = vec!["list_invoices".to_owned()];
+        let openapi_spec = r#"
+openapi: 3.0.3
+info: { title: Billing, version: 1.0.0 }
+paths:
+  /invoices:
+    get:
+      operationId: list_invoices
+      responses:
+        "200": { description: Invoices }
+"#;
+        let swagger_spec = r#"
+swagger: "2.0"
+info: { title: Billing, version: 1.0.0 }
+paths:
+  /invoices:
+    get:
+      operationId: list_invoices
+      summary: List invoices
+      responses:
+        "200": { description: Invoices }
+"#;
+
+        let preview = service
+            .preview(record.id.as_str(), openapi_spec)
+            .await
+            .expect("an OpenAPI 3.x document should preview");
+        assert!(preview.generation.conversion.is_none());
+        service
+            .register(
+                record.id.as_str(),
+                record.etag().as_str(),
+                preview.spec_revision,
+                preview.catalog_revision,
+                &preview.spec_digest,
+                openapi_spec,
+                &selected,
+                &preview.registration_security_selections,
+                "test-admin",
+            )
+            .await
+            .expect("an OpenAPI 3.x document never needs the gate");
+
+        let preview = service
+            .preview(record.id.as_str(), swagger_spec)
+            .await
+            .expect("preview writes nothing, so a converted document is never gated there");
+        assert!(preview.generation.conversion.is_some());
+        let refused = service
+            .register(
+                record.id.as_str(),
+                record.etag().as_str(),
+                preview.spec_revision,
+                preview.catalog_revision,
+                &preview.spec_digest,
+                swagger_spec,
+                &selected,
+                &preview.registration_security_selections,
+                "test-admin",
+            )
+            .await
+            .expect_err("a converted catalog needs the gate's admission");
+        assert_eq!(refused, OpenApiCatalogError::ConvertedCatalogNeedsAdmission);
+        let (catalog, _) = store
+            .openapi_catalog_with_overlay(&record.id)
+            .await
+            .expect("catalog should read");
+        assert_eq!(
+            catalog.expect("the 3.x catalog should remain").spec,
+            openapi_spec,
+            "a refused registration stores nothing"
+        );
+        let registered = service
+            .register_with_admission(
+                record.id.as_str(),
+                record.etag().as_str(),
+                preview.spec_revision,
+                preview.catalog_revision,
+                &preview.spec_digest,
+                swagger_spec,
+                &selected,
+                &preview.registration_security_selections,
+                ConvertedCatalogAdmission::Admitted,
+                "test-admin",
+            )
+            .await
+            .expect("an admitted converted catalog registers");
+
+        let overlay = json!({
+            "schema_version": "0.1.0",
+            "tools": { "list_invoices": { "description": "List billing invoices" } }
+        });
+        let overlay_etag = OverlayEtag::for_revisions(
+            record.id.as_str(),
+            record.revisions.connection,
+            registered.catalog_revision,
+            0,
+        )
+        .to_string();
+        let refused = service
+            .put_overlay(record.id.as_str(), &overlay_etag, &overlay, "test-admin")
+            .await
+            .expect_err("an overlay over a converted catalog needs the gate's admission");
+        assert!(matches!(
+            refused,
+            OpenApiOverlayOperationError::Catalog(
+                OpenApiCatalogError::ConvertedCatalogNeedsAdmission
+            )
+        ));
+        let (_, stored_overlay) = store
+            .openapi_catalog_with_overlay(&record.id)
+            .await
+            .expect("overlay should read");
+        assert!(stored_overlay.is_none(), "a refused overlay stores nothing");
+        let updated = service
+            .put_overlay_with_authorization(
+                record.id.as_str(),
+                &overlay_etag,
+                &overlay,
+                false,
+                true,
+                ConvertedCatalogAdmission::Admitted,
+                "test-admin",
+            )
+            .await
+            .expect("an admitted overlay over a converted catalog stores");
+        service
+            .delete_overlay(record.id.as_str(), updated.etag.as_str(), "test-admin")
+            .await
+            .expect("deleting an overlay is never gated");
+
+        let statuses = store
+            .status_history(&record.id, 64)
+            .await
+            .expect("status history should read")
+            .len();
+        let refused = service
+            .refresh(record.id.as_str(), record.etag().as_str(), "test-admin")
+            .await
+            .expect_err("refreshing to a converted catalog needs the gate's admission");
+        assert_eq!(refused, OpenApiCatalogError::ConvertedCatalogNeedsAdmission);
+        assert_eq!(
+            store
+                .status_history(&record.id, 64)
+                .await
+                .expect("status history should read")
+                .len(),
+            statuses,
+            "a refresh held for the gate records no failure"
+        );
+        let refreshed = service
+            .refresh_with_admission(
+                record.id.as_str(),
+                record.etag().as_str(),
+                ConvertedCatalogAdmission::Admitted,
+                "test-admin",
+            )
+            .await
+            .expect("an admitted refresh stores the converted catalog again");
+        assert_eq!(refreshed.changed_count, 0);
+        assert!(registry.get("list_invoices").is_some());
+    }
+
+    #[tokio::test]
     async fn register_is_revision_bound_and_restart_reconstructs_last_known_good_catalog() {
         let database = TemporaryDatabase::new();
         let mut config = Config::test_defaults();
@@ -4315,6 +4840,7 @@ paths:
                 &raw_source_document,
                 true,
                 false,
+                ConvertedCatalogAdmission::NotAsked,
                 "test-admin",
             )
             .await
