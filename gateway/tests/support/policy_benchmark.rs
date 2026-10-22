@@ -36,6 +36,12 @@ use crate::{
     rbac::Policy,
 };
 
+// The tool-admission and rate-lane benchmarks. A binary has one global
+// allocator, so they live in a child module that counts through this one
+// without widening its visibility. Their file has a digest of its own.
+#[path = "lane_benchmark.rs"]
+mod lane_benchmark;
+
 /// Where the controller expects the report. The test refuses to run without
 /// it and refuses to overwrite an existing file, so a stale report cannot pass.
 const RESULT_ENV: &str = "GREENGATEWAY_MICROBENCH_RESULT";

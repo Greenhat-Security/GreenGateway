@@ -13727,6 +13727,166 @@ async fn connection_test_requires_permission_saved_profile_and_exact_etag() {
     });
 }
 
+/// A stored test of a `delegated_issuer_token` Connection runs as the
+/// principal who asks for it (issue #441): the endpoint attests that
+/// principal, so one an issuer could not look up is refused as naming nobody,
+/// and an attestable one gets as far as the key check, which refuses a
+/// disabled Connection because its keys are not published. Both are refused
+/// before any network or secret I/O.
+#[tokio::test]
+async fn a_delegated_connection_test_runs_as_the_requesting_principal() {
+    let connection_db = TempDb::new("connection-test-delegated");
+    let policy = TempPolicyFile::new(&connection_policy_document_string());
+    let capture = audit::sink::tests::CaptureSink::new();
+    let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+    let router = connection_admin_router(&connection_db, &policy, audit_log);
+    let secrets_editor = test_principal(&["connections-secrets-editor"]);
+    let list = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::GET,
+            CONNECTIONS_ADMIN_ROUTE,
+            Some(secrets_editor.clone()),
+            None,
+            None,
+            false,
+        ))
+        .await
+        .expect("connection list should complete");
+    let mut collection_etag = list
+        .headers()
+        .get(CONNECTION_COLLECTION_ETAG_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .expect("connection list should include collection ETag")
+        .to_owned();
+    let mut assertion = admin_caller_assertion_json();
+    assertion["bind_request"] = json!(false);
+    assertion["audience"] = json!("https://issuer.example.test");
+    // One Connection per tester: the per-Connection test budget admits one
+    // test at a time.
+    let mut created_connections = Vec::new();
+    for display_name in ["Mail for nobody", "Mail for alice"] {
+        let created = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                CONNECTIONS_ADMIN_ROUTE,
+                Some(secrets_editor.clone()),
+                Some(
+                    json!({
+                        "display_name": display_name,
+                        "enabled": false,
+                        "kind": "http_api",
+                        "endpoint": {
+                            "base_url": "https://mail.example.test",
+                            "base_path": "/v1"
+                        },
+                        "authentication": {
+                            "type": "delegated_issuer_token",
+                            "token_exchange_url": "https://issuer.example.test/oauth2/token-exchange",
+                            "client_id": "greengateway",
+                            "client_secret_id": "issuer-exchange-secret",
+                            "subject_token_source": "caller_assertion"
+                        },
+                        "caller_assertion": assertion,
+                        "test_profile": {
+                            "method": "GET",
+                            "path": "/messages",
+                            "expected_statuses": [200]
+                        }
+                    })
+                    .to_string(),
+                ),
+                Some(&collection_etag),
+                true,
+            ))
+            .await
+            .expect("delegated create should complete");
+        assert_eq!(created.status(), StatusCode::CREATED);
+        collection_etag = created
+            .headers()
+            .get(CONNECTION_COLLECTION_ETAG_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("created connection should include collection ETag")
+            .to_owned();
+        let etag = created
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("created connection should include ETag")
+            .to_owned();
+        let id = json_body(created).await["id"]
+            .as_str()
+            .expect("created connection should include ID")
+            .to_owned();
+        created_connections.push((id, etag));
+    }
+
+    // `test_principal` has no identity-provider issuer, so no issuer could
+    // look its subject up; the same principal with one is attestable.
+    let nobody = test_principal(&["connections-tester"]);
+    let alice = auth::Principal {
+        issuer: Some("https://idp.example.test".to_owned()),
+        ..test_principal(&["connections-tester"])
+    };
+    for ((id, etag), tester, stage, reason) in [
+        (
+            &created_connections[0],
+            nobody,
+            "secret_available",
+            "delegated_token_no_principal",
+        ),
+        (
+            &created_connections[1],
+            alice,
+            "authenticated",
+            "caller_assertion_key_not_published",
+        ),
+    ] {
+        let tested = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                &format!("{CONNECTIONS_ADMIN_ROUTE}/{id}/test"),
+                Some(tester),
+                None,
+                Some(etag),
+                true,
+            ))
+            .await
+            .expect("delegated connection test should complete");
+        assert_eq!(tested.status(), StatusCode::OK);
+        let tested = json_body(tested).await;
+        assert_eq!(tested["ok"], json!(false));
+        assert_eq!(
+            tested["stages"],
+            json!([{ "name": stage, "outcome": "failure", "reason": reason }])
+        );
+    }
+
+    assert_eventually(Duration::from_secs(1), || {
+        let events = capture.events();
+        [
+            "delegated_token_no_principal",
+            "caller_assertion_key_not_published",
+        ]
+        .iter()
+        .all(|reason| {
+            events.iter().any(|event| {
+                event.event_type == audit::event::CONNECTION_TESTED
+                    && event.payload["outcome"] == json!("failure")
+                    && event.payload["reason"] == json!(reason)
+                    && event.payload["authentication"] == json!("delegated_issuer_token")
+            })
+        })
+    });
+    // Nothing was exchanged: both tests stopped before the issuer.
+    assert!(!capture
+        .events()
+        .iter()
+        .any(|event| event.event_type == audit::event::CONNECTION_DELEGATED_TOKEN_EXCHANGE));
+}
+
 #[tokio::test]
 async fn connection_test_body_reader_deadline_bounds_slow_clients() {
     let body = Body::from_stream(stream::pending::<Result<Bytes, Infallible>>());
