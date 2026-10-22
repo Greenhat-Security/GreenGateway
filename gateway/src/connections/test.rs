@@ -17,6 +17,7 @@ use crate::{
 
 use super::{
     caller_assertion::{AttestedCaller, CallerAssertionError},
+    google_delegation::GoogleDelegationError,
     http::{ConnectionHttpError, ConnectionHttpRuntime},
     model::{ConnectionId, ConnectionKind},
     oauth::scope_connection_test_oauth_mints,
@@ -441,8 +442,8 @@ impl ConnectionTestService {
     }
 
     /// Runs the stored test for no principal at all. A `delegated_issuer_token`
-    /// Connection is refused with `delegated_token_no_principal`; see
-    /// [`Self::execute_as`].
+    /// or `google_domain_wide_delegation` Connection is refused with
+    /// `delegated_token_no_principal`; see [`Self::execute_as`].
     pub async fn execute(
         &self,
         record: &StoredConnection,
@@ -469,11 +470,11 @@ impl ConnectionTestService {
 
     /// Runs the stored test as `caller` within `deadline`.
     ///
-    /// `caller` matters only to a `delegated_issuer_token` Connection, whose
-    /// credential is the caller's own: the test exchanges `caller`'s token
-    /// inline, sends its one request with it and drops it, and is refused
-    /// without one. Every other Connection is tested with its own credential,
-    /// whoever asks.
+    /// `caller` matters only to a `delegated_issuer_token` or
+    /// `google_domain_wide_delegation` Connection, whose credential is the
+    /// caller's own: the test obtains `caller`'s token inline, sends its one
+    /// request with it and drops it, and is refused without one. Every other
+    /// Connection is tested with its own credential, whoever asks.
     pub async fn execute_before(
         &self,
         record: &StoredConnection,
@@ -935,8 +936,14 @@ pub(crate) fn connection_failure_classification(
             ConnectionOperationalState::Unavailable,
             ConnectionStatusReason::SecretUnavailable,
         ),
+        ConnectionHttpError::GoogleDelegation(error) if !error.is_egress_denial() => (
+            ConnectionTestStageName::SecretAvailable,
+            ConnectionOperationalState::Unavailable,
+            ConnectionStatusReason::SecretUnavailable,
+        ),
         ConnectionHttpError::OAuthTokenEgressDenied
-        | ConnectionHttpError::DelegatedTokenEgressDenied => (
+        | ConnectionHttpError::DelegatedTokenEgressDenied
+        | ConnectionHttpError::GoogleDelegation(_) => (
             ConnectionTestStageName::EgressPolicy,
             ConnectionOperationalState::Unavailable,
             ConnectionStatusReason::EgressDenied,
@@ -1042,10 +1049,33 @@ fn test_reason_from_connection(error: ConnectionHttpError) -> ConnectionTestReas
         ConnectionHttpError::DelegatedTokenUnavailable => {
             ConnectionTestReason::DelegatedTokenUnavailable
         }
+        // A domain-wide delegation is tested with the tester's own Google
+        // token too, and reports the same delegated reasons: a tester Google
+        // cannot act as names nobody the Connection can delegate to.
+        ConnectionHttpError::GoogleDelegation(error) => google_delegation_test_reason(error),
         ConnectionHttpError::UpstreamAuthenticationRejected => {
             ConnectionTestReason::AuthenticationFailed
         }
         ConnectionHttpError::TransportUnavailable => ConnectionTestReason::TransportUnavailable,
+    }
+}
+
+/// The delegated reason a test reports when a domain-wide delegation could
+/// not obtain its tester's Google token: the same vocabulary a delegated
+/// issuer token's test uses, rather than a second set for one credential.
+fn google_delegation_test_reason(error: GoogleDelegationError) -> ConnectionTestReason {
+    match error {
+        GoogleDelegationError::NoEmail | GoogleDelegationError::IssuerNotTrusted => {
+            ConnectionTestReason::DelegatedTokenNoPrincipal
+        }
+        GoogleDelegationError::EgressDenied => ConnectionTestReason::DelegatedTokenEgressDenied,
+        GoogleDelegationError::Denied => ConnectionTestReason::DelegatedTokenDenied,
+        GoogleDelegationError::Unavailable => ConnectionTestReason::DelegatedTokenUnavailable,
+        GoogleDelegationError::IdentityFailed
+        | GoogleDelegationError::SigningFailed
+        | GoogleDelegationError::ExchangeFailed => {
+            ConnectionTestReason::DelegatedTokenExchangeFailed
+        }
     }
 }
 
@@ -1377,6 +1407,64 @@ mod tests {
                 ConnectionStatusReason::EgressDenied,
             )
         );
+    }
+
+    #[test]
+    fn a_domain_wide_delegation_test_reports_the_delegated_reasons() {
+        // A domain-wide delegation is tested with the tester's own Google
+        // token too, and reports in the delegated vocabulary the admin UI
+        // already parses rather than in a second one for one credential.
+        for (error, expected, expected_stage) in [
+            (
+                GoogleDelegationError::NoEmail,
+                "delegated_token_no_principal",
+                ConnectionTestStageName::SecretAvailable,
+            ),
+            (
+                GoogleDelegationError::IssuerNotTrusted,
+                "delegated_token_no_principal",
+                ConnectionTestStageName::SecretAvailable,
+            ),
+            (
+                GoogleDelegationError::EgressDenied,
+                "delegated_token_egress_denied",
+                ConnectionTestStageName::EgressPolicy,
+            ),
+            (
+                GoogleDelegationError::Denied,
+                "delegated_token_denied",
+                ConnectionTestStageName::SecretAvailable,
+            ),
+            (
+                GoogleDelegationError::IdentityFailed,
+                "delegated_token_exchange_failed",
+                ConnectionTestStageName::SecretAvailable,
+            ),
+            (
+                GoogleDelegationError::SigningFailed,
+                "delegated_token_exchange_failed",
+                ConnectionTestStageName::SecretAvailable,
+            ),
+            (
+                GoogleDelegationError::ExchangeFailed,
+                "delegated_token_exchange_failed",
+                ConnectionTestStageName::SecretAvailable,
+            ),
+            (
+                GoogleDelegationError::Unavailable,
+                "delegated_token_unavailable",
+                ConnectionTestStageName::SecretAvailable,
+            ),
+        ] {
+            let error = ConnectionHttpError::GoogleDelegation(error);
+            assert_eq!(
+                serde_json::to_value(test_reason_from_connection(error))
+                    .expect("reason should serialize"),
+                serde_json::json!(expected),
+                "{error:?}"
+            );
+            assert_eq!(connection_failure_classification(error).0, expected_stage);
+        }
     }
 
     #[test]

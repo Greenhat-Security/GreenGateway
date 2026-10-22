@@ -1,0 +1,24 @@
+{
+  "schema_version": "0.2.0",
+  "default_action": "allow",
+  "enforcement_mode": "shadow",
+  "x-owner": "platform-team",
+  "enforcement_mode": "enforce",
+  "routes": [
+    { "path_prefix": "/a", "permission": "p:a" },
+    { "path_prefix": "/b", "permission": "p:b" }
+  ],
+  "rules": [
+    { "id": "1", "path": "/a", "action": "deny" },
+    { "path": "/b", "action": "deny" },
+    { "id": "allow public", "path": "/c", "action": "allow" },
+    { "id": "dup", "path": "/d", "action": "shadow" },
+    { "id": "dup", "path": "/e", "action": "deny" },
+    { "id": "route-0", "path": "/f", "action": "allow" },
+    { "id": "rule-2", "path": "/g", "action": "deny" },
+    { "id": null, "path": "/h", "action": "allow", "action": "deny" }
+  ],
+  "rate_limits": [
+    { "requests_per_second": 1, "burst": 1 }
+  ]
+}

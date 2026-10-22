@@ -299,6 +299,25 @@ export function subjectTokenDraftApplies(form: ConnectionFormState): boolean {
   );
 }
 
+/**
+ * Why the editor cannot open `detail`, or `null` when it can.
+ *
+ * A Google domain-wide delegation is shown read only: the editor has no form
+ * for it, and saving through a form that cannot represent it would replace
+ * the credential with whichever type the form defaulted to.
+ */
+export function editorUnsupportedReason(
+  detail: ConnectionDetail,
+): string | null {
+  if (
+    detail.configuration?.authentication.type ===
+    'google_domain_wide_delegation'
+  ) {
+    return 'This connection uses Google domain-wide delegation, which the editor cannot change yet. Change it through the admin API.';
+  }
+  return null;
+}
+
 export function formFromDetail(detail: ConnectionDetail): ConnectionFormState {
   const configuration = detail.configuration;
   if (configuration === undefined) {
@@ -312,6 +331,11 @@ export function formFromDetail(detail: ConnectionDetail): ConnectionFormState {
   }
 
   const authentication = configuration.authentication;
+  if (authentication.type === 'google_domain_wide_delegation') {
+    // The editor refuses such a connection before it builds a form; see
+    // `editorUnsupportedReason`.
+    throw new Error(editorUnsupportedReason(detail) ?? 'Unsupported connection');
+  }
   const authenticationConfigured =
     authentication.type === 'header_api_key' ||
       authentication.type === 'static_bearer'
