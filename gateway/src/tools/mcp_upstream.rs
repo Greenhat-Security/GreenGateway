@@ -23,12 +23,12 @@ use http::{
 };
 use rmcp::{
     model::{
-        CallToolRequest, CallToolRequestParams, CallToolResult, ClientJsonRpcMessage,
-        ClientRequest, JsonObject, Meta, NumberOrString, PaginatedRequestParams, ProgressToken,
-        Resource as McpResource, ResourceTemplate as McpResourceTemplate, ServerJsonRpcMessage,
-        Tool,
+        CallToolRequest, CallToolRequestParams, CallToolResponse, CallToolResult, ClientConfig,
+        ClientJsonRpcMessage, ClientRequest, JsonObject, NumberOrString, PaginatedRequestParams,
+        ProgressToken, ProtocolVersion, RequestMetaObject, Resource as McpResource,
+        ResourceTemplate as McpResourceTemplate, ServerJsonRpcMessage, Tool,
     },
-    service::{ClientInitializeError, QuitReason, ServiceError},
+    service::{ClientCacheConfig, ClientInitializeError, QuitReason, ServiceError},
     transport::{
         common::client_side_sse::NeverRetry,
         streamable_http_client::{
@@ -75,6 +75,21 @@ const MAX_DISCOVERY_RESOURCE_TEMPLATES_PER_UPSTREAM: usize = 1024;
 const MAX_DISCOVERY_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const PROTOCOL_PROBE_CLEANUP_RESERVE: Duration = Duration::from_millis(500);
 const REDACTED_MCP_UPSTREAM_VALUE: &str = "<redacted>";
+/// The MCP revision GreenGateway asks upstream servers for in `initialize`.
+/// rmcp 3's default client configuration asks for 2026-07-28, which moves the
+/// lifecycle into per-request `_meta`, adds SEP-2243 headers and MRTR rounds.
+/// That revision has not been reviewed for upstream sessions, so sessions keep
+/// the revision rmcp 2 requested.
+const UPSTREAM_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2025_11_25;
+
+/// An initialized upstream MCP client session.
+type UpstreamMcpService = rmcp::service::RunningService<rmcp::RoleClient, ClientConfig>;
+
+/// The client handler for upstream sessions: rmcp's default client identity
+/// and capabilities, with the requested protocol revision pinned.
+fn upstream_client_config() -> ClientConfig {
+    ClientConfig::default().with_protocol_version(UPSTREAM_PROTOCOL_VERSION)
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct McpDiscoveredCatalog {
@@ -508,10 +523,7 @@ pub async fn call_tool(
         .await
         .map_err(|_| McpUpstreamCallError::EgressRejected)?;
     let mut service = connect(server, runtime_config, &destination).await?;
-    let result = service
-        .call_tool(request)
-        .await
-        .map_err(|error| mcp_service_error(error, McpUpstreamCallError::Call))?;
+    let result = call_upstream_tool_once(&service, request).await?;
     let _ = service.close_with_timeout(Duration::from_millis(250)).await;
 
     Ok(result)
@@ -1176,10 +1188,7 @@ async fn call_tool_in_session(
         .map(Arc::new);
     let mut service =
         connect_connection(target, runtime_config, client, credential, None, assertions).await?;
-    let result = service
-        .call_tool(request)
-        .await
-        .map_err(|error| mcp_service_error(error, McpUpstreamCallError::Call))?;
+    let result = call_upstream_tool_once(&service, request).await?;
     let _ = service.close_with_timeout(Duration::from_millis(250)).await;
     Ok(result)
 }
@@ -1536,7 +1545,7 @@ fn serialized_mcp_call_request_size(
     progress_token: i64,
 ) -> Result<usize, McpUpstreamCallError> {
     let mut bounded_request = request.clone();
-    bounded_request.meta = Some(Meta::with_progress_token(ProgressToken(
+    bounded_request.meta = Some(RequestMetaObject::with_progress_token(ProgressToken(
         NumberOrString::Number(progress_token),
     )));
     let message = ClientJsonRpcMessage::request(
@@ -1561,14 +1570,14 @@ async fn list_tools(
 }
 
 async fn list_tools_with_limits(
-    service: &mut rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    service: &mut UpstreamMcpService,
 ) -> Result<Vec<Tool>, McpUpstreamCallError> {
     let mut budget = DiscoveryPageBudget::new();
     list_tools_with_limits_and_budget(service, &mut budget).await
 }
 
 async fn probe_one_advertised_metadata_page(
-    service: &mut rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    service: &mut UpstreamMcpService,
 ) -> Result<(), McpUpstreamCallError> {
     let (supports_tools, supports_resources) = service
         .peer_info()
@@ -1634,7 +1643,7 @@ impl DiscoveryPageBudget {
 }
 
 async fn discover_catalog_with_limits(
-    service: &mut rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    service: &mut UpstreamMcpService,
 ) -> Result<RawMcpDiscoveredCatalog, McpUpstreamCallError> {
     let mut budget = DiscoveryPageBudget::new();
     let (supports_tools, supports_resources) = service
@@ -1679,7 +1688,7 @@ async fn discover_catalog_with_limits(
 }
 
 async fn list_tools_with_limits_and_budget(
-    service: &mut rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    service: &mut UpstreamMcpService,
     budget: &mut DiscoveryPageBudget,
 ) -> Result<Vec<Tool>, McpUpstreamCallError> {
     let mut tools = Vec::new();
@@ -1711,7 +1720,7 @@ async fn list_tools_with_limits_and_budget(
 }
 
 async fn list_resources_with_limits(
-    service: &mut rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    service: &mut UpstreamMcpService,
     budget: &mut DiscoveryPageBudget,
 ) -> Result<Vec<StoredMcpResource>, McpUpstreamCallError> {
     let mut resources = Vec::new();
@@ -1748,7 +1757,7 @@ async fn list_resources_with_limits(
 }
 
 async fn list_resource_templates_with_limits(
-    service: &mut rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    service: &mut UpstreamMcpService,
     budget: &mut DiscoveryPageBudget,
 ) -> Result<Vec<StoredMcpResourceTemplate>, McpUpstreamCallError> {
     let mut resource_templates = Vec::new();
@@ -1825,7 +1834,7 @@ async fn connect(
     server: &McpUpstreamServerConfig,
     runtime_config: &McpUpstreamRuntimeConfig,
     destination: &CheckedEgressDestination,
-) -> Result<rmcp::service::RunningService<rmcp::RoleClient, ()>, McpUpstreamCallError> {
+) -> Result<UpstreamMcpService, McpUpstreamCallError> {
     connect_endpoint(
         &server.name,
         &server.url,
@@ -1847,7 +1856,7 @@ async fn connect_connection(
     credential: Option<Arc<ResolvedConnectionCredential>>,
     discovery_response_budget: Option<DiscoveryResponseByteBudget>,
     caller_assertions: Option<SessionCallerAssertions>,
-) -> Result<rmcp::service::RunningService<rmcp::RoleClient, ()>, McpUpstreamCallError> {
+) -> Result<UpstreamMcpService, McpUpstreamCallError> {
     // The assertion header is the Connection's as much as its credential
     // headers are, so no custom header may set it either.
     let mut credential_header_names = target.credential_header_names().to_vec();
@@ -1885,7 +1894,7 @@ async fn connect_endpoint(
     destination: &CheckedEgressDestination,
     managed_authentication: Option<ManagedMcpAuthentication>,
     discovery_response_budget: Option<DiscoveryResponseByteBudget>,
-) -> Result<rmcp::service::RunningService<rmcp::RoleClient, ()>, McpUpstreamCallError> {
+) -> Result<UpstreamMcpService, McpUpstreamCallError> {
     let client = mcp_http_client(timeout, response_idle_timeout, connect_timeout, destination)
         .map_err(|_| McpUpstreamCallError::ClientBuild)?;
     connect_endpoint_with_client(
@@ -1908,7 +1917,7 @@ async fn connect_endpoint_with_client(
     managed_authentication: Option<ManagedMcpAuthentication>,
     discovery_response_budget: Option<DiscoveryResponseByteBudget>,
     protocol_probe_control: Option<ProtocolProbeTransportControl>,
-) -> Result<rmcp::service::RunningService<rmcp::RoleClient, ()>, McpUpstreamCallError> {
+) -> Result<UpstreamMcpService, McpUpstreamCallError> {
     let mut client = LimitedMcpHttpClient::new(
         client,
         runtime_config.max_request_body_bytes,
@@ -1942,13 +1951,70 @@ async fn connect_endpoint_with_client(
     let transport = StreamableHttpClientTransport::with_client(client, transport_config);
 
     let started = Instant::now();
-    let result = rmcp::serve_client((), transport).await;
+    let result = rmcp::serve_client(upstream_client_config(), transport).await;
     tracing::debug!(
         server_name,
         latency_ms = duration_millis(started.elapsed()),
         "MCP upstream client initialized"
     );
-    result.map_err(|error| mcp_service_error(error, McpUpstreamCallError::Connect))
+    let mut service =
+        result.map_err(|error| mcp_service_error(error, McpUpstreamCallError::Connect))?;
+    // rmcp 3 caches list results for a server-supplied TTL and answers a
+    // failed re-fetch from that cache. A discovery or call failure must
+    // surface as one, as it did before the cache existed.
+    service
+        .set_response_cache_config(ClientCacheConfig::disabled())
+        .await;
+    // A server that answers `initialize` with a revision that has no
+    // handshake (2026-07-28 onward) makes rmcp 3 attach per-request lifecycle
+    // metadata for the rest of the session. That is not the revision
+    // GreenGateway asked for, so the session is refused.
+    if service
+        .peer_info()
+        .is_some_and(|info| !info.protocol_version.has_initialize())
+    {
+        tracing::warn!(
+            server_name,
+            "MCP upstream answered initialize with a protocol revision that was not requested"
+        );
+        let _ = service.close_with_timeout(Duration::from_millis(250)).await;
+        return Err(McpUpstreamCallError::Connect);
+    }
+    Ok(service)
+}
+
+/// Sends one `tools/call` and returns its complete result.
+///
+/// rmcp 3's `call_tool` re-sends the call for each 2026-07-28 MRTR
+/// `input_required` answer. Upstream sessions negotiate 2025-11-25, which has
+/// no such answer, so anything but a complete result is the unexpected
+/// response rmcp 2 reported, and the call is sent once.
+async fn call_upstream_tool_once(
+    service: &UpstreamMcpService,
+    request: CallToolRequestParams,
+) -> Result<CallToolResult, McpUpstreamCallError> {
+    match service.call_tool_once(request).await {
+        Ok(CallToolResponse::Complete(result)) => Ok(normalize_upstream_call_result(result)),
+        Ok(_) => Err(mcp_service_error(
+            ServiceError::UnexpectedResponse,
+            McpUpstreamCallError::Call,
+        )),
+        Err(error) => Err(mcp_service_error(error, McpUpstreamCallError::Call)),
+    }
+}
+
+/// rmcp 3 keeps an explicit `"structuredContent": null` as `Some(Null)`
+/// where rmcp 2 read it as absent. Relayed and projected results keep
+/// omitting it.
+fn normalize_upstream_call_result(mut result: CallToolResult) -> CallToolResult {
+    if result
+        .structured_content
+        .as_ref()
+        .is_some_and(Value::is_null)
+    {
+        result.structured_content = None;
+    }
+    result
 }
 
 #[derive(Clone)]
@@ -2309,11 +2375,17 @@ impl StreamableHttpClient for LimitedMcpHttpClient {
     async fn get_stream(
         &self,
         uri: Arc<str>,
-        session_id: Arc<str>,
+        session_id: Option<Arc<str>>,
         last_event_id: Option<String>,
         auth_token: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<BoxStream<'static, Result<Sse, SseError>>, StreamableHttpError<Self::Error>> {
+        // rmcp 3 resumes a POST response stream that closed early with a GET
+        // that carries no session when the server issued none. rmcp 2 did not
+        // resume sessionless streams, so no such request leaves the gateway.
+        let Some(session_id) = session_id else {
+            return Err(StreamableHttpError::ServerDoesNotSupportSse);
+        };
         let result = async {
             let mut request_builder = self
                 .inner
@@ -3350,8 +3422,8 @@ mod tests {
 
     use rmcp::{
         model::{
-            ListResourcesResult, ListToolsResult, ReadResourceRequestParams, ReadResourceResult,
-            ServerCapabilities, ServerInfo,
+            ListResourcesResult, ListToolsResult, ReadResourceRequestParams, ReadResourceResponse,
+            ReadResourceResult, ServerCapabilities, ServerConfig,
         },
         service::RequestContext,
         ErrorData, RoleServer, ServerHandler, ServiceExt,
@@ -3515,8 +3587,8 @@ mod tests {
     }
 
     impl ServerHandler for PaginatedProbeServer {
-        fn get_info(&self) -> ServerInfo {
-            ServerInfo::new(
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::new(
                 ServerCapabilities::builder()
                     .enable_tools()
                     .enable_resources()
@@ -3552,18 +3624,18 @@ mod tests {
             &self,
             _request: CallToolRequestParams,
             _context: RequestContext<RoleServer>,
-        ) -> Result<CallToolResult, ErrorData> {
+        ) -> Result<CallToolResponse, ErrorData> {
             self.counts.call_tool.fetch_add(1, Ordering::SeqCst);
-            Ok(CallToolResult::default())
+            Ok(CallToolResult::default().into())
         }
 
         async fn read_resource(
             &self,
             _request: ReadResourceRequestParams,
             _context: RequestContext<RoleServer>,
-        ) -> Result<ReadResourceResult, ErrorData> {
+        ) -> Result<ReadResourceResponse, ErrorData> {
             self.counts.read_resource.fetch_add(1, Ordering::SeqCst);
-            Ok(ReadResourceResult::new(Vec::new()))
+            Ok(ReadResourceResult::new(Vec::new()).into())
         }
     }
 
@@ -3584,10 +3656,10 @@ mod tests {
                 .await
                 .expect("probe test server should close cleanly");
         });
-        let mut client =
-            ().serve(client_transport)
-                .await
-                .expect("probe test client should initialize");
+        let mut client = upstream_client_config()
+            .serve(client_transport)
+            .await
+            .expect("probe test client should initialize");
 
         probe_one_advertised_metadata_page(&mut client)
             .await
@@ -4167,6 +4239,283 @@ mod tests {
             .expect("legacy MCP auth server should finish cleanly");
     }
 
+    #[tokio::test]
+    async fn upstream_sessions_ask_for_2025_11_25_and_report_failures_uncached() {
+        let upstream = ScriptedLifecycleUpstream::spawn(
+            "2025-11-25",
+            serde_json::json!({
+                "content": [{ "type": "text", "text": "done" }],
+                "structuredContent": null
+            }),
+        )
+        .await;
+        let (server, runtime, destination) = upstream.config();
+
+        let mut service = connect(&server, &runtime, &destination)
+            .await
+            .expect("a 2025-11-25 upstream should initialize");
+        assert_eq!(
+            service
+                .peer_info()
+                .map(|info| info.protocol_version.clone()),
+            Some(ProtocolVersion::V_2025_11_25)
+        );
+        assert!(
+            !service.response_cache_config().await.enabled,
+            "a failed re-fetch must not be answered from rmcp's response cache"
+        );
+        let result = call_upstream_tool_once(&service, CallToolRequestParams::new("echo"))
+            .await
+            .expect("a complete call result should be returned");
+        let _ = service.close_with_timeout(Duration::from_millis(250)).await;
+
+        assert_eq!(result.content.len(), 1);
+        assert!(
+            result.structured_content.is_none(),
+            "an explicit null structuredContent reads as absent, as it did with rmcp 2"
+        );
+        assert_eq!(
+            *upstream
+                .requested_versions
+                .lock()
+                .expect("requested versions lock should not poison"),
+            vec![serde_json::json!("2025-11-25")],
+            "rmcp 3's default client would ask initialize for 2026-07-28"
+        );
+        assert_eq!(upstream.tool_calls.load(Ordering::SeqCst), 1);
+        upstream.join().await;
+    }
+
+    #[tokio::test]
+    async fn upstream_answering_initialize_with_a_handshakeless_revision_is_refused() {
+        let upstream =
+            ScriptedLifecycleUpstream::spawn("2026-07-28", serde_json::json!({ "content": [] }))
+                .await;
+        let (server, runtime, destination) = upstream.config();
+
+        let error = match connect(&server, &runtime, &destination).await {
+            Ok(_) => panic!("a session the gateway did not ask for must be refused"),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(error, McpUpstreamCallError::Connect),
+            "unexpected refusal: {error:?}"
+        );
+        assert_eq!(upstream.tool_calls.load(Ordering::SeqCst), 0);
+        upstream.join().await;
+    }
+
+    #[tokio::test]
+    async fn upstream_input_required_call_result_fails_without_resending_the_call() {
+        let upstream = ScriptedLifecycleUpstream::spawn(
+            "2025-11-25",
+            serde_json::json!({
+                "resultType": "input_required",
+                "requestState": "opaque-upstream-state"
+            }),
+        )
+        .await;
+        let (server, runtime, destination) = upstream.config();
+        let mut service = connect(&server, &runtime, &destination)
+            .await
+            .expect("a 2025-11-25 upstream should initialize");
+
+        let error = call_upstream_tool_once(&service, CallToolRequestParams::new("echo"))
+            .await
+            .expect_err("an input-required answer is not a 2025-11-25 call result");
+        let _ = service.close_with_timeout(Duration::from_millis(250)).await;
+
+        assert!(
+            matches!(error, McpUpstreamCallError::Call),
+            "unexpected call error: {error:?}"
+        );
+        assert_eq!(
+            upstream.tool_calls.load(Ordering::SeqCst),
+            1,
+            "rmcp 3's call_tool would re-send the call for each MRTR round"
+        );
+        upstream.join().await;
+    }
+
+    #[tokio::test]
+    async fn sessionless_stream_resumption_sends_no_request() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("resumption listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("resumption address should be available");
+        let inner = rmcp_http::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("resumption test client should build");
+        let client = LimitedMcpHttpClient::new(inner, 1024, 1024);
+
+        let result = client
+            .get_stream(
+                Arc::from(format!("http://{address}/mcp")),
+                None,
+                Some("upstream-event-7".to_owned()),
+                None,
+                HashMap::new(),
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(StreamableHttpError::ServerDoesNotSupportSse)
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "a sessionless resumption must not open a connection"
+        );
+    }
+
+    /// An upstream MCP server for the rmcp 3 lifecycle regressions. It
+    /// records the revision each `initialize` asks for, answers it with
+    /// `initialize_version`, and answers every `tools/call` with
+    /// `call_result`. GET and DELETE are not supported.
+    struct ScriptedLifecycleUpstream {
+        address: SocketAddr,
+        requested_versions: Arc<Mutex<Vec<Value>>>,
+        tool_calls: Arc<AtomicUsize>,
+        stop: tokio_util::sync::CancellationToken,
+        handle: JoinHandle<()>,
+    }
+
+    impl ScriptedLifecycleUpstream {
+        async fn spawn(initialize_version: &'static str, call_result: Value) -> Self {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .expect("scripted lifecycle listener should bind");
+            let address = listener
+                .local_addr()
+                .expect("scripted lifecycle address should be available");
+            let requested_versions = Arc::new(Mutex::new(Vec::new()));
+            let tool_calls = Arc::new(AtomicUsize::new(0));
+            let stop = tokio_util::sync::CancellationToken::new();
+            let server_versions = Arc::clone(&requested_versions);
+            let server_calls = Arc::clone(&tool_calls);
+            let server_stop = stop.clone();
+            let handle = tokio::spawn(async move {
+                let mut handlers = tokio::task::JoinSet::new();
+                loop {
+                    tokio::select! {
+                        _ = server_stop.cancelled() => break,
+                        accepted = listener.accept() => {
+                            let Ok((stream, _)) = accepted else {
+                                break;
+                            };
+                            handlers.spawn(handle_scripted_lifecycle_request(
+                                stream,
+                                initialize_version,
+                                call_result.clone(),
+                                Arc::clone(&server_versions),
+                                Arc::clone(&server_calls),
+                            ));
+                        }
+                    }
+                }
+                while handlers.join_next().await.is_some() {}
+            });
+
+            Self {
+                address,
+                requested_versions,
+                tool_calls,
+                stop,
+                handle,
+            }
+        }
+
+        fn config(
+            &self,
+        ) -> (
+            McpUpstreamServerConfig,
+            McpUpstreamRuntimeConfig,
+            CheckedEgressDestination,
+        ) {
+            let server = McpUpstreamServerConfig {
+                name: "scripted-lifecycle".to_owned(),
+                url: format!("http://{}/mcp", self.address),
+                timeout_ms: Some(2_000),
+                response_idle_timeout_ms: Some(2_000),
+                connect_timeout_ms: Some(1_000),
+            };
+            let runtime = McpUpstreamRuntimeConfig {
+                timeout: Duration::from_secs(2),
+                response_idle_timeout: Duration::from_secs(2),
+                connect_timeout: Duration::from_secs(1),
+                max_request_body_bytes: 64 * 1024,
+                max_response_bytes: 64 * 1024,
+            };
+            let destination =
+                CheckedEgressDestination::for_test(Ipv4Addr::LOCALHOST.to_string(), self.address);
+            (server, runtime, destination)
+        }
+
+        async fn join(self) {
+            self.stop.cancel();
+            tokio::time::timeout(Duration::from_secs(2), self.handle)
+                .await
+                .expect("scripted lifecycle server should stop")
+                .expect("scripted lifecycle server task should join");
+        }
+    }
+
+    async fn handle_scripted_lifecycle_request(
+        mut stream: tokio::net::TcpStream,
+        initialize_version: &'static str,
+        call_result: Value,
+        requested_versions: Arc<Mutex<Vec<Value>>>,
+        tool_calls: Arc<AtomicUsize>,
+    ) {
+        let Some(request) = read_raw_protocol_probe_request(&mut stream).await else {
+            return;
+        };
+        if request.method != "POST" {
+            write_raw_protocol_probe_status(&mut stream, "405 Method Not Allowed").await;
+            return;
+        }
+        let body = request.body.unwrap_or(Value::Null);
+        let id = body.get("id").cloned().unwrap_or(Value::Null);
+        match body.get("method").and_then(Value::as_str) {
+            Some("initialize") => {
+                requested_versions
+                    .lock()
+                    .expect("requested versions lock should not poison")
+                    .push(body["params"]["protocolVersion"].clone());
+                write_raw_protocol_probe_json(
+                    &mut stream,
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "protocolVersion": initialize_version,
+                            "capabilities": { "tools": {} },
+                            "serverInfo": { "name": "scripted-lifecycle", "version": "0.0.0" }
+                        }
+                    }),
+                    true,
+                )
+                .await;
+            }
+            Some("tools/call") => {
+                tool_calls.fetch_add(1, Ordering::SeqCst);
+                write_raw_protocol_probe_json(
+                    &mut stream,
+                    serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": call_result }),
+                    false,
+                )
+                .await;
+            }
+            _ => write_raw_protocol_probe_status(&mut stream, "202 Accepted").await,
+        }
+    }
+
     #[test]
     fn mcp_client_ignores_ambient_proxy_environment() {
         let proxy_listener = std::net::TcpListener::bind(("127.0.0.1", 0))
@@ -4244,7 +4593,7 @@ mod tests {
                     "http://{host}:{}/private?token=secret-query",
                     address.port()
                 )),
-                Arc::<str>::from("test-session"),
+                Some(Arc::<str>::from("test-session")),
                 None,
                 None,
                 HashMap::new(),
@@ -4392,7 +4741,7 @@ mod tests {
             get_client
                 .get_stream(
                     Arc::from(get_url),
-                    Arc::from("test-session"),
+                    Some(Arc::from("test-session")),
                     None,
                     Some("attacker-transport-token".to_owned()),
                     HashMap::new(),
@@ -4601,7 +4950,7 @@ mod tests {
             client
                 .get_stream(
                     Arc::from(url),
-                    Arc::from("attested-session"),
+                    Some(Arc::from("attested-session")),
                     None,
                     None,
                     HashMap::new(),
@@ -4938,7 +5287,7 @@ mod tests {
         let result = client
             .get_stream(
                 Arc::from(format!("http://{address}/mcp")),
-                Arc::from("redaction-test-session"),
+                Some(Arc::from("redaction-test-session")),
                 None,
                 None,
                 HashMap::new(),
@@ -5438,7 +5787,7 @@ mod tests {
         client
             .get_stream(
                 Arc::from(url.to_owned()),
-                Arc::from("test-session"),
+                Some(Arc::from("test-session")),
                 None,
                 None,
                 HashMap::new(),

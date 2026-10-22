@@ -1,4 +1,4 @@
-use std::{future::Future, pin::Pin, sync::Arc, time::Instant};
+use std::{borrow::Cow, future::Future, pin::Pin, sync::Arc, time::Instant};
 
 use axum::{
     body::Body,
@@ -8,9 +8,9 @@ use axum::{
 use http::{header, request::Parts};
 use rmcp::{
     model::{
-        CallToolRequestParams, CallToolResult, CreateTaskResult, ErrorCode, ErrorData,
-        Implementation, JsonObject, ListToolsResult, PaginatedRequestParams, ServerCapabilities,
-        ServerInfo, Tool,
+        CallToolRequestParams, CallToolResponse, CallToolResult, ErrorCode, ErrorData,
+        Implementation, JsonObject, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
+        ServerCapabilities, ServerConfig, Tool,
     },
     service::{RequestContext, RoleServer},
     transport::streamable_http_server::{
@@ -18,6 +18,7 @@ use rmcp::{
     },
     ServerHandler,
 };
+use serde::{de::IgnoredAny, Deserialize};
 use serde_json::{json, Map, Value};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
@@ -41,6 +42,14 @@ const TOOL_RUNTIME_UNAVAILABLE_CODE: ErrorCode = ErrorCode(-32000);
 const TOOL_TASK_UNSUPPORTED_REASON: &str = "task_unsupported";
 const JSON_MIME: &str = "application/json";
 
+/// The newest MCP revision `/mcp` serves. rmcp 3 also implements 2026-07-28,
+/// whose per-request `_meta` lifecycle, SEP-2549 cache hints on the
+/// per-caller `tools/list`, input-required results and HTTP status mapping
+/// have not been reviewed for this gateway. `initialize` therefore still
+/// agrees only on 2024-11-05 through 2025-11-25, and a request naming
+/// 2026-07-28 in its `_meta` is refused as an unsupported version.
+const MAX_SERVED_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2025_11_25;
+
 type McpHttpService = StreamableHttpService<McpServer, NeverSessionManager>;
 
 #[derive(Clone)]
@@ -53,15 +62,20 @@ impl McpState {
         registry: ToolRegistry,
         executor: Option<ToolExecutor>,
         client_ip_policy: client_ip::ClientIpPolicy,
+        max_body_size: usize,
     ) -> Self {
         let server = McpServer {
             registry,
             executor,
             client_ip_policy,
         };
+        // `mcp_endpoint` reads the body under MAX_BODY_SIZE before rmcp sees
+        // it. rmcp 3 added its own 4 MiB default, which would refuse bodies a
+        // larger configured limit admits, so it gets the same limit.
         let config = StreamableHttpServerConfig::default()
-            .with_stateful_mode(false)
+            .with_legacy_session_mode(false)
             .with_json_response(true)
+            .with_max_request_body_bytes(max_body_size)
             .disable_allowed_hosts();
 
         Self {
@@ -78,17 +92,65 @@ pub(crate) async fn mcp_endpoint(
     State(app): State<crate::AppState>,
     request: AxumRequest<Body>,
 ) -> Response {
-    let (parts, body) = request.into_parts();
+    let (mut parts, body) = request.into_parts();
     let body = match crate::read_request_body(body, app.max_body_size).await {
         Ok(body) => body,
         Err(response) => return *response,
     };
+    if is_task_augmented_tool_call(&body) {
+        parts.extensions.insert(TaskAugmentedToolCall);
+    }
     let request = AxumRequest::from_parts(parts, Body::from(body));
 
     match app.mcp.service.oneshot(request).await {
         Ok(response) => response.map(Body::new).into_response(),
         Err(error) => match error {},
     }
+}
+
+/// Marks a `tools/call` whose params carry a SEP-1319 `task` member.
+///
+/// MCP 2025-11-25 lets a client ask for a tool call to run as a task. rmcp 2
+/// routed such a call to `ServerHandler::enqueue_task`, which GreenGateway
+/// answers with an audited `task_unsupported` rejection. rmcp 3 replaced
+/// SEP-1319 with the SEP-2663 tasks extension and no longer parses `task`, so
+/// the same call would run synchronously and return an ordinary result to a
+/// client that asked for a task. The endpoint classifies the body before rmcp
+/// parses it and `call_tool` keeps refusing the call.
+#[derive(Clone, Copy, Debug)]
+struct TaskAugmentedToolCall;
+
+#[derive(Deserialize)]
+struct JsonRpcRequestProbe<'a> {
+    #[serde(borrow, default)]
+    method: Option<Cow<'a, str>>,
+    #[serde(default)]
+    params: Option<ToolCallParamsProbe>,
+}
+
+#[derive(Deserialize)]
+struct ToolCallParamsProbe {
+    #[serde(default)]
+    task: Option<IgnoredAny>,
+}
+
+/// Whether `body` is a `tools/call` request with a non-null `params.task`.
+///
+/// Any non-null value counts, including one rmcp 2 could not parse as task
+/// metadata: such a call is refused, never run. A body that is not a single
+/// JSON-RPC object is left to rmcp, which rejects what it cannot parse.
+fn is_task_augmented_tool_call(body: &[u8]) -> bool {
+    serde_json::from_slice::<JsonRpcRequestProbe<'_>>(body).is_ok_and(|probe| {
+        probe.method.as_deref() == Some("tools/call")
+            && probe.params.is_some_and(|params| params.task.is_some())
+    })
+}
+
+fn is_task_augmented_request(context: &RequestContext<RoleServer>) -> bool {
+    context
+        .extensions
+        .get::<Parts>()
+        .is_some_and(|parts| parts.extensions.get::<TaskAugmentedToolCall>().is_some())
 }
 
 #[derive(Clone)]
@@ -99,11 +161,19 @@ struct McpServer {
 }
 
 impl ServerHandler for McpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(
-            Implementation::new("greengateway", env!("CARGO_PKG_VERSION"))
-                .with_title("GreenGateway"),
-        )
+    fn get_info(&self) -> ServerConfig {
+        // The protocol version here is what `initialize` falls back to when a
+        // client names one this server does not support.
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(MAX_SERVED_PROTOCOL_VERSION)
+            .with_server_info(
+                Implementation::new("greengateway", env!("CARGO_PKG_VERSION"))
+                    .with_title("GreenGateway"),
+            )
+    }
+
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        Cow::Borrowed(ProtocolVersion::known_up_to(&MAX_SERVED_PROTOCOL_VERSION))
     }
 
     async fn list_tools(
@@ -160,56 +230,47 @@ impl ServerHandler for McpServer {
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
+    ) -> Result<CallToolResponse, ErrorData> {
         let lookup_started = Instant::now();
         let invocation_context = invocation_context_from_request(&context, &self.client_ip_policy);
         // As in `list_tools`: the lookup, the invocation and the rendered
         // request are judged by the revision the HTTP request was admitted
-        // at, never by one a reconcile installed while it was in flight.
+        // at, never by one a reconcile installed while it was in flight. A
+        // rejected task call is still admitted, audited and observed under it.
         let request_extensions = context
             .extensions
             .get::<Parts>()
             .map(|parts| &parts.extensions);
+        if is_task_augmented_request(&context) {
+            let rejection = crate::middleware::rbac::with_request_pins(
+                request_extensions,
+                self.reject_task_call_work(request, lookup_started, invocation_context),
+            )
+            .await;
+            return Err(rejection);
+        }
         crate::middleware::rbac::with_request_pins(
             request_extensions,
             self.call_tool_work(request, lookup_started, invocation_context),
         )
         .await
-    }
-
-    async fn enqueue_task(
-        &self,
-        request: CallToolRequestParams,
-        context: RequestContext<RoleServer>,
-    ) -> Result<CreateTaskResult, ErrorData> {
-        let lookup_started = Instant::now();
-        let invocation_context = invocation_context_from_request(&context, &self.client_ip_policy);
-        // As in `list_tools`: the rejected call is still admitted, audited and
-        // observed under the revision the HTTP request was admitted at.
-        let request_extensions = context
-            .extensions
-            .get::<Parts>()
-            .map(|parts| &parts.extensions);
-        crate::middleware::rbac::with_request_pins(
-            request_extensions,
-            self.enqueue_task_work(request, lookup_started, invocation_context),
-        )
-        .await
+        .map(CallToolResponse::Complete)
     }
 
     fn get_tool(&self, _name: &str) -> Option<Tool> {
-        // rmcp uses this hook only for taskSupport prevalidation. GreenGateway
-        // intentionally owns SEP-1319 task rejection so rejected task calls feed
-        // the same audit/inventory path as ordinary tool calls.
+        // rmcp uses this hook for SEP-2243 `Mcp-Param-*` header validation on
+        // 2026-07-28 requests, which this server does not serve. GreenGateway
+        // owns task rejection (`TaskAugmentedToolCall`) so rejected task calls
+        // feed the same audit/inventory path as ordinary tool calls.
         None
     }
 }
 
-/// The work of `call_tool` and `enqueue_task`, which run it under the
-/// request's pins. Each is built in a stack frame of its own and boxed: the
-/// tool executor's future is large, and every layer that pins it would
-/// otherwise hold, and in unoptimized builds copy across the stack, a whole
-/// instance of it.
+/// The work of `call_tool`, ordinary or rejected as a task, which it runs
+/// under the request's pins. Each is built in a stack frame of its own and
+/// boxed: the tool executor's future is large, and every layer that pins it
+/// would otherwise hold, and in unoptimized builds copy across the stack, a
+/// whole instance of it.
 impl McpServer {
     fn call_tool_work(
         &self,
@@ -270,12 +331,12 @@ impl McpServer {
         })
     }
 
-    fn enqueue_task_work(
+    fn reject_task_call_work(
         &self,
         request: CallToolRequestParams,
         lookup_started: Instant,
         invocation_context: ToolInvocationContext,
-    ) -> Pin<Box<dyn Future<Output = Result<CreateTaskResult, ErrorData>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = ErrorData> + Send + '_>> {
         Box::pin(async move {
             let tool_name = request.name.to_string();
 
@@ -287,29 +348,27 @@ impl McpServer {
                         lookup_started.elapsed(),
                     );
                 }
-                return Err(unknown_tool_error(&tool_name));
+                return unknown_tool_error(&tool_name);
             }
 
             let Some(executor) = self.executor.as_ref() else {
-                return Err(ErrorData::internal_error(
+                return ErrorData::internal_error(
                     "tool executor is not configured",
                     Some(json!({ "tool_name": tool_name })),
-                ));
+                );
             };
 
             match executor
                 .reject_task_tool_call(invocation_context, &tool_name)
                 .await
             {
-                Ok(()) => Err(task_unsupported_error(tool_name)),
+                Ok(()) => task_unsupported_error(tool_name),
                 Err(ToolRuntimeError::WorkFailed {
                     tool_name,
                     reason: Some(reason),
                     ..
-                }) if reason == TOOL_TASK_UNSUPPORTED_REASON => {
-                    Err(task_unsupported_error(tool_name))
-                }
-                Err(error) => Err(runtime_error_to_mcp_error(error, None)),
+                }) if reason == TOOL_TASK_UNSUPPORTED_REASON => task_unsupported_error(tool_name),
+                Err(error) => runtime_error_to_mcp_error(error, None),
             }
         })
     }
@@ -882,6 +941,8 @@ mod tests {
     const RESTRICTED_TOOL: &str = "payroll_export";
     const COMPOSITE_ONLY_TOOL: &str = "composite_step";
     const PRIVILEGED_ROLE: &str = "payroll-admin";
+    /// The default MAX_BODY_SIZE, which `mcp_endpoint` enforces before rmcp.
+    const TEST_MAX_BODY_SIZE: usize = 1_048_576;
 
     #[test]
     fn composite_runtime_error_carries_request_id_and_pending_compensation_marker() {
@@ -1368,7 +1429,12 @@ mod tests {
         registry
             .merge_definitions(vec![legacy_tool_definition(RESTRICTED_TOOL)])
             .expect("definitions should register");
-        let state = McpState::new(registry, None, client_ip::ClientIpPolicy::default());
+        let state = McpState::new(
+            registry,
+            None,
+            client_ip::ClientIpPolicy::default(),
+            TEST_MAX_BODY_SIZE,
+        );
 
         let body = mcp_json_rpc(&state, 2, "tools/list", None).await;
 
@@ -1377,6 +1443,183 @@ mod tests {
             json!([]),
             "without an executor there is no runtime to evaluate visibility, so nothing may be advertised"
         );
+    }
+
+    #[tokio::test]
+    async fn initialize_agrees_on_the_revisions_served_before_rmcp_3() {
+        let (state, _registry) = mcp_state_from_empty_registry();
+        // A client may name any revision with a handshake and gets it back.
+        // 2026-07-28 has no handshake, and an unknown revision is not served,
+        // so both get the newest served one, as rmcp 3's own clients expect.
+        for (requested, agreed) in [
+            ("2024-11-05", "2024-11-05"),
+            ("2025-03-26", "2025-03-26"),
+            ("2025-06-18", "2025-06-18"),
+            ("2025-11-25", "2025-11-25"),
+            ("2026-07-28", "2025-11-25"),
+            ("2099-01-01", "2025-11-25"),
+        ] {
+            let (status, body) = mcp_json_rpc_status_and_body(
+                &state,
+                mcp_json_rpc_request_at(
+                    1,
+                    "initialize",
+                    Some(json!({
+                        "protocolVersion": requested,
+                        "capabilities": {},
+                        "clientInfo": { "name": "negotiation-test", "version": "0.0.0" }
+                    })),
+                    None,
+                ),
+            )
+            .await;
+
+            assert_eq!(status, http::StatusCode::OK, "{requested}: {body}");
+            assert_eq!(
+                body["result"]["protocolVersion"],
+                json!(agreed),
+                "{requested}: {body}"
+            );
+            assert_eq!(
+                body["result"]["serverInfo"]["name"],
+                json!("greengateway"),
+                "{requested}: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn requests_naming_the_2026_07_28_revision_are_refused_without_serving_tools() {
+        let (state, registry) = mcp_state_from_empty_registry();
+        registry
+            .merge_definitions(vec![legacy_tool_definition(VISIBLE_TOOL)])
+            .expect("definitions should register");
+        let modern_meta = json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }
+        });
+
+        // Self-contained 2026-07-28 requests, with the SEP-2243 method header
+        // such clients send, are an unsupported revision.
+        let modern_request = |id, method: &str, params: Option<Value>| {
+            let mut request = mcp_json_rpc_request_at(id, method, params, Some("2026-07-28"));
+            request.headers_mut().insert(
+                "Mcp-Method",
+                http::HeaderValue::from_str(method).expect("method header should encode"),
+            );
+            request
+        };
+        for method in ["tools/list", "server/discover"] {
+            let (status, body) = mcp_json_rpc_status_and_body(
+                &state,
+                modern_request(3, method, Some(modern_meta.clone())),
+            )
+            .await;
+            assert_eq!(status, http::StatusCode::BAD_REQUEST, "{method}: {body}");
+            assert_eq!(body["error"]["code"], json!(-32022), "{method}: {body}");
+            assert_eq!(
+                body["error"]["data"]["supported"],
+                json!(["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"]),
+                "{method}: {body}"
+            );
+            assert!(body.get("result").is_none(), "{method}: {body}");
+        }
+
+        // rmcp 2 served a request whose only 2026-07-28 signal was the
+        // header with 2025-11-25 semantics. rmcp 3 refuses it as malformed:
+        // without the SEP-2243 headers, and without the `_meta` lifecycle.
+        let (status, body) = mcp_json_rpc_status_and_body(
+            &state,
+            mcp_json_rpc_request_at(4, "tools/list", None, Some("2026-07-28")),
+        )
+        .await;
+        assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["code"], json!(-32020), "{body}");
+        assert!(body.get("result").is_none(), "{body}");
+        let (status, body) =
+            mcp_json_rpc_status_and_body(&state, modern_request(4, "tools/list", None)).await;
+        assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["code"], json!(-32602), "{body}");
+        assert!(body.get("result").is_none(), "{body}");
+
+        // The same tool stays listed for the revisions that are served.
+        let body = mcp_json_rpc(&state, 5, "tools/list", None).await;
+        assert_eq!(listed_tool_names(&body), vec![VISIBLE_TOOL.to_owned()]);
+        assert!(
+            body["result"].get("ttlMs").is_none() && body["result"].get("cacheScope").is_none(),
+            "2025-11-25 results carry no SEP-2549 cache hints: {body}"
+        );
+        assert!(
+            body["result"].get("resultType").is_none(),
+            "2025-11-25 results carry no resultType: {body}"
+        );
+    }
+
+    #[test]
+    fn task_augmented_tool_calls_are_recognized_before_rmcp_parses_them() {
+        for body in [
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "echo", "task": {}}}),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "echo", "task": {"ttl": 60000}}}),
+            // rmcp 2 could not parse this task metadata; it is still refused.
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "echo", "task": "later"}}),
+        ] {
+            assert!(
+                is_task_augmented_tool_call(body.to_string().as_bytes()),
+                "{body}"
+            );
+        }
+        assert!(is_task_augmented_tool_call(
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools\/call","params":{"name":"echo","task":{}}}"#
+        ));
+
+        for body in [
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "echo", "arguments": {"task": {}}}}),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "echo", "task": null}}),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list",
+                   "params": {"task": {}}}),
+            json!([{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": "echo", "task": {}}}]),
+        ] {
+            assert!(
+                !is_task_augmented_tool_call(body.to_string().as_bytes()),
+                "{body}"
+            );
+        }
+        assert!(!is_task_augmented_tool_call(b"not json"));
+    }
+
+    #[tokio::test]
+    async fn mcp_service_admits_bodies_up_to_the_configured_limit_above_the_rmcp_default() {
+        // rmcp 3 refuses bodies over 4 MiB unless told otherwise; MAX_BODY_SIZE
+        // may admit more, and `mcp_endpoint` has already enforced it.
+        let configured_limit = 6 * 1024 * 1024;
+        let state = McpState::new(
+            ToolRegistry::disabled(),
+            None,
+            client_ip::ClientIpPolicy::default(),
+            configured_limit,
+        );
+        let padding = "x".repeat(5 * 1024 * 1024);
+
+        let (status, body) = mcp_json_rpc_status_and_body(
+            &state,
+            mcp_json_rpc_request(
+                6,
+                "tools/list",
+                Some(json!({ "_meta": { "padding": padding } })),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, http::StatusCode::OK);
+        assert_eq!(body["result"]["tools"], json!([]));
     }
 
     #[tokio::test]
@@ -1424,6 +1667,7 @@ mod tests {
             ToolRegistry::disabled(),
             None,
             client_ip::ClientIpPolicy::default(),
+            TEST_MAX_BODY_SIZE,
         );
 
         let body = mcp_json_rpc(
@@ -1550,6 +1794,7 @@ mod tests {
             registry.clone(),
             Some(executor),
             client_ip::ClientIpPolicy::default(),
+            TEST_MAX_BODY_SIZE,
         );
         let gate = ReconcileAfterAdmissionGate {
             admitted,
@@ -1740,6 +1985,7 @@ mod tests {
             registry.clone(),
             executor,
             client_ip::ClientIpPolicy::default(),
+            TEST_MAX_BODY_SIZE,
         );
 
         (state, registry)
@@ -1916,6 +2162,17 @@ mod tests {
     }
 
     fn mcp_json_rpc_request(id: u64, method: &str, params: Option<Value>) -> AxumRequest<Body> {
+        mcp_json_rpc_request_at(id, method, params, Some("2025-11-25"))
+    }
+
+    /// A JSON-RPC POST carrying `protocol_version` in `MCP-Protocol-Version`,
+    /// or no such header.
+    fn mcp_json_rpc_request_at(
+        id: u64,
+        method: &str,
+        params: Option<Value>,
+        protocol_version: Option<&str>,
+    ) -> AxumRequest<Body> {
         let mut payload = json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -1925,15 +2182,33 @@ mod tests {
             payload["params"] = params;
         }
 
-        AxumRequest::builder()
+        let mut request = AxumRequest::builder()
             .method(http::Method::POST)
             .uri("/mcp")
             .header(header::HOST, "localhost")
             .header(header::CONTENT_TYPE, JSON_MIME)
-            .header(header::ACCEPT, "application/json, text/event-stream")
-            .header("MCP-Protocol-Version", "2025-11-25")
+            .header(header::ACCEPT, "application/json, text/event-stream");
+        if let Some(protocol_version) = protocol_version {
+            request = request.header("MCP-Protocol-Version", protocol_version);
+        }
+        request
             .body(Body::from(payload.to_string()))
             .expect("MCP request should build")
+    }
+
+    async fn mcp_json_rpc_status_and_body(
+        state: &McpState,
+        request: AxumRequest<Body>,
+    ) -> (http::StatusCode, Value) {
+        let response = state
+            .service
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("MCP service should respond")
+            .map(Body::new);
+        let status = response.status();
+        (status, mcp_json_rpc_body(response).await)
     }
 
     async fn mcp_json_rpc_body(response: Response) -> Value {
