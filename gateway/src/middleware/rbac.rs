@@ -8,7 +8,7 @@ use std::{
 };
 
 #[cfg(test)]
-use crate::rbac::{DefaultAction, EnforcementMode, RuleDispatchContext, RuleMatcher};
+use crate::rbac::{DefaultAction, EnforcementMode, PolicyEngine, RuleDispatchContext, RuleMatcher};
 use arc_swap::ArcSwap;
 #[cfg(feature = "postgres")]
 use async_trait::async_trait;
@@ -40,8 +40,7 @@ use crate::{
         RuleReference,
     },
     rbac::{
-        policy::ToolPolicyEntry, EgressPolicy, Policy, PolicyEngine, RouteRule, RuleAction,
-        RuleDispatchKind,
+        policy::ToolPolicyEntry, EgressPolicy, Policy, RouteRule, RuleAction, RuleDispatchKind,
     },
     request_bounds::MAX_TOOL_NAME_BYTES,
     upstream_route::{
@@ -389,17 +388,23 @@ pub(crate) fn validate_policy_proxy_dispatch_config(
 }
 
 pub(crate) struct RbacPolicyState {
+    /// The pre-cutover permission engine, direct-rule matcher, default,
+    /// enforcement mode and route vector, kept only for the frozen
+    /// differential oracles in `legacy`. They are copies of their own, so a
+    /// differential test compares the compiled instance with something other
+    /// than itself. Every serving decision, audit attribution and management
+    /// permission reads `compiled`.
+    #[cfg(test)]
     engine: PolicyEngine,
-    /// The pre-cutover direct-rule matcher, kept only for the frozen
-    /// differential oracles in `legacy`. Every serving decision reads
-    /// `compiled`.
     #[cfg(test)]
     rule_matcher: RuleMatcher,
+    /// Derived from `compiled`'s own direct rules; see [`Self::rule_ids`].
     rule_ids: Vec<String>,
     #[cfg(test)]
     default_action: DefaultAction,
     #[cfg(test)]
     enforcement_mode: EnforcementMode,
+    #[cfg(test)]
     routes: Vec<RouteRule>,
     /// The security revision this compiled snapshot is keyed by. `0` for
     /// file-served snapshots (standalone mode has no revisions); a cluster
@@ -418,7 +423,9 @@ pub(crate) struct RbacPolicyState {
     /// disagree with the snapshot it belongs to, and compiling once per install
     /// keeps three parses and a digest off the request path.
     ///
-    /// The HTTP and tool-lane adapters use this instance for every decision.
+    /// The HTTP and tool-lane adapters use this instance for every decision,
+    /// and resolve every rule and route reference it returns against this
+    /// same instance. The management lane asks its permission engine.
     compiled: crate::policy_eval::CompiledPolicy,
 }
 
@@ -800,7 +807,7 @@ impl RbacState {
     }
 
     pub fn current_policy(&self) -> Policy {
-        self.policy.load().engine.policy().clone()
+        self.policy.load().compiled.engine().policy().clone()
     }
 
     /// The live lane's installed snapshot, which [`RbacState::current_policy`]
@@ -813,7 +820,7 @@ impl RbacState {
     }
 
     pub fn current_egress_policy(&self) -> EgressPolicy {
-        self.policy.load().engine.policy().egress.clone()
+        self.policy.load().compiled.engine().policy().egress.clone()
     }
 
     pub(crate) async fn policy_write_guard(&self) -> PolicyWriteGuard<'_> {
@@ -830,7 +837,8 @@ impl RbacState {
     pub fn principal_has_permission(&self, principal: &auth::Principal, permission: &str) -> bool {
         self.policy
             .load()
-            .engine
+            .compiled
+            .engine()
             .principal_has_permission(principal, permission)
     }
 
@@ -844,7 +852,8 @@ impl RbacState {
         permission: &str,
     ) -> bool {
         self.effective_policy()
-            .engine
+            .compiled
+            .engine()
             .principal_has_permission(principal, permission)
     }
 
@@ -858,13 +867,14 @@ impl RbacState {
         requested_roles: &[String],
     ) -> Vec<String> {
         let policy = self.effective_policy();
-        if policy.engine.principal_has_wildcard(principal) {
+        let engine = policy.compiled.engine();
+        if engine.principal_has_wildcard(principal) {
             return Vec::new();
         }
 
         requested_roles
             .iter()
-            .filter(|role| !policy.engine.principal_has_active_role(principal, role))
+            .filter(|role| !engine.principal_has_active_role(principal, role))
             .cloned()
             .collect()
     }
@@ -965,15 +975,7 @@ impl RbacState {
             principal_fact(principal),
             Some((method, path.to_owned())),
         )?;
-        if evaluation.reason() != ToolReason::MatchedRule
-            && (evaluation.reason() != ToolReason::NoHttpRule
-                || evaluation.effect() != PolicyEffect::Allow)
-        {
-            return Err(refused(ToolOperation::RenderedHttp, internal_invariant()));
-        }
-        policy
-            .matched_tool_rule(&evaluation)
-            .map_err(|refusal| refused(ToolOperation::RenderedHttp, refusal))
+        policy.rendered_http_rule(&evaluation)
     }
 
     /// Previews whether the requesting principal may invoke a policy-backed
@@ -1007,6 +1009,15 @@ fn principal_fact(principal: Option<&auth::Principal>) -> PrincipalFact {
     })
 }
 
+/// Whether a tool answer is the evaluator's own allow with no rule behind it,
+/// the only unmatched answer a tool-lane adapter admits on.
+fn is_unmatched_allow(evaluation: &ToolEvaluation, reason: ToolReason) -> bool {
+    evaluation.reason() == reason
+        && evaluation.logical() == LogicalDecision::Allow
+        && evaluation.effect() == PolicyEffect::Allow
+        && evaluation.matched().is_none()
+}
+
 fn inconsistent() -> ToolPolicyRefusal {
     ToolPolicyRefusal::Error(EvaluationError::InconsistentContext)
 }
@@ -1028,39 +1039,10 @@ fn refused(operation: ToolOperation, refusal: ToolPolicyRefusal) -> ToolPolicyRe
 
 impl RbacPolicyState {
     fn from_policy(policy: Policy) -> Self {
-        #[cfg(test)]
-        let default_action = policy.default_action.clone();
-        #[cfg(test)]
-        let enforcement_mode = policy.enforcement_mode;
-        let routes = policy.routes.clone();
-        let rule_ids = policy
-            .rules
-            .iter()
-            .enumerate()
-            .map(|(rule_index, rule)| rule.id.clone().unwrap_or_else(|| rule_index.to_string()))
-            .collect();
-        #[cfg(test)]
-        let rule_matcher = RuleMatcher::new(&policy.rules);
-        let compiled = crate::policy_eval::CompiledPolicy::from_validated_policy(
-            policy.clone(),
-            crate::policy_eval::PolicyAuthority::Standalone,
-        );
-
-        Self {
-            engine: PolicyEngine::new(policy),
-            #[cfg(test)]
-            rule_matcher,
-            rule_ids,
-            #[cfg(test)]
-            default_action,
-            #[cfg(test)]
-            enforcement_mode,
-            routes,
-            security_revision: 0,
-            // Infallible here: the only rejection `from_validated_policy` makes
-            // is of an impossible watermark, and a standalone snapshot has none.
-            compiled: compiled.expect("a standalone authority is always valid"),
-        }
+        // Infallible here: the only rejection `from_validated_policy` makes
+        // is of an impossible watermark, and a standalone snapshot has none.
+        Self::build(policy, crate::policy_eval::PolicyAuthority::Standalone, 0)
+            .expect("a standalone authority is always valid")
     }
 
     /// The cluster-mode constructor: a compiled snapshot keyed by the
@@ -1077,26 +1059,46 @@ impl RbacPolicyState {
         policy: Policy,
         security_revision: i64,
     ) -> Result<Self, crate::policy_eval::CompileError> {
+        Self::build(
+            policy,
+            crate::policy_eval::PolicyAuthority::PostgreSql { security_revision },
+            security_revision,
+        )
+    }
+
+    /// Compile one snapshot and derive everything a serving path reads from
+    /// the compiled instance: its decisions, the rule ids and routes audit
+    /// attribution resolves the evaluator's references against, and the
+    /// permission engine the management lane asks. None of them can then
+    /// describe another policy than the one that decided. The oracle copies
+    /// are built only into tests.
+    fn build(
+        policy: Policy,
+        authority: crate::policy_eval::PolicyAuthority,
+        security_revision: i64,
+    ) -> Result<Self, crate::policy_eval::CompileError> {
         #[cfg(test)]
         let default_action = policy.default_action.clone();
         #[cfg(test)]
         let enforcement_mode = policy.enforcement_mode;
+        #[cfg(test)]
         let routes = policy.routes.clone();
-        let rule_ids = policy
-            .rules
+        #[cfg(test)]
+        let rule_matcher = RuleMatcher::new(&policy.rules);
+        #[cfg(test)]
+        let engine = PolicyEngine::new(policy.clone());
+        let compiled =
+            crate::policy_eval::CompiledPolicy::from_validated_policy(policy, authority)?;
+        let rule_ids = compiled
+            .direct_rules()
             .iter()
             .enumerate()
             .map(|(rule_index, rule)| rule.id.clone().unwrap_or_else(|| rule_index.to_string()))
             .collect();
-        #[cfg(test)]
-        let rule_matcher = RuleMatcher::new(&policy.rules);
-        let compiled = crate::policy_eval::CompiledPolicy::from_validated_policy(
-            policy.clone(),
-            crate::policy_eval::PolicyAuthority::PostgreSql { security_revision },
-        )?;
 
         Ok(Self {
-            engine: PolicyEngine::new(policy),
+            #[cfg(test)]
+            engine,
             #[cfg(test)]
             rule_matcher,
             rule_ids,
@@ -1104,6 +1106,7 @@ impl RbacPolicyState {
             default_action,
             #[cfg(test)]
             enforcement_mode,
+            #[cfg(test)]
             routes,
             security_revision,
             compiled,
@@ -1119,7 +1122,9 @@ impl RbacPolicyState {
     /// The id audit attribution records for each direct rule, in source
     /// order: the rule's `id`, else its zero-based index. These are the ids
     /// `matched_rule_id` carries, so a count keyed by them is a count of what
-    /// this snapshot's rules were recorded as.
+    /// this snapshot's rules were recorded as. They are derived from the
+    /// compiled instance's own direct rules, the vector a
+    /// [`RuleReference::Direct`] index it returns names.
     pub(crate) fn rule_ids(&self) -> &[String] {
         &self.rule_ids
     }
@@ -1168,6 +1173,11 @@ impl RbacPolicyState {
     /// The rule a tool invocation or rendered request matched, attributed by
     /// this snapshot's rule ids exactly as the HTTP adapter attributes one.
     /// The action follows the effect: allow, deny, or a shadow observation.
+    ///
+    /// An answer naming no direct rule this snapshot has, or whose effect and
+    /// logical decision disagree, is refused: the kernel gives neither, so a
+    /// kernel that started to would fail closed here rather than be
+    /// attributed or admitted.
     fn matched_tool_rule(
         &self,
         evaluation: &ToolEvaluation,
@@ -1180,10 +1190,11 @@ impl RbacPolicyState {
             _ => None,
         }
         .ok_or_else(internal_invariant)?;
-        let action = match evaluation.effect() {
-            PolicyEffect::Allow => RuleAction::Allow,
-            PolicyEffect::Block => RuleAction::Deny,
-            PolicyEffect::Observe => RuleAction::Shadow,
+        let action = match (evaluation.effect(), evaluation.logical()) {
+            (PolicyEffect::Allow, LogicalDecision::Allow) => RuleAction::Allow,
+            (PolicyEffect::Block, LogicalDecision::Deny) => RuleAction::Deny,
+            (PolicyEffect::Observe, LogicalDecision::Deny) => RuleAction::Shadow,
+            _ => return Err(internal_invariant()),
         };
         Ok(Some(MatchedRuleDecision {
             action,
@@ -1191,21 +1202,63 @@ impl RbacPolicyState {
         }))
     }
 
+    /// Translate one accepted rendered-HTTP answer: `Ok(None)` for the
+    /// evaluator's own no-rule allow, the attributed rule for a matched one.
+    ///
+    /// Any other answer is refused as an internal invariant: a block or an
+    /// observation with no rule, a rule reference without `MatchedRule`, or a
+    /// reason another operation gives. The kernel gives none of them, so
+    /// these guards are reached only by a test that crafts such an answer
+    /// (`a_rendered_http_answer_the_kernel_never_gives_is_refused`); they
+    /// exist so that a kernel change which started to give one would fail
+    /// closed rather than let the rendered request through unattributed.
+    fn rendered_http_rule(
+        &self,
+        evaluation: &ToolEvaluation,
+    ) -> Result<Option<MatchedRuleDecision>, ToolPolicyRefusal> {
+        if evaluation.reason() != ToolReason::MatchedRule
+            && !is_unmatched_allow(evaluation, ToolReason::NoHttpRule)
+        {
+            return Err(refused(ToolOperation::RenderedHttp, internal_invariant()));
+        }
+        self.matched_tool_rule(evaluation)
+            .map_err(|refusal| refused(ToolOperation::RenderedHttp, refusal))
+    }
+
     fn tool_invocation_verdict(
         &self,
         tool_name: &str,
         principal: Option<&auth::Principal>,
     ) -> ToolInvocationVerdict<'_> {
-        let evaluation = match self.evaluate_tool(
+        match self.evaluate_tool(
             ToolOperation::Invocation,
             tool_name,
             principal_fact(principal),
             None,
         ) {
-            Ok(evaluation) => evaluation,
-            Err(refusal) => return ToolInvocationVerdict::Refused(refusal),
-        };
-        let rule_decision = match self.matched_tool_rule(&evaluation) {
+            Ok(evaluation) => self.invocation_verdict(tool_name, &evaluation),
+            Err(refusal) => ToolInvocationVerdict::Refused(refusal),
+        }
+    }
+
+    /// Translate one accepted invocation answer for the runtime, asking the
+    /// evaluator nothing more.
+    ///
+    /// Only an answer the kernel gives admits: its own unmatched allow for a
+    /// tool this snapshot has an entry for, or a matched rule this snapshot
+    /// can attribute. Any other answer -- an `Allowed` with another effect, a
+    /// rule reference or a disagreeing logical decision, a reason that
+    /// contradicts whether the entry exists -- is refused as an internal
+    /// invariant. The kernel gives none of them, so these guards are reached
+    /// only by a test that crafts such an answer
+    /// (`an_invocation_answer_the_kernel_never_gives_is_refused`); they exist
+    /// so that a kernel change which started to give one would fail closed.
+    fn invocation_verdict(
+        &self,
+        tool_name: &str,
+        evaluation: &ToolEvaluation,
+    ) -> ToolInvocationVerdict<'_> {
+        let rule_decision = match self.matched_tool_rule(evaluation) {
             Ok(rule_decision) => rule_decision,
             Err(refusal) => {
                 return ToolInvocationVerdict::Refused(refused(ToolOperation::Invocation, refusal))
@@ -1221,9 +1274,9 @@ impl RbacPolicyState {
                 }
             }
             // No rule decided, so only the evaluator's own allow admits; any
-            // other effect here is a kernel the adapter does not understand.
+            // other answer here is a kernel the adapter does not understand.
             (ToolReason::Allowed, Some(tool), None)
-                if evaluation.effect() == PolicyEffect::Allow =>
+                if is_unmatched_allow(evaluation, ToolReason::Allowed) =>
             {
                 ToolInvocationVerdict::Entry {
                     tool,
@@ -1760,10 +1813,13 @@ fn apply_http_evaluation(
         ),
         _ => None,
     };
+    // Resolved against the instance that matched it, so the permission and
+    // path prefix recorded are the route's that decided.
     let route = match evaluation.matched() {
         Some(RuleReference::Route(index)) => Some(
             policy
-                .routes
+                .compiled
+                .routes()
                 .get(index)
                 .ok_or(EvaluationError::InternalInvariant)?,
         ),

@@ -318,6 +318,28 @@ impl CompiledPolicy {
         &self.engine.policy().rate_limits
     }
 
+    /// The routes [`Self::evaluate`] matches, in source order: a
+    /// [`RuleReference::Route`] index names an entry of exactly this slice.
+    ///
+    /// The live HTTP adapter resolves a matched route's permission and path
+    /// prefix for its audit record and policy decision here, from the instance
+    /// that matched it, rather than from a second copy of the policy that
+    /// agrees with this one only by construction.
+    pub(crate) fn routes(&self) -> &[RouteRule] {
+        &self.engine.policy().routes
+    }
+
+    /// The permission engine this instance grants route permissions by, over
+    /// the policy it was compiled from.
+    ///
+    /// The live lane's management permissions, delegated-role checks and the
+    /// policy copies it hands out read this engine, so a route permission the
+    /// evaluator grants and a management permission the gateway grants are
+    /// answered by one engine over one policy.
+    pub(crate) fn engine(&self) -> &PolicyEngine {
+        &self.engine
+    }
+
     /// First deciding direct rule, over one path identity or an alias pair.
     ///
     /// The two cases use **different precedence orders**, and neither is a
@@ -484,7 +506,7 @@ impl CompiledPolicy {
         host: Option<&str>,
         host_binding_required: bool,
     ) -> Option<(usize, &RouteRule)> {
-        let routes = &self.engine.policy().routes;
+        let routes = self.routes();
         let admissible = |route: &RouteRule| {
             method_matches(&route.methods, method)
                 && route_host_matches(&route.hosts, host, host_binding_required)
@@ -1159,6 +1181,23 @@ impl Evaluation {
 
     pub(crate) fn limitation(&self) -> Option<Limitation> {
         self.limitation
+    }
+
+    /// This answer with its reason and references replaced, for a test that
+    /// reaches an adapter's guards against a reference the kernel never
+    /// returns. The binding, completeness and effect are kept, so it is still
+    /// a complete answer to the question that was asked.
+    #[cfg(test)]
+    pub(crate) fn crafted(
+        mut self,
+        reason: Reason,
+        matched: Option<RuleReference>,
+        observation: Option<RuleReference>,
+    ) -> Self {
+        self.reason = reason;
+        self.matched = matched;
+        self.observation = observation;
+        self
     }
 
     fn complete(
