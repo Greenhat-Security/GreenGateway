@@ -847,6 +847,105 @@ fn connection_admin_request_schema_tracks_additional_header_validation() {
 }
 
 #[test]
+fn connection_admin_request_schema_keeps_caller_assertion_keys_only_on_replace() {
+    let schema = load_json(&docs_root().join(SCHEMA_RELATIVE_PATH));
+    assert_closed_object(&schema, "MutationCallerAssertion");
+    assert_closed_object(&schema, "MutationCallerAssertionPublishedKey");
+    let candidate = |signing_key: Value, published_key: Value| {
+        let mut assertion = json!({
+            "kid": "gw-test-1",
+            "algorithm": "es256",
+            "issuer": "https://gateway.example.test",
+            "audience": "https://api.example.test",
+            "token_type": "caller-assertion+jwt",
+            "header_name": "x-caller-assertion",
+            "lifetime_seconds": 60,
+            "published_keys": [{ "kid": "gw-test-2", "algorithm": "rs256" }]
+        });
+        for (field, value) in signing_key.as_object().expect("signing key binding") {
+            assertion[field] = value.clone();
+        }
+        for (field, value) in published_key.as_object().expect("published key binding") {
+            assertion["published_keys"][0][field] = value.clone();
+        }
+        json!({
+            "display_name": "Attested API",
+            "enabled": true,
+            "kind": "http_api",
+            "endpoint": {
+                "base_url": "https://api.example.test",
+                "base_path": "/"
+            },
+            "authentication": { "type": "none" },
+            "caller_assertion": assertion
+        })
+    };
+    let validator_for = |definition_name: &str| {
+        let mut request_schema = schema.clone();
+        request_schema
+            .as_object_mut()
+            .expect("admin schema should be an object")
+            .insert(
+                "$ref".to_owned(),
+                Value::String(format!("#/$defs/{definition_name}")),
+            );
+        jsonschema::validator_for(&request_schema)
+            .unwrap_or_else(|error| panic!("{definition_name} should compile: {error}"))
+    };
+    let replace = validator_for("ConnectionReplaceRequest");
+    let create = validator_for("ConnectionCreateRequest");
+
+    let named = candidate(
+        json!({ "signing_key_id": "assertion-key" }),
+        json!({ "signing_key_id": "assertion-key-next" }),
+    );
+    let kept = candidate(
+        json!({ "signing_key_configured": true }),
+        json!({ "signing_key_configured": true }),
+    );
+    assert!(create.is_valid(&named), "a create names every key alias");
+    assert!(
+        replace.is_valid(&named),
+        "a replacement may name every key alias"
+    );
+    assert!(
+        replace.is_valid(&kept),
+        "a replacement may keep every stored key by marker"
+    );
+    assert!(!create.is_valid(&kept), "a create has nothing to keep");
+
+    for (invalid, reason) in [
+        (
+            candidate(
+                json!({ "signing_key_configured": false }),
+                json!({ "signing_key_configured": true }),
+            ),
+            "a key cannot be unbound",
+        ),
+        (
+            candidate(
+                json!({ "signing_key_id": "assertion-key", "signing_key_configured": true }),
+                json!({ "signing_key_configured": true }),
+            ),
+            "a marker beside an alias",
+        ),
+        (
+            candidate(json!({}), json!({ "signing_key_configured": true })),
+            "a signing key with neither",
+        ),
+        (
+            candidate(json!({ "signing_key_configured": true }), json!({})),
+            "a published key with neither",
+        ),
+    ] {
+        assert!(
+            !replace.is_valid(&invalid),
+            "replacement must refuse {reason}"
+        );
+    }
+}
+
+#[test]
 fn connection_admin_closed_copies_accept_overlay_runtime_fields_and_exact_version() {
     let schema = load_json(&docs_root().join(SCHEMA_RELATIVE_PATH));
     let validates = |name: &str, instance: &Value| {
