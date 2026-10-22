@@ -11955,16 +11955,25 @@ fn explicit_hidden_binding_fields_are_secret_authority_intent() {
         json!({"tls": {"ca_bundle_alias": "ca"}}),
         json!({"tls": {"client_certificate_id": "certificate"}}),
         json!({"tls": {"client_private_key_id": null}}),
+        json!({"caller_assertion": {"signing_key_id": "alias"}}),
+        json!({"caller_assertion": {"published_keys": [{"signing_key_id": "alias"}]}}),
     ] {
         assert!(has_explicit_connection_binding_intent(&candidate));
     }
     assert!(!has_explicit_connection_binding_intent(&json!({
         "authentication": {"secret_configured": true},
+        "caller_assertion": {
+            "signing_key_configured": true,
+            "published_keys": [{"signing_key_configured": true}]
+        },
         "tls": {
             "ca_bundle_configured": true,
             "client_certificate_configured": true,
             "client_private_key_configured": true
         }
+    })));
+    assert!(!has_explicit_connection_binding_intent(&json!({
+        "caller_assertion": null
     })));
 }
 
@@ -12225,6 +12234,213 @@ fn replacement_keeps_an_omitted_caller_assertion_and_removes_it_only_on_null() {
     let plain = parse_connection_write_body(&Bytes::from(plain_edit.to_string()), &unattested)
         .expect("an edit of an unattested Connection should parse");
     assert!(plain.caller_assertion.is_none());
+}
+
+fn rotating_caller_assertion_connection() -> connections::model::ConnectionWrite {
+    let current: connections::model::ConnectionWrite = serde_json::from_value(json!({
+        "display_name": "Attested API",
+        "enabled": true,
+        "kind": "http_api",
+        "endpoint": {
+            "base_url": "https://billing.example.test",
+            "base_path": "/"
+        },
+        "authentication": {"type": "none"},
+        "caller_assertion": {
+            "signing_key_id": "assertion-key-current-canary",
+            "kid": "gw-test-1",
+            "algorithm": "es256",
+            "issuer": "https://gateway.example.test",
+            "audience": "https://billing.example.test",
+            "token_type": "caller-assertion+jwt",
+            "header_name": "x-caller-assertion",
+            "lifetime_seconds": 60,
+            "published_keys": [{
+                "signing_key_id": "assertion-key-next-canary",
+                "kid": "gw-test-2",
+                "algorithm": "rs256"
+            }]
+        },
+        "tls": {}
+    }))
+    .expect("attested Connection should deserialize");
+    current
+        .validated()
+        .expect("attested Connection should validate")
+}
+
+fn caller_assertion_edit(assertion: Value) -> Value {
+    json!({
+        "display_name": "Attested API",
+        "enabled": true,
+        "kind": "http_api",
+        "endpoint": {
+            "base_url": "https://billing.example.test",
+            "base_path": "/"
+        },
+        "authentication": {"type": "none"},
+        "caller_assertion": assertion,
+        "tls": {}
+    })
+}
+
+#[test]
+fn replacement_keeps_caller_assertion_key_aliases_by_kid_through_a_rotation() {
+    // The admin UI edits the block without ever seeing its aliases: it marks
+    // each key it keeps, and the gateway keeps the alias stored under that
+    // key's `kid` and algorithm.
+    let current = rotating_caller_assertion_connection();
+    let unchanged = caller_assertion_edit(json!({
+        "signing_key_configured": true,
+        "kid": "gw-test-1",
+        "algorithm": "es256",
+        "issuer": "https://gateway.example.test",
+        "audience": "https://billing.example.test",
+        "token_type": "caller-assertion+jwt",
+        "header_name": "X-Caller-Assertion",
+        "lifetime_seconds": 60,
+        "published_keys": [{
+            "signing_key_configured": true,
+            "kid": "gw-test-2",
+            "algorithm": "rs256"
+        }]
+    }));
+    assert!(!has_explicit_connection_binding_intent(&unchanged));
+    let kept = parse_connection_write_body(&Bytes::from(unchanged.to_string()), &current)
+        .expect("marked keys should keep their stored aliases");
+    assert_eq!(kept.caller_assertion, current.caller_assertion);
+    assert!(!current.requires_secrets_write_to_replace(&kept));
+
+    let mut longer = unchanged.clone();
+    longer["caller_assertion"]["lifetime_seconds"] = json!(120);
+    let longer = parse_connection_write_body(&Bytes::from(longer.to_string()), &current)
+        .expect("an edit of another field should keep both aliases");
+    let assertion = longer.caller_assertion.as_ref().expect("block kept");
+    assert_eq!(assertion.lifetime_seconds, 120);
+    assert_eq!(assertion.signing_key_id, "assertion-key-current-canary");
+    assert_eq!(
+        assertion.published_keys[0].signing_key_id,
+        "assertion-key-next-canary"
+    );
+    assert!(current.requires_secrets_write_to_replace(&longer));
+
+    // Rotation step 3: the next key signs and the previous one stays published.
+    let promoted = caller_assertion_edit(json!({
+        "signing_key_configured": true,
+        "kid": "gw-test-2",
+        "algorithm": "rs256",
+        "issuer": "https://gateway.example.test",
+        "audience": "https://billing.example.test",
+        "token_type": "caller-assertion+jwt",
+        "header_name": "x-caller-assertion",
+        "lifetime_seconds": 60,
+        "published_keys": [{
+            "signing_key_configured": true,
+            "kid": "gw-test-1",
+            "algorithm": "es256"
+        }]
+    }));
+    let promoted = parse_connection_write_body(&Bytes::from(promoted.to_string()), &current)
+        .expect("a promotion should move each alias with its kid");
+    let assertion = promoted.caller_assertion.as_ref().expect("block kept");
+    assert_eq!(assertion.kid, "gw-test-2");
+    assert_eq!(assertion.signing_key_id, "assertion-key-next-canary");
+    assert_eq!(assertion.published_keys[0].kid, "gw-test-1");
+    assert_eq!(
+        assertion.published_keys[0].signing_key_id,
+        "assertion-key-current-canary"
+    );
+
+    // A marked key next to a newly named one: only the new alias is explicit.
+    let mut added = unchanged.clone();
+    added["caller_assertion"]["published_keys"] = json!([{
+        "signing_key_id": "assertion-key-third",
+        "kid": "gw-test-3",
+        "algorithm": "es256"
+    }]);
+    assert!(has_explicit_connection_binding_intent(&added));
+    let added = parse_connection_write_body(&Bytes::from(added.to_string()), &current)
+        .expect("a newly named key should be accepted beside a marked one");
+    let assertion = added.caller_assertion.as_ref().expect("block kept");
+    assert_eq!(assertion.signing_key_id, "assertion-key-current-canary");
+    assert_eq!(
+        assertion.published_keys[0].signing_key_id,
+        "assertion-key-third"
+    );
+}
+
+#[test]
+fn caller_assertion_key_markers_that_match_no_stored_key_fail_closed() {
+    let current = rotating_caller_assertion_connection();
+    let signing = |overrides: Value| {
+        let mut assertion = json!({
+            "signing_key_configured": true,
+            "kid": "gw-test-1",
+            "algorithm": "es256",
+            "issuer": "https://gateway.example.test",
+            "audience": "https://billing.example.test",
+            "token_type": "caller-assertion+jwt",
+            "header_name": "x-caller-assertion",
+            "lifetime_seconds": 60
+        });
+        for (field, value) in overrides.as_object().expect("overrides are an object") {
+            assertion[field] = value.clone();
+        }
+        caller_assertion_edit(assertion)
+    };
+
+    for (invalid, reason) in [
+        (signing(json!({"kid": "gw-test-9"})), "a kid nothing stores"),
+        (
+            signing(json!({"algorithm": "rs256"})),
+            "a stored kid under the other algorithm",
+        ),
+        (
+            signing(json!({"signing_key_configured": false})),
+            "a cleared key",
+        ),
+        (
+            signing(json!({"signing_key_id": "assertion-key-guess"})),
+            "a marker beside an explicit alias",
+        ),
+        (
+            signing(json!({"signing_key_configured": "yes"})),
+            "a non-boolean marker",
+        ),
+        (
+            signing(json!({"published_keys": [{
+                "signing_key_configured": true,
+                "kid": "gw-test-2",
+                "algorithm": "es256"
+            }]})),
+            "a published key under the other algorithm",
+        ),
+        (
+            signing(json!({"published_keys": ["gw-test-2"]})),
+            "a published key that is not an object",
+        ),
+    ] {
+        let error = parse_connection_write_body(&Bytes::from(invalid.to_string()), &current)
+            .expect_err(reason);
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST, "{reason}");
+        let rendered = format!("{error:?}");
+        assert!(
+            !rendered.contains("assertion-key-current-canary"),
+            "{reason}"
+        );
+        assert!(!rendered.contains("assertion-key-next-canary"), "{reason}");
+    }
+
+    // With no stored block there is no alias to keep.
+    let mut unattested = current.clone();
+    unattested.caller_assertion = None;
+    let error =
+        parse_connection_write_body(&Bytes::from(signing(json!({})).to_string()), &unattested)
+            .expect_err("a marker with nothing stored must fail closed");
+    assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+
+    // A create never retains anything, so a marker is an unknown field there.
+    assert!(parse_connection_create_body(&Bytes::from(signing(json!({})).to_string())).is_err());
 }
 
 #[tokio::test]

@@ -6,8 +6,8 @@ import type {
 
 /**
  * A Connection's caller assertion, read only. Shared by the detail page and
- * the editor; nothing in the admin UI edits the block, and saving a
- * Connection keeps it exactly as stored.
+ * the editor, which shows it this way until the operator chooses to edit or
+ * remove it; any other save keeps it exactly as stored.
  *
  * `subjectTokenOnly` is set for a delegated issuer token Connection, whose
  * assertion is signed as the subject token of its token exchange and sent to
@@ -59,18 +59,17 @@ export function CallerAssertionSummary({
           </p>
         ) : (
           <p>
-            The admin UI shows this block read only, and saving the connection
-            here keeps it unchanged. To stop attesting callers, remove the
-            block through the admin API by sending{' '}
-            <code>&quot;caller_assertion&quot;: null</code>, which needs the
-            secrets-write permission.
+            Saving the connection without editing this block keeps it
+            unchanged. Editing or removing it in the connection editor needs
+            the secrets-write permission, as does changing the endpoint or
+            test target of a connection that carries it.
           </p>
         )}
         {assertion.bind_approval ? (
           <p>
             This block asks for approval binding, which the gateway no longer
-            accepts on a save. Remove it through the admin API before saving
-            this connection.
+            accepts on a save. Edit the block, which turns approval binding
+            off, or remove it before saving this connection.
           </p>
         ) : null}
       </div>

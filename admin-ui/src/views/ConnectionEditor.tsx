@@ -705,7 +705,15 @@ export function ConnectionEditor() {
               onUpdate={updateAdditionalHeader}
               onRemove={removeAdditionalHeader}
             />
-            <CallerAssertionSection assertion={form.callerAssertion} />
+            <CallerAssertionSection
+              form={form}
+              errors={fieldErrors}
+              secrets={availableSecrets}
+              canBindSecret={canUseSecretBindings}
+              secretsWriteAllowed={canBindSecret}
+              disabled={!canEdit || editorBusy || !canBindSecret}
+              onUpdate={updateForm}
+            />
             <TlsSection
               form={form}
               errors={fieldErrors}

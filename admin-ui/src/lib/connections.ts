@@ -263,12 +263,8 @@ export type CallerAssertionKeyProblem = {
 
 /**
  * A Connection's caller assertion as the safe read returns it: every field
- * except the signing key alias, which is reduced to `signing_key_configured`.
- *
- * The gateway accepts and stores the block but does not enforce it yet, and
- * refuses every call, test and discovery on a Connection that carries one.
- * This UI only displays it. See `ConnectionWrite.caller_assertion` for why a
- * save never sends it.
+ * except the key aliases, each reduced to `signing_key_configured`. See
+ * `ConnectionWrite.caller_assertion` for how a save sends it back.
  */
 export type SafeCallerAssertion = {
   signing_key_configured: boolean;
@@ -287,6 +283,38 @@ export type SafeCallerAssertion = {
   key_problem?: CallerAssertionKeyProblem;
 };
 
+/**
+ * How a write names a caller-assertion key: `signing_key_id`, an explicit
+ * alias, or, on a replacement only, `signing_key_configured: true`, which
+ * keeps the alias of the stored key with the same `kid` and algorithm. The
+ * gateway refuses a write with both, with neither, or with a marker that
+ * matches no stored key.
+ */
+export type CallerAssertionKeyBinding = {
+  signing_key_id?: string;
+  signing_key_configured?: true;
+};
+
+export type PublishedAssertionKeyWrite = CallerAssertionKeyBinding & {
+  kid: string;
+  algorithm: CallerAssertionAlgorithm;
+};
+
+export type CallerAssertionWrite = CallerAssertionKeyBinding & {
+  kid: string;
+  algorithm: CallerAssertionAlgorithm;
+  issuer: string;
+  audience: string;
+  token_type: string;
+  header_name: string;
+  lifetime_seconds: number;
+  claims?: CallerAssertionClaim[];
+  bind_request: boolean;
+  /** The gateway refuses `true` on every write: nothing can satisfy it yet. */
+  bind_approval: false;
+  published_keys?: PublishedAssertionKeyWrite[];
+};
+
 export type ConnectionWrite = {
   display_name: string;
   description?: string;
@@ -296,14 +324,11 @@ export type ConnectionWrite = {
   authentication: ConnectionAuthentication;
   additional_headers?: ConnectionAdditionalHeader[];
   /**
-   * Never sent. A replacement that omits `caller_assertion` keeps the stored
-   * block, and `null` removes it. The safe read hides the block's signing key
-   * alias, so this UI cannot send the block back, and anything it could send
-   * would at best remove the block: that lifts the refusal and puts a
-   * Connection that cannot yet attest its caller back into service. The type
-   * rules the key out so no save can include it.
+   * Sent only when the operator changes the block. A replacement that omits
+   * `caller_assertion` keeps the stored block exactly as it is, which is how
+   * every other save leaves it alone, and `null` removes it.
    */
-  caller_assertion?: never;
+  caller_assertion?: CallerAssertionWrite | null;
   tls: TlsProfile;
   timeouts?: ConnectionTimeouts;
   discovery?: DiscoveryConfig;
@@ -1059,7 +1084,7 @@ function projectSafeCallerAssertion(value: unknown): SafeCallerAssertion {
 }
 
 // The gateway publishes at most this many keys beside a signing key.
-const MAX_PUBLISHED_ASSERTION_KEYS = 4;
+export const MAX_PUBLISHED_ASSERTION_KEYS = 4;
 
 function isSafePublishedAssertionKeyList(
   value: unknown,

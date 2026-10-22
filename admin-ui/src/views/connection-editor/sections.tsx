@@ -5,8 +5,10 @@ import {
 } from 'react';
 
 import {
-  type ConnectionKind,
-  type SafeCallerAssertion
+  MAX_PUBLISHED_ASSERTION_KEYS,
+  type CallerAssertionAlgorithm,
+  type CallerAssertionClaim,
+  type ConnectionKind
 } from '../../lib/connections';
 import {
   createConnectionSecret,
@@ -22,18 +24,29 @@ import {
   AdditionalHeaderDraft,
   additionalHeaderFieldError,
   ALL_SECRET_PURPOSES,
+  AssertionKeyDraft,
+  assertionKeyWithPatch,
   authenticationPurpose,
   AuthenticationType,
   BindingDraft,
   BindingIntent,
+  CALLER_ASSERTION_PROBLEMS_ID,
+  CallerAssertionDraft,
+  callerAssertionDraftFromStored,
+  callerAssertionDraftWithPromotedKey,
+  CallerAssertionMode,
+  callerAssertionSectionProblems,
   ConnectionFormState,
   describedBy,
   DiscoveryType,
+  emptyAssertionKey,
   FieldErrors,
   formatSecretProvider,
   formatSecretPurpose,
   isTlsSecretPurpose,
   MAX_ADDITIONAL_HEADERS,
+  MAX_CALLER_ASSERTION_LIFETIME_SECONDS,
+  newCallerAssertionDraft,
   secretErrorRequiresReload,
   SecretInventoryState,
   secretMaxLength,
@@ -484,16 +497,59 @@ export function AdditionalHeadersSection({
 }
 
 /**
- * The stored caller assertion, read only. The editor has no controls for it,
- * and a save leaves it exactly as stored.
+ * The caller assertion: the stored block read only until the operator chooses
+ * to edit or remove it, or a new block. A save that does neither leaves the
+ * stored block out of the write, so the gateway keeps it exactly as stored.
+ *
+ * `disabled` is set without the secrets-write permission: binding, changing
+ * or removing the block is secret authority.
  */
 export function CallerAssertionSection({
-  assertion,
+  form,
+  errors,
+  secrets,
+  canBindSecret,
+  secretsWriteAllowed,
+  disabled,
+  onUpdate,
 }: {
-  assertion: SafeCallerAssertion | null;
+  form: ConnectionFormState;
+  errors: FieldErrors;
+  secrets: ConnectionSecretMetadata[];
+  // Whether the alias pickers can bind: the permission and a loaded inventory.
+  canBindSecret: boolean;
+  secretsWriteAllowed: boolean;
+  disabled: boolean;
+  onUpdate: (
+    update: (current: ConnectionFormState) => ConnectionFormState,
+  ) => void;
 }) {
-  if (assertion === null) {
-    return null;
+  const stored = form.callerAssertion;
+  const mode = form.callerAssertionMode;
+  const problems = callerAssertionSectionProblems(errors, mode);
+
+  function setMode(next: CallerAssertionMode) {
+    onUpdate((current) => ({
+      ...current,
+      callerAssertionMode: next,
+      ...(next === 'edit'
+        ? {
+          callerAssertionDraft:
+            current.callerAssertion === null
+              ? newCallerAssertionDraft()
+              : callerAssertionDraftFromStored(current.callerAssertion),
+        }
+        : {}),
+    }));
+  }
+
+  function updateDraft(
+    update: (draft: CallerAssertionDraft) => CallerAssertionDraft,
+  ) {
+    onUpdate((current) => ({
+      ...current,
+      callerAssertionDraft: update(current.callerAssertionDraft),
+    }));
   }
 
   return (
@@ -505,8 +561,483 @@ export function CallerAssertionSection({
         <p className="eyebrow">Caller attestation</p>
         <h3 id="connection-caller-assertion-heading">Caller assertion</h3>
       </div>
-      <CallerAssertionSummary assertion={assertion} />
+      {problems.length > 0 ? (
+        <div
+          className="error-panel alert warning"
+          role="alert"
+          id={CALLER_ASSERTION_PROBLEMS_ID}
+          tabIndex={-1}
+        >
+          <h3>Review the caller assertion</h3>
+          {problems.map((problem) => (
+            <p key={problem}>{problem}</p>
+          ))}
+        </div>
+      ) : null}
+      {mode === 'edit' ? (
+        <CallerAssertionEditor
+          draft={form.callerAssertionDraft}
+          errors={errors}
+          secrets={secrets}
+          canBindSecret={canBindSecret}
+          disabled={disabled}
+          onUpdate={updateDraft}
+        />
+      ) : null}
+      {mode === 'remove' && stored !== null ? (
+        <div className="alert warning" role="status">
+          <p>
+            <strong>Removed when you save.</strong> Requests on this
+            connection then reach the upstream without an assertion of the
+            caller, and its keys are withdrawn from the published key set.
+          </p>
+        </div>
+      ) : null}
+      {mode !== 'edit' && stored !== null ? (
+        <CallerAssertionSummary assertion={stored} />
+      ) : null}
+      {mode !== 'edit' && stored === null ? (
+        <p className="capability-description">
+          No caller assertion. Add one to send the upstream a short-lived JWT,
+          signed by the gateway, that names the calling principal on the
+          requests this connection makes for a caller.
+        </p>
+      ) : null}
+      <div className="form-actions">
+        {mode === 'keep' ? (
+          <button
+            type="button"
+            className="secondary-button"
+            disabled={disabled}
+            onClick={() => setMode('edit')}
+          >
+            {stored === null ? 'Add caller assertion' : 'Edit caller assertion'}
+          </button>
+        ) : null}
+        {mode === 'keep' && stored !== null ? (
+          <button
+            type="button"
+            className="secondary-button"
+            disabled={disabled}
+            onClick={() => setMode('remove')}
+          >
+            Remove caller assertion
+          </button>
+        ) : null}
+        {mode !== 'keep' ? (
+          <button
+            type="button"
+            className="secondary-button"
+            disabled={disabled}
+            onClick={() => setMode('keep')}
+          >
+            {stored === null
+              ? 'Discard new caller assertion'
+              : mode === 'remove'
+                ? 'Keep caller assertion'
+                : 'Discard caller assertion changes'}
+          </button>
+        ) : null}
+        {!secretsWriteAllowed ? (
+          <span className="badge neutral">
+            Changing the caller assertion needs secrets-write permission
+          </span>
+        ) : null}
+      </div>
     </section>
+  );
+}
+
+function CallerAssertionEditor({
+  draft,
+  errors,
+  secrets,
+  canBindSecret,
+  disabled,
+  onUpdate,
+}: {
+  draft: CallerAssertionDraft;
+  errors: FieldErrors;
+  secrets: ConnectionSecretMetadata[];
+  canBindSecret: boolean;
+  disabled: boolean;
+  onUpdate: (
+    update: (draft: CallerAssertionDraft) => CallerAssertionDraft,
+  ) => void;
+}) {
+  const hasKeyAlias = secrets.some(
+    (secret) =>
+      secret.configured &&
+      secret.compatible_purposes.includes('assertion_signing_key'),
+  );
+
+  function patchDraft(patch: Partial<CallerAssertionDraft>) {
+    onUpdate((current) => ({ ...current, ...patch }));
+  }
+
+  function patchSigningKey(
+    patch: Partial<Pick<AssertionKeyDraft, 'kid' | 'algorithm' | 'binding'>>,
+  ) {
+    onUpdate((current) => ({
+      ...current,
+      signingKey: assertionKeyWithPatch(current.signingKey, patch),
+    }));
+  }
+
+  function patchPublishedKey(
+    index: number,
+    patch: Partial<Pick<AssertionKeyDraft, 'kid' | 'algorithm' | 'binding'>>,
+  ) {
+    onUpdate((current) => ({
+      ...current,
+      publishedKeys: current.publishedKeys.map((key, position) =>
+        position === index ? assertionKeyWithPatch(key, patch) : key,
+      ),
+    }));
+  }
+
+  function toggleClaim(claim: CallerAssertionClaim, included: boolean) {
+    onUpdate((current) => ({
+      ...current,
+      // Appended or removed in place, so the stored order survives.
+      claims: included
+        ? current.claims.includes(claim)
+          ? current.claims
+          : [...current.claims, claim]
+        : current.claims.filter((existing) => existing !== claim),
+    }));
+  }
+
+  return (
+    <>
+      <p className="capability-description">
+        Requests this connection makes for a caller carry a JWT naming that
+        caller in the assertion header, signed with the signing key. The
+        upstream verifies it against{' '}
+        <code>/.well-known/caller-assertion-jwks.json</code> and pins the
+        issuer, audience, token type and algorithm. A call with no principal
+        to name, such as a service token, is refused. Saving an enabled
+        connection loads every key, and a key that cannot be used refuses
+        the save.
+      </p>
+      {canBindSecret && !hasKeyAlias ? (
+        <div className="alert info" role="status">
+          No configured secret alias can hold a signing key. A key must sit
+          behind an operator alias or an external secret provider; the
+          encrypted local store cannot hold one.
+        </div>
+      ) : null}
+      <div className="filter-grid connection-form-grid">
+        <AssertionKeyFields
+          idPrefix="connection-caller-assertion"
+          secretFieldId="connection-caller-assertion-signing-key"
+          keyDraft={draft.signingKey}
+          label="Signing key"
+          kidError={errors['caller_assertion.kid']}
+          secretError={errors['caller_assertion.signing_key_id']}
+          secrets={secrets}
+          canBindSecret={canBindSecret}
+          disabled={disabled}
+          onChange={patchSigningKey}
+        />
+        <AssertionTextField
+          id="connection-caller-assertion-issuer"
+          label="Issuer (iss)"
+          value={draft.issuer}
+          placeholder="https://gateway.example"
+          error={errors['caller_assertion.issuer']}
+          disabled={disabled}
+          onChange={(issuer) => patchDraft({ issuer })}
+        />
+        <AssertionTextField
+          id="connection-caller-assertion-audience"
+          label="Audience (aud)"
+          value={draft.audience}
+          placeholder="https://internal.example/api"
+          error={errors['caller_assertion.audience']}
+          disabled={disabled}
+          onChange={(audience) => patchDraft({ audience })}
+        />
+        <AssertionTextField
+          id="connection-caller-assertion-token-type"
+          label="Token type (typ)"
+          value={draft.tokenType}
+          placeholder="caller-assertion+jwt"
+          error={errors['caller_assertion.token_type']}
+          disabled={disabled}
+          onChange={(tokenType) => patchDraft({ tokenType })}
+        />
+        <AssertionTextField
+          id="connection-caller-assertion-header-name"
+          label="Assertion header"
+          value={draft.headerName}
+          maxLength={64}
+          error={errors['caller_assertion.header_name']}
+          disabled={disabled}
+          onChange={(headerName) => patchDraft({ headerName })}
+        />
+        <FormField
+          id="connection-caller-assertion-lifetime"
+          label="Lifetime (seconds)"
+          error={errors['caller_assertion.lifetime_seconds']}
+        >
+          <input
+            id="connection-caller-assertion-lifetime"
+            type="number"
+            min={1}
+            max={MAX_CALLER_ASSERTION_LIFETIME_SECONDS}
+            value={draft.lifetimeSeconds}
+            disabled={disabled}
+            aria-invalid={Boolean(errors['caller_assertion.lifetime_seconds'])}
+            aria-describedby={describedBy(
+              'connection-caller-assertion-lifetime',
+              errors['caller_assertion.lifetime_seconds'],
+            )}
+            onChange={(event) =>
+              patchDraft({ lifetimeSeconds: event.target.value })
+            }
+          />
+        </FormField>
+      </div>
+      <fieldset className="connection-caller-assertion-options">
+        <legend>Claims beyond sub</legend>
+        {(['email', 'roles'] as const).map((claim) => (
+          <label className="rule-check-row" key={claim}>
+            <input
+              type="checkbox"
+              id={`connection-caller-assertion-claim-${claim}`}
+              checked={draft.claims.includes(claim)}
+              disabled={disabled}
+              onChange={(event) => toggleClaim(claim, event.target.checked)}
+            />
+            {claim === 'email'
+              ? 'Email (email), advisory: the identity provider may not have verified it'
+              : 'Roles (roles)'}
+          </label>
+        ))}
+        <label className="rule-check-row">
+          <input
+            type="checkbox"
+            id="connection-caller-assertion-bind-request"
+            checked={draft.bindRequest}
+            disabled={disabled}
+            onChange={(event) =>
+              patchDraft({ bindRequest: event.target.checked })
+            }
+          />
+          Bind the request: method, request target and SHA-256 of the exact
+          body sent (bind_request)
+        </label>
+      </fieldset>
+      <div className="section-heading connection-additional-headers-heading">
+        <div>
+          <h4>Published keys</h4>
+          <p className="capability-description">
+            Keys the JWKS publishes beside the signing key that never sign:
+            the next key, published before it signs, and the previous one,
+            kept until what it signed has expired. Make a published key the
+            signing key to rotate.
+          </p>
+        </div>
+        <button
+          type="button"
+          className="secondary-button"
+          disabled={
+            disabled ||
+            draft.publishedKeys.length >= MAX_PUBLISHED_ASSERTION_KEYS
+          }
+          onClick={() =>
+            onUpdate((current) =>
+              current.publishedKeys.length >= MAX_PUBLISHED_ASSERTION_KEYS
+                ? current
+                : {
+                  ...current,
+                  publishedKeys: [
+                    ...current.publishedKeys,
+                    emptyAssertionKey(),
+                  ],
+                },
+            )
+          }
+        >
+          Add published key
+        </button>
+      </div>
+      {draft.publishedKeys.length > 0 ? (
+        <div className="connection-additional-header-list">
+          {draft.publishedKeys.map((key, index) => {
+            const number = index + 1;
+            return (
+              <div
+                className="connection-additional-header-row"
+                key={key.draftId}
+              >
+                <div className="filter-grid connection-form-grid">
+                  <AssertionKeyFields
+                    idPrefix={`connection-caller-assertion-published-key-${index}`}
+                    secretFieldId={`connection-caller-assertion-published-key-${index}-secret`}
+                    keyDraft={key}
+                    label={`Published key ${number}`}
+                    kidError={
+                      errors[`caller_assertion.published_keys.${index}.kid`]
+                    }
+                    secretError={
+                      errors[
+                      `caller_assertion.published_keys.${index}.signing_key_id`
+                      ]
+                    }
+                    secrets={secrets}
+                    canBindSecret={canBindSecret}
+                    disabled={disabled}
+                    onChange={(patch) => patchPublishedKey(index, patch)}
+                  />
+                </div>
+                <div className="form-actions">
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    disabled={disabled}
+                    onClick={() =>
+                      onUpdate((current) =>
+                        callerAssertionDraftWithPromotedKey(current, index),
+                      )
+                    }
+                  >
+                    Make published key {number} the signing key
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    disabled={disabled}
+                    onClick={() =>
+                      onUpdate((current) => ({
+                        ...current,
+                        publishedKeys: current.publishedKeys.filter(
+                          (_key, position) => position !== index,
+                        ),
+                      }))
+                    }
+                  >
+                    Remove published key {number}
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        <p className="capability-description">No published keys.</p>
+      )}
+    </>
+  );
+}
+
+/**
+ * One key's `kid`, algorithm and secret alias. The alias picker lists only
+ * aliases that can hold an assertion signing key, which leaves out the
+ * encrypted local store.
+ */
+function AssertionKeyFields({
+  idPrefix,
+  secretFieldId,
+  keyDraft,
+  label,
+  kidError,
+  secretError,
+  secrets,
+  canBindSecret,
+  disabled,
+  onChange,
+}: {
+  idPrefix: string;
+  secretFieldId: string;
+  keyDraft: AssertionKeyDraft;
+  label: string;
+  kidError?: string;
+  secretError?: string;
+  secrets: ConnectionSecretMetadata[];
+  canBindSecret: boolean;
+  disabled: boolean;
+  onChange: (
+    patch: Partial<Pick<AssertionKeyDraft, 'kid' | 'algorithm' | 'binding'>>,
+  ) => void;
+}) {
+  return (
+    <>
+      <BindingControl
+        id={secretFieldId}
+        label={`${label} secret alias`}
+        binding={keyDraft.binding}
+        purpose="assertion_signing_key"
+        secrets={secrets}
+        canBindSecret={canBindSecret}
+        disabled={disabled}
+        error={secretError}
+        allowClear={false}
+        onChange={(binding) => onChange({ binding })}
+      />
+      <AssertionTextField
+        id={`${idPrefix}-kid`}
+        label={`${label} ID (kid)`}
+        value={keyDraft.kid}
+        error={kidError}
+        disabled={disabled}
+        onChange={(kid) => onChange({ kid })}
+      />
+      <label htmlFor={`${idPrefix}-algorithm`}>
+        {label} algorithm
+        <select
+          id={`${idPrefix}-algorithm`}
+          value={keyDraft.algorithm}
+          disabled={disabled}
+          onChange={(event) =>
+            onChange({
+              algorithm: event.target.value as CallerAssertionAlgorithm,
+            })
+          }
+        >
+          <option value="es256">ES256 (P-256 key)</option>
+          <option value="rs256">RS256 (RSA key, 2048 bits or more)</option>
+        </select>
+      </label>
+    </>
+  );
+}
+
+function AssertionTextField({
+  id,
+  label,
+  value,
+  placeholder,
+  maxLength,
+  error,
+  disabled,
+  onChange,
+}: {
+  id: string;
+  label: string;
+  value: string;
+  placeholder?: string;
+  maxLength?: number;
+  error?: string;
+  disabled: boolean;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <FormField id={id} label={label} error={error}>
+      <input
+        id={id}
+        value={value}
+        disabled={disabled}
+        placeholder={placeholder}
+        maxLength={maxLength}
+        autoComplete="off"
+        spellCheck={false}
+        aria-invalid={Boolean(error)}
+        aria-describedby={describedBy(id, error)}
+        onChange={(event) => onChange(event.target.value)}
+      />
+    </FormField>
   );
 }
 
@@ -586,6 +1117,7 @@ export function BindingControl({
   canBindSecret,
   disabled,
   error,
+  allowClear = true,
   onChange,
 }: {
   id: string;
@@ -596,6 +1128,8 @@ export function BindingControl({
   canBindSecret: boolean;
   disabled: boolean;
   error?: string;
+  // A caller-assertion key cannot be unbound, only replaced or left out.
+  allowClear?: boolean;
   onChange: (binding: BindingDraft) => void;
 }) {
   const compatibleSecrets =
@@ -648,7 +1182,7 @@ export function BindingControl({
               {secret.label} ({formatSecretProvider(secret.provider)})
             </option>
           ))}
-          {binding.configured ? (
+          {binding.configured && allowClear ? (
             <option value="intent:clear">Clear binding</option>
           ) : null}
         </select>
