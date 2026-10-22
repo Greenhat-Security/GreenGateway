@@ -100,6 +100,15 @@ grant authority. They are outside the operation matrix; their cleanup can still
 affect evidence retention. The inventory includes JWT expiry and Connection
 cascade consequences explicitly.
 
+Server-side policy drafts (#243) are outside the matrix for the same reason:
+creating, editing, re-pinning or deleting one changes no enforcement, advances
+no revision and writes no outbox row. Publishing one does change authority, and
+it is `policy.publish`: `policy_draft_publish_endpoint` commits through
+`persist_policy_mutation` exactly as `PUT /policy` does, so it is listed as an
+entrypoint of both policy rows and inherits their boundaries and gaps. Marking
+the draft published afterwards is a separate draft-store write, not part of the
+authority transaction.
+
 Admin sessions (#424) are in the matrix as `admin_session.grant` and
 `admin_session.withdraw`. In standalone mode, `ADMIN_SESSION_MODE=standalone_memory`
 keeps each session in a bounded process-local map: a grant follows a successful

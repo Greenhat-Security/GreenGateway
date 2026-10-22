@@ -29,9 +29,11 @@ Three consequences you must plan around:
 
 The **principal directory is never imported**: cluster mode has no principal directory, so there is no destination for it — no migration creates the table, and `PRINCIPAL_SQLITE_PATH` is refused in cluster mode. It is a projection of authenticated traffic, and that traffic *is* imported, with the audit log. The report names the source file it left behind (`source.principal_file`, `source.principal_present`, `principal_directory_rows_imported: 0`) so you see it rather than discover it missing afterwards.
 
-The report's `not_imported` field lists everything else deliberately left out — `cluster_members`, `maintenance_jobs`, `execution_leases`, the two rate-limit tables, pending logins, admin sessions and their pending cookie logins, JWT revocations — and the validation pass **proves** those tables empty rather than asserting it in prose. `security_outbox` is named there too, with a caveat worth reading once: the import writes no outbox row of its own, but the policy and tools sections run the ordinary reviewed control-plane commits, and a commit appends one. So that table holds two rows after an import. They describe this deployment's initialization, and they are the reason `security_outbox` is on the `not_imported` list but not on the list of tables proven empty.
+The report's `not_imported` field lists everything else deliberately left out — `cluster_members`, `maintenance_jobs`, `execution_leases`, the two rate-limit tables, pending logins, admin sessions and their pending cookie logins, JWT revocations, policy drafts — and the validation pass **proves** those tables empty rather than asserting it in prose. `security_outbox` is named there too, with a caveat worth reading once: the import writes no outbox row of its own, but the policy and tools sections run the ordinary reviewed control-plane commits, and a commit appends one. So that table holds two rows after an import. They describe this deployment's initialization, and they are the reason `security_outbox` is on the `not_imported` list but not on the list of tables proven empty.
 
 Standalone service-token change evidence — the `service_token_change_evidence` rows that name who rotated or revoked each token — is also left behind and named in `not_imported`. The import carries the token rows only, so that history stays in the `SERVICE_TOKEN_SQLITE_PATH` database; keep the file with the rest of the standalone deployment's records if you need it. The cluster's own evidence table starts empty and records its first rotate or revoke.
+
+Standalone policy drafts (the `policy_drafts` table of the policy history database) are left behind too. A draft is unpublished working state pinned to a standalone policy ETag, and the cluster starts with none; an owner who still needs one recreates it against the imported policy, from the standalone file if it is kept.
 
 The command also never moves secret material. Credential bindings are imported as references; the secrets stay in your secret store, and local-secret keyring material is not touched. A cluster deployment binds credentials through an external secret provider — `CONNECTION_LOCAL_SECRET_KEYRING` is rejected in cluster mode.
 
@@ -134,6 +136,7 @@ Expected output: pretty-printed JSON on stdout and exit `0`. The shape:
     "cluster_members", "maintenance_jobs", "execution_leases",
     "rate_limit_buckets", "rate_limit_cardinality",
     "admin_pending_logins", "admin_session_logins", "admin_sessions", "jwt_revocations",
+    "policy_drafts",
     "security_outbox (the import announces nothing; a commit appends its own row)",
     "principal_directory (cluster mode has none; the audit log it projects from is imported)",
     "connection_local_secrets (the local-secret keyring stays with the standalone deployment; credential bindings cross as references and must be re-provisioned in the cluster's secret store)",

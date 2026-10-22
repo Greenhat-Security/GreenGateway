@@ -1334,6 +1334,26 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
             .map(rbac::PolicyHistoryStore::open)
             .transpose()?
             .map(|store| Arc::new(store) as Arc<dyn storage::PolicyHistory>);
+    // Policy drafts (issue #243, slice 9) live beside the history they will
+    // join once published: migration 21's table in cluster mode, and a
+    // `policy_drafts` table in the same SQLite database as `policy_versions`
+    // in standalone mode. A database that cannot be opened fails startup,
+    // exactly as the history store does.
+    #[cfg(feature = "postgres")]
+    let policy_draft_store: Option<Arc<dyn storage::PolicyDraftStore>> =
+        match build_overrides.pg_policy.as_ref() {
+            Some(seed) => Some(Arc::new(seed.store.draft_store())),
+            None => policy_history_sqlite_path(&config)
+                .map(storage::SqlitePolicyDraftStore::open)
+                .transpose()?
+                .map(|store| Arc::new(store) as Arc<dyn storage::PolicyDraftStore>),
+        };
+    #[cfg(not(feature = "postgres"))]
+    let policy_draft_store: Option<Arc<dyn storage::PolicyDraftStore>> =
+        policy_history_sqlite_path(&config)
+            .map(storage::SqlitePolicyDraftStore::open)
+            .transpose()?
+            .map(|store| Arc::new(store) as Arc<dyn storage::PolicyDraftStore>);
     let observation_state =
         middleware::observation::ObservationState::from_config(&config, audit_log.clone())
             .with_conformance(schema_conformance_state);
@@ -2098,6 +2118,7 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
         policy_file: config.policy_file.as_ref().map(PathBuf::from),
         rbac_state: rbac_state.clone(),
         history_store: policy_history_store,
+        draft_store: policy_draft_store,
         #[cfg(feature = "postgres")]
         control_plane: policy_control_plane,
         #[cfg(feature = "postgres")]

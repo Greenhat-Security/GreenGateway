@@ -96,6 +96,10 @@ const AUTHORITATIVE_TABLES: &[&str] = &[
     // 0020's contract fence and backfill ledger are deliberately absent:
     // they say which builds may serve the schema, not what the namespace
     // holds. The fence is checked on its own in `verify_target`.
+    // 0021's policy drafts are absent too: they are owner-scoped working
+    // state, never authority or history, and a draft needs a live policy to
+    // be pinned to, which an empty namespace does not have. The validation
+    // proves the import left the table empty (`EXCLUDED_RUNTIME_TABLES`).
 ];
 
 /// The authoritative singleton counters and the column that carries them.
