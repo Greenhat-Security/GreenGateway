@@ -8285,7 +8285,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::record_change_evidence#1",
-      "sha256": "5bf9230d68df536f36211c954001b5aa33fcfff17b3f1a804885cef69799b50a",
+      "sha256": "a8d52623e0814dfc022ea52cb879856fc0d529054658be23fc18f4c8ca7829ee",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -12789,7 +12789,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_service_tokens::record_change_evidence#1",
-      "sha256": "3d8c6d80b09119331289fb3691bfc83f98685421c2c784a2a189b3870ec4550e",
+      "sha256": "e29b3ee8319fc20e2f5b24dc7908327de46f0a02b9bdeccbc88712bb01c41a0e",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -14075,7 +14075,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_authority_events::append_to_journal#1",
-      "sha256": "ca21ad14e0862956598f6d12da8fc7ffbfbfa06575ab69734341437f6e3af7b2",
+      "sha256": "d9d1eaf857991353453e660e045a9c09b63e4f56f6c3d03b7f85d6f52316e574",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -14166,6 +14166,16 @@
       ],
       "scope": "gateway::storage::postgres_authority_events::record_capacity_refusal#1",
       "sha256": "87dbe589566ff4025878beadf88e208a24525debebf264e4a7bea7b08748ea5e",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway/src/storage/postgres_authority_events.rs",
+      "reasons": [
+        "unexpanded-macro"
+      ],
+      "scope": "gateway::storage::postgres_authority_events::record_evidence_failure#1",
+      "sha256": "2f61a3ef4e1fd26c84368c0da60683b9e21fb3e22ea1678e6bd7f533392b130e",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     }
