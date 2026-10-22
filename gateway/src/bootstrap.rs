@@ -1537,13 +1537,24 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
     )?;
     let admin_auth_state = if let Some(mut state) = admin_auth_state {
         if let Some(session_config) = config.admin_session.clone() {
-            if config.state_backend != config::StateBackend::Sqlite
+            // Each store is valid in exactly one state backend; there is no
+            // process-local fallback for cluster mode and no shared store in
+            // standalone mode.
+            let backend = match session_config.storage {
+                auth::admin_session::AdminSessionStorage::StandaloneMemory => {
+                    config::StateBackend::Sqlite
+                }
+                auth::admin_session::AdminSessionStorage::ClusterPostgres => {
+                    config::StateBackend::Postgres
+                }
+            };
+            if config.state_backend != backend
                 || !config.auth_enabled
                 || config.auth_mode != config::AuthMode::Required
                 || !config.csrf_enabled
             {
                 return Err(auth::AuthError::Upstream(
-                    "admin sessions require standalone mode, required authentication and CSRF"
+                    "admin sessions require their state backend's store, required authentication and CSRF"
                         .to_owned(),
                 )
                 .into());
@@ -1566,11 +1577,27 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
             .ok_or_else(|| {
                 auth::AuthError::Upstream("admin session authority is not configured".to_owned())
             })?;
+            #[cfg(feature = "postgres")]
+            let cluster_store = build_overrides.pg_pending_logins.as_ref().map(|seed| {
+                Arc::new(
+                    storage::postgres_admin_sessions::PostgresAdminSessionStore::new(
+                        seed.pool.clone(),
+                        &seed.deployment_id,
+                        seed.keyring.clone(),
+                        session_config.clone(),
+                    ),
+                ) as Arc<dyn auth::admin_session::AdminSessionStore>
+            });
+            #[cfg(not(feature = "postgres"))]
+            let cluster_store: Option<Arc<dyn auth::admin_session::AdminSessionStore>> = None;
+            let store = admin_session_store(&session_config, cluster_store)?;
             let sessions = auth::admin_session::AdminSessions::new(
                 session_config,
                 authority,
+                store,
                 &config.admin_prefix,
                 state.login.redirect_origin(),
+                &config.csrf_header_name,
             )?;
             if sessions.cookie_name == config.auth_cookie_name
                 || sessions.cookie_name == config.csrf_cookie_name
@@ -2337,6 +2364,27 @@ pub(super) fn auth_validator_from_config(
     ))
 }
 
+/// The session store `config` selects. Cluster mode's store rides the
+/// pending-login seed (the pool, the deployment ID and the login keyring
+/// its access tokens are sealed under); without it there is no store, and
+/// startup fails rather than fall back to process memory.
+pub(super) fn admin_session_store(
+    config: &auth::admin_session::AdminSessionConfig,
+    cluster_store: Option<Arc<dyn auth::admin_session::AdminSessionStore>>,
+) -> Result<Arc<dyn auth::admin_session::AdminSessionStore>, auth::AuthError> {
+    match config.storage {
+        auth::admin_session::AdminSessionStorage::StandaloneMemory => Ok(Arc::new(
+            auth::admin_session::MemoryAdminSessionStore::new(config.clone()),
+        )),
+        auth::admin_session::AdminSessionStorage::ClusterPostgres => cluster_store.ok_or_else(|| {
+            auth::AuthError::Upstream(
+                "ADMIN_SESSION_MODE=cluster_postgres requires the PostgreSQL session store and ADMIN_LOGIN_KEYRING"
+                    .to_owned(),
+            )
+        }),
+    }
+}
+
 pub(super) fn admin_auth_state_from_config(
     config: &config::Config,
     audit: audit::AuditLog,
@@ -2450,8 +2498,8 @@ pub(super) fn validate_connection_bound_tools(
         match (&definition.source, definition.target.as_ref()) {
             (ToolSource::Manual, Some(ToolTarget::Http { connection_id, .. })) => {
                 // A manual tool may be bound to a Connection that attests its
-                // caller: its calls sign the assertion. Every other binding
-                // below keeps refusing one.
+                // caller, delegated ones included: its calls sign the
+                // assertion.
                 if let Err(error) = runtime.validate_tool_binding(connection_id) {
                     problems.push(format!(
                         "tool '{}' Connection target is unavailable: {}",
@@ -2490,7 +2538,10 @@ pub(super) fn validate_connection_bound_tools(
                     ));
                     continue;
                 }
-                if let Err(error) = runtime.validate_binding(target_connection_id) {
+                // Its calls sign a caller assertion as a manual tool's do, so
+                // an attesting Connection is accepted; a composite's steps
+                // still refuse one when they run.
+                if let Err(error) = runtime.validate_openapi_tool_binding(target_connection_id) {
                     problems.push(format!(
                         "OpenAPI tool '{}' Connection target is unavailable: {}",
                         definition.name,

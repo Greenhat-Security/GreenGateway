@@ -374,6 +374,26 @@ fn insert_public_and_cookie_settings(input: &mut BTreeMap<String, String>, confi
         "admin_login_pending_max_per_ip".into(),
         config.admin_login_pending_max_per_ip.to_string(),
     );
+    // A shared session store is one set of limits too. Absent while sessions
+    // are disabled, so enabling nothing changes no deployment's fingerprint.
+    if let Some(session) = &config.admin_session {
+        input.insert(
+            "admin_session_storage".into(),
+            session.storage.as_str().to_owned(),
+        );
+        input.insert(
+            "admin_session_ttl_secs".into(),
+            session.ttl.as_secs().to_string(),
+        );
+        input.insert(
+            "admin_session_idle_timeout_secs".into(),
+            session.idle_timeout.as_secs().to_string(),
+        );
+        input.insert(
+            "admin_session_max_entries".into(),
+            session.max_entries.to_string(),
+        );
+    }
     input.insert("auth_cookie_name".into(), config.auth_cookie_name.clone());
     input.insert("csrf_enabled".into(), config.csrf_enabled.to_string());
     input.insert("csrf_cookie_name".into(), config.csrf_cookie_name.clone());
@@ -1157,6 +1177,47 @@ mod tests {
             static_config_fingerprint(&base),
             static_config_fingerprint(&changed)
         );
+    }
+
+    #[test]
+    fn fingerprint_covers_admin_session_limits_only_while_sessions_are_enabled() {
+        let base = config_from(&[]);
+        let mut disabled = BTreeMap::new();
+        insert_public_and_cookie_settings(&mut disabled, &base);
+        assert!(
+            !disabled.keys().any(|key| key.starts_with("admin_session")),
+            "a deployment without sessions keeps its fingerprint"
+        );
+        let mut enabled = base.clone();
+        enabled.admin_session = Some(crate::auth::admin_session::AdminSessionConfig {
+            storage: crate::auth::admin_session::AdminSessionStorage::ClusterPostgres,
+            ttl: std::time::Duration::from_secs(3600),
+            idle_timeout: std::time::Duration::from_secs(3600),
+            max_entries: 1024,
+        });
+        assert_ne!(
+            static_config_fingerprint(&base),
+            static_config_fingerprint(&enabled)
+        );
+        let variants: [fn(&mut crate::auth::admin_session::AdminSessionConfig); 4] = [
+            |session| {
+                session.storage = crate::auth::admin_session::AdminSessionStorage::StandaloneMemory
+            },
+            |session| session.ttl = std::time::Duration::from_secs(1800),
+            |session| session.idle_timeout = std::time::Duration::from_secs(600),
+            |session| session.max_entries = 8,
+        ];
+        for change in variants {
+            let mut changed = enabled.clone();
+            if let Some(session) = changed.admin_session.as_mut() {
+                change(session);
+            }
+            assert_ne!(
+                static_config_fingerprint(&enabled),
+                static_config_fingerprint(&changed),
+                "every replica must enforce one set of session limits"
+            );
+        }
     }
 
     #[test]
