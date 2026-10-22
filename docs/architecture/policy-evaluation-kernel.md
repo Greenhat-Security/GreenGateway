@@ -3,9 +3,10 @@
 Issue #421 introduces `gateway/src/policy_eval/`. **The HTTP/RBAC adapter now
 uses it for live decisions**, including routes, host qualification, dispatch
 constraints and raw/canonical MCP HTTP identities (#422, PR 1), and so do tool
-admission (#422, PR 2), policy rate-lane selection (#422, PR 3a) and the static
-egress checks (#422, PR 3b). This does not complete #422 or add Policy Studio
-simulation/replay endpoints.
+admission (#422, PR 2), policy rate-lane selection (#422, PR 3a), the static
+egress checks (#422, PR 3b) and the admin analysis consumers: the historical
+rule preview, endpoint coverage and suggestion coverage (#422, PR 4). This does
+not complete #422 or add Policy Studio simulation/replay endpoints.
 
 It now covers contextless HTTP direct rules and permission routes, host-qualified
 routes and dispatch-scoped direct rules, MCP alias identities, and rate-lane
@@ -51,6 +52,7 @@ freshness or perform a live cluster-revision check.
 | Rate lane selection | `policy_rate_limit_request` guard, `RateLimitPolicyState::matching_limiter` | First matching override; anonymous reaches none, reproducing the live early return; live since #422 PR 3a, with buckets, capacity and enforcement left to the limiter |
 | Policy-backed tools | `ToolRuntime` invocation, visibility, composite enablement, rendered HTTP rules; `RbacState::tool_policy_eligibility` | Separate pure operations preserve each consumer's precedence and shadow behavior; live since #422 PR 2 |
 | Static egress | `EgressClient::checked_destination`, `rebind_checked_destination`, `revalidated_destination` | URL shape, scheme, host and port allowlists before any name is resolved, then the address checks over supplied answers; live since #422 PR 3b, with DNS, redirects, TLS and transport left to `crate::egress` |
+| Analysis consumers | Rule preview, endpoint coverage and suggestion coverage, each with its own `RuleMatcher` call and route check | `evaluate` over representative requests, and `match_direct_rules` for a candidate rule's own predicates; since #422 PR 4, with unanswerable facts reported rather than counted |
 
 Every target is evaluated, so there is no `unsupported_target` limitation and no
 `unsupported_routing_policy`; both are gone. What remains is facts: each missing
@@ -309,4 +311,44 @@ produced. Traces bind the destination facts and the answers but contain none of
 their values: the blocked answer is an ordinal, and the host, scheme, port and
 addresses stay out. `canonical_trace_bytes` and `reusable_for` remain offline.
 The frozen pre-cutover checks and the differential fixtures are described in
+[policy-evaluation-parity.md](policy-evaluation-parity.md).
+
+## Analysis consumers (#422, PR 4)
+
+Three admin consumers used to judge policy beside the evaluator: the
+historical rule preview (`POST .../policy/rules/preview`), the endpoint
+coverage the traffic inventory reports, and the check rule suggestions use to
+skip a candidate the policy already covers. Each now builds an ordinary
+`PolicyEvaluationContext` and asks the kernel (`policy_eval::analysis`), so its
+facts are validated and refused exactly as a live request's are. Rule hit
+counts are recorded attribution, not an evaluation; the endpoint now keys them
+by the live snapshot's own rule ids, the ones the adapter writes as
+`matched_rule_id`.
+
+Coverage asks `evaluate` what the policy would decide for a representative
+request and reads which rule decided. The preview asks something narrower --
+whether one candidate rule's own predicates match a retained observation, with
+no earlier rule, route, default or host narrowing -- which is the existing
+contract of a historical match counter. `CompiledPolicy::match_direct_rules`
+answers it over the same matcher and context: the first enabled direct HTTP
+rule whose method, path, principal and dispatch binding accept the facts. It
+refuses an MCP alias, whose two identities have no first match, and carries no
+input binding because nothing retains its answer.
+
+Like every lane, it demands a fact only when an answer can turn on it: a
+missing principal, or a missing dispatch, is `indeterminate` only when an
+enabled HTTP rule reads it. The preview turns that into a reported
+`unevaluated_reasons` count and `complete: false`, never a non-match; a fact
+the evaluator refuses is reported the same way as `malformed_observation`. An
+evaluator error that is not a refusal of the supplied facts fails the preview.
+`CompiledPolicy::for_analysis` compiles a policy a consumer holds with a
+digest and no revision, since none of them holds the watermark, and
+`for_candidate_rule` compiles a candidate rule alone. `recorded_dispatch` maps
+the routing facts observations and discovery record onto the kernel's target,
+refusing route facts that have no origin.
+
+Representative requests are synthetic, and the parity inventory lists the facts
+they lack: a route id outside a pooled route, the request host, and an MCP
+alias identity. The frozen pre-cutover consumers, the differential fixtures and
+every documented difference are in
 [policy-evaluation-parity.md](policy-evaluation-parity.md).

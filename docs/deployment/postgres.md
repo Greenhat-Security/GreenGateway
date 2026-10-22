@@ -20,6 +20,7 @@ This guide explains the mode. The runbooks beside it are the procedures — exac
 | [Disaster recovery](disaster-recovery.md) | rebuilding a deployment from the database, the secret store and the static configuration |
 | [Operational alerts](operational-alerts.md) | checked Prometheus rules, signal limits, severity and ownership, and first-response procedures |
 | [Upgrading a cluster](#upgrading-a-cluster) | the supported binary/schema/operation matrix, rolling and coordinated upgrades on Kubernetes, aborting a rollout, the rollback cutoff, and release and target-environment evidence |
+| [Production qualification](qualification.md) | the drills to run on the target platform before rollout: image and hardening verification, NetworkPolicy enforcement, an SLO load run, replica loss, database failover and point-in-time restore with RTO and RPO, upgrade and alert delivery, and an evidence record that holds no secrets |
 | [Security incident rehearsal](incident-rehearsal.md) | withdrawing a JWT and a service token, rotating a Connection's secret reference, verifying revision convergence and sanitized evidence, replacing a suspect replica, and what a withdrawal cannot recall |
 
 An example two-replica deployment is in [`docker-compose.ha.yml`](docker-compose.ha.yml) beside them. Its PostgreSQL service is a single container and is labelled as an example only — use a managed or HA PostgreSQL in production.
@@ -363,7 +364,7 @@ python scripts/upgrade_pair_evidence.py --pair-dir "$PAIR" --gate-commit "$(git 
 
 The suite needs the repository's pinned toolchains, and a disposable PostgreSQL 16 set up like the job's service container (trust authentication on a loopback port), because the harness creates its own databases and password-less roles. The first command builds both pinned commits ([the qualified pair](../architecture/ha-state-model.md#the-qualified-pair-at-schema-18-issue-426-pr-2)). The second runs both pair rows against disposable databases; each row writes what it observed to `$PAIR/evidence/`, and only after its assertions have passed. The third refuses a pin this matrix does not list, a binary other than the one built, a row whose evidence is missing (the row failed, or was deleted, renamed or `#[ignore]`d) or is not published here, and any observation that disagrees with the pair's published `evidence`. On success it writes `$PAIR/summary.json`, naming both commits and binary hashes, the gate's commit, the schema point, the operation matrix and the readiness at each step. CI retains the manifest, the evidence and the summary as the `ha-rolling-upgrade-pair-evidence` artifact. Qualifying a new pair means pinning it, adding its row to [`upgrade-support-matrix.json`](upgrade-support-matrix.json) with what its rows must observe, and passing the leg.
 
-What the gate establishes is a pair of debug builds of pinned commits, with the admin UI stubbed, against disposable databases on the runner's PostgreSQL 16 with the migration and runtime roles separated. It is not the shipped images, not Kubernetes and not your database service. Qualification on the intended platform is tracked in [#389](https://github.com/Greenhat-Security/GreenGateway/issues/389), and its upgrade item is met only by a record of real upgrades on that platform. For each one, record:
+What the gate establishes is a pair of debug builds of pinned commits, with the admin UI stubbed, against disposable databases on the runner's PostgreSQL 16 with the migration and runtime roles separated. It is not the shipped images, not Kubernetes and not your database service. Qualification on the intended platform is tracked in [#389](https://github.com/Greenhat-Security/GreenGateway/issues/389), and its upgrade item is met only by a record of real upgrades on that platform. Run each one as [the production qualification kit's upgrade drill](qualification.md#7-upgrade), whose evidence record holds both digests, the procedure and the unavailable window its observer measured, and record beside it:
 
 - both images by digest, the commits their revision labels name, and the matrix row the upgrade follows;
 - `gateway migrate check` before and after, and for a coordinated upgrade the migration Job's output;
@@ -372,7 +373,7 @@ What the gate establishes is a pair of debug builds of pinned commits, with the 
 - every refusal of a gated operation (`cluster.operation_refused`) and when the operation was first admitted;
 - the requests your load balancer counted as failed during the rollout, and any abort, with the step it reverted.
 
-Keep that record apart from the gate's artifact: the gate is evidence about the builds, the record is evidence about your platform.
+Keep that record apart from the gate's artifact, with the kit's records in your restricted evidence store: the gate is evidence about the builds, the record is evidence about your platform.
 
 ## Pool sizing and timeouts
 

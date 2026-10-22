@@ -1,0 +1,121 @@
+{
+  "schema_version": 1,
+  "kind": "greengateway-production-qualification",
+  "notice": "Record identifiers, digests, counts, timestamps and durations only. Never paste a token, password, DSN, private key, raw log or URL that carries credentials. Check this file with `python scripts/qualification.py evidence <file> --records-dir <dir>` before sharing it.",
+  "environment": {
+    "label": "",
+    "platform": "",
+    "kubernetes_version": "",
+    "cni": "",
+    "database_platform": "",
+    "deployment_mode": "",
+    "replicas": null
+  },
+  "release": {
+    "source_revision": "",
+    "image_index_digest": "",
+    "provenance_record": ""
+  },
+  "slo_source": "",
+  "drills": {
+    "deploy_verification": {
+      "status": "not_run",
+      "completed_at": null,
+      "records": [],
+      "notes": ""
+    },
+    "network_policy": {
+      "status": "not_run",
+      "completed_at": null,
+      "records": [],
+      "notes": ""
+    },
+    "load_slo": {
+      "status": "not_run",
+      "completed_at": null,
+      "records": [],
+      "notes": "",
+      "measured": {
+        "profile_sha256": null,
+        "slo_scenarios_passed": null,
+        "slo_scenarios_total": null
+      }
+    },
+    "replica_loss": {
+      "status": "not_run",
+      "completed_at": null,
+      "records": [],
+      "notes": "",
+      "measured": {
+        "rto_seconds": null
+      }
+    },
+    "database_failover": {
+      "status": "not_run",
+      "completed_at": null,
+      "records": [],
+      "notes": "",
+      "measured": {
+        "rto_seconds": null,
+        "rto_target_seconds": null,
+        "rpo_seconds": null,
+        "rpo_target_seconds": null,
+        "audit_markers_missing_during_outage": null
+      }
+    },
+    "backup_pitr": {
+      "status": "not_run",
+      "completed_at": null,
+      "records": [],
+      "notes": "",
+      "measured": {
+        "restore_duration_seconds": null,
+        "rto_target_seconds": null,
+        "recovery_point_gap_seconds": null,
+        "rpo_target_seconds": null,
+        "restore_checks_passed": null
+      }
+    },
+    "upgrade": {
+      "status": "not_run",
+      "completed_at": null,
+      "records": [],
+      "notes": "",
+      "measured": {
+        "from_image_digest": null,
+        "to_image_digest": null,
+        "schema_change": null,
+        "procedure": null,
+        "unavailable_seconds": null
+      }
+    },
+    "alert_delivery": {
+      "status": "not_run",
+      "completed_at": null,
+      "records": [],
+      "notes": "",
+      "measured": {
+        "alert": null,
+        "detection_seconds": null,
+        "notification_seconds": null,
+        "acknowledgement_seconds": null
+      }
+    },
+    "audit_outage_decision": {
+      "status": "not_run",
+      "completed_at": null,
+      "records": [],
+      "notes": "",
+      "measured": {
+        "decision": null,
+        "decided_by_role": null
+      }
+    }
+  },
+  "sign_off": {
+    "approved": false,
+    "approver_role": "",
+    "date": null,
+    "residual_risks": []
+  }
+}

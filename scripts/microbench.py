@@ -3,10 +3,10 @@
 
 The head-owned pure-path benchmark is compiled against both immutable Git
 revisions. Its SHA-256 and zero-growth budgets are owned by the base revision.
-The authoritative HTTP policy decision is measured inside each revision's own
-gateway test binary, whose benchmark digest the budget approves in the same way.
-Timings describe this runner; only stable allocation counts and allocated bytes
-block the gate.
+The authoritative HTTP policy decision, and the tool-admission and rate-lane
+decisions, are measured inside each revision's own gateway test binary, whose
+benchmark digests the budget approves in the same way. Timings describe this
+runner; only stable allocation counts and allocated bytes block the gate.
 """
 from __future__ import annotations
 
@@ -76,6 +76,25 @@ KERNEL_SAMPLES = 9
 # Part of the kernel protocol, like TARGET_METADATA for the pure paths.
 KERNEL_METADATA = {"input_cases": 17, "input_bytes": 1459, "operations_per_iteration": 17,
                    "expected_checksum": 1700}
+# The tool-admission and rate-lane decisions run in the same binary. Their
+# benchmark is a child module of the http_policy harness, so it counts through
+# that harness's global allocator, the only one a binary can have; the
+# declaration is therefore part of the http_policy digest. The child file has
+# its own digest, which a budget approves once it lists these targets.
+LANE_HARNESS_PATH = "gateway/tests/support/lane_benchmark.rs"
+LANE_ATTRIBUTES = '#[path = "lane_benchmark.rs"]\n'
+LANE_MODULE = "mod lane_benchmark;"
+LANE_TESTS = {"tool_policy": "policy_benchmark::lane_benchmark::tool_policy_evaluation",
+              "rate_lane": "policy_benchmark::lane_benchmark::rate_lane_selection"}
+LANE_TARGETS = tuple(LANE_TESTS)
+# Part of the kernel protocol, like KERNEL_METADATA.
+LANE_METADATA = {
+    "tool_policy": {"input_cases": 27, "input_bytes": 1409, "operations_per_iteration": 27,
+                    "expected_checksum": 2700},
+    "rate_lane": {"input_cases": 14, "input_bytes": 830, "operations_per_iteration": 14,
+                  "expected_checksum": 1400},
+}
+KERNEL_TARGET_METADATA = {KERNEL_TARGET: KERNEL_METADATA, **LANE_METADATA}
 CARGO_ARGUMENTS = ["test", "-p", "gateway", "--bin", "gateway", "--locked", "--no-run",
                    "--message-format=json"]
 # Cargo's default test profile, without debug info: allocation behaviour is
@@ -150,7 +169,8 @@ def _harness_digests(digests, label):
 
 def validate_budget(raw):
     """Schema 1 budgets the four pure paths. Schema 2 also budgets `http_policy`
-    and approves the digests of the gateway test-binary benchmark."""
+    and approves the digests of the gateway test-binary benchmark. Schema 3 also
+    budgets the tool and rate lanes and approves the digests of their benchmark."""
     if not isinstance(raw, dict) or type(raw.get("schema_version")) is not int:
         raise ValueError("unsupported budget schema")
     if raw["schema_version"] == 1:
@@ -160,6 +180,12 @@ def validate_budget(raw):
         _keys(raw, ("schema_version", "harness_sha256", "kernel_harness_sha256", "targets"), "budget")
         _harness_digests(raw["kernel_harness_sha256"], "kernel harness")
         identifiers = TARGET_IDS + (KERNEL_TARGET,)
+    elif raw["schema_version"] == 3:
+        _keys(raw, ("schema_version", "harness_sha256", "kernel_harness_sha256",
+                    "lane_harness_sha256", "targets"), "budget")
+        _harness_digests(raw["kernel_harness_sha256"], "kernel harness")
+        _harness_digests(raw["lane_harness_sha256"], "lane harness")
+        identifiers = TARGET_IDS + (KERNEL_TARGET,) + LANE_TARGETS
     else:
         raise ValueError("unsupported budget schema")
     _harness_digests(raw["harness_sha256"], "harness")
@@ -177,7 +203,19 @@ def validate_budget(raw):
 
 
 def budgets_kernel(budget):
-    return budget["schema_version"] == 2
+    return budget["schema_version"] in (2, 3)
+
+
+def budgets_lanes(budget):
+    return budget["schema_version"] == 3
+
+
+def _budget_entry(budget, target):
+    """The validated budget's entry for one target, found by its identifier."""
+    entries = [entry for entry in budget["targets"] if entry["id"] == target]
+    if len(entries) != 1:
+        raise ValueError(f"budget does not list {target} exactly once")
+    return entries[0]
 
 
 def _validate_targets(targets, identifiers, metadata, samples, maximum_ns):
@@ -223,8 +261,11 @@ def validate_result(raw):
     return raw
 
 
-def validate_kernel_result(raw, regression=False):
-    """Validate the gateway test binary's report, including its fixture marker."""
+def validate_kernel_result(raw, regression=False, target=KERNEL_TARGET):
+    """Validate one gateway test-binary report, including its fixture marker."""
+    metadata = KERNEL_TARGET_METADATA.get(target)
+    if metadata is None:
+        raise ValueError("kernel benchmark target has not been configured")
     _keys(raw, ("schema_version", "harness", "regression_fixture", "warmup", "iterations",
                 "samples", "targets"), "kernel result")
     if raw["harness"] != "gateway-test-binary":
@@ -235,7 +276,7 @@ def validate_kernel_result(raw, regression=False):
                           ("iterations", KERNEL_ITERATIONS), ("samples", KERNEL_SAMPLES)):
         if type(raw[key]) is not int or raw[key] != expected:
             raise ValueError(f"kernel result {key} differs from the benchmark protocol")
-    _validate_targets(raw["targets"], (KERNEL_TARGET,), {KERNEL_TARGET: KERNEL_METADATA},
+    _validate_targets(raw["targets"], (target,), {target: metadata},
                       KERNEL_SAMPLES, KERNEL_PROCESS_SECONDS * 10**9)
     return raw
 
@@ -334,7 +375,7 @@ KERNEL_CONTEXT_KEYS = ("rust_ci", "rustc_vv", "cargo_vv", "cargo_arguments", "ca
                        "npm", "machine", "warmup", "iterations", "samples")
 
 
-def validate_kernel_envelope(raw, regression=False):
+def validate_kernel_envelope(raw, regression=False, target=KERNEL_TARGET):
     """A saved gateway test-binary measurement bound to its revision, harness
     digest, actual compiler and Cargo invocation, UI tools and machine."""
     _keys(raw, ("schema_version", "context", "revision", "harness_sha256", "regression_fixture",
@@ -357,18 +398,18 @@ def validate_kernel_envelope(raw, regression=False):
         if type(context[key]) is not int or context[key] != expected:
             raise ValueError("saved kernel measurement protocol differs")
     _validate_machine(context["machine"])
-    validate_kernel_result(raw["result"], regression)
+    validate_kernel_result(raw["result"], regression, target)
     return raw
 
 
 def compare_kernel_results(base, head, limit, regression_head=False):
-    """Compare two kernel envelopes under one budget entry. Approval of each
-    side's harness digest is the caller's policy decision, made beforehand."""
-    validate_kernel_envelope(base)
-    validate_kernel_envelope(head, regression_head)
+    """Compare two envelopes of the target one budget entry names. Approval of
+    each side's harness digest is the caller's policy decision, made beforehand."""
     _keys(limit, ("id", "max_allocation_growth", "max_allocated_bytes_growth"), "kernel budget")
-    if limit["id"] != KERNEL_TARGET:
+    if limit["id"] not in KERNEL_TARGET_METADATA:
         raise ValueError("kernel budget names another target")
+    validate_kernel_envelope(base, target=limit["id"])
+    validate_kernel_envelope(head, regression_head, limit["id"])
     if base["context"] != head["context"]:
         raise ValueError("kernel results have incompatible compiler, build, UI tool or runner metadata")
     entry = _compare_target(base["result"]["targets"][0], head["result"]["targets"][0], limit)
@@ -621,6 +662,30 @@ def kernel_wiring(main_source):
     return True
 
 
+def lane_wiring(harness_source):
+    """Whether the http_policy harness declares the lane benchmark child module
+    with its reviewed wiring, under the same rules as `kernel_wiring`."""
+    masked = mask_rust(harness_source)
+    depths = _depths(masked)
+    declarations = list(re.finditer(r"\bmod\s+lane_benchmark\b", masked))
+    if not declarations:
+        if re.search(r"\blane_benchmark\b", masked):
+            raise ValueError("lane benchmark module is referenced without its reviewed declaration")
+        return False
+    if len(declarations) != 1:
+        raise ValueError("lane benchmark module is declared more than once")
+    module = declarations[0].start()
+    start = module - len(LANE_ATTRIBUTES)
+    if (depths[module] != 0 or start < 0
+            or harness_source[start:module + len(LANE_MODULE)] != LANE_ATTRIBUTES + LANE_MODULE
+            or not masked.startswith("#[path", start)):
+        raise ValueError("lane benchmark module declaration differs from the reviewed wiring")
+    preceding = masked[:start].rstrip()
+    if preceding and preceding[-1] not in ";}":
+        raise ValueError("lane benchmark module declaration gained an attribute or item prefix")
+    return True
+
+
 def repo_root():
     result = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True,
                             text=True, timeout=10, check=True)
@@ -816,6 +881,14 @@ def _measure(root, revision, label, output, compiler, harness, context, deadline
     return envelope
 
 
+def _adoption_state(base_lists, proposed_lists, label):
+    if base_lists:
+        if not proposed_lists:
+            raise ValueError(f"a proposed budget cannot retire the enforced {label}")
+        return "enforced"
+    return "proposed" if proposed_lists else "pending"
+
+
 def kernel_policy(base_budget, proposed_budget):
     """The adoption state of `http_policy`, from the two validated budgets.
 
@@ -825,11 +898,15 @@ def kernel_policy(base_budget, proposed_budget):
     has approved nothing, so it does not block. `enforced`: the base budget
     lists it, and its zero-growth budget blocks like every pure-path target.
     """
-    if budgets_kernel(base_budget):
-        if not budgets_kernel(proposed_budget):
-            raise ValueError("a proposed budget cannot retire the enforced http_policy target")
-        return "enforced"
-    return "proposed" if budgets_kernel(proposed_budget) else "pending"
+    return _adoption_state(budgets_kernel(base_budget), budgets_kernel(proposed_budget),
+                           "http_policy target")
+
+
+def lane_policy(base_budget, proposed_budget):
+    """The adoption state of the tool and rate-lane targets, decided as for
+    `http_policy`. Both share one harness, so a budget lists them together."""
+    return _adoption_state(budgets_lanes(base_budget), budgets_lanes(proposed_budget),
+                           "tool and rate-lane targets")
 
 
 def _kernel_harness(root, revision):
@@ -857,10 +934,10 @@ def _kernel_configuration(root, base, head, output, compiler, context, deadline)
     # that governs it; the head's proposal must also keep approving the head's.
     if state == "enforced":
         approvals = (("base", budget), ("head", budget), ("head", proposed))
-        limit = budget["targets"][-1]
+        limit = _budget_entry(budget, KERNEL_TARGET)
     elif state == "proposed":
         approvals = (("base", proposed), ("head", proposed))
-        limit = proposed["targets"][-1]
+        limit = _budget_entry(proposed, KERNEL_TARGET)
     else:
         approvals = ()
         limit = {"id": KERNEL_TARGET, "max_allocation_growth": 0, "max_allocated_bytes_growth": 0}
@@ -899,6 +976,55 @@ def _kernel_configuration(root, base, head, output, compiler, context, deadline)
                           "iterations": KERNEL_ITERATIONS, "samples": KERNEL_SAMPLES}}
     _write_json(output / "kernel-context.json", kernel)
     return kernel
+
+
+def _lane_harness(root, revision):
+    """The revision's lane benchmark digest, or None when it predates it. The
+    declaration lives in the http_policy harness, so a revision without that
+    harness cannot carry the lanes either."""
+    declared = (_has_blob(root, revision, KERNEL_HARNESS_PATH)
+                and lane_wiring(_blob(root, revision, KERNEL_HARNESS_PATH)))
+    if declared != _has_blob(root, revision, LANE_HARNESS_PATH):
+        raise ValueError(f"{revision}: lane benchmark declaration and harness file disagree")
+    return _digest(_blob(root, revision, LANE_HARNESS_PATH)) if declared else None
+
+
+def _lane_configuration(root, base, head, output, context):
+    """Adoption state, approvals and budgets of the tool and rate-lane targets.
+
+    The rules are http_policy's: the head must carry the harness, a budget
+    cannot land before the base carries it, and every digest that runs must be
+    approved by the budget that governs it. The lanes run in the binaries the
+    http_policy stage builds, with its compiler, profile and recorded context.
+    """
+    budget, proposed = context["budget"], context["proposed_budget"]
+    state = lane_policy(budget, proposed)
+    digests = {"base": _lane_harness(root, base), "head": _lane_harness(root, head)}
+    if digests["head"] is None:
+        raise ValueError("head revision lacks the tool and rate-lane benchmark harness")
+    if state != "pending" and digests["base"] is None:
+        raise ValueError("the lane targets are budgeted, but the base revision lacks their harness; "
+                         "land the harness before its budget")
+    if state == "enforced":
+        approvals, governing = (("base", budget), ("head", budget), ("head", proposed)), budget
+    elif state == "proposed":
+        approvals, governing = (("base", proposed), ("head", proposed)), proposed
+    else:
+        approvals, governing = (), None
+    for label, policy in approvals:
+        if digests[label] not in policy["lane_harness_sha256"]:
+            raise ValueError(f"{label} lane benchmark differs from its budget's approved digests")
+    limits = {}
+    for target in LANE_TARGETS:
+        if governing is None:
+            limits[target] = {"id": target, "max_allocation_growth": 0,
+                              "max_allocated_bytes_growth": 0}
+        else:
+            limits[target] = _budget_entry(governing, target)
+    lanes = {"state": state, "targets": list(LANE_TARGETS), "tests": dict(LANE_TESTS),
+             "budget": limits, "harness_sha256": digests}
+    _write_json(output / "lane-context.json", lanes)
+    return lanes
 
 
 def _extract(root, revision, destination, deadline, paths=()):
@@ -979,9 +1105,11 @@ def _file_digest(path):
     return digest.hexdigest()
 
 
-def _build_kernel(root, revision, label, output, compiler, kernel, digest, work, deadline):
-    """Build one revision's gateway test binary and check test discovery
-    against its source wiring. Returns the binary, environment and log directory."""
+def _build_kernel(root, revision, label, output, compiler, kernel, digest, lane_digest, work,
+                  deadline):
+    """Build one revision's gateway test binary and check discovery of every
+    benchmark test against its source wiring. Returns the binary, environment
+    and log directory."""
     directory = output / (label + "-kernel")
     directory.mkdir()
     tree = Path(work) / "trees" / label
@@ -1005,13 +1133,20 @@ def _build_kernel(root, revision, label, output, compiler, kernel, digest, work,
     binary.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(built, binary)
     # Exact matching avoids libtest's successful zero-test behaviour.
-    listing, _ = _bounded([str(binary), KERNEL_TEST, "--exact", "--ignored", "--list"], directory,
-                          "list", KERNEL_PROCESS_SECONDS, deadline, environment)
-    listed = listing.splitlines().count(KERNEL_TEST + ": test")
+    listing, _ = _bounded([str(binary), KERNEL_TEST, *LANE_TESTS.values(), "--exact", "--ignored",
+                           "--list"], directory, "list", KERNEL_PROCESS_SECONDS, deadline,
+                          environment)
+    lines = listing.splitlines()
+    listed = lines.count(KERNEL_TEST + ": test")
     if listed != (0 if digest is None else 1):
         raise ValueError(f"{label}: benchmark test discovery disagrees with its source wiring")
+    lanes_listed = {target: lines.count(test + ": test") for target, test in LANE_TESTS.items()}
+    if any(count != (0 if lane_digest is None else 1) for count in lanes_listed.values()):
+        raise ValueError(f"{label}: lane benchmark test discovery disagrees with its source wiring")
     _write_json(directory / "build.json", {
         "revision": revision, "harness_sha256": digest, "listed": listed == 1,
+        "lane_harness_sha256": lane_digest,
+        "lanes_listed": {target: count == 1 for target, count in lanes_listed.items()},
         "command": command, "cargo_env": CARGO_PROFILE_ENV, "tree": str(tree),
         "ui_source": kernel["ui_source"], "ui_build_inputs": kernel["ui_build_inputs"],
         "build_seconds": build_seconds, "binary_sha256": _file_digest(binary)})
@@ -1019,29 +1154,73 @@ def _build_kernel(root, revision, label, output, compiler, kernel, digest, work,
 
 
 def _run_kernel(binary, environment, directory, label, revision, digest, kernel, output, deadline,
-                regression=False):
-    result_path = directory / (label + ".result.json")
+                regression=False, target=KERNEL_TARGET):
+    # http_policy keeps its original evidence names; a lane target's names add its id.
+    if target == KERNEL_TARGET:
+        test, stem, process = KERNEL_TEST, label, label + "-run"
+    else:
+        test, stem, process = LANE_TESTS[target], f"{label}.{target}", f"{label}-{target}-run"
+    result_path = directory / (stem + ".result.json")
     if result_path.exists():
         raise ValueError("kernel result path is not fresh")
     run_environment = dict(environment)
     run_environment[KERNEL_RESULT_ENV] = str(result_path)
     if regression:
         run_environment[KERNEL_REGRESSION_ENV] = "1"
-    _bounded([str(binary), KERNEL_TEST, "--exact", "--ignored", "--nocapture", "--test-threads=1"],
-             directory, label + "-run", KERNEL_PROCESS_SECONDS, deadline, run_environment)
+    _bounded([str(binary), test, "--exact", "--ignored", "--nocapture", "--test-threads=1"],
+             directory, process, KERNEL_PROCESS_SECONDS, deadline, run_environment)
     raw = load_json(result_path)
-    shutil.copyfile(result_path, output / (label + ".kernel.raw.json"))
+    shutil.copyfile(result_path, output / (stem + ".kernel.raw.json"))
     envelope = {"schema_version": 1, "context": kernel["context"], "revision": revision,
                 "harness_sha256": digest, "regression_fixture": regression,
-                "result": validate_kernel_result(raw, regression)}
-    validate_kernel_envelope(envelope, regression)
-    _write_json(output / (label + ".kernel.json"), envelope)
+                "result": validate_kernel_result(raw, regression, target)}
+    validate_kernel_envelope(envelope, regression, target)
+    _write_json(output / (stem + ".kernel.json"), envelope)
     return envelope
 
 
+def _run_lanes(binary, environment, directory, label, revision, digest, kernel, output, deadline,
+               regression=False):
+    """Every lane target's envelope from one binary, or None when it predates them."""
+    if digest is None:
+        return None
+    return {target: _run_kernel(binary, environment, directory, label, revision, digest, kernel,
+                                output, deadline, regression, target)
+            for target in LANE_TARGETS}
+
+
+def _lane_report(lanes, before, after):
+    """The lane stage's result, judged as http_policy's is: informational
+    unless the base budget enforces the targets."""
+    report = {"state": lanes["state"], "targets": list(LANE_TARGETS),
+              "blocking": lanes["state"] == "enforced", "status": "failed",
+              "base": "absent" if before is None else "measured",
+              "head": {target: envelope["result"]["targets"][0]["allocation_samples"][0]
+                       for target, envelope in after.items()},
+              "comparisons": [], "errors": []}
+    if before is None:
+        report["status"] = "informational"
+        return report
+    for target in LANE_TARGETS:
+        report["comparisons"].append(
+            compare_kernel_results(before[target], after[target], lanes["budget"][target]))
+    failed = [entry["id"] for entry in report["comparisons"] if entry["status"] != "passed"]
+    if not report["blocking"]:
+        report["status"] = "informational"
+    elif not failed:
+        report["status"] = "passed"
+    else:
+        report["errors"].extend(f"{target}: allocation growth exceeds the base-owned budget"
+                                for target in failed)
+    return report
+
+
 def _kernel_stage(root, base, head, output, compiler, context, work, deadline):
+    """Measure http_policy and the lane targets in each revision's own binary.
+    Returns the http_policy report and the lane report."""
     kernel = _kernel_configuration(root, base, head, output, compiler, context, deadline)
-    digests = kernel["harness_sha256"]
+    lanes = _lane_configuration(root, base, head, output, context)
+    digests, lane_digests = kernel["harness_sha256"], lanes["harness_sha256"]
     report = {"state": kernel["state"], "target": KERNEL_TARGET,
               "blocking": kernel["state"] == "enforced", "status": "failed", "base": "absent",
               "errors": []}
@@ -1049,20 +1228,27 @@ def _kernel_stage(root, base, head, output, compiler, context, work, deadline):
     # record the same two-build cost as an enforced comparison, and discovery
     # proves the test is really absent rather than trusting the source scan.
     binary, environment, directory = _build_kernel(root, base, "base", output, compiler, kernel,
-                                                   digests["base"], work, deadline)
+                                                   digests["base"], lane_digests["base"], work,
+                                                   deadline)
     before = None
     if digests["base"] is not None:
         before = _run_kernel(binary, environment, directory, "base", base, digests["base"], kernel,
                              output, deadline)
         report["base"] = "measured"
+    lanes_before = _run_lanes(binary, environment, directory, "base", base, lane_digests["base"],
+                              kernel, output, deadline)
     binary, environment, directory = _build_kernel(root, head, "head", output, compiler, kernel,
-                                                   digests["head"], work, deadline)
+                                                   digests["head"], lane_digests["head"], work,
+                                                   deadline)
     after = _run_kernel(binary, environment, directory, "head", head, digests["head"], kernel,
                         output, deadline)
+    lanes_after = _run_lanes(binary, environment, directory, "head", head, lane_digests["head"],
+                             kernel, output, deadline)
     report["head"] = after["result"]["targets"][0]["allocation_samples"][0]
+    lane_report = _lane_report(lanes, lanes_before, lanes_after)
     if before is None:
         report["status"] = "informational"
-        return report
+        return report, lane_report
     comparison = compare_kernel_results(before, after, kernel["budget"])
     report["comparison"] = comparison
     if not report["blocking"]:
@@ -1071,7 +1257,7 @@ def _kernel_stage(root, base, head, output, compiler, context, work, deadline):
         report["status"] = "passed"
     else:
         report["errors"].append("http_policy: allocation growth exceeds the base-owned budget")
-    return report
+    return report, lane_report
 
 
 def run_comparison(base, head, output, root=None, work=None):
@@ -1091,11 +1277,13 @@ def run_comparison(base, head, output, root=None, work=None):
         summary["context"] = context
         if time.monotonic() > pure_deadline:
             raise RuntimeError("pure-path comparison exceeded its runtime budget")
-        kernel = _kernel_stage(root, base, head, output, compiler, context, work, deadline)
+        kernel, lanes = _kernel_stage(root, base, head, output, compiler, context, work, deadline)
         summary["kernel"] = kernel
-        if kernel["status"] == "failed":
-            summary["status"] = "failed"
-            summary["errors"].extend(kernel["errors"])
+        summary["lanes"] = lanes
+        for stage in (kernel, lanes):
+            if stage["status"] == "failed":
+                summary["status"] = "failed"
+                summary["errors"].extend(stage["errors"])
     except (ValueError, RuntimeError, OSError, subprocess.SubprocessError, UnicodeError, KeyError) as error:
         # A failure after the pure-path comparison must not inherit its pass.
         summary["status"] = "failed"
@@ -1132,32 +1320,56 @@ def self_test(revision, output, root=None, work=None):
             raise RuntimeError("pure-path self-test exceeded its runtime budget")
         # The kernel's neutral side is an independent build of the same revision
         # in another tree; its regression is the baseline binary run with the
-        # fixture switch, which the report must echo.
+        # fixture switch, which the report must echo. The lanes run in the same
+        # binaries, the same way.
         kernel = _kernel_configuration(root, revision, revision, output, compiler, context, deadline)
+        lanes = _lane_configuration(root, revision, revision, output, context)
         digest = kernel["harness_sha256"]["head"]
+        lane_digest = lanes["harness_sha256"]["head"]
         binary, environment, directory = _build_kernel(root, revision, "base", output, compiler,
-                                                       kernel, digest, work, deadline)
+                                                       kernel, digest, lane_digest, work, deadline)
         kernel_baseline = _run_kernel(binary, environment, directory, "base", revision, digest,
                                       kernel, output, deadline)
         kernel_fixture = _run_kernel(binary, environment, directory, "regression", revision, digest,
                                      kernel, output, deadline, regression=True)
+        lane_baseline = _run_lanes(binary, environment, directory, "base", revision, lane_digest,
+                                   kernel, output, deadline)
+        lane_fixture = _run_lanes(binary, environment, directory, "regression", revision,
+                                  lane_digest, kernel, output, deadline, regression=True)
         binary, environment, directory = _build_kernel(root, revision, "neutral", output, compiler,
-                                                       kernel, digest, work, deadline)
+                                                       kernel, digest, lane_digest, work, deadline)
         kernel_neutral = _run_kernel(binary, environment, directory, "neutral", revision, digest,
                                      kernel, output, deadline)
+        lane_neutral = _run_lanes(binary, environment, directory, "neutral", revision, lane_digest,
+                                  kernel, output, deadline)
         kernel_neutral_report = compare_kernel_results(kernel_baseline, kernel_neutral, kernel["budget"])
         kernel_regression_report = compare_kernel_results(kernel_baseline, kernel_fixture,
                                                           kernel["budget"], regression_head=True)
         kernel_regression_report["deliberate_fixture"] = True
+        lane_neutral_reports, lane_regression_reports = [], []
+        for target in LANE_TARGETS:
+            limit = lanes["budget"][target]
+            lane_neutral_reports.append(
+                compare_kernel_results(lane_baseline[target], lane_neutral[target], limit))
+            fixture_report = compare_kernel_results(lane_baseline[target], lane_fixture[target],
+                                                    limit, regression_head=True)
+            fixture_report["deliberate_fixture"] = True
+            lane_regression_reports.append(fixture_report)
         _write_json(output / "kernel-neutral-comparison.json", kernel_neutral_report)
         _write_json(output / "kernel-regression-comparison.json", kernel_regression_report)
+        _write_json(output / "lane-neutral-comparison.json", lane_neutral_reports)
+        _write_json(output / "lane-regression-comparison.json", lane_regression_reports)
         if (neutral_report["status"] != "passed" or regression_report["status"] != "failed"
                 or kernel_neutral_report["status"] != "passed"
-                or kernel_regression_report["status"] != "failed"):
+                or kernel_regression_report["status"] != "failed"
+                or any(entry["status"] != "passed" for entry in lane_neutral_reports)
+                or any(entry["status"] != "failed" for entry in lane_regression_reports)):
             raise ValueError("neutral rebuild or deliberate allocation regression was not detected correctly")
         summary.update({"status": "passed", "neutral": neutral_report, "regression": regression_report,
                         "kernel_neutral": kernel_neutral_report,
-                        "kernel_regression": kernel_regression_report, "context": context})
+                        "kernel_regression": kernel_regression_report,
+                        "lane_neutral": lane_neutral_reports,
+                        "lane_regression": lane_regression_reports, "context": context})
     except (ValueError, RuntimeError, OSError, subprocess.SubprocessError, UnicodeError, KeyError) as error:
         summary["status"] = "failed"
         summary["errors"].append(str(error))
