@@ -61,9 +61,13 @@ retired no registered function. `egress::host_glob_matches` is the host-pattern
 predicate that lane calls, so it stays selected; its start marker now carries
 `pub(crate)` because the lane in `policy_eval` calls it. The shared path
 functions stay selected too, since the evaluator and the HTTP lane still call
-them. Legacy retirement tracked by #422 is still open. When ownership moves
-again, update the target, function hash and exact tests in the same reviewed
-change, remove the retired target, and remeasure.
+them. The #422 legacy retirement moved the enum-source precheck and the
+tool-name coverage check of rule suggestions onto the evaluator
+(`CompiledPolicy::evaluate_source_request`, `CompiledPolicy::match_tool_rules`).
+It retired no registered function and added no target, so the registry and its
+measured campaign time are unchanged. When ownership moves again, update the
+target, function hash and exact tests in the same reviewed change, remove the
+retired target, and remeasure.
 
 The tool-lane targets select tests that state the evaluator's answers
 outright. The live adapters ask this same evaluator, so a test that only

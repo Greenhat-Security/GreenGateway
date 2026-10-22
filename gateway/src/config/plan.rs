@@ -18,6 +18,7 @@
 use std::env::VarError;
 
 use super::{
+    authority_events::AuthorityEventInputs,
     connections::{self, ConnectionInputs, ConnectionsPlan},
     diagnostic::{Lookups, Report},
     egress::{self, EgressInputs, EgressPlan},
@@ -145,6 +146,7 @@ pub(super) fn compile_blocks(
     let egress = egress::compile(EgressInputs::read(&mut get_var)).report(&mut report);
     let storage = storage::compile(
         StateBackendInputs::read(&mut get_var),
+        AuthorityEventInputs::read(&mut get_var),
         StorageBlocks {
             audit,
             discovery,
@@ -269,6 +271,7 @@ impl ConfigPlan {
             state_backend,
             deployment_id,
             database,
+            authority_events,
             provenance: _,
         } = storage;
         let ConnectionsPlan {
@@ -419,6 +422,7 @@ impl ConfigPlan {
             readiness_probe_cache_ms,
             cluster_status_expose_hostnames,
             audit_postgres_retention_days,
+            authority_events,
             tool_runtime_default_timeout_ms,
             csrf_enabled,
             csrf_cookie_name,

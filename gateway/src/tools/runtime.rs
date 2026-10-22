@@ -23,11 +23,10 @@ use crate::{
         DEFAULT_TOOL_RUNTIME_QUEUE_DEPTH, DEFAULT_TOOL_RUNTIME_QUEUE_TIMEOUT_MS,
     },
     connections::{caller_assertion::AttestedCaller, model::ConnectionId},
-    middleware::rbac::{MatchedRuleDecision, RbacState, ToolInvocationVerdict},
-    rbac::{
-        policy, rule::principal_identity_matches, Policy, Rule, RuleAction, RuleDispatchContext,
-        RuleMatcher,
-    },
+    middleware::rbac::{MatchedRuleDecision, RbacPolicyState, RbacState, ToolInvocationVerdict},
+    policy_eval::tools::{SourceRequestContext, SourceRequestDecision, TOOL_CONTEXT_VERSION},
+    rbac::{policy, rule::principal_identity_matches, Policy, RuleAction},
+    request_bounds::MAX_TOOL_NAME_BYTES,
     tools::lease::{self, ExecutionLease, ExecutionLeaseStore, LeaseAttempt},
 };
 
@@ -64,7 +63,11 @@ pub struct ToolRuntimeConfig {
     pub max_concurrent_global: usize,
     pub default_policy: DefaultToolPolicy,
     pub default_timeout: Duration,
-    pub rules: Vec<Rule>,
+    /// The runtime's own tool entries. With an `RbacState` they only seed the
+    /// per-tool limiters, and the policy decides; without one they decide.
+    /// There are no rules here: a runtime without an `RbacState` has no
+    /// policy, so no rule can judge its calls, and a rule that could be set
+    /// here and silently not enforced would be worse than none.
     pub tools: HashMap<String, ToolRuntimeToolConfig>,
 }
 
@@ -76,7 +79,6 @@ impl Default for ToolRuntimeConfig {
             max_concurrent_global: DEFAULT_TOOL_RUNTIME_GLOBAL_CONCURRENCY,
             default_policy: DefaultToolPolicy::Deny,
             default_timeout: Duration::from_millis(DEFAULT_TOOL_RUNTIME_DEFAULT_TIMEOUT_MS),
-            rules: Vec::new(),
             tools: HashMap::new(),
         }
     }
@@ -94,14 +96,15 @@ impl ToolRuntimeConfig {
         }
     }
 
-    #[allow(dead_code)] // Issue #32's tool registry and issue #33's MCP endpoint will invoke this.
+    /// The tool entries of a policy, for a test runtime given the `RbacState`
+    /// built from the same policy. The policy decides through that state.
+    #[cfg(test)]
     pub fn from_policy(policy: &Policy) -> Option<Self> {
         if policy.tools.is_empty() && !policy.rules.iter().any(|rule| rule.tool_name.is_some()) {
             return None;
         }
 
         Some(Self {
-            rules: policy.rules.clone(),
             tools: policy
                 .tools
                 .iter()
@@ -111,9 +114,10 @@ impl ToolRuntimeConfig {
         })
     }
 
-    #[allow(dead_code)] // Issue #32's tool registry and issue #33's MCP endpoint will invoke this.
+    /// Seed the per-tool limiters from a policy's tool entries, for a runtime
+    /// given the `RbacState` built from the same policy. Every decision is
+    /// that state's; the policy's rules apply only through it.
     pub fn with_policy_tools(mut self, policy: &Policy) -> Self {
-        self.rules = policy.rules.clone();
         self.tools = policy
             .tools
             .iter()
@@ -306,8 +310,6 @@ struct ToolRuntimeInner {
     global: Arc<Semaphore>,
     per_tool: Mutex<HashMap<String, Arc<ToolLimiter>>>,
     rbac_state: Option<RbacState>,
-    rule_matcher: RuleMatcher,
-    rule_ids: Vec<String>,
     /// Cluster mode's lease authority: the global and per-tool limits are
     /// slots leased here, so they bound the whole cluster, not one replica.
     /// None in standalone mode, where the semaphores alone bound them.
@@ -592,14 +594,6 @@ impl ToolRuntime {
                 )
             })
             .collect();
-        let rule_matcher = RuleMatcher::new(&config.rules);
-        let rule_ids = config
-            .rules
-            .iter()
-            .enumerate()
-            .map(|(rule_index, rule)| rule.id.clone().unwrap_or_else(|| rule_index.to_string()))
-            .collect();
-
         Self {
             inner: Arc::new(ToolRuntimeInner {
                 queue: Arc::new(Semaphore::new(config.max_queue.max(1))),
@@ -608,8 +602,6 @@ impl ToolRuntime {
                 config,
                 audit,
                 rbac_state,
-                rule_matcher,
-                rule_ids,
                 leases,
             }),
         }
@@ -1153,21 +1145,14 @@ impl ToolRuntime {
             );
         }
 
+        // Without an RBAC state there is no policy: the runtime's own entries
+        // and default decide, and no rule exists to match the call.
         let state = self.lookup_tool(tool_name)?;
         if !state.config.enabled {
             return Err(ToolRuntimeError::Disabled {
                 tool_name: tool_name.to_owned(),
             });
         }
-
-        let rule_decision = self
-            .inner
-            .rule_matcher
-            .evaluate_tool(tool_name, principal.as_ref())
-            .map(|decision| MatchedRuleDecision {
-                action: decision.action,
-                matched_rule_id: self.rule_id(decision.rule_index),
-            });
 
         if !tool_principal_matches(
             &state.config.allowed_roles,
@@ -1183,7 +1168,7 @@ impl ToolRuntime {
 
         Ok(AuthorizedToolInvocation {
             state,
-            rule_decision,
+            rule_decision: None,
         })
     }
 
@@ -1194,8 +1179,14 @@ impl ToolRuntime {
         path: &str,
         context: &ToolInvocationContext,
     ) -> bool {
+        // Without an RBAC state there is no policy, so no rule exists to
+        // match the rendered request and nothing here can refuse it. Such a
+        // runtime admits only what its own entries and default admit.
+        let Some(rbac_state) = &self.inner.rbac_state else {
+            return true;
+        };
         let principal = principal_from_tool_context(context);
-        let decision = if let Some(rbac_state) = &self.inner.rbac_state {
+        let decision =
             match rbac_state.evaluate_tool_http_rule(tool_name, method, path, principal.as_ref()) {
                 Ok(decision) => decision,
                 Err(refusal) => {
@@ -1215,21 +1206,7 @@ impl ToolRuntime {
                     );
                     return false;
                 }
-            }
-        } else {
-            self.inner
-                .rule_matcher
-                .evaluate_with_dispatch(
-                    method,
-                    path,
-                    principal.as_ref(),
-                    RuleDispatchContext::unknown(),
-                )
-                .map(|decision| MatchedRuleDecision {
-                    action: decision.action,
-                    matched_rule_id: self.rule_id(decision.rule_index),
-                })
-        };
+            };
 
         let Some(decision) = decision else {
             return true;
@@ -1293,14 +1270,6 @@ impl ToolRuntime {
             .is_ok_and(|state| state.config.enabled)
     }
 
-    fn rule_id(&self, rule_index: usize) -> String {
-        self.inner
-            .rule_ids
-            .get(rule_index)
-            .cloned()
-            .unwrap_or_else(|| rule_index.to_string())
-    }
-
     pub(crate) fn tool_visible_to_context(
         &self,
         tool_name: &str,
@@ -1315,17 +1284,8 @@ impl ToolRuntime {
             return false;
         };
 
+        // No policy, so no rule hides it: the runtime's own entry decides.
         if !state.config.enabled {
-            return false;
-        }
-
-        let principal = principal_from_tool_context(context);
-        let rule_action = self
-            .inner
-            .rule_matcher
-            .evaluate_tool(tool_name, principal.as_ref())
-            .map(|decision| decision.action);
-        if !tool_rule_allows_visibility(rule_action.as_ref()) {
             return false;
         }
 
@@ -1636,21 +1596,22 @@ impl SourceAuthorizer for ToolRuntime {
         rendered_path_and_query: &str,
         audit_path_template: &str,
     ) -> Result<(), EnumSourceFailureReason> {
-        // One read of the policy for both checks, so the enable bit and the
-        // deny rules come from the same snapshot even when an install lands
-        // while the precheck runs (#422). It reads the live lane on purpose.
-        // The background refresher runs outside any request, so nothing is
-        // pinned there. An admin overlay install also resolves its sources,
-        // inside the admin request; there the live lane is the policy that
-        // install's read-modify-write baseline (`current_policy`) builds on,
-        // which is the one these sources must agree with.
+        // One read of the live lane's installed snapshot for both checks, so
+        // the enable bit and the deny rules come from the same snapshot even
+        // when an install lands while the precheck runs (#422). It reads the
+        // live lane on purpose. The background refresher runs outside any
+        // request, so nothing is pinned there. An admin overlay install also
+        // resolves its sources, inside the admin request; there the live lane
+        // is the policy that install's read-modify-write baseline
+        // (`current_policy`) builds on, which is the one these sources must
+        // agree with.
         let policy = self
             .inner
             .rbac_state
             .as_ref()
-            .map(RbacState::current_policy);
+            .map(RbacState::live_policy_snapshot);
         self.authorize_source_request(
-            policy.as_ref(),
+            policy.as_deref(),
             connection_id,
             source_id,
             tool,
@@ -1661,14 +1622,18 @@ impl SourceAuthorizer for ToolRuntime {
 }
 
 impl ToolRuntime {
-    /// The enum-source precheck, judged entirely by `policy`: the tool's enable
-    /// bit and the deny rules both come from that one snapshot, which the
-    /// caller read once. Nothing here reads a policy of its own, so the two
-    /// checks cannot straddle an install. Without an RBAC state (`None`) the
-    /// runtime's own configuration decides both, as before.
+    /// The enum-source precheck, judged entirely by `policy`: the shared
+    /// evaluator answers both the tool's enable bit and the deny rules from
+    /// that one compiled snapshot, which the caller read once, and the rule a
+    /// denial names is attributed by the same snapshot's rule ids. Nothing
+    /// here reads a policy of its own, so the two checks cannot straddle an
+    /// install.
+    ///
+    /// Without an RBAC state (`None`) there is no policy: the runtime's own
+    /// entry decides the enable bit and no rule exists to deny the request.
     fn authorize_source_request(
         &self,
-        policy: Option<&Policy>,
+        policy: Option<&RbacPolicyState>,
         connection_id: &ConnectionId,
         source_id: &str,
         tool: Option<&str>,
@@ -1687,71 +1652,75 @@ impl ToolRuntime {
         let audit_path = audit_path_template
             .split_once('?')
             .map_or(audit_path_template, |(path, _)| path);
-        if let Some(tool_name) = tool {
-            let enabled = match policy {
-                Some(policy) => policy
-                    .tools
-                    .get(tool_name)
-                    .is_some_and(|entry| entry.enabled),
-                None => self
-                    .lookup_tool(tool_name)
-                    .is_ok_and(|state| state.config.enabled),
-            };
-            if !enabled {
-                self.emit_enum_source_denial(
-                    connection_id,
-                    source_id,
-                    tool,
-                    audit_path,
-                    "tool_disabled",
-                    None,
-                );
-                return Err(EnumSourceFailureReason::ToolDisabled);
-            }
-        }
-
-        // Source requests have no caller principal or inbound route. Only an
-        // explicit deny can block this contextless internal GET; allow and
-        // shadow rules cannot grant additional authority. Match the rendered
-        // path identity, excluding the deterministic query string.
-        let matched_rule_id = if let Some(policy) = policy {
-            RuleMatcher::new(&policy.rules)
-                .evaluate_denies_with_dispatch(
-                    "GET",
-                    rendered_path,
-                    None,
-                    RuleDispatchContext::contextless(),
-                )
-                .map(|decision| {
-                    policy
-                        .rules
-                        .get(decision.rule_index)
-                        .and_then(|rule| rule.id.clone())
-                        .unwrap_or_else(|| decision.rule_index.to_string())
-                })
-        } else {
-            self.inner
-                .rule_matcher
-                .evaluate_denies_with_dispatch(
-                    "GET",
-                    rendered_path,
-                    None,
-                    RuleDispatchContext::contextless(),
-                )
-                .map(|decision| self.rule_id(decision.rule_index))
-        };
-        if let Some(matched_rule_id) = matched_rule_id {
+        let deny = |reason: &'static str, matched_rule_id: Option<&str>, failure| {
             self.emit_enum_source_denial(
                 connection_id,
                 source_id,
                 tool,
                 audit_path,
-                "http_rule_denied",
-                Some(&matched_rule_id),
+                reason,
+                matched_rule_id,
             );
-            return Err(EnumSourceFailureReason::HttpRuleDenied);
+            Err(failure)
+        };
+
+        let Some(policy) = policy else {
+            if let Some(tool_name) = tool {
+                if !self
+                    .lookup_tool(tool_name)
+                    .is_ok_and(|state| state.config.enabled)
+                {
+                    return deny("tool_disabled", None, EnumSourceFailureReason::ToolDisabled);
+                }
+            }
+            return Ok(());
+        };
+
+        // Policy validation refuses a longer tool key, so no entry can name
+        // this tool: it is absent from the policy, and refused as an absent
+        // tool is, without asking the evaluator a question it would refuse.
+        if tool.is_some_and(|name| name.len() > MAX_TOOL_NAME_BYTES) {
+            return deny("tool_disabled", None, EnumSourceFailureReason::ToolDisabled);
         }
-        Ok(())
+        // Source requests have no caller principal or inbound route. Only an
+        // explicit deny can block this contextless internal GET; allow and
+        // shadow rules cannot grant additional authority. The rendered path
+        // identity is matched, excluding the deterministic query string.
+        let compiled = policy.compiled();
+        let context = SourceRequestContext {
+            version: TOOL_CONTEXT_VERSION,
+            snapshot: compiled.snapshot(),
+            tool_name: tool.map(str::to_owned),
+            path: rendered_path.to_owned(),
+        };
+        let refused = match compiled.evaluate_source_request(&context) {
+            Ok(SourceRequestDecision::Allowed) => return Ok(()),
+            Ok(SourceRequestDecision::ToolDisabled) => {
+                return deny("tool_disabled", None, EnumSourceFailureReason::ToolDisabled);
+            }
+            Ok(SourceRequestDecision::Denied { index }) => match policy.rule_ids().get(index) {
+                Some(matched_rule_id) => {
+                    return deny(
+                        "http_rule_denied",
+                        Some(matched_rule_id),
+                        EnumSourceFailureReason::HttpRuleDenied,
+                    );
+                }
+                None => crate::policy_eval::EvaluationError::InternalInvariant,
+            },
+            Err(error) => error,
+        };
+        // No answer, or one naming a rule this snapshot does not have: the
+        // source is refused as a policy refusal, before any I/O, and audited
+        // with the refusal's reason and no rule. Overlay compilation holds a
+        // source path to a stricter check than the evaluator's, so a compiled
+        // source does not reach here.
+        tracing::warn!(error = ?refused, "enum-source policy evaluation refused");
+        deny(
+            "policy_evaluation_error",
+            None,
+            EnumSourceFailureReason::HttpRuleDenied,
+        )
     }
 
     fn emit_enum_source_denial(
@@ -1797,10 +1766,6 @@ fn tool_config_from_policy(entry: &policy::ToolPolicyEntry) -> ToolRuntimeToolCo
         timeout: Duration::from_millis(entry.timeout_ms),
         max_concurrent: entry.max_concurrent as usize,
     }
-}
-
-fn tool_rule_allows_visibility(rule_action: Option<&RuleAction>) -> bool {
-    !matches!(rule_action, Some(RuleAction::Deny))
 }
 
 fn tool_principal_matches(
@@ -2250,7 +2215,7 @@ mod tests {
 
     #[tokio::test]
     async fn tool_name_deny_rule_blocks_tool_allowed_by_empty_allowed_roles() {
-        let (runtime, capture) = runtime_with_tools_and_rules(
+        let (runtime, capture) = policy_runtime_with_tools_and_rules(
             [("tool", enabled_tool(100, 1))],
             vec![tool_rule(
                 Some("deny-tool-for-viewers"),
@@ -2258,9 +2223,6 @@ mod tests {
                 &["viewer"],
                 RuleAction::Deny,
             )],
-            2,
-            1,
-            100,
         );
 
         let denied = runtime
@@ -2293,7 +2255,7 @@ mod tests {
 
     #[tokio::test]
     async fn tool_name_deny_rule_hides_tool_from_matching_context() {
-        let (runtime, _capture) = runtime_with_tools_and_rules(
+        let (runtime, _capture) = policy_runtime_with_tools_and_rules(
             [("tool", enabled_tool(100, 1))],
             vec![tool_rule(
                 Some("deny-tool-for-viewers"),
@@ -2301,9 +2263,6 @@ mod tests {
                 &["viewer"],
                 RuleAction::Deny,
             )],
-            2,
-            1,
-            100,
         );
 
         assert!(
@@ -2318,7 +2277,7 @@ mod tests {
 
     #[tokio::test]
     async fn tool_name_shadow_rule_emits_would_deny_and_allows_execution() {
-        let (runtime, capture) = runtime_with_tools_and_rules(
+        let (runtime, capture) = policy_runtime_with_tools_and_rules(
             [("tool", enabled_tool(100, 1))],
             vec![tool_rule(
                 Some("shadow-tool-for-viewers"),
@@ -2326,9 +2285,6 @@ mod tests {
                 &["viewer"],
                 RuleAction::Shadow,
             )],
-            2,
-            1,
-            100,
         );
         let work_ran = Arc::new(AtomicBool::new(false));
         let work_ran_in_closure = Arc::clone(&work_ran);
@@ -2867,9 +2823,18 @@ mod tests {
         let runtime = ToolRuntime::new_with_rbac_state(config, audit, Some(rbac_state));
         let connection_id =
             ConnectionId::parse("metadata-api").expect("test Connection id should parse");
+        // Each policy as an installed snapshot, compiled once, as the live
+        // lane holds it.
         let check = |policy: &Policy| {
+            let installed = crate::middleware::rbac::RbacState::new(
+                policy.clone(),
+                Vec::new(),
+                false,
+                AuditLog::new(Arc::new(CaptureSink::new()) as Arc<dyn AuditSink>),
+            )
+            .live_policy_snapshot();
             runtime.authorize_source_request(
-                Some(policy),
+                Some(&installed),
                 &connection_id,
                 "statuses",
                 Some("metadata"),
@@ -2907,6 +2872,61 @@ mod tests {
         );
         assert_eq!(events[1].payload["reason"], json!("tool_disabled"));
         assert_eq!(events[2].payload["reason"], json!("tool_disabled"));
+    }
+
+    /// A source the evaluator will not answer for is refused as a policy
+    /// refusal before any I/O, in shadow mode too, and audited with the
+    /// refusal's reason and no rule. Overlay compilation refuses such a path
+    /// first, so only a precheck asked directly can reach this.
+    #[tokio::test]
+    async fn an_enum_source_the_evaluator_refuses_is_refused_and_audited_without_a_rule() {
+        let policy = Policy::validate_json_value(json!({
+            "schema_version": "0.1.0",
+            "enforcement_mode": "shadow",
+            "default_action": "allow",
+            "tools": {"metadata": {"timeout_ms": 5000, "max_concurrent": 2}}
+        }))
+        .expect("the source policy should parse");
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+        let rbac_state = crate::middleware::rbac::RbacState::new(
+            policy.clone(),
+            Vec::new(),
+            false,
+            audit.clone(),
+        );
+        let installed = rbac_state.live_policy_snapshot();
+        let config = ToolRuntimeConfig::from_policy(&policy)
+            .expect("the source tool should configure the runtime");
+        let runtime = ToolRuntime::new_with_rbac_state(config, audit, Some(rbac_state));
+        let connection_id =
+            ConnectionId::parse("metadata-api").expect("test Connection id should parse");
+
+        for (tool, rendered) in [
+            (Some("metadata"), "/metadata/../statuses"),
+            (None, "/metadata/%GG"),
+            (None, "metadata/statuses"),
+        ] {
+            assert_eq!(
+                runtime.authorize_source_request(
+                    Some(&installed),
+                    &connection_id,
+                    "statuses",
+                    tool,
+                    rendered,
+                    "/metadata/{status}",
+                ),
+                Err(EnumSourceFailureReason::HttpRuleDenied),
+                "{rendered}"
+            );
+        }
+        wait_until(Duration::from_secs(1), || capture.len() == 3).await;
+        for event in capture.events() {
+            assert_eq!(event.event_type, AUTHZ_DENIED);
+            assert_eq!(event.payload["reason"], json!("policy_evaluation_error"));
+            assert_eq!(event.payload["matched_rule_id"], Value::Null);
+            assert_eq!(event.payload["path"], json!("/metadata/{status}"));
+        }
     }
 
     #[tokio::test]
@@ -2974,22 +2994,6 @@ mod tests {
         let runtime_config =
             ToolRuntimeConfig::from_policy(&policy).expect("tool policy should configure runtime");
         let runtime = ToolRuntime::new_with_rbac_state(runtime_config, audit, Some(rbac_state));
-
-        assert!(!runtime.authorize_http_operation("echo", "POST", "/v1/echo", &context()));
-
-        let events = audit_events(&capture, 1).await;
-        assert_eq!(events[0].event_type, AUTHZ_DENIED);
-        assert_eq!(events[0].payload["matched_rule_id"], json!("deny-global"));
-    }
-
-    #[tokio::test]
-    async fn tool_http_operation_fallback_skips_dispatch_bound_allow() {
-        let policy = tool_policy_with_contextless_allow_before_unbound_deny();
-        let capture = CaptureSink::new();
-        let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
-        let runtime_config =
-            ToolRuntimeConfig::from_policy(&policy).expect("tool policy should configure runtime");
-        let runtime = ToolRuntime::new(runtime_config, audit);
 
         assert!(!runtime.authorize_http_operation("echo", "POST", "/v1/echo", &context()));
 
@@ -3436,7 +3440,7 @@ mod tests {
 
     #[tokio::test]
     async fn allowed_roles_still_blocks_tool_call_even_when_tool_rule_allows() {
-        let (runtime, capture) = runtime_with_tools_and_rules(
+        let (runtime, capture) = policy_runtime_with_tools_and_rules(
             [("tool", role_restricted_tool(100, 1, &["operator"]))],
             vec![tool_rule(
                 Some("allow-viewer-tool"),
@@ -3444,9 +3448,6 @@ mod tests {
                 &["viewer"],
                 RuleAction::Allow,
             )],
-            2,
-            1,
-            100,
         );
 
         let denied = runtime
@@ -4367,22 +4368,6 @@ mod tests {
         max_concurrent_global: usize,
         queue_timeout_ms: u64,
     ) -> (ToolRuntime, CaptureSink) {
-        runtime_with_tools_and_rules(
-            tools,
-            Vec::new(),
-            max_queue,
-            max_concurrent_global,
-            queue_timeout_ms,
-        )
-    }
-
-    fn runtime_with_tools_and_rules<const N: usize>(
-        tools: [(&str, ToolRuntimeToolConfig); N],
-        rules: Vec<Rule>,
-        max_queue: usize,
-        max_concurrent_global: usize,
-        queue_timeout_ms: u64,
-    ) -> (ToolRuntime, CaptureSink) {
         let capture = CaptureSink::new();
         let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
         let runtime = ToolRuntime::new(
@@ -4392,7 +4377,6 @@ mod tests {
                 max_concurrent_global,
                 default_policy: DefaultToolPolicy::Deny,
                 default_timeout: Duration::from_millis(100),
-                rules,
                 tools: tools
                     .into_iter()
                     .map(|(name, config)| (name.to_owned(), config))
@@ -4400,6 +4384,57 @@ mod tests {
             },
             audit,
         );
+
+        (runtime, capture)
+    }
+
+    /// A runtime whose tool entries and rules are a policy, decided through
+    /// the `RbacState` built from it, which is the only way a policy's rules
+    /// judge tool calls.
+    fn policy_runtime_with_tools_and_rules<const N: usize>(
+        tools: [(&str, ToolRuntimeToolConfig); N],
+        rules: Vec<Rule>,
+    ) -> (ToolRuntime, CaptureSink) {
+        let policy = Policy {
+            schema_version: "0.1.0".to_owned(),
+            id: None,
+            default_action: crate::rbac::DefaultAction::default(),
+            enforcement_mode: crate::rbac::EnforcementMode::default(),
+            roles: HashMap::new(),
+            routes: Vec::new(),
+            rules,
+            egress: crate::rbac::EgressPolicy::default(),
+            rate_limits: Vec::new(),
+            tools: tools
+                .into_iter()
+                .map(|(name, tool)| {
+                    (
+                        name.to_owned(),
+                        policy::ToolPolicyEntry {
+                            enabled: tool.enabled,
+                            allowed_roles: tool.allowed_roles,
+                            issuers: tool.issuers,
+                            auth_methods: tool.auth_methods,
+                            timeout_ms: u64::try_from(tool.timeout.as_millis())
+                                .expect("a test timeout fits in milliseconds"),
+                            max_concurrent: u32::try_from(tool.max_concurrent)
+                                .expect("a test limit fits the policy field"),
+                        },
+                    )
+                })
+                .collect(),
+        };
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+        let rbac_state = crate::middleware::rbac::RbacState::new(
+            policy.clone(),
+            Vec::new(),
+            false,
+            audit.clone(),
+        );
+        let config = ToolRuntimeConfig::from_policy(&policy)
+            .expect("the tool policy should configure the runtime");
+        let runtime = ToolRuntime::new_with_rbac_state(config, audit, Some(rbac_state));
 
         (runtime, capture)
     }
@@ -4420,7 +4455,6 @@ mod tests {
                 max_concurrent_global,
                 default_policy: DefaultToolPolicy::Deny,
                 default_timeout: Duration::from_millis(100),
-                rules: Vec::new(),
                 tools: tools
                     .into_iter()
                     .map(|(name, config)| (name.to_owned(), config))
@@ -4492,7 +4526,6 @@ mod tests {
             max_concurrent_global: 1,
             default_policy: DefaultToolPolicy::Deny,
             default_timeout: Duration::from_millis(100),
-            rules: Vec::new(),
             tools: HashMap::new(),
         }
     }

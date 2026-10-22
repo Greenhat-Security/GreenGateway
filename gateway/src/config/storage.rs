@@ -2,7 +2,7 @@
 //! cluster's coordination settings, the state backend and PostgreSQL --
 //! compiled in pure stages (issue #433, PR 2).
 //!
-//! `Config::from_env_vars` reads these in five blocks with other domains'
+//! `Config::from_env_vars` reads these in six blocks with other domains'
 //! settings between them, and each block is requested where the legacy parser
 //! requested it, so the read order does not move:
 //!
@@ -13,10 +13,11 @@
 //!    ([`DocumentInputs`]);
 //! 4. the execution lease, cluster membership, maintenance, readiness and
 //!    PostgreSQL audit retention ([`ClusterInputs`]);
-//! 5. the state backend and PostgreSQL ([`StateBackendInputs`]), after which
-//!    [`compile`] checks the rules that pair every store and every
-//!    cluster-only setting with the backend that reads it, and returns the
-//!    [`StoragePlan`].
+//! 5. the state backend and PostgreSQL ([`StateBackendInputs`]);
+//! 6. authority-event delivery ([`AuthorityEventInputs`]), read right after
+//!    the fifth, after which [`compile`] checks the authority-event rules and
+//!    then the rules that pair every store and every cluster-only setting
+//!    with the backend that reads it, and returns the [`StoragePlan`].
 //!
 //! Those rules also need what other domains configured: the Connections
 //! store, keyrings and local keyring (`connections`), the admin session store,
@@ -34,6 +35,9 @@
 use std::{env::VarError, path::PathBuf};
 
 use super::{
+    authority_events::{
+        self, AuthorityEventInputs, AuthorityEventSettings, AUTHORITY_EVENT_RETENTION_HOURS,
+    },
     blank_as_unset,
     connections::ConnectionsPlan,
     diagnostic::ConfigRule,
@@ -788,6 +792,11 @@ impl StateBackendInputs {
     }
 }
 
+/// The last input the storage blocks read. Every rule that pairs a store or
+/// a cluster-only setting with the state backend is reported after it, which
+/// is where the legacy parser reported it: once every input was read.
+const LAST_STORAGE_INPUT: &str = AUTHORITY_EVENT_RETENTION_HOURS;
+
 /// The storage blocks read before the state backend.
 pub(super) struct StorageBlocks {
     pub(super) audit: AuditStores,
@@ -879,7 +888,10 @@ pub(crate) struct StoragePlan {
     pub(crate) state_backend: StateBackend,
     pub(crate) deployment_id: Option<String>,
     pub(crate) database: DatabasePlan,
-    /// Where each of the five blocks' inputs came from, in the order they are
+    /// Authority-event delivery (issue #425, PR 3). The pseudonym key aliases
+    /// name secrets and are never the secrets themselves.
+    pub(crate) authority_events: AuthorityEventSettings,
+    /// Where each of the six blocks' inputs came from, in the order they are
     /// read.
     #[allow(dead_code)] // Read by the stage tests until startup consumes the plan (#433 PR 3).
     pub(crate) provenance: Vec<Provenance>,
@@ -892,8 +904,9 @@ struct ParsedStateBackend {
     database: DatabasePlan,
 }
 
-/// Parses the state backend block, then checks the rules between the backend
-/// and everything that depends on it, and builds the plan.
+/// Parses the state backend block, then the authority-event block and its
+/// rules, then checks the rules between the backend and everything that
+/// depends on it, and builds the plan.
 ///
 /// Everything is validated in both modes, but nothing activates outside
 /// `STATE_BACKEND=postgres`: standalone mode must remain byte-for-byte
@@ -902,6 +915,7 @@ struct ParsedStateBackend {
 /// every problem in one pass.
 pub(super) fn compile(
     inputs: StateBackendInputs,
+    authority_event_inputs: AuthorityEventInputs,
     blocks: StorageBlocks,
     identity: &IdentityPlan,
     connections: &ConnectionsPlan,
@@ -916,9 +930,14 @@ pub(super) fn compile(
         cluster,
     } = blocks;
     let backend = parsed.state_backend;
+    // The authority-event block's own refusals and rules come first: the
+    // legacy parser checked them as it read the block, before any rule below.
+    let authority_events =
+        authority_events::compile(&authority_event_inputs, backend, &mut findings);
 
-    // Every rule below is reported once the last PostgreSQL input is read.
-    let after = DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS;
+    // Every rule below is reported once the last input of the last block,
+    // authority-event delivery's, is read, after the authority-event rules.
+    let after = LAST_STORAGE_INPUT;
     if backend == StateBackend::Postgres {
         reject_local_authority_in_postgres_mode(
             parsed.deployment_id.as_deref(),
@@ -1161,6 +1180,7 @@ pub(super) fn compile(
         documents.provenance,
         cluster.provenance,
         inputs.provenance(),
+        authority_event_inputs.provenance(),
     ]
     .concat();
     let ParsedStateBackend {
@@ -1195,6 +1215,7 @@ pub(super) fn compile(
             state_backend,
             deployment_id,
             database,
+            authority_events,
             provenance,
         },
         findings,
@@ -1388,7 +1409,7 @@ fn reject_local_authority_in_postgres_mode(
     local_authority_settings: &[(&str, bool)],
     findings: &mut Findings,
 ) {
-    let after = DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS;
+    let after = LAST_STORAGE_INPUT;
     if deployment_id.is_none() {
         findings.refuse(
             after,

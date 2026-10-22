@@ -2035,3 +2035,50 @@ fn parity_router(state: RbacState, legacy: bool) -> Router {
         router.layer(from_fn_with_state(state, rbac_middleware))
     }
 }
+
+/// Since the #422 legacy retirement the evaluator holds the only serving
+/// `RuleMatcher`, one per compiled snapshot. Every other construction must be
+/// test code: a test file, an in-file `#[cfg(test)] mod tests` block, or a
+/// statement gated by its own `#[cfg(test)]`. A new serving construction
+/// would be a second rule-matching authority beside the evaluator, so it fails
+/// here rather than relying on review to notice it.
+#[test]
+fn the_evaluator_holds_the_only_serving_rule_matcher() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut serving = Vec::new();
+    let mut pending = vec![root.clone()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            let name = path.file_name().and_then(|name| name.to_str()).unwrap();
+            if !name.ends_with(".rs") || name.ends_with("tests.rs") {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            let source = std::fs::read_to_string(&path).unwrap();
+            let mut previous = "";
+            for line in source.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                if previous == "#[cfg(test)]" && line.starts_with("mod tests {") {
+                    break;
+                }
+                if trimmed.contains("RuleMatcher::new(") && previous != "#[cfg(test)]" {
+                    serving.push(relative.clone());
+                }
+                previous = trimmed;
+            }
+        }
+    }
+    assert_eq!(serving, ["policy_eval/mod.rs"]);
+}

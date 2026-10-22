@@ -167,6 +167,17 @@ pub(crate) enum ConfigRule {
     /// `PAYLOAD_CAPTURE_ENABLED` is on in standalone mode without
     /// `DISCOVERY_SQLITE_PATH` to store the captured shapes.
     PayloadCaptureDestination,
+    /// An authority-event sink is configured without what it needs:
+    /// `AUTHORITY_PSEUDONYM_KEY_ALIAS` for either sink, and
+    /// `AUTHORITY_EVENT_FILE` for the file sink.
+    AuthorityEventSinkRequirements,
+    /// Authority-event delivery material is set that the configured sink
+    /// never reads: the event file or a pseudonym key alias while
+    /// `AUTHORITY_EVENT_SINK` is `none`, or the event file while it is `log`.
+    AuthorityEventMaterialUnused,
+    /// `AUTHORITY_PSEUDONYM_KEY_ALIAS` and
+    /// `AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS` name the same alias.
+    AuthorityPseudonymKeysDistinct,
 }
 
 /// The problems the compiler's stages found, each with the rule that refused

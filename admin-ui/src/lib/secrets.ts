@@ -2,10 +2,10 @@ import { adminFetchResource, type AdminResource } from './api';
 import { adminApiUrl } from './config';
 
 // `assertion_signing_key` and `token_exchange_client_secret` are listed as
-// compatible purposes of operator and external-provider aliases. This UI does
-// not bind or create either -- the encrypted local store cannot hold them --
-// but it must still accept both, or one new entry would reject the whole
-// secret inventory.
+// compatible purposes of operator and external-provider aliases. This UI binds
+// the first to caller-assertion keys and never the second, and creates
+// neither -- the encrypted local store cannot hold them -- but it must accept
+// both, or one new entry would reject the whole secret inventory.
 export type ConnectionSecretPurpose =
   | 'header_api_key'
   | 'static_bearer'

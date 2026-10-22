@@ -308,6 +308,12 @@ const BLANK_IS_UNSET: &[&str] = &[
     "DEPLOYMENT_ID",
     "DATABASE_URL_FILE",
     "DATABASE_TLS_CA_FILE",
+    "AUTHORITY_EVENT_SINK",
+    "AUTHORITY_EVENT_FILE",
+    "AUTHORITY_PSEUDONYM_KEY_ALIAS",
+    "AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS",
+    "AUTHORITY_EVENT_JOURNAL_CAPACITY",
+    "AUTHORITY_EVENT_RETENTION_HOURS",
 ];
 
 /// Variables for which an empty value is a value, and one the parser refuses:
@@ -1290,6 +1296,229 @@ fn storage_modes_keep_their_requirements_and_refuse_each_others_material() {
         accepted(&[("AUDIT_SQLITE_RETENTION_DAYS", "0")]).audit_sqlite_retention_days,
         None
     );
+}
+
+/// Authority-event delivery (issue #425, PR 3) is read right after the
+/// PostgreSQL settings. Its values are refused as they are read, its alias
+/// shapes and sink rules once the block is read, and all of them before the
+/// rules each mode checks once every input is read, even rules about inputs
+/// read long before it.
+#[test]
+fn authority_event_problems_come_after_the_database_and_before_the_mode_rules() {
+    let alias_shape = "must be a secret alias ID of 1 to 128 letters, digits, '.', '_' or '-', starting with a letter or digit; it names the key, never its material";
+
+    // Cluster mode.
+    let error = refused(&[
+        ("STATE_BACKEND", "postgres"),
+        ("DATABASE_POOL_MAX", "0"),
+        ("AUTHORITY_EVENT_SINK", "file"),
+        ("AUTHORITY_PSEUDONYM_KEY_ALIAS", "bad/../key"),
+        ("AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS", "bad/../key"),
+        ("AUTHORITY_EVENT_JOURNAL_CAPACITY", "0"),
+        ("AUTHORITY_EVENT_RETENTION_HOURS", "87601"),
+    ]);
+    assert_eq!(
+        error.problems,
+        [
+            "DATABASE_POOL_MAX must be between 1 and 256, got '0'".to_owned(),
+            "AUTHORITY_EVENT_JOURNAL_CAPACITY must be between 1 and 1000000000, got '0'".to_owned(),
+            "AUTHORITY_EVENT_RETENTION_HOURS must be at most 87600, got '87601'".to_owned(),
+            format!("AUTHORITY_PSEUDONYM_KEY_ALIAS {alias_shape}"),
+            format!("AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS {alias_shape}"),
+            "AUTHORITY_EVENT_FILE is required when AUTHORITY_EVENT_SINK=file".to_owned(),
+            "AUTHORITY_PSEUDONYM_KEY_ALIAS and AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS must name different aliases".to_owned(),
+            "DEPLOYMENT_ID is required when STATE_BACKEND=postgres; it scopes every authoritative row, lock, lease, and notification of the deployment and is non-secret".to_owned(),
+            "DATABASE_URL_FILE is required when STATE_BACKEND=postgres; the PostgreSQL connection string is supplied as a secret file, never as a raw environment variable".to_owned(),
+            "RATE_LIMIT_KEYRING is required when STATE_BACKEND=postgres; shared rate-limit buckets are keyed by an HMAC under it".to_owned(),
+        ]
+    );
+    assert_eq!(
+        error.diagnostics(),
+        [
+            expected_diagnostic(
+                "DATABASE_POOL_MAX",
+                ConfigDiagnosticCode::Refused,
+                ConfigRule::Value
+            ),
+            expected_diagnostic(
+                "AUTHORITY_EVENT_JOURNAL_CAPACITY",
+                ConfigDiagnosticCode::Refused,
+                ConfigRule::Value
+            ),
+            expected_diagnostic(
+                "AUTHORITY_EVENT_RETENTION_HOURS",
+                ConfigDiagnosticCode::Refused,
+                ConfigRule::Value
+            ),
+            expected_diagnostic(
+                "AUTHORITY_PSEUDONYM_KEY_ALIAS",
+                ConfigDiagnosticCode::Refused,
+                ConfigRule::Value
+            ),
+            expected_diagnostic(
+                "AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS",
+                ConfigDiagnosticCode::Refused,
+                ConfigRule::Value
+            ),
+            expected_diagnostic(
+                "AUTHORITY_EVENT_FILE",
+                ConfigDiagnosticCode::Unset,
+                ConfigRule::AuthorityEventSinkRequirements
+            ),
+            expected_diagnostic(
+                "AUTHORITY_PSEUDONYM_KEY_ALIAS",
+                ConfigDiagnosticCode::Refused,
+                ConfigRule::AuthorityPseudonymKeysDistinct
+            ),
+            expected_diagnostic(
+                "DEPLOYMENT_ID",
+                ConfigDiagnosticCode::Unset,
+                ConfigRule::ClusterModeRequirements
+            ),
+            expected_diagnostic(
+                "DATABASE_URL_FILE",
+                ConfigDiagnosticCode::Unset,
+                ConfigRule::ClusterModeRequirements
+            ),
+            expected_diagnostic(
+                "RATE_LIMIT_KEYRING",
+                ConfigDiagnosticCode::Unset,
+                ConfigRule::ClusterModeRequirements
+            ),
+        ]
+    );
+
+    // Material no sink reads, then a local store read long before the block.
+    let mut fixture = postgres_fixture();
+    fixture.extend([
+        ("POLICY_FILE", "/etc/greengateway/policy.json"),
+        (
+            "AUTHORITY_EVENT_FILE",
+            "/var/lib/greengateway/authority-events.jsonl",
+        ),
+        (
+            "AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS",
+            "pseudonym-2026-04",
+        ),
+    ]);
+    let error = refused(&fixture);
+    assert_eq!(
+        error.problems,
+        [
+            "AUTHORITY_EVENT_FILE is set while AUTHORITY_EVENT_SINK is none; no dispatcher runs and nothing reads it",
+            "AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS is set while AUTHORITY_EVENT_SINK is none; no dispatcher runs and nothing reads it",
+            "POLICY_FILE is set while STATE_BACKEND=postgres; in cluster mode PostgreSQL is the single authority and local stores are rejected (import/bootstrap workflows arrive in a later #241 PR) \u{2014} unset POLICY_FILE",
+        ]
+    );
+    assert_eq!(
+        error.diagnostics(),
+        [
+            expected_diagnostic(
+                "AUTHORITY_EVENT_FILE",
+                ConfigDiagnosticCode::Refused,
+                ConfigRule::AuthorityEventMaterialUnused
+            ),
+            expected_diagnostic(
+                "AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS",
+                ConfigDiagnosticCode::Refused,
+                ConfigRule::AuthorityEventMaterialUnused
+            ),
+            expected_diagnostic(
+                "POLICY_FILE",
+                ConfigDiagnosticCode::Refused,
+                ConfigRule::LocalAuthorityInClusterMode
+            ),
+        ]
+    );
+    let mut fixture = postgres_fixture();
+    fixture.extend([
+        ("AUTHORITY_EVENT_SINK", " log "),
+        ("AUTHORITY_PSEUDONYM_KEY_ALIAS", "pseudonym-2026-10"),
+        (
+            "AUTHORITY_EVENT_FILE",
+            "/var/lib/greengateway/authority-events.jsonl",
+        ),
+    ]);
+    let error = refused(&fixture);
+    assert_eq!(
+        error.problems,
+        ["AUTHORITY_EVENT_FILE is set while AUTHORITY_EVENT_SINK=log; only the file sink writes a file"]
+    );
+    assert_eq!(
+        error.diagnostics(),
+        [expected_diagnostic(
+            "AUTHORITY_EVENT_FILE",
+            ConfigDiagnosticCode::Refused,
+            ConfigRule::AuthorityEventMaterialUnused
+        )]
+    );
+
+    // Standalone mode: a value's own refusal, then each setting nothing
+    // reads, then the other cluster material.
+    let error = refused(&[
+        ("CLUSTER_HEARTBEAT_MS", "5000"),
+        ("DEPLOYMENT_ID", "deploy-prod-eu"),
+        ("AUTHORITY_EVENT_SINK", "syslog"),
+        ("AUTHORITY_EVENT_JOURNAL_CAPACITY", "10"),
+    ]);
+    assert_eq!(
+        error.problems,
+        [
+            "AUTHORITY_EVENT_SINK must be a valid authority event sink, got 'syslog': expected one of none, log, file",
+            "AUTHORITY_EVENT_SINK is set while STATE_BACKEND is sqlite; standalone mode has no authority-event journal or dispatcher and never reads it",
+            "AUTHORITY_EVENT_JOURNAL_CAPACITY is set while STATE_BACKEND is sqlite; standalone mode has no authority-event journal or dispatcher and never reads it",
+            "CLUSTER_HEARTBEAT_MS is set while STATE_BACKEND is sqlite; standalone mode has no cluster membership and never reads it",
+            "DEPLOYMENT_ID is set while STATE_BACKEND is sqlite; a deployment ID scopes a cluster-mode deployment and standalone mode never reads it \u{2014} set STATE_BACKEND=postgres or unset DEPLOYMENT_ID",
+        ]
+    );
+    let rules: Vec<ConfigRule> = error
+        .diagnostics()
+        .iter()
+        .map(|diagnostic| diagnostic.rule)
+        .collect();
+    assert_eq!(
+        rules,
+        [
+            ConfigRule::Value,
+            ConfigRule::ClusterSettingInStandaloneMode,
+            ConfigRule::ClusterSettingInStandaloneMode,
+            ConfigRule::ClusterSettingInStandaloneMode,
+            ConfigRule::ClusterSettingInStandaloneMode,
+        ]
+    );
+
+    // A value that is not Unicode is refused as a value and is not also
+    // reported as material standalone mode never reads.
+    for name in [
+        "AUTHORITY_EVENT_SINK",
+        "AUTHORITY_EVENT_FILE",
+        "AUTHORITY_PSEUDONYM_KEY_ALIAS",
+        "AUTHORITY_EVENT_JOURNAL_CAPACITY",
+        "AUTHORITY_EVENT_RETENTION_HOURS",
+    ] {
+        let error = Config::from_env_vars(|requested| {
+            if requested == name {
+                Err(VarError::NotUnicode(non_unicode_value()))
+            } else {
+                Err(VarError::NotPresent)
+            }
+        })
+        .expect_err("a value that is not Unicode is refused");
+        assert_eq!(error.problems.len(), 1, "{name}: {error}");
+        assert!(
+            error.problems[0].starts_with(&format!("{name} must be valid Unicode")),
+            "{name}: {error}"
+        );
+        assert_eq!(
+            error.diagnostics(),
+            [expected_diagnostic(
+                name,
+                ConfigDiagnosticCode::NotUnicode,
+                ConfigRule::Value
+            )],
+            "{name}"
+        );
+    }
 }
 
 #[test]
