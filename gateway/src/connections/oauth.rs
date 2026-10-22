@@ -284,13 +284,8 @@ impl OAuthClientCredentialsRuntime {
         &self,
         binding: &OAuthBinding,
     ) -> Result<OAuthTokenLease, OAuthError> {
-        if CONNECTION_TEST_OWNS_OAUTH_MINT.try_with(|()| ()).is_ok() {
-            let minted = self.mint(binding).await?;
-            return Ok(OAuthTokenLease {
-                access_token: minted.access_token,
-                slot: None,
-                generation: 0,
-            });
+        if connection_test_owns_token_requests() {
+            return Ok(OAuthTokenLease::uncached(self.mint(binding).await?));
         }
 
         let secret_version = self
@@ -435,6 +430,18 @@ impl fmt::Debug for OAuthClientCredentialsRuntime {
             .field("cached_slot_count", &self.cache.slot_guard().len())
             .field("audit_configured", &self.audit.is_some())
             .finish()
+    }
+}
+
+impl<E, C> OAuthTokenLease<E, C> {
+    /// A lease on a token no cache holds: one a Connection test obtained
+    /// inline, which serves that test's request and is dropped with it.
+    pub(super) fn uncached(token: MintedOAuthToken) -> Self {
+        Self {
+            access_token: token.access_token,
+            slot: None,
+            generation: 0,
+        }
     }
 }
 
@@ -794,6 +801,13 @@ where
     F: Future,
 {
     CONNECTION_TEST_OWNS_OAUTH_MINT.scope((), future).await
+}
+
+/// Whether the current task is a saved-connection probe scoped by
+/// [`scope_connection_test_oauth_mints`]: such a probe obtains every token it
+/// uses inline, client-credentials and delegated alike, and caches none.
+pub(super) fn connection_test_owns_token_requests() -> bool {
+    CONNECTION_TEST_OWNS_OAUTH_MINT.try_with(|()| ()).is_ok()
 }
 
 pub(super) fn token_request_headers(

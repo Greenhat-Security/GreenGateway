@@ -1,9 +1,9 @@
 import type { SafeDelegatedIssuerToken } from '../lib/connections';
 
 /**
- * A Connection's delegated issuer token, read only. The admin UI cannot edit
- * this credential type yet; the editor refuses to open such a connection
- * rather than save it through a form that cannot represent it.
+ * A Connection's delegated issuer token as the detail page shows it. The
+ * editor changes these settings; the caller assertion that signs the subject
+ * token is shown separately and changed through the admin API.
  */
 export function DelegatedIssuerTokenSummary({
   authentication,
@@ -30,8 +30,18 @@ export function DelegatedIssuerTokenSummary({
           The issuer can hand out any user&apos;s token to whoever holds this
           connection&apos;s client secret, so keep that secret in an external
           provider and grant read-only scopes where the upstream allows it.
-          This page shows the settings read only; change them through the
-          admin API.
+        </p>
+        <p>
+          <strong>Test connection runs as you.</strong> It exchanges a token
+          for your own account, sends the saved test request with it, and
+          drops it: the token is not cached and serves no other call. It is
+          refused for a service token or a sign-in without an identity
+          provider issuer (<code>delegated_token_no_principal</code>), and
+          while the connection is disabled, because the issuer verifies the
+          subject token against published keys that include only enabled
+          connections (<code>caller_assertion_key_not_published</code>). A
+          passing test shows that your own grant works, not anyone
+          else&apos;s.
         </p>
       </div>
       <dl className="traffic-metadata-grid">

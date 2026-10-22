@@ -8,7 +8,16 @@ import {
   type ConnectionDetail,
   type ConnectionWrite,
 } from '../../lib/connections';
-import { formFromDetail, validateForm, writeFromForm } from './model';
+import {
+  createWriteFromForm,
+  DEFAULT_FORM,
+  delegatedIssuerTokenOffered,
+  fieldErrorsFromProblems,
+  formFromDetail,
+  validateForm,
+  writeFromForm,
+  type ConnectionFormState,
+} from './model';
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -103,6 +112,157 @@ describe('connection editor load and save', () => {
       caller_assertion: null,
     };
     expect(write.display_name).toBe('Plain API');
+  });
+
+  it('loads and writes back a delegated issuer token without its caller assertion', async () => {
+    const stored = delegatedConnection();
+    const form = formFromDetail(await loadThroughClient(stored));
+    expect(form.authenticationType).toBe('delegated_issuer_token');
+    // A stored delegated Connection keeps its type: its block stays through
+    // every save and would otherwise start going upstream.
+    expect(delegatedIssuerTokenOffered(form, false)).toBe(true);
+    expect(validateForm(form)).toEqual({});
+
+    const write = writeFromForm(form);
+    expect(write.authentication).toStrictEqual({
+      type: 'delegated_issuer_token',
+      token_exchange_url: 'https://issuer.example.test/oauth2/token-exchange',
+      client_id: 'greengateway',
+      requested_scopes: ['calendar.read', 'mail.read'],
+      audience: 'https://mail.example.test',
+      resource: 'https://mail.example.test/v1',
+      revocation_url: 'https://issuer.example.test/oauth2/revoke',
+      subject_token_source: 'caller_assertion',
+      client_secret_configured: true,
+    });
+    expect(Object.hasOwn(write, 'caller_assertion')).toBe(false);
+    // The revocation endpoint is optional: cleared, the write leaves it out.
+    expect(
+      Object.hasOwn(
+        writeFromForm({ ...form, revocationUrl: '  ' }).authentication,
+        'revocation_url',
+      ),
+    ).toBe(false);
+    // The stored block is never re-sent, not even by the create body builder.
+    expect(Object.hasOwn(createWriteFromForm(form), 'caller_assertion')).toBe(
+      false,
+    );
+  });
+
+  it('adds the subject-token caller assertion to a delegated create only', () => {
+    const draft: ConnectionFormState = {
+      ...DEFAULT_FORM,
+      displayName: 'Mail API',
+      baseUrl: 'https://mail.example.test',
+      authenticationType: 'delegated_issuer_token',
+      clientId: 'greengateway',
+      tokenExchangeUrl: 'https://issuer.example.test/oauth2/token-exchange',
+      subjectToken: {
+        ...DEFAULT_FORM.subjectToken,
+        signingKeyBinding: {
+          configured: false,
+          intent: 'replace',
+          secretId: 'gateway-assertion-key',
+        },
+        kid: 'gw-2026-10',
+        issuer: 'https://gateway.example.test',
+        audience: 'https://issuer.example.test',
+        tokenType: 'caller-assertion+jwt',
+        claims: ['roles'],
+      },
+    };
+    expect(delegatedIssuerTokenOffered(DEFAULT_FORM, true)).toBe(true);
+    expect(delegatedIssuerTokenOffered(DEFAULT_FORM, false)).toBe(false);
+    expect(
+      validateForm(draft, [
+        {
+          id: 'gateway-assertion-key',
+          etag: '"key-1"',
+          label: 'Gateway assertion key',
+          provider: 'operator_file',
+          configured: true,
+          compatible_purposes: ['assertion_signing_key'],
+          dependency_count: 0,
+          actions: { can_rotate: false, can_delete: false },
+        },
+      ]),
+    ).toEqual({});
+
+    expect(createWriteFromForm(draft).caller_assertion).toStrictEqual({
+      signing_key_id: 'gateway-assertion-key',
+      kid: 'gw-2026-10',
+      algorithm: 'es256',
+      issuer: 'https://gateway.example.test',
+      audience: 'https://issuer.example.test',
+      token_type: 'caller-assertion+jwt',
+      header_name: 'x-caller-assertion',
+      lifetime_seconds: 60,
+      claims: ['roles'],
+    });
+    // Every field it writes is one the create contract's block accepts.
+    for (const field of Object.keys(
+      createWriteFromForm(draft).caller_assertion ?? {},
+    )) {
+      expect(contractFields('CallerAssertion')).toContain(field);
+    }
+    // A replacement never carries it, and no other type ever drafts one.
+    expect(Object.hasOwn(writeFromForm(draft), 'caller_assertion')).toBe(false);
+    expect(
+      Object.hasOwn(
+        createWriteFromForm({ ...draft, authenticationType: 'static_bearer' }),
+        'caller_assertion',
+      ),
+    ).toBe(false);
+  });
+
+  it('refuses a delegated draft the gateway would refuse, naming the field', () => {
+    const errors = validateForm({
+      ...DEFAULT_FORM,
+      displayName: 'Mail API',
+      baseUrl: 'https://mail.example.test',
+      kind: 'mcp_streamable_http',
+      authenticationType: 'delegated_issuer_token',
+      tokenExchangeUrl: 'https://issuer.example.test/token?tenant=1',
+      revocationUrl: 'http://issuer.example.test/oauth2/revoke',
+      scopes: 'mail.read mail.read',
+      subjectToken: {
+        ...DEFAULT_FORM.subjectToken,
+        kid: 'k'.repeat(129),
+        issuer: 'https://gateway.example.test\u0007',
+        headerName: 'x-forwarded-user',
+        lifetimeSeconds: '0',
+      },
+    });
+    expect(Object.keys(errors).sort()).toEqual([
+      'authentication.client_id',
+      'authentication.requested_scopes',
+      'authentication.revocation_url',
+      'authentication.token_exchange_url',
+      'authentication.type',
+      'caller_assertion.audience',
+      'caller_assertion.header_name',
+      'caller_assertion.issuer',
+      'caller_assertion.kid',
+      'caller_assertion.lifetime_seconds',
+      'caller_assertion.signing_key_id',
+      'caller_assertion.token_type',
+    ]);
+  });
+
+  it('shows a problem with the stored caller assertion form-wide', () => {
+    const problems = [
+      { field: 'caller_assertion.signing_key_id', code: 'invalid_signing_key' },
+      { field: 'authentication.token_exchange_url', code: 'invalid_token_url' },
+    ];
+    expect(fieldErrorsFromProblems(problems, true)).toEqual({
+      'caller_assertion.signing_key_id': 'Invalid signing key.',
+      'authentication.token_exchange_url': 'Invalid token url.',
+    });
+    // Without the draft's fields the stored block has no control to show it.
+    expect(fieldErrorsFromProblems(problems)).toEqual({
+      form: 'Invalid signing key.',
+      'authentication.token_exchange_url': 'Invalid token url.',
+    });
   });
 
   it('keeps a test profile an MCP connection was loaded with', async () => {
@@ -286,6 +446,45 @@ function storedConnection() {
     },
     created_at: '2026-10-01T12:00:00Z',
     updated_at: '2026-10-02T12:00:00Z',
+  };
+}
+
+/** A stored delegated issuer token Connection, as the safe read returns it. */
+function delegatedConnection() {
+  const stored = storedConnection();
+  const {
+    published_keys: _published,
+    key_problem: _problem,
+    ...assertion
+  } = stored.configuration.caller_assertion;
+  return {
+    ...stored,
+    authentication: 'delegated_issuer_token',
+    configuration: {
+      endpoint: stored.configuration.endpoint,
+      authentication: {
+        type: 'delegated_issuer_token',
+        token_exchange_url: 'https://issuer.example.test/oauth2/token-exchange',
+        client_id: 'greengateway',
+        requested_scopes: ['calendar.read', 'mail.read'],
+        audience: 'https://mail.example.test',
+        resource: 'https://mail.example.test/v1',
+        revocation_url: 'https://issuer.example.test/oauth2/revoke',
+        subject_token_source: 'caller_assertion',
+        client_secret_configured: true,
+      },
+      caller_assertion: {
+        ...assertion,
+        audience: 'https://issuer.example.test',
+        bind_request: false,
+      },
+      tls: {
+        ca_bundle_configured: false,
+        client_certificate_configured: false,
+        client_private_key_configured: false,
+      },
+      test_profile: stored.configuration.test_profile,
+    },
   };
 }
 
