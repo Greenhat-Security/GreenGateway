@@ -448,6 +448,7 @@ describe('ClusterView', () => {
     const reasons = [
       'starting',
       'draining',
+      'contract_fenced',
       'config_fingerprint_mismatch',
       'storage_unavailable',
       'schema_incompatible',

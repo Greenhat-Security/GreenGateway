@@ -1359,6 +1359,7 @@ mod tests {
         for (reason, draining, expected_state) in [
             ("starting", false, STATE_NOT_READY),
             ("draining", true, STATE_DRAINING),
+            ("contract_fenced", false, STATE_NOT_READY),
             ("config_fingerprint_mismatch", false, STATE_NOT_READY),
             ("storage_unavailable", false, STATE_NOT_READY),
             ("schema_incompatible", false, STATE_NOT_READY),

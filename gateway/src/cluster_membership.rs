@@ -48,8 +48,21 @@
 //! and returned with a stable reason; the caller writes nothing. Unlike
 //! fingerprint agreement, admission is never sticky: every write asks
 //! again, because a member that lacks the capability can join at any time.
-//! The gate is not a durable fence, which is why an operation that needs
-//! one is refused outright (see `storage/compatibility.rs`).
+//!
+//! **The durable contract fence** (issue #426, PR 3). The roster forgets:
+//! a lacking member whose row went stale or was swept can come back. The
+//! fence (`contract_fence`, migration 20) does not. The gate reads it
+//! before every gated write and refuses (`contract_fenced`) when it
+//! excludes this binary; an operation declaring `Activation::DurableFence`
+//! is admitted only by raising the fence to the operation's requirement in
+//! the transaction that confirms every live member already meets it. Every
+//! heartbeat checks the fence in its own statement, so a replica the fence
+//! excludes writes no row: at boot that fails startup, and on a running
+//! replica -- one paused past the stale window while the fence was raised,
+//! then resumed -- the heartbeat stops landing, readiness answers
+//! `contract_fenced` for good (the fence never moves back), the refusal is
+//! logged and audited as `cluster.contract_fenced` once, and the replica
+//! writes nothing more to the roster, its draining stamp included.
 
 use std::{
     sync::{
@@ -68,11 +81,11 @@ use crate::{
     security_cluster::ClusterSecurityRuntime,
     storage::{
         compatibility::{
-            self, BinaryContract, MemberAdvertisement, OperationAdmission, OperationRefusal,
-            OperationRequirement, OPERATION_REQUIREMENTS,
+            self, Activation, Backfill, BinaryContract, ContractFence, MemberAdvertisement,
+            OperationAdmission, OperationRefusal, OperationRequirement, OPERATION_REQUIREMENTS,
         },
-        ClusterMember, MemberRegistration, MemberRevisions, PostgresMembershipStore,
-        RepositoryError,
+        ClusterMember, FenceDecision, FenceRaise, HeartbeatOutcome, MemberRegistration,
+        MemberRevisions, PostgresMembershipStore, RepositoryError,
     },
 };
 
@@ -95,6 +108,40 @@ pub(crate) enum FingerprintAgreement {
     Agreed,
     /// These live members carry another fingerprint.
     Disagreeing(Vec<Uuid>),
+}
+
+/// Why this replica could not register its boot row.
+#[derive(Debug)]
+pub(crate) enum BootRegistrationError {
+    /// The row could not be written, or the first agreement check could not
+    /// read the roster.
+    Store(RepositoryError),
+    /// The durable contract fence excludes this binary: no row was written,
+    /// and none ever can be.
+    ContractFenced,
+}
+
+impl std::fmt::Display for BootRegistrationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Store(error) => write!(formatter, "{error}"),
+            Self::ContractFenced => formatter.write_str(
+                "the deployment's durable contract fence excludes this gateway build, so it \
+                 cannot join the roster; a retired build cannot return once the deployment has \
+                 moved past it -- run an eligible build",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BootRegistrationError {}
+
+/// A raise of the durable contract fence that an admission wrote: logged,
+/// and audited as `cluster.contract_fence_raised`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FenceRaised {
+    before: ContractFence,
+    after: ContractFence,
 }
 
 /// Who asked for a gated write: the request facts a refusal is audited
@@ -154,19 +201,33 @@ impl ClusterMembership {
 
     /// Write the boot row and run the first agreement check. A row that
     /// cannot be written is a startup failure (the database was just
-    /// proven reachable); a disagreement is not -- it is logged and the
-    /// replica boots unready.
-    pub(crate) async fn register_boot(&self) -> Result<FingerprintAgreement, RepositoryError> {
-        self.store
+    /// proven reachable), and so is a durable contract fence that excludes
+    /// this binary: startup checked the fence before it read any authority
+    /// state, so this is a raise that landed in between, and the boot row
+    /// is where it is caught for good. A disagreement is not a failure --
+    /// it is logged and the replica boots unready.
+    pub(crate) async fn register_boot(
+        &self,
+    ) -> Result<FingerprintAgreement, BootRegistrationError> {
+        let outcome = self
+            .store
             .heartbeat(&self.registration, MemberRevisions::default(), None)
-            .await?;
+            .await
+            .map_err(BootRegistrationError::Store)?;
+        if outcome == HeartbeatOutcome::Fenced {
+            self.readiness.record_contract_fenced();
+            tracing::error!(
+                "cluster mode: the durable contract fence excludes this gateway build; the boot row was not written and startup is refused"
+            );
+            return Err(BootRegistrationError::ContractFenced);
+        }
         let agreement = self.check_fingerprint_agreement().await;
         // From the boot row on, so a replica that never gets past the
         // fingerprint door still has a series saying so rather than no
         // series at all -- "held at the door" and "not scraped" must not
         // look the same.
         self.publish_membership_gauges();
-        agreement
+        agreement.map_err(BootRegistrationError::Store)
     }
 
     /// Compare the live roster with this replica's fingerprint, granting
@@ -211,7 +272,11 @@ impl ClusterMembership {
     /// unless it admits; answer a refusal with its reason. Only an
     /// operation in `OPERATION_REQUIREMENTS` can be admitted, so an ad hoc
     /// requirement cannot bypass the registry's review. The policy commit
-    /// paths call it for a document with role descriptions (PR 2).
+    /// paths call it for a document with role descriptions (PR 2). An
+    /// operation declaring a durable fence is admitted only by raising the
+    /// contract fence first (PR 3), which outlives a write that then fails:
+    /// the fence records that the operation was activated, not that it
+    /// wrote.
     pub(crate) async fn admit_operation(
         &self,
         requirement: &OperationRequirement,
@@ -234,25 +299,74 @@ impl ClusterMembership {
     ) -> Result<OperationAdmission, OperationRefusal> {
         let outcome = self.evaluate_operation(requirement, registry).await;
         match &outcome {
-            Ok(admission) => tracing::debug!(
-                operation = requirement.operation,
-                capability = requirement.capability.as_str(),
-                live_members = admission.live_members,
-                "cluster mode: every live member advertises what the operation requires; admitted"
-            ),
+            Ok((admission, raised)) => {
+                if let Some(raised) = raised {
+                    record_fence_raised(requirement, raised, admission, audit, request);
+                }
+                tracing::debug!(
+                    operation = requirement.operation,
+                    capability = requirement.capability.as_str(),
+                    live_members = admission.live_members,
+                    "cluster mode: every live member advertises what the operation requires; admitted"
+                )
+            }
             Err(refusal) => record_operation_refusal(requirement, refusal, audit, request),
         }
-        outcome
+        outcome.map(|(admission, _)| admission)
     }
 
     async fn evaluate_operation(
         &self,
         requirement: &OperationRequirement,
         registry: &[OperationRequirement],
-    ) -> Result<OperationAdmission, OperationRefusal> {
+    ) -> Result<(OperationAdmission, Option<FenceRaised>), OperationRefusal> {
         if !registry.contains(requirement) {
             return Err(OperationRefusal::NotSupportedByThisBinary);
         }
+        match requirement.activation {
+            Activation::LiveMembers => self
+                .evaluate_on_live_members(requirement)
+                .await
+                .map(|admission| (admission, None)),
+            Activation::DurableFence => self.admit_by_raising_the_fence(requirement).await,
+        }
+    }
+
+    /// An operation whose lacking members fail closed: the fence, the
+    /// backfill and the roster are read, unlocked, immediately before the
+    /// write.
+    async fn evaluate_on_live_members(
+        &self,
+        requirement: &OperationRequirement,
+    ) -> Result<OperationAdmission, OperationRefusal> {
+        let fence = match self.store.contract_fence().await {
+            Ok(fence) => fence,
+            Err(error) => {
+                self.note_failure(&error);
+                tracing::warn!(
+                    error = %error,
+                    operation = requirement.operation,
+                    "the durable contract fence could not be read for an operation gate; the operation is refused"
+                );
+                return Err(OperationRefusal::ActivationFenceUnavailable);
+            }
+        };
+        let backfill = match requirement.backfill {
+            Backfill::NotRequired => None,
+            Backfill::Required { name } => match self.store.backfill_state(name).await {
+                Ok(state) => Some(state),
+                Err(error) => {
+                    self.note_failure(&error);
+                    tracing::warn!(
+                        error = %error,
+                        operation = requirement.operation,
+                        backfill = name,
+                        "the backfill ledger could not be read for an operation gate; the operation is refused"
+                    );
+                    None
+                }
+            },
+        };
         let members = match self.store.members(self.stale_window).await {
             Ok(members) => members,
             Err(error) => {
@@ -272,7 +386,75 @@ impl ClusterMembership {
             &BinaryContract::shipped(),
             self.store.instance_id(),
             &advertisements,
+            &fence,
+            backfill,
         )
+    }
+
+    /// An operation whose lacking members would misread its data: admitted
+    /// only by raising the durable contract fence to its requirement, in
+    /// the one transaction that reads the ledger, the backfill and the
+    /// roster under the fence's row lock and confirms every live member
+    /// already meets the raised fence. A member that returns afterwards is
+    /// refused at its heartbeat; a raise refused here writes nothing.
+    async fn admit_by_raising_the_fence(
+        &self,
+        requirement: &OperationRequirement,
+    ) -> Result<(OperationAdmission, Option<FenceRaised>), OperationRefusal> {
+        let backfill = match requirement.backfill {
+            Backfill::NotRequired => None,
+            Backfill::Required { name } => Some(name),
+        };
+        let own_instance = self.store.instance_id();
+        let raised = self
+            .store
+            .raise_contract_fence(
+                self.stale_window,
+                backfill,
+                requirement.operation,
+                |decision: FenceDecision<'_>| {
+                    if crate::storage::migrations::validate_runtime_ledger(decision.ledger)
+                        != Ok(crate::storage::migrations::SchemaStatus::Current)
+                    {
+                        return Err(OperationRefusal::SchemaNotServed);
+                    }
+                    let advertisements: Vec<MemberAdvertisement> = decision
+                        .members
+                        .iter()
+                        .map(MemberAdvertisement::from)
+                        .collect();
+                    let admission = compatibility::evaluate(
+                        requirement,
+                        &BinaryContract::shipped(),
+                        own_instance,
+                        &advertisements,
+                        decision.fence,
+                        decision.backfill,
+                    )?;
+                    let target = compatibility::fence_target(decision.fence, requirement)?;
+                    Ok((admission, target))
+                },
+            )
+            .await;
+        match raised {
+            Ok(FenceRaise::Raised {
+                decided,
+                before,
+                after,
+            }) => Ok((decided, Some(FenceRaised { before, after }))),
+            Ok(FenceRaise::Unchanged { decided }) => Ok((decided, None)),
+            Ok(FenceRaise::Refused(refusal)) => Err(refusal),
+            Ok(FenceRaise::MigrationInProgress) => Err(OperationRefusal::MigrationInProgress),
+            Err(error) => {
+                self.note_failure(&error);
+                tracing::warn!(
+                    error = %error,
+                    operation = requirement.operation,
+                    "the durable contract fence could not be raised for an operation gate; the operation is refused"
+                );
+                Err(OperationRefusal::ActivationFenceUnavailable)
+            }
+        }
     }
 
     /// The heartbeat task: every interval, refresh the row with the
@@ -280,11 +462,15 @@ impl ClusterMembership {
     /// stamp readiness once the lifecycle is serving and the gate is
     /// open. On cancellation (draining or shutdown) the row is stamped
     /// draining under a bounded budget. Failures are logged, classified,
-    /// and carried on the next heartbeat; the task never exits on one.
+    /// and carried on the next heartbeat; the task never exits on one. A
+    /// heartbeat the durable contract fence refuses is not a failure to
+    /// retry: it is recorded once, on `audit` too, and from then on the
+    /// task writes nothing.
     pub(crate) fn spawn_heartbeat(
         self: &Arc<Self>,
         lifecycle: &GatewayLifecycle,
         revisions: Option<Arc<ClusterSecurityRuntime>>,
+        audit: AuditLog,
     ) {
         let membership = Arc::clone(self);
         let lifecycle_for_task = lifecycle.clone();
@@ -304,15 +490,20 @@ impl ClusterMembership {
                     }
                 }
                 membership
-                    .tick(&lifecycle_for_task, revisions.as_deref())
+                    .tick(&lifecycle_for_task, revisions.as_deref(), &audit)
                     .await;
             }
         });
         lifecycle.register_background_task(handle);
     }
 
-    async fn tick(&self, lifecycle: &GatewayLifecycle, revisions: Option<&ClusterSecurityRuntime>) {
-        self.tick_once(lifecycle, revisions).await;
+    async fn tick(
+        &self,
+        lifecycle: &GatewayLifecycle,
+        revisions: Option<&ClusterSecurityRuntime>,
+        audit: &AuditLog,
+    ) {
+        self.tick_once(lifecycle, revisions, audit).await;
         // Published after every tick, however it ended. The failure paths
         // are the ones that matter: a heartbeat that cannot be written is
         // precisely when the age has to keep climbing in the series an
@@ -321,11 +512,18 @@ impl ClusterMembership {
         self.publish_membership_gauges();
     }
 
-    async fn tick_once(
+    pub(crate) async fn tick_once(
         &self,
         lifecycle: &GatewayLifecycle,
         revisions: Option<&ClusterSecurityRuntime>,
+        audit: &AuditLog,
     ) {
+        // Fenced is final: the fence never moves back, so a replica it
+        // excludes writes nothing more to the roster and asks nothing more
+        // of the authority on this task's behalf.
+        if self.readiness.contract_fenced() {
+            return;
+        }
         let revisions = revisions
             .map(|runtime| MemberRevisions {
                 compiled: runtime.compiled_revision(),
@@ -341,7 +539,11 @@ impl ClusterMembership {
             .heartbeat(&self.registration, revisions, carried_error)
             .await
         {
-            Ok(()) => self.note_success(),
+            Ok(HeartbeatOutcome::Written) => self.note_success(),
+            Ok(HeartbeatOutcome::Fenced) => {
+                self.record_fenced_at_rejoin(audit).await;
+                return;
+            }
             Err(error) => {
                 self.note_failure(&error);
                 tracing::warn!(error = %error, "cluster member heartbeat failed; retrying on the next interval");
@@ -369,7 +571,57 @@ impl ClusterMembership {
         }
     }
 
+    /// The heartbeat found the durable contract fence excluding this
+    /// running replica: it was paused or partitioned past the stale window
+    /// while a raise moved the deployment past this build. Readiness is
+    /// refused for good, and the refusal is logged and audited once, with
+    /// the fence's numbers when it can be read.
+    async fn record_fenced_at_rejoin(&self, audit: &AuditLog) {
+        if !self.readiness.record_contract_fenced() {
+            return;
+        }
+        let exclusion = match self.store.contract_fence().await {
+            // The same decision the heartbeat statement made, over the
+            // registration it sent.
+            Ok(fence) => fence.exclusion(
+                self.registration.schema_version.1,
+                &self.registration.capabilities,
+            ),
+            Err(error) => {
+                self.note_failure(&error);
+                None
+            }
+        };
+        tracing::error!(
+            fence_generation = exclusion.map(|exclusion| exclusion.generation),
+            minimum_schema = exclusion.map(|exclusion| exclusion.minimum_schema),
+            missing_capabilities = exclusion.map(|exclusion| exclusion.missing_capabilities),
+            "cluster mode: the durable contract fence excludes this running gateway build; its heartbeat is no longer written and readiness is refused for good (contract_fenced) -- replace this replica with an eligible build"
+        );
+        audit.emit(audit::AuditEvent::new(
+            audit::event::CLUSTER_CONTRACT_FENCED,
+            "cluster-membership",
+            "internal",
+            None,
+            serde_json::json!({
+                "outcome": "refused",
+                "reason": crate::ha::ClusterReadiness::CONTRACT_FENCED,
+                "at": "heartbeat",
+                "schema_max": self.registration.schema_version.1,
+                "fence_generation": exclusion.map(|exclusion| exclusion.generation),
+                "minimum_schema": exclusion.map(|exclusion| exclusion.minimum_schema),
+                "missing_capabilities": exclusion.map(|exclusion| exclusion.missing_capabilities),
+            }),
+        ));
+    }
+
     async fn stamp_draining(&self) {
+        // A replica the fence excludes has no row to stamp, and writing one
+        // would make it look live, and lacking, to every gate for a stale
+        // window.
+        if self.readiness.contract_fenced() {
+            return;
+        }
         match tokio::time::timeout(DRAINING_STAMP_BUDGET, self.store.mark_draining()).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
@@ -450,6 +702,43 @@ fn record_operation_refusal(
         request.source_ip.clone(),
         request.actor.clone(),
         refusal.audit_payload(requirement),
+    ));
+}
+
+/// Make a fence raise observable: one warning naming both fences, and one
+/// `cluster.contract_fence_raised` audit event with the operation that
+/// raised it, the numbers before and after, and the live member count.
+fn record_fence_raised(
+    requirement: &OperationRequirement,
+    raised: &FenceRaised,
+    admission: &OperationAdmission,
+    audit: &AuditLog,
+    request: &GatedWriteRequest,
+) {
+    tracing::warn!(
+        operation = requirement.operation,
+        capability = requirement.capability.as_str(),
+        previous_generation = raised.before.generation,
+        fence_generation = raised.after.generation,
+        minimum_schema = raised.after.minimum_schema,
+        live_members = admission.live_members,
+        "cluster mode: raised the durable contract fence; a gateway build without this capability can no longer start or rejoin this deployment"
+    );
+    audit.emit(audit::AuditEvent::new(
+        audit::event::CLUSTER_CONTRACT_FENCE_RAISED,
+        request.request_id.clone(),
+        request.source_ip.clone(),
+        request.actor.clone(),
+        serde_json::json!({
+            "operation": requirement.operation,
+            "capability": requirement.capability.as_str(),
+            "outcome": "raised",
+            "previous_generation": raised.before.generation,
+            "fence_generation": raised.after.generation,
+            "previous_minimum_schema": raised.before.minimum_schema,
+            "minimum_schema": raised.after.minimum_schema,
+            "live_members": admission.live_members,
+        }),
     ));
 }
 
@@ -553,5 +842,29 @@ mod tests {
         assert_eq!(readiness.blocked_reason(), None);
         readiness.record_fingerprint_agreement();
         assert!(readiness.fingerprint_agreed());
+    }
+
+    /// The durable contract fence excluding this binary is final: it is
+    /// reported ahead of everything else the gate knows, it survives
+    /// fingerprint agreement, and only the first record of it says so.
+    #[test]
+    fn a_fenced_replica_is_unready_for_good() {
+        let readiness = ClusterReadiness::new();
+        assert!(!readiness.contract_fenced());
+        assert!(
+            readiness.record_contract_fenced(),
+            "the transition is reported once"
+        );
+        assert!(!readiness.record_contract_fenced());
+        assert_eq!(
+            readiness.blocked_reason(),
+            Some(ClusterReadiness::CONTRACT_FENCED)
+        );
+        readiness.record_fingerprint_agreement();
+        assert_eq!(
+            readiness.blocked_reason(),
+            Some(ClusterReadiness::CONTRACT_FENCED),
+            "agreement does not reopen a fenced replica"
+        );
     }
 }

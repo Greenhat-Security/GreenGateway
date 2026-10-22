@@ -227,7 +227,7 @@ Expected output: `{"status":"ready"}` with HTTP `200`. A `503` carries a reason;
 gateway cluster-members
 ```
 
-Expected output: `members=1 live=1` and one `ready` line. (PR 14's cluster status API and UI have not landed on this branch; `gateway cluster-members` is the status surface available today. When PR 14 lands, this step becomes a call to the status endpoint and this runbook should be updated to name it.)
+Expected output: `members=1 live=1`, a `fence generation=0` line (the durable contract fence, never raised on a fresh deployment), and one `ready` line. (PR 14's cluster status API and UI have not landed on this branch; `gateway cluster-members` is the status surface available today. When PR 14 lands, this step becomes a call to the status endpoint and this runbook should be updated to name it.)
 
 Then check the imported state through the product, not through SQL:
 
@@ -273,7 +273,7 @@ docker compose -f docs/deployment/docker-compose.ha.yml up -d gateway-2 lb
 gateway cluster-members
 ```
 
-Expected output: `members=2 live=2`, two `ready` lines, identical `fingerprint=` values. Different fingerprints mean the two replicas' static configuration differs and the newcomer will sit at `503 config_fingerprint_mismatch` — fix the configuration, do not work around the gate.
+Expected output: `members=2 live=2`, the `fence` line, two `ready` lines, identical `fingerprint=` values. Different fingerprints mean the two replicas' static configuration differs and the newcomer will sit at `503 config_fingerprint_mismatch` — fix the configuration, do not work around the gate.
 
 ### 8. Close out
 

@@ -7818,6 +7818,48 @@ fn cluster_readiness_app(
     }
 }
 
+/// The durable contract fence (issue #426, PR 3): once the membership
+/// heartbeat finds that the fence excludes this build, `/readyz` answers
+/// `contract_fenced` ahead of every other cluster reason and never ready
+/// again, because the fence only moves forward. Liveness and startup are
+/// untouched, as for every readiness reason.
+#[tokio::test]
+async fn readiness_is_refused_for_good_once_the_contract_fence_excludes_this_build() {
+    let lifecycle = GatewayLifecycle::new();
+    let readiness = ha::ClusterReadiness::new();
+    readiness.record_fingerprint_agreement();
+    let router = cluster_readiness_app(&lifecycle, readiness.clone(), None);
+    lifecycle.mark_ready();
+    assert_eq!(readyz_answer(&router).await.0, StatusCode::OK);
+
+    assert!(readiness.record_contract_fenced());
+    assert_eq!(
+        readyz_answer(&router).await,
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"status":"not_ready","reason":"contract_fenced"}"#.to_owned()
+        )
+    );
+    readiness.record_fingerprint_agreement();
+    assert_eq!(
+        readyz_answer(&router).await.0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    for path in ["/livez", "/startupz"] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("probe request should complete");
+        assert_eq!(response.status(), StatusCode::OK, "{path} is not gated");
+    }
+}
+
 async fn readyz_answer(router: &axum::Router) -> (StatusCode, String) {
     let response = router
         .clone()

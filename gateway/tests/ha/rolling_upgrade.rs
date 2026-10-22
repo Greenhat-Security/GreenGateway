@@ -119,9 +119,10 @@ use harness::{
 /// The `/readyz` reasons this suite waits for, checked against the same
 /// closed vocabulary `failure_matrix.rs` publishes. A reason outside it
 /// reaching a probe is a widened public contract.
-const REASON_VOCABULARY: [&str; 8] = [
+const REASON_VOCABULARY: [&str; 9] = [
     "draining",
     "starting",
+    "contract_fenced",
     "config_fingerprint_mismatch",
     "storage_unavailable",
     "schema_incompatible",
