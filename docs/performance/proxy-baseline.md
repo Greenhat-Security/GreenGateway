@@ -5,8 +5,9 @@ Results are meaningful only when the same revision, release build, machine
 class, container limits, network topology, and load command are recorded.
 
 The separate [pure-path microbenchmark gate](pure-path-benchmarks.md) compares
-allocation budgets for small request, path-pattern and static host predicates
-on each PR. Its wall-clock timings are informational, and it leaves the full
+allocation budgets for small request, path-pattern and static host predicates,
+and for the shared policy evaluator's HTTP, tool and rate-lane decisions, on
+each PR. Its wall-clock timings are informational, and it leaves the full
 proxy load and release qualification described here in place.
 
 ## Reproduce
