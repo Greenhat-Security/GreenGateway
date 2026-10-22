@@ -3005,6 +3005,15 @@ fn connection_http_error(error: ConnectionHttpError) -> OpenApiCatalogError {
         ConnectionHttpError::DelegatedTokenDenied
         | ConnectionHttpError::DelegatedTokenExchangeFailed
         | ConnectionHttpError::DelegatedTokenUnavailable => OpenApiCatalogError::SecretUnavailable,
+        // Unreachable: discovery refuses a domain-wide delegation before it
+        // resolves anything, as it has no caller to act as.
+        ConnectionHttpError::GoogleDelegation(error) if error.is_egress_denial() => {
+            OpenApiCatalogError::EgressDenied
+        }
+        ConnectionHttpError::GoogleDelegation(error) if error.is_caller_refusal() => {
+            OpenApiCatalogError::AuthenticationMismatch
+        }
+        ConnectionHttpError::GoogleDelegation(_) => OpenApiCatalogError::SecretUnavailable,
         ConnectionHttpError::UpstreamAuthenticationRejected => {
             OpenApiCatalogError::AuthenticationFailed
         }

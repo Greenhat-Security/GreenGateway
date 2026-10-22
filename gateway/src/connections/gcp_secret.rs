@@ -55,6 +55,7 @@ use zeroize::Zeroizing;
 use crate::egress::{EgressClient, EgressError};
 
 use super::{
+    google_delegation::{FederatedAccessToken, FederatedIdentityError, GoogleWorkloadIdentity},
     model::{MAX_CREDENTIALS, MAX_DISPLAY_NAME_CHARS, MAX_SECRET_ID_BYTES},
     secret::{
         configured_secret_generation_digest, is_valid_opaque_id, read_bounded_file_secret,
@@ -522,7 +523,7 @@ fn is_valid_gcp_audience(value: &str) -> bool {
 /// Accepts only dedicated service accounts (`{name}@{project}.iam.gserviceaccount.com`).
 /// Default service accounts on other domains are rejected by design: the
 /// impersonation target must be a dedicated, narrowly granted identity.
-fn is_valid_gcp_service_account(value: &str) -> bool {
+pub(crate) fn is_valid_gcp_service_account(value: &str) -> bool {
     if value.is_empty() || value.len() > MAX_GCP_SERVICE_ACCOUNT_BYTES || !value.is_ascii() {
         return false;
     }
@@ -562,6 +563,10 @@ pub(crate) trait GcpTransport: Send + Sync {
     /// Opaque generation of the egress configuration behind this transport.
     fn egress_generation(&self) -> [u8; 32];
 
+    /// Checks `url` against the egress policy, resolving and validating its destination, without
+    /// sending anything: for a flow that must know every hop is allowed before it starts.
+    async fn preflight(&self, url: &str) -> Result<(), EgressError>;
+
     async fn send(
         &self,
         method: Method,
@@ -591,6 +596,10 @@ impl fmt::Debug for EgressGcpTransport {
 impl GcpTransport for EgressGcpTransport {
     fn egress_generation(&self) -> [u8; 32] {
         self.client.configuration_generation()
+    }
+
+    async fn preflight(&self, url: &str) -> Result<(), EgressError> {
+        self.client.checked_destination(url).await.map(|_| ())
     }
 
     async fn send(
@@ -1216,6 +1225,40 @@ impl SecretResolver for GcpSecretManagerProvider {
     }
 }
 
+/// A profile's federated identity, for a `google_domain_wide_delegation` Connection to sign as
+/// its service account with: the same token, cache, single flight and refresh a secret read of
+/// that profile uses, under the same deadline. Nothing here reads a secret, so the read
+/// concurrency bound does not apply.
+#[async_trait]
+impl GoogleWorkloadIdentity for GcpSecretManagerProvider {
+    async fn access_token(
+        &self,
+        profile_id: &str,
+        minimum_generation: u64,
+    ) -> Result<FederatedAccessToken, FederatedIdentityError> {
+        let profile = self
+            .profiles
+            .get(profile_id)
+            .ok_or(FederatedIdentityError::UnknownProfile)?;
+        let outcome = match tokio::time::timeout(
+            self.deadline,
+            self.token(profile, minimum_generation),
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(_) => Err(GcpFailure::DeadlineExceeded),
+        };
+        match outcome {
+            Ok((token, generation)) => Ok(FederatedAccessToken { token, generation }),
+            Err(GcpFailure::EgressDenied) => Err(FederatedIdentityError::EgressDenied),
+            Err(failure) => Err(FederatedIdentityError::Failed {
+                reason: failure.safe_reason(),
+            }),
+        }
+    }
+}
+
 fn record_resolution(outcome: &Result<ResolvedSecret, GcpFailure>, elapsed: Duration) {
     let (result, reason) = match outcome {
         Ok(_) => ("success", "resolved"),
@@ -1834,6 +1877,10 @@ mod tests {
             let mut bytes = [0_u8; 32];
             bytes[..8].copy_from_slice(&generation.to_be_bytes());
             bytes
+        }
+
+        async fn preflight(&self, _url: &str) -> Result<(), EgressError> {
+            Ok(())
         }
 
         async fn send(
@@ -3330,5 +3377,71 @@ mod tests {
 
         assert_eq!(error.kind(), SecretResolveErrorKind::SourceDenied);
         assert!(fixture.gcp.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_profile_is_the_federated_identity_a_domain_wide_delegation_signs_with() {
+        let fixture = provider(Vec::new());
+        fixture.gcp.push_exchange(json_response(
+            200,
+            &exchange_body(FEDERATED_TOKEN_CANARY, 600),
+        ));
+        let first = fixture
+            .provider
+            .access_token("primary", 0)
+            .await
+            .expect("the profile's federated token");
+        assert_eq!(first.token.as_slice(), FEDERATED_TOKEN_CANARY.as_bytes());
+        // The profile's own cache serves it again, exactly as for a secret read.
+        let cached = fixture
+            .provider
+            .access_token("primary", 0)
+            .await
+            .expect("the cached token");
+        assert_eq!(cached.generation, first.generation);
+        assert_eq!(fixture.gcp.exchanges().len(), 1);
+
+        // A token Google refused is replaced by asking for a newer generation.
+        fixture
+            .gcp
+            .push_exchange(json_response(200, &exchange_body("ya29.replacement", 600)));
+        let fresh = fixture
+            .provider
+            .access_token("primary", first.generation.saturating_add(1))
+            .await
+            .expect("a fresh exchange");
+        assert_eq!(fresh.token.as_slice(), b"ya29.replacement");
+        assert!(fresh.generation > first.generation);
+        assert_eq!(fixture.gcp.exchanges().len(), 2);
+
+        assert_eq!(
+            fixture.provider.access_token("unconfigured", 0).await.err(),
+            Some(FederatedIdentityError::UnknownProfile)
+        );
+        assert!(
+            fixture.gcp.reads().is_empty(),
+            "no secret is read for an identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_federated_identity_fails_closed_with_a_fixed_reason() {
+        let denied = provider(Vec::new());
+        denied.gcp.push_exchange(json_response(403, "{}"));
+        assert_eq!(
+            denied.provider.access_token("primary", 0).await.err(),
+            Some(FederatedIdentityError::Failed {
+                reason: "identity_denied"
+            })
+        );
+
+        let blocked = provider(Vec::new());
+        blocked.gcp.push_exchange(egress_failure(|| {
+            EgressError::HostNotAllowed("sts.googleapis.com".to_owned())
+        }));
+        assert_eq!(
+            blocked.provider.access_token("primary", 0).await.err(),
+            Some(FederatedIdentityError::EgressDenied)
+        );
     }
 }

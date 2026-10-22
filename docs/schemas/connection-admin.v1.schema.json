@@ -235,6 +235,7 @@
         "static_bearer",
         "oauth2_client_credentials",
         "delegated_issuer_token",
+        "google_domain_wide_delegation",
         "legacy_configured"
       ]
     },
@@ -570,6 +571,65 @@
               "client_secret_configured"
             ]
           }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "The calling user's own Google Workspace token, obtained per caller by domain-wide delegation and injected as Authorization: Bearer, instead of one service credential shared by every caller. On a cache miss the gateway builds a JWT claim set (iss the service account, sub the caller's email, scope the space-separated scopes, aud https://oauth2.googleapis.com/token, iat, and exp 300 seconds later), has Google sign it as the service account through the IAM Credentials signJwt method, authenticated as the federated identity of workload_identity_profile, so no service-account key is held by the gateway, checks the signed claims are exactly those sent, and exchanges it at https://oauth2.googleapis.com/token with grant_type urn:ietf:params:oauth:grant-type:jwt-bearer. Both endpoints are fixed and must be egress-allowlisted; each is checked before the federated identity is read. The token is cached per caller until shortly before Google's expires_in and for at most 900 seconds, and every mint is audited as connection.google_delegation_token with the caller as actor and no token material. Requires kind http_api and no caller_assertion. Only manual HTTP tool calls, and a stored Connection test run as the principal who asks for it with a token minted for that request alone, are served; every other lane is refused with authentication_not_supported. A call with no principal, a service token included, is refused with delegated_token_no_principal; a caller attested by an issuer outside subject_issuers with google_delegation_issuer_not_trusted; one without an email with google_delegation_no_email; all before any request. A delegated service account can act as every user of the domain for its scopes: use a dedicated account and read-only scopes.",
+          "required": [
+            "type",
+            "service_account_email",
+            "workload_identity_profile",
+            "scopes",
+            "subject_claim",
+            "subject_issuers"
+          ],
+          "properties": {
+            "type": {
+              "const": "google_domain_wide_delegation"
+            },
+            "service_account_email": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[a-z][a-z0-9-]{2,30}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\\.iam\\.gserviceaccount\\.com$",
+              "description": "The delegated service account, a dedicated name@project.iam.gserviceaccount.com account a Workspace super-admin authorised for scopes. The federated identity must hold roles/iam.serviceAccountTokenCreator on it."
+            },
+            "workload_identity_profile": {
+              "$ref": "#/$defs/StableId",
+              "description": "The id of a CONNECTION_GCP_PROVIDER profile: the workload identity that signs as the service account. A reference to trusted startup configuration, never a token file, audience or key. Saving an enabled Connection requires the profile to be configured."
+            },
+            "scopes": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 16,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^\\S+$"
+              },
+              "description": "Sent as the space-separated scope claim, sorted. Must be within what the Workspace administrator authorised for the service account; prefer read-only scopes."
+            },
+            "subject_claim": {
+              "const": "email",
+              "description": "Which attested claim becomes sub. email, the only value, is the validated principal's email."
+            },
+            "subject_issuers": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 8,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512,
+                "pattern": "^\\S+$"
+              },
+              "description": "The identity providers trusted to name Workspace users by email, compared with the principal's canonical issuer (a trailing slash is ignored). Any configured provider can put any address in its tokens, so list only the one authoritative for the domain."
+            }
+          }
         }
       ]
     },
@@ -744,6 +804,37 @@
         {
           "if": {
             "required": [
+              "authentication"
+            ],
+            "properties": {
+              "authentication": {
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "const": "google_domain_wide_delegation"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "not": {
+              "required": [
+                "caller_assertion"
+              ]
+            },
+            "properties": {
+              "kind": {
+                "const": "http_api"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
               "caller_assertion"
             ],
             "properties": {
@@ -903,6 +994,35 @@
                     "const": false
                   }
                 }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "authentication"
+            ],
+            "properties": {
+              "authentication": {
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "const": "google_domain_wide_delegation"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "kind": {
+                "const": "http_api"
+              },
+              "caller_assertion": {
+                "type": "null"
               }
             }
           }
@@ -1125,6 +1245,44 @@
             },
             "client_secret_configured": {
               "type": "boolean"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "service_account_email",
+            "workload_identity_profile",
+            "scopes",
+            "subject_claim",
+            "subject_issuers"
+          ],
+          "properties": {
+            "type": {
+              "const": "google_domain_wide_delegation"
+            },
+            "service_account_email": {
+              "type": "string"
+            },
+            "workload_identity_profile": {
+              "type": "string"
+            },
+            "scopes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "subject_claim": {
+              "const": "email"
+            },
+            "subject_issuers": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
             }
           }
         }
@@ -5545,6 +5703,65 @@
             },
             "subject_token_source": {
               "const": "caller_assertion"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "The calling user's own Google Workspace token, obtained per caller by domain-wide delegation and injected as Authorization: Bearer, instead of one service credential shared by every caller. On a cache miss the gateway builds a JWT claim set (iss the service account, sub the caller's email, scope the space-separated scopes, aud https://oauth2.googleapis.com/token, iat, and exp 300 seconds later), has Google sign it as the service account through the IAM Credentials signJwt method, authenticated as the federated identity of workload_identity_profile, so no service-account key is held by the gateway, checks the signed claims are exactly those sent, and exchanges it at https://oauth2.googleapis.com/token with grant_type urn:ietf:params:oauth:grant-type:jwt-bearer. Both endpoints are fixed and must be egress-allowlisted; each is checked before the federated identity is read. The token is cached per caller until shortly before Google's expires_in and for at most 900 seconds, and every mint is audited as connection.google_delegation_token with the caller as actor and no token material. Requires kind http_api and no caller_assertion. Only manual HTTP tool calls, and a stored Connection test run as the principal who asks for it with a token minted for that request alone, are served; every other lane is refused with authentication_not_supported. A call with no principal, a service token included, is refused with delegated_token_no_principal; a caller attested by an issuer outside subject_issuers with google_delegation_issuer_not_trusted; one without an email with google_delegation_no_email; all before any request. A delegated service account can act as every user of the domain for its scopes: use a dedicated account and read-only scopes.",
+          "required": [
+            "type",
+            "service_account_email",
+            "workload_identity_profile",
+            "scopes",
+            "subject_claim",
+            "subject_issuers"
+          ],
+          "properties": {
+            "type": {
+              "const": "google_domain_wide_delegation"
+            },
+            "service_account_email": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[a-z][a-z0-9-]{2,30}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\\.iam\\.gserviceaccount\\.com$",
+              "description": "The delegated service account, a dedicated name@project.iam.gserviceaccount.com account a Workspace super-admin authorised for scopes. The federated identity must hold roles/iam.serviceAccountTokenCreator on it."
+            },
+            "workload_identity_profile": {
+              "$ref": "#/$defs/StableId",
+              "description": "The id of a CONNECTION_GCP_PROVIDER profile: the workload identity that signs as the service account. A reference to trusted startup configuration, never a token file, audience or key. Saving an enabled Connection requires the profile to be configured."
+            },
+            "scopes": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 16,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^\\S+$"
+              },
+              "description": "Sent as the space-separated scope claim, sorted. Must be within what the Workspace administrator authorised for the service account; prefer read-only scopes."
+            },
+            "subject_claim": {
+              "const": "email",
+              "description": "Which attested claim becomes sub. email, the only value, is the validated principal's email."
+            },
+            "subject_issuers": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 8,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512,
+                "pattern": "^\\S+$"
+              },
+              "description": "The identity providers trusted to name Workspace users by email, compared with the principal's canonical issuer (a trailing slash is ignored). Any configured provider can put any address in its tokens, so list only the one authoritative for the domain."
             }
           }
         }

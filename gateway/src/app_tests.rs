@@ -1738,6 +1738,10 @@ fn admin_routes_keep_default_api_prefix_and_remap_custom_api_under_v1() {
         default_routes.policy_validate_route,
         POLICY_VALIDATE_ADMIN_ROUTE
     );
+    assert_eq!(
+        default_routes.policy_convert_route,
+        POLICY_CONVERT_ADMIN_ROUTE
+    );
     assert_eq!(default_routes.policy_rules_route, POLICY_RULES_ADMIN_ROUTE);
     assert_eq!(default_routes.policy_rule_route, POLICY_RULE_ADMIN_ROUTE);
     assert_eq!(
@@ -1853,6 +1857,7 @@ fn admin_routes_keep_default_api_prefix_and_remap_custom_api_under_v1() {
         custom_routes.policy_validate_route,
         "/v1/ops/policy/validate"
     );
+    assert_eq!(custom_routes.policy_convert_route, "/v1/ops/policy/convert");
     assert_eq!(custom_routes.policy_rules_route, "/v1/ops/policy/rules");
     assert_eq!(custom_routes.policy_rule_route, "/v1/ops/policy/rules/{id}");
     assert_eq!(
@@ -19891,6 +19896,201 @@ async fn policy_validate_reports_v1_diagnostics_and_both_digests() {
     assert_eq!(body["errors"].as_array().map(Vec::len), Some(3));
     assert!(body.get("source_digest").is_none(), "{body}");
     assert!(body.get("semantic_digest").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn policy_convert_returns_the_v1_document_without_changing_the_live_policy() {
+    let policy = TempPolicyFile::new(&policy_document_string("initial-policy", "test:old"));
+    let capture = audit::sink::tests::CaptureSink::new();
+    let router = policy_admin_router(
+        Some(&policy),
+        audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>),
+    );
+    let before_contents = fs::read_to_string(&policy.path).expect("policy file should read");
+    let get_response = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::GET,
+            POLICY_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            None,
+            None,
+        ))
+        .await
+        .expect("policy GET should complete");
+    let etag = policy_etag_header(&get_response);
+    let candidate = policy_document_string("converted", "test:new");
+
+    let response = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::POST,
+            POLICY_CONVERT_ADMIN_ROUTE,
+            Some(test_principal(&["policy-reader"])),
+            Some(candidate.clone()),
+            None,
+        ))
+        .await
+        .expect("policy convert should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["converted"], json!(true));
+    assert_eq!(body["source_schema_version"], json!("0.1.0"));
+    assert_eq!(body["schema_version"], json!("1.0.0"));
+    assert_eq!(body["parity"], json!("verified"));
+    assert_eq!(body["diagnostics"], json!([]));
+    assert!(body.get("errors").is_none(), "{body}");
+    assert_eq!(
+        body["source_digest"],
+        json!(canonical_json::source_digest(
+            "application/json",
+            "0.1.0",
+            candidate.as_bytes()
+        ))
+    );
+    // The test policy has routes and no rules or rate overrides: every route
+    // gets `route-N`, and each assignment is listed after the version.
+    let converted = body["policy"].clone();
+    assert_eq!(converted["schema_version"], json!("1.0.0"));
+    assert_eq!(converted["id"], json!("converted"));
+    let routes = converted["routes"].as_array().expect("routes");
+    let changes = body["changes"].as_array().expect("changes");
+    assert_eq!(changes.len(), routes.len() + 1);
+    assert_eq!(changes[0]["code"], json!("schema_version_set"));
+    for (index, route) in routes.iter().enumerate() {
+        assert_eq!(route["id"], json!(format!("route-{index}")));
+        assert_eq!(
+            changes[index + 1],
+            json!({
+                "code": "element_id_assigned",
+                "pointer": format!("/routes/{index}/id"),
+                "element_id": format!("route-{index}"),
+                "message": rbac::policy_conversion::ChangeCode::ElementIdAssigned.message(),
+            })
+        );
+    }
+
+    // Converting changed nothing: same file, same ETag, no policy.changed.
+    assert_eq!(
+        fs::read_to_string(&policy.path).expect("policy file should read"),
+        before_contents
+    );
+    assert!(!capture
+        .events()
+        .iter()
+        .any(|event| event.event_type == audit::event::POLICY_CHANGED));
+
+    // The converted document validates, with the semantic digest the
+    // conversion reported, and can replace the live policy.
+    let validated = json_body(
+        router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::POST,
+                POLICY_VALIDATE_ADMIN_ROUTE,
+                Some(test_principal(&["policy-reader"])),
+                Some(serde_json::to_string_pretty(&converted).expect("serialize")),
+                None,
+            ))
+            .await
+            .expect("validate should complete"),
+    )
+    .await;
+    assert_eq!(validated["valid"], json!(true), "{validated}");
+    assert_eq!(validated["semantic_digest"], body["semantic_digest"]);
+    let put = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::PUT,
+            POLICY_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            Some(converted.to_string()),
+            Some(&etag),
+        ))
+        .await
+        .expect("PUT should complete");
+    assert_eq!(put.status(), StatusCode::OK);
+    let live = json_body(
+        router
+            .oneshot(policy_admin_request(
+                Method::GET,
+                POLICY_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("policy GET should complete"),
+    )
+    .await;
+    assert_eq!(live["schema_version"], json!("1.0.0"));
+    assert_eq!(live["routes"], converted["routes"]);
+}
+
+#[tokio::test]
+async fn policy_convert_refuses_without_permission_or_a_convertible_document() {
+    let policy = TempPolicyFile::new(&policy_document_string("initial-policy", "test:old"));
+    let router = policy_admin_router(Some(&policy), test_audit_log());
+    let convert = |principal: Option<auth::Principal>, body: String| {
+        router.clone().oneshot(policy_admin_request(
+            Method::POST,
+            POLICY_CONVERT_ADMIN_ROUTE,
+            principal,
+            Some(body),
+            None,
+        ))
+    };
+    let candidate = policy_document_string("converted", "test:new");
+
+    let unauthenticated = convert(None, candidate.clone())
+        .await
+        .expect("convert should complete");
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    let forbidden = convert(Some(test_principal(&["reader"])), candidate)
+        .await
+        .expect("convert should complete");
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+    // A v1 document is not converted again.
+    let response = convert(
+        Some(test_principal(&["policy-reader"])),
+        v1_policy_document("already-v1", "test:new").to_string(),
+    )
+    .await
+    .expect("convert should complete");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert_eq!(body["converted"], json!(false));
+    assert_eq!(body["source_schema_version"], json!("1.0.0"));
+    assert_eq!(
+        body["diagnostics"][0]["code"],
+        json!("conversion_requires_v0")
+    );
+    assert_eq!(body["diagnostics"][0]["pointer"], json!("/schema_version"));
+    assert_eq!(body["errors"].as_array().map(Vec::len), Some(1));
+    assert!(body.get("policy").is_none(), "{body}");
+
+    // An invalid 0.x document is refused in validation's own words.
+    let mut invalid = policy_document("relative-route", "test:new");
+    invalid["routes"][5]["path_prefix"] = json!("__test");
+    let body = json_body(
+        convert(
+            Some(test_principal(&["policy-reader"])),
+            invalid.to_string(),
+        )
+        .await
+        .expect("convert should complete"),
+    )
+    .await;
+    assert_eq!(body["converted"], json!(false));
+    assert_eq!(body["diagnostics"][0]["code"], json!("path_not_absolute"));
+    assert!(
+        body["errors"][0]
+            .as_str()
+            .unwrap_or_default()
+            .contains("routes[5].path_prefix must start with '/'"),
+        "{body}"
+    );
 }
 
 #[tokio::test]

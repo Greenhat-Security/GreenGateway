@@ -1185,6 +1185,144 @@ mod tests {
         );
     }
 
+    /// The published support matrix (`docs/deployment/upgrade-support-matrix.json`,
+    /// issue #426 PR 4) describes this binary: its read/write contracts, its
+    /// manifest, its document format, what it advertises and every operation
+    /// it gates, plus one coordinated step per schema point the deployment
+    /// guide documents, ending at this binary's. A migration, a capability or
+    /// a gated operation that leaves the published matrix behind fails here,
+    /// in the pull request that adds it. The pinned qualified pair is checked
+    /// against its evidence by `scripts/upgrade_pair_evidence.py`.
+    #[test]
+    fn the_published_upgrade_matrix_describes_this_binary() {
+        use crate::storage::compatibility::{
+            Activation, Backfill, BINARY_CAPABILITIES, OPERATION_REQUIREMENTS,
+        };
+        use serde_json::{json, Value};
+
+        let matrix: Value = serde_json::from_str(include_str!(
+            "../../../docs/deployment/upgrade-support-matrix.json"
+        ))
+        .expect("the published support matrix is JSON");
+        let guide = include_str!("../../../docs/deployment/postgres.md").replace("\r\n", "\n");
+        let published = &matrix["this_build"];
+        let contract = &BINARY_SCHEMA_COMPATIBILITY;
+        let stale = "docs/deployment/upgrade-support-matrix.json no longer describes this binary; \
+                     update this_build and the deployment guide's upgrade matrix together";
+
+        assert_eq!(matrix["schema"], 1);
+        assert_eq!(
+            published["manifest_versions"],
+            json!(MANIFEST.len()),
+            "{stale}"
+        );
+        assert_eq!(
+            published["read"],
+            json!([contract.read.0, contract.read.1]),
+            "{stale}"
+        );
+        assert_eq!(
+            published["write"],
+            json!([contract.write.0, contract.write.1]),
+            "{stale}"
+        );
+        let extensions: Vec<Value> = contract
+            .approved_extensions
+            .iter()
+            .map(
+                |extension| json!({ "version": extension.version, "checksum": extension.checksum }),
+            )
+            .collect();
+        assert_eq!(
+            published["approved_extensions"],
+            Value::Array(extensions),
+            "{stale}"
+        );
+        let document = crate::cluster_membership::DOCUMENT_VERSION_RANGE;
+        assert_eq!(
+            published["document_format"],
+            json!([document.0, document.1]),
+            "{stale}"
+        );
+        let capabilities: Vec<&str> = BINARY_CAPABILITIES
+            .iter()
+            .map(|capability| capability.as_str())
+            .collect();
+        assert_eq!(published["capabilities"], json!(capabilities), "{stale}");
+        let operations: Vec<Value> = OPERATION_REQUIREMENTS
+            .iter()
+            .map(|requirement| {
+                json!({
+                    "operation": requirement.operation,
+                    "capability": requirement.capability.as_str(),
+                    "minimum_schema": requirement.minimum_schema,
+                    "document_format": requirement.document_format,
+                    "backfill": match requirement.backfill {
+                        Backfill::NotRequired => Value::Null,
+                        Backfill::Required { name } => json!(name),
+                    },
+                    "activation": match requirement.activation {
+                        Activation::LiveMembers => "live_members",
+                        Activation::DurableFence => "durable_fence",
+                    },
+                })
+            })
+            .collect();
+        assert_eq!(published["operations"], Value::Array(operations), "{stale}");
+
+        // Until an extension is approved, every schema step is a coordinated
+        // drain, migrate, restart, and the guide must say how to perform it.
+        // An approved extension is the first step that could roll, and it
+        // changes what this test has to check.
+        assert!(
+            contract.approved_extensions.is_empty(),
+            "publish the first approved extension's expand step and its qualified pair in the \
+             matrix's schema_steps, then teach this test what that step must say"
+        );
+        let steps = matrix["schema_steps"]
+            .as_array()
+            .expect("the matrix lists its schema steps");
+        let mut expected_from = steps
+            .first()
+            .and_then(|step| step["from"].as_i64())
+            .expect("the matrix lists at least one schema step");
+        for step in steps {
+            let (from, to) = (step["from"].as_i64(), step["to"].as_i64());
+            assert_eq!(
+                (from, to),
+                (Some(expected_from), Some(expected_from + 1)),
+                "schema steps are contiguous, one migration each: {step}"
+            );
+            let version = expected_from + 1;
+            let migration = MANIFEST
+                .iter()
+                .find(|migration| migration.version == version)
+                .unwrap_or_else(|| {
+                    panic!("the matrix names schema {version}, which is not in the manifest")
+                });
+            assert_eq!(step["migration"], json!(migration.name), "{step}");
+            assert_eq!(step["procedure"], "coordinated", "{step}");
+            let heading =
+                format!("\n### Coordinated upgrade: schema {expected_from} to {version}\n");
+            assert!(
+                guide.contains(&heading),
+                "docs/deployment/postgres.md must document the coordinated upgrade the matrix \
+                 publishes: {heading:?}"
+            );
+            expected_from = version;
+        }
+        assert_eq!(
+            i64::try_from(MANIFEST.len()).ok(),
+            Some(expected_from),
+            "the matrix's last schema step must reach this binary's schema; add a coordinated \
+             step for every new migration, with its section in the deployment guide"
+        );
+        assert!(
+            guide.contains("\n## Upgrading a cluster\n"),
+            "the deployment guide carries the procedure the matrix names"
+        );
+    }
+
     fn prepared_fixture() -> SchemaCompatibility {
         let checksum: &'static str =
             Box::leak(hex_checksum("-- approved additive fixture").into_boxed_str());
