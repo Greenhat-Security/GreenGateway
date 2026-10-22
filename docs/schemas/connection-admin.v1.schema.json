@@ -4190,7 +4190,7 @@
     "OpenApiConversionReport": {
       "type": "object",
       "additionalProperties": false,
-      "description": "How a document that was not OpenAPI 3.x was converted to OpenAPI 3.0 before generation (issue #443).",
+      "description": "How a document that was not OpenAPI 3.x (a Swagger 2.0 or Google Discovery document) was converted to OpenAPI 3.0 before generation (issue #443).",
       "required": [
         "source_format",
         "warnings"
@@ -4198,7 +4198,8 @@
       "properties": {
         "source_format": {
           "enum": [
-            "swagger_2_0"
+            "swagger_2_0",
+            "google_discovery_v1"
           ]
         },
         "warnings": {
@@ -4236,6 +4237,15 @@
             "file_parameter_outside_form",
             "multiple_body_parameters",
             "body_and_form_parameters",
+            "global_parameter_not_mapped",
+            "unsupported_schema_keyword",
+            "media_upload_not_mapped",
+            "invalid_method_definition",
+            "unsupported_http_method",
+            "unsupported_path_expansion",
+            "repeated_path_parameter",
+            "duplicate_operation",
+            "recursive_request_schema",
             "warnings_truncated"
           ]
         },
@@ -4258,7 +4268,7 @@
         "subject": {
           "type": "string",
           "maxLength": 256,
-          "description": "The field, parameter, location, security definition or base path the warning names, cut to 256 bytes."
+          "description": "The field, parameter, location, security definition, schema keyword, schema, Discovery method ID or base path the warning names, cut to 256 bytes."
         }
       }
     },

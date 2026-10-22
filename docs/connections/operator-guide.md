@@ -1954,6 +1954,111 @@ before rolling back to an earlier release, re-register those Connections with
 an OpenAPI 3.x document (or delete their overlays first, so the earlier
 release can still start).
 
+## Importing Google Discovery Documents
+
+Managed OpenAPI Connections also accept Google Discovery documents (the REST
+descriptions Google publishes at URLs such as
+`https://gmail.googleapis.com/$discovery/rest?version=v1`) in preview,
+registration and refresh. A document is read as a Discovery document when it
+has neither an `openapi` nor a `swagger` field and has a `discoveryVersion`
+or a `kind` starting with `discovery#`. Its `discoveryVersion` must then be
+`v1`, its `kind`, when present, `discovery#restDescription`, and its
+`protocol`, when present, `rest`; anything else is refused. The legacy
+tools-file import remains OpenAPI 3.x only.
+
+As for Swagger 2.0, GreenGateway converts the document to the OpenAPI 3.0
+document it describes and generates tools from that; the stored
+specification, its digest and the 2 MiB limit apply to the document you
+submitted, and refresh and overlay edits convert it again.
+
+| Discovery | Converted to |
+| --- | --- |
+| every method in `methods`, `resources.*.methods` and nested `resources` | one operation at `/` plus the method `path`, with the method `id` (for example `gmail.users.messages.list`) as its `operationId`, so the generated tool has that name |
+| `path` and `query` parameters | parameters with a `schema`; `minimum`, `maximum` and `default`, which Discovery writes as strings, become numbers and booleans; `type: any` becomes a schema without a type; a `repeated` query parameter becomes an array with `style: form` and `explode: true` |
+| `schemas` | `components.schemas`; every `$ref` (a schema name in Discovery) is rewritten to `#/components/schemas/{name}`, and a property's `required: true` moves into its parent's `required` list |
+| `request` | a required `application/json` request body |
+| `response` | the `200` response's `application/json` content (a method without one gets a `200` without content) |
+| method `scopes` | requirements on one `oauth2` scheme named `Oauth2`, one alternative per scope, because any one listed scope grants the method; the scheme's descriptions come from `auth.oauth2.scopes` |
+| `rootUrl`, `servicePath` | `servers`, which generated tools do not use |
+
+Discovery documents name scopes but no OAuth 2.0 endpoints. The converted
+scheme is an `authorizationCode` flow with Google's published authorization
+and token endpoints, so that it is a complete OpenAPI 3.0 scheme; nothing on
+this path contacts them. Binding does not change: a user-consent flow is
+reported as incompatible (`OAuth2WithoutClientCredentials`), exactly as for
+an OpenAPI 3.x document, so a scoped method does not bind to a
+client-credentials Connection. A method without `scopes` declares no
+security and binds to a Connection without authentication.
+
+The document-level `parameters` of a Discovery document are Google's system
+parameters (`key`, `access_token`, `oauth_token`, `alt`, `fields`,
+`prettyPrint`, `quotaUser`, `uploadType`, `$.xgafv` and others). They are
+never tool arguments, so no caller can supply a key or token through a tool
+and no tool changes the response format; each is named in a
+`global_parameter_not_mapped` warning. Documentation-only fields
+(`enumDescriptions`, `annotations`, icons, links and similar) are not carried
+over.
+
+The preview's `conversion` object has `source_format` `google_discovery_v1`
+and the same warning shape as for Swagger 2.0. Discovery documents add these
+codes:
+
+- `base_path_not_in_paths`: the document has a `servicePath` (for example
+  `drive/v3/`). Generated paths do not include it; put it in the
+  Connection's `base_path` (`/drive/v3`). Gmail's `servicePath` is empty and
+  its method paths start with `gmail/v1/`.
+- `global_parameter_not_mapped`, described above.
+- `unsupported_schema_keyword`: a schema keyword with no OpenAPI 3.0 form,
+  such as `variant`, was dropped, so the gateway does not check it. Reported
+  once per keyword.
+- `media_upload_not_mapped`: the method also accepts a media upload at a
+  separate `/upload/` path. The tool sends only the JSON request.
+- `unsupported_document_field`: an unknown top-level field was ignored.
+
+These codes leave the method out, so no tool is generated for it, and set
+`operation_omitted`: `unsupported_path_expansion` (a `{+name}` or other URI
+template expansion, common in Google Cloud APIs, which OpenAPI 3.0 cannot
+express), `repeated_path_parameter`, `recursive_request_schema` (the request
+schema refers to itself, as Gmail's `Message` does through `MessagePart`, so
+`users.messages.send`, `insert`, `import` and the draft methods are left out;
+the generator cannot expand such a schema), `duplicate_operation` (an
+earlier method has the same HTTP method and path), `unsupported_http_method`,
+`invalid_method_definition` (no usable `path` or `httpMethod`, `scopes` that
+are not a list, or a path starting with `/` while the document has a
+`servicePath`), `unsupported_operation_field` (a method field that is not
+part of the Discovery format), `invalid_parameter` (including a path
+parameter the path does not use), `unsupported_parameter_location` and
+`unsupported_parameter_field`. A method that uses only these constructs in
+its response is kept: responses are not expanded at generation.
+
+The whole document is refused when its version, kind or protocol is not the
+one above, a structural field has the wrong type, a `$ref` names no schema of
+the document (a remote reference included), a `minimum` or `maximum` is not
+a number, the document has more than 4,096 methods, or resources or schemas
+nest deeper than 256 levels.
+
+To keep a Connection to read operations, select only the tools whose
+`upstream.method` is `GET` in the preview: for Gmail, for example,
+`gmail.users.messages.list`, `gmail.users.messages.get`,
+`gmail.users.threads.list` and `gmail.users.threads.get`. A tool with a
+request body, such as `gmail.users.threads.modify`, sends its whole argument
+object as the body, path and query arguments included, as every generated
+tool does until an [overlay](#openapi-overlays) names it; naming it in an
+overlay switches it to `body_args_json`, which sends only the body fields.
+
+Upgrade, rollback and cluster mode work as for Swagger 2.0, with their own
+gated operation: releases before this one cannot generate tools from a
+Discovery document, and a release with Swagger 2.0 import but without
+Discovery import cannot either. In cluster mode, storing a catalog converted
+from a Discovery document (registering one, refreshing to one, or putting an
+overlay over one) is `connections.openapi_discovery_catalog`, admitted only
+while every live replica, draining ones included, advertises
+`openapi_discovery_catalogs`; otherwise it is refused with `409` and reason
+`capability_not_advertised` (or `503` without a roster), nothing is stored,
+and the refusal is audited as `cluster.operation_refused`. Before rolling
+back, re-register those Connections with an OpenAPI 3.x document, or delete
+their overlays first.
+
 ## OpenAPI Overlays
 
 An OpenAPI overlay is one versioned document stored beside a managed
