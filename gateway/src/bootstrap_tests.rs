@@ -7,8 +7,8 @@
 //! every variable the compiler asks the environment for. That shows the
 //! compiler runs first and alone, that every stage receives its one result,
 //! that a refused configuration reaches no stage at all, and that a stage
-//! that fails stops the ones after it -- with an activation failure
-//! withdrawing what preflight published.
+//! that fails stops the ones after it -- with a preflight or activation
+//! failure withdrawing what preflight had published.
 
 use std::{cell::RefCell, env::VarError, rc::Rc};
 
@@ -25,9 +25,13 @@ enum Call {
     Serve,
 }
 
+/// Where the double fails.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Stage {
+    /// Preflight, before it publishes anything.
     Preflight,
+    /// Preflight, after it published this boot's membership row.
+    PreflightAfterPublishing,
     Activation,
     Serving,
 }
@@ -58,17 +62,19 @@ impl StartupStages for RecordingStages {
     async fn preflight(
         &mut self,
         config: &config::Config,
-    ) -> Result<Preflighted<u64, &'static str>, Box<dyn std::error::Error>> {
+        published: &mut Option<&'static str>,
+    ) -> Result<u64, Box<dyn std::error::Error>> {
         self.calls.borrow_mut().push(Call::Preflight);
         (self.at_preflight)();
         self.preflighted = Some(config.clone());
         if self.fail_at == Some(Stage::Preflight) {
             return Err("the database did not answer".into());
         }
-        Ok(Preflighted {
-            seeds: SEEDS,
-            published: PUBLISHED,
-        })
+        *published = Some(PUBLISHED);
+        if self.fail_at == Some(Stage::PreflightAfterPublishing) {
+            return Err("the authority event journal could not be configured".into());
+        }
+        Ok(SEEDS)
     }
 
     async fn activate(
@@ -239,6 +245,27 @@ fn a_preflight_failure_activates_nothing() {
     assert_eq!(stage_error(result), "the database did not answer");
     assert_eq!(stage_calls(&stages), [Call::Preflight]);
     assert_eq!(stages.activated, None);
+    assert_eq!(stages.withdrawn, None, "nothing was published to withdraw");
+}
+
+#[test]
+fn a_preflight_failure_after_publishing_withdraws_what_it_published() {
+    // Cluster preflight writes this boot's membership row and then still
+    // has the authority-event journal to configure; a boot refused there
+    // never serves, so its row must not be left looking like one that
+    // might.
+    let (result, stages) = start(
+        STANDALONE,
+        Some(Stage::PreflightAfterPublishing),
+        nothing_to_check(),
+    );
+    assert_eq!(
+        stage_error(result),
+        "the authority event journal could not be configured"
+    );
+    assert_eq!(stage_calls(&stages), [Call::Preflight, Call::Withdraw]);
+    assert_eq!(stages.activated, None);
+    assert_eq!(stages.withdrawn, Some(PUBLISHED));
 }
 
 #[test]

@@ -590,14 +590,6 @@ pub(super) enum StartupFailure {
     Stage(Box<dyn std::error::Error>),
 }
 
-/// What preflight hands on: the seeds activation builds the gateway from,
-/// and what preflight published outside this process, which is withdrawn
-/// if activation fails.
-pub(super) struct Preflighted<Seeds, Published> {
-    pub(super) seeds: Seeds,
-    pub(super) published: Published,
-}
-
 /// The stages of serving startup that do I/O (issue #433, PR 3), run in
 /// order by [`start_serving`] once the configuration compiler has accepted
 /// the environment. Each receives the compiled configuration; none reads
@@ -623,10 +615,15 @@ pub(super) trait StartupStages {
     type Published;
     type Activated;
 
+    /// Returns the seeds activation builds from. What preflight publishes
+    /// outside this process goes into `published` before the step that
+    /// publishes it, so it is withdrawn whichever later step fails,
+    /// preflight's own included.
     async fn preflight(
         &mut self,
         config: &config::Config,
-    ) -> Result<Preflighted<Self::Seeds, Self::Published>, Box<dyn std::error::Error>>;
+        published: &mut Option<Self::Published>,
+    ) -> Result<Self::Seeds, Box<dyn std::error::Error>>;
 
     async fn activate(
         &mut self,
@@ -634,7 +631,8 @@ pub(super) trait StartupStages {
         seeds: Self::Seeds,
     ) -> Result<Self::Activated, Box<dyn std::error::Error>>;
 
-    /// Withdraw what preflight published, after activation failed.
+    /// Withdraw what preflight published, after preflight or activation
+    /// failed.
     async fn withdraw(&mut self, published: Self::Published);
 
     async fn serve(&mut self, activated: Self::Activated)
@@ -653,9 +651,9 @@ pub(super) trait StartupStages {
 /// startup that fails still fails with the same error.
 ///
 /// Serving starts only with a gateway activation built in full. When
-/// activation fails, what preflight published is withdrawn before the error
-/// is returned, so a gateway that will not serve leaves nothing behind that
-/// says it might.
+/// preflight or activation fails, what preflight published is withdrawn
+/// before the error is returned, so a gateway that will not serve leaves
+/// nothing behind that says it might.
 pub(super) async fn start_serving<S: StartupStages>(
     stages: &mut S,
     get_var: impl FnMut(&str) -> Result<String, std::env::VarError>,
@@ -665,13 +663,22 @@ pub(super) async fn start_serving<S: StartupStages>(
     // Each stage's future is boxed: an unoptimized build would otherwise
     // hold all of them inline, and the main thread's stack on Windows is
     // 1 MiB.
-    let Preflighted { seeds, published } = Box::pin(stages.preflight(&config))
-        .await
-        .map_err(StartupFailure::Stage)?;
+    let mut published = None;
+    let seeds = match Box::pin(stages.preflight(&config, &mut published)).await {
+        Ok(seeds) => seeds,
+        Err(error) => {
+            if let Some(published) = published {
+                Box::pin(stages.withdraw(published)).await;
+            }
+            return Err(StartupFailure::Stage(error));
+        }
+    };
     let activated = match Box::pin(stages.activate(config, seeds)).await {
         Ok(activated) => activated,
         Err(error) => {
-            Box::pin(stages.withdraw(published)).await;
+            if let Some(published) = published {
+                Box::pin(stages.withdraw(published)).await;
+            }
             return Err(StartupFailure::Stage(error));
         }
     };
@@ -694,12 +701,13 @@ pub(super) struct ProcessSeeds {
     cluster: ClusterBootSeeds,
 }
 
-/// What preflight published outside the process: in cluster mode, this
-/// boot's membership row. Standalone mode publishes nothing.
-pub(super) struct ProcessPublication {
-    #[cfg(feature = "postgres")]
-    membership: Option<Arc<cluster_membership::ClusterMembership>>,
-}
+/// What preflight publishes outside the process: in cluster mode, this
+/// boot's membership row. Standalone mode publishes nothing, and a build
+/// without the PostgreSQL client has nothing it could publish.
+#[cfg(feature = "postgres")]
+pub(super) type ProcessPublication = Arc<cluster_membership::ClusterMembership>;
+#[cfg(not(feature = "postgres"))]
+pub(super) type ProcessPublication = std::convert::Infallible;
 
 /// Cluster mode's boot seeds, read from the authority by preflight. Every
 /// one is `None` in standalone mode.
@@ -739,7 +747,8 @@ impl StartupStages for ProcessStartup {
     async fn preflight(
         &mut self,
         config: &config::Config,
-    ) -> Result<Preflighted<ProcessSeeds, ProcessPublication>, Box<dyn std::error::Error>> {
+        published: &mut Option<ProcessPublication>,
+    ) -> Result<ProcessSeeds, Box<dyn std::error::Error>> {
         // Cluster mode's startup prerequisites, before anything binds: this
         // build must carry the PostgreSQL client at all, and a selected
         // STATE_BACKEND=postgres must prove the database answers within its
@@ -768,21 +777,17 @@ impl StartupStages for ProcessStartup {
             config,
             database_foundation.as_ref(),
             ha_foundation.as_ref(),
+            published,
         )
         .await?;
-        let published = ProcessPublication {
+        #[cfg(not(feature = "postgres"))]
+        let _ = published;
+        Ok(ProcessSeeds {
+            ha_foundation,
             #[cfg(feature = "postgres")]
-            membership: cluster.membership.clone(),
-        };
-        Ok(Preflighted {
-            seeds: ProcessSeeds {
-                ha_foundation,
-                #[cfg(feature = "postgres")]
-                database_foundation,
-                #[cfg(feature = "postgres")]
-                cluster,
-            },
-            published,
+            database_foundation,
+            #[cfg(feature = "postgres")]
+            cluster,
         })
     }
 
@@ -900,11 +905,9 @@ impl StartupStages for ProcessStartup {
 
     async fn withdraw(&mut self, published: ProcessPublication) {
         #[cfg(feature = "postgres")]
-        if let Some(membership) = published.membership {
-            membership.withdraw_unserved_boot().await;
-        }
+        published.withdraw_unserved_boot().await;
         #[cfg(not(feature = "postgres"))]
-        let ProcessPublication {} = published;
+        let _ = published;
     }
 
     async fn serve(
@@ -1006,13 +1009,15 @@ fn build_activated_gateway(
 
 /// Cluster mode's preflight against the authority the database foundation
 /// established: the boot seeds, read and checked in the order startup has
-/// always read them, and this boot's membership row. Standalone mode, with
-/// no foundation, reads nothing.
+/// always read them, and this boot's membership row, which goes into
+/// `published` before it is written. Standalone mode, with no foundation,
+/// reads and publishes nothing.
 #[cfg(feature = "postgres")]
 async fn preflight_cluster_authority(
     config: &config::Config,
     database_foundation: Option<&storage::postgres::PostgresFoundation>,
     ha_foundation: Option<&ha::HaFoundation>,
+    published: &mut Option<ProcessPublication>,
 ) -> Result<ClusterBootSeeds, Box<dyn std::error::Error>> {
     // The foundation bound the database to this DEPLOYMENT_ID (or refused
     // one bound elsewhere) as part of establishing itself: deployments
@@ -1271,14 +1276,14 @@ async fn preflight_cluster_authority(
                 config.cluster_heartbeat_interval(),
                 config.cluster_member_stale_window(),
             );
-            if let Err(error) = membership.register_boot().await {
-                // The boot row may already be written when a later step of
-                // registration fails, and this boot will never serve.
-                membership.withdraw_unserved_boot().await;
-                return Err(
-                    Box::new(ClusterMembershipStartupError(error)) as Box<dyn std::error::Error>
-                );
-            }
+            // Published before registration, which may write the boot row
+            // and then fail: from here on, a startup that fails before it
+            // serves -- registration, the journal below, activation --
+            // has the row withdrawn.
+            *published = Some(Arc::clone(&membership));
+            membership.register_boot().await.map_err(|error| {
+                Box::new(ClusterMembershipStartupError(error)) as Box<dyn std::error::Error>
+            })?;
             Some(membership)
         }
         _ => None,
