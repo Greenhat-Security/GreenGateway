@@ -130,6 +130,18 @@ export type ConnectionAuthentication =
       audience?: string;
       resource?: string;
       client_auth_method: OAuthClientAuthMethod;
+    }
+  | {
+      type: 'delegated_issuer_token';
+      token_exchange_url: string;
+      client_id: string;
+      client_secret_id?: string;
+      client_secret_configured?: boolean;
+      requested_scopes?: string[];
+      audience?: string;
+      resource?: string;
+      revocation_url?: string;
+      subject_token_source: 'caller_assertion';
     };
 
 export type SafeConnectionAuthentication =
@@ -157,8 +169,8 @@ export type SafeConnectionAuthentication =
 
 /**
  * The calling user's own upstream token, obtained per caller by RFC 8693
- * token exchange. Read only: the admin UI shows it and never writes it, so it
- * has no counterpart in `ConnectionAuthentication`.
+ * token exchange. The client secret's alias is reduced to
+ * `client_secret_configured`, like every other secret binding.
  */
 export type SafeDelegatedIssuerToken = {
   type: 'delegated_issuer_token';
@@ -300,6 +312,13 @@ export type PublishedAssertionKeyWrite = CallerAssertionKeyBinding & {
   algorithm: CallerAssertionAlgorithm;
 };
 
+/**
+ * A caller assertion as this UI writes it: in full whenever the operator
+ * edits a block, and when it creates a `delegated_issuer_token` Connection,
+ * whose subject tokens the block signs. That create leaves `bind_request`
+ * and `bind_approval` to their default, `false`, which a delegated
+ * Connection requires, and configures no published keys.
+ */
 export type CallerAssertionWrite = CallerAssertionKeyBinding & {
   kid: string;
   algorithm: CallerAssertionAlgorithm;
@@ -309,9 +328,9 @@ export type CallerAssertionWrite = CallerAssertionKeyBinding & {
   header_name: string;
   lifetime_seconds: number;
   claims?: CallerAssertionClaim[];
-  bind_request: boolean;
+  bind_request?: boolean;
   /** The gateway refuses `true` on every write: nothing can satisfy it yet. */
-  bind_approval: false;
+  bind_approval?: false;
   published_keys?: PublishedAssertionKeyWrite[];
 };
 
@@ -333,6 +352,15 @@ export type ConnectionWrite = {
   timeouts?: ConnectionTimeouts;
   discovery?: DiscoveryConfig;
   test_profile?: ConnectionTestProfile;
+};
+
+/**
+ * A create: a `ConnectionWrite` whose caller assertion, if any, is new. There
+ * is nothing to remove, and a create names every key alias: it accepts no
+ * `signing_key_configured` marker.
+ */
+export type ConnectionCreateWrite = Omit<ConnectionWrite, 'caller_assertion'> & {
+  caller_assertion?: CallerAssertionWrite;
 };
 
 export type SafeConnectionConfiguration = {
@@ -409,12 +437,18 @@ export type ConnectionTestReason =
   | 'tls_unavailable'
   | 'authentication_not_supported'
   | 'caller_assertion_not_enforced'
+  | 'caller_assertion_key_not_published'
   | 'credential_invalid'
   | 'credential_unavailable'
   | 'oauth_token_egress_denied'
   | 'oauth_token_unavailable'
   | 'oauth_token_rejected'
   | 'oauth_token_invalid_response'
+  | 'delegated_token_no_principal'
+  | 'delegated_token_egress_denied'
+  | 'delegated_token_denied'
+  | 'delegated_token_exchange_failed'
+  | 'delegated_token_unavailable'
   | 'authentication_failed'
   | 'transport_unavailable'
   | 'invalid_target_path'
@@ -511,7 +545,7 @@ export async function getConnection(
 }
 
 export async function createConnection(
-  write: ConnectionWrite,
+  write: ConnectionCreateWrite,
   collectionEtag: string,
   signal?: AbortSignal,
 ): Promise<AdminResource<ConnectionDetail>> {
@@ -1511,12 +1545,18 @@ function isConnectionTestReason(
     value === 'tls_unavailable' ||
     value === 'authentication_not_supported' ||
     value === 'caller_assertion_not_enforced' ||
+    value === 'caller_assertion_key_not_published' ||
     value === 'credential_invalid' ||
     value === 'credential_unavailable' ||
     value === 'oauth_token_egress_denied' ||
     value === 'oauth_token_unavailable' ||
     value === 'oauth_token_rejected' ||
     value === 'oauth_token_invalid_response' ||
+    value === 'delegated_token_no_principal' ||
+    value === 'delegated_token_egress_denied' ||
+    value === 'delegated_token_denied' ||
+    value === 'delegated_token_exchange_failed' ||
+    value === 'delegated_token_unavailable' ||
     value === 'authentication_failed' ||
     value === 'transport_unavailable' ||
     value === 'invalid_target_path' ||

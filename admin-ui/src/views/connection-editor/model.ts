@@ -7,6 +7,7 @@ import {
   type CallerAssertionKeyBinding,
   type CallerAssertionWrite,
   type ConnectionAuthentication,
+  type ConnectionCreateWrite,
   type ConnectionDetail,
   type ConnectionKind,
   type ConnectionWrite,
@@ -36,6 +37,23 @@ export type AdditionalHeaderDraft = {
   initialHeaderName?: string;
   initiallyConfigured: boolean;
   binding: BindingDraft;
+};
+
+/**
+ * The caller assertion a new delegated issuer token Connection signs its
+ * subject tokens with. Written only when the editor creates the Connection;
+ * see `createWriteFromForm`.
+ */
+export type SubjectTokenDraft = {
+  signingKeyBinding: BindingDraft;
+  kid: string;
+  algorithm: CallerAssertionAlgorithm;
+  issuer: string;
+  audience: string;
+  tokenType: string;
+  headerName: string;
+  lifetimeSeconds: string;
+  claims: CallerAssertionClaim[];
 };
 
 /**
@@ -90,8 +108,13 @@ export type ConnectionFormState = {
   authenticationType: AuthenticationType;
   initialAuthenticationType: AuthenticationType;
   headerName: string;
+  // Shared by OAuth client credentials and the delegated issuer token, whose
+  // token requests take the same client ID, scope, audience and resource.
   clientId: string;
   tokenUrl: string;
+  tokenExchangeUrl: string;
+  // A delegated issuer token's optional RFC 7009 endpoint.
+  revocationUrl: string;
   scopes: string;
   audience: string;
   resource: string;
@@ -103,6 +126,9 @@ export type ConnectionFormState = {
   callerAssertionMode: CallerAssertionMode;
   // Written only in `edit` mode; see `writeFromForm`.
   callerAssertionDraft: CallerAssertionDraft;
+  // A new delegated Connection's block, used only while `callerAssertion` is
+  // null; see `subjectTokenDraftApplies`.
+  subjectToken: SubjectTokenDraft;
   caBundleBinding: BindingDraft;
   clientCertificateBinding: BindingDraft;
   clientPrivateKeyBinding: BindingDraft;
@@ -181,6 +207,8 @@ export const DEFAULT_FORM: ConnectionFormState = {
   headerName: 'X-API-Key',
   clientId: '',
   tokenUrl: '',
+  tokenExchangeUrl: '',
+  revocationUrl: '',
   scopes: '',
   audience: '',
   resource: '',
@@ -189,6 +217,19 @@ export const DEFAULT_FORM: ConnectionFormState = {
   callerAssertion: null,
   callerAssertionMode: 'keep',
   callerAssertionDraft: newCallerAssertionDraft(),
+  subjectToken: {
+    signingKeyBinding: emptyBinding(),
+    kid: '',
+    algorithm: 'es256',
+    issuer: '',
+    audience: '',
+    tokenType: '',
+    // Never sent upstream by a delegated Connection; the gateway still needs
+    // a valid name, which it clears from anything a caller sends.
+    headerName: 'x-caller-assertion',
+    lifetimeSeconds: '60',
+    claims: [],
+  },
   caBundleBinding: emptyBinding(),
   clientCertificateBinding: emptyBinding(),
   clientPrivateKeyBinding: emptyBinding(),
@@ -217,20 +258,45 @@ export const ALL_SECRET_PURPOSES: ConnectionSecretPurpose[] = [
   'tls_private_key',
 ];
 
+// The gateway's bounds on a caller assertion's fields.
+export const MAX_CALLER_ASSERTION_LIFETIME_SECONDS = 300;
+const MAX_ASSERTION_KID_BYTES = 128;
+const MAX_ASSERTION_ISSUER_AUDIENCE_BYTES = 512;
+const MAX_ASSERTION_TOKEN_TYPE_BYTES = 128;
+
 /**
- * Why the editor cannot open `detail`, or `null` when it can.
- *
- * A delegated issuer token is shown read only: the editor has no form for it,
- * and saving through a form that cannot represent it would replace the
- * credential with whichever type the form defaulted to.
+ * Whether the authentication type of this form is fixed. A stored delegated
+ * issuer token Connection keeps its type: its caller assertion stays through
+ * every save, and under any other type the gateway would start sending that
+ * subject-token assertion upstream on every call.
  */
-export function editorUnsupportedReason(
-  detail: ConnectionDetail,
-): string | null {
-  if (detail.configuration?.authentication.type === 'delegated_issuer_token') {
-    return 'This connection uses a delegated issuer token, which the editor cannot change yet. Its settings are shown on the connection page; change them through the admin API.';
-  }
-  return null;
+export function authenticationTypeLocked(form: ConnectionFormState): boolean {
+  return form.initialAuthenticationType === 'delegated_issuer_token';
+}
+
+/**
+ * Whether the delegated issuer token is offered: when creating a Connection,
+ * and on a stored one that already uses it. The editor drafts the subject
+ * token only on a create, so an existing Connection cannot turn a caller
+ * assertion it already has, whose audience names its upstream, into a
+ * subject token, nor gain one through this credential.
+ */
+export function delegatedIssuerTokenOffered(
+  form: ConnectionFormState,
+  creating: boolean,
+): boolean {
+  return creating || authenticationTypeLocked(form);
+}
+
+/**
+ * Whether a save writes `form.subjectToken`: a delegated issuer token with no
+ * stored caller assertion, which only a create can be.
+ */
+export function subjectTokenDraftApplies(form: ConnectionFormState): boolean {
+  return (
+    form.authenticationType === 'delegated_issuer_token' &&
+    form.callerAssertion === null
+  );
 }
 
 export function formFromDetail(detail: ConnectionDetail): ConnectionFormState {
@@ -246,18 +312,30 @@ export function formFromDetail(detail: ConnectionDetail): ConnectionFormState {
   }
 
   const authentication = configuration.authentication;
-  if (authentication.type === 'delegated_issuer_token') {
-    // The editor refuses such a connection before it builds a form; see
-    // `editorUnsupportedReason`.
-    throw new Error(editorUnsupportedReason(detail) ?? 'Unsupported connection');
-  }
   const authenticationConfigured =
     authentication.type === 'header_api_key' ||
       authentication.type === 'static_bearer'
       ? authentication.secret_configured
-      : authentication.type === 'oauth2_client_credentials'
+      : authentication.type === 'oauth2_client_credentials' ||
+        authentication.type === 'delegated_issuer_token'
         ? authentication.client_secret_configured
         : false;
+  const tokenRequest =
+    authentication.type === 'oauth2_client_credentials'
+      ? {
+        clientId: authentication.client_id,
+        scopes: authentication.scopes,
+        audience: authentication.audience,
+        resource: authentication.resource,
+      }
+      : authentication.type === 'delegated_issuer_token'
+        ? {
+          clientId: authentication.client_id,
+          scopes: authentication.requested_scopes,
+          audience: authentication.audience,
+          resource: authentication.resource,
+        }
+        : null;
   const timeouts = configuration.timeouts;
   const discovery = configuration.discovery;
   const testProfile = configuration.test_profile;
@@ -277,26 +355,22 @@ export function formFromDetail(detail: ConnectionDetail): ConnectionFormState {
       authentication.type === 'header_api_key'
         ? authentication.header_name
         : 'X-API-Key',
-    clientId:
-      authentication.type === 'oauth2_client_credentials'
-        ? authentication.client_id
-        : '',
+    clientId: tokenRequest?.clientId ?? '',
     tokenUrl:
       authentication.type === 'oauth2_client_credentials'
         ? authentication.token_url
         : '',
-    scopes:
-      authentication.type === 'oauth2_client_credentials'
-        ? authentication.scopes.join(' ')
+    tokenExchangeUrl:
+      authentication.type === 'delegated_issuer_token'
+        ? authentication.token_exchange_url
         : '',
-    audience:
-      authentication.type === 'oauth2_client_credentials'
-        ? authentication.audience ?? ''
+    revocationUrl:
+      authentication.type === 'delegated_issuer_token'
+        ? authentication.revocation_url ?? ''
         : '',
-    resource:
-      authentication.type === 'oauth2_client_credentials'
-        ? authentication.resource ?? ''
-        : '',
+    scopes: tokenRequest?.scopes.join(' ') ?? '',
+    audience: tokenRequest?.audience ?? '',
+    resource: tokenRequest?.resource ?? '',
     authenticationBinding: authenticationConfigured
       ? configuredBinding()
       : emptyBinding(),
@@ -312,6 +386,7 @@ export function formFromDetail(detail: ConnectionDetail): ConnectionFormState {
     callerAssertion: configuration.caller_assertion ?? null,
     callerAssertionMode: 'keep',
     callerAssertionDraft: newCallerAssertionDraft(),
+    subjectToken: DEFAULT_FORM.subjectToken,
     caBundleBinding: bindingFromMarker(
       configuration.tls.ca_bundle_configured,
     ),
@@ -401,11 +476,13 @@ export function writeFromForm(form: ConnectionFormState): ConnectionWrite {
 
   // The stored block is written only when the operator edits or removes it.
   // The replace contract keeps an omitted block exactly as stored, so every
-  // other save, a rename or a credential rotation, cannot change it.
+  // other save, a rename or a credential rotation, cannot change it. A new
+  // delegated Connection's block is added by `createWriteFromForm`.
+  const mode = effectiveCallerAssertionMode(form);
   const callerAssertion =
-    form.callerAssertionMode === 'edit'
+    mode === 'edit'
       ? { caller_assertion: callerAssertionWrite(form.callerAssertionDraft) }
-      : form.callerAssertionMode === 'remove' && form.callerAssertion !== null
+      : mode === 'remove' && form.callerAssertion !== null
         ? { caller_assertion: null }
         : {};
   return {
@@ -460,11 +537,47 @@ export function writeFromForm(form: ConnectionFormState): ConnectionWrite {
   };
 }
 
+/**
+ * The body of a create: `writeFromForm`, with the caller assertion a new
+ * delegated issuer token Connection signs its subject tokens with in place of
+ * the general block, which that credential never edits. A create has nothing
+ * stored to remove.
+ */
+export function createWriteFromForm(
+  form: ConnectionFormState,
+): ConnectionCreateWrite {
+  const { caller_assertion: callerAssertion, ...write } = writeFromForm(form);
+  if (subjectTokenDraftApplies(form)) {
+    return {
+      ...write,
+      caller_assertion: subjectTokenFromForm(form.subjectToken),
+    };
+  }
+  return callerAssertion ? { ...write, caller_assertion: callerAssertion } : write;
+}
+
+export function subjectTokenFromForm(
+  draft: SubjectTokenDraft,
+): CallerAssertionWrite {
+  return {
+    signing_key_id: draft.signingKeyBinding.secretId.trim(),
+    kid: draft.kid.trim(),
+    algorithm: draft.algorithm,
+    issuer: draft.issuer.trim(),
+    audience: draft.audience.trim(),
+    token_type: draft.tokenType.trim(),
+    header_name: draft.headerName.trim(),
+    lifetime_seconds: Number(draft.lifetimeSeconds),
+    ...(draft.claims.length > 0 ? { claims: [...draft.claims] } : {}),
+  };
+}
+
 export function authenticationFromForm(
   form: ConnectionFormState,
 ): ConnectionAuthentication {
   const binding =
-    form.authenticationType === 'oauth2_client_credentials'
+    form.authenticationType === 'oauth2_client_credentials' ||
+      form.authenticationType === 'delegated_issuer_token'
       ? bindingPayload(
         form.authenticationBinding,
         'client_secret_id',
@@ -499,6 +612,26 @@ export function authenticationFromForm(
           ? { resource: form.resource.trim() }
           : {}),
         client_auth_method: 'client_secret_basic',
+        ...binding,
+      };
+    case 'delegated_issuer_token':
+      return {
+        type: 'delegated_issuer_token',
+        token_exchange_url: form.tokenExchangeUrl.trim(),
+        client_id: form.clientId.trim(),
+        requested_scopes: normalizeList(form.scopes),
+        ...(form.audience.trim()
+          ? { audience: form.audience.trim() }
+          : {}),
+        ...(form.resource.trim()
+          ? { resource: form.resource.trim() }
+          : {}),
+        ...(form.revocationUrl.trim()
+          ? { revocation_url: form.revocationUrl.trim() }
+          : {}),
+        // The only value: the gateway signs a caller assertion naming the
+        // caller. The caller's own inbound token is never forwarded.
+        subject_token_source: 'caller_assertion',
         ...binding,
       };
   }
@@ -554,11 +687,15 @@ export function validateForm(
   }
   // A save that keeps the stored caller assertion has the gateway revalidate
   // it against the headers being saved, so these would be refused anyway;
-  // saying so here names the field to change instead of a form-wide error. An
-  // edited block reports a clash on its own header field instead; see
+  // saying so here names the field to change instead of a form-wide error. A
+  // new delegated Connection's block is checked the same way. An edited block
+  // reports a clash on its own header field instead; see
   // `validateCallerAssertion`.
-  const callerAssertionHeaderName =
-    form.callerAssertionMode === 'keep'
+  const draftsSubjectToken = subjectTokenDraftApplies(form);
+  const callerAssertionMode = effectiveCallerAssertionMode(form);
+  const callerAssertionHeaderName = draftsSubjectToken
+    ? form.subjectToken.headerName.trim().toLowerCase() || null
+    : callerAssertionMode === 'keep'
       ? form.callerAssertion?.header_name.toLowerCase() ?? null
       : null;
   if (
@@ -570,13 +707,13 @@ export function validateForm(
       'The API key header cannot use the caller assertion header name.';
   }
   if (
-    form.callerAssertionMode === 'keep' &&
+    callerAssertionMode === 'keep' &&
     form.callerAssertion?.bind_approval === true
   ) {
     errors.form =
       'This connection was saved with a caller assertion that asks for approval binding, which the gateway no longer accepts. Edit the caller assertion, which turns approval binding off, or remove it before saving this connection.';
   }
-  if (form.callerAssertionMode === 'edit') {
+  if (callerAssertionMode === 'edit') {
     validateCallerAssertion(form, secrets, errors);
   }
   if (form.additionalHeaders.length > MAX_ADDITIONAL_HEADERS) {
@@ -644,8 +781,35 @@ export function validateForm(
       errors['authentication.scopes'] = 'OAuth scopes must be unique.';
     }
   }
+  if (form.authenticationType === 'delegated_issuer_token') {
+    if (form.kind !== 'http_api') {
+      errors['authentication.type'] =
+        'A delegated issuer token works only on an HTTP API connection.';
+    }
+    if (!form.clientId.trim()) {
+      errors['authentication.client_id'] =
+        'Enter the client ID the gateway uses at the issuer.';
+    }
+    if (!validTokenUrl(form.tokenExchangeUrl)) {
+      errors['authentication.token_exchange_url'] =
+        'Enter an HTTPS token exchange URL with no credentials, query, or fragment.';
+    }
+    if (form.revocationUrl.trim() && !validTokenUrl(form.revocationUrl)) {
+      errors['authentication.revocation_url'] =
+        'Enter an HTTPS revocation URL with no credentials, query, or fragment, or leave it empty.';
+    }
+    const scopes = normalizeList(form.scopes);
+    if (new Set(scopes).size !== scopes.length) {
+      errors['authentication.requested_scopes'] =
+        'Requested scopes must be unique.';
+    }
+  }
+  if (draftsSubjectToken) {
+    validateSubjectToken(form, secrets, errors);
+  }
   const authenticationSecretField =
-    form.authenticationType === 'oauth2_client_credentials'
+    form.authenticationType === 'oauth2_client_credentials' ||
+      form.authenticationType === 'delegated_issuer_token'
       ? 'authentication.client_secret_id'
       : 'authentication.secret_id';
   const requiredAuthenticationPurpose = authenticationPurpose(
@@ -804,7 +968,74 @@ export function validateForm(
   return errors;
 }
 
-export const MAX_CALLER_ASSERTION_LIFETIME_SECONDS = 300;
+/**
+ * The gateway's rules for the caller assertion a new delegated Connection
+ * signs its subject tokens with, so a refusal names the field to change. An
+ * enabled save also loads the key, which only the gateway can do.
+ */
+function validateSubjectToken(
+  form: ConnectionFormState,
+  secrets: ConnectionSecretMetadata[],
+  errors: FieldErrors,
+) {
+  const draft = form.subjectToken;
+  if (
+    !bindingHasCompatibleSecret(
+      draft.signingKeyBinding,
+      'assertion_signing_key',
+      secrets,
+    )
+  ) {
+    errors['caller_assertion.signing_key_id'] =
+      'Select a configured assertion signing key alias.';
+  }
+  for (const [field, value, maxBytes, label] of [
+    ['caller_assertion.kid', draft.kid, MAX_ASSERTION_KID_BYTES, 'a key ID'],
+    [
+      'caller_assertion.issuer',
+      draft.issuer,
+      MAX_ASSERTION_ISSUER_AUDIENCE_BYTES,
+      'the issuer the subject token names',
+    ],
+    [
+      'caller_assertion.audience',
+      draft.audience,
+      MAX_ASSERTION_ISSUER_AUDIENCE_BYTES,
+      'the audience the token issuer expects',
+    ],
+    [
+      'caller_assertion.token_type',
+      draft.tokenType,
+      MAX_ASSERTION_TOKEN_TYPE_BYTES,
+      'a token type',
+    ],
+  ] as const) {
+    const trimmed = value.trim();
+    if (
+      trimmed.length === 0 ||
+      new TextEncoder().encode(trimmed).length > maxBytes ||
+      /[\u0000-\u001f\u007f-\u009f]/.test(trimmed)
+    ) {
+      errors[field] =
+        `Enter ${label} of 1 to ${maxBytes} bytes with no control characters.`;
+    }
+  }
+  const headerName = draft.headerName.trim();
+  if (!validCredentialHeaderName(headerName)) {
+    errors['caller_assertion.header_name'] =
+      'Enter a valid, non-reserved HTTP header name of at most 64 bytes.';
+  }
+  const lifetime = Number(draft.lifetimeSeconds);
+  if (
+    !/^\d+$/.test(draft.lifetimeSeconds.trim()) ||
+    !Number.isInteger(lifetime) ||
+    lifetime < 1 ||
+    lifetime > MAX_CALLER_ASSERTION_LIFETIME_SECONDS
+  ) {
+    errors['caller_assertion.lifetime_seconds'] =
+      `Enter a whole number of seconds from 1 to ${MAX_CALLER_ASSERTION_LIFETIME_SECONDS}.`;
+  }
+}
 
 export function newCallerAssertionDraft(): CallerAssertionDraft {
   return {
@@ -966,11 +1197,27 @@ function assertionKeyBindingPayload(
   return {};
 }
 
+/**
+ * What a save does with the caller assertion. A delegated issuer token
+ * Connection's block is its subject token: a new one is drafted in
+ * `subjectToken` and a stored one stays read only, so for that credential the
+ * general block is always kept.
+ */
+export function effectiveCallerAssertionMode(
+  form: ConnectionFormState,
+): CallerAssertionMode {
+  return form.authenticationType === 'delegated_issuer_token'
+    ? 'keep'
+    : form.callerAssertionMode;
+}
+
 /** Whether a save leaves the Connection carrying a caller assertion. */
 export function savesCallerAssertion(form: ConnectionFormState): boolean {
+  const mode = effectiveCallerAssertionMode(form);
   return (
-    form.callerAssertionMode === 'edit' ||
-    (form.callerAssertionMode === 'keep' && form.callerAssertion !== null)
+    subjectTokenDraftApplies(form) ||
+    mode === 'edit' ||
+    (mode === 'keep' && form.callerAssertion !== null)
   );
 }
 
@@ -987,10 +1234,30 @@ function validateCallerAssertion(
     errors,
   );
   for (const [value, field, maxBytes, label] of [
-    [draft.signingKey.kid, 'caller_assertion.kid', 128, 'a key ID'],
-    [draft.issuer, 'caller_assertion.issuer', 512, 'an issuer'],
-    [draft.audience, 'caller_assertion.audience', 512, 'an audience'],
-    [draft.tokenType, 'caller_assertion.token_type', 128, 'a token type'],
+    [
+      draft.signingKey.kid,
+      'caller_assertion.kid',
+      MAX_ASSERTION_KID_BYTES,
+      'a key ID',
+    ],
+    [
+      draft.issuer,
+      'caller_assertion.issuer',
+      MAX_ASSERTION_ISSUER_AUDIENCE_BYTES,
+      'an issuer',
+    ],
+    [
+      draft.audience,
+      'caller_assertion.audience',
+      MAX_ASSERTION_ISSUER_AUDIENCE_BYTES,
+      'an audience',
+    ],
+    [
+      draft.tokenType,
+      'caller_assertion.token_type',
+      MAX_ASSERTION_TOKEN_TYPE_BYTES,
+      'a token type',
+    ],
   ] as const) {
     if (!validAssertionText(value, maxBytes)) {
       errors[field] =
@@ -1044,7 +1311,7 @@ function validateCallerAssertion(
   for (const [index, key] of draft.publishedKeys.entries()) {
     const kidField = `caller_assertion.published_keys.${index}.kid`;
     const secretField = `caller_assertion.published_keys.${index}.signing_key_id`;
-    if (!validAssertionText(key.kid, 128)) {
+    if (!validAssertionText(key.kid, MAX_ASSERTION_KID_BYTES)) {
       errors[kidField] =
         'Enter a key ID of 1 to 128 bytes with no control characters.';
     } else if (kids.has(key.kid)) {
@@ -1386,6 +1653,8 @@ export function authenticationPurpose(
       return 'static_bearer';
     case 'oauth2_client_credentials':
       return 'oauth_client_secret';
+    case 'delegated_issuer_token':
+      return 'token_exchange_client_secret';
     case 'none':
       return null;
   }
@@ -1655,14 +1924,25 @@ export function focusFirstProblem(errors: FieldErrors) {
     display_name: 'connection-display-name',
     'endpoint.base_url': 'connection-base-url',
     'endpoint.base_path': 'connection-base-path',
+    'authentication.type': 'connection-authentication-type',
     'authentication.header_name': 'connection-header-name',
     'authentication.client_id': 'connection-client-id',
     'authentication.token_url': 'connection-token-url',
+    'authentication.token_exchange_url': 'connection-token-exchange-url',
+    'authentication.revocation_url': 'connection-revocation-url',
     'authentication.scopes': 'connection-oauth-scopes',
+    'authentication.requested_scopes': 'connection-oauth-scopes',
     'authentication.audience': 'connection-oauth-audience',
     'authentication.resource': 'connection-oauth-resource',
     'authentication.secret_id': 'connection-auth-secret',
     'authentication.client_secret_id': 'connection-auth-secret',
+    'caller_assertion.signing_key_id': 'connection-subject-token-key',
+    'caller_assertion.kid': 'connection-subject-token-kid',
+    'caller_assertion.issuer': 'connection-subject-token-issuer',
+    'caller_assertion.audience': 'connection-subject-token-audience',
+    'caller_assertion.token_type': 'connection-subject-token-type',
+    'caller_assertion.header_name': 'connection-subject-token-header',
+    'caller_assertion.lifetime_seconds': 'connection-subject-token-lifetime',
     'additional_headers.header_name': 'connection-additional-header-0-name',
     'additional_headers.secret_id': 'connection-additional-header-0-secret',
     'tls.ca_bundle_alias': 'connection-ca-bundle',
@@ -1674,6 +1954,11 @@ export function focusFirstProblem(errors: FieldErrors) {
     'discovery.path': 'connection-discovery-path',
     'test_profile.path': 'connection-test-path',
     'test_profile.expected_statuses': 'connection-expected-statuses',
+  };
+  // The same caller-assertion field is drafted by the subject-token section
+  // of a new delegated Connection or by the caller-assertion editor; when
+  // neither shows it, its problem is listed in the caller-assertion section.
+  const callerAssertionEditorIds: Record<string, string> = {
     'caller_assertion.signing_key_id': 'connection-caller-assertion-signing-key',
     'caller_assertion.kid': 'connection-caller-assertion-kid',
     'caller_assertion.issuer': 'connection-caller-assertion-issuer',
@@ -1682,40 +1967,42 @@ export function focusFirstProblem(errors: FieldErrors) {
     'caller_assertion.header_name': 'connection-caller-assertion-header-name',
     'caller_assertion.lifetime_seconds': 'connection-caller-assertion-lifetime',
   };
-  const target = Object.keys(errors)
-    .map((field) => {
+  const candidates = Object.keys(errors)
+    .map((field): string[] | undefined => {
+      if (field === 'caller_assertion' || field.startsWith('caller_assertion.')) {
+        const indexedPublishedKey =
+          /^caller_assertion\.published_keys\.(\d+)\.(kid|signing_key_id)$/.exec(
+            field,
+          );
+        return [
+          fieldToId[field],
+          callerAssertionEditorIds[field],
+          indexedPublishedKey
+            ? `connection-caller-assertion-published-key-${indexedPublishedKey[1]}-${indexedPublishedKey[2] === 'kid' ? 'kid' : 'secret'
+            }`
+            : undefined,
+          CALLER_ASSERTION_PROBLEMS_ID,
+        ].filter((id): id is string => id !== undefined);
+      }
       if (fieldToId[field]) {
-        return fieldToId[field];
+        return [fieldToId[field]];
       }
       const indexedAdditionalHeader =
         /^additional_headers\.(\d+)\.(header_name|secret_id)$/.exec(field);
-      if (indexedAdditionalHeader) {
-        return `connection-additional-header-${indexedAdditionalHeader[1]}-${indexedAdditionalHeader[2] === 'header_name' ? 'name' : 'secret'
-        }`;
-      }
-      const indexedPublishedKey =
-        /^caller_assertion\.published_keys\.(\d+)\.(kid|signing_key_id)$/.exec(
-          field,
-        );
-      if (indexedPublishedKey) {
-        return `connection-caller-assertion-published-key-${indexedPublishedKey[1]}-${indexedPublishedKey[2] === 'kid' ? 'kid' : 'secret'
-        }`;
-      }
-      // The block's own problems, and any of its fields while it is shown
-      // read only, are listed in one alert in its section.
-      return field === 'caller_assertion' || field.startsWith('caller_assertion.')
-        ? CALLER_ASSERTION_PROBLEMS_ID
+      return indexedAdditionalHeader
+        ? [
+          `connection-additional-header-${indexedAdditionalHeader[1]}-${indexedAdditionalHeader[2] === 'header_name' ? 'name' : 'secret'
+          }`,
+        ]
         : undefined;
     })
-    .find((id) => id !== undefined);
-  if (target) {
+    .find((ids) => ids !== undefined);
+  if (candidates) {
     queueMicrotask(() =>
-      (
-        document.getElementById(target) ??
-        (target.startsWith('connection-caller-assertion-')
-          ? document.getElementById(CALLER_ASSERTION_PROBLEMS_ID)
-          : null)
-      )?.focus(),
+      candidates
+        .map((id) => document.getElementById(id))
+        .find((element) => element !== null)
+        ?.focus(),
     );
   }
 }
@@ -1724,28 +2011,30 @@ export const CALLER_ASSERTION_PROBLEMS_ID = 'connection-caller-assertion-problem
 
 /**
  * The caller-assertion problems that have no field of their own on screen:
- * the block's own, and those of fields the editor does not show. While the
- * block is kept or removed it is shown read only, so all of them.
+ * the block's own, and those of fields no section shows. While a stored block
+ * is kept or removed it is shown read only, so all of them; while it is
+ * edited, or a new delegated Connection drafts it as its subject token, those
+ * of the block's own fields are shown on the fields.
  */
 export function callerAssertionSectionProblems(
   errors: FieldErrors,
-  mode: CallerAssertionMode,
+  fieldsShown: boolean,
 ): string[] {
   return Object.entries(errors)
     .filter(
       ([field]) =>
         field === 'caller_assertion' ||
         (field.startsWith('caller_assertion.') &&
-          (mode !== 'edit' || !CALLER_ASSERTION_EDITOR_FIELDS.has(field)) &&
+          !(fieldsShown && CALLER_ASSERTION_DRAFT_FIELDS.has(field)) &&
           !(
-            mode === 'edit' &&
+            fieldsShown &&
             /^caller_assertion\.published_keys\.\d+\./.test(field)
           )),
     )
     .map(([, message]) => message);
 }
 
-const CALLER_ASSERTION_EDITOR_FIELDS = new Set([
+const CALLER_ASSERTION_DRAFT_FIELDS = new Set([
   'caller_assertion.signing_key_id',
   'caller_assertion.kid',
   'caller_assertion.issuer',
@@ -1755,6 +2044,12 @@ const CALLER_ASSERTION_EDITOR_FIELDS = new Set([
   'caller_assertion.lifetime_seconds',
 ]);
 
+/**
+ * The gateway's field problems as editor field errors. A caller-assertion
+ * problem keeps its field and shows its code beside what it means; the
+ * section shows it wherever no field does (see
+ * `callerAssertionSectionProblems`).
+ */
 export function fieldErrorsFromProblems(
   problems: readonly { field: string; code: string }[],
 ): FieldErrors {
@@ -1762,10 +2057,14 @@ export function fieldErrorsFromProblems(
     'display_name',
     'endpoint.base_url',
     'endpoint.base_path',
+    'authentication.type',
     'authentication.header_name',
     'authentication.client_id',
     'authentication.token_url',
+    'authentication.token_exchange_url',
+    'authentication.revocation_url',
     'authentication.scopes',
+    'authentication.requested_scopes',
     'authentication.audience',
     'authentication.resource',
     'authentication.secret_id',

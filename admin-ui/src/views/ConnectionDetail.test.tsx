@@ -419,7 +419,7 @@ describe('ConnectionDetail', () => {
     expect(specValue('Also published')).toBe('gw-2026-10 (RS256, configured)');
   });
 
-  it('shows a delegated issuer token read only, with its assertion as the subject token', async () => {
+  it('shows a delegated issuer token, with its assertion as the subject token', async () => {
     vi.stubGlobal(
       'fetch',
       vi.fn().mockResolvedValue(
@@ -478,6 +478,14 @@ describe('ConnectionDetail', () => {
     expect(section?.textContent).toContain('delegated_token_no_principal');
     expect(section?.textContent).toContain('delegated_token_denied');
     expect(section?.textContent).toContain('delegated_token_exchange_failed');
+    // A test runs as whoever presses the button, and says so.
+    expect(section?.textContent).toContain('Test connection runs as you.');
+    expect(section?.textContent).toContain(
+      'caller_assertion_key_not_published',
+    );
+    expect(
+      screen.getByText(/exchanges a token for your own account at\s+its issuer/),
+    ).toBeTruthy();
     expect(specValue('Token exchange URL')).toBe(
       'https://issuer.example.test/oauth2/token-exchange',
     );
@@ -505,11 +513,153 @@ describe('ConnectionDetail', () => {
       'cannot be removed while this connection authenticates with a delegated issuer token',
     );
     expect(assertion?.textContent).toContain(
-      'disable the connection through the admin API',
+      'To stop this connection, disable it.',
+    );
+    expect(assertion?.textContent).toContain(
+      'change it, or rotate its key, through the admin API',
     );
     expect(document.body.textContent).not.toContain(
       'CLIENT_SECRET_ALIAS_CANARY',
     );
+  });
+
+  it('tests a delegated issuer token connection as the administrator and says why it was refused', async () => {
+    const delegated = connectionDetail({
+      id: 'mail-api',
+      authentication: 'delegated_issuer_token',
+      configuration: {
+        endpoint: { base_url: 'https://mail.example.test', base_path: '/v1' },
+        authentication: {
+          type: 'delegated_issuer_token',
+          token_exchange_url: 'https://issuer.example.test/oauth2/token-exchange',
+          client_id: 'greengateway',
+          requested_scopes: ['mail.read'],
+          subject_token_source: 'caller_assertion',
+          client_secret_configured: true,
+        },
+        caller_assertion: {
+          signing_key_configured: true,
+          kid: 'gw-2026-09',
+          algorithm: 'es256',
+          issuer: 'https://gateway.example.test',
+          audience: 'https://issuer.example.test',
+          token_type: 'caller-assertion+jwt',
+          header_name: 'x-caller-assertion',
+          lifetime_seconds: 60,
+          bind_request: false,
+          bind_approval: false,
+        },
+        tls: {
+          ca_bundle_configured: false,
+          client_certificate_configured: false,
+          client_private_key_configured: false,
+        },
+        test_profile: {
+          method: 'GET',
+          path: '/messages',
+          expected_statuses: [200],
+        },
+      },
+    });
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input), 'http://localhost');
+      if (url.pathname === '/v1/admin/connections/mail-api' && !init?.method) {
+        return Promise.resolve(
+          jsonResponse(200, delegated, { ETag: '"connection-v3"' }),
+        );
+      }
+      if (
+        url.pathname === '/v1/admin/connections/mail-api/test' &&
+        init?.method === 'POST'
+      ) {
+        return Promise.resolve(
+          jsonResponse(
+            200,
+            {
+              ok: false,
+              state: 'unavailable',
+              tested_at: '2026-10-21T12:30:00Z',
+              latency_ms: 18,
+              stages: [
+                { name: 'egress_policy', outcome: 'success' },
+                {
+                  name: 'secret_available',
+                  outcome: 'failure',
+                  reason: 'delegated_token_denied',
+                },
+              ],
+            },
+            { ETag: '"connection-v3"' },
+          ),
+        );
+      }
+      return Promise.reject(
+        new Error(`unexpected fetch ${init?.method ?? 'GET'} ${url.pathname}`),
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderDetail('/connections/mail-api');
+
+    expect(
+      await screen.findByText(/Testing this connection exchanges a token/),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
+
+    expect(await screen.findByText('Connection test failed')).toBeTruthy();
+    expect(screen.getByText('Delegated token denied')).toBeTruthy();
+    expect(screen.getByText(/The issuer refused your account/)).toBeTruthy();
+    // The request carries no tester identity: the gateway takes it from the
+    // authenticated session, never from the page.
+    const testRequest = fetchMock.mock.calls.find(([input, init]) => {
+      const url = new URL(String(input), 'http://localhost');
+      return url.pathname.endsWith('/test') && init?.method === 'POST';
+    });
+    expect(testRequest?.[1]?.body).toBeUndefined();
+  });
+
+  it('says a disabled delegated issuer token connection is tested only once enabled', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        jsonResponse(
+          200,
+          connectionDetail({
+            enabled: false,
+            authentication: 'delegated_issuer_token',
+            status: { state: 'disabled', reason: 'disabled' },
+            configuration: {
+              endpoint: { base_url: 'https://mail.example.test', base_path: '/v1' },
+              authentication: {
+                type: 'delegated_issuer_token',
+                token_exchange_url:
+                  'https://issuer.example.test/oauth2/token-exchange',
+                client_id: 'greengateway',
+                requested_scopes: [],
+                subject_token_source: 'caller_assertion',
+                client_secret_configured: false,
+              },
+              tls: {
+                ca_bundle_configured: false,
+                client_certificate_configured: false,
+                client_private_key_configured: false,
+              },
+            },
+          }),
+          { ETag: '"connection-v1"' },
+        ),
+      ),
+    );
+
+    renderDetail();
+
+    expect(await screen.findByText('Disabled draft')).toBeTruthy();
+    expect(
+      screen.getByText(/can be tested only once it is enabled/),
+    ).toBeTruthy();
+    expect(
+      screen.queryByText(/You can safely test the saved settings/),
+    ).toBeNull();
   });
 
   it('stops on an ETag conflict and reloads before allowing another operation', async () => {

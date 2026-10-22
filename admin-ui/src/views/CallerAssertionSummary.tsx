@@ -5,9 +5,10 @@ import type {
 } from '../lib/connections';
 
 /**
- * A Connection's caller assertion, read only. Shared by the detail page and
- * the editor, which shows it this way until the operator chooses to edit or
- * remove it; any other save keeps it exactly as stored.
+ * A Connection's stored caller assertion, read only. Shared by the detail
+ * page and the editor, which shows it this way until the operator chooses to
+ * edit or remove it; any other save keeps it exactly as stored. A delegated
+ * issuer token Connection's block stays read only once it exists.
  *
  * `subjectTokenOnly` is set for a delegated issuer token Connection, whose
  * assertion is signed as the subject token of its token exchange and sent to
@@ -50,12 +51,14 @@ export function CallerAssertionSummary({
         )}
         {subjectTokenOnly ? (
           <p>
-            The admin UI shows this block read only. It cannot be removed
+            The admin UI shows this block read only once the connection
+            exists, and saving the connection here keeps it unchanged; change
+            it, or rotate its key, through the admin API. It cannot be removed
             while this connection authenticates with a delegated issuer token:
             the gateway signs the subject token with it, and refuses a change
-            that removes it. To stop this connection, disable the connection
-            through the admin API. After an incident, also revoke the grants at
-            the issuer and rotate the client secret before enabling it again.
+            that removes it. To stop this connection, disable it. After an
+            incident, also revoke the grants at the issuer and rotate the
+            client secret before enabling it again.
           </p>
         ) : (
           <p>

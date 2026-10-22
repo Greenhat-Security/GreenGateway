@@ -13943,6 +13943,166 @@ async fn connection_test_requires_permission_saved_profile_and_exact_etag() {
     });
 }
 
+/// A stored test of a `delegated_issuer_token` Connection runs as the
+/// principal who asks for it (issue #441): the endpoint attests that
+/// principal, so one an issuer could not look up is refused as naming nobody,
+/// and an attestable one gets as far as the key check, which refuses a
+/// disabled Connection because its keys are not published. Both are refused
+/// before any network or secret I/O.
+#[tokio::test]
+async fn a_delegated_connection_test_runs_as_the_requesting_principal() {
+    let connection_db = TempDb::new("connection-test-delegated");
+    let policy = TempPolicyFile::new(&connection_policy_document_string());
+    let capture = audit::sink::tests::CaptureSink::new();
+    let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+    let router = connection_admin_router(&connection_db, &policy, audit_log);
+    let secrets_editor = test_principal(&["connections-secrets-editor"]);
+    let list = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::GET,
+            CONNECTIONS_ADMIN_ROUTE,
+            Some(secrets_editor.clone()),
+            None,
+            None,
+            false,
+        ))
+        .await
+        .expect("connection list should complete");
+    let mut collection_etag = list
+        .headers()
+        .get(CONNECTION_COLLECTION_ETAG_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .expect("connection list should include collection ETag")
+        .to_owned();
+    let mut assertion = admin_caller_assertion_json();
+    assertion["bind_request"] = json!(false);
+    assertion["audience"] = json!("https://issuer.example.test");
+    // One Connection per tester: the per-Connection test budget admits one
+    // test at a time.
+    let mut created_connections = Vec::new();
+    for display_name in ["Mail for nobody", "Mail for alice"] {
+        let created = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                CONNECTIONS_ADMIN_ROUTE,
+                Some(secrets_editor.clone()),
+                Some(
+                    json!({
+                        "display_name": display_name,
+                        "enabled": false,
+                        "kind": "http_api",
+                        "endpoint": {
+                            "base_url": "https://mail.example.test",
+                            "base_path": "/v1"
+                        },
+                        "authentication": {
+                            "type": "delegated_issuer_token",
+                            "token_exchange_url": "https://issuer.example.test/oauth2/token-exchange",
+                            "client_id": "greengateway",
+                            "client_secret_id": "issuer-exchange-secret",
+                            "subject_token_source": "caller_assertion"
+                        },
+                        "caller_assertion": assertion,
+                        "test_profile": {
+                            "method": "GET",
+                            "path": "/messages",
+                            "expected_statuses": [200]
+                        }
+                    })
+                    .to_string(),
+                ),
+                Some(&collection_etag),
+                true,
+            ))
+            .await
+            .expect("delegated create should complete");
+        assert_eq!(created.status(), StatusCode::CREATED);
+        collection_etag = created
+            .headers()
+            .get(CONNECTION_COLLECTION_ETAG_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("created connection should include collection ETag")
+            .to_owned();
+        let etag = created
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("created connection should include ETag")
+            .to_owned();
+        let id = json_body(created).await["id"]
+            .as_str()
+            .expect("created connection should include ID")
+            .to_owned();
+        created_connections.push((id, etag));
+    }
+
+    // `test_principal` has no identity-provider issuer, so no issuer could
+    // look its subject up; the same principal with one is attestable.
+    let nobody = test_principal(&["connections-tester"]);
+    let alice = auth::Principal {
+        issuer: Some("https://idp.example.test".to_owned()),
+        ..test_principal(&["connections-tester"])
+    };
+    for ((id, etag), tester, stage, reason) in [
+        (
+            &created_connections[0],
+            nobody,
+            "secret_available",
+            "delegated_token_no_principal",
+        ),
+        (
+            &created_connections[1],
+            alice,
+            "authenticated",
+            "caller_assertion_key_not_published",
+        ),
+    ] {
+        let tested = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                &format!("{CONNECTIONS_ADMIN_ROUTE}/{id}/test"),
+                Some(tester),
+                None,
+                Some(etag),
+                true,
+            ))
+            .await
+            .expect("delegated connection test should complete");
+        assert_eq!(tested.status(), StatusCode::OK);
+        let tested = json_body(tested).await;
+        assert_eq!(tested["ok"], json!(false));
+        assert_eq!(
+            tested["stages"],
+            json!([{ "name": stage, "outcome": "failure", "reason": reason }])
+        );
+    }
+
+    assert_eventually(Duration::from_secs(1), || {
+        let events = capture.events();
+        [
+            "delegated_token_no_principal",
+            "caller_assertion_key_not_published",
+        ]
+        .iter()
+        .all(|reason| {
+            events.iter().any(|event| {
+                event.event_type == audit::event::CONNECTION_TESTED
+                    && event.payload["outcome"] == json!("failure")
+                    && event.payload["reason"] == json!(reason)
+                    && event.payload["authentication"] == json!("delegated_issuer_token")
+            })
+        })
+    });
+    // Nothing was exchanged: both tests stopped before the issuer.
+    assert!(!capture
+        .events()
+        .iter()
+        .any(|event| event.event_type == audit::event::CONNECTION_DELEGATED_TOKEN_EXCHANGE));
+}
+
 #[tokio::test]
 async fn connection_test_body_reader_deadline_bounds_slow_clients() {
     let body = Body::from_stream(stream::pending::<Result<Bytes, Infallible>>());
@@ -18979,6 +19139,8 @@ async fn policy_rule_preview_returns_matches_samples_and_does_not_mutate_policy(
     let body = json_body(response).await;
     assert_eq!(body["match_count"], json!(2));
     assert_eq!(body["scanned_event_count"], json!(3));
+    assert_eq!(body["unevaluated_event_count"], json!(0));
+    assert_eq!(body["unevaluated_reasons"], json!({}));
     assert_eq!(body["scan_truncated"], json!(false));
     assert_eq!(body["complete"], json!(true));
     assert_eq!(body["sample_strategy"], json!("newest_matches"));
@@ -19104,6 +19266,18 @@ async fn policy_rule_preview_contextless_binding_excludes_unclassified_history()
     let body = json_body(response).await;
     assert_eq!(body["match_count"], json!(1));
     assert_eq!(body["samples"][0]["event_id"], json!("match-new"));
+    // The other three scanned observations were never classified, and the
+    // rule is bound to a dispatch, so the evaluator cannot say whether it
+    // matches them. They are reported rather than counted as non-matches, and
+    // the count is a lower bound for the window.
+    assert_eq!(body["scanned_event_count"], json!(4));
+    assert_eq!(body["unevaluated_event_count"], json!(3));
+    assert_eq!(
+        body["unevaluated_reasons"],
+        json!({"missing_dispatch_fact": 3})
+    );
+    assert_eq!(body["scan_truncated"], json!(false));
+    assert_eq!(body["complete"], json!(false));
 }
 
 #[tokio::test]
@@ -22493,6 +22667,21 @@ async fn traffic_endpoint_lifecycle_flags_rule_coverage_and_hot_reload() {
             status_counts: &[(200, 2)],
         },
     );
+    // Classified traffic without a proxy dispatch, as the aggregator records
+    // it. Coverage is judged in that routing context; with none recorded at
+    // all the evaluator would be missing the dispatch fact.
+    for (endpoint_template, call_count) in [("/covered/{id}", 3), ("/open/{id}", 2)] {
+        insert_discovery_routing_context(
+            &discovery_db.path,
+            "GET",
+            endpoint_template,
+            "",
+            "",
+            "",
+            call_count,
+            1,
+        );
+    }
     let policy = TempPolicyFile::new(&traffic_policy_document_with_rules(json!([
         {
             "id": "cover-id-endpoint",
@@ -24790,15 +24979,34 @@ async fn suggestions_admin_dismiss_rejects_non_open_suggestion_without_overwriti
 
 #[test]
 fn endpoint_rule_coverage_without_rules_is_none() {
-    let policy: rbac::Policy = serde_json::from_value(json!({
-        "schema_version": "0.1.0",
-        "default_action": "deny",
-        "roles": {}
-    }))
-    .expect("policy should parse");
+    let policy = policy_eval::CompiledPolicy::for_analysis(
+        serde_json::from_value(json!({
+            "schema_version": "0.1.0",
+            "default_action": "deny",
+            "roles": {}
+        }))
+        .expect("policy should parse"),
+    );
+    let contextless = discovery::query::EndpointRoutingContext {
+        route_host: None,
+        route_path_prefix: None,
+        upstream_origin: None,
+        first_seen: "2024-06-01T12:00:00Z".to_owned(),
+        last_seen: "2024-06-01T12:00:00Z".to_owned(),
+        call_count: 1,
+        distinct_principal_count: 1,
+        covered_by_rule: false,
+        coverage_scope: discovery::query::EndpointCoverageScope::None,
+    };
+    assert_eq!(
+        endpoint_coverage_scope(&policy, "GET", "/anything/{id}", Some(&contextless)),
+        discovery::query::EndpointCoverageScope::None
+    );
+    // With no routing context recorded at all the evaluator is missing the
+    // dispatch fact, so coverage is unknown rather than none.
     assert_eq!(
         endpoint_coverage_scope(&policy, "GET", "/anything/{id}", None),
-        discovery::query::EndpointCoverageScope::None
+        discovery::query::EndpointCoverageScope::Unknown
     );
 }
 
