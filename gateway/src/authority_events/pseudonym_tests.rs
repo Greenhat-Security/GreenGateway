@@ -127,6 +127,11 @@ fn derivation_matches_the_documented_construction() {
             vec!["https://issuer.example.test"],
         ),
         (
+            ReferenceDomain::ActorRecorded,
+            "actor.recorded",
+            vec!["user-123"],
+        ),
+        (
             ReferenceDomain::Connection,
             "resource.connection",
             vec!["billing-api"],
@@ -462,6 +467,12 @@ fn components_must_fit_their_domain_and_stay_bounded() {
         ),
         (ReferenceDomain::ActorIssuer, Vec::new()),
         (ReferenceDomain::ActorIssuer, vec!["issuer-a", "issuer-b"]),
+        // A recorded actor is one identifier, never an issuer and a subject.
+        (ReferenceDomain::ActorRecorded, Vec::new()),
+        (
+            ReferenceDomain::ActorRecorded,
+            vec!["https://issuer.example.test", "user-123"],
+        ),
     ] {
         assert_eq!(
             keyring.derive(domain, &components),

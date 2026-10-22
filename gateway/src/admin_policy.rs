@@ -696,7 +696,11 @@ pub(super) async fn policy_rule_hits_endpoint(
     let Some(query_store) = state.query_store.as_ref() else {
         return policy_evidence_unavailable("policy rule hit counts require an audit query store");
     };
-    let policy = rbac_state.current_policy();
+    // Recorded results, not an evaluation: each count is how many observed
+    // requests the gateway attributed to a rule id when it decided them. The
+    // ids come from the live snapshot's own attribution, the one that writes
+    // `matched_rule_id`, so the two cannot derive a rule's id differently.
+    let snapshot = rbac_state.live_policy_snapshot();
     let counts = match query_store.rule_hit_counts().await {
         Ok(counts) => counts,
         Err(err) => {
@@ -706,14 +710,12 @@ pub(super) async fn policy_rule_hits_endpoint(
     };
 
     Json(PolicyRuleHitsResponse {
-        rules: policy
-            .rules
+        rules: snapshot
+            .rule_ids()
             .iter()
-            .enumerate()
-            .map(|(rule_index, rule)| {
-                let rule_id = rule.id.clone().unwrap_or_else(|| rule_index.to_string());
-                let hits = counts.get(&rule_id).copied().unwrap_or(0);
-                PolicyRuleHitCount { rule_id, hits }
+            .map(|rule_id| PolicyRuleHitCount {
+                rule_id: rule_id.clone(),
+                hits: counts.get(rule_id).copied().unwrap_or(0),
             })
             .collect(),
     })
@@ -1331,20 +1333,67 @@ pub(super) fn validate_rule_preview_request(
 pub(super) async fn preview_rule(
     query_store: &dyn storage::AuditEventStore,
     request: PolicyRulePreviewRequest,
-) -> Result<PolicyRulePreviewResponse, storage::RepositoryError> {
+) -> Result<PolicyRulePreviewResponse, RulePreviewError> {
     preview_rule_with_scan_limit(query_store, request, MAX_RULE_PREVIEW_SCAN_ROWS).await
+}
+
+/// Why a rule preview failed instead of answering.
+#[derive(Debug)]
+pub(super) enum RulePreviewError {
+    /// The audit store could not be read.
+    Storage(storage::RepositoryError),
+    /// The evaluator refused the question the preview built, rather than an
+    /// observation's facts. Only a preview bug can cause that, and ADR-0004
+    /// fails an analysis on it rather than counting around it.
+    Evaluation(policy_eval::EvaluationError),
+}
+
+impl std::fmt::Display for RulePreviewError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Storage(error) => write!(formatter, "audit store read failed: {error}"),
+            Self::Evaluation(error) => write!(formatter, "policy evaluation failed: {error:?}"),
+        }
+    }
+}
+
+impl From<storage::RepositoryError> for RulePreviewError {
+    fn from(error: storage::RepositoryError) -> Self {
+        Self::Storage(error)
+    }
+}
+
+/// The reason a preview reports for an observation whose recorded facts the
+/// evaluator refused: a method, path, principal or routing context no served
+/// request could have presented to the policy stage.
+pub(super) const PREVIEW_MALFORMED_OBSERVATION: &str = "malformed_observation";
+
+/// How the shared evaluator answered the candidate rule for one observation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PreviewObservationOutcome {
+    Matched,
+    NotMatched,
+    /// Neither: the evaluator could not judge the rule against this
+    /// observation, for this stable reason.
+    Unevaluated(&'static str),
 }
 
 /// Scan at most `max_scan_rows` observations, newest first, however wide the
 /// requested window is. A window holding more rows than that answers with
 /// `scan_truncated` and `complete: false`, so a count over the newest rows is
 /// never presented as a count over the whole window.
+///
+/// Each scanned observation is judged by the shared evaluator
+/// ([`policy_eval::CompiledPolicy::match_direct_rules`]) over the candidate
+/// rule alone. An observation it cannot judge is counted, by reason, in
+/// `unevaluated_reasons` rather than as a non-match, and makes the answer
+/// incomplete: a count that skipped it is a lower bound, not the count.
 pub(super) async fn preview_rule_with_scan_limit(
     query_store: &dyn storage::AuditEventStore,
     request: PolicyRulePreviewRequest,
     max_scan_rows: usize,
-) -> Result<PolicyRulePreviewResponse, storage::RepositoryError> {
-    let matcher = rbac::RuleMatcher::new(std::slice::from_ref(&request.rule));
+) -> Result<PolicyRulePreviewResponse, RulePreviewError> {
+    let candidate = policy_eval::CompiledPolicy::for_candidate_rule(request.rule.clone());
     let sample_limit = request
         .sample_limit
         .unwrap_or(DEFAULT_RULE_PREVIEW_SAMPLE_LIMIT)
@@ -1352,6 +1401,8 @@ pub(super) async fn preview_rule_with_scan_limit(
     let max_scan_rows = u64::try_from(max_scan_rows).unwrap_or(u64::MAX);
     let mut match_count = 0_u64;
     let mut scanned_event_count = 0_u64;
+    let mut unevaluated_event_count = 0_u64;
+    let mut unevaluated_reasons = BTreeMap::<&'static str, u64>::new();
     let mut scan_truncated = false;
     let mut samples = Vec::with_capacity(sample_limit);
 
@@ -1378,46 +1429,20 @@ pub(super) async fn preview_rule_with_scan_limit(
             }
             filters.before_id = Some(observation.id);
             scanned_event_count = scanned_event_count.saturating_add(1);
-            let principal = observation
-                .actor
-                .as_ref()
-                .and_then(principal_from_audit_actor);
-            let payload = serde_json::from_str::<Value>(&observation.payload_json).ok();
-            let payload_string = |key: &str| {
-                payload
-                    .as_ref()
-                    .and_then(|payload| payload.get(key))
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.trim().is_empty())
-            };
-            let dispatch_context = if payload
-                .as_ref()
-                .and_then(|payload| payload.get("routing_context_known"))
-                .and_then(Value::as_bool)
-                == Some(true)
+            match preview_observation_outcome(&candidate, &observation)
+                .map_err(RulePreviewError::Evaluation)?
             {
-                rbac::RuleDispatchContext::classified_with_route_id(
-                    payload_string("upstream_route_id"),
-                    payload_string("upstream_route_host"),
-                    payload_string("upstream_route_path_prefix"),
-                    payload_string("upstream_origin"),
-                )
-            } else {
-                rbac::RuleDispatchContext::unknown()
-            };
-
-            if matcher
-                .evaluate_with_dispatch(
-                    &observation.method,
-                    &observation.path,
-                    principal.as_ref(),
-                    dispatch_context,
-                )
-                .is_some()
-            {
-                match_count = match_count.saturating_add(1);
-                if samples.len() < sample_limit {
-                    samples.push(preview_sample(observation));
+                PreviewObservationOutcome::Matched => {
+                    match_count = match_count.saturating_add(1);
+                    if samples.len() < sample_limit {
+                        samples.push(preview_sample(observation));
+                    }
+                }
+                PreviewObservationOutcome::NotMatched => {}
+                PreviewObservationOutcome::Unevaluated(reason) => {
+                    unevaluated_event_count = unevaluated_event_count.saturating_add(1);
+                    let count = unevaluated_reasons.entry(reason).or_insert(0);
+                    *count = count.saturating_add(1);
                 }
             }
         }
@@ -1426,11 +1451,90 @@ pub(super) async fn preview_rule_with_scan_limit(
     Ok(PolicyRulePreviewResponse {
         match_count,
         scanned_event_count,
+        unevaluated_event_count,
+        unevaluated_reasons,
         scan_truncated,
-        complete: !scan_truncated,
+        complete: !scan_truncated && unevaluated_event_count == 0,
         sample_strategy: "newest_matches",
         samples,
     })
+}
+
+/// Ask the shared evaluator whether the candidate rule matches one retained
+/// observation, from the facts the observation recorded.
+///
+/// The facts are the ones the live HTTP adapter supplies, as the observation
+/// recorded them: the method and exact path, the actor as a principal, and the
+/// routing classification with its dispatch facts when `routing_context_known`
+/// is set. An actor whose authentication mode no principal can carry is a
+/// missing principal, not an anonymous one, and an unclassified observation a
+/// missing dispatch; the evaluator answers either only when the rule reads it.
+/// A fact the evaluator refuses -- a path no served request reaches the policy
+/// stage with, for one -- makes the observation unevaluated, as does a method
+/// that does not parse. Any other evaluator error is this function's own and
+/// is returned.
+pub(super) fn preview_observation_outcome(
+    candidate: &policy_eval::CompiledPolicy,
+    observation: &audit::query::RequestObservation,
+) -> Result<PreviewObservationOutcome, policy_eval::EvaluationError> {
+    let unevaluated = PreviewObservationOutcome::Unevaluated(PREVIEW_MALFORMED_OBSERVATION);
+    let Ok(method) = Method::from_bytes(observation.method.as_bytes()) else {
+        return Ok(unevaluated);
+    };
+    let payload = serde_json::from_str::<Value>(&observation.payload_json).ok();
+    let payload_string = |key: &str| {
+        payload
+            .as_ref()
+            .and_then(|payload| payload.get(key))
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+    };
+    let routing_context_known = payload
+        .as_ref()
+        .and_then(|payload| payload.get("routing_context_known"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    let (target, dispatch) = if routing_context_known {
+        match policy_eval::analysis::recorded_dispatch(
+            payload_string("upstream_route_id"),
+            payload_string("upstream_route_host"),
+            payload_string("upstream_route_path_prefix"),
+            payload_string("upstream_origin"),
+        ) {
+            Ok(recorded) => recorded,
+            Err(error) if error.rejects_supplied_facts() => return Ok(unevaluated),
+            Err(error) => return Err(error),
+        }
+    } else {
+        (policy_eval::HttpTarget::Missing, None)
+    };
+    let context = policy_eval::PolicyEvaluationContext {
+        version: policy_eval::CONTEXT_VERSION,
+        snapshot: candidate.snapshot(),
+        method: Some(method),
+        path: Some(observation.path.clone()),
+        principal: audit_actor_principal_fact(observation.actor.as_ref()),
+        target,
+        // The preview's question reads no host; an observation's recorded
+        // host is not offered as one.
+        request_host: policy_eval::HostFact::Missing,
+        dispatch,
+    };
+    match candidate.match_direct_rules(&context) {
+        Ok(answer) => Ok(match answer {
+            policy_eval::analysis::DirectRuleOutcome::Matched { .. } => {
+                PreviewObservationOutcome::Matched
+            }
+            policy_eval::analysis::DirectRuleOutcome::NoMatch => {
+                PreviewObservationOutcome::NotMatched
+            }
+            policy_eval::analysis::DirectRuleOutcome::Indeterminate(limitation) => {
+                PreviewObservationOutcome::Unevaluated(limitation.as_str())
+            }
+        }),
+        Err(error) if error.rejects_supplied_facts() => Ok(unevaluated),
+        Err(error) => Err(error),
+    }
 }
 
 pub(super) fn exact_preview_path_filter(pattern: &str) -> Option<String> {
@@ -1491,23 +1595,39 @@ pub(super) fn preview_path_filter(pattern: &str) -> PreviewPathFilter {
     }
 }
 
-pub(super) fn principal_from_audit_actor(actor: &audit::Actor) -> Option<auth::Principal> {
+/// The principal fact a retained observation's actor supplies.
+///
+/// No actor is an anonymous request. An actor is the principal the live
+/// adapter judged, projected to the policy facts the audit record keeps:
+/// subject, issuer, roles and the authentication mode, each of the four modes
+/// a principal can carry. A mode none of them names cannot be turned into a
+/// principal, so the fact is missing rather than guessed; before the cutover
+/// such an actor, and every client-certificate actor, was judged as
+/// anonymous.
+pub(super) fn audit_actor_principal_fact(
+    actor: Option<&audit::Actor>,
+) -> policy_eval::PrincipalFact {
+    let Some(actor) = actor else {
+        return policy_eval::PrincipalFact::Anonymous;
+    };
     let auth_method = match actor.auth_mode.as_str() {
         rbac::rule::AUTH_METHOD_BEARER_TOKEN => auth::AuthMethod::Bearer,
         rbac::rule::AUTH_METHOD_SESSION_COOKIE => auth::AuthMethod::Cookie,
         rbac::rule::AUTH_METHOD_SERVICE_TOKEN => auth::AuthMethod::ServiceToken,
-        _ => return None,
+        rbac::rule::AUTH_METHOD_CLIENT_CERTIFICATE => auth::AuthMethod::ClientCertificate,
+        _ => return policy_eval::PrincipalFact::Missing,
     };
-
-    Some(auth::Principal {
-        user_id: actor.user_id.clone(),
-        issuer: actor.issuer.clone(),
-        email: actor.email.clone(),
-        org_id: None,
-        roles: actor.roles.clone().unwrap_or_default(),
-        session_id: "audit-history".to_owned(),
-        auth_method,
-    })
+    policy_eval::PrincipalFact::Authenticated(policy_eval::PrincipalIdentity::from_principal(
+        &auth::Principal {
+            user_id: actor.user_id.clone(),
+            issuer: actor.issuer.clone(),
+            email: None,
+            org_id: None,
+            roles: actor.roles.clone().unwrap_or_default(),
+            session_id: String::new(),
+            auth_method,
+        },
+    ))
 }
 
 pub(super) fn preview_sample(

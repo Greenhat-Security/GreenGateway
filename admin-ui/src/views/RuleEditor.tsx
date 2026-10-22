@@ -955,15 +955,17 @@ function PreviewResult({
   response: PolicyRulePreviewResponse;
   windowHours: number;
 }) {
-  // A truncated scan counted only the newest observations, so its match
-  // count is a lower bound for the window, never the window's count.
-  const truncated =
-    response.scan_truncated === true || response.complete === false;
+  // A truncated scan counted only the newest observations, and an
+  // unevaluated observation was counted neither way, so either makes the
+  // match count a lower bound for the window, never the window's count.
+  const truncated = response.scan_truncated === true;
+  const unevaluated = response.unevaluated_event_count ?? 0;
+  const lowerBound = truncated || unevaluated > 0 || response.complete === false;
 
   // Nothing in the window reached the matcher, so there was nothing to
   // count: "would have matched 0 requests" would read as evidence that the
   // rule matches nothing.
-  if (response.scanned_event_count === 0 && !truncated) {
+  if (response.scanned_event_count === 0 && !lowerBound) {
     return (
       <div className="rule-preview-result">
         <div className="error-panel alert info" role="status">
@@ -997,12 +999,27 @@ function PreviewResult({
               {formatCount(response.scanned_event_count)} observations that passed
               the rule&apos;s method and path pre-filter.
             </>
+          ) : lowerBound ? (
+            <>
+              This rule would have matched at least{' '}
+              {formatCount(response.match_count)} requests in the last{' '}
+              {formatWindowHours(windowHours)}.
+            </>
           ) : (
             <>
               This rule would have matched {formatCount(response.match_count)}{' '}
               requests in the last {formatWindowHours(windowHours)}.
             </>
           )}
+          {unevaluated > 0 ? (
+            <>
+              {' '}
+              {formatCount(unevaluated)} of the{' '}
+              {formatCount(response.scanned_event_count)} scanned observations
+              could not be evaluated against it:{' '}
+              {unevaluatedReasonsLabel(response.unevaluated_reasons)}.
+            </>
+          ) : null}
         </span>
       </div>
       <div className="rule-preview-meta">
@@ -1010,6 +1027,11 @@ function PreviewResult({
           {formatCount(response.scanned_event_count)} scanned
         </span>
         {truncated ? <span className="badge warning">Scan truncated</span> : null}
+        {unevaluated > 0 ? (
+          <span className="badge warning">
+            {formatCount(unevaluated)} not evaluated
+          </span>
+        ) : null}
         <span className="badge neutral">{response.sample_strategy}</span>
       </div>
       {response.samples.length === 0 ? (
@@ -1686,4 +1708,23 @@ function formatWindowHours(hours: number): string {
 
 function formatCount(value: number): string {
   return value.toLocaleString();
+}
+
+// Why the gateway could not judge a rule against some observations, in the
+// order the response lists them. An unknown reason is shown as sent.
+function unevaluatedReasonsLabel(
+  reasons: Record<string, number> | undefined,
+): string {
+  const labels: Record<string, string> = {
+    missing_dispatch_fact: 'recorded without routing classification',
+    missing_principal_fact: 'caller recorded in an unsupported authentication mode',
+    malformed_observation: 'request the gateway refuses before policy',
+  };
+  const entries = Object.entries(reasons ?? {}).filter(([, count]) => count > 0);
+  if (entries.length === 0) {
+    return 'reason not reported';
+  }
+  return entries
+    .map(([reason, count]) => `${formatCount(count)} ${labels[reason] ?? reason}`)
+    .join(', ');
 }

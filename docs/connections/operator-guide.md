@@ -9,7 +9,10 @@ before GreenGateway resolves its protected material or contacts an upstream.
 This guide covers production custody and day-two operations. See the
 [migration guide](migration.md) for moving legacy settings and the
 [admin guide](admin-guide.md) for the browser workflow. The complete field and
-limit reference remains in [configuration.md](../configuration.md).
+limit reference remains in [configuration.md](../configuration.md). Where
+trust sits when a Connection acts for the calling user, through a signed
+caller assertion or a delegated issuer token, is collected in the
+[per-caller credential trust boundary](per-caller-trust-boundary.md).
 
 ## Production Readiness Checklist
 
@@ -370,6 +373,9 @@ the gateway's published key set (see [The published JWKS](#the-published-jwks))
 and can then apply its own per-user ownership and entitlement checks, which a
 single shared credential makes impossible. It is the same shape as Google IAP's
 `X-Goog-IAP-JWT-Assertion` and Cloudflare Access's `Cf-Access-Jwt-Assertion`.
+What the signing key can do in the wrong hands, and what a verifier must
+check, is summarized in the
+[per-caller credential trust boundary](per-caller-trust-boundary.md).
 
 #### Which calls are attested
 
@@ -382,6 +388,9 @@ request before it sends it, attests that caller:
 - Managed MCP tool calls. A call opens a session of its own, and every request
   of that session carries its own assertion; see
   [Managed MCP tool calls](#managed-mcp-tool-calls).
+- Composite tools. Every request a composite sends, each forward step, each
+  iteration of a fan-out and each compensation, carries its own assertion; see
+  [Composite tool leaves](#composite-tool-leaves).
 - Requests a connection-bound proxy route forwards; see
   [Proxied requests](#proxied-requests).
 
@@ -389,14 +398,13 @@ The lanes that have no calling principal to attest are refused with
 `caller_assertion_not_enforced` before any DNS lookup, secret read, OAuth mint
 or upstream request, rather than sent without the assertion: fetching an
 OpenAPI specification from the upstream on a refresh, MCP catalog refresh,
-enum and label source fetches, and stored Connection tests. So are the steps
-of a composite tool, which would each need an assertion with a `jti` of its
-own, and every lane when the stored block is one only an earlier release
-accepted (see [HTTPS only](#https-only) and
-[Failure reasons](#failure-reasons)). A `delegated_issuer_token` Connection,
-whose assertion is the subject token of the caller's own credential, is
-served by manual HTTP tools only, and its stored test runs as the principal
-who asks for it; see [Which calls are served](#which-calls-are-served).
+enum and label source fetches, and stored Connection tests. So is every lane
+when the stored block is one only an earlier release accepted (see
+[HTTPS only](#https-only) and [Failure reasons](#failure-reasons)). A
+`delegated_issuer_token` Connection, whose assertion is the subject token of
+the caller's own credential, is served by manual HTTP tools only, and its
+stored test runs as the principal who asks for it; see
+[Which calls are served](#which-calls-are-served).
 
 On the refused lanes the reason appears as follows:
 
@@ -405,7 +413,9 @@ On the refused lanes the reason appears as follows:
   `tool.invoke_failure` and the `reason` of `tool.upstream_request`. A
   composite tool reports at the tool level: its `failure_reason` is
   `composite_failed`, and the failing step's `caller_assertion_not_enforced` is
-  only in the error details returned to the caller, not in any audit event.
+  only in the error details returned to the caller, because the step is
+  refused before it makes a request; see
+  [Composite tool leaves](#composite-tool-leaves).
 - Stored Connection test: the `authenticated` stage reason.
 - OpenAPI refresh of a catalog whose discovery has a `path`, and MCP catalog
   refresh: the `reason` of a `409 Conflict` response, also audited as
@@ -449,7 +459,7 @@ The JOSE header carries `alg` (`ES256` or `RS256`, from `algorithm`), `kid`
 | `sub` | The caller's identity provider issuer, `#`, then the provider's subject, for example `https://idp.example#alice`. The provider issuer scopes the subject because two providers can issue the same subject for different people. |
 | `caller_iss`, `caller_sub` | The two halves of `sub`, unscoped. An upstream that matches its own user records reads these and never parses `sub`. |
 | `iat`, `exp` | Signing time and `iat` plus `lifetime_seconds`. |
-| `jti` | The gateway request ID of the call (`X-Request-Id`), the same ID its audit events carry. |
+| `jti` | The gateway request ID of the call (`X-Request-Id`), the same ID its audit events carry. A call that sends several requests gives each its own: a managed MCP session's requests and a composite tool's leaves add `.` and a sequence number. |
 | `email` | With `email` in `claims`, the principal's email, when it has one. Copied from the principal as its identity provider gave it; see the note below the table. |
 | `roles` | With `roles` in `claims`, the principal's roles, as an array. |
 | `method`, `path`, `request_sha256` | With `bind_request: true`: the request method, the request target exactly as it appears on the request line (path, then `?` and the query when there is one), and the lowercase hexadecimal SHA-256 of the exact body bytes sent, which is the hash of empty input for a request without a body. |
@@ -551,6 +561,43 @@ the stored catalog stale, so a Connection that gains the block cannot serve
 its MCP tools until discovery can run on it. Attesting discovery itself is not
 supported yet.
 
+#### Composite tool leaves
+
+A [composite tool](#composite-tools) sends one request per leaf: each forward
+step, each iteration of a `for_each` fan-out, and each compensation. Every
+leaf is signed separately, just before it is sent, exactly as a managed
+OpenAPI tool call is: the same admission, key load and header rules.
+
+- The `jti` of the `n`th leaf that carries an assertion is the call's request
+  ID, a dot, and `n`, counting from 1 in the order the leaves are sent,
+  forward steps and compensations alike (`6f1c2a4e-....1`, `6f1c2a4e-....2`,
+  ...). A replay cache keyed on `sub` and `jti` therefore accepts every leaf of
+  the call, including the compensations that undo earlier leaves. A leaf that
+  was refused takes no number.
+- With `bind_request`, each assertion covers its own leaf's method, request
+  target and exact body.
+- Each leaf's `tool.upstream_request` records `"caller_assertion": {"kid",
+  "jti"}` for the assertion it sent, so an upstream's log line joins the
+  leaf that sent it. The composite itself is recorded on
+  `tool.composite_completed`, which carries no assertion.
+- A composite that names nobody, a service token included, is refused at its
+  first leaf with `caller_assertion_no_principal`, before any DNS lookup,
+  secret read or upstream request, so nothing needs to be undone.
+
+A composite reports a refused leaf through its own failure, as for any failed
+step: `tool.invoke_failure` has the `failure_reason` `composite_failed`, the
+error details returned to the caller name the failed step and carry the leaf's
+reason as `failure_reason` (`caller_assertion_no_principal`,
+`caller_assertion_key_unavailable`, and so on), and the refused leaf's
+`tool.upstream_request` has the reason too. A leaf refused before it makes a
+request, such as `caller_assertion_not_enforced` for a block only an earlier
+release accepted, has no `tool.upstream_request`. A compensation refused for
+any of these reasons sends nothing: `tool.composite_completed` records it as
+`skipped` with the reason, and the write it would have undone is returned as a
+`confirmed` orphan with the same reason, rather than as
+`compensation_transport_error`. Fix what the reason names, then undo the write
+by hand.
+
 #### Which callers can be attested
 
 A principal that an identity provider vouched for can be attested: a bearer
@@ -584,10 +631,10 @@ Each refusal is a fixed string in the `failure_reason` of `tool.invoke_failure`
 | `caller_assertion_key_not_published` | This replica leaves the Connection's keys out of the published JWKS, so no upstream that fetched it could verify what the Connection signed: one of its keys, the signing key or a published key, did not resolve or load at the last check, or another enabled Connection publishes a different key under one of its `kid`s. See [Stored Connections whose keys cannot be used](#stored-connections-whose-keys-cannot-be-used). |
 | `caller_assertion_key_unusable` | At call time, the signing key's alias is unknown or refused, or holds material that is not a usable key for `algorithm`. |
 | `caller_assertion_key_unavailable` | At call time, the signing key's source could not be read. |
-| `caller_assertion_claim_invalid` | A value would not survive as a claim: a subject longer than 256 bytes, an issuer longer than 512 bytes or containing `#`, a role longer than 128 bytes, an email longer than 320 bytes, a request ID (a `jti`, with a managed MCP session's sequence suffix) longer than 128 bytes or missing, with `bind_request` a request target longer than 2048 bytes or a method longer than 16 bytes, or any of them containing a control character. |
+| `caller_assertion_claim_invalid` | A value would not survive as a claim: a subject longer than 256 bytes, an issuer longer than 512 bytes or containing `#`, a role longer than 128 bytes, an email longer than 320 bytes, a request ID (a `jti`, with the sequence suffix of a managed MCP session's request or a composite tool's leaf) longer than 128 bytes or missing, with `bind_request` a request target longer than 2048 bytes or a method longer than 16 bytes, or any of them containing a control character. |
 | `caller_assertion_header_conflict` | Another header source had already set the assertion header. |
 | `caller_assertion_signature_failed`, `caller_assertion_token_too_long` | Signing failed, including on a host whose clock reads before 1970 and a managed MCP session asked to sign after its call ended, or the assertion would exceed 8 KiB. |
-| `caller_assertion_not_enforced` | The lane has no caller to attest (discovery, enum and label sources, stored tests), is a composite tool's step, serves a `delegated_issuer_token` Connection other than through a manual tool or a stored test, or the stored block is one only an earlier release accepted: `bind_approval: true`, an assertion header that matches an additional header, or a plain HTTP endpoint. |
+| `caller_assertion_not_enforced` | The lane has no caller to attest (discovery, enum and label sources, stored tests), serves a `delegated_issuer_token` Connection other than through a manual tool or a stored test, or the stored block is one only an earlier release accepted: `bind_approval: true`, an assertion header that matches an additional header, or a plain HTTP endpoint. |
 
 A signing key that cannot be read or loaded at call time also raises
 `connection.secret_resolution_failed` with the same reason. A proxied request
@@ -617,14 +664,15 @@ records which key signed it and its `jti`, whatever the outcome:
 "caller_assertion": { "kid": "gw-2026-09", "jti": "6f1c2a4e-..." }
 ```
 
-A managed MCP tool call records its session's assertions as `kid`,
-`jti_base` and `count` (see
-[Managed MCP tool calls](#managed-mcp-tool-calls)), and a proxied request
-records its assertion on `connection.caller_assertion` (see
+Each leaf of a composite tool has a `tool.upstream_request` of its own, with
+its own `jti` (see [Composite tool leaves](#composite-tool-leaves)). A managed
+MCP tool call records its session's assertions as `kid`, `jti_base` and
+`count` (see [Managed MCP tool calls](#managed-mcp-tool-calls)), and a proxied
+request records its assertion on `connection.caller_assertion` (see
 [Proxied requests](#proxied-requests)). The attested caller is the event's
 `actor`. To find the gateway's record of a request an upstream logged, search
-the audit for its `jti`, or for its request ID without the MCP sequence
-suffix.
+the audit for its `jti`, or for its request ID without the sequence suffix of
+a managed MCP session or a composite.
 
 #### Verifying an assertion
 
@@ -677,17 +725,48 @@ clock; if the two clocks can drift apart, allow a few seconds of leeway
 
 #### The block in the admin UI
 
-The admin UI shows the block read only, on the Connection detail page and in
-the editor: every field except the key aliases, which appear only as
-configured or not, with a note on which calls are attested. The UI has no
-controls for the block and never sends it. A replacement (`PUT`) that omits
-`caller_assertion` keeps the current block, so a save in the UI leaves it
-exactly as stored and cannot put the Connection back into service unattested.
-The gateway revalidates the kept block on every save, so the editor refuses a
-primary or additional header name that matches the assertion header before it
-writes, and a block stored with `bind_approval: true` has to be removed before
-the Connection can be saved again. To stop attesting, remove the block
-deliberately: send `"caller_assertion": null` in a `PUT` through the admin API.
+The Connection detail page shows the block read only: every field except the
+key aliases, which appear only as configured or not, with a note on which
+calls are attested and any `key_problem`. The editor shows it the same way
+until the operator chooses **Add caller assertion**, **Edit caller assertion**
+or **Remove caller assertion**:
+
+- A save that does none of these leaves `caller_assertion` out of the `PUT`.
+  A replacement that omits the block keeps it exactly as stored, so a rename,
+  a disable or a credential rotation cannot change it or put the Connection
+  back into service unattested. The gateway still revalidates the kept block
+  on every save, so the editor refuses a primary or additional header name
+  that matches the assertion header before it writes, and a block stored with
+  `bind_approval: true` must be edited, which turns approval binding off, or
+  removed before the Connection can be saved again.
+- Editing sends the whole block. Each key's alias is picked from the aliases
+  whose compatible purposes include `assertion_signing_key`: operator aliases
+  and external providers, never the encrypted local store. A key the editor
+  keeps is sent as `"signing_key_configured": true` instead of its alias,
+  which the editor never sees, and the gateway keeps the alias of the stored
+  key with the same `kid` and algorithm. Changing a kept key's `kid` or
+  algorithm therefore drops its binding until an alias is picked again.
+  **Make published key N the signing key** swaps that key with the signing
+  key, each with its binding, which is rotation step 3 below.
+- Removing sends `"caller_assertion": null`.
+
+A `delegated_issuer_token` Connection's block is its subject token, which the
+editor drafts only when it creates the Connection; once it exists the block is
+shown read only there (see [In the admin UI](#in-the-admin-ui)).
+
+Each of these needs `admin:connections:secrets:write`; without it the
+section's controls are disabled, and so are the endpoint and test target of a
+Connection that carries the block. A save the gateway refuses shows each
+problem's code beside what it means, on the field that configures it, or in
+the section when that field is not on screen. The gateway names a published
+key's field without its index, so such a problem is shown beside the list.
+
+A marker on a `PUT` that names no stored key, under that `kid` and algorithm,
+is refused with `400`, as are `"signing_key_configured": false` and a marker
+beside a `signing_key_id`; a create has nothing to keep and accepts no
+marker. Naming any key alias in a `PUT`, even the stored one, needs the
+secrets-write permission, so a principal without it cannot test guesses
+against a hidden alias.
 
 New and replacement writes reject `bind_approval: true`, because no approval
 subsystem exists for a mutation to be bound to, an assertion `header_name` that
@@ -884,7 +963,10 @@ signed has expired:
    honours it has fetched the next key before it signs anything. Wait longer if
    a verifier caches the set for longer.
 3. In one `PUT`, make the next key the signing key (`signing_key_id`, `kid` and
-   `algorithm`) and move the previous signing key into `published_keys`.
+   `algorithm`) and move the previous signing key into `published_keys`. A
+   key can keep its alias through the move with `"signing_key_configured":
+   true`, which the gateway resolves by `kid` and algorithm; in the admin UI,
+   this is **Make published key N the signing key**.
 4. Keep the previous key published for at least `lifetime_seconds` plus the
    verifiers' cache time, 300 seconds for one that honours `max-age`, so every
    assertion it signed has expired before a verifier drops it. Then remove it
@@ -935,8 +1017,9 @@ Before upgrading, check every enabled Connection that carries the block:
   remove the block with `"caller_assertion": null` before upgrading.
 
 Managed OpenAPI tools, managed MCP tool calls and proxied requests followed in
-a later release; see the next note. Composite tools, discovery, enum and label
-sources and stored tests on such a Connection stay refused, as before.
+a later release, and composite tools after them; see the next notes.
+Discovery, enum and label sources and stored tests on such a Connection stay
+refused, as before.
 
 #### Upgrade note: OpenAPI tools, MCP tool calls and proxied requests
 
@@ -963,10 +1046,34 @@ the block:
   Connection, and cannot be refreshed while the block is present; see
   [Managed MCP tool calls](#managed-mcp-tool-calls).
 - Delegated Connections, composite tools, discovery, enum and label sources
-  and stored tests are unchanged.
+  and stored tests are unchanged. Composite tools followed; see the next note.
 
 To keep one of these lanes refused until its upstream is ready, disable the
 Connection or remove the block with `"caller_assertion": null` before
+upgrading.
+
+#### Upgrade note: composite tools
+
+From this release, a composite tool on an attested Connection is served
+instead of failing at its first step with `caller_assertion_not_enforced`,
+and every leaf request it sends, compensations included, carries its own
+signed assertion; see [Composite tool leaves](#composite-tool-leaves). Before
+upgrading, check every enabled Connection that carries the block and has
+composite tools in its managed OpenAPI catalog:
+
+- Its upstream accepts a `jti` it has not seen for every leaf, including the
+  compensations, and the extra header on each.
+- Its composites are called by principals an identity provider vouched for:
+  a composite called anonymously or with a service token is now refused at its
+  first leaf with `caller_assertion_no_principal`, inside the
+  `composite_failed` error details, instead of
+  `caller_assertion_not_enforced`.
+- A client or dashboard that reads a composite's orphan reasons can now see a
+  `caller_assertion_*` reason on a compensation that could not be signed.
+
+Delegated Connections, discovery, enum and label sources and stored tests are
+unchanged. To keep composites refused until the upstream is ready, disable
+the Connection or remove the block with `"caller_assertion": null` before
 upgrading.
 
 ### Delegated issuer tokens
@@ -1311,12 +1418,17 @@ error, a log line, a metric or an audit event.
 #### Trust boundary
 
 Phase 8 moves per-user systems behind the gateway; this credential is where
-the trust sits:
+the trust sits. The
+[per-caller credential trust boundary](per-caller-trust-boundary.md) covers
+it together with signed caller assertions: what each component can do in the
+wrong hands, the bounded caches, the audit of every hand-out, what the issuer
+must enforce because the gateway cannot, and what is out of scope. In short:
 
 - **The issuer's grant store is the most sensitive component in the
-  deployment.** Whoever holds this Connection's client secret can ask the
-  issuer for any user's upstream token, so one leaked secret unlocks every
-  stored grant. Keep the secret in an external provider, restrict the issuer
+  deployment.** Whoever holds this Connection's client secret can exchange
+  any subject token the issuer accepts for that user's upstream token, and
+  with the signing key as well, any user's, so one leaked secret can unlock
+  every stored grant. Keep the secret in an external provider, restrict the issuer
   to this client's subject tokens and audience, have it store grants
   encrypted, grant read-only scopes wherever the upstream allows it, and
   have it log every hand-out.
@@ -1369,10 +1481,12 @@ The editor creates and edits delegated Connections:
 - **Edit.** Every credential field above can change, and the client secret can
   be kept, replaced or cleared. The credential type cannot: the stored
   `caller_assertion` is kept through every save, and under any other type the
-  gateway would start sending it upstream. A replacement never sends the
-  block, so it is shown read only; change it, or rotate its key, through the
-  admin API. For the same reason the editor does not offer the delegated
-  type on a Connection created with another one.
+  gateway would start sending it upstream. The editor never sends a
+  delegated Connection's block, so it is shown read only; change it, or
+  rotate its key, through the admin API, where a `PUT` can keep each key's
+  alias by marker (see [The block in the admin UI](#the-block-in-the-admin-ui)).
+  The editor does not offer the delegated type on a Connection created with
+  another one, whose block names that Connection's upstream as its audience.
 - **Test.** *Test connection* runs as you; see
   [Testing a delegated Connection](#testing-a-delegated-connection). The page
   explains each refusal, for example that the issuer has no grant for your
@@ -1434,6 +1548,126 @@ For OpenAPI, preview and confirm the selected generated tools before the first
 registration. Subsequent refreshes preserve a surviving public tool name only
 when it still represents the same operation and safe mapping; a document
 cannot silently move an existing name to a different request.
+
+## Importing Swagger 2.0 Documents
+
+Managed OpenAPI Connections accept Swagger 2.0 documents, in JSON or YAML, in
+preview, registration and refresh, beside OpenAPI 3.x. A document is read as
+Swagger 2.0 when it has a `swagger` field and no `openapi` field, and its
+`swagger` value must be the string `"2.0"`: quote it in YAML, where an
+unquoted `2.0` is a number and is refused. A document that declares `openapi`
+is always read as OpenAPI 3.x, exactly as before. The legacy tools-file import
+(`/v1/admin/tools/openapi/preview` and `/register`) remains OpenAPI 3.x only.
+
+GreenGateway converts the document to the OpenAPI 3.0 document it describes
+and generates tools from that, so the tools, security alternatives and
+bindings are the ones a hand conversion would produce. The stored
+specification, its digest and the 2 MiB limit all apply to the document you
+submitted; registration stores it unchanged, and refresh and overlay edits
+convert it again.
+
+| Swagger 2.0 | Converted to |
+| --- | --- |
+| `definitions` | `components.schemas`; every `#/definitions/` reference is rewritten to `#/components/schemas/` |
+| `query`, `header` and `path` parameters | parameters with a `schema`; array `collectionFormat` `csv`, `multi`, `ssv` and `pipes` become explicit `style`/`explode` |
+| one `body` parameter | `requestBody`, one content entry per `consumes` media type |
+| `formData` parameters | a form `requestBody` (`application/x-www-form-urlencoded`, or `multipart/form-data` when the operation consumes it or has a `file` field) |
+| response `schema` | response content, one entry per `produces` media type |
+| `#/parameters/` and `#/responses/` references | inlined into each operation |
+| `securityDefinitions` | `components.securitySchemes`: `basic` becomes HTTP basic, `apiKey` keeps `in: header` or `in: query`, and the `oauth2` flows `implicit`, `password`, `application` and `accessCode` become `implicit`, `password`, `clientCredentials` and `authorizationCode` |
+| `host`, `basePath`, `schemes` | `servers`, which generated tools do not use |
+| `discriminator`, `type: file`, `x-nullable` | their OpenAPI 3.0 forms |
+
+Response headers, `examples`, `externalDocs` and vendor extensions outside
+schemas are documentation and are not carried over.
+
+Binding does not change. An `application` flow binds to an
+`oauth2_client_credentials` Connection with the same token URL and scopes, and
+`apiKey` in a header binds to `header_api_key`. The user-consent flows
+(`accessCode`, `implicit`, `password`), `basic` and query API keys are
+reported as incompatible, as their OpenAPI 3.0 forms are.
+
+The preview response of a converted document carries a `conversion` object
+with `source_format` `swagger_2_0` and a `warnings` list; an OpenAPI 3.x
+preview has no `conversion` field. Each warning has a `code`, a fixed
+`message`, an `operation_omitted` flag, and, where they apply, the `method`
+and `path_template` of the operation and a `subject` (the field, parameter,
+location, security definition or base path concerned, cut to 256 bytes).
+Review them before registering:
+
+- `base_path_not_in_paths`: generated tools call the Connection's endpoint
+  plus the operation path, and the document's `basePath` is not added. Put it
+  in the Connection's `base_path` (for an API with `basePath: /api`, set
+  `base_path` to `/api`).
+- `request_body_not_mapped`: the operation's request body has no JSON media
+  type, as with every `formData` body. Generated tools send JSON bodies only,
+  so its fields are not tool arguments and the tool sends no body, exactly as
+  for an OpenAPI 3.x form body. Leave such tools unselected unless the
+  upstream accepts the call without them.
+- `consumes_defaulted`, `produces_defaulted`: neither the operation nor the
+  document declares a media type, so body parameters or response schemas are
+  treated as `application/json`. Reported once per document.
+- `security_definition_not_converted`: the definition is incomplete (for
+  example an `oauth2` flow without its URLs or scopes) or has no OpenAPI 3.0
+  form. It is left out, so operations that require it bind as incompatible.
+- `unsupported_document_field`, `unsupported_path_item_field`: a field that
+  is not part of Swagger 2.0, such as an OpenAPI 3.x `servers` or a `trace`
+  operation, was ignored.
+- `warnings_truncated`: the list stopped at its bound; fix the reported
+  problems and preview again.
+
+These codes leave the operation out of the converted document, so no tool is
+generated for it, and set `operation_omitted`: `unsupported_operation_field`
+(for example an OpenAPI 3.x `requestBody` inside a Swagger operation),
+`invalid_parameter` (no usable name, location, body schema or items),
+`unsupported_parameter_location`, `unsupported_parameter_field` (for example
+an OpenAPI 3.x `schema` on a query parameter), `unsupported_collection_format`
+(`tsv`, a nested array format, or anything but `csv` on a path or header),
+`file_parameter_outside_form`, `multiple_body_parameters` and
+`body_and_form_parameters`. A problem in a path item's own `parameters` leaves
+out every operation of that path.
+
+The whole document is refused, and preview or registration fails as for any
+invalid specification, when `swagger` is not the string `"2.0"`, a structural
+field has the wrong type, a reference is remote, a local reference points
+anywhere but `#/definitions/`, `#/parameters/` or `#/responses/` (or a path
+item uses `$ref`), a `#/parameters/` or `#/responses/` reference names no
+component or points into one instead of at it, the document has more than
+4,096 operations, conversion would copy more than 262,144 nodes more than
+once (inlined references, path-level body fields, schemas repeated under
+several media types), or schemas nest deeper than 256 levels. A
+`#/definitions/` reference is rewritten without being resolved; the generator
+then treats a missing target exactly as it treats a missing
+`#/components/schemas/` target in an OpenAPI 3.x document.
+
+Registration publishes only the `selected_tool_names` you confirm. To keep a
+Connection to read operations, select only the tools whose
+`upstream.method` is `GET` or `HEAD` in the preview.
+
+Upgrade and rollback: releases before this one cannot generate tools from a
+Swagger 2.0 document. A replica on an earlier release keeps serving the tools
+already published for such a catalog, but cannot refresh it (it reports
+`degraded/catalog_stale`), and if the Connection also has an overlay it cannot
+rebuild the overlay's source plan from the stored document: it fails at
+startup, and a running one holds its Connection reconciliation unavailable.
+
+In cluster mode this is enforced: storing a catalog converted from a Swagger
+2.0 document (registering one, refreshing to one, or putting an overlay over
+one) is the gated operation `connections.openapi_swagger2_catalog`, admitted
+only while every live replica, draining ones included, advertises the
+`openapi_swagger2_catalogs` capability. While an earlier replica is live the
+write is refused with `409` and reason `capability_not_advertised`, nothing is
+stored, and the refusal is audited as `cluster.operation_refused`; finish the
+rollout, or wait for the earlier replicas' rows to go stale, and retry. A
+refresh learns that its document is Swagger 2.0 only after fetching it, so an
+admitted refresh fetches it again. Preview, OpenAPI 3.x documents and deleting
+an overlay never ask. See
+[operation gating](../deployment/postgres.md#membership-and-maintenance).
+
+In standalone mode there is no other replica to wait for. In either mode,
+before rolling back to an earlier release, re-register those Connections with
+an OpenAPI 3.x document (or delete their overlays first, so the earlier
+release can still start).
 
 ## OpenAPI Overlays
 
@@ -1645,7 +1879,9 @@ A composite is one agent-facing tool whose sequential steps name generated
 tools from the same managed OpenAPI catalog. It cannot introduce a method or
 path. Each real forward or compensation request still uses the Connection's
 credential and additional headers, passes the Connection egress policy, and is
-checked against HTTP deny rules on its rendered path.
+checked against HTTP deny rules on its rendered path. On a Connection with a
+`caller_assertion`, each also carries a signed assertion of its own; see
+[Composite tool leaves](#composite-tool-leaves).
 
 Composite input properties can use
 `composites.<name>.parameters.<property>.enum_source` to share the same dynamic

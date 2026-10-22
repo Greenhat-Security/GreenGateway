@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "label": "representative-read",
+  "path": "/api/representative-read",
+  "method": "GET",
+  "timeout_ms": 5000,
+  "expected_statuses": ["200"],
+  "gateway_metrics": false,
+  "warmup": {
+    "concurrency": 10,
+    "duration_seconds": 60
+  },
+  "scenarios": [
+    {
+      "name": "steady-c25",
+      "concurrency": 25,
+      "duration_seconds": 600,
+      "slo": {
+        "p95_ms": 250,
+        "p99_ms": 500,
+        "max_error_rate": 0.001
+      }
+    },
+    {
+      "name": "peak-c100",
+      "concurrency": 100,
+      "duration_seconds": 600,
+      "slo": {
+        "p99_ms": 1000,
+        "max_error_rate": 0.005,
+        "min_requests_per_second": 200
+      }
+    },
+    {
+      "name": "saturation-c400",
+      "concurrency": 400,
+      "duration_seconds": 300,
+      "observe_only": true
+    }
+  ]
+}

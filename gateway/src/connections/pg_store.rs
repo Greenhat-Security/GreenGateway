@@ -620,8 +620,10 @@ impl PostgresConnectionStore {
     /// versions, bindings, catalogs, and status rows in the same commit
     /// as the state/outbox bumps and the deletion's durable evidence
     /// (`connection_change_evidence`, migration 16), which does not
-    /// cascade. A refused or failed delete writes no evidence, and a
-    /// delete whose evidence cannot be written does not commit.
+    /// cascade, and its journal row for delivery (migration 21). A refused
+    /// or failed delete writes no evidence, and a delete whose evidence or
+    /// journal row cannot be written -- the journal full included -- does
+    /// not commit.
     pub async fn delete(
         &self,
         id: &ConnectionId,
@@ -4949,10 +4951,12 @@ struct ChangeEvidence<'a> {
     actor_user_id: &'a str,
 }
 
-/// Append one evidence row inside the caller's transaction. The row's
-/// `event_id` is minted here, once; `committed_at` is the database
+/// Append one evidence row inside the caller's transaction, and journal it
+/// for delivery (migration 21). The row's `event_id` is minted here, once,
+/// and the journal carries the same one; `committed_at` is the database
 /// clock's. Any failure is returned for the caller to roll back, so the
-/// change it describes never commits without it.
+/// change it describes never commits without both. A full journal refuses
+/// the change as unavailable rather than evict an accepted event.
 async fn record_change_evidence(
     client: &deadpool_postgres::Object,
     evidence: &ChangeEvidence<'_>,
@@ -4980,7 +4984,23 @@ async fn record_change_evidence(
         )
         .await
         .map_err(|error| pg_error(OPERATION_CHANGE_EVIDENCE, error))?;
-    Ok(())
+    crate::storage::postgres_authority_events::append_to_journal(
+        client,
+        crate::storage::postgres_authority_events::JournalSource::ConnectionChange,
+        &event_id,
+    )
+    .await
+    .map_err(|error| {
+        use crate::storage::postgres_authority_events::{
+            JournalAppendError, OPERATION_JOURNAL_APPEND,
+        };
+        match error {
+            JournalAppendError::CapacityExhausted => ConnectionStoreError::Unavailable {
+                operation: OPERATION_JOURNAL_APPEND,
+            },
+            JournalAppendError::Store(error) => pg_error(OPERATION_JOURNAL_APPEND, error),
+        }
+    })
 }
 
 /// Open a mutating transaction: `BEGIN`, then immediately take the one

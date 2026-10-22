@@ -63,11 +63,13 @@
 //! The key is resolved through the secret providers under
 //! [`SecretPurpose::AuthorityPseudonymKey`], which the encrypted local store
 //! neither holds nor resolves. `docs/authority-evidence.md` gives the key
-//! source, rotation and backup policy. Nothing calls this module at runtime
-//! yet: the producer that puts these references into authority events is a
-//! later #425 slice.
+//! source, rotation and backup policy. In cluster mode the authority-event
+//! dispatcher resolves the keyring at startup and derives the references of
+//! every delivered event here (`super::delivery`).
 
-#![allow(dead_code)] // No runtime producer exists yet; a later #425 slice wires this in.
+// Most domains, verification and the previous-key window have no runtime
+// caller yet, and a build without the `postgres` feature has none at all.
+#![allow(dead_code)]
 
 use std::{error::Error, fmt};
 
@@ -121,6 +123,14 @@ pub(crate) enum ReferenceDomain {
     /// The issuer that authenticated the actor: exactly one component, the
     /// canonical issuer.
     ActorIssuer,
+    /// An actor as an evidence row recorded it, with no issuer: exactly one
+    /// component, the recorded actor identifier. Migrations 16 and 18 keep
+    /// only the acting principal's subject, or a command's fixed system
+    /// label, so the dispatcher can name the actor of those rows only this
+    /// way. It is a separate domain on purpose: the same subject never yields
+    /// the same reference here and under [`Self::ActorSubject`], so an
+    /// issuer-less reference can never be mistaken for an issuer-scoped one.
+    ActorRecorded,
     Policy,
     Tools,
     Connection,
@@ -135,9 +145,10 @@ pub(crate) enum ReferenceDomain {
 }
 
 impl ReferenceDomain {
-    pub(crate) const ALL: [Self; 13] = [
+    pub(crate) const ALL: [Self; 14] = [
         Self::ActorSubject,
         Self::ActorIssuer,
+        Self::ActorRecorded,
         Self::Policy,
         Self::Tools,
         Self::Connection,
@@ -157,6 +168,7 @@ impl ReferenceDomain {
         match self {
             Self::ActorSubject => "actor.subject",
             Self::ActorIssuer => "actor.issuer",
+            Self::ActorRecorded => "actor.recorded",
             Self::Policy => "resource.policy",
             Self::Tools => "resource.tools",
             Self::Connection => "resource.connection",
@@ -177,7 +189,7 @@ impl ReferenceDomain {
     fn accepts(self, count: usize) -> bool {
         match self {
             Self::ActorSubject => count == 2,
-            Self::ActorIssuer => count == 1,
+            Self::ActorIssuer | Self::ActorRecorded => count == 1,
             _ => (1..=MAX_REFERENCE_COMPONENTS).contains(&count),
         }
     }
@@ -554,6 +566,36 @@ fn frame_length(length: usize) -> [u8; 8] {
     // usize is at most 64 bits on every target Rust supports, so this is
     // lossless.
     (length as u64).to_be_bytes()
+}
+
+/// Keyrings under keys generated at run time, for the tests of the modules
+/// that derive references. No key material is ever committed.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// A fresh key, hex encoded the way an operator provisions one.
+    pub(crate) fn generated_key_hex() -> String {
+        let mut bytes = [0_u8; PSEUDONYM_KEY_BYTES];
+        getrandom::fill(&mut bytes).expect("the OS random source should be available");
+        hex::encode(bytes)
+    }
+
+    /// A keyring for `authority_id` under `material`, with no previous key.
+    pub(crate) fn keyring_from_hex(authority_id: Uuid, material: &str) -> PseudonymKeyring {
+        let secret = ResolvedSecret::new(
+            SecretPurpose::AuthorityPseudonymKey,
+            material.as_bytes().to_vec(),
+        )
+        .expect("bounded test material should be accepted");
+        let key = PseudonymKey::from_resolved(&secret).expect("a generated key should parse");
+        PseudonymKeyring::new(authority_id, key, None).expect("the keyring should build")
+    }
+
+    /// A keyring under a freshly generated key.
+    pub(crate) fn generated_keyring(authority_id: Uuid) -> PseudonymKeyring {
+        keyring_from_hex(authority_id, &generated_key_hex())
+    }
 }
 
 #[cfg(test)]

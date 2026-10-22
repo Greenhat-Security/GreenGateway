@@ -698,6 +698,21 @@ class LaneBudgetSchemaTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             bench.validate_budget(schema_two_with_lanes)
 
+    def test_repository_budget_enforces_the_lanes_over_the_committed_harnesses(self):
+        # A later comparison loads this budget from its base, so it must approve
+        # every harness the repository compiles, or that comparison is refused.
+        repository = bench.validate_budget(
+            json.loads((ROOT / bench.BUDGET_PATH).read_text(encoding="utf-8")))
+        self.assertTrue(bench.budgets_kernel(repository))
+        self.assertTrue(bench.budgets_lanes(repository))
+        self.assertEqual(bench.lane_policy(repository, repository), "enforced")
+        for key, path in (("harness_sha256", bench.HARNESS_PATH),
+                          ("kernel_harness_sha256", bench.KERNEL_HARNESS_PATH),
+                          ("lane_harness_sha256", bench.LANE_HARNESS_PATH)):
+            with self.subTest(harness=path):
+                committed = bench._digest((ROOT / path).read_text(encoding="utf-8"))
+                self.assertIn(committed, repository[key])
+
     def test_lane_adoption_follows_the_base_budget_and_keeps_http_policy_enforced(self):
         self.assertEqual(bench.lane_policy(kernel_budget(), kernel_budget()), "pending")
         self.assertEqual(bench.lane_policy(kernel_budget(), lane_budget()), "proposed")

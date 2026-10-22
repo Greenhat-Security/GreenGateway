@@ -1686,6 +1686,7 @@ fn test_config(jwks_url: Option<&str>) -> Config {
         readiness_probe_cache_ms: crate::config::DEFAULT_READINESS_PROBE_CACHE_MS,
         cluster_status_expose_hostnames: false,
         audit_postgres_retention_days: None,
+        authority_events: Default::default(),
         tool_runtime_default_timeout_ms: crate::config::DEFAULT_TOOL_RUNTIME_DEFAULT_TIMEOUT_MS,
         csrf_enabled: true,
         csrf_cookie_name: "csrf_token".to_owned(),

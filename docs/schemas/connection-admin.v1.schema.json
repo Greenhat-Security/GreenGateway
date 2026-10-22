@@ -8,7 +8,7 @@
     "CallerAssertion": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Attests the calling principal to the upstream on every manual HTTP, managed OpenAPI and managed MCP tool call and every proxied request made through this Connection, alongside the primary credential rather than instead of it: the credential says which system is calling, the assertion says on whose behalf, so an upstream the operator controls can apply its own per-user checks. Per request the gateway signs one short-lived JWT naming the validated principal (sub is the identity provider's issuer, '#', and its subject; jti is the gateway request ID, with '.' and a sequence number for each request of a managed MCP tool call's session) and writes it, as the last header, in header_name; with bind_request it also binds the method, the request target and the SHA-256 of the exact body sent. A call with no principal to name, a service token included, is refused with caller_assertion_no_principal before any network or secret I/O. The endpoint must use https. Lanes with no caller to attest (discovery, enum and label sources, stored tests) and composite tool steps are refused with caller_assertion_not_enforced, as is every lane but manual tools and stored tests, which run as the principal who asks for them, on a delegated_issuer_token Connection and every lane for a stored block only an earlier release accepted. Saving an enabled Connection resolves its signing key and every published key, from whichever secret source holds it, and loads each for its algorithm; a key that cannot be used refuses the save, and every call reads and loads the signing key again. The public halves of every enabled Connection's keys are served at /.well-known/caller-assertion-jwks.json, which the upstream verifies against. A stored Connection whose keys can no longer be used is left out of that set, with a diagnostic, rather than stopping the gateway, and its calls are refused with caller_assertion_key_not_published until its keys load again. Omit the block to send only the credential.",
+      "description": "Attests the calling principal to the upstream on every manual HTTP, managed OpenAPI and managed MCP tool call, every request a composite tool sends and every proxied request made through this Connection, alongside the primary credential rather than instead of it: the credential says which system is calling, the assertion says on whose behalf, so an upstream the operator controls can apply its own per-user checks. Per request the gateway signs one short-lived JWT naming the validated principal (sub is the identity provider's issuer, '#', and its subject; jti is the gateway request ID, with '.' and a sequence number for each request of a managed MCP tool call's session and each leaf request of a composite tool) and writes it, as the last header, in header_name; with bind_request it also binds the method, the request target and the SHA-256 of the exact body sent. A call with no principal to name, a service token included, is refused with caller_assertion_no_principal before any network or secret I/O. The endpoint must use https. Lanes with no caller to attest (discovery, enum and label sources, stored tests) are refused with caller_assertion_not_enforced, as is every lane but manual tools and stored tests, which run as the principal who asks for them, on a delegated_issuer_token Connection and every lane for a stored block only an earlier release accepted. Saving an enabled Connection resolves its signing key and every published key, from whichever secret source holds it, and loads each for its algorithm; a key that cannot be used refuses the save, and every call reads and loads the signing key again. The public halves of every enabled Connection's keys are served at /.well-known/caller-assertion-jwks.json, which the upstream verifies against. A stored Connection whose keys can no longer be used is left out of that set, with a diagnostic, rather than stopping the gateway, and its calls are refused with caller_assertion_key_not_published until its keys load again. Omit the block to send only the credential.",
       "required": [
         "signing_key_id",
         "kid",
@@ -49,10 +49,62 @@
         "algorithm": { "enum": ["es256", "rs256"] }
       }
     },
+    "MutationCallerAssertion": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "A caller assertion in a replacement (PUT). The same block as CallerAssertion, except that each key may name its alias with signing_key_id or keep the stored one with signing_key_configured. Any change to the block is a secrets write, and so is naming any key alias, even the one already stored.",
+      "required": [
+        "kid",
+        "algorithm",
+        "issuer",
+        "audience",
+        "token_type",
+        "header_name",
+        "lifetime_seconds"
+      ],
+      "properties": {
+        "signing_key_id": { "type": "string", "minLength": 1, "maxLength": 128, "description": "Secret alias holding the signing key, as in CallerAssertion." },
+        "signing_key_configured": { "const": true, "description": "PUT-only redaction marker: keeps the alias of the stored key, the signing key or a published one, with the same kid and algorithm, so a rotation can move a key between signing_key_id and published_keys without naming its alias. A marker that matches no stored key, false, and a marker beside signing_key_id are refused with 400." },
+        "kid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "algorithm": { "enum": ["es256", "rs256"] },
+        "issuer": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "audience": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "token_type": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "header_name": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "lifetime_seconds": { "type": "integer", "minimum": 1, "maximum": 300 },
+        "claims": { "type": "array", "maxItems": 2, "uniqueItems": true, "items": { "enum": ["email", "roles"] } },
+        "bind_request": { "type": "boolean" },
+        "bind_approval": { "type": "boolean", "const": false },
+        "published_keys": {
+          "type": "array",
+          "maxItems": 4,
+          "items": { "$ref": "#/$defs/MutationCallerAssertionPublishedKey" }
+        }
+      },
+      "oneOf": [
+        { "required": ["signing_key_id"] },
+        { "required": ["signing_key_configured"] }
+      ]
+    },
+    "MutationCallerAssertionPublishedKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kid", "algorithm"],
+      "properties": {
+        "signing_key_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "signing_key_configured": { "const": true, "description": "PUT-only redaction marker, matched like the signing key's." },
+        "kid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "algorithm": { "enum": ["es256", "rs256"] }
+      },
+      "oneOf": [
+        { "required": ["signing_key_id"] },
+        { "required": ["signing_key_configured"] }
+      ]
+    },
     "SafeCallerAssertion": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Attests the calling principal to the upstream on every manual HTTP, managed OpenAPI and managed MCP tool call and every proxied request made through this Connection, alongside the primary credential rather than instead of it: the credential says which system is calling, the assertion says on whose behalf, so an upstream the operator controls can apply its own per-user checks. Per request the gateway signs one short-lived JWT naming the validated principal (sub is the identity provider's issuer, '#', and its subject; jti is the gateway request ID, with '.' and a sequence number for each request of a managed MCP tool call's session) and writes it, as the last header, in header_name; with bind_request it also binds the method, the request target and the SHA-256 of the exact body sent. A call with no principal to name, a service token included, is refused with caller_assertion_no_principal before any network or secret I/O. The endpoint must use https. Lanes with no caller to attest (discovery, enum and label sources, stored tests) and composite tool steps are refused with caller_assertion_not_enforced, as is every lane but manual tools and stored tests, which run as the principal who asks for them, on a delegated_issuer_token Connection and every lane for a stored block only an earlier release accepted. Saving an enabled Connection resolves its signing key and every published key, from whichever secret source holds it, and loads each for its algorithm; a key that cannot be used refuses the save, and every call reads and loads the signing key again. The public halves of every enabled Connection's keys are served at /.well-known/caller-assertion-jwks.json, which the upstream verifies against. A stored Connection whose keys can no longer be used is left out of that set, with a diagnostic, rather than stopping the gateway, and its calls are refused with caller_assertion_key_not_published until its keys load again. Omit the block to send only the credential.",
+      "description": "Attests the calling principal to the upstream on every manual HTTP, managed OpenAPI and managed MCP tool call, every request a composite tool sends and every proxied request made through this Connection, alongside the primary credential rather than instead of it: the credential says which system is calling, the assertion says on whose behalf, so an upstream the operator controls can apply its own per-user checks. Per request the gateway signs one short-lived JWT naming the validated principal (sub is the identity provider's issuer, '#', and its subject; jti is the gateway request ID, with '.' and a sequence number for each request of a managed MCP tool call's session and each leaf request of a composite tool) and writes it, as the last header, in header_name; with bind_request it also binds the method, the request target and the SHA-256 of the exact body sent. A call with no principal to name, a service token included, is refused with caller_assertion_no_principal before any network or secret I/O. The endpoint must use https. Lanes with no caller to attest (discovery, enum and label sources, stored tests) are refused with caller_assertion_not_enforced, as is every lane but manual tools and stored tests, which run as the principal who asks for them, on a delegated_issuer_token Connection and every lane for a stored block only an earlier release accepted. Saving an enabled Connection resolves its signing key and every published key, from whichever secret source holds it, and loads each for its algorithm; a key that cannot be used refuses the save, and every call reads and loads the signing key again. The public halves of every enabled Connection's keys are served at /.well-known/caller-assertion-jwks.json, which the upstream verifies against. A stored Connection whose keys can no longer be used is left out of that set, with a diagnostic, rather than stopping the gateway, and its calls are refused with caller_assertion_key_not_published until its keys load again. Omit the block to send only the credential.",
       "required": [
         "signing_key_configured",
         "kid",
@@ -792,10 +844,10 @@
         },
         "caller_assertion": {
           "oneOf": [
-            { "$ref": "#/$defs/CallerAssertion" },
+            { "$ref": "#/$defs/MutationCallerAssertion" },
             { "type": "null" }
           ],
-          "description": "Omitted keeps the current block; null removes it. A safe read cannot be sent back, so the admin UI, which shows the block read only, always omits it."
+          "description": "Omitted keeps the current block exactly as stored; null removes it. The admin UI omits it unless the operator edits or removes the block, and sends an edited block with signing_key_configured for every key it keeps."
         },
         "authentication": {
           "$ref": "#/$defs/MutationAuthentication"
@@ -3977,6 +4029,81 @@
         }
       }
     },
+    "OpenApiConversionReport": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "How a document that was not OpenAPI 3.x was converted to OpenAPI 3.0 before generation (issue #443).",
+      "required": [
+        "source_format",
+        "warnings"
+      ],
+      "properties": {
+        "source_format": {
+          "enum": [
+            "swagger_2_0"
+          ]
+        },
+        "warnings": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": {
+            "$ref": "#/$defs/OpenApiConversionWarning"
+          }
+        }
+      }
+    },
+    "OpenApiConversionWarning": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "message",
+        "operation_omitted"
+      ],
+      "properties": {
+        "code": {
+          "enum": [
+            "base_path_not_in_paths",
+            "unsupported_document_field",
+            "unsupported_path_item_field",
+            "security_definition_not_converted",
+            "consumes_defaulted",
+            "produces_defaulted",
+            "request_body_not_mapped",
+            "unsupported_operation_field",
+            "invalid_parameter",
+            "unsupported_parameter_location",
+            "unsupported_parameter_field",
+            "unsupported_collection_format",
+            "file_parameter_outside_form",
+            "multiple_body_parameters",
+            "body_and_form_parameters",
+            "warnings_truncated"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Fixed text for the code; it never contains document content."
+        },
+        "operation_omitted": {
+          "type": "boolean",
+          "description": "True when the named operation was left out of the converted document, so no tool was generated for it."
+        },
+        "method": {
+          "type": "string"
+        },
+        "path_template": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "subject": {
+          "type": "string",
+          "maxLength": 256,
+          "description": "The field, parameter, location, security definition or base path the warning names, cut to 256 bytes."
+        }
+      }
+    },
     "OpenApiPreviewResponse": {
       "type": "object",
       "additionalProperties": false,
@@ -4049,6 +4176,10 @@
         },
         "overlay": {
           "$ref": "#/$defs/OpenApiOverlayReport"
+        },
+        "conversion": {
+          "$ref": "#/$defs/OpenApiConversionReport",
+          "description": "Present only when the submitted document was not OpenAPI 3.x and was converted to OpenAPI 3.0 before generation."
         }
       }
     },

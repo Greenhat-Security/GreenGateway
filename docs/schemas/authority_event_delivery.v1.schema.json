@@ -1,0 +1,146 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GreenGateway authority event delivery v1",
+  "description": "What the authority-event dispatcher delivers for one journaled evidence row (issue #425 PR 3). A safe projection of identifiers and revisions; the actor is the issuer-less identifier the evidence row recorded, referenced under the keyed actor.recorded domain. Not the proposed authority_event.v1 contract: the evidence rows do not yet record the actor's issuer or authentication mode.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "authority_id",
+    "event_id",
+    "operation_id",
+    "sequence",
+    "operation",
+    "result",
+    "committed_at",
+    "actor",
+    "resource",
+    "revision"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "authority_event_delivery.v1"
+    },
+    "authority_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "maxLength": 36
+    },
+    "event_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "maxLength": 36
+    },
+    "operation_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "maxLength": 36
+    },
+    "sequence": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]{0,18}$",
+      "maxLength": 19
+    },
+    "operation": {
+      "type": "string",
+      "enum": [
+        "connection.delete",
+        "jwt.revoke",
+        "service_token.revoke",
+        "service_token.rotate"
+      ]
+    },
+    "result": {
+      "const": "committed"
+    },
+    "committed_at": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,9})?Z$",
+      "maxLength": 30
+    },
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "recorded_ref"
+      ],
+      "properties": {
+        "recorded_ref": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "maxLength": 64
+        }
+      }
+    },
+    "resource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "ref"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "connection",
+            "jwt_revocation",
+            "service_token"
+          ]
+        },
+        "ref": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "maxLength": 64
+        }
+      }
+    },
+    "revision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "axis",
+        "before",
+        "after",
+        "security"
+      ],
+      "properties": {
+        "axis": {
+          "enum": [
+            "connection",
+            "jwt_revocation",
+            "token"
+          ]
+        },
+        "before": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[1-9][0-9]{0,18}$",
+              "maxLength": 19
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "after": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[1-9][0-9]{0,18}$",
+              "maxLength": 19
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "security": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]{0,18}$",
+          "maxLength": 19
+        }
+      }
+    }
+  }
+}

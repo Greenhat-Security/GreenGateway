@@ -61,18 +61,39 @@ pub(crate) fn semantic_digest(
     value: &Value,
 ) -> Result<String, CanonicalJsonError> {
     let payload = canonical_json_bytes(value)?;
+    Ok(framed_digest(
+        b"semantic",
+        media_type,
+        schema_version,
+        &payload,
+    ))
+}
+
+/// `sha256:<hex>` over the ADR-0004 frame of a source payload: the exact
+/// accepted source-document bytes, labelled with the media type and exact
+/// schema version that define them.
+///
+/// ```text
+/// "GGDIGEST" 0x00 || u64be(len) "source" || u64be(len) media_type
+///   || u64be(len) schema_version || u64be(len) payload
+/// ```
+pub(crate) fn source_digest(media_type: &str, schema_version: &str, payload: &[u8]) -> String {
+    framed_digest(b"source", media_type, schema_version, payload)
+}
+
+fn framed_digest(kind: &[u8], media_type: &str, schema_version: &str, payload: &[u8]) -> String {
     let mut digest = Sha256::new();
     digest.update(b"GGDIGEST\0");
     for part in [
-        b"semantic".as_slice(),
+        kind,
         media_type.as_bytes(),
         schema_version.as_bytes(),
-        payload.as_slice(),
+        payload,
     ] {
         digest.update((part.len() as u64).to_be_bytes());
         digest.update(part);
     }
-    Ok(format!("sha256:{}", hex::encode(digest.finalize())))
+    format!("sha256:{}", hex::encode(digest.finalize()))
 }
 
 fn write_value(value: &Value, out: &mut Vec<u8>) -> Result<(), CanonicalJsonError> {
@@ -279,6 +300,32 @@ mod tests {
             Err(CanonicalJsonError::UnsupportedNumber)
         );
     }
+
+    #[test]
+    fn source_digest_frames_the_exact_payload_bytes() {
+        // Computed independently from the ADR-0004 frame definition:
+        // SHA-256(b"GGDIGEST\0" + framed("source") + framed(media type)
+        //   + framed(schema version) + framed(b"a: 1\n")).
+        let digest = source_digest(
+            "application/vnd.greengateway.bundle+yaml",
+            "greengateway.dev/v1alpha1",
+            b"a: 1\n",
+        );
+
+        assert_eq!(digest, SOURCE_DIGEST_VECTOR);
+        // Formatting is significant to a source digest, unlike a semantic one.
+        assert_ne!(
+            digest,
+            source_digest(
+                "application/vnd.greengateway.bundle+yaml",
+                "greengateway.dev/v1alpha1",
+                b"a:  1\n",
+            )
+        );
+    }
+
+    const SOURCE_DIGEST_VECTOR: &str =
+        "sha256:f617734214f1fe485e45f01f36000685233f8e82c0c327cc1099d8cdf1d89c6f";
 
     const SEMANTIC_DIGEST_VECTOR: &str =
         "sha256:124516292c7c3fd03616bc36b37cb73344539155601465c400929d4ab5ca6184";
