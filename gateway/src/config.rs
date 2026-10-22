@@ -59,6 +59,7 @@ use crate::{
     upstream_route,
 };
 
+mod bundle;
 mod diagnostic;
 mod identity;
 mod inventory;
