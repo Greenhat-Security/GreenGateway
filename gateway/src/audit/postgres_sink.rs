@@ -1016,6 +1016,32 @@ mod tests {
         (pool, listener)
     }
 
+    /// A pool whose every checkout is refused at once: nothing listens on
+    /// its port.
+    fn refusing_pool() -> deadpool_postgres::Pool {
+        let port = {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener should bind");
+            listener
+                .local_addr()
+                .expect("listener should have an address")
+                .port()
+        };
+        let mut config = tokio_postgres::Config::new();
+        config
+            .host("127.0.0.1")
+            .port(port)
+            .user("gateway_sink_test")
+            .dbname("gateway_sink_test");
+        deadpool_postgres::Pool::builder(deadpool_postgres::Manager::new(
+            config,
+            tokio_postgres::NoTls,
+        ))
+        .config(deadpool_postgres::PoolConfig::new(1))
+        .runtime(deadpool_postgres::Runtime::Tokio1)
+        .build()
+        .expect("refusing pool should build")
+    }
+
     #[tokio::test]
     async fn a_full_buffer_drops_and_counts_without_blocking_emit() {
         let (pool, _listener) = hanging_pool();
@@ -1891,6 +1917,10 @@ mod tests {
     /// `flush` is still waiting -- it runs on the writer thread, which has
     /// no runtime -- and it is the one that must do the counting, because
     /// the task that would have is gone.
+    ///
+    /// The flusher holds a batch between attempts: a first attempt whose
+    /// checkout is refused takes the batch, and the retry backoff then
+    /// parks the flusher with it in flight.
     #[test]
     fn a_flusher_torn_down_mid_batch_counts_the_batch_it_held() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1898,27 +1928,23 @@ mod tests {
             .enable_all()
             .build()
             .expect("the test runtime should build");
-        let (pool, _listener) = hanging_pool();
+        let pool = refusing_pool();
         let store = Arc::new(PostgresAuditEventStore::new(pool, Some(identity())));
-        // A deadline far past the teardown, so the only way the wait ends
-        // is the flusher going away.
+        // A deadline and a backoff far past the teardown, so the only way
+        // the wait ends is the flusher going away.
+        let mut settings = test_settings(
+            1_000,
+            Duration::from_secs(3_600),
+            64,
+            Duration::from_secs(30),
+        );
+        settings.retry_backoff = Duration::from_secs(60);
         let sink = runtime.block_on(async {
-            Arc::new(
-                PostgresSink::new_with_settings(
-                    store,
-                    test_settings(
-                        1_000,
-                        Duration::from_secs(3_600),
-                        64,
-                        Duration::from_secs(30),
-                    ),
-                )
-                .expect("sink should build"),
-            )
+            Arc::new(PostgresSink::new_with_settings(store, settings).expect("sink should build"))
         });
         // This regression needs one in-flight batch. Seed it atomically so
         // the flusher cannot take a partial batch while the producer is
-        // still emitting, then park in I/O with the remaining events buffered.
+        // still emitting.
         sink.shared
             .buffer_guard()
             .extend((0..10).map(|index| (Instant::now(), test_event(index), None)));
@@ -1926,9 +1952,10 @@ mod tests {
             let sink = Arc::clone(&sink);
             thread::spawn(move || sink.flush())
         };
-        // The flusher wakes on the shutdown, takes the batch, and parks in
-        // the pool's checkout: the buffer is empty and the batch in flight.
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // The flusher wakes on the shutdown, its checkout is refused, it
+        // takes the batch and parks in the backoff: the buffer is empty and
+        // the batch in flight.
+        let deadline = Instant::now() + Duration::from_secs(30);
         while !sink.shared.buffer_guard().is_empty() {
             assert!(
                 Instant::now() < deadline,
@@ -1959,6 +1986,77 @@ mod tests {
             "the batch the flusher held when it was torn down must be counted as dropped"
         );
         assert_eq!(sink.stored_total(), 0);
+    }
+
+    /// The flusher takes its batch only once it holds a connection (so the
+    /// records arriving during the wait share the commit), and a flusher
+    /// torn down while it still waits for one has taken nothing: `flush`
+    /// counts the whole buffer it left behind.
+    #[test]
+    fn a_flusher_torn_down_waiting_for_the_pool_counts_the_buffer_it_had_not_taken() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("the test runtime should build");
+        let (pool, _listener) = hanging_pool();
+        let store = Arc::new(PostgresAuditEventStore::new(pool, Some(identity())));
+        let sink = runtime.block_on(async {
+            Arc::new(
+                PostgresSink::new_with_settings(
+                    store,
+                    test_settings(
+                        1_000,
+                        Duration::from_secs(3_600),
+                        64,
+                        Duration::from_secs(30),
+                    ),
+                )
+                .expect("sink should build"),
+            )
+        });
+        let mut outcomes = Vec::new();
+        for index in 0..3 {
+            let (ack, outcome) = DurableAck::channel();
+            sink.emit_durable(&test_event(index), ack);
+            outcomes.push(outcome);
+        }
+        let flushing = {
+            let sink = Arc::clone(&sink);
+            thread::spawn(move || sink.flush())
+        };
+        // Parked in the pool's checkout, the flusher has formed no batch.
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(sink.shared.buffer_guard().len(), 3);
+        assert_eq!(sink.shared.in_flight.load(Ordering::Acquire), 0);
+        assert_eq!(
+            sink.dropped_total(),
+            0,
+            "nothing is lost before the teardown"
+        );
+
+        drop(runtime);
+
+        let error = flushing
+            .join()
+            .expect("flush should not panic")
+            .expect_err("a flusher torn down before its batch must be reported");
+        assert!(
+            error.contains("stopped before the drain completed"),
+            "flush should name the teardown: {error}"
+        );
+        assert_eq!(
+            sink.dropped_total(),
+            3,
+            "the buffer the flusher never took must be counted as dropped"
+        );
+        for mut outcome in outcomes {
+            assert_eq!(
+                outcome.try_recv(),
+                Ok(crate::audit::durable::DurableOutcome::NotStored),
+                "a waiting record left in the buffer is reported not stored"
+            );
+        }
     }
 
     /// A drain deadline earlier than the sink's own bound wins: the flush
