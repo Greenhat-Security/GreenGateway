@@ -103,15 +103,37 @@ toml_datetime and winnow although none of them is built
 (`cargo tree -p gateway --target all -i jsonschema-macros` prints nothing). The
 transport inventory and the syn 2 duplicate exception record them as resolved.
 
-CI caches are written only by pushes to `main`. Every Rust cache in a workflow
-that pull requests trigger saves under `save-if: ${{ github.event_name == 'push'
-&& github.ref == 'refs/heads/main' }}` or never saves (`save-if: false`, for a
-job that only restores another job's dependency cache), and
-`scripts/build_tools.py check` rejects any other condition, a cache save action
-or an image build cache export in such a workflow or in a composite action. A
-pull request reads `main`'s caches but cannot write one that a later run would
+Pull requests do not write CI caches: in a workflow that pull requests trigger,
+caches are written only by pushes to `main`. `scripts/build_tools.py check`
+enforces this for every step of such a workflow and of every composite action
+`.github/actions/<name>/action.yml` (composite actions run inside pull request
+jobs too).
+It compares action names and input names in lower case, as GitHub resolves
+them, and rejects:
+
+- a `Swatinem/rust-cache` step whose `save-if` is absent (the action then
+  saves) or is anything other than exactly `${{ github.event_name == 'push' &&
+  github.ref == 'refs/heads/main' }}` or `false` (for a job that only restores
+  another job's dependency cache);
+- `actions/cache` and `actions/cache/save` (`actions/cache/restore` may be used);
+- a `cache` input other than `false` on any `actions/setup-*` action, whose
+  post step saves the cache it restored, and `actions/setup-go` without
+  `cache: false`, because it caches by default;
+- an image build cache export: a `cache-to` input or value on a `docker/*`
+  action, or `cache-to` anywhere in a `run` command or a step's environment
+  (`docker buildx build --cache-to`, `docker buildx bake --set *.cache-to=`);
+- two inputs of one step whose names differ only in case;
+- a job that calls a reusable workflow (job-level `uses:`) unless its `if` is
+  that push-to-`main` expression, or is `github.event_name == 'push'` and it
+  calls a workflow in `.github/workflows/` whose jobs pass these same rules, so
+  that a release-tag push cannot write a cache through it either.
+  `image-candidate` is the second case: tag pushes build release candidates.
+
+A pull request reads `main`'s caches but cannot write one that a later run would
 restore; Cargo still checks every restored artifact against its own fingerprint
-and rebuilds what differs.
+and rebuilds what differs. Workflows that only a schedule or a manual dispatch
+starts are outside this check: `nightly-performance.yml` and
+`security-corpus.yml` save their Rust caches.
 Within one run, the production image is built once by `gateway-image` and handed
 to its consumers as an artifact, and each consumer checks the loaded image ID
 against the one that job recorded before using it. The HA release-gate
