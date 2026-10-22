@@ -856,6 +856,10 @@ async fn a_domain_wide_delegation_serves_its_callers_own_lanes_and_no_other() {
         unsupported
     );
     assert_eq!(
+        harness.runtime.composite_leaf_target(id, "/").err(),
+        unsupported
+    );
+    assert_eq!(
         harness.runtime.proxy_route_target(id, "/").err(),
         unsupported
     );
@@ -863,15 +867,32 @@ async fn a_domain_wide_delegation_serves_its_callers_own_lanes_and_no_other() {
 
     // A stored test is run as the principal who asked for it, with a token
     // minted inline for that one request and cached nowhere.
-    let etag = harness
+    let record = harness
         .control_plane
         .runtime_snapshot()
         .managed()
         .values()
         .next()
-        .expect("the Connection is stored")
-        .etag()
-        .to_string();
+        .cloned()
+        .expect("the Connection is stored");
+    let etag = record.etag().to_string();
+
+    // A test that names nobody is refused before the egress preflight, and
+    // before anything is asked of Google.
+    let nobody = crate::connections::test::ConnectionTestService::new(harness.runtime.clone())
+        .execute_as(&record, &etag, None)
+        .await
+        .result;
+    assert!(!nobody.ok);
+    assert_eq!(
+        nobody.stages,
+        [crate::connections::test::ConnectionTestStage::failure(
+            crate::connections::test::ConnectionTestStageName::SecretAvailable,
+            crate::connections::test::ConnectionTestReason::DelegatedTokenNoPrincipal,
+        )]
+    );
+    assert!(harness.google.requests().is_empty());
+
     for expected in [
         "Bearer google-alice@example.test-1",
         "Bearer google-alice@example.test-2",
@@ -899,11 +920,17 @@ async fn a_domain_wide_delegation_serves_its_callers_own_lanes_and_no_other() {
         );
     }
     assert_eq!(harness.runtime.google_delegation_cache_entries(), 0);
-    assert_eq!(
-        harness.mint_events(2).await.len(),
-        2,
-        "a test's mint is audited"
-    );
+    let mints = harness.mint_events(2).await;
+    assert_eq!(mints.len(), 2, "a test's mint is audited");
+    for mint in &mints {
+        assert_eq!(mint.payload["outcome"], json!("success"));
+        assert_eq!(
+            mint.actor.as_ref().map(|actor| actor.user_id.as_str()),
+            Some("alice"),
+            "as the tester"
+        );
+    }
+    assert_no_token_material(&harness.rendered_audit());
 }
 
 #[tokio::test]

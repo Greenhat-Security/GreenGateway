@@ -1410,6 +1410,64 @@ mod tests {
     }
 
     #[test]
+    fn a_domain_wide_delegation_test_reports_the_delegated_reasons() {
+        // A domain-wide delegation is tested with the tester's own Google
+        // token too, and reports in the delegated vocabulary the admin UI
+        // already parses rather than in a second one for one credential.
+        for (error, expected, expected_stage) in [
+            (
+                GoogleDelegationError::NoEmail,
+                "delegated_token_no_principal",
+                ConnectionTestStageName::SecretAvailable,
+            ),
+            (
+                GoogleDelegationError::IssuerNotTrusted,
+                "delegated_token_no_principal",
+                ConnectionTestStageName::SecretAvailable,
+            ),
+            (
+                GoogleDelegationError::EgressDenied,
+                "delegated_token_egress_denied",
+                ConnectionTestStageName::EgressPolicy,
+            ),
+            (
+                GoogleDelegationError::Denied,
+                "delegated_token_denied",
+                ConnectionTestStageName::SecretAvailable,
+            ),
+            (
+                GoogleDelegationError::IdentityFailed,
+                "delegated_token_exchange_failed",
+                ConnectionTestStageName::SecretAvailable,
+            ),
+            (
+                GoogleDelegationError::SigningFailed,
+                "delegated_token_exchange_failed",
+                ConnectionTestStageName::SecretAvailable,
+            ),
+            (
+                GoogleDelegationError::ExchangeFailed,
+                "delegated_token_exchange_failed",
+                ConnectionTestStageName::SecretAvailable,
+            ),
+            (
+                GoogleDelegationError::Unavailable,
+                "delegated_token_unavailable",
+                ConnectionTestStageName::SecretAvailable,
+            ),
+        ] {
+            let error = ConnectionHttpError::GoogleDelegation(error);
+            assert_eq!(
+                serde_json::to_value(test_reason_from_connection(error))
+                    .expect("reason should serialize"),
+                serde_json::json!(expected),
+                "{error:?}"
+            );
+            assert_eq!(connection_failure_classification(error).0, expected_stage);
+        }
+    }
+
+    #[test]
     fn additional_header_only_managed_mcp_exercises_credential_stages() {
         let write = serde_json::from_value(serde_json::json!({
             "display_name": "Access-protected MCP",

@@ -307,13 +307,15 @@ provide:
 - **User-consent OAuth scheme binding for imported specifications (#443)** is
   not implemented.
 - **Delegated tokens on other lanes.** Managed OpenAPI and composite tools,
-  proxied requests, managed MCP, discovery, enum and label sources and stored
-  Connection tests refuse a delegated Connection with
-  `caller_assertion_not_enforced`.
+  proxied requests, managed MCP, discovery, enum and label sources refuse a
+  delegated Connection with `caller_assertion_not_enforced`. A stored
+  Connection test is served, as the administrator who asks, with that
+  administrator's own token exchanged inline and cached nowhere.
 - **Attesting every lane.** OpenAPI and MCP discovery, enum and label sources
-  and stored tests have no caller to attest, and each composite tool step
-  would need an assertion of its own; all of them refuse an attested
-  Connection rather than send a request without the assertion.
+  have no caller to attest, a stored test attests its tester only to a
+  delegated Connection's issuer, and each composite tool step would need an
+  assertion of its own; all of them refuse any other attested Connection
+  rather than send a request without the assertion.
 - **Learning that a user was disabled**, for example through SCIM or an
   identity-provider webhook, and **carrying a purge between cluster replicas**.
 - **Verifying issued tokens**: no introspection, scope, audience or subject

@@ -4,6 +4,7 @@ import { Link, useNavigate, useParams } from 'react-router-dom';
 import { AdminApiError } from '../lib/api';
 import {
   ConnectionContractError,
+  type ConnectionAuthenticationKind,
   type ConnectionCatalogRefreshResult,
   type ConnectionDetail as ConnectionDetailData,
   type ConnectionTestReason,
@@ -362,7 +363,10 @@ export function ConnectionDetail() {
                   />
                 ) : null}
                 {testResult ? (
-                  <ConnectionTestPanel result={testResult} />
+                  <ConnectionTestPanel
+                    result={testResult}
+                    authentication={detail.authentication}
+                  />
                 ) : null}
                 {refreshResult ? (
                   <ConnectionRefreshPanel result={refreshResult} />
@@ -865,6 +869,14 @@ function ConnectionActionsPanel({
           not cached, and the result says whether your grant works, not
           anyone else&apos;s.
         </p>
+      ) : detail.authentication === 'google_domain_wide_delegation' &&
+        detail.actions.can_test ? (
+        <p className="alert info" role="status">
+          Testing this connection has Google mint a token for your own
+          Workspace account through the domain-wide delegation and sends the
+          saved test request with it. The token is not cached, and the result
+          says whether the service account may act as you, not as anyone else.
+        </p>
       ) : !detail.enabled && detail.actions.can_test ? (
         <p className="alert info" role="status">
           Testing this disabled draft uses its saved settings but does not
@@ -875,10 +887,20 @@ function ConnectionActionsPanel({
   );
 }
 
-function ConnectionTestPanel({ result }: { result: ConnectionTestResult }) {
+function ConnectionTestPanel({
+  result,
+  authentication,
+}: {
+  result: ConnectionTestResult;
+  authentication: ConnectionAuthenticationKind;
+}) {
+  const hints =
+    authentication === 'google_domain_wide_delegation'
+      ? GOOGLE_DELEGATION_TEST_REASON_HINTS
+      : TEST_REASON_HINTS;
   const hint = result.stages
     .map((stage) =>
-      stage.reason === undefined ? undefined : TEST_REASON_HINTS[stage.reason],
+      stage.reason === undefined ? undefined : hints[stage.reason],
     )
     .find((text) => text !== undefined);
   return (
@@ -962,6 +984,23 @@ const TEST_REASON_HINTS: Partial<Record<ConnectionTestReason, string>> = {
     'The issuer returned no usable token: it was unreachable or failed, refused the client ID and secret, or answered with something other than a bearer access token. The connection.delegated_token_exchange audit event records the issuer status and error code.',
   caller_assertion_key_not_published:
     'The gateway does not publish the subject-token keys of this connection, so the issuer could not verify a subject token and nothing was sent: the connection is disabled, or one of its keys does not load. Enable it, or fix the key, and test again.',
+};
+
+/**
+ * What to do about a failed domain-wide delegation test, which runs as the
+ * administrator who asked for it and reports the delegated reasons above.
+ */
+const GOOGLE_DELEGATION_TEST_REASON_HINTS: Partial<
+  Record<ConnectionTestReason, string>
+> = {
+  delegated_token_no_principal:
+    'This connection is tested as you, and Google is asked only for a Workspace user named by email by one of its subject issuers: your sign-in is a service token, carries no plain email address, or comes from another identity provider. Sign in through a listed subject issuer to test it.',
+  delegated_token_denied:
+    'Google refused a token for your account: usually it is not a user of the Workspace domain, or it is suspended. The connection.google_delegation_token audit event records the Google status and error code.',
+  delegated_token_egress_denied:
+    'The gateway egress policy does not allow a Google endpoint the delegation needs. Add sts.googleapis.com, iamcredentials.googleapis.com and oauth2.googleapis.com to the egress allowlist.',
+  delegated_token_exchange_failed:
+    'Google returned no usable token: the workload identity profile is missing or could not obtain its federated identity, that identity may not sign as the service account, the Workspace administrator has not authorised these scopes for it, or Google failed. The connection.google_delegation_token audit event records the step, the Google status and the error code.',
 };
 
 function ConnectionRefreshPanel({
