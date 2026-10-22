@@ -25,10 +25,12 @@ A delegated Connection always carries a `caller_assertion` block: the
 assertion is the subject token of the exchange and goes to the issuer only,
 never upstream.
 
-Two other Phase 8 items are open and not implemented: the
-`google_domain_wide_delegation` credential (#442) and Swagger 2.0 and Google
-Discovery import with user-consent OAuth scheme binding (#443). Nothing on
-this page applies to them yet; each must extend this page when it lands.
+A third mechanism, the `google_domain_wide_delegation` credential (#442),
+obtains the caller's own Google Workspace token without any grant store; its
+trust boundary is different enough to have [its own section](#google-domain-wide-delegation-442).
+Everything else on this page is about the two mechanisms above unless it says
+otherwise. One Phase 8 item is open and not implemented: Swagger 2.0 and
+Google Discovery import with user-consent OAuth scheme binding (#443).
 
 ## What each component can do in the wrong hands
 
@@ -302,27 +304,117 @@ provide:
 - **Consent flows and refresh tokens.** No Connection runs an
   authorization-code, PKCE or device-code flow, and the gateway stores no
   upstream refresh token. Users connect their accounts at the issuer.
-- **Domain-wide delegation (#442)** and **user-consent OAuth scheme binding for
-  imported specifications (#443)** are not implemented.
+- **User-consent OAuth scheme binding for imported specifications (#443)** is
+  not implemented.
 - **Delegated tokens on other lanes.** Managed OpenAPI and composite tools,
-  proxied requests, managed MCP, discovery, enum and label sources and stored
-  Connection tests refuse a delegated Connection with
-  `caller_assertion_not_enforced`.
+  proxied requests, managed MCP, discovery, enum and label sources refuse a
+  delegated Connection with `caller_assertion_not_enforced`. A stored
+  Connection test is served, as the administrator who asks, with that
+  administrator's own token exchanged inline and cached nowhere.
 - **Attesting every lane.** OpenAPI and MCP discovery, enum and label sources
-  and stored tests have no caller to attest, and each composite tool step
-  would need an assertion of its own; all of them refuse an attested
-  Connection rather than send a request without the assertion.
+  have no caller to attest, a stored test attests its tester only to a
+  delegated Connection's issuer, and each composite tool step would need an
+  assertion of its own; all of them refuse any other attested Connection
+  rather than send a request without the assertion.
 - **Learning that a user was disabled**, for example through SCIM or an
   identity-provider webhook, and **carrying a purge between cluster replicas**.
 - **Verifying issued tokens**: no introspection, scope, audience or subject
   check of the token the issuer returns.
 - **Retrying a failed revocation.**
 
+## Google domain-wide delegation (#442)
+
+A `google_domain_wide_delegation` Connection holds no secret and no grant. A
+Workspace super-admin authorises one service account for a fixed list of
+scopes; whoever can sign a JWT as that account can then obtain a token for
+any user of the domain, for those scopes, by naming the user's email as
+`sub`. The gateway never holds the account's key: it has Google sign each
+assertion through the IAM Credentials `signJwt` method, authenticated as the
+federated identity of a `CONNECTION_GCP_PROVIDER` workload identity profile,
+and exchanges it at Google's token endpoint.
+
+### What it can do in the wrong hands
+
+- **The workload identity profile's federated identity** (or the
+  `service_account` the profile impersonates), with
+  `roles/iam.serviceAccountTokenCreator` on the delegated account, signs as
+  that account, and so obtains any domain user's token for the authorised
+  scopes. It is the most sensitive part of this mechanism. It is read from a
+  projected token file named only in startup configuration; nothing an admin
+  API caller writes can name another file or audience.
+- **The Workspace scope list for the account.** It, not the Connection's
+  `scopes`, is what Google enforces: a Connection can only ask for less.
+- **`admin:connections:secrets:write`.** Writing such a Connection is
+  credential authority: it decides which service account, profile, scopes and
+  trusted issuers are used, and which tools then act as every user of the
+  domain.
+- **Any identity provider listed in `subject_issuers`.** It names the
+  Workspace user by the `email` it puts in its tokens. The gateway copies
+  `email` without checking `email_verified`, so a provider that lets a user
+  choose or change an unverified address could make the gateway act as
+  someone else.
+
+### What the gateway enforces
+
+- **Only listed issuers name a user.** A caller attested by any other issuer
+  is refused with `google_delegation_issuer_not_trusted`, a caller with no
+  single plain email address with `google_delegation_no_email`, and a call
+  with no principal, a service token included, with
+  `delegated_token_no_principal`, all before anything is read or sent.
+- **No key at rest, fixed endpoints.** The account must be a dedicated
+  `{name}@{project}.iam.gserviceaccount.com` account, and the only
+  caller-independent value that reaches a URL. `iamcredentials.googleapis.com`
+  and `oauth2.googleapis.com` are fixed, must be egress-allowlisted, and are
+  both checked before the federated identity is read.
+- **The assertion says only what was asked.** `iss` is the account, `sub` the
+  caller's email, `scope` the Connection's sorted scopes, `aud` the token
+  endpoint, and `exp` 300 seconds after `iat`. A signed assertion whose claims
+  differ from those sent is refused and never exchanged.
+- **Manual HTTP tool calls and stored tests only**, on `http_api` Connections
+  without a `caller_assertion`. A stored test runs as the principal who asks
+  for it, with a token minted for that one request and cached nowhere, as for
+  a delegated issuer token. Every other lane answers
+  `authentication_not_supported`.
+- **The same bounded, per-caller cache** as delegated tokens, keyed on the
+  caller's issuer, subject and email: at most 1,024 callers per replica and
+  900 seconds per token, dropped on an upstream `401`, a save of the
+  Connection, or a principal purge (counted as `google_delegation_entries` in
+  `connection.delegated_token_purge`).
+- **Every mint is audited** as `connection.google_delegation_token`, with the
+  caller as `actor`, the service account, the scopes, the last step attempted,
+  Google's status and only a registered error code; no federated token,
+  assertion or access token reaches an error, a log line, a metric or an
+  audit event. `connection_google_delegation_token_total` counts the same
+  decisions.
+
+### What the operator must provide
+
+- **A dedicated service account** used for nothing else, authorised in the
+  Workspace admin console for read-only scopes only, and for as few as the
+  bound tools need.
+- **Token Creator for the profile's identity alone** on that account, and on
+  no other account.
+- **`subject_issuers` names only the provider authoritative for the domain**,
+  one that asserts only verified addresses the domain owns.
+- **App verification for restricted scopes.** Google requires verification
+  for restricted scopes (Gmail, Drive) used by external apps; an internal
+  Workspace app is normally exempt. Check this before relying on such a scope.
+
+### Not covered
+
+- **Revocation at Google.** A purge or a save drops cached tokens, but Google
+  is not asked to revoke them, so a dropped token stays valid there until it
+  expires (about an hour). Suspending the user in Workspace stops new tokens.
+- **Editing in the admin UI.** The UI lists and names such a Connection but
+  its editor refuses to open one; write it through the admin API.
+
 ## Where it is enforced
 
 | Concern | Source |
 | --- | --- |
 | Exchange, cache key, purge and revocation | `gateway/src/connections/token_exchange.rs` |
+| Domain-wide delegation: issuer and email checks, signing, exchange and audit | `gateway/src/connections/google_delegation.rs` |
+| The workload identity profile's federated token | `gateway/src/connections/gcp_secret.rs` |
 | Bounded token cache, refresh skew and zeroized slots | `gateway/src/connections/oauth.rs` |
 | Assertion claims, signing, key loading and the JWKS | `gateway/src/connections/caller_assertion.rs` |
 | Secret purposes and the local-store refusal | `gateway/src/connections/secret.rs` |

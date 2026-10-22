@@ -34,6 +34,7 @@ import {
   delegatedIssuerTokenOffered,
   detailConfiguresCredentialAuthority,
   EditorLoadState,
+  editorUnsupportedReason,
   emptyAdditionalHeader,
   emptyBinding,
   FieldErrors,
@@ -135,6 +136,17 @@ export function ConnectionEditor() {
         }
         if (resource.etag === null) {
           throw new Error('The gateway did not return the connection ETag.');
+        }
+
+        const unsupported = editorUnsupportedReason(resource.value);
+        if (unsupported !== null) {
+          setLoadState({
+            kind: 'error',
+            title: 'Editing not available',
+            message: unsupported,
+            tone: 'warning',
+          });
+          return;
         }
 
         setEtag(resource.etag);
