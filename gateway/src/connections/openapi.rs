@@ -23,7 +23,10 @@ use crate::{
             ToolTarget,
         },
         enum_source::{EnumSourceRuntime, EnumSourceState, ResolvedPlan, SourceAuthorizer},
-        openapi::{self, OpenApiToolBinding, OpenApiToolGeneration, OpenApiToolSecuritySelection},
+        openapi::{
+            self, OpenApiSourceFormat, OpenApiToolBinding, OpenApiToolGeneration,
+            OpenApiToolSecuritySelection,
+        },
         overlay::{
             self, CompiledCatalog, OverlayCompileContext, OverlayCompositeReport, OverlayDocument,
             OverlayError, OverlayProblem, OverlaySourcePlan, OverlayToolReport, OverlayWarning,
@@ -75,10 +78,12 @@ pub struct OpenApiConnectionCatalogService {
     source_authorizer: Arc<OnceLock<Arc<dyn SourceAuthorizer>>>,
     rbac: Option<RbacState>,
     /// Cluster mode: storing a catalog generated from a converted (Swagger
-    /// 2.0) document needs the operation gate's admission first, because a
-    /// replica built before the conversion cannot regenerate from it (issue
-    /// #443, gated as `connections.openapi_swagger2_catalog`). Standalone
-    /// mode has no other reader and leaves it off.
+    /// 2.0 or Google Discovery) document needs the operation gate's
+    /// admission first, because a replica built before that conversion
+    /// cannot regenerate from it (issue #443, gated as
+    /// `connections.openapi_swagger2_catalog` and
+    /// `connections.openapi_discovery_catalog`). Standalone mode has no
+    /// other reader and leaves it off.
     gate_converted_catalogs: bool,
     /// Test seam: runs between the authority commit and the registry
     /// install, where another lane can move underneath a publish.
@@ -90,12 +95,15 @@ pub struct OpenApiConnectionCatalogService {
 /// a catalog generated from a converted document. Only the admin endpoints
 /// ask the gate; they call once with [`Self::NotAsked`], and only when the
 /// service answers [`OpenApiCatalogError::ConvertedCatalogNeedsAdmission`]
-/// do they ask the gate and call again with [`Self::Admitted`]. An OpenAPI
-/// 3.x document, and every call in standalone mode, never needs it.
+/// do they ask the gate for that source format and call again with
+/// [`Self::Admitted`] for it. Admission covers only the format it names: a
+/// refresh whose document changed format between the two calls is refused
+/// again. An OpenAPI 3.x document, and every call in standalone mode, never
+/// needs it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConvertedCatalogAdmission {
     NotAsked,
-    Admitted,
+    Admitted(OpenApiSourceFormat),
 }
 
 struct OpenApiPublishCandidate<'a> {
@@ -281,11 +289,13 @@ pub enum OpenApiCatalogError {
     RequestFailed,
     InvalidResponse,
     StorageUnavailable,
-    /// The write would store a catalog generated from a converted document
-    /// and the caller has not been admitted by the cluster's operation
-    /// gate. Nothing was written or recorded; see
-    /// [`ConvertedCatalogAdmission`].
-    ConvertedCatalogNeedsAdmission,
+    /// The write would store a catalog generated from a document converted
+    /// from `source_format`, and the caller has not been admitted by the
+    /// cluster's operation gate for that format. Nothing was written or
+    /// recorded; see [`ConvertedCatalogAdmission`].
+    ConvertedCatalogNeedsAdmission {
+        source_format: OpenApiSourceFormat,
+    },
 }
 
 impl OpenApiCatalogError {
@@ -313,7 +323,7 @@ impl OpenApiCatalogError {
             Self::RequestFailed => "request_failed",
             Self::InvalidResponse => "invalid_response",
             Self::StorageUnavailable => "storage_unavailable",
-            Self::ConvertedCatalogNeedsAdmission => "operation_gate_required",
+            Self::ConvertedCatalogNeedsAdmission { .. } => "operation_gate_required",
         }
     }
 }
@@ -603,11 +613,15 @@ impl OpenApiConnectionCatalogService {
         generation: &openapi::OpenApiToolGeneration,
         admission: ConvertedCatalogAdmission,
     ) -> Result<(), OpenApiCatalogError> {
+        let Some(conversion) = generation.conversion.as_ref() else {
+            return Ok(());
+        };
         if self.gate_converted_catalogs
-            && generation.conversion.is_some()
-            && admission != ConvertedCatalogAdmission::Admitted
+            && admission != ConvertedCatalogAdmission::Admitted(conversion.source_format)
         {
-            return Err(OpenApiCatalogError::ConvertedCatalogNeedsAdmission);
+            return Err(OpenApiCatalogError::ConvertedCatalogNeedsAdmission {
+                source_format: conversion.source_format,
+            });
         }
         Ok(())
     }
@@ -4340,7 +4354,12 @@ paths:
             )
             .await
             .expect_err("a converted catalog needs the gate's admission");
-        assert_eq!(refused, OpenApiCatalogError::ConvertedCatalogNeedsAdmission);
+        assert_eq!(
+            refused,
+            OpenApiCatalogError::ConvertedCatalogNeedsAdmission {
+                source_format: OpenApiSourceFormat::Swagger2
+            }
+        );
         let (catalog, _) = store
             .openapi_catalog_with_overlay(&record.id)
             .await
@@ -4360,7 +4379,7 @@ paths:
                 swagger_spec,
                 &selected,
                 &preview.registration_security_selections,
-                ConvertedCatalogAdmission::Admitted,
+                ConvertedCatalogAdmission::Admitted(OpenApiSourceFormat::Swagger2),
                 "test-admin",
             )
             .await
@@ -4384,7 +4403,9 @@ paths:
         assert!(matches!(
             refused,
             OpenApiOverlayOperationError::Catalog(
-                OpenApiCatalogError::ConvertedCatalogNeedsAdmission
+                OpenApiCatalogError::ConvertedCatalogNeedsAdmission {
+                    source_format: OpenApiSourceFormat::Swagger2
+                }
             )
         ));
         let (_, stored_overlay) = store
@@ -4399,7 +4420,7 @@ paths:
                 &overlay,
                 false,
                 true,
-                ConvertedCatalogAdmission::Admitted,
+                ConvertedCatalogAdmission::Admitted(OpenApiSourceFormat::Swagger2),
                 "test-admin",
             )
             .await
@@ -4418,7 +4439,12 @@ paths:
             .refresh(record.id.as_str(), record.etag().as_str(), "test-admin")
             .await
             .expect_err("refreshing to a converted catalog needs the gate's admission");
-        assert_eq!(refused, OpenApiCatalogError::ConvertedCatalogNeedsAdmission);
+        assert_eq!(
+            refused,
+            OpenApiCatalogError::ConvertedCatalogNeedsAdmission {
+                source_format: OpenApiSourceFormat::Swagger2
+            }
+        );
         assert_eq!(
             store
                 .status_history(&record.id, 64)
@@ -4432,13 +4458,185 @@ paths:
             .refresh_with_admission(
                 record.id.as_str(),
                 record.etag().as_str(),
-                ConvertedCatalogAdmission::Admitted,
+                ConvertedCatalogAdmission::Admitted(OpenApiSourceFormat::Swagger2),
                 "test-admin",
             )
             .await
             .expect("an admitted refresh stores the converted catalog again");
         assert_eq!(refreshed.changed_count, 0);
         assert!(registry.get("list_invoices").is_some());
+    }
+
+    /// A Google Discovery catalog (issue #443) is gated as its own format:
+    /// admission for Swagger 2.0 does not admit it, because a replica built
+    /// with Swagger 2.0 import but before Discovery import cannot regenerate
+    /// from it. Once admitted it registers from the stored submitted
+    /// document, and an overlay over it rebuilds its source plan.
+    #[tokio::test]
+    async fn gated_service_admits_a_discovery_catalog_only_for_its_own_format() {
+        let database = TemporaryDatabase::new();
+        let mut config = Config::test_defaults();
+        config.connections_sqlite_path = Some(database.0.display().to_string());
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let snapshot = control_plane.runtime_snapshot();
+        let candidate: ConnectionWrite = serde_json::from_value(json!({
+            "display_name": "Gated Discovery Widgets",
+            "enabled": true,
+            "kind": "http_api",
+            "endpoint": { "base_url": "https://widgets.example.test", "base_path": "/widgets/v1" },
+            "authentication": {"type": "none"},
+            "tls": {},
+            "timeouts": {
+                "connect_timeout_ms": 1000,
+                "request_timeout_ms": 3000,
+                "response_idle_timeout_ms": 1000
+            },
+            "discovery": {
+                "type": "managed_openapi",
+                "use_connection_authentication": false
+            }
+        }))
+        .expect("managed OpenAPI Connection should deserialize");
+        let record = control_plane
+            .create_managed(snapshot.collection_etag(), candidate, "test-admin")
+            .await
+            .expect("managed OpenAPI Connection should create");
+        let egress_config = EgressConfig::from_config(&config);
+        let egress_client =
+            Arc::new(EgressClient::new(egress_config.clone()).expect("egress should build"));
+        let http = ConnectionHttpRuntime::new(control_plane.clone(), egress_config, egress_client);
+        let registry = ToolRegistry::disabled();
+        let service =
+            OpenApiConnectionCatalogService::load(control_plane.clone(), http, registry.clone())
+                .expect("managed OpenAPI service should load")
+                .with_converted_catalog_gate();
+        let spec = json!({
+            "kind": "discovery#restDescription",
+            "discoveryVersion": "v1",
+            "name": "widgets",
+            "version": "v1",
+            "rootUrl": "https://widgets.example.test/",
+            "servicePath": "widgets/v1/",
+            "schemas": {
+                "Widget": { "id": "Widget", "type": "object", "properties": { "id": { "type": "string" } } }
+            },
+            "resources": {
+                "widgets": {
+                    "methods": {
+                        "get": {
+                            "id": "widgets.widgets.get",
+                            "path": "widgets/{widgetId}",
+                            "httpMethod": "GET",
+                            "description": "Read one widget.",
+                            "parameters": {
+                                "widgetId": { "type": "string", "location": "path", "required": true }
+                            },
+                            "response": { "$ref": "Widget" }
+                        }
+                    }
+                }
+            }
+        })
+        .to_string();
+        let selected = vec!["widgets.widgets.get".to_owned()];
+
+        let preview = service
+            .preview(record.id.as_str(), &spec)
+            .await
+            .expect("a Discovery document should preview");
+        assert_eq!(
+            preview
+                .generation
+                .conversion
+                .as_ref()
+                .map(|conversion| conversion.source_format),
+            Some(OpenApiSourceFormat::GoogleDiscovery)
+        );
+        for admission in [
+            ConvertedCatalogAdmission::NotAsked,
+            ConvertedCatalogAdmission::Admitted(OpenApiSourceFormat::Swagger2),
+        ] {
+            let refused = service
+                .register_with_admission(
+                    record.id.as_str(),
+                    record.etag().as_str(),
+                    preview.spec_revision,
+                    preview.catalog_revision,
+                    &preview.spec_digest,
+                    &spec,
+                    &selected,
+                    &preview.registration_security_selections,
+                    admission,
+                    "test-admin",
+                )
+                .await
+                .expect_err("a Discovery catalog needs its own format's admission");
+            assert_eq!(
+                refused,
+                OpenApiCatalogError::ConvertedCatalogNeedsAdmission {
+                    source_format: OpenApiSourceFormat::GoogleDiscovery
+                },
+                "{admission:?}"
+            );
+        }
+        let registered = service
+            .register_with_admission(
+                record.id.as_str(),
+                record.etag().as_str(),
+                preview.spec_revision,
+                preview.catalog_revision,
+                &preview.spec_digest,
+                &spec,
+                &selected,
+                &preview.registration_security_selections,
+                ConvertedCatalogAdmission::Admitted(OpenApiSourceFormat::GoogleDiscovery),
+                "test-admin",
+            )
+            .await
+            .expect("an admitted Discovery catalog registers");
+        let published = registry
+            .get("widgets.widgets.get")
+            .expect("the converted tool should be served");
+        assert_eq!(published.upstream.path_template, "/widgets/{widgetId}");
+
+        let overlay = json!({
+            "schema_version": "0.1.0",
+            "tools": { "widgets.widgets.get": { "rename": "read_widget" } }
+        });
+        service
+            .put_overlay_with_authorization(
+                record.id.as_str(),
+                &OverlayEtag::for_revisions(
+                    record.id.as_str(),
+                    record.revisions.connection,
+                    registered.catalog_revision,
+                    0,
+                )
+                .to_string(),
+                &overlay,
+                false,
+                true,
+                ConvertedCatalogAdmission::Admitted(OpenApiSourceFormat::GoogleDiscovery),
+                "test-admin",
+            )
+            .await
+            .expect("an admitted overlay over a Discovery catalog stores");
+        assert!(registry.get("read_widget").is_some());
+        let store = control_plane
+            .managed_store()
+            .expect("managed store should exist");
+        let (catalog, stored_overlay) = store
+            .openapi_catalog_with_overlay(&record.id)
+            .await
+            .expect("catalog/overlay pair should read");
+        let catalog = catalog.expect("catalog should exist");
+        assert_eq!(
+            catalog.spec, spec,
+            "the submitted document is stored, not its conversion"
+        );
+        stored_source_plan(&catalog, &stored_overlay.expect("overlay should exist"))
+            .expect("the stored Discovery document should rebuild its source plan");
     }
 
     #[tokio::test]

@@ -1083,11 +1083,12 @@ async fn refresh_managed_openapi_catalog(
             )
             .await;
         match result {
-            Err(connections::openapi::OpenApiCatalogError::ConvertedCatalogNeedsAdmission)
-                if converted_catalog
-                    == connections::openapi::ConvertedCatalogAdmission::NotAsked =>
+            Err(connections::openapi::OpenApiCatalogError::ConvertedCatalogNeedsAdmission {
+                source_format,
+            }) if converted_catalog
+                == connections::openapi::ConvertedCatalogAdmission::NotAsked =>
             {
-                admit_converted_openapi_catalog(state, parts, principal)
+                admit_converted_openapi_catalog(state, parts, principal, source_format)
                     .await
                     .map_err(|refusal| {
                         Box::new((
@@ -1095,7 +1096,8 @@ async fn refresh_managed_openapi_catalog(
                             *refusal.response,
                         ))
                     })?;
-                converted_catalog = connections::openapi::ConvertedCatalogAdmission::Admitted;
+                converted_catalog =
+                    connections::openapi::ConvertedCatalogAdmission::Admitted(source_format);
             }
             result => {
                 return result.map_err(|error| {
@@ -1654,19 +1656,23 @@ pub(super) async fn connection_openapi_overlay_put_endpoint(
                 &principal.user_id,
             )
             .await;
-        if converted_catalog == connections::openapi::ConvertedCatalogAdmission::NotAsked
-            && matches!(
-                result,
-                Err(connections::openapi::OpenApiOverlayOperationError::Catalog(
-                    connections::openapi::OpenApiCatalogError::ConvertedCatalogNeedsAdmission
-                ))
-            )
+        if let (
+            connections::openapi::ConvertedCatalogAdmission::NotAsked,
+            Err(connections::openapi::OpenApiOverlayOperationError::Catalog(
+                connections::openapi::OpenApiCatalogError::ConvertedCatalogNeedsAdmission {
+                    source_format,
+                },
+            )),
+        ) = (converted_catalog, &result)
         {
-            if let Err(refusal) = admit_converted_openapi_catalog(&state, &parts, &principal).await
+            let source_format = *source_format;
+            if let Err(refusal) =
+                admit_converted_openapi_catalog(&state, &parts, &principal, source_format).await
             {
                 return *refusal.response;
             }
-            converted_catalog = connections::openapi::ConvertedCatalogAdmission::Admitted;
+            converted_catalog =
+                connections::openapi::ConvertedCatalogAdmission::Admitted(source_format);
             continue;
         }
         break result;
@@ -1728,26 +1734,36 @@ pub(super) struct ConvertedCatalogRefusal {
 }
 
 /// Ask the cluster's operation gate before storing a managed OpenAPI catalog
-/// generated from a Swagger 2.0 document (issue #443).
+/// generated from a Swagger 2.0 or Google Discovery document (issue #443).
 ///
 /// The catalog service answers `ConvertedCatalogNeedsAdmission`, before it
 /// writes or records anything, only when it gates converted catalogs
 /// (cluster mode) and only for a converted document, so an OpenAPI 3.x
-/// document never asks. The write is the registered operation
-/// `connections.openapi_swagger2_catalog`: it proceeds only while every live
-/// member, draining ones included, advertises `openapi_swagger2_catalogs`,
-/// because a member built before the conversion cannot regenerate from the
-/// stored document. The gate reads the roster for every such write and logs
-/// and audits each refusal (`cluster.operation_refused`). A deployment with
-/// no roster to ask refuses rather than admits.
+/// document never asks. The write is the registered operation for its
+/// source format, `connections.openapi_swagger2_catalog` or
+/// `connections.openapi_discovery_catalog`: it proceeds only while every
+/// live member, draining ones included, advertises that format's capability
+/// (`openapi_swagger2_catalogs` or `openapi_discovery_catalogs`), because a
+/// member built before the conversion cannot regenerate from the stored
+/// document. The gate reads the roster for every such write and logs and
+/// audits each refusal (`cluster.operation_refused`). A deployment with no
+/// roster to ask refuses rather than admits.
 pub(super) async fn admit_converted_openapi_catalog(
     state: &ConnectionAdminState,
     parts: &http::request::Parts,
     principal: &auth::Principal,
+    source_format: tools::openapi::OpenApiSourceFormat,
 ) -> Result<(), ConvertedCatalogRefusal> {
     #[cfg(feature = "postgres")]
     {
-        let requirement = &storage::compatibility::OPENAPI_SWAGGER2_CATALOGS;
+        let requirement = match source_format {
+            tools::openapi::OpenApiSourceFormat::Swagger2 => {
+                &storage::compatibility::OPENAPI_SWAGGER2_CATALOGS
+            }
+            tools::openapi::OpenApiSourceFormat::GoogleDiscovery => {
+                &storage::compatibility::OPENAPI_DISCOVERY_CATALOGS
+            }
+        };
         let Some(membership) = state.membership.as_ref() else {
             tracing::error!(
                 operation = requirement.operation,
@@ -1782,7 +1798,7 @@ pub(super) async fn admit_converted_openapi_catalog(
     // deployment does.
     #[cfg(not(feature = "postgres"))]
     {
-        let _ = (state, parts, principal);
+        let _ = (state, parts, principal, source_format);
         tracing::error!("a gated managed OpenAPI write has no roster to ask; the write is refused");
         Err(ConvertedCatalogRefusal {
             reason: "roster_unavailable",
@@ -1884,13 +1900,16 @@ pub(super) async fn connection_openapi_register_endpoint(
                 &principal.user_id,
             )
             .await;
-        if converted_catalog == connections::openapi::ConvertedCatalogAdmission::NotAsked
-            && matches!(
-                result,
-                Err(connections::openapi::OpenApiCatalogError::ConvertedCatalogNeedsAdmission)
-            )
+        if let (
+            connections::openapi::ConvertedCatalogAdmission::NotAsked,
+            Err(connections::openapi::OpenApiCatalogError::ConvertedCatalogNeedsAdmission {
+                source_format,
+            }),
+        ) = (converted_catalog, &result)
         {
-            if let Err(refusal) = admit_converted_openapi_catalog(&state, &parts, &principal).await
+            let source_format = *source_format;
+            if let Err(refusal) =
+                admit_converted_openapi_catalog(&state, &parts, &principal, source_format).await
             {
                 emit_managed_openapi_catalog_rejected(
                     &state,
@@ -1901,7 +1920,8 @@ pub(super) async fn connection_openapi_register_endpoint(
                 );
                 return with_etag(*refusal.response, current_etag.as_str());
             }
-            converted_catalog = connections::openapi::ConvertedCatalogAdmission::Admitted;
+            converted_catalog =
+                connections::openapi::ConvertedCatalogAdmission::Admitted(source_format);
             continue;
         }
         break result;

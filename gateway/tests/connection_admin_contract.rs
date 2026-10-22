@@ -1307,3 +1307,54 @@ fn connection_admin_preview_schema_describes_swagger_conversion_reports() {
         "conversion warnings stay closed and never echo document content"
     );
 }
+
+#[test]
+fn connection_admin_preview_schema_describes_discovery_conversion_reports() {
+    let schema = load_json(&docs_root().join(SCHEMA_RELATIVE_PATH));
+    let envelope = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": schema["$defs"].clone(),
+        "$ref": "#/$defs/OpenApiConversionReport"
+    });
+    let validator = jsonschema::validator_for(&envelope)
+        .unwrap_or_else(|error| panic!("$defs/OpenApiConversionReport should compile: {error}"));
+    let report = json!({
+        "source_format": "google_discovery_v1",
+        "warnings": [
+            {
+                "code": "global_parameter_not_mapped",
+                "message": "this document-level parameter is not a tool argument, and generated tools never send it",
+                "operation_omitted": false,
+                "subject": "key"
+            },
+            {
+                "code": "recursive_request_schema",
+                "message": "the method's request schema refers to itself, which the generator cannot expand; it was left out",
+                "operation_omitted": true,
+                "method": "POST",
+                "path_template": "/gmail/v1/users/{userId}/messages/send",
+                "subject": "Message"
+            }
+        ]
+    });
+    assert!(validator.is_valid(&report));
+    for code in [
+        "unsupported_schema_keyword",
+        "media_upload_not_mapped",
+        "invalid_method_definition",
+        "unsupported_http_method",
+        "unsupported_path_expansion",
+        "repeated_path_parameter",
+        "duplicate_operation",
+    ] {
+        let mut coded = report.clone();
+        coded["warnings"][0]["code"] = json!(code);
+        assert!(validator.is_valid(&coded), "{code} should be a known code");
+    }
+    let mut unknown_format = report;
+    unknown_format["source_format"] = json!("google_discovery_v2");
+    assert!(
+        !validator.is_valid(&unknown_format),
+        "source formats are a closed set"
+    );
+}

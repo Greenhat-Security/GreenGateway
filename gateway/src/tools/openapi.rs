@@ -24,6 +24,7 @@ use crate::{
 };
 
 use super::{
+    google_discovery::{self, DiscoveryConversionError},
     swagger2::{self, Swagger2ConversionError},
     transforms::DeclaredResponseSchema,
 };
@@ -69,12 +70,14 @@ pub struct OpenApiDocumentConversion {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenApiSourceFormat {
     Swagger2,
+    GoogleDiscovery,
 }
 
 impl OpenApiSourceFormat {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Swagger2 => "swagger_2_0",
+            Self::GoogleDiscovery => "google_discovery_v1",
         }
     }
 }
@@ -107,6 +110,15 @@ pub enum OpenApiConversionWarningCode {
     FileParameterOutsideForm,
     MultipleBodyParameters,
     BodyAndFormParameters,
+    GlobalParameterNotMapped,
+    UnsupportedSchemaKeyword,
+    MediaUploadNotMapped,
+    InvalidMethodDefinition,
+    UnsupportedHttpMethod,
+    UnsupportedPathExpansion,
+    RepeatedPathParameter,
+    DuplicateOperation,
+    RecursiveRequestSchema,
     WarningsTruncated,
 }
 
@@ -128,6 +140,15 @@ impl OpenApiConversionWarningCode {
             Self::FileParameterOutsideForm => "file_parameter_outside_form",
             Self::MultipleBodyParameters => "multiple_body_parameters",
             Self::BodyAndFormParameters => "body_and_form_parameters",
+            Self::GlobalParameterNotMapped => "global_parameter_not_mapped",
+            Self::UnsupportedSchemaKeyword => "unsupported_schema_keyword",
+            Self::MediaUploadNotMapped => "media_upload_not_mapped",
+            Self::InvalidMethodDefinition => "invalid_method_definition",
+            Self::UnsupportedHttpMethod => "unsupported_http_method",
+            Self::UnsupportedPathExpansion => "unsupported_path_expansion",
+            Self::RepeatedPathParameter => "repeated_path_parameter",
+            Self::DuplicateOperation => "duplicate_operation",
+            Self::RecursiveRequestSchema => "recursive_request_schema",
             Self::WarningsTruncated => "warnings_truncated",
         }
     }
@@ -139,7 +160,7 @@ impl OpenApiConversionWarningCode {
                 "basePath is not part of generated path templates; include it in the Connection base path"
             }
             Self::UnsupportedDocumentField => {
-                "this top-level field is not part of Swagger 2.0 and was ignored"
+                "this top-level field is not part of the document's format and was ignored"
             }
             Self::UnsupportedPathItemField => {
                 "this path item field is not part of Swagger 2.0 and was ignored"
@@ -157,16 +178,16 @@ impl OpenApiConversionWarningCode {
                 "the request body has no JSON media type, so its fields are not tool arguments and the tool sends no body"
             }
             Self::UnsupportedOperationField => {
-                "the operation uses a field that is not part of Swagger 2.0; it was left out"
+                "the operation uses a field that is not part of the document's format; it was left out"
             }
             Self::InvalidParameter => {
                 "the operation has a parameter without a usable name, location, schema or items; it was left out"
             }
             Self::UnsupportedParameterLocation => {
-                "the operation has a parameter in a location Swagger 2.0 does not define; it was left out"
+                "the operation has a parameter in a location the document's format does not define; it was left out"
             }
             Self::UnsupportedParameterField => {
-                "the operation has a parameter field that is not part of Swagger 2.0; it was left out"
+                "the operation has a parameter field that is not part of the document's format; it was left out"
             }
             Self::UnsupportedCollectionFormat => {
                 "the operation has an array parameter whose collectionFormat has no OpenAPI 3.0 style; it was left out"
@@ -179,6 +200,33 @@ impl OpenApiConversionWarningCode {
             }
             Self::BodyAndFormParameters => {
                 "the operation mixes body and formData parameters; it was left out"
+            }
+            Self::GlobalParameterNotMapped => {
+                "this document-level parameter is not a tool argument, and generated tools never send it"
+            }
+            Self::UnsupportedSchemaKeyword => {
+                "this schema keyword has no OpenAPI 3.0 form and was ignored, so the gateway does not check it"
+            }
+            Self::MediaUploadNotMapped => {
+                "the method also accepts a media upload at a separate upload path; the tool sends only the JSON request"
+            }
+            Self::InvalidMethodDefinition => {
+                "the method has no usable path, httpMethod or scopes; it was left out"
+            }
+            Self::UnsupportedHttpMethod => {
+                "the method uses an HTTP method that OpenAPI 3.0 does not define; it was left out"
+            }
+            Self::UnsupportedPathExpansion => {
+                "the method path uses a URI template expansion other than a plain {name}, such as {+name}, which has no OpenAPI 3.0 form; it was left out"
+            }
+            Self::RepeatedPathParameter => {
+                "the method has a repeated path parameter, which has no OpenAPI 3.0 form; it was left out"
+            }
+            Self::DuplicateOperation => {
+                "an earlier method already uses this HTTP method and path; it was left out"
+            }
+            Self::RecursiveRequestSchema => {
+                "the method's request schema refers to itself, which the generator cannot expand; it was left out"
             }
             Self::WarningsTruncated => "further conversion warnings were not reported",
         }
@@ -197,6 +245,12 @@ impl OpenApiConversionWarningCode {
                 | Self::FileParameterOutsideForm
                 | Self::MultipleBodyParameters
                 | Self::BodyAndFormParameters
+                | Self::InvalidMethodDefinition
+                | Self::UnsupportedHttpMethod
+                | Self::UnsupportedPathExpansion
+                | Self::RepeatedPathParameter
+                | Self::DuplicateOperation
+                | Self::RecursiveRequestSchema
         )
     }
 }
@@ -423,6 +477,9 @@ pub enum OpenApiToolGenerationError {
     },
     Swagger2 {
         source: Swagger2ConversionError,
+    },
+    GoogleDiscovery {
+        source: DiscoveryConversionError,
     },
 }
 
@@ -795,6 +852,7 @@ impl fmt::Display for OpenApiToolGenerationError {
                 ),
             },
             Self::Swagger2 { source } => write!(formatter, "{source}"),
+            Self::GoogleDiscovery { source } => write!(formatter, "{source}"),
         }
     }
 }
@@ -852,6 +910,7 @@ impl Error for OpenApiToolGenerationError {
             Self::Reference { .. } => None,
             Self::GenerationLimit { .. } => None,
             Self::Swagger2 { source } => Some(source),
+            Self::GoogleDiscovery { source } => Some(source),
         }
     }
 }
@@ -877,7 +936,7 @@ pub fn generate_tools_from_openapi_path(
 ///
 /// The legacy tools-file import uses this entry point. Managed OpenAPI
 /// Connections use [`generate_tools_from_api_document_str`], which also
-/// imports Swagger 2.0.
+/// imports Swagger 2.0 and Google Discovery documents.
 pub fn generate_tools_from_openapi_str(
     source: &str,
     contents: &str,
@@ -888,14 +947,16 @@ pub fn generate_tools_from_openapi_str(
     generate_tools_from_document(parsed_spec, document, None)
 }
 
-/// Generate tools from an OpenAPI 3.x document, or from a Swagger 2.0
-/// document converted to OpenAPI 3.0 first (issue #443).
+/// Generate tools from an OpenAPI 3.x document, or from a Swagger 2.0 or
+/// Google Discovery document converted to OpenAPI 3.0 first (issue #443).
 ///
 /// An OpenAPI 3.x document takes exactly the
 /// [`generate_tools_from_openapi_str`] path, errors included. Conversion is
 /// attempted only after that path rejected the document, and only when the
-/// document has a `swagger` field and no `openapi` field; any other rejected
-/// document keeps its original error.
+/// document has no `openapi` field and either a `swagger` field (Swagger
+/// 2.0) or a `discoveryVersion` or `discovery#` kind (see
+/// [`google_discovery::is_discovery_document`]); any other rejected document
+/// keeps its original error.
 pub fn generate_tools_from_api_document_str(
     source: &str,
     contents: &str,
@@ -911,19 +972,32 @@ pub fn generate_tools_from_api_document_str(
     let Ok(document) = parse_document_value(source, contents) else {
         return Err(openapi_error.into());
     };
-    if !swagger2::is_swagger_document(&document) {
+    let (source_format, converted, warnings) = if swagger2::is_swagger_document(&document) {
+        let conversion = swagger2::convert(&document)?;
+        (
+            OpenApiSourceFormat::Swagger2,
+            conversion.document,
+            conversion.warnings,
+        )
+    } else if google_discovery::is_discovery_document(&document) {
+        let conversion = google_discovery::convert(&document)?;
+        (
+            OpenApiSourceFormat::GoogleDiscovery,
+            conversion.document,
+            conversion.warnings,
+        )
+    } else {
         return Err(openapi_error.into());
-    }
-    let conversion = swagger2::convert(&document)?;
+    };
     drop(document);
-    let parsed_spec = OpenApiSpec::from_document_value(source, &conversion.document)?;
+    let parsed_spec = OpenApiSpec::from_document_value(source, &converted)?;
     check_operation_count(&parsed_spec)?;
     generate_tools_from_document(
         parsed_spec,
-        conversion.document,
+        converted,
         Some(OpenApiDocumentConversion {
-            source_format: OpenApiSourceFormat::Swagger2,
-            warnings: conversion.warnings,
+            source_format,
+            warnings,
         }),
     )
 }
@@ -2515,7 +2589,7 @@ pub(super) fn is_json_media_type(media_type: &str) -> bool {
     subtype.to_ascii_lowercase().ends_with("+json")
 }
 
-fn json_pointer_escape(value: &str) -> String {
+pub(super) fn json_pointer_escape(value: &str) -> String {
     value.replace('~', "~0").replace('/', "~1")
 }
 

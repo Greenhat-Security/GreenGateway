@@ -1,0 +1,1699 @@
+{
+  "converted_document": {
+    "components": {
+      "schemas": {
+        "ListMessagesResponse": {
+          "properties": {
+            "messages": {
+              "description": "Messages on this page.",
+              "items": {
+                "$ref": "#/components/schemas/Message"
+              },
+              "type": "array"
+            },
+            "nextPageToken": {
+              "description": "Token for the next page.",
+              "type": "string"
+            },
+            "resultSizeEstimate": {
+              "description": "Estimated total.",
+              "format": "uint32",
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "ListThreadsResponse": {
+          "properties": {
+            "nextPageToken": {
+              "type": "string"
+            },
+            "resultSizeEstimate": {
+              "format": "uint32",
+              "type": "integer"
+            },
+            "threads": {
+              "items": {
+                "$ref": "#/components/schemas/Thread"
+              },
+              "type": "array"
+            }
+          },
+          "type": "object"
+        },
+        "Message": {
+          "description": "An email message.",
+          "properties": {
+            "historyId": {
+              "format": "uint64",
+              "type": "string"
+            },
+            "id": {
+              "readOnly": true,
+              "type": "string"
+            },
+            "internalDate": {
+              "format": "int64",
+              "type": "string"
+            },
+            "labelIds": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "payload": {
+              "$ref": "#/components/schemas/MessagePart"
+            },
+            "raw": {
+              "format": "byte",
+              "type": "string"
+            },
+            "sizeEstimate": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "snippet": {
+              "type": "string"
+            },
+            "threadId": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "MessagePart": {
+          "properties": {
+            "body": {
+              "$ref": "#/components/schemas/MessagePartBody"
+            },
+            "filename": {
+              "type": "string"
+            },
+            "headers": {
+              "items": {
+                "$ref": "#/components/schemas/MessagePartHeader"
+              },
+              "type": "array"
+            },
+            "mimeType": {
+              "type": "string"
+            },
+            "partId": {
+              "type": "string"
+            },
+            "parts": {
+              "items": {
+                "$ref": "#/components/schemas/MessagePart"
+              },
+              "type": "array"
+            }
+          },
+          "type": "object"
+        },
+        "MessagePartBody": {
+          "properties": {
+            "attachmentId": {
+              "type": "string"
+            },
+            "data": {
+              "format": "byte",
+              "type": "string"
+            },
+            "size": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "MessagePartHeader": {
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "ModifyMessageRequest": {
+          "properties": {
+            "addLabelIds": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "removeLabelIds": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "type": "object"
+        },
+        "ModifyThreadRequest": {
+          "properties": {
+            "addLabelIds": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "removeLabelIds": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "type": "object"
+        },
+        "Profile": {
+          "properties": {
+            "emailAddress": {
+              "type": "string"
+            },
+            "historyId": {
+              "format": "uint64",
+              "type": "string"
+            },
+            "messagesTotal": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "threadsTotal": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "Thread": {
+          "properties": {
+            "historyId": {
+              "format": "uint64",
+              "type": "string"
+            },
+            "id": {
+              "type": "string"
+            },
+            "messages": {
+              "items": {
+                "$ref": "#/components/schemas/Message"
+              },
+              "type": "array"
+            },
+            "snippet": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        }
+      },
+      "securitySchemes": {
+        "Oauth2": {
+          "flows": {
+            "authorizationCode": {
+              "authorizationUrl": "https://accounts.google.com/o/oauth2/auth",
+              "scopes": {
+                "https://mail.google.com/": "Read, compose, send, and permanently delete all your email",
+                "https://www.googleapis.com/auth/gmail.metadata": "View your email message metadata such as labels and headers",
+                "https://www.googleapis.com/auth/gmail.modify": "Read, compose, and send emails",
+                "https://www.googleapis.com/auth/gmail.readonly": "View your email messages and settings",
+                "https://www.googleapis.com/auth/gmail.send": "Send email on your behalf"
+              },
+              "tokenUrl": "https://oauth2.googleapis.com/token"
+            }
+          },
+          "type": "oauth2"
+        }
+      }
+    },
+    "info": {
+      "description": "A trimmed, hand-written subset shaped like the Gmail v1 Discovery document, for golden tests.",
+      "title": "Gmail API",
+      "version": "v1"
+    },
+    "openapi": "3.0.3",
+    "paths": {
+      "/gmail/v1/users/{userId}/messages": {
+        "get": {
+          "description": "Lists the messages in the user's mailbox.",
+          "operationId": "gmail.users.messages.list",
+          "parameters": [
+            {
+              "in": "query",
+              "name": "includeSpamTrash",
+              "schema": {
+                "default": false,
+                "type": "boolean"
+              }
+            },
+            {
+              "explode": true,
+              "in": "query",
+              "name": "labelIds",
+              "schema": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "style": "form"
+            },
+            {
+              "description": "Maximum number of messages to return.",
+              "in": "query",
+              "name": "maxResults",
+              "schema": {
+                "default": 100,
+                "format": "uint32",
+                "maximum": 500,
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            {
+              "in": "query",
+              "name": "pageToken",
+              "schema": {
+                "type": "string"
+              }
+            },
+            {
+              "description": "Only return messages matching the specified query.",
+              "in": "query",
+              "name": "q",
+              "schema": {
+                "type": "string"
+              }
+            },
+            {
+              "in": "path",
+              "name": "userId",
+              "required": true,
+              "schema": {
+                "default": "me",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/ListMessagesResponse"
+                  }
+                }
+              },
+              "description": "Successful response"
+            }
+          },
+          "security": [
+            {
+              "Oauth2": [
+                "https://mail.google.com/"
+              ]
+            },
+            {
+              "Oauth2": [
+                "https://www.googleapis.com/auth/gmail.metadata"
+              ]
+            },
+            {
+              "Oauth2": [
+                "https://www.googleapis.com/auth/gmail.modify"
+              ]
+            },
+            {
+              "Oauth2": [
+                "https://www.googleapis.com/auth/gmail.readonly"
+              ]
+            }
+          ]
+        }
+      },
+      "/gmail/v1/users/{userId}/messages/{id}": {
+        "delete": {
+          "description": "Immediately and permanently deletes the specified message.",
+          "operationId": "gmail.users.messages.delete",
+          "parameters": [
+            {
+              "description": "The ID of the message to delete.",
+              "in": "path",
+              "name": "id",
+              "required": true,
+              "schema": {
+                "type": "string"
+              }
+            },
+            {
+              "in": "path",
+              "name": "userId",
+              "required": true,
+              "schema": {
+                "default": "me",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "description": "Successful response"
+            }
+          },
+          "security": [
+            {
+              "Oauth2": [
+                "https://mail.google.com/"
+              ]
+            }
+          ]
+        },
+        "get": {
+          "description": "Gets the specified message.",
+          "operationId": "gmail.users.messages.get",
+          "parameters": [
+            {
+              "description": "The format to return the message in.",
+              "in": "query",
+              "name": "format",
+              "schema": {
+                "default": "full",
+                "enum": [
+                  "minimal",
+                  "full",
+                  "raw",
+                  "metadata"
+                ],
+                "type": "string"
+              }
+            },
+            {
+              "description": "The ID of the message to retrieve.",
+              "in": "path",
+              "name": "id",
+              "required": true,
+              "schema": {
+                "type": "string"
+              }
+            },
+            {
+              "description": "When given and format is METADATA, only include headers specified.",
+              "explode": true,
+              "in": "query",
+              "name": "metadataHeaders",
+              "schema": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "style": "form"
+            },
+            {
+              "in": "path",
+              "name": "userId",
+              "required": true,
+              "schema": {
+                "default": "me",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/Message"
+                  }
+                }
+              },
+              "description": "Successful response"
+            }
+          },
+          "security": [
+            {
+              "Oauth2": [
+                "https://mail.google.com/"
+              ]
+            },
+            {
+              "Oauth2": [
+                "https://www.googleapis.com/auth/gmail.metadata"
+              ]
+            },
+            {
+              "Oauth2": [
+                "https://www.googleapis.com/auth/gmail.modify"
+              ]
+            },
+            {
+              "Oauth2": [
+                "https://www.googleapis.com/auth/gmail.readonly"
+              ]
+            }
+          ]
+        }
+      },
+      "/gmail/v1/users/{userId}/messages/{id}/modify": {
+        "post": {
+          "description": "Modifies the labels on the specified message.",
+          "operationId": "gmail.users.messages.modify",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "id",
+              "required": true,
+              "schema": {
+                "type": "string"
+              }
+            },
+            {
+              "in": "path",
+              "name": "userId",
+              "required": true,
+              "schema": {
+                "default": "me",
+                "type": "string"
+              }
+            }
+          ],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModifyMessageRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/Message"
+                  }
+                }
+              },
+              "description": "Successful response"
+            }
+          },
+          "security": [
+            {
+              "Oauth2": [
+                "https://mail.google.com/"
+              ]
+            },
+            {
+              "Oauth2": [
+                "https://www.googleapis.com/auth/gmail.modify"
+              ]
+            }
+          ]
+        }
+      },
+      "/gmail/v1/users/{userId}/messages/{id}/trash": {
+        "post": {
+          "description": "Moves the specified message to the trash.",
+          "operationId": "gmail.users.messages.trash",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "id",
+              "required": true,
+              "schema": {
+                "type": "string"
+              }
+            },
+            {
+              "in": "path",
+              "name": "userId",
+              "required": true,
+              "schema": {
+                "default": "me",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/Message"
+                  }
+                }
+              },
+              "description": "Successful response"
+            }
+          },
+          "security": [
+            {
+              "Oauth2": [
+                "https://mail.google.com/"
+              ]
+            },
+            {
+              "Oauth2": [
+                "https://www.googleapis.com/auth/gmail.modify"
+              ]
+            }
+          ]
+        }
+      },
+      "/gmail/v1/users/{userId}/profile": {
+        "get": {
+          "description": "Gets the current user's Gmail profile.",
+          "operationId": "gmail.users.getProfile",
+          "parameters": [
+            {
+              "description": "The user's email address. The special value `me` can be used to indicate the authenticated user.",
+              "in": "path",
+              "name": "userId",
+              "required": true,
+              "schema": {
+                "default": "me",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/Profile"
+                  }
+                }
+              },
+              "description": "Successful response"
+            }
+          },
+          "security": [
+            {
+              "Oauth2": [
+                "https://mail.google.com/"
+              ]
+            },
+            {
+              "Oauth2": [
+                "https://www.googleapis.com/auth/gmail.metadata"
+              ]
+            },
+            {
+              "Oauth2": [
+                "https://www.googleapis.com/auth/gmail.modify"
+              ]
+            },
+            {
+              "Oauth2": [
+                "https://www.googleapis.com/auth/gmail.readonly"
+              ]
+            }
+          ]
+        }
+      },
+      "/gmail/v1/users/{userId}/threads": {
+        "get": {
+          "description": "Lists the threads in the user's mailbox.",
+          "operationId": "gmail.users.threads.list",
+          "parameters": [
+            {
+              "in": "query",
+              "name": "includeSpamTrash",
+              "schema": {
+                "default": false,
+                "type": "boolean"
+              }
+            },
+            {
+              "explode": true,
+              "in": "query",
+              "name": "labelIds",
+              "schema": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "style": "form"
+            },
+            {
+              "in": "query",
+              "name": "maxResults",
+              "schema": {
+                "default": 100,
+                "format": "uint32",
+                "type": "integer"
+              }
+            },
+            {
+              "in": "query",
+              "name": "pageToken",
+              "schema": {
+                "type": "string"
+              }
+            },
+            {
+              "in": "query",
+              "name": "q",
+              "schema": {
+                "type": "string"
+              }
+            },
+            {
+              "in": "path",
+              "name": "userId",
+              "required": true,
+              "schema": {
+                "default": "me",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/ListThreadsResponse"
+                  }
+                }
+              },
+              "description": "Successful response"
+            }
+          },
+          "security": [
+            {
+              "Oauth2": [
+                "https://mail.google.com/"
+              ]
+            },
+            {
+              "Oauth2": [
+                "https://www.googleapis.com/auth/gmail.metadata"
+              ]
+            },
+            {
+              "Oauth2": [
+                "https://www.googleapis.com/auth/gmail.modify"
+              ]
+            },
+            {
+              "Oauth2": [
+                "https://www.googleapis.com/auth/gmail.readonly"
+              ]
+            }
+          ]
+        }
+      },
+      "/gmail/v1/users/{userId}/threads/{id}": {
+        "delete": {
+          "operationId": "gmail.users.threads.delete",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "id",
+              "required": true,
+              "schema": {
+                "type": "string"
+              }
+            },
+            {
+              "in": "path",
+              "name": "userId",
+              "required": true,
+              "schema": {
+                "default": "me",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "description": "Successful response"
+            }
+          },
+          "security": [
+            {
+              "Oauth2": [
+                "https://mail.google.com/"
+              ]
+            }
+          ]
+        },
+        "get": {
+          "description": "Gets the specified thread.",
+          "operationId": "gmail.users.threads.get",
+          "parameters": [
+            {
+              "in": "query",
+              "name": "format",
+              "schema": {
+                "default": "full",
+                "enum": [
+                  "full",
+                  "metadata",
+                  "minimal"
+                ],
+                "type": "string"
+              }
+            },
+            {
+              "in": "path",
+              "name": "id",
+              "required": true,
+              "schema": {
+                "type": "string"
+              }
+            },
+            {
+              "explode": true,
+              "in": "query",
+              "name": "metadataHeaders",
+              "schema": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "style": "form"
+            },
+            {
+              "in": "path",
+              "name": "userId",
+              "required": true,
+              "schema": {
+                "default": "me",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/Thread"
+                  }
+                }
+              },
+              "description": "Successful response"
+            }
+          },
+          "security": [
+            {
+              "Oauth2": [
+                "https://mail.google.com/"
+              ]
+            },
+            {
+              "Oauth2": [
+                "https://www.googleapis.com/auth/gmail.metadata"
+              ]
+            },
+            {
+              "Oauth2": [
+                "https://www.googleapis.com/auth/gmail.modify"
+              ]
+            },
+            {
+              "Oauth2": [
+                "https://www.googleapis.com/auth/gmail.readonly"
+              ]
+            }
+          ]
+        }
+      },
+      "/gmail/v1/users/{userId}/threads/{id}/modify": {
+        "post": {
+          "operationId": "gmail.users.threads.modify",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "id",
+              "required": true,
+              "schema": {
+                "type": "string"
+              }
+            },
+            {
+              "in": "path",
+              "name": "userId",
+              "required": true,
+              "schema": {
+                "default": "me",
+                "type": "string"
+              }
+            }
+          ],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModifyThreadRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/Thread"
+                  }
+                }
+              },
+              "description": "Successful response"
+            }
+          },
+          "security": [
+            {
+              "Oauth2": [
+                "https://mail.google.com/"
+              ]
+            },
+            {
+              "Oauth2": [
+                "https://www.googleapis.com/auth/gmail.modify"
+              ]
+            }
+          ]
+        }
+      },
+      "/gmail/v1/users/{userId}/threads/{id}/trash": {
+        "post": {
+          "operationId": "gmail.users.threads.trash",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "id",
+              "required": true,
+              "schema": {
+                "type": "string"
+              }
+            },
+            {
+              "in": "path",
+              "name": "userId",
+              "required": true,
+              "schema": {
+                "default": "me",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/Thread"
+                  }
+                }
+              },
+              "description": "Successful response"
+            }
+          },
+          "security": [
+            {
+              "Oauth2": [
+                "https://mail.google.com/"
+              ]
+            },
+            {
+              "Oauth2": [
+                "https://www.googleapis.com/auth/gmail.modify"
+              ]
+            }
+          ]
+        }
+      },
+      "/gmail/v1/users/{userId}/threads/{id}/untrash": {
+        "post": {
+          "operationId": "gmail.users.threads.untrash",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "id",
+              "required": true,
+              "schema": {
+                "type": "string"
+              }
+            },
+            {
+              "in": "path",
+              "name": "userId",
+              "required": true,
+              "schema": {
+                "default": "me",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/Thread"
+                  }
+                }
+              },
+              "description": "Successful response"
+            }
+          },
+          "security": [
+            {
+              "Oauth2": [
+                "https://mail.google.com/"
+              ]
+            },
+            {
+              "Oauth2": [
+                "https://www.googleapis.com/auth/gmail.modify"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    "servers": [
+      {
+        "url": "https://gmail.googleapis.com"
+      }
+    ]
+  },
+  "operation_id_fallbacks": 0,
+  "security_requirements": [
+    {
+      "alternatives": [
+        [
+          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+        ],
+        [
+          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+        ],
+        [
+          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+        ],
+        [
+          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+        ]
+      ],
+      "tool_name": "gmail.users.messages.list"
+    },
+    {
+      "alternatives": [
+        [
+          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+        ],
+        [
+          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+        ],
+        [
+          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+        ],
+        [
+          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+        ]
+      ],
+      "tool_name": "gmail.users.messages.get"
+    },
+    {
+      "alternatives": [
+        [
+          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+        ],
+        [
+          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+        ],
+        [
+          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+        ],
+        [
+          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+        ]
+      ],
+      "tool_name": "gmail.users.getProfile"
+    },
+    {
+      "alternatives": [
+        [
+          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+        ],
+        [
+          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+        ],
+        [
+          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+        ],
+        [
+          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+        ]
+      ],
+      "tool_name": "gmail.users.threads.list"
+    },
+    {
+      "alternatives": [
+        [
+          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+        ],
+        [
+          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+        ],
+        [
+          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+        ],
+        [
+          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+        ]
+      ],
+      "tool_name": "gmail.users.threads.get"
+    },
+    {
+      "alternatives": [
+        [
+          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+        ],
+        [
+          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+        ]
+      ],
+      "tool_name": "gmail.users.messages.modify"
+    },
+    {
+      "alternatives": [
+        [
+          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+        ],
+        [
+          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+        ]
+      ],
+      "tool_name": "gmail.users.messages.trash"
+    },
+    {
+      "alternatives": [
+        [
+          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+        ],
+        [
+          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+        ]
+      ],
+      "tool_name": "gmail.users.threads.modify"
+    },
+    {
+      "alternatives": [
+        [
+          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+        ],
+        [
+          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+        ]
+      ],
+      "tool_name": "gmail.users.threads.trash"
+    },
+    {
+      "alternatives": [
+        [
+          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+        ],
+        [
+          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+        ]
+      ],
+      "tool_name": "gmail.users.threads.untrash"
+    },
+    {
+      "alternatives": [
+        [
+          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+        ]
+      ],
+      "tool_name": "gmail.users.messages.delete"
+    },
+    {
+      "alternatives": [
+        [
+          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+        ]
+      ],
+      "tool_name": "gmail.users.threads.delete"
+    }
+  ],
+  "skipped_operations": [],
+  "tools_file": {
+    "schema_version": "0.1.0",
+    "tools": [
+      {
+        "description": "Lists the messages in the user's mailbox.",
+        "input_json_schema": {
+          "additionalProperties": false,
+          "properties": {
+            "includeSpamTrash": {
+              "default": false,
+              "type": "boolean"
+            },
+            "labelIds": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "maxResults": {
+              "default": 100,
+              "format": "uint32",
+              "maximum": 500,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "pageToken": {
+              "type": "string"
+            },
+            "q": {
+              "type": "string"
+            },
+            "userId": {
+              "default": "me",
+              "type": "string"
+            }
+          },
+          "required": [
+            "userId"
+          ],
+          "type": "object"
+        },
+        "name": "gmail.users.messages.list",
+        "upstream": {
+          "method": "GET",
+          "path_template": "/gmail/v1/users/{userId}/messages",
+          "query_params": [
+            {
+              "arg_name": "includeSpamTrash",
+              "query_name": "includeSpamTrash",
+              "required": false
+            },
+            {
+              "arg_name": "labelIds",
+              "query_name": "labelIds",
+              "required": false
+            },
+            {
+              "arg_name": "maxResults",
+              "query_name": "maxResults",
+              "required": false
+            },
+            {
+              "arg_name": "pageToken",
+              "query_name": "pageToken",
+              "required": false
+            },
+            {
+              "arg_name": "q",
+              "query_name": "q",
+              "required": false
+            }
+          ]
+        }
+      },
+      {
+        "description": "Gets the specified message.",
+        "input_json_schema": {
+          "additionalProperties": false,
+          "properties": {
+            "format": {
+              "default": "full",
+              "enum": [
+                "minimal",
+                "full",
+                "raw",
+                "metadata"
+              ],
+              "type": "string"
+            },
+            "id": {
+              "type": "string"
+            },
+            "metadataHeaders": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "userId": {
+              "default": "me",
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "userId"
+          ],
+          "type": "object"
+        },
+        "name": "gmail.users.messages.get",
+        "upstream": {
+          "method": "GET",
+          "path_template": "/gmail/v1/users/{userId}/messages/{id}",
+          "query_params": [
+            {
+              "arg_name": "format",
+              "query_name": "format",
+              "required": false
+            },
+            {
+              "arg_name": "metadataHeaders",
+              "query_name": "metadataHeaders",
+              "required": false
+            }
+          ]
+        }
+      },
+      {
+        "description": "Gets the current user's Gmail profile.",
+        "input_json_schema": {
+          "additionalProperties": false,
+          "properties": {
+            "userId": {
+              "default": "me",
+              "type": "string"
+            }
+          },
+          "required": [
+            "userId"
+          ],
+          "type": "object"
+        },
+        "name": "gmail.users.getProfile",
+        "upstream": {
+          "method": "GET",
+          "path_template": "/gmail/v1/users/{userId}/profile"
+        }
+      },
+      {
+        "description": "Lists the threads in the user's mailbox.",
+        "input_json_schema": {
+          "additionalProperties": false,
+          "properties": {
+            "includeSpamTrash": {
+              "default": false,
+              "type": "boolean"
+            },
+            "labelIds": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "maxResults": {
+              "default": 100,
+              "format": "uint32",
+              "type": "integer"
+            },
+            "pageToken": {
+              "type": "string"
+            },
+            "q": {
+              "type": "string"
+            },
+            "userId": {
+              "default": "me",
+              "type": "string"
+            }
+          },
+          "required": [
+            "userId"
+          ],
+          "type": "object"
+        },
+        "name": "gmail.users.threads.list",
+        "upstream": {
+          "method": "GET",
+          "path_template": "/gmail/v1/users/{userId}/threads",
+          "query_params": [
+            {
+              "arg_name": "includeSpamTrash",
+              "query_name": "includeSpamTrash",
+              "required": false
+            },
+            {
+              "arg_name": "labelIds",
+              "query_name": "labelIds",
+              "required": false
+            },
+            {
+              "arg_name": "maxResults",
+              "query_name": "maxResults",
+              "required": false
+            },
+            {
+              "arg_name": "pageToken",
+              "query_name": "pageToken",
+              "required": false
+            },
+            {
+              "arg_name": "q",
+              "query_name": "q",
+              "required": false
+            }
+          ]
+        }
+      },
+      {
+        "description": "Gets the specified thread.",
+        "input_json_schema": {
+          "additionalProperties": false,
+          "properties": {
+            "format": {
+              "default": "full",
+              "enum": [
+                "full",
+                "metadata",
+                "minimal"
+              ],
+              "type": "string"
+            },
+            "id": {
+              "type": "string"
+            },
+            "metadataHeaders": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "userId": {
+              "default": "me",
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "userId"
+          ],
+          "type": "object"
+        },
+        "name": "gmail.users.threads.get",
+        "upstream": {
+          "method": "GET",
+          "path_template": "/gmail/v1/users/{userId}/threads/{id}",
+          "query_params": [
+            {
+              "arg_name": "format",
+              "query_name": "format",
+              "required": false
+            },
+            {
+              "arg_name": "metadataHeaders",
+              "query_name": "metadataHeaders",
+              "required": false
+            }
+          ]
+        }
+      },
+      {
+        "description": "Modifies the labels on the specified message.",
+        "input_json_schema": {
+          "additionalProperties": false,
+          "properties": {
+            "addLabelIds": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "id": {
+              "type": "string"
+            },
+            "removeLabelIds": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "userId": {
+              "default": "me",
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "userId"
+          ],
+          "type": "object"
+        },
+        "name": "gmail.users.messages.modify",
+        "upstream": {
+          "body": {
+            "mode": "whole_args_json"
+          },
+          "method": "POST",
+          "path_template": "/gmail/v1/users/{userId}/messages/{id}/modify"
+        }
+      },
+      {
+        "description": "Moves the specified message to the trash.",
+        "input_json_schema": {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "userId": {
+              "default": "me",
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "userId"
+          ],
+          "type": "object"
+        },
+        "name": "gmail.users.messages.trash",
+        "upstream": {
+          "method": "POST",
+          "path_template": "/gmail/v1/users/{userId}/messages/{id}/trash"
+        }
+      },
+      {
+        "description": "POST /gmail/v1/users/{userId}/threads/{id}/modify",
+        "input_json_schema": {
+          "additionalProperties": false,
+          "properties": {
+            "addLabelIds": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "id": {
+              "type": "string"
+            },
+            "removeLabelIds": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "userId": {
+              "default": "me",
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "userId"
+          ],
+          "type": "object"
+        },
+        "name": "gmail.users.threads.modify",
+        "upstream": {
+          "body": {
+            "mode": "whole_args_json"
+          },
+          "method": "POST",
+          "path_template": "/gmail/v1/users/{userId}/threads/{id}/modify"
+        }
+      },
+      {
+        "description": "POST /gmail/v1/users/{userId}/threads/{id}/trash",
+        "input_json_schema": {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "userId": {
+              "default": "me",
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "userId"
+          ],
+          "type": "object"
+        },
+        "name": "gmail.users.threads.trash",
+        "upstream": {
+          "method": "POST",
+          "path_template": "/gmail/v1/users/{userId}/threads/{id}/trash"
+        }
+      },
+      {
+        "description": "POST /gmail/v1/users/{userId}/threads/{id}/untrash",
+        "input_json_schema": {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "userId": {
+              "default": "me",
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "userId"
+          ],
+          "type": "object"
+        },
+        "name": "gmail.users.threads.untrash",
+        "upstream": {
+          "method": "POST",
+          "path_template": "/gmail/v1/users/{userId}/threads/{id}/untrash"
+        }
+      },
+      {
+        "description": "Immediately and permanently deletes the specified message.",
+        "input_json_schema": {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "userId": {
+              "default": "me",
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "userId"
+          ],
+          "type": "object"
+        },
+        "name": "gmail.users.messages.delete",
+        "upstream": {
+          "method": "DELETE",
+          "path_template": "/gmail/v1/users/{userId}/messages/{id}"
+        }
+      },
+      {
+        "description": "DELETE /gmail/v1/users/{userId}/threads/{id}",
+        "input_json_schema": {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "userId": {
+              "default": "me",
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "userId"
+          ],
+          "type": "object"
+        },
+        "name": "gmail.users.threads.delete",
+        "upstream": {
+          "method": "DELETE",
+          "path_template": "/gmail/v1/users/{userId}/threads/{id}"
+        }
+      }
+    ]
+  },
+  "warnings": [
+    {
+      "code": "global_parameter_not_mapped",
+      "method": null,
+      "operation_omitted": false,
+      "path_template": null,
+      "subject": "$.xgafv"
+    },
+    {
+      "code": "global_parameter_not_mapped",
+      "method": null,
+      "operation_omitted": false,
+      "path_template": null,
+      "subject": "access_token"
+    },
+    {
+      "code": "global_parameter_not_mapped",
+      "method": null,
+      "operation_omitted": false,
+      "path_template": null,
+      "subject": "alt"
+    },
+    {
+      "code": "global_parameter_not_mapped",
+      "method": null,
+      "operation_omitted": false,
+      "path_template": null,
+      "subject": "fields"
+    },
+    {
+      "code": "global_parameter_not_mapped",
+      "method": null,
+      "operation_omitted": false,
+      "path_template": null,
+      "subject": "key"
+    },
+    {
+      "code": "global_parameter_not_mapped",
+      "method": null,
+      "operation_omitted": false,
+      "path_template": null,
+      "subject": "prettyPrint"
+    },
+    {
+      "code": "global_parameter_not_mapped",
+      "method": null,
+      "operation_omitted": false,
+      "path_template": null,
+      "subject": "quotaUser"
+    },
+    {
+      "code": "global_parameter_not_mapped",
+      "method": null,
+      "operation_omitted": false,
+      "path_template": null,
+      "subject": "uploadType"
+    },
+    {
+      "code": "recursive_request_schema",
+      "method": "POST",
+      "operation_omitted": true,
+      "path_template": "/gmail/v1/users/{userId}/messages/send",
+      "subject": "Message"
+    }
+  ]
+}

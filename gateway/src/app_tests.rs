@@ -12873,6 +12873,186 @@ async fn managed_openapi_gated_swagger2_writes_fail_closed_without_a_roster() {
     );
 }
 
+/// A small Google Discovery document (issue #443): one unscoped method that
+/// binds to a Connection without authentication, one scoped method, one
+/// method left out, and Google's system parameters.
+fn widget_discovery_document() -> String {
+    json!({
+        "kind": "discovery#restDescription",
+        "discoveryVersion": "v1",
+        "name": "widgets",
+        "version": "v1",
+        "rootUrl": "https://widgets.example.test/",
+        "servicePath": "widgets/v1/",
+        "parameters": { "key": { "type": "string", "location": "query" } },
+        "auth": { "oauth2": { "scopes": { "https://widgets.example.test/read": { "description": "Read widgets" } } } },
+        "schemas": {
+            "Widget": { "id": "Widget", "type": "object", "properties": { "id": { "type": "string" } } }
+        },
+        "resources": {
+            "widgets": {
+                "methods": {
+                    "get": {
+                        "id": "widgets.widgets.get",
+                        "path": "widgets/{widgetId}",
+                        "httpMethod": "GET",
+                        "parameters": {
+                            "widgetId": { "type": "string", "location": "path", "required": true }
+                        },
+                        "response": { "$ref": "Widget" }
+                    },
+                    "list": {
+                        "id": "widgets.widgets.list",
+                        "path": "widgets",
+                        "httpMethod": "GET",
+                        "scopes": ["https://widgets.example.test/read"]
+                    },
+                    "move": {
+                        "id": "widgets.widgets.move",
+                        "path": "{+name}:move",
+                        "httpMethod": "POST",
+                        "parameters": {
+                            "name": { "type": "string", "location": "path", "required": true }
+                        }
+                    }
+                }
+            }
+        }
+    })
+    .to_string()
+}
+
+#[tokio::test]
+async fn managed_openapi_preview_reports_google_discovery_conversion_and_registers_converted_tools()
+{
+    let connection_db = TempDb::new("connection-openapi-discovery-preview");
+    let policy = TempPolicyFile::new(&connection_policy_document_string());
+    let router = connection_admin_router(&connection_db, &policy, test_audit_log());
+    let (connection_id, connection_etag) =
+        create_managed_openapi_connection(&router, "Managed Discovery").await;
+    let spec = widget_discovery_document();
+    let preview = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::POST,
+            &format!("{CONNECTIONS_ADMIN_ROUTE}/{connection_id}/openapi/preview"),
+            Some(test_principal(&["openapi-tools-reader"])),
+            Some(json!({ "spec": spec }).to_string()),
+            None,
+            true,
+        ))
+        .await
+        .expect("Discovery preview should complete");
+    assert_eq!(preview.status(), StatusCode::OK);
+    let preview = json_body(preview).await;
+    assert_eq!(
+        preview["conversion"],
+        json!({
+            "source_format": "google_discovery_v1",
+            "warnings": [
+                {
+                    "code": "base_path_not_in_paths",
+                    "message": "basePath is not part of generated path templates; include it in the Connection base path",
+                    "operation_omitted": false,
+                    "subject": "/widgets/v1"
+                },
+                {
+                    "code": "global_parameter_not_mapped",
+                    "message": "this document-level parameter is not a tool argument, and generated tools never send it",
+                    "operation_omitted": false,
+                    "subject": "key"
+                },
+                {
+                    "code": "unsupported_path_expansion",
+                    "message": "the method path uses a URI template expansion other than a plain {name}, such as {+name}, which has no OpenAPI 3.0 form; it was left out",
+                    "operation_omitted": true,
+                    "method": "POST",
+                    "path_template": "/{+name}:move",
+                    "subject": "+name"
+                }
+            ]
+        })
+    );
+    assert_eq!(
+        preview["tools"]
+            .as_array()
+            .expect("preview should list tools")
+            .iter()
+            .map(|tool| tool["name"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!("widgets.widgets.get")],
+        "tools are named by their Discovery method IDs; the omitted method generates none"
+    );
+    assert!(
+        preview["incompatibilities"]
+            .as_array()
+            .expect("preview should list incompatibilities")
+            .iter()
+            .any(|incompatibility| incompatibility["tool_name"] == json!("widgets.widgets.list")),
+        "a scoped method needs an OAuth 2.0 credential the Connection does not have: {preview}"
+    );
+
+    let registered = preview_and_register_managed_openapi(
+        &router,
+        &connection_id,
+        &connection_etag,
+        &spec,
+        &["widgets.widgets.get"],
+    )
+    .await;
+    assert_eq!(registered.status(), StatusCode::CREATED);
+    assert_eq!(
+        json_body(registered).await["registered_tool_names"],
+        json!(["widgets.widgets.get"])
+    );
+}
+
+/// A Discovery catalog is a gated converted catalog like a Swagger 2.0 one:
+/// without a roster its registration is refused and stores nothing.
+#[tokio::test]
+async fn managed_openapi_gated_discovery_registration_fails_closed_without_a_roster() {
+    let connection_db = TempDb::new("connection-openapi-discovery-gated");
+    let policy = TempPolicyFile::new(&connection_policy_document_string());
+    let router = gated_connection_admin_router(
+        &connection_db,
+        &policy,
+        test_audit_log(),
+        GatewayAppBuildOverrides::default(),
+    );
+    let (connection_id, connection_etag) =
+        create_managed_openapi_connection(&router, "Gated Discovery").await;
+    let refused = preview_and_register_managed_openapi(
+        &router,
+        &connection_id,
+        &connection_etag,
+        &widget_discovery_document(),
+        &["widgets.widgets.get"],
+    )
+    .await;
+    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        json_body(refused).await["reason"],
+        json!("roster_unavailable")
+    );
+    let preview = router
+        .oneshot(connection_admin_request(
+            Method::POST,
+            &format!("{CONNECTIONS_ADMIN_ROUTE}/{connection_id}/openapi/preview"),
+            Some(test_principal(&["openapi-tools-reader"])),
+            Some(json!({ "spec": widget_discovery_document() }).to_string()),
+            None,
+            true,
+        ))
+        .await
+        .expect("Discovery preview should complete");
+    assert_eq!(preview.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(preview).await["catalog_revision"],
+        json!(0),
+        "a refused registration stores no catalog"
+    );
+}
+
 #[test]
 fn stored_overlay_source_response_projects_only_a_strict_typed_envelope() {
     let mut reports = connections::store::StoredOpenApiSourceReports::empty();
@@ -34011,6 +34191,163 @@ mod cluster_policy_tests {
             refusals().len(),
             1,
             "an admission is not audited as a refusal"
+        );
+    }
+
+    /// Google Discovery catalogs (issue #443) through the register endpoint
+    /// against a real roster: a member built with Swagger 2.0 import but
+    /// before Discovery import advertises `openapi_swagger2_catalogs` only,
+    /// which admits Swagger 2.0 catalogs and not Discovery ones.
+    #[tokio::test]
+    async fn cluster_discovery_catalogs_wait_for_members_built_before_discovery_import() {
+        use crate::storage::{MemberRegistration, PostgresMembershipStore};
+
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (_, pool) = migrated_policy_foundation(&database.dsn).await;
+        let deployment = "deploy-cluster-discovery";
+        let membership = cluster_membership::ClusterMembership::new(
+            PostgresMembershipStore::new(
+                pool.clone(),
+                deployment,
+                crate::ha::InstanceIdentity::generate(),
+            ),
+            MemberRegistration {
+                binary_version: env!("CARGO_PKG_VERSION").to_owned(),
+                schema_version: migrations::schema_version_range(),
+                document_version: cluster_membership::DOCUMENT_VERSION_RANGE,
+                fingerprint: "b".repeat(64),
+                capabilities: storage::compatibility::BINARY_CAPABILITIES.to_vec(),
+            },
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+        );
+        membership.register_boot().await.expect("boot row");
+        let swagger_only = uuid::Uuid::new_v4();
+        pool.get()
+            .await
+            .expect("client")
+            .execute(
+                "INSERT INTO greengateway.cluster_members
+                     (deployment_id, instance_id, boot_id, binary_version,
+                      schema_version_min, schema_version_max,
+                      document_version_min, document_version_max, fingerprint,
+                      capabilities)
+                 VALUES ($1, $2::text::uuid, $3::text::uuid, '1.0.1', 18, 18, 0, 0,
+                         repeat('b', 64),
+                         'openapi_swagger2_catalogs,operation_requirements,policy_role_descriptions')",
+                &[
+                    &deployment,
+                    &swagger_only.to_string(),
+                    &uuid::Uuid::new_v4().to_string(),
+                ],
+            )
+            .await
+            .expect("a Swagger-only member row inserts");
+
+        let connection_db = TempDb::new("cluster-openapi-discovery-gate");
+        let policy = TempPolicyFile::new(&connection_policy_document_string());
+        let capture = audit::sink::tests::CaptureSink::new();
+        let router = gated_connection_admin_router(
+            &connection_db,
+            &policy,
+            audit::AuditLog::new(Arc::new(capture.clone())),
+            GatewayAppBuildOverrides {
+                pg_membership: Some(membership),
+                ..GatewayAppBuildOverrides::default()
+            },
+        );
+        let (connection_id, connection_etag) =
+            create_managed_openapi_connection(&router, "Cluster Discovery").await;
+        let refusals = || {
+            capture
+                .events()
+                .into_iter()
+                .filter(|event| event.event_type == "cluster.operation_refused")
+                .collect::<Vec<_>>()
+        };
+
+        let swagger = preview_and_register_managed_openapi(
+            &router,
+            &connection_id,
+            &connection_etag,
+            &json!({
+                "swagger": "2.0",
+                "info": { "title": "Widget API", "version": "1.0.0" },
+                "paths": {
+                    "/widgets": {
+                        "get": {
+                            "operationId": "listWidgets",
+                            "responses": { "200": { "description": "Widgets" } }
+                        }
+                    }
+                }
+            })
+            .to_string(),
+            &["listWidgets"],
+        )
+        .await;
+        assert_eq!(
+            swagger.status(),
+            StatusCode::CREATED,
+            "the Swagger-only member admits a Swagger 2.0 catalog"
+        );
+
+        let (status, body) = refusal_of(
+            preview_and_register_managed_openapi(
+                &router,
+                &connection_id,
+                &connection_etag,
+                &widget_discovery_document(),
+                &["widgets.widgets.get"],
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["reason"], "capability_not_advertised");
+        let started = std::time::Instant::now();
+        while refusals().is_empty() && started.elapsed() < Duration::from_secs(5) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let refused = refusals();
+        assert_eq!(refused.len(), 1, "one refusal, one gate audit event");
+        assert_eq!(
+            refused[0].payload["operation"],
+            "connections.openapi_discovery_catalog"
+        );
+        assert_eq!(
+            refused[0].payload["capability"],
+            "openapi_discovery_catalogs"
+        );
+        assert_eq!(refused[0].payload["lacking_members"], 1);
+
+        pool.get()
+            .await
+            .expect("client")
+            .execute(
+                "UPDATE greengateway.cluster_members
+                 SET last_heartbeat_at = now() - interval '60 seconds'
+                 WHERE instance_id = $1::text::uuid",
+                &[&swagger_only.to_string()],
+            )
+            .await
+            .expect("backdate the Swagger-only member");
+        let admitted = preview_and_register_managed_openapi(
+            &router,
+            &connection_id,
+            &connection_etag,
+            &widget_discovery_document(),
+            &["widgets.widgets.get"],
+        )
+        .await;
+        assert_eq!(admitted.status(), StatusCode::CREATED);
+        assert_eq!(
+            json_body(admitted).await["registered_tool_names"],
+            json!(["widgets.widgets.get"])
         );
     }
 

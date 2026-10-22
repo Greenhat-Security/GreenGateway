@@ -1229,6 +1229,7 @@ mod tests {
         assert_eq!(
             only.capabilities,
             vec![
+                "openapi_discovery_catalogs",
                 "openapi_swagger2_catalogs",
                 "operation_requirements",
                 "policy_role_descriptions"
