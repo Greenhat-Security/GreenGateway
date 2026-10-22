@@ -2381,7 +2381,7 @@ pub(super) async fn persist_policy_mutation(
 /// Ask the cluster's operation gate before committing a document that uses
 /// a feature an older member cannot read (issue #426).
 ///
-/// A document without such a feature needs nothing beyond the schema-20
+/// A document without such a feature needs nothing beyond the schema-22
 /// contract every member shares, and passes without a roster read. One that
 /// gives a role a `description` is the registered operation
 /// `policy.role_descriptions`: it is committed only while every live member,
@@ -2782,7 +2782,16 @@ pub(super) fn if_match_matches(
 pub(super) fn exact_strong_if_match(
     headers: &HeaderMap,
 ) -> Result<String, ToolPlaygroundIfMatchError> {
-    let mut values = headers.get_all(header::IF_MATCH).iter();
+    exact_strong_entity_tag(headers, &header::IF_MATCH)
+}
+
+/// Exactly one strong entity tag in the header `name`: no list, no `*`, no
+/// weak tag. Shared by every precondition that compares one value exactly.
+pub(super) fn exact_strong_entity_tag(
+    headers: &HeaderMap,
+    name: &HeaderName,
+) -> Result<String, ToolPlaygroundIfMatchError> {
+    let mut values = headers.get_all(name).iter();
     let Some(value) = values.next() else {
         return Err(ToolPlaygroundIfMatchError::Missing);
     };

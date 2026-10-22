@@ -42,7 +42,7 @@
       "description": "No corresponding gateway-owned operation/delivery is shipped in this mode; required authority-event delivery cannot be inferred from provider audit or future plans.",
       "sources": [
         {
-          "path": "gateway/src/config.rs",
+          "path": "gateway/src/config/storage.rs",
           "anchor": "fn reject_local_authority_in_postgres_mode("
         }
       ]
@@ -108,6 +108,10 @@
         {
           "path": "gateway/src/admin_policy.rs",
           "anchor": "async fn policy_rules_order_put_endpoint("
+        },
+        {
+          "path": "gateway/src/admin_policy_drafts.rs",
+          "anchor": "async fn policy_draft_publish_endpoint("
         }
       ],
       "boundary": "persist_policy_mutation -> PolicyControlPlane::commit -> commit_policy_in / postgres_documents::commit_in; active row lock and expected ETag guard; document/history, shared revision, active pointer and security_outbox commit together. Discovery acceptance invokes commit_policy_in inside its suggestion transaction.",
@@ -189,6 +193,10 @@
         {
           "path": "gateway/src/admin_policy.rs",
           "anchor": "async fn policy_rules_order_put_endpoint("
+        },
+        {
+          "path": "gateway/src/admin_policy_drafts.rs",
+          "anchor": "async fn policy_draft_publish_endpoint("
         }
       ],
       "boundary": "persist_to_file writes temporary file and renames; reload swaps runtime; append_policy_version_after_commit writes a separately configured SQLite history database afterward.",
@@ -288,7 +296,7 @@
       "follow_up": "Keep this operation refused; do not introduce a local file authority fallback.",
       "sources": [
         {
-          "path": "gateway/src/config.rs",
+          "path": "gateway/src/config/storage.rs",
           "anchor": "fn reject_local_authority_in_postgres_mode("
         }
       ],
@@ -883,7 +891,7 @@
       "follow_up": "Keep local-secret administration unavailable in cluster mode; external provider rotation is a separate authority and cannot share the gateway transaction.",
       "sources": [
         {
-          "path": "gateway/src/config.rs",
+          "path": "gateway/src/config/storage.rs",
           "anchor": "CONNECTION_LOCAL_SECRET_KEYRING,"
         },
         {
@@ -1483,11 +1491,11 @@
           "anchor": "const PRUNE_SESSIONS_SQL: &str"
         },
         {
-          "path": "gateway/src/config.rs",
+          "path": "gateway/src/config/storage.rs",
           "anchor": "standalone_memory is unsupported with {STATE_BACKEND}=postgres"
         },
         {
-          "path": "gateway/src/config.rs",
+          "path": "gateway/src/config/storage.rs",
           "anchor": "cluster_postgres requires {STATE_BACKEND}=postgres"
         }
       ],

@@ -10,6 +10,7 @@ pub enum SafeAuthenticationKind {
     StaticBearer,
     Oauth2ClientCredentials,
     DelegatedIssuerToken,
+    GoogleDomainWideDelegation,
     LegacyConfigured,
 }
 
