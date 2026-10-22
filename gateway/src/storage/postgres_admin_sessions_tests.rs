@@ -1,5 +1,5 @@
 //! Verified-PostgreSQL contract tests for the cluster admin session store
-//! (issue #424, ADR-0008). Gated on the test harness locator: CI sets it, a
+//! (issue #424, ADR-0009). Gated on the test harness locator: CI sets it, a
 //! checkout without a database skips.
 //!
 //! Two replicas are two stores over one database and share nothing else, so

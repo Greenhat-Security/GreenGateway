@@ -2,7 +2,8 @@
 
 Part of [#425](https://github.com/Greenhat-Security/GreenGateway/issues/425), PR 1
 and the first two PR 2 slices (PostgreSQL Connection deletion evidence; service-token
-rotate/revoke and JWT revocation evidence).
+rotate/revoke and JWT revocation evidence), plus the keyed safe-reference derivation
+every future event producer needs ([Keyed safe references](#keyed-safe-references)).
 Reviewed source: `4a32d10e38d2ac36d6bcbee627443b1fbb80d059`.
 
 This inventory identifies existing atomic records and the work needed for required
@@ -109,7 +110,7 @@ or logout carries no actor or session identity; implicit withdrawals emit
 nothing. That row stays `unsupported_future_operation`: required-durability mode
 must refuse in-memory sessions rather than relabel that event durable.
 
-In cluster mode, `ADMIN_SESSION_MODE=cluster_postgres` ([ADR-0008](adr/0008-shared-admin-sessions.md))
+In cluster mode, `ADMIN_SESSION_MODE=cluster_postgres` ([ADR-0009](adr/0009-shared-admin-sessions.md))
 is the durable session authority, and it ships with its own transactional
 evidence (migration 19). Every grant writes the session row and an
 `admin_session_evidence` row in one statement inside the grant's transaction;
@@ -131,8 +132,9 @@ define a **proposed** safe projection. Current `security_outbox` rows,
 satisfy this schema, and neither do migration 18's `service_token_change_evidence`
 and `jwt_revocation_evidence` rows, migration 19's `admin_session_evidence` rows or
 the standalone token evidence rows: the evidence rows hold the internal actor
-ID, not a keyed safe reference, and no `authority_id`. Runtime producer, identity derivation and
-dispatcher integration belong to later slices.
+ID, not a keyed safe reference, and no `authority_id`. The keyed reference derivation exists (see
+[Keyed safe references](#keyed-safe-references)) but nothing calls it yet; runtime
+producer and dispatcher integration belong to later slices.
 
 Revision transitions are operation-specific. Resource creation (`connection.create`,
 `secret.create`, `service_token.issue`, `admin_session.grant`) has no prior revision; replacement,
@@ -157,13 +159,13 @@ assigns every operation exactly one transition contract.
 | `revision` | Named revision axis, previous/new revision, and optional shared security revision, encoded as decimal strings to preserve exact 64-bit values |
 
 Safe references are 64-character lowercase hexadecimal pseudonyms, **not**
-arbitrary hashes of input payloads. The producer design must use domain-separated,
-authority-scoped keyed derivation for principal and sensitive resource
-correlation, with a documented stable key/rotation/backup policy; a schema cannot
-prove that a digest was safely derived. Do not add another secret store or choose
-an unreviewed key source in this inventory-only slice. This derivation contract
-must be implemented and tested before runtime adoption. Non-sensitive identities
-may also use the same reference format for one closed projection.
+arbitrary hashes of input payloads. Producers must use the domain-separated,
+authority-scoped keyed derivation described under
+[Keyed safe references](#keyed-safe-references) for principal and sensitive
+resource correlation; a schema cannot prove that a digest was safely derived. That
+derivation, its key source and its rotation and backup policy are implemented and
+tested, but no runtime producer calls it yet. Non-sensitive identities may also
+use the same reference format for one closed projection.
 
 The operation record must bind authenticated actor, operation, payload digest and
 conditional revision/ETag tuple in the owning transaction. The schema is the
@@ -196,6 +198,135 @@ timestamps, imprecise numeric revisions and invalid transitions. These tests do
 not prove runtime redaction; future producer tests must construct events from
 real safe mutation inputs with synthetic sensitive markers and inspect stored
 records, logs and metrics.
+
+## Keyed safe references
+
+`gateway/src/authority_events/pseudonym.rs` derives the `subject_ref`, `issuer_ref`
+and `resource.ref` values of the proposed event. It is a pure module with tests and
+no runtime caller: nothing reads a pseudonym key at startup, no setting names one,
+and no stored record carries a reference yet. The producer slice that adopts it
+must also deliver the integration requirements listed at the end of this section.
+
+### Derivation
+
+A reference is HMAC-SHA256 under the authority's pseudonym key, laid out as 64
+lowercase hexadecimal characters so it matches the schema's `^[0-9a-f]{64}$`:
+
+- **Key ID** (first 8 characters): the leftmost 4 bytes of HMAC-SHA256 under the key
+  over the framed label `greengateway.authority_pseudonym.key_id.v1`. It depends on
+  the key alone, so replicas holding the same key agree on it without configuration,
+  and after a rotation it says which key made a reference. It reveals nothing about
+  the key.
+- **Tag** (remaining 56 characters): the leftmost 28 bytes (224 bits) of HMAC-SHA256
+  under the same key over the framed derivation input.
+
+Every field is framed as an 8-byte big-endian length followed by its bytes, so no
+identifier, whatever bytes it contains, can run into the next. The derivation input
+is the label `greengateway.authority_pseudonym.v1`, the 16 bytes of the
+`authority_id`, the domain label, the component count, then each component:
+
+| Domain label | Components |
+| --- | --- |
+| `actor.subject` | Exactly two: the canonical issuer, then the subject. A subject is never referenced without the issuer that vouched for it, as `Principal` and caller assertions already scope it |
+| `actor.issuer` | Exactly one: the canonical issuer |
+| `resource.<kind>` for each schema `resource.kind` | One to four: the resource identifier, optionally preceded by the identifiers of the resources that own it |
+
+A component is the identifier's canonical text exactly as its store keeps it, at most
+4,096 bytes (the largest subject or issuer a principal may carry) and never empty.
+The same identifier in two domains, under two authority IDs (for example, a clone
+deliberately re-namespaced from its source) or under two keys gives unrelated
+references. The labels and the framing are fixed for v1: changing either would
+orphan every committed reference, and a unit test recomputes the construction
+from this description to catch that. A test also keeps the resource domains equal
+to the schema's `resource.kind` enum.
+
+Without the key a reference can only be compared with other references. With it, a
+guessed identity can be confirmed against any reference the key produced. That is
+why the key is held like a credential and never leaves the gateway, and why a plain
+digest was rejected: subjects, Connection IDs and token IDs are guessable.
+
+### Key source
+
+The key is resolved through the existing secret providers under the dedicated
+`authority_pseudonym_key` secret purpose: an operator environment or file alias,
+Vault KV v2, GCP Secret Manager, Azure Key Vault, AWS Secrets Manager or Kubernetes
+Secrets. The encrypted local store can neither hold it (a local create under the
+purpose is refused before anything is written) nor resolve it (a local alias
+resolves only under the purpose it was stored with). The key is never written to
+PostgreSQL or SQLite, so a database reader or a database backup never holds it.
+The Connection admin API does not list the purpose among an alias's compatible
+purposes, because no Connection field resolves it.
+
+The material is exactly 64 hexadecimal characters encoding 32 random bytes, with
+no trailing newline. The purpose's byte bound is that exact length, so a
+newline-terminated file is refused rather than trimmed. Generate it inside the
+secret provider or a private staging directory, for example
+`(umask 077 && printf '%s' "$(openssl rand -hex 32)" > pseudonym.key)`, and never
+print or commit it. Material resolved under any other purpose, of any other length, with
+non-hexadecimal characters, or with every byte equal (a placeholder) is refused.
+Every resolution or parse failure is fatal: there is no unkeyed mode, no fallback
+key, and no key generated on the fly.
+
+### Rotation: a dual-key verify window
+
+A keyring holds the **current** key, which derives every new reference, and at most
+one **previous** key, which only verifies. The two must be different keys (their
+key IDs must differ) and different aliases.
+
+1. Provision a new key under a new alias. Make it current and the old key previous
+   on every replica of the authority.
+2. From then on, new events carry references under the new key ID. References in
+   committed evidence are never rewritten.
+3. During the window the gateway recognises a reference made under either key from
+   the identity it names, comparing tags in constant time. Downstream consumers
+   without the key see a new reference for the same identity: rotation
+   deliberately breaks linkability at the boundary, and the key ID change shows
+   where it happened.
+4. Close the window by removing the previous key. Its references stay valid opaque
+   identifiers, but the gateway can no longer recompute or match them from an
+   identity.
+
+Keep the window open for as long as pre-rotation evidence must still be matched
+to live identities, such as an open investigation or the period over which an
+event consumer correlates. A second rotation inside a window retires the oldest
+key. On suspected key compromise, rotate at once. Rotation limits future exposure
+only: whoever holds a compromised key can still confirm guessed identities against
+every reference that key produced, and evidence already delivered cannot be
+recalled.
+
+### Backup
+
+- Back up the current key, and the previous key for as long as its window is open,
+  in the secret provider on the same schedule and with the same protection as the
+  gateway's other secrets. Never store it with the database backup, in version
+  control, or in an event stream.
+- Decide explicitly whether to escrow a retired key once its window closes. By
+  default, destroy it once no evidence still needs matching. An escrowed key keeps
+  every reference it made re-identifiable by anyone who can restore it.
+- Losing the current key loses no evidence: references are self-contained opaque
+  values. It loses correlation, because new references for the same identities no
+  longer match old ones. Recover by provisioning a new key, which is an unplanned
+  rotation with no previous key to verify against.
+- A restore of the same authority (same `authority_id`) needs the same key for
+  continuity. A clone re-namespaced under a new `authority_id` derives unrelated
+  references even with the same key, by design.
+
+### Integration requirements for the producer slice
+
+- Name the current and previous aliases in validated startup configuration, with
+  `.env.example` and the configuration reference, and refuse startup, not degrade,
+  when either fails to resolve or parse.
+- Require every replica of one authority to hold the same keys, for example by
+  including the key IDs in the replica configuration fingerprint. Two replicas
+  deriving under different keys would emit unrelated references for one identity.
+- Refuse any Connection binding of a pseudonym-key alias, as the store already
+  refuses binding a token-exchange client secret's alias under any other field. An
+  operator or provider alias is not tied to a purpose, so a Connection bound to it
+  would otherwise send the key upstream.
+- Emit a structured audit event when the keyring loads or rotates, with key IDs and
+  roles only.
+- Build event references only through this module, and extend the
+  synthetic-marker tests to stored records, logs and metrics.
 
 ## Delivery, retention and recovery contract
 

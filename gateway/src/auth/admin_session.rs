@@ -1,4 +1,4 @@
-//! Opt-in, gateway-issued admin sessions (issue #424, ADR-0008).
+//! Opt-in, gateway-issued admin sessions (issue #424, ADR-0009).
 //!
 //! Cookies contain independent random capabilities; only purpose-separated
 //! digests of them reach a store. Access tokens stay on the server and the

@@ -300,7 +300,7 @@ When `ADMIN_LOGIN_PROVIDER` is set, the OIDC login flow's pending state (the `st
 
 ### Admin sessions in cluster mode
 
-With `ADMIN_SESSION_MODE=cluster_postgres` (issue #424, [ADR-0008](../adr/0008-shared-admin-sessions.md)), the gateway-issued admin session that a cookie completion sets lives on the primary, so the admin UI's default HttpOnly session works behind a load balancer without sticky routing. `standalone_memory` stays refused in cluster mode: there is no process-local fallback. The mode needs `ADMIN_LOGIN_PROVIDER` and `ADMIN_LOGIN_KEYRING` like the pending-login store above, plus required authentication, CSRF and an HTTPS login `redirect_uri` ([configuration](../configuration.md#admin_session_mode)).
+With `ADMIN_SESSION_MODE=cluster_postgres` (issue #424, [ADR-0009](../adr/0009-shared-admin-sessions.md)), the gateway-issued admin session that a cookie completion sets lives on the primary, so the admin UI's default HttpOnly session works behind a load balancer without sticky routing. `standalone_memory` stays refused in cluster mode: there is no process-local fallback. The mode needs `ADMIN_LOGIN_PROVIDER` and `ADMIN_LOGIN_KEYRING` like the pending-login store above, plus required authentication, CSRF and an HTTPS login `redirect_uri` ([configuration](../configuration.md#admin_session_mode)).
 
 What is stored, and what is not:
 

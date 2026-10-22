@@ -1,4 +1,4 @@
-# ADR-0008: Shared Admin Sessions in Cluster Mode
+# ADR-0009: Shared Admin Sessions in Cluster Mode
 
 ## Status
 

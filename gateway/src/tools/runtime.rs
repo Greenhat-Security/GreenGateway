@@ -2613,7 +2613,16 @@ mod tests {
             "enablement answers from the admitted snapshot"
         );
         assert!(visible, "visibility answers from the admitted snapshot");
-        let events = audit_events(&capture, 1).await;
+        // Audit delivery is asynchronous: wait for the denial itself rather than
+        // for any first event, which can be one recorded before it.
+        wait_until(Duration::from_secs(5), || {
+            capture
+                .events()
+                .iter()
+                .any(|event| event.event_type == AUTHZ_DENIED)
+        })
+        .await;
+        let events = capture.events();
         let denied = events
             .iter()
             .find(|event| event.event_type == AUTHZ_DENIED)

@@ -50,7 +50,7 @@ Both are supported product shapes, chosen at startup, one at a time. Standalone 
 | Singleton housekeeping | in-process | one leased leader, fenced on the database clock |
 | Credential secrets | external providers, or a local-secret keyring | external providers only; the local keyring is rejected |
 | Principal directory | local SQLite | none — cluster mode has no principal directory |
-| Gateway-issued admin sessions | `ADMIN_SESSION_MODE=standalone_memory`: process memory, ended by a restart | `ADMIN_SESSION_MODE=cluster_postgres`: rows on the primary shared by every replica ([ADR-0008](0008-shared-admin-sessions.md)) |
+| Gateway-issued admin sessions | `ADMIN_SESSION_MODE=standalone_memory`: process memory, ended by a restart | `ADMIN_SESSION_MODE=cluster_postgres`: rows on the primary shared by every replica ([ADR-0009](0009-shared-admin-sessions.md)) |
 | Behaviour when the authority cannot be reached | not applicable | fail closed: `503`, never a stale allow, never `401`/`403` |
 | Schema migrations | not applicable | checksummed ledger, applied by a migration job under a DDL-capable role; serving replicas validate only |
 | Support status | fully supported | supported within the boundary `docs/deployment/postgres.md` draws under "Supported cluster operation", which names the release-gate suite behind each guarantee and the non-goals it does not cover |

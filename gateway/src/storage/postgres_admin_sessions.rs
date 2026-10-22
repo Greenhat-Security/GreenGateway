@@ -1,4 +1,4 @@
-//! PostgreSQL admin session store (issue #424, ADR-0008).
+//! PostgreSQL admin session store (issue #424, ADR-0009).
 //!
 //! The `ADMIN_SESSION_MODE=cluster_postgres` backend of
 //! [`AdminSessionStore`]: the sessions the gateway issues after a

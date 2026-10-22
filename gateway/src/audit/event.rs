@@ -25,6 +25,12 @@ pub const CONNECTION_OAUTH_TOKEN_REFRESH: &str = "connection.oauth_token_refresh
 /// caller (issue #441): the actor it was made for, the outcome and the
 /// issuer's decision, never any token.
 pub const CONNECTION_DELEGATED_TOKEN_EXCHANGE: &str = "connection.delegated_token_exchange";
+/// One decision about the signed caller assertion of a request a
+/// connection-bound proxy route forwards (issue #463): the `kid` and `jti` of
+/// the assertion it carried, or the reason it was refused. The caller is the
+/// actor; the token and the key are never recorded. Tool calls record theirs
+/// on `tool.upstream_request` instead.
+pub const CONNECTION_CALLER_ASSERTION: &str = "connection.caller_assertion";
 pub const CONNECTION_SECRET_RESOLUTION_FAILED: &str = "connection.secret_resolution_failed";
 pub const CONNECTION_UNSAFE_METHOD_REJECTED: &str = "connection.unsafe_method_rejected";
 pub const GATEWAY_READY: &str = "gateway.ready";

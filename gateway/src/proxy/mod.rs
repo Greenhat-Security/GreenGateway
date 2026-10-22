@@ -492,12 +492,14 @@ impl ProxyState {
                                     .to_owned(),
                             )
                         })?;
-                        runtime.target(connection_id, "/").map_err(|error| {
-                            egress::EgressError::InvalidPolicy(format!(
-                                "connection-bound proxy route is unavailable: {}",
-                                error.safe_reason()
-                            ))
-                        })
+                        runtime
+                            .proxy_route_target(connection_id, "/")
+                            .map_err(|error| {
+                                egress::EgressError::InvalidPolicy(format!(
+                                    "connection-bound proxy route is unavailable: {}",
+                                    error.safe_reason()
+                                ))
+                            })
                     })
                     .transpose()?;
                 let request_header_policy = route_request_header_policy(route, config);
@@ -982,7 +984,17 @@ fn validate_connection_header_policy(
     policy: &RouteRequestHeaderPolicy,
     target: &ConnectionHttpTarget,
 ) -> Result<(), egress::EgressError> {
-    validate_connection_credential_header_policy(policy, target.credential_header_names())
+    validate_connection_credential_header_policy(policy, target.credential_header_names())?;
+    // The caller assertion is the gateway's to write, exactly once: a route
+    // that set it would hand the upstream a value the gateway did not sign,
+    // and one that stripped it would remove the gateway's own.
+    if let Some(assertion_header) = target.caller_assertion_header_name() {
+        validate_connection_credential_header_policy(
+            policy,
+            std::slice::from_ref(assertion_header),
+        )?;
+    }
+    Ok(())
 }
 
 /// Route header transforms may not touch any header the Connection owns:

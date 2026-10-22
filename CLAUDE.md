@@ -33,11 +33,13 @@ A Node even a patch version off fails the build before any Rust compiles. Do not
 or module names ahead of their issues.
 
 Design decisions live in `docs/adr/` — eight ADRs, not two. `0001` (HTTP upstreams only) and
-`0002` (single-tenant per deployment) still bound the scope; `0003`–`0008` cover the admin-UI
+`0002` (single-tenant per deployment) still bound the scope; `0003`–`0007` cover the admin-UI
 stack, Policy Studio authority and evidence, the production proxy data plane, first-class
-connections and credentials, shared state / HA modes with the PostgreSQL trust boundary, and
-shared admin sessions in cluster mode.
-Read them before proposing a design; new scope of that shape needs a new ADR.
+connections and credentials, and shared state / HA modes with the PostgreSQL trust boundary.
+`0008` (setup, `ggctl` and configuration bundles, issue #242) is still **Proposed**: read it as
+the design under review, not as shipped behavior. `0009` covers shared admin sessions in
+cluster mode. Read them before proposing a design; new
+scope of that shape needs a new ADR.
 
 `docs/architecture.md` is the authoritative request-lifecycle design and has landed, despite
 the "once that document lands" wording still in AGENTS.md.

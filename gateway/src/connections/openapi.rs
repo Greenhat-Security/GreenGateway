@@ -34,7 +34,9 @@ use crate::{
 
 use super::{
     control_plane::{CatalogLifecycleError, CatalogMutationGuard, ConnectionControlPlane},
-    http::{ConnectionHttpError, ConnectionHttpRuntime},
+    http::{
+        caller_assertion_servable_on, AttestingLane, ConnectionHttpError, ConnectionHttpRuntime,
+    },
     model::{
         normalize_origin_relative_path, ConnectionId, ConnectionKind, DiscoveryConfig,
         MAX_CATALOG_ENTRIES, MAX_MANAGED_OPENAPI_CATALOG_BYTES, MAX_MANAGED_SPEC_BYTES,
@@ -248,8 +250,11 @@ pub enum OpenApiCatalogError {
     InvalidSpec,
     InvalidSelection,
     AuthenticationMismatch,
-    /// The Connection asks for a signed caller assertion, which OpenAPI
-    /// discovery does not sign; nothing is fetched or published for it.
+    /// The Connection asks for a signed caller assertion that this operation
+    /// cannot honour: fetching the specification is discovery, which has no
+    /// caller to attest, and a block only an earlier release accepted, or a
+    /// delegated credential, is honoured by no OpenAPI lane. Nothing is
+    /// fetched or published for it.
     CallerAssertionNotEnforced,
     ToolConflict,
     EgressDenied,
@@ -1719,8 +1724,12 @@ impl OpenApiConnectionCatalogService {
         if !record.write.enabled {
             return Err(OpenApiCatalogError::ConnectionDisabled);
         }
+        // The catalog's tools are what this record is for, so it is judged as
+        // their binding is: an attesting Connection is accepted. Fetching the
+        // specification from the upstream is discovery, which has no caller
+        // to attest, and refuses one on its own target.
         self.http
-            .validate_binding(connection_id.as_str())
+            .validate_openapi_tool_binding(connection_id.as_str())
             .map_err(connection_http_error)?;
         Ok((connection_id, record))
     }
@@ -2782,15 +2791,16 @@ fn supports_managed_openapi_catalog(record: &StoredConnection) -> bool {
 
 /// Whether a Connection's stored OpenAPI catalog may be live in the registry.
 ///
-/// A catalog on a Connection that carries a `caller_assertion` is withdrawn
-/// like one on a disabled Connection. Only manual tools sign the assertion:
-/// a managed OpenAPI tool, like the discovery and refresh that produce it, is
-/// refused on such a Connection, and the binding validation each registry
-/// change runs refuses its tools, so leaving them installed would fail every
-/// later change to any lane, and a restart.
+/// Its tools sign a caller assertion on every call, so a Connection that
+/// attests its caller keeps its catalog. One whose block no OpenAPI tool can
+/// honour -- a block only an earlier release accepted, or a
+/// `delegated_issuer_token` credential -- is withdrawn like one on a disabled
+/// Connection: every call would be refused, and the binding validation each
+/// registry change runs refuses its tools, so leaving them installed would
+/// fail every later change to any lane, and a restart.
 fn serves_managed_openapi_catalog(record: &StoredConnection) -> bool {
     record.write.enabled
-        && record.write.caller_assertion.is_none()
+        && caller_assertion_servable_on(&record.write, AttestingLane::OpenApiTool)
         && supports_managed_openapi_catalog(record)
 }
 
@@ -3664,7 +3674,7 @@ paths:
 
     /// A caller assertion as an operator would configure one. Its signing key is
     /// loaded when the Connection is saved, and nothing here signs with it:
-    /// only a manual tool call does, and every OpenAPI lane refuses the
+    /// only a tool call does, and fetching the specification refuses the
     /// Connection first.
     fn caller_assertion_json() -> Value {
         json!({
@@ -3698,7 +3708,7 @@ paths:
 "#;
 
     #[tokio::test]
-    async fn an_unenforced_caller_assertion_refuses_preview_register_and_refresh() {
+    async fn an_attested_connection_registers_an_uploaded_catalog_but_refuses_spec_discovery() {
         let database = TemporaryDatabase::new();
         let mut config = Config::test_defaults();
         config.connections_sqlite_path = Some(database.0.display().to_string());
@@ -3739,39 +3749,42 @@ paths:
         let service =
             OpenApiConnectionCatalogService::load(control_plane.clone(), http, registry.clone())
                 .expect("managed OpenAPI service should load");
-        let refused = Some(OpenApiCatalogError::CallerAssertionNotEnforced);
         let spec = CALLER_ASSERTION_TEST_SPEC;
 
-        assert_eq!(
-            service.preview(record.id.as_str(), spec).await.err(),
-            refused
-        );
-        assert_eq!(
-            service
-                .register(
-                    record.id.as_str(),
-                    record.etag().as_str(),
-                    0,
-                    0,
-                    &spec_digest(spec),
-                    spec,
-                    &["get_invoice".to_owned()],
-                    &[],
-                    "test-admin",
-                )
-                .await
-                .err(),
-            refused
-        );
+        // The catalog's tools sign the assertion on every call, so a catalog
+        // uploaded by an operator previews and registers.
+        let preview = service
+            .preview(record.id.as_str(), spec)
+            .await
+            .expect("an attested Connection previews an uploaded specification");
+        service
+            .register(
+                record.id.as_str(),
+                record.etag().as_str(),
+                preview.spec_revision,
+                preview.catalog_revision,
+                &preview.spec_digest,
+                spec,
+                &["get_invoice".to_owned()],
+                &preview.binding.security_selections,
+                "test-admin",
+            )
+            .await
+            .expect("an attested Connection registers an uploaded catalog");
+        assert!(registry.get("get_invoice").is_some());
+        assert!(service.runtime().current_revision(&record.id).is_some());
+
+        // Fetching the specification from the upstream is discovery, which
+        // has no caller to attest: refused before any request, and the
+        // registered catalog stays served.
         assert_eq!(
             service
                 .refresh(record.id.as_str(), record.etag().as_str(), "test-admin")
                 .await
                 .err(),
-            refused
+            Some(OpenApiCatalogError::CallerAssertionNotEnforced)
         );
-        assert!(registry.get("get_invoice").is_none());
-        assert_eq!(service.runtime().current_revision(&record.id), None);
+        assert!(registry.get("get_invoice").is_some());
         assert_eq!(
             OpenApiCatalogError::CallerAssertionNotEnforced.safe_reason(),
             "caller_assertion_not_enforced"
@@ -3779,7 +3792,7 @@ paths:
     }
 
     #[tokio::test]
-    async fn a_live_catalog_is_withdrawn_when_its_connection_gains_a_caller_assertion() {
+    async fn a_live_catalog_stays_served_with_a_caller_assertion_its_tools_can_honour() {
         let database = TemporaryDatabase::new();
         let mut config = Config::test_defaults();
         config.connections_sqlite_path = Some(database.0.display().to_string());
@@ -3857,9 +3870,51 @@ paths:
             .expect("adding a caller assertion should save");
         service.reconcile_connection(&updated);
 
-        // Its tools would be refused on every call; left installed, they would
+        // Its tools sign the assertion on every call, so the catalog stays
+        // live, and the binding validation every registry change runs accepts
+        // them.
+        assert!(registry.get("get_invoice").is_some());
+        assert!(service.runtime().current_revision(&record.id).is_some());
+        let validator_http = http.clone();
+        registry
+            .set_definition_validator(Arc::new(move |definitions| {
+                crate::bootstrap::validate_connection_bound_tools(&validator_http, definitions)
+            }))
+            .expect("an attested OpenAPI catalog should validate");
+
+        // Adding the block was a save, so the catalog stays stale until it is
+        // published for the new revision. Without a discovery `path` a refresh
+        // reads the stored specification and fetches nothing, so it is served
+        // on an attested Connection and makes the tools current again.
+        let held = registry.get("get_invoice").expect("the tool stays listed");
+        assert!(!service
+            .runtime()
+            .definition_is_current(&held, updated.etag().as_str()));
+        service
+            .refresh(record.id.as_str(), updated.etag().as_str(), "test-admin")
+            .await
+            .expect("a refresh that fetches nothing is served on an attested Connection");
+        let refreshed = registry
+            .get("get_invoice")
+            .expect("the refreshed tool is listed");
+        assert!(service
+            .runtime()
+            .definition_is_current(&refreshed, updated.etag().as_str()));
+
+        // A block only an earlier release accepted is honoured by no lane. Its
+        // tools would be refused on every call; left installed, they would
         // also fail the binding validation every later registry change runs,
-        // for every lane, which the gateway's own validator shows here.
+        // for every lane, so the catalog is withdrawn and kept in storage.
+        let mut legacy = updated.clone();
+        if let Some(assertion) = legacy.write.caller_assertion.as_mut() {
+            assertion.bind_approval = true;
+        }
+        assert!(!legacy.write.caller_assertion_enforceable());
+        control_plane
+            .publish_authoritative_records(vec![legacy.clone()])
+            .await
+            .expect("a legacy document still loads");
+        service.reconcile_connection(&legacy);
         assert!(registry.get("get_invoice").is_none());
         assert_eq!(service.runtime().current_revision(&record.id), None);
         let validator_http = http.clone();

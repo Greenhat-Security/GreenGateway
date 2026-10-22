@@ -1051,5 +1051,187 @@ async fn a_verifier_holding_both_published_keys_accepts_either_signing_key() {
     );
 }
 
+/// A managed OpenAPI tool on `connection_id` that sends its arguments as a
+/// JSON body, as a catalog registered from an operator's specification
+/// generates it.
+fn openapi_pay_invoice(connection_id: &str) -> ToolDefinition {
+    let mapping: crate::tools::definitions::HttpToolMapping = serde_json::from_value(json!({
+        "method": "POST",
+        "path_template": "/invoices/{invoice_id}/payments",
+        "body": { "mode": "body_args_json" }
+    }))
+    .expect("the OpenAPI tool mapping deserializes");
+    ToolDefinition {
+        name: "pay_invoice".to_owned(),
+        title: None,
+        description: "Pays an invoice through an attested Connection.".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "required": ["invoice_id", "amount"],
+            "properties": {
+                "invoice_id": { "type": "string" },
+                "amount": { "type": "integer" }
+            },
+            "additionalProperties": false
+        }),
+        target: Some(ToolTarget::Http {
+            connection_id: connection_id.to_owned(),
+            mapping: mapping.clone(),
+        }),
+        source: ToolSource::OpenApi {
+            connection_id: connection_id.to_owned(),
+            operation_id: Some("pay_invoice".to_owned()),
+            catalog_revision: Some(1),
+        },
+        upstream: mapping,
+        composite: None,
+        visibility: crate::tools::definitions::ToolVisibility::Listed,
+        transform: None,
+        enum_bindings: Vec::new(),
+        annotations: None,
+    }
+}
+
+#[tokio::test]
+async fn an_openapi_tool_call_is_attested_and_bound_like_a_manual_one() {
+    let (addr, ca_pem, server) =
+        scripted_tls_server(vec![(StatusCode::OK, json!({ "paid": true }))]).await;
+    let signing_key = generated_es256_pem();
+    let mut settings = TemporaryStaticAuthRuntime::caller_assertion_settings();
+    settings.bind_request = true;
+    settings.claims = vec![CallerAssertionClaim::Email];
+    let (connection, secrets) = TemporaryStaticAuthRuntime::attested(
+        addr,
+        &ca_pem,
+        API_KEY.as_bytes(),
+        signing_key.as_bytes(),
+        settings,
+        &[],
+    )
+    .await;
+    // The catalog's binding is accepted on an attesting Connection, as the
+    // registry validates it on every change.
+    assert!(connection
+        .runtime
+        .validate_openapi_tool_binding(&connection.connection_id)
+        .is_ok());
+    let (executor, capture) = executor_for_composite_definitions(
+        vec![openapi_pay_invoice(&connection.connection_id)],
+        &connection,
+        ["pay_invoice"],
+    );
+    let saved = secrets.resolutions();
+
+    // A call that names nobody is refused before any secret is read or any
+    // byte is sent; the scripted upstream answers exactly one request.
+    let anonymous = ToolInvocationContext {
+        caller: None,
+        ..context_for(&bearer("alice", &[]), "request-openapi-anonymous")
+    };
+    let error = executor
+        .execute(
+            "pay_invoice",
+            json!({ "invoice_id": "inv_1", "amount": 1250 }),
+            anonymous,
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("a call naming nobody is refused");
+    let ToolRuntimeError::WorkFailed { reason, .. } = error else {
+        panic!("the refusal should surface as a work failure");
+    };
+    assert_eq!(reason.as_deref(), Some("caller_assertion_no_principal"));
+    assert_eq!(secrets.resolutions(), saved, "no secret is read");
+
+    executor
+        .execute(
+            "pay_invoice",
+            json!({ "invoice_id": "inv_1", "amount": 1250 }),
+            context_for(&bearer("alice", &[]), "request-openapi"),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("an attested OpenAPI tool call should succeed");
+    let requests = server.await.expect("the TLS server task should join");
+    assert_eq!(
+        requests.len(),
+        1,
+        "only the attested call reached the upstream"
+    );
+    let request = &requests[0];
+    assert_eq!(request.header("x-api-key"), Some(API_KEY));
+    assert_eq!(request.header_count(ASSERTION_HEADER), 1);
+    let jwks = connection
+        .control_plane
+        .caller_assertion_jwks()
+        .await
+        .expect("the signing key is published");
+    let claims = verify_with_published_set(
+        request
+            .header(ASSERTION_HEADER)
+            .expect("the upstream receives the assertion"),
+        jwks.body(),
+    );
+    assert_eq!(claims["sub"], json!(format!("{PROVIDER}#alice")));
+    assert_eq!(claims["email"], json!("alice@example.test"));
+    assert_eq!(claims["jti"], json!("request-openapi"));
+    assert_eq!(claims["method"], json!(request.method));
+    assert_eq!(claims["path"], json!(request.target));
+    assert_eq!(request.target, "/v1/invoices/inv_1/payments");
+    assert!(!request.body.is_empty());
+    assert_eq!(
+        claims["request_sha256"],
+        json!(upstream_digest(&request.body))
+    );
+
+    wait_until(Duration::from_secs(1), || {
+        let events = capture.events();
+        events.iter().any(|event| {
+            event.event_type == audit::event::TOOL_UPSTREAM_REQUEST
+                && event.request_id == "request-openapi"
+        }) && events.iter().any(|event| {
+            event.event_type == audit::event::TOOL_INVOKE_FAILURE
+                && event.request_id == "request-openapi-anonymous"
+        })
+    })
+    .await;
+    let events = capture.events();
+    let attested = events
+        .iter()
+        .find(|event| {
+            event.event_type == audit::event::TOOL_UPSTREAM_REQUEST
+                && event.request_id == "request-openapi"
+        })
+        .expect("the attested call is audited");
+    assert_eq!(attested.payload["outcome"], json!("success"));
+    assert_eq!(
+        attested.payload["caller_assertion"],
+        json!({ "kid": "gw-test-1", "jti": "request-openapi" })
+    );
+    assert_eq!(
+        attested.actor.as_ref().map(|actor| actor.user_id.as_str()),
+        Some("alice")
+    );
+    let refused = events
+        .iter()
+        .find(|event| {
+            event.event_type == audit::event::TOOL_INVOKE_FAILURE
+                && event.request_id == "request-openapi-anonymous"
+        })
+        .expect("the refused call is audited");
+    assert_eq!(
+        refused.payload["failure_reason"],
+        json!("caller_assertion_no_principal")
+    );
+    let mut canaries = vec![API_KEY];
+    canaries.extend(pem_body_lines(&signing_key));
+    let token = request
+        .header(ASSERTION_HEADER)
+        .expect("the upstream receives the assertion");
+    canaries.push(token);
+    let rendered = serde_json::to_string(&events).expect("events serialize");
+    assert_absent(&rendered, &canaries, "the audit");
+}
+
 #[path = "executor_delegated_token_tests.rs"]
 mod delegated_token_tests;

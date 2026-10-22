@@ -1185,6 +1185,7 @@ fn purpose_as_str(purpose: SecretPurpose) -> &'static str {
         // total.
         SecretPurpose::AssertionSigningKey => "assertion_signing_key",
         SecretPurpose::TokenExchangeClientSecret => "token_exchange_client_secret",
+        SecretPurpose::AuthorityPseudonymKey => "authority_pseudonym_key",
     }
 }
 
@@ -1508,6 +1509,38 @@ mod tests {
             Err(LocalSecretError::InvalidSecret)
         ));
         assert!(provider.metadata().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_authority_pseudonym_key_is_neither_stored_nor_resolved_locally() {
+        let environment = TestEnvironment::new("authority-pseudonym-key");
+        environment.write_key(PRIMARY_FILE, 11);
+        let (_store, provider) = environment
+            .provider(&environment.primary_config())
+            .expect("provider should open");
+
+        assert!(matches!(
+            provider.create(
+                "Authority pseudonym key",
+                secret(SecretPurpose::AuthorityPseudonymKey, CANARY),
+            ),
+            Err(LocalSecretError::InvalidSecret)
+        ));
+        assert!(provider.metadata().is_empty());
+
+        // A local secret resolves only under the purpose it was stored with,
+        // so no stored alias can be read as the pseudonym key.
+        let stored = provider
+            .create(
+                "Billing bearer",
+                secret(SecretPurpose::StaticBearer, CANARY),
+            )
+            .expect("secret should create");
+        let error = provider
+            .resolve(&stored.id, SecretPurpose::AuthorityPseudonymKey)
+            .await
+            .expect_err("a local alias never resolves as the pseudonym key");
+        assert_eq!(error.kind(), SecretResolveErrorKind::SourceDenied);
     }
 
     #[tokio::test]
