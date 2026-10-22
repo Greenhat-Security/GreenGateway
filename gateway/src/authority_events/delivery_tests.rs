@@ -9,6 +9,8 @@ const ACTOR_MARKER: &str = "actor-marker@example.test";
 const CONNECTION_MARKER: &str = "7d1f3f0e-5b8a-4c39-9a51-2f6c1d0e4b77";
 const TOKEN_MARKER: &str = "svc-token-marker";
 const ISSUER_MARKER: &str = "https://issuer-marker.example.test";
+/// The acting principal's issuer, distinct from a revoked token's.
+const ACTOR_ISSUER_MARKER: &str = "https://actor-issuer-marker.example.test";
 const JTI_DIGEST_MARKER: &str = "abababababababababababababababababababababababababababababababab";
 
 fn evidence(source: JournalSource, action: &str) -> JournaledEvidence {
@@ -30,7 +32,24 @@ fn evidence(source: JournalSource, action: &str) -> JournaledEvidence {
         new_version,
         security_revision: Some(17),
         committed_at: Some("2026-10-21T12:34:56.123456Z".to_owned()),
+        actor_issuer: Some(ACTOR_ISSUER_MARKER.to_owned()),
+        actor_kind: Some("principal".to_owned()),
+        actor_auth_mode: Some("session_cookie".to_owned()),
     }
+}
+
+/// The same evidence with the actor metadata a row of the given shape
+/// records (`None` everywhere for a row committed before migration 22).
+fn with_actor(
+    mut evidence: JournaledEvidence,
+    kind: Option<&str>,
+    auth_mode: Option<&str>,
+    issuer: Option<&str>,
+) -> JournaledEvidence {
+    evidence.actor_kind = kind.map(str::to_owned);
+    evidence.actor_auth_mode = auth_mode.map(str::to_owned);
+    evidence.actor_issuer = issuer.map(str::to_owned);
+    evidence
 }
 
 fn every_delivered_shape() -> Vec<JournaledEvidence> {
@@ -164,6 +183,7 @@ fn references_name_the_recorded_identities_and_carry_none_of_them() {
         let serialized = serde_json::to_string(&record).expect("a record serializes");
         for marker in [
             ACTOR_MARKER,
+            ACTOR_ISSUER_MARKER,
             CONNECTION_MARKER,
             TOKEN_MARKER,
             ISSUER_MARKER,
@@ -180,6 +200,18 @@ fn references_name_the_recorded_identities_and_carry_none_of_them() {
                 ReferenceDomain::ActorRecorded,
                 &[ACTOR_MARKER],
                 &record.actor.recorded_ref
+            ),
+            Ok(ReferenceCheck::Current)
+        );
+        assert_eq!(
+            keyring.verify(
+                ReferenceDomain::ActorIssuer,
+                &[ACTOR_ISSUER_MARKER],
+                record
+                    .actor
+                    .issuer_ref
+                    .as_deref()
+                    .expect("a principal with an issuer has an issuer reference")
             ),
             Ok(ReferenceCheck::Current)
         );
@@ -313,6 +345,111 @@ fn a_row_that_cannot_be_projected_faithfully_is_refused() {
         refused(&|evidence| evidence.resource_id = Some("x".repeat(4097))),
         ProjectionError::Reference(PseudonymError::InvalidComponents)
     ));
+}
+
+/// The actor's kind and auth mode are carried as the evidence recorded them
+/// and its issuer only as a reference; evidence committed before migration
+/// 22 recorded none of the three and says `null`, never a guess. Every kind
+/// the evidence tables admit, and every auth mode, projects.
+#[test]
+fn the_actor_is_projected_as_the_evidence_recorded_it() {
+    let keyring = generated_keyring(Uuid::new_v4());
+    let validator = delivery_schema();
+    let base = evidence(JournalSource::JwtRevocation, ACTION_JWT_REVOKE);
+    let issuer_ref = keyring
+        .derive(ReferenceDomain::ActorIssuer, &[ACTOR_ISSUER_MARKER])
+        .expect("an issuer reference derives");
+    for (kind, auth_mode, issuer, expected_issuer_ref) in [
+        (None, None, None, None),
+        (
+            Some("principal"),
+            Some("bearer_token"),
+            Some(ACTOR_ISSUER_MARKER),
+            Some(issuer_ref.as_str()),
+        ),
+        (Some("principal"), Some("session_cookie"), None, None),
+        (Some("principal"), Some("client_certificate"), None, None),
+        (Some("service_token"), Some("service_token"), None, None),
+        (Some("system"), Some("system"), None, None),
+    ] {
+        let record = project(&with_actor(base.clone(), kind, auth_mode, issuer), &keyring)
+            .expect("recorded actor metadata projects");
+        assert_eq!(
+            (
+                record.actor.kind.as_deref(),
+                record.actor.auth_mode.as_deref(),
+                record.actor.issuer_ref.as_deref()
+            ),
+            (kind, auth_mode, expected_issuer_ref)
+        );
+        // The subject reference does not depend on the metadata, so a row
+        // reads the same whether or not it recorded any.
+        assert_eq!(
+            keyring.verify(
+                ReferenceDomain::ActorRecorded,
+                &[ACTOR_MARKER],
+                &record.actor.recorded_ref
+            ),
+            Ok(ReferenceCheck::Current)
+        );
+        let value = serde_json::to_value(&record).expect("a record serializes");
+        if let Err(error) = validator.validate(&value) {
+            panic!("the published schema must accept {value}: {error}");
+        }
+    }
+}
+
+/// A row whose actor metadata is not a shape migration 22's CHECK admits is
+/// refused rather than delivered with part of it or a guess, and an issuer
+/// past the reference bound is refused rather than truncated.
+#[test]
+fn actor_metadata_that_cannot_be_projected_faithfully_is_refused() {
+    let keyring = generated_keyring(Uuid::new_v4());
+    let base = evidence(JournalSource::ConnectionChange, ACTION_CONNECTION_DELETE);
+    for (kind, auth_mode, issuer) in [
+        // Some but not all.
+        (Some("principal"), None, None),
+        (None, Some("bearer_token"), None),
+        (None, None, Some(ACTOR_ISSUER_MARKER)),
+        (None, Some("bearer_token"), Some(ACTOR_ISSUER_MARKER)),
+        // A kind or mode outside the vocabulary.
+        (Some("person"), Some("bearer_token"), None),
+        (Some("principal"), Some("password"), None),
+        // A pairing authentication cannot produce.
+        (Some("principal"), Some("service_token"), None),
+        (Some("principal"), Some("system"), None),
+        (Some("service_token"), Some("bearer_token"), None),
+        (Some("system"), Some("session_cookie"), None),
+        // Only a principal is vouched for by an issuer.
+        (
+            Some("service_token"),
+            Some("service_token"),
+            Some(ACTOR_ISSUER_MARKER),
+        ),
+        (Some("system"), Some("system"), Some(ACTOR_ISSUER_MARKER)),
+    ] {
+        assert_eq!(
+            project(&with_actor(base.clone(), kind, auth_mode, issuer), &keyring),
+            Err(ProjectionError::InvalidEvidence),
+            "{kind:?} {auth_mode:?} {issuer:?}"
+        );
+    }
+    for issuer in [String::new(), "i".repeat(4097)] {
+        assert!(matches!(
+            project(
+                &with_actor(
+                    base.clone(),
+                    Some("principal"),
+                    Some("bearer_token"),
+                    Some(&issuer)
+                ),
+                &keyring
+            ),
+            Err(ProjectionError::Reference(
+                PseudonymError::InvalidComponents
+            ))
+        ));
+    }
 }
 
 #[test]

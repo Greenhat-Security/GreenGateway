@@ -8,13 +8,17 @@
 //! below validate every projection against.
 //!
 //! It is deliberately **not** the proposed `authority_event.v1` event. That
-//! contract names the actor by an issuer-scoped subject reference, an issuer
-//! reference and an authentication mode, and the evidence rows of migrations
-//! 16 and 18 record none of the three: they keep the acting principal's
-//! subject, or a command's fixed system label, and nothing else. Rather than
-//! invent an issuer or a mode, the record names the actor by the one
-//! identifier that was recorded, under the separate `actor.recorded`
-//! reference domain. The revision fields follow the v1 transition contract.
+//! contract names every actor by an issuer-scoped subject reference, an issuer
+//! reference, a kind and an authentication mode. Since migration 22 the
+//! evidence rows record the actor's kind, auth mode and, for a principal that
+//! has one, its canonical issuer, and the record carries them as
+//! `actor.kind`, `actor.auth_mode` and `actor.issuer_ref` (the `actor.issuer`
+//! reference). Evidence committed before migration 22 recorded none of the
+//! three, and a service token or an operator command has no issuer, so rather
+//! than invent one the record says `null` there. The subject is still named by
+//! the one identifier that was recorded, under the separate `actor.recorded`
+//! reference domain, so a row reads the same before and after migration 22.
+//! The revision fields follow the v1 transition contract.
 //!
 //! A row that cannot be projected faithfully -- its evidence row is gone, its
 //! action is not one this build knows, a stored value is out of shape -- is
@@ -28,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::pseudonym::{PseudonymError, PseudonymKeyring, ReferenceDomain};
+use crate::auth::change_actor::{auth_mode_agrees, ActorKind};
 use crate::storage::postgres_authority_events::{JournalSource, JournaledEvidence};
 
 /// The `schema_version` of every delivered record.
@@ -74,9 +79,19 @@ pub(crate) struct DeliveryRecord {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DeliveryActor {
+    /// `principal`, `service_token` or `system`; `null` for evidence
+    /// committed before migration 22.
+    pub(crate) kind: Option<String>,
     /// The recorded actor identifier's reference in the `actor.recorded`
     /// domain.
     pub(crate) recorded_ref: String,
+    /// The actor's canonical issuer's reference in the `actor.issuer`
+    /// domain; `null` for an actor without one and for evidence committed
+    /// before migration 22.
+    pub(crate) issuer_ref: Option<String>,
+    /// The audit auth mode, or `system`; `null` for evidence committed
+    /// before migration 22.
+    pub(crate) auth_mode: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -245,9 +260,7 @@ pub(crate) fn project(
         _ => return Err(ProjectionError::MissingEvidence),
     }
     .map_err(ProjectionError::Reference)?;
-    let actor_reference = keyring
-        .derive(ReferenceDomain::ActorRecorded, &[actor])
-        .map_err(ProjectionError::Reference)?;
+    let actor = project_actor(evidence, actor, keyring)?;
 
     Ok(DeliveryRecord {
         schema_version: DELIVERY_SCHEMA_VERSION.to_owned(),
@@ -258,9 +271,7 @@ pub(crate) fn project(
         operation: action.to_owned(),
         result: RESULT_COMMITTED.to_owned(),
         committed_at: committed_at.to_owned(),
-        actor: DeliveryActor {
-            recorded_ref: actor_reference.as_str().to_owned(),
-        },
+        actor,
         resource: DeliveryResource {
             kind: shape.resource_kind.to_owned(),
             reference: resource_reference.as_str().to_owned(),
@@ -271,6 +282,57 @@ pub(crate) fn project(
             after: after.map(|value| value.to_string()),
             security: security_revision.to_string(),
         },
+    })
+}
+
+/// The actor as the evidence recorded it. A row records its kind, auth mode
+/// and issuer together or not at all (migration 22's CHECK), in a pairing
+/// authentication produces; anything else is out of shape. An issuer is
+/// referenced, never carried.
+fn project_actor(
+    evidence: &JournaledEvidence,
+    subject: &str,
+    keyring: &PseudonymKeyring,
+) -> Result<DeliveryActor, ProjectionError> {
+    let recorded_ref = keyring
+        .derive(ReferenceDomain::ActorRecorded, &[subject])
+        .map_err(ProjectionError::Reference)?;
+    let (kind, auth_mode, issuer_ref) = match (
+        evidence.actor_kind.as_deref(),
+        evidence.actor_auth_mode.as_deref(),
+        evidence.actor_issuer.as_deref(),
+    ) {
+        // Committed before migration 22: nothing to say, and nothing guessed.
+        (None, None, None) => (None, None, None),
+        (Some(kind), Some(auth_mode), issuer) => {
+            let kind = ActorKind::from_stored(kind).ok_or(ProjectionError::InvalidEvidence)?;
+            if !auth_mode_agrees(kind, auth_mode) {
+                return Err(ProjectionError::InvalidEvidence);
+            }
+            let issuer_ref = match issuer {
+                None => None,
+                Some(issuer) if kind == ActorKind::Principal => Some(
+                    keyring
+                        .derive(ReferenceDomain::ActorIssuer, &[issuer])
+                        .map_err(ProjectionError::Reference)?
+                        .as_str()
+                        .to_owned(),
+                ),
+                Some(_) => return Err(ProjectionError::InvalidEvidence),
+            };
+            (
+                Some(kind.as_str().to_owned()),
+                Some(auth_mode.to_owned()),
+                issuer_ref,
+            )
+        }
+        _ => return Err(ProjectionError::InvalidEvidence),
+    };
+    Ok(DeliveryActor {
+        kind,
+        recorded_ref: recorded_ref.as_str().to_owned(),
+        issuer_ref,
+        auth_mode,
     })
 }
 

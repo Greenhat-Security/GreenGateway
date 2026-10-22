@@ -36,14 +36,15 @@
 //! - **Every revoke that changes the denylist leaves evidence that outlives
 //!   the row.** Replacing a row overwrites its actor, and cleanup deletes
 //!   it, so the same transaction also appends one `jwt_revocation_evidence`
-//!   row (migration 18): the actor, the action, generated event and
-//!   operation IDs, the key (issuer and digest, never the raw `jti`), the
-//!   expiry the row now carries, its shared revision and the database
-//!   clock's commit time. An extension or reactivation is a second row, not
-//!   an overwrite, and cleanup never touches the table. The same transaction
-//!   journals the row for delivery (migration 21). If the evidence or its
-//!   journal row cannot be written, or the journal is full, the revoke rolls
-//!   back; a repeat that changes nothing writes none.
+//!   row (migration 18): the actor (its subject, and since migration 22 its
+//!   kind, auth mode and, for a principal, its own issuer), the action,
+//!   generated event and operation IDs, the key (issuer and digest, never
+//!   the raw `jti`), the expiry the row now carries, its shared revision and
+//!   the database clock's commit time. An extension or reactivation is a
+//!   second row, not an overwrite, and cleanup never touches the table. The
+//!   same transaction journals the row for delivery (migration 21). If the
+//!   evidence or its journal row cannot be written, or the journal is full,
+//!   the revoke rolls back; a repeat that changes nothing writes none.
 //!
 //! Failure classification on the read path: a store that cannot be
 //! consulted is `AuthError::Upstream`, which the middleware answers with
@@ -55,7 +56,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 
-use crate::auth::{AuthError, RevocationStore};
+use crate::auth::{change_actor::ChangeActor, AuthError, RevocationStore};
 
 use super::{
     log_classified,
@@ -148,14 +149,15 @@ impl PostgresJwtRevocationStore {
 
     /// Record a JWT as withdrawn. `expires_at` is RFC 3339 (the token's
     /// own `exp` when known); `None` keeps the row until cleanup.
-    /// `actor_user_id` is recorded on the row and, for a revoke that changes
-    /// the denylist, as its append-only evidence; the `revoke-jwt` command
-    /// passes its fixed system label, which names no authenticated human.
+    /// `actor`'s subject is recorded on the row and, for a revoke that
+    /// changes the denylist, the whole actor is its append-only evidence; the
+    /// `revoke-jwt` command passes a [`ChangeActor::system`] actor under its
+    /// fixed label, which names no authenticated human.
     pub async fn revoke(
         &self,
         jti: &str,
         expires_at: Option<&str>,
-        actor_user_id: &str,
+        actor: &ChangeActor,
     ) -> Result<JwtRevocationOutcome, RepositoryError> {
         // An empty `jti` names no token: the validator never consults the
         // store for one, so a row for it would be a false assurance.
@@ -165,9 +167,10 @@ impl PostgresJwtRevocationStore {
         // An unattributable revocation has no evidence to record, so it is
         // refused before anything is written; the column checks are the
         // backstop. No caller input can produce it.
-        if !crate::auth::tokens::is_valid_change_actor(actor_user_id) {
+        if !crate::auth::tokens::is_valid_change_actor(actor) {
             return Err(invalid_data(OPERATION_REVOKE));
         }
+        let actor_user_id = actor.subject();
         // One logical operation, minted once per call and never
         // regenerated: its evidence row carries it.
         let operation_id = uuid::Uuid::new_v4().to_string();
@@ -308,10 +311,12 @@ impl PostgresJwtRevocationStore {
                     r#"
                     INSERT INTO greengateway.jwt_revocation_evidence (
                         event_id, operation_id, actor_user_id, action,
-                        issuer, jti_hash, expires_at, security_revision
+                        issuer, jti_hash, expires_at, security_revision,
+                        actor_issuer, actor_kind, actor_auth_mode
                     )
                     SELECT $1::text::uuid, $2::text::uuid, $3, $4,
-                           issuer, jti_hash, expires_at, security_revision
+                           issuer, jti_hash, expires_at, security_revision,
+                           $8, $9, $10
                     FROM greengateway.jwt_revocations
                     WHERE issuer = $5 AND jti_hash = $6 AND security_revision = $7
                     "#,
@@ -323,6 +328,9 @@ impl PostgresJwtRevocationStore {
                         &self.issuer.as_ref(),
                         &digest,
                         &security_revision,
+                        &actor.issuer(),
+                        &actor.kind().as_str(),
+                        &actor.auth_mode(),
                     ],
                 )
                 .await

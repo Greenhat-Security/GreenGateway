@@ -92,7 +92,19 @@ test("all current authentication modes including certificates have a valid actor
   assert.deepEqual([...schema.properties.actor.properties.auth_mode.enum].sort(), [...modes, "system"].sort());
   for (const mode of modes) {
     const value = fixture(); value.actor.auth_mode = mode;
+    if (mode === "service_token") value.actor.kind = "service_token";
     assert.doesNotThrow(() => validateEvent(value));
+  }
+});
+
+test("actor kinds are the evidence tables' vocabulary and agree with the auth mode", () => {
+  const kinds = [...source("gateway/src/auth/change_actor.rs").matchAll(/Self::[A-Za-z]+ => "([a-z_]+)"/g)].map((match) => match[1]);
+  assert.deepEqual([...schema.properties.actor.properties.kind.enum].sort(), [...kinds].sort());
+  const migration = source("gateway/src/storage/migrations/0022_authority_evidence_actor_metadata.sql");
+  for (const kind of kinds) assert.ok(migration.includes(`actor_kind = '${kind}'`), kind);
+  for (const [kind, mode] of [["principal", "service_token"], ["service_token", "bearer_token"], ["service_token", "system"], ["system", "session_cookie"]]) {
+    const value = fixture(); value.actor.kind = kind; value.actor.auth_mode = mode;
+    assert.throws(() => validateEvent(value), /actor\/auth mode mismatch/, `${kind}/${mode}`);
   }
 });
 

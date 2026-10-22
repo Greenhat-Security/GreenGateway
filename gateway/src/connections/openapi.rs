@@ -3613,7 +3613,11 @@ paths:
 
         // The Connection disappears from the live state after admission.
         control_plane
-            .delete_managed(&record.id, &record.etag(), "test-admin")
+            .delete_managed(
+                &record.id,
+                &record.etag(),
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("delete");
         assert!(
@@ -4681,7 +4685,11 @@ paths:
             .expect("dependencies should load")
             .is_empty());
         control_plane
-            .delete_managed(&disabled.id, &disabled.etag(), "test-admin")
+            .delete_managed(
+                &disabled.id,
+                &disabled.etag(),
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("cleared disabled Connection should be deleteable");
     }

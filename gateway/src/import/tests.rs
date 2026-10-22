@@ -994,8 +994,12 @@ mod database {
             },
         )
         .expect("the revoked fixture token should mint");
-        TokenStore::revoke(&token_store, &revoked.record.id, "operator@example.test")
-            .expect("the fixture token should revoke");
+        TokenStore::revoke(
+            &token_store,
+            &revoked.record.id,
+            &crate::auth::change_actor::ChangeActor::for_test("operator@example.test"),
+        )
+        .expect("the fixture token should revoke");
         drop(live);
         drop(revoked);
         let exported = token_store
