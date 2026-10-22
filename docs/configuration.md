@@ -26,7 +26,7 @@ The deployment probes are exact, gateway-owned `GET`/`HEAD` routes on the data l
 - `/startupz` returns `503` until listener startup completes, then remains `200` for the lifetime of the process.
 - `/readyz` returns `200` only while the process accepts work, configured security storage is healthy, and every upstream pool configured with `required_for_readiness:true` has at least `minimum_healthy` eligible endpoints. It returns `503` while starting, while draining, when security storage is unavailable, or when a required pool lacks capacity. Pools not marked as required do not affect readiness.
 
-In standalone SQLite mode, configured service-token, Connection, and policy-history databases receive a background committed write check every 15 seconds. The check updates one reserved `gateway_storage_canary` row, reads it back after commit, and never creates a missing database. Lock contention waits at most 500 ms per store. HTTP probes only read the cached result; a failed check or a result older than 45 seconds returns `503` with `storage_unavailable`. Recovery needs no incoming traffic. This proves a small write can commit now; it cannot reserve disk space for future writes. Monitor filesystem capacity alongside readiness. Audit-only failures do not refuse traffic, but must alert on audit health and loss metrics.
+In standalone SQLite mode, configured service-token, Connection, and policy-history databases receive a background committed write check every 15 seconds. The check updates one reserved `gateway_storage_canary` row, reads it back after commit, and never creates a missing database. Lock contention waits at most 500 ms per store. HTTP probes only read the cached result; a failed check or a result older than 45 seconds returns `503` with `storage_unavailable`. Recovery needs no incoming traffic. This proves a small write can commit now; it cannot reserve disk space for future writes. Monitor filesystem capacity alongside readiness. Readiness does not check the audit store. Under the default `AUDIT_DURABILITY=required` (below) an audit store that cannot commit refuses authenticated and authorized requests with `503 audit_unavailable` while `/readyz` stays `200`; with `AUDIT_DURABILITY=best_effort`, audit-only failures do not refuse traffic. Either way, alert on audit health, refusal and loss metrics.
 - `/health` remains a backward-compatible `200` aggregate response. Detailed per-pool and per-endpoint state remains available only from the protected admin status endpoint.
 
 Probe bodies contain only aggregate state and stable reason categories; they do not expose upstream URLs, endpoint topology, credentials, or internal errors. The default authentication, RBAC, and CSRF exemptions include all four probe routes. Setting an exempt-path variable explicitly replaces that default, so operators using explicit lists should retain the probes needed by their orchestrator.
@@ -418,6 +418,44 @@ When set, `GET` at the derived metadata document URL is public and unauthenticat
 
 The protected-resource requirement applies to every credential type that can otherwise authenticate to `/mcp`. JWT bearer tokens must include the MCP resource identifier in the `aud` claim, in addition to any existing provider-level static `audience` requirement. GreenGateway `ggw_` service tokens must include the exact `mcp:tools` scope. Cookie-session credentials are not accepted for `/mcp` when protected-resource binding is active; browser admin sessions remain valid for non-MCP routes. Non-MCP endpoints are unchanged by this setting.
 
+### AUDIT_DURABILITY
+
+Whether a request's security decision must be durably recorded before the gateway acts on it (issue #425).
+
+Default: `required`.
+
+Format and validation: must be exactly `required` or `best_effort`. Anything else fails startup.
+
+With `required`, the authentication and authorization stages act on a decision only once its audit record has committed to the audit store of record: the SQLite database named by `AUDIT_SQLITE_PATH` in standalone mode, or the shared PostgreSQL audit store (`greengateway.audit_events`) in cluster mode.
+
+- An authenticated request continues only once its `auth.success` record has committed. A credential that is not accepted is answered (`401`; `403` for an admin session cookie whose origin or CSRF binding does not match; or `503` for an identity dependency that failed) or, in `AUTH_MODE=observe`, forwarded only once its `auth.failure` record has committed.
+- The RBAC stage forwards an allowed or shadow-observed request only once its `authz.allowed` or `authz.would_deny` records have committed, and answers a denial with `403` only once its `authz.denied` record has committed. Its early refusals wait the same way: unsafe paths, incomplete or failed policy evaluation, the policy rate stage's unevaluated refusals and, in cluster mode, the security-revision gate's `503`.
+- When a record cannot be committed, the request is answered `503 {"error":"audit unavailable","reason":"audit_unavailable"}` instead, before any upstream, tool or handler work. That happens when the store refuses or fails the write, when the audit writer's queue is full or closed for shutdown, or when the commit does not finish within `AUDIT_DURABILITY_TIMEOUT_MS`. The response carries no store detail. Each such refusal increments `greengateway_audit_durability_refusals_total{reason}`, where `reason` is `admission`, `store` or `timeout`. The first refusal of an episode, and the first success after it, are logged once each.
+- Recovery needs no restart: the next record the store commits serves its request again.
+- A refusal does not withdraw the record. A record that commits after its request was already refused -- the bound passed first, or the store was blocked rather than failing -- stays in the store, and the request's own observation, when it lands, records the `503` with `audit_unavailable`.
+
+A required record does not wait for the sink's batch timer. The SQLite sink commits it at once, on the audit writer thread, together with everything queued ahead of it; the PostgreSQL sink wakes its flusher and group-commits. Records that arrive while a commit is in flight, or while the flusher waits for a pooled connection, share the next store call, and during a burst a record that wakes an idle flusher first waits up to the last store call's duration, at most 25 ms, for the records arriving behind it; a lone record commits at once. The events written after a decision is acted on are not urgent: they ride the next required commit or the 250 ms batch interval, as under `best_effort`. Every commit ends in a WAL flush that the database's other writers queue behind, the shared rate limiter's per-request commit among them, which is why records share commits instead of taking one each. Each stage therefore adds about one commit to a request's latency, two for an authenticated request the RBAC stage authorizes, plus at most that window during a burst.
+
+What `required` does not cover:
+
+- Records written after a decision has been acted on keep the bounded asynchronous delivery described under `AUDIT_SQLITE_PATH` and are counted on `audit_events_dropped_total` when lost: the terminal `http.request_observed` observation, upstream attempt and egress events, tool invocation start and outcome events, and lifecycle, admin-plane and discovery events.
+- Decisions made after a request has passed both stages are not waited on yet. The MCP tool runtime's own decisions -- its tool-name rules, its rendered-HTTP rules and its admission refusals (`authz.*` and `tool.invoke_rejected` events carrying an `invocation_source`) -- and the admin API handlers' permission checks are recorded with the same bounded asynchronous delivery. A request only reaches them once its own authentication and authorization records have committed, so an audit store that is already failing refuses it before it gets there; a store that fails between those commits and the later decision does not.
+- Requests on paths exempt from authentication and RBAC (the probes, `/metrics`, `/health`, `/version`, the admin UI shell) make no decision and wait for nothing, and so does every request when `AUTH_ENABLED=false` and no policy is loaded. Admin API handlers check their permissions inside the handler: an admin request's authentication record is required, the handler's own events are not.
+- It does not qualify authority-change evidence (policy, tools, Connection or token changes) for issue #425's required-durability contract; see [the authority-evidence inventory](authority-evidence.md).
+- SQLite commits run in WAL mode with `synchronous=NORMAL`: a committed record survives a gateway crash, and the newest commits can be lost if the host itself loses power.
+
+Startup refuses `required` when the configuration has no audit store of record. In standalone mode that means `AUDIT_SQLITE_PATH` is unset; stdout and `AUDIT_LOG_FILE` are not stores of record. The error names both remedies.
+
+`best_effort` is the explicit opt-out and keeps the behaviour of earlier releases: decisions are queued and acted on at once, and a record the store later loses is only counted on `audit_events_dropped_total`. Startup logs a warning when it is set. In cluster mode, run every replica with the same value: the static configuration fingerprint does not compare it.
+
+### AUDIT_DURABILITY_TIMEOUT_MS
+
+How long, in milliseconds, a request may wait for one stage's decision record to commit under `AUDIT_DURABILITY=required` before it is refused with `503 audit_unavailable`.
+
+Default: `5000`
+
+Format and validation: must parse as a `u64` between `1` and `60000`. The bound starts when the record is queued. It has no effect with `AUDIT_DURABILITY=best_effort`.
+
 ### AUDIT_LOG_FILE
 
 Optional JSON Lines audit log file path.
@@ -430,7 +468,7 @@ Format and validation: unset, empty, or whitespace-only values become `None`. No
 
 Optional SQLite audit event store path for queryable local audit history.
 
-Default: empty, which disables the SQLite sink.
+Default: empty, which disables the SQLite sink. In standalone mode this database is also the audit store of record the default `AUDIT_DURABILITY=required` needs, so leaving it empty requires `AUDIT_DURABILITY=best_effort`.
 
 Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must be valid Unicode and are used as a filesystem path. When set, the gateway opens or creates the database at startup, creates the audit event schema and indexes if needed, and fans audit events out to SQLite in addition to stdout and any JSONL file sink. Startup also migrates older audit databases in place by adding any missing promoted payload columns used for indexed queries, including `payload_matched_rule_id` for rule hit counts. It also adds and backfills an indexed `timestamp_epoch_us` column used by retention pruning; the original timestamp column and index remain available for audit queries and compatibility.
 
@@ -450,7 +488,7 @@ Default: `false`.
 
 When `true`, successful GET/HEAD responses from the built-in `/livez`, `/startupz`, `/readyz`, and `/metrics` handlers skip `http.request_observed`. Their request metrics remain and `greengateway_successful_operational_observations_suppressed_total` counts suppressed observations. The handler marks its own response, so a business route with a similar name is never excluded. Failed probes, rejected authentication, policy denials and shadow denials, schema mismatches, and upstream traffic remain audited. Authentication and authorization decision events remain unchanged. `/health` and `/version` remain audited. The setting applies to all observation sinks, including stdout and discovery, rather than merely hiding query results.
 
-SQLite audit batches that fail to commit count their events under `audit_events_dropped_total{reason="sqlite"}` and in the admin audit loss total. `greengateway_audit_sqlite_healthy` is `0` after a failed flush and returns to `1` after a later successful flush. Recovery never clears the cumulative loss count, and shutdown still reports historical flush errors.
+SQLite audit batches that fail to commit count their events under `audit_events_dropped_total{reason="sqlite"}` and in the admin audit loss total. `greengateway_audit_sqlite_healthy` is `0` after a failed flush and returns to `1` after a later successful flush. Recovery never clears the cumulative loss count, and shutdown still reports historical flush errors. Under `AUDIT_DURABILITY=required`, every request waiting on a record in a failed batch is refused with `503 audit_unavailable`.
 
 ### SHUTDOWN_DRAIN_DELAY_MS
 

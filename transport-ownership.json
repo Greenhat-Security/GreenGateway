@@ -6060,6 +6060,13 @@
             "file": "gateway/src/main.rs"
           },
           {
+            "name": "audit_durability_startup",
+            "kind": [
+              "test"
+            ],
+            "file": "gateway/tests/audit_durability_startup.rs"
+          },
+          {
             "name": "connection_admin_contract",
             "kind": [
               "test"
@@ -6936,6 +6943,26 @@
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
     {
+      "file": "gateway/src/audit/durable.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::audit::durable::AUDIT_DURABILITY_REFUSAL_REASONS#1",
+      "sha256": "1045a913c8b4a4c973cc926eb25c6fd8aed944ab5b48ce4dd831ada427a1afff",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
+    },
+    {
+      "file": "gateway/src/audit/durable.rs",
+      "reasons": [
+        "unexpanded-macro"
+      ],
+      "scope": "gateway::audit::durable::record_durability_refusal#1",
+      "sha256": "dda830fa11dc8bfb9251734bea07678ab458c2a851bd8d97f8af857c2d593ec0",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
+    },
+    {
       "file": "gateway/src/admin_policy_test_runs.rs",
       "reasons": [
         "capability-import-or-glob"
@@ -6952,16 +6979,6 @@
       ],
       "scope": "gateway::use admin_policy_test_runs :: *#1",
       "sha256": "fa6cd2e48a9cc10d258e091e44bf8f8211f2d602bd2d9c4e54552efc493f593d",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
-    },
-    {
-      "file": "gateway/src/audit/postgres_sink.rs",
-      "reasons": [
-        "capability-import-or-glob"
-      ],
-      "scope": "gateway::audit::postgres_sink::use crate :: { audit :: { record_flush_outcome , AuditEvent , AuditSink , AUDIT_EVENTS_DROPPED_TOTAL } , metrics :: LOCK_POISON_RECOVERIES_TOTAL , storage :: { postgres_audit :: PostgresAuditEventStore , AuditEventStore as _ } , }#1",
-      "sha256": "63f79eb95f90db11924f3b591e8f632ff1dbdbb7415d32eb53b6c8b20147477f",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
@@ -7001,7 +7018,7 @@
         "capability-in-macro-input"
       ],
       "scope": "gateway::audit::postgres_sink::flusher_loop#1",
-      "sha256": "9741912e7dffff5cc3afce6af62126506916cbba5ad9b257ebf7d728fb791915",
+      "sha256": "da578a603b7e9fde39187979da47ec62757a463010024dfd55d5cbf658a9ebf6",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -7091,7 +7108,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::audit::sink::AuditSink#1",
-      "sha256": "8b569b6763e25f667758ff4f8690938b7fed3c9fcd08f88656d2d9b679d9f9d7",
+      "sha256": "7b48927f214602ffd437c2b9db7989276ec1c3a30a2f097c32a0bb5fb5ee8636",
       "owner": "GreenGateway maintainers",
       "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
     },
@@ -7171,7 +7188,7 @@
         "unexpanded-macro"
       ],
       "scope": "gateway::audit::sqlite_sink::impl  SqliteSink::new_with_intervals#1",
-      "sha256": "95e004c950cb13f28e1f43971486c611901ce4c0d6bc521d92d622143fbafed5",
+      "sha256": "843878f8ffb8d07891209f4e4c07855e8402e59b382d12042c698694ba5bc6e2",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed standalone reliability changes: process-local readiness state, fixed-label metrics and exact audit loss accounting. No new outbound transport authority; SQLite probes use configured local paths and observation filtering preserves security findings."
     },
@@ -7181,7 +7198,7 @@
         "unexpanded-macro"
       ],
       "scope": "gateway::audit::sqlite_sink::impl  SqliteSinkShared::flush_buffer#1",
-      "sha256": "c60ecbfee7cbe7e0336814da3ec883c93b8bebb9b827461900ca9244fcc1d54e",
+      "sha256": "3b74751c8bed19f099656d42df1cdaedd45ada4343c984e57e5691a814666449",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed standalone reliability changes: process-local readiness state, fixed-label metrics and exact audit loss accounting. No new outbound transport authority; SQLite probes use configured local paths and observation filtering preserves security findings."
     },
@@ -7201,7 +7218,7 @@
         "unexpanded-macro"
       ],
       "scope": "gateway::audit::sqlite_sink::impl  SqliteSinkShared::buffer_guard#1",
-      "sha256": "16006470c7fbc9ca6213d61df777b162c0edf229dd487827195182ba88e68a3f",
+      "sha256": "1cdd25f428df504d11de455b7eaad1cff4a743ceb5b54351e1b51b688c6fd04a",
       "owner": "GreenGateway maintainers",
       "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
     },
@@ -7271,7 +7288,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::audit::impl  AuditLog::from_config#1",
-      "sha256": "a0d11a858f168120d0f328ca393a040e7a98ac329f5008448f9256ccfea891f7",
+      "sha256": "3f2a895ef13b3cc86deb4ddf7488d933027be71d459399666e3c76f46de094f3",
       "owner": "GreenGateway maintainers",
       "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
     },
@@ -10529,7 +10546,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::middleware::rbac::rbac_middleware#1",
-      "sha256": "7e1d1bffaeae03b1176d652411b710a1ad4d343736059ca2235d6be6283b6fbd",
+      "sha256": "71ad797e8337593c2d836296f7d97b3807e46f869223143a6fd84b76740be163",
       "owner": "GreenGateway maintainers",
       "purpose": "Issue #422 HTTP adapter: evaluate the admitted immutable policy snapshot and translate its result into existing audit and response behavior. Existing cfg/cfg_attr inputs only; no new transport, provider, resolver or process authority."
     },
@@ -11978,6 +11995,26 @@
       ],
       "scope": "gateway::storage::postgres_audit::classify_query#1",
       "sha256": "a3ae50a4c225309e969e2992b81a42ffc30aa9b18ade0e67684a1f44b7243573",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_audit.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_audit::impl  PostgresAuditEventStore::checkout_for_insert#1",
+      "sha256": "3cfd0ebcb24656e1bda0153175f546c269551be778ad716ea358b05f78ad24a0",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_audit.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_audit::impl  PostgresAuditEventStore::insert_events_on#1",
+      "sha256": "ab8664706cc498fa5bec3bb785019d1cf324ad07405b2ef73540545c2f7bf95a",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },

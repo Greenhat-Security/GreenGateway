@@ -77,6 +77,20 @@ describe("buildGreenGatewayContainerEnv", () => {
     });
   });
 
+  it("forwards the audit durability mode, its bound, and its store of record", () => {
+    const env = buildGreenGatewayContainerEnv({
+      AUDIT_DURABILITY: "required",
+      AUDIT_DURABILITY_TIMEOUT_MS: "5000",
+      AUDIT_SQLITE_PATH: "/tmp/greengateway-audit.sqlite",
+    });
+
+    expect(env).toMatchObject({
+      AUDIT_DURABILITY: "required",
+      AUDIT_DURABILITY_TIMEOUT_MS: "5000",
+      AUDIT_SQLITE_PATH: "/tmp/greengateway-audit.sqlite",
+    });
+  });
+
   it("forwards bounded login, session, discovery, and NAT64 settings", () => {
     const env = buildGreenGatewayContainerEnv({
       ADMIN_LOGIN_PENDING_TTL_SECS: "600",

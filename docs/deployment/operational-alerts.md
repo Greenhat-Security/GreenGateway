@@ -252,6 +252,17 @@ controls, or silently discard the backlog to make monitoring green. Keep raw
 audit payloads, tokens, provider addresses and detailed errors out of alert
 annotations and shared incident summaries.
 
+Under the default `AUDIT_DURABILITY=required`, the same sink failures also
+refuse traffic: a request whose authentication or authorization record cannot
+commit is answered `503 audit_unavailable` and counted on
+`greengateway_audit_durability_refusals_total{reason}` (`admission`, `store`,
+`timeout`), while `/readyz` stays `200`. No rule in this pack selects that
+counter yet; graph it beside the drop and flush counters, and treat a rising
+count as an outage of the audit store that the gateway is answering with
+refusals. Service resumes on its own once the store commits again. Switching to
+`AUDIT_DURABILITY=best_effort` to restore traffic trades the outage for
+unrecorded decisions and needs the audit owner's sign-off.
+
 ### Database capacity
 
 The platform/database on-call compares the affected replica's `/readyz` reason

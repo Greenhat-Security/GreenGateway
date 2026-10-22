@@ -8,6 +8,11 @@ services:
       SHUTDOWN_DRAIN_DELAY_MS: "5000"
       SHUTDOWN_TIMEOUT_MS: "30000"
       AUDIT_DRAIN_TIMEOUT_MS: "5000"
+      # The audit store of record that the default AUDIT_DURABILITY=required
+      # needs. /tmp is writable in the image as UID 10001; the file survives a
+      # gateway restart in the same container, not a recreated one. Mount a
+      # volume writable by UID 10001 and point this at it to keep the history.
+      AUDIT_SQLITE_PATH: /tmp/greengateway-audit.sqlite
     stop_signal: SIGTERM
     stop_grace_period: 45s
     healthcheck:

@@ -22,8 +22,19 @@ adds migration 23's `greengateway.document_change_evidence`, written by every
 PostgreSQL policy and tools document commit, and `greengateway.catalog_change_evidence`,
 written by every managed MCP and OpenAPI catalog publication; neither is a journal
 source yet, so the dispatcher does not deliver them. None of them implements or
-enables required-durability mode or a standalone revision ledger, and no row is
-qualified for that future mode. Storage selection is unchanged.
+enables the authority-evidence required-durability mode or a standalone revision
+ledger, and no row is qualified for that future mode. Storage selection is
+unchanged.
+
+`AUDIT_DURABILITY=required`, the default since the request-path slice of this issue,
+is a different and narrower guarantee: the authentication and authorization stages
+wait for their own decision records to commit to the audit store of record, and
+refuse the request with `503 audit_unavailable` when they cannot (see
+[the configuration reference](configuration.md#audit_durability)). It does not
+make any authority-change row below qualified, which is why the inventory's
+`required_durability_mode` stays `not_implemented`: an admin mutation's evidence is
+still its own transaction's rows, its journal entry, or the ordinary audit event its
+handler emits after the commit.
 
 Run the executable inventory and proposed event-contract tests with the pinned
 Node version from `build-tools.json`:
@@ -367,11 +378,17 @@ What the producer slice was required to add, and where PR 3 stands on each:
 
 ## Durable delivery
 
-Ordinary request audit remains bounded asynchronous telemetry. Its PostgreSQL
-sink retries a bounded number of times, then drops/counts failed batches or
-overflow. The SQLite sink is also separate from authority mutation transactions.
-Neither delivery path establishes required evidence by accepting an event into
-memory after the mutation commits, and PR 3 changes neither. `security_outbox`
+Ordinary request audit is bounded asynchronous telemetry, with one exception.
+Its PostgreSQL sink retries a bounded number of times, then drops/counts failed
+batches or overflow. The SQLite sink is also separate from authority mutation
+transactions. Neither delivery path establishes required evidence by accepting an
+event into memory after the mutation commits, and PR 3 changes neither. The
+exception is `AUDIT_DURABILITY=required` (the default): the request path's
+authentication and authorization records are acknowledged by the same sinks only
+once the transaction carrying them commits, and the request is not acted on until
+then. That is write-ahead evidence of a request's admission decision, not
+authority-change evidence: the records an admin handler emits after its mutation
+commits keep the bounded asynchronous delivery described here. `security_outbox`
 and its `outbox_after` reader remain the security runtime's reconciliation
 mechanism, not a downstream evidence cursor.
 

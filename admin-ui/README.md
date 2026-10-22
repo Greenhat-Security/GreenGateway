@@ -7,7 +7,7 @@ This is the Vite + React + TypeScript admin UI scaffold. It is built as a separa
 Run the Rust backend and Vite dev server side by side:
 
 ```sh
-cargo run
+AUDIT_SQLITE_PATH=target/dev-audit.sqlite cargo run
 ```
 
 ```sh
