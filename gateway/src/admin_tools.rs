@@ -508,7 +508,7 @@ pub(super) async fn register_tools_via_control_plane(
                 etag: current_etag.to_owned(),
             },
             &merged.candidate_value,
-            &principal.user_id,
+            storage::DocumentChange::by_principal(storage::DocumentAction::ToolsPublish, principal),
             &diff_summary,
         )
         .await

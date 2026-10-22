@@ -282,6 +282,13 @@ static MANIFEST: LazyLock<Vec<Migration>> = LazyLock::new(|| {
         )
         .finalize()
         .with_pinned_checksum("336ccd5be1bf7995b19b94d73d8f480dc66a1c0bb730b651931d84a01e59e468"),
+        Migration::new(
+            22,
+            "document_and_catalog_change_evidence",
+            include_str!("migrations/0022_document_and_catalog_change_evidence.sql"),
+        )
+        .finalize()
+        .with_pinned_checksum("05aba2b9a66a70f6e0d7671ec2a834bedd47e84a28a2086b3087e86980ca8967"),
     ]
 });
 
@@ -316,27 +323,29 @@ impl SchemaCompatibility {
 
 // No adjacent release pair has been qualified across a schema change. Do
 // not widen these bounds or add an extension without the pinned SQL and
-// two-binary gate in issue #426. Moving the point from 20 to 21 (the
-// authority-event journal, #425 PR 3) is not an overlap: a schema-20 binary
-// refuses schema 21 and this binary refuses schema 20, so that upgrade is a
-// coordinated drain/migrate/restart, as the moves from 15 to 16 (#425),
-// from 16 to 17 (member capability advertisements, #426 PR 1), from 17 to
-// 18 (service-token and JWT revocation change evidence, #425 PR 2b), from
-// 18 to 19 (shared admin sessions, #424) and from 19 to 20 (the durable
-// contract fence, #426 PR 3) were. A schema-20 binary must not keep writing
-// evidence after migration 21: its rows would never be journaled. The move
-// to 20 is also what makes the fence cover every binary that can serve this
+// two-binary gate in issue #426. Moving the point from 21 to 22 (policy,
+// tools and catalog change evidence, #425 PR 2c) is not an overlap: a
+// schema-21 binary refuses schema 22 and this binary refuses schema 21, so
+// that upgrade is a coordinated drain/migrate/restart, as the moves from 15
+// to 16 (#425), from 16 to 17 (member capability advertisements, #426 PR
+// 1), from 17 to 18 (service-token and JWT revocation change evidence, #425
+// PR 2b), from 18 to 19 (shared admin sessions, #424), from 19 to 20 (the
+// durable contract fence, #426 PR 3) and from 20 to 21 (the authority-event
+// journal, #425 PR 3) were. A schema-21 binary would keep committing
+// policy, tools and catalog changes without their evidence, and a schema-20
+// one would also write evidence that is never journaled. The move to 20 is
+// also what makes the fence cover every binary that can serve this
 // database: none that predates the fence accepts its ledger.
 const BINARY_SCHEMA_COMPATIBILITY: SchemaCompatibility = SchemaCompatibility {
-    read: (21, 21),
-    write: (21, 21),
+    read: (22, 22),
+    write: (22, 22),
     approved_extensions: &[],
 };
 
 /// The intersection of the explicit read/write contracts, advertised to the
 /// roster. This is a summary, not proof of ledger integrity, permission to
 /// write a gated operation (`storage/compatibility.rs`), or permission to
-/// contract the schema. The shipped contract accepts only schema 21.
+/// contract the schema. The shipped contract accepts only schema 22.
 pub(crate) fn schema_version_range() -> (i32, i32) {
     BINARY_SCHEMA_COMPATIBILITY.serving_range()
 }
@@ -1116,12 +1125,12 @@ mod tests {
     fn the_shipped_contract_has_no_unproved_overlap() {
         assert_eq!(
             MANIFEST.len(),
-            21,
+            22,
             "review the compatibility contract when adding SQL"
         );
-        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.read, (21, 21));
-        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.write, (21, 21));
-        assert_eq!(schema_version_range(), (21, 21));
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.read, (22, 22));
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.write, (22, 22));
+        assert_eq!(schema_version_range(), (22, 22));
         assert!(BINARY_SCHEMA_COMPATIBILITY.approved_extensions.is_empty());
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len(), "")),
@@ -1132,7 +1141,7 @@ mod tests {
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 1, "")),
             Ok(SchemaStatus::NeedsUpgrade {
-                applied: 20,
+                applied: 21,
                 missing: 1
             })
         );
@@ -1141,36 +1150,43 @@ mod tests {
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 2, "")),
             Ok(SchemaStatus::NeedsUpgrade {
-                applied: 19,
+                applied: 20,
                 missing: 2
             })
         );
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 3, "")),
             Ok(SchemaStatus::NeedsUpgrade {
-                applied: 18,
+                applied: 19,
                 missing: 3
             })
         );
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 4, "")),
             Ok(SchemaStatus::NeedsUpgrade {
-                applied: 17,
+                applied: 18,
                 missing: 4
             })
         );
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 5, "")),
             Ok(SchemaStatus::NeedsUpgrade {
-                applied: 16,
+                applied: 17,
                 missing: 5
             })
         );
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 6, "")),
             Ok(SchemaStatus::NeedsUpgrade {
-                applied: 15,
+                applied: 16,
                 missing: 6
+            })
+        );
+        assert_eq!(
+            validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 7, "")),
+            Ok(SchemaStatus::NeedsUpgrade {
+                applied: 15,
+                missing: 7
             })
         );
     }
@@ -1629,7 +1645,7 @@ mod tests {
         let authority = PostgresReadinessAuthority::new(foundation.pool().clone());
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::Writable { schema_version: 21 }
+            AuthorityObservation::Writable { schema_version: 22 }
         );
         let client = foundation.pool().get().await.expect("fixture client");
         client
@@ -1641,7 +1657,7 @@ mod tests {
             .expect("change fixture checksum without changing extent");
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::IncompatibleSchema { schema_version: 21 }
+            AuthorityObservation::IncompatibleSchema { schema_version: 22 }
         );
         client
             .execute(
@@ -1652,7 +1668,7 @@ mod tests {
             .expect("restore fixture checksum");
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::Writable { schema_version: 21 }
+            AuthorityObservation::Writable { schema_version: 22 }
         );
         client
             .execute(
@@ -1663,7 +1679,7 @@ mod tests {
             .expect("remove a fixture history row");
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::IncompatibleSchema { schema_version: 21 }
+            AuthorityObservation::IncompatibleSchema { schema_version: 22 }
         );
         drop(client);
         clean_database(foundation.pool()).await;
@@ -1937,6 +1953,8 @@ mod tests {
                  DROP TABLE greengateway.authority_event_cursors; \
                  DROP TABLE greengateway.authority_event_journal; \
                  DROP TABLE greengateway.authority_event_state; \
+                 DROP TABLE greengateway.document_change_evidence; \
+                 DROP TABLE greengateway.catalog_change_evidence; \
                  DELETE FROM {LEDGER_TABLE} WHERE version >= 13;"
             ))
             .await

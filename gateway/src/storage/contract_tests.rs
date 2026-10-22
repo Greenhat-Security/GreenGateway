@@ -5514,7 +5514,7 @@ pub(crate) mod postgres_audit_tests {
         PolicyCommitRequest {
             precondition,
             candidate: policy,
-            actor_user_id: actor,
+            change: crate::storage::DocumentChange::test_policy(actor),
             diff_summary: &TEST_DIFF_SUMMARY,
         }
     }
@@ -12444,7 +12444,7 @@ pub(crate) mod postgres_audit_tests {
 
     /// The policy-side facts an acceptance must leave untouched when it
     /// does not commit: active version/ETag/revision, history rows,
-    /// outbox rows.
+    /// outbox rows, change-evidence rows (migration 22).
     #[derive(Debug, PartialEq)]
     struct PolicyFootprint {
         active_version: i64,
@@ -12452,6 +12452,7 @@ pub(crate) mod postgres_audit_tests {
         security_revision: i64,
         document_rows: i64,
         outbox_rows: i64,
+        evidence_rows: i64,
     }
 
     async fn policy_footprint(
@@ -12468,6 +12469,7 @@ pub(crate) mod postgres_audit_tests {
             security_revision: active.security_revision,
             document_rows: count_rows(pool, "policy_documents").await,
             outbox_rows: count_rows(pool, "security_outbox").await,
+            evidence_rows: count_rows(pool, "document_change_evidence").await,
         }
     }
 
@@ -12640,6 +12642,7 @@ pub(crate) mod postgres_audit_tests {
                 security_revision: before.security_revision + 1,
                 document_rows: 2,
                 outbox_rows: 2,
+                evidence_rows: 2,
             }
         );
         let stored = lifecycle
@@ -12740,6 +12743,7 @@ pub(crate) mod postgres_audit_tests {
                 security_revision: before.security_revision + 1,
                 document_rows: 2,
                 outbox_rows: 2,
+                evidence_rows: 2,
             }
         );
         assert_eq!(
@@ -12940,7 +12944,144 @@ pub(crate) mod postgres_audit_tests {
                 security_revision: before.security_revision + 1,
                 document_rows: 2,
                 outbox_rows: 2,
+                evidence_rows: 2,
             }
+        );
+    }
+
+    /// An acceptance's change evidence (issue #425, PR 2c) is written by
+    /// the policy commit it composes, so it shares the suggestion's
+    /// transaction: an accepted suggestion leaves one
+    /// `policy.suggestion.accept` row naming the accepting principal, and an
+    /// acceptance whose evidence cannot be written transitions nothing and
+    /// commits nothing.
+    #[tokio::test]
+    async fn an_accepted_suggestion_records_its_evidence_in_the_acceptance_transaction() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_discovery_pool(&database).await;
+        let policy_store = PostgresPolicyStore::new(pool.clone());
+        let lifecycle = PostgresDiscoveryLifecycleStore::new(pool.clone());
+        let current_etag = initialize_policy(&policy_store).await;
+        seed_open_suggestion(&pool, "faulted", true).await;
+        seed_open_suggestion(&pool, "evidenced", true).await;
+        let principal = crate::auth::Principal {
+            user_id: "admin-a".to_owned(),
+            issuer: Some("https://issuer.example".to_owned()),
+            email: None,
+            org_id: None,
+            roles: vec!["admin".to_owned()],
+            session_id: "session-a".to_owned(),
+            auth_method: crate::auth::AuthMethod::Cookie,
+        };
+        let candidate = contract_policy_variant("accept-evidenced", "reader");
+        let request = |suggestion_id| AcceptSuggestionRequest {
+            suggestion_id,
+            expected_revision: Some(1),
+            actor: "admin-a",
+            policy_commit: PolicyCommitRequest {
+                precondition: PolicyCommitPrecondition::Expected {
+                    etag: current_etag.clone(),
+                },
+                candidate: &candidate,
+                change: crate::storage::DocumentChange::by_principal(
+                    crate::storage::DocumentAction::PolicySuggestionAccept,
+                    &principal,
+                ),
+                diff_summary: &TEST_DIFF_SUMMARY,
+            },
+        };
+        let before = policy_footprint(&policy_store, &pool).await;
+        assert_eq!(
+            before.evidence_rows, 1,
+            "the initial policy recorded itself"
+        );
+
+        let client = pool.get().await.expect("failure trigger checkout");
+        client
+            .batch_execute(
+                r#"
+                CREATE FUNCTION greengateway.fail_document_change_evidence()
+                RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN
+                    RAISE EXCEPTION 'injected evidence failure';
+                END;
+                $$;
+                CREATE TRIGGER fail_document_change_evidence
+                BEFORE INSERT ON greengateway.document_change_evidence
+                FOR EACH ROW EXECUTE FUNCTION greengateway.fail_document_change_evidence();
+                "#,
+            )
+            .await
+            .expect("failure trigger should install");
+        let failed = lifecycle
+            .accept_suggestion(request("faulted"))
+            .await
+            .expect_err("an acceptance whose evidence cannot commit fails");
+        assert!(
+            matches!(failed, AcceptRefused::Policy(PolicyCommitError::Store(_))),
+            "got {failed:?}"
+        );
+        client
+            .batch_execute(
+                r#"
+                DROP TRIGGER fail_document_change_evidence
+                    ON greengateway.document_change_evidence;
+                DROP FUNCTION greengateway.fail_document_change_evidence();
+                "#,
+            )
+            .await
+            .expect("failure trigger should drop");
+        drop(client);
+        assert_eq!(policy_footprint(&policy_store, &pool).await, before);
+        let untouched = lifecycle
+            .get_suggestion("faulted")
+            .await
+            .expect("reload")
+            .expect("exists");
+        assert_eq!(untouched.state, RuleSuggestionLifecycleState::Open);
+        assert_eq!(untouched.revision, 1);
+
+        let accepted = lifecycle
+            .accept_suggestion(request("evidenced"))
+            .await
+            .expect("the acceptance commits with its evidence");
+        assert_eq!(
+            accepted.suggestion.state,
+            RuleSuggestionLifecycleState::Accepted
+        );
+        let row = pool
+            .get()
+            .await
+            .expect("evidence checkout")
+            .query_one(
+                "SELECT action, resource_type, actor_kind, actor_user_id, actor_issuer, \
+                        actor_auth_mode, prior_version, new_version, security_revision \
+                 FROM greengateway.document_change_evidence \
+                 WHERE action = 'policy.suggestion.accept'",
+                &[],
+            )
+            .await
+            .expect("exactly one acceptance evidence row");
+        assert_eq!(row.get::<_, String>(0), "policy.suggestion.accept");
+        assert_eq!(row.get::<_, String>(1), "policy");
+        assert_eq!(row.get::<_, String>(2), "principal");
+        assert_eq!(row.get::<_, String>(3), "admin-a");
+        assert_eq!(
+            row.get::<_, Option<String>>(4).as_deref(),
+            Some("https://issuer.example")
+        );
+        assert_eq!(row.get::<_, String>(5), "session_cookie");
+        assert_eq!(row.get::<_, Option<i64>>(6), Some(before.active_version));
+        assert_eq!(row.get::<_, i64>(7), accepted.policy.version);
+        assert_eq!(row.get::<_, i64>(8), accepted.policy.security_revision);
+        assert_eq!(
+            policy_footprint(&policy_store, &pool).await.evidence_rows,
+            before.evidence_rows + 1
         );
     }
 

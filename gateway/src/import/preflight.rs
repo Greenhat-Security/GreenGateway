@@ -102,6 +102,13 @@ const AUTHORITATIVE_TABLES: &[&str] = &[
     // before anything has happened, and its position is covered by the
     // journal's own counter below.
     "authority_event_journal",
+    // 0022: policy, tools and catalog change evidence. The import writes
+    // document evidence itself (its policy and tools activations are
+    // `configuration.import` rows), so on a fresh target a row here means
+    // the namespace already holds history; catalog evidence is written only
+    // by publications, never by the import.
+    "document_change_evidence",
+    "catalog_change_evidence",
 ];
 
 /// The authoritative singleton counters and the column that carries them.

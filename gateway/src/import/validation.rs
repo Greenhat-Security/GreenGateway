@@ -868,6 +868,11 @@ pub(super) fn expected_rows(
     expected.insert("tool_documents", 1);
     expected.insert("tool_active", 1);
     expected.insert("tool_name_reservations", reservations);
+    // The policy and tools activations each record one change-evidence row
+    // (`configuration.import`, issue #425); the Connections section writes
+    // catalogs as imported rows, never as publications, so it records none.
+    expected.insert("document_change_evidence", 2);
+    expected.insert("catalog_change_evidence", 0);
     expected.insert("connection_records", records);
     expected.insert("connection_documents", records);
     expected.insert("connection_credential_bindings", bindings);

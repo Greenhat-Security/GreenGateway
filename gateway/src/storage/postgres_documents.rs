@@ -25,8 +25,16 @@
 //! 5. The pointer advances (or is initialized under `ON CONFLICT DO
 //!    NOTHING`, whose zero-row result is the initialize race's loser).
 //! 6. One `security_outbox` row records the change with identifiers and
-//!    revisions only.
-//! 7. `COMMIT` -- once; every step rolls back together.
+//!    revisions only, and one `document_change_evidence` row (migration 22,
+//!    issue #425 PR 2c) records who made it and which operation it was:
+//!    the actor's kind, subject, issuer and auth mode, the action, fresh
+//!    event and operation IDs, the prior and new versions and the shared
+//!    revision the outbox row took. The evidence row has no foreign key and
+//!    is never rewritten.
+//! 7. `COMMIT` -- once; every step rolls back together, so a commit whose
+//!    evidence cannot be written does not happen, and a refused one (a
+//!    stale ETag, a lost initialize race, a tool name another lane holds)
+//!    leaves no evidence behind.
 //!
 //! Steps 1-6 are [`commit_in`], over a client whose transaction the caller
 //! has already opened; [`commit`] wraps them in `BEGIN`/`COMMIT` for the
@@ -38,8 +46,8 @@
 //! exactly once and a failure anywhere rolls the whole workflow back.
 
 use super::{
-    log_classified, policy_history::PolicyCommitError, postgres::classify_pool_error,
-    RepositoryError, RepositoryErrorKind,
+    change_evidence::DocumentChange, log_classified, policy_history::PolicyCommitError,
+    postgres::classify_pool_error, RepositoryError, RepositoryErrorKind,
 };
 
 /// The tables and identity of one versioned-document resource.
@@ -61,13 +69,15 @@ pub(crate) struct DocumentResource {
 pub(crate) use super::policy_history::PolicyCommitPrecondition as DocumentPrecondition;
 
 /// A fully serialized commit: the document JSON, its computed ETag, the
-/// actor, and the diff summary. Validation of the document itself is the
-/// caller's job before this runs; the transaction never activates a
-/// candidate the caller has not validated.
+/// change (the operation and its actor), and the diff summary. Validation
+/// of the document itself is the caller's job before this runs; the
+/// transaction never activates a candidate the caller has not validated.
 pub(crate) struct DocumentCommit<'a> {
     pub document_json: &'a str,
     pub document_etag: &'a str,
-    pub actor_user_id: &'a str,
+    /// What the evidence row records. The version row's `actor_user_id`
+    /// is the actor's subject (or system label), as it always was.
+    pub change: DocumentChange<'a>,
     pub diff_summary_json: &'a str,
     /// The tool names this document publishes into the local lane, to be
     /// reserved at the authority in the same transaction. `None` for
@@ -96,6 +106,97 @@ fn store_error(error: RepositoryError) -> PolicyCommitError {
 fn classify_query(error: tokio_postgres::Error, operation: &'static str) -> RepositoryError {
     let kind = super::postgres::classify_postgres_error(&error);
     log_classified(operation, &error, RepositoryError::new(kind, operation))
+}
+
+/// The classified operation label of the evidence append and its refusals.
+const OPERATION_DOCUMENT_EVIDENCE: &str = "document_change_evidence_append";
+
+/// The longest subject and issuer migration 22 accepts. They are exactly the
+/// principal bounds authentication enforces, so evidence never refuses a
+/// principal a validator produced; the assertions keep the immutable SQL
+/// bounds and the Rust bounds from drifting apart silently.
+pub(crate) const EVIDENCE_ACTOR_MAX_BYTES: usize = 4096;
+pub(crate) const EVIDENCE_ISSUER_MAX_BYTES: usize = 4096;
+const _: () =
+    assert!(EVIDENCE_ACTOR_MAX_BYTES == crate::auth::principal::MAX_PRINCIPAL_SUBJECT_BYTES);
+const _: () =
+    assert!(EVIDENCE_ISSUER_MAX_BYTES == crate::auth::principal::MAX_PRINCIPAL_ISSUER_BYTES);
+
+/// An unattributable or mislabeled change has no evidence to record, so it
+/// is refused before the transaction writes anything rather than committed
+/// anonymously: an empty or oversized subject or issuer, or an action that
+/// cannot describe this resource. An authenticated principal and every
+/// shipped call site satisfy it; migration 22's CHECKs are the backstop.
+fn validate_change(
+    resource: DocumentResource,
+    change: &DocumentChange<'_>,
+) -> Result<(), PolicyCommitError> {
+    let subject = change.actor.user_id();
+    let issuer_in_bounds = change
+        .actor
+        .issuer()
+        .is_none_or(|issuer| !issuer.is_empty() && issuer.len() <= EVIDENCE_ISSUER_MAX_BYTES);
+    if subject.is_empty()
+        || subject.len() > EVIDENCE_ACTOR_MAX_BYTES
+        || !issuer_in_bounds
+        || !change.action.applies_to(resource.resource_type)
+    {
+        tracing::error!(
+            resource = resource.resource_type,
+            action = change.action.code(),
+            "refusing a document commit whose change evidence would be unattributable \
+             or mislabeled; nothing was written"
+        );
+        return Err(PolicyCommitError::Store(invalid_data(
+            OPERATION_DOCUMENT_EVIDENCE,
+        )));
+    }
+    Ok(())
+}
+
+/// Append the commit's evidence row inside the caller's transaction. Its
+/// `event_id` and `operation_id` are minted here, once; `committed_at` is
+/// the database clock's. Any failure is returned for the caller to roll
+/// back, so the commit it describes never happens without it.
+async fn record_document_change(
+    client: &deadpool_postgres::Object,
+    resource: DocumentResource,
+    change: &DocumentChange<'_>,
+    prior_version: Option<i64>,
+    new_version: i64,
+    security_revision: i64,
+) -> Result<(), PolicyCommitError> {
+    let event_id = uuid::Uuid::new_v4().to_string();
+    let operation_id = uuid::Uuid::new_v4().to_string();
+    client
+        .execute(
+            r#"
+            INSERT INTO greengateway.document_change_evidence (
+                event_id, operation_id, actor_kind, actor_user_id, actor_issuer,
+                actor_auth_mode, action, resource_type, prior_version, new_version,
+                security_revision
+            ) VALUES (
+                $1::text::uuid, $2::text::uuid, $3, $4, $5, $6, $7, $8, $9, $10, $11
+            )
+            "#,
+            &[
+                &event_id,
+                &operation_id,
+                &change.actor.kind(),
+                &change.actor.user_id(),
+                &change.actor.issuer(),
+                &change.actor.auth_mode(),
+                &change.action.code(),
+                &resource.resource_type,
+                &prior_version,
+                &new_version,
+                &security_revision,
+            ],
+        )
+        .await
+        .map_err(|error| classify_query(error, OPERATION_DOCUMENT_EVIDENCE))
+        .map_err(store_error)?;
+    Ok(())
 }
 
 /// Read the active document row (joined for its creation timestamp), or
@@ -202,6 +303,7 @@ pub(crate) async fn commit_in(
     precondition: DocumentPrecondition,
     commit: DocumentCommit<'_>,
 ) -> Result<DocumentCommitted, PolicyCommitError> {
+    validate_change(resource, &commit.change)?;
     {
         // 1. Lock the pointer and verify its self-consistency.
         let lock_sql = format!(
@@ -260,7 +362,7 @@ pub(crate) async fn commit_in(
             .query_one(
                 insert_sql.as_str(),
                 &[
-                    &commit.actor_user_id,
+                    &commit.change.actor.user_id(),
                     &commit.diff_summary_json,
                     &commit.document_json,
                     &commit.document_etag,
@@ -316,14 +418,15 @@ pub(crate) async fn commit_in(
             .ok_or_else(|| invalid_data(resource.operation))
             .map_err(store_error)?;
 
-        // 5. Advance (or initialize) the pointer.
+        // 5. Advance (or initialize) the pointer and 6. append the outbox
+        // row; the evidence row follows once both have succeeded.
         const APPEND_OUTBOX_SQL: &str = r#"
             INSERT INTO greengateway.security_outbox (
                 revision, resource_type, from_version, to_version
             )
             VALUES ($1, $2, $3, $4)
             "#;
-        match current {
+        let prior_version = match current {
             Some((previous_version, _, _)) => {
                 let advance_sql = format!(
                     r#"
@@ -355,6 +458,7 @@ pub(crate) async fn commit_in(
                     .await
                     .map_err(|error| classify_query(error, resource.operation))
                     .map_err(store_error)?;
+                Some(previous_version)
             }
             None => {
                 let initialize_sql = format!(
@@ -394,8 +498,21 @@ pub(crate) async fn commit_in(
                     .await
                     .map_err(|error| classify_query(error, resource.operation))
                     .map_err(store_error)?;
+                None
             }
-        }
+        };
+
+        // 6b. The change's evidence: the same versions and shared revision
+        // as the outbox row above, in the same transaction.
+        record_document_change(
+            client,
+            resource,
+            &commit.change,
+            prior_version,
+            new_version,
+            new_revision,
+        )
+        .await?;
 
         Ok(DocumentCommitted {
             version: new_version,
@@ -403,3 +520,7 @@ pub(crate) async fn commit_in(
         })
     }
 }
+
+#[cfg(test)]
+#[path = "postgres_documents_tests.rs"]
+mod tests;

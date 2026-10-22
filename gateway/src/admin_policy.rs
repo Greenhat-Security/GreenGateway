@@ -125,6 +125,7 @@ pub(super) async fn policy_put_endpoint(
             parts: &parts,
             principal: &principal,
         },
+        storage::DocumentAction::PolicyPublish,
         &before_policy,
         &current_etag,
         &candidate,
@@ -246,6 +247,7 @@ pub(super) async fn policy_rollback_endpoint(
             parts: &parts,
             principal: &principal,
         },
+        storage::DocumentAction::PolicyRollback,
         &before_policy,
         &current_etag,
         &target_policy,
@@ -498,6 +500,7 @@ pub(super) async fn policy_rule_patch_endpoint(
             parts: &parts,
             principal: &principal,
         },
+        storage::DocumentAction::PolicyRuleUpdate,
         &before_policy,
         &current_etag,
         &candidate,
@@ -571,6 +574,7 @@ pub(super) async fn policy_rule_delete_endpoint(
             parts: &parts,
             principal: &principal,
         },
+        storage::DocumentAction::PolicyRuleDelete,
         &before_policy,
         &current_etag,
         &candidate,
@@ -646,6 +650,7 @@ pub(super) async fn policy_rules_order_put_endpoint(
             parts: &parts,
             principal: &principal,
         },
+        storage::DocumentAction::PolicyRuleReorder,
         &before_policy,
         &current_etag,
         &candidate,
@@ -1970,6 +1975,7 @@ pub(super) async fn create_policy_rule(
             parts,
             principal,
         },
+        storage::DocumentAction::PolicyRuleCreate,
         &prepared.before_policy,
         &prepared.current_etag,
         &prepared.candidate,
@@ -2017,13 +2023,16 @@ pub(super) fn validate_policy_mutation_candidate(
 
 pub(super) async fn persist_policy_mutation(
     context: PolicyMutationCommitContext<'_, '_>,
+    action: storage::DocumentAction,
     before_policy: &rbac::Policy,
     expected_etag: &str,
     candidate: &rbac::Policy,
     diff_summary: Value,
 ) -> ResponseResult<PolicyMutationCommitResult> {
+    // Standalone writes record no change evidence (#425 PR 4): the file,
+    // the reload and the optional history are separate steps.
     #[cfg(not(feature = "postgres"))]
-    let _ = expected_etag;
+    let _ = (expected_etag, action);
     validate_policy_mutation_candidate(context.rbac_state, before_policy, candidate)?;
 
     // Cluster mode: one transaction through the authority -- new immutable
@@ -2039,7 +2048,7 @@ pub(super) async fn persist_policy_mutation(
                     etag: expected_etag.to_owned(),
                 },
                 candidate,
-                actor_user_id: &context.principal.user_id,
+                change: storage::DocumentChange::by_principal(action, context.principal),
                 diff_summary: &diff_summary,
             })
             .await;
@@ -2150,7 +2159,7 @@ pub(super) async fn persist_policy_mutation(
 /// Ask the cluster's operation gate before committing a document that uses
 /// a feature an older member cannot read (issue #426).
 ///
-/// A document without such a feature needs nothing beyond the schema-20
+/// A document without such a feature needs nothing beyond the schema-22
 /// contract every member shares, and passes without a roster read. One that
 /// gives a role a `description` is the registered operation
 /// `policy.role_descriptions`: it is committed only while every live member,
