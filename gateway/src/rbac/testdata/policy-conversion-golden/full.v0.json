@@ -1,0 +1,70 @@
+{
+  "schema_version": "0.1.0",
+  "id": "golden-full",
+  "default_action": "deny",
+  "enforcement_mode": "enforce",
+  "roles": {
+    "admin": { "permissions": ["*"], "auth_methods": ["session_cookie"] },
+    "reader": {
+      "permissions": ["data:read", "tools:lookup"],
+      "issuers": ["https://idp.example.test/"],
+      "description": "Reads data and looks records up"
+    },
+    "writer": { "permissions": ["data:write"] },
+    "ops": { "permissions": ["ops:read"], "auth_methods": ["service_token"] }
+  },
+  "routes": [
+    { "methods": ["GET"], "path_prefix": "/data", "permission": "data:read" },
+    { "methods": ["POST", "PUT"], "path_prefix": "/data", "permission": "data:write", "enforcement_mode": "shadow" },
+    { "hosts": ["api.example.test"], "path_prefix": "/", "permission": "data:read" },
+    { "path_prefix": "/ops", "permission": "ops:read" },
+    { "methods": ["*"], "path_prefix": "/mcp", "permission": "tools:lookup" }
+  ],
+  "rules": [
+    { "path": "/data/secret/**", "action": "deny" },
+    { "id": "export-shadow", "methods": ["POST"], "path": "/data/export", "action": "shadow" },
+    { "id": "public-pages", "path": "/public/**", "action": "allow" },
+    {
+      "path": "/data/{item}/history",
+      "principal": { "roles": ["reader"], "issuers": ["https://idp.example.test/"] },
+      "action": "allow"
+    },
+    {
+      "id": "ops-service",
+      "path": "/ops/**",
+      "principal": { "auth_methods": ["service_token"], "principal_ids": ["svc-ops"] },
+      "action": "allow"
+    },
+    { "id": "routed-billing", "path": "/billing/**", "dispatch": { "kind": "route", "route_id": "billing" }, "action": "deny" },
+    { "id": "contextless-health", "path": "/healthz", "dispatch": { "kind": "contextless" }, "action": "allow" },
+    {
+      "id": "legacy-upstream",
+      "path": "/legacy/*",
+      "dispatch": { "kind": "legacy", "upstream_origin": "https://legacy.example.test" },
+      "action": "shadow"
+    },
+    { "enabled": false, "path": "/disabled/**", "action": "deny" },
+    { "tool_name": "delete_record", "action": "deny" },
+    { "id": "lookup-shadow", "tool_name": "lookup", "principal": { "roles": ["writer"] }, "action": "shadow" }
+  ],
+  "egress": {
+    "hosts": ["api.partner.example.test", "*.cdn.example.test"],
+    "cidrs": ["10.20.0.0/16"],
+    "ports": [443, 8443]
+  },
+  "rate_limits": [
+    { "principal": { "roles": ["reader"] }, "methods": ["GET"], "path": "/data/**", "requests_per_second": 2.5, "burst": 5 },
+    { "principal": { "principal_ids": ["svc-ops"] }, "requests_per_second": 50, "burst": 100 },
+    { "requests_per_second": 0.5, "burst": 1 }
+  ],
+  "tools": {
+    "lookup": { "allowed_roles": ["reader", "writer"] },
+    "delete_record": {
+      "allowed_roles": ["admin"],
+      "issuers": ["https://idp.example.test/"],
+      "timeout_ms": 5000,
+      "max_concurrent": 2
+    },
+    "maintenance": { "enabled": false }
+  }
+}
