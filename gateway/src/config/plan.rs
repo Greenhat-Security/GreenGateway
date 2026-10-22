@@ -20,6 +20,7 @@
 use std::env::VarError;
 
 use super::{
+    authority_events::AuthorityEventInputs,
     connections::{self, ConnectionInputs, ConnectionsPlan},
     diagnostic::{Lookups, Report},
     egress::{self, EgressInputs, EgressPlan},
@@ -147,6 +148,7 @@ pub(super) fn compile_blocks(
     let egress = egress::compile(EgressInputs::read(&mut get_var)).report(&mut report);
     let storage = storage::compile(
         StateBackendInputs::read(&mut get_var),
+        AuthorityEventInputs::read(&mut get_var),
         StorageBlocks {
             audit,
             discovery,

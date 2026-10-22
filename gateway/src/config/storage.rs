@@ -2,7 +2,7 @@
 //! cluster's coordination settings, the state backend and PostgreSQL --
 //! compiled in pure stages (issue #433, PR 2).
 //!
-//! `Config::from_env_vars` reads these in five blocks with other domains'
+//! `Config::from_env_vars` reads these in six blocks with other domains'
 //! settings between them, and each block is requested where the legacy parser
 //! requested it, so the read order does not move:
 //!
@@ -13,10 +13,11 @@
 //!    ([`DocumentInputs`]);
 //! 4. the execution lease, cluster membership, maintenance, readiness and
 //!    PostgreSQL audit retention ([`ClusterInputs`]);
-//! 5. the state backend and PostgreSQL ([`StateBackendInputs`]), after which
-//!    [`compile`] checks the rules that pair every store and every
-//!    cluster-only setting with the backend that reads it, and returns the
-//!    [`StoragePlan`].
+//! 5. the state backend and PostgreSQL ([`StateBackendInputs`]);
+//! 6. authority-event delivery ([`AuthorityEventInputs`]), read right after
+//!    the fifth, after which [`compile`] checks the authority-event rules and
+//!    then the rules that pair every store and every cluster-only setting
+//!    with the backend that reads it, and returns the [`StoragePlan`].
 //!
 //! Those rules also need what other domains configured: the Connections
 //! store, keyrings and local keyring (`connections`), the admin session store,
@@ -34,7 +35,9 @@
 use std::{env::VarError, path::PathBuf};
 
 use super::{
-    authority_events::{self, AuthorityEventInputs, AUTHORITY_EVENT_RETENTION_HOURS},
+    authority_events::{
+        self, AuthorityEventInputs, AuthorityEventSettings, AUTHORITY_EVENT_RETENTION_HOURS,
+    },
     blank_as_unset,
     connections::ConnectionsPlan,
     diagnostic::ConfigRule,
@@ -45,26 +48,26 @@ use super::{
     stage::{Checked, Findings, Provenance, RawInput, SecretLocator},
     validate_deployment_id, validate_maximum_u64, validate_minimum_u64,
     validate_positive_bounded_u64, validate_positive_timeout_ms, validate_positive_u64,
-    validate_positive_usize, AuthorityEventSettings, DatabaseSettings, DatabaseTlsMode,
-    StateBackend, ADMIN_LOGIN_KEYRING, ADMIN_LOGIN_PROVIDER, ADMIN_SESSION_MODE, AUDIT_LOG_FILE,
-    AUDIT_POSTGRES_RETENTION_DAYS, AUDIT_SQLITE_PATH, AUDIT_SQLITE_RETENTION_DAYS,
-    AUDIT_SUCCESSFUL_PROBES_METRICS_ONLY, CLUSTER_HEARTBEAT_MS, CLUSTER_MAINTENANCE_INTERVAL_MS,
-    CLUSTER_MAINTENANCE_LEASE_TTL_MS, CLUSTER_MEMBER_STALE_MS, CLUSTER_STATUS_EXPOSE_HOSTNAMES,
-    CONNECTIONS_SQLITE_PATH, CONNECTION_LOCAL_SECRET_KEYRING, DATABASE_ACQUIRE_TIMEOUT_MS,
-    DATABASE_AUTO_MIGRATE, DATABASE_CONNECT_TIMEOUT_MS, DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS,
-    DATABASE_LOCK_TIMEOUT_MS, DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS, DATABASE_POOL_MAX,
-    DATABASE_STARTUP_RETRY_LIMIT, DATABASE_STATEMENT_TIMEOUT_MS, DATABASE_TLS_CA_FILE,
-    DATABASE_TLS_MODE, DATABASE_URL_FILE, DEFAULT_CLUSTER_HEARTBEAT_MS,
-    DEFAULT_CLUSTER_MAINTENANCE_INTERVAL_MS, DEFAULT_CLUSTER_MAINTENANCE_LEASE_TTL_MS,
-    DEFAULT_CLUSTER_MEMBER_STALE_MS, DEFAULT_DATABASE_ACQUIRE_TIMEOUT_MS,
-    DEFAULT_DATABASE_CONNECT_TIMEOUT_MS, DEFAULT_DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS,
-    DEFAULT_DATABASE_LOCK_TIMEOUT_MS, DEFAULT_DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS,
-    DEFAULT_DATABASE_POOL_MAX, DEFAULT_DATABASE_STARTUP_RETRY_LIMIT,
-    DEFAULT_DATABASE_STATEMENT_TIMEOUT_MS, DEFAULT_DISCOVERY_ENDPOINT_LIMIT,
-    DEFAULT_DISCOVERY_PROJECTOR_BATCH, DEFAULT_DISCOVERY_PROJECTOR_LEASE_TTL_MS,
-    DEFAULT_DISCOVERY_PROJECTOR_POLL_MS, DEFAULT_READINESS_PROBE_CACHE_MS,
-    DEFAULT_TOOL_LEASE_TTL_MS, DEPLOYMENT_ID, DISCOVERY_ENDPOINT_LIMIT, DISCOVERY_PROJECTOR_BATCH,
-    DISCOVERY_PROJECTOR_LEASE_TTL_MS, DISCOVERY_PROJECTOR_POLL_MS, DISCOVERY_SQLITE_PATH,
+    validate_positive_usize, DatabaseSettings, DatabaseTlsMode, StateBackend, ADMIN_LOGIN_KEYRING,
+    ADMIN_LOGIN_PROVIDER, ADMIN_SESSION_MODE, AUDIT_LOG_FILE, AUDIT_POSTGRES_RETENTION_DAYS,
+    AUDIT_SQLITE_PATH, AUDIT_SQLITE_RETENTION_DAYS, AUDIT_SUCCESSFUL_PROBES_METRICS_ONLY,
+    CLUSTER_HEARTBEAT_MS, CLUSTER_MAINTENANCE_INTERVAL_MS, CLUSTER_MAINTENANCE_LEASE_TTL_MS,
+    CLUSTER_MEMBER_STALE_MS, CLUSTER_STATUS_EXPOSE_HOSTNAMES, CONNECTIONS_SQLITE_PATH,
+    CONNECTION_LOCAL_SECRET_KEYRING, DATABASE_ACQUIRE_TIMEOUT_MS, DATABASE_AUTO_MIGRATE,
+    DATABASE_CONNECT_TIMEOUT_MS, DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS, DATABASE_LOCK_TIMEOUT_MS,
+    DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS, DATABASE_POOL_MAX, DATABASE_STARTUP_RETRY_LIMIT,
+    DATABASE_STATEMENT_TIMEOUT_MS, DATABASE_TLS_CA_FILE, DATABASE_TLS_MODE, DATABASE_URL_FILE,
+    DEFAULT_CLUSTER_HEARTBEAT_MS, DEFAULT_CLUSTER_MAINTENANCE_INTERVAL_MS,
+    DEFAULT_CLUSTER_MAINTENANCE_LEASE_TTL_MS, DEFAULT_CLUSTER_MEMBER_STALE_MS,
+    DEFAULT_DATABASE_ACQUIRE_TIMEOUT_MS, DEFAULT_DATABASE_CONNECT_TIMEOUT_MS,
+    DEFAULT_DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS, DEFAULT_DATABASE_LOCK_TIMEOUT_MS,
+    DEFAULT_DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS, DEFAULT_DATABASE_POOL_MAX,
+    DEFAULT_DATABASE_STARTUP_RETRY_LIMIT, DEFAULT_DATABASE_STATEMENT_TIMEOUT_MS,
+    DEFAULT_DISCOVERY_ENDPOINT_LIMIT, DEFAULT_DISCOVERY_PROJECTOR_BATCH,
+    DEFAULT_DISCOVERY_PROJECTOR_LEASE_TTL_MS, DEFAULT_DISCOVERY_PROJECTOR_POLL_MS,
+    DEFAULT_READINESS_PROBE_CACHE_MS, DEFAULT_TOOL_LEASE_TTL_MS, DEPLOYMENT_ID,
+    DISCOVERY_ENDPOINT_LIMIT, DISCOVERY_PROJECTOR_BATCH, DISCOVERY_PROJECTOR_LEASE_TTL_MS,
+    DISCOVERY_PROJECTOR_POLL_MS, DISCOVERY_SQLITE_PATH,
     MAX_DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS, MAX_DATABASE_POOL_MAX,
     MAX_DATABASE_STARTUP_RETRY_LIMIT, MAX_DISCOVERY_PROJECTOR_BATCH, MAX_READINESS_PROBE_CACHE_MS,
     MIN_CLUSTER_HEARTBEAT_MS, MIN_CLUSTER_MAINTENANCE_INTERVAL_MS,
@@ -716,9 +719,6 @@ pub(super) struct StateBackendInputs {
     database_startup_retry_limit: RawInput,
     database_auto_migrate: RawInput,
     database_migration_statement_timeout_ms: RawInput,
-    /// Read last, as the legacy parser read them: authority-event delivery
-    /// is cluster mode's, and its rules are checked against the backend.
-    authority_events: AuthorityEventInputs,
 }
 
 impl StateBackendInputs {
@@ -766,7 +766,6 @@ impl StateBackendInputs {
                 DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS,
                 get_var(DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS),
             ),
-            authority_events: AuthorityEventInputs::read(&mut get_var),
         }
     }
 
@@ -789,10 +788,14 @@ impl StateBackendInputs {
         ]
         .into_iter()
         .map(RawInput::provenance)
-        .chain(self.authority_events.provenance())
         .collect()
     }
 }
+
+/// The last input the storage blocks read. Every rule that pairs a store or
+/// a cluster-only setting with the state backend is reported after it, which
+/// is where the legacy parser reported it: once every input was read.
+const LAST_STORAGE_INPUT: &str = AUTHORITY_EVENT_RETENTION_HOURS;
 
 /// The storage blocks read before the state backend.
 pub(super) struct StorageBlocks {
@@ -885,8 +888,10 @@ pub(crate) struct StoragePlan {
     pub(crate) state_backend: StateBackend,
     pub(crate) deployment_id: Option<String>,
     pub(crate) database: DatabasePlan,
+    /// Authority-event delivery (issue #425, PR 3). The pseudonym key aliases
+    /// name secrets and are never the secrets themselves.
     pub(crate) authority_events: AuthorityEventSettings,
-    /// Where each of the five blocks' inputs came from, in the order they are
+    /// Where each of the six blocks' inputs came from, in the order they are
     /// read.
     #[allow(dead_code)] // Read by the stage tests until startup consumes the plan (#433 PR 3).
     pub(crate) provenance: Vec<Provenance>,
@@ -899,8 +904,9 @@ struct ParsedStateBackend {
     database: DatabasePlan,
 }
 
-/// Parses the state backend block, then checks the rules between the backend
-/// and everything that depends on it, and builds the plan.
+/// Parses the state backend block, then the authority-event block and its
+/// rules, then checks the rules between the backend and everything that
+/// depends on it, and builds the plan.
 ///
 /// Everything is validated in both modes, but nothing activates outside
 /// `STATE_BACKEND=postgres`: standalone mode must remain byte-for-byte
@@ -909,6 +915,7 @@ struct ParsedStateBackend {
 /// every problem in one pass.
 pub(super) fn compile(
     inputs: StateBackendInputs,
+    authority_event_inputs: AuthorityEventInputs,
     blocks: StorageBlocks,
     identity: &IdentityPlan,
     connections: &ConnectionsPlan,
@@ -916,11 +923,6 @@ pub(super) fn compile(
 ) -> Checked<StoragePlan> {
     let mut findings = Findings::default();
     let parsed = parse_state_backend(&inputs, &mut findings);
-    let authority_events = authority_events::compile(
-        &inputs.authority_events,
-        parsed.state_backend,
-        &mut findings,
-    );
     let StorageBlocks {
         audit,
         discovery,
@@ -928,10 +930,14 @@ pub(super) fn compile(
         cluster,
     } = blocks;
     let backend = parsed.state_backend;
+    // The authority-event block's own refusals and rules come first: the
+    // legacy parser checked them as it read the block, before any rule below.
+    let authority_events =
+        authority_events::compile(&authority_event_inputs, backend, &mut findings);
 
-    // Every rule below is reported once the last input, the authority-event
-    // block's, is read, after that block's own checks.
-    let after = AUTHORITY_EVENT_RETENTION_HOURS;
+    // Every rule below is reported once the last input of the last block,
+    // authority-event delivery's, is read, after the authority-event rules.
+    let after = LAST_STORAGE_INPUT;
     if backend == StateBackend::Postgres {
         reject_local_authority_in_postgres_mode(
             parsed.deployment_id.as_deref(),
@@ -1174,6 +1180,7 @@ pub(super) fn compile(
         documents.provenance,
         cluster.provenance,
         inputs.provenance(),
+        authority_event_inputs.provenance(),
     ]
     .concat();
     let ParsedStateBackend {
@@ -1402,7 +1409,7 @@ fn reject_local_authority_in_postgres_mode(
     local_authority_settings: &[(&str, bool)],
     findings: &mut Findings,
 ) {
-    let after = DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS;
+    let after = LAST_STORAGE_INPUT;
     if deployment_id.is_none() {
         findings.refuse(
             after,

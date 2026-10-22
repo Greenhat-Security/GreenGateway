@@ -11,6 +11,7 @@
 use std::{env::VarError, fs, path::Path, time::Duration};
 
 use super::{
+    authority_events::AuthorityEventInputs,
     connections::ConnectionInputs,
     diagnostic::{ConfigDiagnosticCode, ConfigRule, Report},
     egress::EgressInputs,
@@ -204,6 +205,12 @@ fn blocks() -> Vec<(Domain, Vec<String>)> {
                 StateBackendInputs::read(get);
             }),
         ),
+        (
+            Domain::Storage,
+            recorded(|get| {
+                AuthorityEventInputs::read(get);
+            }),
+        ),
     ]
 }
 
@@ -315,6 +322,23 @@ fn from_env_vars_builds_the_compiled_plan_and_reports_its_problems() {
             ("DATABASE_TLS_CA_FILE", "/run/tls/database-ca.pem"),
         ])
         .collect();
+    let postgres_authority_events: Vec<(&str, &str)> = POSTGRES
+        .into_iter()
+        .chain([
+            ("AUTHORITY_EVENT_SINK", "file"),
+            (
+                "AUTHORITY_EVENT_FILE",
+                "/var/lib/greengateway/authority-events.jsonl",
+            ),
+            ("AUTHORITY_PSEUDONYM_KEY_ALIAS", "pseudonym-2026-10"),
+            (
+                "AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS",
+                "pseudonym-2026-04",
+            ),
+            ("AUTHORITY_EVENT_JOURNAL_CAPACITY", "5000"),
+            ("AUTHORITY_EVENT_RETENTION_HOURS", "24"),
+        ])
+        .collect();
     let fixtures: &[&[(&str, &str)]] = &[
         &[],
         &[
@@ -373,6 +397,7 @@ fn from_env_vars_builds_the_compiled_plan_and_reports_its_problems() {
         ],
         &POSTGRES,
         &postgres_session,
+        &postgres_authority_events,
         // Refused, with problems from every domain.
         &[
             ("LISTEN_ADDR", "127.0.0.1:9090"),
@@ -408,6 +433,15 @@ fn from_env_vars_builds_the_compiled_plan_and_reports_its_problems() {
             ),
             ("CONNECTION_LOCAL_SECRET_KEYRING", KEYRING),
             ("DEPLOYMENT_ID", "-not-a-deployment"),
+            ("AUTHORITY_EVENT_SINK", "file"),
+            ("AUTHORITY_PSEUDONYM_KEY_ALIAS", "bad/../key"),
+            ("AUTHORITY_EVENT_RETENTION_HOURS", "87601"),
+        ],
+        // Authority-event delivery material in standalone mode.
+        &[
+            ("AUTHORITY_EVENT_SINK", "log"),
+            ("AUTHORITY_EVENT_JOURNAL_CAPACITY", "0"),
+            ("CLUSTER_HEARTBEAT_MS", "5000"),
         ],
     ];
 
@@ -1153,8 +1187,7 @@ fn rule_fixture(rule: ConfigRule) -> (&'static [(&'static str, &'static str)], &
             &[("PAYLOAD_CAPTURE_ENABLED", "true")],
             "PAYLOAD_CAPTURE_ENABLED",
         ),
-        // A sink with no pseudonym key to key its references under.
-        ConfigRule::AuthorityEventDelivery => (
+        ConfigRule::AuthorityEventSinkRequirements => (
             &[
                 POSTGRES[0],
                 POSTGRES[1],
@@ -1165,10 +1198,37 @@ fn rule_fixture(rule: ConfigRule) -> (&'static [(&'static str, &'static str)], &
             ],
             "AUTHORITY_PSEUDONYM_KEY_ALIAS",
         ),
+        ConfigRule::AuthorityEventMaterialUnused => (
+            &[
+                POSTGRES[0],
+                POSTGRES[1],
+                POSTGRES[2],
+                POSTGRES[3],
+                POSTGRES[4],
+                (
+                    "AUTHORITY_EVENT_FILE",
+                    "/var/lib/greengateway/authority-events.jsonl",
+                ),
+            ],
+            "AUTHORITY_EVENT_FILE",
+        ),
+        ConfigRule::AuthorityPseudonymKeysDistinct => (
+            &[
+                POSTGRES[0],
+                POSTGRES[1],
+                POSTGRES[2],
+                POSTGRES[3],
+                POSTGRES[4],
+                ("AUTHORITY_EVENT_SINK", "log"),
+                ("AUTHORITY_PSEUDONYM_KEY_ALIAS", "pseudonym-a"),
+                ("AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS", "pseudonym-a"),
+            ],
+            "AUTHORITY_PSEUDONYM_KEY_ALIAS",
+        ),
     }
 }
 
-const EVERY_RULE: [ConfigRule; 26] = [
+const EVERY_RULE: [ConfigRule; 28] = [
     ConfigRule::Value,
     ConfigRule::AdminListenerCollision,
     ConfigRule::GrpcListenerCollision,
@@ -1194,7 +1254,9 @@ const EVERY_RULE: [ConfigRule; 26] = [
     ConfigRule::AdminSessionStoreBackend,
     ConfigRule::ClusterSettingInStandaloneMode,
     ConfigRule::PayloadCaptureDestination,
-    ConfigRule::AuthorityEventDelivery,
+    ConfigRule::AuthorityEventSinkRequirements,
+    ConfigRule::AuthorityEventMaterialUnused,
+    ConfigRule::AuthorityPseudonymKeysDistinct,
 ];
 
 /// Every rule is reachable, and a refusal under it is reported as a
