@@ -1,7 +1,7 @@
 {
   "version": 1,
   "issue": 425,
-  "reviewed_revision": "146d5063801270fe23852fb6caa946862fb4390f",
+  "reviewed_revision": "ebb579e6444d437bf477d0617b8841d1eea34cfc",
   "storage_modes": [
     "postgres",
     "standalone"
@@ -114,16 +114,16 @@
           "anchor": "async fn policy_draft_publish_endpoint("
         }
       ],
-      "boundary": "persist_policy_mutation -> PolicyControlPlane::commit -> commit_policy_in / postgres_documents::commit_in; active row lock and expected ETag guard; document/history, shared revision, active pointer and security_outbox commit together. Discovery acceptance invokes commit_policy_in inside its suggestion transaction.",
-      "record": "Immutable policy_documents retain actor, diff/action, document ETag and version. security_outbox retains committed revision/from/to; history is already an atomic record.",
-      "actor": "actor_user_id retained per document; issuer/auth method and an unambiguous operation identity are not captured by the shared commit request.",
-      "identity": "Version + deployment-scoped security revision identify committed authority; diff_summary carries handler action (including rollback). No persisted client operation/idempotency ID.",
+      "boundary": "persist_policy_mutation -> PolicyControlPlane::commit -> commit_policy_in / postgres_documents::commit_in; active row lock and expected ETag guard; document/history, shared revision, active pointer, security_outbox and one document_change_evidence row commit together. Discovery acceptance invokes commit_policy_in inside its suggestion transaction, so its evidence row shares that transaction. An empty or oversized actor, or an action that cannot describe the resource, is refused before anything is written; an evidence insert failure rolls the whole commit (and an acceptance's transition) back.",
+      "record": "Immutable policy_documents retain actor subject, diff/action, document ETag and version; security_outbox retains committed revision/from/to. document_change_evidence (migration 23) has no foreign key and holds one row per committed change: operation code, event/operation UUIDs, actor kind/subject/issuer/auth mode, prior/new version, the outbox row's shared revision and database-clock committed_at. Stale ETag, lost initialize race and refused acceptance write none.",
+      "actor": "The handler names the operation and passes the authenticated principal: subject (1 to 4096 bytes), issuer (1 to 4096 bytes, or none) and auth mode (session_cookie, bearer_token, service_token, client_certificate), the principal bounds. The import's activation is the system actor import-standalone with auth mode system. No keyed safe actor reference yet.",
+      "identity": "Generated event_id and operation_id UUIDs; operation code policy.publish, policy.rollback, policy.rule.create/update/delete/reorder or policy.suggestion.accept (configuration.import for the import); prior/new version and shared security revision equal to the outbox row's; exactly one row per activated version. operation_id is minted per commit, not bound to a client idempotency key; a lost response is reconciled from the version's evidence row.",
       "delivery": "post_commit_telemetry",
       "disposition": [
         "missing_metadata",
         "missing_delivery"
       ],
-      "follow_up": "PR2: add scoped actor and stable operation/event identity at the existing document transaction boundary; preserve suggestion transaction composition. PR3: delivery cursor and retention contract.",
+      "follow_up": "PR2 follow-up: caller-bound operation identity at the commit boundary and keyed safe actor references. Journal document_change_evidence (it is not a migration 21 journal source yet) so the dispatcher delivers it, with the journal's capacity reservation in the same transaction.",
       "sources": [
         {
           "path": "gateway/src/admin_policy.rs",
@@ -131,11 +131,19 @@
         },
         {
           "path": "gateway/src/storage/postgres_documents.rs",
-          "anchor": "INSERT INTO greengateway.security_outbox"
+          "anchor": "INSERT INTO greengateway.document_change_evidence"
+        },
+        {
+          "path": "gateway/src/storage/postgres_documents.rs",
+          "anchor": "fn validate_change("
         },
         {
           "path": "gateway/src/storage/postgres_discovery_lifecycle.rs",
           "anchor": "commit_policy_in"
+        },
+        {
+          "path": "gateway/src/storage/migrations/0023_document_and_catalog_change_evidence.sql",
+          "anchor": "CREATE TABLE greengateway.document_change_evidence ("
         }
       ],
       "tests": [
@@ -148,12 +156,24 @@
           "anchor": "async fn policy_control_plane_concurrent_same_etag_commits_produce_exactly_one_winner("
         },
         {
+          "path": "gateway/src/storage/postgres_documents_tests.rs",
+          "anchor": "async fn committed_document_changes_record_attributed_evidence_and_refusals_record_none("
+        },
+        {
+          "path": "gateway/src/storage/postgres_documents_tests.rs",
+          "anchor": "async fn a_failed_document_evidence_insert_rolls_back_the_whole_commit("
+        },
+        {
+          "path": "gateway/src/storage/postgres_documents_tests.rs",
+          "anchor": "async fn unattributable_or_mislabeled_changes_are_refused_and_principal_bounds_are_recorded("
+        },
+        {
           "path": "gateway/src/storage/contract_tests.rs",
-          "anchor": "async fn policy_control_plane_aborted_commit_writes_nothing("
+          "anchor": "async fn an_accepted_suggestion_records_its_evidence_in_the_acceptance_transaction("
         }
       ],
       "required_durability_supported": false,
-      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+      "test_claim": "PostgreSQL-gated regression anchors for the transactional document evidence. They do not certify the proposed authority-event contract, delivery or retention."
     },
     {
       "id": "policy_standalone",
@@ -323,16 +343,16 @@
           "anchor": "async fn tools_openapi_register_endpoint("
         }
       ],
-      "boundary": "register_tools_via_control_plane -> commit_tools -> shared document transaction with CAS, name reservations, immutable version, pointer, revision and outbox.",
-      "record": "tool_documents retain actor and action/diff with version and ETag; outbox is atomic. A later failed local install does not undo that commit.",
-      "actor": "actor_user_id per immutable version; no issuer/auth method.",
-      "identity": "tools version and security revision, action openapi_tools_registered; no operation ID.",
+      "boundary": "register_tools_via_control_plane -> commit_tools -> shared document transaction with CAS, name reservations, immutable version, pointer, revision, outbox and one document_change_evidence row. The first-boot seed and the import's activation use the same transaction.",
+      "record": "tool_documents retain actor subject and action/diff with version and ETag; the outbox row and the non-cascading document_change_evidence row (migration 23) commit with them. A later failed local install does not undo that commit, and its evidence row keeps describing the committed version. A tool name another lane holds writes none.",
+      "actor": "Authenticated principal kind/subject/issuer/auth mode for registration; the system actors bootstrap (first-boot seed) and import-standalone (import), auth mode system. No keyed safe actor reference yet.",
+      "identity": "Generated event/operation UUIDs, tools.publish (configuration.import for the import), prior/new tools version and the outbox row's shared security revision; operation_id minted per commit, no client-bound operation ID.",
       "delivery": "post_commit_telemetry",
       "disposition": [
         "missing_metadata",
         "missing_delivery"
       ],
-      "follow_up": "PR2: extend shared document contract once for policy/tools; preserve tool-name locks and committed-but-not-locally-installed semantics.",
+      "follow_up": "PR2 follow-up: caller-bound operation identity and keyed safe actor references, shared with policy; preserve tool-name locks and committed-but-not-locally-installed semantics. Journal the rows for dispatch, as for policy.",
       "sources": [
         {
           "path": "gateway/src/admin_tools.rs",
@@ -343,8 +363,12 @@
           "anchor": "async fn commit_tools("
         },
         {
-          "path": "gateway/src/storage/migrations/0005_tools_control_plane.sql",
-          "anchor": "CREATE TABLE greengateway.tool_documents"
+          "path": "gateway/src/storage/postgres_tools.rs",
+          "anchor": "pub(crate) const SEED_ACTOR"
+        },
+        {
+          "path": "gateway/src/storage/postgres_documents.rs",
+          "anchor": "async fn record_document_change("
         }
       ],
       "tests": [
@@ -355,10 +379,18 @@
         {
           "path": "gateway/src/app_tests.rs",
           "anchor": "async fn a_stale_tools_install_never_rolls_the_live_lane_back("
+        },
+        {
+          "path": "gateway/src/storage/postgres_documents_tests.rs",
+          "anchor": "async fn committed_document_changes_record_attributed_evidence_and_refusals_record_none("
+        },
+        {
+          "path": "gateway/src/storage/postgres_documents_tests.rs",
+          "anchor": "async fn a_failed_document_evidence_insert_rolls_back_the_whole_commit("
         }
       ],
       "required_durability_supported": false,
-      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+      "test_claim": "PostgreSQL-gated regression anchors for the transactional document evidence. They do not certify the proposed authority-event contract, delivery or retention."
     },
     {
       "id": "tools_standalone",
@@ -690,16 +722,16 @@
           "anchor": "async fn connection_openapi_overlay_delete_endpoint("
         }
       ],
-      "boundary": "MCP/OpenAPI replacements and overlay updates share Connection-state transaction and revision/CAS checks; entries, reservations, dependencies and outbox commit together. Includes scheduled refresh through store methods.",
-      "record": "Current catalogs/overlay actor fields and catalog-specific outbox revisions; replacing catalogs deletes old rows and deleting Connection cascades them.",
-      "actor": "Actor supplied to catalog writers; replaced/deleted current rows do not retain historical actor linkage.",
-      "identity": "Connection ID, catalog revision (distinct from specification revision), shared revision; no operation ID.",
+      "boundary": "MCP/OpenAPI replacements and overlay updates share the Connection-state transaction and revision/CAS checks; entries, reservations, dependencies, outbox and one catalog_change_evidence row commit together. Registration, refresh and overlay put/delete all reach the OpenAPI replacement. An empty or oversized actor is refused before the transaction opens; an evidence insert failure rolls the publication back.",
+      "record": "Current catalog/overlay rows keep their actor and are still replaced or cascaded. catalog_change_evidence (migration 23) has no foreign key and keeps one row per publication: action, event/operation UUIDs, actor subject, Connection ID, prior/new catalog revision, the overlay revision the catalog was compiled from, the outbox row's shared revision and committed_at. A stale catalog or overlay revision, a conflict or a limit writes none.",
+      "actor": "actor_user_id (the authenticated principal subject, 1 to 4096 bytes, the principal bound) survives replacement and Connection deletion. Every catalog writer is an admin endpoint. Issuer, auth mode and a keyed safe actor reference are still absent, as for Connection deletion.",
+      "identity": "Generated event/operation UUIDs; catalog.mcp.publish, catalog.openapi.publish, catalog.overlay.replace or catalog.overlay.delete, derived from the write; the catalog revision transition of the connection_catalog outbox row (its 0 stored as NULL), overlay revision and shared revision. Catalog revisions restart when a Connection re-enters a managed kind, so evidence is ordered by security revision. No client-bound operation ID.",
       "delivery": "post_commit_telemetry",
       "disposition": [
         "missing_metadata",
         "missing_delivery"
       ],
-      "follow_up": "PR2: preserve actor/action/revision evidence before replacement/cascade, including system refresh attribution; keep catalog outbox resource_type and version axis unchanged.",
+      "follow_up": "PR2 follow-up: carry issuer/auth mode and a caller-bound operation identity to the Connection store's catalog writers; a scheduled refresh, if one is added, needs a system actor this table cannot express yet. Catalogs removed by a Connection kind change are connection.replace evidence. Journal catalog_change_evidence (not a migration 21 journal source yet) so the dispatcher delivers it.",
       "sources": [
         {
           "path": "gateway/src/connections/pg_store.rs",
@@ -712,6 +744,14 @@
         {
           "path": "gateway/src/connections/pg_store.rs",
           "anchor": "async fn write_openapi_overlay("
+        },
+        {
+          "path": "gateway/src/connections/pg_store.rs",
+          "anchor": "async fn record_catalog_change_evidence("
+        },
+        {
+          "path": "gateway/src/storage/migrations/0023_document_and_catalog_change_evidence.sql",
+          "anchor": "CREATE TABLE greengateway.catalog_change_evidence ("
         }
       ],
       "tests": [
@@ -722,10 +762,22 @@
         {
           "path": "gateway/src/connections/pg_store_tests.rs",
           "anchor": "async fn openapi_overlay_catalog_cas_prune_and_restart_are_atomic("
+        },
+        {
+          "path": "gateway/src/connections/pg_store_tests.rs",
+          "anchor": "async fn catalog_evidence_survives_replacement_cascade_and_restart("
+        },
+        {
+          "path": "gateway/src/connections/pg_store_tests.rs",
+          "anchor": "async fn openapi_publication_evidence_names_the_overlay_change("
+        },
+        {
+          "path": "gateway/src/connections/pg_store_tests.rs",
+          "anchor": "async fn a_failed_catalog_evidence_insert_rolls_back_the_publication("
         }
       ],
       "required_durability_supported": false,
-      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+      "test_claim": "PostgreSQL-gated regression anchors for the transactional catalog evidence. They do not certify the proposed authority-event contract, delivery or retention."
     },
     {
       "id": "catalog_standalone",
@@ -1626,8 +1678,8 @@
       ],
       "entrypoints": [],
       "boundary": "import-standalone apply is offline and commits each section separately. Policy/tools activation reuse document transactions; Connection/token imports preserve state and intentionally do not replay old outbox entries.",
-      "record": "Imported durable state and policy/tools activation records; JSON stdout report carries section counts/checksums. The entire import/report has no single transaction or immutable operator-operation ledger.",
-      "actor": "IMPORT_ACTOR marks migration provenance; historic actors retained for imported policy history. It is not authenticated human attribution.",
+      "record": "Imported durable state and policy/tools activation records; each activation also writes one configuration.import document_change_evidence row (migration 23), which the import's validation counts. JSON stdout report carries section counts/checksums. The entire import/report has no single transaction or immutable operator-operation ledger.",
+      "actor": "IMPORT_ACTOR marks migration provenance, recorded as a system actor (auth mode system) on the activation evidence; historic actors retained for imported policy history. It is not authenticated human attribution.",
       "identity": "Natural-key idempotence per section and canonical checksums support resume; report has no persisted whole-import operation ID.",
       "delivery": "operator_output",
       "disposition": [

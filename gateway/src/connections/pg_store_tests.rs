@@ -1964,7 +1964,7 @@ async fn policy_and_overlay_name_adoption_serialize_in_commit_order_across_repli
         PolicyCommitRequest {
             precondition: PolicyCommitPrecondition::Initialize,
             candidate: &initial_policy,
-            actor_user_id: "installer",
+            change: crate::storage::DocumentChange::test_policy("installer"),
             diff_summary: &initial_diff,
         },
     )
@@ -1998,7 +1998,7 @@ async fn policy_and_overlay_name_adoption_serialize_in_commit_order_across_repli
                 PolicyCommitRequest {
                     precondition: PolicyCommitPrecondition::Expected { etag: expected },
                     candidate: &candidate,
-                    actor_user_id: "policy-replica",
+                    change: crate::storage::DocumentChange::test_policy("policy-replica"),
                     diff_summary: &diff,
                 },
             )
@@ -2127,7 +2127,7 @@ async fn policy_and_overlay_name_adoption_serialize_in_commit_order_across_repli
                 PolicyCommitRequest {
                     precondition: PolicyCommitPrecondition::Expected { etag: expected },
                     candidate: &candidate,
-                    actor_user_id: "policy-replica",
+                    change: crate::storage::DocumentChange::test_policy("policy-replica"),
                     diff_summary: &diff,
                 },
             )
@@ -2591,7 +2591,7 @@ async fn tool_names_are_reserved_across_lanes_at_the_authority() {
                 etag: active.etag.clone(),
             },
             &local_tools_document(&["shared_tool"]),
-            "op-3",
+            crate::storage::DocumentChange::test_tools("op-3"),
             &json!({"action": "test"}),
         )
         .await
@@ -2663,7 +2663,7 @@ async fn tool_names_are_reserved_across_lanes_at_the_authority() {
                 etag: unchanged.etag.clone(),
             },
             &local_tools_document(&["shared_tool"]),
-            "op-7",
+            crate::storage::DocumentChange::test_tools("op-7"),
             &json!({"action": "test"}),
         )
         .await
@@ -2735,7 +2735,7 @@ async fn concurrent_cross_lane_publishes_of_one_tool_name_produce_exactly_one_wi
                 etag: seeded.etag.clone(),
             },
             &local_tools_document(&["warmup_tool"]),
-            "op-w",
+            crate::storage::DocumentChange::test_tools("op-w"),
             &json!({"action": "warmup"}),
         )
         .await
@@ -2757,7 +2757,7 @@ async fn concurrent_cross_lane_publishes_of_one_tool_name_produce_exactly_one_wi
                     .commit_tools(
                         PolicyCommitPrecondition::Expected { etag },
                         &local_tools_document(&[name.as_str()]),
-                        "op-l",
+                        crate::storage::DocumentChange::test_tools("op-l"),
                         &json!({"action": "race"}),
                     )
                     .await
@@ -4044,4 +4044,507 @@ async fn concurrent_writes_cannot_both_bind_one_alias_under_two_purposes() {
         .await,
         1
     );
+}
+
+// ==== Catalog change evidence (issue #425, PR 2c; migration 23) ====
+
+/// One `catalog_change_evidence` row, every column, UUIDs and the timestamp
+/// read as text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CatalogEvidenceRow {
+    event_id: String,
+    operation_id: String,
+    actor_user_id: String,
+    action: String,
+    connection_id: String,
+    prior_version: Option<i64>,
+    new_version: i64,
+    overlay_revision: Option<i64>,
+    security_revision: i64,
+    committed_at: String,
+}
+
+/// The whole catalog evidence table in commit order.
+async fn catalog_evidence_rows(pool: &deadpool_postgres::Pool) -> Vec<CatalogEvidenceRow> {
+    pool.get()
+        .await
+        .expect("catalog evidence checkout")
+        .query(
+            r#"
+            SELECT event_id::text, operation_id::text, actor_user_id, action,
+                   connection_id::text, prior_version, new_version, overlay_revision,
+                   security_revision, committed_at::text
+            FROM greengateway.catalog_change_evidence
+            ORDER BY security_revision
+            "#,
+            &[],
+        )
+        .await
+        .expect("catalog evidence rows should read")
+        .iter()
+        .map(|row| CatalogEvidenceRow {
+            event_id: row.get(0),
+            operation_id: row.get(1),
+            actor_user_id: row.get(2),
+            action: row.get(3),
+            connection_id: row.get(4),
+            prior_version: row.get(5),
+            new_version: row.get(6),
+            overlay_revision: row.get(7),
+            security_revision: row.get(8),
+            committed_at: row.get(9),
+        })
+        .collect()
+}
+
+/// One Connection's catalog outbox rows as `(revision, from, to)`.
+async fn catalog_outbox(pool: &deadpool_postgres::Pool, id: &ConnectionId) -> Vec<(i64, i64, i64)> {
+    pool.get()
+        .await
+        .expect("catalog outbox checkout")
+        .query(
+            "SELECT revision, from_version, to_version FROM greengateway.security_outbox \
+             WHERE resource_type = 'connection_catalog' AND resource_id = $1 \
+             ORDER BY revision",
+            &[&id.as_str()],
+        )
+        .await
+        .expect("catalog outbox rows should read")
+        .iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .collect()
+}
+
+/// Each row describes the outbox row of the same change: the same shared
+/// revision and the same catalog revision transition (`0` in the outbox is
+/// NULL in the evidence).
+fn assert_evidence_matches_outbox(rows: &[CatalogEvidenceRow], outbox: &[(i64, i64, i64)]) {
+    assert_eq!(rows.len(), outbox.len(), "{rows:#?} {outbox:#?}");
+    for (row, (revision, from, to)) in rows.iter().zip(outbox) {
+        assert_eq!(row.security_revision, *revision, "{row:?}");
+        assert_eq!(row.prior_version.unwrap_or(0), *from, "{row:?}");
+        assert_eq!(row.new_version, *to, "{row:?}");
+        assert!(
+            uuid::Uuid::parse_str(&row.event_id).is_ok_and(|id| id.get_version_num() == 4),
+            "{row:?}"
+        );
+        assert!(
+            uuid::Uuid::parse_str(&row.operation_id).is_ok_and(|id| id.get_version_num() == 4),
+            "{row:?}"
+        );
+        assert_ne!(row.event_id, row.operation_id);
+        assert!(!row.committed_at.is_empty());
+    }
+}
+
+/// Who published an MCP catalog outlives the catalog row that named them:
+/// the next replacement deletes that row and the Connection's deletion
+/// cascades the rest, but each publication's evidence row -- actor, action,
+/// event and operation identity, the catalog revision transition and the
+/// outbox row's shared revision -- has no foreign key and is still there
+/// after both, and after a restart. A refused publication (a stale catalog
+/// revision, an unattributable actor) writes none.
+#[tokio::test]
+async fn catalog_evidence_survives_replacement_cascade_and_restart() {
+    let Some(admin_dsn) = locator() else {
+        eprintln!("skipping: no test database locator; CI runs this test");
+        return;
+    };
+    let database = create_test_database(&admin_dsn).await;
+    let (store, pool) = migrated_store(&database.dsn, 64).await;
+    let created = store
+        .create(mcp_candidate(), "creator", None)
+        .await
+        .expect("MCP connection should create");
+    store
+        .replace_mcp_catalog(
+            &created.id,
+            &created.etag(),
+            &[mcp_entry("alpha")],
+            &[mcp_resource("file:///evidence")],
+            &[],
+            0,
+            "publisher-a",
+        )
+        .await
+        .expect("the first catalog publishes");
+
+    let stale = store
+        .replace_mcp_catalog(
+            &created.id,
+            &created.etag(),
+            &[mcp_entry("stale")],
+            &[],
+            &[],
+            0,
+            "stale-publisher",
+        )
+        .await
+        .expect_err("a stale catalog revision is refused");
+    assert!(
+        matches!(stale, ConnectionStoreError::Conflict { .. }),
+        "{stale}"
+    );
+    let unattributed = store
+        .replace_mcp_catalog(&created.id, &created.etag(), &[], &[], &[], 1, "")
+        .await
+        .expect_err("an unattributable publication is refused");
+    assert!(
+        matches!(unattributed, ConnectionStoreError::Validation { .. }),
+        "{unattributed}"
+    );
+    let oversized_actor = "a".repeat(EVIDENCE_ACTOR_MAX_BYTES + 1);
+    assert!(matches!(
+        store
+            .replace_mcp_catalog(
+                &created.id,
+                &created.etag(),
+                &[],
+                &[],
+                &[],
+                1,
+                &oversized_actor
+            )
+            .await,
+        Err(ConnectionStoreError::Validation { .. })
+    ));
+    assert_eq!(catalog_evidence_rows(&pool).await.len(), 1);
+
+    // The second publication empties the catalog, which also releases the
+    // managed-tool dependency the delete would otherwise refuse on.
+    store
+        .replace_mcp_catalog(
+            &created.id,
+            &created.etag(),
+            &[],
+            &[],
+            &[],
+            1,
+            "publisher-b",
+        )
+        .await
+        .expect("the second catalog publishes");
+    let outbox_before_delete = catalog_outbox(&pool, &created.id).await;
+    store
+        .delete(&created.id, &created.etag(), "deleter")
+        .await
+        .expect("the Connection deletes");
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT COUNT(*) FROM greengateway.connection_mcp_catalogs"
+        )
+        .await,
+        0,
+        "the catalog row cascaded with the Connection"
+    );
+    drop(store);
+    drop(pool);
+
+    // A fresh process sees what the first one committed.
+    let (_restarted, pool) = migrated_store(&database.dsn, 64).await;
+    let rows = catalog_evidence_rows(&pool).await;
+    assert_eq!(
+        rows.iter()
+            .map(|row| (
+                row.action.as_str(),
+                row.actor_user_id.as_str(),
+                row.connection_id.as_str(),
+                row.prior_version,
+                row.new_version,
+                row.overlay_revision,
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "catalog.mcp.publish",
+                "publisher-a",
+                created.id.as_str(),
+                None,
+                1,
+                None
+            ),
+            (
+                "catalog.mcp.publish",
+                "publisher-b",
+                created.id.as_str(),
+                Some(1),
+                2,
+                None
+            ),
+        ]
+    );
+    assert_evidence_matches_outbox(&rows, &outbox_before_delete);
+    assert_ne!(rows[0].operation_id, rows[1].operation_id);
+
+    // Identifiers, revisions and the actor only.
+    let rendered = format!("{rows:?}");
+    for marker in [
+        "alpha",
+        "file:///evidence",
+        "mcp.example.test",
+        "description",
+    ] {
+        assert!(!rendered.contains(marker), "{marker}");
+    }
+}
+
+/// Every OpenAPI publication goes through one replacement, and its evidence
+/// names what the write did to the overlay: a put is
+/// `catalog.overlay.replace`, a delete `catalog.overlay.delete` (overlay
+/// revision 0), and a publication that leaves the overlay alone is
+/// `catalog.openapi.publish` with the overlay revision it was compiled
+/// from. A stale overlay or catalog precondition writes nothing.
+#[tokio::test]
+async fn openapi_publication_evidence_names_the_overlay_change() {
+    let Some(admin_dsn) = locator() else {
+        eprintln!("skipping: no test database locator; CI runs this test");
+        return;
+    };
+    let database = create_test_database(&admin_dsn).await;
+    let (store, pool) = migrated_store(&database.dsn, 64).await;
+    let api = store
+        .create(http_candidate("Evidence API"), "creator", None)
+        .await
+        .expect("connection should create");
+    let digest = reservation_spec_digest();
+    let overlay_put = StoredOverlayWrite::Put {
+        schema_version: "0.1.0".to_owned(),
+        overlay_json: r#"{"schema_version":"0.1.0","tools":{}}"#.to_owned(),
+        source_reports_json: r#"{"schema_version":"0.1.0","sources":[]}"#.to_owned(),
+        expected_overlay_revision: 0,
+    };
+    let first = store
+        .replace_openapi_catalog_with_overlay(
+            &api.id,
+            &api.etag(),
+            0,
+            0,
+            RESERVATION_SPEC,
+            &digest,
+            &[openapi_entry("evidence_listing")],
+            Some(&overlay_put),
+            1,
+            "overlay-admin",
+            &[],
+        )
+        .await
+        .expect("the overlay publishes with its catalog");
+    assert_eq!((first.catalog_revision, first.overlay_revision), (1, 1));
+
+    // The same put again is stale against overlay revision 1.
+    assert!(matches!(
+        store
+            .replace_openapi_catalog_with_overlay(
+                &api.id,
+                &api.etag(),
+                first.spec_revision,
+                first.catalog_revision,
+                RESERVATION_SPEC,
+                &digest,
+                &[openapi_entry("evidence_listing")],
+                Some(&overlay_put),
+                1,
+                "stale-admin",
+                &[],
+            )
+            .await,
+        Err(ConnectionStoreError::OverlayConflict { .. })
+    ));
+
+    let refreshed = store
+        .replace_openapi_catalog_with_overlay(
+            &api.id,
+            &api.etag(),
+            first.spec_revision,
+            first.catalog_revision,
+            RESERVATION_SPEC,
+            &digest,
+            &[openapi_entry("evidence_listing")],
+            None,
+            first.overlay_revision,
+            "refresher",
+            &[],
+        )
+        .await
+        .expect("a refresh keeps the overlay");
+    assert_eq!(
+        (refreshed.catalog_revision, refreshed.overlay_revision),
+        (2, 1)
+    );
+    // A stale catalog revision is refused too.
+    assert!(store
+        .replace_openapi_catalog_with_overlay(
+            &api.id,
+            &api.etag(),
+            first.spec_revision,
+            first.catalog_revision,
+            RESERVATION_SPEC,
+            &digest,
+            &[],
+            None,
+            1,
+            "stale-refresher",
+            &[],
+        )
+        .await
+        .is_err());
+
+    let removed = store
+        .replace_openapi_catalog_with_overlay(
+            &api.id,
+            &api.etag(),
+            refreshed.spec_revision,
+            refreshed.catalog_revision,
+            RESERVATION_SPEC,
+            &digest,
+            &[openapi_entry("evidence_listing")],
+            Some(&StoredOverlayWrite::Delete {
+                expected_overlay_revision: 1,
+            }),
+            0,
+            "overlay-remover",
+            &[],
+        )
+        .await
+        .expect("the overlay deletes with a recompiled catalog");
+    assert_eq!((removed.catalog_revision, removed.overlay_revision), (3, 0));
+
+    let rows = catalog_evidence_rows(&pool).await;
+    assert_eq!(
+        rows.iter()
+            .map(|row| (
+                row.action.as_str(),
+                row.actor_user_id.as_str(),
+                row.prior_version,
+                row.new_version,
+                row.overlay_revision,
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            ("catalog.overlay.replace", "overlay-admin", None, 1, Some(1)),
+            ("catalog.openapi.publish", "refresher", Some(1), 2, Some(1)),
+            (
+                "catalog.overlay.delete",
+                "overlay-remover",
+                Some(2),
+                3,
+                Some(0)
+            ),
+        ]
+    );
+    assert!(rows.iter().all(|row| row.connection_id == api.id.as_str()));
+    assert_evidence_matches_outbox(&rows, &catalog_outbox(&pool, &api.id).await);
+    let rendered = format!("{rows:?}");
+    for marker in [
+        "evidence_listing",
+        "listInvoices",
+        "3.1.0",
+        "billing.example.test",
+    ] {
+        assert!(!rendered.contains(marker), "{marker}");
+    }
+}
+
+/// A publication whose evidence cannot be written does not commit: the
+/// catalog, its dependencies and tool-name reservations, the shared
+/// revision and the outbox row roll back with the failed insert, and the
+/// caller sees a store failure rather than a conflict.
+#[tokio::test]
+async fn a_failed_catalog_evidence_insert_rolls_back_the_publication() {
+    let Some(admin_dsn) = locator() else {
+        eprintln!("skipping: no test database locator; CI runs this test");
+        return;
+    };
+    let database = create_test_database(&admin_dsn).await;
+    let (store, pool) = migrated_store(&database.dsn, 64).await;
+    let created = store
+        .create(mcp_candidate(), "creator", None)
+        .await
+        .expect("MCP connection should create");
+    let revision_before = security_revision(&pool).await;
+    let outbox_before = count(&pool, "SELECT COUNT(*) FROM greengateway.security_outbox").await;
+
+    pool.get()
+        .await
+        .expect("failure trigger checkout")
+        .batch_execute(
+            r#"
+                CREATE FUNCTION greengateway.fail_catalog_change_evidence()
+                RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN
+                    RAISE EXCEPTION 'injected evidence failure';
+                END;
+                $$;
+                CREATE TRIGGER fail_catalog_change_evidence
+                BEFORE INSERT ON greengateway.catalog_change_evidence
+                FOR EACH ROW EXECUTE FUNCTION greengateway.fail_catalog_change_evidence();
+                "#,
+        )
+        .await
+        .expect("failure trigger should install");
+    let failed = store
+        .replace_mcp_catalog(
+            &created.id,
+            &created.etag(),
+            &[mcp_entry("alpha")],
+            &[],
+            &[],
+            0,
+            "faulted-publisher",
+        )
+        .await
+        .expect_err("a publication whose evidence cannot commit must fail");
+    assert!(
+        matches!(failed, ConnectionStoreError::Postgres { .. }),
+        "{failed}"
+    );
+    pool.get()
+        .await
+        .expect("failure trigger cleanup checkout")
+        .batch_execute(
+            r#"
+                DROP TRIGGER fail_catalog_change_evidence
+                    ON greengateway.catalog_change_evidence;
+                DROP FUNCTION greengateway.fail_catalog_change_evidence();
+                "#,
+        )
+        .await
+        .expect("failure trigger should drop");
+
+    assert_eq!(store.mcp_catalog(&created.id).await.expect("read"), None);
+    assert!(store
+        .dependencies(&created.id)
+        .await
+        .expect("dependencies")
+        .is_empty());
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT COUNT(*) FROM greengateway.tool_name_reservations"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        count(&pool, "SELECT COUNT(*) FROM greengateway.security_outbox").await,
+        outbox_before
+    );
+    assert_eq!(security_revision(&pool).await, revision_before);
+    assert!(catalog_evidence_rows(&pool).await.is_empty());
+
+    // With the fault gone the same publication commits and records itself.
+    store
+        .replace_mcp_catalog(
+            &created.id,
+            &created.etag(),
+            &[mcp_entry("alpha")],
+            &[],
+            &[],
+            0,
+            "faulted-publisher",
+        )
+        .await
+        .expect("the publication commits once evidence can be written");
+    assert_eq!(catalog_evidence_rows(&pool).await.len(), 1);
 }
