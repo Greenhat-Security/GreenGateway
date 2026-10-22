@@ -27,13 +27,10 @@ use crate::{
     metrics::LOCK_POISON_RECOVERIES_TOTAL,
     policy_eval::{
         analysis::{recorded_dispatch, DirectRuleOutcome},
-        CompiledPolicy, HostFact, LogicalDecision, PolicyEvaluationContext, PrincipalFact,
-        PrincipalIdentity, RuleReference, CONTEXT_VERSION,
+        CompiledPolicy, EvaluationError, HostFact, LogicalDecision, PolicyEvaluationContext,
+        PrincipalFact, PrincipalIdentity, RuleReference, CONTEXT_VERSION,
     },
-    rbac::{
-        Policy, PrincipalMatcher, Rule, RuleAction, RuleDispatchKind, RuleDispatchMatcher,
-        RuleMatcher,
-    },
+    rbac::{Policy, PrincipalMatcher, Rule, RuleAction, RuleDispatchKind, RuleDispatchMatcher},
     storage::{RepositoryError, RepositoryErrorKind},
 };
 
@@ -486,8 +483,7 @@ pub(crate) const AUDIT_POSTGRES_EVIDENCE_SOURCE: &str = "audit_postgres";
 /// logic of its own, so the suggestion set for a given fixture is the same
 /// on both.
 pub(crate) struct SuggestionPlanner<'a> {
-    policy: &'a Policy,
-    /// The same policy for the shared evaluator, compiled once per run, which
+    /// The policy for the shared evaluator, compiled once per run, which
     /// judges whether the policy already covers a candidate (#422 PR 4).
     compiled: CompiledPolicy,
     config: RuleSuggestionConfig,
@@ -503,7 +499,6 @@ impl<'a> SuggestionPlanner<'a> {
         observed_endpoints: &'a [ObservedEndpoint],
     ) -> Self {
         Self {
-            policy,
             compiled: CompiledPolicy::for_analysis(policy.clone()),
             config,
             configured_proxy_routes,
@@ -553,7 +548,6 @@ impl<'a> SuggestionPlanner<'a> {
                 principal_ids: Vec::new(),
             };
             let coverage = policy_coverage(
-                self.policy,
                 &self.compiled,
                 &observation.method,
                 &observation.endpoint_template,
@@ -696,7 +690,6 @@ impl<'a> SuggestionPlanner<'a> {
             // contextless traffic, a dispatch it never had.
             let (route_id, upstream_origin) = coverage_dispatch_for_binding(&dispatch);
             match policy_coverage(
-                self.policy,
                 &self.compiled,
                 &target.method,
                 &target.path_pattern,
@@ -1696,10 +1689,13 @@ struct CoverageDispatch<'a> {
 ///   it.
 ///
 /// A tool-name candidate off a host-routed dispatch is judged by the tool
-/// rules alone, as before; see the parity inventory for why that check is not
-/// the tool lane's admission.
+/// rules alone, as before: the first tool-name rule whose predicates accept
+/// the representative principal covers when its action is a covering one
+/// ([`CompiledPolicy::match_tool_rules`]). That is not the tool lane's
+/// admission, which judges the entry, its enablement and its identity
+/// constraints before any tool rule; coverage asks only whether a rule
+/// already decides the call.
 fn policy_coverage(
-    policy: &Policy,
     compiled: &CompiledPolicy,
     method: &str,
     path_pattern: &str,
@@ -1717,16 +1713,16 @@ fn policy_coverage(
     {
         return PolicyCoverage::NotCovered;
     }
+    let principal = representative_principal_for_matcher(principal)
+        .map_or(PrincipalFact::Anonymous, |principal| {
+            PrincipalFact::Authenticated(PrincipalIdentity::from_principal(&principal))
+        });
     if !host_routed {
         if let Some(tool_name) = tool_name_from_mcp_endpoint(method, path_pattern) {
-            // Not migrated: the tool lane's operations judge admission (entry,
-            // enablement, identity) before any tool rule, and this asks only
-            // whether a tool rule already covers the call.
-            let principal = representative_principal_for_matcher(principal);
-            return covered_if(
-                RuleMatcher::new(&policy.rules)
-                    .evaluate_tool(tool_name, principal.as_ref())
-                    .is_some_and(|decision| covering_actions.contains(&decision.action)),
+            return covered_by_matched_rule(
+                compiled,
+                compiled.match_tool_rules(tool_name, &principal),
+                covering_actions,
             );
         }
     }
@@ -1747,10 +1743,7 @@ fn policy_coverage(
         snapshot: compiled.snapshot(),
         method: Some(method),
         path: Some(representative_path_from_endpoint_template(path_pattern)),
-        principal: representative_principal_for_matcher(principal)
-            .map_or(PrincipalFact::Anonymous, |principal| {
-                PrincipalFact::Authenticated(PrincipalIdentity::from_principal(&principal))
-            }),
+        principal,
         target,
         // A representative request carries no Host; a host-routed dispatch
         // supplies the bound host through its facts.
@@ -1768,7 +1761,21 @@ fn policy_coverage(
         };
     }
 
-    match compiled.match_direct_rules(&context) {
+    covered_by_matched_rule(
+        compiled,
+        compiled.match_direct_rules(&context),
+        covering_actions,
+    )
+}
+
+/// A candidate is covered when the first rule whose predicates match it has a
+/// covering action. A rule index is resolved on the instance that matched it.
+fn covered_by_matched_rule(
+    compiled: &CompiledPolicy,
+    outcome: Result<DirectRuleOutcome, EvaluationError>,
+    covering_actions: &[RuleAction],
+) -> PolicyCoverage {
+    match outcome {
         Ok(DirectRuleOutcome::Matched { index }) => covered_if(
             compiled
                 .direct_rules()

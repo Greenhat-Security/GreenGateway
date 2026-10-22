@@ -347,3 +347,99 @@ fn an_analysis_snapshot_binds_the_policy_digest_and_claims_no_revision() {
     let second = CompiledPolicy::for_candidate_rule(rule(json!({"path": "/b", "action": "deny"})));
     assert_ne!(first.snapshot(), second.snapshot());
 }
+
+fn authenticated(principal: Principal) -> PrincipalFact {
+    PrincipalFact::Authenticated(PrincipalIdentity::from_principal(&principal))
+}
+
+#[test]
+fn tool_rule_matching_is_the_first_enabled_tool_rule_its_principal_accepts() {
+    let compiled = CompiledPolicy::for_analysis(policy(json!({
+        "schema_version": "0.1.0",
+        // No entry for the tool: admission is not what this asks.
+        "rules": [
+            {"path": "/mcp/tools/reports.export", "action": "deny"},
+            {"tool_name": "reports.export", "enabled": false, "action": "deny"},
+            {"tool_name": "reports.import", "action": "deny"},
+            {"tool_name": "reports.export", "principal": {"roles": ["admin"]}, "action": "deny"},
+            {"tool_name": "reports.export", "principal": {"roles": ["reader"]}, "action": "shadow"},
+            {"tool_name": "reports.export", "action": "allow"}
+        ]
+    })));
+    let matched = |principal: PrincipalFact| {
+        compiled
+            .match_tool_rules("reports.export", &principal)
+            .unwrap()
+    };
+    assert_eq!(
+        matched(authenticated(principal(&["admin"]))),
+        DirectRuleOutcome::Matched { index: 3 }
+    );
+    assert_eq!(
+        matched(authenticated(principal(&["reader"]))),
+        DirectRuleOutcome::Matched { index: 4 }
+    );
+    assert_eq!(
+        matched(PrincipalFact::Anonymous),
+        DirectRuleOutcome::Matched { index: 5 }
+    );
+    assert_eq!(
+        compiled
+            .match_tool_rules("reports.unknown", &PrincipalFact::Anonymous)
+            .unwrap(),
+        DirectRuleOutcome::NoMatch
+    );
+    // An enabled tool rule reads the principal, so a missing one is unanswerable.
+    assert_eq!(
+        matched(PrincipalFact::Missing),
+        DirectRuleOutcome::Indeterminate(Limitation::MissingPrincipalFact)
+    );
+}
+
+#[test]
+fn a_missing_principal_is_demanded_only_when_an_enabled_tool_rule_reads_it() {
+    let compiled = CompiledPolicy::for_analysis(policy(json!({
+        "schema_version": "0.1.0",
+        "rules": [
+            {"path": "/data/**", "principal": {"roles": ["reader"]}, "action": "deny"},
+            {"tool_name": "reports.export", "enabled": false, "principal": {"roles": ["reader"]}, "action": "deny"},
+            {"tool_name": "reports.export", "action": "allow"}
+        ]
+    })));
+    assert_eq!(
+        compiled
+            .match_tool_rules("reports.export", &PrincipalFact::Missing)
+            .unwrap(),
+        DirectRuleOutcome::Matched { index: 2 }
+    );
+}
+
+#[test]
+fn a_tool_rule_question_the_evaluator_cannot_accept_is_refused() {
+    let compiled = CompiledPolicy::for_analysis(policy(json!({
+        "schema_version": "0.1.0",
+        "rules": [{"tool_name": "reports.export", "action": "allow"}]
+    })));
+    let at_bound = "t".repeat(MAX_TOOL_NAME_BYTES);
+    assert_eq!(
+        compiled
+            .match_tool_rules(&at_bound, &PrincipalFact::Anonymous)
+            .unwrap(),
+        DirectRuleOutcome::NoMatch
+    );
+    let over_bound = "t".repeat(MAX_TOOL_NAME_BYTES + 1);
+    assert_eq!(
+        compiled.match_tool_rules(&over_bound, &PrincipalFact::Anonymous),
+        Err(EvaluationError::ContextTooLarge)
+    );
+    assert_eq!(
+        compiled.match_tool_rules("reports.export", &authenticated(principal(&[""]))),
+        Err(EvaluationError::InvalidPrincipal)
+    );
+    let too_many: Vec<String> = (0..257).map(|index| format!("role-{index}")).collect();
+    let too_many: Vec<&str> = too_many.iter().map(String::as_str).collect();
+    assert_eq!(
+        compiled.match_tool_rules("reports.export", &authenticated(principal(&too_many))),
+        Err(EvaluationError::ContextTooLarge)
+    );
+}
