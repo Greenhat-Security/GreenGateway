@@ -9,13 +9,15 @@ It is intentionally small. Most routes cover GreenGateway's own control-plane su
 - `/v1/admin/status`
 - `/v1/admin/policy`
 - `/v1/admin/policy/validate`
+- `/v1/admin/policy/convert`
 - `/v1/admin/policy/rules`
+- `/v1/admin/policy/drafts`
 - `/v1/admin/traffic`
 
 The dev compose stack also starts an internal-only echo upstream and points `UPSTREAM_URL` at it. The `/__dev-echo` route is a narrow allowance for authenticated proxy smoke-test traffic to reach that upstream while the policy remains `default_action: "deny"`.
 
 The `admin` role grants `"*"` for local demos. The `reader` role intentionally has no seeded permissions so follow-up traffic tests can demonstrate denied requests without implying working control-plane access.
 
-The RBAC policy rules for these routes are still evaluated before the handlers and can emit `authz.allowed` or `authz.denied` audit events. Admin handlers also enforce dedicated live-policy permissions such as `admin:audit:read` for audit queries, `admin:audit:stream` for the audit event stream, `admin:status:read` for status, `admin:policy:read` for `GET /v1/admin/policy` and `POST /v1/admin/policy/validate`, and `admin:policy:write` for `PUT /v1/admin/policy`, `POST /v1/admin/policy/rules`, `PATCH /v1/admin/policy/rules/{id}`, `DELETE /v1/admin/policy/rules/{id}`, and `PUT /v1/admin/policy/rules/order`. Traffic inventory uses `admin:traffic:read` for list/detail reads and `admin:traffic:write` for marking or clearing endpoint review state. The seeded `admin` role grants `"*"` so it can exercise all of them locally. A `reader`-role token receives `403 Forbidden` for the admin routes.
+The RBAC policy rules for these routes are still evaluated before the handlers and can emit `authz.allowed` or `authz.denied` audit events. Admin handlers also enforce dedicated live-policy permissions such as `admin:audit:read` for audit queries, `admin:audit:stream` for the audit event stream, `admin:status:read` for status, `admin:policy:read` for `GET /v1/admin/policy`, `POST /v1/admin/policy/validate`, and `POST /v1/admin/policy/convert`, and `admin:policy:write` for `PUT /v1/admin/policy`, `POST /v1/admin/policy/rules`, `PATCH /v1/admin/policy/rules/{id}`, `DELETE /v1/admin/policy/rules/{id}`, and `PUT /v1/admin/policy/rules/order`; the policy draft routes under `/v1/admin/policy/drafts` take `admin:policy:read` for reads and `admin:policy:write` for every write, publication included, and serve each draft only to the principal that created it. Traffic inventory uses `admin:traffic:read` for list/detail reads and `admin:traffic:write` for marking or clearing endpoint review state. The seeded `admin` role grants `"*"` so it can exercise all of them locally. A `reader`-role token receives `403 Forbidden` for the admin routes.
 
 Health, version, metrics, and `/admin` remain exempt through the compose environment, matching the gateway defaults.

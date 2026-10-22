@@ -165,12 +165,13 @@ pub(crate) enum IssueCode {
     StableIdsUnavailable,
     DispatchNotConfigured,
     DocumentFormatUnsupportedInCluster,
+    ConversionRequiresV0,
 }
 
 impl IssueCode {
     /// Every code, so tests can check the vocabulary as a whole.
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 40] = [
+    pub(crate) const ALL: [Self; 41] = [
         Self::InvalidJson,
         Self::DocumentTooLarge,
         Self::DuplicateMember,
@@ -211,6 +212,7 @@ impl IssueCode {
         Self::StableIdsUnavailable,
         Self::DispatchNotConfigured,
         Self::DocumentFormatUnsupportedInCluster,
+        Self::ConversionRequiresV0,
     ];
 
     pub(crate) const fn as_str(self) -> &'static str {
@@ -255,6 +257,7 @@ impl IssueCode {
             Self::StableIdsUnavailable => "stable_ids_unavailable",
             Self::DispatchNotConfigured => "dispatch_not_configured",
             Self::DocumentFormatUnsupportedInCluster => "document_format_unsupported_in_cluster",
+            Self::ConversionRequiresV0 => "conversion_requires_v0",
         }
     }
 
@@ -326,6 +329,7 @@ impl IssueCode {
             Self::DocumentFormatUnsupportedInCluster => {
                 "cluster mode does not yet commit documents of this schema_version"
             }
+            Self::ConversionRequiresV0 => "only a 0.x document is converted to policy v1",
         }
     }
 
@@ -428,6 +432,9 @@ impl IssueCode {
             Self::DocumentFormatUnsupportedInCluster => {
                 "Keep a cluster deployment on a 0.x document until a release that gates v1 \
                  documents on every replica's capability."
+            }
+            Self::ConversionRequiresV0 => {
+                "The document already is policy v1; validate it instead of converting it."
             }
         }
     }
@@ -634,6 +641,24 @@ impl PolicyInspection {
             None,
         ));
         self.details.push(detail);
+    }
+
+    /// Records every error `derived` found as a refusal of this document. For
+    /// a document produced from this one whose pointers locate the same
+    /// members, such as its v1 conversion. The element ids are dropped: they
+    /// name elements of the derived document, not of this one.
+    pub(super) fn refuse_with_errors_of(&mut self, derived: &PolicyInspection) {
+        let errors = derived
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error);
+        for (diagnostic, detail) in errors.zip(&derived.details) {
+            self.diagnostics.push(PolicyDiagnostic {
+                element_id: None,
+                ..diagnostic.clone()
+            });
+            self.details.push(detail.clone());
+        }
     }
 
     /// The policy if it may be published, or every error's detail.
@@ -876,18 +901,19 @@ impl IssueList {
     }
 }
 
-/// One object's closed member vocabulary in policy v1.
-struct Members {
-    allowed: &'static [&'static str],
+/// One object's closed member vocabulary in policy v1, listed in the order
+/// the gateway writes the members.
+pub(super) struct Members {
+    pub(super) allowed: &'static [&'static str],
     /// Required members other than `id`, which the id checks report.
     required: &'static [&'static str],
 }
 
-const ROLE_MEMBERS: Members = Members {
+pub(super) const ROLE_MEMBERS: Members = Members {
     allowed: &["permissions", "issuers", "auth_methods", "description"],
     required: &[],
 };
-const ROUTE_MEMBERS: Members = Members {
+pub(super) const ROUTE_MEMBERS: Members = Members {
     allowed: &[
         "id",
         "methods",
@@ -898,7 +924,7 @@ const ROUTE_MEMBERS: Members = Members {
     ],
     required: &["path_prefix", "permission"],
 };
-const RULE_MEMBERS: Members = Members {
+pub(super) const RULE_MEMBERS: Members = Members {
     allowed: &[
         "id",
         "enabled",
@@ -911,19 +937,19 @@ const RULE_MEMBERS: Members = Members {
     ],
     required: &["action"],
 };
-const PRINCIPAL_MEMBERS: Members = Members {
+pub(super) const PRINCIPAL_MEMBERS: Members = Members {
     allowed: &["roles", "issuers", "auth_methods", "principal_ids"],
     required: &[],
 };
-const DISPATCH_MEMBERS: Members = Members {
+pub(super) const DISPATCH_MEMBERS: Members = Members {
     allowed: &["kind", "upstream_origin", "route_id"],
     required: &["kind"],
 };
-const EGRESS_MEMBERS: Members = Members {
+pub(super) const EGRESS_MEMBERS: Members = Members {
     allowed: &["hosts", "cidrs", "ports"],
     required: &[],
 };
-const RATE_LIMIT_MEMBERS: Members = Members {
+pub(super) const RATE_LIMIT_MEMBERS: Members = Members {
     allowed: &[
         "id",
         "principal",
@@ -934,7 +960,7 @@ const RATE_LIMIT_MEMBERS: Members = Members {
     ],
     required: &["requests_per_second", "burst"],
 };
-const TOOL_MEMBERS: Members = Members {
+pub(super) const TOOL_MEMBERS: Members = Members {
     allowed: &[
         "enabled",
         "allowed_roles",
@@ -1323,11 +1349,33 @@ pub(crate) fn check_unique_members(source: &[u8]) -> Result<(), PolicyIssue> {
     }
 }
 
+/// Every repeated member name in well-formed JSON `source`, as the pointer
+/// of each repeat after the first copy, in document order and up to
+/// [`MAX_REPORTED_ISSUES`]; the flag says whether more were left out. Unlike
+/// [`check_unique_members`], the scan reads on past a repeat. Malformed JSON
+/// reports what was found before the error.
+pub(super) fn repeated_member_pointers(source: &[u8]) -> (Vec<String>, bool) {
+    let mut scan = MemberScan {
+        collect: true,
+        ..MemberScan::default()
+    };
+    let mut deserializer = serde_json::Deserializer::from_slice(source);
+    // A document that reaches the conversion has already parsed, so the scan
+    // cannot fail; if it did, what it found so far is still accurate.
+    let _ = ScanSeed { scan: &mut scan }.deserialize(&mut deserializer);
+    (scan.repeats, scan.repeats_overflowed)
+}
+
 #[derive(Default)]
 struct MemberScan {
     /// Reference tokens from the root to the value being read.
     path: Vec<String>,
     duplicate: Option<String>,
+    /// Read past a repeat, recording it in `repeats`, instead of stopping at
+    /// the first one.
+    collect: bool,
+    repeats: Vec<String>,
+    repeats_overflowed: bool,
 }
 
 impl MemberScan {
@@ -1409,7 +1457,14 @@ impl<'de> Visitor<'de> for ScanVisitor<'_> {
         while let Some(name) = object.next_key::<String>()? {
             let repeated = !names.insert(name.clone());
             self.scan.path.push(name);
-            if repeated {
+            if repeated && self.scan.collect {
+                if self.scan.repeats.len() < MAX_REPORTED_ISSUES {
+                    let pointer = self.scan.pointer();
+                    self.scan.repeats.push(pointer);
+                } else {
+                    self.scan.repeats_overflowed = true;
+                }
+            } else if repeated {
                 self.scan.duplicate = Some(self.scan.pointer());
                 return Err(de::Error::custom("duplicate object member"));
             }

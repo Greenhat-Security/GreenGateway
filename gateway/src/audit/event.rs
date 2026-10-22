@@ -5,6 +5,15 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 pub const SCHEMA_VERSION: &str = "0.2.0";
 pub const POLICY_CHANGED: &str = "policy.changed";
 pub const POLICY_SHADOW_TRANSITION_REFUSED: &str = "policy.shadow_transition_refused";
+/// A server-side policy draft was created, changed or deleted (issue #243,
+/// slice 9). Drafts are inactive, so this records workspace activity, not an
+/// authorization change.
+pub const POLICY_DRAFT_CHANGED: &str = "policy.draft_changed";
+/// A draft was published: its candidate became the live policy. Emitted in
+/// addition to the `policy.changed` event of the commit itself.
+pub const POLICY_DRAFT_PUBLISHED: &str = "policy.draft_published";
+/// A publication of a draft its owner holds was refused without writing.
+pub const POLICY_DRAFT_PUBLISH_REFUSED: &str = "policy.draft_publish_refused";
 pub const SIGNAL_OPENED: &str = "signal.opened";
 pub const SIGNAL_LIFECYCLE_CHANGED: &str = "signal.lifecycle_changed";
 pub const SUGGESTION_LIFECYCLE_CHANGED: &str = "suggestion.lifecycle_changed";
@@ -40,6 +49,11 @@ pub const CONNECTION_OAUTH_TOKEN_REFRESH: &str = "connection.oauth_token_refresh
 /// caller (issue #441): the actor it was made for, the outcome and the
 /// issuer's decision, never any token.
 pub const CONNECTION_DELEGATED_TOKEN_EXCHANGE: &str = "connection.delegated_token_exchange";
+/// One mint of a caller's own Google token by a `google_domain_wide_delegation`
+/// Connection (issue #442): the actor it was minted for, the service account
+/// and scopes, how far it got and Google's status and registered error code,
+/// never the assertion or any token.
+pub const CONNECTION_GOOGLE_DELEGATION_TOKEN: &str = "connection.google_delegation_token";
 /// One decision about the signed caller assertion of a request a
 /// connection-bound proxy route forwards (issue #463): the `kid` and `jti` of
 /// the assertion it carried, or the reason it was refused. The caller is the

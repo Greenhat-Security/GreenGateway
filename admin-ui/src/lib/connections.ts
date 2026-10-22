@@ -15,6 +15,7 @@ export type ConnectionAuthenticationKind =
   | 'static_bearer'
   | 'oauth2_client_credentials'
   | 'delegated_issuer_token'
+  | 'google_domain_wide_delegation'
   | 'legacy_configured';
 
 export type ConnectionOperationalState =
@@ -142,7 +143,23 @@ export type ConnectionAuthentication =
       resource?: string;
       revocation_url?: string;
       subject_token_source: 'caller_assertion';
-    };
+    }
+  | GoogleDomainWideDelegationWrite;
+
+/**
+ * A domain-wide delegation as this UI writes it. It binds no secret: the
+ * profile is the `id` of a `CONNECTION_GCP_PROVIDER` profile in the gateway's
+ * startup configuration, so a write is the same on a create and a
+ * replacement, and the safe read returns every field.
+ */
+export type GoogleDomainWideDelegationWrite = {
+  type: 'google_domain_wide_delegation';
+  service_account_email: string;
+  workload_identity_profile: string;
+  scopes: string[];
+  subject_claim: 'email';
+  subject_issuers: string[];
+};
 
 export type SafeConnectionAuthentication =
   | { type: 'none' }
@@ -165,7 +182,24 @@ export type SafeConnectionAuthentication =
       client_auth_method: OAuthClientAuthMethod;
       client_secret_configured: boolean;
     }
-  | SafeDelegatedIssuerToken;
+  | SafeDelegatedIssuerToken
+  | SafeGoogleDomainWideDelegation;
+
+/**
+ * The calling user's own Google Workspace token, minted per caller by
+ * domain-wide delegation. None of its fields is a secret, so the safe read is
+ * the whole credential and the editor writes it back as it reads it.
+ */
+export type SafeGoogleDomainWideDelegation = {
+  type: 'google_domain_wide_delegation';
+  service_account_email: string;
+  /** The `id` of a `CONNECTION_GCP_PROVIDER` profile, never a locator. */
+  workload_identity_profile: string;
+  scopes: string[];
+  subject_claim: 'email';
+  /** Identity providers trusted to name Workspace users by email. */
+  subject_issuers: string[];
+};
 
 /**
  * The calling user's own upstream token, obtained per caller by RFC 8693
@@ -1309,6 +1343,23 @@ function projectSafeConnectionAuthentication(
       client_secret_configured: source.client_secret_configured,
     };
   }
+  if (
+    source.type === 'google_domain_wide_delegation' &&
+    typeof source.service_account_email === 'string' &&
+    typeof source.workload_identity_profile === 'string' &&
+    isStringList(source.scopes) &&
+    source.subject_claim === 'email' &&
+    isStringList(source.subject_issuers)
+  ) {
+    return {
+      type: 'google_domain_wide_delegation',
+      service_account_email: source.service_account_email,
+      workload_identity_profile: source.workload_identity_profile,
+      scopes: [...source.scopes],
+      subject_claim: source.subject_claim,
+      subject_issuers: [...source.subject_issuers],
+    };
+  }
 
   throw invalidConnectionResponse('safe connection authentication');
 }
@@ -1456,7 +1507,14 @@ function isConnectionAuthenticationKind(
     value === 'static_bearer' ||
     value === 'oauth2_client_credentials' ||
     value === 'delegated_issuer_token' ||
+    value === 'google_domain_wide_delegation' ||
     value === 'legacy_configured'
+  );
+}
+
+function isStringList(value: unknown): value is string[] {
+  return (
+    Array.isArray(value) && value.every((entry) => typeof entry === 'string')
   );
 }
 

@@ -1,0 +1,590 @@
+{
+  "full": {
+    "changes": [
+      {
+        "code": "schema_version_set",
+        "pointer": "/schema_version"
+      },
+      {
+        "code": "rule_id_written",
+        "element_id": "0",
+        "pointer": "/rules/0/id"
+      },
+      {
+        "code": "rule_id_written",
+        "element_id": "3",
+        "pointer": "/rules/3/id"
+      },
+      {
+        "code": "rule_id_written",
+        "element_id": "8",
+        "pointer": "/rules/8/id"
+      },
+      {
+        "code": "rule_id_written",
+        "element_id": "9",
+        "pointer": "/rules/9/id"
+      },
+      {
+        "code": "element_id_assigned",
+        "element_id": "route-0",
+        "pointer": "/routes/0/id"
+      },
+      {
+        "code": "element_id_assigned",
+        "element_id": "route-1",
+        "pointer": "/routes/1/id"
+      },
+      {
+        "code": "element_id_assigned",
+        "element_id": "route-2",
+        "pointer": "/routes/2/id"
+      },
+      {
+        "code": "element_id_assigned",
+        "element_id": "route-3",
+        "pointer": "/routes/3/id"
+      },
+      {
+        "code": "element_id_assigned",
+        "element_id": "route-4",
+        "pointer": "/routes/4/id"
+      },
+      {
+        "code": "element_id_assigned",
+        "element_id": "rate-limit-0",
+        "pointer": "/rate_limits/0/id"
+      },
+      {
+        "code": "element_id_assigned",
+        "element_id": "rate-limit-1",
+        "pointer": "/rate_limits/1/id"
+      },
+      {
+        "code": "element_id_assigned",
+        "element_id": "rate-limit-2",
+        "pointer": "/rate_limits/2/id"
+      }
+    ],
+    "policy": {
+      "default_action": "deny",
+      "egress": {
+        "cidrs": [
+          "10.20.0.0/16"
+        ],
+        "hosts": [
+          "api.partner.example.test",
+          "*.cdn.example.test"
+        ],
+        "ports": [
+          443,
+          8443
+        ]
+      },
+      "enforcement_mode": "enforce",
+      "id": "golden-full",
+      "rate_limits": [
+        {
+          "burst": 5,
+          "id": "rate-limit-0",
+          "methods": [
+            "GET"
+          ],
+          "path": "/data/**",
+          "principal": {
+            "auth_methods": [],
+            "issuers": [],
+            "principal_ids": [],
+            "roles": [
+              "reader"
+            ]
+          },
+          "requests_per_second": 2.5
+        },
+        {
+          "burst": 100,
+          "id": "rate-limit-1",
+          "methods": [],
+          "principal": {
+            "auth_methods": [],
+            "issuers": [],
+            "principal_ids": [
+              "svc-ops"
+            ],
+            "roles": []
+          },
+          "requests_per_second": 50.0
+        },
+        {
+          "burst": 1,
+          "id": "rate-limit-2",
+          "methods": [],
+          "principal": {
+            "auth_methods": [],
+            "issuers": [],
+            "principal_ids": [],
+            "roles": []
+          },
+          "requests_per_second": 0.5
+        }
+      ],
+      "roles": {
+        "admin": {
+          "auth_methods": [
+            "session_cookie"
+          ],
+          "permissions": [
+            "*"
+          ]
+        },
+        "ops": {
+          "auth_methods": [
+            "service_token"
+          ],
+          "permissions": [
+            "ops:read"
+          ]
+        },
+        "reader": {
+          "description": "Reads data and looks records up",
+          "issuers": [
+            "https://idp.example.test"
+          ],
+          "permissions": [
+            "data:read",
+            "tools:lookup"
+          ]
+        },
+        "writer": {
+          "permissions": [
+            "data:write"
+          ]
+        }
+      },
+      "routes": [
+        {
+          "id": "route-0",
+          "methods": [
+            "GET"
+          ],
+          "path_prefix": "/data",
+          "permission": "data:read"
+        },
+        {
+          "enforcement_mode": "shadow",
+          "id": "route-1",
+          "methods": [
+            "POST",
+            "PUT"
+          ],
+          "path_prefix": "/data",
+          "permission": "data:write"
+        },
+        {
+          "hosts": [
+            "api.example.test"
+          ],
+          "id": "route-2",
+          "methods": [],
+          "path_prefix": "/",
+          "permission": "data:read"
+        },
+        {
+          "id": "route-3",
+          "methods": [],
+          "path_prefix": "/ops",
+          "permission": "ops:read"
+        },
+        {
+          "id": "route-4",
+          "methods": [
+            "*"
+          ],
+          "path_prefix": "/mcp",
+          "permission": "tools:lookup"
+        }
+      ],
+      "rules": [
+        {
+          "action": "deny",
+          "id": "0",
+          "methods": [],
+          "path": "/data/secret/**",
+          "principal": {
+            "auth_methods": [],
+            "issuers": [],
+            "principal_ids": [],
+            "roles": []
+          }
+        },
+        {
+          "action": "shadow",
+          "id": "export-shadow",
+          "methods": [
+            "POST"
+          ],
+          "path": "/data/export",
+          "principal": {
+            "auth_methods": [],
+            "issuers": [],
+            "principal_ids": [],
+            "roles": []
+          }
+        },
+        {
+          "action": "allow",
+          "id": "public-pages",
+          "methods": [],
+          "path": "/public/**",
+          "principal": {
+            "auth_methods": [],
+            "issuers": [],
+            "principal_ids": [],
+            "roles": []
+          }
+        },
+        {
+          "action": "allow",
+          "id": "3",
+          "methods": [],
+          "path": "/data/{item}/history",
+          "principal": {
+            "auth_methods": [],
+            "issuers": [
+              "https://idp.example.test"
+            ],
+            "principal_ids": [],
+            "roles": [
+              "reader"
+            ]
+          }
+        },
+        {
+          "action": "allow",
+          "id": "ops-service",
+          "methods": [],
+          "path": "/ops/**",
+          "principal": {
+            "auth_methods": [
+              "service_token"
+            ],
+            "issuers": [],
+            "principal_ids": [
+              "svc-ops"
+            ],
+            "roles": []
+          }
+        },
+        {
+          "action": "deny",
+          "dispatch": {
+            "kind": "route",
+            "route_id": "billing"
+          },
+          "id": "routed-billing",
+          "methods": [],
+          "path": "/billing/**",
+          "principal": {
+            "auth_methods": [],
+            "issuers": [],
+            "principal_ids": [],
+            "roles": []
+          }
+        },
+        {
+          "action": "allow",
+          "dispatch": {
+            "kind": "contextless"
+          },
+          "id": "contextless-health",
+          "methods": [],
+          "path": "/healthz",
+          "principal": {
+            "auth_methods": [],
+            "issuers": [],
+            "principal_ids": [],
+            "roles": []
+          }
+        },
+        {
+          "action": "shadow",
+          "dispatch": {
+            "kind": "legacy",
+            "upstream_origin": "https://legacy.example.test"
+          },
+          "id": "legacy-upstream",
+          "methods": [],
+          "path": "/legacy/*",
+          "principal": {
+            "auth_methods": [],
+            "issuers": [],
+            "principal_ids": [],
+            "roles": []
+          }
+        },
+        {
+          "action": "deny",
+          "enabled": false,
+          "id": "8",
+          "methods": [],
+          "path": "/disabled/**",
+          "principal": {
+            "auth_methods": [],
+            "issuers": [],
+            "principal_ids": [],
+            "roles": []
+          }
+        },
+        {
+          "action": "deny",
+          "id": "9",
+          "methods": [],
+          "principal": {
+            "auth_methods": [],
+            "issuers": [],
+            "principal_ids": [],
+            "roles": []
+          },
+          "tool_name": "delete_record"
+        },
+        {
+          "action": "shadow",
+          "id": "lookup-shadow",
+          "methods": [],
+          "principal": {
+            "auth_methods": [],
+            "issuers": [],
+            "principal_ids": [],
+            "roles": [
+              "writer"
+            ]
+          },
+          "tool_name": "lookup"
+        }
+      ],
+      "schema_version": "1.0.0",
+      "tools": {
+        "delete_record": {
+          "allowed_roles": [
+            "admin"
+          ],
+          "enabled": true,
+          "issuers": [
+            "https://idp.example.test"
+          ],
+          "max_concurrent": 2,
+          "timeout_ms": 5000
+        },
+        "lookup": {
+          "allowed_roles": [
+            "reader",
+            "writer"
+          ],
+          "enabled": true,
+          "max_concurrent": 8,
+          "timeout_ms": 30000
+        },
+        "maintenance": {
+          "allowed_roles": [],
+          "enabled": false,
+          "max_concurrent": 8,
+          "timeout_ms": 30000
+        }
+      }
+    },
+    "semantic_digest": "sha256:731f88d530ded08d2b15ed77ec1cdee7c475a5769668df0ca5dc060c4a6b41ad",
+    "source_schema_version": "0.1.0"
+  },
+  "ids": {
+    "changes": [
+      {
+        "code": "schema_version_set",
+        "pointer": "/schema_version"
+      },
+      {
+        "code": "unknown_member_removed",
+        "pointer": "/x-owner"
+      },
+      {
+        "code": "duplicate_member_resolved",
+        "pointer": "/enforcement_mode"
+      },
+      {
+        "code": "duplicate_member_resolved",
+        "pointer": "/rules/7/action"
+      },
+      {
+        "code": "rule_id_written",
+        "element_id": "7",
+        "pointer": "/rules/7/id"
+      },
+      {
+        "code": "element_id_assigned",
+        "element_id": "route-0-2",
+        "pointer": "/routes/0/id"
+      },
+      {
+        "code": "element_id_assigned",
+        "element_id": "route-1",
+        "pointer": "/routes/1/id"
+      },
+      {
+        "code": "rule_id_replaced",
+        "element_id": "rule-1",
+        "pointer": "/rules/1/id",
+        "previous_id": "1"
+      },
+      {
+        "code": "rule_id_replaced",
+        "element_id": "rule-2-2",
+        "pointer": "/rules/2/id",
+        "previous_id": "allow public"
+      },
+      {
+        "code": "rule_id_replaced",
+        "element_id": "rule-4",
+        "pointer": "/rules/4/id",
+        "previous_id": "dup"
+      },
+      {
+        "code": "element_id_assigned",
+        "element_id": "rate-limit-0",
+        "pointer": "/rate_limits/0/id"
+      }
+    ],
+    "policy": {
+      "default_action": "allow",
+      "enforcement_mode": "enforce",
+      "rate_limits": [
+        {
+          "burst": 1,
+          "id": "rate-limit-0",
+          "methods": [],
+          "principal": {
+            "auth_methods": [],
+            "issuers": [],
+            "principal_ids": [],
+            "roles": []
+          },
+          "requests_per_second": 1.0
+        }
+      ],
+      "roles": {},
+      "routes": [
+        {
+          "id": "route-0-2",
+          "methods": [],
+          "path_prefix": "/a",
+          "permission": "p:a"
+        },
+        {
+          "id": "route-1",
+          "methods": [],
+          "path_prefix": "/b",
+          "permission": "p:b"
+        }
+      ],
+      "rules": [
+        {
+          "action": "deny",
+          "id": "1",
+          "methods": [],
+          "path": "/a",
+          "principal": {
+            "auth_methods": [],
+            "issuers": [],
+            "principal_ids": [],
+            "roles": []
+          }
+        },
+        {
+          "action": "deny",
+          "id": "rule-1",
+          "methods": [],
+          "path": "/b",
+          "principal": {
+            "auth_methods": [],
+            "issuers": [],
+            "principal_ids": [],
+            "roles": []
+          }
+        },
+        {
+          "action": "allow",
+          "id": "rule-2-2",
+          "methods": [],
+          "path": "/c",
+          "principal": {
+            "auth_methods": [],
+            "issuers": [],
+            "principal_ids": [],
+            "roles": []
+          }
+        },
+        {
+          "action": "shadow",
+          "id": "dup",
+          "methods": [],
+          "path": "/d",
+          "principal": {
+            "auth_methods": [],
+            "issuers": [],
+            "principal_ids": [],
+            "roles": []
+          }
+        },
+        {
+          "action": "deny",
+          "id": "rule-4",
+          "methods": [],
+          "path": "/e",
+          "principal": {
+            "auth_methods": [],
+            "issuers": [],
+            "principal_ids": [],
+            "roles": []
+          }
+        },
+        {
+          "action": "allow",
+          "id": "route-0",
+          "methods": [],
+          "path": "/f",
+          "principal": {
+            "auth_methods": [],
+            "issuers": [],
+            "principal_ids": [],
+            "roles": []
+          }
+        },
+        {
+          "action": "deny",
+          "id": "rule-2",
+          "methods": [],
+          "path": "/g",
+          "principal": {
+            "auth_methods": [],
+            "issuers": [],
+            "principal_ids": [],
+            "roles": []
+          }
+        },
+        {
+          "action": "deny",
+          "id": "7",
+          "methods": [],
+          "path": "/h",
+          "principal": {
+            "auth_methods": [],
+            "issuers": [],
+            "principal_ids": [],
+            "roles": []
+          }
+        }
+      ],
+      "schema_version": "1.0.0"
+    },
+    "semantic_digest": "sha256:d22bfb0074420b5bcfddc63ce5e74672cecbae29baf22d2cbc9a223fbb34353c",
+    "source_schema_version": "0.2.0"
+  }
+}

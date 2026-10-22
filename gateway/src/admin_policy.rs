@@ -333,6 +333,70 @@ pub(super) async fn policy_validate_endpoint(
         .into_response()
 }
 
+/// `POST /policy/convert`: converts the 0.x document in the body to policy
+/// v1 and returns it, without persisting it or changing the live policy.
+/// Pure like validation, and under the same permission: it reads nothing but
+/// the request body. Whether this deployment can commit the result is a
+/// separate question `POST /policy/validate` answers.
+pub(super) async fn policy_convert_endpoint(
+    State(state): State<PolicyAdminState>,
+    request: AxumRequest,
+) -> Response {
+    record_request(POLICY_CONVERT_ADMIN_ROUTE);
+
+    let (parts, body) = request.into_parts();
+    let Some(principal) = parts.extensions.get::<auth::Principal>() else {
+        return unauthorized();
+    };
+    if let Err(error) = authorized_policy_state(&state, principal, ADMIN_POLICY_READ_PERMISSION) {
+        return policy_admin_authz_error_response(error);
+    }
+
+    let body = match read_request_body(body, state.max_body_size).await {
+        Ok(body) => body,
+        Err(response) => return *response,
+    };
+
+    match rbac::policy_conversion::convert_v0_source(&body) {
+        Ok(conversion) => (
+            StatusCode::OK,
+            Json(PolicyConversionResponse {
+                converted: true,
+                errors: &[],
+                source_schema_version: Some(conversion.source_schema_version()),
+                schema_version: Some(rbac::policy_document::POLICY_V1_SCHEMA_VERSION),
+                diagnostics: &[],
+                source_digest: Some(conversion.source_digest()),
+                semantic_digest: Some(conversion.semantic_digest()),
+                parity: Some("verified"),
+                changes: conversion.changes(),
+                policy: Some(conversion.document()),
+            }),
+        )
+            .into_response(),
+        Err(rbac::policy_conversion::ConversionError::Refused(inspection)) => (
+            StatusCode::BAD_REQUEST,
+            Json(PolicyConversionResponse {
+                converted: false,
+                errors: inspection.error_details(),
+                source_schema_version: inspection.schema_version(),
+                schema_version: None,
+                diagnostics: inspection.diagnostics(),
+                source_digest: None,
+                semantic_digest: None,
+                parity: None,
+                changes: &[],
+                policy: None,
+            }),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(error = ?error, "policy conversion refused its own result");
+            internal_server_error("policy conversion failed")
+        }
+    }
+}
+
 pub(super) async fn policy_rule_post_endpoint(
     State(state): State<PolicyAdminState>,
     request: AxumRequest,
@@ -2150,7 +2214,7 @@ pub(super) async fn persist_policy_mutation(
 /// Ask the cluster's operation gate before committing a document that uses
 /// a feature an older member cannot read (issue #426).
 ///
-/// A document without such a feature needs nothing beyond the schema-20
+/// A document without such a feature needs nothing beyond the schema-22
 /// contract every member shares, and passes without a roster read. One that
 /// gives a role a `description` is the registered operation
 /// `policy.role_descriptions`: it is committed only while every live member,
@@ -2551,7 +2615,16 @@ pub(super) fn if_match_matches(
 pub(super) fn exact_strong_if_match(
     headers: &HeaderMap,
 ) -> Result<String, ToolPlaygroundIfMatchError> {
-    let mut values = headers.get_all(header::IF_MATCH).iter();
+    exact_strong_entity_tag(headers, &header::IF_MATCH)
+}
+
+/// Exactly one strong entity tag in the header `name`: no list, no `*`, no
+/// weak tag. Shared by every precondition that compares one value exactly.
+pub(super) fn exact_strong_entity_tag(
+    headers: &HeaderMap,
+    name: &HeaderName,
+) -> Result<String, ToolPlaygroundIfMatchError> {
+    let mut values = headers.get_all(name).iter();
     let Some(value) = values.next() else {
         return Err(ToolPlaygroundIfMatchError::Missing);
     };
