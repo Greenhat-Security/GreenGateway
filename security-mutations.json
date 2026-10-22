@@ -56,9 +56,9 @@
       "id": "egress-host",
       "path": "gateway/src/egress.rs",
       "function": "egress::host_glob_matches",
-      "start_marker": "fn host_glob_matches(",
+      "start_marker": "pub(crate) fn host_glob_matches(",
       "end_marker": "\n}\n",
-      "source_sha256": "5c6ed2395981367dd4ed5104da48981f8e7615a7e865b3f3f5d8bb602195c988",
+      "source_sha256": "849382ec2720dedc37e92834cd0538ccb30e2900f413a7eeef3fe8699bff7128",
       "tests": [
         "egress::tests::host_glob_matching_supports_exact_and_leading_wildcard_patterns"
       ],
@@ -197,6 +197,69 @@
           "id": "allow-dot-dot-segment",
           "old": ".any(|segment| segment == \".\" || segment == \"..\")",
           "new": ".any(|segment| segment == \".\")"
+        }
+      ]
+    },
+    {
+      "id": "egress-static-evaluate",
+      "path": "gateway/src/policy_eval/egress.rs",
+      "function": "policy_eval::egress::CompiledEgressPolicy::evaluate",
+      "start_marker": "    pub(crate) fn evaluate(",
+      "end_marker": "\n    }\n",
+      "source_sha256": "76a6a84b5ebc43696b0a28249edec13b1bc6203fd91723e65416dff95c85e2ca",
+      "tests": [
+        "policy_eval::egress::tests::a_refused_destination_is_decided_without_resolution_facts",
+        "egress::static_differential_tests::a_statically_refused_destination_never_reaches_the_resolver_on_any_entry_point"
+      ],
+      "mutations": [
+        {
+          "id": "resolve-before-static-denial",
+          "old": "let outcome = match self.admit_destination(context.destination) {",
+          "new": "let outcome = match self.admit_destination(context.destination).or_else(|denial| match context.resolution { ResolutionFact::Missing => Ok(0), ResolutionFact::Resolved(_) => Err(denial) }) {"
+        }
+      ]
+    },
+    {
+      "id": "egress-static-admit",
+      "path": "gateway/src/policy_eval/egress.rs",
+      "function": "policy_eval::egress::CompiledEgressPolicy::admit_destination",
+      "start_marker": "    fn admit_destination(",
+      "end_marker": "\n    }\n",
+      "source_sha256": "697ae7cb7826475ac50c8cc0a9f22c49d53c8631362b1551c1ea33ea7b4f226e",
+      "tests": [
+        "policy_eval::egress::tests::an_exact_host_admits_only_itself_and_a_pattern_only_its_subdomains",
+        "policy_eval::egress::tests::a_port_list_admits_only_its_own_ports_and_an_empty_one_admits_every_port",
+        "egress::static_differential_tests::the_frozen_and_live_checks_agree_across_the_named_matrix"
+      ],
+      "mutations": [
+        {
+          "id": "exact-host-admits-suffix",
+          "old": "self.controls.allowed_hosts.contains(host)",
+          "new": "self.controls.allowed_hosts.iter().any(|allowed| host.ends_with(allowed.as_str()))"
+        },
+        {
+          "id": "ignore-port-allowlist",
+          "old": "&& !self.controls.allowed_ports.contains(&port)",
+          "new": "&& false"
+        }
+      ]
+    },
+    {
+      "id": "egress-static-answers",
+      "path": "gateway/src/policy_eval/egress.rs",
+      "function": "policy_eval::egress::CompiledEgressPolicy::check_answers",
+      "start_marker": "    fn check_answers(",
+      "end_marker": "\n    }\n",
+      "source_sha256": "ee6cef68f36070682e3a3e39e658f4bf50d0815cbf5aef98409e1eba82cf0f66",
+      "tests": [
+        "policy_eval::egress::tests::every_answer_is_judged_and_the_first_is_pinned",
+        "egress::static_differential_tests::the_frozen_and_live_checks_agree_across_the_named_matrix"
+      ],
+      "mutations": [
+        {
+          "id": "check-only-pinned-answer",
+          "old": "answers.iter().position(|answer| {",
+          "new": "answers.iter().take(1).position(|answer| {"
         }
       ]
     }

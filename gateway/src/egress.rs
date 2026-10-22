@@ -22,7 +22,18 @@ use sha2::{Digest, Sha256};
 use tokio::net::lookup_host;
 use zeroize::Zeroizing;
 
-use crate::{config::Config, rbac::EgressPolicy};
+use crate::{
+    config::Config,
+    policy_eval::{
+        egress::{
+            CompiledEgressPolicy, EgressControls, EgressDenial, EgressDestination,
+            EgressEvaluationContext, EgressLimitation, EgressOutcome, ResolutionFact,
+            EGRESS_CONTEXT_VERSION,
+        },
+        EvaluationError,
+    },
+    rbac::EgressPolicy,
+};
 
 // MCP's transport adapter needs the same HTTP types as the exact-pinned egress
 // client. Keeping the crate alias here makes that dependency cross the egress
@@ -48,6 +59,10 @@ mod grpc_tests;
 mod mtls_tests;
 #[cfg(test)]
 mod property_tests;
+#[cfg(test)]
+mod static_differential_tests;
+#[cfg(test)]
+mod static_legacy_tests;
 mod tls;
 #[cfg(test)]
 mod tls_tests;
@@ -777,6 +792,19 @@ impl EgressConfig {
         self.allowed_hosts.len() + self.allowed_host_globs.len()
     }
 
+    /// The controls the shared evaluator's static egress lane decides by: the
+    /// same fields `egress_policy_generation` identifies, and no others.
+    fn static_egress_controls(&self) -> EgressControls {
+        EgressControls {
+            allowed_hosts: self.allowed_hosts.clone(),
+            allowed_host_globs: self.allowed_host_globs.clone(),
+            allowed_ports: self.allowed_ports.clone(),
+            deny_private_ips: self.deny_private_ips,
+            nat64_prefixes: self.nat64_prefixes.clone(),
+            private_ip_allow_cidrs: self.private_ip_allow_cidrs.clone(),
+        }
+    }
+
     pub fn auto_seed_endpoint_host(&mut self, endpoint: &str) -> Option<String> {
         let mut auto_seeded_hosts = Vec::new();
         auto_seed_endpoint_host(
@@ -1063,6 +1091,10 @@ impl fmt::Debug for EgressStreamResponse {
 #[derive(Clone)]
 pub struct EgressClient {
     config: EgressConfig,
+    /// The shared evaluator's static egress lane, compiled from `config` when
+    /// this client was built. Every destination is decided by it: the host,
+    /// port and address controls in `config` are not read by any other check.
+    static_policy: Arc<CompiledEgressPolicy>,
     resolver: Arc<dyn DnsResolver>,
     config_generation: [u8; 32],
     policy_generation: [u8; 32],
@@ -1173,9 +1205,11 @@ impl EgressClient {
         base_client_builder(&config)?.build()?;
         let config_generation = egress_config_generation(&config);
         let policy_generation = egress_policy_generation(&config);
+        let static_policy = Arc::new(CompiledEgressPolicy::new(config.static_egress_controls()));
 
         Ok(Self {
             config,
+            static_policy,
             resolver,
             config_generation,
             policy_generation,
@@ -1245,23 +1279,23 @@ impl EgressClient {
             .await
     }
 
+    /// Decides a destination through the shared evaluator and pins the address
+    /// to connect to.
+    ///
+    /// The evaluator is asked twice: first with no resolution facts, then with
+    /// the resolver's answers. Only an answer to the first question that asks
+    /// for those facts reaches the resolver, so a destination its static checks
+    /// refuse is refused without a DNS lookup.
     pub async fn checked_destination(
         &self,
         url: &str,
     ) -> Result<CheckedEgressDestination, EgressError> {
-        let parsed = self.checked_url(url)?;
-        let host = checked_host(
-            &parsed,
-            &self.config.allowed_hosts,
-            &self.config.allowed_host_globs,
-        )?;
-        let port = checked_port(&parsed)?;
-        checked_policy_port(port, &self.config.allowed_ports)?;
-        let pinned_addr = self.resolve_and_check(&host, port).await?;
+        let admitted = admit_destination(&self.static_policy, url)?;
+        let pinned_addr = self.resolve_and_check(&admitted).await?;
 
         Ok(CheckedEgressDestination {
-            scheme: parsed.scheme().to_owned(),
-            host,
+            scheme: admitted.url.scheme().to_owned(),
+            host: admitted.host,
             pinned_addr,
             config_generation: self.config_generation,
             policy_generation: self.policy_generation,
@@ -1285,28 +1319,18 @@ impl EgressClient {
             ));
         }
 
-        let parsed = self.checked_url(url)?;
-        let host = checked_host(
-            &parsed,
-            &self.config.allowed_hosts,
-            &self.config.allowed_host_globs,
-        )?;
-        let port = checked_port(&parsed)?;
-        checked_policy_port(port, &self.config.allowed_ports)?;
-        if destination.scheme != parsed.scheme()
-            || destination.host != host
-            || destination.pinned_addr.port() != port
-        {
+        let admitted = admit_destination(&self.static_policy, url)?;
+        if !admitted.matches_authority_of(destination) {
             return Err(EgressError::InvalidPolicy(
                 "checked destination does not match the request authority".to_owned(),
             ));
         }
-        checked_socket_addr(
-            &host,
-            &[destination.pinned_addr],
-            self.config.deny_private_ips,
-            &self.config.nat64_prefixes,
-            &self.config.private_ip_allow_cidrs,
+        // The pinned address is the only answer: a fact an earlier check under
+        // these same controls produced, judged again without resolving anything.
+        admit_address(
+            &self.static_policy,
+            &admitted,
+            std::slice::from_ref(&destination.pinned_addr),
         )?;
 
         Ok(CheckedEgressDestination {
@@ -1575,7 +1599,9 @@ impl EgressClient {
     /// pinned reqwest clients check -- configuration generation, allowed host,
     /// allowed port, authority match against the checked destination, and the
     /// private-IP rules applied to the pinned socket -- is checked here, for
-    /// both transports, in this order.
+    /// both transports, in this order. The host, port and address checks are
+    /// the shared evaluator's, with the pinned socket as the only answer, so no
+    /// name is resolved.
     fn revalidated_destination(
         &self,
         destination: &CheckedEgressDestination,
@@ -1586,73 +1612,19 @@ impl EgressClient {
                 "checked destination belongs to a different egress configuration".to_owned(),
             ));
         }
-        let parsed = self.checked_url(url)?;
-        let host = checked_host(
-            &parsed,
-            &self.config.allowed_hosts,
-            &self.config.allowed_host_globs,
-        )?;
-        let port = checked_port(&parsed)?;
-        checked_policy_port(port, &self.config.allowed_ports)?;
-        if destination.scheme != parsed.scheme()
-            || destination.host != host
-            || destination.pinned_addr.port() != port
-        {
+        let admitted = admit_destination(&self.static_policy, url)?;
+        if !admitted.matches_authority_of(destination) {
             return Err(EgressError::InvalidPolicy(
                 "checked destination does not match the request authority".to_owned(),
             ));
         }
-        checked_socket_addr(
-            &host,
-            &[destination.pinned_addr],
-            self.config.deny_private_ips,
-            &self.config.nat64_prefixes,
-            &self.config.private_ip_allow_cidrs,
+        admit_address(
+            &self.static_policy,
+            &admitted,
+            std::slice::from_ref(&destination.pinned_addr),
         )?;
 
-        Ok((parsed, host, port))
-    }
-
-    fn checked_url(&self, url: &str) -> Result<Url, EgressError> {
-        let parsed = Url::parse(url).map_err(|err| EgressError::InvalidUrl(err.to_string()))?;
-
-        if parsed.host_str().is_none() {
-            tracing::warn!(
-                error_category = "invalid_url",
-                "egress blocked URL without host"
-            );
-            return Err(EgressError::InvalidUrl("missing host".to_owned()));
-        }
-
-        if !parsed.username().is_empty() || parsed.password().is_some() {
-            tracing::warn!(
-                error_category = "invalid_url",
-                "egress blocked URL containing userinfo"
-            );
-            return Err(EgressError::InvalidUrl(
-                "URL userinfo is not allowed".to_owned(),
-            ));
-        }
-        if parsed.fragment().is_some() {
-            tracing::warn!(
-                error_category = "invalid_url",
-                "egress blocked URL containing a fragment"
-            );
-            return Err(EgressError::InvalidUrl(
-                "URL fragments are not allowed".to_owned(),
-            ));
-        }
-
-        match parsed.scheme() {
-            "http" | "https" => Ok(parsed),
-            scheme => {
-                tracing::warn!(
-                    error_category = "scheme_not_allowed",
-                    "egress blocked URL scheme"
-                );
-                Err(EgressError::SchemeNotAllowed(scheme.to_owned()))
-            }
-        }
+        Ok((admitted.url, admitted.host, admitted.port))
     }
 
     fn pinned_client_with_profile(
@@ -1701,29 +1673,25 @@ impl EgressClient {
         )
     }
 
-    async fn resolve_and_check(&self, host: &str, port: u16) -> Result<SocketAddr, EgressError> {
+    /// Resolves an admitted destination and has the evaluator judge the answers.
+    /// A resolver failure refuses here: the evaluator is never asked to decide
+    /// over facts that could not be obtained.
+    async fn resolve_and_check(
+        &self,
+        admitted: &AdmittedDestination,
+    ) -> Result<SocketAddr, EgressError> {
+        let (host, port) = (admitted.host.as_str(), admitted.port);
+        // IPv6 literal URL hosts may enter the allowlist through auto-seeded
+        // infrastructure endpoints. They still fail closed today because the
+        // resolver is given the bracketed form, so IPv6 literal JWKS and
+        // endpoint URLs remain unsupported for now.
         let resolved = self
             .resolver
             .resolve(host, port)
             .await
             .map_err(|err| EgressError::DnsResolutionFailed(format!("{host}:{port}: {err}")))?;
 
-        if resolved.is_empty() {
-            return Err(EgressError::DnsResolutionFailed(format!("{host}:{port}")));
-        }
-        if resolved.iter().any(|address| address.port() != port) {
-            return Err(EgressError::DnsResolutionFailed(format!(
-                "{host}:{port}: resolver returned an unexpected port"
-            )));
-        }
-
-        checked_socket_addr(
-            host,
-            &resolved,
-            self.config.deny_private_ips,
-            &self.config.nat64_prefixes,
-            &self.config.private_ip_allow_cidrs,
-        )
+        admit_address(&self.static_policy, admitted, &resolved)
     }
 
     async fn send_with_client(
@@ -2354,36 +2322,216 @@ fn hash_duration(hasher: &mut Sha256, duration: Duration) {
     hasher.update(duration.subsec_nanos().to_be_bytes());
 }
 
-fn checked_host(
-    url: &Url,
-    allowed_hosts: &HashSet<String>,
-    allowed_host_globs: &[String],
-) -> Result<String, EgressError> {
-    let host = url
-        .host_str()
-        .ok_or_else(|| EgressError::InvalidUrl("missing host".to_owned()))?
-        .to_ascii_lowercase();
+/// A destination the shared evaluator admitted on its static checks alone,
+/// before any of its names was resolved.
+///
+/// The host and port are the evaluator's own normalization of the URL, so the
+/// name the resolver is asked for, the authority a pinned destination is
+/// compared with and the host a checked destination records are all the name
+/// the controls admitted.
+struct AdmittedDestination {
+    url: Url,
+    facts: EgressDestination,
+    host: String,
+    port: u16,
+}
 
-    // IPv6 literal URL hosts may enter the allowlist through auto-seeded
-    // infrastructure endpoints. They still fail closed today because the
-    // resolver is given the bracketed form, so IPv6 literal JWKS and endpoint
-    // URLs remain unsupported for now.
-    if allowed_hosts.contains(&host)
-        || allowed_host_globs
-            .iter()
-            .any(|pattern| host_glob_matches(pattern, &host))
-    {
-        Ok(host)
-    } else {
-        tracing::warn!(
-            error_category = "host_not_allowed",
-            "egress blocked non-allowlisted host"
-        );
-        Err(EgressError::HostNotAllowed(host))
+impl AdmittedDestination {
+    fn matches_authority_of(&self, destination: &CheckedEgressDestination) -> bool {
+        destination.scheme == self.url.scheme()
+            && destination.host == self.host
+            && destination.pinned_addr.port() == self.port
     }
 }
 
-fn host_glob_matches(pattern: &str, host: &str) -> bool {
+/// The static half of every egress decision: asks the evaluator about `url`
+/// with no resolution facts.
+///
+/// A URL that does not parse is refused before the evaluator is asked, as it
+/// always was; there is no destination to decide.
+fn admit_destination(
+    policy: &CompiledEgressPolicy,
+    url: &str,
+) -> Result<AdmittedDestination, EgressError> {
+    let parsed = Url::parse(url).map_err(|err| EgressError::InvalidUrl(err.to_string()))?;
+    let facts = EgressDestination::from_url(&parsed);
+    let answer = evaluate_static_egress(policy, &facts, ResolutionFact::Missing);
+    admitted_from_answer(parsed, facts, answer)
+}
+
+/// The address half: asks the evaluator about an admitted destination with
+/// `answers` as its resolution facts, and returns the address to pin.
+fn admit_address(
+    policy: &CompiledEgressPolicy,
+    admitted: &AdmittedDestination,
+    answers: &[SocketAddr],
+) -> Result<SocketAddr, EgressError> {
+    let answer = evaluate_static_egress(policy, &admitted.facts, ResolutionFact::Resolved(answers));
+    address_from_answer(admitted, answers, answer)
+}
+
+fn evaluate_static_egress(
+    policy: &CompiledEgressPolicy,
+    facts: &EgressDestination,
+    resolution: ResolutionFact<'_>,
+) -> Result<EgressOutcome, EvaluationError> {
+    policy
+        .evaluate(&EgressEvaluationContext {
+            version: EGRESS_CONTEXT_VERSION,
+            snapshot: policy.snapshot(),
+            destination: facts,
+            resolution,
+        })
+        .map(|evaluation| evaluation.outcome())
+}
+
+/// Translates the answer to the static question. Only a request for
+/// resolution facts admits a destination; an allow cannot answer a question
+/// that supplied none, and neither it nor a refused question admits anything.
+fn admitted_from_answer(
+    url: Url,
+    facts: EgressDestination,
+    answer: Result<EgressOutcome, EvaluationError>,
+) -> Result<AdmittedDestination, EgressError> {
+    match answer {
+        Ok(EgressOutcome::Indeterminate(EgressLimitation::MissingResolution)) => {
+            let (host, port) = match (facts.host(), facts.port()) {
+                (Some(host), Some(port)) => (host.to_owned(), port),
+                _ => return Err(unanswered_static_egress(None)),
+            };
+            Ok(AdmittedDestination {
+                url,
+                facts,
+                host,
+                port,
+            })
+        }
+        Ok(EgressOutcome::Deny(denial)) => Err(static_egress_refusal(denial, &url, &facts, &[])),
+        Ok(EgressOutcome::Allow { .. }) => Err(unanswered_static_egress(None)),
+        Err(error) => Err(unanswered_static_egress(Some(error))),
+    }
+}
+
+/// Translates the answer to the address question. Only an allow naming one of
+/// the supplied answers pins anything.
+fn address_from_answer(
+    admitted: &AdmittedDestination,
+    answers: &[SocketAddr],
+    answer: Result<EgressOutcome, EvaluationError>,
+) -> Result<SocketAddr, EgressError> {
+    match answer {
+        Ok(EgressOutcome::Allow { pinned }) => answers
+            .get(pinned)
+            .copied()
+            .ok_or_else(|| unanswered_static_egress(None)),
+        Ok(EgressOutcome::Deny(denial)) => Err(static_egress_refusal(
+            denial,
+            &admitted.url,
+            &admitted.facts,
+            answers,
+        )),
+        Ok(EgressOutcome::Indeterminate(_)) => Err(unanswered_static_egress(None)),
+        Err(error) => Err(unanswered_static_egress(Some(error))),
+    }
+}
+
+/// The error, and the warning, the pre-cutover check emitted for each
+/// refusal, unchanged: callers, retry and passive-health classification,
+/// proxy answers and audit categories all read `EgressError`.
+///
+/// A host or port a refusal names is always present in the facts by the time
+/// that check runs, because the checks before it require it. Should that ever
+/// not hold, the destination is still refused; only the message is emptier.
+fn static_egress_refusal(
+    denial: EgressDenial,
+    url: &Url,
+    facts: &EgressDestination,
+    answers: &[SocketAddr],
+) -> EgressError {
+    let host = facts.host().unwrap_or_default();
+    let port = facts.port().unwrap_or_default();
+    match denial {
+        EgressDenial::MissingHost => {
+            tracing::warn!(
+                error_category = "invalid_url",
+                "egress blocked URL without host"
+            );
+            EgressError::InvalidUrl("missing host".to_owned())
+        }
+        EgressDenial::Userinfo => {
+            tracing::warn!(
+                error_category = "invalid_url",
+                "egress blocked URL containing userinfo"
+            );
+            EgressError::InvalidUrl("URL userinfo is not allowed".to_owned())
+        }
+        EgressDenial::Fragment => {
+            tracing::warn!(
+                error_category = "invalid_url",
+                "egress blocked URL containing a fragment"
+            );
+            EgressError::InvalidUrl("URL fragments are not allowed".to_owned())
+        }
+        EgressDenial::SchemeNotAllowed => {
+            tracing::warn!(
+                error_category = "scheme_not_allowed",
+                "egress blocked URL scheme"
+            );
+            EgressError::SchemeNotAllowed(url.scheme().to_owned())
+        }
+        EgressDenial::HostNotAllowed => {
+            tracing::warn!(
+                error_category = "host_not_allowed",
+                "egress blocked non-allowlisted host"
+            );
+            EgressError::HostNotAllowed(host.to_owned())
+        }
+        EgressDenial::MissingPort => {
+            EgressError::InvalidUrl("missing port for URL scheme".to_owned())
+        }
+        EgressDenial::PortNotAllowed => {
+            tracing::warn!(
+                error_category = "port_not_allowed",
+                "egress blocked non-allowlisted port"
+            );
+            EgressError::PortNotAllowed(port)
+        }
+        EgressDenial::EmptyResolution => EgressError::DnsResolutionFailed(format!("{host}:{port}")),
+        EgressDenial::UnexpectedResolvedPort => EgressError::DnsResolutionFailed(format!(
+            "{host}:{port}: resolver returned an unexpected port"
+        )),
+        // An ordinal outside the answers the adapter supplied names no address
+        // to report, and is an answer the question cannot have.
+        EgressDenial::NonGlobalAddress { index } => match answers.get(index) {
+            Some(blocked) => {
+                tracing::warn!(
+                    error_category = "non_global_ip_blocked",
+                    "egress blocked non-global resolved address outside policy CIDRs"
+                );
+                EgressError::NonGlobalIpBlocked(blocked.ip())
+            }
+            None => unanswered_static_egress(None),
+        },
+    }
+}
+
+/// The evaluator refused the question, or gave an answer the question cannot
+/// have. Nothing is admitted.
+///
+/// Every input that could cause either is the adapter's own -- the context
+/// version, the snapshot, an answer set it supplied -- so reaching this is a
+/// broken invariant, not a destination the gateway reached before. The
+/// warning carries only the bounded evaluator error.
+fn unanswered_static_egress(error: Option<EvaluationError>) -> EgressError {
+    tracing::warn!(
+        error_category = "policy_evaluation_error",
+        evaluation_error = ?error,
+        "static egress evaluation did not answer; destination refused"
+    );
+    EgressError::InvalidPolicy("static egress evaluation did not answer".to_owned())
+}
+
+pub(crate) fn host_glob_matches(pattern: &str, host: &str) -> bool {
     let pattern = pattern.to_ascii_lowercase();
     let host = host.to_ascii_lowercase();
 
@@ -2401,46 +2549,7 @@ fn checked_port(url: &Url) -> Result<u16, EgressError> {
         .ok_or_else(|| EgressError::InvalidUrl("missing port for URL scheme".to_owned()))
 }
 
-fn checked_policy_port(port: u16, allowed_ports: &HashSet<u16>) -> Result<(), EgressError> {
-    if allowed_ports.is_empty() || allowed_ports.contains(&port) {
-        Ok(())
-    } else {
-        tracing::warn!(
-            error_category = "port_not_allowed",
-            "egress blocked non-allowlisted port"
-        );
-        Err(EgressError::PortNotAllowed(port))
-    }
-}
-
-fn checked_socket_addr(
-    host: &str,
-    resolved: &[SocketAddr],
-    deny_private_ips: bool,
-    nat64_prefixes: &[IpNet],
-    private_ip_allow_cidrs: &[IpNet],
-) -> Result<SocketAddr, EgressError> {
-    if resolved.is_empty() {
-        return Err(EgressError::DnsResolutionFailed(host.to_owned()));
-    }
-
-    if deny_private_ips {
-        if let Some(blocked) = resolved.iter().map(SocketAddr::ip).find(|ip| {
-            is_non_global_ip(*ip, nat64_prefixes)
-                && !ip_matches_policy_cidr(*ip, private_ip_allow_cidrs)
-        }) {
-            tracing::warn!(
-                error_category = "non_global_ip_blocked",
-                "egress blocked non-global resolved address outside policy CIDRs"
-            );
-            return Err(EgressError::NonGlobalIpBlocked(blocked));
-        }
-    }
-
-    Ok(resolved[0])
-}
-
-fn ip_matches_policy_cidr(ip: IpAddr, private_ip_allow_cidrs: &[IpNet]) -> bool {
+pub(crate) fn ip_matches_policy_cidr(ip: IpAddr, private_ip_allow_cidrs: &[IpNet]) -> bool {
     private_ip_allow_cidrs.iter().any(|cidr| cidr.contains(&ip))
 }
 

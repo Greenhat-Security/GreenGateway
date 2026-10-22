@@ -10214,6 +10214,36 @@
       "purpose": "Inspect the existing request body end-of-stream flag for an enabled, exact registered POST logout route; creates no client, connection, listener or task."
     },
     {
+      "file": "gateway/src/policy_eval/egress.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::policy_eval::egress::use std :: { collections :: HashSet , fmt , net :: SocketAddr }#1",
+      "sha256": "7bdfe1a737c2af1b55773b0719136e63e48807e5cb56cc2d73cf529256b0f7fb",
+      "owner": "policy evaluation static egress lane (#422)",
+      "purpose": "Import the SocketAddr value type so the pure static egress lane can decide over resolution facts the egress adapter supplies (the answer set, or the one pinned address). A value type only: the lane resolves no name, opens no socket and builds no client; the DNS lookup and every transport stay in crate::egress."
+    },
+    {
+      "file": "gateway/src/policy_eval/egress.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::policy_eval::egress::impl  EgressEvaluation::canonical_trace_bytes#1",
+      "sha256": "e2577d4d10f644103d92039147c4a9970886c2eb368162ad298cbc5dcfd6e854",
+      "owner": "policy evaluation static egress lane (#422)",
+      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the static egress lane's offline trace encoding, which the live egress adapter (#422 PR 3b) does not read. Serializes a bounded trace into memory with serde_json; dead-code gating only, no I/O and no transport or process capability."
+    },
+    {
+      "file": "gateway/src/policy_eval/egress.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::policy_eval::egress::impl  EgressEvaluation::reusable_for#1",
+      "sha256": "ca6f2633d8af5e83f24389bac788147ce0773f6ed3d6f7db02694aed7d0a7831",
+      "owner": "policy evaluation static egress lane (#422)",
+      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the static egress lane's offline trace reuse check, which the live egress adapter (#422 PR 3b) does not call. Compares an evaluation binding with a context digest and does no I/O; dead-code gating only, no transport or process capability."
+    },
+    {
       "file": "gateway/src/policy_eval/input.rs",
       "reasons": [
         "unexpanded-attribute"
