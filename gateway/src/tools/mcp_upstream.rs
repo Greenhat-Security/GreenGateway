@@ -41,6 +41,11 @@ use rmcp::{
 use serde_json::Value;
 use sse_stream::{Sse, SseStream};
 
+use crate::connections::{
+    caller_assertion::{AttestedCaller, CallerAssertionError},
+    http::{IssuedSessionCallerAssertions, SessionCallerAssertions},
+};
+
 use crate::{
     config::{Config, McpUpstreamServerConfig},
     connections::{
@@ -146,20 +151,50 @@ pub enum McpUpstreamCallError {
     ClientBuild,
     Connect,
     Call,
-    Connection { reason: &'static str },
+    Connection {
+        reason: &'static str,
+    },
+    /// The Connection attests its caller and this call could not carry an
+    /// assertion: refused before the session opened, or while signing one of
+    /// its requests.
+    CallerAssertion(CallerAssertionError),
     AuthenticationRejected,
-    UpstreamMethodNotFound { method: &'static str },
-    UpstreamError { method: &'static str, code: i32 },
-    UpstreamTransport { method: &'static str },
-    DiscoveryPageLimitExceeded { max: usize },
-    DiscoveryToolLimitExceeded { max: usize },
-    DiscoveryResourceLimitExceeded { max: usize },
-    DiscoveryResourceTemplateLimitExceeded { max: usize },
-    DiscoveryCapabilityLimitExceeded { max: usize },
-    DiscoveryResponseLimitExceeded { max: usize },
+    UpstreamMethodNotFound {
+        method: &'static str,
+    },
+    UpstreamError {
+        method: &'static str,
+        code: i32,
+    },
+    UpstreamTransport {
+        method: &'static str,
+    },
+    DiscoveryPageLimitExceeded {
+        max: usize,
+    },
+    DiscoveryToolLimitExceeded {
+        max: usize,
+    },
+    DiscoveryResourceLimitExceeded {
+        max: usize,
+    },
+    DiscoveryResourceTemplateLimitExceeded {
+        max: usize,
+    },
+    DiscoveryCapabilityLimitExceeded {
+        max: usize,
+    },
+    DiscoveryResponseLimitExceeded {
+        max: usize,
+    },
     InvalidDiscoveryMetadata,
-    RequestBodyTooLarge { size: usize, max: usize },
-    ResponseTooLarge { max: usize },
+    RequestBodyTooLarge {
+        size: usize,
+        max: usize,
+    },
+    ResponseTooLarge {
+        max: usize,
+    },
 }
 
 impl McpUpstreamCallError {
@@ -170,6 +205,7 @@ impl McpUpstreamCallError {
             Self::Connect => "connect_failed",
             Self::Call => "call_failed",
             Self::Connection { reason } => reason,
+            Self::CallerAssertion(error) => error.safe_reason(),
             Self::AuthenticationRejected => "auth_failed",
             Self::UpstreamMethodNotFound { .. } => "upstream_method_not_found",
             Self::UpstreamError { .. } => "upstream_error",
@@ -203,6 +239,9 @@ impl fmt::Display for McpUpstreamCallError {
             Self::Call => write!(formatter, "upstream MCP tool call failed"),
             Self::Connection { reason } => {
                 write!(formatter, "managed MCP connection is unavailable: {reason}")
+            }
+            Self::CallerAssertion(error) => {
+                write!(formatter, "managed MCP caller assertion refused: {error}")
             }
             Self::AuthenticationRejected => {
                 formatter.write_str("managed MCP authentication failed")
@@ -501,12 +540,15 @@ pub async fn discover_connection_catalog(
         .map_err(connection_mcp_error)?
         .map(Arc::new);
     let response_budget = DiscoveryResponseByteBudget::new(MAX_DISCOVERY_RESPONSE_BYTES);
+    // Discovery is refused on a Connection that attests its caller (see
+    // `mcp_target`), so it signs nothing.
     let mut service = connect_connection(
         &target,
         &runtime_config,
         client,
         credential,
         Some(response_budget.clone()),
+        None,
     )
     .await?;
     let discovered = discover_catalog_with_limits(&mut service).await;
@@ -600,6 +642,9 @@ pub async fn probe_connection_protocol_before(
         ManagedMcpAuthentication {
             credential,
             credential_header_names: target.credential_header_names().to_vec(),
+            // A Connection test's target refuses a Connection that attests
+            // its caller, so a probe signs nothing.
+            caller_assertions: None,
         },
         operation_deadline,
         hard_deadline,
@@ -861,6 +906,13 @@ impl ProtocolProbeTransportControl {
             LimitedMcpHttpError::Connection(error) => {
                 protocol_probe_connection_error(*error, ConnectionTestStageName::ProtocolValid)
             }
+            // A probe signs no assertion; reported as the refusal the probe's
+            // target gives an attesting Connection, if that ever changed.
+            LimitedMcpHttpError::CallerAssertion(_) => ConnectionProtocolProbeError::new(
+                ConnectionTestStageName::Authenticated,
+                ConnectionTestReason::CallerAssertionNotEnforced,
+                ConnectionStatusReason::RequestFailed,
+            ),
             LimitedMcpHttpError::AuthenticationRejected => ConnectionProtocolProbeError::new(
                 ConnectionTestStageName::Authenticated,
                 ConnectionTestReason::AuthenticationFailed,
@@ -1010,14 +1062,41 @@ pub async fn call_connection_tool(
             reason: "catalog_stale",
         });
     }
-    call_connection_tool_at_target(runtime, target, remote_tool_name, args).await
+    call_connection_tool_at_target(
+        runtime,
+        target,
+        remote_tool_name,
+        args,
+        McpToolCallAttestation {
+            caller: None,
+            request_id: "tool-runtime",
+        },
+        &mut None,
+    )
+    .await
 }
 
+/// Who a managed MCP tool call is made for, as the lane that admitted it
+/// attested them, and the request ID its assertions' `jti`s extend.
+pub struct McpToolCallAttestation<'a> {
+    pub caller: Option<&'a AttestedCaller>,
+    pub request_id: &'a str,
+}
+
+/// Calls one tool through a session opened for this call alone.
+///
+/// When `target` attests its caller, every request of the session carries
+/// its own assertion naming `attestation.caller` (see
+/// [`SessionCallerAssertions`]), and `issued_assertions` is set to what they
+/// were once the session is over, whatever its outcome, so the call's audit
+/// names every assertion it sent.
 pub async fn call_connection_tool_at_target(
     runtime: &ConnectionHttpRuntime,
     target: ConnectionHttpTarget,
     remote_tool_name: &str,
     args: Value,
+    attestation: McpToolCallAttestation<'_>,
+    issued_assertions: &mut Option<IssuedSessionCallerAssertions>,
 ) -> Result<CallToolResult, McpUpstreamCallError> {
     let runtime_config = McpUpstreamRuntimeConfig::from_connection_target(&target);
     let arguments = match args {
@@ -1026,17 +1105,77 @@ pub async fn call_connection_tool_at_target(
     };
     let request = CallToolRequestParams::new(remote_tool_name.to_owned()).with_arguments(arguments);
     enforce_mcp_call_request_size_before_egress(&request, runtime_config.max_request_body_bytes)?;
+    // A Connection that attests its caller refuses a call that names nobody,
+    // and one whose keys no upstream could verify, before the egress
+    // preflight resolves anything or any credential is read.
+    runtime
+        .admit_caller_assertion(&target, attestation.caller)
+        .await
+        .map_err(McpUpstreamCallError::CallerAssertion)?;
     let client = managed_mcp_http_client(runtime, &target).await?;
-    // A managed MCP session is shared by every caller of the Connection, so it
-    // is opened for none of them: a credential that belongs to one is refused
-    // rather than resolved.
+    // The signing key is read and loaded before the credential, so a key
+    // that cannot sign refuses the call before any token endpoint is asked
+    // for a token.
+    let assertions = session_caller_assertions(runtime, &target, &attestation).await?;
+    let result = call_tool_in_session(
+        runtime,
+        &target,
+        &runtime_config,
+        client,
+        assertions.clone(),
+        request,
+    )
+    .await;
+    // Sealed once the session is over: a request the transport still sends
+    // after this, such as a late `DELETE`, is refused rather than signed
+    // where no audit record would count it.
+    *issued_assertions = assertions.as_ref().and_then(SessionCallerAssertions::seal);
+    result
+}
+
+/// The signer every request of an attesting `target`'s session uses, or
+/// `None` for a target that attests nobody.
+async fn session_caller_assertions(
+    runtime: &ConnectionHttpRuntime,
+    target: &ConnectionHttpTarget,
+    attestation: &McpToolCallAttestation<'_>,
+) -> Result<Option<SessionCallerAssertions>, McpUpstreamCallError> {
+    let Some(signer) = runtime
+        .caller_assertion_signer(target)
+        .await
+        .map_err(McpUpstreamCallError::CallerAssertion)?
+    else {
+        return Ok(None);
+    };
+    // Admission already refused a call without a caller; this holds even if
+    // that order were to change.
+    let caller = attestation
+        .caller
+        .ok_or(McpUpstreamCallError::CallerAssertion(
+            CallerAssertionError::NoPrincipal,
+        ))?;
+    Ok(Some(signer.into_session(caller, attestation.request_id)))
+}
+
+async fn call_tool_in_session(
+    runtime: &ConnectionHttpRuntime,
+    target: &ConnectionHttpTarget,
+    runtime_config: &McpUpstreamRuntimeConfig,
+    client: rmcp_http::Client,
+    assertions: Option<SessionCallerAssertions>,
+    request: CallToolRequestParams,
+) -> Result<CallToolResult, McpUpstreamCallError> {
+    // The session is opened for this call alone, but its credential is the
+    // Connection's: a credential that belongs to a caller is refused rather
+    // than resolved. When the Connection attests its caller, the assertions
+    // name them.
     let credential = runtime
-        .resolve_credential(&target, None)
+        .resolve_credential(target, None)
         .await
         .map_err(connection_mcp_error)?
         .map(Arc::new);
     let mut service =
-        connect_connection(&target, &runtime_config, client, credential, None).await?;
+        connect_connection(target, runtime_config, client, credential, None, assertions).await?;
     let result = service
         .call_tool(request)
         .await
@@ -1244,6 +1383,11 @@ fn protocol_probe_mcp_error(
         McpUpstreamCallError::Connection { reason } => {
             protocol_probe_connection_reason(reason, default_stage)
         }
+        McpUpstreamCallError::CallerAssertion(_) => ConnectionProtocolProbeError::new(
+            ConnectionTestStageName::Authenticated,
+            ConnectionTestReason::CallerAssertionNotEnforced,
+            ConnectionStatusReason::RequestFailed,
+        ),
         McpUpstreamCallError::RequestBodyTooLarge { .. } => ConnectionProtocolProbeError::new(
             default_stage,
             ConnectionTestReason::RequestBodyTooLarge,
@@ -1702,7 +1846,12 @@ async fn connect_connection(
     client: rmcp_http::Client,
     credential: Option<Arc<ResolvedConnectionCredential>>,
     discovery_response_budget: Option<DiscoveryResponseByteBudget>,
+    caller_assertions: Option<SessionCallerAssertions>,
 ) -> Result<rmcp::service::RunningService<rmcp::RoleClient, ()>, McpUpstreamCallError> {
+    // The assertion header is the Connection's as much as its credential
+    // headers are, so no custom header may set it either.
+    let mut credential_header_names = target.credential_header_names().to_vec();
+    credential_header_names.extend(target.caller_assertion_header_name().cloned());
     connect_endpoint_with_client(
         target.connection_id().as_str(),
         target.url(),
@@ -1710,7 +1859,8 @@ async fn connect_connection(
         client,
         Some(ManagedMcpAuthentication {
             credential,
-            credential_header_names: target.credential_header_names().to_vec(),
+            credential_header_names,
+            caller_assertions,
         }),
         discovery_response_budget,
         None,
@@ -1721,6 +1871,7 @@ async fn connect_connection(
 struct ManagedMcpAuthentication {
     credential: Option<Arc<ResolvedConnectionCredential>>,
     credential_header_names: Vec<HeaderName>,
+    caller_assertions: Option<SessionCallerAssertions>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1774,10 +1925,12 @@ async fn connect_endpoint_with_client(
         client = client.with_protocol_probe_control(protocol_probe_control.clone());
     }
     let client = if let Some(authentication) = managed_authentication {
-        client.with_connection_credential(
-            authentication.credential,
-            authentication.credential_header_names,
-        )
+        client
+            .with_connection_credential(
+                authentication.credential,
+                authentication.credential_header_names,
+            )
+            .with_caller_assertions(authentication.caller_assertions)
     } else {
         client
     };
@@ -1884,6 +2037,7 @@ struct LimitedMcpHttpClient {
     managed_connection: bool,
     connection_credential: Option<Arc<ResolvedConnectionCredential>>,
     credential_header_names: Vec<HeaderName>,
+    caller_assertions: Option<SessionCallerAssertions>,
 }
 
 impl LimitedMcpHttpClient {
@@ -1903,6 +2057,7 @@ impl LimitedMcpHttpClient {
             managed_connection: false,
             connection_credential: None,
             credential_header_names: Vec::new(),
+            caller_assertions: None,
         }
     }
 
@@ -1941,6 +2096,42 @@ impl LimitedMcpHttpClient {
         self.connection_credential = connection_credential;
         self.credential_header_names = credential_header_names;
         self
+    }
+
+    /// Signs a caller assertion onto every request this client sends, when
+    /// the Connection attests its caller.
+    fn with_caller_assertions(
+        mut self,
+        caller_assertions: Option<SessionCallerAssertions>,
+    ) -> Self {
+        self.caller_assertions = caller_assertions;
+        self
+    }
+
+    /// Writes this request's caller assertion, signed over its method and
+    /// exact body, once every other header is set, as the last header. A
+    /// value already under the name refuses the request rather than being
+    /// replaced or joined: validation keeps every other header source off
+    /// the name, and this is the check that holds if one of those rules were
+    /// to change.
+    fn apply_caller_assertion(
+        &self,
+        builder: rmcp_http::RequestBuilder,
+        method: &http::Method,
+        body: &[u8],
+    ) -> Result<rmcp_http::RequestBuilder, StreamableHttpError<LimitedMcpHttpError>> {
+        let Some(assertions) = self.caller_assertions.as_ref() else {
+            return Ok(builder);
+        };
+        let (client, request) = builder.build_split();
+        let mut request = request.map_err(mcp_http_error)?;
+        assertions
+            .sign_next(method, body)
+            .and_then(|signed| signed.inject(request.headers_mut()))
+            .map_err(|error| {
+                StreamableHttpError::Client(LimitedMcpHttpError::CallerAssertion(error))
+            })?;
+        Ok(rmcp_http::RequestBuilder::from_parts(client, request))
     }
 
     fn apply_connection_credential(
@@ -2044,6 +2235,7 @@ impl LimitedMcpHttpClient {
 enum LimitedMcpHttpError {
     Http(&'static str),
     Connection(ConnectionHttpError),
+    CallerAssertion(CallerAssertionError),
     AuthenticationRejected,
     Serialize(serde_json::Error),
     RequestBodyTooLarge { size: usize, max: usize },
@@ -2056,6 +2248,9 @@ impl fmt::Display for LimitedMcpHttpError {
         match self {
             Self::Http(category) => write!(formatter, "MCP upstream HTTP error: {category}"),
             Self::Connection(error) => write!(formatter, "MCP connection error: {error}"),
+            Self::CallerAssertion(error) => {
+                write!(formatter, "MCP caller assertion refused: {error}")
+            }
             Self::AuthenticationRejected => {
                 formatter.write_str("MCP connection authentication rejected")
             }
@@ -2086,6 +2281,7 @@ impl Error for LimitedMcpHttpError {
         match self {
             Self::Serialize(error) => Some(error),
             Self::Connection(error) => Some(error),
+            Self::CallerAssertion(error) => Some(error),
             Self::Http(_)
             | Self::AuthenticationRejected
             | Self::RequestBodyTooLarge { .. }
@@ -2139,6 +2335,8 @@ impl StreamableHttpClient for LimitedMcpHttpClient {
                 self.managed_connection,
             )?;
             request_builder = self.apply_connection_credential(request_builder)?;
+            request_builder =
+                self.apply_caller_assertion(request_builder, &http::Method::GET, &[])?;
             let (response, deadline) = self.send_request(request_builder).await?;
             let response = self.reject_connection_authentication(response).await?;
             if response.status() == StatusCode::METHOD_NOT_ALLOWED {
@@ -2205,6 +2403,8 @@ impl StreamableHttpClient for LimitedMcpHttpClient {
                 self.managed_connection,
             )?;
             request_builder = self.apply_connection_credential(request_builder)?;
+            request_builder =
+                self.apply_caller_assertion(request_builder, &http::Method::DELETE, &[])?;
             let (response, _deadline) = self.send_request(request_builder).await?;
             let response = self.reject_connection_authentication(response).await?;
 
@@ -2260,6 +2460,7 @@ impl StreamableHttpClient for LimitedMcpHttpClient {
                 request = request.header(CONTENT_TYPE, JSON_MIME);
             }
             request = self.apply_connection_credential(request)?;
+            request = self.apply_caller_assertion(request, &http::Method::POST, &body)?;
             let (response, deadline) = self.send_request(request.body(body)).await?;
             let response = self.reject_connection_authentication(response).await?;
             if response.status() == StatusCode::UNAUTHORIZED
@@ -2823,6 +3024,8 @@ where
 {
     if mcp_authentication_rejected(&error) {
         McpUpstreamCallError::AuthenticationRejected
+    } else if let Some(refusal) = mcp_caller_assertion_refusal(&error) {
+        McpUpstreamCallError::CallerAssertion(refusal)
     } else if let Some((size, max)) = mcp_request_body_too_large_size_max(&error) {
         McpUpstreamCallError::RequestBodyTooLarge { size, max }
     } else if let Some(max) = mcp_discovery_response_too_large_max(&error) {
@@ -2894,6 +3097,43 @@ fn mcp_authentication_rejected(error: &(dyn Error + 'static)) -> bool {
         current = error.source();
     }
     false
+}
+
+/// The refusal to sign one request's caller assertion, wherever the session's
+/// error wraps it, so the call reports why rather than a bare failure.
+fn mcp_caller_assertion_refusal(error: &(dyn Error + 'static)) -> Option<CallerAssertionError> {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if let Some(ServiceError::TransportSend(error)) = error.downcast_ref::<ServiceError>() {
+            if let Some(refusal) = mcp_caller_assertion_refusal(error.error.as_ref()) {
+                return Some(refusal);
+            }
+        }
+        if let Some(ClientInitializeError::TransportError { error, .. }) =
+            error.downcast_ref::<ClientInitializeError>()
+        {
+            if let Some(refusal) = mcp_caller_assertion_refusal(error.error.as_ref()) {
+                return Some(refusal);
+            }
+        }
+        if let Some(error) = error.downcast_ref::<DynamicTransportError>() {
+            if let Some(refusal) = mcp_caller_assertion_refusal(error.error.as_ref()) {
+                return Some(refusal);
+            }
+        }
+        // The transport's client error is not exposed as a source, so it is
+        // looked for by type, as an authentication rejection is.
+        if let Some(StreamableHttpError::Client(LimitedMcpHttpError::CallerAssertion(refusal))) =
+            error.downcast_ref::<StreamableHttpError<LimitedMcpHttpError>>()
+        {
+            return Some(*refusal);
+        }
+        if let Some(refusal) = error.downcast_ref::<CallerAssertionError>() {
+            return Some(*refusal);
+        }
+        current = error.source();
+    }
+    None
 }
 
 fn mcp_streamable_error_response_too_large(
@@ -4182,6 +4422,342 @@ mod tests {
         );
     }
 
+    /// One enabled managed MCP Connection that attests its caller, with a
+    /// generated signing key behind an operator alias. Its endpoint is never
+    /// reached: the egress policy allows no host. Removed on drop.
+    struct AttestedMcpRuntime {
+        _key: crate::connections::test_support::AssertionSigningKeyRoot,
+        database: std::path::PathBuf,
+        control_plane: crate::connections::control_plane::ConnectionControlPlane,
+        runtime: ConnectionHttpRuntime,
+        connection_id: String,
+    }
+
+    impl Drop for AttestedMcpRuntime {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", self.database.display()));
+            }
+        }
+    }
+
+    async fn attested_mcp_runtime(bind_request: bool) -> AttestedMcpRuntime {
+        let key = crate::connections::test_support::AssertionSigningKeyRoot::new();
+        let database = std::env::temp_dir().join(format!(
+            "greengateway-attested-mcp-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let mut config = Config::test_defaults();
+        config.connections_sqlite_path = Some(database.display().to_string());
+        key.configure(&mut config);
+        let control_plane =
+            crate::connections::control_plane::ConnectionControlPlane::from_config(&config)
+                .expect("attested MCP control plane should build");
+        let write: crate::connections::model::ConnectionWrite =
+            serde_json::from_value(serde_json::json!({
+                "display_name": "Attested MCP",
+                "enabled": true,
+                "kind": "mcp_streamable_http",
+                "endpoint": {
+                    "base_url": "https://mcp.example.test",
+                    "base_path": "/mcp"
+                },
+                "authentication": { "type": "none" },
+                "caller_assertion": {
+                    "signing_key_id": crate::connections::test_support::ASSERTION_SIGNING_KEY_ALIAS,
+                    "kid": "gw-mcp-1",
+                    "algorithm": "es256",
+                    "issuer": "https://gateway.example.test",
+                    "audience": "https://mcp.example.test",
+                    "token_type": "at+jwt",
+                    "header_name": "x-caller-assertion",
+                    "lifetime_seconds": 60,
+                    "bind_request": bind_request
+                },
+                "discovery": {
+                    "type": "managed_mcp",
+                    "use_connection_authentication": false
+                }
+            }))
+            .expect("attested MCP Connection should deserialize");
+        let created = control_plane
+            .create_managed(
+                control_plane.runtime_snapshot().collection_etag(),
+                write,
+                "test-admin",
+            )
+            .await
+            .expect("attested MCP Connection should create");
+        let egress_config = crate::egress::EgressConfig::default();
+        let egress_client = Arc::new(
+            EgressClient::new(egress_config.clone()).expect("attested MCP egress should build"),
+        );
+        let runtime =
+            ConnectionHttpRuntime::new(control_plane.clone(), egress_config, egress_client);
+        AttestedMcpRuntime {
+            _key: key,
+            database,
+            control_plane,
+            runtime,
+            connection_id: created.id.to_string(),
+        }
+    }
+
+    fn attested_mcp_caller(subject: &str) -> AttestedCaller {
+        AttestedCaller::from_principal(&crate::auth::Principal {
+            user_id: subject.to_owned(),
+            issuer: Some("https://idp.example.test".to_owned()),
+            email: None,
+            org_id: None,
+            roles: Vec::new(),
+            session_id: format!("session-{subject}"),
+            auth_method: crate::auth::AuthMethod::Bearer,
+        })
+        .expect("a provider-vouched principal is attestable")
+    }
+
+    /// The one assertion a captured request carried, verified the way an
+    /// upstream verifies it: by `kid` against the published key set.
+    fn verified_mcp_assertion(raw_request: &str, jwks: &str) -> serde_json::Value {
+        let assertions = raw_request
+            .lines()
+            .filter_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("x-caller-assertion")
+                    .then(|| value.trim().to_owned())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(assertions.len(), 1, "exactly one assertion per request");
+        let header =
+            jsonwebtoken::decode_header(&assertions[0]).expect("the assertion header decodes");
+        let set: jsonwebtoken::jwk::JwkSet =
+            serde_json::from_str(jwks).expect("the JWKS is a standard JWK Set");
+        let jwk = set
+            .find(&header.kid.expect("the assertion names its key"))
+            .expect("the signing key is published");
+        let key = jsonwebtoken::DecodingKey::from_jwk(jwk).expect("the published key loads");
+        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::ES256);
+        validation.set_issuer(&["https://gateway.example.test"]);
+        validation.set_audience(&["https://mcp.example.test"]);
+        jsonwebtoken::decode::<serde_json::Value>(&assertions[0], &key, &validation)
+            .expect("the assertion verifies against the published set")
+            .claims
+    }
+
+    #[tokio::test]
+    async fn an_attested_session_signs_every_request_with_its_own_assertion() {
+        let attested = attested_mcp_runtime(true).await;
+        let target = attested
+            .runtime
+            .mcp_tool_call_target(&attested.connection_id)
+            .expect("an attested MCP Connection serves tool calls");
+        let session = attested
+            .runtime
+            .caller_assertion_signer(&target)
+            .await
+            .expect("the signing key loads")
+            .expect("an attested target signs")
+            .into_session(&attested_mcp_caller("alice"), "request-mcp");
+        // The Connection's credential and its assertion travel together, and
+        // neither may be set by a custom header.
+        let api_key_header = HeaderName::from_static("x-managed-mcp-key");
+        let owned = vec![api_key_header.clone(), session.header_name().clone()];
+        let credential = Arc::new(ResolvedConnectionCredential::header_api_key_for_test(
+            api_key_header,
+            b"managed-mcp-key-canary",
+        ));
+        let capture = |response: &'static [u8]| {
+            let credential = Arc::clone(&credential);
+            let owned = owned.clone();
+            let session = session.clone();
+            async move {
+                let (client, url, server) =
+                    managed_client_capture_with_headers(credential, owned, response).await;
+                (client.with_caller_assertions(Some(session)), url, server)
+            }
+        };
+        let request = ClientJsonRpcMessage::request(
+            ClientRequest::CallToolRequest(CallToolRequest::new(CallToolRequestParams::new(
+                "attested_tool".to_owned(),
+            ))),
+            NumberOrString::Number(1),
+        );
+        let posted = serialize_mcp_request_body(&request).expect("the request serializes");
+
+        let (client, url, server) =
+            capture(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await;
+        client
+            .post_message(Arc::from(url), request, None, None, HashMap::new())
+            .await
+            .expect("an attested POST should succeed");
+        let post = server.await.expect("POST capture should finish");
+        let (client, url, server) = capture(
+            b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(matches!(
+            client
+                .get_stream(
+                    Arc::from(url),
+                    Arc::from("attested-session"),
+                    None,
+                    None,
+                    HashMap::new(),
+                )
+                .await,
+            Err(StreamableHttpError::ServerDoesNotSupportSse)
+        ));
+        let get = server.await.expect("GET capture should finish");
+        let (client, url, server) =
+            capture(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+        client
+            .delete_session(
+                Arc::from(url),
+                Arc::from("attested-session"),
+                None,
+                HashMap::new(),
+            )
+            .await
+            .expect("an attested DELETE should succeed");
+        let delete = server.await.expect("DELETE capture should finish");
+
+        let jwks = attested
+            .control_plane
+            .caller_assertion_jwks()
+            .await
+            .expect("the signing key is published");
+        for (raw, jti, method, body) in [
+            (&post, "request-mcp.1", "POST", posted.as_slice()),
+            (&get, "request-mcp.2", "GET", b"".as_slice()),
+            (&delete, "request-mcp.3", "DELETE", b"".as_slice()),
+        ] {
+            assert!(raw
+                .to_ascii_lowercase()
+                .contains("\r\nx-managed-mcp-key: managed-mcp-key-canary\r\n"));
+            let claims = verified_mcp_assertion(raw, jwks.body());
+            // Its own `jti` for each request, so an upstream replay cache
+            // keyed on `sub` and `jti` accepts the whole session.
+            assert_eq!(claims["jti"], serde_json::json!(jti));
+            assert_eq!(
+                claims["sub"],
+                serde_json::json!("https://idp.example.test#alice")
+            );
+            // Each binds its own method and the exact body it sent.
+            assert_eq!(claims["method"], serde_json::json!(method));
+            assert_eq!(claims["path"], serde_json::json!("/mcp"));
+            assert_eq!(
+                claims["request_sha256"],
+                serde_json::json!(hex::encode(<sha2::Sha256 as sha2::Digest>::digest(body)))
+            );
+        }
+        assert_eq!(
+            session.seal(),
+            Some(IssuedSessionCallerAssertions {
+                kid: "gw-mcp-1".to_owned(),
+                jti_base: "request-mcp".to_owned(),
+                count: 3,
+            })
+        );
+
+        // Once the call is over, a late request is refused before it is
+        // sent, rather than carrying an assertion no audit record counts, and
+        // the call reports why.
+        let (client, url, server) =
+            capture(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+        let error = client
+            .delete_session(
+                Arc::from(url),
+                Arc::from("attested-session"),
+                None,
+                HashMap::new(),
+            )
+            .await
+            .expect_err("a sealed session signs nothing");
+        assert!(matches!(
+            error,
+            StreamableHttpError::Client(LimitedMcpHttpError::CallerAssertion(
+                CallerAssertionError::SignatureFailed
+            ))
+        ));
+        assert_eq!(
+            mcp_service_error(error, McpUpstreamCallError::Call),
+            McpUpstreamCallError::CallerAssertion(CallerAssertionError::SignatureFailed)
+        );
+        server.abort();
+
+        // No custom header may name the assertion header.
+        let assertion_header = HeaderName::from_static("x-caller-assertion");
+        assert_eq!(
+            validate_mcp_custom_header(&assertion_header, &owned, true),
+            Err(assertion_header.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_attested_mcp_call_without_a_principal_is_refused_before_any_io() {
+        let attested = attested_mcp_runtime(false).await;
+        let mut issued = None;
+        for request_id in ["request-anonymous", "request-service-token"] {
+            // A service token never becomes an attested caller, so both
+            // arrive here as `None`.
+            let target = attested
+                .runtime
+                .mcp_tool_call_target(&attested.connection_id)
+                .expect("an attested MCP Connection serves tool calls");
+            let error = call_connection_tool_at_target(
+                &attested.runtime,
+                target,
+                "attested_tool",
+                serde_json::json!({}),
+                McpToolCallAttestation {
+                    caller: None,
+                    request_id,
+                },
+                &mut issued,
+            )
+            .await
+            .expect_err("a call naming nobody is refused");
+            assert_eq!(
+                error,
+                McpUpstreamCallError::CallerAssertion(CallerAssertionError::NoPrincipal)
+            );
+            assert_eq!(error.reason(), "caller_assertion_no_principal");
+            assert_eq!(issued, None);
+        }
+
+        // The egress policy allows no host, so the same call made for a caller
+        // goes on to the preflight and fails there: the refusal above came
+        // before it, and nothing was signed for a session that never opened.
+        let target = attested
+            .runtime
+            .mcp_tool_call_target(&attested.connection_id)
+            .expect("an attested MCP Connection serves tool calls");
+        let alice = attested_mcp_caller("alice");
+        let error = call_connection_tool_at_target(
+            &attested.runtime,
+            target,
+            "attested_tool",
+            serde_json::json!({}),
+            McpToolCallAttestation {
+                caller: Some(&alice),
+                request_id: "request-alice",
+            },
+            &mut issued,
+        )
+        .await
+        .expect_err("the egress policy refuses the endpoint");
+        assert_eq!(error, McpUpstreamCallError::EgressRejected);
+        assert_eq!(issued, None);
+        // Discovery has no caller to attest, so it is refused before any
+        // session opens.
+        assert_eq!(
+            attested.runtime.mcp_target(&attested.connection_id).err(),
+            Some(ConnectionHttpError::CallerAssertionNotEnforced)
+        );
+    }
+
     #[test]
     fn managed_mcp_custom_headers_reject_every_connection_owned_header() {
         let owned = vec![
@@ -4508,6 +5084,7 @@ mod tests {
             ManagedMcpAuthentication {
                 credential: None,
                 credential_header_names: Vec::new(),
+                caller_assertions: None,
             },
             operation_deadline,
             hard_deadline,

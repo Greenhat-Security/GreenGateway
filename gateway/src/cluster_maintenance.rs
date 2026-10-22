@@ -41,7 +41,8 @@
 //! - **Bounded, independent jobs in a fixed order.** Each job is one
 //!   bounded step (`JOB_STEP_LIMIT` rows, `JOB_BUDGET` wall time) that
 //!   deletes what is already dead by database time: expired JWT
-//!   revocations, idle rate-limit buckets, expired pending logins, stale
+//!   revocations, idle rate-limit buckets, expired pending logins, expired
+//!   admin sessions and their pending cookie logins, stale
 //!   member rows, audit events past `AUDIT_POSTGRES_RETENTION_DAYS` (never
 //!   past the retention floor, see [`AuditRetentionFloor`]), and lease rows
 //!   expired for more than one TTL. A failing job is logged, recorded in the
@@ -71,6 +72,7 @@ use crate::{
         CLUSTER_MAINTENANCE_JOB_RUNS_TOTAL, CLUSTER_MAINTENANCE_LEADER, CLUSTER_MEMBERS_LIVE,
     },
     storage::{
+        postgres_admin_sessions::PostgresAdminSessionStore,
         postgres_audit::PostgresAuditEventStore, postgres_session::advisory_lock_key,
         DedicatedSession, JobOutcome, PostgresExecutionLeaseStore, PostgresJwtRevocationStore,
         PostgresMembershipStore, PostgresPendingLoginStore, PostgresRateLimitStore,
@@ -110,6 +112,7 @@ const MIN_ACQUISITION_BACKOFF: Duration = Duration::from_millis(20);
 pub(crate) const JOB_JWT_REVOCATION_CLEANUP: &str = "jwt_revocation_cleanup";
 pub(crate) const JOB_RATE_LIMIT_IDLE_SWEEP: &str = "rate_limit_idle_sweep";
 pub(crate) const JOB_PENDING_LOGIN_PRUNE: &str = "pending_login_prune";
+pub(crate) const JOB_ADMIN_SESSION_PRUNE: &str = "admin_session_prune";
 pub(crate) const JOB_STALE_MEMBER_SWEEP: &str = "stale_member_sweep";
 pub(crate) const JOB_AUDIT_RETENTION: &str = "audit_retention";
 pub(crate) const JOB_EXECUTION_LEASE_REAPER: &str = "execution_lease_reaper";
@@ -121,10 +124,11 @@ pub(crate) const JOB_EXECUTION_LEASE_REAPER: &str = "execution_lease_reaper";
 /// `the_leader_task_vocabulary_is_the_singletons_job_names` in
 /// `cluster_status.rs` already keeps the status view's copy of this list
 /// in step; the registry label audit uses this one.
-pub(crate) const JOB_NAMES: [&str; 6] = [
+pub(crate) const JOB_NAMES: [&str; 7] = [
     JOB_JWT_REVOCATION_CLEANUP,
     JOB_RATE_LIMIT_IDLE_SWEEP,
     JOB_PENDING_LOGIN_PRUNE,
+    JOB_ADMIN_SESSION_PRUNE,
     JOB_STALE_MEMBER_SWEEP,
     JOB_AUDIT_RETENTION,
     JOB_EXECUTION_LEASE_REAPER,
@@ -274,6 +278,25 @@ impl MaintenanceJob for PendingLoginPrune {
     }
 }
 
+/// Withdraw expired admin sessions, each with its evidence row, and delete
+/// expired pending cookie logins
+/// (`PostgresAdminSessionStore::prune_expired_with`). Needs no keyring, so it
+/// runs whether or not this replica has a session mode configured.
+pub(crate) struct AdminSessionPrune {
+    pub(crate) limit: u32,
+}
+
+#[async_trait]
+impl MaintenanceJob for AdminSessionPrune {
+    fn name(&self) -> &'static str {
+        JOB_ADMIN_SESSION_PRUNE
+    }
+
+    async fn run_step(&self, client: &tokio_postgres::Client) -> Result<u64, RepositoryError> {
+        PostgresAdminSessionStore::prune_expired_with(client, self.limit).await
+    }
+}
+
 /// Sweep roster rows whose heartbeat is older than the stale window
 /// (`PostgresMembershipStore::sweep_stale`), then publish the live count.
 pub(crate) struct StaleMemberSweep {
@@ -402,6 +425,9 @@ pub(crate) fn standard_jobs(sources: StandardJobSources) -> Vec<Arc<dyn Maintena
             limit: JOB_STEP_LIMIT,
         }),
         Arc::new(PendingLoginPrune {
+            limit: JOB_STEP_LIMIT,
+        }),
+        Arc::new(AdminSessionPrune {
             limit: JOB_STEP_LIMIT,
         }),
         Arc::new(StaleMemberSweep {
@@ -912,6 +938,7 @@ mod tests {
             JOB_JWT_REVOCATION_CLEANUP,
             JOB_RATE_LIMIT_IDLE_SWEEP,
             JOB_PENDING_LOGIN_PRUNE,
+            JOB_ADMIN_SESSION_PRUNE,
             JOB_STALE_MEMBER_SWEEP,
             JOB_AUDIT_RETENTION,
             JOB_EXECUTION_LEASE_REAPER,

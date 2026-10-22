@@ -84,6 +84,11 @@ const AUTHORITATIVE_TABLES: &[&str] = &[
     // evidence is history once written.
     "service_token_change_evidence",
     "jwt_revocation_evidence",
+    // 0019: admin session grant and withdrawal evidence. Sessions themselves
+    // are runtime state (standalone sessions live in process memory and are
+    // never imported); a grant row means an administrator already signed in
+    // to this cluster.
+    "admin_session_evidence",
 ];
 
 /// The authoritative singleton counters and the column that carries them.

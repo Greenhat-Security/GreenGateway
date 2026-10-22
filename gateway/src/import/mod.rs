@@ -153,6 +153,8 @@ const NOT_IMPORTED: &[&str] = &[
     "rate_limit_buckets",
     "rate_limit_cardinality",
     "admin_pending_logins",
+    "admin_session_logins",
+    "admin_sessions",
     "jwt_revocations",
     "security_outbox (the import announces nothing; a commit appends its own row)",
     "principal_directory (cluster mode has none; the audit log it projects from is imported)",

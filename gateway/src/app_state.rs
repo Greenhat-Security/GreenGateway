@@ -493,7 +493,7 @@ impl AdminAuthState {
         self.sessions
             .as_ref()
             .map(|sessions| AdminSessionCapabilities {
-                storage: "standalone_memory",
+                storage: sessions.storage().as_str(),
                 completion_mode: "cookie",
                 login_url: format!("{}auth/login", sessions.api_prefix),
                 completion_url: format!("{}auth/callback", sessions.api_prefix),

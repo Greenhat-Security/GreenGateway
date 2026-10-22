@@ -16,10 +16,10 @@
 //! that becomes a tested guarantee. Three variables are requested twice --
 //! `DISCOVERY_PROJECTOR_LEASE_TTL_MS`, `DISCOVERY_PROJECTOR_POLL_MS` and
 //! `DISCOVERY_PROJECTOR_BATCH`, once to learn whether they were set and once
-//! to parse them -- and one is requested conditionally:
-//! `ADMIN_SESSION_MAX_ENTRIES` is not requested at all when
-//! `ADMIN_SESSION_MODE` is anything but `standalone_memory` and
-//! `ADMIN_SESSION_TTL_SECS` is set, because the check that reads it
+//! to parse them -- and two are requested conditionally:
+//! `ADMIN_SESSION_IDLE_TIMEOUT_SECS` and `ADMIN_SESSION_MAX_ENTRIES` are not
+//! requested at all when `ADMIN_SESSION_MODE` enables no session store and
+//! `ADMIN_SESSION_TTL_SECS` is set, because the check that reads them
 //! short-circuits.
 //!
 //! The gateway's own source also reads the environment outside the parser.
@@ -43,9 +43,9 @@ use super::{
     ADMIN_CLIENT_CERT_CA_FILE, ADMIN_CLIENT_CERT_CRL_FILE, ADMIN_CLIENT_CERT_MODE,
     ADMIN_LISTEN_ADDR, ADMIN_LOGIN_KEYRING, ADMIN_LOGIN_PENDING_MAX_ENTRIES,
     ADMIN_LOGIN_PENDING_MAX_PER_IP, ADMIN_LOGIN_PENDING_TTL_SECS, ADMIN_LOGIN_PROVIDER,
-    ADMIN_PREFIX, ADMIN_SESSION_MAX_ENTRIES, ADMIN_SESSION_MODE, ADMIN_SESSION_TTL_SECS,
-    ADMIN_TLS_CERT_FILE, ADMIN_TLS_KEY_FILE, AUDIT_DRAIN_TIMEOUT_MS, AUDIT_LOG_FILE,
-    AUDIT_POSTGRES_RETENTION_DAYS, AUDIT_SQLITE_PATH, AUDIT_SQLITE_RETENTION_DAYS,
+    ADMIN_PREFIX, ADMIN_SESSION_IDLE_TIMEOUT_SECS, ADMIN_SESSION_MAX_ENTRIES, ADMIN_SESSION_MODE,
+    ADMIN_SESSION_TTL_SECS, ADMIN_TLS_CERT_FILE, ADMIN_TLS_KEY_FILE, AUDIT_DRAIN_TIMEOUT_MS,
+    AUDIT_LOG_FILE, AUDIT_POSTGRES_RETENTION_DAYS, AUDIT_SQLITE_PATH, AUDIT_SQLITE_RETENTION_DAYS,
     AUDIT_SUCCESSFUL_PROBES_METRICS_ONLY, AUTH_COOKIE_NAME, AUTH_ENABLED, AUTH_EXEMPT_PATHS,
     AUTH_MODE, AUTH_PROVIDERS, CLIENT_CERT_CA_FILE, CLIENT_CERT_CRL_FILE,
     CLIENT_CERT_IDENTITY_SOURCE, CLIENT_CERT_MODE, CLUSTER_HEARTBEAT_MS,
@@ -115,6 +115,7 @@ pub(crate) const CONFIG_INPUTS: &[&str] = &[
     ADMIN_LOGIN_PROVIDER,
     ADMIN_SESSION_MODE,
     ADMIN_SESSION_TTL_SECS,
+    ADMIN_SESSION_IDLE_TIMEOUT_SECS,
     ADMIN_SESSION_MAX_ENTRIES,
     ADMIN_LOGIN_PENDING_TTL_SECS,
     ADMIN_LOGIN_PENDING_MAX_ENTRIES,
@@ -525,7 +526,10 @@ mod tests {
             "unlisted variables requested: {unlisted:?}"
         );
         let skipped: Vec<&str> = inventory.difference(&requested).copied().collect();
-        assert_eq!(skipped, [ADMIN_SESSION_MAX_ENTRIES]);
+        assert_eq!(
+            skipped,
+            [ADMIN_SESSION_IDLE_TIMEOUT_SECS, ADMIN_SESSION_MAX_ENTRIES]
+        );
     }
 
     #[test]

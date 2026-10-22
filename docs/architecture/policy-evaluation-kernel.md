@@ -3,13 +3,13 @@
 Issue #421 introduces `gateway/src/policy_eval/`. **The HTTP/RBAC adapter now
 uses it for live decisions**, including routes, host qualification, dispatch
 constraints and raw/canonical MCP HTTP identities (#422, PR 1), and so do tool
-admission (#422, PR 2) and policy rate-lane selection (#422, PR 3a). Static
-egress retains its existing authority. This does not complete #422 or add Policy
-Studio simulation/replay endpoints.
+admission (#422, PR 2), policy rate-lane selection (#422, PR 3a) and the static
+egress checks (#422, PR 3b). This does not complete #422 or add Policy Studio
+simulation/replay endpoints.
 
 It now covers contextless HTTP direct rules and permission routes, host-qualified
 routes and dispatch-scoped direct rules, MCP alias identities, and rate-lane
-selection, plus five policy-backed tool operations. Static egress is not implemented.
+selection, plus five policy-backed tool operations and the static egress lane.
 [policy-evaluation-parity.md](policy-evaluation-parity.md) is the per-lane
 inventory: legacy entry point, normalization, default, trace reason, authority.
 
@@ -50,7 +50,7 @@ freshness or perform a live cluster-revision check.
 | MCP raw/canonical aliases | `evaluate_equivalent_paths_with_dispatch`, exact-then-prefix route search | Both identities decide, under action-major precedence; the request path is matched exactly and only the canonical identity by prefix |
 | Rate lane selection | `policy_rate_limit_request` guard, `RateLimitPolicyState::matching_limiter` | First matching override; anonymous reaches none, reproducing the live early return; live since #422 PR 3a, with buckets, capacity and enforcement left to the limiter |
 | Policy-backed tools | `ToolRuntime` invocation, visibility, composite enablement, rendered HTTP rules; `RbacState::tool_policy_eligibility` | Separate pure operations preserve each consumer's precedence and shadow behavior; live since #422 PR 2 |
-| Static egress | Existing egress authority | Not evaluated; #421 PR 2 still owns extraction |
+| Static egress | `EgressClient::checked_destination`, `rebind_checked_destination`, `revalidated_destination` | URL shape, scheme, host and port allowlists before any name is resolved, then the address checks over supplied answers; live since #422 PR 3b, with DNS, redirects, TLS and transport left to `crate::egress` |
 
 Every target is evaluated, so there is no `unsupported_target` limitation and no
 `unsupported_routing_policy`; both are gone. What remains is facts: each missing
@@ -209,10 +209,10 @@ execution closures, and exercise shadow/default combinations and identity
 constraints. Additional tests assert input binding, missing/invalid facts,
 redacted bounded traces, thread determinism and no audit emission.
 
-The HTTP/route adapter is the first #422 cutover. The remaining #421 PR 2 lane is
-static egress; it needs its trusted-fact boundary
-established before any of it is pure, since its acceptance criterion is that a
-denied request makes zero DNS calls.
+The HTTP/route adapter was the first #422 cutover and static egress the last
+lane of #421 PR 2. Its trusted-fact boundary is described below; its acceptance
+criterion, that a denied request makes zero DNS calls, is held by tests whose
+resolver panics when called.
 
 ## Live HTTP adapter (#422, PR 1)
 
@@ -261,3 +261,52 @@ the authorization stage's answer for an unevaluated request: `403`, an
 unsafe paths and asterisk-form targets, were already refused by the
 authorization stage with the same answer. Mutable capacity, the shared store and
 the global lanes are unchanged and stay outside the evaluator.
+
+## Static egress lane (#422, PR 3b)
+
+`CompiledEgressPolicy::evaluate` (`policy_eval::egress`) accepts
+`EgressEvaluationContext` version 1, independent of the HTTP and tool context
+versions. Its domain is `static_egress_v1` and its semantics version is
+`gg-static-egress-v1`. Its resource is not the HTTP policy: the controls it
+decides by are partly configuration (the exact bootstrap and auto-seeded hosts,
+the non-global switch, NAT64 prefixes) and partly the policy `egress` section
+(host patterns, ports, private-address CIDRs), so its `EgressSnapshot` binds a
+digest over exactly those controls, with every collection sorted, under its own
+frame kind `gg.egress-controls.v1`.
+
+The context carries the destination as `EgressDestination` -- scheme, lowercased
+host, explicit or default port, and whether userinfo or a fragment is present,
+normalized once from the URL -- and a `ResolutionFact`: `Missing`, or `Resolved`
+with the complete answer set in resolver order. The static checks run first and
+in the pre-cutover order (host present, no userinfo, no fragment, `http` or
+`https`, host allowlist, port allowlist), and a refusal there is complete and
+final whatever the facts are. A destination they admit is `Indeterminate` with
+`missing_resolution_fact` until answers are supplied. Over answers, the lane
+refuses an empty set or any answer on another port, then refuses the set if any
+answer is non-global and outside every policy CIDR (when non-global blocking is
+on), reporting that answer's ordinal; otherwise it allows and pins answer 0.
+
+The answers are trusted only in the sense that the lane decides over what it is
+given. It never resolves a name, and it cannot say whether a set is what a
+resolver returned or how fresh it is; those, the lookup itself, redirect
+refusal, TLS, the pinned transport and request and response bounds are in
+`not_evaluated`. The predicates are the egress module's own -- host patterns,
+the non-global registry with its NAT64 handling, CIDR membership -- so their
+semantics cannot drift between the lane and the module applying it. The lane
+imposes no bound of its own on a URL or an answer set: the pre-cutover checks had
+none, and a bound found at decision time would refuse destinations the gateway
+reaches today.
+
+The live adapter is `crate::egress`. Each `EgressClient` compiles one lane from
+its configuration when it is built and asks it twice per decision: with no
+facts, so that only a destination it admits reaches the resolver, then with the
+resolver's answers. Rebinding and revalidation ask with the pinned address as
+the only answer and resolve nothing. A resolver failure is refused by the
+adapter before the lane is asked again. An evaluator error, or an answer the
+question cannot have, refuses the destination as `invalid_policy`; every other
+refusal is the error, warning and safe category the pre-cutover checks
+produced. Traces bind the destination facts and the answers but contain none of
+their values: the blocked answer is an ordinal, and the host, scheme, port and
+addresses stay out. `canonical_trace_bytes` and `reusable_for` remain offline.
+The frozen pre-cutover checks and the differential fixtures are described in
+[policy-evaluation-parity.md](policy-evaluation-parity.md).

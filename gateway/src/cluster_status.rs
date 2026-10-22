@@ -119,7 +119,8 @@ pub(crate) const REASON_MEMBER_ERROR_REPORTED: &str = "member_error_reported";
 /// row written by hand -- is reported as `unknown` rather than echoed.
 /// `the_leader_task_vocabulary_is_the_singletons_job_names` keeps this
 /// list and `cluster_maintenance`'s constants in step.
-pub(crate) const KNOWN_LEADER_TASKS: [&str; 6] = [
+pub(crate) const KNOWN_LEADER_TASKS: [&str; 7] = [
+    "admin_session_prune",
     "audit_retention",
     "execution_lease_reaper",
     "jwt_revocation_cleanup",
@@ -1783,6 +1784,7 @@ mod tests {
             cluster_maintenance::JOB_JWT_REVOCATION_CLEANUP,
             cluster_maintenance::JOB_RATE_LIMIT_IDLE_SWEEP,
             cluster_maintenance::JOB_PENDING_LOGIN_PRUNE,
+            cluster_maintenance::JOB_ADMIN_SESSION_PRUNE,
             cluster_maintenance::JOB_STALE_MEMBER_SWEEP,
             cluster_maintenance::JOB_AUDIT_RETENTION,
             cluster_maintenance::JOB_EXECUTION_LEASE_REAPER,
