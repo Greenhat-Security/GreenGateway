@@ -2,13 +2,17 @@ use super::*;
 use crate::{
     audit::{sink::tests::CaptureSink, AuditLog, AuditSink},
     auth::{actor_from_principal, AuthMethod},
+    connections::model::ConnectionId,
     middleware::rbac::{RbacState, ToolPolicyEligibility},
     policy_eval::{PolicyAuthority, PrincipalIdentity},
     rbac::Policy,
     request_bounds::MAX_REQUEST_PATH_BYTES,
-    tools::runtime::{
-        ToolInvocationContext, ToolInvocationSource, ToolRuntime, ToolRuntimeConfig,
-        ToolRuntimeError,
+    tools::{
+        enum_source::SourceAuthorizer,
+        runtime::{
+            ToolInvocationContext, ToolInvocationSource, ToolRuntime, ToolRuntimeConfig,
+            ToolRuntimeError,
+        },
     },
 };
 use proptest::prelude::*;
@@ -819,6 +823,15 @@ const RENDERED_PATHS: [&str; 4] = [
     "/reports/private%2Frecord",
     "/elsewhere",
 ];
+/// Rendered enum-source requests: each rendered path, and one with the fixed
+/// query a source appends, which neither side may match or audit.
+const SOURCE_REQUESTS: [&str; 5] = [
+    "/reports/42",
+    "/reports/42/child?api_key=source-query-canary",
+    "/reports/private%2Frecord",
+    "/elsewhere",
+    "/",
+];
 
 /// Each identity varies one fact a tool entry or rule can constrain. A client
 /// certificate is projected away by the runtime's Actor projection and kept by
@@ -936,6 +949,33 @@ async fn assert_old_and_new_agree(policy: &Policy) {
             }
         }
     }
+    // The enum-source precheck has no caller, so it is asked once per source,
+    // for each probed tool, a name longer than any policy may carry, and a
+    // source that names a path only.
+    let connection_id = ConnectionId::parse("differential-source").unwrap();
+    let over_long = "t".repeat(MAX_TOOL_NAME_BYTES + 1);
+    for tool in PROBED_NAMES
+        .into_iter()
+        .chain([over_long.as_str()])
+        .map(Some)
+        .chain([None])
+    {
+        for request in SOURCE_REQUESTS {
+            let template = request.split_once('?').map_or(request, |(path, _)| path);
+            assert_eq!(
+                runtime_old.legacy_authorize_source_request(
+                    policy,
+                    &connection_id,
+                    "statuses",
+                    tool,
+                    request,
+                    template,
+                ),
+                runtime_new.authorize(&connection_id, "statuses", tool, request, template),
+                "source request {request} for {tool:?}"
+            );
+        }
+    }
     audit_old
         .close_and_drain(Duration::from_secs(5))
         .await
@@ -948,6 +988,12 @@ async fn assert_old_and_new_agree(policy: &Policy) {
     assert!(
         !old.is_empty(),
         "the corpus must exercise audited decisions"
+    );
+    assert!(
+        !serde_json::to_string(&old)
+            .unwrap()
+            .contains("source-query-canary"),
+        "a source's fixed query is never audited"
     );
     assert_eq!(old, audit_records(&capture_new));
 }
@@ -1354,5 +1400,128 @@ async fn refusals_block_with_stable_reasons_where_the_frozen_consumers_answered(
             denied("policy_evaluation_error"),
             denied("policy_evaluation_error"),
         ]
+    );
+}
+
+fn source_request(
+    compiled: &CompiledPolicy,
+    tool: Option<&str>,
+    path: &str,
+) -> SourceRequestContext {
+    SourceRequestContext {
+        version: TOOL_CONTEXT_VERSION,
+        snapshot: compiled.snapshot(),
+        tool_name: tool.map(str::to_owned),
+        path: path.to_owned(),
+    }
+}
+
+#[test]
+fn a_source_request_is_refused_only_by_a_deny_its_anonymous_contextless_get_matches() {
+    // Spelled out rather than compared with the live precheck, which asks
+    // this same evaluator. The frozen-oracle corpus above covers breadth.
+    let mut value = base();
+    value["rules"] = json!([
+        // None of these can refuse: an allow and a shadow never do, and the
+        // denies each constrain a fact the request does not have.
+        {"path":"/reports/**","action":"allow"},
+        {"path":"/reports/**","action":"shadow"},
+        {"path":"/reports/**","methods":["POST"],"action":"deny"},
+        {"path":"/reports/**","principal":{"roles":["reader"]},"action":"deny"},
+        {"path":"/reports/**","dispatch":{"kind":"legacy","upstream_origin":"https://upstream.example.test"},"action":"deny"},
+        {"path":"/reports/**","dispatch":{"kind":"route","route_id":"reports"},"action":"deny"},
+        {"tool_name":"reports.export","action":"deny"},
+        {"path":"/reports/**","enabled":false,"action":"deny"},
+        // These can, and the first in source order is named.
+        {"path":"/reports/{id}","methods":["GET"],"dispatch":{"kind":"contextless"},"action":"deny"},
+        {"path":"/reports/**","action":"deny"}
+    ]);
+    let compiled = compile(value);
+    let decide = |tool, path| {
+        compiled
+            .evaluate_source_request(&source_request(&compiled, tool, path))
+            .unwrap()
+    };
+    assert_eq!(
+        decide(Some("reports.export"), "/reports/42"),
+        SourceRequestDecision::Denied { index: 8 }
+    );
+    assert_eq!(
+        decide(None, "/reports/private%2Frecord"),
+        SourceRequestDecision::Denied { index: 8 }
+    );
+    assert_eq!(
+        decide(None, "/reports/42/child"),
+        SourceRequestDecision::Denied { index: 9 }
+    );
+    assert_eq!(decide(None, "/elsewhere"), SourceRequestDecision::Allowed);
+    // The default does not decide: this policy's default denies.
+    assert_eq!(
+        decide(Some("reports.export"), "/elsewhere"),
+        SourceRequestDecision::Allowed
+    );
+}
+
+#[test]
+fn a_source_request_for_an_absent_or_disabled_tool_is_refused_before_any_rule() {
+    let mut value = base();
+    value["tools"]["reports.import"] = json!({"enabled": false});
+    value["rules"] = json!([{"path":"/elsewhere","action":"deny"}]);
+    let compiled = compile(value);
+    for tool in ["reports.import", "reports.unknown"] {
+        for path in ["/reports/42", "/elsewhere"] {
+            assert_eq!(
+                compiled
+                    .evaluate_source_request(&source_request(&compiled, Some(tool), path))
+                    .unwrap(),
+                SourceRequestDecision::ToolDisabled,
+                "{tool} {path}"
+            );
+        }
+    }
+    // A source that names a path has no entry to read.
+    assert_eq!(
+        compiled
+            .evaluate_source_request(&source_request(&compiled, None, "/reports/42"))
+            .unwrap(),
+        SourceRequestDecision::Allowed
+    );
+}
+
+#[test]
+fn a_source_request_the_evaluator_cannot_accept_is_refused_rather_than_answered() {
+    let compiled = compile(base());
+    let refused = |context: SourceRequestContext| compiled.evaluate_source_request(&context);
+    let mut context = source_request(&compiled, None, "/reports/42");
+    context.version = TOOL_CONTEXT_VERSION + 1;
+    assert_eq!(
+        refused(context),
+        Err(EvaluationError::UnsupportedContextVersion)
+    );
+    let mut context = source_request(&compiled, None, "/reports/42");
+    context.snapshot = compile(json!({"schema_version":"0.1.0"})).snapshot();
+    assert_eq!(refused(context), Err(EvaluationError::SnapshotMismatch));
+    let long_name = "t".repeat(MAX_TOOL_NAME_BYTES + 1);
+    assert_eq!(
+        refused(source_request(&compiled, Some(&long_name), "/reports/42")),
+        Err(EvaluationError::ContextTooLarge)
+    );
+    for path in [
+        "reports/42",
+        "/reports/../42",
+        "/reports//42",
+        "/reports/42?x=1",
+        "/reports/%GG",
+    ] {
+        assert_eq!(
+            refused(source_request(&compiled, None, path)),
+            Err(EvaluationError::MalformedPath),
+            "{path}"
+        );
+    }
+    let long_path = format!("/{}", "a".repeat(MAX_REQUEST_PATH_BYTES));
+    assert_eq!(
+        refused(source_request(&compiled, None, &long_path)),
+        Err(EvaluationError::ContextTooLarge)
     );
 }

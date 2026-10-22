@@ -33,7 +33,10 @@
 //! against the recomputed document hash (a tampered pointer fails closed as
 //! `InvalidData` rather than serving an unverifiable document) and parses
 //! the document through [`Policy::validate_json_value`], so callers only
-//! ever see a document this binary can serve.
+//! ever see a document this binary can serve. A document whose format is
+//! outside `cluster_membership::DOCUMENT_VERSION_RANGE` -- policy v1, today
+//! -- is refused the same way: every replica reads only the formats it
+//! advertises, and the commit path refuses to write any other.
 //!
 //! Redaction follows the foundation's rules: no SQL text, no query values,
 //! and no DSN-derived material cross the error boundary.
@@ -282,6 +285,11 @@ pub(crate) async fn commit_policy_in(
     client: &deadpool_postgres::Object,
     request: PolicyCommitRequest<'_>,
 ) -> Result<ActivePolicy, PolicyCommitError> {
+    // The commit paths refuse such a candidate before they get here; this
+    // keeps the authority from ever holding a document no replica reads.
+    if !request.candidate.cluster_serves_document_format() {
+        return Err(store_error(invalid_data(OPERATION_COMMIT)));
+    }
     acquire_policy_overlay_lock(client)
         .await
         .map_err(store_error)?;
@@ -589,13 +597,32 @@ fn policy_from_json(
 ) -> Result<Policy, RepositoryError> {
     let value =
         serde_json::from_str::<Value>(document_json).map_err(|_| invalid_data(operation))?;
-    Policy::validate_json_value(value).map_err(|error| {
+    let policy = Policy::validate_json_value(value).map_err(|error| {
         log_classified(
             operation,
             &error,
             RepositoryError::new(RepositoryErrorKind::InvalidData, operation),
         )
-    })
+    })?;
+    // A document this build parses is not necessarily one it may serve here:
+    // a replica reads only the document formats it advertises on the roster,
+    // so every member that serves this deployment reads it the same way. A
+    // policy v1 document fails closed exactly as it does on a build that
+    // predates v1.
+    if !policy.cluster_serves_document_format() {
+        let (minimum, maximum) = crate::cluster_membership::DOCUMENT_VERSION_RANGE;
+        let error = crate::rbac::policy::PolicyError::Invalid(format!(
+            "policy schema_version '{}' is outside the document formats this replica serves \
+             ({minimum} to {maximum})",
+            policy.schema_version
+        ));
+        return Err(log_classified(
+            operation,
+            &error,
+            RepositoryError::new(RepositoryErrorKind::InvalidData, operation),
+        ));
+    }
+    Ok(policy)
 }
 
 fn invalid_data(operation: &'static str) -> RepositoryError {
@@ -613,4 +640,25 @@ fn classify_query(error: tokio_postgres::Error, operation: &'static str) -> Repo
 
 fn query_limit(limit: usize) -> i64 {
     limit.saturating_add(1).min(i64::MAX as usize) as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A replica parses a stored document through the same validator the
+    /// file loader uses, and then serves it only if its format is one the
+    /// roster says this build reads. Policy v1 is not, yet: it is refused
+    /// as invalid data, exactly as a build that predates v1 refuses it.
+    #[test]
+    fn a_stored_document_outside_the_advertised_formats_is_refused() {
+        let v0 = r#"{"schema_version":"0.1.0","default_action":"deny"}"#;
+        let v1 = r#"{"schema_version":"1.0.0","default_action":"deny"}"#;
+
+        assert!(policy_from_json(v0, OPERATION_ACTIVE).is_ok());
+        let refused = policy_from_json(v1, OPERATION_ACTIVE).expect_err("v1 must not be served");
+        assert_eq!(refused.kind(), RepositoryErrorKind::InvalidData);
+        // The document itself is a valid policy; only the cluster refuses it.
+        assert!(Policy::validate_json_value(serde_json::from_str(v1).expect("JSON")).is_ok());
+    }
 }

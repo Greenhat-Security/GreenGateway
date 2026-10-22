@@ -16,6 +16,9 @@
 //! no earlier rule pre-empts it, and a selected virtual upstream does not
 //! narrow it to denies as live evaluation does. That is the existing preview
 //! contract: a historical match counter, not a simulation of the whole policy.
+//! Suggestion coverage of a tool-name candidate asks only whether a tool rule
+//! already decides the call, answered by [`CompiledPolicy::match_tool_rules`],
+//! the tool lane's rule step without its admission.
 //!
 //! Like every other operation here, it demands a fact only when an answer can
 //! turn on it. A missing principal or an unclassified routing context is
@@ -28,9 +31,12 @@ use super::{
     validated_policy_digest, CompiledPolicy, DispatchFacts, EvaluationError, HttpTarget,
     Limitation, PolicyAuthority, PolicyDigest, PolicyEvaluationContext, PrincipalFact,
 };
-use crate::rbac::{
-    matcher::RuleDispatchContext, policy::RoleEntry, DefaultAction, EgressPolicy, EnforcementMode,
-    Policy, Rule,
+use crate::{
+    rbac::{
+        matcher::RuleDispatchContext, policy::RoleEntry, DefaultAction, EgressPolicy,
+        EnforcementMode, Policy, Rule,
+    },
+    request_bounds::MAX_TOOL_NAME_BYTES,
 };
 
 /// The schema the candidate-rule policy is built at. It decides nothing: the
@@ -175,6 +181,59 @@ impl CompiledPolicy {
         self.direct_rules()
             .iter()
             .any(|rule| rule.enabled && rule.tool_name.is_none() && reads(rule))
+    }
+
+    /// The first enabled tool-name rule whose own predicates -- the tool name
+    /// and the principal -- accept the supplied facts, in source order.
+    ///
+    /// This is the tool lane's rule step alone, for suggestion coverage, which
+    /// asks whether a tool rule already decides a call. No tool entry,
+    /// enablement or entry identity constraint participates: those are the
+    /// tool lane's admission, which runs before any tool rule and is not what
+    /// coverage asks. HTTP rules never match a tool name.
+    ///
+    /// A missing principal is indeterminate only when an enabled tool-name
+    /// rule constrains it. A name longer than any policy may carry, or a
+    /// principal the evaluator refuses for shape, is refused as it is on the
+    /// tool lane.
+    pub(crate) fn match_tool_rules(
+        &self,
+        tool_name: &str,
+        principal: &PrincipalFact,
+    ) -> Result<DirectRuleOutcome, EvaluationError> {
+        if tool_name.len() > MAX_TOOL_NAME_BYTES {
+            return Err(EvaluationError::ContextTooLarge);
+        }
+        let principal = match principal {
+            PrincipalFact::Authenticated(identity) => {
+                if let Err(problem) = identity.0.check_shape() {
+                    return Err(if problem.is_size() {
+                        EvaluationError::ContextTooLarge
+                    } else {
+                        EvaluationError::InvalidPrincipal
+                    });
+                }
+                Some(&identity.0)
+            }
+            PrincipalFact::Missing
+                if self.direct_rules().iter().any(|rule| {
+                    rule.enabled && rule.tool_name.is_some() && !rule.principal.is_unconstrained()
+                }) =>
+            {
+                return Ok(DirectRuleOutcome::Indeterminate(
+                    Limitation::MissingPrincipalFact,
+                ));
+            }
+            // No enabled tool-name rule reads a missing principal, so the
+            // anonymous stand-in gives the same answer.
+            PrincipalFact::Anonymous | PrincipalFact::Missing => None,
+        };
+        Ok(match self.matcher.evaluate_tool(tool_name, principal) {
+            Some(decision) => DirectRuleOutcome::Matched {
+                index: decision.rule_index,
+            },
+            None => DirectRuleOutcome::NoMatch,
+        })
     }
 }
 
