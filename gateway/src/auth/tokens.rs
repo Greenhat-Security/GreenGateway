@@ -12,7 +12,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-use crate::metrics::LOCK_POISON_RECOVERIES_TOTAL;
+use crate::{auth::change_actor::ChangeActor, metrics::LOCK_POISON_RECOVERIES_TOTAL};
 
 const CREATE_SERVICE_TOKEN_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS service_tokens (
@@ -60,6 +60,37 @@ CREATE INDEX IF NOT EXISTS idx_service_token_change_evidence_token
 ON service_token_change_evidence(token_id, sequence);
 "#;
 
+/// The actor metadata of the change evidence (issue #425, the v1 contract
+/// metadata PostgreSQL migration 24 adds): the actor's kind, its auth mode
+/// and, for a principal that has one, its canonical issuer. They are added to
+/// the table above whenever a database is opened, in this order, because a
+/// database an older binary wrote has the table without them; a fresh
+/// database gets them the same way, so there is one schema. The columns are
+/// nullable and nothing is backfilled: a row written before them recorded
+/// none of the three, and evidence is never rewritten. The last column carries
+/// the CHECK that a row records all three or none, in a pairing
+/// authentication can produce, exactly as migration 24 does. The issuer bound
+/// is the principal issuer bound (MAX_TOKEN_CHANGE_ACTOR_ISSUER_BYTES).
+const CHANGE_EVIDENCE_ACTOR_COLUMNS: [(&str, &str); 3] = [
+    ("actor_kind", "TEXT"),
+    ("actor_auth_mode", "TEXT"),
+    (
+        "actor_issuer",
+        r#"TEXT CHECK (
+    actor_issuer IS NULL OR length(CAST(actor_issuer AS BLOB)) BETWEEN 1 AND 4096
+) CHECK (
+    (actor_kind IS NULL AND actor_auth_mode IS NULL AND actor_issuer IS NULL)
+    OR (actor_kind IS NOT NULL AND actor_auth_mode IS NOT NULL AND (
+        (actor_kind = 'principal'
+            AND actor_auth_mode IN ('bearer_token', 'session_cookie', 'client_certificate'))
+        OR (actor_kind = 'service_token'
+            AND actor_auth_mode = 'service_token' AND actor_issuer IS NULL)
+        OR (actor_kind = 'system' AND actor_auth_mode = 'system' AND actor_issuer IS NULL)
+    ))
+)"#,
+    ),
+];
+
 /// The longest actor a rotate or revoke records as its change evidence, in
 /// both the SQLite table above and PostgreSQL migration 18. It is exactly
 /// the principal subject bound authentication enforces, so evidence never
@@ -68,6 +99,14 @@ ON service_token_change_evidence(token_id, sequence);
 pub(crate) const MAX_TOKEN_CHANGE_ACTOR_BYTES: usize = 4096;
 const _: () =
     assert!(MAX_TOKEN_CHANGE_ACTOR_BYTES == crate::auth::principal::MAX_PRINCIPAL_SUBJECT_BYTES);
+
+/// The longest actor issuer the evidence records, in the SQLite column above
+/// and in every table of PostgreSQL migration 24: exactly the principal
+/// issuer bound, for the same reason.
+pub(crate) const MAX_TOKEN_CHANGE_ACTOR_ISSUER_BYTES: usize = 4096;
+const _: () = assert!(
+    MAX_TOKEN_CHANGE_ACTOR_ISSUER_BYTES == crate::auth::principal::MAX_PRINCIPAL_ISSUER_BYTES
+);
 
 /// The closed action vocabulary of service-token change evidence. Values are
 /// the proposed authority-event operation codes
@@ -78,10 +117,10 @@ pub(crate) const TOKEN_CHANGE_ACTION_REVOKE: &str = "service_token.revoke";
 
 /// An unattributable change has no evidence to record, so a store refuses
 /// it before it changes anything rather than committing it anonymously. An
-/// authenticated principal always satisfies this; the CHECK constraints
-/// are the backstop.
-pub(crate) fn is_valid_change_actor(actor_user_id: &str) -> bool {
-    !actor_user_id.is_empty() && actor_user_id.len() <= MAX_TOKEN_CHANGE_ACTOR_BYTES
+/// authenticated principal always satisfies this
+/// ([`ChangeActor::is_recordable`]); the CHECK constraints are the backstop.
+pub(crate) fn is_valid_change_actor(actor: &ChangeActor) -> bool {
+    actor.is_recordable()
 }
 
 const TOKEN_MARKER: &str = "ggw_";
@@ -102,19 +141,19 @@ pub trait TokenStore: Send + Sync {
 
     fn get_by_id(&self, id: &str) -> Result<Option<TokenRecord>, TokenStoreError>;
 
-    /// Revoke on behalf of `actor_user_id`, who is recorded as the change's
+    /// Revoke on behalf of `actor`, who is recorded as the change's
     /// evidence in the same transaction. A repeat revoke changes nothing
     /// and records nothing.
-    fn revoke(&self, id: &str, actor_user_id: &str)
+    fn revoke(&self, id: &str, actor: &ChangeActor)
         -> Result<Option<TokenRecord>, TokenStoreError>;
 
-    /// Rotate on behalf of `actor_user_id`, who is recorded as the change's
+    /// Rotate on behalf of `actor`, who is recorded as the change's
     /// evidence in the same transaction. Rotating a revoked token is a
     /// conflict and records nothing.
     fn rotate(
         &self,
         id: &str,
-        actor_user_id: &str,
+        actor: &ChangeActor,
     ) -> Result<Option<CreatedToken>, TokenStoreError>;
 
     fn verify(&self, plaintext_token: &str) -> Result<TokenVerification, TokenStoreError>;
@@ -248,8 +287,9 @@ pub enum TokenStoreError {
     RevokedToken {
         id: String,
     },
-    /// A rotate or revoke named no actor, or one longer than
-    /// [`MAX_TOKEN_CHANGE_ACTOR_BYTES`]; refused before anything changed.
+    /// A rotate or revoke named no actor, one longer than
+    /// [`MAX_TOKEN_CHANGE_ACTOR_BYTES`], or an issuer evidence cannot record
+    /// ([`ChangeActor::is_recordable`]); refused before anything changed.
     InvalidChangeActor,
     /// The change's evidence could not be written, so the change was
     /// rolled back with it.
@@ -481,9 +521,9 @@ impl TokenStore for SqliteTokenStore {
     fn revoke(
         &self,
         id: &str,
-        actor_user_id: &str,
+        actor: &ChangeActor,
     ) -> Result<Option<TokenRecord>, TokenStoreError> {
-        if !is_valid_change_actor(actor_user_id) {
+        if !is_valid_change_actor(actor) {
             return Err(TokenStoreError::InvalidChangeActor);
         }
         let revoked_at = utc_timestamp_rfc3339()?;
@@ -522,7 +562,7 @@ impl TokenStore for SqliteTokenStore {
             &ChangeEvidence {
                 action: TOKEN_CHANGE_ACTION_REVOKE,
                 token_id: id,
-                actor_user_id,
+                actor,
                 committed_at: &revoked_at,
             },
         )?;
@@ -536,9 +576,9 @@ impl TokenStore for SqliteTokenStore {
     fn rotate(
         &self,
         id: &str,
-        actor_user_id: &str,
+        actor: &ChangeActor,
     ) -> Result<Option<CreatedToken>, TokenStoreError> {
-        if !is_valid_change_actor(actor_user_id) {
+        if !is_valid_change_actor(actor) {
             return Err(TokenStoreError::InvalidChangeActor);
         }
         let plaintext_token = generate_plaintext_token()?;
@@ -580,7 +620,7 @@ impl TokenStore for SqliteTokenStore {
             &ChangeEvidence {
                 action: TOKEN_CHANGE_ACTION_ROTATE,
                 token_id: id,
-                actor_user_id,
+                actor,
                 committed_at: &rotated_at,
             },
         )?;
@@ -721,7 +761,7 @@ impl fmt::Display for TokenStoreError {
             Self::InvalidChangeActor => {
                 write!(
                     formatter,
-                    "a service-token change actor must be between 1 and {MAX_TOKEN_CHANGE_ACTOR_BYTES} bytes"
+                    "a service-token change actor must be between 1 and {MAX_TOKEN_CHANGE_ACTOR_BYTES} bytes, and only a principal may carry an issuer, of at most {MAX_TOKEN_CHANGE_ACTOR_ISSUER_BYTES} bytes"
                 )
             }
             Self::ChangeEvidence { path, source } => {
@@ -811,7 +851,7 @@ impl RawTokenRecord {
 struct ChangeEvidence<'a> {
     action: &'static str,
     token_id: &'a str,
-    actor_user_id: &'a str,
+    actor: &'a ChangeActor,
     committed_at: &'a str,
 }
 
@@ -832,13 +872,17 @@ fn record_change_evidence(
         .execute(
             r#"
             INSERT INTO service_token_change_evidence (
-                event_id, operation_id, actor_user_id, action, token_id, committed_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                event_id, operation_id, actor_user_id, actor_issuer, actor_kind,
+                actor_auth_mode, action, token_id, committed_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
             "#,
             params![
                 event_id.as_str(),
                 operation_id.as_str(),
-                evidence.actor_user_id,
+                evidence.actor.subject(),
+                evidence.actor.issuer(),
+                evidence.actor.kind().as_str(),
+                evidence.actor.auth_mode(),
                 evidence.action,
                 evidence.token_id,
                 evidence.committed_at,
@@ -852,7 +896,41 @@ fn record_change_evidence(
 }
 
 pub fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
-    connection.execute_batch(CREATE_SERVICE_TOKEN_SCHEMA_SQL)
+    connection.execute_batch(CREATE_SERVICE_TOKEN_SCHEMA_SQL)?;
+    add_change_evidence_actor_columns(connection)
+}
+
+/// Add whichever actor metadata columns the evidence table lacks. The common
+/// case -- every column present -- reads the schema and writes nothing. A
+/// database that lacks one is altered in one IMMEDIATE transaction that looks
+/// again under the write lock, so two processes opening the same older file
+/// cannot both add a column, and a failure leaves the table as it was.
+fn add_change_evidence_actor_columns(connection: &Connection) -> rusqlite::Result<()> {
+    if missing_change_evidence_actor_columns(connection)?.is_empty() {
+        return Ok(());
+    }
+    let transaction =
+        rusqlite::Transaction::new_unchecked(connection, rusqlite::TransactionBehavior::Immediate)?;
+    for (name, definition) in missing_change_evidence_actor_columns(&transaction)? {
+        transaction.execute(
+            &format!("ALTER TABLE service_token_change_evidence ADD COLUMN {name} {definition}"),
+            [],
+        )?;
+    }
+    transaction.commit()
+}
+
+fn missing_change_evidence_actor_columns(
+    connection: &Connection,
+) -> rusqlite::Result<Vec<(&'static str, &'static str)>> {
+    let mut statement = connection.prepare("PRAGMA table_info(service_token_change_evidence)")?;
+    let existing = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(CHANGE_EVIDENCE_ACTOR_COLUMNS
+        .into_iter()
+        .filter(|(name, _)| !existing.iter().any(|column| column == name))
+        .collect())
 }
 
 fn load_record_by_id(
@@ -1152,7 +1230,7 @@ mod tests {
         );
 
         store
-            .revoke(&revoked.record.id, "revoking-admin")
+            .revoke(&revoked.record.id, &ChangeActor::for_test("revoking-admin"))
             .expect("revocation should succeed")
             .expect("revoked token should exist");
         assert_eq!(
@@ -1184,12 +1262,12 @@ mod tests {
             .expect("token should create");
 
         let first = store
-            .revoke(&created.record.id, "revoking-admin")
+            .revoke(&created.record.id, &ChangeActor::for_test("revoking-admin"))
             .expect("first revoke should succeed")
             .expect("token should exist");
         let first_revoked_at = first.revoked_at.clone().expect("token should be revoked");
         let second = store
-            .revoke(&created.record.id, "revoking-admin")
+            .revoke(&created.record.id, &ChangeActor::for_test("revoking-admin"))
             .expect("second revoke should succeed")
             .expect("token should still exist");
 
@@ -1218,6 +1296,119 @@ mod tests {
         );
     }
 
+    /// The actor issuer bound and the kind/auth-mode pairs are written four
+    /// times: the SQLite column here and the three tables of PostgreSQL
+    /// migration 24. Pin the SQL to the Rust bound and keep the four CHECKs
+    /// identical, so the stores cannot disagree about what is recordable.
+    #[test]
+    fn change_evidence_actor_metadata_matches_both_schemas() {
+        let issuer_bound = format!(
+            "actor_issuer IS NULL OR length(CAST(actor_issuer AS BLOB)) BETWEEN 1 AND {MAX_TOKEN_CHANGE_ACTOR_ISSUER_BYTES}"
+        );
+        let (_, sqlite_issuer) = CHANGE_EVIDENCE_ACTOR_COLUMNS[2];
+        assert!(sqlite_issuer.contains(&issuer_bound), "{sqlite_issuer}");
+        let migration =
+            include_str!("../storage/migrations/0024_authority_evidence_actor_metadata.sql");
+        assert_eq!(
+            migration
+                .matches(&format!(
+                    "actor_issuer IS NULL OR octet_length(actor_issuer) BETWEEN 1 AND {MAX_TOKEN_CHANGE_ACTOR_ISSUER_BYTES}"
+                ))
+                .count(),
+            3
+        );
+        // The pairing CHECK, whitespace aside, is the same text in both.
+        let squeeze = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let pairing = squeeze(
+            sqlite_issuer
+                .split_once(") CHECK (")
+                .map(|(_, pairing)| pairing)
+                .expect("the issuer column carries the pairing CHECK"),
+        );
+        assert_eq!(squeeze(migration).matches(&pairing).count(), 3, "{pairing}");
+    }
+
+    #[test]
+    fn an_older_evidence_table_gains_the_actor_columns_once_and_keeps_its_rows() {
+        let db = TempDb::new("evidence-actor-columns");
+        let connection = Connection::open(&db.path).expect("database should open");
+        connection
+            .execute_batch(CREATE_SERVICE_TOKEN_SCHEMA_SQL)
+            .expect("the older schema should create");
+        connection
+            .execute(
+                "INSERT INTO service_token_change_evidence \
+                     (event_id, operation_id, actor_user_id, action, token_id, committed_at) \
+                 VALUES (?1, ?2, 'older-admin', 'service_token.revoke', 'token_1', \
+                         '2026-10-01T00:00:00Z')",
+                params![
+                    uuid::Uuid::new_v4().to_string(),
+                    uuid::Uuid::new_v4().to_string()
+                ],
+            )
+            .expect("an older binary's evidence row");
+        drop(connection);
+
+        for _ in 0..2 {
+            drop(SqliteTokenStore::open(&db.path).expect("the store should open"));
+        }
+        let connection = Connection::open(&db.path).expect("database should open");
+        assert!(missing_change_evidence_actor_columns(&connection)
+            .expect("the schema should read")
+            .is_empty());
+        let row: (String, Option<String>, Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT actor_user_id, actor_issuer, actor_kind, actor_auth_mode \
+                 FROM service_token_change_evidence",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("the older row should remain");
+        assert_eq!(
+            row,
+            ("older-admin".to_owned(), None, None, None),
+            "nothing is guessed into a row that did not record it"
+        );
+
+        // A row recording some of the metadata, or a pairing authentication
+        // cannot produce, is refused by the table itself.
+        for (issuer, kind, mode) in [
+            (None, Some("principal"), None),
+            (None, None, Some("bearer_token")),
+            (Some("https://idp.example.test"), None, None),
+            (None, Some("principal"), Some("service_token")),
+            (None, Some("service_token"), Some("bearer_token")),
+            (
+                Some("https://idp.example.test"),
+                Some("service_token"),
+                Some("service_token"),
+            ),
+            (
+                Some("https://idp.example.test"),
+                Some("system"),
+                Some("system"),
+            ),
+            (None, Some("person"), Some("bearer_token")),
+            (Some(""), Some("principal"), Some("bearer_token")),
+        ] {
+            let refused = connection.execute(
+                "INSERT INTO service_token_change_evidence \
+                     (event_id, operation_id, actor_user_id, actor_issuer, actor_kind, \
+                      actor_auth_mode, action, token_id, committed_at) \
+                 VALUES (?1, ?2, 'admin', ?3, ?4, ?5, 'service_token.revoke', 'token_1', \
+                         '2026-10-01T00:00:00Z')",
+                params![
+                    uuid::Uuid::new_v4().to_string(),
+                    uuid::Uuid::new_v4().to_string(),
+                    issuer,
+                    kind,
+                    mode
+                ],
+            );
+            assert!(refused.is_err(), "{issuer:?} {kind:?} {mode:?}");
+        }
+    }
+
     #[test]
     fn rotate_preserves_record_metadata_and_invalidates_old_plaintext() {
         let db = TempDb::new("rotate");
@@ -1236,7 +1427,7 @@ mod tests {
             .expect("hash should exist");
 
         let rotated = store
-            .rotate(&created.record.id, "rotating-admin")
+            .rotate(&created.record.id, &ChangeActor::for_test("rotating-admin"))
             .expect("rotate should succeed")
             .expect("token should exist");
         let rotated_hash = token_hashes(&db.path)

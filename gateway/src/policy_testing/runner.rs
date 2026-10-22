@@ -15,16 +15,20 @@
 
 use serde::Serialize;
 
+use http::Method;
+
 use super::suite::{
-    Case, CaseInput, CaseKind, DecisionExpectation, MatchedExpectation, RateExpectation, Suite,
-    SyntheticPrincipal, SyntheticTarget,
+    Case, CaseInput, CaseKind, DecisionExpectation, HttpRequest, MatchedExpectation,
+    RateExpectation, Suite, SyntheticPrincipal, SyntheticTarget,
 };
 use crate::{
     policy_eval::{
-        tools::{ToolEvaluationContext, ToolLimitation, ToolReason, TOOL_CONTEXT_VERSION},
+        tools::{
+            ToolEvaluationContext, ToolLimitation, ToolOperation, ToolReason, TOOL_CONTEXT_VERSION,
+        },
         CompiledPolicy, EvaluationError, HostFact, HttpTarget, Limitation, LogicalDecision,
         PolicyEffect, PolicyEvaluationContext, PrincipalFact, PrincipalIdentity, RateLaneOutcome,
-        Reason, RuleReference, CONTEXT_VERSION,
+        Reason, ResourceSnapshot, RuleReference, CONTEXT_VERSION,
     },
     rbac::Policy,
 };
@@ -230,6 +234,84 @@ fn principal_fact(principal: &SyntheticPrincipal) -> PrincipalFact {
     }
 }
 
+/// The context the live HTTP adapter builds for a synthetic request.
+///
+/// Shared with the simulator ([`crate::policy_simulation`]), so a simulated
+/// case and a test case with the same facts ask the evaluator the same
+/// question.
+pub(crate) fn http_context(
+    snapshot: ResourceSnapshot,
+    request: &HttpRequest,
+    principal: &SyntheticPrincipal,
+) -> PolicyEvaluationContext {
+    let (target, dispatch) = match &request.target {
+        SyntheticTarget::Contextless => (HttpTarget::Contextless, None),
+        SyntheticTarget::McpAlias { canonical_path } => (
+            HttpTarget::McpAlias {
+                canonical_path: canonical_path.clone(),
+            },
+            None,
+        ),
+        SyntheticTarget::ProxyDispatch(facts) => (HttpTarget::ProxyDispatch, Some(facts.clone())),
+    };
+    PolicyEvaluationContext {
+        version: CONTEXT_VERSION,
+        snapshot,
+        method: Some(request.method.clone()),
+        path: Some(request.path.clone()),
+        principal: principal_fact(principal),
+        target,
+        // A synthetic request states its host, so it is never the
+        // uncaptured `Missing`: no host is a request without one.
+        request_host: request
+            .host
+            .clone()
+            .map_or(HostFact::Absent, HostFact::Present),
+        dispatch,
+    }
+}
+
+/// The context the live tool adapters build for `operation`; a rendered
+/// request also carries its method and path.
+pub(crate) fn tool_context(
+    snapshot: ResourceSnapshot,
+    operation: ToolOperation,
+    tool_name: &str,
+    principal: &SyntheticPrincipal,
+    rendered: Option<(&Method, &str)>,
+) -> ToolEvaluationContext {
+    ToolEvaluationContext {
+        version: TOOL_CONTEXT_VERSION,
+        snapshot,
+        operation,
+        tool_name: Some(tool_name.to_owned()),
+        principal: principal_fact(principal),
+        method: rendered.map(|(method, _)| method.clone()),
+        path: rendered.map(|(_, path)| path.to_owned()),
+    }
+}
+
+/// The live rate adapter's context exactly: selection reads method, path and
+/// principal, and states routing and host as uncaptured rather than claim the
+/// request had none.
+pub(crate) fn rate_context(
+    snapshot: ResourceSnapshot,
+    method: &Method,
+    path: &str,
+    principal: &SyntheticPrincipal,
+) -> PolicyEvaluationContext {
+    PolicyEvaluationContext {
+        version: CONTEXT_VERSION,
+        snapshot,
+        method: Some(method.clone()),
+        path: Some(path.to_owned()),
+        principal: principal_fact(principal),
+        target: HttpTarget::Missing,
+        request_host: HostFact::Missing,
+        dispatch: None,
+    }
+}
+
 fn run_case(policy: &PolicyUnderTest, case: &Case) -> CaseResult {
     let compiled = &policy.compiled;
     match &case.input {
@@ -238,33 +320,7 @@ fn run_case(policy: &PolicyUnderTest, case: &Case) -> CaseResult {
             principal,
             expect,
         } => {
-            let (target, dispatch) = match &request.target {
-                SyntheticTarget::Contextless => (HttpTarget::Contextless, None),
-                SyntheticTarget::McpAlias { canonical_path } => (
-                    HttpTarget::McpAlias {
-                        canonical_path: canonical_path.clone(),
-                    },
-                    None,
-                ),
-                SyntheticTarget::ProxyDispatch(facts) => {
-                    (HttpTarget::ProxyDispatch, Some(facts.clone()))
-                }
-            };
-            let context = PolicyEvaluationContext {
-                version: CONTEXT_VERSION,
-                snapshot: compiled.snapshot(),
-                method: Some(request.method.clone()),
-                path: Some(request.path.clone()),
-                principal: principal_fact(principal),
-                target,
-                // A synthetic request states its host, so it is never the
-                // uncaptured `Missing`: no host is a request without one.
-                request_host: request
-                    .host
-                    .clone()
-                    .map_or(HostFact::Absent, HostFact::Present),
-                dispatch,
-            };
+            let context = http_context(compiled.snapshot(), request, principal);
             let expected = expected_decision(expect, Reason::as_str);
             match compiled.evaluate(&context) {
                 Ok(evaluation) => {
@@ -306,15 +362,7 @@ fn run_case(policy: &PolicyUnderTest, case: &Case) -> CaseResult {
         } => evaluate_tool_case(
             policy,
             case,
-            ToolEvaluationContext {
-                version: TOOL_CONTEXT_VERSION,
-                snapshot: compiled.snapshot(),
-                operation: *operation,
-                tool_name: Some(tool_name.clone()),
-                principal: principal_fact(principal),
-                method: None,
-                path: None,
-            },
+            tool_context(compiled.snapshot(), *operation, tool_name, principal, None),
             expect,
         ),
         CaseInput::ToolHttp {
@@ -326,15 +374,13 @@ fn run_case(policy: &PolicyUnderTest, case: &Case) -> CaseResult {
         } => evaluate_tool_case(
             policy,
             case,
-            ToolEvaluationContext {
-                version: TOOL_CONTEXT_VERSION,
-                snapshot: compiled.snapshot(),
-                operation: crate::policy_eval::tools::ToolOperation::RenderedHttp,
-                tool_name: Some(tool_name.clone()),
-                principal: principal_fact(principal),
-                method: Some(method.clone()),
-                path: Some(path.clone()),
-            },
+            tool_context(
+                compiled.snapshot(),
+                ToolOperation::RenderedHttp,
+                tool_name,
+                principal,
+                Some((method, path)),
+            ),
             expect,
         ),
         CaseInput::Rate {
@@ -343,19 +389,7 @@ fn run_case(policy: &PolicyUnderTest, case: &Case) -> CaseResult {
             principal,
             expect,
         } => {
-            // The live rate adapter's context exactly: selection reads method,
-            // path and principal, and states routing and host as uncaptured
-            // rather than claim the request had none.
-            let context = PolicyEvaluationContext {
-                version: CONTEXT_VERSION,
-                snapshot: compiled.snapshot(),
-                method: Some(method.clone()),
-                path: Some(path.clone()),
-                principal: principal_fact(principal),
-                target: HttpTarget::Missing,
-                request_host: HostFact::Missing,
-                dispatch: None,
-            };
+            let context = rate_context(compiled.snapshot(), method, path, principal);
             let expected_override = match expect {
                 RateExpectation::NoOverride => None,
                 RateExpectation::Override(index) => Some(*index),
@@ -570,7 +604,7 @@ pub(crate) fn effect_code(effect: PolicyEffect) -> &'static str {
 
 /// The trace's stable limitation codes, matching the evaluator's own
 /// serialization of [`Limitation`].
-fn limitation_code(limitation: Limitation) -> &'static str {
+pub(crate) fn limitation_code(limitation: Limitation) -> &'static str {
     match limitation {
         Limitation::MissingMethod => "missing_method",
         Limitation::MissingPath => "missing_path",
@@ -582,7 +616,7 @@ fn limitation_code(limitation: Limitation) -> &'static str {
 
 /// The tool lane's stable limitation codes, matching its serialization of
 /// [`ToolLimitation`].
-fn tool_limitation_code(limitation: ToolLimitation) -> &'static str {
+pub(crate) fn tool_limitation_code(limitation: ToolLimitation) -> &'static str {
     match limitation {
         ToolLimitation::ToolName => "missing_tool_name",
         ToolLimitation::Principal => "missing_principal_fact",

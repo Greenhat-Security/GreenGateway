@@ -253,12 +253,17 @@ async fn sessions_expire_idle_and_absolute_on_the_database_clock() {
         (true, false),
         "the idle limit binds first"
     );
+    // Each fixture reads the database clock once and derives every deadline
+    // it writes from that one reading: two clock_timestamp() calls in one
+    // statement are microseconds apart, and the table's CHECK
+    // (idle_expires_at <= expires_at) must hold however they fall.
     execute(
         &pool,
         &format!(
             "UPDATE greengateway.admin_sessions \
-             SET idle_expires_at = clock_timestamp() + interval '1 second', \
-                 expires_at = clock_timestamp() + interval '5 seconds' \
+             SET idle_expires_at = clock.now + interval '1 second', \
+                 expires_at = clock.now + interval '5 seconds' \
+             FROM (SELECT clock_timestamp() AS now) AS clock \
              WHERE session_hash = '{key}'"
         ),
     )
@@ -272,7 +277,9 @@ async fn sessions_expire_idle_and_absolute_on_the_database_clock() {
         &pool,
         &format!(
             "UPDATE greengateway.admin_sessions \
-             SET idle_expires_at = clock_timestamp() - interval '1 millisecond' \
+             SET idle_expires_at = clock.now - interval '1 millisecond', \
+                 expires_at = GREATEST(expires_at, clock.now + interval '5 seconds') \
+             FROM (SELECT clock_timestamp() AS now) AS clock \
              WHERE session_hash = '{key}'"
         ),
     )
@@ -291,9 +298,10 @@ async fn sessions_expire_idle_and_absolute_on_the_database_clock() {
         &pool,
         &format!(
             "UPDATE greengateway.admin_sessions \
-             SET created_at = clock_timestamp() - interval '2 hours', \
-                 expires_at = clock_timestamp() - interval '1 second', \
-                 idle_expires_at = clock_timestamp() - interval '1 second' \
+             SET created_at = clock.now - interval '2 hours', \
+                 expires_at = clock.now - interval '1 second', \
+                 idle_expires_at = clock.now - interval '1 second' \
+             FROM (SELECT clock_timestamp() AS now) AS clock \
              WHERE session_hash = '{absolute_key}'"
         ),
     )

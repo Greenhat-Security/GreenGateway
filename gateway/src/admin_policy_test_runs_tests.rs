@@ -71,6 +71,7 @@ fn failing_suite() -> Value {
 
 struct Harness {
     router: Router,
+    audit: audit::AuditLog,
     capture: audit::sink::tests::CaptureSink,
     policy: TempPolicyFile,
 }
@@ -81,9 +82,10 @@ fn harness() -> Harness {
     let policy = TempPolicyFile::new(
         &serde_json::to_string_pretty(&runs_policy_document()).expect("policy serializes"),
     );
-    let router = policy_admin_router(Some(&policy), audit_log);
+    let router = policy_admin_router(Some(&policy), audit_log.clone());
     Harness {
         router,
+        audit: audit_log,
         capture,
         policy,
     }
@@ -122,6 +124,40 @@ fn test_run_events(harness: &Harness) -> Vec<audit::AuditEvent> {
         .collect()
 }
 
+/// Audit delivery is asynchronous: the handler queues its record for the
+/// writer thread, which can reach the capture after the response does. Wait,
+/// bounded, for `count` test-run records before reading them.
+async fn wait_for_test_run_events(harness: &Harness, count: usize) -> Vec<audit::AuditEvent> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let events = test_run_events(harness);
+            if events.len() >= count {
+                return events;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "expected {count} policy test-run audit records, saw {}",
+            test_run_events(harness).len()
+        )
+    })
+}
+
+/// Close the log and wait, bounded, until the writer has delivered every
+/// queued record, so a count or an absence read afterwards covers every
+/// request the test made. Only for the end of a test: the log accepts
+/// nothing more.
+async fn drain_audit(harness: &Harness) {
+    harness
+        .audit
+        .close_and_drain(Duration::from_secs(5))
+        .await
+        .expect("the audit log drains");
+}
+
 #[tokio::test]
 async fn a_run_needs_authentication_policy_read_and_simulate() {
     let harness = harness();
@@ -132,6 +168,7 @@ async fn a_run_needs_authentication_policy_read_and_simulate() {
         let response = run_request(&harness, Some(test_principal(roles)), body.clone(), None).await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN, "{roles:?}");
     }
+    drain_audit(&harness).await;
     assert!(test_run_events(&harness).is_empty());
 }
 
@@ -169,6 +206,7 @@ async fn a_passing_run_answers_the_report_and_audits_digests_and_counts_only() {
         fs::read_to_string(&harness.policy.path).expect("policy reads"),
         before
     );
+    drain_audit(&harness).await;
     let events = harness.capture.events();
     assert!(!events
         .iter()
@@ -216,7 +254,7 @@ async fn a_failing_run_is_still_a_completed_run_with_a_failed_status() {
     assert_eq!(report["summary"]["failed"], json!(1));
     assert_eq!(report["cases"][1]["mismatches"], json!(["logical"]));
     assert_eq!(
-        test_run_events(&harness)[0].payload["status"],
+        wait_for_test_run_events(&harness, 1).await[0].payload["status"],
         json!("failed")
     );
 }
@@ -273,6 +311,7 @@ async fn if_match_pins_the_active_policy() {
     assert_eq!(response.status(), StatusCode::OK);
     let response = run_request(&harness, tester(), body, Some("\"sha256:stale\"")).await;
     assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    drain_audit(&harness).await;
     assert_eq!(test_run_events(&harness).len(), 1);
 }
 
@@ -301,7 +340,7 @@ async fn a_candidate_is_judged_without_being_written() {
     let (_, live) = current_policy(&harness.router).await;
     assert_eq!(live["rules"][0]["action"], json!("allow"));
     assert_eq!(
-        test_run_events(&harness)[0].payload["policy_source"],
+        wait_for_test_run_events(&harness, 1).await[0].payload["policy_source"],
         json!("inline_candidate")
     );
 
@@ -368,6 +407,7 @@ async fn an_invalid_suite_or_body_is_refused_before_any_run() {
         let response = run_request(&harness, tester(), body.clone(), None).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
     }
+    drain_audit(&harness).await;
     assert!(test_run_events(&harness).is_empty());
 }
 

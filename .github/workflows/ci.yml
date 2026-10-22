@@ -219,6 +219,14 @@ jobs:
             'rustflags = ["-Zthreads=4", "-Clinker=rust-lld"]'
           )
           Get-Content -Path $config
+      - name: Measure operator CLI security branches
+        # ggctl (issue #242, ADR-0008) is its own package with its own tests,
+        # so it is measured in its own run and the gateway measurement below
+        # stays exactly the run its floors were set against. Its integration
+        # tests run the instrumented ggctl binary itself. A failure here skips
+        # the gateway measurement, so the floor check and the evidence upload
+        # never run on a partial result.
+        run: cargo llvm-cov --no-rustc-wrapper --branch --json --output-path target/ggctl-security-coverage.json -p ggctl --locked --jobs 4
       - name: Measure security branches
         id: coverage
         # The mandatory uninstrumented test job enforces the SQLite wall-clock
@@ -230,20 +238,24 @@ jobs:
         run: cargo llvm-cov --no-rustc-wrapper --branch --json --output-path target/security-coverage.json -p gateway --bin gateway --locked --jobs 4 -- --test-threads=8 --skip audit::sqlite_sink::tests::moderate_scale_batched_inserts_complete_quickly
       - name: Enforce production-code coverage floors
         if: ${{ always() && steps.coverage.outcome == 'success' }}
-        run: python scripts/check-security-coverage.py target/security-coverage.json
+        run: python scripts/check-security-coverage.py target/security-coverage.json target/ggctl-security-coverage.json
       - name: Preserve coverage evidence
         if: ${{ always() && steps.coverage.outcome == 'success' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: security-coverage
-          path: target/security-coverage.json
+          path: |
+            target/security-coverage.json
+            target/ggctl-security-coverage.json
           if-no-files-found: error
       - name: Preserve available coverage failure diagnostics
         if: ${{ always() && steps.coverage.outcome != 'success' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: security-coverage-diagnostics
-          path: target/security-coverage.json
+          path: |
+            target/security-coverage.json
+            target/ggctl-security-coverage.json
           if-no-files-found: ignore
 
   supply-chain:
@@ -449,6 +461,42 @@ jobs:
           mkdir -p target/security-mutations
           cargo test --workspace --locked -- --list --format terse > target/security-mutations/test-list.txt
           python scripts/security_mutations.py --check-test-list target/security-mutations/test-list.txt
+
+  # The operator CLI and the library it shares with the gateway (issue #242,
+  # ADR-0008), on every platform it is released for. The `test` job already
+  # runs both on Linux as part of the workspace; this adds macOS and Windows,
+  # where terminal detection, file permissions, path handling and the
+  # platform certificate verifier differ. Neither package has a build script
+  # or embeds the admin UI, so nothing here builds Node assets; the tool
+  # contract still installs Node for every job that runs `cargo test`.
+  ggctl:
+    name: ggctl (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up pinned build tools
+        uses: ./.github/actions/build-tools
+        with:
+          rust: ci
+          node: 'true'
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      # The integration tests run the built binary itself: exit codes,
+      # standard streams, token files and loopback HTTPS.
+      - name: Test the operator CLI and the shared configuration library
+        run: cargo test --locked -p ggctl -p gateway-config
 
   # PostgreSQL foundation (issue #241, PR 3): the gateway suite against a real
   # PostgreSQL 16 service container, in both feature states.
@@ -1738,6 +1786,7 @@ jobs:
       - fmt
       - clippy
       - test
+      - ggctl
       - postgres-foundation-pg
       - postgres-foundation-no-default
       - postgres-foundation-lint

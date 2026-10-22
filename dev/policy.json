@@ -33,6 +33,11 @@
     },
     {
       "methods": ["GET"],
+      "path_prefix": "/v1/admin/config",
+      "permission": "admin:config:read"
+    },
+    {
+      "methods": ["GET"],
       "path_prefix": "/v1/admin/connections",
       "permission": "admin:connections:read"
     },
@@ -59,6 +64,11 @@
     {
       "methods": ["POST"],
       "path_prefix": "/v1/admin/policy/tests/runs",
+      "permission": "admin:policy:simulate"
+    },
+    {
+      "methods": ["POST"],
+      "path_prefix": "/v1/admin/policy/simulations",
       "permission": "admin:policy:simulate"
     },
     {

@@ -19,7 +19,7 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::{
-    audit::{AuditEvent, AuditLog},
+    audit::{AuditEvent, AuditLog, AuditReceipt},
     auth::{
         actor_from_principal,
         admin_session::{self, SessionRefusal},
@@ -31,7 +31,10 @@ use crate::{
     path_match::exempt_path_matches,
 };
 
-use super::{bearer::bearer_token, decision::AuthOutcome};
+use super::{
+    bearer::bearer_token,
+    decision::{audit_unavailable_response, AuthOutcome, AUDIT_UNAVAILABLE_REASON},
+};
 
 const AUTH_SUCCESS: &str = "auth.success";
 const AUTH_FAILURE: &str = "auth.failure";
@@ -186,12 +189,14 @@ pub async fn auth_middleware(
         });
     if let Some((sessions, _)) = &admin_session {
         if !admin_session::is_safe_method(req.method()) && !sessions.origin_matches(req.headers()) {
-            emit_failure(&state, &audit, "admin_session_origin_mismatch");
-            return (
+            let invalid_origin = (
                 StatusCode::FORBIDDEN,
                 Json(json!({"error": "invalid_origin"})),
             )
                 .into_response();
+            return unrecorded_failure(&state, &audit, "admin_session_origin_mismatch")
+                .await
+                .unwrap_or(invalid_origin);
         }
     }
     let credential = admin_session
@@ -223,12 +228,14 @@ pub async fn auth_middleware(
             Err(SessionRefusal::CsrfUnbound) => {
                 // The double-submit pair agreed with itself, but it is not
                 // the token this session was issued with.
-                emit_failure(&state, &audit, "admin_session_csrf_unbound");
-                return (
+                let csrf_refused = (
                     StatusCode::FORBIDDEN,
                     Json(json!({"error": "csrf token missing or invalid"})),
                 )
                     .into_response();
+                return unrecorded_failure(&state, &audit, "admin_session_csrf_unbound")
+                    .await
+                    .unwrap_or(csrf_refused);
             }
         }
     } else {
@@ -288,7 +295,12 @@ pub async fn auth_middleware(
 
     match validation {
         Ok(principal) => {
-            emit_success(&state, &audit, &credential, &principal);
+            // Required audit durability (issue #425): the authenticated
+            // principal is acted on only once its record has committed.
+            let receipt = emit_success(&state, &audit, &credential, &principal);
+            if state.audit.confirm(receipt).await.is_err() {
+                return audit_unavailable_with_auth_outcome();
+            }
             if !is_admin_session {
                 if let Some(session) = ValidatedCookieSession::capture(
                     req.headers(),
@@ -498,8 +510,8 @@ fn emit_success(
     context: &AuditContext,
     credential: &SessionCredential,
     principal: &Principal,
-) {
-    state.audit.emit(with_optional_user_agent(
+) -> AuditReceipt {
+    state.audit.record(with_optional_user_agent(
         AuditEvent::new(
             AUTH_SUCCESS,
             &context.request_id,
@@ -512,11 +524,11 @@ fn emit_success(
             }),
         ),
         context.user_agent.as_deref(),
-    ));
+    ))
 }
 
-fn emit_failure(state: &AuthState, context: &AuditContext, reason: &str) {
-    state.audit.emit(with_optional_user_agent(
+fn emit_failure(state: &AuthState, context: &AuditContext, reason: &str) -> AuditReceipt {
+    state.audit.record(with_optional_user_agent(
         AuditEvent::new(
             AUTH_FAILURE,
             &context.request_id,
@@ -528,7 +540,38 @@ fn emit_failure(state: &AuthState, context: &AuditContext, reason: &str) {
             }),
         ),
         context.user_agent.as_deref(),
-    ));
+    ))
+}
+
+/// Record an authentication failure and wait for the record under required
+/// audit durability (issue #425): a refusal -- or, in observe mode, a
+/// forward -- is acted on only once its record has committed. `Some` is the
+/// response to answer instead, because the record could not be.
+async fn unrecorded_failure(
+    state: &AuthState,
+    context: &AuditContext,
+    reason: &str,
+) -> Option<Response> {
+    let receipt = emit_failure(state, context, reason);
+    state
+        .audit
+        .confirm(receipt)
+        .await
+        .err()
+        .map(|_| audit_unavailable_with_auth_outcome())
+}
+
+/// `503 audit_unavailable`, tagged as a request that was not admitted as
+/// authenticated so its observation never names a principal the gateway
+/// did not act for.
+fn audit_unavailable_with_auth_outcome() -> Response {
+    let mut response = audit_unavailable_response();
+    response.extensions_mut().insert(AuthOutcome {
+        principal: None,
+        authenticated: false,
+        reason: Some(AUDIT_UNAVAILABLE_REASON.to_owned()),
+    });
+    response
 }
 
 async fn auth_failure_response(
@@ -540,7 +583,9 @@ async fn auth_failure_response(
     next: Next,
 ) -> Response {
     let reason = reason.into();
-    emit_failure(state, context, &reason);
+    if let Some(refused) = unrecorded_failure(state, context, &reason).await {
+        return refused;
+    }
 
     match (state.mode, kind) {
         (AuthMode::Required, AuthFailureKind::Rejected) => unauthorized_with_auth_outcome(

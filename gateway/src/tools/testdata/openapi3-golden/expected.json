@@ -8402,6 +8402,60 @@
                   "method": "GET",
                   "path_template": "/optional"
                 }
+              },
+              {
+                "description": "GET /user",
+                "input_json_schema": {
+                  "additionalProperties": false,
+                  "properties": {},
+                  "required": [],
+                  "type": "object"
+                },
+                "name": "userConsent",
+                "source": {
+                  "connection_id": "golden-api",
+                  "operation_id": "userConsent",
+                  "type": "open_api"
+                },
+                "target": {
+                  "connection_id": "golden-api",
+                  "mapping": {
+                    "method": "GET",
+                    "path_template": "/user"
+                  },
+                  "type": "http"
+                },
+                "upstream": {
+                  "method": "GET",
+                  "path_template": "/user"
+                }
+              },
+              {
+                "description": "PATCH /unsupported",
+                "input_json_schema": {
+                  "additionalProperties": false,
+                  "properties": {},
+                  "required": [],
+                  "type": "object"
+                },
+                "name": "openIdOnly",
+                "source": {
+                  "connection_id": "golden-api",
+                  "operation_id": "openIdOnly",
+                  "type": "open_api"
+                },
+                "target": {
+                  "connection_id": "golden-api",
+                  "mapping": {
+                    "method": "PATCH",
+                    "path_template": "/unsupported"
+                  },
+                  "type": "http"
+                },
+                "upstream": {
+                  "method": "PATCH",
+                  "path_template": "/unsupported"
+                }
               }
             ],
             "incompatibilities": [],
@@ -8413,6 +8467,18 @@
               {
                 "selected_scheme_names": [],
                 "tool_name": "optionalAuth"
+              },
+              {
+                "selected_scheme_names": [
+                  "UserOAuth"
+                ],
+                "tool_name": "userConsent"
+              },
+              {
+                "selected_scheme_names": [
+                  "OpenId"
+                ],
+                "tool_name": "openIdOnly"
               }
             ]
           },
@@ -8471,6 +8537,60 @@
                   "method": "GET",
                   "path_template": "/optional"
                 }
+              },
+              {
+                "description": "GET /user",
+                "input_json_schema": {
+                  "additionalProperties": false,
+                  "properties": {},
+                  "required": [],
+                  "type": "object"
+                },
+                "name": "userConsent",
+                "source": {
+                  "connection_id": "golden-api",
+                  "operation_id": "userConsent",
+                  "type": "open_api"
+                },
+                "target": {
+                  "connection_id": "golden-api",
+                  "mapping": {
+                    "method": "GET",
+                    "path_template": "/user"
+                  },
+                  "type": "http"
+                },
+                "upstream": {
+                  "method": "GET",
+                  "path_template": "/user"
+                }
+              },
+              {
+                "description": "PATCH /unsupported",
+                "input_json_schema": {
+                  "additionalProperties": false,
+                  "properties": {},
+                  "required": [],
+                  "type": "object"
+                },
+                "name": "openIdOnly",
+                "source": {
+                  "connection_id": "golden-api",
+                  "operation_id": "openIdOnly",
+                  "type": "open_api"
+                },
+                "target": {
+                  "connection_id": "golden-api",
+                  "mapping": {
+                    "method": "PATCH",
+                    "path_template": "/unsupported"
+                  },
+                  "type": "http"
+                },
+                "upstream": {
+                  "method": "PATCH",
+                  "path_template": "/unsupported"
+                }
               }
             ],
             "incompatibilities": [
@@ -8508,10 +8628,6 @@
               },
               {
                 "reason": "NoCompatibleSecurityAlternative",
-                "tool_name": "userConsent"
-              },
-              {
-                "reason": "NoCompatibleSecurityAlternative",
                 "tool_name": "invalidRequirementShape"
               },
               {
@@ -8525,10 +8641,6 @@
               {
                 "reason": "NoCompatibleSecurityAlternative",
                 "tool_name": "digestOnly"
-              },
-              {
-                "reason": "NoCompatibleSecurityAlternative",
-                "tool_name": "openIdOnly"
               },
               {
                 "reason": "NoCompatibleSecurityAlternative",
@@ -8551,6 +8663,18 @@
               {
                 "selected_scheme_names": [],
                 "tool_name": "optionalAuth"
+              },
+              {
+                "selected_scheme_names": [
+                  "UserOAuth"
+                ],
+                "tool_name": "userConsent"
+              },
+              {
+                "selected_scheme_names": [
+                  "OpenId"
+                ],
+                "tool_name": "openIdOnly"
               }
             ]
           }
@@ -9802,7 +9926,7 @@
           {
             "alternatives": [
               [
-                "OAuth2ClientCredentials { scheme_name: \"ServiceOAuth\", token_url: \"https://idp.example.test/oauth/token\", required_scopes: [\"widgets.read\"] }"
+                "OAuth2ClientCredentials { scheme_name: \"ServiceOAuth\", token_url: \"https://idp.example.test/oauth/token\", required_scopes: [\"widgets.read\"], user_consent: false }"
               ]
             ],
             "method": "GET",
@@ -9824,7 +9948,7 @@
           {
             "alternatives": [
               [
-                "Unsupported { scheme_name: \"UserOAuth\", category: OAuth2WithoutClientCredentials }"
+                "OAuth2UserConsent { scheme_name: \"UserOAuth\", required_scopes: [\"widgets.read\"] }"
               ]
             ],
             "method": "GET",
@@ -9846,7 +9970,7 @@
           {
             "alternatives": [
               [
-                "OAuth2ClientCredentials { scheme_name: \"ServiceOAuth\", token_url: \"https://idp.example.test/oauth/token\", required_scopes: [\"widgets.read\", \"widgets.write\"] }"
+                "OAuth2ClientCredentials { scheme_name: \"ServiceOAuth\", token_url: \"https://idp.example.test/oauth/token\", required_scopes: [\"widgets.read\", \"widgets.write\"], user_consent: false }"
               ]
             ],
             "method": "POST",
@@ -9879,7 +10003,7 @@
           {
             "alternatives": [
               [
-                "Unsupported { scheme_name: \"OpenId\", category: OpenIdConnect }"
+                "OpenIdConnect { scheme_name: \"OpenId\", required_scopes: [] }"
               ]
             ],
             "method": "PATCH",

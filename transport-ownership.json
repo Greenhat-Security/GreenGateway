@@ -1101,6 +1101,16 @@
         ]
       },
       {
+        "package": "gateway-config@0.1.0|workspace",
+        "checksum": null,
+        "features": [],
+        "dependencies": [
+          "jsonschema@0.58.6|registry+https://github.com/rust-lang/crates.io-index",
+          "serde@1.0.229|registry+https://github.com/rust-lang/crates.io-index",
+          "serde_json@1.0.154|registry+https://github.com/rust-lang/crates.io-index"
+        ]
+      },
+      {
         "package": "gateway@1.0.1|workspace",
         "checksum": null,
         "features": [
@@ -1119,6 +1129,7 @@
           "chacha20poly1305@0.11.0|registry+https://github.com/rust-lang/crates.io-index",
           "deadpool-postgres@0.14.2|registry+https://github.com/rust-lang/crates.io-index",
           "futures-util@0.3.34|registry+https://github.com/rust-lang/crates.io-index",
+          "gateway-config@0.1.0|workspace",
           "getrandom@0.4.3|registry+https://github.com/rust-lang/crates.io-index",
           "hex@0.4.3|registry+https://github.com/rust-lang/crates.io-index",
           "hmac@0.13.0|registry+https://github.com/rust-lang/crates.io-index",
@@ -1243,6 +1254,23 @@
           "r-efi@6.0.0|registry+https://github.com/rust-lang/crates.io-index",
           "rand_core@0.10.1|registry+https://github.com/rust-lang/crates.io-index",
           "wasm-bindgen@0.2.128|registry+https://github.com/rust-lang/crates.io-index"
+        ]
+      },
+      {
+        "package": "ggctl@0.1.0|workspace",
+        "checksum": null,
+        "features": [],
+        "dependencies": [
+          "gateway-config@0.1.0|workspace",
+          "jsonschema@0.58.6|registry+https://github.com/rust-lang/crates.io-index",
+          "rcgen@0.14.10|registry+https://github.com/rust-lang/crates.io-index",
+          "reqwest@0.13.5|registry+https://github.com/rust-lang/crates.io-index",
+          "serde@1.0.229|registry+https://github.com/rust-lang/crates.io-index",
+          "serde_json@1.0.154|registry+https://github.com/rust-lang/crates.io-index",
+          "tokio-rustls@0.26.5|registry+https://github.com/rust-lang/crates.io-index",
+          "tokio@1.53.1|registry+https://github.com/rust-lang/crates.io-index",
+          "url@2.5.8|registry+https://github.com/rust-lang/crates.io-index",
+          "zeroize@1.9.1|registry+https://github.com/rust-lang/crates.io-index"
         ]
       },
       {
@@ -5713,6 +5741,17 @@
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           {
+            "name": "gateway-config",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "=0.1.0",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [],
+            "source": null
+          },
+          {
             "name": "getrandom",
             "rename": null,
             "kind": null,
@@ -6021,6 +6060,13 @@
             "file": "gateway/src/main.rs"
           },
           {
+            "name": "audit_durability_startup",
+            "kind": [
+              "test"
+            ],
+            "file": "gateway/tests/audit_durability_startup.rs"
+          },
+          {
             "name": "connection_admin_contract",
             "kind": [
               "test"
@@ -6117,6 +6163,215 @@
               "test"
             ],
             "file": "gateway/tests/release_gate_workflow.rs"
+          }
+        ]
+      },
+      {
+        "package": "gateway-config",
+        "dependencies": [
+          {
+            "name": "jsonschema",
+            "rename": null,
+            "kind": "dev",
+            "target": null,
+            "req": "^0.58.6",
+            "optional": false,
+            "uses_default_features": false,
+            "features": [
+              "arbitrary-precision",
+              "idna"
+            ],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "serde_json",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "^1.0.150",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [
+              "arbitrary_precision"
+            ],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "serde",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "^1.0.228",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [
+              "derive"
+            ],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          }
+        ],
+        "features": {},
+        "targets": [
+          {
+            "name": "gateway_config",
+            "kind": [
+              "lib"
+            ],
+            "file": "gateway-config/src/lib.rs"
+          }
+        ]
+      },
+      {
+        "package": "ggctl",
+        "dependencies": [
+          {
+            "name": "jsonschema",
+            "rename": null,
+            "kind": "dev",
+            "target": null,
+            "req": "^0.58.6",
+            "optional": false,
+            "uses_default_features": false,
+            "features": [
+              "arbitrary-precision",
+              "idna"
+            ],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "serde_json",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "^1.0.150",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [
+              "arbitrary_precision"
+            ],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "serde",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "^1.0.228",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [
+              "derive"
+            ],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "tokio",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "^1.52.3",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [
+              "io-util",
+              "macros",
+              "net",
+              "rt-multi-thread",
+              "signal",
+              "sync",
+              "time"
+            ],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "reqwest",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "^0.13.2",
+            "optional": false,
+            "uses_default_features": false,
+            "features": [
+              "json",
+              "rustls",
+              "stream"
+            ],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "tokio-rustls",
+            "rename": null,
+            "kind": "dev",
+            "target": null,
+            "req": "^0.26.4",
+            "optional": false,
+            "uses_default_features": false,
+            "features": [
+              "ring",
+              "tls12"
+            ],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "rcgen",
+            "rename": null,
+            "kind": "dev",
+            "target": null,
+            "req": "^0.14.10",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "gateway-config",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "=0.1.0",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [],
+            "source": null
+          },
+          {
+            "name": "url",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "^2.5.7",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "zeroize",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "^1.8.2",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          }
+        ],
+        "features": {},
+        "targets": [
+          {
+            "name": "ggctl",
+            "kind": [
+              "bin"
+            ],
+            "file": "ggctl/src/main.rs"
+          },
+          {
+            "name": "cli",
+            "kind": [
+              "test"
+            ],
+            "file": "ggctl/tests/cli.rs"
           }
         ]
       }
@@ -6313,7 +6568,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::bootstrap::run#1",
-      "sha256": "d1002bccde85efe7c9662e82eab8c35b44fc4255c5896792760a2d078e515145",
+      "sha256": "816abf3ca37846695768241f81e5789b7ba5aa7f075281b8b8a0276899580cf2",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -6343,7 +6598,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::routing::add_admin_api_routes#1",
-      "sha256": "563c6d4b21b74d87e1394a6a5216220cc4f8c3a650edcc7dda9cb3e43ff0beaf",
+      "sha256": "3378b12cc3ab34039279255c4554ff825bcf0e2d82ef5d0ed6ed770a694c9b67",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
@@ -6688,6 +6943,26 @@
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
     {
+      "file": "gateway/src/audit/durable.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::audit::durable::AUDIT_DURABILITY_REFUSAL_REASONS#1",
+      "sha256": "1045a913c8b4a4c973cc926eb25c6fd8aed944ab5b48ce4dd831ada427a1afff",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
+    },
+    {
+      "file": "gateway/src/audit/durable.rs",
+      "reasons": [
+        "unexpanded-macro"
+      ],
+      "scope": "gateway::audit::durable::record_durability_refusal#1",
+      "sha256": "dda830fa11dc8bfb9251734bea07678ab458c2a851bd8d97f8af857c2d593ec0",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
+    },
+    {
       "file": "gateway/src/admin_policy_test_runs.rs",
       "reasons": [
         "capability-import-or-glob"
@@ -6708,12 +6983,22 @@
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
     {
-      "file": "gateway/src/audit/postgres_sink.rs",
+      "file": "gateway/src/admin_policy_simulations.rs",
       "reasons": [
         "capability-import-or-glob"
       ],
-      "scope": "gateway::audit::postgres_sink::use crate :: { audit :: { record_flush_outcome , AuditEvent , AuditSink , AUDIT_EVENTS_DROPPED_TOTAL } , metrics :: LOCK_POISON_RECOVERIES_TOTAL , storage :: { postgres_audit :: PostgresAuditEventStore , AuditEventStore as _ } , }#1",
-      "sha256": "63f79eb95f90db11924f3b591e8f632ff1dbdbb7415d32eb53b6c8b20147477f",
+      "scope": "gateway::admin_policy_simulations::use super :: *#1",
+      "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/main.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::use admin_policy_simulations :: *#1",
+      "sha256": "a6b33445074e02cb3fdd3aef5ba8a4cae0ab586a01896760641accd889546470",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
@@ -6753,7 +7038,7 @@
         "capability-in-macro-input"
       ],
       "scope": "gateway::audit::postgres_sink::flusher_loop#1",
-      "sha256": "9741912e7dffff5cc3afce6af62126506916cbba5ad9b257ebf7d728fb791915",
+      "sha256": "da578a603b7e9fde39187979da47ec62757a463010024dfd55d5cbf658a9ebf6",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -6843,7 +7128,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::audit::sink::AuditSink#1",
-      "sha256": "8b569b6763e25f667758ff4f8690938b7fed3c9fcd08f88656d2d9b679d9f9d7",
+      "sha256": "7b48927f214602ffd437c2b9db7989276ec1c3a30a2f097c32a0bb5fb5ee8636",
       "owner": "GreenGateway maintainers",
       "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
     },
@@ -6923,7 +7208,7 @@
         "unexpanded-macro"
       ],
       "scope": "gateway::audit::sqlite_sink::impl  SqliteSink::new_with_intervals#1",
-      "sha256": "95e004c950cb13f28e1f43971486c611901ce4c0d6bc521d92d622143fbafed5",
+      "sha256": "843878f8ffb8d07891209f4e4c07855e8402e59b382d12042c698694ba5bc6e2",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed standalone reliability changes: process-local readiness state, fixed-label metrics and exact audit loss accounting. No new outbound transport authority; SQLite probes use configured local paths and observation filtering preserves security findings."
     },
@@ -6933,7 +7218,7 @@
         "unexpanded-macro"
       ],
       "scope": "gateway::audit::sqlite_sink::impl  SqliteSinkShared::flush_buffer#1",
-      "sha256": "c60ecbfee7cbe7e0336814da3ec883c93b8bebb9b827461900ca9244fcc1d54e",
+      "sha256": "3b74751c8bed19f099656d42df1cdaedd45ada4343c984e57e5691a814666449",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed standalone reliability changes: process-local readiness state, fixed-label metrics and exact audit loss accounting. No new outbound transport authority; SQLite probes use configured local paths and observation filtering preserves security findings."
     },
@@ -6953,7 +7238,7 @@
         "unexpanded-macro"
       ],
       "scope": "gateway::audit::sqlite_sink::impl  SqliteSinkShared::buffer_guard#1",
-      "sha256": "16006470c7fbc9ca6213d61df777b162c0edf229dd487827195182ba88e68a3f",
+      "sha256": "1cdd25f428df504d11de455b7eaad1cff4a743ceb5b54351e1b51b688c6fd04a",
       "owner": "GreenGateway maintainers",
       "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
     },
@@ -7023,9 +7308,39 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::audit::impl  AuditLog::from_config#1",
-      "sha256": "a0d11a858f168120d0f328ca393a040e7a98ac329f5008448f9256ccfea891f7",
+      "sha256": "3f2a895ef13b3cc86deb4ddf7488d933027be71d459399666e3c76f46de094f3",
       "owner": "GreenGateway maintainers",
       "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
+    },
+    {
+      "file": "gateway/src/auth/change_actor.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::auth::change_actor::ActorKind#1",
+      "sha256": "6d7c0db13ee2b143fb3f09caf9f4a24c4c446740e933e2d5ed3b12079d646755",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Issue #425 change-actor kind vocabulary for authority evidence. Its cfg_attr only allows dead code for the System variant in builds without the postgres feature, where the cluster-mode revoke-jwt command that records it is absent; plain data, no I/O and no transport or process capability."
+    },
+    {
+      "file": "gateway/src/auth/change_actor.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::auth::change_actor::impl  ActorKind::from_stored#1",
+      "sha256": "bdd791d1a53fcbb5367c2ab2fff92c125433b508697dd8e215ea00aa54bc4c2a",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Issue #425 parse of a stored actor_kind value against the closed vocabulary, read by the cluster-mode delivery projection. Its cfg_attr only allows dead code in builds without the postgres feature; pure string comparison, no I/O and no transport or process capability."
+    },
+    {
+      "file": "gateway/src/auth/change_actor.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::auth::change_actor::impl  ChangeActor::system#1",
+      "sha256": "2c0efc2af79b1b10eabec1b1078e1d520bfafd8ac21c8fa1a8e55d8987f7150e",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Issue #425 constructor of the system actor the cluster-mode revoke-jwt command records. Its cfg_attr only allows dead code in builds without the postgres feature; builds an in-memory value, no I/O and no transport or process capability."
     },
     {
       "file": "gateway/src/auth/cookie_session_validator.rs",
@@ -8335,9 +8650,19 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::record_change_evidence#1",
-      "sha256": "a8d52623e0814dfc022ea52cb879856fc0d529054658be23fc18f4c8ca7829ee",
+      "sha256": "11e3ab16855d4f9ac9e52b88108115452d60cddf89e8549019d52df38cfe02bb",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/connections/pg_store.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::connections::pg_store::record_catalog_change_evidence#1",
+      "sha256": "b9b7b591233ada0d85f9446b0a9811900e204c20e72220f5a6cb8606a580dff1",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Appends one catalog change-evidence row through the caller's open PostgreSQL transaction (issue #425); no new connection, endpoint or transport."
     },
     {
       "file": "gateway/src/connections/pg_store.rs",
@@ -9449,7 +9774,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::import::sections::impl  PolicySection::apply_in#1",
-      "sha256": "55765effb0914e22a1f9ce28ecd455be9e397d2957b31d288f2c45b6522d7c28",
+      "sha256": "0ded964e3ada434647868959154be4d72f6ab18e0c093aa85911836e7659f3fa",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -9459,7 +9784,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::import::sections::impl  ToolsSection::apply#1",
-      "sha256": "1ccdc02079e9acf9c6ac293c09e47092eb01e8b2e61b7cbfef2d20c18238e081",
+      "sha256": "ed24e2b66e8aa5ec21b56f6d6694e56ab7deeb0bf7535531a35e3ae65f13af82",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -10271,7 +10596,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::middleware::rbac::rbac_middleware#1",
-      "sha256": "7e1d1bffaeae03b1176d652411b710a1ad4d343736059ca2235d6be6283b6fbd",
+      "sha256": "71ad797e8337593c2d836296f7d97b3807e46f869223143a6fd84b76740be163",
       "owner": "GreenGateway maintainers",
       "purpose": "Issue #422 HTTP adapter: evaluate the admitted immutable policy snapshot and translate its result into existing audit and response behavior. Existing cfg/cfg_attr inputs only; no new transport, provider, resolver or process authority."
     },
@@ -11082,6 +11407,16 @@
       "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
     },
     {
+      "file": "gateway/src/storage/change_evidence.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::storage::change_evidence::DocumentAction#1",
+      "sha256": "e82368759f3c4ad40aff3a7b877f7edbaecb74e7cda437d090af3ad2d4618d35",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Closed action vocabulary of document change evidence; its derive/cfg_attr attributes add no transport capability (issue #425)."
+    },
+    {
       "file": "gateway/src/storage/migrations.rs",
       "reasons": [
         "network-or-process-reference"
@@ -11714,6 +12049,26 @@
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
     {
+      "file": "gateway/src/storage/postgres_audit.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_audit::impl  PostgresAuditEventStore::checkout_for_insert#1",
+      "sha256": "3cfd0ebcb24656e1bda0153175f546c269551be778ad716ea358b05f78ad24a0",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_audit.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_audit::impl  PostgresAuditEventStore::insert_events_on#1",
+      "sha256": "ab8664706cc498fa5bec3bb785019d1cf324ad07405b2ef73540545c2f7bf95a",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
       "file": "gateway/src/storage/postgres_discovery.rs",
       "reasons": [
         "network-or-process-reference"
@@ -12298,6 +12653,16 @@
       "reasons": [
         "network-or-process-reference"
       ],
+      "scope": "gateway::storage::postgres_documents::record_document_change#1",
+      "sha256": "ee12343618666614c8b914f5e3e1e5eee83171525128e4b07c9e65b5e88dec34",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Appends one document change-evidence row through the caller's open PostgreSQL transaction (issue #425); no new connection, endpoint or transport."
+    },
+    {
+      "file": "gateway/src/storage/postgres_documents.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
       "scope": "gateway::storage::postgres_documents::read_active#1",
       "sha256": "e626f70699377170d4583c68dcaeed060e0365f27fa08544c6bdf10b9c90d342",
       "owner": "GreenGateway maintainers",
@@ -12339,7 +12704,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_documents::commit_in#1",
-      "sha256": "8685889c1e82dcdaeb8b662b3ede0cc4cae76375b3f68b00d0dac28e4744211e",
+      "sha256": "2f67acb8d7292d8a6331678b738048efa6125b32f87ddcbc1cff4159344ba821",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -12669,7 +13034,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_policy::commit_policy_in#1",
-      "sha256": "a9fafaada85e9185f00eae23fd2ac4efa7af8077d51a43961b348f8ec203fa78",
+      "sha256": "2a58c6f0cf3563ad16e997ed6e12378dee68f1ea9ae5ffc0e8fe37a60ebd03c7",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -12899,7 +13264,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_service_tokens::record_change_evidence#1",
-      "sha256": "e29b3ee8319fc20e2f5b24dc7908327de46f0a02b9bdeccbc88712bb01c41a0e",
+      "sha256": "6db322e7023adf28962884359b9dfd5c6ab1babef2624c14a67e6fe3395bdb80",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -14255,7 +14620,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_authority_events::journaled_evidence_from_row#1",
-      "sha256": "0feaef3cb9f594c4f54e82efc7cf73e62fc6bef6763cb2e959e0d7d0d7f455bd",
+      "sha256": "08b5b3590ed6622748f9e8e805dcf0cdac7b2e324f2deee4f3342b949f9b7439",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -14278,6 +14643,196 @@
       "sha256": "87dbe589566ff4025878beadf88e208a24525debebf264e4a7bea7b08748ea5e",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway/src/admin_config.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::admin_config::use super :: *#1",
+      "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/main.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::use admin_config :: *#1",
+      "sha256": "f7ea42fbe0a39befb09e21a9a49ab5caef8ef939b0a749d731b79a43836992a0",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "ggctl/src/completion.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "ggctl::completion::use std :: fmt :: Write as _#1",
+      "sha256": "ae6db2eb90a4daf2aea533b77a1b4679e616f8a55a6de96b23c20145d7f90905",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 5: the in-memory string formatting trait for generated shell completion scripts; no I/O, network or process capability."
+    },
+    {
+      "file": "ggctl/src/credential.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "ggctl::credential::permissions_are_owner_only#1",
+      "sha256": "93ff7585a3de003ce522965c8b37e7eccea29bf2b7270b83cf280a0c4e86cf41",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 5: reads the Unix mode bits of token-file metadata through PermissionsExt to refuse a credential readable or writable by group or other; read-only metadata, no network or process capability."
+    },
+    {
+      "file": "ggctl/src/help.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "ggctl::help::use std :: fmt :: Write as _#1",
+      "sha256": "ae6db2eb90a4daf2aea533b77a1b4679e616f8a55a6de96b23c20145d7f90905",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 5: the in-memory string formatting trait for generated help text; no I/O, network or process capability."
+    },
+    {
+      "file": "ggctl/src/remote.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "ggctl::remote::use std :: { future :: Future , io :: Read , net :: IpAddr , path :: { Path , PathBuf } , time :: Duration , }#1",
+      "sha256": "519844834c83f9a615cbcca2314fc3114bfad820fe5340dc03ddefa6e3297d03",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 5: value types, Read and Future for the admin API client and its credential and trust-anchor loading; constructor bodies require separate scope review."
+    },
+    {
+      "file": "ggctl/src/remote.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "ggctl::remote::use url :: { Host , Url }#1",
+      "sha256": "f588e18c20f4040c5ad5e5131d34958e68bc9b3deea55c624013775e0bece6c4",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 5: URL parsing and host classification for the --server admin API base; parsing opens no connection."
+    },
+    {
+      "file": "ggctl/src/remote.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "ggctl::remote::is_loopback_literal#1",
+      "sha256": "45ab40ae51078e3356ff77f004a1ce782bffcde6a4da69a445c3c18d25c0048e",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 5: classifies an already-parsed --server host as a loopback IP literal for the plaintext-HTTP exception. A pure address check: no resolution and no connection."
+    },
+    {
+      "file": "ggctl/src/remote.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "ggctl::remote::TrustAnchors#1",
+      "sha256": "832d33b99ef60be4067ab707669658ba4d80a3cef8fbec721f22c61c3bcfbd0b",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 5: ggctl's admin API client, its only network capability. One reqwest client, built in admin_http_client with no proxy, no redirects, no transparent retries, HTTP/1.1, platform certificate and hostname verification plus optional --ca-file trust anchors, and bounded time and response size. It talks only to the operator-named admin API base, is not linked into the gateway, and scripts/check-egress-only.sh pins its builder."
+    },
+    {
+      "file": "ggctl/src/remote.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "ggctl::remote::roots_from_pem#1",
+      "sha256": "1e5326e1f02a642c34105d734e615c79f5ccb4f34178a49e65cf95844b1147a8",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 5: ggctl's admin API client, its only network capability. One reqwest client, built in admin_http_client with no proxy, no redirects, no transparent retries, HTTP/1.1, platform certificate and hostname verification plus optional --ca-file trust anchors, and bounded time and response size. It talks only to the operator-named admin API base, is not linked into the gateway, and scripts/check-egress-only.sh pins its builder."
+    },
+    {
+      "file": "ggctl/src/remote.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "ggctl::remote::admin_http_client#1",
+      "sha256": "a70eeaa206a9dbc600b3ee3b4f54c9c704fb4aaa91766ccadb522ad08bf3848d",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 5: ggctl's admin API client, its only network capability. One reqwest client, built in admin_http_client with no proxy, no redirects, no transparent retries, HTTP/1.1, platform certificate and hostname verification plus optional --ca-file trust anchors, and bounded time and response size. It talks only to the operator-named admin API base, is not linked into the gateway, and scripts/check-egress-only.sh pins its builder."
+    },
+    {
+      "file": "ggctl/src/remote.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "ggctl::remote::AdminClient#1",
+      "sha256": "43b21611fc66aae86ac956a1edadcf3114b519b6dc0fc5c4ecf1ee3cf9400d69",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 5: ggctl's admin API client, its only network capability. One reqwest client, built in admin_http_client with no proxy, no redirects, no transparent retries, HTTP/1.1, platform certificate and hostname verification plus optional --ca-file trust anchors, and bounded time and response size. It talks only to the operator-named admin API base, is not linked into the gateway, and scripts/check-egress-only.sh pins its builder."
+    },
+    {
+      "file": "ggctl/src/remote.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "ggctl::remote::impl  AdminClient::get_json#1",
+      "sha256": "919dd904f3f34d16bb35cc015270dc214805dba8228af411f13406150619572a",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 5: ggctl's admin API client, its only network capability. One reqwest client, built in admin_http_client with no proxy, no redirects, no transparent retries, HTTP/1.1, platform certificate and hostname verification plus optional --ca-file trust anchors, and bounded time and response size. It talks only to the operator-named admin API base, is not linked into the gateway, and scripts/check-egress-only.sh pins its builder."
+    },
+    {
+      "file": "ggctl/src/remote.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "ggctl::remote::transport_code#1",
+      "sha256": "6a704453d153c85d9ad2fb8946ddfd2366470a82fd117605fcc94b0074524f23",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 5: ggctl's admin API client, its only network capability. One reqwest client, built in admin_http_client with no proxy, no redirects, no transparent retries, HTTP/1.1, platform certificate and hostname verification plus optional --ca-file trust anchors, and bounded time and response size. It talks only to the operator-named admin API base, is not linked into the gateway, and scripts/check-egress-only.sh pins its builder."
+    },
+    {
+      "file": "ggctl/src/remote.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "ggctl::remote::is_json#1",
+      "sha256": "0d43a2a52b437659c7e44cf99d58e59eac6e246a40e4765980a9b2f6d1f2871e",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 5: ggctl's admin API client, its only network capability. One reqwest client, built in admin_http_client with no proxy, no redirects, no transparent retries, HTTP/1.1, platform certificate and hostname verification plus optional --ca-file trust anchors, and bounded time and response size. It talks only to the operator-named admin API base, is not linked into the gateway, and scripts/check-egress-only.sh pins its builder."
+    },
+    {
+      "file": "ggctl/src/remote.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "ggctl::remote::read_body#1",
+      "sha256": "e4bfa7df187811ce65092898177761a846fc06fb7c728b97f4913bc46666e6bd",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 5: ggctl's admin API client, its only network capability. One reqwest client, built in admin_http_client with no proxy, no redirects, no transparent retries, HTTP/1.1, platform certificate and hostname verification plus optional --ca-file trust anchors, and bounded time and response size. It talks only to the operator-named admin API base, is not linked into the gateway, and scripts/check-egress-only.sh pins its builder."
+    },
+    {
+      "file": "ggctl/src/sarif.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "ggctl::sarif::file_attributes#1",
+      "sha256": "b00904082cc65a1f3303a0ba6a7be66e26e8fbdb8f97bf07a7f5bb17a2d02b5f",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the SARIF writer, which ggctl validate (#242 PR 8) will call; it builds JSON in memory only, with no I/O and no transport or process capability."
+    },
+    {
+      "file": "ggctl/src/main.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "ggctl::use std :: { ffi :: OsString , io :: IsTerminal , process :: ExitCode }#1",
+      "sha256": "6fb1d83fb3d783f26969f80640ce163ecf6fd3539acf3efdecf6eaaecf5a034d",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 5: argument, terminal-detection and exit-status types for the ggctl entry point; it imports no way to spawn a process or open a connection."
+    },
+    {
+      "file": "ggctl/src/main.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "ggctl::main#1",
+      "sha256": "734eeba6449bfb1313d54c2d92461c135c56f69ade467d7d68284b3dfb867d85",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 5: the ggctl entry point reads its arguments, locks the standard streams, detects a terminal on standard input and returns a std::process::ExitCode. It spawns no process and opens no connection itself."
     },
     {
       "file": "gateway/src/storage/postgres_authority_events.rs",

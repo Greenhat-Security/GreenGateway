@@ -18,7 +18,7 @@ failure reasons and step-by-step procedures stay in the
 | The upstream receives | The Connection's own credential, if it has one, plus a short-lived JWT the gateway signs that names the caller | The caller's own access token, as `Authorization: Bearer` |
 | Who decides access upstream | The upstream, from the assertion's `caller_iss` and `caller_sub` | The issuer, by the grant it holds for the caller, then the upstream |
 | The gateway holds | A signing key, by alias | A signing key and a token-exchange client secret, by alias, and the issued tokens in a bounded memory cache |
-| Lanes that serve it | Manual HTTP tools, managed OpenAPI tools, managed MCP tool calls and connection-bound proxy routes; see [Which calls are attested](operator-guide.md#which-calls-are-attested) | Manual HTTP tool calls only; see [Which calls are served](operator-guide.md#which-calls-are-served) |
+| Lanes that serve it | Manual HTTP tools, managed OpenAPI tools, managed MCP tool calls and connection-bound proxy routes; see [Which calls are attested](operator-guide.md#which-calls-are-attested) | Manual HTTP tool calls and managed OpenAPI tool calls; see [Which calls are served](operator-guide.md#which-calls-are-served) |
 | Reference | [Signed caller assertions](operator-guide.md#signed-caller-assertions) | [Delegated issuer tokens](operator-guide.md#delegated-issuer-tokens) |
 
 A delegated Connection always carries a `caller_assertion` block: the
@@ -29,8 +29,16 @@ A third mechanism, the `google_domain_wide_delegation` credential (#442),
 obtains the caller's own Google Workspace token without any grant store; its
 trust boundary is different enough to have [its own section](#google-domain-wide-delegation-442).
 Everything else on this page is about the two mechanisms above unless it says
-otherwise. One Phase 8 item is open and not implemented: Swagger 2.0 and
-Google Discovery import with user-consent OAuth scheme binding (#443).
+otherwise.
+
+Swagger 2.0 and Google Discovery import (#443) brings catalogs whose
+operations require user-consent OAuth 2.0 flows or OpenID Connect. Those
+schemes bind only to a delegated issuer token Connection, so such a catalog's
+tools send each caller's own token through the same exchange, cache and
+audit as manual tools; see
+[Security binding and read-only selection](operator-guide.md#security-binding-and-read-only-selection).
+A `google_domain_wide_delegation` Connection is not served on the managed
+OpenAPI lane, so no catalog binds to one.
 
 ## What each component can do in the wrong hands
 
@@ -61,8 +69,10 @@ From most to least sensitive:
   audience and resource. Every verifier of the one gateway-wide JWKS trusts a
   key such a principal binds.
 - **`admin:tools:write`.** It decides which upstream operations a caller's own
-  token is used for, by binding manual tools to a delegated Connection.
-  HTTP direct rules and tool policy still apply to every call.
+  token is used for, by binding manual tools to a delegated Connection and by
+  registering the operations of its managed OpenAPI catalog, of those the
+  Connection's requested scopes bind. HTTP direct rules and tool policy still
+  apply to every call.
 - **`admin:principals:write`.** It purges a principal's cached tokens and
   revokes them at the issuer. That costs the user a fresh exchange on their
   next call; it cannot obtain a token.

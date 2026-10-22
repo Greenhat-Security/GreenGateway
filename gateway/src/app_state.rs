@@ -17,6 +17,7 @@ pub(super) const ADMIN_AUTH_LOGIN_ROUTE: &str = "/v1/admin/auth/login";
 pub(super) const ADMIN_AUTH_CALLBACK_ROUTE: &str = "/v1/admin/auth/callback";
 pub(super) const ADMIN_CAPABILITIES_ROUTE: &str = "/v1/admin/capabilities";
 pub(super) const STATUS_ADMIN_ROUTE: &str = "/v1/admin/status";
+pub(super) const CONFIG_CAPABILITIES_ADMIN_ROUTE: &str = "/v1/admin/config/capabilities";
 pub(super) const CLUSTER_ADMIN_ROUTE: &str = "/v1/admin/cluster";
 pub(super) const CLUSTER_REPLICAS_ADMIN_ROUTE: &str = "/v1/admin/cluster/replicas";
 pub(super) const POLICY_ADMIN_ROUTE: &str = "/v1/admin/policy";
@@ -34,6 +35,9 @@ pub(super) const POLICY_VALIDATE_ADMIN_ROUTE: &str = "/v1/admin/policy/validate"
 pub(super) const POLICY_CONVERT_ADMIN_ROUTE: &str = "/v1/admin/policy/convert";
 /// Run a `policy-tests.v1` suite (issue #243, slice 11).
 pub(super) const POLICY_TEST_RUNS_ADMIN_ROUTE: &str = "/v1/admin/policy/tests/runs";
+/// Simulate synthetic cases against the active policy and a candidate
+/// (issue #243, slice 10).
+pub(super) const POLICY_SIMULATIONS_ADMIN_ROUTE: &str = "/v1/admin/policy/simulations";
 pub(super) const POLICY_RULES_ADMIN_ROUTE: &str = "/v1/admin/policy/rules";
 pub(super) const POLICY_RULE_ADMIN_ROUTE: &str = "/v1/admin/policy/rules/{id}";
 pub(super) const POLICY_RULES_ORDER_ADMIN_ROUTE: &str = "/v1/admin/policy/rules/order";
@@ -101,6 +105,10 @@ pub(super) const PRINCIPAL_DELEGATED_TOKENS_REVOKE_ADMIN_ROUTE: &str =
 pub(super) const ADMIN_AUDIT_READ_PERMISSION: &str = "admin:audit:read";
 pub(super) const ADMIN_AUDIT_STREAM_PERMISSION: &str = "admin:audit:stream";
 pub(super) const ADMIN_STATUS_READ_PERMISSION: &str = "admin:status:read";
+/// Reads configuration state and the configuration capability document
+/// (issue #242, ADR-0008). Later slices extend what it grants; it never grants
+/// a write.
+pub(super) const ADMIN_CONFIG_READ_PERMISSION: &str = "admin:config:read";
 pub(super) const ADMIN_CLUSTER_READ_PERMISSION: &str = connections::permissions::ADMIN_CLUSTER_READ;
 pub(super) const ADMIN_POLICY_READ_PERMISSION: &str = "admin:policy:read";
 pub(super) const ADMIN_POLICY_WRITE_PERMISSION: &str = "admin:policy:write";
@@ -218,6 +226,7 @@ pub(super) struct AdminRoutes {
     pub(super) auth_login_route: String,
     pub(super) auth_callback_route: String,
     pub(super) status_route: String,
+    pub(super) config_capabilities_route: String,
     pub(super) cluster_route: String,
     pub(super) cluster_replicas_route: String,
     pub(super) policy_route: String,
@@ -229,6 +238,7 @@ pub(super) struct AdminRoutes {
     pub(super) policy_validate_route: String,
     pub(super) policy_convert_route: String,
     pub(super) policy_test_runs_route: String,
+    pub(super) policy_simulations_route: String,
     pub(super) policy_rules_route: String,
     pub(super) policy_rule_route: String,
     pub(super) policy_rules_order_route: String,
@@ -326,6 +336,7 @@ impl AdminRoutes {
             auth_login_route: format!("{api_prefix}/auth/login"),
             auth_callback_route: format!("{api_prefix}/auth/callback"),
             status_route: format!("{api_prefix}/status"),
+            config_capabilities_route: format!("{api_prefix}/config/capabilities"),
             cluster_route: format!("{api_prefix}/cluster"),
             cluster_replicas_route: format!("{api_prefix}/cluster/replicas"),
             policy_route: format!("{api_prefix}/policy"),
@@ -337,6 +348,7 @@ impl AdminRoutes {
             policy_validate_route: format!("{api_prefix}/policy/validate"),
             policy_convert_route: format!("{api_prefix}/policy/convert"),
             policy_test_runs_route: format!("{api_prefix}/policy/tests/runs"),
+            policy_simulations_route: format!("{api_prefix}/policy/simulations"),
             policy_rules_route: format!("{api_prefix}/policy/rules"),
             policy_rule_route: format!("{api_prefix}/policy/rules/{{id}}"),
             policy_rules_order_route: format!("{api_prefix}/policy/rules/order"),

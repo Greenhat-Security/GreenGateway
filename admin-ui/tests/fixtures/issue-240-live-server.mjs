@@ -318,6 +318,9 @@ function gatewayEnvironment() {
     CONNECTIONS_SQLITE_PATH: databasePath,
     PRINCIPAL_SQLITE_PATH: path.join(runtimeRoot, 'principals.sqlite'),
     SERVICE_TOKEN_SQLITE_PATH: path.join(runtimeRoot, 'tokens.sqlite'),
+    // The audit store of record the default AUDIT_DURABILITY=required needs;
+    // without one the gateway refuses to start.
+    AUDIT_SQLITE_PATH: path.join(runtimeRoot, 'audit.sqlite'),
     CONNECTION_SECRETS_ROOT: runtimeRoot,
     CONNECTION_LOCAL_SECRET_KEYRING: JSON.stringify([
       {

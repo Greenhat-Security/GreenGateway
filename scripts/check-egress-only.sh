@@ -42,6 +42,11 @@ ALIAS_TYPE_CONSUMERS="gateway/src/tools/mcp_upstream.rs"
 # Keep an independent pinning check for the migrated MCP factory.
 PINNED_CLIENT_BUILDERS="gateway/src/egress.rs:mcp_http_client"
 
+# The operator CLI's admin API client (issue #242): the one ggctl file that may
+# name reqwest, and the one function in it that may build a client.
+OPERATOR_CLIENT_FILE="ggctl/src/remote.rs"
+OPERATOR_CLIENT_BUILDER="admin_http_client"
+
 # `pub(crate) use reqwest as rmcp_http;` -> `rmcp_http`
 aliases="$(
     sed -nE 's/^[[:space:]]*(pub(\([^)]*\))?[[:space:]]+)?use[[:space:]]+reqwest[[:space:]]+as[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*;.*/\3/p' \
@@ -91,6 +96,16 @@ matches="$(
                 # gate that could not be written is not a stricter
                 # invariant -- it is no gate at all.
                 gateway/tests/ha/*)
+                    continue
+                    ;;
+                # `ggctl` (issue #242, ADR-0008) is a separate operator
+                # binary, not the gateway: its one client talks only to the
+                # admin API base the operator names, never on a caller's
+                # behalf. That one file is its only network capability, and
+                # the properties it must keep are pinned below
+                # (OPERATOR_CLIENT_BUILDER). Every other ggctl and
+                # gateway-config file is still enforced.
+                "$OPERATOR_CLIENT_FILE")
                     continue
                     ;;
             esac
@@ -163,6 +178,64 @@ if [ -n "$problems" ]; then
     echo "the checked MCP client factory must pin the checked address with .resolve()"
     printf '%s
 ' "$problems" | tr '|' '
+' | sed '/^$/d;s/^/  /'
+    exit 1
+fi
+
+# The operator CLI's client (issue #242, ADR-0008 "Remote client"). It is
+# exempt from the reqwest confinement above only because it is a separate
+# binary talking to the operator's own admin API, so the properties that make
+# it safe are checked here instead: exactly one client construction in the
+# file, inside OPERATOR_CLIENT_BUILDER, with proxies, redirects and transparent
+# retries off and HTTP/1.1 and a timeout set, and no option anywhere in the file
+# that weakens certificate verification or adds a proxy.
+operator_problems=""
+if [ ! -f "$OPERATOR_CLIENT_FILE" ]; then
+    operator_problems="|$OPERATOR_CLIENT_FILE does not exist; update OPERATOR_CLIENT_FILE"
+else
+    operator_code="$(grep -vE '^[[:space:]]*//' "$OPERATOR_CLIENT_FILE")"
+    operator_body="$(
+        printf '%s
+' "$operator_code" |
+            awk -v want="fn $OPERATOR_CLIENT_BUILDER(" '
+                index($0, want) { inside = 1 }
+                inside { print }
+                inside && /^\}/ { exit }
+            '
+    )"
+    if [ -z "$operator_body" ]; then
+        operator_problems="$operator_problems|$OPERATOR_CLIENT_FILE no longer defines $OPERATOR_CLIENT_BUILDER(); update OPERATOR_CLIENT_BUILDER"
+    else
+        for required in '\.no_proxy\(\)' 'redirect::Policy::none\(\)' 'retry::never\(\)' '\.http1_only\(\)' '\.timeout\('; do
+            if ! printf '%s
+' "$operator_body" | grep -qE "$required"; then
+                operator_problems="$operator_problems|$OPERATOR_CLIENT_FILE:$OPERATOR_CLIENT_BUILDER does not set $required"
+            fi
+        done
+    fi
+    constructions="$(
+        printf '%s
+' "$operator_code" | grep -cE 'Client::builder\(\)|ClientBuilder::new\(\)|Client::new\(\)' || true
+    )"
+    in_builder="$(
+        printf '%s
+' "$operator_body" | grep -cE 'Client::builder\(\)' || true
+    )"
+    if [ "$constructions" != 1 ] || [ "$in_builder" != 1 ]; then
+        operator_problems="$operator_problems|$OPERATOR_CLIENT_FILE must build exactly one client, in $OPERATOR_CLIENT_BUILDER()"
+    fi
+    for forbidden in 'danger_accept_invalid' 'tls_certs_only' 'tls_backend_preconfigured' 'use_preconfigured_tls' 'tls_sslkeylogfile' '\.proxy\('; do
+        if printf '%s
+' "$operator_code" | grep -qE "$forbidden"; then
+            operator_problems="$operator_problems|$OPERATOR_CLIENT_FILE uses $forbidden"
+        fi
+    done
+fi
+
+if [ -n "$operator_problems" ]; then
+    echo "the operator CLI client must keep its reviewed transport properties:"
+    printf '%s
+' "$operator_problems" | tr '|' '
 ' | sed '/^$/d;s/^/  /'
     exit 1
 fi
