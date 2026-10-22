@@ -343,6 +343,15 @@ A purge stops the gateway serving tokens it obtained earlier; it does not stop
 a user whose credentials still validate and whose grant the issuer still
 holds.
 
+The [per-caller credential trust boundary](../connections/per-caller-trust-boundary.md)
+consolidates this boundary for both per-caller mechanisms, delegated issuer
+tokens and signed caller assertions (issue #463): what each component can do
+if compromised, the storage and cache bounds, the audit of every hand-out,
+the controls only the issuer or the upstream can provide, and what remains
+out of scope, raw forwarding of the caller's inbound bearer token included.
+It is part of issue #446 and must be extended by any later per-caller
+credential, such as the domain-wide delegation of issue #442.
+
 ### Secret trust and confidentiality
 
 The trust chain is:
@@ -541,8 +550,9 @@ API response.
 Operational procedures are documented in the
 [operator guide](../connections/operator-guide.md),
 [migration and rollback guide](../connections/migration.md),
-[admin guide](../connections/admin-guide.md), and
-[issue #240 acceptance map](../testing/issue-240-acceptance.md).
+[admin guide](../connections/admin-guide.md),
+[per-caller credential trust boundary](../connections/per-caller-trust-boundary.md),
+and [issue #240 acceptance map](../testing/issue-240-acceptance.md).
 
 ## Consequences
 
