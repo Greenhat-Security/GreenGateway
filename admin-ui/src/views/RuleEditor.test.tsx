@@ -424,6 +424,42 @@ describe('RuleEditor', () => {
     ).toBeTruthy();
   });
 
+  it('presents unevaluated observations as a lower bound with their reasons', async () => {
+    const fetchMock = policyBackedFetch(policyFixture(), 'W/"policy-1"', {
+      preview: {
+        ...previewResponseFixture(3, '/api/users/123'),
+        unevaluated_event_count: 2,
+        unevaluated_reasons: { missing_dispatch_fact: 2 },
+        scan_truncated: false,
+        complete: false,
+      },
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderRuleEditor();
+
+    await screen.findByLabelText('Path pattern');
+    vi.useFakeTimers();
+    fireEvent.change(screen.getByLabelText('Path pattern'), {
+      target: { value: '/api/users/{id}' },
+    });
+    await advanceTimersByTime(RULE_PREVIEW_DEBOUNCE_MS);
+    vi.useRealTimers();
+
+    expect(await screen.findByText('2 not evaluated')).toBeTruthy();
+    expect(screen.queryByText('Scan truncated')).toBeNull();
+    expect(
+      screen.getByText((_, node) =>
+        Boolean(
+          node instanceof HTMLElement &&
+            node.classList.contains('body-copy') &&
+            node.textContent ===
+              'This rule would have matched at least 3 requests in the last 24 hours. 2 of the 25 scanned observations could not be evaluated against it: 2 recorded without routing classification.',
+        ),
+      ),
+    ).toBeTruthy();
+  });
+
   it('presents a preview over a window with no observations as its own state, not zero matches', async () => {
     const fetchMock = policyBackedFetch(policyFixture(), 'W/"policy-1"', {
       preview: {
