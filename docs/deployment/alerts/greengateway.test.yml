@@ -64,6 +64,13 @@ tests:
       - {eval_time: 12m, alertname: GreenGatewaySecurityRevisionLag, exp_alerts: []}
       - {eval_time: 12m, alertname: GreenGatewayClusterConfigMismatch, exp_alerts: []}
       - {eval_time: 12m, alertname: GreenGatewayClusterMetricsMissing, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayAuthorityEventCapacityRefusals, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayAuthorityEvidenceWriteFailures, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayAuthorityEventJournalFull, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayAuthorityEventJournalFilling, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayAuthorityEventDeliveryLag, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayAuthorityEventDeliveryFailures, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayAuthorityEventJournalUnobserved, exp_alerts: []}
 
   # Pool gauges exist. Optional security reconciliation and lazy failure counters need not emit series.
   - name: 'healthy cluster; optional revision gauge and all lazy failure counters absent'
@@ -1213,6 +1220,10 @@ tests:
         values: '10+0x5 0+0x34'
       - series: 'greengateway_database_pool_timeouts_total{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
         values: '10+0x5 0+0x34'
+      - series: 'greengateway_authority_event_capacity_refusals_total{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '10+0x5 0+0x34'
+      - series: 'greengateway_authority_event_evidence_failures_total{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '10+0x5 0+0x34'
     alert_rule_test:
       - {eval_time: 2m30s, alertname: GreenGatewayAuditLoss, exp_alerts: []}
       - {eval_time: 2m30s, alertname: GreenGatewayAuditFlushFailures, exp_alerts: []}
@@ -1223,6 +1234,12 @@ tests:
       - {eval_time: 12m, alertname: GreenGatewayAuditLoss, exp_alerts: []}
       - {eval_time: 12m, alertname: GreenGatewayAuditFlushFailures, exp_alerts: []}
       - {eval_time: 12m, alertname: GreenGatewayDatabasePoolTimeouts, exp_alerts: []}
+      - {eval_time: 2m30s, alertname: GreenGatewayAuthorityEventCapacityRefusals, exp_alerts: []}
+      - {eval_time: 2m30s, alertname: GreenGatewayAuthorityEvidenceWriteFailures, exp_alerts: []}
+      - {eval_time: 6m, alertname: GreenGatewayAuthorityEventCapacityRefusals, exp_alerts: []}
+      - {eval_time: 6m, alertname: GreenGatewayAuthorityEvidenceWriteFailures, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayAuthorityEventCapacityRefusals, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayAuthorityEvidenceWriteFailures, exp_alerts: []}
 
   # Reset at 3m is healthy; first post-reset increase at 3m30s starts the 2m hold.
   - name: 'new failures after a counter reset still fire and later recover'
@@ -1247,6 +1264,10 @@ tests:
         values: '10+0x5 0+1x14 14+0x20'
       - series: 'greengateway_database_pool_timeouts_total{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
         values: '10+0x5 0+1x14 14+0x20'
+      - series: 'greengateway_authority_event_capacity_refusals_total{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '10+0x5 0+1x14 14+0x20'
+      - series: 'greengateway_authority_event_evidence_failures_total{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '10+0x5 0+1x14 14+0x20'
     alert_rule_test:
       - {eval_time: 5m, alertname: GreenGatewayAuditLoss, exp_alerts: []}
       - {eval_time: 5m30s, alertname: GreenGatewayAuditLoss, exp_alerts: [*fires_audit_loss_gateway_1_cluster]}
@@ -1260,3 +1281,316 @@ tests:
       - {eval_time: 5m30s, alertname: GreenGatewayDatabasePoolTimeouts, exp_alerts: [*fires_database_pool_timeouts_gateway_1_cluster]}
       - {eval_time: 8m, alertname: GreenGatewayDatabasePoolTimeouts, exp_alerts: [*fires_database_pool_timeouts_gateway_1_cluster]}
       - {eval_time: 16m, alertname: GreenGatewayDatabasePoolTimeouts, exp_alerts: []}
+      - {eval_time: 5m, alertname: GreenGatewayAuthorityEventCapacityRefusals, exp_alerts: []}
+      - eval_time: 5m30s
+        alertname: GreenGatewayAuthorityEventCapacityRefusals
+        exp_alerts:
+          - &fires_authority_event_capacity_refusals_gateway_1_cluster
+            exp_labels: {job: 'greengateway', instance: 'gateway-1', deployment_mode: 'cluster', severity: 'critical', owner: 'gateway-operations'}
+            exp_annotations:
+              summary: 'Authority changes were refused because the authority-event journal is full'
+              runbook_url: 'https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#authority-event-journal'
+      - {eval_time: 8m, alertname: GreenGatewayAuthorityEventCapacityRefusals, exp_alerts: [*fires_authority_event_capacity_refusals_gateway_1_cluster]}
+      - {eval_time: 16m, alertname: GreenGatewayAuthorityEventCapacityRefusals, exp_alerts: []}
+      - {eval_time: 5m, alertname: GreenGatewayAuthorityEvidenceWriteFailures, exp_alerts: []}
+      - eval_time: 5m30s
+        alertname: GreenGatewayAuthorityEvidenceWriteFailures
+        exp_alerts:
+          - &fires_authority_evidence_write_failures_gateway_1_cluster
+            exp_labels: {job: 'greengateway', instance: 'gateway-1', deployment_mode: 'cluster', severity: 'critical', owner: 'gateway-operations'}
+            exp_annotations:
+              summary: 'Authority changes were refused because their required evidence could not be written'
+              runbook_url: 'https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#authority-evidence-failures'
+      - {eval_time: 8m, alertname: GreenGatewayAuthorityEvidenceWriteFailures, exp_alerts: [*fires_authority_evidence_write_failures_gateway_1_cluster]}
+      - {eval_time: 16m, alertname: GreenGatewayAuthorityEvidenceWriteFailures, exp_alerts: []}
+
+  # Authority-event journal rules (issue #440 PR 4). gateway-1 leads maintenance
+  # and so publishes the journal gauges; gateway-2 leads the dispatcher.
+  - name: 'authority-event journal healthy with a dispatcher; lazy refusal and failure counters absent'
+    interval: 30s
+    input_series:
+      - *series_up_gateway_1_cluster
+      - *series_up_gateway_2_cluster
+      - &series_maintenance_leader_gateway_1_cluster
+        series: 'greengateway_cluster_maintenance_leader{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '1+0x40'
+      - &series_maintenance_follower_gateway_2_cluster
+        series: 'greengateway_cluster_maintenance_leader{job="greengateway",instance="gateway-2",deployment_mode="cluster"}'
+        values: '0+0x40'
+      - &series_retention_success_gateway_1_cluster
+        series: 'greengateway_leader_task_last_success_age_seconds{job="greengateway",instance="gateway-1",deployment_mode="cluster",task="authority_event_retention"}'
+        values: '30+0x40'
+      - &series_journal_retained_gateway_1_cluster
+        series: 'greengateway_authority_event_journal_retained{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '100+0x40'
+      - &series_journal_capacity_gateway_1_cluster
+        series: 'greengateway_authority_event_journal_capacity{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '1000+0x40'
+      - &series_journal_oldest_gateway_1_cluster
+        series: 'greengateway_authority_event_oldest_undelivered_age_seconds{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '0+0x40'
+      - series: 'greengateway_authority_event_undelivered{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '0+0x40'
+      - &series_dispatcher_lease_gateway_2_cluster
+        series: 'greengateway_cluster_lease_age_seconds{job="greengateway",instance="gateway-2",deployment_mode="cluster",scope="authority_event_dispatcher"}'
+        values: '15+30x40'
+      - series: 'greengateway_authority_event_delivered_total{job="greengateway",instance="gateway-2",deployment_mode="cluster"}'
+        values: '0+5x40'
+    alert_rule_test:
+      - {eval_time: 1m, alertname: GreenGatewayAuthorityEventCapacityRefusals, exp_alerts: []}
+      - {eval_time: 1m, alertname: GreenGatewayAuthorityEvidenceWriteFailures, exp_alerts: []}
+      - {eval_time: 1m, alertname: GreenGatewayAuthorityEventJournalFull, exp_alerts: []}
+      - {eval_time: 1m, alertname: GreenGatewayAuthorityEventJournalFilling, exp_alerts: []}
+      - {eval_time: 1m, alertname: GreenGatewayAuthorityEventDeliveryLag, exp_alerts: []}
+      - {eval_time: 1m, alertname: GreenGatewayAuthorityEventDeliveryFailures, exp_alerts: []}
+      - {eval_time: 1m, alertname: GreenGatewayAuthorityEventJournalUnobserved, exp_alerts: []}
+      - {eval_time: 15m, alertname: GreenGatewayAuthorityEventCapacityRefusals, exp_alerts: []}
+      - {eval_time: 15m, alertname: GreenGatewayAuthorityEvidenceWriteFailures, exp_alerts: []}
+      - {eval_time: 15m, alertname: GreenGatewayAuthorityEventJournalFull, exp_alerts: []}
+      - {eval_time: 15m, alertname: GreenGatewayAuthorityEventJournalFilling, exp_alerts: []}
+      - {eval_time: 15m, alertname: GreenGatewayAuthorityEventDeliveryLag, exp_alerts: []}
+      - {eval_time: 15m, alertname: GreenGatewayAuthorityEventDeliveryFailures, exp_alerts: []}
+      - {eval_time: 15m, alertname: GreenGatewayAuthorityEventJournalUnobserved, exp_alerts: []}
+
+  # gateway-1 crosses 80% at 2m and reaches capacity at 8m; retention frees room at 13m.
+  # gateway-2 once led maintenance and still exports a full journal it no longer observes.
+  - name: 'journal filling and full fire from the maintenance leader only and recover'
+    interval: 30s
+    input_series:
+      - *series_up_gateway_1_cluster
+      - *series_up_gateway_2_cluster
+      - *series_maintenance_leader_gateway_1_cluster
+      - *series_maintenance_follower_gateway_2_cluster
+      - *series_retention_success_gateway_1_cluster
+      - series: 'greengateway_authority_event_journal_retained{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '100+0x3 850+0x11 1000+0x9 100+0x15'
+      - *series_journal_capacity_gateway_1_cluster
+      - *series_journal_oldest_gateway_1_cluster
+      - series: 'greengateway_leader_task_last_success_age_seconds{job="greengateway",instance="gateway-2",deployment_mode="cluster",task="authority_event_retention"}'
+        values: '30+0x40'
+      - series: 'greengateway_authority_event_journal_retained{job="greengateway",instance="gateway-2",deployment_mode="cluster"}'
+        values: '1000+0x40'
+      - series: 'greengateway_authority_event_journal_capacity{job="greengateway",instance="gateway-2",deployment_mode="cluster"}'
+        values: '1000+0x40'
+      - *series_dispatcher_lease_gateway_2_cluster
+    alert_rule_test:
+      - {eval_time: 1m30s, alertname: GreenGatewayAuthorityEventJournalFull, exp_alerts: []}
+      - {eval_time: 8m30s, alertname: GreenGatewayAuthorityEventJournalFull, exp_alerts: []}
+      - eval_time: 9m
+        alertname: GreenGatewayAuthorityEventJournalFull
+        exp_alerts:
+          - &fires_authority_event_journal_full_cluster
+            exp_labels: {job: 'greengateway', deployment_mode: 'cluster', severity: 'critical', owner: 'gateway-operations'}
+            exp_annotations:
+              summary: 'Authority-event journal is at capacity and will refuse authority changes'
+              runbook_url: 'https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#authority-event-journal'
+      - {eval_time: 12m, alertname: GreenGatewayAuthorityEventJournalFull, exp_alerts: [*fires_authority_event_journal_full_cluster]}
+      - {eval_time: 14m, alertname: GreenGatewayAuthorityEventJournalFull, exp_alerts: []}
+      - {eval_time: 6m30s, alertname: GreenGatewayAuthorityEventJournalFilling, exp_alerts: []}
+      - eval_time: 7m
+        alertname: GreenGatewayAuthorityEventJournalFilling
+        exp_alerts:
+          - &fires_authority_event_journal_filling_cluster
+            exp_labels: {job: 'greengateway', deployment_mode: 'cluster', severity: 'warning', owner: 'gateway-operations'}
+            exp_annotations:
+              summary: 'Authority-event journal retains more than 80 percent of its capacity'
+              runbook_url: 'https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#authority-event-journal'
+      - {eval_time: 12m, alertname: GreenGatewayAuthorityEventJournalFilling, exp_alerts: [*fires_authority_event_journal_filling_cluster]}
+      - {eval_time: 14m, alertname: GreenGatewayAuthorityEventJournalFilling, exp_alerts: []}
+      - {eval_time: 15m, alertname: GreenGatewayAuthorityEventJournalUnobserved, exp_alerts: []}
+
+  # The retention step's last success ages past the 300s gate at 4m30s, so the
+  # leader's frozen zero age is reported as unobserved instead of healthy. Retained
+  # rows only fall through retention, so its 90% reading still counts.
+  - name: 'stalled retention makes the journal unobserved but cannot hide a filling journal'
+    interval: 30s
+    input_series:
+      - *series_up_gateway_1_cluster
+      - *series_up_gateway_2_cluster
+      - *series_maintenance_leader_gateway_1_cluster
+      - *series_maintenance_follower_gateway_2_cluster
+      - series: 'greengateway_leader_task_last_success_age_seconds{job="greengateway",instance="gateway-1",deployment_mode="cluster",task="authority_event_retention"}'
+        values: '30+30x40'
+      - series: 'greengateway_authority_event_journal_retained{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '900+0x40'
+      - *series_journal_capacity_gateway_1_cluster
+      - *series_journal_oldest_gateway_1_cluster
+      - *series_dispatcher_lease_gateway_2_cluster
+    alert_rule_test:
+      - {eval_time: 14m, alertname: GreenGatewayAuthorityEventJournalUnobserved, exp_alerts: []}
+      - eval_time: 14m30s
+        alertname: GreenGatewayAuthorityEventJournalUnobserved
+        exp_alerts:
+          - &fires_authority_event_journal_unobserved_cluster
+            exp_labels: {job: 'greengateway', deployment_mode: 'cluster', severity: 'warning', owner: 'gateway-operations'}
+            exp_annotations:
+              summary: 'No replica is publishing fresh authority-event journal gauges'
+              runbook_url: 'https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#authority-event-journal'
+      - {eval_time: 20m, alertname: GreenGatewayAuthorityEventJournalUnobserved, exp_alerts: [*fires_authority_event_journal_unobserved_cluster]}
+      - {eval_time: 4m30s, alertname: GreenGatewayAuthorityEventJournalFilling, exp_alerts: []}
+      - {eval_time: 5m, alertname: GreenGatewayAuthorityEventJournalFilling, exp_alerts: [*fires_authority_event_journal_filling_cluster]}
+      - {eval_time: 15m, alertname: GreenGatewayAuthorityEventJournalFilling, exp_alerts: [*fires_authority_event_journal_filling_cluster]}
+      - {eval_time: 15m, alertname: GreenGatewayAuthorityEventJournalFull, exp_alerts: []}
+      - {eval_time: 15m, alertname: GreenGatewayAuthorityEventDeliveryLag, exp_alerts: []}
+
+  # The oldest undelivered event waits 600s from 2m to 9m30s, then the sink catches up.
+  - name: 'delivery lag fires after its hold while a dispatcher runs and recovers'
+    interval: 30s
+    input_series:
+      - *series_up_gateway_1_cluster
+      - *series_up_gateway_2_cluster
+      - *series_maintenance_leader_gateway_1_cluster
+      - *series_maintenance_follower_gateway_2_cluster
+      - *series_retention_success_gateway_1_cluster
+      - *series_journal_retained_gateway_1_cluster
+      - *series_journal_capacity_gateway_1_cluster
+      - series: 'greengateway_authority_event_oldest_undelivered_age_seconds{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '0+0x3 600+0x15 0+0x21'
+      - *series_dispatcher_lease_gateway_2_cluster
+    alert_rule_test:
+      - {eval_time: 6m30s, alertname: GreenGatewayAuthorityEventDeliveryLag, exp_alerts: []}
+      - eval_time: 7m
+        alertname: GreenGatewayAuthorityEventDeliveryLag
+        exp_alerts:
+          - &fires_authority_event_delivery_lag_cluster
+            exp_labels: {job: 'greengateway', deployment_mode: 'cluster', severity: 'warning', owner: 'gateway-operations'}
+            exp_annotations:
+              summary: 'Committed authority events are waiting for delivery'
+              runbook_url: 'https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#authority-event-delivery'
+      - {eval_time: 9m, alertname: GreenGatewayAuthorityEventDeliveryLag, exp_alerts: [*fires_authority_event_delivery_lag_cluster]}
+      - {eval_time: 11m, alertname: GreenGatewayAuthorityEventDeliveryLag, exp_alerts: []}
+      - {eval_time: 9m, alertname: GreenGatewayAuthorityEventDeliveryFailures, exp_alerts: []}
+
+  # No dispatcher lease series and no dispatcher failure series anywhere: no sink.
+  - name: 'without a sink every retained event is undelivered by design and delivery is not judged'
+    interval: 30s
+    input_series:
+      - *series_up_gateway_1_cluster
+      - *series_up_gateway_2_cluster
+      - *series_maintenance_leader_gateway_1_cluster
+      - *series_maintenance_follower_gateway_2_cluster
+      - *series_retention_success_gateway_1_cluster
+      - *series_journal_retained_gateway_1_cluster
+      - *series_journal_capacity_gateway_1_cluster
+      - series: 'greengateway_authority_event_oldest_undelivered_age_seconds{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '86400+30x40'
+      - series: 'greengateway_authority_event_undelivered{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '100+0x40'
+    alert_rule_test:
+      - {eval_time: 15m, alertname: GreenGatewayAuthorityEventDeliveryLag, exp_alerts: []}
+      - {eval_time: 15m, alertname: GreenGatewayAuthorityEventDeliveryFailures, exp_alerts: []}
+      - {eval_time: 15m, alertname: GreenGatewayAuthorityEventJournalUnobserved, exp_alerts: []}
+      - {eval_time: 15m, alertname: GreenGatewayAuthorityEventJournalFilling, exp_alerts: []}
+      - {eval_time: 15m, alertname: GreenGatewayAuthorityEventJournalFull, exp_alerts: []}
+
+  # gateway-2's dispatcher never wins its lease (failing until 12m), so no replica
+  # exports the dispatcher's lease age; its failure series still marks a configured
+  # sink. gateway-1's fenced steps are handovers and never count as failures.
+  - name: 'a dispatcher that cannot take its lease fails sustainedly and keeps lag judged'
+    interval: 30s
+    input_series:
+      - *series_up_gateway_1_cluster
+      - *series_up_gateway_2_cluster
+      - *series_maintenance_leader_gateway_1_cluster
+      - *series_maintenance_follower_gateway_2_cluster
+      - *series_retention_success_gateway_1_cluster
+      - *series_journal_retained_gateway_1_cluster
+      - *series_journal_capacity_gateway_1_cluster
+      - series: 'greengateway_authority_event_oldest_undelivered_age_seconds{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '600+0x40'
+      - series: 'greengateway_authority_event_delivery_failures_total{job="greengateway",instance="gateway-1",deployment_mode="cluster",kind="fenced"}'
+        values: '0+1x40'
+      - series: 'greengateway_authority_event_delivery_failures_total{job="greengateway",instance="gateway-2",deployment_mode="cluster",kind="lease_acquire"}'
+        values: '0+1x24 24+0x15'
+    alert_rule_test:
+      - {eval_time: 4m30s, alertname: GreenGatewayAuthorityEventDeliveryLag, exp_alerts: []}
+      - {eval_time: 5m, alertname: GreenGatewayAuthorityEventDeliveryLag, exp_alerts: [*fires_authority_event_delivery_lag_cluster]}
+      - {eval_time: 15m, alertname: GreenGatewayAuthorityEventDeliveryLag, exp_alerts: [*fires_authority_event_delivery_lag_cluster]}
+      - {eval_time: 10m, alertname: GreenGatewayAuthorityEventDeliveryFailures, exp_alerts: []}
+      - eval_time: 10m30s
+        alertname: GreenGatewayAuthorityEventDeliveryFailures
+        exp_alerts:
+          - &fires_authority_event_delivery_failures_gateway_2_cluster
+            exp_labels: {job: 'greengateway', instance: 'gateway-2', deployment_mode: 'cluster', severity: 'warning', owner: 'gateway-operations'}
+            exp_annotations:
+              summary: 'Authority-event dispatcher steps keep failing'
+              runbook_url: 'https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#authority-event-delivery'
+      - {eval_time: 15m, alertname: GreenGatewayAuthorityEventDeliveryFailures, exp_alerts: [*fires_authority_event_delivery_failures_gateway_2_cluster]}
+      - {eval_time: 18m, alertname: GreenGatewayAuthorityEventDeliveryFailures, exp_alerts: []}
+
+  # The leader scrapes successfully but its journal gauges are absent until 12m.
+  - name: 'missing journal gauges on the maintenance leader are not healthy zeros'
+    interval: 30s
+    input_series:
+      - *series_up_gateway_1_cluster
+      - *series_maintenance_leader_gateway_1_cluster
+      - *series_retention_success_gateway_1_cluster
+      - series: 'greengateway_authority_event_journal_retained{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '_x24 100+0x16'
+      - series: 'greengateway_authority_event_journal_capacity{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '_x24 1000+0x16'
+      - series: 'greengateway_authority_event_oldest_undelivered_age_seconds{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '_x24 0+0x16'
+    alert_rule_test:
+      - {eval_time: 9m30s, alertname: GreenGatewayAuthorityEventJournalUnobserved, exp_alerts: []}
+      - {eval_time: 10m, alertname: GreenGatewayAuthorityEventJournalUnobserved, exp_alerts: [*fires_authority_event_journal_unobserved_cluster]}
+      - {eval_time: 11m30s, alertname: GreenGatewayAuthorityEventJournalUnobserved, exp_alerts: [*fires_authority_event_journal_unobserved_cluster]}
+      - {eval_time: 13m, alertname: GreenGatewayAuthorityEventJournalUnobserved, exp_alerts: []}
+      - {eval_time: 11m, alertname: GreenGatewayAuthorityEventJournalFilling, exp_alerts: []}
+      - {eval_time: 11m, alertname: GreenGatewayAuthorityEventJournalFull, exp_alerts: []}
+
+  # gateway-1 leads until it drains at 5m, still exporting a 95% journal; gateway-2
+  # takes over at 6m and publishes its first reading.
+  - name: 'maintenance handover neither alerts nor trusts the former leader'
+    interval: 30s
+    input_series:
+      - *series_up_gateway_1_cluster
+      - *series_up_gateway_2_cluster
+      - series: 'greengateway_cluster_maintenance_leader{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '1+0x9 0+0x30'
+      - series: 'greengateway_cluster_maintenance_leader{job="greengateway",instance="gateway-2",deployment_mode="cluster"}'
+        values: '0+0x11 1+0x28'
+      - *series_retention_success_gateway_1_cluster
+      - series: 'greengateway_authority_event_journal_retained{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '950+0x40'
+      - *series_journal_capacity_gateway_1_cluster
+      - *series_journal_oldest_gateway_1_cluster
+      - series: 'greengateway_leader_task_last_success_age_seconds{job="greengateway",instance="gateway-2",deployment_mode="cluster",task="authority_event_retention"}'
+        values: '_x12 30+0x28'
+      - series: 'greengateway_authority_event_journal_retained{job="greengateway",instance="gateway-2",deployment_mode="cluster"}'
+        values: '_x12 100+0x28'
+      - series: 'greengateway_authority_event_journal_capacity{job="greengateway",instance="gateway-2",deployment_mode="cluster"}'
+        values: '_x12 1000+0x28'
+      - series: 'greengateway_authority_event_oldest_undelivered_age_seconds{job="greengateway",instance="gateway-2",deployment_mode="cluster"}'
+        values: '_x12 0+0x28'
+    alert_rule_test:
+      - {eval_time: 4m30s, alertname: GreenGatewayAuthorityEventJournalFilling, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayAuthorityEventJournalFilling, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayAuthorityEventJournalFull, exp_alerts: []}
+      - {eval_time: 5m30s, alertname: GreenGatewayAuthorityEventJournalUnobserved, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayAuthorityEventJournalUnobserved, exp_alerts: []}
+      - {eval_time: 18m, alertname: GreenGatewayAuthorityEventJournalUnobserved, exp_alerts: []}
+
+  # Refusals are consequences, not lifecycle noise: gateway-1 is draining throughout.
+  - name: 'refused authority changes page per replica even while draining, then recover'
+    interval: 30s
+    input_series:
+      - *series_up_gateway_1_cluster
+      - *series_up_gateway_2_cluster
+      - series: 'greengateway_gateway_ready{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '0+0x40'
+      - series: 'greengateway_gateway_draining{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '1+0x40'
+      - series: 'greengateway_authority_event_capacity_refusals_total{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '0+1x24 24+0x15'
+      - series: 'greengateway_authority_event_evidence_failures_total{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '0+1x24 24+0x15'
+    alert_rule_test:
+      - {eval_time: 2m, alertname: GreenGatewayAuthorityEventCapacityRefusals, exp_alerts: []}
+      - {eval_time: 2m30s, alertname: GreenGatewayAuthorityEventCapacityRefusals, exp_alerts: [*fires_authority_event_capacity_refusals_gateway_1_cluster]}
+      - {eval_time: 12m, alertname: GreenGatewayAuthorityEventCapacityRefusals, exp_alerts: [*fires_authority_event_capacity_refusals_gateway_1_cluster]}
+      - {eval_time: 18m, alertname: GreenGatewayAuthorityEventCapacityRefusals, exp_alerts: []}
+      - {eval_time: 2m, alertname: GreenGatewayAuthorityEvidenceWriteFailures, exp_alerts: []}
+      - {eval_time: 2m30s, alertname: GreenGatewayAuthorityEvidenceWriteFailures, exp_alerts: [*fires_authority_evidence_write_failures_gateway_1_cluster]}
+      - {eval_time: 12m, alertname: GreenGatewayAuthorityEvidenceWriteFailures, exp_alerts: [*fires_authority_evidence_write_failures_gateway_1_cluster]}
+      - {eval_time: 18m, alertname: GreenGatewayAuthorityEvidenceWriteFailures, exp_alerts: []}

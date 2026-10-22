@@ -4956,7 +4956,9 @@ struct ChangeEvidence<'a> {
 /// and the journal carries the same one; `committed_at` is the database
 /// clock's. Any failure is returned for the caller to roll back, so the
 /// change it describes never commits without both. A full journal refuses
-/// the change as unavailable rather than evict an accepted event.
+/// the change as unavailable rather than evict an accepted event. A failed
+/// evidence insert is counted here, a failed or refused append by the
+/// journal.
 async fn record_change_evidence(
     client: &deadpool_postgres::Object,
     evidence: &ChangeEvidence<'_>,
@@ -4983,7 +4985,10 @@ async fn record_change_evidence(
             ],
         )
         .await
-        .map_err(|error| pg_error(OPERATION_CHANGE_EVIDENCE, error))?;
+        .map_err(|error| {
+            crate::storage::postgres_authority_events::record_evidence_failure();
+            pg_error(OPERATION_CHANGE_EVIDENCE, error)
+        })?;
     crate::storage::postgres_authority_events::append_to_journal(
         client,
         crate::storage::postgres_authority_events::JournalSource::ConnectionChange,

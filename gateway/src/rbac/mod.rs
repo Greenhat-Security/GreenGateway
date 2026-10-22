@@ -1,12 +1,14 @@
 pub mod engine;
 pub mod matcher;
 pub mod policy;
+pub mod policy_document;
 pub mod policy_history;
 pub mod rule;
 
 pub use engine::PolicyEngine;
 #[allow(unused_imports)]
-// Public direct-rule matcher API is available for tests and future admin APIs.
+// The direct-rule matcher backs the shared policy evaluator (`policy_eval`),
+// its only serving consumer; tests and the frozen oracles also name it.
 pub use matcher::{RuleDecision, RuleDispatchContext, RuleMatcher};
 pub use policy::{DefaultAction, EgressPolicy, EnforcementMode, Policy, RateLimitRule, RouteRule};
 #[allow(unused_imports)]

@@ -8611,6 +8611,7 @@ fn expected_ha_metric_names() -> Vec<&'static str> {
         metrics::AUTHORITY_EVENT_DELIVERED_TOTAL,
         metrics::AUTHORITY_EVENT_DELIVERY_FAILURES_TOTAL,
         metrics::AUTHORITY_EVENT_CAPACITY_REFUSALS_TOTAL,
+        metrics::AUTHORITY_EVENT_EVIDENCE_FAILURES_TOTAL,
     ]);
     names
 }
@@ -8917,8 +8918,8 @@ async fn synthetic_ha_run() {
         record_audit_stream_duplicates(1);
 
         // Authority-event delivery: the journal gauges, every failure step,
-        // a delivered batch and a refused mutation. None names an event,
-        // an actor, a resource or a position.
+        // a delivered batch and both kinds of refused mutation. None names
+        // an event, an actor, a resource or a position.
         authority_events::dispatcher::record_journal_stats(
             &storage::postgres_authority_events::JournalStats {
                 retained: 7,
@@ -8934,6 +8935,7 @@ async fn synthetic_ha_run() {
         }
         authority_events::dispatcher::record_delivered(3);
         storage::postgres_authority_events::record_capacity_refusal();
+        storage::postgres_authority_events::record_evidence_failure();
     }
 }
 
@@ -11030,7 +11032,7 @@ async fn policy_put_with_invalid_policy_returns_errors_without_persisting_or_swa
             Method::PUT,
             POLICY_ADMIN_ROUTE,
             Some(test_principal(&["admin"])),
-            Some(r#"{ "schema_version": "1.0.0" }"#.to_owned()),
+            Some(r#"{ "schema_version": "2.0.0" }"#.to_owned()),
             Some(&current_etag),
         ))
         .await
@@ -19406,7 +19408,31 @@ async fn policy_validate_accepts_valid_candidate_without_changing_live_policy_or
         .expect("policy validate should complete");
 
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(json_body(response).await, json!({ "valid": true }));
+    let candidate = policy_document_string("validated-only", "test:new");
+    let body = json_body(response).await;
+    // A 0.x document: valid, a source digest over the bytes sent, no
+    // semantic digest (0.x defines no normalization), and the one stated
+    // limitation of a document whose routes carry no stable id.
+    assert_eq!(
+        body,
+        json!({
+            "valid": true,
+            "schema_version": "0.1.0",
+            "diagnostics": [{
+                "code": "stable_ids_unavailable",
+                "severity": "warning",
+                "pointer": "",
+                "message": rbac::policy_document::IssueCode::StableIdsUnavailable.message(),
+                "remediation": rbac::policy_document::IssueCode::StableIdsUnavailable.remediation(),
+                "blocks": { "simulation": false, "tests": false, "publication": false, "evidence": true }
+            }],
+            "source_digest": canonical_json::source_digest(
+                "application/json",
+                "0.1.0",
+                candidate.as_bytes()
+            ),
+        })
+    );
     assert_eq!(
         fs::read_to_string(&policy.path).expect("policy file should read"),
         before_contents
@@ -19442,7 +19468,7 @@ async fn policy_validate_invalid_candidate_returns_errors_without_changes() {
             Method::POST,
             POLICY_VALIDATE_ADMIN_ROUTE,
             Some(test_principal(&["policy-reader"])),
-            Some(r#"{ "schema_version": "1.0.0" }"#.to_owned()),
+            Some(r#"{ "schema_version": "2.0.0" }"#.to_owned()),
             None,
         ))
         .await
@@ -19511,6 +19537,238 @@ async fn policy_validate_rejects_relative_route_prefix_without_changes() {
         .await
         .expect("policy GET after invalid validation should complete");
     assert_eq!(json_body(after_get).await["id"], json!("initial-policy"));
+}
+
+/// The test policy as policy v1: the same members, `schema_version`
+/// `1.0.0`, and a stable id on every route.
+fn v1_policy_document(id: &str, test_permission: &str) -> Value {
+    let mut policy = policy_document(id, test_permission);
+    policy["schema_version"] = json!("1.0.0");
+    for (index, route) in policy["routes"]
+        .as_array_mut()
+        .expect("the test policy has routes")
+        .iter_mut()
+        .enumerate()
+    {
+        route["id"] = json!(format!("route-{index}"));
+    }
+    policy
+}
+
+#[tokio::test]
+async fn policy_validate_reports_v1_diagnostics_and_both_digests() {
+    let policy = TempPolicyFile::new(&policy_document_string("initial-policy", "test:old"));
+    let router = policy_admin_router(Some(&policy), test_audit_log());
+    let candidate = v1_policy_document("validated-v1", "test:new").to_string();
+
+    let response = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::POST,
+            POLICY_VALIDATE_ADMIN_ROUTE,
+            Some(test_principal(&["policy-reader"])),
+            Some(candidate.clone()),
+            None,
+        ))
+        .await
+        .expect("v1 validate should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["valid"], json!(true));
+    assert_eq!(body["schema_version"], json!("1.0.0"));
+    assert_eq!(body["diagnostics"], json!([]));
+    assert!(body.get("errors").is_none(), "{body}");
+    assert_eq!(
+        body["source_digest"],
+        json!(canonical_json::source_digest(
+            "application/json",
+            "1.0.0",
+            candidate.as_bytes()
+        ))
+    );
+    let semantic = body["semantic_digest"]
+        .as_str()
+        .expect("a v1 document has a semantic digest")
+        .to_owned();
+    assert!(
+        semantic.starts_with("sha256:") && semantic.len() == 71,
+        "{semantic}"
+    );
+
+    // The same policy respelled -- other whitespace and member order -- has
+    // another source digest and the same semantic one.
+    let respelled = serde_json::to_string_pretty(&v1_policy_document("validated-v1", "test:new"))
+        .expect("serialize");
+    let body = json_body(
+        router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::POST,
+                POLICY_VALIDATE_ADMIN_ROUTE,
+                Some(test_principal(&["policy-reader"])),
+                Some(respelled),
+                None,
+            ))
+            .await
+            .expect("respelled validate should complete"),
+    )
+    .await;
+    assert_eq!(body["semantic_digest"], json!(semantic));
+    assert_ne!(
+        body["source_digest"],
+        json!(canonical_json::source_digest(
+            "application/json",
+            "1.0.0",
+            candidate.as_bytes()
+        ))
+    );
+
+    // Every structural problem is reported, each with its pointer, and the
+    // errors list carries one detail per error diagnostic.
+    let mut broken = v1_policy_document("broken-v1", "test:new");
+    broken["routes"][1]["id"] = json!("route-0");
+    broken["routes"][2]
+        .as_object_mut()
+        .expect("route")
+        .remove("id");
+    broken["routes"][3]["weight"] = json!(1);
+    let response = router
+        .oneshot(policy_admin_request(
+            Method::POST,
+            POLICY_VALIDATE_ADMIN_ROUTE,
+            Some(test_principal(&["policy-reader"])),
+            Some(broken.to_string()),
+            None,
+        ))
+        .await
+        .expect("broken v1 validate should complete");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert_eq!(body["valid"], json!(false));
+    let found: Vec<(Value, Value)> = body["diagnostics"]
+        .as_array()
+        .expect("diagnostics")
+        .iter()
+        .map(|diagnostic| (diagnostic["code"].clone(), diagnostic["pointer"].clone()))
+        .collect();
+    assert_eq!(
+        found,
+        vec![
+            (json!("element_id_duplicate"), json!("/routes/1/id")),
+            (json!("element_id_missing"), json!("/routes/2/id")),
+            (json!("unknown_member"), json!("/routes/3/weight")),
+        ]
+    );
+    assert_eq!(body["diagnostics"][0]["element_id"], json!("route-0"));
+    assert_eq!(body["errors"].as_array().map(Vec::len), Some(3));
+    assert!(body.get("source_digest").is_none(), "{body}");
+    assert!(body.get("semantic_digest").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn policy_put_accepts_a_v1_document_and_keeps_its_stable_ids() {
+    let policy = TempPolicyFile::new(&policy_document_string("initial-policy", "test:old"));
+    let router = policy_admin_router(Some(&policy), test_audit_log());
+    let get_response = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::GET,
+            POLICY_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            None,
+            None,
+        ))
+        .await
+        .expect("policy GET should complete");
+    let etag = policy_etag_header(&get_response);
+
+    // A v1 document that repeats an id is refused with every problem named,
+    // and nothing is written.
+    let before_contents = fs::read_to_string(&policy.path).expect("policy file should read");
+    let mut duplicate = v1_policy_document("duplicate-ids", "test:new");
+    duplicate["routes"][5]["id"] = json!("route-4");
+    let response = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::PUT,
+            POLICY_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            Some(duplicate.to_string()),
+            Some(&etag),
+        ))
+        .await
+        .expect("duplicate-id PUT should complete");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert_eq!(body["valid"], json!(false));
+    assert!(
+        body["errors"][0]
+            .as_str()
+            .unwrap_or_default()
+            .contains("/routes/5/id"),
+        "{body}"
+    );
+    assert_eq!(
+        fs::read_to_string(&policy.path).expect("policy file should read"),
+        before_contents
+    );
+
+    let response = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::PUT,
+            POLICY_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            Some(v1_policy_document("v1-policy", "test:new").to_string()),
+            Some(&etag),
+        ))
+        .await
+        .expect("v1 PUT should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let etag = policy_etag_header(&response);
+    let body = json_body(response).await;
+    assert_eq!(body["schema_version"], json!("1.0.0"));
+    assert_eq!(body["routes"][5]["id"], json!("route-5"));
+
+    // Persisted with its ids, and enforced: the new reader is admitted by the
+    // route the v1 document now names.
+    let persisted: Value =
+        serde_json::from_str(&fs::read_to_string(&policy.path).expect("policy file should read"))
+            .expect("persisted policy is JSON");
+    assert_eq!(persisted["schema_version"], json!("1.0.0"));
+    assert_eq!(persisted["routes"][0]["id"], json!("route-0"));
+    let new_reader = router
+        .clone()
+        .oneshot(audit_query_request(
+            "/__test/principal",
+            Some(test_principal(&["new-reader"])),
+        ))
+        .await
+        .expect("new-reader request should complete");
+    assert_eq!(new_reader.status(), StatusCode::OK);
+
+    // A rule created through the API in a v1 policy is given the stable id
+    // v1 requires.
+    let response = router
+        .oneshot(policy_admin_request(
+            Method::POST,
+            POLICY_RULES_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            Some(json!({ "path": "/__test/blocked", "action": "deny" }).to_string()),
+            Some(&etag),
+        ))
+        .await
+        .expect("rule POST should complete");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let created = json_body(response).await;
+    let rule_id = created["id"].as_str().expect("an assigned id").to_owned();
+    assert!(
+        rbac::policy_document::is_valid_element_id(&rule_id),
+        "{rule_id}"
+    );
+    let reloaded = rbac::Policy::from_file(&policy.path).expect("the persisted v1 policy reloads");
+    assert_eq!(reloaded.rules[0].id.as_deref(), Some(rule_id.as_str()));
 }
 
 #[tokio::test]
@@ -34134,6 +34392,87 @@ mod cluster_policy_tests {
                 .any(|event| event.event_type == audit::event::POLICY_CHANGED),
             "the admitted commit is audited as the policy change it is"
         );
+    }
+
+    /// Policy v1 is document format 1, and no replica of this build
+    /// advertises it (`cluster_membership::DOCUMENT_VERSION_RANGE`), so the
+    /// policy API refuses to commit one with a `400` and writes nothing. The
+    /// store refuses the same candidate if a caller skips that check, and a
+    /// 0.x document on the same path is committed as before.
+    #[tokio::test]
+    async fn cluster_policy_refuses_to_commit_a_v1_document() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_policy_foundation(&database.dsn).await;
+        let active = initialize(&store, "v1-init").await;
+        let (router, rbac_state) = cluster_policy_router(store.clone());
+        rbac_state
+            .install_revision_snapshot(active.policy.clone(), active.security_revision)
+            .await
+            .expect("the authority's revision should install");
+        let v1 = r#"{
+            "schema_version": "1.0.0",
+            "id": "v1-held",
+            "default_action": "deny",
+            "roles": { "admin": { "permissions": ["admin:policy:read", "admin:policy:write"] } }
+        }"#;
+
+        let before = policy_version_count(&pool).await;
+        let (status, body) = refusal_of(
+            router
+                .clone()
+                .oneshot(admin_request(
+                    Method::PUT,
+                    POLICY_ADMIN_ROUTE,
+                    Some((&active.etag, v1)),
+                ))
+                .await
+                .expect("PUT should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["valid"], json!(false));
+        assert!(
+            body["errors"][0]
+                .as_str()
+                .unwrap_or_default()
+                .contains("cannot be committed in cluster mode"),
+            "{body}"
+        );
+        assert_eq!(policy_version_count(&pool).await, before);
+
+        let candidate = parse_policy_body(&Bytes::from(v1)).expect("a valid v1 document");
+        let refused = PolicyControlPlane::commit(
+            store.as_ref(),
+            PolicyCommitRequest {
+                precondition: PolicyCommitPrecondition::Expected {
+                    etag: active.etag.clone(),
+                },
+                candidate: &candidate,
+                actor_user_id: "test",
+                diff_summary: &DIFF,
+            },
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(storage::PolicyCommitError::Store(_))),
+            "the store must refuse a document no replica reads"
+        );
+        assert_eq!(policy_version_count(&pool).await, before);
+
+        let committed = router
+            .oneshot(admin_request(
+                Method::PUT,
+                POLICY_ADMIN_ROUTE,
+                Some((&active.etag, &cluster_policy_json("v0-after"))),
+            ))
+            .await
+            .expect("PUT should complete");
+        assert_eq!(committed.status(), StatusCode::OK);
+        assert_eq!(policy_version_count(&pool).await, before + 1);
     }
 
     /// Issue #443's registered operation through the managed OpenAPI

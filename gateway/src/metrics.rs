@@ -436,6 +436,17 @@ pub const AUTHORITY_EVENT_DELIVERY_FAILURES_TOTAL: &str =
 pub const AUTHORITY_EVENT_CAPACITY_REFUSALS_TOTAL: &str =
     "greengateway_authority_event_capacity_refusals_total";
 
+/// Authority mutations refused because their evidence row or its journal
+/// entry could not be written for any reason other than capacity: the
+/// database refused or did not answer the statement, or the insert did not
+/// record exactly the change. Counted by the replica that refused them.
+/// Like a capacity refusal, every one is a security change that did not
+/// happen. A failure of the transaction's own `COMMIT` is the mutation's
+/// failure, not the evidence's, and is not counted here.
+#[cfg(feature = "postgres")]
+pub const AUTHORITY_EVENT_EVIDENCE_FAILURES_TOTAL: &str =
+    "greengateway_authority_event_evidence_failures_total";
+
 /// Client-certificate outcomes, per listener.
 ///
 /// Every label value is a compile-time constant. The identity a rejected
