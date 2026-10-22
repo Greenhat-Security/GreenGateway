@@ -213,7 +213,10 @@ mod tests {
             result: "committed".to_owned(),
             committed_at: "2026-10-21T12:34:56.123456Z".to_owned(),
             actor: DeliveryActor {
+                kind: Some("service_token".to_owned()),
                 recorded_ref: "0".repeat(64),
+                issuer_ref: None,
+                auth_mode: Some("service_token".to_owned()),
             },
             resource: DeliveryResource {
                 kind: "service_token".to_owned(),

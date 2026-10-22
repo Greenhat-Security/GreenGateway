@@ -628,9 +628,9 @@ impl PostgresConnectionStore {
         &self,
         id: &ConnectionId,
         expected: &ConnectionEtag,
-        actor_user_id: &str,
+        actor: &crate::auth::change_actor::ChangeActor,
     ) -> Result<(), ConnectionStoreError> {
-        validate_evidence_actor(actor_user_id)?;
+        validate_evidence_actor(actor)?;
         // One logical operation, minted once per call: every evidence row
         // this transaction writes carries it, and nothing regenerates it.
         let operation_id = uuid::Uuid::new_v4();
@@ -664,11 +664,12 @@ impl PostgresConnectionStore {
             // deletion (specification versions start at 1). The version
             // rows cascade with the record, as they do in the standalone
             // store, so they cannot attribute the deletion; its evidence
-            // row -- actor, action, event and operation identity, prior
-            // version, and the shared revision the outbox row took -- has
-            // no foreign key and outlives the record. Both commit with the
-            // delete or not at all. Any tool names the record's catalogs
-            // held are released in the same transaction.
+            // row -- the actor (subject, issuer, kind and auth mode), action,
+            // event and operation identity, prior version, and the shared
+            // revision the outbox row took -- has no foreign key and
+            // outlives the record. Both commit with the delete or not at
+            // all. Any tool names the record's catalogs held are released in
+            // the same transaction.
             let security_revision = bump_connection_state(
                 &client,
                 RESOURCE_CONNECTION,
@@ -685,7 +686,7 @@ impl PostgresConnectionStore {
                     id,
                     prior_version: current.revisions.connection,
                     security_revision,
-                    actor_user_id,
+                    actor,
                 },
             )
             .await?;
@@ -783,7 +784,7 @@ impl PostgresConnectionStore {
         expected_catalog_revision: u64,
         actor_user_id: &str,
     ) -> Result<StoredMcpCatalog, ConnectionStoreError> {
-        validate_evidence_actor(actor_user_id)?;
+        validate_catalog_evidence_actor(actor_user_id)?;
         let validated = validate_mcp_catalog(id, entries, resources, resource_templates)?;
         let now = utc_timestamp()?;
         let operation_id = uuid::Uuid::new_v4();
@@ -1590,7 +1591,7 @@ impl PostgresConnectionStore {
         policy_protected_names: &[String],
         enum_values: &[StoredEnumSourceValueWrite],
     ) -> Result<StoredOpenApiCatalog, ConnectionStoreError> {
-        validate_evidence_actor(actor_user_id)?;
+        validate_catalog_evidence_actor(actor_user_id)?;
         let evidence_action = match overlay {
             Some(StoredOverlayWrite::Put { .. }) => CATALOG_EVIDENCE_ACTION_OVERLAY_REPLACE,
             Some(StoredOverlayWrite::Delete { .. }) => CATALOG_EVIDENCE_ACTION_OVERLAY_DELETE,
@@ -4979,9 +4980,27 @@ const OPERATION_CHANGE_EVIDENCE: &str = "change_evidence_append";
 
 /// An unattributable change has no evidence to record, so it is refused
 /// before any transaction opens rather than committed anonymously. An
-/// authenticated principal always satisfies this; the CHECKs in
-/// migrations 16 and 23 are the backstop.
-fn validate_evidence_actor(actor_user_id: &str) -> Result<(), ConnectionStoreError> {
+/// authenticated principal always satisfies this
+/// ([`crate::auth::change_actor::ChangeActor::is_recordable`]); the CHECKs
+/// in migrations 16 and 24 are the backstop.
+fn validate_evidence_actor(
+    actor: &crate::auth::change_actor::ChangeActor,
+) -> Result<(), ConnectionStoreError> {
+    if !actor.is_recordable() {
+        return Err(ConnectionStoreError::Validation {
+            problems: vec![format!(
+                "the change actor must be between 1 and {EVIDENCE_ACTOR_MAX_BYTES} bytes, and only a principal may carry an issuer, of at most {} bytes",
+                crate::auth::principal::MAX_PRINCIPAL_ISSUER_BYTES
+            )],
+        });
+    }
+    Ok(())
+}
+
+/// The same refusal for a catalog change, whose evidence (migration 23)
+/// records the actor's subject alone. An authenticated principal always
+/// satisfies this; the CHECK in migration 23 is the backstop.
+fn validate_catalog_evidence_actor(actor_user_id: &str) -> Result<(), ConnectionStoreError> {
     if actor_user_id.is_empty() || actor_user_id.len() > EVIDENCE_ACTOR_MAX_BYTES {
         return Err(ConnectionStoreError::Validation {
             problems: vec![format!(
@@ -5000,7 +5019,7 @@ struct ChangeEvidence<'a> {
     id: &'a ConnectionId,
     prior_version: u64,
     security_revision: i64,
-    actor_user_id: &'a str,
+    actor: &'a crate::auth::change_actor::ChangeActor,
 }
 
 /// Append one evidence row inside the caller's transaction, and journal it
@@ -5022,14 +5041,19 @@ async fn record_change_evidence(
         .execute(
             r#"
             INSERT INTO greengateway.connection_change_evidence (
-                event_id, operation_id, actor_user_id, action, connection_id,
-                prior_version, security_revision
-            ) VALUES ($1::text::uuid, $2::text::uuid, $3, $4, $5::text::uuid, $6, $7)
+                event_id, operation_id, actor_user_id, actor_issuer, actor_kind,
+                actor_auth_mode, action, connection_id, prior_version, security_revision
+            ) VALUES (
+                $1::text::uuid, $2::text::uuid, $3, $4, $5, $6, $7, $8::text::uuid, $9, $10
+            )
             "#,
             &[
                 &event_id,
                 &operation_id,
-                &evidence.actor_user_id,
+                &evidence.actor.subject(),
+                &evidence.actor.issuer(),
+                &evidence.actor.kind().as_str(),
+                &evidence.actor.auth_mode(),
                 &evidence.action,
                 &evidence.id.as_str(),
                 &prior_version,

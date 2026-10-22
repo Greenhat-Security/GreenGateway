@@ -4,8 +4,9 @@ Part of [#425](https://github.com/Greenhat-Security/GreenGateway/issues/425), PR
 the first three PR 2 slices (PostgreSQL Connection deletion evidence; service-token
 rotate/revoke and JWT revocation evidence; policy, tools and catalog publication
 evidence), the keyed safe-reference derivation
-([Keyed safe references](#keyed-safe-references)) and PR 3's durable delivery
-([Durable delivery](#durable-delivery)).
+([Keyed safe references](#keyed-safe-references)), PR 3's durable delivery
+([Durable delivery](#durable-delivery)) and the journaled evidence's actor metadata
+([Actor metadata](#actor-metadata)).
 Reviewed source: `ebb579e6444d437bf477d0617b8841d1eea34cfc`.
 
 This inventory identifies existing atomic records and the work needed for required
@@ -21,7 +22,9 @@ opt-in dispatcher that delivers it behind a persisted cursor. The third PR 2 sli
 adds migration 23's `greengateway.document_change_evidence`, written by every
 PostgreSQL policy and tools document commit, and `greengateway.catalog_change_evidence`,
 written by every managed MCP and OpenAPI catalog publication; neither is a journal
-source yet, so the dispatcher does not deliver them. None of them implements or
+source yet, so the dispatcher does not deliver them. Migration 24 adds the actor's
+kind, auth mode and issuer to the three journaled tables, and the standalone token
+database gains the same columns. None of them implements or
 enables the authority-evidence required-durability mode or a standalone revision
 ledger, and no row is qualified for that future mode. Storage selection is
 unchanged.
@@ -68,11 +71,11 @@ or unconfigured individual stores.
 | Policy publish, rollback, rule edits and suggestion acceptance | Immutable document/history, actor subject, action/diff, active pointer, shared revision and outbox, plus one non-cascading `document_change_evidence` row (operation code, event/operation UUIDs, actor kind, subject, issuer and auth mode, prior/new version, the outbox row's shared revision, database-clock time) in the same transaction; suggestion acceptance composes its own state, and so its evidence, in the same transaction | Caller-bound operation identity, safe-reference projection, durable delivery and retention |
 | Tools publication | Shared document transaction plus name reservations and the same `document_change_evidence` row; the first-boot seed and the import's activation are recorded as system actors | Same as policy |
 | Connection and credential binding changes | Record, bindings, immutable version, shared revision and outbox | Actor/history must survive Connection deletion; safe per-operation metadata and delivery |
-| Connection deletion | Outbox tombstone with prior version and shared revision, plus a non-cascading `connection_change_evidence` row (actor, action, event/operation UUIDs, prior version, the tombstone's shared revision, database-clock time) and its journal row in the same transaction; delivered with keyed safe references since PR 3 | Issuer/auth mode and a caller-bound operation identity, without which the delivered record cannot be `authority_event.v1` |
+| Connection deletion | Outbox tombstone with prior version and shared revision, plus a non-cascading `connection_change_evidence` row (actor, action, event/operation UUIDs, prior version, the tombstone's shared revision, database-clock time) and its journal row in the same transaction; delivered with keyed safe references since PR 3; since migration 24 the actor's kind, auth mode and canonical issuer too | A caller-bound operation identity and an issuer-scoped subject reference, without which the delivered record cannot be `authority_event.v1` |
 | Managed MCP/OpenAPI catalog and overlay publication | Catalog/overlay CAS, entries, dependencies, reservations, revision and outbox, plus one non-cascading `catalog_change_evidence` row (action derived from the write, event/operation UUIDs, actor subject, catalog revision transition, compiled overlay revision, shared revision, database-clock time) that outlives the replacement and the Connection's deletion | Issuer/auth mode, caller-bound operation identity, journaling for delivery |
 | Service-token issue | Token row with creator, row/shared revisions and outbox | Creation retains only `created_by`; no issue evidence row, operation identity or delivery |
-| Service-token rotate/revoke | Token change, row/shared revisions and outbox, plus a non-cascading `service_token_change_evidence` row (actor, action, event/operation UUIDs, prior/new row revision, the outbox row's shared revision, database-clock time) in the same transaction; repeated revoke and refused rotate write none. Standalone writes the same evidence in the token database's own transaction. In PostgreSQL the change also journals its evidence and is delivered since PR 3 | Issuer/auth mode and a caller-bound operation identity; standalone evidence is not delivered |
-| JWT revocation | Scoped JTI digest, actor row, shared revision and outbox, plus one non-cascading `jwt_revocation_evidence` row per effective revoke (actor, JTI digest, resulting expiry, shared revision) that extension, reactivation and expiry cleanup never rewrite, journaled in the same transaction and delivered since PR 3 | CLI actor is system provenance, not a named human; no actor kind or issuer/auth mode |
+| Service-token rotate/revoke | Token change, row/shared revisions and outbox, plus a non-cascading `service_token_change_evidence` row (actor, action, event/operation UUIDs, prior/new row revision, the outbox row's shared revision, database-clock time) in the same transaction; repeated revoke and refused rotate write none. Standalone writes the same evidence in the token database's own transaction. In PostgreSQL the change also journals its evidence and is delivered since PR 3. Both stores record the actor's kind, auth mode and canonical issuer (migration 24 and the token database's own columns) | A caller-bound operation identity and an issuer-scoped subject reference; standalone evidence is not delivered |
+| JWT revocation | Scoped JTI digest, actor row, shared revision and outbox, plus one non-cascading `jwt_revocation_evidence` row per effective revoke (actor, JTI digest, resulting expiry, shared revision) that extension, reactivation and expiry cleanup never rewrite, journaled in the same transaction and delivered since PR 3; since migration 24 the CLI's actor is recorded as kind `system`, auth mode `system` and no issuer | The CLI actor stays system provenance, not a named human; a caller-bound operation identity |
 | Admin session grant/withdrawal (#424) | With `ADMIN_SESSION_MODE=cluster_postgres`, the session row and one non-cascading `admin_session_evidence` row (event/operation UUIDs, session ID, action, reason, subject and issuer, absolute deadline, database-clock time) commit together for each grant and each withdrawal; a replacement's withdrawal and grant share one operation ID | Actor kind/auth mode, keyed safe actor reference, a session revision axis, and delivery: these rows are not journaled (see [Durable delivery](#durable-delivery)). Standalone sessions are process-local memory with no durable record and stay `unsupported_future_operation` |
 
 These foundations are already sufficient for their **existing atomic change-record
@@ -164,10 +167,15 @@ the standalone token evidence rows: the evidence rows hold the internal actor
 ID, not a keyed safe reference, and no `authority_id`. Since PR 3 the dispatcher
 delivers the journaled evidence with keyed references under a persisted
 `authority_id`, but as `authority_event_delivery.v1` ([Durable delivery](#durable-delivery)),
-not as this schema: the journaled evidence records neither the actor's issuer nor
-its auth mode, and a v1 event cannot be produced faithfully without both. Migration
-23's document rows are the first to carry the actor's kind, issuer and auth mode,
-the facts the schema's `actor` object projects, but they are not journaled yet.
+not as this schema. Since migration 24 the journaled evidence records the actor's kind, auth
+mode and, for a principal that has one, canonical issuer
+([Actor metadata](#actor-metadata)), but a v1 event still cannot be produced
+faithfully: its `subject_ref` binds the subject to its issuer and its `issuer_ref`
+is required, while a service token, an operator command, an issuer-less principal and
+every row committed before migration 24 have no issuer to bind, and the operation
+identity is not yet caller-bound. Migration 23's document rows also carry an actor
+kind, issuer and auth mode, in their own vocabulary, but they are not journaled
+yet.
 
 Revision transitions are operation-specific. Resource creation (`connection.create`,
 `secret.create`, `service_token.issue`, `admin_session.grant`) has no prior revision; replacement,
@@ -187,7 +195,7 @@ assigns every operation exactly one transition contract.
 | `operation_id` | Persisted UUID binding one authenticated logical operation and its authoritative result; repeated delivery or an identical reconciled request keeps it |
 | `operation` / `result` | Closed operation code; `committed` means the mutation or export-evidence record committed. Failed CAS, rollback, denial and ineffective no-op do not create success records |
 | `committed_at` | Store-authored UTC timestamp retained unchanged across delivery; transaction acceptance time, not a claim to measure the physical instant of COMMIT |
-| `actor` | Principal/system kind, safe subject/issuer references and known auth mode (including client certificates); a CLI system actor must not masquerade as an authenticated human |
+| `actor` | Principal, service-token or system kind, safe subject/issuer references and known auth mode (including client certificates); a CLI system actor must not masquerade as an authenticated human, and a service token's `service-token:<id>` subject must not read as a person's |
 | `resource` | Closed resource kind plus safe, stable opaque reference; no raw secret IDs or binding identifiers |
 | `revision` | Named revision axis, previous/new revision, and optional shared security revision, encoded as decimal strings to preserve exact 64-bit values |
 
@@ -235,8 +243,8 @@ records, logs and metrics.
 ## Keyed safe references
 
 `gateway/src/authority_events/pseudonym.rs` derives the `subject_ref`, `issuer_ref`
-and `resource.ref` values of the proposed event, and the `actor.recorded_ref` and
-`resource.ref` values the dispatcher delivers today. Its runtime caller is the
+and `resource.ref` values of the proposed event, and the `actor.recorded_ref`,
+`actor.issuer_ref` and `resource.ref` values the dispatcher delivers today. Its runtime caller is the
 authority-event dispatcher: a cluster replica with `AUTHORITY_EVENT_SINK` set
 resolves the keyring named by `AUTHORITY_PSEUDONYM_KEY_ALIAS` at startup and derives
 each delivered reference at delivery time. No stored record carries a reference: the
@@ -264,8 +272,8 @@ is the label `greengateway.authority_pseudonym.v1`, the 16 bytes of the
 | Domain label | Components |
 | --- | --- |
 | `actor.subject` | Exactly two: the canonical issuer, then the subject. A subject is never referenced without the issuer that vouched for it, as `Principal` and caller assertions already scope it |
-| `actor.issuer` | Exactly one: the canonical issuer |
-| `actor.recorded` | Exactly one: an actor identifier exactly as an evidence row recorded it, with no issuer. Migrations 16 and 18 record only the acting principal's subject, or a command's fixed system label (`operator:revoke-jwt`), so this is how the dispatcher names their actors. It is its own domain, so it never yields the reference `actor.subject` gives the same subject |
+| `actor.issuer` | Exactly one: the canonical issuer. The dispatcher derives it from the acting principal's issuer as migration 24's evidence records it |
+| `actor.recorded` | Exactly one: an actor identifier exactly as an evidence row recorded it, with no issuer. Migrations 16 and 18 record the acting principal's subject, or a command's fixed system label (`operator:revoke-jwt`), with no issuer beside it in older rows and none at all for a service token or a command, so this is how the dispatcher names their actors, before and after migration 24 alike. It is its own domain, so it never yields the reference `actor.subject` gives the same subject |
 | `resource.<kind>` for each schema `resource.kind` | One to four: the resource identifier, optionally preceded by the identifiers of the resources that own it |
 
 A component is the identifier's canonical text exactly as its store keeps it, at most
@@ -444,7 +452,10 @@ migration 21; `gateway/src/storage/postgres_authority_events.rs` and
   evidence row's `event_id` and `operation_id`, the journal position as
   `sequence`, the operation, `result: committed`, the evidence row's
   database-clock `committed_at`, `actor.recorded_ref` (the `actor.recorded`
-  reference of the recorded actor), the resource kind and its keyed reference (a
+  reference of the recorded actor), `actor.kind`, `actor.auth_mode` and
+  `actor.issuer_ref` (the `actor.issuer` reference) as the evidence recorded them
+  since migration 24, each `null` where the row recorded none, the resource kind
+  and its keyed reference (a
   JWT revocation's under its issuer and `jti` digest), and the v1 revision
   transition as decimal strings. No identifier, token material, `jti`, issuer or
   secret reaches it.
@@ -485,9 +496,10 @@ Not covered by PR 3, and still open:
   journaling it needs its own capacity decision first.
 - **Standalone mode.** There is no journal and no dispatcher; the SQLite token
   evidence is not delivered.
-- **The v1 contract.** Issuer, auth mode, actor kind and caller-bound operation
-  identity at the store boundary, after which the delivered record can become
-  `authority_event.v1`.
+- **The v1 contract.** A caller-bound operation identity at the store boundary and
+  an issuer-scoped subject reference, after which the delivered record can become
+  `authority_event.v1` for the actors that have an issuer. Kind, auth mode and
+  issuer are recorded since migration 24 ([Actor metadata](#actor-metadata)).
 - **Policy, tools and catalog evidence.** Migration 23's `document_change_evidence`
   and `catalog_change_evidence` rows exist but are not journal sources, so they are
   retained and not delivered. Journaling them adds the journal's capacity
@@ -497,6 +509,60 @@ Not covered by PR 3, and still open:
   the rule pack does not page on it.
 - **Every other operation.** Connection create/replace, credential bindings and
   token issue have no evidence rows to journal yet.
+
+## Actor metadata
+
+Migration 24 (`authority_evidence_actor_metadata`) adds three nullable columns to
+`connection_change_evidence`, `service_token_change_evidence` and
+`jwt_revocation_evidence`, and the standalone token database adds the same three
+columns to its own `service_token_change_evidence` when it is opened:
+
+| Column | Contract |
+| --- | --- |
+| `actor_kind` | `principal` (a session cookie, bearer JWT or client certificate that an identity provider or the inbound TLS handshake vouched for), `service_token` (a gateway-issued service token, whose `service-token:<id>` subject an identity provider could also assert for a person) or `system` (an operator command under its fixed label, such as `operator:revoke-jwt`; nobody authenticated it) |
+| `actor_auth_mode` | The audit vocabulary of the principal's authentication (`session_cookie`, `bearer_token`, `client_certificate`, `service_token`), or `system`; it always agrees with the kind |
+| `actor_issuer` | The canonical issuer, in the form audit and policy use, of a principal that has one; never for a service token or a command. On `jwt_revocation_evidence` this is the acting principal's issuer, and the existing `issuer` column stays the revoked token's |
+
+The admin endpoints build the actor (`auth::change_actor::ChangeActor`) from the
+authenticated `Principal` and pass it to the store, which records it in the
+change's own transaction: Connection delete (`connection_delete_endpoint`), token
+rotate and revoke (`token_rotate_endpoint`, `token_revoke_endpoint`), and the
+`revoke-jwt` command, which passes a `system` actor. Each field is bounded by
+exactly the bound authentication enforces (`MAX_PRINCIPAL_SUBJECT_BYTES` and
+`MAX_PRINCIPAL_ISSUER_BYTES`, 4,096 bytes each), so no principal a validator
+accepted is refused. A store refuses any other actor before it changes anything,
+rather than truncate it or commit the change anonymously, and a CHECK on each
+table is the backstop: a row records all three or none, in a pairing
+authentication produces, with an issuer only for a principal. Only the subject,
+issuer, kind and auth mode are recorded; never a credential, session ID, role,
+organization or email address. Nothing is backfilled: a row committed before
+migration 24 (or before the token database gained the columns) records none of the
+three, and is delivered with `null` there rather than a guess. The dispatcher
+refuses to project a row whose metadata is out of shape, which stalls delivery at
+that row as any other unprojectable row does.
+
+Tests: the shared service-token change-evidence contract and the JWT revocation
+evidence tests in `gateway/src/storage/contract_tests.rs` (both token stores), the
+Connection deletion evidence tests in `gateway/src/connections/pg_store_tests.rs`,
+`migration_twenty_four_adds_actor_metadata_and_guesses_none_for_existing_evidence`,
+the standalone column upgrade in `gateway/src/auth/tokens.rs`, the delivery
+projection tests in `gateway/src/authority_events/delivery_tests.rs`, the
+commit-order dispatcher test, and the app-level
+`admin_token_rotate_and_revoke_record_the_authenticated_subject_and_issuer_sqlite`
+and `_postgres`, which drive the admin endpoints with principals from two identity
+providers and a service token and read the evidence rows back. The PostgreSQL ones
+run in CI against its disposable loopback database, not verified TLS.
+
+Migration 23's two tables are outside this contract, and migration 24 leaves them
+unchanged. `document_change_evidence` records an actor kind, issuer and auth mode
+in its own vocabulary: kind `principal` for every authenticated caller, a service
+token included (only its `service_token` auth mode tells it apart), or `system`,
+and the issuer as the principal carried it rather than in canonical form.
+`catalog_change_evidence` records the publishing subject alone, with no kind,
+issuer or auth mode. Neither table is a journal source, so nothing delivers either
+row; aligning both with this section's columns is a later #425 slice (the
+inventory's `policy_postgres`, `tools_postgres`, `configuration_import` and
+`catalog_postgres` rows keep `missing_metadata`).
 
 ## Next reviewable slices and validation gates
 
@@ -509,7 +575,8 @@ Not covered by PR 3, and still open:
    stale ETag, dependency rejection, a missing record, two writers, a forced
    evidence-insert failure and its rollback, and reconciling a lost response
    from the evidence row; CI runs them against its disposable loopback database,
-   not verified TLS. Still open for this row: issuer/auth mode and a
+   not verified TLS. Migration 24 adds the deleting actor's kind, auth mode and
+   canonical issuer ([Actor metadata](#actor-metadata)). Still open for this row: a
    caller-bound operation identity at the store boundary.
 2. **Service-token and JWT metadata (landed).** `ServiceTokenStore` rotate and
    revoke now take the mutating actor, and both adapters write one evidence row
@@ -527,10 +594,12 @@ Not covered by PR 3, and still open:
    rotate/revoke races, actor survival after token deletion and restart, a
    forced evidence-insert failure and its rollback, extension, reactivation and
    cleanup, and synthetic token-material exclusion; the PostgreSQL ones run in
-   CI against its disposable loopback database, not verified TLS. Still open:
-   issuer/auth mode, an actor kind for the CLI's system label, a caller-bound
-   operation identity, and token issue evidence (`created_by` remains its only
-   actor record).
+   CI against its disposable loopback database, not verified TLS. Migration 24
+   (and the standalone token database's own columns) adds the actor's kind, auth
+   mode and canonical issuer, and records the CLI's system label as kind `system`
+   ([Actor metadata](#actor-metadata)). Still open: a caller-bound operation
+   identity, and token issue evidence (`created_by` remains its only actor
+   record).
 3. **Shared documents/catalog metadata (landed).** The shared document core
    (`postgres_documents::commit_in`) now writes one migration 23
    `document_change_evidence` row beside the outbox row of every policy and tools
@@ -559,7 +628,9 @@ Not covered by PR 3, and still open:
    catalog replacement, Connection deletion and restart, and the overlay
    vocabulary; CI runs them against its disposable loopback database, not
    verified TLS. Still open: issuer and auth mode for catalog publications (their
-   writers carry the subject only, like Connection deletion), a caller-bound
+   writers carry the subject only; Connection deletion records both since
+   migration 24), the alignment of the document rows' actor vocabulary with
+   migration 24's ([Actor metadata](#actor-metadata)), a caller-bound
    operation identity, and journaling: neither table is a migration 21 journal
    source, so the dispatcher does not deliver their rows yet. No scheduled
    catalog refresh ships, so no system catalog actor is needed yet.

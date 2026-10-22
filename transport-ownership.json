@@ -6568,7 +6568,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::bootstrap::run#1",
-      "sha256": "d1002bccde85efe7c9662e82eab8c35b44fc4255c5896792760a2d078e515145",
+      "sha256": "816abf3ca37846695768241f81e5789b7ba5aa7f075281b8b8a0276899580cf2",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -7311,6 +7311,36 @@
       "sha256": "3f2a895ef13b3cc86deb4ddf7488d933027be71d459399666e3c76f46de094f3",
       "owner": "GreenGateway maintainers",
       "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
+    },
+    {
+      "file": "gateway/src/auth/change_actor.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::auth::change_actor::ActorKind#1",
+      "sha256": "6d7c0db13ee2b143fb3f09caf9f4a24c4c446740e933e2d5ed3b12079d646755",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Issue #425 change-actor kind vocabulary for authority evidence. Its cfg_attr only allows dead code for the System variant in builds without the postgres feature, where the cluster-mode revoke-jwt command that records it is absent; plain data, no I/O and no transport or process capability."
+    },
+    {
+      "file": "gateway/src/auth/change_actor.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::auth::change_actor::impl  ActorKind::from_stored#1",
+      "sha256": "bdd791d1a53fcbb5367c2ab2fff92c125433b508697dd8e215ea00aa54bc4c2a",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Issue #425 parse of a stored actor_kind value against the closed vocabulary, read by the cluster-mode delivery projection. Its cfg_attr only allows dead code in builds without the postgres feature; pure string comparison, no I/O and no transport or process capability."
+    },
+    {
+      "file": "gateway/src/auth/change_actor.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::auth::change_actor::impl  ChangeActor::system#1",
+      "sha256": "2c0efc2af79b1b10eabec1b1078e1d520bfafd8ac21c8fa1a8e55d8987f7150e",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Issue #425 constructor of the system actor the cluster-mode revoke-jwt command records. Its cfg_attr only allows dead code in builds without the postgres feature; builds an in-memory value, no I/O and no transport or process capability."
     },
     {
       "file": "gateway/src/auth/cookie_session_validator.rs",
@@ -8620,7 +8650,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::record_change_evidence#1",
-      "sha256": "a8d52623e0814dfc022ea52cb879856fc0d529054658be23fc18f4c8ca7829ee",
+      "sha256": "11e3ab16855d4f9ac9e52b88108115452d60cddf89e8549019d52df38cfe02bb",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -13234,7 +13264,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_service_tokens::record_change_evidence#1",
-      "sha256": "e29b3ee8319fc20e2f5b24dc7908327de46f0a02b9bdeccbc88712bb01c41a0e",
+      "sha256": "6db322e7023adf28962884359b9dfd5c6ab1babef2624c14a67e6fe3395bdb80",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -14590,7 +14620,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_authority_events::journaled_evidence_from_row#1",
-      "sha256": "0feaef3cb9f594c4f54e82efc7cf73e62fc6bef6763cb2e959e0d7d0d7f455bd",
+      "sha256": "08b5b3590ed6622748f9e8e805dcf0cdac7b2e324f2deee4f3342b949f9b7439",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },

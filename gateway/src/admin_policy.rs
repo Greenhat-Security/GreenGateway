@@ -2223,7 +2223,7 @@ pub(super) async fn persist_policy_mutation(
 /// Ask the cluster's operation gate before committing a document that uses
 /// a feature an older member cannot read (issue #426).
 ///
-/// A document without such a feature needs nothing beyond the schema-23
+/// A document without such a feature needs nothing beyond the schema-24
 /// contract every member shares, and passes without a roster read. One that
 /// gives a role a `description` is the registered operation
 /// `policy.role_descriptions`: it is committed only while every live member,

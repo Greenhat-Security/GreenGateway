@@ -92,7 +92,11 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
             &boundary,
         );
         match store
-            .revoke(&jti, expires_at.as_deref(), "operator:revoke-jwt")
+            .revoke(
+                &jti,
+                expires_at.as_deref(),
+                &auth::change_actor::ChangeActor::system("operator:revoke-jwt"),
+            )
             .await
             .map_err(|error| match error.invalid_parameter_name() {
                 Some("jti") => Box::<dyn std::error::Error>::from(

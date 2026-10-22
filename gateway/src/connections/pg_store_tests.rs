@@ -1,4 +1,5 @@
 use super::*;
+use crate::auth::change_actor::ChangeActor;
 use crate::connections::status::ConnectionOperationalState;
 use crate::storage::postgres::PostgresFoundation;
 use serde_json::json;
@@ -361,7 +362,7 @@ async fn records_create_replace_delete_with_cas_and_shared_state_bumps() {
         .await
         .expect("dependency insert");
     let blocked = store
-        .delete(&created.id, &etag, "op-6")
+        .delete(&created.id, &etag, &ChangeActor::for_test("op-6"))
         .await
         .expect_err("a referenced connection must not delete");
     assert!(
@@ -375,7 +376,7 @@ async fn records_create_replace_delete_with_cas_and_shared_state_bumps() {
         .await
         .expect("dependency cleanup");
     store
-        .delete(&created.id, &etag, "op-7")
+        .delete(&created.id, &etag, &ChangeActor::for_test("op-7"))
         .await
         .expect("delete should commit");
     assert_eq!(store.count().await.expect("count"), 0);
@@ -2409,7 +2410,11 @@ async fn a_delete_waits_for_an_in_flight_dependency_flush() {
     let mut deleter = {
         let control_plane = control_plane.clone();
         let (id, etag) = (record.id.clone(), record.etag());
-        tokio::spawn(async move { control_plane.delete_managed(&id, &etag, "op-2").await })
+        tokio::spawn(async move {
+            control_plane
+                .delete_managed(&id, &etag, &ChangeActor::for_test("op-2"))
+                .await
+        })
     };
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(300), &mut deleter)
@@ -2500,7 +2505,7 @@ async fn delete_flushes_queued_dependency_guards_before_it_is_judged() {
     assert_eq!(queued_only, 0, "nothing is written until a flush");
 
     let refused = control_plane
-        .delete_managed(&record.id, &record.etag(), "op-2")
+        .delete_managed(&record.id, &record.etag(), &ChangeActor::for_test("op-2"))
         .await
         .expect_err("a referenced Connection must not be deleted");
     assert!(
@@ -2529,7 +2534,7 @@ async fn delete_flushes_queued_dependency_guards_before_it_is_judged() {
         .replace_runtime_dependencies(ConnectionDependencyKind::ProxyRoute, &[])
         .expect("the empty set queues");
     control_plane
-        .delete_managed(&record.id, &record.etag(), "op-3")
+        .delete_managed(&record.id, &record.etag(), &ChangeActor::for_test("op-3"))
         .await
         .expect("an unreferenced Connection deletes");
 
@@ -3405,6 +3410,9 @@ struct EvidenceRow {
     event_id: String,
     operation_id: String,
     actor_user_id: String,
+    actor_issuer: Option<String>,
+    actor_kind: Option<String>,
+    actor_auth_mode: Option<String>,
     action: String,
     connection_id: String,
     prior_version: i64,
@@ -3421,7 +3429,7 @@ async fn evidence_rows(pool: &deadpool_postgres::Pool) -> Vec<EvidenceRow> {
             r#"
             SELECT event_id::text, operation_id::text, actor_user_id, action,
                    connection_id::text, prior_version, security_revision,
-                   committed_at::text
+                   committed_at::text, actor_issuer, actor_kind, actor_auth_mode
             FROM greengateway.connection_change_evidence
             ORDER BY security_revision, event_id
             "#,
@@ -3434,6 +3442,9 @@ async fn evidence_rows(pool: &deadpool_postgres::Pool) -> Vec<EvidenceRow> {
             event_id: row.get(0),
             operation_id: row.get(1),
             actor_user_id: row.get(2),
+            actor_issuer: row.get(8),
+            actor_kind: row.get(9),
+            actor_auth_mode: row.get(10),
             action: row.get(3),
             connection_id: row.get(4),
             prior_version: row.get(5),
@@ -3478,6 +3489,17 @@ async fn deletion_evidence_survives_cascade_and_restart_and_reconciles_a_lost_re
     };
     let database = create_test_database(&admin_dsn).await;
     let (store, pool) = migrated_store(&database.dsn, 64).await;
+    // A person signed in through a provider deletes, as the admin endpoint
+    // would pass them: the issuer is recorded in its canonical form.
+    let deleting_admin = ChangeActor::from_principal(&crate::auth::Principal {
+        user_id: "deleting-admin".to_owned(),
+        issuer: Some(" https://idp.example.test/ ".to_owned()),
+        email: Some("deleting-admin@example.test".to_owned()),
+        org_id: None,
+        roles: vec!["connections-admin".to_owned()],
+        session_id: "session-deleting-admin".to_owned(),
+        auth_method: crate::auth::AuthMethod::Cookie,
+    });
 
     let columns: Vec<String> = pool
         .get()
@@ -3504,7 +3526,10 @@ async fn deletion_evidence_survives_cascade_and_restart_and_reconciles_a_lost_re
             "connection_id",
             "prior_version",
             "security_revision",
-            "committed_at"
+            "committed_at",
+            "actor_kind",
+            "actor_auth_mode",
+            "actor_issuer"
         ],
         "evidence holds identifiers, revisions and the actor; a new column needs review"
     );
@@ -3529,7 +3554,7 @@ async fn deletion_evidence_survives_cascade_and_restart_and_reconciles_a_lost_re
     );
 
     store
-        .delete(&created.id, &replaced.etag(), "deleting-admin")
+        .delete(&created.id, &replaced.etag(), &deleting_admin)
         .await
         .expect("delete should commit");
 
@@ -3572,6 +3597,19 @@ async fn deletion_evidence_survives_cascade_and_restart_and_reconciles_a_lost_re
     let row = &evidence[0];
     assert_eq!(row.action, "connection.delete");
     assert_eq!(row.actor_user_id, "deleting-admin");
+    assert_eq!(
+        (
+            row.actor_issuer.as_deref(),
+            row.actor_kind.as_deref(),
+            row.actor_auth_mode.as_deref()
+        ),
+        (
+            Some("https://idp.example.test"),
+            Some("principal"),
+            Some("session_cookie")
+        ),
+        "the deleting principal's canonical issuer, kind and auth mode"
+    );
     assert_eq!(row.connection_id, created.id.as_str());
     assert_eq!(row.prior_version, 2);
     assert_eq!(row.security_revision, tombstone_revision);
@@ -3603,6 +3641,10 @@ async fn deletion_evidence_survives_cascade_and_restart_and_reconciles_a_lost_re
         "billing.example.test",
         "/openapi.json",
         "Evidence API",
+        // The actor is its subject, issuer, kind and auth mode only.
+        "deleting-admin@example.test",
+        "connections-admin",
+        "session-deleting-admin",
     ] {
         assert!(
             !stored.contains(material),
@@ -3628,7 +3670,7 @@ async fn deletion_evidence_survives_cascade_and_restart_and_reconciles_a_lost_re
     // committed delete is not repeated, and the original evidence is the
     // reconciliation answer.
     let retried = restarted
-        .delete(&created.id, &replaced.etag(), "deleting-admin")
+        .delete(&created.id, &replaced.etag(), &deleting_admin)
         .await
         .expect_err("a committed delete is not repeated");
     assert!(
@@ -3662,7 +3704,7 @@ async fn refused_deletes_write_no_evidence() {
         .delete(
             &created.id,
             &fabricated_stale_etag(&created.id),
-            "stale-admin",
+            &ChangeActor::for_test("stale-admin"),
         )
         .await
         .expect_err("a stale ETag must not delete");
@@ -3683,7 +3725,11 @@ async fn refused_deletes_write_no_evidence() {
         .await
         .expect("dependency insert");
     let blocked = store
-        .delete(&created.id, &created.etag(), "blocked-admin")
+        .delete(
+            &created.id,
+            &created.etag(),
+            &ChangeActor::for_test("blocked-admin"),
+        )
         .await
         .expect_err("a referenced Connection must not delete");
     assert!(
@@ -3693,7 +3739,11 @@ async fn refused_deletes_write_no_evidence() {
 
     let absent = ConnectionId::new_managed();
     let missing = store
-        .delete(&absent, &fabricated_stale_etag(&absent), "absent-admin")
+        .delete(
+            &absent,
+            &fabricated_stale_etag(&absent),
+            &ChangeActor::for_test("absent-admin"),
+        )
         .await
         .expect_err("an absent Connection must not delete");
     assert!(
@@ -3701,11 +3751,23 @@ async fn refused_deletes_write_no_evidence() {
         "{missing}"
     );
 
-    for actor in [String::new(), "a".repeat(EVIDENCE_ACTOR_MAX_BYTES + 1)] {
+    for actor in [
+        ChangeActor::for_test(""),
+        ChangeActor::for_test(&"a".repeat(EVIDENCE_ACTOR_MAX_BYTES + 1)),
+        ChangeActor::for_test_with_issuer("issuing-admin", ""),
+        ChangeActor::for_test_with_issuer(
+            "issuing-admin",
+            &"i".repeat(crate::auth::principal::MAX_PRINCIPAL_ISSUER_BYTES + 1),
+        ),
+        ChangeActor::service_token_with_issuer_for_test(
+            "service-token:token_1",
+            "https://idp.example.test",
+        ),
+    ] {
         let unattributable = store
             .delete(&created.id, &created.etag(), &actor)
             .await
-            .expect_err("an unattributable delete must not commit");
+            .expect_err("an unrecordable delete must not commit");
         assert!(
             matches!(unattributable, ConnectionStoreError::Validation { .. }),
             "{unattributable}"
@@ -3728,13 +3790,22 @@ async fn refused_deletes_write_no_evidence() {
         .await
         .expect("dependency cleanup");
     let maximal_actor = "m".repeat(EVIDENCE_ACTOR_MAX_BYTES);
+    let maximal_issuer = "i".repeat(crate::auth::principal::MAX_PRINCIPAL_ISSUER_BYTES);
     store
-        .delete(&created.id, &created.etag(), &maximal_actor)
+        .delete(
+            &created.id,
+            &created.etag(),
+            &ChangeActor::for_test_with_issuer(&maximal_actor, &maximal_issuer),
+        )
         .await
-        .expect("a maximal principal subject still deletes");
+        .expect("a maximal principal subject and issuer still delete");
     let evidence = evidence_rows(&pool).await;
     assert_eq!(evidence.len(), 1);
     assert_eq!(evidence[0].actor_user_id, maximal_actor);
+    assert_eq!(
+        evidence[0].actor_issuer.as_deref(),
+        Some(maximal_issuer.as_str())
+    );
     assert_eq!(evidence[0].security_revision, revision_before + 1);
 }
 
@@ -3757,9 +3828,13 @@ async fn concurrent_deletes_produce_one_winner_and_one_evidence_row() {
 
     let store_a = PostgresConnectionStore::new(pool.clone(), 64).expect("store a");
     let store_b = PostgresConnectionStore::new(pool.clone(), 64).expect("store b");
+    let (replica_a, replica_b) = (
+        ChangeActor::for_test("replica-a"),
+        ChangeActor::for_test("replica-b"),
+    );
     let (a, b) = tokio::join!(
-        store_a.delete(&created.id, &etag, "replica-a"),
-        store_b.delete(&created.id, &etag, "replica-b")
+        store_a.delete(&created.id, &etag, &replica_a),
+        store_b.delete(&created.id, &etag, &replica_b)
     );
     let (winner, loser) = match (a, b) {
         (Ok(()), Err(loser)) => ("replica-a", loser),
@@ -3822,7 +3897,11 @@ async fn a_failed_evidence_insert_rolls_back_the_whole_delete() {
         .await
         .expect("failure trigger should install");
     let failed = store
-        .delete(&created.id, &created.etag(), "faulted-admin")
+        .delete(
+            &created.id,
+            &created.etag(),
+            &ChangeActor::for_test("faulted-admin"),
+        )
         .await
         .expect_err("a delete whose evidence cannot commit must fail");
     assert!(
@@ -3883,7 +3962,11 @@ async fn a_failed_evidence_insert_rolls_back_the_whole_delete() {
     assert!(evidence_rows(&pool).await.is_empty());
 
     store
-        .delete(&created.id, &created.etag(), "recovered-admin")
+        .delete(
+            &created.id,
+            &created.etag(),
+            &ChangeActor::for_test("recovered-admin"),
+        )
         .await
         .expect("the unchanged ETag deletes once evidence can commit");
     let evidence = evidence_rows(&pool).await;
@@ -4226,7 +4309,11 @@ async fn catalog_evidence_survives_replacement_cascade_and_restart() {
         .expect("the second catalog publishes");
     let outbox_before_delete = catalog_outbox(&pool, &created.id).await;
     store
-        .delete(&created.id, &created.etag(), "deleter")
+        .delete(
+            &created.id,
+            &created.etag(),
+            &ChangeActor::for_test("deleter"),
+        )
         .await
         .expect("the Connection deletes");
     assert_eq!(

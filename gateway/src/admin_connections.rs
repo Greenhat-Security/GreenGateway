@@ -1024,10 +1024,17 @@ pub(super) async fn connection_delete_endpoint(
         Err(error) => return connection_catalog_lifecycle_error_response(error),
     };
 
-    // The catalog-lifecycle guard stays held across the delete.
+    // The catalog-lifecycle guard stays held across the delete. The deleting
+    // principal -- subject, issuer, kind and auth mode -- is the deletion's
+    // evidence, committed with it or not at all; the audit event below stays
+    // post-commit telemetry.
     if let Err(error) = state
         .control_plane
-        .delete_managed(&id, &current_etag, &principal.user_id)
+        .delete_managed(
+            &id,
+            &current_etag,
+            &auth::change_actor::ChangeActor::from_principal(&principal),
+        )
         .await
     {
         return connection_mutation_error_response(error);

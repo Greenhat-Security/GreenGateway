@@ -3498,7 +3498,11 @@ async fn connection_bound_proxy_uses_stored_destination_and_protects_its_depende
     );
 
     let dependency_protected = control_plane
-        .delete_managed(&created.id, &created.etag(), "test-admin")
+        .delete_managed(
+            &created.id,
+            &created.etag(),
+            &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+        )
         .await;
     assert!(matches!(
         dependency_protected,
@@ -17430,6 +17434,229 @@ async fn token_rotation_delegation_contract_postgres() {
     let store =
         storage::postgres_service_tokens::PostgresServiceTokenStore::new(foundation.pool().clone());
     assert_token_rotation_delegation_contract(Arc::new(store)).await;
+}
+
+/// One service-token change evidence row as the admin endpoints' test reads
+/// it: action, token, actor subject, actor issuer, actor kind, auth mode.
+type TokenChangeActorRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// Issue #425: the admin rotate and revoke endpoints pass the authenticated
+/// principal to the store, which records it -- subject, canonical issuer,
+/// actor kind and auth mode -- as the change's evidence. Neither the token's
+/// creator nor a fixed label stands in for it. A person signed in through
+/// one provider rotates, a bearer principal from a second provider revokes
+/// that token, and a service token revokes another; the rows the store
+/// recorded are returned beside the evidence each should be.
+async fn admin_token_changes_record_the_authenticated_actor(
+    store: Arc<dyn storage::ServiceTokenStore>,
+) -> Vec<TokenChangeActorRow> {
+    let policy = parse_policy_body(&Bytes::from(token_policy_document_string()))
+        .expect("token policy should parse");
+    let config = test_config(Vec::new());
+    let audit_log = test_audit_log();
+    let state = TokenAdminState {
+        store: Some(Arc::clone(&store)),
+        validator: None,
+        rbac_state: Some(middleware::rbac::RbacState::new(
+            policy,
+            Vec::new(),
+            false,
+            audit_log.clone(),
+        )),
+        audit: audit_log,
+        client_ip_policy: client_ip::ClientIpPolicy::from_config(&config),
+        max_body_size: config.max_body_size,
+    };
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        ids.push(
+            store
+                .create(auth::tokens::CreateTokenRequest {
+                    scopes: vec!["probe-reader".to_owned()],
+                    created_by: "bootstrap-admin".to_owned(),
+                    expires_at: None,
+                })
+                .await
+                .expect("fixture token should create")
+                .record
+                .id,
+        );
+    }
+    let principal = |user_id: &str, issuer: Option<&str>, auth_method| auth::Principal {
+        user_id: user_id.to_owned(),
+        issuer: issuer.map(str::to_owned),
+        auth_method,
+        ..test_principal(&["superadmin"])
+    };
+
+    let rotated = token_rotate_endpoint(
+        State(state.clone()),
+        Path(ids[0].clone()),
+        token_admin_request(
+            Method::POST,
+            &format!("{TOKENS_ADMIN_ROUTE}/{}/rotate", ids[0]),
+            Some(principal(
+                "rotating-admin",
+                Some(" https://idp.example.test/ "),
+                auth::AuthMethod::Cookie,
+            )),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(rotated.status(), StatusCode::OK);
+    for (id, actor) in [
+        (
+            &ids[0],
+            principal(
+                "revoking-admin",
+                Some("https://other-idp.example.test"),
+                auth::AuthMethod::Bearer,
+            ),
+        ),
+        (
+            &ids[1],
+            principal(
+                "service-token:token_admin",
+                None,
+                auth::AuthMethod::ServiceToken,
+            ),
+        ),
+    ] {
+        let revoked = token_revoke_endpoint(
+            State(state.clone()),
+            Path(id.clone()),
+            token_admin_request(
+                Method::DELETE,
+                &format!("{TOKENS_ADMIN_ROUTE}/{id}"),
+                Some(actor),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(revoked.status(), StatusCode::OK);
+    }
+
+    let owned = |value: &str| value.to_owned();
+    vec![
+        (
+            owned("service_token.rotate"),
+            ids[0].clone(),
+            owned("rotating-admin"),
+            Some(owned("https://idp.example.test")),
+            Some(owned("principal")),
+            Some(owned("session_cookie")),
+        ),
+        (
+            owned("service_token.revoke"),
+            ids[0].clone(),
+            owned("revoking-admin"),
+            Some(owned("https://other-idp.example.test")),
+            Some(owned("principal")),
+            Some(owned("bearer_token")),
+        ),
+        (
+            owned("service_token.revoke"),
+            ids[1].clone(),
+            owned("service-token:token_admin"),
+            None,
+            Some(owned("service_token")),
+            Some(owned("service_token")),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn admin_token_rotate_and_revoke_record_the_authenticated_subject_and_issuer_sqlite() {
+    let token_db = TempDb::new("token-change-actor-evidence");
+    let store =
+        auth::tokens::SqliteTokenStore::open(&token_db.path).expect("token store should open");
+    let expected = admin_token_changes_record_the_authenticated_actor(Arc::new(store)).await;
+    let connection = Connection::open(&token_db.path).expect("token database should open");
+    let mut statement = connection
+        .prepare(
+            "SELECT action, token_id, actor_user_id, actor_issuer, actor_kind, actor_auth_mode \
+             FROM service_token_change_evidence ORDER BY sequence",
+        )
+        .expect("evidence query should prepare");
+    let recorded = statement
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })
+        .expect("evidence query should run")
+        .collect::<Result<Vec<TokenChangeActorRow>, _>>()
+        .expect("evidence rows should decode");
+    assert_eq!(recorded, expected);
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_token_rotate_and_revoke_record_the_authenticated_subject_and_issuer_postgres() {
+    use storage::contract_tests::postgres_audit_tests::{
+        create_test_database, locator, write_dsn_file, DATABASE,
+    };
+
+    let Some(admin_dsn) = locator() else {
+        eprintln!("skipping PostgreSQL change-actor evidence: no test database locator");
+        return;
+    };
+    let _serial = DATABASE.lock().await;
+    let database = create_test_database(&admin_dsn).await;
+    let dsn_file = write_dsn_file(&database.dsn);
+    let mut config = config::Config::test_defaults();
+    config.state_backend = config::StateBackend::Postgres;
+    config.deployment_id = Some("deploy-token-change-actor".to_owned());
+    config.database.url_file = Some(dsn_file.path.clone());
+    config.database.tls_mode = config::DatabaseTlsMode::LoopbackDev;
+    let foundation = storage::postgres::PostgresFoundation::establish(&config)
+        .await
+        .expect("test database should establish");
+    storage::migrations::apply_missing_for_startup(foundation.pool(), &config.database)
+        .await
+        .expect("test database should migrate");
+    let store =
+        storage::postgres_service_tokens::PostgresServiceTokenStore::new(foundation.pool().clone());
+    let expected = admin_token_changes_record_the_authenticated_actor(Arc::new(store)).await;
+    let recorded = foundation
+        .pool()
+        .get()
+        .await
+        .expect("evidence checkout")
+        .query(
+            "SELECT action, token_id, actor_user_id, actor_issuer, actor_kind, actor_auth_mode \
+             FROM greengateway.service_token_change_evidence \
+             ORDER BY security_revision",
+            &[],
+        )
+        .await
+        .expect("evidence rows should read")
+        .iter()
+        .map(|row| {
+            (
+                row.get(0),
+                row.get(1),
+                row.get(2),
+                row.get(3),
+                row.get(4),
+                row.get(5),
+            )
+        })
+        .collect::<Vec<TokenChangeActorRow>>();
+    assert_eq!(recorded, expected);
 }
 
 /// Pins the narrowed create mapping restored from the #340 review: a
@@ -36590,10 +36817,14 @@ mod cluster_tools_tests {
             .expect("replica B accepts and caches");
 
         // The revoke commits through replica A's admin path.
-        storage::ServiceTokenStore::revoke(&*store, &created.record.id, "revoking-admin")
-            .await
-            .expect("revoke should commit")
-            .expect("token exists");
+        storage::ServiceTokenStore::revoke(
+            &*store,
+            &created.record.id,
+            &auth::change_actor::ChangeActor::for_test("revoking-admin"),
+        )
+        .await
+        .expect("revoke should commit")
+        .expect("token exists");
 
         // Replica B's very next request, 60 s of TTL to spare.
         let refused = auth::SessionValidator::validate_session(&*replica_b, &bearer)
