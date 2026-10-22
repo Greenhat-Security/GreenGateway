@@ -2,14 +2,18 @@
 //! for the values the admin control plane binds stale-safe decisions to.
 //!
 //! The encoder covers the I-JSON (RFC 7493) value domain those bindings use:
-//! objects, arrays, strings, booleans, null, and integers whose magnitude is
-//! at most 2^53 - 1. A number outside that domain -- a fraction, an exponent,
-//! or a larger integer -- is refused rather than approximated, because JCS
-//! serializes numbers the way ECMAScript does and an approximation would give
-//! the same value two digests on two platforms. Within the domain the output
-//! is exactly the JCS byte sequence: object members sorted by their names'
-//! UTF-16 code units, strings escaped as ECMAScript `JSON.stringify` escapes
-//! them, and no insignificant whitespace.
+//! objects, arrays, strings, booleans, null, and numbers whose magnitude is at
+//! most 2^53 - 1. Within that range a number may carry a fraction or an
+//! exponent: JCS writes the IEEE 754 double nearest its source text the way
+//! ECMAScript's `Number.prototype.toString` does, which depends only on the
+//! shortest round-tripping digits of that double -- a platform-independent
+//! quantity -- so `1.0`, `1e0` and `1` are one value with one encoding. A
+//! number outside the range is refused rather than approximated: integers
+//! there are not all representable, so two different source values would
+//! share an encoding and a digest over it would bind neither. Within the
+//! domain the output is exactly the JCS byte sequence: object members sorted
+//! by their names' UTF-16 code units, strings escaped as ECMAScript
+//! `JSON.stringify` escapes them, and no insignificant whitespace.
 //!
 //! This is deliberately separate from the key-sorted serialization the
 //! policy ETag uses. That one sorts by UTF-8 bytes and is kept unchanged as a
@@ -24,7 +28,8 @@ const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 /// Why a value has no canonical form under this encoder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CanonicalJsonError {
-    /// A number that is not an integer within the I-JSON safe range.
+    /// A number that is not finite, or whose magnitude exceeds the I-JSON
+    /// safe range.
     UnsupportedNumber,
 }
 
@@ -32,7 +37,7 @@ impl std::fmt::Display for CanonicalJsonError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnsupportedNumber => {
-                formatter.write_str("number is not an integer within the I-JSON safe range")
+                formatter.write_str("number is not within the I-JSON safe range")
             }
         }
     }
@@ -70,8 +75,8 @@ pub(crate) fn semantic_digest(
 }
 
 /// `sha256:<hex>` over the ADR-0004 frame of a source payload: the exact
-/// accepted source-document bytes, labelled with the media type and exact
-/// schema version that define them.
+/// accepted source-document bytes, neither parsed nor normalized, labelled
+/// with the media type and exact schema version that define them.
 ///
 /// ```text
 /// "GGDIGEST" 0x00 || u64be(len) "source" || u64be(len) media_type
@@ -137,9 +142,11 @@ fn write_value(value: &Value, out: &mut Vec<u8>) -> Result<(), CanonicalJsonErro
 
 fn write_number(number: &Number, out: &mut Vec<u8>) -> Result<(), CanonicalJsonError> {
     // `serde_json` is built with `arbitrary_precision` here, so a number keeps
-    // the text it was parsed from. Only an exact integer is accepted, and it
-    // is written from its value, not from that text: `1.0` and `1e0` are not
-    // integers to `as_i64`/`as_u64` and are refused.
+    // the text it was parsed from. That text is never copied. An integer token
+    // is written from its value; anything else -- a fraction, an exponent, or
+    // an integer too long for 64 bits -- is read as the double nearest its
+    // text and written the way ECMAScript writes that double, so `1.0`, `1e0`
+    // and `1` all become `1`.
     if let Some(value) = number.as_u64() {
         if value > MAX_SAFE_INTEGER {
             return Err(CanonicalJsonError::UnsupportedNumber);
@@ -154,7 +161,105 @@ fn write_number(number: &Number, out: &mut Vec<u8>) -> Result<(), CanonicalJsonE
         out.extend_from_slice(value.to_string().as_bytes());
         return Ok(());
     }
-    Err(CanonicalJsonError::UnsupportedNumber)
+    // `None` for text that is not a finite double, which includes a number
+    // forged through serde_json's private number tag.
+    let value = number
+        .as_f64()
+        .ok_or(CanonicalJsonError::UnsupportedNumber)?;
+    // Every double at or beyond 2^53 is an integer outside the safe range.
+    if value.abs() > MAX_SAFE_INTEGER as f64 {
+        return Err(CanonicalJsonError::UnsupportedNumber);
+    }
+    out.extend_from_slice(ecmascript_number(value)?.as_bytes());
+    Ok(())
+}
+
+/// ECMAScript `Number::toString(x)` for a finite double (RFC 8785 section
+/// 3.2.2.3; ECMA-262 `Number::toString`).
+///
+/// The specification asks for the fewest decimal digits `s`, with exponent
+/// `n`, that still identify `x`; among those for the digits closest to `x`;
+/// and of two equally close, for the even one. Rust's `{:e}` prints the
+/// shortest round-trip digits, so it fixes how many digits there are, but it
+/// breaks that last tie upward: for `0x43143ff3c1cb0959`, exactly
+/// `1424953923781206.25`, it prints `...063` where ECMAScript writes `...062`.
+/// `{:.p$e}` instead rounds the exact binary value to that many digits with
+/// ties to even, which is the closest such decimal. When that decimal still
+/// identifies `x` it is the one the specification chooses; when it does not
+/// (only possible where the rounding interval is lopsided, at a power of
+/// two), the closest one that does is the shortest form `{:e}` found. Only
+/// the layout rules follow: plain digits up to 21 integer places, a leading
+/// `0.` down to 10^-6, and exponent notation with an explicit sign
+/// otherwise. RFC 8785 Appendix B's vectors pin the result.
+fn ecmascript_number(value: f64) -> Result<String, CanonicalJsonError> {
+    if !value.is_finite() {
+        return Err(CanonicalJsonError::UnsupportedNumber);
+    }
+    // Both zeros: negative zero is written "0".
+    if value == 0.0 {
+        return Ok("0".to_owned());
+    }
+    let mut text = String::new();
+    if value < 0.0 {
+        text.push('-');
+    }
+    let magnitude = value.abs();
+    let shortest = format!("{magnitude:e}");
+    let shortest_digits = shortest
+        .split_once('e')
+        .map(|(mantissa, _)| mantissa.chars().filter(char::is_ascii_digit).count())
+        .ok_or(CanonicalJsonError::UnsupportedNumber)?;
+    let nearest = format!(
+        "{magnitude:.precision$e}",
+        precision = shortest_digits.saturating_sub(1)
+    );
+    let scientific = if nearest.parse::<f64>() == Ok(magnitude) {
+        nearest
+    } else {
+        shortest
+    };
+    let (mantissa, exponent) = scientific
+        .split_once('e')
+        .ok_or(CanonicalJsonError::UnsupportedNumber)?;
+    let exponent: i64 = exponent
+        .parse()
+        .map_err(|_| CanonicalJsonError::UnsupportedNumber)?;
+    let digits: String = mantissa
+        .chars()
+        .filter(|character| *character != '.')
+        .collect();
+    let digits = digits.trim_end_matches('0');
+    if digits.is_empty() {
+        return Err(CanonicalJsonError::UnsupportedNumber);
+    }
+    // In the specification's terms `x = s * 10^(n - k)` for the `k` digits of
+    // `s`; `{:e}` reports `d.ddd * 10^exponent`, so `n = exponent + 1`.
+    let k = digits.len() as i64;
+    let n = exponent + 1;
+    if k <= n && n <= 21 {
+        text.push_str(digits);
+        text.extend(std::iter::repeat_n('0', (n - k) as usize));
+    } else if 0 < n && n <= 21 {
+        let (integer, fraction) = digits.split_at(n as usize);
+        text.push_str(integer);
+        text.push('.');
+        text.push_str(fraction);
+    } else if -6 < n && n <= 0 {
+        text.push_str("0.");
+        text.extend(std::iter::repeat_n('0', (-n) as usize));
+        text.push_str(digits);
+    } else {
+        let (first, rest) = digits.split_at(1);
+        text.push_str(first);
+        if !rest.is_empty() {
+            text.push('.');
+            text.push_str(rest);
+        }
+        text.push('e');
+        text.push(if n > 0 { '+' } else { '-' });
+        text.push_str(&(n - 1).unsigned_abs().to_string());
+    }
+    Ok(text)
 }
 
 /// ECMAScript `JSON.stringify` string serialization (RFC 8785 section
@@ -250,7 +355,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_only_safe_integers() {
+    fn accepts_numbers_within_the_safe_range_and_refuses_the_rest() {
         assert_eq!(
             canonical(&json!(9_007_199_254_740_991_u64)),
             "9007199254740991"
@@ -260,13 +365,113 @@ mod tests {
             "-9007199254740991"
         );
         assert_eq!(canonical(&json!(0)), "0");
+        assert_eq!(canonical(&json!(20.0_f64)), "20");
+        assert_eq!(canonical(&json!(0.25_f64)), "0.25");
 
-        for unsupported in ["9007199254740992", "-9007199254740992", "1.5", "1.0", "1e3"] {
+        // A fraction or an exponent is the double nearest its text, written as
+        // ECMAScript writes it: the source spelling never survives.
+        for (source, expected) in [
+            ("1.5", "1.5"),
+            ("1.0", "1"),
+            ("1e3", "1000"),
+            ("1E+3", "1000"),
+            ("0.5", "0.5"),
+            ("-0", "0"),
+            ("-0.0", "0"),
+            ("0.1", "0.1"),
+            ("1e-7", "1e-7"),
+            ("0.000001", "0.000001"),
+            ("123.456e1", "1234.56"),
+            ("0.30000000000000001", "0.3"),
+            ("9007199254740991.0", "9007199254740991"),
+            ("-9007199254740991.0", "-9007199254740991"),
+            // Exact binary values halfway between the two nearest shortest
+            // decimals: ECMAScript takes the even one, where Rust's shortest
+            // formatting would round up. Checked against Node's
+            // `Number.prototype.toString`.
+            ("1424953923781206.25", "1424953923781206.2"),
+            ("-1718043322977948.25", "-1718043322977948.2"),
+            ("943656659140389.25", "943656659140389.2"),
+            ("265906862195952.625", "265906862195952.62"),
+            ("204203881532002.125", "204203881532002.12"),
+            ("10833678074757.8125", "10833678074757.812"),
+        ] {
+            let value: Value = serde_json::from_str(source).expect("number should parse");
+            assert_eq!(canonical(&value), expected, "{source}");
+        }
+
+        for unsupported in [
+            "9007199254740992",
+            "-9007199254740992",
+            "9007199254740992.0",
+            "18446744073709551616",
+            "1e16",
+            "1e400",
+            "-1e400",
+        ] {
             let value: Value = serde_json::from_str(unsupported).expect("number should parse");
             assert_eq!(
                 canonical_json_bytes(&value),
                 Err(CanonicalJsonError::UnsupportedNumber),
                 "{unsupported} must not canonicalize"
+            );
+        }
+    }
+
+    #[test]
+    fn a_number_spelled_through_the_private_tag_is_written_from_its_value() {
+        // With `arbitrary_precision`, an object carrying serde_json's private
+        // number tag deserializes into a `Number` holding the tagged text. The
+        // encoder writes the value, never that text, so the tag cannot carry
+        // a spelling of its own into the canonical bytes.
+        let forged: Value = serde_json::from_str(r#"{"$serde_json::private::Number":"1.50"}"#)
+            .expect("the tagged number should parse");
+
+        assert!(forged.is_number());
+        assert_eq!(canonical(&forged), "1.5");
+    }
+
+    #[test]
+    fn serializes_doubles_as_rfc_8785_appendix_b_does() {
+        // RFC 8785 Appendix B: IEEE 754 bit patterns and their JCS text. The
+        // encoder reaches only the in-range rows, but the serializer must
+        // produce every row, or the in-range rows are right by accident.
+        for (bits, expected) in [
+            (0x0000_0000_0000_0000_u64, "0"),
+            (0x8000_0000_0000_0000, "0"),
+            (0x0000_0000_0000_0001, "5e-324"),
+            (0x8000_0000_0000_0001, "-5e-324"),
+            (0x7fef_ffff_ffff_ffff, "1.7976931348623157e+308"),
+            (0xffef_ffff_ffff_ffff, "-1.7976931348623157e+308"),
+            (0x4340_0000_0000_0000, "9007199254740992"),
+            (0xc340_0000_0000_0000, "-9007199254740992"),
+            (0x4430_0000_0000_0000, "295147905179352830000"),
+            (0x44b5_2d02_c7e1_4af5, "9.999999999999997e+22"),
+            (0x44b5_2d02_c7e1_4af6, "1e+23"),
+            (0x44b5_2d02_c7e1_4af7, "1.0000000000000001e+23"),
+            (0x444b_1ae4_d6e2_ef4e, "999999999999999700000"),
+            (0x444b_1ae4_d6e2_ef4f, "999999999999999900000"),
+            (0x444b_1ae4_d6e2_ef50, "1e+21"),
+            (0x3eb0_c6f7_a0b5_ed8c, "9.999999999999997e-7"),
+            (0x3eb0_c6f7_a0b5_ed8d, "0.000001"),
+            (0x41b3_de43_5555_5553, "333333333.3333332"),
+            (0x41b3_de43_5555_5554, "333333333.33333325"),
+            (0x41b3_de43_5555_5555, "333333333.3333333"),
+            (0x41b3_de43_5555_5556, "333333333.3333334"),
+            (0x41b3_de43_5555_5557, "333333333.33333343"),
+            (0xbecb_f647_612f_3696, "-0.0000033333333333333333"),
+            (0x4314_3ff3_c1cb_0959, "1424953923781206.2"),
+        ] {
+            assert_eq!(
+                ecmascript_number(f64::from_bits(bits)).as_deref(),
+                Ok(expected),
+                "{bits:016x}"
+            );
+        }
+        for bits in [0x7fff_ffff_ffff_ffff_u64, 0x7ff0_0000_0000_0000] {
+            assert_eq!(
+                ecmascript_number(f64::from_bits(bits)),
+                Err(CanonicalJsonError::UnsupportedNumber)
             );
         }
     }
@@ -295,9 +500,30 @@ mod tests {
             base,
             semantic_digest("application/vnd.example+json", "0.1.0", &value).expect("digest")
         );
+        let unsupported: Value = serde_json::from_str("1e300").expect("number should parse");
         assert_eq!(
-            semantic_digest("application/json", "0.1.0", &json!(1.5)),
+            semantic_digest("application/json", "0.1.0", &unsupported),
             Err(CanonicalJsonError::UnsupportedNumber)
+        );
+    }
+
+    #[test]
+    fn source_digest_frames_the_exact_bytes() {
+        // Computed independently from the ADR-0004 frame definition:
+        // SHA-256(b"GGDIGEST\0" + framed("source") + framed(media type)
+        //   + framed(schema version) + framed(b'{"b":"x", "a":1}')).
+        let digest = source_digest("application/json", "0.1.0", br#"{"b":"x", "a":1}"#);
+
+        assert_eq!(digest, JSON_SOURCE_DIGEST_VECTOR);
+        // The bytes are hashed as given: other whitespace is another digest,
+        // and so is the semantic frame over the same canonical bytes.
+        assert_ne!(
+            source_digest("application/json", "0.1.0", br#"{"b":"x","a":1}"#),
+            digest
+        );
+        assert_ne!(
+            source_digest("application/json", "0.1.0", br#"{"a":1,"b":"x"}"#),
+            SEMANTIC_DIGEST_VECTOR
         );
     }
 
@@ -324,9 +550,10 @@ mod tests {
         );
     }
 
-    const SOURCE_DIGEST_VECTOR: &str =
-        "sha256:f617734214f1fe485e45f01f36000685233f8e82c0c327cc1099d8cdf1d89c6f";
-
     const SEMANTIC_DIGEST_VECTOR: &str =
         "sha256:124516292c7c3fd03616bc36b37cb73344539155601465c400929d4ab5ca6184";
+    const JSON_SOURCE_DIGEST_VECTOR: &str =
+        "sha256:e6c6b953a0920d9d98079cbf0a70bed945601726e770b7f4b5bf914710cee3eb";
+    const SOURCE_DIGEST_VECTOR: &str =
+        "sha256:f617734214f1fe485e45f01f36000685233f8e82c0c327cc1099d8cdf1d89c6f";
 }

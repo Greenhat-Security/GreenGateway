@@ -12915,7 +12915,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_policy::commit_policy_in#1",
-      "sha256": "e96e0ef6ca0a81b2d9705f0439b89f85a443c84837f792cc1b7732b43865be69",
+      "sha256": "a9fafaada85e9185f00eae23fd2ac4efa7af8077d51a43961b348f8ec203fa78",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
