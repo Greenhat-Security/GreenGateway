@@ -1,0 +1,194 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://greengateway.dev/schemas/gateway-bundle.v1alpha1.schema.json",
+  "title": "GreenGateway Configuration Bundle Manifest",
+  "description": "The bundle.yaml manifest of a greengateway.dev/v1alpha1 configuration bundle: a flat directory holding this manifest, one deployment document, and the policy and tools documents the manifest pins by SHA-256. Validate the manifest's JSON value; the YAML it is written in must also be in the safe subset documented in docs/configuration-bundles.md. This schema is necessary but not sufficient: the gateway's reader is authoritative and additionally checks the file layout, digests, duplicate references, and the referenced documents. A SHA-256 pin is integrity metadata, not authenticity.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "properties": {
+    "apiVersion": {
+      "description": "Exact document version. No other version, prefix, or spelling is accepted.",
+      "const": "greengateway.dev/v1alpha1"
+    },
+    "kind": {
+      "const": "GatewayBundle"
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": {
+          "description": "A lowercase DNS label, as Kubernetes object names use.",
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+        }
+      }
+    },
+    "spec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["deployment"],
+      "properties": {
+        "deployment": {
+          "description": "The GatewayDeployment document, written as YAML (.yaml) or JSON (.json).",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path", "sha256"],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/deploymentFileName"
+            },
+            "sha256": {
+              "$ref": "#/$defs/sha256"
+            }
+          }
+        },
+        "resources": {
+          "description": "Control-plane resources. Each stays its own document under its own schema and production validator; the bundle only pins it.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "policy": {
+              "$ref": "#/$defs/policyResource"
+            },
+            "tools": {
+              "$ref": "#/$defs/toolsResource"
+            },
+            "connections": {
+              "description": "Connections are managed by the gateway's Connections store in this document version and are never bundle content.",
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["source"],
+              "properties": {
+                "source": {
+                  "const": "server"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "fileName": {
+      "description": "A portable bundle file name: lowercase, at most 63 bytes, not ending in a dot, and not a Windows device name. It can name neither a path nor an alternate data stream.",
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,62}$",
+      "not": {
+        "anyOf": [
+          {
+            "pattern": "\\.$"
+          },
+          {
+            "pattern": "^(con|prn|aux|nul|com[0-9]|lpt[0-9])(\\.|$)"
+          }
+        ]
+      }
+    },
+    "deploymentFileName": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/fileName"
+        },
+        {
+          "pattern": "^.+\\.(yaml|json)$"
+        },
+        {
+          "not": {
+            "const": "bundle.yaml"
+          }
+        }
+      ]
+    },
+    "resourceFileName": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/fileName"
+        },
+        {
+          "pattern": "^.+\\.json$"
+        }
+      ]
+    },
+    "sha256": {
+      "description": "SHA-256 of the referenced file's exact bytes, as 64 lowercase hexadecimal digits.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "policyResource": {
+      "oneOf": [
+        {
+          "description": "The bundle is the policy's only writer.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["source", "path", "schema_version", "sha256"],
+          "properties": {
+            "source": {
+              "const": "bundle"
+            },
+            "path": {
+              "$ref": "#/$defs/resourceFileName"
+            },
+            "schema_version": {
+              "description": "Must equal the referenced document's schema_version exactly.",
+              "enum": ["0.1.0"]
+            },
+            "sha256": {
+              "$ref": "#/$defs/sha256"
+            }
+          }
+        },
+        {
+          "description": "The gateway's existing policy store is the writer.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["source"],
+          "properties": {
+            "source": {
+              "const": "server"
+            }
+          }
+        }
+      ]
+    },
+    "toolsResource": {
+      "oneOf": [
+        {
+          "description": "The bundle is the tool definitions' only writer.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["source", "path", "schema_version", "sha256"],
+          "properties": {
+            "source": {
+              "const": "bundle"
+            },
+            "path": {
+              "$ref": "#/$defs/resourceFileName"
+            },
+            "schema_version": {
+              "description": "Must equal the referenced document's schema_version exactly.",
+              "enum": ["0.1.0"]
+            },
+            "sha256": {
+              "$ref": "#/$defs/sha256"
+            }
+          }
+        },
+        {
+          "description": "The gateway's existing tools store is the writer.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["source"],
+          "properties": {
+            "source": {
+              "const": "server"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

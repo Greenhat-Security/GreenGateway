@@ -1057,6 +1057,58 @@ pub(super) async fn connection_delete_endpoint(
     )
 }
 
+/// Refresh a managed OpenAPI catalog, asking the operation gate when the
+/// refreshed document turns out to be converted. Whether it is converted is
+/// known only once it is fetched, so an admitted refresh fetches it again;
+/// the service stopped the first pass before writing or recording anything.
+async fn refresh_managed_openapi_catalog(
+    state: &ConnectionAdminState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    id: &connections::model::ConnectionId,
+    current_etag: &str,
+) -> Result<
+    connections::openapi::OpenApiCatalogPublishResult,
+    Box<(ConnectionRefreshFailure, Response)>,
+> {
+    let mut converted_catalog = connections::openapi::ConvertedCatalogAdmission::NotAsked;
+    loop {
+        let result = state
+            .openapi_catalogs
+            .refresh_with_admission(
+                id.as_str(),
+                current_etag,
+                converted_catalog,
+                &principal.user_id,
+            )
+            .await;
+        match result {
+            Err(connections::openapi::OpenApiCatalogError::ConvertedCatalogNeedsAdmission)
+                if converted_catalog
+                    == connections::openapi::ConvertedCatalogAdmission::NotAsked =>
+            {
+                admit_converted_openapi_catalog(state, parts, principal)
+                    .await
+                    .map_err(|refusal| {
+                        Box::new((
+                            ConnectionRefreshFailure::plain(refusal.reason),
+                            *refusal.response,
+                        ))
+                    })?;
+                converted_catalog = connections::openapi::ConvertedCatalogAdmission::Admitted;
+            }
+            result => {
+                return result.map_err(|error| {
+                    Box::new((
+                        ConnectionRefreshFailure::plain(error.safe_reason()),
+                        openapi_catalog_error_response(error, "refresh"),
+                    ))
+                });
+            }
+        }
+    }
+}
+
 pub(super) async fn connection_refresh_endpoint(
     State(state): State<ConnectionAdminState>,
     Path(raw_id): Path<String>,
@@ -1123,17 +1175,12 @@ pub(super) async fn connection_refresh_endpoint(
                     connection_refresh_error_response(error),
                 )
             }),
-        Some(connections::model::DiscoveryConfig::ManagedOpenapi { .. }) => state
-            .openapi_catalogs
-            .refresh(id.as_str(), current_etag.as_str(), &principal.user_id)
-            .await
-            .map(ConnectionCatalogRefreshResponse::OpenApi)
-            .map_err(|error| {
-                (
-                    ConnectionRefreshFailure::plain(error.safe_reason()),
-                    openapi_catalog_error_response(error, "refresh"),
-                )
-            }),
+        Some(connections::model::DiscoveryConfig::ManagedOpenapi { .. }) => {
+            refresh_managed_openapi_catalog(&state, &parts, &principal, &id, current_etag.as_str())
+                .await
+                .map(ConnectionCatalogRefreshResponse::OpenApi)
+                .map_err(|failure| *failure)
+        }
         None => Err((
             ConnectionRefreshFailure::plain("discovery_not_configured"),
             (
@@ -1591,18 +1638,40 @@ pub(super) async fn connection_openapi_overlay_put_endpoint(
     };
     let secrets_write_authorized =
         rbac_state.principal_has_permission(&principal, ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION);
-    match state
-        .openapi_catalogs
-        .put_overlay_with_authorization(
-            &raw_id,
-            &expected_etag,
-            &document,
-            params.allow_unresolved_enum_sources,
-            secrets_write_authorized,
-            &principal.user_id,
-        )
-        .await
-    {
+    // At most two passes, as for registration: an overlay over a converted
+    // catalog asks the operation gate before anything is written.
+    let mut converted_catalog = connections::openapi::ConvertedCatalogAdmission::NotAsked;
+    let updated = loop {
+        let result = state
+            .openapi_catalogs
+            .put_overlay_with_authorization(
+                &raw_id,
+                &expected_etag,
+                &document,
+                params.allow_unresolved_enum_sources,
+                secrets_write_authorized,
+                converted_catalog,
+                &principal.user_id,
+            )
+            .await;
+        if converted_catalog == connections::openapi::ConvertedCatalogAdmission::NotAsked
+            && matches!(
+                result,
+                Err(connections::openapi::OpenApiOverlayOperationError::Catalog(
+                    connections::openapi::OpenApiCatalogError::ConvertedCatalogNeedsAdmission
+                ))
+            )
+        {
+            if let Err(refusal) = admit_converted_openapi_catalog(&state, &parts, &principal).await
+            {
+                return *refusal.response;
+            }
+            converted_catalog = connections::openapi::ConvertedCatalogAdmission::Admitted;
+            continue;
+        }
+        break result;
+    };
+    match updated {
         Ok(result) => {
             emit_managed_openapi_catalog_changed(&state, &parts, &principal, &result.catalog);
             overlay_mutation_response(result)
@@ -1648,6 +1717,87 @@ pub(super) async fn connection_openapi_overlay_delete_endpoint(
             overlay_mutation_response(result)
         }
         Err(error) => openapi_overlay_operation_error_response(error, "overlay delete"),
+    }
+}
+
+/// The operation gate refused to store a converted managed OpenAPI catalog.
+/// Nothing was written; `reason` is the refusal's stable code.
+pub(super) struct ConvertedCatalogRefusal {
+    pub(super) reason: &'static str,
+    pub(super) response: Box<Response>,
+}
+
+/// Ask the cluster's operation gate before storing a managed OpenAPI catalog
+/// generated from a Swagger 2.0 document (issue #443).
+///
+/// The catalog service answers `ConvertedCatalogNeedsAdmission`, before it
+/// writes or records anything, only when it gates converted catalogs
+/// (cluster mode) and only for a converted document, so an OpenAPI 3.x
+/// document never asks. The write is the registered operation
+/// `connections.openapi_swagger2_catalog`: it proceeds only while every live
+/// member, draining ones included, advertises `openapi_swagger2_catalogs`,
+/// because a member built before the conversion cannot regenerate from the
+/// stored document. The gate reads the roster for every such write and logs
+/// and audits each refusal (`cluster.operation_refused`). A deployment with
+/// no roster to ask refuses rather than admits.
+pub(super) async fn admit_converted_openapi_catalog(
+    state: &ConnectionAdminState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+) -> Result<(), ConvertedCatalogRefusal> {
+    #[cfg(feature = "postgres")]
+    {
+        let requirement = &storage::compatibility::OPENAPI_SWAGGER2_CATALOGS;
+        let Some(membership) = state.membership.as_ref() else {
+            tracing::error!(
+                operation = requirement.operation,
+                "a gated managed OpenAPI write has no roster to ask; the write is refused"
+            );
+            let refusal = storage::compatibility::OperationRefusal::RosterUnavailable;
+            return Err(ConvertedCatalogRefusal {
+                reason: refusal.reason(),
+                response: Box::new(operation_refused(&refusal)),
+            });
+        };
+        let request = cluster_membership::GatedWriteRequest {
+            request_id: client_ip::request_id(&parts.headers, &parts.extensions),
+            source_ip: client_ip::canonical_client_ip(
+                &parts.headers,
+                &parts.extensions,
+                &state.client_ip_policy,
+            ),
+            actor: Some(auth::actor_from_principal(principal)),
+        };
+        membership
+            .admit_operation(requirement, &state.audit, &request)
+            .await
+            .map(|_| ())
+            .map_err(|refusal| ConvertedCatalogRefusal {
+                reason: refusal.reason(),
+                response: Box::new(operation_refused(&refusal)),
+            })
+    }
+    // A build without cluster mode has no roster, and its catalog service
+    // never gates outside tests; refuse exactly as a roster-less cluster
+    // deployment does.
+    #[cfg(not(feature = "postgres"))]
+    {
+        let _ = (state, parts, principal);
+        tracing::error!("a gated managed OpenAPI write has no roster to ask; the write is refused");
+        Err(ConvertedCatalogRefusal {
+            reason: "roster_unavailable",
+            response: Box::new(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({
+                        "error": "no cluster roster can be read, so no live member can be shown to \
+                                  support the operation; nothing was written",
+                        "reason": "roster_unavailable",
+                    })),
+                )
+                    .into_response(),
+            ),
+        })
     }
 }
 
@@ -1715,21 +1865,48 @@ pub(super) async fn connection_openapi_register_endpoint(
         })
         .collect::<Vec<_>>();
 
-    match state
-        .openapi_catalogs
-        .register(
-            id.as_str(),
-            current_etag.as_str(),
-            requested.expected_spec_revision,
-            requested.expected_catalog_revision,
-            &requested.spec_digest,
-            &requested.spec,
-            &requested.selected_tool_names,
-            &confirmations,
-            &principal.user_id,
-        )
-        .await
-    {
+    // At most two passes: the second only after the operation gate admitted
+    // a converted document the first pass stopped at, before writing.
+    let mut converted_catalog = connections::openapi::ConvertedCatalogAdmission::NotAsked;
+    let registered = loop {
+        let result = state
+            .openapi_catalogs
+            .register_with_admission(
+                id.as_str(),
+                current_etag.as_str(),
+                requested.expected_spec_revision,
+                requested.expected_catalog_revision,
+                &requested.spec_digest,
+                &requested.spec,
+                &requested.selected_tool_names,
+                &confirmations,
+                converted_catalog,
+                &principal.user_id,
+            )
+            .await;
+        if converted_catalog == connections::openapi::ConvertedCatalogAdmission::NotAsked
+            && matches!(
+                result,
+                Err(connections::openapi::OpenApiCatalogError::ConvertedCatalogNeedsAdmission)
+            )
+        {
+            if let Err(refusal) = admit_converted_openapi_catalog(&state, &parts, &principal).await
+            {
+                emit_managed_openapi_catalog_rejected(
+                    &state,
+                    &parts,
+                    &principal,
+                    &id,
+                    refusal.reason,
+                );
+                return with_etag(*refusal.response, current_etag.as_str());
+            }
+            converted_catalog = connections::openapi::ConvertedCatalogAdmission::Admitted;
+            continue;
+        }
+        break result;
+    };
+    match registered {
         Ok(result) => {
             emit_managed_openapi_catalog_changed(&state, &parts, &principal, &result);
             (
@@ -1830,14 +2007,13 @@ pub(super) fn parse_connection_write_body(
     let mut candidate = serde_json::from_slice::<Value>(body)
         .map_err(|_| Box::new(bad_request("invalid connection JSON")))?;
     retain_hidden_connection_bindings(&mut candidate, current)?;
-    // The admin UI does not edit `caller_assertion`, and the safe read shows
-    // only whether its signing key is bound, so a routine edit (a display
-    // name, the enabled flag, a secret rotation) cannot send the block back.
-    // Reading that omission as removal would quietly lift the refusal of a
-    // Connection that cannot yet attest its caller and serve its calls
-    // unattested. An omitted block is therefore kept, and removing it takes
-    // an explicit `"caller_assertion": null`. The body is known to be an
-    // object here, so a missing key and an explicit `null` are distinct.
+    // The admin UI sends `caller_assertion` only when the operator edits the
+    // block, so a routine edit (a display name, the enabled flag, a secret
+    // rotation) leaves it out. Reading that omission as removal would quietly
+    // stop attesting the caller and serve the Connection's calls unattested.
+    // An omitted block is therefore kept, and removing it takes an explicit
+    // `"caller_assertion": null`. The body is known to be an object here, so a
+    // missing key and an explicit `null` are distinct.
     let caller_assertion_omitted = candidate.get("caller_assertion").is_none();
     let mut candidate = serde_json::from_value::<connections::model::ConnectionWrite>(candidate)
         .map_err(|_| Box::new(bad_request("invalid connection JSON")))?;
@@ -1878,6 +2054,25 @@ pub(super) fn has_explicit_connection_binding_intent(candidate: &Value) -> bool 
                 tls.contains_key("ca_bundle_alias")
                     || tls.contains_key("client_certificate_id")
                     || tls.contains_key("client_private_key_id")
+            })
+        // A caller assertion's key aliases are hidden like every other
+        // binding. Naming one is secret authority even when it matches what is
+        // stored, or a principal without it could learn a hidden alias by
+        // sending guesses and seeing which save goes through unchanged.
+        || candidate
+            .get("caller_assertion")
+            .and_then(Value::as_object)
+            .is_some_and(|assertion| {
+                assertion.contains_key("signing_key_id")
+                    || assertion
+                        .get("published_keys")
+                        .and_then(Value::as_array)
+                        .is_some_and(|keys| {
+                            keys.iter().any(|key| {
+                                key.as_object()
+                                    .is_some_and(|key| key.contains_key("signing_key_id"))
+                            })
+                        })
             })
 }
 
@@ -1977,6 +2172,13 @@ pub(super) fn retain_hidden_connection_bindings(
         }
     }
 
+    if let Some(assertion) = object
+        .get_mut("caller_assertion")
+        .and_then(Value::as_object_mut)
+    {
+        retain_hidden_caller_assertion_keys(assertion, current.caller_assertion.as_ref())?;
+    }
+
     let tls = object
         .entry("tls")
         .or_insert_with(|| Value::Object(serde_json::Map::new()))
@@ -2007,6 +2209,78 @@ pub(super) fn retain_hidden_connection_bindings(
         current.tls.client_private_key_id.as_deref(),
         true,
     )
+}
+
+/// Keeps the hidden alias of each caller-assertion key a replacement marks
+/// `"signing_key_configured": true`: the signing key and every entry in
+/// `published_keys`.
+///
+/// A marked key is matched to the stored key with the same `kid` and
+/// algorithm, wherever that key is in the stored block, rather than to the key
+/// in the same position. A rotation moves a key between `signing_key_id` and
+/// `published_keys` in one `PUT` (see the operator guide), and a `kid` names
+/// exactly one key, so keeping the alias stored under it is the only reading
+/// that cannot put other key material behind a published `kid`. A marker that
+/// matches no stored key is refused rather than ignored, and `false` is
+/// refused because a key cannot be unbound: leave the key out, or remove the
+/// block, instead.
+fn retain_hidden_caller_assertion_keys(
+    assertion: &mut serde_json::Map<String, Value>,
+    current: Option<&connections::model::CallerAssertionSettings>,
+) -> ResponseResult<()> {
+    retain_hidden_caller_assertion_key(assertion, current)?;
+    if let Some(keys) = assertion
+        .get_mut("published_keys")
+        .and_then(Value::as_array_mut)
+    {
+        for key in keys.iter_mut() {
+            let key = key.as_object_mut().ok_or_else(|| {
+                Box::new(bad_request(
+                    "caller_assertion published_keys entries must be objects",
+                ))
+            })?;
+            retain_hidden_caller_assertion_key(key, current)?;
+        }
+    }
+    Ok(())
+}
+
+fn retain_hidden_caller_assertion_key(
+    key: &mut serde_json::Map<String, Value>,
+    current: Option<&connections::model::CallerAssertionSettings>,
+) -> ResponseResult<()> {
+    let Some(marker) = take_redacted_marker(key, "signing_key_configured")? else {
+        return Ok(());
+    };
+    if key.contains_key("signing_key_id") {
+        return Err(Box::new(bad_request(
+            "redacted connection binding markers cannot be combined with explicit binding IDs",
+        )));
+    }
+    if !marker {
+        return Err(Box::new(bad_request(
+            "a caller assertion key cannot be cleared; leave the key out instead",
+        )));
+    }
+    let kid = key.get("kid").and_then(Value::as_str);
+    let algorithm = key.get("algorithm").cloned().and_then(|algorithm| {
+        serde_json::from_value::<connections::model::CallerAssertionAlgorithm>(algorithm).ok()
+    });
+    let stored = current.and_then(|current| {
+        current
+            .keys()
+            .find(|stored| Some(stored.kid) == kid && Some(stored.algorithm) == algorithm)
+    });
+    let Some(stored) = stored else {
+        return Err(Box::new(bad_request(
+            "redacted connection binding marker does not match the current resource",
+        )));
+    };
+    key.insert(
+        "signing_key_id".to_owned(),
+        Value::String(stored.signing_key_id.to_owned()),
+    );
+    Ok(())
 }
 
 pub(super) fn retain_hidden_binding(

@@ -107,20 +107,27 @@ pub(crate) const LEASE_SCOPE_MAINTENANCE: &str = "maintenance";
 /// [`LEASE_SCOPE_MAINTENANCE`].
 pub(crate) const LEASE_SCOPE_DISCOVERY_PROJECTOR: &str = "discovery_projector";
 
+/// The authority-event dispatcher's lease scope, as a metric label. See
+/// [`LEASE_SCOPE_MAINTENANCE`].
+pub(crate) const LEASE_SCOPE_AUTHORITY_EVENT_DISPATCHER: &str = "authority_event_dispatcher";
+
 /// The whole vocabulary of `greengateway_cluster_lease_age_seconds`'s
-/// `scope` label: the two *singleton* scopes and nothing else.
+/// `scope` label: the three *singleton* scopes and nothing else.
 ///
 /// Per-tool leases are scoped `tool:<name>`, and a tool name is
 /// control-plane data an operator adds and removes -- labelling by it
-/// would mint and abandon a time series per tool. The singletons are two,
-/// fixed, and the ones an operator alerts on ("nobody is leading").
+/// would mint and abandon a time series per tool. The singletons are
+/// three, fixed, and the ones an operator alerts on ("nobody is leading").
 ///
 /// Read by the registry label audit
 /// (`the_ha_metric_registry_never_labels_by_a_caller_influenced_value`);
-/// the two callers pass their own constant directly.
+/// the three callers pass their own constant directly.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const LEASE_SCOPE_LABELS: [&str; 2] =
-    [LEASE_SCOPE_MAINTENANCE, LEASE_SCOPE_DISCOVERY_PROJECTOR];
+pub(crate) const LEASE_SCOPE_LABELS: [&str; 3] = [
+    LEASE_SCOPE_MAINTENANCE,
+    LEASE_SCOPE_DISCOVERY_PROJECTOR,
+    LEASE_SCOPE_AUTHORITY_EVENT_DISPATCHER,
+];
 
 /// The renewal reported the lease gone; the holder must stop its work.
 pub(crate) const LEASE_FAILURE_LOST: &str = "lost";
@@ -159,7 +166,7 @@ pub(crate) fn record_lease_failure(kind: &'static str) {
 /// the deployment's single leader; an age that resets repeatedly is a
 /// leadership that keeps changing hands, which is the shape of a lease TTL
 /// too short for the authority's latency.
-#[cfg(feature = "postgres")] // the two singletons exist only in cluster mode
+#[cfg(feature = "postgres")] // the singletons exist only in cluster mode
 pub(crate) fn record_lease_age(scope: &'static str, age: Duration) {
     ::metrics::gauge!(crate::metrics::CLUSTER_LEASE_AGE_SECONDS, "scope" => scope)
         .set(age.as_secs_f64());
@@ -353,10 +360,16 @@ mod metric_label_tests {
             crate::discovery::projector::PROJECTOR_LEASE_SCOPE.replace('-', "_"),
             "the projector label must name the projector lease scope"
         );
+        #[cfg(feature = "postgres")]
+        assert_eq!(
+            LEASE_SCOPE_AUTHORITY_EVENT_DISPATCHER,
+            crate::authority_events::dispatcher::DISPATCHER_LEASE_SCOPE.replace('-', "_"),
+            "the dispatcher label must name the dispatcher lease scope"
+        );
         assert_eq!(
             LEASE_SCOPE_LABELS.len(),
-            2,
-            "a third singleton scope must be added to the label vocabulary too"
+            3,
+            "a fourth singleton scope must be added to the label vocabulary too"
         );
     }
 

@@ -267,7 +267,9 @@ evidence for secret material, and replaces a replica, on every pull request.
 That rehearsal remains separate from the target-platform production exercise in
 [issue #389](https://github.com/Greenhat-Security/GreenGateway/issues/389),
 which must prove real alert delivery to the assigned responder and measure
-detection, notification, acknowledgement and recovery times. Neither passing
+detection, notification, acknowledgement and recovery times; the
+[qualification kit's alert drill](qualification.md#8-alert-delivery) records
+routing and rule timing for that exercise. Neither passing
 `promtool` fixtures nor a disposable local rehearsal completes those operational
 recovery objectives.
 

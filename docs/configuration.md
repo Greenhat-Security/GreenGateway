@@ -1295,7 +1295,7 @@ The executor supports manual and managed-OpenAPI HTTP targets plus refreshed man
 
 Managed OpenAPI catalog flow uses the Connection-scoped endpoints, not an arbitrary-fetch API:
 
-- `POST /v1{ADMIN_PREFIX}/connections/{id}/openapi/preview` requires `admin:tools:read` and accepts `{"spec":"<OpenAPI 3.x JSON or YAML>"}`. It parses and validates the bounded document without persistence, network access, or tool execution and returns the current Connection ETag, a SHA-256 specification digest, current spec/catalog revisions, typed generated definitions, required security confirmations, incompatibilities, deterministic operation-ID fallbacks, and skipped operations.
+- `POST /v1{ADMIN_PREFIX}/connections/{id}/openapi/preview` requires `admin:tools:read` and accepts `{"spec":"<OpenAPI 3.x or Swagger 2.0 JSON or YAML>"}`. It parses and validates the bounded document without persistence, network access, or tool execution and returns the current Connection ETag, a SHA-256 specification digest, current spec/catalog revisions, typed generated definitions, required security confirmations, incompatibilities, deterministic operation-ID fallbacks, and skipped operations. A Swagger 2.0 document is converted to OpenAPI 3.0 first and the response adds a `conversion` report of its warnings. In cluster mode, registering, refreshing or putting an overlay over a catalog converted from Swagger 2.0 waits for the operation gate (`409 capability_not_advertised` while a replica built before Swagger 2.0 import is live); see [Importing Swagger 2.0 documents](connections/operator-guide.md#importing-swagger-20-documents).
 - `POST /v1{ADMIN_PREFIX}/connections/{id}/openapi/register` requires `admin:tools:write` and the exact Connection `If-Match`. The request repeats the exact specification and preview digest/revisions, explicitly names selected tools and security schemes, and fails stale rather than silently regenerating against a changed Connection or catalog. A successful transaction persists the specification and selected catalog, reconciles dependencies, publishes one complete runtime snapshot, and returns the safe catalog result.
 - `POST /v1{ADMIN_PREFIX}/connections/{id}/refresh` later fetches the registered Connection discovery path using the stored target/authentication/TLS policy and re-applies that explicit registration binding. Preview/register bodies are capped by `MAX_BODY_SIZE` and the 2 MiB managed-spec limit plus a bounded JSON envelope. Unknown request fields and ambiguous or unsupported OpenAPI security are rejected.
 
@@ -2306,7 +2306,7 @@ Format and validation: must parse as a `u64` millisecond duration of at least `3
 
 ### CLUSTER_MAINTENANCE_INTERVAL_MS
 
-How often, in milliseconds, the replica holding the maintenance lease runs one bounded pass of the singleton housekeeping jobs (issue #241, PR 13): JWT revocation cleanup, rate-limit idle sweep, pending-login prune, stale member sweep, PostgreSQL audit retention (when `AUDIT_POSTGRES_RETENTION_DAYS` is set), and execution-lease reaping, in that fixed order, each bounded to 1000 rows per step. A replica that does not hold the lease retries it with a jittered backoff of a quarter of this interval plus or minus up to an eighth, the offset fixed by its instance ID, so a leader's crash is followed by one staggered takeover rather than a stampede.
+How often, in milliseconds, the replica holding the maintenance lease runs one bounded pass of the singleton housekeeping jobs (issue #241, PR 13): JWT revocation cleanup, rate-limit idle sweep, pending-login prune, admin session prune, stale member sweep, PostgreSQL audit retention (when `AUDIT_POSTGRES_RETENTION_DAYS` is set), authority-event retention, and execution-lease reaping, in that fixed order, each bounded to 1000 rows per step. A replica that does not hold the lease retries it with a jittered backoff of a quarter of this interval plus or minus up to an eighth, the offset fixed by its instance ID, so a leader's crash is followed by one staggered takeover rather than a stampede.
 
 Default: `60000`
 
@@ -2343,6 +2343,58 @@ Whether the cluster status API may report this replica's own hostname (issue #24
 Default: `false`
 
 Format and validation: must parse as a boolean. Honoured in both modes -- unlike the other cluster settings it is not rejected under `STATE_BACKEND=sqlite`, because standalone mode serves the same endpoint and has the same hostname to report. The value is still bounded on the way out: a hostname longer than 253 characters, or carrying anything but ASCII letters, digits, `-`, `.`, or `_`, is dropped whole and the field reports `null`, so an opted-in deployment cannot turn the field into a channel for arbitrary text.
+
+### AUTHORITY_EVENT_SINK
+
+Where the authority-event dispatcher delivers committed authority evidence (issue #425, PR 3; see [Durable delivery](authority-evidence.md#durable-delivery)). In cluster mode every committed Connection delete, service-token rotate or revoke, and effective JWT revoke is journaled in `greengateway.authority_event_journal` in its own transaction, whatever this setting says. With a sink configured, one replica at a time -- whichever holds the `authority-event-dispatcher` execution lease -- reads the journal after its durable cursor in batches of at most 100, projects each row into an `authority_event_delivery.v1` record ([schema](schemas/authority_event_delivery.v1.schema.json)) whose actor and resource are keyed safe references, hands the batch to the sink, and advances the cursor only after the sink accepted it. Delivery is at least once: a crash between acceptance and the cursor advance delivers the batch again with the same `event_id`s, so a consumer deduplicates on `(authority_id, event_id)`. A failing sink is retried with exponential backoff from 0.5 s to 60 s; nothing is skipped.
+
+- `none`: no dispatcher runs. Events are still journaled and still count against `AUTHORITY_EVENT_JOURNAL_CAPACITY`.
+- `log`: one structured `INFO` line per event under the tracing target `greengateway::authority_event`, the record's JSON in the `authority_event` field. Accepted means handed to the process's log writer; it is a reference sink for wiring a log pipeline, not a durable store.
+- `file`: JSON lines appended to `AUTHORITY_EVENT_FILE`, with `fsync` before a batch counts as delivered.
+
+Default: `none`
+
+Format and validation: exactly `none`, `log` or `file`. A sink other than `none` requires `AUTHORITY_PSEUDONYM_KEY_ALIAS`. Cluster mode only: rejected when `STATE_BACKEND=sqlite`, which has no journal and no dispatcher. Every replica of a deployment must agree on it: the sink kind is part of the static-configuration fingerprint.
+
+### AUTHORITY_EVENT_FILE
+
+The file the `file` sink appends to. Startup opens it once, creating it owner-only (`0600` on Unix) if missing, and refuses to start if it cannot be opened for appending; after that it is reopened for every batch, so an operator can rotate it by renaming it and letting the gateway create the next one. A crash in the middle of a write can leave one partial final line; the next batch starts on a fresh line, so a reader skips at most that line, whose events are delivered again in full. The gateway never truncates or deletes the file.
+
+Default: (empty)
+
+Format and validation: a non-empty path. Required when `AUTHORITY_EVENT_SINK=file` and rejected otherwise. Cluster mode only.
+
+### AUTHORITY_PSEUDONYM_KEY_ALIAS
+
+The secret alias of the current authority pseudonym key, the key every delivered event's safe references are derived under (see [Keyed safe references](authority-evidence.md#keyed-safe-references)). It names the key; the material stays in the secret provider. The alias is resolved at startup through the configured operator aliases and external secret providers under the `authority_pseudonym_key` purpose, which the encrypted local store neither holds nor resolves, and the material must be exactly 64 hexadecimal characters. A missing alias, a provider failure, or material of any other shape fails startup: there is no unkeyed mode and no fallback key. On load the gateway logs and audits the key IDs (`authority_event.keyring_loaded`), never the key. No Connection may bind this alias, so the key can never be sent upstream: a create or replace that binds it is refused with `422 secret_purpose_conflict`, and startup fails while a stored Connection binds it.
+
+Default: (empty)
+
+Format and validation: a secret alias ID of 1 to 128 ASCII letters, digits, `.`, `_` or `-`, starting with a letter or digit. Required when `AUTHORITY_EVENT_SINK` is `log` or `file`, rejected when it is `none`. Cluster mode only. The alias is part of the static-configuration fingerprint, so replicas naming different aliases are held at the fingerprint door. The gateway does not compare the key material behind one alias across replicas: every replica must resolve it to the same key, since two keys would give one identity two unrelated references. Each replica logs and audits the key ID it loaded, so a mismatch is visible as two key IDs for one authority ID.
+
+### AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS
+
+The secret alias of the previous pseudonym key while a rotation's dual-key window is open. It is resolved and validated like the current key but only verifies; every new reference uses the current key. Close the window by unsetting it.
+
+Default: (empty)
+
+Format and validation: as `AUTHORITY_PSEUDONYM_KEY_ALIAS`; must name a different alias, and the two must resolve to different keys. Rejected when `AUTHORITY_EVENT_SINK` is `none`. Cluster mode only.
+
+### AUTHORITY_EVENT_JOURNAL_CAPACITY
+
+The most authority events the journal may retain, delivered or not. Each journaled event reserves one unit inside the mutation's own transaction; when the journal is full, the reservation fails and the whole mutation rolls back and is answered `503`, with `greengateway_authority_event_capacity_refusals_total` counting it. An accepted event is never evicted to admit a new one. Room comes back only when retention prunes delivered events, so the operator actions at capacity are: restore delivery (fix the sink so the cursor advances), wait for or shorten `AUTHORITY_EVENT_RETENTION_HOURS`, or raise this value. Note that a refused service-token revoke or JWT revoke leaves the credential live until it can commit; watch `greengateway_authority_event_journal_retained` against `greengateway_authority_event_journal_capacity` well before they meet. Every replica writes the value to the journal's state row at startup.
+
+Default: `1000000`
+
+Format and validation: an integer between `1` and `1000000000`. A value below the number already retained admits nothing until retention frees room. Cluster mode only; part of the static-configuration fingerprint.
+
+### AUTHORITY_EVENT_RETENTION_HOURS
+
+How long, in hours, a delivered authority event stays in the journal. The maintenance leader's `authority_event_retention` job deletes a bounded batch (1000 rows) per pass of journal rows that are at or below the dispatcher's cursor and journaled at least this long ago, and gives their capacity back. An undelivered event is never pruned once a dispatcher has claimed the cursor, whatever its age. Before any dispatcher has ever run, there is no required consumer and events older than this are pruned by age alone. The evidence tables the journal indexes (`connection_change_evidence`, `service_token_change_evidence`, `jwt_revocation_evidence`) are never pruned. `0` prunes delivered events on the next pass.
+
+Default: `168`
+
+Format and validation: an integer hour count of at most `87600`. Cluster mode only; part of the static-configuration fingerprint.
 
 ## Production Deployment And Migration
 

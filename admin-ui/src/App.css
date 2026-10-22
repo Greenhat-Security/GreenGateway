@@ -1080,6 +1080,23 @@ textarea:focus-visible {
   justify-self: start;
 }
 
+.connection-caller-assertion-options {
+  display: grid;
+  gap: var(--gh-ref-space-2);
+  min-width: 0;
+  margin: 0;
+  border: 0;
+  padding: 0;
+}
+
+.connection-caller-assertion-options legend {
+  margin-bottom: var(--gh-ref-space-2);
+  padding: 0;
+  color: var(--gh-sys-fg);
+  font-size: var(--gh-type-body-sm);
+  font-weight: 650;
+}
+
 .connection-enable-confirmation {
   align-items: flex-start;
   border: 1px solid var(--gh-sys-warning);

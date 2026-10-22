@@ -913,6 +913,19 @@ jobs:
         with:
           rust: none
           node: 'true'
+      # Static checks of the production qualification kit
+      # (docs/deployment/qualification.md): its fixtures, the shipped example
+      # manifests it judges, the example load profile and the evidence
+      # template. Offline and loopback only; no cluster and no image needed.
+      - name: Check the production qualification kit
+        shell: bash
+        run: |
+          set -eu
+          python -m unittest discover -s scripts -p test_qualification.py -v
+          node scripts/run-load-suite.mjs --profile docs/deployment/qualification/load-profile.example.json --validate-only
+          python scripts/qualification.py netpol --cases docs/deployment/qualification/netpol-cases.example.json --plan > /dev/null
+          python scripts/qualification.py evidence docs/deployment/qualification/evidence-template.json
+
       # Compose names the gateway service's image `<project>-gateway`; the
       # project is pinned below so that name is fixed, and `--no-build` runs
       # exactly this run's production image (Compose's build of the same
