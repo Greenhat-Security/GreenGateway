@@ -1041,7 +1041,10 @@ class WorkflowTests(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8").replace("\r\n", "\n")
         job = re.search(r"\n  ha-compose-example:\n(.*?)(?=\n  [a-z][a-z0-9-]*:\n|\Z)", workflow, re.DOTALL)
         self.assertIsNotNone(job)
-        self.assertNotRegex(job.group(1), r"\n    if:")
+        # The job waits for this run's image and must still run when that
+        # build did not succeed, so its only condition is `always()`.
+        conditions = re.findall(r"\n    if: (.*)", job.group(1))
+        self.assertEqual(conditions, ["${{ always() }}"])
         steps = re.split(r"\n      - ", job.group(1))
         names = [step.split("\n", 1)[0] for step in steps]
         index = names.index("name: Check the shipped examples' PostgreSQL connection budgets")
@@ -1052,7 +1055,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("python -m unittest discover -s scripts -p test_pool_sizing.py -v", step)
         self.assertIn("--profile bootstrap --profile import config --format json", step)
         self.assertIn(f"python scripts/pool_sizing.py examples --rendered {COMPOSE_EXAMPLE}=", step)
-        self.assertLess(index, names.index("name: Build the production image"))
+        self.assertLess(index, names.index("name: Load the production image"))
 
 
 if __name__ == "__main__":

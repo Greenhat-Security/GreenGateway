@@ -1,0 +1,62 @@
+name: This run's prebuilt binaries
+description: >-
+  Unpack an archive of executables a producer job built earlier in this run,
+  after requiring that job's success and only once the archive's SHA-256
+  matches the one that job recorded.
+inputs:
+  producer:
+    description: The producing job's id, for messages
+    required: true
+  producer-result:
+    description: needs.<producer>.result of the calling job
+    required: true
+  archive:
+    description: The artifact name; the archive inside it is <archive>.tar.zst
+    required: true
+  sha256:
+    description: The SHA-256 of the archive, from the producer's outputs
+    required: true
+  destination:
+    description: Directory the archive unpacks into
+    required: true
+runs:
+  using: composite
+  steps:
+    # A consumer runs under `always()`, so it reaches this step even when the
+    # build failed, was skipped or was cancelled; only `success` continues.
+    - name: Require the producer
+      shell: bash
+      env:
+        PRODUCER: ${{ inputs.producer }}
+        PRODUCER_RESULT: ${{ inputs.producer-result }}
+      run: |
+        if [ "${PRODUCER_RESULT}" != "success" ]; then
+          echo "::error::${PRODUCER} completed with result '${PRODUCER_RESULT}'"
+          exit 1
+        fi
+    - name: Download this run's archive
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      with:
+        name: ${{ inputs.archive }}
+        path: ${{ runner.temp }}/${{ inputs.archive }}
+    - name: Verify and unpack the archive
+      shell: bash
+      env:
+        ARCHIVE_NAME: ${{ inputs.archive }}
+        EXPECTED_SHA256: ${{ inputs.sha256 }}
+        DESTINATION: ${{ inputs.destination }}
+      run: |
+        set -euo pipefail
+        if ! [[ "${EXPECTED_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
+          echo "::error::the producer recorded no SHA-256 for ${ARCHIVE_NAME}"
+          exit 1
+        fi
+        archive="${RUNNER_TEMP}/${ARCHIVE_NAME}/${ARCHIVE_NAME}.tar.zst"
+        actual="$(sha256sum "${archive}" | cut -d ' ' -f 1)"
+        if [ "${actual}" != "${EXPECTED_SHA256}" ]; then
+          echo "::error::${ARCHIVE_NAME} is ${actual}, not the ${EXPECTED_SHA256} its producer recorded"
+          exit 1
+        fi
+        mkdir -p "${DESTINATION}"
+        tar --zstd -xf "${archive}" -C "${DESTINATION}"
+        echo "Unpacked ${ARCHIVE_NAME} (${actual}) into ${DESTINATION}"

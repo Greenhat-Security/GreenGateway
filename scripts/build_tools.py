@@ -13,6 +13,88 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
 EXACT = re.compile(r"\d+\.\d+\.\d+")
+# A `run` command that builds an image: `docker build`, `docker buildx build`,
+# `docker image build`, `compose build` or `compose ... --build`. Compose's
+# `--no-build` is not a build.
+IMAGE_BUILD = re.compile(
+    r"\bdocker\s+(?:buildx\s+|image\s+)?build\b|\bcompose\b[^\n]*?\s(?:--build|build)\b")
+# The only condition under which a pull-request-triggered workflow may write
+# a cache: a push to main, whose code is reviewed. A pull request can then
+# read main's caches but never write one a later run would restore.
+TRUSTED_CACHE_WRITE = "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}"
+# A job may also restore a cache it never writes: one that reads another
+# job's dependency cache but builds something that cache must not hold.
+NEVER_CACHE_WRITE = "false"
+# The one other gate a reusable-workflow call may have: it keeps the call off
+# pull requests, and the called workflow (which must then be one of ours) is
+# held to these same rules, so a tag push cannot write a cache through it.
+PUSH_ONLY = "github.event_name == 'push'"
+# Setup actions that save a cache unless told `cache: false`.
+SETUP_CACHES_BY_DEFAULT = ("actions/setup-go@",)
+
+
+def pull_request_triggered(doc):
+    events = doc.get("on", {})
+    names = events if isinstance(events, list) else [events] if isinstance(events, str) else list(events)
+    return bool({"pull_request", "pull_request_target"} & set(names))
+
+
+def action_name(step):
+    # GitHub resolves owners, repositories and input names without regard to
+    # case, so `Actions/Cache@...` is actions/cache and `Save-If` is save-if.
+    return str(step.get("uses", "")).strip().lower()
+
+
+def expression(condition):
+    text = str(condition).strip()
+    if text.startswith("${{") and text.endswith("}}"):
+        text = text[3:-2].strip()
+    return text
+
+
+def cache_write_errors(where, steps):
+    errors = []
+    for step in steps:
+        use, given = action_name(step), step.get("with") or {}
+        opts = {str(key).strip().lower(): str(value) for key, value in given.items()}
+        if len(opts) != len(given):
+            errors.append(f"{where}: step inputs may not differ only in case")
+        env = step.get("env") or {}
+        commands = "\n".join([str(step.get("run", ""))] + [str(v) for v in (env.values() if isinstance(env, dict) else [env])])
+        if use.startswith("swatinem/rust-cache@") and opts.get("save-if") not in (TRUSTED_CACHE_WRITE, NEVER_CACHE_WRITE):
+            errors.append(f"{where}: Rust caches may be saved only from main pushes")
+        if use.startswith(("actions/cache@", "actions/cache/save@")):
+            errors.append(f"{where}: pull request jobs may only restore caches")
+        if use.startswith("actions/setup-"):
+            default = "true" if use.startswith(SETUP_CACHES_BY_DEFAULT) else "false"
+            if opts.get("cache", default).strip().lower() != "false":
+                errors.append(f"{where}: setup actions may not save caches in pull request jobs")
+        if (use.startswith("docker/") and ("cache-to" in opts or any("cache-to" in v.lower() for v in opts.values()))) \
+                or "cache-to" in commands.lower():
+            errors.append(f"{where}: pull request jobs may not export image build caches")
+    return errors
+
+
+def reusable_call_errors(where, job, root, seen=()):
+    """A job-level `uses:` in a pull request workflow, which runs another workflow's jobs."""
+    called, gate = str(job.get("uses", "")).strip(), expression(job.get("if", ""))
+    if gate == expression(TRUSTED_CACHE_WRITE):
+        return []
+    refusal = [f"{where}: reusable workflows may be called from pull request workflows only on pushes to main"]
+    if gate != PUSH_ONLY or not re.fullmatch(r"\./\.github/workflows/[\w.-]+\.ya?ml", called) or called in seen:
+        return refusal
+    import yaml
+    try:
+        doc = yaml.load((root / called).read_text(), Loader=yaml.BaseLoader)
+    except OSError:
+        return refusal
+    errors = []
+    for job_name, called_job in (doc.get("jobs") or {}).items():
+        inner = f"{where} -> {called[2:]}/{job_name}"
+        errors += cache_write_errors(inner, called_job.get("steps", []))
+        if "uses" in called_job:
+            errors += reusable_call_errors(inner, called_job, root, (*seen, called))
+    return errors
 
 
 def versions(root=ROOT):
@@ -162,8 +244,17 @@ def check(root=ROOT):
         builder = yaml.load((root / ".github/actions/buildx/action.yml").read_text(), Loader=yaml.BaseLoader)
         if builder.get("runs", {}).get("steps") != [{"shell": "bash", "run": "python scripts/build_tools.py install-buildx"}]:
             errors.append("Buildx setup must use the verified installer")
+        for path in sorted((root / ".github/actions").glob("*/action.y*ml")):
+            composite = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
+            # Composite actions run inside pull request jobs too.
+            errors += cache_write_errors(path.parent.name, composite.get("runs", {}).get("steps", []))
         for path in (root / ".github/workflows").glob("*.y*ml"):
             doc = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
+            if pull_request_triggered(doc):
+                for job_name, job in doc.get("jobs", {}).items():
+                    errors += cache_write_errors(f"{path.name}/{job_name}", job.get("steps", []))
+                    if "uses" in job:
+                        errors += reusable_call_errors(f"{path.name}/{job_name}", job, root)
             if path.name == "ci.yml" and "cargo-policy" not in doc.get("jobs", {}):
                 errors.append("CI must retain the required Cargo policy job")
             if path.name == "ci.yml" and "egress-only" not in doc.get("jobs", {}):
@@ -183,8 +274,10 @@ def check(root=ROOT):
                 if job_name == "security-coverage" and rust_profile != "coverage":
                     errors.append("coverage compiler profile must not change implicitly")
                 commands = "\n".join(s.get("run", "") for s in steps)
-                builds_image = any(s.get("uses", "").startswith("docker/build-push-action@") for s in steps)
-                builds_image |= job_name in {"ha-compose-example", "dev-traffic-smoke", "promote-image"}
+                builds_image = any(action_name(s).startswith("docker/build-push-action@") for s in steps)
+                builds_image |= bool(IMAGE_BUILD.search(commands))
+                # promote_image.py drives `docker buildx imagetools` itself.
+                builds_image |= job_name == "promote-image"
                 if builds_image and not any(s.get("uses") == "./.github/actions/buildx" for s in steps):
                     errors.append(f"{job_name}: verified Buildx setup is required")
                 if re.search(r"\bcargo\b", commands) and rust_profile == "none":
@@ -202,7 +295,7 @@ def check(root=ROOT):
                         if required_command not in commands:
                             errors.append("Cargo policy must retain verified installer, full-graph check and rejection fixtures")
                 for s in steps:
-                    use, opts, run = s.get("uses", ""), s.get("with", {}), s.get("run", "")
+                    use, opts, run = action_name(s), s.get("with", {}), s.get("run", "")
                     if any(use.startswith(x) for x in ["actions/setup-node@", "actions/setup-python@", "dtolnay/rust-toolchain@"]):
                         errors.append(f"{job_name}: use the shared tool contract")
                     if use.startswith("docker/setup-buildx-action@"):

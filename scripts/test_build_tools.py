@@ -22,6 +22,7 @@ class ToolContractTests(unittest.TestCase):
                  "admin-ui/package.json", ".npmrc", "admin-ui/.npmrc",
                  ".github/actions/build-tools/action.yml", ".github/actions/buildx/action.yml"]
         files += [str(p.relative_to(ROOT)) for p in (ROOT / ".github/workflows").glob("*.y*ml")]
+        files += [str(p.relative_to(ROOT)) for p in (ROOT / ".github/actions").glob("*/action.y*ml")]
         for file in files:
             target = self.root / file
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -72,6 +73,181 @@ class ToolContractTests(unittest.TestCase):
         self.rejects("verified Buildx setup")
         with self.assertRaisesRegex(ValueError, "checksum mismatch"):
             build_tools.verify_download(b"substituted binary", "a" * 64)
+
+    def test_image_builds_in_run_commands_require_verified_buildx(self):
+        path = self.root / ".github/workflows/ci.yml"
+        original = path.read_text()
+        for command in ["docker build -t example .", "docker buildx build .", "docker image build .",
+                        "docker compose -f a.yml up -d --build", "docker compose -f a.yml build"]:
+            with self.subTest(command=command):
+                path.write_text(original + "\n  unpinned:\n    runs-on: ubuntu-latest\n    steps:\n"
+                                "      - uses: ./.github/actions/build-tools\n"
+                                f"      - run: {command}\n")
+                self.rejects("verified Buildx setup")
+        # Running an already-built image is not a build.
+        path.write_text(original + "\n  loader:\n    runs-on: ubuntu-latest\n    steps:\n"
+                        "      - uses: ./.github/actions/build-tools\n"
+                        "      - run: docker compose -f a.yml up -d --no-build\n")
+        self.assertEqual(build_tools.check(self.root), [])
+
+    def test_pull_request_runs_cannot_write_caches(self):
+        trusted = "save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}"
+        path = self.root / ".github/workflows/ci.yml"
+        original = path.read_text()
+        self.assertIn(trusted, original)
+        for replacement in ["save-if: true", "save-if: ${{ github.ref == 'refs/heads/main' }}"]:
+            with self.subTest(replacement=replacement):
+                path.write_text(original.replace(trusted, replacement, 1))
+                self.rejects("saved only from main pushes")
+        path.write_text(original.replace("\n        with:\n          " + trusted, "", 1))
+        self.rejects("saved only from main pushes")
+        # Restoring without ever saving is allowed; only the literal never-save is.
+        path.write_text(original.replace(trusted, "save-if: false", 1))
+        self.assertEqual(build_tools.check(self.root), [])
+        for replacement in ["save-if: ${{ false }}", "save-if: 'no'", "save-if: ''"]:
+            with self.subTest(replacement=replacement):
+                path.write_text(original.replace(trusted, replacement, 1))
+                self.rejects("saved only from main pushes")
+        for step in ["      - uses: actions/cache@" + "c" * 40 + "\n        with:\n          path: x\n          key: y\n",
+                     "      - uses: actions/cache/save@" + "c" * 40 + "\n        with:\n          path: x\n          key: y\n",
+                     "      - uses: docker/build-push-action@" + "c" * 40 + "\n        with:\n          cache-to: type=gha\n"]:
+            with self.subTest(step=step.split("@")[0]):
+                path.write_text(original + "\n  writer:\n    runs-on: ubuntu-latest\n    steps:\n"
+                                "      - uses: ./.github/actions/build-tools\n"
+                                "      - uses: ./.github/actions/buildx\n" + step)
+                self.rejects("pull request jobs may")
+        path.write_text(original)
+        # A composite action runs inside pull request jobs as well.
+        action = self.root / ".github/actions/buildx/action.yml"
+        action.write_text(action.read_text() + "    - uses: actions/cache@" + "c" * 40 + "\n")
+        self.rejects("pull request jobs may only restore caches")
+
+    def add_pull_request_job(self, steps, prefix="      - uses: ./.github/actions/build-tools\n"
+                                                "      - uses: ./.github/actions/buildx\n"):
+        path = self.root / ".github/workflows/ci.yml"
+        path.write_text(self.ci + "\n  writer:\n    runs-on: ubuntu-latest\n    steps:\n" + prefix + steps)
+
+    @property
+    def ci(self):
+        if not hasattr(self, "_ci"):
+            self._ci = (self.root / ".github/workflows/ci.yml").read_text()
+        return self._ci
+
+    def test_cache_writes_are_found_whatever_the_case_of_the_action_or_input(self):
+        pin = "@" + "c" * 40
+        for step, fragment in [
+                ("      - uses: Actions/cache" + pin + "\n        with:\n          path: x\n          key: y\n",
+                 "may only restore caches"),
+                ("      - uses: ACTIONS/CACHE/SAVE" + pin + "\n        with:\n          path: x\n          key: y\n",
+                 "may only restore caches"),
+                ("      - uses: swatinem/rust-cache" + pin + "\n", "saved only from main pushes"),
+                ("      - uses: SWATINEM/Rust-Cache" + pin + "\n        with:\n          save-if: true\n",
+                 "saved only from main pushes"),
+                ("      - uses: Docker/Build-Push-Action" + pin + "\n        with:\n          Cache-To: type=gha\n",
+                 "image build caches"),
+                ("      - uses: Actions/Setup-Node" + pin + "\n        with:\n          Cache: npm\n",
+                 "setup actions may not save caches")]:
+            with self.subTest(step=step.split("@")[0].strip()):
+                self.add_pull_request_job(step)
+                self.rejects(fragment)
+        # Two spellings of one input are one input to GitHub: neither may hide the other.
+        trusted = build_tools.TRUSTED_CACHE_WRITE
+        self.add_pull_request_job("      - uses: Swatinem/rust-cache" + pin + "\n        with:\n"
+                                  f"          save-if: {trusted}\n          Save-If: true\n")
+        self.rejects("inputs may not differ only in case")
+
+    def test_rust_cache_saves_unless_save_if_is_the_main_push_expression(self):
+        pin = "@" + "c" * 40
+        # An absent save-if means save, for every spelling of the action.
+        for name in ["Swatinem/rust-cache", "swatinem/rust-cache"]:
+            for inputs in ["", "        with:\n          workspaces: .\n"]:
+                with self.subTest(name=name, inputs=inputs):
+                    self.add_pull_request_job(f"      - uses: {name}{pin}\n" + inputs)
+                    self.rejects("saved only from main pushes")
+        for condition in ["${{ github.event_name == 'push' }}", "${{ github.ref == 'refs/heads/main' }}",
+                          "${{ github.event_name == 'pull_request' }}", "${{ always() }}", "'true'", "False",
+                          "${{ github.event_name=='push' && github.ref=='refs/heads/main' }}",
+                          "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' || true }}"]:
+            with self.subTest(condition=condition):
+                self.add_pull_request_job(f"      - uses: swatinem/rust-cache{pin}\n        with:\n"
+                                          f"          save-if: {condition}\n")
+                self.rejects("saved only from main pushes")
+        for condition in [build_tools.TRUSTED_CACHE_WRITE, "false"]:
+            with self.subTest(condition=condition):
+                self.add_pull_request_job(f"      - uses: swatinem/rust-cache{pin}\n        with:\n"
+                                          f"          save-if: {condition}\n")
+                self.assertEqual(build_tools.check(self.root), [])
+
+    def test_run_commands_cannot_export_image_build_caches(self):
+        for step in ["      - run: docker buildx build --cache-to type=gha,mode=max -t x .\n",
+                     "      - run: docker buildx build --cache-from type=gha --CACHE-TO=type=local,dest=c .\n",
+                     "      - run: docker buildx bake --set '*.cache-to=type=gha'\n",
+                     "      - run: docker buildx build $FLAGS .\n        env:\n          FLAGS: --cache-to=type=gha\n",
+                     "      - uses: docker/bake-action@" + "c" * 40 + "\n        with:\n          set: '*.cache-to=type=gha'\n"]:
+            with self.subTest(step=step):
+                self.add_pull_request_job(step)
+                self.rejects("may not export image build caches")
+        # Reading a build cache writes nothing.
+        self.add_pull_request_job("      - run: docker buildx build --cache-from type=gha -t x .\n")
+        self.assertEqual(build_tools.check(self.root), [])
+        # A composite action runs inside pull request jobs as well.
+        self.add_pull_request_job("")
+        action = self.root / ".github/actions/buildx/action.yml"
+        action.write_text(action.read_text() + "    - shell: bash\n      run: docker buildx build --cache-to type=gha .\n")
+        self.rejects("buildx: pull request jobs may not export image build caches")
+
+    def test_setup_actions_cannot_save_caches_in_pull_requests(self):
+        composite = ".github/actions/build-tools/action.yml"
+        for old, new in [("python-version: '3.13.15'", "python-version: '3.13.15'\n        cache: pip"),
+                         ("node-version-file: .node-version", "node-version-file: .node-version\n        cache: npm"),
+                         ("node-version-file: .node-version", "node-version-file: .node-version\n        cache: ''")]:
+            with self.subTest(new=new.split("\n")[-1].strip()):
+                original = (self.root / composite).read_text()
+                self.replace(composite, old, new)
+                self.rejects("build-tools: setup actions may not save caches in pull request jobs")
+                (self.root / composite).write_text(original)
+        pin = "@" + "c" * 40
+        for step in ["      - uses: actions/setup-java" + pin + "\n        with:\n          cache: gradle\n",
+                     "      - uses: actions/setup-dotnet" + pin + "\n        with:\n          cache: true\n",
+                     "      - uses: actions/setup-python" + pin + "\n        with:\n          cache: ${{ github.event_name == 'push' && 'pip' || '' }}\n",
+                     # setup-go saves its module cache unless told not to.
+                     "      - uses: actions/setup-go" + pin + "\n        with:\n          go-version: '1.25'\n",
+                     "      - uses: actions/setup-go" + pin + "\n"]:
+            with self.subTest(step=step.split("@")[0].strip()):
+                self.add_pull_request_job(step)
+                self.rejects("setup actions may not save caches")
+        self.add_pull_request_job("      - uses: actions/setup-go" + pin + "\n        with:\n          cache: false\n")
+        self.assertFalse([e for e in build_tools.check(self.root) if "setup actions may not save" in e])
+
+    def test_reusable_workflow_calls_must_be_gated_to_main_pushes(self):
+        call = "  image-candidate:\n    if: github.event_name == 'push'\n"
+        self.assertIn(call, self.ci)
+        path = self.root / ".github/workflows/ci.yml"
+        for gate in ["", "    if: ${{ always() }}\n", "    if: github.event_name != 'pull_request'\n",
+                     "    if: github.ref == 'refs/heads/main'\n", "    if: github.event_name == 'push' || true\n"]:
+            with self.subTest(gate=gate):
+                path.write_text(self.ci.replace(call, "  image-candidate:\n" + gate, 1))
+                self.rejects("ci.yml/image-candidate: reusable workflows may be called from pull request workflows only on pushes to main")
+        # The same gate inside an expression is the same gate.
+        path.write_text(self.ci.replace(call, "  image-candidate:\n    if: ${{ github.event_name == 'push' }}\n", 1))
+        self.assertEqual(build_tools.check(self.root), [])
+        # A push-only call is accepted only for a workflow of ours that writes
+        # no cache on a tag push either.
+        called = self.root / ".github/workflows/publish-image.yml"
+        original = called.read_text()
+        buildx = "      - name: Set up verified Buildx and pinned BuildKit\n        uses: ./.github/actions/buildx\n"
+        self.assertIn(buildx, original)
+        path.write_text(self.ci)
+        called.write_text(original.replace(buildx, buildx + "      - uses: Swatinem/rust-cache@" + "c" * 40 + "\n", 1))
+        self.rejects("ci.yml/image-candidate -> .github/workflows/publish-image.yml/build: Rust caches may be saved only from main pushes")
+        called.write_text(original)
+        remote = "\n  remote:\n    {gate}\n    uses: octo/workflows/.github/workflows/build.yml@" + "c" * 40 + "\n"
+        path.write_text(self.ci + remote.format(gate="if: github.event_name == 'push'"))
+        self.rejects("ci.yml/remote: reusable workflows may be called")
+        path.write_text(self.ci + "\n  again:\n    uses: ./.github/workflows/publish-image.yml\n")
+        self.rejects("ci.yml/again: reusable workflows may be called")
+        path.write_text(self.ci + remote.format(gate="if: " + build_tools.TRUSTED_CACHE_WRITE))
+        self.assertEqual(build_tools.check(self.root), [])
 
     def test_coverage_profile_cannot_silently_become_stable(self):
         self.replace(".github/workflows/ci.yml", "rust: coverage", "rust: ci")
