@@ -1,11 +1,12 @@
 # Durable authority-change evidence inventory and contract
 
 Part of [#425](https://github.com/Greenhat-Security/GreenGateway/issues/425), PR 1,
-the first two PR 2 slices (PostgreSQL Connection deletion evidence; service-token
-rotate/revoke and JWT revocation evidence), the keyed safe-reference derivation
+the first three PR 2 slices (PostgreSQL Connection deletion evidence; service-token
+rotate/revoke and JWT revocation evidence; policy, tools and catalog publication
+evidence), the keyed safe-reference derivation
 ([Keyed safe references](#keyed-safe-references)) and PR 3's durable delivery
 ([Durable delivery](#durable-delivery)).
-Reviewed source: `146d5063801270fe23852fb6caa946862fb4390f`.
+Reviewed source: `ebb579e6444d437bf477d0617b8841d1eea34cfc`.
 
 This inventory identifies existing atomic records and the work needed for required
 authority-change evidence. PR 1 added the inventory and the proposed event
@@ -16,9 +17,13 @@ and `greengateway.jwt_revocation_evidence`, written by PostgreSQL token rotate/r
 and JWT revokes, and the same token evidence table inside the standalone SQLite token
 database. PR 3 adds migration 21's authority-event journal, which every PostgreSQL
 producer of those three evidence tables appends to in the same transaction, and an
-opt-in dispatcher that delivers it behind a persisted cursor. None of them
-implements or enables required-durability mode or a standalone revision ledger, and
-no row is qualified for that future mode. Storage selection is unchanged.
+opt-in dispatcher that delivers it behind a persisted cursor. The third PR 2 slice
+adds migration 23's `greengateway.document_change_evidence`, written by every
+PostgreSQL policy and tools document commit, and `greengateway.catalog_change_evidence`,
+written by every managed MCP and OpenAPI catalog publication; neither is a journal
+source yet, so the dispatcher does not deliver them. None of them implements or
+enables required-durability mode or a standalone revision ledger, and no row is
+qualified for that future mode. Storage selection is unchanged.
 
 Run the executable inventory and proposed event-contract tests with the pinned
 Node version from `build-tools.json`:
@@ -49,11 +54,11 @@ or unconfigured individual stores.
 
 | Authority | Already atomic in PostgreSQL | Remaining evidence work |
 | --- | --- | --- |
-| Policy publish, rollback, rule edits and suggestion acceptance | Immutable document/history, actor subject, action/diff, active pointer, shared revision and outbox; suggestion acceptance composes its own state in the same transaction | Stable operation/event identity, scoped actor context, durable delivery |
-| Tools publication | Shared document transaction plus name reservations | Same metadata/delivery extension as policy |
+| Policy publish, rollback, rule edits and suggestion acceptance | Immutable document/history, actor subject, action/diff, active pointer, shared revision and outbox, plus one non-cascading `document_change_evidence` row (operation code, event/operation UUIDs, actor kind, subject, issuer and auth mode, prior/new version, the outbox row's shared revision, database-clock time) in the same transaction; suggestion acceptance composes its own state, and so its evidence, in the same transaction | Caller-bound operation identity, safe-reference projection, durable delivery and retention |
+| Tools publication | Shared document transaction plus name reservations and the same `document_change_evidence` row; the first-boot seed and the import's activation are recorded as system actors | Same as policy |
 | Connection and credential binding changes | Record, bindings, immutable version, shared revision and outbox | Actor/history must survive Connection deletion; safe per-operation metadata and delivery |
 | Connection deletion | Outbox tombstone with prior version and shared revision, plus a non-cascading `connection_change_evidence` row (actor, action, event/operation UUIDs, prior version, the tombstone's shared revision, database-clock time) and its journal row in the same transaction; delivered with keyed safe references since PR 3 | Issuer/auth mode and a caller-bound operation identity, without which the delivered record cannot be `authority_event.v1` |
-| Managed MCP/OpenAPI catalog and overlay publication | Catalog/overlay CAS, entries, dependencies, reservations, revision and outbox | Current actor rows are replaced or cascaded; retain per-change evidence |
+| Managed MCP/OpenAPI catalog and overlay publication | Catalog/overlay CAS, entries, dependencies, reservations, revision and outbox, plus one non-cascading `catalog_change_evidence` row (action derived from the write, event/operation UUIDs, actor subject, catalog revision transition, compiled overlay revision, shared revision, database-clock time) that outlives the replacement and the Connection's deletion | Issuer/auth mode, caller-bound operation identity, journaling for delivery |
 | Service-token issue | Token row with creator, row/shared revisions and outbox | Creation retains only `created_by`; no issue evidence row, operation identity or delivery |
 | Service-token rotate/revoke | Token change, row/shared revisions and outbox, plus a non-cascading `service_token_change_evidence` row (actor, action, event/operation UUIDs, prior/new row revision, the outbox row's shared revision, database-clock time) in the same transaction; repeated revoke and refused rotate write none. Standalone writes the same evidence in the token database's own transaction. In PostgreSQL the change also journals its evidence and is delivered since PR 3 | Issuer/auth mode and a caller-bound operation identity; standalone evidence is not delivered |
 | JWT revocation | Scoped JTI digest, actor row, shared revision and outbox, plus one non-cascading `jwt_revocation_evidence` row per effective revoke (actor, JTI digest, resulting expiry, shared revision) that extension, reactivation and expiry cleanup never rewrite, journaled in the same transaction and delivered since PR 3 | CLI actor is system provenance, not a named human; no actor kind or issuer/auth mode |
@@ -142,13 +147,16 @@ nothing dispatches the rows yet.
 define a **proposed** safe projection. Current `security_outbox` rows,
 `connection_change_evidence` rows and `audit_event.v0` events do not already
 satisfy this schema, and neither do migration 18's `service_token_change_evidence`
-and `jwt_revocation_evidence` rows, migration 19's `admin_session_evidence` rows or
+and `jwt_revocation_evidence` rows, migration 19's `admin_session_evidence` rows,
+migration 23's `document_change_evidence` and `catalog_change_evidence` rows or
 the standalone token evidence rows: the evidence rows hold the internal actor
 ID, not a keyed safe reference, and no `authority_id`. Since PR 3 the dispatcher
 delivers the journaled evidence with keyed references under a persisted
 `authority_id`, but as `authority_event_delivery.v1` ([Durable delivery](#durable-delivery)),
-not as this schema: the evidence records neither the actor's issuer nor its auth
-mode, and a v1 event cannot be produced faithfully without both.
+not as this schema: the journaled evidence records neither the actor's issuer nor
+its auth mode, and a v1 event cannot be produced faithfully without both. Migration
+23's document rows are the first to carry the actor's kind, issuer and auth mode,
+the facts the schema's `actor` object projects, but they are not journaled yet.
 
 Revision transitions are operation-specific. Resource creation (`connection.create`,
 `secret.create`, `service_token.issue`, `admin_session.grant`) has no prior revision; replacement,
@@ -463,8 +471,15 @@ Not covered by PR 3, and still open:
 - **The v1 contract.** Issuer, auth mode, actor kind and caller-bound operation
   identity at the store boundary, after which the delivered record can become
   `authority_event.v1`.
-- **Every other operation.** Policy, tools, catalogs, Connection create/replace,
-  credential bindings and token issue have no evidence rows to journal yet.
+- **Policy, tools and catalog evidence.** Migration 23's `document_change_evidence`
+  and `catalog_change_evidence` rows exist but are not journal sources, so they are
+  retained and not delivered. Journaling them adds the journal's capacity
+  reservation to every policy, tools and catalog commit, and to the first-boot
+  tools seed. A change refused because its evidence insert failed is logged with
+  its classified store error but is not counted by `_evidence_failures_total`, so
+  the rule pack does not page on it.
+- **Every other operation.** Connection create/replace, credential bindings and
+  token issue have no evidence rows to journal yet.
 
 ## Next reviewable slices and validation gates
 
@@ -499,10 +514,38 @@ Not covered by PR 3, and still open:
    issuer/auth mode, an actor kind for the CLI's system label, a caller-bound
    operation identity, and token issue evidence (`created_by` remains its only
    actor record).
-3. **Shared documents/catalog metadata.** Extend the existing document core once
-   for policy/tools, retaining suggestion transaction composition. Add immutable
-   catalog/overlay evidence before replacement/cascade. Cover CAS rollback, name
-   conflicts, system refresh, and commit followed by local installation failure.
+3. **Shared documents/catalog metadata (landed).** The shared document core
+   (`postgres_documents::commit_in`) now writes one migration 23
+   `document_change_evidence` row beside the outbox row of every policy and tools
+   commit, so suggestion acceptance, which runs it inside its own transaction,
+   records its evidence there too. Each handler names its operation explicitly
+   (`policy.publish`, `policy.rollback`, `policy.rule.create`/`update`/`delete`/`reorder`,
+   `policy.suggestion.accept`, `tools.publish`), the import's activations are
+   `configuration.import`, and the actor is recorded as the principal presented it --
+   kind, subject, issuer and auth mode, within the principal bounds -- or as the
+   gateway (`bootstrap` for the first-boot tools seed, `import-standalone` for the
+   import). The Connection store's MCP and OpenAPI catalog replacement writes one
+   `catalog_change_evidence` row per publication, naming registration and refresh
+   `catalog.openapi.publish` or `catalog.mcp.publish` and overlay writes
+   `catalog.overlay.replace` or `catalog.overlay.delete`; it has no foreign key, so
+   it outlives the next replacement and the Connection's deletion. A failed
+   evidence insert rolls the change back and is reported as a store failure; a
+   stale ETag or catalog revision, a lost initialize race and a tool name another
+   lane holds write nothing; an empty or oversized actor, or an action that cannot
+   describe the resource, is refused before anything is written. A tools commit
+   followed by a failed local install keeps its evidence, because the commit is
+   durable. Migration 23 moves the serving contract from exactly schema 22 to
+   exactly schema 23, a coordinated drain/migrate/restart. PostgreSQL-gated tests
+   cover attribution of each operation and the system actors, outbox agreement,
+   refusals that write nothing, forced evidence-insert failure and its rollback
+   (including inside a suggestion acceptance), principal bounds, survival after
+   catalog replacement, Connection deletion and restart, and the overlay
+   vocabulary; CI runs them against its disposable loopback database, not
+   verified TLS. Still open: issuer and auth mode for catalog publications (their
+   writers carry the subject only, like Connection deletion), a caller-bound
+   operation identity, and journaling: neither table is a migration 21 journal
+   source, so the dispatcher does not deliver their rows yet. No scheduled
+   catalog refresh ships, so no system catalog actor is needed yet.
 4. **Durable dispatch (landed for the journaled evidence).** Migration 21's
    journal, capacity reservation and dispatcher cursor, the leased dispatcher and
    the log and file sinks, as described under [Durable delivery](#durable-delivery).

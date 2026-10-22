@@ -17,6 +17,9 @@
 //!   contract.
 
 mod audit;
+/// What a policy or tools document commit's durable evidence records about
+/// it (issue #425, PR 2c): the closed action vocabulary and the actor.
+mod change_evidence;
 /// Member capability advertisements and per-operation requirements
 /// (issue #426, PR 1): the closed vocabulary every build can recognize, and
 /// in cluster mode the gate a write of a registered operation passes first,
@@ -81,6 +84,9 @@ mod service_token;
 pub(crate) mod contract_tests;
 
 pub use audit::{AuditEventStore, SqliteAuditEventStore};
+pub use change_evidence::DocumentAction;
+#[cfg(feature = "postgres")]
+pub use change_evidence::{ChangeActor, DocumentChange};
 pub use policy_drafts::{PolicyDraftStore, SqlitePolicyDraftStore};
 pub use policy_history::PolicyHistory;
 #[cfg(feature = "postgres")]

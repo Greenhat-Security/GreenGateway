@@ -79,13 +79,14 @@ pub enum PolicyCommitPrecondition {
 
 /// A control-plane mutation request: everything the transaction needs to
 /// write the new immutable version, advance the active pointer and the
-/// security revision, append history, and emit the durable outbox record.
+/// security revision, append history, emit the durable outbox record, and
+/// record the change's evidence (which operation, by whom).
 #[cfg(feature = "postgres")]
 #[derive(Clone, Debug)]
 pub struct PolicyCommitRequest<'a> {
     pub precondition: PolicyCommitPrecondition,
     pub candidate: &'a Policy,
-    pub actor_user_id: &'a str,
+    pub change: super::DocumentChange<'a>,
     pub diff_summary: &'a Value,
 }
 

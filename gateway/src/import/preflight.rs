@@ -106,6 +106,13 @@ const AUTHORITATIVE_TABLES: &[&str] = &[
     // state, never authority or history, and a draft needs a live policy to
     // be pinned to, which an empty namespace does not have. The validation
     // proves the import left the table empty (`EXCLUDED_RUNTIME_TABLES`).
+    // 0023: policy, tools and catalog change evidence. The import writes
+    // document evidence itself (its policy and tools activations are
+    // `configuration.import` rows), so on a fresh target a row here means
+    // the namespace already holds history; catalog evidence is written only
+    // by publications, never by the import.
+    "document_change_evidence",
+    "catalog_change_evidence",
 ];
 
 /// The authoritative singleton counters and the column that carries them.

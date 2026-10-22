@@ -34311,7 +34311,7 @@ mod cluster_policy_tests {
             PolicyCommitRequest {
                 precondition: PolicyCommitPrecondition::Initialize,
                 candidate: &cluster_policy(id),
-                actor_user_id: "seed",
+                change: crate::storage::DocumentChange::test_policy("seed"),
                 diff_summary: &DIFF,
             },
         )
@@ -34760,7 +34760,7 @@ mod cluster_policy_tests {
                     etag: active.etag.clone(),
                 },
                 candidate: &candidate,
-                actor_user_id: "test",
+                change: crate::storage::DocumentChange::test_policy("test"),
                 diff_summary: &DIFF,
             },
         )
@@ -35071,6 +35071,48 @@ mod cluster_policy_tests {
             row.get(0)
         };
         assert_eq!(documents, 3, "two commits plus the rollback version");
+
+        // Each committed change recorded itself (issue #425): the endpoint
+        // named its operation and the authenticated principal that made it;
+        // the stale PUT recorded nothing.
+        let evidence: Vec<(String, String, String, Option<String>, String)> = pool
+            .get()
+            .await
+            .expect("evidence checkout")
+            .query(
+                "SELECT action, actor_kind, actor_user_id, actor_issuer, actor_auth_mode \
+                 FROM greengateway.document_change_evidence ORDER BY security_revision",
+                &[],
+            )
+            .await
+            .expect("evidence rows")
+            .iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4)))
+            .collect();
+        let principal = admin_principal();
+        let by_admin = |action: &str| {
+            (
+                action.to_owned(),
+                "principal".to_owned(),
+                principal.user_id.clone(),
+                None,
+                principal.auth_method.audit_mode().to_owned(),
+            )
+        };
+        assert_eq!(
+            evidence,
+            vec![
+                (
+                    "policy.publish".to_owned(),
+                    "principal".to_owned(),
+                    "seed".to_owned(),
+                    None,
+                    "bearer_token".to_owned(),
+                ),
+                by_admin("policy.publish"),
+                by_admin("policy.rollback"),
+            ]
+        );
     }
 
     /// Server-side drafts in cluster mode (issue #243, slice 9): a draft is
@@ -35198,6 +35240,40 @@ mod cluster_policy_tests {
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
         assert_eq!(body["reason"], "policy_draft_base_stale");
         assert_eq!(policy_version_count(&pool).await, versions_before + 1);
+
+        // The publication is a `policy.publish` like `PUT /policy` (issue
+        // #425): it recorded the publishing principal in its own commit,
+        // after the seed's row, and the refused stale publish recorded
+        // nothing.
+        let evidence: Vec<(String, String, String)> = pool
+            .get()
+            .await
+            .expect("evidence checkout")
+            .query(
+                "SELECT action, actor_kind, actor_user_id \
+                 FROM greengateway.document_change_evidence ORDER BY security_revision",
+                &[],
+            )
+            .await
+            .expect("evidence rows")
+            .iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect();
+        assert_eq!(
+            evidence,
+            vec![
+                (
+                    "policy.publish".to_owned(),
+                    "principal".to_owned(),
+                    "seed".to_owned()
+                ),
+                (
+                    "policy.publish".to_owned(),
+                    "principal".to_owned(),
+                    admin_principal().user_id
+                ),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -35326,7 +35402,7 @@ mod cluster_policy_tests {
             PolicyCommitRequest {
                 precondition: PolicyCommitPrecondition::Expected { etag: current.etag },
                 candidate: &candidate,
-                actor_user_id: "other-replica",
+                change: crate::storage::DocumentChange::test_policy("other-replica"),
                 diff_summary: &DIFF,
             },
         )
@@ -35462,7 +35538,7 @@ mod cluster_policy_tests {
                     etag: current.expect("active").etag,
                 },
                 candidate: &revoked,
-                actor_user_id: "other-replica",
+                change: crate::storage::DocumentChange::test_policy("other-replica"),
                 diff_summary: &DIFF,
             },
         )
@@ -35553,7 +35629,7 @@ mod cluster_policy_tests {
                     etag: active.etag.clone(),
                 },
                 candidate: &updated,
-                actor_user_id: "other-replica",
+                change: crate::storage::DocumentChange::test_policy("other-replica"),
                 diff_summary: &DIFF,
             },
         )
@@ -35813,7 +35889,7 @@ mod cluster_tools_tests {
             PolicyCommitRequest {
                 precondition: PolicyCommitPrecondition::Initialize,
                 candidate: &cluster_policy("tools-cas"),
-                actor_user_id: "seed",
+                change: crate::storage::DocumentChange::test_policy("seed"),
                 diff_summary: &DIFF,
             },
         )
@@ -35851,7 +35927,7 @@ mod cluster_tools_tests {
                     etag: active.etag.clone(),
                 },
                 &tools_document_with("cluster_echo"),
-                "op-1",
+                crate::storage::DocumentChange::test_tools("op-1"),
                 &DIFF,
             )
             .await
@@ -35863,7 +35939,7 @@ mod cluster_tools_tests {
                     etag: active.etag.clone(),
                 },
                 &tools_document_with("cluster_other"),
-                "op-2",
+                crate::storage::DocumentChange::test_tools("op-2"),
                 &DIFF,
             )
             .await
@@ -35908,7 +35984,7 @@ mod cluster_tools_tests {
             PolicyCommitRequest {
                 precondition: PolicyCommitPrecondition::Initialize,
                 candidate: &cluster_policy("gate-tools"),
-                actor_user_id: "seed",
+                change: crate::storage::DocumentChange::test_policy("seed"),
                 diff_summary: &DIFF,
             },
         )
@@ -35996,7 +36072,7 @@ mod cluster_tools_tests {
                     etag: boot_tools.etag.clone(),
                 },
                 &tools_document_with("post_boot_tool"),
-                "op",
+                crate::storage::DocumentChange::test_tools("op"),
                 &DIFF,
             )
             .await
@@ -36159,7 +36235,7 @@ mod cluster_tools_tests {
             PolicyCommitRequest {
                 precondition: PolicyCommitPrecondition::Initialize,
                 candidate: &cluster_policy("gate-late-register"),
-                actor_user_id: "seed",
+                change: crate::storage::DocumentChange::test_policy("seed"),
                 diff_summary: &DIFF,
             },
         )
@@ -36253,7 +36329,7 @@ mod cluster_tools_tests {
             PolicyCommitRequest {
                 precondition: PolicyCommitPrecondition::Initialize,
                 candidate: &cluster_policy("gate-budget"),
-                actor_user_id: "seed",
+                change: crate::storage::DocumentChange::test_policy("seed"),
                 diff_summary: &DIFF,
             },
         )
@@ -36413,7 +36489,7 @@ mod cluster_tools_tests {
             PolicyCommitRequest {
                 precondition: PolicyCommitPrecondition::Initialize,
                 candidate: &cluster_policy("gate-connections"),
-                actor_user_id: "seed",
+                change: crate::storage::DocumentChange::test_policy("seed"),
                 diff_summary: &DIFF,
             },
         )
@@ -36439,7 +36515,7 @@ mod cluster_tools_tests {
                 .commit_tools(
                     PolicyCommitPrecondition::Expected { etag: tools_etag },
                     &tools_document_with(&format!("counter_mover_{index}")),
-                    "op",
+                    crate::storage::DocumentChange::test_tools("op"),
                     &DIFF,
                 )
                 .await
@@ -36608,7 +36684,7 @@ mod cluster_tools_tests {
             PolicyCommitRequest {
                 precondition: PolicyCommitPrecondition::Initialize,
                 candidate: &cluster_policy("gate-invalid"),
-                actor_user_id: "seed",
+                change: crate::storage::DocumentChange::test_policy("seed"),
                 diff_summary: &DIFF,
             },
         )
@@ -36653,7 +36729,7 @@ mod cluster_tools_tests {
                     etag: boot_tools.etag.clone(),
                 },
                 &tools_document_with("reconciled_tool"),
-                "op",
+                crate::storage::DocumentChange::test_tools("op"),
                 &DIFF,
             )
             .await
@@ -36690,7 +36766,7 @@ mod cluster_tools_tests {
                     etag: active.etag.clone(),
                 },
                 &invalid,
-                "op",
+                crate::storage::DocumentChange::test_tools("op"),
                 &DIFF,
             )
             .await
@@ -36724,7 +36800,7 @@ mod cluster_tools_tests {
             PolicyCommitRequest {
                 precondition: PolicyCommitPrecondition::Initialize,
                 candidate: &cluster_policy("register-tools"),
-                actor_user_id: "seed",
+                change: crate::storage::DocumentChange::test_policy("seed"),
                 diff_summary: &DIFF,
             },
         )
@@ -37024,7 +37100,7 @@ mod cluster_discovery_tests {
             .commit(storage::PolicyCommitRequest {
                 precondition: storage::PolicyCommitPrecondition::Initialize,
                 candidate: &policy,
-                actor_user_id: "installer",
+                change: crate::storage::DocumentChange::test_policy("installer"),
                 diff_summary: &json!({"action": "seed"}),
             })
             .await
@@ -37346,7 +37422,7 @@ mod cluster_discovery_tests {
             storage::PolicyCommitRequest {
                 precondition: storage::PolicyCommitPrecondition::Initialize,
                 candidate: &policy,
-                actor_user_id: "installer",
+                change: crate::storage::DocumentChange::test_policy("installer"),
                 diff_summary: &seed_diff,
             },
         )
@@ -38198,7 +38274,7 @@ mod cluster_discovery_tests {
                     etag: active.etag.clone(),
                 },
                 candidate: &covering,
-                actor_user_id: "other-replica",
+                change: crate::storage::DocumentChange::test_policy("other-replica"),
                 diff_summary: &diff_summary,
             },
         )
@@ -38491,7 +38567,7 @@ mod cluster_discovery_tests {
                     etag: before.active_etag.clone(),
                 },
                 candidate: &interfering_candidate,
-                actor_user_id: "peer",
+                change: crate::storage::DocumentChange::test_policy("peer"),
                 diff_summary: &interfering_diff,
             },
         )
