@@ -41,6 +41,9 @@ Options:
   --token TOKEN           Use an explicit bearer token instead of the seeded dev key
   --expected-statuses CSV Override accepted HTTP statuses (for resilience runs)
   --require-metrics       Fail if the gateway metrics endpoint is unavailable
+  --exact-path            Send --path exactly as given (a query string is
+                          allowed), without the development upstream's
+                          response_bytes query; steady scenario only
   --expected-upstream-attempts N  Require an exact upstream-attempt delta
   --expected-retries N    Require an exact retry delta
   --min-retry-amplification N  Require attempts / completed responses at or above N
@@ -67,6 +70,7 @@ function parseArgs(argv) {
     token: process.env.GREENGATEWAY_BEARER_TOKEN || null,
     expectedStatuses: null,
     requireMetrics: false,
+    exactPath: false,
     expectedUpstreamAttempts: null,
     expectedRetries: null,
     minRetryAmplification: null,
@@ -82,6 +86,10 @@ function parseArgs(argv) {
     }
     if (arg === "--require-metrics") {
       parsed.requireMetrics = true;
+      continue;
+    }
+    if (arg === "--exact-path") {
+      parsed.exactPath = true;
       continue;
     }
     const [name, inlineValue] = arg.split("=", 2);
@@ -153,7 +161,14 @@ function parseArgs(argv) {
   if (!["GET", "POST"].includes(parsed.method)) {
     throw new Error("--method must be GET or POST");
   }
-  if (!parsed.path.startsWith("/") || parsed.path.includes("?")) {
+  if (parsed.exactPath) {
+    if (parsed.scenario !== "steady") {
+      throw new Error("--exact-path supports the steady scenario only");
+    }
+    if (!parsed.path.startsWith("/") || /[#\s]/.test(parsed.path)) {
+      throw new Error("--path must be an absolute path without a fragment or whitespace");
+    }
+  } else if (!parsed.path.startsWith("/") || parsed.path.includes("?")) {
     throw new Error("--path must be an absolute path without a query string");
   }
   if (parsed.method === "GET" && parsed.bodyBytes !== 0) {
@@ -252,6 +267,9 @@ function jsonBodyOfExactSize(size) {
 }
 
 function requestPath(options, sequence) {
+  if (options.exactPath) {
+    return options.path;
+  }
   const query = new URLSearchParams({
     response_bytes: String(options.responseBytes),
   });
@@ -481,6 +499,7 @@ async function main() {
       response_bytes: options.responseBytes,
       body_bytes: options.bodyBytes,
       timeout_ms: options.timeoutMs,
+      exact_path: options.exactPath,
       expected_statuses: [
         ...(options.expectedStatuses ||
           (options.scenario === "steady"
