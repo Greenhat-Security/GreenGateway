@@ -159,6 +159,13 @@ virtual range; their memory use remains subject to the runner's capacity.
 Builds retain CPU and wall limits, a 4 GiB per-file limit, disabled core dumps
 and bounded captured output. The controller stops a process whose output
 exceeds its cap; exceeding a resource limit cannot count as a killed mutation.
+Tests and short metadata commands share a per-file limit of their 64 KiB
+output cap plus one byte, so the controller's git commands (`status`,
+`rev-parse`, `ls-files` and the HEAD `archive`) run as
+`git --no-optional-locks` and only read the repository. A plain `git status`
+refreshes stale stat data, such as a fresh checkout's, by rewriting
+`.git/index`, and this repository's index outgrew that limit before it
+reached 700 tracked files.
 
 Tool setup and artifact handling sit outside the campaign timer and inside
 the CI job timer. A cold compilation can consume a large part of these budgets;

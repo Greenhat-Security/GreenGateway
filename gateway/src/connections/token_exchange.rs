@@ -98,7 +98,7 @@ const TOKEN_TYPE_HINT_ACCESS_TOKEN: &str = "access_token";
 /// The error codes RFC 6749 section 5.2 and RFC 8693 section 2.2.2 register for a token endpoint.
 /// An issuer's code is recorded only when it is one of these, so audit never carries text the
 /// issuer chose.
-const REGISTERED_ERROR_CODES: &[&str] = &[
+pub(super) const REGISTERED_ERROR_CODES: &[&str] = &[
     "invalid_request",
     "invalid_client",
     "invalid_grant",
@@ -356,11 +356,18 @@ impl DelegatedTokenRuntime {
     /// An operator's purge is audited even when it finds nothing. One a revoked credential started
     /// is audited only when it purged something, because the same refused credential can be
     /// presented any number of times.
+    ///
+    /// `google_purged` is how many Google domain-wide delegation tokens the caller already dropped
+    /// for the same principal (see
+    /// [`super::google_delegation::GoogleDelegationRuntime::purge_principal`]): they count towards
+    /// the total and are named in the same audit event, so one purge has one record. Google
+    /// offers no revocation for them, so none is attempted.
     pub(crate) fn purge_principal(
         &self,
         issuer: &str,
         subject: &str,
         trigger: DelegatedTokenPurgeTrigger,
+        google_purged: usize,
     ) -> usize {
         let Some(issuer) = canonical_issuer(issuer) else {
             return 0;
@@ -369,7 +376,7 @@ impl DelegatedTokenRuntime {
         let retired = self
             .cache
             .retire_where(|key| key.principal == Some(principal));
-        let purged = retired.len();
+        let purged = retired.len().saturating_add(google_purged);
         if purged == 0 && matches!(trigger, DelegatedTokenPurgeTrigger::CredentialRevoked) {
             return 0;
         }
@@ -380,7 +387,7 @@ impl DelegatedTokenRuntime {
             issuer,
             subject: subject.to_owned(),
         });
-        purge.emit(purged);
+        purge.emit(purged, google_purged);
         if !retired.is_empty() {
             let runtime = self.clone();
             // Detached, like an exchange: the request that asked for the purge may end before the
@@ -603,7 +610,7 @@ fn cache_lifetime(expires_in: u64) -> Duration {
 /// Whose tokens a purge drops: a digest of the attested issuer and subject alone, so it matches
 /// every token exchanged for that principal whatever email or roles it carried. Length-prefixed
 /// so no two principals share an encoding.
-fn principal_digest(issuer: &str, subject: &str) -> [u8; 32] {
+pub(super) fn principal_digest(issuer: &str, subject: &str) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(b"greengateway:delegated-token-principal:v1\0");
     for part in [issuer, subject] {
@@ -727,7 +734,10 @@ struct ExchangeErrorResponse {
 
 /// The issuer's error code when it is one of `registered`, `unregistered` for any other, and
 /// `None` when the body names none.
-fn registered_error_code(body: &[u8], registered: &[&'static str]) -> Option<&'static str> {
+pub(super) fn registered_error_code(
+    body: &[u8],
+    registered: &[&'static str],
+) -> Option<&'static str> {
     let code = serde_json::from_slice::<ExchangeErrorResponse>(body)
         .ok()?
         .error?;
@@ -857,7 +867,7 @@ struct DelegatedTokenPurge {
 }
 
 impl DelegatedTokenPurge {
-    fn emit(&self, purged: usize) {
+    fn emit(&self, purged: usize, google_purged: usize) {
         metrics::counter!(
             "connection_delegated_token_purge_total",
             "trigger" => self.trigger.label()
@@ -870,6 +880,7 @@ impl DelegatedTokenPurge {
                 "trigger": self.trigger.label(),
                 "principal": { "issuer": self.issuer, "subject": self.subject },
                 "purged_entries": purged,
+                "google_delegation_entries": google_purged,
             }),
         );
     }
