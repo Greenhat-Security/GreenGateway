@@ -7,11 +7,12 @@ use futures_util::StreamExt;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use rmcp::{
     model::{
-        CallToolRequestParams as RmcpCallToolRequestParams, CallToolResult as RmcpCallToolResult,
+        CallToolRequestParams as RmcpCallToolRequestParams,
+        CallToolResponse as RmcpCallToolResponse, CallToolResult as RmcpCallToolResult,
         ErrorData as RmcpErrorData, Implementation, JsonObject as RmcpJsonObject,
         ListToolsResult as RmcpListToolsResult,
         PaginatedRequestParams as RmcpPaginatedRequestParams,
-        ServerCapabilities as RmcpServerCapabilities, ServerInfo as RmcpServerInfo,
+        ServerCapabilities as RmcpServerCapabilities, ServerConfig as RmcpServerConfig,
         Tool as RmcpTool,
     },
     service::{RequestContext as RmcpRequestContext, RoleServer as RmcpRoleServer},
@@ -30653,8 +30654,8 @@ struct TestMcpUpstreamServer {
 }
 
 impl RmcpServerHandler for TestMcpUpstreamServer {
-    fn get_info(&self) -> RmcpServerInfo {
-        RmcpServerInfo::new(RmcpServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> RmcpServerConfig {
+        RmcpServerConfig::new(RmcpServerCapabilities::builder().enable_tools().build())
             .with_server_info(
                 Implementation::new("greengateway-test-upstream", "0.0.0")
                     .with_title("GreenGateway Test Upstream"),
@@ -30677,7 +30678,7 @@ impl RmcpServerHandler for TestMcpUpstreamServer {
         &self,
         request: RmcpCallToolRequestParams,
         _context: RmcpRequestContext<RmcpRoleServer>,
-    ) -> Result<RmcpCallToolResult, RmcpErrorData> {
+    ) -> Result<RmcpCallToolResponse, RmcpErrorData> {
         let arguments = request.arguments.unwrap_or_default();
         let call = json!({
             "name": request.name.to_string(),
@@ -30691,7 +30692,8 @@ impl RmcpServerHandler for TestMcpUpstreamServer {
         Ok(RmcpCallToolResult::structured(json!({
             "remote_tool": request.name.to_string(),
             "arguments": Value::Object(arguments),
-        })))
+        }))
+        .into())
     }
 }
 
@@ -30702,7 +30704,7 @@ async fn spawn_test_mcp_upstream(tool_name: &str) -> TestMcpUpstream {
         calls: Arc::clone(&calls),
     };
     let config = RmcpStreamableHttpServerConfig::default()
-        .with_stateful_mode(false)
+        .with_legacy_session_mode(false)
         .with_json_response(true)
         .disable_allowed_hosts();
     let service = RmcpStreamableHttpService::new(

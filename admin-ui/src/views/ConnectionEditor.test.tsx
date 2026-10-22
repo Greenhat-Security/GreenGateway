@@ -3048,34 +3048,409 @@ describe('ConnectionEditor', () => {
     )) as HTMLSelectElement;
     // A replacement never carries a caller assertion, so it could not add the
     // subject-token block this credential needs.
+    // A domain-wide delegation binds no secret and carries no caller
+    // assertion, so any Connection can move to it.
     expect(Array.from(type.options).map((option) => option.value)).toEqual([
       'none',
       'header_api_key',
       'static_bearer',
       'oauth2_client_credentials',
+      'google_domain_wide_delegation',
     ]);
   });
 
-  it('refuses to edit a Google domain-wide delegation rather than save over it', async () => {
-    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
-      const url = requestUrl(input);
-      if (url.pathname === '/v1/admin/connections/billing' && !init?.method) {
-        return Promise.resolve(
-          jsonResponse(200, googleDelegationDetail(), { ETag: '"record-8"' }),
-        );
-      }
-      return Promise.reject(new Error(`unexpected request: ${url.pathname}`));
-    });
-    vi.stubGlobal('fetch', fetchMock);
+  it('edits a Google domain-wide delegation, writing every field back and no secret', async () => {
+    const puts: RequestInit[] = [];
+    vi.stubGlobal(
+      'fetch',
+      attestedConnectionFetch({
+        detail: googleDelegationDetail({ canBindSecret: true }),
+        secrets: [],
+        onPut: (init) => {
+          puts.push(init);
+          return jsonResponse(
+            200,
+            googleDelegationDetail({ canBindSecret: true }),
+            { ETag: '"record-8"' },
+          );
+        },
+      }),
+    );
 
     renderEditor('/connections/billing/edit');
-
-    expect(await screen.findByText('Editing not available')).toBeTruthy();
+    const account = (await screen.findByLabelText(
+      'Delegated service account',
+    )) as HTMLInputElement;
+    expect(account.value).toBe(
+      'gateway-delegate@example-project.iam.gserviceaccount.com',
+    );
     expect(
-      screen.getByText(/Google domain-wide delegation, which the editor cannot change/),
+      (screen.getByLabelText('Workload identity profile') as HTMLInputElement)
+        .value,
+    ).toBe('gateway-wif');
+    expect(
+      (screen.getByLabelText('Google scopes') as HTMLInputElement).value,
+    ).toBe('https://www.googleapis.com/auth/gmail.readonly');
+    expect(
+      (
+        screen.getByLabelText(
+          'Subject issuers (one per line)',
+        ) as HTMLTextAreaElement
+      ).value,
+    ).toBe('https://idp.example.test');
+    expect(
+      screen.getByText(/Each caller reaches Google as themselves/),
     ).toBeTruthy();
-    expect(screen.queryByLabelText('Display name')).toBeNull();
-    expect(fetchMock.mock.calls.every(([, init]) => !init?.method)).toBe(true);
+    // Nothing to bind: the profile is startup configuration, not a secret.
+    expect(screen.queryByLabelText('Authentication secret')).toBeNull();
+    const type = screen.getByLabelText(
+      'Authentication type',
+    ) as HTMLSelectElement;
+    await waitFor(() => expect(type.disabled).toBe(false));
+    expect(optionValues(type)).toEqual([
+      'none',
+      'header_api_key',
+      'static_bearer',
+      'oauth2_client_credentials',
+      'google_domain_wide_delegation',
+    ]);
+
+    fireEvent.change(screen.getByLabelText('Google scopes'), {
+      target: {
+        value:
+          'https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/calendar.readonly',
+      },
+    });
+    fireEvent.change(screen.getByLabelText('Subject issuers (one per line)'), {
+      target: { value: 'https://idp.example.test\n\n  https://login.example.test/  \n' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save connection' }));
+
+    expect(await screen.findByText('Connection detail route')).toBeTruthy();
+    expect(puts).toHaveLength(1);
+    expect(headerValue(puts[0]?.headers, 'If-Match')).toBe('"record-7"');
+    const body = JSON.parse(String(puts[0]?.body)) as Record<string, unknown>;
+    expect(body.authentication).toEqual({
+      type: 'google_domain_wide_delegation',
+      service_account_email:
+        'gateway-delegate@example-project.iam.gserviceaccount.com',
+      workload_identity_profile: 'gateway-wif',
+      scopes: [
+        'https://www.googleapis.com/auth/gmail.readonly',
+        'https://www.googleapis.com/auth/calendar.readonly',
+      ],
+      subject_claim: 'email',
+      subject_issuers: [
+        'https://idp.example.test',
+        'https://login.example.test/',
+      ],
+    });
+    // None was stored, so nothing is removed either.
+    expect(Object.hasOwn(body, 'caller_assertion')).toBe(false);
+    expect(String(puts[0]?.body)).not.toContain('secret_id');
+  });
+
+  it('creates a Google domain-wide delegation connection without a secret or a caller assertion', async () => {
+    const posts: RequestInit[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = requestUrl(input);
+        if (url.pathname === '/v1/admin/connections' && !init?.method) {
+          return Promise.resolve(
+            jsonResponse(200, connectionList(true, { canManageSecrets: false }), {
+              ETag: '"connections"',
+              'X-GreenGateway-Connections-ETag': '"connections-collection"',
+            }),
+          );
+        }
+        if (
+          url.pathname === '/v1/admin/connection-secrets' &&
+          !init?.method
+        ) {
+          return Promise.resolve(
+            jsonResponse(200, secretList(), {
+              ETag: '"secrets"',
+              'X-GreenGateway-Connection-Secrets-ETag': '"secret-collection"',
+            }),
+          );
+        }
+        if (
+          url.pathname === '/v1/admin/connections' &&
+          init?.method === 'POST'
+        ) {
+          posts.push(init);
+          return Promise.resolve(
+            jsonResponse(201, googleDelegationDetail({ canBindSecret: true }), {
+              ETag: '"connection-created"',
+              'X-GreenGateway-Connections-ETag': '"connections-collection-2"',
+            }),
+          );
+        }
+        return Promise.reject(new Error(`unexpected request: ${url.pathname}`));
+      }),
+    );
+
+    renderEditor('/connections/new');
+    fireEvent.change(await screen.findByLabelText('Display name'), {
+      target: { value: 'Gmail' },
+    });
+    fireEvent.change(screen.getByLabelText('Base URL'), {
+      target: { value: 'https://gmail.googleapis.com' },
+    });
+    fireEvent.change(screen.getByLabelText('Base path'), {
+      target: { value: '/gmail/v1' },
+    });
+    const type = screen.getByLabelText(
+      'Authentication type',
+    ) as HTMLSelectElement;
+    await waitFor(() => expect(type.disabled).toBe(false));
+    expect(optionValues(type)).toContain('google_domain_wide_delegation');
+    fireEvent.change(type, {
+      target: { value: 'google_domain_wide_delegation' },
+    });
+    expect(
+      screen.getByText(/can act as every user of the Workspace domain/),
+    ).toBeTruthy();
+    expect(screen.queryByLabelText('Authentication secret')).toBeNull();
+    // No caller assertion to add: Google verifies none of the gateway's.
+    expect(
+      screen.queryByRole('button', { name: 'Add caller assertion' }),
+    ).toBeNull();
+    fireEvent.change(screen.getByLabelText('Delegated service account'), {
+      target: {
+        value: ' gateway-delegate@example-project.iam.gserviceaccount.com ',
+      },
+    });
+    fireEvent.change(screen.getByLabelText('Workload identity profile'), {
+      target: { value: 'gateway-wif' },
+    });
+    fireEvent.change(screen.getByLabelText('Google scopes'), {
+      target: { value: 'https://www.googleapis.com/auth/gmail.readonly' },
+    });
+    fireEvent.change(screen.getByLabelText('Subject issuers (one per line)'), {
+      target: { value: 'https://idp.example.test' },
+    });
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Save disabled draft' }),
+    );
+
+    expect(await screen.findByText('Connection detail route')).toBeTruthy();
+    expect(posts).toHaveLength(1);
+    expect(headerValue(posts[0]?.headers, 'If-Match')).toBe(
+      '"connections-collection"',
+    );
+    const body = JSON.parse(String(posts[0]?.body)) as Record<string, unknown>;
+    expect(body).toMatchObject({
+      display_name: 'Gmail',
+      enabled: false,
+      kind: 'http_api',
+      endpoint: { base_url: 'https://gmail.googleapis.com', base_path: '/gmail/v1' },
+      tls: {},
+    });
+    expect(body.authentication).toEqual({
+      type: 'google_domain_wide_delegation',
+      service_account_email:
+        'gateway-delegate@example-project.iam.gserviceaccount.com',
+      workload_identity_profile: 'gateway-wif',
+      scopes: ['https://www.googleapis.com/auth/gmail.readonly'],
+      subject_claim: 'email',
+      subject_issuers: ['https://idp.example.test'],
+    });
+    expect(Object.hasOwn(body, 'caller_assertion')).toBe(false);
+  });
+
+  it('refuses a Google domain-wide delegation draft the gateway would refuse before writing', async () => {
+    let writes = 0;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = requestUrl(input);
+        if (init?.method) {
+          writes += 1;
+        }
+        if (url.pathname === '/v1/admin/connections' && !init?.method) {
+          return Promise.resolve(
+            jsonResponse(200, connectionList(true, { canManageSecrets: false }), {
+              ETag: '"connections"',
+              'X-GreenGateway-Connections-ETag': '"connections-collection"',
+            }),
+          );
+        }
+        if (
+          url.pathname === '/v1/admin/connection-secrets' &&
+          !init?.method
+        ) {
+          return Promise.resolve(
+            jsonResponse(200, secretList(), {
+              ETag: '"secrets"',
+              'X-GreenGateway-Connection-Secrets-ETag': '"secret-collection"',
+            }),
+          );
+        }
+        return Promise.reject(new Error(`unexpected request: ${url.pathname}`));
+      }),
+    );
+
+    renderEditor('/connections/new');
+    fireEvent.change(await screen.findByLabelText('Display name'), {
+      target: { value: 'Gmail' },
+    });
+    fireEvent.change(screen.getByLabelText('Base URL'), {
+      target: { value: 'https://gmail.googleapis.com' },
+    });
+    const type = screen.getByLabelText(
+      'Authentication type',
+    ) as HTMLSelectElement;
+    await waitFor(() => expect(type.disabled).toBe(false));
+    fireEvent.change(type, {
+      target: { value: 'google_domain_wide_delegation' },
+    });
+    // A user account, a default compute account on another domain and a
+    // path are all refused, as the gateway refuses them.
+    fireEvent.change(screen.getByLabelText('Delegated service account'), {
+      target: { value: 'someone@gmail.com' },
+    });
+    fireEvent.change(screen.getByLabelText('Workload identity profile'), {
+      target: { value: '../profile' },
+    });
+    fireEvent.change(screen.getByLabelText('Subject issuers (one per line)'), {
+      target: { value: 'https://idp.example.test\nhttps://idp.example.test/' },
+    });
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Save disabled draft' }),
+    );
+
+    expect(
+      await screen.findByText(
+        'Enter a dedicated service account of the form name@project.iam.gserviceaccount.com.',
+      ),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(/Enter the ID of a CONNECTION_GCP_PROVIDER profile/),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(
+        'Enter at least one scope the Workspace administrator authorised for the service account.',
+      ),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(/a trailing slash does not make it another one/),
+    ).toBeTruthy();
+    expect(
+      document
+        .getElementById('connection-google-service-account')
+        ?.getAttribute('aria-invalid'),
+    ).toBe('true');
+    await waitFor(() =>
+      expect(document.activeElement?.id).toBe(
+        'connection-google-service-account',
+      ),
+    );
+    expect(writes).toBe(0);
+  });
+
+  it('removes a caller assertion with an explicit null when a connection moves to Google domain-wide delegation', async () => {
+    const puts: RequestInit[] = [];
+    vi.stubGlobal(
+      'fetch',
+      attestedConnectionFetch({
+        detail: managedDetail({
+          canBindSecret: true,
+          callerAssertion: storedAssertion(),
+        }),
+        secrets: assertionAliases(),
+        onPut: (init) => {
+          puts.push(init);
+          return jsonResponse(
+            200,
+            googleDelegationDetail({ canBindSecret: true }),
+            { ETag: '"record-8"' },
+          );
+        },
+      }),
+    );
+
+    renderEditor('/connections/billing/edit');
+    const type = (await screen.findByLabelText(
+      'Authentication type',
+    )) as HTMLSelectElement;
+    await waitFor(() => expect(type.disabled).toBe(false));
+    fireEvent.change(type, {
+      target: { value: 'google_domain_wide_delegation' },
+    });
+    expect(screen.getByText('Removed when you save.')).toBeTruthy();
+    // Another type keeps the stored block again.
+    fireEvent.change(type, { target: { value: 'header_api_key' } });
+    expect(screen.queryByText('Removed when you save.')).toBeNull();
+    expect(
+      screen.getByRole('button', { name: 'Edit caller assertion' }),
+    ).toBeTruthy();
+    fireEvent.change(type, {
+      target: { value: 'google_domain_wide_delegation' },
+    });
+    fireEvent.change(screen.getByLabelText('Delegated service account'), {
+      target: {
+        value: 'gateway-delegate@example-project.iam.gserviceaccount.com',
+      },
+    });
+    fireEvent.change(screen.getByLabelText('Workload identity profile'), {
+      target: { value: 'gateway-wif' },
+    });
+    fireEvent.change(screen.getByLabelText('Google scopes'), {
+      target: { value: 'https://www.googleapis.com/auth/gmail.readonly' },
+    });
+    fireEvent.change(screen.getByLabelText('Subject issuers (one per line)'), {
+      target: { value: 'https://idp.example.test' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save connection' }));
+
+    expect(await screen.findByText('Connection detail route')).toBeTruthy();
+    expect(puts).toHaveLength(1);
+    const body = JSON.parse(String(puts[0]?.body)) as Record<string, unknown>;
+    expect(body.authentication).toMatchObject({
+      type: 'google_domain_wide_delegation',
+      subject_claim: 'email',
+    });
+    // Omitted would keep the block, which the gateway refuses on this type.
+    expect(body.caller_assertion).toBeNull();
+  });
+
+  it('shows the gateway Google delegation problems with their codes', async () => {
+    vi.stubGlobal(
+      'fetch',
+      attestedConnectionFetch({
+        detail: googleDelegationDetail({ canBindSecret: true }),
+        secrets: [],
+        onPut: () =>
+          jsonResponse(422, {
+            error: 'connection validation failed',
+            problems: [
+              {
+                field: 'authentication.workload_identity_profile',
+                code: 'unresolvable_binding',
+              },
+            ],
+          }),
+      }),
+    );
+
+    renderEditor('/connections/billing/edit');
+    await screen.findByLabelText('Workload identity profile');
+    fireEvent.click(screen.getByLabelText('Enabled'));
+    fireEvent.click(
+      screen.getByLabelText(/I understand that enabling this connection/),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Save connection' }));
+
+    expect(
+      await screen.findByText(
+        /No CONNECTION_GCP_PROVIDER profile with this ID is configured on the gateway.*\(unresolvable_binding\)/,
+      ),
+    ).toBeTruthy();
+    await waitFor(() =>
+      expect(document.activeElement?.id).toBe('connection-google-profile'),
+    );
   });
 
   it('renders legacy projections as read only without an editor form', async () => {
@@ -3137,8 +3512,10 @@ function delegatedDetail({
   };
 }
 
-function googleDelegationDetail(): ConnectionDetail {
-  const detail = managedDetail();
+function googleDelegationDetail({
+  canBindSecret = false,
+}: { canBindSecret?: boolean } = {}): ConnectionDetail {
+  const detail = managedDetail({ canBindSecret, authentication: 'none' });
   if (detail.configuration === undefined) {
     throw new Error('the managed fixture carries a configuration');
   }
@@ -3147,6 +3524,7 @@ function googleDelegationDetail(): ConnectionDetail {
     authentication: 'google_domain_wide_delegation',
     configuration: {
       ...detail.configuration,
+      discovery: undefined,
       authentication: {
         type: 'google_domain_wide_delegation',
         service_account_email:
