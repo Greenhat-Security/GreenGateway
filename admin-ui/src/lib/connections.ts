@@ -15,6 +15,7 @@ export type ConnectionAuthenticationKind =
   | 'static_bearer'
   | 'oauth2_client_credentials'
   | 'delegated_issuer_token'
+  | 'google_domain_wide_delegation'
   | 'legacy_configured';
 
 export type ConnectionOperationalState =
@@ -165,7 +166,24 @@ export type SafeConnectionAuthentication =
       client_auth_method: OAuthClientAuthMethod;
       client_secret_configured: boolean;
     }
-  | SafeDelegatedIssuerToken;
+  | SafeDelegatedIssuerToken
+  | SafeGoogleDomainWideDelegation;
+
+/**
+ * The calling user's own Google Workspace token, minted per caller by
+ * domain-wide delegation. Read only, like a delegated issuer token: the admin
+ * UI shows it and never writes it. None of its fields is a secret.
+ */
+export type SafeGoogleDomainWideDelegation = {
+  type: 'google_domain_wide_delegation';
+  service_account_email: string;
+  /** The `id` of a `CONNECTION_GCP_PROVIDER` profile, never a locator. */
+  workload_identity_profile: string;
+  scopes: string[];
+  subject_claim: 'email';
+  /** Identity providers trusted to name Workspace users by email. */
+  subject_issuers: string[];
+};
 
 /**
  * The calling user's own upstream token, obtained per caller by RFC 8693
@@ -1309,6 +1327,23 @@ function projectSafeConnectionAuthentication(
       client_secret_configured: source.client_secret_configured,
     };
   }
+  if (
+    source.type === 'google_domain_wide_delegation' &&
+    typeof source.service_account_email === 'string' &&
+    typeof source.workload_identity_profile === 'string' &&
+    isStringList(source.scopes) &&
+    source.subject_claim === 'email' &&
+    isStringList(source.subject_issuers)
+  ) {
+    return {
+      type: 'google_domain_wide_delegation',
+      service_account_email: source.service_account_email,
+      workload_identity_profile: source.workload_identity_profile,
+      scopes: [...source.scopes],
+      subject_claim: source.subject_claim,
+      subject_issuers: [...source.subject_issuers],
+    };
+  }
 
   throw invalidConnectionResponse('safe connection authentication');
 }
@@ -1456,7 +1491,14 @@ function isConnectionAuthenticationKind(
     value === 'static_bearer' ||
     value === 'oauth2_client_credentials' ||
     value === 'delegated_issuer_token' ||
+    value === 'google_domain_wide_delegation' ||
     value === 'legacy_configured'
+  );
+}
+
+function isStringList(value: unknown): value is string[] {
+  return (
+    Array.isArray(value) && value.every((entry) => typeof entry === 'string')
   );
 }
 

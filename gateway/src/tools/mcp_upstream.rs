@@ -1326,6 +1326,18 @@ fn protocol_probe_connection_error(
             ConnectionTestReason::OauthTokenUnavailable,
             ConnectionStatusReason::SecretUnavailable,
         ),
+        // Unreachable: a domain-wide delegation is an HTTP API, which no MCP
+        // lane serves.
+        ConnectionHttpError::GoogleDelegation(error) if error.is_egress_denial() => (
+            ConnectionTestStageName::EgressPolicy,
+            ConnectionTestReason::OauthTokenEgressDenied,
+            ConnectionStatusReason::EgressDenied,
+        ),
+        ConnectionHttpError::GoogleDelegation(_) => (
+            ConnectionTestStageName::SecretAvailable,
+            ConnectionTestReason::OauthTokenUnavailable,
+            ConnectionStatusReason::SecretUnavailable,
+        ),
         ConnectionHttpError::OAuthTokenUnavailable => (
             ConnectionTestStageName::SecretAvailable,
             ConnectionTestReason::OauthTokenUnavailable,

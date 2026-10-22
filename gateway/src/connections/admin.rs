@@ -10,7 +10,7 @@ use super::{
         CallerAssertionAlgorithm, CallerAssertionClaim, ConnectionAuthentication,
         ConnectionEndpoint, ConnectionId, ConnectionKind, ConnectionManagementSource,
         ConnectionTestProfile, ConnectionTimeouts, ConnectionWrite, DiscoveryConfig,
-        OAuthClientAuthMethod, SubjectTokenSource,
+        GoogleSubjectClaim, OAuthClientAuthMethod, SubjectTokenSource,
     },
     secret::{SecretAliasMetadata, SecretProviderKind, SecretPurpose},
     status::{ConnectionOperationalState, SafeConnectionStatus, SafeConnectionSummary},
@@ -439,6 +439,16 @@ pub enum SafeConnectionAuthentication {
         subject_token_source: SubjectTokenSource,
         client_secret_configured: bool,
     },
+    /// Every field: none of them is a secret. The workload identity profile
+    /// is the ID of trusted startup configuration, never a locator, and the
+    /// service account is Google's public name for the delegated identity.
+    GoogleDomainWideDelegation {
+        service_account_email: String,
+        workload_identity_profile: String,
+        scopes: Vec<String>,
+        subject_claim: GoogleSubjectClaim,
+        subject_issuers: Vec<String>,
+    },
 }
 
 impl SafeConnectionAuthentication {
@@ -490,6 +500,19 @@ impl SafeConnectionAuthentication {
                 revocation_url: revocation_url.clone(),
                 subject_token_source: *subject_token_source,
                 client_secret_configured: client_secret_id.is_some(),
+            },
+            ConnectionAuthentication::GoogleDomainWideDelegation {
+                service_account_email,
+                workload_identity_profile,
+                scopes,
+                subject_claim,
+                subject_issuers,
+            } => Self::GoogleDomainWideDelegation {
+                service_account_email: service_account_email.clone(),
+                workload_identity_profile: workload_identity_profile.clone(),
+                scopes: scopes.clone(),
+                subject_claim: *subject_claim,
+                subject_issuers: subject_issuers.clone(),
             },
         }
     }
