@@ -138,6 +138,12 @@ pub struct ConnectionControlPlane {
     /// The caller-assertion JWKS, and why any Connection's keys are left out
     /// of it, shared by every clone.
     caller_assertion_keys: Arc<CallerAssertionKeys>,
+    /// Secret aliases no Connection may bind: the authority pseudonym keys
+    /// (issue #425). An operator or provider alias carries no purpose of its
+    /// own, so a Connection bound to one would send the key upstream, and
+    /// with it the ability to confirm any guessed identity against every
+    /// delivered reference.
+    reserved_secret_aliases: Arc<BTreeSet<String>>,
 }
 
 /// The published caller-assertion key set, and the reasons this replica
@@ -712,6 +718,17 @@ impl ConnectionControlPlane {
                 .transpose()?
                 .unwrap_or_default(),
         };
+        let reserved_secret_aliases: BTreeSet<String> = config
+            .authority_events
+            .pseudonym_key_aliases()
+            .map(str::to_owned)
+            .collect();
+        if let Some((id, field)) = managed_records.iter().find_map(|record| {
+            reserved_binding(&record.write, &reserved_secret_aliases)
+                .map(|field| (record.id.to_string(), field))
+        }) {
+            return Err(ConnectionControlPlaneError::ReservedSecretAlias { id, field });
+        }
         if cluster.is_some() || sqlite_store.is_some() {
             let legacy_ids = legacy
                 .iter()
@@ -1035,6 +1052,7 @@ impl ConnectionControlPlane {
             aws_config: config.connection_aws_provider.clone(),
             kubernetes_config: config.connection_kubernetes_provider.clone(),
             caller_assertion_keys: Arc::new(CallerAssertionKeys::new(caller_assertion_problems)),
+            reserved_secret_aliases: Arc::new(reserved_secret_aliases),
         })
     }
 
@@ -1060,6 +1078,14 @@ impl ConnectionControlPlane {
 
     pub fn secret_resolver(&self) -> &(dyn SecretResolver + Send + Sync) {
         self.secret_resolver.as_ref()
+    }
+
+    /// The same resolver as a shared handle, for a consumer that outlives
+    /// this borrow: the authority-event startup, which resolves the
+    /// pseudonym keyring after the network providers are activated.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+    pub(crate) fn secret_resolver_handle(&self) -> Arc<dyn SecretResolver> {
+        Arc::clone(&self.secret_resolver) as Arc<dyn SecretResolver>
     }
 
     pub(crate) fn local_secret_version(&self, id: &str) -> Option<u64> {
@@ -1531,6 +1557,7 @@ impl ConnectionControlPlane {
                 current: current.collection_etag().to_owned(),
             });
         }
+        self.ensure_no_reserved_alias(&candidate)?;
         self.ensure_activatable(&candidate)?;
         self.ensure_assertion_kids_unambiguous(None, &candidate, &current)?;
         // The local check above is authoritative in standalone mode. In
@@ -1575,6 +1602,7 @@ impl ConnectionControlPlane {
         actor: &str,
     ) -> Result<StoredConnection, ConnectionMutationError> {
         let _guard = self.mutation_guard().await;
+        self.ensure_no_reserved_alias(&candidate)?;
         self.ensure_activatable(&candidate)?;
         self.ensure_assertion_kids_unambiguous(Some(id), &candidate, &self.runtime.load_full())?;
         let replaced = self
@@ -1963,6 +1991,22 @@ impl ConnectionControlPlane {
         }
 
         Ok(())
+    }
+
+    /// Refuses a candidate that binds a reserved secret alias under any
+    /// field, before anything is resolved or written. Answered as the same
+    /// `secret_purpose_conflict` a token-exchange client secret bound under
+    /// another field is, naming the candidate's field and not the alias.
+    fn ensure_no_reserved_alias(
+        &self,
+        candidate: &ConnectionWrite,
+    ) -> Result<(), ConnectionMutationError> {
+        match reserved_binding(candidate, &self.reserved_secret_aliases) {
+            Some(field) => Err(ConnectionMutationError::Store(
+                ConnectionStoreError::SecretPurposeConflict { field },
+            )),
+            None => Ok(()),
+        }
     }
 
     fn ensure_activatable(
@@ -3311,6 +3355,27 @@ pub enum ConnectionControlPlaneError {
         fields: Vec<&'static str>,
         reason: &'static str,
     },
+    /// A stored Connection binds a reserved secret alias (an authority
+    /// pseudonym key's) under `field`.
+    ReservedSecretAlias {
+        id: String,
+        field: &'static str,
+    },
+}
+
+/// The field of `candidate` that binds one of `reserved`, if any.
+fn reserved_binding(
+    candidate: &ConnectionWrite,
+    reserved: &BTreeSet<String>,
+) -> Option<&'static str> {
+    if reserved.is_empty() {
+        return None;
+    }
+    candidate
+        .bound_secret_aliases()
+        .into_iter()
+        .find(|bound| reserved.contains(bound.alias))
+        .map(|bound| bound.field)
 }
 
 impl fmt::Display for ConnectionControlPlaneError {
@@ -3340,6 +3405,10 @@ impl fmt::Display for ConnectionControlPlaneError {
             Self::NetworkAliasIdCollision { id } => write!(
                 formatter,
                 "secret alias '{id}' is claimed by more than one network secret provider"
+            ),
+            Self::ReservedSecretAlias { id, field } => write!(
+                formatter,
+                "managed connection '{id}' binds an authority pseudonym key alias under {field}; no Connection may bind it, so unbind it before configuring the key"
             ),
             Self::UnresolvableBindings { id, fields, reason } => {
                 if fields.is_empty() {
@@ -5167,6 +5236,98 @@ mod tests {
             }
         }))
         .expect("managed candidate should deserialize")
+    }
+
+    /// An authority pseudonym key's alias is reserved: no Connection may bind
+    /// it under any field, on create or replace, and a stored Connection that
+    /// already binds it refuses startup rather than keep the key one request
+    /// away from an upstream (issue #425).
+    #[tokio::test]
+    async fn a_connection_may_never_bind_an_authority_pseudonym_key_alias() {
+        let temporary = TemporaryLocalControlPlane::new("reserved-alias");
+        let bound_to = |alias: &str| {
+            let mut candidate = managed_candidate();
+            // Disabled, so nothing needs to resolve: the refusal must not
+            // depend on whether the alias exists.
+            candidate.enabled = false;
+            candidate.authentication = ConnectionAuthentication::StaticBearer {
+                secret_id: Some(alias.to_owned()),
+            };
+            candidate
+        };
+
+        // Bound before the key was configured: allowed then.
+        let unreserved = ConnectionControlPlane::from_config(&temporary.config())
+            .expect("control plane should build");
+        let before = unreserved.runtime_snapshot();
+        let stored = unreserved
+            .create_managed(
+                before.collection_etag(),
+                bound_to("pseudonym-later"),
+                "test-admin",
+            )
+            .await
+            .expect("an unreserved alias binds");
+        drop(unreserved);
+
+        let mut config = temporary.config();
+        config.authority_events.pseudonym_key_alias = Some("pseudonym-later".to_owned());
+        assert!(matches!(
+            ConnectionControlPlane::from_config(&config),
+            Err(ConnectionControlPlaneError::ReservedSecretAlias { ref id, field })
+                if *id == stored.id.to_string() && field == "authentication.secret_id"
+        ));
+
+        // With the stored binding gone, the reserved aliases are refused on
+        // every write.
+        let plain = ConnectionControlPlane::from_config(&temporary.config())
+            .expect("control plane should build");
+        plain
+            .delete_managed(&stored.id, &stored.etag(), "test-admin")
+            .await
+            .expect("the stored binding is removed");
+        drop(plain);
+        config.authority_events.pseudonym_key_alias = Some("pseudonym-current".to_owned());
+        config.authority_events.previous_pseudonym_key_alias =
+            Some("pseudonym-previous".to_owned());
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let initial = control_plane.runtime_snapshot();
+        for alias in ["pseudonym-current", "pseudonym-previous"] {
+            assert!(matches!(
+                control_plane
+                    .create_managed(initial.collection_etag(), bound_to(alias), "test-admin")
+                    .await,
+                Err(ConnectionMutationError::Store(
+                    ConnectionStoreError::SecretPurposeConflict {
+                        field: "authentication.secret_id"
+                    }
+                ))
+            ));
+        }
+        assert!(control_plane.runtime_snapshot().managed().is_empty());
+
+        let created = control_plane
+            .create_managed(initial.collection_etag(), managed_candidate(), "test-admin")
+            .await
+            .expect("a Connection that binds nothing reserved creates");
+        let mut replacement = created.write.clone();
+        replacement.enabled = false;
+        replacement.authentication = ConnectionAuthentication::StaticBearer {
+            secret_id: Some("pseudonym-current".to_owned()),
+        };
+        assert!(matches!(
+            control_plane
+                .replace_managed(&created.id, &created.etag(), replacement, "test-admin")
+                .await,
+            Err(ConnectionMutationError::Store(
+                ConnectionStoreError::SecretPurposeConflict { .. }
+            ))
+        ));
+        assert_eq!(
+            control_plane.runtime_snapshot().managed().get(&created.id),
+            Some(&created)
+        );
     }
 
     #[tokio::test]

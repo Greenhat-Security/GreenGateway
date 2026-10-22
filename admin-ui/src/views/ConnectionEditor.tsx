@@ -29,7 +29,9 @@ import {
   BindingDraft,
   configuredBinding,
   ConnectionFormState,
+  createWriteFromForm,
   DEFAULT_FORM,
+  delegatedIssuerTokenOffered,
   detailConfiguresCredentialAuthority,
   EditorLoadState,
   emptyAdditionalHeader,
@@ -37,7 +39,6 @@ import {
   FieldErrors,
   fieldErrorsFromProblems,
   focusFirstProblem,
-  editorUnsupportedReason,
   formFromDetail,
   MAX_ADDITIONAL_HEADERS,
   requiredEtag,
@@ -46,6 +47,7 @@ import {
   secretInventoryLoadError,
   SecretInventoryState,
   secretMutationReloadRequired,
+  subjectTokenDraftApplies,
   toLoadError,
   toSaveError,
   validateForm,
@@ -59,6 +61,7 @@ import {
   ConnectionIdentitySection,
   EditorAlert,
   LocalSecretManager,
+  SubjectTokenSection,
   TestProfileSection,
   TimeoutsAndDiscoverySection,
   TlsSection,
@@ -132,17 +135,6 @@ export function ConnectionEditor() {
         }
         if (resource.etag === null) {
           throw new Error('The gateway did not return the connection ETag.');
-        }
-
-        const unsupported = editorUnsupportedReason(resource.value);
-        if (unsupported !== null) {
-          setLoadState({
-            kind: 'error',
-            title: 'Editing not available',
-            message: unsupported,
-            tone: 'warning',
-          });
-          return;
         }
 
         setEtag(resource.etag);
@@ -271,6 +263,11 @@ export function ConnectionEditor() {
         authenticationBinding: configured
           ? configuredBinding()
           : emptyBinding(),
+        // A new delegated Connection drafts its block as the subject token
+        // instead, so an edit of the general block in progress is dropped.
+        ...(next === 'delegated_issuer_token'
+          ? { callerAssertionMode: 'keep' as const }
+          : {}),
       };
     });
   }
@@ -381,7 +378,6 @@ export function ConnectionEditor() {
       return;
     }
 
-    const write = writeFromForm(form);
     saveController.current?.abort();
     const controller = new AbortController();
     saveController.current = controller;
@@ -390,7 +386,7 @@ export function ConnectionEditor() {
       const resource =
         id === undefined
           ? await createConnection(
-            write,
+            createWriteFromForm(form),
             requiredEtag(
               collectionEtag,
               'Connection collection ETag is unavailable. Reload and retry.',
@@ -399,7 +395,7 @@ export function ConnectionEditor() {
           )
           : await updateConnection(
             id,
-            write,
+            writeFromForm(form),
             requiredEtag(
               etag,
               'Connection ETag is unavailable. Reload and retry.',
@@ -575,6 +571,13 @@ export function ConnectionEditor() {
         current.clientPrivateKeyBinding,
         secretId,
       ),
+      subjectToken: {
+        ...current.subjectToken,
+        signingKeyBinding: withoutDeletedBinding(
+          current.subjectToken.signingKeyBinding,
+          secretId,
+        ),
+      },
     }));
   }
 
@@ -687,9 +690,23 @@ export function ConnectionEditor() {
                 credentialAuthorityLocked ||
                 !canBindSecret
               }
+              delegatedOffered={delegatedIssuerTokenOffered(
+                form,
+                id === undefined,
+              )}
               onUpdate={updateForm}
               onAuthenticationTypeChange={updateAuthenticationType}
             />
+            {subjectTokenDraftApplies(form) ? (
+              <SubjectTokenSection
+                draft={form.subjectToken}
+                errors={fieldErrors}
+                canBindSecret={canUseSecretBindings}
+                secrets={availableSecrets}
+                disabled={!canEdit || editorBusy || !canBindSecret}
+                onChange={(subjectToken) => updateForm({ subjectToken })}
+              />
+            ) : null}
             <AdditionalHeadersSection
               headers={form.additionalHeaders}
               errors={fieldErrors}
@@ -705,7 +722,15 @@ export function ConnectionEditor() {
               onUpdate={updateAdditionalHeader}
               onRemove={removeAdditionalHeader}
             />
-            <CallerAssertionSection assertion={form.callerAssertion} />
+            <CallerAssertionSection
+              form={form}
+              errors={fieldErrors}
+              secrets={availableSecrets}
+              canBindSecret={canUseSecretBindings}
+              secretsWriteAllowed={canBindSecret}
+              disabled={!canEdit || editorBusy || !canBindSecret}
+              onUpdate={updateForm}
+            />
             <TlsSection
               form={form}
               errors={fieldErrors}

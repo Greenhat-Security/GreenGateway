@@ -1243,7 +1243,7 @@ fn section_names(report: &Value) -> Vec<String> {
 /// checks against, and a drill that asked the import to define emptiness
 /// and then checked emptiness with the import's own definition would agree
 /// with itself no matter what fell off the list.
-const AUTHORITATIVE_TABLES: [&str; 42] = [
+const AUTHORITATIVE_TABLES: [&str; 43] = [
     "audit_events",
     "audit_stream",
     "policy_documents",
@@ -1286,16 +1286,18 @@ const AUTHORITATIVE_TABLES: [&str; 42] = [
     "service_token_change_evidence",
     "jwt_revocation_evidence",
     "admin_session_evidence",
+    "authority_event_journal",
 ];
 
 /// The singleton counters migration seeds at zero. A moved counter is an
 /// occupied namespace even when every table is still empty.
-const AUTHORITATIVE_COUNTERS: [(&str, &str); 5] = [
+const AUTHORITATIVE_COUNTERS: [(&str, &str); 6] = [
     ("security_revision_state", "last_revision"),
     ("audit_stream_state", "last_position"),
     ("connection_state_revision", "last_revision"),
     ("service_token_state_revision", "last_revision"),
     ("discovery_projector_state", "checkpoint_position"),
+    ("authority_event_state", "last_position"),
 ];
 
 /// The sections the import writes, in the order it writes them.

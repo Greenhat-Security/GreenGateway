@@ -91,8 +91,8 @@ pub struct ConnectionHttpTarget {
     credential_header_names: Vec<HeaderName>,
     transport: ConnectionTransportBinding,
     /// What a tool call signs and where it sends it, when the Connection
-    /// attests its caller. Only [`ConnectionHttpRuntime::tool_call_target`]
-    /// ever sets this; every other constructor refuses such a Connection.
+    /// attests its caller. Only the constructors of an [`AttestingLane`] ever
+    /// set this; every other constructor refuses such a Connection.
     caller_assertion: Option<CallerAssertionBinding>,
 }
 
@@ -714,16 +714,18 @@ impl ConnectionHttpRuntime {
 
     /// The target of one manual HTTP tool call. Like every attesting lane's
     /// constructor it serves a Connection carrying a `caller_assertion`, and
-    /// it is the only one that serves a `delegated_issuer_token` Connection,
-    /// whose assertion is the subject token of its exchange.
+    /// it is the only tool lane that serves a `delegated_issuer_token`
+    /// Connection, whose assertion is the subject token of its exchange.
     ///
     /// A lane may attest its caller when it has a validated principal to
     /// attest and the exact bytes it sends in hand before it sends them: tool
     /// calls (this, [`Self::openapi_tool_target`] and
-    /// [`Self::mcp_tool_call_target`]) and proxied requests
-    /// ([`Self::proxy_route_target`]). Every other lane -- discovery, enum
-    /// and label sources, composite steps, stored tests -- builds its target
-    /// with a constructor that keeps refusing such a Connection with
+    /// [`Self::mcp_tool_call_target`]), the leaf requests of a composite tool
+    /// ([`Self::composite_leaf_target`]) and proxied requests
+    /// ([`Self::proxy_route_target`]). A stored test attests the principal
+    /// running it, for a delegated Connection only ([`Self::test_target`]).
+    /// Every other lane -- discovery, enum and label sources -- builds its
+    /// target with a constructor that keeps refusing such a Connection with
     /// `caller_assertion_not_enforced`, as do these for a stored assertion
     /// that only the legacy reading admits
     /// ([`ConnectionWrite::caller_assertion_enforceable`]).
@@ -755,6 +757,23 @@ impl ConnectionHttpRuntime {
         path_and_query: &str,
     ) -> Result<ConnectionHttpTarget, ConnectionHttpError> {
         self.attesting_http_target(connection_id, path_and_query, AttestingLane::OpenApiTool)
+    }
+
+    /// The target of one leaf request of a composite tool: a forward step,
+    /// one iteration of a fan-out, or a compensation. Each leaf calls one of
+    /// the managed OpenAPI tools the composite is built from, so it is
+    /// attested like one (see [`Self::openapi_tool_target`]), with an
+    /// assertion of its own: the composite gives every leaf a distinct `jti`,
+    /// so an upstream that refuses a `jti` it has already seen accepts every
+    /// request of the call. A `delegated_issuer_token` Connection is refused
+    /// with `caller_assertion_not_enforced`, as before composite steps signed
+    /// anything.
+    pub fn composite_leaf_target(
+        &self,
+        connection_id: &str,
+        path_and_query: &str,
+    ) -> Result<ConnectionHttpTarget, ConnectionHttpError> {
+        self.attesting_http_target(connection_id, path_and_query, AttestingLane::CompositeLeaf)
     }
 
     /// The target of one request a connection-bound proxy route forwards,
@@ -854,6 +873,9 @@ impl ConnectionHttpRuntime {
     /// this answers.
     ///
     /// Every verdict is reached on the configuration `target` was built from.
+    /// A disabled Connection publishes no keys at all, so a target built from
+    /// one -- only a stored test builds such a target -- is refused with
+    /// [`CallerAssertionError::KeyNotPublished`] too.
     pub async fn admit_caller_assertion(
         &self,
         target: &ConnectionHttpTarget,
@@ -870,6 +892,9 @@ impl ConnectionHttpRuntime {
             .managed()
             .get(target.connection_id())
             .ok_or(CallerAssertionError::KeyNotPublished)?;
+        if !record.write.enabled {
+            return Err(CallerAssertionError::KeyNotPublished);
+        }
         if super::control_plane::publishes_an_ambiguous_kid(&binding.configuration, record) {
             return Err(CallerAssertionError::KeyNotPublished);
         }
@@ -1039,6 +1064,13 @@ impl ConnectionHttpRuntime {
     /// managed connection. Normal data-plane target constructors remain
     /// fail-closed for disabled connections. A missing target indicates that
     /// the persisted connection no longer matches `expected_connection_etag`.
+    ///
+    /// A `delegated_issuer_token` Connection is tested as the principal who
+    /// runs the test: the target carries its caller assertion, as the subject
+    /// token of that principal's exchange, and the caller must admit the test
+    /// with [`Self::admit_caller_assertion`] before any I/O. Every other
+    /// Connection carrying a `caller_assertion` is refused with
+    /// `caller_assertion_not_enforced`; see [`caller_assertion_servable_on`].
     pub fn test_target(
         &self,
         connection_id: &str,
@@ -1047,7 +1079,11 @@ impl ConnectionHttpRuntime {
         let connection_id = ConnectionId::parse(connection_id.to_owned())
             .map_err(|_| ConnectionHttpError::InvalidConnectionId)?;
         let snapshot = self.control_plane.runtime_snapshot();
-        let record = managed_record(&snapshot, &connection_id)?;
+        let record = snapshot
+            .managed()
+            .get(&connection_id)
+            .ok_or(ConnectionHttpError::ConnectionNotFound)?;
+        let caller_assertion = attesting_binding(record, &snapshot, AttestingLane::ConnectionTest)?;
         let connection_etag = record.etag();
         if connection_etag.as_str() != expected_connection_etag {
             return Ok(None);
@@ -1087,16 +1123,28 @@ impl ConnectionHttpRuntime {
         let authentication = self.authentication_binding(record)?;
         let additional_headers = additional_header_bindings(record)?;
 
-        Ok(Some(ConnectionHttpTestTarget {
-            target: ConnectionHttpTarget::assemble(
-                connection_id,
-                connection_etag.to_string(),
-                url,
-                client,
+        // Only a delegated Connection's block gets here, and its assertion is
+        // the subject token of the tester's exchange: it goes to the issuer
+        // alone; see `CallerAssertionBinding::signs_upstream`.
+        let caller_assertion = caller_assertion.map(|mut binding| {
+            binding.signs_upstream = !matches!(
                 authentication,
-                additional_headers,
-                connection_transport_binding(record),
-            ),
+                HttpAuthenticationBinding::DelegatedIssuerToken(_)
+            );
+            binding
+        });
+        let mut target = ConnectionHttpTarget::assemble(
+            connection_id,
+            connection_etag.to_string(),
+            url,
+            client,
+            authentication,
+            additional_headers,
+            connection_transport_binding(record),
+        );
+        target.caller_assertion = caller_assertion;
+        Ok(Some(ConnectionHttpTestTarget {
+            target,
             method,
             expected_statuses: expected_statuses.clone(),
         }))
@@ -2042,15 +2090,21 @@ fn refuse_unenforced_caller_assertion(
 /// caller, and so may serve a Connection carrying a `caller_assertion`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttestingLane {
-    /// A manual HTTP tool call. The one lane that also serves a
+    /// A manual HTTP tool call. The one tool lane that also serves a
     /// `delegated_issuer_token` Connection.
     ManualTool,
     /// A managed OpenAPI tool call.
     OpenApiTool,
+    /// One leaf request of a composite tool, each signed separately.
+    CompositeLeaf,
     /// A request a connection-bound proxy route forwards.
     ProxyRoute,
     /// The session a managed MCP tool call opens.
     ManagedMcpTool,
+    /// A stored test of a `delegated_issuer_token` Connection, which exchanges
+    /// the token of the principal running the test. It sends no assertion
+    /// upstream and serves no other attested Connection.
+    ConnectionTest,
 }
 
 /// Whether `write` can be served on `lane` as far as its caller assertion is
@@ -2059,10 +2113,12 @@ pub enum AttestingLane {
 /// A stored block only the legacy reading admits is served by no lane (see
 /// [`ConnectionWrite::caller_assertion_enforceable`]). A
 /// `delegated_issuer_token` Connection, whose assertion is the subject token
-/// of the caller's own credential, is served by manual tool calls alone:
-/// that is the only lane that obtains a caller's delegated token, so on every
-/// other lane the Connection stays refused exactly as it was before those
-/// lanes signed anything.
+/// of the caller's own credential, is served by manual tool calls and by
+/// stored tests alone: those are the lanes that obtain a caller's delegated
+/// token, so on every other lane the Connection stays refused exactly as it
+/// was before those lanes signed anything. A stored test serves no other
+/// attested Connection: it would have to send the upstream an assertion
+/// naming the tester, which no operator configured a test to do.
 ///
 /// [`ConnectionWrite::caller_assertion_enforceable`]:
 ///     super::model::ConnectionWrite::caller_assertion_enforceable
@@ -2070,12 +2126,19 @@ pub fn caller_assertion_servable_on(write: &ConnectionWrite, lane: AttestingLane
     if write.caller_assertion.is_none() {
         return true;
     }
+    let delegated = matches!(
+        write.authentication,
+        ConnectionAuthentication::DelegatedIssuerToken { .. }
+    );
     write.caller_assertion_enforceable()
-        && (lane == AttestingLane::ManualTool
-            || !matches!(
-                write.authentication,
-                ConnectionAuthentication::DelegatedIssuerToken { .. }
-            ))
+        && match lane {
+            AttestingLane::ManualTool => true,
+            AttestingLane::ConnectionTest => delegated,
+            AttestingLane::OpenApiTool
+            | AttestingLane::CompositeLeaf
+            | AttestingLane::ProxyRoute
+            | AttestingLane::ManagedMcpTool => !delegated,
+        }
 }
 
 /// The caller assertion a target built for `lane` carries, or the refusal
@@ -3240,7 +3303,7 @@ mod tests {
         let etag = stored.etag().to_string();
         let refused = Some(ConnectionHttpError::CallerAssertionNotEnforced);
 
-        // Composite steps and enum sources.
+        // Enum and label sources.
         assert_eq!(
             temporary.runtime.target(connection_id, "/charges").err(),
             refused
@@ -3408,12 +3471,17 @@ mod tests {
             .runtime
             .validate_tool_binding(connection_id)
             .is_ok());
-        // Managed OpenAPI tools and proxied requests attest the same way.
+        // Managed OpenAPI tools, composite leaves and proxied requests attest
+        // the same way.
         for lane_target in [
             temporary
                 .runtime
                 .openapi_tool_target(connection_id, "/charges")
                 .expect("a valid attested Connection serves OpenAPI tool calls"),
+            temporary
+                .runtime
+                .composite_leaf_target(connection_id, "/charges")
+                .expect("a valid attested Connection serves composite leaves"),
             temporary
                 .runtime
                 .proxy_route_target(connection_id, "/charges")
@@ -3596,7 +3664,6 @@ mod tests {
         .await;
         let connection_id = temporary.connection_id.as_str();
         let stored = temporary.stored_connection();
-        let etag = stored.etag().to_string();
 
         let target = temporary
             .runtime
@@ -3656,10 +3723,11 @@ mod tests {
         // A delegated subject token is never a request binding.
         assert!(!target.caller_assertion_binds_request_body());
 
-        // Every other lane refuses it before preparing anything, because it
-        // carries the caller assertion its subject token is signed with. That
-        // includes the lanes that attest their callers: only a manual tool
-        // obtains a caller's own delegated token.
+        // Every other tool and proxy lane refuses it before preparing
+        // anything, because it carries the caller assertion its subject token
+        // is signed with. That includes the lanes that attest their callers:
+        // only a manual tool obtains a caller's own delegated token, and a
+        // stored test its tester's (see the next test).
         let refused = Some(ConnectionHttpError::CallerAssertionNotEnforced);
         assert_eq!(
             temporary.runtime.target(connection_id, "/messages").err(),
@@ -3686,22 +3754,145 @@ mod tests {
         assert_eq!(
             temporary
                 .runtime
+                .composite_leaf_target(connection_id, "/messages")
+                .err(),
+            refused
+        );
+        assert_eq!(
+            temporary
+                .runtime
                 .proxy_route_target(connection_id, "/messages")
                 .err(),
             refused
         );
-        assert!(!caller_assertion_servable_on(
-            &stored.write,
-            AttestingLane::OpenApiTool
-        ));
+        for lane in [
+            AttestingLane::OpenApiTool,
+            AttestingLane::CompositeLeaf,
+            AttestingLane::ProxyRoute,
+            AttestingLane::ManagedMcpTool,
+        ] {
+            assert!(!caller_assertion_servable_on(&stored.write, lane));
+        }
         assert!(caller_assertion_servable_on(
             &stored.write,
             AttestingLane::ManualTool
         ));
+        assert!(caller_assertion_servable_on(
+            &stored.write,
+            AttestingLane::ConnectionTest
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_delegated_connection_is_tested_as_the_tester_and_sends_no_assertion_upstream() {
+        let mut write = record("/v1").write;
+        write.caller_assertion = Some(unenforced_caller_assertion());
+        write.authentication = ConnectionAuthentication::DelegatedIssuerToken {
+            token_exchange_url: "https://token.example.test/oauth2/token-exchange".to_owned(),
+            client_id: "greengateway".to_owned(),
+            client_secret_id: Some("issuer-exchange-secret".to_owned()),
+            requested_scopes: vec!["mail.read".to_owned()],
+            audience: None,
+            resource: None,
+            revocation_url: None,
+            subject_token_source: SubjectTokenSource::CallerAssertion,
+        };
+        write.test_profile = Some(ConnectionTestProfile {
+            method: "GET".to_owned(),
+            path: "/messages".to_owned(),
+            expected_statuses: vec![200],
+        });
+        let root = temporary_managed_root("delegated-test-target");
+        fs::create_dir(&root).expect("temporary managed root should create");
+        let aliases = vec![
+            crate::connections::test_support::write_assertion_signing_key(
+                &root,
+                &crate::connections::test_support::generated_es256_pem(),
+            ),
+            crate::connections::test_support::write_secret_file(
+                &root,
+                "issuer-exchange-secret",
+                b"issuer-exchange-value",
+            ),
+        ];
+        let temporary = TemporaryManagedRuntime::build_with_root(
+            "delegated-test-target",
+            root,
+            write,
+            aliases,
+            None,
+        )
+        .await;
+        let connection_id = temporary.connection_id.as_str();
+        let stored = temporary.stored_connection();
+        let etag = stored.etag().to_string();
+
+        let test_target = temporary
+            .runtime
+            .test_target(connection_id, &etag)
+            .expect("a delegated Connection is tested")
+            .expect("the etag is current");
+        let target = test_target.target();
+        assert!(target.attests_caller());
+        assert!(target.credential_belongs_to_caller());
+        // The subject token goes to the issuer only, as on a tool call.
+        assert!(temporary
+            .runtime
+            .caller_assertion_signer(target)
+            .await
+            .expect("nothing is loaded")
+            .is_none());
+        assert!(!target.caller_assertion_binds_request_body());
+
+        // A test that names nobody, and one of a Connection whose keys are
+        // not published, is refused before anything is resolved or sent: the
+        // issuer host does not even resolve.
+        let alice = AttestedCaller::from_principal(&principal(crate::auth::AuthMethod::Bearer))
+            .expect("a provider-vouched principal is attestable");
+        let tests = ConnectionTestService::new(temporary.runtime.clone());
         assert_eq!(
-            temporary.runtime.test_target(connection_id, &etag).err(),
-            refused
+            tests.execute(&stored, &etag).await.result.stages,
+            vec![ConnectionTestStage::failure(
+                ConnectionTestStageName::SecretAvailable,
+                ConnectionTestReason::DelegatedTokenNoPrincipal,
+            )]
         );
+        let mut disabled = stored.write.clone();
+        disabled.enabled = false;
+        let disabled = temporary
+            .runtime
+            .control_plane
+            .replace_managed(&stored.id, &stored.etag(), disabled, "test-admin")
+            .await
+            .expect("the Connection disables");
+        let disabled_etag = disabled.etag().to_string();
+        let target = temporary
+            .runtime
+            .test_target(connection_id, &disabled_etag)
+            .expect("a disabled delegated Connection still builds a test target")
+            .expect("the etag is current");
+        assert_eq!(
+            temporary
+                .runtime
+                .admit_caller_assertion(target.target(), Some(&alice))
+                .await,
+            Err(CallerAssertionError::KeyNotPublished)
+        );
+        let execution = tests
+            .execute_as(&disabled, &disabled_etag, Some(&alice))
+            .await;
+        assert_eq!(
+            execution.result.stages,
+            vec![ConnectionTestStage::failure(
+                ConnectionTestStageName::Authenticated,
+                ConnectionTestReason::CallerAssertionKeyNotPublished,
+            )]
+        );
+        assert_eq!(
+            execution.status_reason,
+            ConnectionStatusReason::RequestFailed
+        );
+        assert_eq!(temporary.runtime.delegated_token_cache_entries(), 0);
     }
 
     #[test]
@@ -3853,6 +4044,13 @@ mod tests {
                 temporary
                     .runtime
                     .openapi_tool_target(connection_id, "/charges")
+                    .err(),
+                Some(ConnectionHttpError::CallerAssertionNotEnforced)
+            );
+            assert_eq!(
+                temporary
+                    .runtime
+                    .composite_leaf_target(connection_id, "/charges")
                     .err(),
                 Some(ConnectionHttpError::CallerAssertionNotEnforced)
             );
@@ -4247,6 +4445,7 @@ mod tests {
             ConnectionTestService::new(temporary.runtime.clone()).execute_before(
                 &record,
                 &expected_etag,
+                None,
                 tokio::time::Instant::now() + Duration::from_secs(1),
             ),
         )

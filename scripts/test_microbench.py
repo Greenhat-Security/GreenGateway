@@ -408,7 +408,7 @@ class BudgetSchemaTests(unittest.TestCase):
             "kernel byte growth": lambda value: value["targets"][-1].update(
                 max_allocated_bytes_growth=True),
             "unknown key": lambda value: value.update(skipped_targets=["http_policy"]),
-            "future schema": lambda value: value.update(schema_version=3),
+            "future schema": lambda value: value.update(schema_version=4),
             "boolean schema": lambda value: value.update(schema_version=True),
         }
         for name, change in changes.items():
@@ -594,6 +594,249 @@ class KernelWiringTests(unittest.TestCase):
                 source = self.main_source().replace(DECLARATION, replacement)
                 with self.assertRaises(ValueError):
                     bench.kernel_wiring(source)
+
+
+def lane_budget():
+    value = kernel_budget()
+    value["schema_version"] = 3
+    value["lane_harness_sha256"] = ["e" * 64]
+    value["targets"].extend({"id": target, "max_allocation_growth": 0,
+                             "max_allocated_bytes_growth": 0}
+                            for target in ("tool_policy", "rate_lane"))
+    return value
+
+
+# Captured from the gateway test binary (unoptimized test profile) on the lane
+# harness this change adds: cases, fact bytes, checksum, then the calls and
+# requested bytes of one sample of 100 passes.
+LANE_ROWS = {
+    "tool_policy": (27, 1409, 2700, 9000, 1007400),
+    "rate_lane": (14, 830, 1400, 19600, 909800),
+}
+
+
+def lane_result(target, regression=False):
+    cases, size, checksum, calls, size_sum = LANE_ROWS[target]
+    if regression:
+        # The fixture adds one 64-byte allocation per decision.
+        calls, size_sum = calls + cases * 100, size_sum + cases * 100 * 64
+    return {
+        "schema_version": 1, "harness": "gateway-test-binary", "regression_fixture": regression,
+        "warmup": 10, "iterations": 100, "samples": 9,
+        "targets": [{
+            "id": target, "input_cases": cases, "input_bytes": size,
+            "operations_per_iteration": cases, "expected_checksum": checksum,
+            "allocation_samples": [
+                {"allocations": calls, "allocated_bytes": size_sum, "checksum": checksum}
+                for _ in range(9)
+            ],
+            "timing_samples_ns": [20000000 + i * 100000 for i in range(9)],
+        }],
+    }
+
+
+def lane_envelope(target, regression=False):
+    value = kernel_envelope(regression)
+    value["harness_sha256"] = "e" * 64
+    value["result"] = lane_result(target, regression)
+    return value
+
+
+def lane_limit(target):
+    return {"id": target, "max_allocation_growth": 0, "max_allocated_bytes_growth": 0}
+
+
+LANES = ("tool_policy", "rate_lane")
+
+
+class LaneBudgetSchemaTests(unittest.TestCase):
+    def test_schema_three_budgets_the_kernel_and_both_lanes(self):
+        value = bench.validate_budget(lane_budget())
+        self.assertTrue(bench.budgets_kernel(value))
+        self.assertTrue(bench.budgets_lanes(value))
+        self.assertFalse(bench.budgets_lanes(bench.validate_budget(kernel_budget())))
+        self.assertFalse(bench.budgets_lanes(bench.validate_budget(budget())))
+        # Entries are found by identifier, not position: http_policy is no
+        # longer last once the lanes follow it.
+        self.assertEqual(bench._budget_entry(value, "http_policy"), kernel_limit())
+        self.assertEqual(bench._budget_entry(value, "rate_lane"), lane_limit("rate_lane"))
+        with self.assertRaises(ValueError):
+            bench._budget_entry(kernel_budget(), "tool_policy")
+        report = bench.compare_results(result(), result(), value)
+        self.assertEqual([target["id"] for target in report["targets"]], list(bench.TARGET_IDS))
+
+    def test_lane_budget_must_be_complete_ordered_approved_and_zero(self):
+        changes = {
+            "no lane digests": lambda value: value.pop("lane_harness_sha256"),
+            "empty lane digests": lambda value: value.update(lane_harness_sha256=[]),
+            "three lane digests": lambda value: value.update(
+                lane_harness_sha256=["1" * 64, "2" * 64, "3" * 64]),
+            "duplicate lane digest": lambda value: value.update(
+                lane_harness_sha256=["1" * 64, "1" * 64]),
+            "uppercase lane digest": lambda value: value.update(lane_harness_sha256=["E" * 64]),
+            "no kernel digests": lambda value: value.pop("kernel_harness_sha256"),
+            "lane target missing": lambda value: value["targets"].pop(),
+            "lane targets swapped": lambda value: value["targets"].insert(-1, value["targets"].pop()),
+            "lane before kernel": lambda value: value["targets"].insert(4, value["targets"].pop()),
+            "kernel target missing": lambda value: value["targets"].pop(4),
+            "lane growth": lambda value: value["targets"][-1].update(max_allocation_growth=1),
+            "lane byte growth": lambda value: value["targets"][-2].update(
+                max_allocated_bytes_growth=True),
+            "unknown key": lambda value: value.update(skipped_targets=["rate_lane"]),
+        }
+        for name, change in changes.items():
+            with self.subTest(change=name):
+                value = lane_budget()
+                change(value)
+                with self.assertRaises(ValueError):
+                    bench.validate_budget(value)
+        schema_two_with_lanes = lane_budget()
+        schema_two_with_lanes["schema_version"] = 2
+        with self.assertRaises(ValueError):
+            bench.validate_budget(schema_two_with_lanes)
+        del schema_two_with_lanes["lane_harness_sha256"]
+        with self.assertRaises(ValueError):
+            bench.validate_budget(schema_two_with_lanes)
+
+    def test_repository_budget_enforces_the_lanes_over_the_committed_harnesses(self):
+        # A later comparison loads this budget from its base, so it must approve
+        # every harness the repository compiles, or that comparison is refused.
+        repository = bench.validate_budget(
+            json.loads((ROOT / bench.BUDGET_PATH).read_text(encoding="utf-8")))
+        self.assertTrue(bench.budgets_kernel(repository))
+        self.assertTrue(bench.budgets_lanes(repository))
+        self.assertEqual(bench.lane_policy(repository, repository), "enforced")
+        for key, path in (("harness_sha256", bench.HARNESS_PATH),
+                          ("kernel_harness_sha256", bench.KERNEL_HARNESS_PATH),
+                          ("lane_harness_sha256", bench.LANE_HARNESS_PATH)):
+            with self.subTest(harness=path):
+                committed = bench._digest((ROOT / path).read_text(encoding="utf-8"))
+                self.assertIn(committed, repository[key])
+
+    def test_lane_adoption_follows_the_base_budget_and_keeps_http_policy_enforced(self):
+        self.assertEqual(bench.lane_policy(kernel_budget(), kernel_budget()), "pending")
+        self.assertEqual(bench.lane_policy(kernel_budget(), lane_budget()), "proposed")
+        self.assertEqual(bench.lane_policy(lane_budget(), lane_budget()), "enforced")
+        with self.assertRaisesRegex(ValueError, "retire"):
+            bench.lane_policy(lane_budget(), kernel_budget())
+        self.assertEqual(bench.kernel_policy(kernel_budget(), lane_budget()), "enforced")
+        self.assertEqual(bench.kernel_policy(lane_budget(), lane_budget()), "enforced")
+        with self.assertRaisesRegex(ValueError, "retire"):
+            bench.kernel_policy(lane_budget(), budget())
+
+
+class LaneResultTests(unittest.TestCase):
+    def test_each_lane_report_validates_only_as_its_own_target(self):
+        for target in LANES:
+            with self.subTest(target=target):
+                bench.validate_kernel_result(lane_result(target), target=target)
+                bench.validate_kernel_result(lane_result(target, True), True, target)
+        mismatches = (
+            (lane_result("tool_policy"), "rate_lane"),
+            (lane_result("rate_lane"), "tool_policy"),
+            (kernel_result(), "tool_policy"),
+            (lane_result("rate_lane"), "http_policy"),
+            (lane_result("tool_policy"), "egress_host"),
+            (lane_result("tool_policy"), "unlisted_lane"),
+        )
+        for value, target in mismatches:
+            with self.subTest(target=target), self.assertRaises(ValueError):
+                bench.validate_kernel_result(value, target=target)
+
+    def test_lane_protocol_dataset_fixture_and_stability_drift_reject(self):
+        for target in LANES:
+            for field in ("input_cases", "input_bytes", "operations_per_iteration",
+                          "expected_checksum"):
+                with self.subTest(target=target, field=field):
+                    value = lane_result(target)
+                    value["targets"][0][field] -= 1
+                    with self.assertRaises(ValueError):
+                        bench.validate_kernel_result(value, target=target)
+            with self.subTest(target=target, change="unstable"):
+                value = lane_result(target)
+                value["targets"][0]["allocation_samples"][3]["allocated_bytes"] += 1
+                with self.assertRaises(ValueError):
+                    bench.validate_kernel_result(value, target=target)
+            with self.subTest(target=target, change="fixture marker"):
+                with self.assertRaises(ValueError):
+                    bench.validate_kernel_result(lane_result(target, True), target=target)
+                with self.assertRaises(ValueError):
+                    bench.validate_kernel_result(lane_result(target), True, target)
+
+
+class LaneComparisonTests(unittest.TestCase):
+    def test_neutral_counts_pass_and_growth_or_fixture_fails_per_lane(self):
+        for target in LANES:
+            with self.subTest(target=target):
+                report = bench.compare_kernel_results(lane_envelope(target), lane_envelope(target),
+                                                      lane_limit(target))
+                self.assertEqual((report["id"], report["status"]), (target, "passed"))
+                for field in ("allocations", "allocated_bytes"):
+                    head = lane_envelope(target)
+                    for sample in head["result"]["targets"][0]["allocation_samples"]:
+                        sample[field] += 1
+                    report = bench.compare_kernel_results(lane_envelope(target), head,
+                                                          lane_limit(target))
+                    self.assertEqual(report["status"], "failed")
+                cases = LANE_ROWS[target][0]
+                report = bench.compare_kernel_results(lane_envelope(target),
+                                                      lane_envelope(target, True),
+                                                      lane_limit(target), regression_head=True)
+                self.assertEqual(report["status"], "failed")
+                self.assertEqual(report["growth"], {"allocations": cases * 100,
+                                                    "allocated_bytes": cases * 6400})
+                with self.assertRaises(ValueError):
+                    bench.compare_kernel_results(lane_envelope(target), lane_envelope(target, True),
+                                                 lane_limit(target))
+
+    def test_envelopes_and_budget_entries_of_different_targets_reject(self):
+        cases = (
+            (lane_envelope("tool_policy"), lane_envelope("rate_lane"), lane_limit("tool_policy")),
+            (lane_envelope("rate_lane"), lane_envelope("tool_policy"), lane_limit("rate_lane")),
+            (kernel_envelope(), kernel_envelope(), lane_limit("tool_policy")),
+            (lane_envelope("rate_lane"), lane_envelope("rate_lane"), kernel_limit()),
+            (lane_envelope("rate_lane"), lane_envelope("rate_lane"), lane_limit("egress_host")),
+        )
+        for base, head, limit in cases:
+            with self.subTest(limit=limit["id"]), self.assertRaises(ValueError):
+                bench.compare_kernel_results(base, head, limit)
+
+
+LANE_DECLARATION = '#[path = "lane_benchmark.rs"]\nmod lane_benchmark;\n'
+
+
+class LaneWiringTests(unittest.TestCase):
+    def harness_source(self):
+        return (ROOT / bench.KERNEL_HARNESS_PATH).read_text(encoding="utf-8")
+
+    def test_repository_harness_declares_the_reviewed_child_module(self):
+        self.assertIn(LANE_DECLARATION, self.harness_source())
+        self.assertTrue(bench.lane_wiring(self.harness_source()))
+        self.assertTrue((ROOT / bench.LANE_HARNESS_PATH).is_file())
+
+    def test_harness_without_the_declaration_is_absent(self):
+        source = self.harness_source().replace(LANE_DECLARATION, "")
+        self.assertFalse(bench.lane_wiring(source))
+        commented = self.harness_source().replace(
+            LANE_DECLARATION, "".join("// " + line + "\n" for line in LANE_DECLARATION.splitlines()))
+        self.assertFalse(bench.lane_wiring(commented))
+
+    def test_redirected_disabled_or_duplicated_wiring_is_rejected(self):
+        replacements = {
+            "other file": LANE_DECLARATION.replace("lane_benchmark.rs", "decoy.rs"),
+            "disabled": "#[cfg(any())]\n" + LANE_DECLARATION,
+            "redirected": '#[cfg_attr(test, path = "decoy.rs")]\n' + LANE_DECLARATION,
+            "public": LANE_DECLARATION.replace("mod lane", "pub mod lane"),
+            "duplicated": LANE_DECLARATION + "#[cfg(any())]\nmod lane_benchmark {}\n",
+            "nested": "mod nested {\n" + LANE_DECLARATION + "}\n",
+            "inline module": "mod lane_benchmark {}\n",
+            "renamed reference": "use crate::decoy as lane_benchmark;\n",
+        }
+        for name, replacement in replacements.items():
+            with self.subTest(change=name):
+                source = self.harness_source().replace(LANE_DECLARATION, replacement)
+                with self.assertRaises(ValueError):
+                    bench.lane_wiring(source)
 
 
 if __name__ == '__main__':

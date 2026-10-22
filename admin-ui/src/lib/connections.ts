@@ -130,6 +130,18 @@ export type ConnectionAuthentication =
       audience?: string;
       resource?: string;
       client_auth_method: OAuthClientAuthMethod;
+    }
+  | {
+      type: 'delegated_issuer_token';
+      token_exchange_url: string;
+      client_id: string;
+      client_secret_id?: string;
+      client_secret_configured?: boolean;
+      requested_scopes?: string[];
+      audience?: string;
+      resource?: string;
+      revocation_url?: string;
+      subject_token_source: 'caller_assertion';
     };
 
 export type SafeConnectionAuthentication =
@@ -157,8 +169,8 @@ export type SafeConnectionAuthentication =
 
 /**
  * The calling user's own upstream token, obtained per caller by RFC 8693
- * token exchange. Read only: the admin UI shows it and never writes it, so it
- * has no counterpart in `ConnectionAuthentication`.
+ * token exchange. The client secret's alias is reduced to
+ * `client_secret_configured`, like every other secret binding.
  */
 export type SafeDelegatedIssuerToken = {
   type: 'delegated_issuer_token';
@@ -263,12 +275,8 @@ export type CallerAssertionKeyProblem = {
 
 /**
  * A Connection's caller assertion as the safe read returns it: every field
- * except the signing key alias, which is reduced to `signing_key_configured`.
- *
- * The gateway accepts and stores the block but does not enforce it yet, and
- * refuses every call, test and discovery on a Connection that carries one.
- * This UI only displays it. See `ConnectionWrite.caller_assertion` for why a
- * save never sends it.
+ * except the key aliases, each reduced to `signing_key_configured`. See
+ * `ConnectionWrite.caller_assertion` for how a save sends it back.
  */
 export type SafeCallerAssertion = {
   signing_key_configured: boolean;
@@ -287,6 +295,45 @@ export type SafeCallerAssertion = {
   key_problem?: CallerAssertionKeyProblem;
 };
 
+/**
+ * How a write names a caller-assertion key: `signing_key_id`, an explicit
+ * alias, or, on a replacement only, `signing_key_configured: true`, which
+ * keeps the alias of the stored key with the same `kid` and algorithm. The
+ * gateway refuses a write with both, with neither, or with a marker that
+ * matches no stored key.
+ */
+export type CallerAssertionKeyBinding = {
+  signing_key_id?: string;
+  signing_key_configured?: true;
+};
+
+export type PublishedAssertionKeyWrite = CallerAssertionKeyBinding & {
+  kid: string;
+  algorithm: CallerAssertionAlgorithm;
+};
+
+/**
+ * A caller assertion as this UI writes it: in full whenever the operator
+ * edits a block, and when it creates a `delegated_issuer_token` Connection,
+ * whose subject tokens the block signs. That create leaves `bind_request`
+ * and `bind_approval` to their default, `false`, which a delegated
+ * Connection requires, and configures no published keys.
+ */
+export type CallerAssertionWrite = CallerAssertionKeyBinding & {
+  kid: string;
+  algorithm: CallerAssertionAlgorithm;
+  issuer: string;
+  audience: string;
+  token_type: string;
+  header_name: string;
+  lifetime_seconds: number;
+  claims?: CallerAssertionClaim[];
+  bind_request?: boolean;
+  /** The gateway refuses `true` on every write: nothing can satisfy it yet. */
+  bind_approval?: false;
+  published_keys?: PublishedAssertionKeyWrite[];
+};
+
 export type ConnectionWrite = {
   display_name: string;
   description?: string;
@@ -296,18 +343,24 @@ export type ConnectionWrite = {
   authentication: ConnectionAuthentication;
   additional_headers?: ConnectionAdditionalHeader[];
   /**
-   * Never sent. A replacement that omits `caller_assertion` keeps the stored
-   * block, and `null` removes it. The safe read hides the block's signing key
-   * alias, so this UI cannot send the block back, and anything it could send
-   * would at best remove the block: that lifts the refusal and puts a
-   * Connection that cannot yet attest its caller back into service. The type
-   * rules the key out so no save can include it.
+   * Sent only when the operator changes the block. A replacement that omits
+   * `caller_assertion` keeps the stored block exactly as it is, which is how
+   * every other save leaves it alone, and `null` removes it.
    */
-  caller_assertion?: never;
+  caller_assertion?: CallerAssertionWrite | null;
   tls: TlsProfile;
   timeouts?: ConnectionTimeouts;
   discovery?: DiscoveryConfig;
   test_profile?: ConnectionTestProfile;
+};
+
+/**
+ * A create: a `ConnectionWrite` whose caller assertion, if any, is new. There
+ * is nothing to remove, and a create names every key alias: it accepts no
+ * `signing_key_configured` marker.
+ */
+export type ConnectionCreateWrite = Omit<ConnectionWrite, 'caller_assertion'> & {
+  caller_assertion?: CallerAssertionWrite;
 };
 
 export type SafeConnectionConfiguration = {
@@ -384,12 +437,18 @@ export type ConnectionTestReason =
   | 'tls_unavailable'
   | 'authentication_not_supported'
   | 'caller_assertion_not_enforced'
+  | 'caller_assertion_key_not_published'
   | 'credential_invalid'
   | 'credential_unavailable'
   | 'oauth_token_egress_denied'
   | 'oauth_token_unavailable'
   | 'oauth_token_rejected'
   | 'oauth_token_invalid_response'
+  | 'delegated_token_no_principal'
+  | 'delegated_token_egress_denied'
+  | 'delegated_token_denied'
+  | 'delegated_token_exchange_failed'
+  | 'delegated_token_unavailable'
   | 'authentication_failed'
   | 'transport_unavailable'
   | 'invalid_target_path'
@@ -486,7 +545,7 @@ export async function getConnection(
 }
 
 export async function createConnection(
-  write: ConnectionWrite,
+  write: ConnectionCreateWrite,
   collectionEtag: string,
   signal?: AbortSignal,
 ): Promise<AdminResource<ConnectionDetail>> {
@@ -1059,7 +1118,7 @@ function projectSafeCallerAssertion(value: unknown): SafeCallerAssertion {
 }
 
 // The gateway publishes at most this many keys beside a signing key.
-const MAX_PUBLISHED_ASSERTION_KEYS = 4;
+export const MAX_PUBLISHED_ASSERTION_KEYS = 4;
 
 function isSafePublishedAssertionKeyList(
   value: unknown,
@@ -1486,12 +1545,18 @@ function isConnectionTestReason(
     value === 'tls_unavailable' ||
     value === 'authentication_not_supported' ||
     value === 'caller_assertion_not_enforced' ||
+    value === 'caller_assertion_key_not_published' ||
     value === 'credential_invalid' ||
     value === 'credential_unavailable' ||
     value === 'oauth_token_egress_denied' ||
     value === 'oauth_token_unavailable' ||
     value === 'oauth_token_rejected' ||
     value === 'oauth_token_invalid_response' ||
+    value === 'delegated_token_no_principal' ||
+    value === 'delegated_token_egress_denied' ||
+    value === 'delegated_token_denied' ||
+    value === 'delegated_token_exchange_failed' ||
+    value === 'delegated_token_unavailable' ||
     value === 'authentication_failed' ||
     value === 'transport_unavailable' ||
     value === 'invalid_target_path' ||

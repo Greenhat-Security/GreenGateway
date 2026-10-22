@@ -53,17 +53,22 @@
 //!
 //! Schema presence alone never enables an operation.
 //!
-//! The registry ([`OPERATION_REQUIREMENTS`]) holds one operation (issue
-//! #426, PR 2): committing a policy document in which a role carries a
-//! `description` ([`POLICY_ROLE_DESCRIPTIONS`]). A gateway built before the
-//! field refuses such a document outright -- the role's fields are closed --
-//! so the write waits until every live member advertises
+//! The registry ([`OPERATION_REQUIREMENTS`]) holds two operations. The
+//! first (issue #426, PR 2) is committing a policy document in which a role
+//! carries a `description` ([`POLICY_ROLE_DESCRIPTIONS`]). A gateway built
+//! before the field refuses such a document outright -- the role's fields
+//! are closed -- so the write waits until every live member advertises
 //! [`Capability::PolicyRoleDescriptions`], and a member that lacks it and
 //! returns later fails closed on the document rather than misreading it.
-//! The approved-extension list in `migrations.rs` stays empty: the operation
-//! changes no schema, and no schema overlap has been qualified. Every other
-//! operation this binary performs belongs to the schema-20 contract, which
-//! every schema-20 member shares. No shipped operation declares a durable
+//! The second (issue #443) is storing a managed OpenAPI catalog whose
+//! specification is a Swagger 2.0 document
+//! ([`OPENAPI_SWAGGER2_CATALOGS`]), which a gateway built before Swagger 2.0
+//! import cannot generate from; it waits for
+//! [`Capability::OpenApiSwagger2Catalogs`] the same way. The
+//! approved-extension list in `migrations.rs` stays empty: neither operation
+//! changes the schema, and no schema overlap has been qualified. Every other
+//! operation this binary performs belongs to the schema-21 contract, which
+//! every schema-21 member shares. No shipped operation declares a durable
 //! fence or a backfill, so in this release nothing raises the fence and
 //! the backfill ledger is empty; both are checked everywhere they apply.
 
@@ -90,6 +95,11 @@ const SEPARATOR: char = ',';
 /// these, and recognizes only these.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum Capability {
+    /// The member generates, refreshes and replays a managed OpenAPI
+    /// catalog whose specification is a Swagger 2.0 document (issue #443).
+    /// A member without it cannot generate from one, so
+    /// [`OPENAPI_SWAGGER2_CATALOGS`] waits for it.
+    OpenApiSwagger2Catalogs,
     /// The member advertises its capabilities on its own roster row and
     /// holds a registered operation at the gate until every live member
     /// advertises what the operation requires (schema 17). A member
@@ -104,10 +114,15 @@ pub(crate) enum Capability {
 
 impl Capability {
     /// Every capability, in name order.
-    pub(crate) const KNOWN: [Self; 2] = [Self::OperationRequirements, Self::PolicyRoleDescriptions];
+    pub(crate) const KNOWN: [Self; 3] = [
+        Self::OpenApiSwagger2Catalogs,
+        Self::OperationRequirements,
+        Self::PolicyRoleDescriptions,
+    ];
 
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
+            Self::OpenApiSwagger2Catalogs => "openapi_swagger2_catalogs",
             Self::OperationRequirements => "operation_requirements",
             Self::PolicyRoleDescriptions => "policy_role_descriptions",
         }
@@ -122,6 +137,7 @@ impl Capability {
 
 /// What this binary advertises: every capability it implements.
 pub(crate) const BINARY_CAPABILITIES: &[Capability] = &[
+    Capability::OpenApiSwagger2Catalogs,
     Capability::OperationRequirements,
     Capability::PolicyRoleDescriptions,
 ];
@@ -201,7 +217,8 @@ impl RecognizedCapabilities {
 pub(crate) use gate::{
     evaluate, fence_target, Activation, Backfill, BackfillState, BinaryContract, ContractFence,
     FenceExclusion, FenceTarget, MemberAdvertisement, OperationAdmission, OperationRefusal,
-    OperationRequirement, OPERATION_REQUIREMENTS, POLICY_ROLE_DESCRIPTIONS,
+    OperationRequirement, OPENAPI_SWAGGER2_CATALOGS, OPERATION_REQUIREMENTS,
+    POLICY_ROLE_DESCRIPTIONS,
 };
 
 #[cfg(feature = "postgres")]
@@ -274,7 +291,7 @@ mod gate {
     /// schema object and no migration, and the document format stays
     /// major 0. `minimum_schema` is 17 because that is the first schema
     /// whose members advertise capabilities at all; the policy tables it
-    /// writes are older. Every member that shares this binary's schema-20
+    /// writes are older. Every member that shares this binary's schema-21
     /// contract meets it, so among those the capability alone decides.
     pub(crate) const POLICY_ROLE_DESCRIPTIONS: OperationRequirement = OperationRequirement {
         operation: "policy.role_descriptions",
@@ -285,10 +302,38 @@ mod gate {
         activation: Activation::LiveMembers,
     };
 
+    /// Storing a managed OpenAPI catalog whose specification is a Swagger
+    /// 2.0 document (issue #443): registering one, refreshing to one, or
+    /// writing an overlay over one.
+    ///
+    /// The stored specification is the submitted document, and every
+    /// replica regenerates from it to refresh the catalog and to rebuild an
+    /// overlay's source plan. A gateway built before Swagger 2.0 import
+    /// cannot generate from it: it keeps serving the tool definitions
+    /// already stored, which it reads exactly as published, but its refresh
+    /// fails with `catalog_stale`, and with an overlay present its startup
+    /// fails and its connection reconciliation holds the security revision
+    /// check unavailable, so it serves nothing new. That is failing closed,
+    /// never a misreading, so live-roster agreement is enough
+    /// ([`Activation::LiveMembers`]). Deleting an overlay is not gated: it
+    /// removes what makes an older member fail. The specification is not a
+    /// policy or tools document, so no document format is required, and
+    /// `minimum_schema` is 17 for the same reason as
+    /// [`POLICY_ROLE_DESCRIPTIONS`]: the catalog tables are older.
+    pub(crate) const OPENAPI_SWAGGER2_CATALOGS: OperationRequirement = OperationRequirement {
+        operation: "connections.openapi_swagger2_catalog",
+        minimum_schema: 17,
+        document_format: None,
+        capability: Capability::OpenApiSwagger2Catalogs,
+        backfill: Backfill::NotRequired,
+        activation: Activation::LiveMembers,
+    };
+
     /// Every operation this binary gates. An operation added later
     /// registers here, advertises a new capability, and calls the gate
     /// before its write.
-    pub(crate) const OPERATION_REQUIREMENTS: &[OperationRequirement] = &[POLICY_ROLE_DESCRIPTIONS];
+    pub(crate) const OPERATION_REQUIREMENTS: &[OperationRequirement] =
+        &[POLICY_ROLE_DESCRIPTIONS, OPENAPI_SWAGGER2_CATALOGS];
 
     /// What this binary serves and advertises: the left-hand side of every
     /// requirement.
