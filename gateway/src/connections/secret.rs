@@ -29,6 +29,11 @@ pub const MAX_TLS_CERTIFICATE_BYTES: usize = 1024 * 1024;
 /// is under 7 KiB. The cap leaves room for a comment line while refusing
 /// anything that is plainly not one key -- a bundle, a keystore, a log file.
 pub const MAX_ASSERTION_SIGNING_KEY_BYTES: usize = 16 * 1024;
+/// An authority pseudonym key is exactly 64 hexadecimal characters (32 random
+/// bytes). The bound is that exact length, so a trailing newline is refused at
+/// resolution rather than trimmed; `authority_events::pseudonym` checks the
+/// encoding itself.
+pub const MAX_AUTHORITY_PSEUDONYM_KEY_BYTES: usize = 64;
 pub const MAX_OPERATOR_SECRET_ALIASES: usize = MAX_CREDENTIALS;
 pub const MAX_OPERATOR_SECRET_ALIAS_CONFIG_BYTES: usize = 256 * 1024;
 pub const MAX_CONCURRENT_SECRET_RESOLUTIONS: usize = 16;
@@ -300,6 +305,21 @@ pub enum SecretResolveErrorKind {
     ProviderFailure,
 }
 
+impl SecretResolveErrorKind {
+    /// The stable snake_case name, as it is serialized.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnknownAlias => "unknown_alias",
+            Self::ProviderBusy => "provider_busy",
+            Self::SourceUnavailable => "source_unavailable",
+            Self::SourceDenied => "source_denied",
+            Self::UnsafeSource => "unsafe_source",
+            Self::InvalidMaterial => "invalid_material",
+            Self::ProviderFailure => "provider_failure",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SecretResolveError {
     alias_id: String,
@@ -329,15 +349,7 @@ impl fmt::Display for SecretResolveError {
             formatter,
             "secret alias '{}' resolution failed: {}",
             self.alias_id,
-            match self.kind {
-                SecretResolveErrorKind::UnknownAlias => "unknown_alias",
-                SecretResolveErrorKind::ProviderBusy => "provider_busy",
-                SecretResolveErrorKind::SourceUnavailable => "source_unavailable",
-                SecretResolveErrorKind::SourceDenied => "source_denied",
-                SecretResolveErrorKind::UnsafeSource => "unsafe_source",
-                SecretResolveErrorKind::InvalidMaterial => "invalid_material",
-                SecretResolveErrorKind::ProviderFailure => "provider_failure",
-            }
+            self.kind.as_str()
         )
     }
 }
@@ -896,6 +908,15 @@ pub enum SecretPurpose {
     /// another field to an alias some Connection exchanges with (see
     /// `model::token_exchange_secret_conflict`).
     TokenExchangeClientSecret,
+    /// The HMAC key authority evidence derives keyed, domain-separated safe
+    /// references (pseudonyms) for actors and resources with (#425). Whoever
+    /// holds it can test a guessed identity against any reference it produced,
+    /// so it never leaves the gateway and is never a header value.
+    ///
+    /// It is not a Connection credential: no Connection field resolves under
+    /// it, so it is not among an alias's compatible purposes, and like the
+    /// signing key the encrypted local store does not hold it.
+    AuthorityPseudonymKey,
 }
 
 impl SecretPurpose {
@@ -908,6 +929,7 @@ impl SecretPurpose {
             Self::TlsPrivateKey => MAX_TLS_PRIVATE_KEY_BYTES,
             Self::TlsCertificate | Self::TlsCaBundle => MAX_TLS_CERTIFICATE_BYTES,
             Self::AssertionSigningKey => MAX_ASSERTION_SIGNING_KEY_BYTES,
+            Self::AuthorityPseudonymKey => MAX_AUTHORITY_PSEUDONYM_KEY_BYTES,
         }
     }
 
@@ -917,9 +939,9 @@ impl SecretPurpose {
     /// The OAuth and token-exchange client secrets are deliberately excluded:
     /// each is URL-encoded and then base64-encoded into a Basic credential, so
     /// bytes that no header may carry survive that transformation harmlessly.
-    /// The assertion signing key
-    /// is excluded because it never leaves the gateway at all; only signatures
-    /// made with it do.
+    /// The assertion signing key and the authority pseudonym key are excluded
+    /// because they never leave the gateway at all; only signatures and
+    /// references made with them do.
     pub(crate) const fn is_http_header_value(self) -> bool {
         matches!(self, Self::HeaderApiKey | Self::StaticBearer)
     }
@@ -927,13 +949,17 @@ impl SecretPurpose {
     /// Whether the encrypted local store can hold material for this purpose.
     ///
     /// Its table constrains the purpose column to the purposes it was created
-    /// with, so a signing key or a token-exchange client secret is
-    /// provisioned through an operator alias or a network provider instead,
-    /// and a local create for one is refused before anything is written.
+    /// with, so a signing key, a token-exchange client secret or an authority
+    /// pseudonym key is provisioned through an operator alias or a network
+    /// provider instead, and a local create for one is refused before anything
+    /// is written. A local alias resolves only under the purpose it was stored
+    /// with, so none of these ever resolves from the local store either.
     pub(crate) const fn is_locally_storable(self) -> bool {
         !matches!(
             self,
-            Self::AssertionSigningKey | Self::TokenExchangeClientSecret
+            Self::AssertionSigningKey
+                | Self::TokenExchangeClientSecret
+                | Self::AuthorityPseudonymKey
         )
     }
 }
@@ -1338,6 +1364,54 @@ mod tests {
             serde_json::to_value(SecretPurpose::AssertionSigningKey)
                 .expect("purpose should serialize"),
             serde_json::json!("assertion_signing_key")
+        );
+    }
+
+    #[test]
+    fn resolve_error_kind_names_match_their_serialized_form() {
+        for kind in [
+            SecretResolveErrorKind::UnknownAlias,
+            SecretResolveErrorKind::ProviderBusy,
+            SecretResolveErrorKind::SourceUnavailable,
+            SecretResolveErrorKind::SourceDenied,
+            SecretResolveErrorKind::UnsafeSource,
+            SecretResolveErrorKind::InvalidMaterial,
+            SecretResolveErrorKind::ProviderFailure,
+        ] {
+            assert_eq!(
+                serde_json::to_value(kind).expect("kind should serialize"),
+                serde_json::json!(kind.as_str())
+            );
+            assert_eq!(
+                SecretResolveError::new("billing-api", kind).to_string(),
+                format!(
+                    "secret alias 'billing-api' resolution failed: {}",
+                    kind.as_str()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn an_authority_pseudonym_key_is_exact_length_internal_material() {
+        let purpose = SecretPurpose::AuthorityPseudonymKey;
+        // It never leaves the gateway, so it is never header-checked, and the
+        // local store's purpose column predates it.
+        assert!(!purpose.is_http_header_value());
+        assert!(!purpose.is_locally_storable());
+        assert_eq!(purpose.max_bytes(), MAX_AUTHORITY_PSEUDONYM_KEY_BYTES);
+        ResolvedSecret::new(purpose, vec![b'a'; MAX_AUTHORITY_PSEUDONYM_KEY_BYTES])
+            .expect("material at the exact key length is accepted");
+        assert_eq!(
+            ResolvedSecret::new(purpose, vec![b'a'; MAX_AUTHORITY_PSEUDONYM_KEY_BYTES + 1])
+                .expect_err("a trailing newline or any longer value is refused"),
+            SecretValueError::TooLarge {
+                maximum: MAX_AUTHORITY_PSEUDONYM_KEY_BYTES
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(purpose).expect("purpose should serialize"),
+            serde_json::json!("authority_pseudonym_key")
         );
     }
 

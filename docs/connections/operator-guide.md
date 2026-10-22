@@ -361,10 +361,11 @@ place a purpose-built token broker behind an independently secured Connection.
 ### Signed caller assertions
 
 A Connection with a `caller_assertion` block tells its upstream who is
-calling. On every call of a manual HTTP tool it signs a short-lived JWT that
-names the validated calling principal and sends it in `header_name`, alongside
-the Connection's own credential. The credential says which system is calling; the assertion says on
-whose behalf. An upstream the operator controls verifies the assertion against
+calling. On every tool call and every proxied request made for a caller it
+signs a short-lived JWT that names the validated calling principal and sends
+it in `header_name`, alongside the Connection's own credential. The credential
+says which system is calling; the assertion says on whose behalf. An upstream
+the operator controls verifies the assertion against
 the gateway's published key set (see [The published JWKS](#the-published-jwks))
 and can then apply its own per-user ownership and entitlement checks, which a
 single shared credential makes impossible. It is the same shape as Google IAP's
@@ -372,43 +373,69 @@ single shared credential makes impossible. It is the same shape as Google IAP's
 
 #### Which calls are attested
 
-Manual HTTP tools bound to the Connection are attested, whether they are called
-through the MCP endpoint or the admin tool playground. Every other lane on such
-a Connection is refused with `caller_assertion_not_enforced`, before any DNS
-lookup, secret read, OAuth mint or upstream request, rather than sent without
-the assertion: managed OpenAPI tools and composite tools, proxied requests,
-managed MCP sessions and MCP tool calls, OpenAPI and MCP discovery, enum and
-label source fetches, and stored Connection tests. Those lanes either have no
-calling principal to attest, or do not hold the exact request before it is
-sent.
+Every lane that makes a request for a validated caller, and holds the exact
+request before it sends it, attests that caller:
 
-On those lanes the refusal reason appears as follows:
+- Manual HTTP tools, whether they are called through the MCP endpoint or the
+  admin tool playground.
+- Managed OpenAPI tools.
+- Managed MCP tool calls. A call opens a session of its own, and every request
+  of that session carries its own assertion; see
+  [Managed MCP tool calls](#managed-mcp-tool-calls).
+- Requests a connection-bound proxy route forwards; see
+  [Proxied requests](#proxied-requests).
 
-- Managed OpenAPI or MCP tool call: the `failure_reason` of
+The lanes that have no calling principal to attest are refused with
+`caller_assertion_not_enforced` before any DNS lookup, secret read, OAuth mint
+or upstream request, rather than sent without the assertion: fetching an
+OpenAPI specification from the upstream on a refresh, MCP catalog refresh,
+enum and label source fetches, and stored Connection tests. So are the steps
+of a composite tool, which would each need an assertion with a `jti` of its
+own, and every lane when the stored block is one only an earlier release
+accepted (see [HTTPS only](#https-only) and
+[Failure reasons](#failure-reasons)). A `delegated_issuer_token` Connection,
+whose assertion is the subject token of the caller's own credential, is
+served by manual HTTP tools only; see
+[Which calls are served](#which-calls-are-served).
+
+On the refused lanes the reason appears as follows:
+
+- Managed OpenAPI or MCP tool call on a block only an earlier release
+  accepted, or on a delegated Connection: the `failure_reason` of
   `tool.invoke_failure` and the `reason` of `tool.upstream_request`. A
   composite tool reports at the tool level: its `failure_reason` is
   `composite_failed`, and the failing step's `caller_assertion_not_enforced` is
   only in the error details returned to the caller, not in any audit event.
 - Stored Connection test: the `authenticated` stage reason.
-- OpenAPI preview, registration and refresh, and MCP catalog refresh: the
-  `reason` of a `409 Conflict` response. A refused registration is also
-  audited as `tool_registry.changed` with action
-  `managed_openapi_catalog_registration_rejected`, and a refused refresh as
-  `connection.refreshed`, both with outcome `failure` and this reason.
+- OpenAPI refresh of a catalog whose discovery has a `path`, and MCP catalog
+  refresh: the `reason` of a `409 Conflict` response, also audited as
+  `connection.refreshed` with outcome `failure` and this reason. OpenAPI
+  preview and registration of an uploaded specification, and a refresh of a
+  catalog without a discovery `path`, which reads the stored specification,
+  fetch nothing and are served.
 - Enum source refresh: the `reason` of `connection.enum_source_refresh_failed`.
-  Label sources compile during OpenAPI preview and registration, which are
-  refused first.
+  An overlay's label and enum sources are fetched through the same refused
+  lane, so a preview or registration that needs them fails.
 - Proxied request: the caller receives `502` with `{"error":"bad_gateway"}`.
-  The refusal is recorded by tracing only: the reason appears as
-  `error_category` on the gateway's warning log line, and no structured audit
-  event names it. Every other Connection failure on a proxy route behaves the
-  same way.
+  This refusal is recorded by tracing only: the reason appears as
+  `error_category` on the gateway's warning log line, as for every other
+  Connection failure on a proxy route.
 
-A manual tool may be bound to an attested Connection. Other bindings fail the way bindings to a disabled Connection do: a
-proxy route bound to it fails startup or the whole reload that contains it. A
-managed OpenAPI catalog on it is withdrawn from the tool list and kept in
-storage; refresh it after removing the block to publish it again. Managed MCP
-tools stay listed, and every call to one is refused.
+Manual tools, managed OpenAPI catalogs and proxy routes may be bound to an
+attested Connection, and managed MCP tools on it stay listed. Because discovery
+has no caller to attest, an OpenAPI catalog whose discovery `path` is set
+cannot fetch its specification again, so register an OpenAPI catalog from an
+uploaded specification. An MCP catalog has no such path: it is only ever
+discovered, and discovery is refused while the block is present. Any save of
+a Connection, adding the block included, makes its stored catalog stale until
+it is refreshed, and a stale MCP catalog refuses every call with
+`catalog_stale`. So the only managed MCP tools an attested Connection can
+serve are those of a catalog an earlier release discovered while the block
+was already stored, on a Connection not saved since; see
+[Managed MCP tool calls](#managed-mcp-tool-calls). A binding to a Connection
+whose block no lane honours fails the way a binding to a disabled Connection
+does: a proxy route fails startup or the whole reload that contains it, and a
+managed OpenAPI catalog is withdrawn from the tool list and kept in storage.
 
 #### What the assertion says
 
@@ -428,12 +455,13 @@ The JOSE header carries `alg` (`ES256` or `RS256`, from `algorithm`), `kid`
 | `method`, `path`, `request_sha256` | With `bind_request: true`: the request method, the request target exactly as it appears on the request line (path, then `?` and the query when there is one), and the lowercase hexadecimal SHA-256 of the exact body bytes sent, which is the hash of empty input for a request without a body. |
 
 Every identity claim comes from the authenticated principal, never from a tool
-argument; the bound request claims describe the request the gateway built
-from the arguments, as sent. The assertion is signed once per call,
-after every other header and the body are final, and written as the last
-header. The lane removes the header name from anything a caller supplied, and
-validation keeps it apart from the Connection's primary and additional header
-names and from the headers a tool sets. If a value were still present at
+argument or anything a proxied request carries; the bound request claims
+describe the request the gateway built or forwards, as sent. The assertion is
+signed once per request, after every other header and the body are final, and
+written as the last header. The lane removes the header name from anything a
+caller supplied, and validation keeps it apart from the Connection's primary
+and additional header names, from the headers a tool sets and from a proxy
+route's header transforms. If a value were still present at
 injection the call would be refused with `caller_assertion_header_conflict`
 rather than send two values or replace one. The signing key is read and
 loaded on every call, through the same secret resolution and loader that admit
@@ -452,6 +480,77 @@ caller is.
 JSON: the upstream hashes exactly what it received. A body that parses to the
 same JSON with its keys in another order has a different digest.
 
+#### Proxied requests
+
+A connection-bound proxy route attests the caller of every request it
+forwards, with the request ID (`X-Request-Id`) as `jti`:
+
+- A value the client sent under `header_name` is removed before anything is
+  injected; the upstream receives only the gateway's. A route whose
+  `add_request_headers` or `strip_request_headers` names the assertion header
+  is refused like one that names a credential header: at startup or reload,
+  and with `502` on a request.
+- With `bind_request`, the route reads the whole body before it signs, even
+  when its `request_body.mode` is `stream`, so the digest covers every byte
+  the upstream receives. The body is held in memory up to
+  `EGRESS_MAX_REQUEST_BODY_BYTES` and bounded by the route's `timeout_ms`, as
+  in buffered mode: a larger body is answered `413` and never signed or
+  forwarded in part. Without `bind_request` a streamed body still streams.
+- Every attempt sends the same headers, so a retry carries the same assertion
+  and `jti`, which is how an upstream recognises a retry. An upstream that
+  refuses every `jti` it has already seen refuses the retry too, so leave
+  `retry` unset on a route to such an upstream. Keep `lifetime_seconds` longer
+  than the Connection's `timeouts.request_timeout_ms`, which bounds the request
+  with all of its retries.
+- A request without a principal to attest -- anonymous, a service token, or a
+  principal without an issuer -- is answered `403` with
+  `{"error":"caller_assertion_no_principal"}` before any DNS lookup, secret
+  read or upstream request. A signing key whose source cannot be read is
+  answered `503` with `{"error":"service_unavailable"}`, and every other
+  refusal `502` with `{"error":"bad_gateway"}`.
+- Every decision is audited as `connection.caller_assertion` with the caller
+  as `actor`, `consumer_kind` `proxy_route` and the route as `consumer_id`:
+  outcome `success` with the assertion's `kid` and `jti`, or outcome
+  `failure` with the `reason`. A key that cannot be read or loaded also raises
+  `connection.secret_resolution_failed`.
+- An upstream `401` or `403` is answered `502` without the upstream's body,
+  as for every credentialed Connection route. Any other response is returned
+  to the client as on any proxy route, so an upstream that echoes request
+  headers hands the caller the assertion that names them; have the upstream
+  verify the Connection's credential beside it.
+- A `delegated_issuer_token` Connection stays refused on a proxy route with
+  `caller_assertion_not_enforced`: a proxied request is never served by a
+  credential that belongs to its caller.
+
+#### Managed MCP tool calls
+
+A managed MCP tool call opens a session of its own: `initialize`, the
+`notifications/initialized` notification, the event stream `GET` when the
+server offers one, `tools/call`, and the closing `DELETE`. Every one of those
+requests carries its own assertion naming the caller, signed with the
+Connection's key just before it is sent, so an upstream that checks every
+request of a session can.
+
+- The `jti` of the `n`th request of the session is the call's request ID, a
+  dot, and `n`, counting from 1 (`6f1c2a4e-....1`, `6f1c2a4e-....2`, ...), so
+  a replay cache keyed on `sub` and `jti` accepts the whole session.
+- With `bind_request`, each assertion covers its own method, the MCP endpoint's
+  request target and the exact JSON-RPC body of that request (empty for `GET`
+  and `DELETE`).
+- No custom transport header may use the assertion header's name.
+- `tool.upstream_request` records what the session signed:
+  `"caller_assertion": {"kid": "gw-2026-09", "jti_base": "6f1c2a4e-...",
+  "count": 4}`, where the requests carried `jti`s `<jti_base>.1` to
+  `<jti_base>.<count>`. Once the call is over the session signs nothing more:
+  a request the transport would still send after it is refused instead.
+
+A call is served only while the Connection's MCP catalog is current, and
+discovering one is refused while the block is present, because discovery has
+no caller to attest. Adding the block is a save of the Connection, which makes
+the stored catalog stale, so a Connection that gains the block cannot serve
+its MCP tools until discovery can run on it. Attesting discovery itself is not
+supported yet.
+
 #### Which callers can be attested
 
 A principal that an identity provider vouched for can be attested: a bearer
@@ -462,7 +561,8 @@ name: an anonymous call, a service token (a credential the gateway issued to a
 system, not a person), or a principal without an issuer to scope its subject
 by. The refusal is audited like any other: `tool.invoke_failure` names the
 reason and the caller's actor, and `tool.upstream_request` records the
-refused request.
+refused request; a proxied request's refusal is `connection.caller_assertion`
+with outcome `failure`.
 
 #### HTTPS only
 
@@ -484,15 +584,17 @@ Each refusal is a fixed string in the `failure_reason` of `tool.invoke_failure`
 | `caller_assertion_key_not_published` | This replica leaves the Connection's keys out of the published JWKS, so no upstream that fetched it could verify what the Connection signed: one of its keys, the signing key or a published key, did not resolve or load at the last check, or another enabled Connection publishes a different key under one of its `kid`s. See [Stored Connections whose keys cannot be used](#stored-connections-whose-keys-cannot-be-used). |
 | `caller_assertion_key_unusable` | At call time, the signing key's alias is unknown or refused, or holds material that is not a usable key for `algorithm`. |
 | `caller_assertion_key_unavailable` | At call time, the signing key's source could not be read. |
-| `caller_assertion_claim_invalid` | A value would not survive as a claim: a subject longer than 256 bytes, an issuer longer than 512 bytes or containing `#`, a role longer than 128 bytes, an email longer than 320 bytes, a request ID longer than 128 bytes, with `bind_request` a request target longer than 2048 bytes or a method longer than 16 bytes, or any of them containing a control character. |
+| `caller_assertion_claim_invalid` | A value would not survive as a claim: a subject longer than 256 bytes, an issuer longer than 512 bytes or containing `#`, a role longer than 128 bytes, an email longer than 320 bytes, a request ID (a `jti`, with a managed MCP session's sequence suffix) longer than 128 bytes or missing, with `bind_request` a request target longer than 2048 bytes or a method longer than 16 bytes, or any of them containing a control character. |
 | `caller_assertion_header_conflict` | Another header source had already set the assertion header. |
-| `caller_assertion_signature_failed`, `caller_assertion_token_too_long` | Signing failed, including on a host whose clock reads before 1970, or the assertion would exceed 8 KiB. |
-| `caller_assertion_not_enforced` | The lane does not attest its caller, or the stored block is one only an earlier release accepted: `bind_approval: true`, an assertion header that matches an additional header, or a plain HTTP endpoint. |
+| `caller_assertion_signature_failed`, `caller_assertion_token_too_long` | Signing failed, including on a host whose clock reads before 1970 and a managed MCP session asked to sign after its call ended, or the assertion would exceed 8 KiB. |
+| `caller_assertion_not_enforced` | The lane has no caller to attest (discovery, enum and label sources, stored tests), is a composite tool's step, serves a `delegated_issuer_token` Connection other than through a manual tool, or the stored block is one only an earlier release accepted: `bind_approval: true`, an assertion header that matches an additional header, or a plain HTTP endpoint. |
 
 A signing key that cannot be read or loaded at call time also raises
-`connection.secret_resolution_failed` with the same reason. None of these
-responses, logs or events carries the assertion, the key or anything derived
-from either.
+`connection.secret_resolution_failed` with the same reason. A proxied request
+reports each refusal on `connection.caller_assertion` instead of
+`tool.invoke_failure`; see [Proxied requests](#proxied-requests). None of
+these responses, logs or events carries the assertion, the key or anything
+derived from either.
 
 An assertion counts as a credential when the upstream answers. A `401` or
 `403` from the upstream of an attested Connection fails the call with
@@ -508,15 +610,21 @@ credential or assertion it cannot verify.
 
 #### Audit
 
-`tool.upstream_request` for a request that carried an assertion records which
-key signed it and its `jti`, whatever the outcome:
+`tool.upstream_request` for an HTTP tool request that carried an assertion
+records which key signed it and its `jti`, whatever the outcome:
 
 ```json
 "caller_assertion": { "kid": "gw-2026-09", "jti": "6f1c2a4e-..." }
 ```
 
-The attested caller is the event's `actor`. To find the gateway's record of a
-request an upstream logged, search the audit for its `jti`.
+A managed MCP tool call records its session's assertions as `kid`,
+`jti_base` and `count` (see
+[Managed MCP tool calls](#managed-mcp-tool-calls)), and a proxied request
+records its assertion on `connection.caller_assertion` (see
+[Proxied requests](#proxied-requests)). The attested caller is the event's
+`actor`. To find the gateway's record of a request an upstream logged, search
+the audit for its `jti`, or for its request ID without the MCP sequence
+suffix.
 
 #### Verifying an assertion
 
@@ -724,8 +832,9 @@ the problem at once, because the save loads every key.
 
 A key that cannot be read or loaded when a call signs, after the keys were
 last published, refuses that call with `caller_assertion_key_unusable` or
-`caller_assertion_key_unavailable`. Every other lane refuses the Connection
-with `caller_assertion_not_enforced`, as it refuses every attested Connection.
+`caller_assertion_key_unavailable`. Proxied requests are refused the same way.
+Every lane that has no caller to attest refuses the Connection with
+`caller_assertion_not_enforced`, as it refuses every attested Connection.
 Startup and reconcile still refuse a stored Connection whose other bindings
 this replica cannot resolve, as they always have.
 
@@ -825,9 +934,40 @@ Before upgrading, check every enabled Connection that carries the block:
 - To keep a Connection refused until its upstream is ready, disable it or
   remove the block with `"caller_assertion": null` before upgrading.
 
-Managed OpenAPI tools, composite tools, proxied requests, managed MCP, discovery,
-enum and label sources and stored tests on such a Connection stay refused, as
-before.
+Managed OpenAPI tools, managed MCP tool calls and proxied requests followed in
+a later release; see the next note. Composite tools, discovery, enum and label
+sources and stored tests on such a Connection stay refused, as before.
+
+#### Upgrade note: OpenAPI tools, MCP tool calls and proxied requests
+
+From this release, managed OpenAPI tools, managed MCP tool calls and the
+requests of connection-bound proxy routes on an attested Connection are
+served, and every request carries the signed assertion, under the same rules
+as manual tools. Before upgrading, check every enabled Connection that carries
+the block:
+
+- A proxy route bound to one used to fail startup or the reload that
+  contained it, and now loads. Its requests are answered `403` when they name
+  nobody: a route that admits anonymous requests or service tokens now refuses
+  them. With `bind_request`, a streaming route holds each body in memory up to
+  `EGRESS_MAX_REQUEST_BODY_BYTES` before forwarding it.
+- A managed OpenAPI catalog on one used to be withdrawn from the tool list.
+  Adding the block changed the Connection, so the stored catalog is stale:
+  register it again from an uploaded specification, or refresh it when its
+  discovery has no `path` (the refresh reads the stored specification), and
+  its tools are served. A refresh that fetches from a discovery `path` is
+  still refused.
+- Managed MCP tools on one, which stayed listed and were refused, are served
+  while their catalog is current, and every request of each call's session
+  carries an assertion. A catalog stays stale after any save of the
+  Connection, and cannot be refreshed while the block is present; see
+  [Managed MCP tool calls](#managed-mcp-tool-calls).
+- Delegated Connections, composite tools, discovery, enum and label sources
+  and stored tests are unchanged.
+
+To keep one of these lanes refused until its upstream is ready, disable the
+Connection or remove the block with `"caller_assertion": null` before
+upgrading.
 
 ### Delegated issuer tokens
 
@@ -941,12 +1081,12 @@ a `refresh_token` included, are skipped unread and never kept.
 #### Which calls are served
 
 Only manual HTTP tool calls, whether from `/mcp` or the admin playground: they
-are the one lane that has a validated principal to exchange a token for. Every
-other lane -- managed OpenAPI and composite tools, proxied requests, managed MCP,
-discovery, enum and label sources and stored Connection tests -- is refused with
-`caller_assertion_not_enforced`, as on any Connection carrying a
-`caller_assertion` block. There is no service-principal fallback: a call
-with no principal, or a service token's, is refused with
+are the one lane that obtains a caller's own token. Every other lane --
+managed OpenAPI and composite tools, proxied requests, discovery, enum and
+label sources and stored Connection tests -- is refused with
+`caller_assertion_not_enforced`, including the lanes that attest the caller of
+an ordinary attested Connection. There is no service-principal fallback: a
+call with no principal, or a service token's, is refused with
 `delegated_token_no_principal` before anything is read or sent.
 
 #### The cache
