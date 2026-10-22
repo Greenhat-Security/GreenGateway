@@ -35124,13 +35124,13 @@ mod cluster_discovery_tests {
         }
     }
 
-    const DEPLOYMENT_ID: &str = "deploy-cluster-discovery";
+    const CLUSTER_DISCOVERY_DEPLOYMENT_ID: &str = "deploy-cluster-discovery";
 
     async fn migrated_pool(dsn: &str) -> deadpool_postgres::Pool {
         let dsn_file = write_dsn_file(dsn);
         let mut config = test_config(Vec::new());
         config.state_backend = config::StateBackend::Postgres;
-        config.deployment_id = Some(DEPLOYMENT_ID.to_owned());
+        config.deployment_id = Some(CLUSTER_DISCOVERY_DEPLOYMENT_ID.to_owned());
         config.database.url_file = Some(dsn_file.path.clone());
         config.database.tls_mode = config::DatabaseTlsMode::LoopbackDev;
         let foundation = PostgresFoundation::establish(&config)
@@ -35222,7 +35222,7 @@ mod cluster_discovery_tests {
         let mut config = test_config(Vec::new());
         config.auth_enabled = false;
         config.state_backend = config::StateBackend::Postgres;
-        config.deployment_id = Some(DEPLOYMENT_ID.to_owned());
+        config.deployment_id = Some(CLUSTER_DISCOVERY_DEPLOYMENT_ID.to_owned());
         config
             .rbac_exempt_paths
             .extend([AUDIT_ADMIN_ROUTE.to_owned(), POLICY_ADMIN_ROUTE.to_owned()]);
@@ -35376,7 +35376,7 @@ mod cluster_discovery_tests {
         let lifecycle = GatewayLifecycle::new();
         let mut config = test_config(Vec::new());
         config.state_backend = config::StateBackend::Postgres;
-        config.deployment_id = Some(DEPLOYMENT_ID.to_owned());
+        config.deployment_id = Some(CLUSTER_DISCOVERY_DEPLOYMENT_ID.to_owned());
         config.discovery_projector_poll_ms = 50;
         let recorder = PrometheusBuilder::new().build_recorder();
         let app = gateway_app_with_process_started_at_and_overrides(
@@ -35390,7 +35390,7 @@ mod cluster_discovery_tests {
                 pg_audit: Some(audit_store.clone()),
                 pg_discovery: Some(ClusterDiscoverySeed {
                     pool: pool.clone(),
-                    deployment_id: DEPLOYMENT_ID.to_owned(),
+                    deployment_id: CLUSTER_DISCOVERY_DEPLOYMENT_ID.to_owned(),
                     instance_id,
                     audit: audit_store.clone(),
                 }),
