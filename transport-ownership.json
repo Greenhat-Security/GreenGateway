@@ -10020,9 +10020,9 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::mcp::impl ServerHandler McpServer::list_tools#1",
-      "sha256": "d0b5b8ca18cd1751b1babd0d17141c1cc027a82d628a704784b7275661fedab4",
+      "sha256": "85e440b290581c3397f08f27825e82f3e522546312764867d3b27757c55e7bfd",
       "owner": "GreenGateway maintainers",
-      "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
+      "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review. Reviewed for #422: the listing now returns early without an executor and asks ToolExecutor::list_visible_tools, which reads the registry once and pins one policy snapshot for every visibility check; the item still names only rmcp's ListToolsResult, ErrorData and RequestContext and adds no network, process or transport capability."
     },
     {
       "file": "gateway/src/mcp.rs",
