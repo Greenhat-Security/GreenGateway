@@ -11,16 +11,21 @@
 //!
 //! Apart from the lookups, the parser has one side effect: a retention of `0`
 //! days for either audit store is accepted as "no pruning" and logged as a
-//! warning. By inspection it logs nothing else, opens no file and calls no
-//! store, secret provider or network; the compiler's pure stages are where
-//! that becomes a tested guarantee. Three variables are requested twice --
-//! `DISCOVERY_PROJECTOR_LEASE_TTL_MS`, `DISCOVERY_PROJECTOR_POLL_MS` and
-//! `DISCOVERY_PROJECTOR_BATCH`, once to learn whether they were set and once
-//! to parse them -- and two are requested conditionally:
-//! `ADMIN_SESSION_IDLE_TIMEOUT_SECS` and `ADMIN_SESSION_MAX_ENTRIES` are not
-//! requested at all when `ADMIN_SESSION_MODE` enables no session store and
-//! `ADMIN_SESSION_TTL_SECS` is set, because the check that reads them
-//! short-circuits.
+//! warning. It logs nothing else, opens no file and calls no store, secret
+//! provider or network, which a source scan in the stage tests holds the
+//! configuration modules to. For the domains the compiler has extracted so
+//! far -- the listeners, the identity settings and the proxy, see `stage` --
+//! the parse and validate stages are also given values rather than a reader.
+//!
+//! Three variables are requested twice -- `DISCOVERY_PROJECTOR_LEASE_TTL_MS`,
+//! `DISCOVERY_PROJECTOR_POLL_MS` and `DISCOVERY_PROJECTOR_BATCH`, once to
+//! learn whether they were set and once to parse them -- and none is
+//! requested conditionally. `ADMIN_SESSION_IDLE_TIMEOUT_SECS` and
+//! `ADMIN_SESSION_MAX_ENTRIES` used to be skipped when `ADMIN_SESSION_MODE`
+//! enabled no session store and `ADMIN_SESSION_TTL_SECS` was set, because the
+//! check that read them short-circuited. The admin surface's inputs are now
+//! requested together, before any of them is parsed, and that check reads
+//! what was requested.
 //!
 //! The gateway's own source also reads the environment outside the parser.
 //! The test-only `ENVIRONMENT_READS` table lists every file under
@@ -246,6 +251,16 @@ pub(crate) const CONFIG_INPUTS: &[&str] = &[
 /// never requests it.
 pub(crate) fn config_input(name: &str) -> Option<&'static str> {
     CONFIG_INPUTS.iter().copied().find(|input| *input == name)
+}
+
+/// Where `name` comes in the order `from_env_vars` first requests its
+/// inputs. A name it never requests sorts after all of them, so a problem
+/// placed after one is still reported, last, rather than dropped.
+pub(super) fn position(name: &str) -> usize {
+    CONFIG_INPUTS
+        .iter()
+        .position(|input| *input == name)
+        .unwrap_or(CONFIG_INPUTS.len())
 }
 
 /// Who an environment read serves.
@@ -507,9 +522,8 @@ mod tests {
         );
     }
 
-    /// With every variable set, nothing outside the inventory is requested,
-    /// and the one conditional read is the one the module documentation
-    /// names.
+    /// With every variable set, nothing outside the inventory is requested
+    /// and nothing in it is skipped.
     ///
     /// The probe is a value most settings refuse, so a read that only a valid
     /// value reaches is not exercised here; the parity tests record the reads
@@ -526,10 +540,7 @@ mod tests {
             "unlisted variables requested: {unlisted:?}"
         );
         let skipped: Vec<&str> = inventory.difference(&requested).copied().collect();
-        assert_eq!(
-            skipped,
-            [ADMIN_SESSION_IDLE_TIMEOUT_SECS, ADMIN_SESSION_MAX_ENTRIES]
-        );
+        assert!(skipped.is_empty(), "skipped variables: {skipped:?}");
     }
 
     #[test]

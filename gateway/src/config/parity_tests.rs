@@ -11,7 +11,7 @@
 
 use std::collections::BTreeSet;
 
-use super::diagnostic::{ConfigDiagnostic, ConfigDiagnosticCode};
+use super::diagnostic::{ConfigDiagnostic, ConfigDiagnosticCode, ConfigRule};
 use super::*;
 
 /// What a fixture environment holds for `name`: exactly the listed value, or
@@ -66,8 +66,14 @@ fn with_probes(extra: &[&str]) -> Vec<String> {
     paths
 }
 
-/// The diagnostic `from_env_vars` reports for a problem about `variable`.
-fn expected_diagnostic(variable: &'static str, code: ConfigDiagnosticCode) -> ConfigDiagnostic {
+/// The diagnostic `from_env_vars` reports for a problem about `variable`,
+/// refused under `rule` by an extracted compiler stage or, with `None`, by the
+/// legacy parser.
+fn expected_diagnostic(
+    variable: &'static str,
+    code: ConfigDiagnosticCode,
+    rule: Option<ConfigRule>,
+) -> ConfigDiagnostic {
     let message = match code {
         ConfigDiagnosticCode::Unset => format!("{variable} is not set"),
         ConfigDiagnosticCode::Empty => format!("{variable} is set but empty"),
@@ -78,6 +84,7 @@ fn expected_diagnostic(variable: &'static str, code: ConfigDiagnosticCode) -> Co
     ConfigDiagnostic {
         variable: Some(variable),
         code,
+        rule,
         message,
     }
 }
@@ -408,6 +415,7 @@ fn every_input_treats_a_blank_value_by_one_of_three_legacy_rules() {
     assert_eq!(classified, inputs, "every input is classified exactly once");
 
     let defaults = accepted(&[]);
+    let extracted = super::stage_tests::extracted_inputs();
     for blank in ["", " \t "] {
         for &name in BLANK_IS_UNSET {
             assert_eq!(accepted(&[(name, blank)]), defaults, "{name}={blank:?}");
@@ -424,6 +432,7 @@ fn every_input_treats_a_blank_value_by_one_of_three_legacy_rules() {
                 [ConfigDiagnostic {
                     variable: Some(name),
                     code: ConfigDiagnosticCode::Empty,
+                    rule: extracted.contains(name).then_some(ConfigRule::Value),
                     message: format!("{name} is set but empty"),
                 }],
                 "{name}={blank:?}"
@@ -880,12 +889,178 @@ fn every_problem_is_reported_in_one_pass_in_the_order_the_settings_are_read() {
     assert_eq!(
         error.diagnostics(),
         [
-            expected_diagnostic("LISTEN_ADDR", ConfigDiagnosticCode::Refused),
-            expected_diagnostic("TRUSTED_PROXY_CIDRS", ConfigDiagnosticCode::Unset),
-            expected_diagnostic("AUTH_ENABLED", ConfigDiagnosticCode::Refused),
-            expected_diagnostic("UPSTREAM_URL", ConfigDiagnosticCode::Refused),
-            expected_diagnostic("EGRESS_TIMEOUT_MS", ConfigDiagnosticCode::Refused),
+            expected_diagnostic(
+                "LISTEN_ADDR",
+                ConfigDiagnosticCode::Refused,
+                Some(ConfigRule::Value)
+            ),
+            expected_diagnostic(
+                "TRUSTED_PROXY_CIDRS",
+                ConfigDiagnosticCode::Unset,
+                Some(ConfigRule::TrustedProxyNetworksRequired)
+            ),
+            expected_diagnostic(
+                "AUTH_ENABLED",
+                ConfigDiagnosticCode::Refused,
+                Some(ConfigRule::Value)
+            ),
+            expected_diagnostic(
+                "UPSTREAM_URL",
+                ConfigDiagnosticCode::Refused,
+                Some(ConfigRule::UpstreamRoutingSourcesExclusive)
+            ),
+            // Egress is not extracted yet, so the legacy parser reports it.
+            expected_diagnostic("EGRESS_TIMEOUT_MS", ConfigDiagnosticCode::Refused, None),
         ]
+    );
+}
+
+/// Some rules are checked between two reads, so their problems sit between
+/// two inputs' own refusals. These fixtures pin that order inside the blocks
+/// whose rules are checked after every input is parsed (issue #433, PR 2).
+#[test]
+fn a_rule_checked_between_two_reads_is_reported_between_them() {
+    let cookie_session_route = r#"[{"id":"pm-session","path_prefix":"/api/exponential","upstream_url":"https://pm-backend.example.test","forward_cookie_session":true}]"#;
+    for (fixture, expected) in [
+        // Listeners: a collision before a later bound, a pair before a
+        // later version, and composed client-certificate checks between
+        // the inputs they follow.
+        (
+            &[
+                ("ADMIN_LISTEN_ADDR", "0.0.0.0:8080"),
+                ("GRPC_MAX_CONCURRENT_STREAMS", "0"),
+            ][..],
+            &[
+                "ADMIN_LISTEN_ADDR must not be the same address as LISTEN_ADDR (both resolved to 0.0.0.0:8080)",
+                "GRPC_MAX_CONCURRENT_STREAMS must be between 1 and 10000, got 0",
+            ][..],
+        ),
+        (
+            &[
+                ("TLS_CERT_FILE", "/run/tls/data.crt"),
+                ("TLS_MIN_VERSION", "1.0"),
+            ][..],
+            &[
+                "TLS_CERT_FILE is set without TLS_KEY_FILE",
+                "TLS_MIN_VERSION must be a valid TLS version, got '1.0': expected `1.2` or `1.3`",
+            ][..],
+        ),
+        (
+            &[
+                ("ADMIN_CLIENT_CERT_CA_FILE", "/run/tls/admins.pem"),
+                ("CLIENT_CERT_IDENTITY_SOURCE", "dns"),
+                ("CLIENT_CERT_CA_FILE", "/run/tls/clients.pem"),
+            ][..],
+            &[
+                "CLIENT_CERT_CA_FILE is set while CLIENT_CERT_MODE is `off`",
+                "ADMIN_CLIENT_CERT_CA_FILE is set while ADMIN_CLIENT_CERT_MODE is `off`",
+                "CLIENT_CERT_IDENTITY_SOURCE is set while CLIENT_CERT_MODE and ADMIN_CLIENT_CERT_MODE are both off",
+            ][..],
+        ),
+        // The admin surface: an invalid mode, then the settings it leaves
+        // unread, then a later bound.
+        (
+            &[
+                ("ADMIN_SESSION_MODE", "shared"),
+                ("ADMIN_SESSION_TTL_SECS", "600"),
+                ("ADMIN_LOGIN_PENDING_TTL_SECS", "0"),
+            ][..],
+            &[
+                "ADMIN_SESSION_MODE must be disabled, standalone_memory or cluster_postgres",
+                "ADMIN_SESSION_TTL_SECS, ADMIN_SESSION_IDLE_TIMEOUT_SECS and ADMIN_SESSION_MAX_ENTRIES require ADMIN_SESSION_MODE=standalone_memory or cluster_postgres",
+                "ADMIN_LOGIN_PENDING_TTL_SECS must be greater than 0, got '0'",
+            ][..],
+        ),
+        // A session's idle limit, bounded by its lifetime, before a later
+        // session bound; the session's requirements come after CSRF.
+        (
+            &[
+                ("ADMIN_SESSION_MODE", "standalone_memory"),
+                ("ADMIN_SESSION_TTL_SECS", "600"),
+                ("ADMIN_SESSION_IDLE_TIMEOUT_SECS", "900"),
+                ("ADMIN_SESSION_MAX_ENTRIES", "0"),
+            ][..],
+            &[
+                "ADMIN_SESSION_IDLE_TIMEOUT_SECS must be between 1 and 600, got '900'",
+                "ADMIN_SESSION_MAX_ENTRIES must be between 1 and 100000, got '0'",
+                "ADMIN_SESSION_MODE=standalone_memory requires ADMIN_LOGIN_PROVIDER",
+            ][..],
+        ),
+        // The identity providers: the admin login's provider before the CSRF
+        // settings, and the session's requirements after them.
+        (
+            &[
+                ("ADMIN_LOGIN_PROVIDER", "missing"),
+                ("CSRF_ENABLED", "maybe"),
+            ][..],
+            &[
+                "ADMIN_LOGIN_PROVIDER references unknown auth provider 'missing'",
+                "CSRF_ENABLED must be a valid boolean, got 'maybe'",
+            ][..],
+        ),
+        (
+            &[
+                ("ADMIN_SESSION_MODE", "standalone_memory"),
+                ("CSRF_COOKIE_NAME", "bad name"),
+            ][..],
+            &[
+                "CSRF_COOKIE_NAME must be a non-empty RFC 6265 cookie name, got 'bad name'",
+                "ADMIN_SESSION_MODE=standalone_memory requires ADMIN_LOGIN_PROVIDER",
+            ][..],
+        ),
+        // Upstream routing: delegation right after the routes, the routing
+        // sources after the MCP servers, then the global timeouts.
+        (
+            &[
+                ("AUTH_ENABLED", "false"),
+                ("UPSTREAM_URL", "https://legacy.example.test"),
+                ("UPSTREAM_ROUTES", cookie_session_route),
+                ("MCP_UPSTREAM_SERVERS", "{}"),
+                ("UPSTREAM_TIMEOUT_MS", "0"),
+            ][..],
+            &[
+                "UPSTREAM_ROUTES[0].forward_cookie_session requires AUTH_ENABLED=true, AUTH_MODE=required and CSRF_ENABLED=true",
+                "MCP_UPSTREAM_SERVERS must be a JSON array of MCP upstream server objects",
+                "UPSTREAM_URL and UPSTREAM_ROUTES are mutually exclusive",
+                "UPSTREAM_TIMEOUT_MS must be greater than 0, got '0'",
+            ][..],
+        ),
+        // Proxy trust before the authorization exemptions read after it.
+        (
+            &[
+                ("RBAC_EXEMPT_PATHS", "relative"),
+                ("TRUST_PROXY_HEADERS", "true"),
+            ][..],
+            &[
+                "TRUSTED_PROXY_CIDRS must contain at least one CIDR when TRUST_PROXY_HEADERS=true",
+                "RBAC_EXEMPT_PATHS entries must be URI paths starting with '/', got 'relative'",
+            ][..],
+        ),
+    ] {
+        let error = refused(fixture);
+        assert_eq!(error.problems.len(), expected.len(), "{fixture:?}\n{error}");
+        for (problem, start) in error.problems.iter().zip(expected) {
+            assert!(problem.starts_with(start), "{fixture:?}\n{error}");
+        }
+    }
+
+    // A composed client-certificate check comes before the refusal of an
+    // input read after it, even one that is only refused for not being
+    // Unicode.
+    let error = Config::from_env_vars(|name| match name {
+        "CLIENT_CERT_CA_FILE" => Ok("/run/tls/clients.pem".to_owned()),
+        "ADMIN_CLIENT_CERT_CRL_FILE" => Err(VarError::NotUnicode(non_unicode_value())),
+        _ => Err(VarError::NotPresent),
+    })
+    .expect_err("both inputs are refused");
+    assert_eq!(error.problems.len(), 2, "{error}");
+    assert!(
+        error.problems[0].starts_with("CLIENT_CERT_CA_FILE is set while CLIENT_CERT_MODE is `off`"),
+        "{error}"
+    );
+    assert!(
+        error.problems[1].starts_with("ADMIN_CLIENT_CERT_CRL_FILE must be valid Unicode"),
+        "{error}"
     );
 }
 
@@ -922,9 +1097,9 @@ fn storage_modes_keep_their_requirements_and_refuse_each_others_material() {
     assert_eq!(
         error.diagnostics(),
         [
-            expected_diagnostic("DEPLOYMENT_ID", ConfigDiagnosticCode::Unset),
-            expected_diagnostic("DATABASE_URL_FILE", ConfigDiagnosticCode::Unset),
-            expected_diagnostic("RATE_LIMIT_KEYRING", ConfigDiagnosticCode::Unset),
+            expected_diagnostic("DEPLOYMENT_ID", ConfigDiagnosticCode::Unset, None),
+            expected_diagnostic("DATABASE_URL_FILE", ConfigDiagnosticCode::Unset, None),
+            expected_diagnostic("RATE_LIMIT_KEYRING", ConfigDiagnosticCode::Unset, None),
         ]
     );
 
@@ -1103,26 +1278,31 @@ fn diagnostics_follow_the_problems_one_for_one_and_describe_the_input() {
             ConfigDiagnostic {
                 variable: Some("LISTEN_ADDR"),
                 code: ConfigDiagnosticCode::Empty,
+                rule: Some(ConfigRule::Value),
                 message: "LISTEN_ADDR is set but empty".to_owned(),
             },
             ConfigDiagnostic {
                 variable: Some("AUTH_ENABLED"),
                 code: ConfigDiagnosticCode::Refused,
+                rule: Some(ConfigRule::Value),
                 message: "AUTH_ENABLED is set to a value that was refused".to_owned(),
             },
             ConfigDiagnostic {
                 variable: Some("DEPLOYMENT_ID"),
                 code: ConfigDiagnosticCode::Unset,
+                rule: None,
                 message: "DEPLOYMENT_ID is not set".to_owned(),
             },
             ConfigDiagnostic {
                 variable: Some("DATABASE_URL_FILE"),
                 code: ConfigDiagnosticCode::Unset,
+                rule: None,
                 message: "DATABASE_URL_FILE is not set".to_owned(),
             },
             ConfigDiagnostic {
                 variable: Some("RATE_LIMIT_KEYRING"),
                 code: ConfigDiagnosticCode::Unset,
+                rule: None,
                 message: "RATE_LIMIT_KEYRING is not set".to_owned(),
             },
         ]
@@ -1144,7 +1324,8 @@ fn a_problem_is_attributed_to_the_setting_it_begins_with() {
         error.diagnostics(),
         [expected_diagnostic(
             "ADMIN_SESSION_TTL_SECS",
-            ConfigDiagnosticCode::Unset
+            ConfigDiagnosticCode::Unset,
+            Some(ConfigRule::AdminSessionSettingsWithoutMode)
         )]
     );
 }
@@ -1166,7 +1347,10 @@ fn non_unicode_value() -> std::ffi::OsString {
 
 #[test]
 fn a_value_that_is_not_unicode_is_reported_without_its_bytes() {
-    for name in ["LISTEN_ADDR", "CONNECTION_SECRET_ALIASES"] {
+    for (name, rule) in [
+        ("LISTEN_ADDR", Some(ConfigRule::Value)),
+        ("CONNECTION_SECRET_ALIASES", None),
+    ] {
         let error = Config::from_env_vars(|requested| {
             if requested == name {
                 Err(VarError::NotUnicode(non_unicode_value()))
@@ -1182,7 +1366,11 @@ fn a_value_that_is_not_unicode_is_reported_without_its_bytes() {
         );
         assert_eq!(
             error.diagnostics(),
-            [expected_diagnostic(name, ConfigDiagnosticCode::NotUnicode)]
+            [expected_diagnostic(
+                name,
+                ConfigDiagnosticCode::NotUnicode,
+                rule
+            )]
         );
     }
 }
