@@ -1710,6 +1710,10 @@ fn admin_routes_keep_default_api_prefix_and_remap_custom_api_under_v1() {
         AUDIT_EVENTS_STREAM_ROUTE
     );
     assert_eq!(default_routes.status_route, STATUS_ADMIN_ROUTE);
+    assert_eq!(
+        default_routes.config_capabilities_route,
+        CONFIG_CAPABILITIES_ADMIN_ROUTE
+    );
     assert_eq!(default_routes.cluster_route, CLUSTER_ADMIN_ROUTE);
     assert_eq!(
         default_routes.cluster_replicas_route,
@@ -1832,6 +1836,10 @@ fn admin_routes_keep_default_api_prefix_and_remap_custom_api_under_v1() {
     assert_eq!(custom_routes.audit_route, "/v1/ops/audit");
     assert_eq!(custom_routes.events_stream_route, "/v1/ops/events/stream");
     assert_eq!(custom_routes.status_route, "/v1/ops/status");
+    assert_eq!(
+        custom_routes.config_capabilities_route,
+        "/v1/ops/config/capabilities"
+    );
     assert_eq!(custom_routes.cluster_route, "/v1/ops/cluster");
     assert_eq!(
         custom_routes.cluster_replicas_route,
