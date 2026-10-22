@@ -1,20 +1,69 @@
 //! admin events boundary extracted from the application composition root.
 use super::*;
 
-pub(super) fn emit_policy_rule_changed(
+/// The `policy.changed` record of a committed policy write: the before and
+/// after summary and the `diff_summary`, plus what the cross-resource checks
+/// that admitted it read and found (issue #243, slice 8) -- the digest of the
+/// resource snapshot and the stable codes of the risks it carried, never
+/// what they describe.
+pub(super) fn emit_policy_published(
     state: &PolicyAdminState,
     parts: &http::request::Parts,
     principal: &auth::Principal,
     before: &rbac::Policy,
     after: &rbac::Policy,
     diff_summary: Value,
+    review: &PublicationReview,
 ) {
     let mut payload = policy_change_payload(before, after);
     if let Some(payload) = payload.as_object_mut() {
         payload.insert("diff_summary".to_owned(), diff_summary);
+        payload.insert(
+            "resource_snapshot_digest".to_owned(),
+            json!(review.resource_snapshot_digest),
+        );
+        payload.insert("risks".to_owned(), json!(review.risks));
     }
 
     emit_policy_changed_payload(state, parts, principal, payload);
+}
+
+/// A policy write the cross-resource checks refused, and what it was
+/// compared with. Stable codes, an ETag and a digest only: no principals,
+/// hosts, paths or policy contents.
+pub(super) struct PolicyPublicationRefusal<'a> {
+    /// The `diff_summary.action` the write would have recorded.
+    pub(super) action: Option<&'a str>,
+    /// The codes that refused it, sorted and unique.
+    pub(super) codes: &'a [&'static str],
+    /// The ETag of the policy it would have replaced.
+    pub(super) policy_etag: &'a str,
+    pub(super) resource_snapshot_digest: Option<&'a str>,
+}
+
+pub(super) fn emit_policy_publication_refused(
+    state: &PolicyAdminState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    refusal: PolicyPublicationRefusal<'_>,
+) {
+    let request_id = client_ip::request_id(&parts.headers, &parts.extensions);
+    let source_ip =
+        client_ip::canonical_client_ip(&parts.headers, &parts.extensions, &state.client_ip_policy);
+    let payload = json!({
+        "action": refusal.action,
+        "codes": refusal.codes,
+        "policy_etag": refusal.policy_etag,
+        "resource_snapshot_digest": refusal.resource_snapshot_digest,
+    });
+
+    state.audit.emit(audit::AuditEvent::new(
+        audit::event::POLICY_PUBLICATION_REFUSED,
+        request_id,
+        source_ip,
+        Some(auth::actor_from_principal(principal)),
+        payload,
+    ));
 }
 
 pub(super) fn emit_policy_changed_payload(

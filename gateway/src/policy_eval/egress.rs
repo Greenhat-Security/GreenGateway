@@ -34,7 +34,7 @@ use super::{framed_digest, EvaluationError, LogicalDecision, PolicyEffect, MAX_T
 use crate::egress::{host_glob_matches, ip_matches_policy_cidr, is_non_global_ip};
 
 pub(crate) const EGRESS_CONTEXT_VERSION: u16 = 1;
-const EGRESS_SEMANTICS_VERSION: &str = "gg-static-egress-v1";
+pub(crate) const EGRESS_SEMANTICS_VERSION: &str = "gg-static-egress-v1";
 const EGRESS_DOMAIN: &str = "static_egress_v1";
 /// Frame kind for the digest over the controls a compiled lane decides by.
 const EGRESS_CONTROLS_DIGEST_KIND: &str = "gg.egress-controls.v1";
@@ -324,6 +324,15 @@ impl EgressEvaluation {
             && context
                 .binding()
                 .is_ok_and(|binding| binding == self.binding)
+    }
+}
+
+impl EgressSnapshot {
+    /// The digest of the exact controls this snapshot names, for a policy
+    /// resource snapshot that binds the effective egress controls by identity
+    /// without carrying a host, port or range itself.
+    pub(crate) fn controls_digest(&self) -> [u8; 32] {
+        self.controls_digest
     }
 }
 

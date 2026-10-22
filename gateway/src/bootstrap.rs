@@ -1764,6 +1764,23 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
     let mcp_upstream_definitions =
         tools::mcp_upstream::discover_upstream_tools_blocking(&config, Arc::clone(&egress_client))?;
     tool_registry.merge_definitions(mcp_upstream_definitions)?;
+    // What a candidate policy is validated against before it is published
+    // (issue #243, slice 8): the live tool registry and Connection control
+    // plane, the egress lane the egress client decides by, and this
+    // process's configuration fingerprint. Attached before any admin state
+    // takes its copy of the RBAC state.
+    let rbac_state = rbac_state.map(|state| {
+        state.with_policy_resources(rbac::policy_resources::PolicyResourceSources {
+            tools: tool_registry.clone(),
+            connections: connection_control_plane.clone(),
+            egress: egress_client.static_egress_policy(),
+            configuration_fingerprint: format!(
+                "sha256:{}",
+                ha::static_config_fingerprint(&config).hex()
+            ),
+            policy_route: routes.admin.policy_route.clone(),
+        })
+    });
     // Cluster mode: the registry's local lane belongs to the authoritative
     // tools document (not TOOLS_FILE, which cluster mode rejects). Install
     // the boot document -- validating it exactly as a file load would, and

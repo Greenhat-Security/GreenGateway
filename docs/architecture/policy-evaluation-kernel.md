@@ -164,6 +164,17 @@ is the initialized ledger value). The caller supplies that watermark; the pure
 compiler does not prove it current or prove it originated from a database.
 There is no invented Connection, routing, configuration or tool revision.
 
+Those resources are identified one level up, by the policy resource snapshot
+(`rbac/policy_resources.rs`, #243 slice 8) that cross-resource validation reads
+and the policy validation API reports: the gateway build, every lane's semantics
+and context versions, the static configuration fingerprint, the effective static
+egress controls digest, a tool registry digest, the Connection collection ETag
+and, in cluster mode, the installed snapshot's security revision. It names what
+a validation read; it is not part of a kernel result's binding. Validation asks
+the kernel only ordinary questions -- the publisher's `PUT` of the policy route
+through `evaluate`, and Connection endpoints through the static egress lane with
+no resolution facts -- and matches nothing itself.
+
 Each result binds source, authority/watermark, context version, exact evaluator
 semantics version and a digest of the supplied policy-relevant context facts.
 `reusable_for` requires complete evaluation, validated matching snapshot/version

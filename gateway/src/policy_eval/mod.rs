@@ -1342,7 +1342,12 @@ fn write_json_scalar(value: &Value, out: &mut Vec<u8>) {
     }
 }
 
-fn framed_digest(kind: &str, media_type: &str, version: &str, payload: &[u8]) -> [u8; 32] {
+pub(crate) fn framed_digest(
+    kind: &str,
+    media_type: &str,
+    version: &str,
+    payload: &[u8],
+) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(b"GGDIGEST\0");
     for part in [

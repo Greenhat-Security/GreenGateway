@@ -668,6 +668,23 @@ pub(super) async fn accept_suggestion_in_cluster(
             Ok(prepared) => prepared,
             Err(response) => return *response,
         };
+    // The acceptance publishes the whole document, so it is checked against
+    // the other resources exactly as every other policy write is.
+    let review = match admit_policy_resources(
+        PublicationRequest {
+            state: &state.policy,
+            rbac_state,
+            parts,
+            principal,
+        },
+        &prepared.before_policy,
+        &prepared.current_etag,
+        &prepared.candidate,
+        &prepared.diff_summary,
+    ) {
+        Ok(review) => review,
+        Err(response) => return *response,
+    };
     // The acceptance commits the whole document, so a role description
     // already in it is written again and the gate is asked again.
     if let Err(response) =
@@ -714,13 +731,14 @@ pub(super) async fn accept_suggestion_in_cluster(
         .get(prepared.position)
         .cloned()
         .unwrap_or(prepared.created_rule);
-    emit_policy_rule_changed(
+    emit_policy_published(
         &state.policy,
         parts,
         principal,
         &prepared.before_policy,
         &accepted.policy.policy,
         prepared.diff_summary,
+        &review,
     );
     emit_suggestion_lifecycle_changed(state, parts, principal, &accepted.suggestion);
     // Both changes are durable, so both are audited, even when this replica

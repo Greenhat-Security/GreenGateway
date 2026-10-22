@@ -313,6 +313,26 @@ pub(super) async fn policy_validate_endpoint(
             detail,
         );
     }
+    // What only the other resources can show: the same cross-resource,
+    // lockout and risk checks a publication runs, as the replacement of
+    // the policy the authority holds now, for this caller.
+    let mut resource_snapshot = None;
+    if inspection.policy().is_some() {
+        let live = match authoritative_policy(&state, rbac_state).await {
+            Ok(live) => live,
+            Err(response) => return *response,
+        };
+        let review = inspection.policy().map(|candidate| {
+            review_policy_resources(rbac_state, &parts, principal, &live, candidate)
+        });
+        if let Some(review) = review {
+            let (findings, snapshot) = review.into_parts();
+            for finding in findings {
+                inspection.record_finding(finding.diagnostic, finding.detail);
+            }
+            resource_snapshot = Some(snapshot);
+        }
+    }
 
     let status = if inspection.is_valid() {
         StatusCode::OK
@@ -328,6 +348,7 @@ pub(super) async fn policy_validate_endpoint(
             diagnostics: inspection.diagnostics(),
             source_digest: inspection.source_digest(),
             semantic_digest: inspection.semantic_digest(),
+            resource_snapshot: resource_snapshot.as_ref(),
         }),
     )
         .into_response()
@@ -2079,6 +2100,140 @@ pub(super) fn validate_policy_mutation_candidate(
     Ok(())
 }
 
+/// The request a publication is checked for: who is publishing, how they
+/// reached the gateway, and the state that judges them.
+pub(super) struct PublicationRequest<'a> {
+    pub(super) state: &'a PolicyAdminState,
+    pub(super) rbac_state: &'a middleware::rbac::RbacState,
+    pub(super) parts: &'a http::request::Parts,
+    pub(super) principal: &'a auth::Principal,
+}
+
+/// What the cross-resource checks said about a publication that went
+/// ahead, for its `policy.changed` record: the resource snapshot it was
+/// checked against, and the risks it carried.
+pub(super) struct PublicationReview {
+    pub(super) resource_snapshot_digest: Option<String>,
+    pub(super) risks: Vec<&'static str>,
+}
+
+/// The cross-resource, lockout and risk checks of `candidate` as the
+/// replacement of `live`, from `principal`'s point of view (issue #243,
+/// slice 8). Reads the RBAC state's resource view once and writes nothing.
+pub(super) fn review_policy_resources(
+    rbac_state: &middleware::rbac::RbacState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    live: &rbac::Policy,
+    candidate: &rbac::Policy,
+) -> rbac::policy_resources::ResourceValidation {
+    let view = rbac_state.policy_resource_view();
+    let publisher = rbac::policy_resources::Publisher {
+        principal,
+        request_host: upstream_route::request_host_without_port(&parts.uri, &parts.headers),
+    };
+    rbac::policy_resources::validate_resources(candidate, live, &view, Some(&publisher))
+}
+
+/// Refuses a publication the cross-resource checks block, before any
+/// authority sees the candidate: `400` with every finding and the resource
+/// snapshot they read, and a `policy.publication_refused` audit event, and
+/// nothing written. Every commit the policy API makes passes through here:
+/// [`persist_policy_mutation`], which every mutation endpoint, rollback and a
+/// standalone suggestion acceptance use, and a cluster-mode suggestion
+/// acceptance, which commits inside the suggestion's transaction.
+pub(super) fn admit_policy_resources(
+    request: PublicationRequest<'_>,
+    live: &rbac::Policy,
+    live_etag: &str,
+    candidate: &rbac::Policy,
+    diff_summary: &Value,
+) -> ResponseResult<PublicationReview> {
+    let review = review_policy_resources(
+        request.rbac_state,
+        request.parts,
+        request.principal,
+        live,
+        candidate,
+    );
+    let refuse = |codes: &[&'static str]| {
+        emit_policy_publication_refused(
+            request.state,
+            request.parts,
+            request.principal,
+            PolicyPublicationRefusal {
+                action: diff_summary.get("action").and_then(Value::as_str),
+                codes,
+                policy_etag: live_etag,
+                resource_snapshot_digest: review.snapshot().digest(),
+            },
+        );
+    };
+    // A write bound to the snapshot its caller reviewed is refused once the
+    // resources have moved: the findings that were reviewed may no longer
+    // be the ones that apply, and they are never silently re-judged.
+    if let Some(expected) = expected_resource_snapshot(&request.parts.headers)? {
+        let current = review.snapshot();
+        if !current.is_complete() || current.digest() != Some(expected.as_str()) {
+            refuse(&[RESOURCE_SNAPSHOT_STALE_REASON]);
+            return Err(Box::new(resource_snapshot_stale(current)));
+        }
+    }
+    if !review.blocks_publication() {
+        return Ok(PublicationReview {
+            resource_snapshot_digest: review.snapshot().digest().map(str::to_owned),
+            risks: review.risk_codes(),
+        });
+    }
+    refuse(&review.blocking_codes());
+    Err(Box::new(policy_publication_refused(&review)))
+}
+
+/// The header a policy write names the resource snapshot it was reviewed
+/// against in: the `resource_snapshot.digest` a validation reported.
+pub(super) const RESOURCE_SNAPSHOT_HEADER: &str = "x-greengateway-resource-snapshot";
+/// The stable reason of a write whose named resource snapshot is no longer
+/// the current one.
+pub(super) const RESOURCE_SNAPSHOT_STALE_REASON: &str = "resource_snapshot_stale";
+
+/// The resource snapshot digest the request binds its write to, if it names
+/// one. Optional, and exactly one value when present: a repeated or
+/// non-ASCII header is refused rather than read one way or the other.
+pub(super) fn expected_resource_snapshot(headers: &HeaderMap) -> ResponseResult<Option<String>> {
+    let mut values = headers.get_all(RESOURCE_SNAPSHOT_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(Box::new(bad_request(
+            "X-GreenGateway-Resource-Snapshot must appear at most once",
+        )));
+    }
+    match value.to_str() {
+        Ok(value) => Ok(Some(value.trim().to_owned())),
+        Err(_) => Err(Box::new(bad_request(
+            "X-GreenGateway-Resource-Snapshot must be valid ASCII",
+        ))),
+    }
+}
+
+/// `409`: the write named a resource snapshot that is no longer current.
+/// Carries the current one, so the caller can validate again and review
+/// what it says now.
+pub(super) fn resource_snapshot_stale(
+    current: &rbac::policy_resources::PolicyResourceSnapshot,
+) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": "the resources this policy was reviewed against have changed; validate it again",
+            "reason": RESOURCE_SNAPSHOT_STALE_REASON,
+            "resource_snapshot": current,
+        })),
+    )
+        .into_response()
+}
+
 pub(super) async fn persist_policy_mutation(
     context: PolicyMutationCommitContext<'_, '_>,
     before_policy: &rbac::Policy,
@@ -2086,9 +2241,19 @@ pub(super) async fn persist_policy_mutation(
     candidate: &rbac::Policy,
     diff_summary: Value,
 ) -> ResponseResult<PolicyMutationCommitResult> {
-    #[cfg(not(feature = "postgres"))]
-    let _ = expected_etag;
     validate_policy_mutation_candidate(context.rbac_state, before_policy, candidate)?;
+    let review = admit_policy_resources(
+        PublicationRequest {
+            state: context.state,
+            rbac_state: context.rbac_state,
+            parts: context.parts,
+            principal: context.principal,
+        },
+        before_policy,
+        expected_etag,
+        candidate,
+        &diff_summary,
+    )?;
 
     // Cluster mode: one transaction through the authority -- new immutable
     // version, revision advance, history row, and outbox record commit
@@ -2118,13 +2283,14 @@ pub(super) async fn persist_policy_mutation(
                 // either way. Returning the install failure first would leave a
                 // security change that actually happened absent from the audit
                 // stream, which is a worse outcome than the failure it reports.
-                emit_policy_rule_changed(
+                emit_policy_published(
                     context.state,
                     context.parts,
                     context.principal,
                     before_policy,
                     &active.policy,
                     diff_summary,
+                    &review,
                 );
                 if installed.is_err() {
                     return Err(Box::new(policy_snapshot_not_installable()));
@@ -2185,13 +2351,14 @@ pub(super) async fn persist_policy_mutation(
         &diff_summary,
     )
     .await;
-    emit_policy_rule_changed(
+    emit_policy_published(
         context.state,
         context.parts,
         context.principal,
         before_policy,
         &after_policy,
         diff_summary,
+        &review,
     );
 
     let new_etag = match policy_etag(&after_policy) {
@@ -2652,6 +2819,34 @@ pub(super) fn policy_validation_failed(errors: Vec<String>) -> Response {
         Json(PolicyValidationResponse {
             valid: false,
             errors,
+        }),
+    )
+        .into_response()
+}
+
+/// A publication the cross-resource checks refused: the `valid`/`errors`
+/// pair every policy write has always refused with, plus every finding and
+/// the resource snapshot they read.
+pub(super) fn policy_publication_refused(
+    review: &rbac::policy_resources::ResourceValidation,
+) -> Response {
+    let errors = review
+        .findings()
+        .iter()
+        .filter_map(|finding| finding.detail.clone())
+        .collect();
+    let diagnostics = review
+        .findings()
+        .iter()
+        .map(|finding| &finding.diagnostic)
+        .collect();
+    (
+        StatusCode::BAD_REQUEST,
+        Json(PolicyPublicationRefusedResponse {
+            valid: false,
+            errors,
+            diagnostics,
+            resource_snapshot: review.snapshot(),
         }),
     )
         .into_response()
