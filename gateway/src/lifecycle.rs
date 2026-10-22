@@ -351,6 +351,10 @@ pub(crate) struct GrpcApp {
 pub(crate) struct GatewayApps {
     pub(crate) http: GatewayApp,
     pub(crate) grpc: Option<GrpcApp>,
+    /// Cluster mode with an authority-event sink configured: the delivery
+    /// startup the serving path must finish before any listener binds.
+    #[cfg(feature = "postgres")]
+    pub(crate) authority_events: Option<crate::authority_events::startup::AuthorityEventStartup>,
 }
 
 /// The data and admin listener addresses [`serve_gateway`] binds, read from

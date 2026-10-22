@@ -96,6 +96,12 @@ const AUTHORITATIVE_TABLES: &[&str] = &[
     // 0020's contract fence and backfill ledger are deliberately absent:
     // they say which builds may serve the schema, not what the namespace
     // holds. The fence is checked on its own in `verify_target`.
+    // 0021: the authority-event journal indexes that evidence for
+    // delivery, so a row in it is history too. The dispatcher's cursor is
+    // not: a replica that started with a sink claims it at position 0
+    // before anything has happened, and its position is covered by the
+    // journal's own counter below.
+    "authority_event_journal",
 ];
 
 /// The authoritative singleton counters and the column that carries them.
@@ -108,6 +114,7 @@ const AUTHORITATIVE_COUNTERS: &[(&str, &str)] = &[
     ("connection_state_revision", "last_revision"),
     ("service_token_state_revision", "last_revision"),
     ("discovery_projector_state", "checkpoint_position"),
+    ("authority_event_state", "last_position"),
 ];
 
 const OPERATION: &str = "import_namespace_inspect";

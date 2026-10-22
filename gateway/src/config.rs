@@ -37,6 +37,7 @@ use crate::{
     upstream_route,
 };
 
+mod authority_events;
 mod bundle;
 mod connections;
 mod diagnostic;
@@ -65,6 +66,11 @@ pub(crate) use plan::compile;
 pub(crate) fn process_environment(name: &str) -> Result<String, VarError> {
     env::var(name)
 }
+
+pub use authority_events::AuthorityEventSettings;
+// Named only by the cluster wiring and by tests.
+#[cfg(any(feature = "postgres", test))]
+pub use authority_events::AuthorityEventSinkSetting;
 
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:8080";
 static DEFAULT_LISTEN_SOCKET_ADDR: LazyLock<SocketAddr> = LazyLock::new(|| {
@@ -545,6 +551,10 @@ pub struct Config {
     /// PostgreSQL audit retention in days, pruned by the maintenance
     /// singleton; `None` (or `0`) keeps everything. Cluster mode only.
     pub audit_postgres_retention_days: Option<u32>,
+    /// Authority-event delivery (issue #425, PR 3): the dispatcher's sink,
+    /// the pseudonym key aliases, the journal's capacity and retention.
+    /// Cluster mode only; every field is refused in standalone mode.
+    pub authority_events: AuthorityEventSettings,
     pub tool_runtime_default_timeout_ms: u64,
     pub csrf_enabled: bool,
     pub csrf_cookie_name: String,

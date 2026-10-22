@@ -391,6 +391,7 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
             audit_floor: Some(Arc::new(
                 storage::postgres_discovery::PostgresDiscoveryStore::new(pool.clone()),
             )),
+            authority_event_retention: config.authority_events.retention(),
             lease_holder: identity.instance_id(),
             tool_lease_ttl: config.tool_lease_ttl(),
         });
@@ -661,18 +662,22 @@ pub(super) async fn start_serving<S: StartupStages>(
 ) -> Result<(), StartupFailure> {
     let plan = config::compile(get_var).map_err(StartupFailure::Configuration)?;
     let config = plan.into_config();
-    let Preflighted { seeds, published } = stages
-        .preflight(&config)
+    // Each stage's future is boxed: an unoptimized build would otherwise
+    // hold all of them inline, and the main thread's stack on Windows is
+    // 1 MiB.
+    let Preflighted { seeds, published } = Box::pin(stages.preflight(&config))
         .await
         .map_err(StartupFailure::Stage)?;
-    let activated = match stages.activate(config, seeds).await {
+    let activated = match Box::pin(stages.activate(config, seeds)).await {
         Ok(activated) => activated,
         Err(error) => {
-            stages.withdraw(published).await;
+            Box::pin(stages.withdraw(published)).await;
             return Err(StartupFailure::Stage(error));
         }
     };
-    stages.serve(activated).await.map_err(StartupFailure::Stage)
+    Box::pin(stages.serve(activated))
+        .await
+        .map_err(StartupFailure::Stage)
 }
 
 /// The gateway process's startup stages.
@@ -709,6 +714,7 @@ pub(super) struct ClusterBootSeeds {
     membership: Option<Arc<cluster_membership::ClusterMembership>>,
     audit: Option<Arc<storage::postgres_audit::PostgresAuditEventStore>>,
     discovery: Option<ClusterDiscoverySeed>,
+    authority_events: Option<Arc<storage::postgres_authority_events::PostgresAuthorityEventStore>>,
 }
 
 /// A gateway activation built in full: everything serving needs, and the
@@ -824,6 +830,8 @@ impl StartupStages for ProcessStartup {
             pg_discovery: cluster.discovery,
             #[cfg(feature = "postgres")]
             pg_membership: cluster.membership,
+            #[cfg(feature = "postgres")]
+            pg_authority_events: cluster.authority_events,
             #[cfg(test)]
             cluster_readiness: None,
             #[cfg(test)]
@@ -861,6 +869,21 @@ impl StartupStages for ProcessStartup {
                 stop_failed_activation(&lifecycle, shutdown_budget).await;
                 return Err(error);
             }
+        };
+        // Authority-event delivery needs the pseudonym keyring, which may
+        // sit behind a network secret provider the builder only just
+        // activated, so it starts here, after the build and before any
+        // listener binds. Any failure refuses startup like a build failure.
+        #[cfg(feature = "postgres")]
+        let apps = {
+            let mut apps = apps;
+            if let Some(startup) = apps.authority_events.take() {
+                if let Err(error) = Box::pin(startup.start(&lifecycle, &audit_log)).await {
+                    stop_failed_activation(&lifecycle, shutdown_budget).await;
+                    return Err(Box::new(error));
+                }
+            }
+            apps
         };
         Ok(ActivatedGateway {
             apps,
@@ -1296,6 +1319,32 @@ async fn preflight_cluster_authority(
         }
         _ => None,
     };
+    // The authority-event journal (issue #425, PR 3) rides the same pool.
+    // Every replica applies the configured capacity before serving; the
+    // value is fingerprinted, so agreeing replicas write the same number.
+    // A journal that cannot be configured refuses startup: every authority
+    // mutation reserves capacity in it.
+    let authority_events = match database_foundation {
+        Some(foundation) => {
+            let store = Arc::new(
+                storage::postgres_authority_events::PostgresAuthorityEventStore::new(
+                    foundation.pool().clone(),
+                ),
+            );
+            // Boxed, as is the delivery startup activation runs: an
+            // unoptimized build holds every startup sub-future inline, and
+            // the main thread's stack on Windows is 1 MiB.
+            Box::pin(store.configure_capacity(config.authority_events.journal_capacity))
+                .await
+                .map_err(|error| {
+                    Box::<dyn std::error::Error>::from(format!(
+                        "the authority event journal could not be configured: {error}"
+                    ))
+                })?;
+            Some(store)
+        }
+        None => None,
+    };
     Ok(ClusterBootSeeds {
         policy,
         tools,
@@ -1306,6 +1355,7 @@ async fn preflight_cluster_authority(
         membership,
         audit,
         discovery,
+        authority_events,
     })
 }
 
@@ -1715,6 +1765,13 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
         &build_overrides,
     )?);
     connection_control_plane.activate_network_secret_providers(&egress_client)?;
+    // Cluster mode with an authority-event sink: everything the dispatcher's
+    // startup needs, finished by `run()` once it can await the keyring. The
+    // control plane's resolver is the one that knows the operator aliases
+    // and the network providers just activated.
+    #[cfg(feature = "postgres")]
+    let authority_event_startup =
+        authority_event_startup(&config, &build_overrides, &connection_control_plane);
     let connection_http_runtime = connections::http::ConnectionHttpRuntime::new(
         connection_control_plane.clone(),
         egress_config,
@@ -2253,6 +2310,7 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
             audit_floor: Some(Arc::new(
                 storage::postgres_discovery::PostgresDiscoveryStore::new(seed.pool.clone()),
             )),
+            authority_event_retention: config.authority_events.retention(),
             lease_holder: seed.instance_id,
             tool_lease_ttl: config.tool_lease_ttl(),
         });
@@ -2612,7 +2670,41 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
         ))
     };
 
-    Ok(GatewayApps { http, grpc })
+    Ok(GatewayApps {
+        http,
+        grpc,
+        #[cfg(feature = "postgres")]
+        authority_events: authority_event_startup,
+    })
+}
+
+/// What `run()` needs to start authority-event delivery, when this is a
+/// cluster replica with a sink configured. Kept out of the app builder, whose
+/// unoptimized stack frame already sits close to the main thread's limit.
+#[cfg(feature = "postgres")]
+#[inline(never)]
+fn authority_event_startup(
+    config: &config::Config,
+    build_overrides: &GatewayAppBuildOverrides,
+    connection_control_plane: &connections::control_plane::ConnectionControlPlane,
+) -> Option<authority_events::startup::AuthorityEventStartup> {
+    if config.authority_events.sink == config::AuthorityEventSinkSetting::None {
+        return None;
+    }
+    let store = build_overrides.pg_authority_events.as_ref()?;
+    let seed = build_overrides.pg_limits.as_ref()?;
+    Some(authority_events::startup::AuthorityEventStartup {
+        store: Arc::clone(store),
+        resolver: connection_control_plane.secret_resolver_handle(),
+        settings: config.authority_events.clone(),
+        leases: Arc::new(storage::PostgresExecutionLeaseStore::new(
+            seed.pool.clone(),
+            &seed.deployment_id,
+            seed.instance_id,
+            authority_events::dispatcher::DISPATCHER_LEASE_TTL,
+        )) as Arc<dyn tools::lease::ExecutionLeaseStore>,
+        holder: seed.instance_id,
+    })
 }
 
 pub(super) fn auth_validator_from_config(

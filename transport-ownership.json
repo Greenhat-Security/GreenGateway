@@ -7342,7 +7342,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::cluster_maintenance::StandardJobSources#1",
-      "sha256": "708e736cd0e393bcb446ec0f8d7cd1b955e9d49119f94ec2f18bb8b051d6dd59",
+      "sha256": "2613cbc6040d3e9a9c98c14b81f1b7057aaea0b680026694b4bbbe4aab9e2285",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -8343,7 +8343,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::record_change_evidence#1",
-      "sha256": "7b435547b32d65efca0e29ad4614803d7afcc17adabbc5e2f0ffade8992286b0",
+      "sha256": "5bf9230d68df536f36211c954001b5aa33fcfff17b3f1a804885cef69799b50a",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -12847,7 +12847,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_service_tokens::record_change_evidence#1",
-      "sha256": "419913da5e23768a6ff79db33db9506c4e3905b8b3ee61567da70a74f2bd23a4",
+      "sha256": "3d8c6d80b09119331289fb3691bfc83f98685421c2c784a2a189b3870ec4550e",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -13267,7 +13267,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::tools::lease::LEASE_SCOPE_LABELS#1",
-      "sha256": "e4a96cac483c84d1ce3c6c740e9e0e26b0de53ba6182a7a1d9c0b89dbfb9eb39",
+      "sha256": "2f32ce63365adc576d67f875078e525adce6af0b2d0c53a4ab63f44f9d99f843",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
@@ -13973,7 +13973,237 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::main#1",
-      "sha256": "6a4854d1b7657b51e60ddb9b420ab8b064957b95168b17f0a8ffa53f34ead444",
+      "sha256": "8fbb785272e3d2a1f734233cb3f1166193aa149aad24c975040fa3ee85efdbe4",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway/src/authority_events/dispatcher.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::authority_events::dispatcher::FAILURE_KINDS#1",
+      "sha256": "e21b1f529ebfc944dc72d570219b29f72c59a36bfdd910b5480466e2bfd99f0f",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway/src/authority_events/dispatcher.rs",
+      "reasons": [
+        "unexpanded-macro"
+      ],
+      "scope": "gateway::authority_events::dispatcher::record_delivered#1",
+      "sha256": "76cb578f08c9aebcb8ecab08db1405439857e6d63757473008230d3359da7f5d",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway/src/authority_events/dispatcher.rs",
+      "reasons": [
+        "unexpanded-macro"
+      ],
+      "scope": "gateway::authority_events::dispatcher::record_failure#1",
+      "sha256": "b320d43b1bb65a1e767002e43f232477d4d1dfb30e680c970ac098c8bcece78c",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway/src/authority_events/dispatcher.rs",
+      "reasons": [
+        "unexpanded-macro"
+      ],
+      "scope": "gateway::authority_events::dispatcher::record_journal_stats#1",
+      "sha256": "7d1642231c3f8902db8e57663fec4695d9bd7991ea2c4db5c774e0613ed0b80c",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway/src/authority_events/dispatcher.rs",
+      "reasons": [
+        "capability-in-macro-input"
+      ],
+      "scope": "gateway::authority_events::dispatcher::sleep_or_stop#1",
+      "sha256": "1a7bff11c99452f9003b7abdbedf2d7941de0140f2f80af7069f0ad981f2d58c",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway/src/authority_events/sink.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::authority_events::sink::impl  SinkError::kind#1",
+      "sha256": "1036a1dcc91e4402e1cbece47b94b5bf80523fa8449cabf9ede8169ceabc3629",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway/src/authority_events/sink.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::authority_events::sink::open_for_append#1",
+      "sha256": "b4e92296c095b89cd0834a5a6d41b106c92283970200b9a495a28ec65b168b67",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Opens the operator-configured AUTHORITY_EVENT_FILE for appending with std::fs; a local file only, no network, socket or process capability."
+    },
+    {
+      "file": "gateway/src/cluster_maintenance.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::cluster_maintenance::impl MaintenanceJob AuthorityEventRetention::run_step#1",
+      "sha256": "aafd32ef0210b49eff05897f323831285868e60fb0625e85408cb62ca210930b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
+    },
+    {
+      "file": "gateway/src/config/authority_events.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::config::authority_events::AuthorityEventSinkSetting#1",
+      "sha256": "f5ef9e35e4d2ca02be18a568f1c64792fbd79433ae4191195d3ca705e1ef31f4",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway/src/config/authority_events.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::config::authority_events::impl  AuthorityEventSettings::retention#1",
+      "sha256": "e5f0f85f57447269aa7d76fd7187872f459993214341bfa959539733fc4d0fbc",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway/src/connections/control_plane.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::connections::control_plane::impl  ConnectionControlPlane::secret_resolver_handle#1",
+      "sha256": "16632a67fe234815719e6e6cb113b0443e79b5001e559c70efca8d205682e946",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway/src/storage/postgres_authority_events.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_authority_events::JournalAppendError#1",
+      "sha256": "2befaf3bc972ae744b89a395f963483b4817394ce41040badd75a2e1d136991d",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_authority_events.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_authority_events::PostgresAuthorityEventStore#1",
+      "sha256": "ef364e0068a135c69d413d512ea6d0b4819c192cde679e352c1e8cb2152ed581",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_authority_events.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_authority_events::append_to_journal#1",
+      "sha256": "ca21ad14e0862956598f6d12da8fc7ffbfbfa06575ab69734341437f6e3af7b2",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_authority_events.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_authority_events::classify_query#1",
+      "sha256": "b9618bf4127da4a3c48146f04769b3bf1026ac7481910dafc4f502dbfdacaf3b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_authority_events.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_authority_events::column#1",
+      "sha256": "b00ff4d69a8051ac828295d2b539cee6ec1fee87d8b89b61dd78bf9420644ba8",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_authority_events.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::storage::postgres_authority_events::impl  JournalSource::ALL#1",
+      "sha256": "a14e519ac249c5759f4e94639370643f6ecab0c78cb46185cab41dc71c2d9b7b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway/src/storage/postgres_authority_events.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_authority_events::impl  PostgresAuthorityEventStore::new#1",
+      "sha256": "203a48edd5eae2e7646054e2def27ee419dfab16952f0ad2cedfc42c516194f5",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_authority_events.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_authority_events::impl  PostgresAuthorityEventStore::prune_with#1",
+      "sha256": "0d1b6785542be8a5e490b7f4c53ce864720cea88a248814fc07d66b3f3ce2ad8",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_authority_events.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_authority_events::impl  PostgresAuthorityEventStore::stats_with#1",
+      "sha256": "cf84ace15c203026e71c05ac97af748fcb450a7d8dc93df9d8c0ff75cfe6eea7",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_authority_events.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_authority_events::journaled_evidence_from_row#1",
+      "sha256": "0feaef3cb9f594c4f54e82efc7cf73e62fc6bef6763cb2e959e0d7d0d7f455bd",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_authority_events.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_authority_events::read_stats#1",
+      "sha256": "d2a47bf98201da40e9bebeb22de2d015ad5709052ffb82e93e5391adceafe802",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_authority_events.rs",
+      "reasons": [
+        "unexpanded-macro"
+      ],
+      "scope": "gateway::storage::postgres_authority_events::record_capacity_refusal#1",
+      "sha256": "87dbe589566ff4025878beadf88e208a24525debebf264e4a7bea7b08748ea5e",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     }

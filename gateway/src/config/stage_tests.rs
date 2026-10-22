@@ -970,6 +970,7 @@ fn the_configuration_modules_name_no_input_or_output_api() {
     for (file, logging) in [
         // The audit-retention warning for a `0`-day window.
         ("src/config.rs", 1),
+        ("src/config/authority_events.rs", 0),
         ("src/config/connections.rs", 0),
         ("src/config/diagnostic.rs", 0),
         ("src/config/egress.rs", 0),
@@ -1152,10 +1153,22 @@ fn rule_fixture(rule: ConfigRule) -> (&'static [(&'static str, &'static str)], &
             &[("PAYLOAD_CAPTURE_ENABLED", "true")],
             "PAYLOAD_CAPTURE_ENABLED",
         ),
+        // A sink with no pseudonym key to key its references under.
+        ConfigRule::AuthorityEventDelivery => (
+            &[
+                POSTGRES[0],
+                POSTGRES[1],
+                POSTGRES[2],
+                POSTGRES[3],
+                POSTGRES[4],
+                ("AUTHORITY_EVENT_SINK", "log"),
+            ],
+            "AUTHORITY_PSEUDONYM_KEY_ALIAS",
+        ),
     }
 }
 
-const EVERY_RULE: [ConfigRule; 25] = [
+const EVERY_RULE: [ConfigRule; 26] = [
     ConfigRule::Value,
     ConfigRule::AdminListenerCollision,
     ConfigRule::GrpcListenerCollision,
@@ -1181,6 +1194,7 @@ const EVERY_RULE: [ConfigRule; 25] = [
     ConfigRule::AdminSessionStoreBackend,
     ConfigRule::ClusterSettingInStandaloneMode,
     ConfigRule::PayloadCaptureDestination,
+    ConfigRule::AuthorityEventDelivery,
 ];
 
 /// Every rule is reachable, and a refusal under it is reported as a

@@ -308,6 +308,12 @@ const BLANK_IS_UNSET: &[&str] = &[
     "DEPLOYMENT_ID",
     "DATABASE_URL_FILE",
     "DATABASE_TLS_CA_FILE",
+    "AUTHORITY_EVENT_SINK",
+    "AUTHORITY_EVENT_FILE",
+    "AUTHORITY_PSEUDONYM_KEY_ALIAS",
+    "AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS",
+    "AUTHORITY_EVENT_JOURNAL_CAPACITY",
+    "AUTHORITY_EVENT_RETENTION_HOURS",
 ];
 
 /// Variables for which an empty value is a value, and one the parser refuses:

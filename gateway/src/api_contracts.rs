@@ -1109,6 +1109,13 @@ pub(super) struct GatewayAppBuildOverrides {
     /// readiness gate into `/readyz`. None in standalone mode.
     #[cfg(feature = "postgres")]
     pub(super) pg_membership: Option<Arc<cluster_membership::ClusterMembership>>,
+    /// The authority-event journal's store (issue #425, PR 3), its capacity
+    /// already applied by `run()`. With a sink configured the builder hands
+    /// back the dispatcher's startup in `GatewayApps`. None in standalone
+    /// mode.
+    #[cfg(feature = "postgres")]
+    pub(super) pg_authority_events:
+        Option<Arc<storage::postgres_authority_events::PostgresAuthorityEventStore>>,
     /// Test seam: a readiness gate for `/readyz` without a membership
     /// store behind it, so the `config_fingerprint_mismatch` answer is
     /// testable without PostgreSQL.

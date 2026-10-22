@@ -167,6 +167,11 @@ pub(crate) enum ConfigRule {
     /// `PAYLOAD_CAPTURE_ENABLED` is on in standalone mode without
     /// `DISCOVERY_SQLITE_PATH` to store the captured shapes.
     PayloadCaptureDestination,
+    /// Cluster mode's authority-event delivery settings do not fit
+    /// together: a sink without the pseudonym key it needs, a file sink
+    /// without its file, a file or key set for a sink that never reads it,
+    /// or the same alias as the current and the previous key.
+    AuthorityEventDelivery,
 }
 
 /// The problems the compiler's stages found, each with the rule that refused

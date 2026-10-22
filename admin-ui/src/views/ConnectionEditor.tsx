@@ -263,6 +263,11 @@ export function ConnectionEditor() {
         authenticationBinding: configured
           ? configuredBinding()
           : emptyBinding(),
+        // A new delegated Connection drafts its block as the subject token
+        // instead, so an edit of the general block in progress is dropped.
+        ...(next === 'delegated_issuer_token'
+          ? { callerAssertionMode: 'keep' as const }
+          : {}),
       };
     });
   }
@@ -445,10 +450,7 @@ export function ConnectionEditor() {
         setRequiresReload(true);
       }
       if (error instanceof AdminApiError && error.problems.length > 0) {
-        const serverErrors = fieldErrorsFromProblems(
-          error.problems,
-          subjectTokenDraftApplies(form),
-        );
+        const serverErrors = fieldErrorsFromProblems(error.problems);
         setFieldErrors(serverErrors);
         focusFirstProblem(serverErrors);
       }
@@ -721,10 +723,13 @@ export function ConnectionEditor() {
               onRemove={removeAdditionalHeader}
             />
             <CallerAssertionSection
-              assertion={form.callerAssertion}
-              subjectTokenOnly={
-                form.authenticationType === 'delegated_issuer_token'
-              }
+              form={form}
+              errors={fieldErrors}
+              secrets={availableSecrets}
+              canBindSecret={canUseSecretBindings}
+              secretsWriteAllowed={canBindSecret}
+              disabled={!canEdit || editorBusy || !canBindSecret}
+              onUpdate={updateForm}
             />
             <TlsSection
               form={form}

@@ -272,6 +272,7 @@ impl ConfigPlan {
             state_backend,
             deployment_id,
             database,
+            authority_events,
             provenance: _,
         } = storage;
         let ConnectionsPlan {
@@ -422,6 +423,7 @@ impl ConfigPlan {
             readiness_probe_cache_ms,
             cluster_status_expose_hostnames,
             audit_postgres_retention_days,
+            authority_events,
             tool_runtime_default_timeout_ms,
             csrf_enabled,
             csrf_cookie_name,
