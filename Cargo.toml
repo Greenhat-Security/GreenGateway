@@ -1,5 +1,5 @@
 [workspace]
-members = ["gateway"]
+members = ["gateway", "gateway-config", "ggctl"]
 resolver = "2"
 
 [workspace.package]
@@ -29,6 +29,9 @@ bytes = "1.11.0"
 cap-fs-ext = "4.0.2"
 cap-std = "4.0.2"
 chacha20poly1305 = { version = "0.11.0", features = ["zeroize"] }
+# The configuration contracts shared by `gateway` and `ggctl` (issue #242,
+# ADR-0008): a workspace path package, not a registry dependency.
+gateway-config = { path = "gateway-config" }
 hex = "0.4.3"
 hmac = "0.13.0"
 futures-util = "0.3.31"

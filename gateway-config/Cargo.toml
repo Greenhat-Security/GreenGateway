@@ -1,0 +1,17 @@
+[package]
+name = "gateway-config"
+version = "0.1.0"
+edition.workspace = true
+license-file.workspace = true
+
+# The configuration contracts `gateway` and `ggctl` share (issue #242,
+# ADR-0008). No build script, no I/O and no network: both binaries link it, and
+# `ggctl` must build without Node or the admin UI.
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+# Holds each published schema to the documents this crate defines. Already in
+# the graph through the gateway; this is a test-only edge, not a crate.
+jsonschema.workspace = true

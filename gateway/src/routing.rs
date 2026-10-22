@@ -280,6 +280,10 @@ pub(super) fn add_admin_api_routes(
             Router::new()
                 .route(routes.admin.status_route.as_str(), get(status_endpoint))
                 .route(
+                    routes.admin.config_capabilities_route.as_str(),
+                    get(config_capabilities_endpoint),
+                )
+                .route(
                     &format!("{}/capabilities", routes.admin.api_prefix),
                     get(admin_capabilities_endpoint),
                 )

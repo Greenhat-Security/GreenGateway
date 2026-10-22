@@ -450,6 +450,42 @@ jobs:
           cargo test --workspace --locked -- --list --format terse > target/security-mutations/test-list.txt
           python scripts/security_mutations.py --check-test-list target/security-mutations/test-list.txt
 
+  # The operator CLI and the library it shares with the gateway (issue #242,
+  # ADR-0008), on every platform it is released for. The `test` job already
+  # runs both on Linux as part of the workspace; this adds macOS and Windows,
+  # where terminal detection, file permissions, path handling and the
+  # platform certificate verifier differ. Neither package has a build script
+  # or embeds the admin UI, so nothing here builds Node assets; the tool
+  # contract still installs Node for every job that runs `cargo test`.
+  ggctl:
+    name: ggctl (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up pinned build tools
+        uses: ./.github/actions/build-tools
+        with:
+          rust: ci
+          node: 'true'
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      # The integration tests run the built binary itself: exit codes,
+      # standard streams, token files and loopback HTTPS.
+      - name: Test the operator CLI and the shared configuration library
+        run: cargo test --locked -p ggctl -p gateway-config
+
   # PostgreSQL foundation (issue #241, PR 3): the gateway suite against a real
   # PostgreSQL 16 service container, in both feature states.
   #
@@ -1708,6 +1744,7 @@ jobs:
       - fmt
       - clippy
       - test
+      - ggctl
       - postgres-foundation-pg
       - postgres-foundation-no-default
       - postgres-foundation-lint

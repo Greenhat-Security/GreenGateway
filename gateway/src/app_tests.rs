@@ -1,4 +1,6 @@
 use super::*;
+#[path = "admin_config_app_tests.rs"]
+mod admin_config_app_tests;
 #[path = "admin_session_app_tests.rs"]
 mod admin_session_app_tests;
 use crate::auth::TokenStore;

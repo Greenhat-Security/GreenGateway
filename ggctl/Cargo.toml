@@ -1,0 +1,28 @@
+[package]
+name = "ggctl"
+version = "0.1.0"
+edition.workspace = true
+license-file.workspace = true
+
+# The GreenGateway operator CLI (issue #242, ADR-0008). A separate package so
+# it builds without Node, the admin UI or the gateway crate, and has no build
+# script. Every dependency below is already in the workspace graph.
+[dependencies]
+gateway-config.workspace = true
+# The admin API client (`src/remote.rs`, its only network capability):
+# HTTP/1.1, rustls with platform roots, redirects and proxies off.
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# A current-thread runtime for the one sequential request a command makes.
+tokio.workspace = true
+url.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+# Holds every report this binary writes to the published report schema.
+jsonschema.workspace = true
+# Local TLS fixtures for the remote-client tests: a CA and server certificate
+# generated at test runtime, served over loopback only.
+rcgen.workspace = true
+tokio-rustls.workspace = true

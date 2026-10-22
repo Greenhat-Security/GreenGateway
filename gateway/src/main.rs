@@ -74,6 +74,8 @@ mod admin_authorization;
 use admin_authorization::*;
 mod admin_events;
 use admin_events::*;
+mod admin_config;
+use admin_config::*;
 mod admin_responses;
 use admin_responses::*;
 
