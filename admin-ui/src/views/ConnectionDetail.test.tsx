@@ -692,6 +692,25 @@ describe('ConnectionDetail', () => {
       await screen.findByText(/has Google mint a token for your own/),
     ).toBeTruthy();
     expect(screen.queryByText(/exchanges a token for your own account/)).toBeNull();
+    // Every setting is shown, since none is a secret.
+    const settings = screen
+      .getByRole('heading', { name: 'Google domain-wide delegation' })
+      .closest('section');
+    expect(settings?.textContent).toContain(
+      'gateway-delegate@example-project.iam.gserviceaccount.com',
+    );
+    expect(settings?.textContent).toContain('Workload identity profilegateway-wif');
+    expect(settings?.textContent).toContain(
+      'Scopeshttps://www.googleapis.com/auth/gmail.readonly',
+    );
+    expect(settings?.textContent).toContain('Subject claimemail');
+    expect(settings?.textContent).toContain(
+      'Subject issuershttps://idp.example.test',
+    );
+    expect(settings?.textContent).toContain(
+      'Each caller reaches Google as themselves.',
+    );
+    expect(settings?.textContent).toContain('connection.google_delegation_token');
     fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
 
     expect(await screen.findByText('Connection test failed')).toBeTruthy();

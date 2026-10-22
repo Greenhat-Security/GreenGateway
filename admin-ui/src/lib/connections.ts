@@ -143,7 +143,23 @@ export type ConnectionAuthentication =
       resource?: string;
       revocation_url?: string;
       subject_token_source: 'caller_assertion';
-    };
+    }
+  | GoogleDomainWideDelegationWrite;
+
+/**
+ * A domain-wide delegation as this UI writes it. It binds no secret: the
+ * profile is the `id` of a `CONNECTION_GCP_PROVIDER` profile in the gateway's
+ * startup configuration, so a write is the same on a create and a
+ * replacement, and the safe read returns every field.
+ */
+export type GoogleDomainWideDelegationWrite = {
+  type: 'google_domain_wide_delegation';
+  service_account_email: string;
+  workload_identity_profile: string;
+  scopes: string[];
+  subject_claim: 'email';
+  subject_issuers: string[];
+};
 
 export type SafeConnectionAuthentication =
   | { type: 'none' }
@@ -171,8 +187,8 @@ export type SafeConnectionAuthentication =
 
 /**
  * The calling user's own Google Workspace token, minted per caller by
- * domain-wide delegation. Read only, like a delegated issuer token: the admin
- * UI shows it and never writes it. None of its fields is a secret.
+ * domain-wide delegation. None of its fields is a secret, so the safe read is
+ * the whole credential and the editor writes it back as it reads it.
  */
 export type SafeGoogleDomainWideDelegation = {
   type: 'google_domain_wide_delegation';
