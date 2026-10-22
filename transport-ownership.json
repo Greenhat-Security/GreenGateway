@@ -6313,7 +6313,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::bootstrap::run#1",
-      "sha256": "4705fe484f923cc6fcc98b4c81f3eb999b30a2390de5d2bedb0455a8150eab0c",
+      "sha256": "d1002bccde85efe7c9662e82eab8c35b44fc4255c5896792760a2d078e515145",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -6352,8 +6352,18 @@
       "reasons": [
         "unexpanded-macro"
       ],
-      "scope": "gateway::routing::install_metrics_recorder#1",
-      "sha256": "4579d46b05f6c52a1fe69f477bc34055f589c006995c6ace420373fa3efa3c1a",
+      "scope": "gateway::routing::register_metrics#1",
+      "sha256": "c1eeb7bfaa806a6504af052a457dc827686a0660bf8b03ebdbfe729c9a2cbe6b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway/src/routing.rs",
+      "reasons": [
+        "unexpanded-macro"
+      ],
+      "scope": "gateway::routing::seed_alerted_counters#1",
+      "sha256": "bf3b4e44a877038429a11b9d15c8afafc13b015488c5d93e330771cdab28857c",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
@@ -6833,7 +6843,7 @@
         "unexpanded-macro"
       ],
       "scope": "gateway::audit::sink::impl AuditSink StdoutSink::emit#1",
-      "sha256": "9079233c1a8a7acc63748d688c8fc1ebc5bb9db75ff58ed7bf20e9b2209beaee",
+      "sha256": "bee8496c1376fe79509b894cc4307a67a97af76b6f88f43e459da16ee9d66ff9",
       "owner": "GreenGateway maintainers",
       "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
     },
@@ -6853,7 +6863,7 @@
         "unexpanded-macro"
       ],
       "scope": "gateway::audit::sink::impl AuditSink FileSink::emit#1",
-      "sha256": "949a9885d721e397467d080b459cdf002dbbba21394a8d81f2efbfa5ab86855e",
+      "sha256": "119f14f5ebbe3363d5102e590f1f9d15b681a6c7274b442c08ae37080daf6fe7",
       "owner": "GreenGateway maintainers",
       "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
     },
@@ -6903,7 +6913,7 @@
         "unexpanded-macro"
       ],
       "scope": "gateway::audit::sqlite_sink::impl  SqliteSinkShared::flush_buffer#1",
-      "sha256": "beda9dab8b35db4b541f7e51db66463672a67416fc08af78c6ddc05ef1839bce",
+      "sha256": "c60ecbfee7cbe7e0336814da3ec883c93b8bebb9b827461900ca9244fcc1d54e",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed standalone reliability changes: process-local readiness state, fixed-label metrics and exact audit loss accounting. No new outbound transport authority; SQLite probes use configured local paths and observation filtering preserves security findings."
     },
