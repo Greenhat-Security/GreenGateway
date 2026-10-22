@@ -1117,6 +1117,25 @@ class ReleaseGateBinariesGate(unittest.TestCase):
             self.assertLess(steps.index(unpack), steps.index(run))
         self.assertLess(steps.index(locator), steps.index(run))
 
+    def test_the_rolling_upgrade_leg_verifies_its_evidence_after_the_suite(self):
+        # Issue #426 PR 4: only a suite that passed is verified, the check's
+        # own tests run first, and the summary it writes is retained.
+        steps = self.leg['steps']
+        run = self.named('ha-release-gate', 'Run the release-gate suite')
+        verify = self.named('ha-release-gate', 'Verify the upgrade-pair evidence against the published matrix')
+        self.assertEqual(verify['if'], "${{ matrix.suite == 'ha_rolling_upgrade' }}")
+        tests = "python -m unittest discover -s scripts -p 'test_upgrade_pair_evidence.py' -v"
+        check = ('python scripts/upgrade_pair_evidence.py --pair-dir "${RUNNER_TEMP}/upgrade-pair" '
+                 '--gate-commit "${GITHUB_SHA}"')
+        self.assertIn(tests, verify['run'])
+        self.assertIn(check, verify['run'])
+        self.assertLess(verify['run'].index(tests), verify['run'].index(check))
+        retain = self.named('ha-release-gate', 'Retain the upgrade-pair evidence')
+        self.assertIn('${{ runner.temp }}/upgrade-pair/summary.json',
+                      [line.strip() for line in retain['with']['path'].splitlines()])
+        self.assertLess(steps.index(run), steps.index(verify))
+        self.assertLess(steps.index(verify), steps.index(retain))
+
     def test_a_binary_consumer_stops_unless_the_producer_succeeded(self):
         names = [step['name'] for step in self.unpack_steps]
         self.assertEqual(names, ['Require the producer', "Download this run's archive", 'Verify and unpack the archive'])

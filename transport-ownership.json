@@ -6649,7 +6649,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::routing::add_admin_api_routes#1",
-      "sha256": "c938da36acda134621d00d88ff434f8ed2df1b9ac245db2f837e1ad8cd250070",
+      "sha256": "066d3a6a0c25d8895d27fc01a2bc27513ae997059189d345dad4812743a8b946",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },

@@ -57,6 +57,11 @@
       "permission": "admin:policy:read"
     },
     {
+      "methods": ["POST"],
+      "path_prefix": "/v1/admin/policy/convert",
+      "permission": "admin:policy:read"
+    },
+    {
       "methods": ["PUT", "POST", "PATCH", "DELETE"],
       "path_prefix": "/v1/admin/policy",
       "permission": "admin:policy:write"
