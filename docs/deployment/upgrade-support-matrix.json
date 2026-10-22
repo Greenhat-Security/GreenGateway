@@ -8,13 +8,21 @@
     "write": [20, 20],
     "approved_extensions": [],
     "document_format": [0, 0],
-    "capabilities": ["operation_requirements", "policy_role_descriptions"],
+    "capabilities": ["openapi_swagger2_catalogs", "operation_requirements", "policy_role_descriptions"],
     "operations": [
       {
         "operation": "policy.role_descriptions",
         "capability": "policy_role_descriptions",
         "minimum_schema": 17,
         "document_format": 0,
+        "backfill": null,
+        "activation": "live_members"
+      },
+      {
+        "operation": "connections.openapi_swagger2_catalog",
+        "capability": "openapi_swagger2_catalogs",
+        "minimum_schema": 17,
+        "document_format": null,
         "backfill": null,
         "activation": "live_members"
       }

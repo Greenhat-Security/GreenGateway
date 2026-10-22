@@ -1,0 +1,59 @@
+{
+  "openapi": "3.0.0",
+  "info": { "title": "Golden JSON API", "version": "2.0.0" },
+  "components": {
+    "securitySchemes": {
+      "Bearer": { "type": "http", "scheme": "bearer" }
+    },
+    "schemas": {
+      "Message": {
+        "type": "object",
+        "required": ["channel", "text"],
+        "properties": {
+          "channel": { "type": "string" },
+          "text": { "type": "string" },
+          "thread": { "type": "string", "nullable": true }
+        }
+      }
+    }
+  },
+  "security": [{ "Bearer": [] }],
+  "paths": {
+    "/messages": {
+      "post": {
+        "operationId": "chat.postMessage",
+        "summary": "Post a message",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json; charset=utf-8": {
+              "schema": { "$ref": "#/components/schemas/Message" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Posted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": { "ok": { "type": "boolean" } }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/messages/{ts}": {
+      "get": {
+        "operationId": "chat.getMessage",
+        "parameters": [
+          { "name": "ts", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "channel", "in": "query", "required": true, "schema": { "type": "string" } }
+        ]
+      }
+    }
+  }
+}

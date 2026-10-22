@@ -160,7 +160,25 @@ impl OpenApiSpec {
     }
 
     pub fn parse_str(source: &str, contents: &str) -> Result<Self, OpenApiSpecError> {
-        let document = parse_document(source, contents)?;
+        Self::from_raw_document(source, parse_document(source, contents)?)
+    }
+
+    /// Build the operation list from an already parsed OpenAPI 3.x document,
+    /// such as the one Swagger 2.0 import produces. Validation is identical
+    /// to [`Self::parse_str`].
+    pub fn from_document_value(
+        source: &str,
+        document: &serde_json::Value,
+    ) -> Result<Self, OpenApiSpecError> {
+        let document = RawOpenApiDocument::deserialize(document)
+            .map_err(|source| OpenApiSpecError::Json { source })?;
+        Self::from_raw_document(source, document)
+    }
+
+    fn from_raw_document(
+        source: &str,
+        document: RawOpenApiDocument,
+    ) -> Result<Self, OpenApiSpecError> {
         if !document.openapi.starts_with("3.") {
             return Err(OpenApiSpecError::UnsupportedVersion {
                 version: document.openapi,

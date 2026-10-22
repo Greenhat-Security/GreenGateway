@@ -11,4 +11,5 @@ pub mod overlay;
 pub mod playground;
 pub mod runtime;
 pub mod selector;
+pub mod swagger2;
 pub mod transforms;

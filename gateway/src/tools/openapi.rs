@@ -23,7 +23,10 @@ use crate::{
     },
 };
 
-use super::transforms::DeclaredResponseSchema;
+use super::{
+    swagger2::{self, Swagger2ConversionError},
+    transforms::DeclaredResponseSchema,
+};
 
 const TOOLS_FILE_SCHEMA_VERSION: &str = "0.1.0";
 const MAX_TOOL_NAME_LENGTH: usize = 128;
@@ -49,7 +52,153 @@ pub struct OpenApiToolGeneration {
     /// shapes target body properties and that response selectors/pointers
     /// agree with every declared JSON success response.
     pub transform_metadata: BTreeMap<String, OpenApiTransformMetadata>,
+    /// Present only when the source was not an OpenAPI 3.x document and was
+    /// converted to one before generation. OpenAPI 3.x input leaves it `None`.
+    pub conversion: Option<OpenApiDocumentConversion>,
     document: Value,
+}
+
+/// How a source document was converted to OpenAPI 3.x before generation,
+/// and what an operator should review about that conversion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenApiDocumentConversion {
+    pub source_format: OpenApiSourceFormat,
+    pub warnings: Vec<OpenApiConversionWarning>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenApiSourceFormat {
+    Swagger2,
+}
+
+impl OpenApiSourceFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Swagger2 => "swagger_2_0",
+        }
+    }
+}
+
+/// One reviewable fact about a conversion. `method` and `path_template`
+/// identify the operation when the warning concerns one; `subject` is the
+/// field, parameter, scheme or base path it names, truncated to 256 bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenApiConversionWarning {
+    pub code: OpenApiConversionWarningCode,
+    pub method: Option<String>,
+    pub path_template: Option<String>,
+    pub subject: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum OpenApiConversionWarningCode {
+    BasePathNotInPaths,
+    UnsupportedDocumentField,
+    UnsupportedPathItemField,
+    SecurityDefinitionNotConverted,
+    ConsumesDefaulted,
+    ProducesDefaulted,
+    RequestBodyNotMapped,
+    UnsupportedOperationField,
+    InvalidParameter,
+    UnsupportedParameterLocation,
+    UnsupportedParameterField,
+    UnsupportedCollectionFormat,
+    FileParameterOutsideForm,
+    MultipleBodyParameters,
+    BodyAndFormParameters,
+    WarningsTruncated,
+}
+
+impl OpenApiConversionWarningCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BasePathNotInPaths => "base_path_not_in_paths",
+            Self::UnsupportedDocumentField => "unsupported_document_field",
+            Self::UnsupportedPathItemField => "unsupported_path_item_field",
+            Self::SecurityDefinitionNotConverted => "security_definition_not_converted",
+            Self::ConsumesDefaulted => "consumes_defaulted",
+            Self::ProducesDefaulted => "produces_defaulted",
+            Self::RequestBodyNotMapped => "request_body_not_mapped",
+            Self::UnsupportedOperationField => "unsupported_operation_field",
+            Self::InvalidParameter => "invalid_parameter",
+            Self::UnsupportedParameterLocation => "unsupported_parameter_location",
+            Self::UnsupportedParameterField => "unsupported_parameter_field",
+            Self::UnsupportedCollectionFormat => "unsupported_collection_format",
+            Self::FileParameterOutsideForm => "file_parameter_outside_form",
+            Self::MultipleBodyParameters => "multiple_body_parameters",
+            Self::BodyAndFormParameters => "body_and_form_parameters",
+            Self::WarningsTruncated => "warnings_truncated",
+        }
+    }
+
+    /// A fixed explanation; it never contains document content.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::BasePathNotInPaths => {
+                "basePath is not part of generated path templates; include it in the Connection base path"
+            }
+            Self::UnsupportedDocumentField => {
+                "this top-level field is not part of Swagger 2.0 and was ignored"
+            }
+            Self::UnsupportedPathItemField => {
+                "this path item field is not part of Swagger 2.0 and was ignored"
+            }
+            Self::SecurityDefinitionNotConverted => {
+                "this security definition is incomplete or has no OpenAPI 3.0 form; operations that require it cannot bind"
+            }
+            Self::ConsumesDefaulted => {
+                "no consumes media type is declared; body parameters are treated as application/json"
+            }
+            Self::ProducesDefaulted => {
+                "no produces media type is declared; response schemas are treated as application/json"
+            }
+            Self::RequestBodyNotMapped => {
+                "the request body has no JSON media type, so its fields are not tool arguments and the tool sends no body"
+            }
+            Self::UnsupportedOperationField => {
+                "the operation uses a field that is not part of Swagger 2.0; it was left out"
+            }
+            Self::InvalidParameter => {
+                "the operation has a parameter without a usable name, location, schema or items; it was left out"
+            }
+            Self::UnsupportedParameterLocation => {
+                "the operation has a parameter in a location Swagger 2.0 does not define; it was left out"
+            }
+            Self::UnsupportedParameterField => {
+                "the operation has a parameter field that is not part of Swagger 2.0; it was left out"
+            }
+            Self::UnsupportedCollectionFormat => {
+                "the operation has an array parameter whose collectionFormat has no OpenAPI 3.0 style; it was left out"
+            }
+            Self::FileParameterOutsideForm => {
+                "the operation has a file parameter outside formData; it was left out"
+            }
+            Self::MultipleBodyParameters => {
+                "the operation has more than one body parameter; it was left out"
+            }
+            Self::BodyAndFormParameters => {
+                "the operation mixes body and formData parameters; it was left out"
+            }
+            Self::WarningsTruncated => "further conversion warnings were not reported",
+        }
+    }
+
+    /// Whether the operation the warning names is absent from the converted
+    /// document, so no tool is generated for it.
+    pub fn omits_operation(self) -> bool {
+        matches!(
+            self,
+            Self::UnsupportedOperationField
+                | Self::InvalidParameter
+                | Self::UnsupportedParameterLocation
+                | Self::UnsupportedParameterField
+                | Self::UnsupportedCollectionFormat
+                | Self::FileParameterOutsideForm
+                | Self::MultipleBodyParameters
+                | Self::BodyAndFormParameters
+        )
+    }
 }
 
 impl OpenApiToolGeneration {
@@ -271,6 +420,9 @@ pub enum OpenApiToolGenerationError {
     GenerationLimit {
         limit: OpenApiToolGenerationLimit,
         maximum: usize,
+    },
+    Swagger2 {
+        source: Swagger2ConversionError,
     },
 }
 
@@ -642,6 +794,7 @@ impl fmt::Display for OpenApiToolGenerationError {
                     "OpenAPI security metadata size cache exceeds the entry maximum of {maximum}"
                 ),
             },
+            Self::Swagger2 { source } => write!(formatter, "{source}"),
         }
     }
 }
@@ -698,6 +851,7 @@ impl Error for OpenApiToolGenerationError {
             Self::Yaml { source } => Some(source),
             Self::Reference { .. } => None,
             Self::GenerationLimit { .. } => None,
+            Self::Swagger2 { source } => Some(source),
         }
     }
 }
@@ -719,18 +873,76 @@ pub fn generate_tools_from_openapi_path(
     generate_tools_from_openapi_str(&path.to_string_lossy(), &contents)
 }
 
+/// Generate tools from an OpenAPI 3.x document only.
+///
+/// The legacy tools-file import uses this entry point. Managed OpenAPI
+/// Connections use [`generate_tools_from_api_document_str`], which also
+/// imports Swagger 2.0.
 pub fn generate_tools_from_openapi_str(
     source: &str,
     contents: &str,
 ) -> Result<OpenApiToolGeneration, OpenApiToolGenerationError> {
     let parsed_spec = OpenApiSpec::parse_str(source, contents)?;
+    check_operation_count(&parsed_spec)?;
+    let document = parse_document_value(source, contents)?;
+    generate_tools_from_document(parsed_spec, document, None)
+}
+
+/// Generate tools from an OpenAPI 3.x document, or from a Swagger 2.0
+/// document converted to OpenAPI 3.0 first (issue #443).
+///
+/// An OpenAPI 3.x document takes exactly the
+/// [`generate_tools_from_openapi_str`] path, errors included. Conversion is
+/// attempted only after that path rejected the document, and only when the
+/// document has a `swagger` field and no `openapi` field; any other rejected
+/// document keeps its original error.
+pub fn generate_tools_from_api_document_str(
+    source: &str,
+    contents: &str,
+) -> Result<OpenApiToolGeneration, OpenApiToolGenerationError> {
+    let openapi_error = match OpenApiSpec::parse_str(source, contents) {
+        Ok(parsed_spec) => {
+            check_operation_count(&parsed_spec)?;
+            let document = parse_document_value(source, contents)?;
+            return generate_tools_from_document(parsed_spec, document, None);
+        }
+        Err(error) => error,
+    };
+    let Ok(document) = parse_document_value(source, contents) else {
+        return Err(openapi_error.into());
+    };
+    if !swagger2::is_swagger_document(&document) {
+        return Err(openapi_error.into());
+    }
+    let conversion = swagger2::convert(&document)?;
+    drop(document);
+    let parsed_spec = OpenApiSpec::from_document_value(source, &conversion.document)?;
+    check_operation_count(&parsed_spec)?;
+    generate_tools_from_document(
+        parsed_spec,
+        conversion.document,
+        Some(OpenApiDocumentConversion {
+            source_format: OpenApiSourceFormat::Swagger2,
+            warnings: conversion.warnings,
+        }),
+    )
+}
+
+fn check_operation_count(parsed_spec: &OpenApiSpec) -> Result<(), OpenApiToolGenerationError> {
     if parsed_spec.operations.len() > MAX_CATALOG_ENTRIES {
         return Err(OpenApiToolGenerationError::GenerationLimit {
             limit: OpenApiToolGenerationLimit::OperationCount,
             maximum: MAX_CATALOG_ENTRIES,
         });
     }
-    let document = parse_document_value(source, contents)?;
+    Ok(())
+}
+
+fn generate_tools_from_document(
+    parsed_spec: OpenApiSpec,
+    document: Value,
+    conversion: Option<OpenApiDocumentConversion>,
+) -> Result<OpenApiToolGeneration, OpenApiToolGenerationError> {
     reject_non_local_references(&document)?;
 
     let mut definitions = Vec::new();
@@ -870,6 +1082,7 @@ pub fn generate_tools_from_openapi_str(
         api_key_header_auth_requirements,
         security_requirements,
         transform_metadata,
+        conversion,
         document,
     })
 }
@@ -1155,7 +1368,9 @@ fn raw_url_path(value: &str) -> Option<&str> {
     suffix.get(..path_end)
 }
 
-fn reject_non_local_references(document: &Value) -> Result<(), OpenApiToolGenerationError> {
+pub(super) fn reject_non_local_references(
+    document: &Value,
+) -> Result<(), OpenApiToolGenerationError> {
     let mut remaining = vec![document];
     while let Some(value) = remaining.pop() {
         match value {
@@ -2303,6 +2518,10 @@ pub(super) fn is_json_media_type(media_type: &str) -> bool {
 fn json_pointer_escape(value: &str) -> String {
     value.replace('~', "~0").replace('/', "~1")
 }
+
+#[cfg(test)]
+#[path = "openapi_golden_tests.rs"]
+mod golden_tests;
 
 #[cfg(test)]
 mod tests {
