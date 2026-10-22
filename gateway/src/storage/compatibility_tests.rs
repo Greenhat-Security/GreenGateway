@@ -37,7 +37,10 @@ fn every_capability_name_is_bounded_shaped_and_in_canonical_order() {
 #[test]
 fn this_binary_advertises_a_bounded_canonical_set_it_recognizes() {
     let rendered = advertisement(BINARY_CAPABILITIES).expect("the shipped set fits the column");
-    assert_eq!(rendered, "operation_requirements,policy_role_descriptions");
+    assert_eq!(
+        rendered,
+        "openapi_swagger2_catalogs,operation_requirements,policy_role_descriptions"
+    );
     let recognized = RecognizedCapabilities::parse(&rendered);
     assert_eq!(recognized.unrecognized(), 0);
     for capability in BINARY_CAPABILITIES {
@@ -45,7 +48,11 @@ fn this_binary_advertises_a_bounded_canonical_set_it_recognizes() {
     }
     assert_eq!(
         recognized.names(),
-        vec!["operation_requirements", "policy_role_descriptions"]
+        vec![
+            "openapi_swagger2_catalogs",
+            "operation_requirements",
+            "policy_role_descriptions"
+        ]
     );
 }
 
@@ -57,6 +64,7 @@ fn a_prepared_members_advertisement_lacks_the_successors_capability() {
     let prepared = RecognizedCapabilities::parse("operation_requirements");
     assert!(prepared.contains(Capability::OperationRequirements));
     assert!(!prepared.contains(Capability::PolicyRoleDescriptions));
+    assert!(!prepared.contains(Capability::OpenApiSwagger2Catalogs));
     assert_eq!(prepared.unrecognized(), 0);
 }
 
@@ -246,9 +254,20 @@ mod gate_tests {
     fn the_shipped_registry_is_pinned_and_its_checks_reject_malformed_entries() {
         assert_eq!(
             OPERATION_REQUIREMENTS,
-            &[POLICY_ROLE_DESCRIPTIONS],
+            &[POLICY_ROLE_DESCRIPTIONS, OPENAPI_SWAGGER2_CATALOGS],
             "registering an operation is a protocol change: review its requirement, its new \
              capability and the docs in ha-state-model.md section 7 before updating this test"
+        );
+        assert_eq!(
+            OPENAPI_SWAGGER2_CATALOGS,
+            OperationRequirement {
+                operation: "connections.openapi_swagger2_catalog",
+                minimum_schema: 17,
+                document_format: None,
+                capability: Capability::OpenApiSwagger2Catalogs,
+                backfill: Backfill::NotRequired,
+                activation: Activation::LiveMembers,
+            }
         );
         assert_eq!(
             POLICY_ROLE_DESCRIPTIONS,
@@ -333,6 +352,70 @@ mod gate_tests {
             ),
             Ok(OperationAdmission { live_members: 1 })
         );
+    }
+
+    /// Issue #443's operation against what the release before Swagger 2.0
+    /// import advertises (issue #426's successor): refused while such a
+    /// member is live, whatever else it advertises, and admitted once only
+    /// members of this build remain.
+    #[test]
+    fn swagger2_catalogs_wait_for_every_member_built_before_the_conversion() {
+        let earlier = member(
+            PEER,
+            true,
+            "operation_requirements,policy_role_descriptions",
+        );
+        let current = member(
+            OWN,
+            true,
+            "openapi_swagger2_catalogs,operation_requirements,policy_role_descriptions",
+        );
+        assert_eq!(
+            gate(
+                &OPENAPI_SWAGGER2_CATALOGS,
+                &BinaryContract::shipped(),
+                OWN,
+                &[current.clone(), earlier]
+            ),
+            Err(OperationRefusal::MembersLackRequirement {
+                lacking: vec![PEER],
+                live: 2
+            })
+        );
+        let departed = member(
+            PEER,
+            false,
+            "operation_requirements,policy_role_descriptions",
+        );
+        assert_eq!(
+            gate(
+                &OPENAPI_SWAGGER2_CATALOGS,
+                &BinaryContract::shipped(),
+                OWN,
+                &[current.clone(), departed]
+            ),
+            Ok(OperationAdmission { live_members: 1 })
+        );
+        // Each capability admits only its own operation.
+        let without_role_descriptions = member(PEER, true, "openapi_swagger2_catalogs");
+        assert_eq!(
+            gate(
+                &OPENAPI_SWAGGER2_CATALOGS,
+                &BinaryContract::shipped(),
+                OWN,
+                &[current.clone(), without_role_descriptions.clone()]
+            ),
+            Ok(OperationAdmission { live_members: 2 })
+        );
+        assert!(matches!(
+            gate(
+                &POLICY_ROLE_DESCRIPTIONS,
+                &BinaryContract::shipped(),
+                OWN,
+                &[current, without_role_descriptions]
+            ),
+            Err(OperationRefusal::MembersLackRequirement { .. })
+        ));
     }
 
     #[test]

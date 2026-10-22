@@ -59,10 +59,17 @@ use crate::{
     upstream_route,
 };
 
+mod bundle;
 mod diagnostic;
+mod identity;
 mod inventory;
+mod listeners;
 #[cfg(test)]
 mod parity_tests;
+mod proxy;
+mod stage;
+#[cfg(test)]
+mod stage_tests;
 
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:8080";
 static DEFAULT_LISTEN_SOCKET_ADDR: LazyLock<SocketAddr> = LazyLock::new(|| {
@@ -1556,368 +1563,36 @@ impl Config {
         };
         let mut problems = Vec::new();
 
-        let listener_problem_count = problems.len();
-        let listen_addr = parse_var(
-            LISTEN_ADDR,
-            get_var(LISTEN_ADDR),
-            *DEFAULT_LISTEN_SOCKET_ADDR,
-            "socket address",
-            &mut problems,
-        );
-        let admin_listen_addr = parse_optional_socket_addr(
-            ADMIN_LISTEN_ADDR,
-            get_var(ADMIN_LISTEN_ADDR),
-            &mut problems,
-        );
-        if problems.len() == listener_problem_count && admin_listen_addr == Some(listen_addr) {
-            problems.push(format!(
-                "{ADMIN_LISTEN_ADDR} must not be the same address as {LISTEN_ADDR} (both resolved to {listen_addr}); choose a different port for the admin listener or leave {ADMIN_LISTEN_ADDR} unset"
-            ));
-        }
-        let grpc_listen_addr =
-            parse_optional_socket_addr(GRPC_LISTEN_ADDR, get_var(GRPC_LISTEN_ADDR), &mut problems);
-        // Sharing a socket with either existing listener is refused rather than
-        // resolved. The gRPC listener speaks HTTP/2 and nothing else, and the
-        // other two refuse an HTTP/2 preface outright, so a collision is not a
-        // preference to reconcile -- one of the two listeners would simply
-        // never answer.
-        if problems.len() == listener_problem_count && grpc_listen_addr.is_some() {
-            if grpc_listen_addr == Some(listen_addr) {
-                problems.push(format!(
-                    "{GRPC_LISTEN_ADDR} must not be the same address as {LISTEN_ADDR} (both resolved to {listen_addr}); the gRPC listener serves HTTP/2 and the data listener refuses it"
-                ));
-            }
-            if admin_listen_addr.is_some() && grpc_listen_addr == admin_listen_addr {
-                problems.push(format!(
-                    "{GRPC_LISTEN_ADDR} must not be the same address as {ADMIN_LISTEN_ADDR}; the gRPC listener serves HTTP/2 and the admin listener refuses it"
-                ));
-            }
-        }
-        let grpc_max_concurrent_streams = validate_range_u32(
-            GRPC_MAX_CONCURRENT_STREAMS,
-            parse_var(
-                GRPC_MAX_CONCURRENT_STREAMS,
-                get_var(GRPC_MAX_CONCURRENT_STREAMS),
-                DEFAULT_GRPC_MAX_CONCURRENT_STREAMS,
-                "stream count",
-                &mut problems,
-            ),
-            1,
-            MAX_GRPC_MAX_CONCURRENT_STREAMS,
-            DEFAULT_GRPC_MAX_CONCURRENT_STREAMS,
-            &mut problems,
-        );
-        let grpc_max_metadata_bytes = validate_range_u32(
-            GRPC_MAX_METADATA_BYTES,
-            parse_var(
-                GRPC_MAX_METADATA_BYTES,
-                get_var(GRPC_MAX_METADATA_BYTES),
-                DEFAULT_GRPC_MAX_METADATA_BYTES,
-                "byte count",
-                &mut problems,
-            ),
-            MIN_GRPC_MAX_METADATA_BYTES,
-            MAX_GRPC_MAX_METADATA_BYTES,
-            DEFAULT_GRPC_MAX_METADATA_BYTES,
-            &mut problems,
-        );
-        let tls_cert_files =
-            parse_material_file_list(TLS_CERT_FILE, get_var(TLS_CERT_FILE), &mut problems);
-        let tls_key_files =
-            parse_material_file_list(TLS_KEY_FILE, get_var(TLS_KEY_FILE), &mut problems);
-        let admin_tls_cert_files = parse_material_file_list(
-            ADMIN_TLS_CERT_FILE,
-            get_var(ADMIN_TLS_CERT_FILE),
-            &mut problems,
-        );
-        let admin_tls_key_files = parse_material_file_list(
-            ADMIN_TLS_KEY_FILE,
-            get_var(ADMIN_TLS_KEY_FILE),
-            &mut problems,
-        );
-        // Half a pair is the shape that quietly serves plaintext on a listener
-        // an operator believes is protected, so it is a startup failure rather
-        // than a warning or an implicit "TLS off".
-        require_inbound_tls_pair(
-            TLS_CERT_FILE,
-            tls_cert_files.as_deref(),
-            TLS_KEY_FILE,
-            tls_key_files.as_deref(),
-            &mut problems,
-        );
-        require_inbound_tls_pair(
-            ADMIN_TLS_CERT_FILE,
-            admin_tls_cert_files.as_deref(),
-            ADMIN_TLS_KEY_FILE,
-            admin_tls_key_files.as_deref(),
-            &mut problems,
-        );
-        // Admin TLS only has a listener to terminate on when the admin surface
-        // has its own listener. Accepting the settings without one would leave
-        // the admin surface on the data listener's scheme while its own
-        // settings say otherwise.
-        if admin_listen_addr.is_none()
-            && (admin_tls_cert_files.is_some() || admin_tls_key_files.is_some())
-        {
-            problems.push(format!(
-                "{ADMIN_TLS_CERT_FILE} and {ADMIN_TLS_KEY_FILE} require {ADMIN_LISTEN_ADDR} to be set; without a separate admin listener there is nothing for them to terminate"
-            ));
-        }
-        let tls_min_version = parse_var(
-            TLS_MIN_VERSION,
-            get_var(TLS_MIN_VERSION),
-            DEFAULT_TLS_MIN_VERSION,
-            "TLS version",
-            &mut problems,
-        );
-        let tls_handshake_timeout_ms = validate_positive_timeout_ms(
-            TLS_HANDSHAKE_TIMEOUT_MS,
-            parse_var(
-                TLS_HANDSHAKE_TIMEOUT_MS,
-                get_var(TLS_HANDSHAKE_TIMEOUT_MS),
-                DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS,
-                "millisecond duration",
-                &mut problems,
-            ),
-            DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS,
-            &mut problems,
-        );
-        let tls_max_concurrent_handshakes = validate_positive_usize(
-            TLS_MAX_CONCURRENT_HANDSHAKES,
-            parse_var(
-                TLS_MAX_CONCURRENT_HANDSHAKES,
-                get_var(TLS_MAX_CONCURRENT_HANDSHAKES),
-                DEFAULT_TLS_MAX_CONCURRENT_HANDSHAKES,
-                "handshake count",
-                &mut problems,
-            ),
-            DEFAULT_TLS_MAX_CONCURRENT_HANDSHAKES,
-            &mut problems,
-        );
-        // Client-certificate authentication, per listener.
-        //
-        // Parsed after the certificate/key pair because it depends on it: a
-        // listener that terminates no TLS cannot ask for a client certificate,
-        // and a mode that says otherwise is a configuration an operator would
-        // reasonably read as "mutual TLS is on".
-        let client_cert_identity_source = parse_optional_string(
-            CLIENT_CERT_IDENTITY_SOURCE,
-            get_var(CLIENT_CERT_IDENTITY_SOURCE),
-            &mut problems,
-        )
-        .and_then(|value| match value.parse::<ClientCertIdentitySource>() {
-            Ok(source) => Some(source),
-            Err(expected) => {
-                problems.push(format!(
-                    "{CLIENT_CERT_IDENTITY_SOURCE} must name a supported identity source, got '{value}': {expected}"
-                ));
-                None
-            }
-        });
-        let client_cert_mode = parse_var(
-            CLIENT_CERT_MODE,
-            get_var(CLIENT_CERT_MODE),
-            ClientCertMode::Off,
-            "client certificate mode",
-            &mut problems,
-        );
-        let admin_client_cert_mode = parse_var(
-            ADMIN_CLIENT_CERT_MODE,
-            get_var(ADMIN_CLIENT_CERT_MODE),
-            ClientCertMode::Off,
-            "client certificate mode",
-            &mut problems,
-        );
-        let client_cert_auth = compose_inbound_client_auth(
-            RawInboundClientAuth {
-                mode_setting: CLIENT_CERT_MODE,
-                mode: client_cert_mode,
-                ca_setting: CLIENT_CERT_CA_FILE,
-                ca_file: parse_optional_string(
-                    CLIENT_CERT_CA_FILE,
-                    get_var(CLIENT_CERT_CA_FILE),
-                    &mut problems,
-                ),
-                crl_setting: CLIENT_CERT_CRL_FILE,
-                crl_file: parse_optional_string(
-                    CLIENT_CERT_CRL_FILE,
-                    get_var(CLIENT_CERT_CRL_FILE),
-                    &mut problems,
-                ),
-                identity_source: client_cert_identity_source,
-                tls_certificate_setting: TLS_CERT_FILE,
-                tls_configured: tls_cert_files.is_some(),
-            },
-            &mut problems,
-        );
-        let admin_client_cert_auth = compose_inbound_client_auth(
-            RawInboundClientAuth {
-                mode_setting: ADMIN_CLIENT_CERT_MODE,
-                mode: admin_client_cert_mode,
-                ca_setting: ADMIN_CLIENT_CERT_CA_FILE,
-                ca_file: parse_optional_string(
-                    ADMIN_CLIENT_CERT_CA_FILE,
-                    get_var(ADMIN_CLIENT_CERT_CA_FILE),
-                    &mut problems,
-                ),
-                crl_setting: ADMIN_CLIENT_CERT_CRL_FILE,
-                crl_file: parse_optional_string(
-                    ADMIN_CLIENT_CERT_CRL_FILE,
-                    get_var(ADMIN_CLIENT_CERT_CRL_FILE),
-                    &mut problems,
-                ),
-                identity_source: client_cert_identity_source,
-                tls_certificate_setting: ADMIN_TLS_CERT_FILE,
-                tls_configured: admin_tls_cert_files.is_some(),
-            },
-            &mut problems,
-        );
-        // An identity source with nothing to apply it to is a setting that
-        // reads as "client certificates are configured" and does nothing. Say
-        // so rather than ignoring it.
-        if client_cert_identity_source.is_some()
-            && client_cert_mode == ClientCertMode::Off
-            && admin_client_cert_mode == ClientCertMode::Off
-        {
-            problems.push(format!(
-                "{CLIENT_CERT_IDENTITY_SOURCE} is set while {CLIENT_CERT_MODE} and {ADMIN_CLIENT_CERT_MODE} are both off; set one of them to `optional` or `required`, or unset the identity source"
-            ));
-        }
-        let admin_prefix = parse_admin_prefix(
-            ADMIN_PREFIX,
-            get_var(ADMIN_PREFIX),
-            DEFAULT_ADMIN_PREFIX,
-            &mut problems,
-        );
-        let admin_login_provider = parse_optional_string(
-            ADMIN_LOGIN_PROVIDER,
-            get_var(ADMIN_LOGIN_PROVIDER),
-            &mut problems,
-        );
-        let admin_session_mode = parse_optional_string(
-            ADMIN_SESSION_MODE,
-            get_var(ADMIN_SESSION_MODE),
-            &mut problems,
-        );
-        let admin_session_storage = match admin_session_mode.as_deref() {
-            None | Some("disabled") => None,
-            Some("standalone_memory") => {
-                Some(crate::auth::admin_session::AdminSessionStorage::StandaloneMemory)
-            }
-            Some("cluster_postgres") => {
-                Some(crate::auth::admin_session::AdminSessionStorage::ClusterPostgres)
-            }
-            Some(_) => {
-                problems.push(format!(
-                    "{ADMIN_SESSION_MODE} must be disabled, standalone_memory or cluster_postgres"
-                ));
-                None
-            }
-        };
-        let admin_session = match admin_session_storage {
-            Some(storage) => {
-                let ttl = validate_positive_bounded_u64(
-                    ADMIN_SESSION_TTL_SECS,
-                    parse_optional_var(
-                        ADMIN_SESSION_TTL_SECS,
-                        get_var(ADMIN_SESSION_TTL_SECS),
-                        "second duration",
-                        &mut problems,
-                    )
-                    .unwrap_or(3600),
-                    86_400,
-                    3600,
-                    &mut problems,
-                );
-                // Unset, the idle limit is the absolute lifetime: it never
-                // binds, which is the behavior before the setting existed.
-                let idle_timeout = match parse_optional_var(
-                    ADMIN_SESSION_IDLE_TIMEOUT_SECS,
-                    get_var(ADMIN_SESSION_IDLE_TIMEOUT_SECS),
-                    "second duration",
-                    &mut problems,
-                ) {
-                    Some(idle) => validate_positive_bounded_u64(
-                        ADMIN_SESSION_IDLE_TIMEOUT_SECS,
-                        idle,
-                        ttl,
-                        ttl,
-                        &mut problems,
-                    ),
-                    None => ttl,
-                };
-                Some(crate::auth::admin_session::AdminSessionConfig {
-                    storage,
-                    ttl: std::time::Duration::from_secs(ttl),
-                    idle_timeout: std::time::Duration::from_secs(idle_timeout),
-                    max_entries: validate_positive_bounded_u64(
-                        ADMIN_SESSION_MAX_ENTRIES,
-                        parse_optional_var(
-                            ADMIN_SESSION_MAX_ENTRIES,
-                            get_var(ADMIN_SESSION_MAX_ENTRIES),
-                            "entry count",
-                            &mut problems,
-                        )
-                        .unwrap_or(1024),
-                        100_000,
-                        1024,
-                        &mut problems,
-                    ) as usize,
-                })
-            }
-            None => None,
-        };
-        let admin_session_mode = admin_session
-            .as_ref()
-            .map(|session| session.storage.as_str());
-        if admin_session.is_none()
-            && (is_var_set(get_var(ADMIN_SESSION_TTL_SECS))
-                || is_var_set(get_var(ADMIN_SESSION_IDLE_TIMEOUT_SECS))
-                || is_var_set(get_var(ADMIN_SESSION_MAX_ENTRIES)))
-        {
-            problems.push(format!("{ADMIN_SESSION_TTL_SECS}, {ADMIN_SESSION_IDLE_TIMEOUT_SECS} and {ADMIN_SESSION_MAX_ENTRIES} require {ADMIN_SESSION_MODE}=standalone_memory or cluster_postgres"));
-        }
-        let admin_login_pending_ttl_secs = validate_positive_u64(
-            ADMIN_LOGIN_PENDING_TTL_SECS,
-            parse_var(
-                ADMIN_LOGIN_PENDING_TTL_SECS,
-                get_var(ADMIN_LOGIN_PENDING_TTL_SECS),
-                DEFAULT_ADMIN_LOGIN_PENDING_TTL_SECS,
-                "second duration",
-                &mut problems,
-            ),
-            DEFAULT_ADMIN_LOGIN_PENDING_TTL_SECS,
-            &mut problems,
-        );
-        let admin_login_pending_max_entries = validate_positive_usize(
-            ADMIN_LOGIN_PENDING_MAX_ENTRIES,
-            parse_var(
-                ADMIN_LOGIN_PENDING_MAX_ENTRIES,
-                get_var(ADMIN_LOGIN_PENDING_MAX_ENTRIES),
-                DEFAULT_ADMIN_LOGIN_PENDING_MAX_ENTRIES,
-                "entry count",
-                &mut problems,
-            ),
-            DEFAULT_ADMIN_LOGIN_PENDING_MAX_ENTRIES,
-            &mut problems,
-        );
-        let admin_login_pending_max_per_ip = validate_positive_usize(
-            ADMIN_LOGIN_PENDING_MAX_PER_IP,
-            parse_var(
-                ADMIN_LOGIN_PENDING_MAX_PER_IP,
-                get_var(ADMIN_LOGIN_PENDING_MAX_PER_IP),
-                DEFAULT_ADMIN_LOGIN_PENDING_MAX_PER_IP,
-                "entry count",
-                &mut problems,
-            ),
-            DEFAULT_ADMIN_LOGIN_PENDING_MAX_PER_IP,
-            &mut problems,
-        );
-        let gateway_public_url = parse_optional_gateway_public_url(
-            GATEWAY_PUBLIC_URL,
-            get_var(GATEWAY_PUBLIC_URL),
-            &mut problems,
-        );
+        // Rules found by the extracted compiler stages, by problem position.
+        let mut rules = diagnostic::Rules::default();
+
+        // The domains extracted into the compiler's pure stages (issue #433)
+        // are each read as a block, where the legacy parser read them, and
+        // parsed and validated from those values alone. Their problems join
+        // the others in the order the legacy parser reported them.
+        let listeners::ListenerPlan {
+            listen_addr,
+            admin_listen_addr,
+            grpc_listen_addr,
+            grpc_max_concurrent_streams,
+            grpc_max_metadata_bytes,
+            data_tls,
+            admin_tls,
+            tls_min_version,
+            tls_handshake_timeout_ms,
+            tls_max_concurrent_handshakes,
+            client_cert_auth,
+            admin_client_cert_auth,
+            provenance: _,
+        } = listeners::compile(listeners::ListenerInputs::read(&mut get_var))
+            .report(&mut problems, &mut rules);
+        let (tls_cert_files, tls_key_files) =
+            data_tls.map(listeners::TlsMaterial::into_files).unzip();
+        let (admin_tls_cert_files, admin_tls_key_files) =
+            admin_tls.map(listeners::TlsMaterial::into_files).unzip();
+        let admin_surface =
+            identity::compile_admin_surface(identity::AdminSurfaceInputs::read(&mut get_var))
+                .report(&mut problems, &mut rules);
         let audit_log_file =
             parse_optional_string(AUDIT_LOG_FILE, get_var(AUDIT_LOG_FILE), &mut problems);
         let audit_sqlite_path =
@@ -2363,135 +2038,25 @@ impl Config {
             DEFAULT_RATE_LIMIT_BUCKET_TTL_MS,
             &mut problems,
         );
-        let trust_proxy_headers = parse_var(
-            TRUST_PROXY_HEADERS,
-            get_var(TRUST_PROXY_HEADERS),
-            false,
-            "boolean",
-            &mut problems,
-        );
-        let trusted_proxy_cidrs = parse_comma_separated_cidrs(
-            TRUSTED_PROXY_CIDRS,
-            get_var(TRUSTED_PROXY_CIDRS),
-            &mut problems,
-        );
-        if trust_proxy_headers && trusted_proxy_cidrs.is_empty() {
-            problems.push(format!(
-                "{TRUSTED_PROXY_CIDRS} must contain at least one CIDR when {TRUST_PROXY_HEADERS}=true"
-            ));
-        }
-        let mut rbac_exempt_paths = parse_comma_separated_paths(
-            RBAC_EXEMPT_PATHS,
-            get_var(RBAC_EXEMPT_PATHS),
-            &default_admin_exempt_paths(&admin_prefix, admin_login_provider.is_some()),
-            &mut problems,
-        );
-        append_admin_login_exempt_paths(
-            &mut rbac_exempt_paths,
-            &admin_prefix,
-            admin_login_provider.is_some(),
-        );
+        let trusted_proxy =
+            proxy::compile_trusted_proxy(proxy::TrustedProxyInputs::read(&mut get_var))
+                .report(&mut problems, &mut rules);
+        let rbac_exemptions = identity::compile_rbac_exemptions(
+            identity::RbacExemptionInputs::read(&mut get_var),
+            &admin_surface,
+        )
+        .report(&mut problems, &mut rules);
         let validation_allowed_content_types = parse_comma_separated_header_values(
             VALIDATION_ALLOWED_CONTENT_TYPES,
             get_var(VALIDATION_ALLOWED_CONTENT_TYPES),
             DEFAULT_VALIDATION_ALLOWED_CONTENT_TYPES,
             &mut problems,
         );
-        let auth_enabled = parse_var(
-            AUTH_ENABLED,
-            get_var(AUTH_ENABLED),
-            DEFAULT_AUTH_ENABLED,
-            "boolean",
-            &mut problems,
-        );
-        let auth_mode = parse_var(
-            AUTH_MODE,
-            get_var(AUTH_MODE),
-            DEFAULT_AUTH_MODE,
-            "auth mode",
-            &mut problems,
-        );
-        let auth_cookie_name = parse_cookie_name(
-            AUTH_COOKIE_NAME,
-            get_var(AUTH_COOKIE_NAME),
-            DEFAULT_AUTH_COOKIE_NAME,
-            &mut problems,
-        );
-        let mut auth_exempt_paths = parse_comma_separated_paths(
-            AUTH_EXEMPT_PATHS,
-            get_var(AUTH_EXEMPT_PATHS),
-            &default_admin_exempt_paths(&admin_prefix, admin_login_provider.is_some()),
-            &mut problems,
-        );
-        append_admin_login_exempt_paths(
-            &mut auth_exempt_paths,
-            &admin_prefix,
-            admin_login_provider.is_some(),
-        );
-        let jwt_jwks_url =
-            parse_optional_string(JWT_JWKS_URL, get_var(JWT_JWKS_URL), &mut problems);
-        let jwt_issuer = parse_optional_string(JWT_ISSUER, get_var(JWT_ISSUER), &mut problems);
-        // The issuer becomes every principal's `issuer`, which authentication
-        // holds to the principal bounds; an over-long one would refuse every
-        // credential at runtime, so it is refused here instead.
-        if jwt_issuer
-            .as_deref()
-            .is_some_and(|issuer| issuer.len() > MAX_PRINCIPAL_ISSUER_BYTES)
-        {
-            problems.push(format!(
-                "{JWT_ISSUER} must be at most {MAX_PRINCIPAL_ISSUER_BYTES} bytes"
-            ));
-        }
-        let jwt_audience =
-            parse_optional_string(JWT_AUDIENCE, get_var(JWT_AUDIENCE), &mut problems);
-        let jwt_jwks_timeout_ms = parse_var(
-            JWT_JWKS_TIMEOUT_MS,
-            get_var(JWT_JWKS_TIMEOUT_MS),
-            DEFAULT_JWT_JWKS_TIMEOUT_MS,
-            "millisecond duration",
-            &mut problems,
-        );
-        let jwt_jwks_max_key_age_secs = validate_jwks_max_key_age(
-            JWT_JWKS_MAX_KEY_AGE_SECS,
-            parse_var(
-                JWT_JWKS_MAX_KEY_AGE_SECS,
-                get_var(JWT_JWKS_MAX_KEY_AGE_SECS),
-                DEFAULT_JWT_JWKS_MAX_KEY_AGE_SECS,
-                "second duration",
-                &mut problems,
-            ),
-            &mut problems,
-        );
-        let jwt_require_jti = parse_var(
-            JWT_REQUIRE_JTI,
-            get_var(JWT_REQUIRE_JTI),
-            false,
-            "boolean",
-            &mut problems,
-        );
-        let roles_claim = parse_non_empty_string(
-            ROLES_CLAIM,
-            get_var(ROLES_CLAIM),
-            DEFAULT_ROLES_CLAIM,
-            &mut problems,
-        );
-        let service_token_sqlite_path = parse_optional_string(
-            SERVICE_TOKEN_SQLITE_PATH,
-            get_var(SERVICE_TOKEN_SQLITE_PATH),
-            &mut problems,
-        );
-        let service_token_cache_ttl_ms = validate_positive_u64(
-            SERVICE_TOKEN_CACHE_TTL_MS,
-            parse_var(
-                SERVICE_TOKEN_CACHE_TTL_MS,
-                get_var(SERVICE_TOKEN_CACHE_TTL_MS),
-                DEFAULT_SERVICE_TOKEN_CACHE_TTL_MS,
-                "millisecond duration",
-                &mut problems,
-            ),
-            DEFAULT_SERVICE_TOKEN_CACHE_TTL_MS,
-            &mut problems,
-        );
+        let authentication = identity::compile_authentication(
+            identity::AuthenticationInputs::read(&mut get_var),
+            &admin_surface,
+        )
+        .report(&mut problems, &mut rules);
         let tool_runtime_queue_depth = validate_positive_usize(
             TOOL_RUNTIME_QUEUE_DEPTH,
             parse_var(
@@ -2709,210 +2274,65 @@ impl Config {
             DEFAULT_TOOL_RUNTIME_DEFAULT_TIMEOUT_MS,
             &mut problems,
         );
-        let auth_providers =
-            parse_auth_providers(AUTH_PROVIDERS, get_var(AUTH_PROVIDERS), &mut problems)
-                .unwrap_or_else(|| {
-                    legacy_auth_providers(
-                        jwt_jwks_url.as_deref(),
-                        jwt_issuer.as_deref(),
-                        jwt_audience.as_deref(),
-                        jwt_jwks_timeout_ms,
-                        jwt_jwks_max_key_age_secs,
-                        jwt_require_jti,
-                        &roles_claim,
-                    )
-                });
-        validate_admin_login_provider(
-            admin_login_provider.as_deref(),
-            &auth_providers,
-            &mut problems,
-        );
-        let csrf_enabled = parse_var(
-            CSRF_ENABLED,
-            get_var(CSRF_ENABLED),
-            DEFAULT_CSRF_ENABLED,
-            "boolean",
-            &mut problems,
-        );
-        let csrf_cookie_name = parse_cookie_name(
-            CSRF_COOKIE_NAME,
-            get_var(CSRF_COOKIE_NAME),
-            DEFAULT_CSRF_COOKIE_NAME,
-            &mut problems,
-        );
-        let csrf_header_name = parse_header_name_string(
-            CSRF_HEADER_NAME,
-            get_var(CSRF_HEADER_NAME),
-            DEFAULT_CSRF_HEADER_NAME,
-            &mut problems,
-        );
-        let csrf_cookie_domain = parse_optional_cookie_domain(
-            CSRF_COOKIE_DOMAIN,
-            get_var(CSRF_COOKIE_DOMAIN),
-            &mut problems,
-        );
-        let csrf_exempt_paths = parse_comma_separated_paths(
-            CSRF_EXEMPT_PATHS,
-            get_var(CSRF_EXEMPT_PATHS),
-            &default_paths(DEFAULT_CSRF_EXEMPT_PATHS),
-            &mut problems,
-        );
-        if let Some(mode) = admin_session_mode {
-            if admin_login_provider.is_none()
-                || !auth_enabled
-                || auth_mode != AuthMode::Required
-                || !csrf_enabled
-            {
-                problems.push(format!("{ADMIN_SESSION_MODE}={mode} requires {ADMIN_LOGIN_PROVIDER}, {AUTH_ENABLED}=true, {AUTH_MODE}=required and {CSRF_ENABLED}=true"));
-            }
-            if let Some(provider) = auth_providers
-                .iter()
-                .find(|provider| Some(provider.name.as_str()) == admin_login_provider.as_deref())
-            {
-                if !provider
-                    .redirect_uri
-                    .as_deref()
-                    .is_some_and(|uri| uri.starts_with("https://"))
-                {
-                    problems.push(format!(
-                        "{ADMIN_SESSION_MODE}={mode} requires an HTTPS admin login redirect_uri"
-                    ));
-                }
-            }
-            let api_prefix = format!("/v1{admin_prefix}");
-            if csrf_exempt_paths
-                .iter()
-                .any(|path| path == &api_prefix || path.starts_with(&format!("{api_prefix}/")))
-            {
-                problems.push(format!(
-                    "{CSRF_EXEMPT_PATHS} cannot exempt admin API routes while {ADMIN_SESSION_MODE}={mode}"
-                ));
-            }
-            // Logout is usable after expiry, but always checks its own exact
-            // origin and configured CSRF pair before revoking/clearing anything.
-            for route in ["logout", "config"] {
-                let path = format!("{api_prefix}/auth/{route}");
-                auth_exempt_paths.push(path.clone());
-                rbac_exempt_paths.push(path);
-            }
-        }
-        let upstream_url =
-            parse_optional_upstream_url(UPSTREAM_URL, get_var(UPSTREAM_URL), &mut problems);
-        let upstream_routes =
-            parse_upstream_routes(UPSTREAM_ROUTES, get_var(UPSTREAM_ROUTES), &mut problems);
-        for (index, route) in upstream_routes.iter().enumerate() {
-            if let Some(name) = &route.upstream_csrf_cookie_name {
-                let name_base = name
-                    .strip_prefix("__Secure-")
-                    .or_else(|| name.strip_prefix("__Host-"))
-                    .unwrap_or(name);
-                let auth_base = auth_cookie_name
-                    .strip_prefix("__Secure-")
-                    .or_else(|| auth_cookie_name.strip_prefix("__Host-"))
-                    .unwrap_or(&auth_cookie_name);
-                if !route.forward_cookie_session
-                    || !crate::middleware::auth::safe_cookie_token(name)
-                    || name_base == auth_base
-                {
-                    problems.push(format!("{UPSTREAM_ROUTES}[{index}].upstream_csrf_cookie_name requires cookie-session delegation and a safe non-identity cookie name"));
-                }
-            }
-            if !route.forward_cookie_session {
-                continue;
-            }
-            let route_name = format!("{UPSTREAM_ROUTES}[{index}].forward_cookie_session");
-            if !auth_enabled || auth_mode != AuthMode::Required || !csrf_enabled {
-                problems.push(format!(
-                    "{route_name} requires {AUTH_ENABLED}=true, {AUTH_MODE}=required and {CSRF_ENABLED}=true"
-                ));
-            }
-            let auth_cookie_base = auth_cookie_name
-                .strip_prefix("__Secure-")
-                .or_else(|| auth_cookie_name.strip_prefix("__Host-"))
-                .unwrap_or(&auth_cookie_name);
-            let csrf_cookie_base = csrf_cookie_name
-                .strip_prefix("__Secure-")
-                .or_else(|| csrf_cookie_name.strip_prefix("__Host-"))
-                .unwrap_or(&csrf_cookie_name);
-            if auth_cookie_base == csrf_cookie_base {
-                problems.push(format!(
-                    "{route_name} requires distinct {AUTH_COOKIE_NAME} and {CSRF_COOKIE_NAME}"
-                ));
-            }
-            if cookie_session_identity_header(&csrf_header_name) {
-                problems.push(format!(
-                    "{route_name} requires {CSRF_HEADER_NAME} not to name a credential or identity header"
-                ));
-            }
-            if route.add_request_headers.contains_key(&csrf_header_name)
-                || route.strip_request_headers.contains(&csrf_header_name)
-            {
-                problems.push(format!(
-                    "{route_name} must not add or strip the configured {CSRF_HEADER_NAME}"
-                ));
-            }
-            if let Some(prefix) = route.path_prefix.as_deref() {
-                if auth_exempt_paths.iter().any(|exempt| {
-                    crate::path_match::exempt_path_matches(prefix, exempt)
-                        || crate::path_match::path_prefix_matches(exempt, prefix)
-                }) {
-                    problems.push(format!("{route_name} must not overlap {AUTH_EXEMPT_PATHS}"));
-                }
-                // CSRF exemptions match exact paths; an exempt descendant is enough
-                // to leave a delegated mutation without the gateway's outer check.
-                if csrf_exempt_paths
-                    .iter()
-                    .any(|exempt| crate::path_match::path_prefix_matches(exempt, prefix))
-                {
-                    problems.push(format!("{route_name} must not overlap {CSRF_EXEMPT_PATHS}"));
-                }
-            }
-        }
-        let mcp_upstream_servers = parse_mcp_upstream_servers(
-            MCP_UPSTREAM_SERVERS,
-            get_var(MCP_UPSTREAM_SERVERS),
-            &mut problems,
-        );
-        if upstream_url.is_some() && !upstream_routes.is_empty() {
-            problems.push(format!(
-                "{UPSTREAM_URL} and {UPSTREAM_ROUTES} are mutually exclusive; set one proxy routing source"
-            ));
-        }
-        if policy_file.is_none() && upstream_routes.iter().any(|route| route.host.is_some()) {
-            problems.push(format!(
-                "{UPSTREAM_ROUTES} entries with host require {POLICY_FILE} so RBAC can bind authorization to the selected request host"
-            ));
-        }
-        let upstream_timeout_ms = validate_optional_positive_timeout_ms(
-            UPSTREAM_TIMEOUT_MS,
-            parse_optional_var(
-                UPSTREAM_TIMEOUT_MS,
-                get_var(UPSTREAM_TIMEOUT_MS),
-                "millisecond duration",
-                &mut problems,
-            ),
-            &mut problems,
-        );
-        let upstream_response_idle_timeout_ms = validate_optional_positive_timeout_ms(
-            UPSTREAM_RESPONSE_IDLE_TIMEOUT_MS,
-            parse_optional_var(
-                UPSTREAM_RESPONSE_IDLE_TIMEOUT_MS,
-                get_var(UPSTREAM_RESPONSE_IDLE_TIMEOUT_MS),
-                "millisecond duration",
-                &mut problems,
-            ),
-            &mut problems,
-        );
-        let upstream_connect_timeout_ms = validate_optional_positive_timeout_ms(
-            UPSTREAM_CONNECT_TIMEOUT_MS,
-            parse_optional_var(
-                UPSTREAM_CONNECT_TIMEOUT_MS,
-                get_var(UPSTREAM_CONNECT_TIMEOUT_MS),
-                "millisecond duration",
-                &mut problems,
-            ),
-            &mut problems,
-        );
+        let identity_plan = identity::compile(
+            identity::ProviderAndCsrfInputs::read(&mut get_var),
+            admin_surface,
+            rbac_exemptions,
+            authentication,
+        )
+        .report(&mut problems, &mut rules);
+        let proxy::ProxyPlan {
+            trust_proxy_headers,
+            trusted_proxy_cidrs,
+            upstream_url,
+            upstream_routes,
+            mcp_upstream_servers,
+            upstream_timeout_ms,
+            upstream_response_idle_timeout_ms,
+            upstream_connect_timeout_ms,
+            provenance: _,
+        } = proxy::compile(
+            proxy::RoutingInputs::read(&mut get_var),
+            trusted_proxy,
+            &identity_plan,
+            policy_file.is_some(),
+        )
+        .report(&mut problems, &mut rules);
+        let identity::IdentityPlan {
+            admin_prefix,
+            admin_login_provider,
+            admin_session,
+            admin_login_pending_ttl_secs,
+            admin_login_pending_max_entries,
+            admin_login_pending_max_per_ip,
+            gateway_public_url,
+            rbac_exempt_paths,
+            auth_enabled,
+            auth_mode,
+            auth_cookie_name,
+            auth_exempt_paths,
+            auth_providers,
+            jwt_jwks_url,
+            jwt_issuer,
+            jwt_audience,
+            jwt_jwks_timeout_ms,
+            jwt_jwks_max_key_age_secs,
+            jwt_require_jti,
+            roles_claim,
+            service_token_sqlite_path,
+            service_token_cache_ttl_ms,
+            csrf_enabled,
+            csrf_cookie_name,
+            csrf_header_name,
+            csrf_cookie_domain,
+            csrf_exempt_paths,
+            provenance: _,
+        } = identity_plan;
+        // The admin session's store, by its `ADMIN_SESSION_MODE` value, for
+        // the state-backend checks below.
+        let admin_session_mode = admin_session
+            .as_ref()
+            .map(|session| session.storage.as_str());
         let egress_allowed_hosts = parse_comma_separated_hostnames(
             EGRESS_ALLOWED_HOSTS,
             get_var(EGRESS_ALLOWED_HOSTS),
@@ -3416,7 +2836,7 @@ impl Config {
                 database,
             })
         } else {
-            let diagnostics = diagnostic::diagnose(&problems, &lookups);
+            let diagnostics = diagnostic::diagnose(&problems, &lookups, &rules);
             Err(ConfigError {
                 problems,
                 diagnostics,

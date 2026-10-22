@@ -6371,7 +6371,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::bootstrap::run#1",
-      "sha256": "87fd0b73e4f2c0a44c513007e2666db39386ef2391927c072778e8ca0e1fff18",
+      "sha256": "777e5cb6a2bf9f903a13e859ba23b3325b393e8be371cf4e102e094f4c5ad8c1",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -7455,6 +7455,56 @@
       "sha256": "a82115cd7f23df27472f360ce15ca064c567ff292a12bb255a02f1337f5f4ec2",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/config/bundle/source.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::config::bundle::source::use std :: { ffi :: OsStr , fs , io :: { self , Read as _ } , path :: { Component , Path } , }#1",
+      "sha256": "2e0ff740827a8be877c4e9e4bf7936c8001bfea168a1f4e2ec43b9910a9293a2",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 PR 4: the configuration bundle reader's contained, read-only filesystem access (canonicalized root opened as a cap-std directory, no-follow opens, link count, reparse attribute and Unix mode read from the opened handle). It adds no network or process capability; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/config/bundle/source.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::config::bundle::source::use cap_fs_ext :: { DirExt as _ , FollowSymlinks , MetadataExt as CapabilityMetadataExt , OpenOptionsFollowExt as _ , OpenOptionsSyncExt as _ , }#1",
+      "sha256": "2f7e6c8c421f86038c184491f0f85e0d1aa00ac960e89c1e03e79a3d8c19b4df",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 PR 4: the configuration bundle reader's contained, read-only filesystem access (canonicalized root opened as a cap-std directory, no-follow opens, link count, reparse attribute and Unix mode read from the opened handle). It adds no network or process capability; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/config/bundle/source.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::config::bundle::source::use cap_std :: { ambient_authority , fs :: { Dir , OpenOptions as CapabilityOpenOptions } , }#1",
+      "sha256": "195f6c89077f4e307f3177b3c7d3c177e0e7b8004353c1e9b857d2d1b820e3aa",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 PR 4: the configuration bundle reader's contained, read-only filesystem access (canonicalized root opened as a cap-std directory, no-follow opens, link count, reparse attribute and Unix mode read from the opened handle). It adds no network or process capability; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/config/bundle/source.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::config::bundle::source::file_permissions_are_safe#1",
+      "sha256": "cc98ef622850697a82d4d193e72b206f2ecca69f2fb3751ffd0b9d3886e39f3f",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 PR 4: the configuration bundle reader's contained, read-only filesystem access (canonicalized root opened as a cap-std directory, no-follow opens, link count, reparse attribute and Unix mode read from the opened handle). It adds no network or process capability; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/config/bundle/source.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::config::bundle::source::is_reparse_point#1",
+      "sha256": "b38daad4bb5a2611dccf7b648e45aa79aa9af9944222f0319f6ec5b8b24f642b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 PR 4: the configuration bundle reader's contained, read-only filesystem access (canonicalized root opened as a cap-std directory, no-follow opens, link count, reparse attribute and Unix mode read from the opened handle). It adds no network or process capability; constructor bodies require separate scope review."
     },
     {
       "file": "gateway/src/config.rs",

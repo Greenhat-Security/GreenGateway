@@ -802,6 +802,15 @@ impl RbacState {
         self.policy.load().engine.policy().clone()
     }
 
+    /// The live lane's installed snapshot, which [`RbacState::current_policy`]
+    /// copies, for the admin analysis consumers: endpoint coverage asks its
+    /// compiled kernel, and rule hit counts key by its rule attribution ids.
+    /// The same instance live requests are judged by, not a recompilation of
+    /// a copy of it.
+    pub(crate) fn live_policy_snapshot(&self) -> Arc<RbacPolicyState> {
+        self.policy.load_full()
+    }
+
     pub fn current_egress_policy(&self) -> EgressPolicy {
         self.policy.load().engine.policy().egress.clone()
     }
@@ -1104,6 +1113,14 @@ impl RbacPolicyState {
     /// install, pinned to the revision this snapshot serves under.
     pub(crate) fn compiled(&self) -> &crate::policy_eval::CompiledPolicy {
         &self.compiled
+    }
+
+    /// The id audit attribution records for each direct rule, in source
+    /// order: the rule's `id`, else its zero-based index. These are the ids
+    /// `matched_rule_id` carries, so a count keyed by them is a count of what
+    /// this snapshot's rules were recorded as.
+    pub(crate) fn rule_ids(&self) -> &[String] {
+        &self.rule_ids
     }
 
     /// Ask the shared evaluator one tool-lane question of this snapshot.

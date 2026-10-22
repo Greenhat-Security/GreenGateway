@@ -14,10 +14,12 @@
 //! value-free by construction rather than by redaction: there is no pattern
 //! to miss.
 //!
-//! The code describes the input, not the rule that refused it. Rule-specific
-//! codes belong to the stages the configuration compiler extracts, which can
-//! assign them where each rule is checked; this module only reports what the
-//! existing parser already says, without changing a word of it.
+//! The code describes the input, not the rule that refused it. The rule is a
+//! separate field, assigned by the configuration compiler's stages where each
+//! rule is checked (issue #433, PR 2): a problem one of those stages reports
+//! carries the [`ConfigRule`] that refused it, and a problem the legacy parser
+//! still reports directly carries none until its domain is extracted. Neither
+//! changes a word of the problems themselves.
 
 use std::{collections::BTreeMap, env::VarError};
 
@@ -84,6 +86,83 @@ pub(crate) enum ConfigDiagnosticCode {
     Unattributed,
 }
 
+/// The check that refused a problem one of the configuration compiler's
+/// stages reports (issue #433, PR 2).
+///
+/// [`ConfigRule::Value`] is the refusal of one input's value on its own: it
+/// does not parse, is out of bounds, or is not one of the accepted words.
+/// Every other rule relates inputs, and is named for what it requires.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConfigRule {
+    /// The input's own value was refused.
+    Value,
+    /// `ADMIN_LISTEN_ADDR` resolves to the data listener's address.
+    AdminListenerCollision,
+    /// `GRPC_LISTEN_ADDR` resolves to the data or the admin listener's
+    /// address.
+    GrpcListenerCollision,
+    /// A listener's certificate and private key files are not set together,
+    /// or are not paired one key per certificate chain.
+    TlsMaterialUnpaired,
+    /// Admin TLS material is set without a separate admin listener to
+    /// terminate it.
+    AdminTlsWithoutAdminListener,
+    /// A listener's client-certificate authentication is incomplete: its
+    /// mode is on without TLS, a CA bundle or an identity source, or its CA or
+    /// CRL file is set while its mode is `off`.
+    ClientCertificateAuth,
+    /// A client-certificate identity source is set while both listeners'
+    /// modes are `off`.
+    ClientCertIdentitySourceUnused,
+    /// Admin session settings are set without a session mode that reads
+    /// them.
+    AdminSessionSettingsWithoutMode,
+    /// `ADMIN_SESSION_IDLE_TIMEOUT_SECS` is not between 1 and the session's
+    /// absolute lifetime, `ADMIN_SESSION_TTL_SECS`.
+    AdminSessionIdleTimeoutBounds,
+    /// `ADMIN_LOGIN_PROVIDER` names a provider that cannot serve the admin
+    /// login.
+    AdminLoginProviderUnusable,
+    /// An admin session store is on without the login, authentication, CSRF
+    /// protection or HTTPS redirect it relies on.
+    AdminSessionRequirements,
+    /// `CSRF_EXEMPT_PATHS` exempts admin API routes while an admin session
+    /// store is on.
+    AdminSessionCsrfExemption,
+    /// `TRUST_PROXY_HEADERS` is on without a trusted proxy network.
+    TrustedProxyNetworksRequired,
+    /// An upstream route's cookie-session delegation is not backed by the
+    /// authentication and CSRF settings it relies on, or overlaps an
+    /// exemption.
+    CookieSessionDelegation,
+    /// `UPSTREAM_URL` and `UPSTREAM_ROUTES` are both set.
+    UpstreamRoutingSourcesExclusive,
+    /// A host-bound upstream route is configured without `POLICY_FILE`.
+    HostRoutesRequirePolicy,
+}
+
+/// The rule behind each problem a compiler stage reported, by the problem's
+/// position in the report.
+///
+/// A side table rather than a field of the problem, because the legacy parser
+/// still pushes plain problems for the domains not extracted yet. A stage
+/// records the rule as it appends the problem, and nothing is ever inserted
+/// before an existing problem, so a recorded position never moves.
+#[derive(Default)]
+pub(super) struct Rules {
+    by_problem: BTreeMap<usize, ConfigRule>,
+}
+
+impl Rules {
+    pub(super) fn record(&mut self, problem: usize, rule: ConfigRule) {
+        self.by_problem.insert(problem, rule);
+    }
+
+    pub(super) fn rule(&self, problem: usize) -> Option<ConfigRule> {
+        self.by_problem.get(&problem).copied()
+    }
+}
+
 /// One configuration problem, without the value that caused it.
 #[allow(dead_code)] // Fields are read by the parity tests until the #433 compiler reads them.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -92,23 +171,33 @@ pub(crate) struct ConfigDiagnostic {
     /// begins with none.
     pub(crate) variable: Option<&'static str>,
     pub(crate) code: ConfigDiagnosticCode,
+    /// The rule that refused the problem when an extracted compiler stage
+    /// reported it, or `None` for a problem the legacy parser still reports
+    /// directly.
+    pub(crate) rule: Option<ConfigRule>,
     /// Built from `variable`, `code` and fixed text only.
     pub(crate) message: String,
 }
 
 /// One diagnostic per problem, in the same order.
-pub(super) fn diagnose(problems: &[String], lookups: &Lookups) -> Vec<ConfigDiagnostic> {
+pub(super) fn diagnose(
+    problems: &[String],
+    lookups: &Lookups,
+    rules: &Rules,
+) -> Vec<ConfigDiagnostic> {
     problems
         .iter()
-        .map(|problem| diagnostic(problem, lookups))
+        .enumerate()
+        .map(|(index, problem)| diagnostic(problem, lookups, rules.rule(index)))
         .collect()
 }
 
-fn diagnostic(problem: &str, lookups: &Lookups) -> ConfigDiagnostic {
+fn diagnostic(problem: &str, lookups: &Lookups, rule: Option<ConfigRule>) -> ConfigDiagnostic {
     let Some(variable) = attributed_variable(problem) else {
         return ConfigDiagnostic {
             variable: None,
             code: ConfigDiagnosticCode::Unattributed,
+            rule,
             message: "a configuration problem names no inventoried setting".to_owned(),
         };
     };
@@ -133,6 +222,7 @@ fn diagnostic(problem: &str, lookups: &Lookups) -> ConfigDiagnostic {
     ConfigDiagnostic {
         variable: Some(variable),
         code,
+        rule,
         message,
     }
 }
@@ -163,12 +253,13 @@ mod tests {
             "lowercase lead quoting 'zqcanary-value'".to_owned(),
             "NOT_A_GATEWAY_SETTING must be 'zqcanary-value'".to_owned(),
         ];
-        let diagnostics = diagnose(&problems, &Lookups::default());
+        let diagnostics = diagnose(&problems, &Lookups::default(), &Rules::default());
 
         assert_eq!(diagnostics.len(), 2);
         for diagnostic in &diagnostics {
             assert_eq!(diagnostic.variable, None);
             assert_eq!(diagnostic.code, ConfigDiagnosticCode::Unattributed);
+            assert_eq!(diagnostic.rule, None);
             assert_eq!(
                 diagnostic.message,
                 "a configuration problem names no inventoried setting"

@@ -5,6 +5,8 @@ import {
 } from 'react';
 
 import {
+  type CallerAssertionAlgorithm,
+  type CallerAssertionClaim,
   type ConnectionKind,
   type SafeCallerAssertion
 } from '../../lib/connections';
@@ -24,6 +26,7 @@ import {
   ALL_SECRET_PURPOSES,
   authenticationPurpose,
   AuthenticationType,
+  authenticationTypeLocked,
   BindingDraft,
   BindingIntent,
   ConnectionFormState,
@@ -34,11 +37,13 @@ import {
   formatSecretPurpose,
   isTlsSecretPurpose,
   MAX_ADDITIONAL_HEADERS,
+  MAX_CALLER_ASSERTION_LIFETIME_SECONDS,
   secretErrorRequiresReload,
   SecretInventoryState,
   secretMaxLength,
   secretMutationError,
   secretMutationReloadRequired,
+  SubjectTokenDraft,
 } from './model';
 export function ConnectionIdentitySection({
   form,
@@ -168,6 +173,7 @@ export function AuthenticationSection({
   canBindSecret,
   secrets,
   disabled,
+  delegatedOffered,
   onUpdate,
   onAuthenticationTypeChange,
 }: {
@@ -176,10 +182,18 @@ export function AuthenticationSection({
   canBindSecret: boolean;
   secrets: ConnectionSecretMetadata[];
   disabled: boolean;
+  delegatedOffered: boolean;
   onUpdate: (patch: Partial<ConnectionFormState>) => void;
   onAuthenticationTypeChange: (type: AuthenticationType) => void;
 }) {
   const hasSecret = form.authenticationType !== 'none';
+  const typeLocked = authenticationTypeLocked(form);
+  const delegated = form.authenticationType === 'delegated_issuer_token';
+  const requestsToken =
+    form.authenticationType === 'oauth2_client_credentials' || delegated;
+  const scopesField = delegated
+    ? 'authentication.requested_scopes'
+    : 'authentication.scopes';
   return (
     <section
       className="connection-form-section"
@@ -190,26 +204,46 @@ export function AuthenticationSection({
         <h3 id="connection-auth-heading">Authentication</h3>
       </div>
       <div className="filter-grid connection-form-grid">
-        <label htmlFor="connection-authentication-type">
-          Authentication type
+        <FormField
+          id="connection-authentication-type"
+          label="Authentication type"
+          error={errors['authentication.type']}
+        >
           <select
             id="connection-authentication-type"
             value={form.authenticationType}
-            disabled={disabled}
+            disabled={disabled || typeLocked}
+            aria-invalid={Boolean(errors['authentication.type'])}
+            aria-describedby={
+              describedBy(
+                'connection-authentication-type',
+                errors['authentication.type'],
+              ) ??
+              (typeLocked ? 'connection-authentication-type-locked' : undefined)
+            }
             onChange={(event) =>
               onAuthenticationTypeChange(
                 event.target.value as AuthenticationType,
               )
             }
           >
-            <option value="none">None</option>
-            <option value="header_api_key">Header API key</option>
-            <option value="static_bearer">Static bearer</option>
-            <option value="oauth2_client_credentials">
-              OAuth 2 client credentials
-            </option>
+            {typeLocked ? null : (
+              <>
+                <option value="none">None</option>
+                <option value="header_api_key">Header API key</option>
+                <option value="static_bearer">Static bearer</option>
+                <option value="oauth2_client_credentials">
+                  OAuth 2 client credentials
+                </option>
+              </>
+            )}
+            {delegatedOffered ? (
+              <option value="delegated_issuer_token">
+                Delegated issuer token (each caller&apos;s own)
+              </option>
+            ) : null}
           </select>
-        </label>
+        </FormField>
         {form.authenticationType === 'header_api_key' ? (
           <FormField
             id="connection-header-name"
@@ -231,11 +265,11 @@ export function AuthenticationSection({
             />
           </FormField>
         ) : null}
-        {form.authenticationType === 'oauth2_client_credentials' ? (
+        {requestsToken ? (
           <>
             <FormField
               id="connection-client-id"
-              label="OAuth client ID"
+              label={delegated ? 'Issuer client ID' : 'OAuth client ID'}
               error={errors['authentication.client_id']}
             >
               <input
@@ -252,48 +286,76 @@ export function AuthenticationSection({
                 onChange={(event) => onUpdate({ clientId: event.target.value })}
               />
             </FormField>
-            <FormField
-              id="connection-token-url"
-              label="OAuth token URL"
-              error={errors['authentication.token_url']}
-            >
-              <input
+            {delegated ? (
+              <FormField
+                id="connection-token-exchange-url"
+                label="Token exchange URL"
+                error={errors['authentication.token_exchange_url']}
+              >
+                <input
+                  id="connection-token-exchange-url"
+                  type="url"
+                  value={form.tokenExchangeUrl}
+                  disabled={disabled}
+                  placeholder="https://issuer.example/oauth2/token-exchange"
+                  autoComplete="off"
+                  spellCheck={false}
+                  aria-invalid={Boolean(
+                    errors['authentication.token_exchange_url'],
+                  )}
+                  aria-describedby={describedBy(
+                    'connection-token-exchange-url',
+                    errors['authentication.token_exchange_url'],
+                  )}
+                  onChange={(event) =>
+                    onUpdate({ tokenExchangeUrl: event.target.value })
+                  }
+                />
+              </FormField>
+            ) : (
+              <FormField
                 id="connection-token-url"
-                type="url"
-                value={form.tokenUrl}
-                disabled={disabled}
-                autoComplete="off"
-                spellCheck={false}
-                aria-invalid={Boolean(errors['authentication.token_url'])}
-                aria-describedby={describedBy(
-                  'connection-token-url',
-                  errors['authentication.token_url'],
-                )}
-                onChange={(event) => onUpdate({ tokenUrl: event.target.value })}
-              />
-            </FormField>
+                label="OAuth token URL"
+                error={errors['authentication.token_url']}
+              >
+                <input
+                  id="connection-token-url"
+                  type="url"
+                  value={form.tokenUrl}
+                  disabled={disabled}
+                  autoComplete="off"
+                  spellCheck={false}
+                  aria-invalid={Boolean(errors['authentication.token_url'])}
+                  aria-describedby={describedBy(
+                    'connection-token-url',
+                    errors['authentication.token_url'],
+                  )}
+                  onChange={(event) => onUpdate({ tokenUrl: event.target.value })}
+                />
+              </FormField>
+            )}
             <FormField
               id="connection-oauth-scopes"
-              label="OAuth scopes"
-              error={errors['authentication.scopes']}
+              label={delegated ? 'Requested scopes' : 'OAuth scopes'}
+              error={errors[scopesField]}
             >
               <input
                 id="connection-oauth-scopes"
                 value={form.scopes}
                 disabled={disabled}
-                placeholder="read write"
+                placeholder={delegated ? 'mail.read' : 'read write'}
                 autoComplete="off"
-                aria-invalid={Boolean(errors['authentication.scopes'])}
+                aria-invalid={Boolean(errors[scopesField])}
                 aria-describedby={describedBy(
                   'connection-oauth-scopes',
-                  errors['authentication.scopes'],
+                  errors[scopesField],
                 )}
                 onChange={(event) => onUpdate({ scopes: event.target.value })}
               />
             </FormField>
             <FormField
               id="connection-oauth-audience"
-              label="OAuth audience"
+              label={delegated ? 'Requested audience' : 'OAuth audience'}
               error={errors['authentication.audience']}
             >
               <input
@@ -311,7 +373,7 @@ export function AuthenticationSection({
             </FormField>
             <FormField
               id="connection-oauth-resource"
-              label="OAuth resource"
+              label={delegated ? 'Requested resource' : 'OAuth resource'}
               error={errors['authentication.resource']}
             >
               <input
@@ -327,16 +389,68 @@ export function AuthenticationSection({
                 onChange={(event) => onUpdate({ resource: event.target.value })}
               />
             </FormField>
+            {delegated ? (
+              <FormField
+                id="connection-revocation-url"
+                label="Revocation URL (optional)"
+                error={errors['authentication.revocation_url']}
+              >
+                <input
+                  id="connection-revocation-url"
+                  type="url"
+                  value={form.revocationUrl}
+                  disabled={disabled}
+                  placeholder="https://issuer.example/oauth2/revoke"
+                  autoComplete="off"
+                  spellCheck={false}
+                  aria-invalid={Boolean(errors['authentication.revocation_url'])}
+                  aria-describedby={
+                    describedBy(
+                      'connection-revocation-url',
+                      errors['authentication.revocation_url'],
+                    ) ?? 'connection-revocation-url-help'
+                  }
+                  onChange={(event) =>
+                    onUpdate({ revocationUrl: event.target.value })
+                  }
+                />
+              </FormField>
+            ) : null}
           </>
         ) : null}
       </div>
+      {typeLocked ? (
+        <p
+          id="connection-authentication-type-locked"
+          className="capability-description"
+        >
+          A delegated issuer token connection keeps its credential type. Its
+          caller assertion stays through every save, and under any other type
+          the gateway would start sending it upstream. Create a new connection
+          to use another credential.
+        </p>
+      ) : null}
+      {delegated ? (
+        <p
+          id="connection-revocation-url-help"
+          className="capability-description"
+        >
+          When a principal&apos;s tokens are purged, the gateway revokes each
+          one at the revocation URL (RFC 7009), once and best effort, with the
+          exchange&apos;s client credentials. Without it a purged token is only
+          dropped and stays valid at the issuer until it expires.
+        </p>
+      ) : null}
+      {delegated ? <DelegatedIssuerTokenNote /> : null}
       {hasSecret ? (
         <BindingControl
           id="connection-auth-secret"
           label={
             form.authenticationType === 'oauth2_client_credentials'
               ? 'OAuth client secret'
-              : 'Authentication secret'
+              : delegated
+                ? 'Token exchange client secret'
+                : 'Authentication secret'
           }
           binding={form.authenticationBinding}
           purpose={authenticationPurpose(form.authenticationType)}
@@ -345,7 +459,7 @@ export function AuthenticationSection({
           disabled={disabled}
           error={
             errors[
-            form.authenticationType === 'oauth2_client_credentials'
+            requestsToken
               ? 'authentication.client_secret_id'
               : 'authentication.secret_id'
             ]
@@ -355,7 +469,39 @@ export function AuthenticationSection({
           }
         />
       ) : null}
+      {delegated ? (
+        <p className="capability-description">
+          The client secret resolves only from an operator alias or an
+          external secret provider; the encrypted local store cannot hold it.
+          Give it an alias of its own: the gateway refuses a save that binds
+          it under any other field of any connection.
+        </p>
+      ) : null}
     </section>
+  );
+}
+
+/**
+ * What a delegated issuer token does and where its trust sits, beside the
+ * fields that configure it.
+ */
+function DelegatedIssuerTokenNote() {
+  return (
+    <div className="alert warning" role="status">
+      <p>
+        <strong>Each caller reaches the upstream as themselves.</strong> For
+        every calling principal the gateway exchanges a caller assertion it
+        signs for that principal&apos;s own access token at the issuer (RFC
+        8693 token exchange), caches it for that principal only, and sends it
+        as the bearer token. Only manual HTTP tool calls are served, and a call
+        without a principal, such as a service token, is refused.
+      </p>
+      <p>
+        Whoever holds the client secret can ask the issuer for any
+        user&apos;s token. Keep it in an external provider, and request
+        read-only scopes where the upstream allows it.
+      </p>
+    </div>
   );
 }
 
@@ -489,8 +635,10 @@ export function AdditionalHeadersSection({
  */
 export function CallerAssertionSection({
   assertion,
+  subjectTokenOnly = false,
 }: {
   assertion: SafeCallerAssertion | null;
+  subjectTokenOnly?: boolean;
 }) {
   if (assertion === null) {
     return null;
@@ -503,9 +651,209 @@ export function CallerAssertionSection({
     >
       <div className="section-heading">
         <p className="eyebrow">Caller attestation</p>
-        <h3 id="connection-caller-assertion-heading">Caller assertion</h3>
+        <h3 id="connection-caller-assertion-heading">
+          {subjectTokenOnly ? 'Subject token' : 'Caller assertion'}
+        </h3>
       </div>
-      <CallerAssertionSummary assertion={assertion} />
+      <CallerAssertionSummary
+        assertion={assertion}
+        subjectTokenOnly={subjectTokenOnly}
+      />
+    </section>
+  );
+}
+
+const SUBJECT_TOKEN_CLAIMS: { claim: CallerAssertionClaim; label: string }[] = [
+  { claim: 'email', label: 'Email' },
+  { claim: 'roles', label: 'Roles' },
+];
+
+/**
+ * The caller assertion a new delegated issuer token Connection signs its
+ * subject tokens with. Shown only while creating one: once the Connection
+ * exists the block is read only here (see `CallerAssertionSection`).
+ */
+export function SubjectTokenSection({
+  draft,
+  errors,
+  canBindSecret,
+  secrets,
+  disabled,
+  onChange,
+}: {
+  draft: SubjectTokenDraft;
+  errors: FieldErrors;
+  canBindSecret: boolean;
+  secrets: ConnectionSecretMetadata[];
+  disabled: boolean;
+  onChange: (draft: SubjectTokenDraft) => void;
+}) {
+  const update = (patch: Partial<SubjectTokenDraft>) =>
+    onChange({ ...draft, ...patch });
+  const textField = (
+    id: string,
+    field: string,
+    label: string,
+    key: 'kid' | 'issuer' | 'audience' | 'tokenType' | 'headerName',
+    placeholder: string,
+  ) => (
+    <FormField id={id} label={label} error={errors[field]}>
+      <input
+        id={id}
+        value={draft[key]}
+        disabled={disabled}
+        placeholder={placeholder}
+        autoComplete="off"
+        spellCheck={false}
+        aria-invalid={Boolean(errors[field])}
+        aria-describedby={describedBy(id, errors[field])}
+        onChange={(event) => update({ [key]: event.target.value })}
+      />
+    </FormField>
+  );
+
+  return (
+    <section
+      className="connection-form-section"
+      aria-labelledby="connection-subject-token-heading"
+    >
+      <div className="section-heading">
+        <p className="eyebrow">Caller attestation</p>
+        <h3 id="connection-subject-token-heading">Subject token</h3>
+      </div>
+      <p className="capability-description">
+        The gateway names each caller to the issuer with a short-lived JWT it
+        signs with this key: <code>sub</code> is the caller&apos;s identity
+        provider issuer, <code>#</code> and subject, with{' '}
+        <code>caller_iss</code> and <code>caller_sub</code> beside it. The
+        issuer verifies it against{' '}
+        <code>/.well-known/caller-assertion-jwks.json</code>, which carries
+        the keys of enabled connections only, and pins its issuer, audience
+        and token type. Set the audience to the value the issuer expects,
+        never an upstream&apos;s, and use one no other connection&apos;s
+        caller assertion uses. The token is never sent upstream.
+      </p>
+      <BindingControl
+        id="connection-subject-token-key"
+        label="Signing key"
+        binding={draft.signingKeyBinding}
+        purpose="assertion_signing_key"
+        secrets={secrets}
+        canBindSecret={canBindSecret}
+        disabled={disabled}
+        error={errors['caller_assertion.signing_key_id']}
+        onChange={(signingKeyBinding) => update({ signingKeyBinding })}
+      />
+      <p className="capability-description">
+        A PKCS#8 private key behind an operator alias or an external secret
+        provider: P-256 for ES256, RSA of at least 2048 bits for RS256. An
+        enabled save loads it and is refused if it cannot be used. After the
+        connection is created, change this block or rotate its key through
+        the admin API.
+      </p>
+      <div className="filter-grid connection-form-grid">
+        {textField(
+          'connection-subject-token-kid',
+          'caller_assertion.kid',
+          'Key ID (kid)',
+          'kid',
+          'gw-2026-10',
+        )}
+        <label htmlFor="connection-subject-token-algorithm">
+          Algorithm
+          <select
+            id="connection-subject-token-algorithm"
+            value={draft.algorithm}
+            disabled={disabled}
+            onChange={(event) =>
+              update({
+                algorithm: event.target.value as CallerAssertionAlgorithm,
+              })
+            }
+          >
+            <option value="es256">ES256</option>
+            <option value="rs256">RS256</option>
+          </select>
+        </label>
+        {textField(
+          'connection-subject-token-issuer',
+          'caller_assertion.issuer',
+          'Issuer (iss)',
+          'issuer',
+          'https://gateway.example',
+        )}
+        {textField(
+          'connection-subject-token-audience',
+          'caller_assertion.audience',
+          'Audience (aud)',
+          'audience',
+          'https://issuer.example',
+        )}
+        {textField(
+          'connection-subject-token-type',
+          'caller_assertion.token_type',
+          'Token type (typ)',
+          'tokenType',
+          'caller-assertion+jwt',
+        )}
+        <FormField
+          id="connection-subject-token-lifetime"
+          label="Lifetime (seconds)"
+          error={errors['caller_assertion.lifetime_seconds']}
+        >
+          <input
+            id="connection-subject-token-lifetime"
+            type="number"
+            min={1}
+            max={MAX_CALLER_ASSERTION_LIFETIME_SECONDS}
+            value={draft.lifetimeSeconds}
+            disabled={disabled}
+            aria-invalid={Boolean(errors['caller_assertion.lifetime_seconds'])}
+            aria-describedby={describedBy(
+              'connection-subject-token-lifetime',
+              errors['caller_assertion.lifetime_seconds'],
+            )}
+            onChange={(event) =>
+              update({ lifetimeSeconds: event.target.value })
+            }
+          />
+        </FormField>
+        {textField(
+          'connection-subject-token-header',
+          'caller_assertion.header_name',
+          'Reserved header name',
+          'headerName',
+          'x-caller-assertion',
+        )}
+      </div>
+      <p className="capability-description">
+        The reserved header carries nothing on a delegated connection; the
+        gateway only clears it from what a caller sends, so it must differ
+        from every other header this connection owns. Lifetime is at most{' '}
+        {MAX_CALLER_ASSERTION_LIFETIME_SECONDS} seconds.
+      </p>
+      <fieldset className="connection-subject-token-claims">
+        <legend>Claims beside sub</legend>
+        {SUBJECT_TOKEN_CLAIMS.map(({ claim, label }) => (
+          <label key={claim}>
+            <input
+              type="checkbox"
+              checked={draft.claims.includes(claim)}
+              disabled={disabled}
+              onChange={(event) =>
+                update({
+                  claims: event.target.checked
+                    ? SUBJECT_TOKEN_CLAIMS.map((entry) => entry.claim).filter(
+                      (entry) => entry === claim || draft.claims.includes(entry),
+                    )
+                    : draft.claims.filter((entry) => entry !== claim),
+                })
+              }
+            />
+            {label}
+          </label>
+        ))}
+      </fieldset>
     </section>
   );
 }

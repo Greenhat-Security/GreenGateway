@@ -303,11 +303,18 @@ is explicit.
   or fragment) and passes the token client's egress check before any key or
   secret is read.
 - Only the manual HTTP tool-call lane obtains a caller's own token, so only it
-  serves such a Connection; every other lane, the ones that attest an ordinary
-  Connection's caller included, refuses it through the caller-assertion
-  refusal. A call with no principal, or a service token's, is
+  serves such a Connection among the call lanes; every other one, the ones
+  that attest an ordinary Connection's caller included, refuses it through the
+  caller-assertion refusal. A call with no principal, or a service token's, is
   refused with `delegated_token_no_principal`. There is no fallback to a
   service identity.
+- A stored Connection test has no caller of its own, so it is run as the
+  administrator who asks for it, as the admin playground already calls tools:
+  the test exchanges that principal's token inline, under the test deadline
+  like an OAuth probe's mint, uses it for the one test request and caches
+  nothing. A test therefore proves the tester's grant only. A disabled
+  Connection's keys are not in the JWKS, so its test is refused before any I/O
+  rather than sending the issuer a subject token it cannot verify.
 - The token cache reuses the OAuth cache's single flight and generation-bound
   `401` invalidation, adds the attested caller to the key, holds at most 1,024
   entries, never reuses a token for more than 900 seconds, and drops every
@@ -342,6 +349,15 @@ best effort, at the issuer's RFC 7009 endpoint when the Connection names a
 A purge stops the gateway serving tokens it obtained earlier; it does not stop
 a user whose credentials still validate and whose grant the issuer still
 holds.
+
+The [per-caller credential trust boundary](../connections/per-caller-trust-boundary.md)
+consolidates this boundary for both per-caller mechanisms, delegated issuer
+tokens and signed caller assertions (issue #463): what each component can do
+if compromised, the storage and cache bounds, the audit of every hand-out,
+the controls only the issuer or the upstream can provide, and what remains
+out of scope, raw forwarding of the caller's inbound bearer token included.
+It is part of issue #446 and must be extended by any later per-caller
+credential, such as the domain-wide delegation of issue #442.
 
 ### Secret trust and confidentiality
 
@@ -541,8 +557,9 @@ API response.
 Operational procedures are documented in the
 [operator guide](../connections/operator-guide.md),
 [migration and rollback guide](../connections/migration.md),
-[admin guide](../connections/admin-guide.md), and
-[issue #240 acceptance map](../testing/issue-240-acceptance.md).
+[admin guide](../connections/admin-guide.md),
+[per-caller credential trust boundary](../connections/per-caller-trust-boundary.md),
+and [issue #240 acceptance map](../testing/issue-240-acceptance.md).
 
 ## Consequences
 

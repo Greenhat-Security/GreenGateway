@@ -676,6 +676,8 @@ fn connection_admin_json_schema_is_strict_resolvable_and_secret_safe() {
         "ConnectionTestResult",
         "CatalogPublishResult",
         "OpenApiPreviewResponse",
+        "OpenApiConversionReport",
+        "OpenApiConversionWarning",
         "SecretList",
         "SafeSecretAlias",
         "SecretDeleted",
@@ -1242,5 +1244,66 @@ fn connection_admin_closed_copies_accept_overlay_runtime_fields_and_exact_versio
             &widened_playground_validation
         ),
         "the playground validation contract must remain closed and never expose the rejected value"
+    );
+}
+
+#[test]
+fn connection_admin_preview_schema_describes_swagger_conversion_reports() {
+    let schema = load_json(&docs_root().join(SCHEMA_RELATIVE_PATH));
+    let validates = |name: &str, instance: &Value| {
+        let envelope = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$defs": schema["$defs"].clone(),
+            "$ref": format!("#/$defs/{name}")
+        });
+        jsonschema::validator_for(&envelope)
+            .unwrap_or_else(|error| panic!("$defs/{name} should compile: {error}"))
+            .is_valid(instance)
+    };
+    assert_eq!(
+        definition(&schema, "OpenApiPreviewResponse")
+            .pointer("/properties/conversion/$ref")
+            .and_then(Value::as_str),
+        Some("#/$defs/OpenApiConversionReport")
+    );
+    assert!(
+        !definition(&schema, "OpenApiPreviewResponse")["required"]
+            .as_array()
+            .expect("preview response should list required fields")
+            .iter()
+            .any(|field| field == "conversion"),
+        "an OpenAPI 3.x preview carries no conversion report"
+    );
+
+    let report = json!({
+        "source_format": "swagger_2_0",
+        "warnings": [
+            {
+                "code": "base_path_not_in_paths",
+                "message": "basePath is not part of generated path templates; include it in the Connection base path",
+                "operation_omitted": false,
+                "subject": "/api"
+            },
+            {
+                "code": "multiple_body_parameters",
+                "message": "the operation has more than one body parameter; it was left out",
+                "operation_omitted": true,
+                "method": "POST",
+                "path_template": "/widgets"
+            }
+        ]
+    });
+    assert!(validates("OpenApiConversionReport", &report));
+    let mut unknown_code = report.clone();
+    unknown_code["warnings"][0]["code"] = json!("silently_dropped");
+    assert!(
+        !validates("OpenApiConversionReport", &unknown_code),
+        "conversion warning codes are a closed set"
+    );
+    let mut widened = report;
+    widened["warnings"][1]["operation"] = json!({ "operationId": "createWidget" });
+    assert!(
+        !validates("OpenApiConversionReport", &widened),
+        "conversion warnings stay closed and never echo document content"
     );
 }
