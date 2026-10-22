@@ -204,7 +204,10 @@ jobs:
         #     MSVC linker.
         # They name only the gateway package, so every cached dependency
         # keeps its fingerprint, and they live in this runner's user-level
-        # Cargo configuration, not the repository's.
+        # Cargo configuration, not the repository's. If one of them ever made
+        # the report count fewer lines or branches for a gated file, the
+        # denominators recorded in .github/security-coverage.json fail the
+        # floor check instead of letting the percentage rise.
         shell: pwsh
         run: |
           $config = Join-Path $env:CARGO_HOME 'config.toml'

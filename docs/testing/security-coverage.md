@@ -19,8 +19,9 @@ JWT handling, authentication and RBAC middleware, CSRF, response headers,
 validation, role evaluation, admin authorization and egress. Their inline test
 suites are separate test files, so test implementation lines cannot
 inflate these production-file percentages. Missing files, absent branch
-instrumentation and results below either floor fail the job. Evidence is uploaded
-even when a floor fails, and image promotion depends on the coverage job.
+instrumentation, results below either floor and a shrunken denominator (below)
+fail the job. Evidence is uploaded even when a floor fails, and image promotion
+depends on the coverage job.
 
 Reproduce on the same compiler/platform:
 
@@ -61,7 +62,11 @@ gateway sources), where the crate's build took 3m32s instead of 6m53s. The
 covered counts of a few timing-dependent modules outside the floors (connection
 administration, the PostgreSQL audit sink, the proxy health and forwarding
 paths) vary between runs of one build either way. Reproducing without the
-configuration gives the same measurements, only more slowly.
+configuration gives the same measurements, only more slowly. Because the
+floors' [recorded denominators](#recorded-denominators) are checked on every
+run, a later toolchain or setting change that made the instrumentation report
+fewer lines or branches for a gated file fails the job instead of raising its
+percentage.
 
 Wrapper-free mode is intentional: Cargo can pass the long Windows compiler
 command through a response file, which cargo-llvm-cov 0.9.0's wrapper does not
@@ -76,6 +81,30 @@ its timing. All security coverage floors and the normal test gate still apply.
 
 Do not run UI tests concurrently with a Rust build in the same checkout: the
 existing Rust build script runs the reviewed npm installer (`scripts/npm-script-policy.mjs`) to rebuild embedded UI assets.
+
+## Recorded denominators
+
+A floor is a percentage of the lines or branches the instrumentation reports
+for a file. A compiler, linker or build-setting change that dropped the coverage
+records of uncovered code would raise that percentage without a single new test.
+So every entry in `.github/security-coverage.json` also records
+`min_line_count` and `min_branch_count`: the instrumented line and branch counts
+of that file when the minimum was last set. `scripts/check-security-coverage.py`
+prints each file's covered/total counts and fails when a total is below its
+recorded minimum, or when either minimum is missing or not a positive integer.
+A larger total (new code) passes.
+
+When the gate reports that a denominator shrank:
+
+- if the toolchain, `cargo-llvm-cov`, the linker or a build setting changed,
+  find out why records were dropped. Do not lower the minimum to make it pass;
+- if code was really removed from that file, set the minimum to the new count
+  the gate printed, in the same change that removes the code, and say in the
+  pull request which code went. Raising a minimum after code is added is
+  optional but keeps the guard tight.
+
+The current minimums are the counts the `main` CI run 39717886274 measured on
+October 22, 2026 (commit `6fc83e9`).
 
 ## Initial measured baseline
 

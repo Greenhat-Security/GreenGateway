@@ -29,14 +29,61 @@ evidence = load('check-test-evidence')
 
 
 class CoverageGate(unittest.TestCase):
-    limits = {'gateway/src/auth/jwt.rs': {'lines': 80, 'branches': 70}}
+    limits = {'gateway/src/auth/jwt.rs': {'lines': 80, 'branches': 70, 'min_line_count': 10, 'min_branch_count': 10}}
 
-    def report(self, branches=8):
+    def report(self, branches=8, lines=(10, 9), branch_count=10):
         return {'data': [{'files': [{'filename': 'C:\\repo\\gateway\\src\\auth\\jwt.rs', 'summary': {
-            'lines': {'count': 10, 'covered': 9}, 'branches': {'count': 10, 'covered': branches}}}]}]}
+            'lines': {'count': lines[0], 'covered': lines[1]},
+            'branches': {'count': branch_count, 'covered': branches}}}]}]}
+
+    def limits_with(self, **changes):
+        limits = {**self.limits['gateway/src/auth/jwt.rs'], **changes}
+        return {'gateway/src/auth/jwt.rs': {key: value for key, value in limits.items() if value is not None}}
 
     def test_accepts_instrumented_windows_paths(self):
         self.assertEqual(coverage.check(self.report(), self.limits), [])
+
+    def test_a_grown_denominator_passes(self):
+        # New code in a file raises its counts; only a smaller count than recorded fails.
+        self.assertEqual(coverage.check(self.report(branches=10, lines=(14, 13), branch_count=12), self.limits), [])
+
+    def test_fewer_instrumented_lines_than_recorded_fail_even_at_full_coverage(self):
+        errors = coverage.check(self.report(lines=(9, 9)), self.limits)
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn('instrumented lines denominator shrank: 9 lines, below the recorded minimum of 10', errors[0])
+        self.assertIn('set "min_line_count" to 9 in .github/security-coverage.json', errors[0])
+        self.assertIn('code was really removed', errors[0])
+
+    def test_fewer_instrumented_branches_than_recorded_fail_even_at_full_coverage(self):
+        errors = coverage.check(self.report(branches=9, branch_count=9), self.limits)
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn('instrumented branches denominator shrank: 9 branches, below the recorded minimum of 10', errors[0])
+        self.assertIn('set "min_branch_count" to 9', errors[0])
+
+    def test_a_missing_or_invalid_recorded_minimum_fails(self):
+        for key in ('min_line_count', 'min_branch_count'):
+            for value in (None, 0, -1, True, 10.0, '10'):
+                with self.subTest(key=key, value=value):
+                    errors = coverage.check(self.report(), self.limits_with(**{key: value}))
+                    self.assertEqual(len(errors), 1, errors)
+                    self.assertIn(f'must record "{key}"', errors[0])
+
+    def test_a_missing_percentage_floor_fails(self):
+        for metric in ('lines', 'branches'):
+            with self.subTest(metric=metric):
+                errors = coverage.check(self.report(), self.limits_with(**{metric: None}))
+                self.assertEqual(len(errors), 1, errors)
+                self.assertIn(f'must give a {metric} floor', errors[0])
+
+    def test_committed_floors_record_every_denominator(self):
+        floors = json.loads((Path(__file__).resolve().parents[1] / '.github/security-coverage.json').read_text())
+        self.assertTrue(floors)
+        for path, limits in floors.items():
+            with self.subTest(path=path):
+                self.assertEqual(set(limits), {'lines', 'branches', 'min_line_count', 'min_branch_count'})
+                for key in ('min_line_count', 'min_branch_count'):
+                    self.assertIs(type(limits[key]), int)
+                    self.assertGreater(limits[key], 0)
 
     def test_accepts_repository_relative_paths(self):
         report = self.report()
