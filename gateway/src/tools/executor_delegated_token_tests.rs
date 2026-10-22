@@ -23,7 +23,11 @@ use crate::connections::{
         ConnectionTestReason, ConnectionTestResult, ConnectionTestService, ConnectionTestStage,
         ConnectionTestStageName,
     },
-    token_exchange::{DelegatedTokenPurgeTrigger, ManualTokenClock},
+    token_exchange::{
+        is_purge_key, DelegatedTokenPurgeFailure, DelegatedTokenPurgeLedger,
+        DelegatedTokenPurgeOutcome, DelegatedTokenPurgeTrigger, ManualTokenClock, PurgeNotRecorded,
+        RecordedPurge,
+    },
 };
 
 const EXCHANGE_PATH: &str = "/oauth2/token-exchange";
@@ -1703,4 +1707,397 @@ async fn a_disabled_delegated_connection_is_not_tested_because_its_keys_are_not_
     assert_eq!(harness.secrets.resolutions(), saved);
     assert_eq!(harness.deployment.exchange_count(), 0);
     assert_eq!(harness.deployment.upstream_count(), 0);
+}
+
+// --- cluster mode: one purge, every replica (issue #441) ---------------------------------------
+
+const PURGE_DEPLOYMENT: &str = "deploy-delegated-replicas";
+
+/// The authority's purge record, in memory: what cluster mode's ledger does, without the
+/// operation gate or PostgreSQL in front of it (both are tested with the security gate in
+/// `security_cluster`). Each record takes the next revision; a refusal set with `refuse_with`
+/// answers as a gate that refused, and records nothing.
+#[derive(Default)]
+struct MemoryPurgeLedger {
+    records: Mutex<Vec<String>>,
+    refusal: Mutex<Option<PurgeNotRecorded>>,
+}
+
+impl MemoryPurgeLedger {
+    fn recorded(&self) -> Vec<String> {
+        self.records.lock().expect("ledger lock").clone()
+    }
+
+    fn refuse_with(&self, refusal: PurgeNotRecorded) {
+        *self.refusal.lock().expect("ledger lock") = Some(refusal);
+    }
+}
+
+#[async_trait::async_trait]
+impl DelegatedTokenPurgeLedger for MemoryPurgeLedger {
+    async fn record(
+        &self,
+        purge_key: &str,
+        _origin: &DelegatedTokenPurgeTrigger,
+    ) -> Result<i64, PurgeNotRecorded> {
+        if let Some(refusal) = self.refusal.lock().expect("ledger lock").clone() {
+            return Err(refusal);
+        }
+        let mut records = self.records.lock().expect("ledger lock");
+        records.push(purge_key.to_owned());
+        Ok(i64::try_from(records.len()).expect("a test ledger stays small"))
+    }
+}
+
+/// Two replicas of one deployment: the harness's runtime is replica A, and replica B is another
+/// runtime over the same Connection with a delegated-token cache of its own, as a second process
+/// would have. Both record purges in `ledger`.
+struct Replicas {
+    harness: Harness,
+    ledger: Arc<MemoryPurgeLedger>,
+    replica_b: ConnectionHttpRuntime,
+    executor_b: ToolExecutor,
+}
+
+async fn replicas() -> Replicas {
+    let ledger = Arc::new(MemoryPurgeLedger::default());
+    let for_a = Arc::clone(&ledger) as Arc<dyn DelegatedTokenPurgeLedger>;
+    let harness = build_harness(
+        Issuer::Grant { expires_in: 3_600 },
+        "127.0.0.1",
+        Some("127.0.0.1"),
+        move |runtime| runtime.with_delegated_token_purge_ledger(for_a, PURGE_DEPLOYMENT),
+    )
+    .await;
+    let replica_b = harness
+        .connection
+        .runtime
+        .clone()
+        .with_delegated_token_cache_for_test(Arc::new(ManualTokenClock::new()), 16)
+        .with_delegated_token_purge_ledger(
+            Arc::clone(&ledger) as Arc<dyn DelegatedTokenPurgeLedger>,
+            PURGE_DEPLOYMENT,
+        );
+    let audit = AuditLog::new(Arc::new(harness.capture.clone()) as Arc<dyn AuditSink>);
+    let registry = ToolRegistry::from_json_value(json!({
+        "schema_version": "0.1.0",
+        "tools": [read_mail_tool(&harness.connection.connection_id)]
+    }))
+    .expect("connection-bound tool should load");
+    let executor_b = ToolExecutor::new_inner(
+        registry,
+        ToolRuntime::new(
+            runtime_config([("read_mail", enabled_tool(5_000, 4))], 8, 4, 1_000),
+            audit.clone(),
+        ),
+        Arc::clone(&harness.connection.egress_client),
+        audit,
+        ToolExecutorBackends {
+            upstream_url: None,
+            connection_http: Some(replica_b.clone()),
+            mcp_catalog_runtime: None,
+            openapi_catalog_runtime: None,
+            mcp_upstream_servers: HashMap::new(),
+            mcp_upstream_runtime_config: McpUpstreamRuntimeConfig {
+                timeout: Duration::from_secs(30),
+                response_idle_timeout: Duration::from_secs(30),
+                connect_timeout: Duration::from_secs(10),
+                max_request_body_bytes: 1_048_576,
+                max_response_bytes: 5_242_880,
+            },
+        },
+    )
+    .expect("replica B's executor builds");
+    Replicas {
+        harness,
+        ledger,
+        replica_b,
+        executor_b,
+    }
+}
+
+impl Replicas {
+    async fn call_on_b(&self, caller: &Principal, request_id: &str) -> Value {
+        let result = self
+            .executor_b
+            .execute(
+                "read_mail",
+                json!({}),
+                context_for(caller, request_id),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("a delegated call on replica B succeeds");
+        let response = http_response(result);
+        assert_eq!(response.status, StatusCode::OK);
+        serde_json::from_slice(&response.body).expect("the upstream answers JSON")
+    }
+
+    /// What replica B's security gate does when it reconciles: applies every record so far.
+    fn reconcile_b(&self) -> usize {
+        let recorded = self.ledger.recorded();
+        let purges: Vec<RecordedPurge<'_>> = recorded
+            .iter()
+            .enumerate()
+            .map(|(index, key)| RecordedPurge {
+                security_revision: i64::try_from(index + 1).expect("a test ledger stays small"),
+                purge_key: Some(key.as_str()),
+            })
+            .collect();
+        self.replica_b
+            .apply_recorded_delegated_token_purges(&purges)
+    }
+
+    fn revoked_tokens(&self) -> Vec<String> {
+        let mut revoked = Vec::new();
+        self.harness.deployment.with_requests(|requests| {
+            for request in requests
+                .iter()
+                .filter(|request| request.target == REVOCATION_PATH)
+            {
+                revoked.extend(form_field(&form_fields(request), "token").map(str::to_owned));
+            }
+        });
+        revoked.sort();
+        revoked
+    }
+}
+
+#[tokio::test]
+async fn an_operators_purge_on_one_replica_retires_and_revokes_on_every_replica_once_each() {
+    let replicas = replicas().await;
+    let harness = &replicas.harness;
+    let alice = bearer("alice", &["mail:read"]);
+    let bob = bearer("bob", &["mail:read"]);
+    // Each replica exchanges for alice on its own; bob is served on B only.
+    harness.call(&alice, "request-a").await.expect("A's call");
+    replicas.call_on_b(&alice, "request-b").await;
+    replicas.call_on_b(&bob, "request-b-bob").await;
+    assert_eq!(harness.deployment.exchange_count(), 3);
+
+    let outcome = harness
+        .connection
+        .runtime
+        .purge_delegated_tokens_everywhere("https://idp.example.test/", "alice", operator_purge())
+        .await
+        .expect("the purge is recorded for every replica");
+    assert_eq!(
+        outcome,
+        DelegatedTokenPurgeOutcome {
+            purged_entries: 1,
+            security_revision: Some(1),
+        }
+    );
+    // One record, naming a digest and nothing else.
+    let recorded = replicas.ledger.recorded();
+    assert_eq!(recorded.len(), 1);
+    assert!(is_purge_key(&recorded[0]), "{}", recorded[0]);
+    // Replica B still holds alice's token until it reconciles the revision.
+    assert_eq!(replicas.replica_b.delegated_token_cache_entries(), 2);
+    assert_eq!(replicas.reconcile_b(), 1);
+    assert_eq!(
+        replicas.replica_b.delegated_token_cache_entries(),
+        1,
+        "only bob's token is left on B"
+    );
+    // Reconciling the same record again, as A's own gate does, finds nothing more.
+    assert_eq!(replicas.reconcile_b(), 0);
+    assert_eq!(
+        harness
+            .connection
+            .runtime
+            .apply_recorded_delegated_token_purges(&[RecordedPurge {
+                security_revision: 1,
+                purge_key: Some(recorded[0].as_str()),
+            }]),
+        0
+    );
+
+    // Each replica revoked the token it held, once: alice's two tokens, never bob's.
+    harness
+        .wait_for(audit::event::CONNECTION_DELEGATED_TOKEN_REVOCATION, 2)
+        .await;
+    assert_eq!(
+        replicas.revoked_tokens(),
+        ["delegated-alice-1", "delegated-alice-2"]
+    );
+
+    // One purge on each replica.
+    harness
+        .wait_for(audit::event::CONNECTION_DELEGATED_TOKEN_PURGE, 2)
+        .await;
+    let purges = harness.events_of(audit::event::CONNECTION_DELEGATED_TOKEN_PURGE);
+    let principal = json!({ "issuer": "https://idp.example.test", "subject": "alice" });
+    let on_a = &purges[0];
+    assert_eq!(on_a.payload["trigger"], json!("operator"));
+    assert_eq!(on_a.payload["principal"], principal);
+    assert_eq!(on_a.payload["purged_entries"], json!(1));
+    assert_eq!(
+        on_a.payload["replication"],
+        json!({ "outcome": "recorded", "security_revision": 1 })
+    );
+    assert_eq!(on_a.request_id, "request-purge");
+    let on_b = &purges[1];
+    assert_eq!(on_b.payload["trigger"], json!("replicated"));
+    assert_eq!(on_b.payload["principal"], principal);
+    assert_eq!(on_b.payload["purged_entries"], json!(1));
+    assert_eq!(
+        on_b.payload["replication"],
+        json!({ "outcome": "applied", "security_revision": 1 })
+    );
+    // Nobody asked B: its purge has no actor and no request of its own.
+    assert!(on_b.actor.is_none());
+    assert_eq!(on_b.request_id, "connection-delegated-token-purge");
+    for revocation in harness.events_of(audit::event::CONNECTION_DELEGATED_TOKEN_REVOCATION) {
+        assert_eq!(revocation.payload["outcome"], json!("success"));
+        assert!(
+            revocation.payload["purge_id"] == on_a.payload["purge_id"]
+                || revocation.payload["purge_id"] == on_b.payload["purge_id"]
+        );
+    }
+
+    // Alice's next call on B asks the issuer again; bob is still served from B's cache.
+    assert_eq!(
+        replicas.call_on_b(&alice, "request-b-again").await,
+        json!({ "mailbox": "alice" })
+    );
+    replicas.call_on_b(&bob, "request-b-bob-again").await;
+    assert_eq!(harness.deployment.exchange_count(), 4);
+}
+
+#[tokio::test]
+async fn a_purge_the_gate_will_not_record_reports_what_this_replica_purged() {
+    let replicas = replicas().await;
+    let harness = &replicas.harness;
+    let alice = bearer("alice", &["mail:read"]);
+    harness.call(&alice, "request-a").await.expect("A's call");
+    replicas.call_on_b(&alice, "request-b").await;
+    let refusal = PurgeNotRecorded::Refused {
+        reason: "capability_not_advertised",
+        detail: "a live member does not apply recorded purges".to_owned(),
+        members_lack_capability: true,
+    };
+    replicas.ledger.refuse_with(refusal.clone());
+
+    let failure = harness
+        .connection
+        .runtime
+        .purge_delegated_tokens_everywhere("https://idp.example.test", "alice", operator_purge())
+        .await
+        .expect_err("the record is refused");
+    assert_eq!(
+        failure,
+        DelegatedTokenPurgeFailure {
+            purged_entries: 1,
+            not_recorded: refusal,
+        }
+    );
+    // This replica's entry is gone and revoked; nothing reached B.
+    assert_eq!(
+        harness.connection.runtime.delegated_token_cache_entries(),
+        0
+    );
+    assert_eq!(replicas.reconcile_b(), 0);
+    assert_eq!(replicas.replica_b.delegated_token_cache_entries(), 1);
+    harness
+        .wait_for(audit::event::CONNECTION_DELEGATED_TOKEN_REVOCATION, 1)
+        .await;
+    assert_eq!(replicas.revoked_tokens(), ["delegated-alice-1"]);
+    harness
+        .wait_for(audit::event::CONNECTION_DELEGATED_TOKEN_PURGE, 1)
+        .await;
+    let purges = harness.events_of(audit::event::CONNECTION_DELEGATED_TOKEN_PURGE);
+    assert_eq!(
+        purges[0].payload["replication"],
+        json!({ "outcome": "not_recorded", "reason": "capability_not_advertised" })
+    );
+}
+
+#[tokio::test]
+async fn a_revoked_credential_is_recorded_for_every_replica_once_per_window() {
+    let replicas = replicas().await;
+    let harness = &replicas.harness;
+    let alice = bearer("alice", &["mail:read"]);
+    // Alice's token is cached on B only; the revoked JWT is presented to A.
+    replicas.call_on_b(&alice, "request-b").await;
+    let observer: &dyn crate::auth::RevokedCredentialObserver = &harness.connection.runtime;
+    observer.credential_revoked("https://idp.example.test", "alice");
+    harness
+        .wait_for(audit::event::CONNECTION_DELEGATED_TOKEN_PURGE, 1)
+        .await;
+    assert_eq!(replicas.ledger.recorded().len(), 1);
+    let on_a = &harness.events_of(audit::event::CONNECTION_DELEGATED_TOKEN_PURGE)[0];
+    assert_eq!(on_a.payload["trigger"], json!("credential_revoked"));
+    assert_eq!(on_a.payload["purged_entries"], json!(0));
+    assert_eq!(
+        on_a.payload["replication"],
+        json!({ "outcome": "recorded", "security_revision": 1 })
+    );
+
+    // B applies the record and revokes the token it held.
+    assert_eq!(replicas.reconcile_b(), 1);
+    assert_eq!(replicas.replica_b.delegated_token_cache_entries(), 0);
+    harness
+        .wait_for(audit::event::CONNECTION_DELEGATED_TOKEN_REVOCATION, 1)
+        .await;
+    assert_eq!(replicas.revoked_tokens(), ["delegated-alice-1"]);
+
+    // The same refused credential presented to A again records nothing more within the window,
+    // and with nothing to purge here it is not audited again.
+    observer.credential_revoked("https://idp.example.test", "alice");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(replicas.ledger.recorded().len(), 1);
+    assert_eq!(
+        harness
+            .events_of(audit::event::CONNECTION_DELEGATED_TOKEN_PURGE)
+            .len(),
+        2,
+        "A's record and B's application, and nothing for the repeat"
+    );
+}
+
+#[tokio::test]
+async fn a_record_this_build_cannot_read_purges_every_delegated_token() {
+    let replicas = replicas().await;
+    let alice = bearer("alice", &["mail:read"]);
+    let bob = bearer("bob", &["mail:read"]);
+    replicas.call_on_b(&alice, "request-b").await;
+    replicas.call_on_b(&bob, "request-b-bob").await;
+
+    assert_eq!(
+        replicas
+            .replica_b
+            .apply_recorded_delegated_token_purges(&[RecordedPurge {
+                security_revision: 9,
+                purge_key: Some("not-a-purge-key"),
+            }]),
+        2
+    );
+    assert_eq!(replicas.replica_b.delegated_token_cache_entries(), 0);
+    // Each principal purged is audited.
+    replicas
+        .harness
+        .wait_for(audit::event::CONNECTION_DELEGATED_TOKEN_PURGE, 2)
+        .await;
+    let purges = replicas
+        .harness
+        .events_of(audit::event::CONNECTION_DELEGATED_TOKEN_PURGE);
+    for purge in &purges {
+        assert_eq!(purge.payload["trigger"], json!("replicated"));
+        assert_eq!(
+            purge.payload["replication"],
+            json!({ "outcome": "applied", "security_revision": 9 })
+        );
+    }
+    // A record with no key at all is read the same way.
+    replicas.call_on_b(&alice, "request-b-again").await;
+    assert_eq!(
+        replicas
+            .replica_b
+            .apply_recorded_delegated_token_purges(&[RecordedPurge {
+                security_revision: 10,
+                purge_key: None,
+            }]),
+        1
+    );
 }

@@ -39,7 +39,8 @@ fn this_binary_advertises_a_bounded_canonical_set_it_recognizes() {
     let rendered = advertisement(BINARY_CAPABILITIES).expect("the shipped set fits the column");
     assert_eq!(
         rendered,
-        "openapi_swagger2_catalogs,operation_requirements,policy_role_descriptions"
+        "delegated_token_purges,openapi_swagger2_catalogs,operation_requirements,\
+         policy_role_descriptions"
     );
     let recognized = RecognizedCapabilities::parse(&rendered);
     assert_eq!(recognized.unrecognized(), 0);
@@ -49,6 +50,7 @@ fn this_binary_advertises_a_bounded_canonical_set_it_recognizes() {
     assert_eq!(
         recognized.names(),
         vec![
+            "delegated_token_purges",
             "openapi_swagger2_catalogs",
             "operation_requirements",
             "policy_role_descriptions"
@@ -65,6 +67,7 @@ fn a_prepared_members_advertisement_lacks_the_successors_capability() {
     assert!(prepared.contains(Capability::OperationRequirements));
     assert!(!prepared.contains(Capability::PolicyRoleDescriptions));
     assert!(!prepared.contains(Capability::OpenApiSwagger2Catalogs));
+    assert!(!prepared.contains(Capability::DelegatedTokenPurges));
     assert_eq!(prepared.unrecognized(), 0);
 }
 
@@ -254,9 +257,24 @@ mod gate_tests {
     fn the_shipped_registry_is_pinned_and_its_checks_reject_malformed_entries() {
         assert_eq!(
             OPERATION_REQUIREMENTS,
-            &[POLICY_ROLE_DESCRIPTIONS, OPENAPI_SWAGGER2_CATALOGS],
+            &[
+                POLICY_ROLE_DESCRIPTIONS,
+                OPENAPI_SWAGGER2_CATALOGS,
+                DELEGATED_TOKEN_PURGES
+            ],
             "registering an operation is a protocol change: review its requirement, its new \
              capability and the docs in ha-state-model.md section 7 before updating this test"
+        );
+        assert_eq!(
+            DELEGATED_TOKEN_PURGES,
+            OperationRequirement {
+                operation: "connections.delegated_token_purge",
+                minimum_schema: 17,
+                document_format: None,
+                capability: Capability::DelegatedTokenPurges,
+                backfill: Backfill::NotRequired,
+                activation: Activation::LiveMembers,
+            }
         );
         assert_eq!(
             OPENAPI_SWAGGER2_CATALOGS,
@@ -416,6 +434,61 @@ mod gate_tests {
             ),
             Err(OperationRefusal::MembersLackRequirement { .. })
         ));
+    }
+
+    /// Issue #441's operation against what the release before the purge
+    /// record advertises: refused while such a member is live, because it
+    /// would not apply the record, and admitted once only members of this
+    /// build remain.
+    #[test]
+    fn delegated_token_purges_wait_for_every_member_built_before_the_record() {
+        let earlier = member(
+            PEER,
+            true,
+            "openapi_swagger2_catalogs,operation_requirements,policy_role_descriptions",
+        );
+        let current = member(
+            OWN,
+            true,
+            "delegated_token_purges,openapi_swagger2_catalogs,operation_requirements,\
+             policy_role_descriptions",
+        );
+        assert_eq!(
+            gate(
+                &DELEGATED_TOKEN_PURGES,
+                &BinaryContract::shipped(),
+                OWN,
+                &[current.clone(), earlier.clone()]
+            ),
+            Err(OperationRefusal::MembersLackRequirement {
+                lacking: vec![PEER],
+                live: 2
+            })
+        );
+        // The earlier member still admits what it advertises.
+        assert_eq!(
+            gate(
+                &OPENAPI_SWAGGER2_CATALOGS,
+                &BinaryContract::shipped(),
+                OWN,
+                &[current.clone(), earlier]
+            ),
+            Ok(OperationAdmission { live_members: 2 })
+        );
+        let departed = member(
+            PEER,
+            false,
+            "openapi_swagger2_catalogs,operation_requirements,policy_role_descriptions",
+        );
+        assert_eq!(
+            gate(
+                &DELEGATED_TOKEN_PURGES,
+                &BinaryContract::shipped(),
+                OWN,
+                &[current, departed]
+            ),
+            Ok(OperationAdmission { live_members: 1 })
+        );
     }
 
     #[test]

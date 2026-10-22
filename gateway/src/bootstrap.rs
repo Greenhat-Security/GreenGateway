@@ -760,6 +760,38 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => None,
     };
+    // Delegated-token purges ride the same pool (issue #441). The revision
+    // is read before any listener serves, while this replica's cache is
+    // still empty, so nothing recorded at or below it can name a token the
+    // replica holds; the gate's resource applies only what is recorded
+    // above it.
+    #[cfg(feature = "postgres")]
+    let pg_delegated_token_purges_seed = match &_database_foundation {
+        Some(foundation) => {
+            let revisions = storage::SecurityRevisionSource::new(foundation.pool().clone());
+            // Boxed for the same reason as the journal's capacity below.
+            let revision = Box::pin(revisions.current()).await.map_err(|error| {
+                Box::<dyn std::error::Error>::from(format!(
+                    "the shared security revision could not be read for the delegated-token \
+                         purge record: {error}"
+                ))
+            })?;
+            let deployment_id = config.deployment_id.clone().ok_or_else(|| {
+                Box::<dyn std::error::Error>::from(
+                    "STATE_BACKEND=postgres requires DEPLOYMENT_ID for the delegated-token purge \
+                     record",
+                )
+            })?;
+            Some(ClusterDelegatedTokenPurgeSeed {
+                store: Arc::new(storage::PostgresDelegatedTokenPurgeStore::new(
+                    foundation.pool().clone(),
+                )),
+                deployment_id,
+                revision,
+            })
+        }
+        None => None,
+    };
     // Pending admin logins ride the same pool when an admin login provider
     // is configured. The keyring is loaded here, from files beneath the
     // secrets root, with the connections keyring's reader.
@@ -987,6 +1019,8 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
             pg_connections: pg_connections_seed,
             #[cfg(feature = "postgres")]
             pg_service_tokens: pg_service_tokens_seed,
+            #[cfg(feature = "postgres")]
+            pg_delegated_token_purges: pg_delegated_token_purges_seed,
             #[cfg(feature = "postgres")]
             pg_pending_logins: pg_pending_logins_seed,
             #[cfg(feature = "postgres")]
@@ -1466,6 +1500,25 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
         Arc::clone(&egress_client),
     )
     .with_audit(audit_log.clone());
+    // Cluster mode: a delegated-token purge is recorded for every replica,
+    // through the operation gate, before it is reported done (issue #441).
+    // Wired before the runtime is cloned into anything that purges.
+    #[cfg(feature = "postgres")]
+    let connection_http_runtime = match build_overrides.pg_delegated_token_purges.as_ref() {
+        Some(seed) => connection_http_runtime.with_delegated_token_purge_ledger(
+            security_cluster::delegated_tokens::ClusterDelegatedTokenPurgeLedger::new(
+                Arc::clone(&seed.store),
+                build_overrides.pg_membership.clone(),
+                audit_log.clone(),
+            ),
+            &seed.deployment_id,
+        ),
+        None => connection_http_runtime,
+    };
+    #[cfg(feature = "postgres")]
+    let delegated_token_purges_recorded = build_overrides.pg_delegated_token_purges.is_some();
+    #[cfg(not(feature = "postgres"))]
+    let delegated_token_purges_recorded = false;
     let proxy_egress_client = Arc::new(egress_client_for_build(
         proxy_egress_config.clone(),
         &build_overrides,
@@ -1906,6 +1959,21 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
             seed.revision,
         ));
     }
+    // Every replica applies each recorded delegated-token purge to its own
+    // cache before it serves another protected request (issue #441).
+    #[cfg(feature = "postgres")]
+    if let (Some(seed), Some(runtime)) = (
+        build_overrides.pg_delegated_token_purges.as_ref(),
+        cluster_security_runtime.as_ref(),
+    ) {
+        runtime.register_resource(
+            security_cluster::delegated_tokens::DelegatedTokenPurgesResource::new(
+                Arc::clone(&seed.store),
+                connection_http_runtime.clone(),
+                seed.revision,
+            ),
+        );
+    }
     // Every resource is registered; only now may the background reconciler
     // start. A pass that ran before tools or Connections registered would
     // confirm policy alone and advance the watermark past any commit those
@@ -2307,7 +2375,10 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
         audit_query_store: audit_query_store.clone(),
         discovery_store: discovery_read_store.clone(),
         rbac_state: rbac_state.clone(),
-        delegated_tokens: (config.state_backend == config::StateBackend::Sqlite)
+        // Cluster mode purges by principal only where the purge can be
+        // recorded for the other replicas; a build with no record refuses.
+        delegated_tokens: (config.state_backend == config::StateBackend::Sqlite
+            || delegated_token_purges_recorded)
             .then(|| connection_http_runtime.clone()),
         client_ip_policy: client_ip_policy.clone(),
         max_body_size: config.max_body_size,

@@ -7296,6 +7296,8 @@ async fn principal_delegated_token_revocation_needs_principals_write_and_a_well_
         json!({ "issuer": "https://idp.example.test", "subject": "alice" })
     );
     assert_eq!(purge.payload["purged_entries"], json!(0));
+    // Standalone mode has no other replica to tell.
+    assert_eq!(purge.payload["replication"], json!(null));
 
     for malformed in [
         "not json".to_owned(),
@@ -7319,7 +7321,8 @@ async fn principal_delegated_token_revocation_needs_principals_write_and_a_well_
 }
 
 #[tokio::test]
-async fn principal_delegated_token_revocation_is_refused_where_replicas_cache_their_own() {
+async fn principal_delegated_token_revocation_is_refused_where_the_purge_cannot_reach_every_replica(
+) {
     let policy = parse_policy_body(&Bytes::from(principal_policy_document_string()))
         .expect("principal policy should parse");
     let state = PrincipalAdminState {
@@ -7332,7 +7335,7 @@ async fn principal_delegated_token_revocation_is_refused_where_replicas_cache_th
             false,
             test_audit_log(),
         )),
-        // What cluster mode builds.
+        // What a cluster-mode build with no purge record builds.
         delegated_tokens: None,
         client_ip_policy: client_ip::ClientIpPolicy::from_config(&test_config(Vec::new())),
         max_body_size: 1_024,
@@ -7348,7 +7351,126 @@ async fn principal_delegated_token_revocation_is_refused_where_replicas_cache_th
     )
     .await;
     assert_eq!(response.status(), StatusCode::CONFLICT);
-    assert!(body_string(response).await.contains("cluster mode"));
+    assert!(body_string(response)
+        .await
+        .contains("cannot record the purge for the other replicas"));
+}
+
+/// A purge ledger that answers as `answer` says: what the endpoint sees of
+/// cluster mode's record, without a roster or a database behind it.
+struct ScriptedPurgeLedger {
+    answer: Result<i64, connections::token_exchange::PurgeNotRecorded>,
+}
+
+#[async_trait::async_trait]
+impl connections::token_exchange::DelegatedTokenPurgeLedger for ScriptedPurgeLedger {
+    async fn record(
+        &self,
+        _purge_key: &str,
+        _origin: &connections::token_exchange::DelegatedTokenPurgeTrigger,
+    ) -> Result<i64, connections::token_exchange::PurgeNotRecorded> {
+        self.answer.clone()
+    }
+}
+
+/// Cluster mode's contract (issue #441): `200` names the shared security
+/// revision every replica applies the purge at; a purge that could not be
+/// recorded for the other replicas is `409` while a live replica predates
+/// the record and `503` when the authority did not answer, each saying how
+/// many entries the answering replica purged anyway.
+#[tokio::test]
+async fn principal_delegated_token_revocation_in_cluster_mode_reports_the_record() {
+    use connections::token_exchange::PurgeNotRecorded;
+
+    let policy = parse_policy_body(&Bytes::from(principal_policy_document_string()))
+        .expect("principal policy should parse");
+    let state_with = |answer: Result<i64, PurgeNotRecorded>| {
+        let egress = egress::EgressConfig::default();
+        let client =
+            Arc::new(egress::EgressClient::new(egress.clone()).expect("egress client builds"));
+        PrincipalAdminState {
+            directory: auth::PrincipalDirectory::disabled(),
+            audit_query_store: None,
+            discovery_store: None,
+            rbac_state: Some(middleware::rbac::RbacState::new(
+                policy.clone(),
+                Vec::new(),
+                false,
+                test_audit_log(),
+            )),
+            delegated_tokens: Some(
+                connections::http::ConnectionHttpRuntime::new(
+                    connections::control_plane::ConnectionControlPlane::from_config(&test_config(
+                        Vec::new(),
+                    ))
+                    .expect("control plane builds"),
+                    egress,
+                    client,
+                )
+                .with_delegated_token_purge_ledger(
+                    Arc::new(ScriptedPurgeLedger { answer }),
+                    "deploy-endpoint",
+                ),
+            ),
+            client_ip_policy: client_ip::ClientIpPolicy::from_config(&test_config(Vec::new())),
+            max_body_size: 1_024,
+        }
+    };
+    let purge = |state: PrincipalAdminState| {
+        principal_delegated_tokens_revoke_endpoint(
+            State(state),
+            traffic_admin_json_request(
+                Method::POST,
+                PRINCIPAL_DELEGATED_TOKENS_REVOKE_ADMIN_ROUTE,
+                Some(test_principal(&["principal-writer"])),
+                Some(
+                    json!({ "issuer": "https://idp.example.test", "subject": "alice" }).to_string(),
+                ),
+            ),
+        )
+    };
+
+    let recorded = purge(state_with(Ok(42))).await;
+    assert_eq!(recorded.status(), StatusCode::OK);
+    assert_eq!(recorded.headers()[header::CACHE_CONTROL], "no-store");
+    assert_eq!(
+        json_body(recorded).await,
+        json!({ "purged_entries": 0, "security_revision": 42 })
+    );
+
+    let lacking = purge(state_with(Err(PurgeNotRecorded::Refused {
+        reason: "capability_not_advertised",
+        detail: "a live member does not advertise delegated_token_purges".to_owned(),
+        members_lack_capability: true,
+    })))
+    .await;
+    assert_eq!(lacking.status(), StatusCode::CONFLICT);
+    assert_eq!(lacking.headers()[header::CACHE_CONTROL], "no-store");
+    let body = json_body(lacking).await;
+    assert_eq!(body["reason"], json!("capability_not_advertised"));
+    assert_eq!(body["purged_entries"], json!(0));
+    assert!(body["error"]
+        .as_str()
+        .is_some_and(|error| error.contains("not recorded for the other replicas")));
+
+    let roster = purge(state_with(Err(PurgeNotRecorded::Refused {
+        reason: "roster_unavailable",
+        detail: "cluster membership could not be read".to_owned(),
+        members_lack_capability: false,
+    })))
+    .await;
+    assert_eq!(roster.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        json_body(roster).await["reason"],
+        json!("roster_unavailable")
+    );
+
+    let unavailable = purge(state_with(Err(PurgeNotRecorded::Unavailable))).await;
+    assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        json_body(unavailable).await["reason"],
+        json!("purge_not_recorded")
+    );
 }
 
 #[tokio::test]

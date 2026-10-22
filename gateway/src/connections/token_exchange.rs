@@ -30,10 +30,18 @@
 //! revocation (RFC 7009) when its Connection names a `revocation_url`. Revocation is best effort:
 //! it is attempted once, in the background, and audited as
 //! [`audit::event::CONNECTION_DELEGATED_TOKEN_REVOCATION`] whatever the issuer says.
+//!
+//! Each replica caches its own tokens, so in cluster mode a purge is also recorded at the
+//! authority (see [`DelegatedTokenPurgeLedger`]) as one shared security revision. Every replica's
+//! strict gate reconciles that revision -- applying the purge to the tokens it holds, and revoking
+//! each of them once -- before it serves another protected request (see
+//! [`DelegatedTokenRuntime::apply_recorded_purges`]). The record names a digest of the principal
+//! under the deployment ID, never the principal.
 
 use std::{
+    collections::{BTreeMap, HashMap},
     fmt,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -89,8 +97,26 @@ const TOKEN_TYPE_ACCESS_TOKEN: &str = "urn:ietf:params:oauth:token-type:access_t
 const EXCHANGE_AUDIT_REQUEST_ID: &str = "connection-delegated-token";
 
 /// The `request_id` of the audit events of a purge no request asked for: one a validator's refusal
-/// of a revoked credential started. Their `purge_id` joins them to each other.
+/// of a revoked credential started, or one another replica recorded. Their `purge_id` joins them to
+/// each other, and a recorded purge's `security_revision` joins every replica's events of it.
 const PURGE_AUDIT_REQUEST_ID: &str = "connection-delegated-token-purge";
+
+/// How long a purge a revoked credential started stays recorded for its principal (cluster mode):
+/// the same principal's refused credentials record nothing more on this replica until it ends.
+/// Every token exchanged before the record has expired by then, whatever its issuer said, and one
+/// exchanged after it came from a call whose credential still validated.
+const REVOKED_CREDENTIAL_RECORD_WINDOW: Duration =
+    Duration::from_secs(MAX_DELEGATED_TOKEN_CACHE_SECONDS);
+
+/// Most principals whose revoked-credential records this replica remembers at once. A replica
+/// that remembers this many fresh ones records the next purge anyway, unremembered.
+const MAX_REMEMBERED_REVOKED_CREDENTIAL_RECORDS: usize = MAX_DELEGATED_TOKEN_CACHE_ENTRIES;
+
+/// The waits before a revoked credential's purge is offered again to an authority that did not
+/// take it. Nobody waits on that record, so it is retried in the background; an operator's purge
+/// is not retried, because the operator is told and asks again.
+const REVOKED_CREDENTIAL_RECORD_RETRY_DELAYS: [Duration; 2] =
+    [Duration::from_millis(250), Duration::from_secs(1)];
 
 /// RFC 7009 section 2.1: the hint that the token being revoked is an access token.
 const TOKEN_TYPE_HINT_ACCESS_TOKEN: &str = "access_token";
@@ -208,15 +234,37 @@ pub(crate) struct SubjectTokenSettings {
     pub claims: Vec<PrincipalClaim>,
 }
 
+/// What a cache entry keeps beside its tokens, fixed when the entry is created.
+pub(crate) struct DelegatedTokenSlot {
+    /// The binding of the revision the tokens were exchanged under, so a purged token is revoked
+    /// at the issuer that issued it, whatever the Connection says now.
+    binding: DelegatedTokenBinding,
+    /// Whose tokens they are: the issuer and subject the key's principal digest is taken over, so
+    /// a purge another replica recorded -- which names only a digest -- is audited with the
+    /// principal it dropped.
+    issuer: String,
+    subject: String,
+}
+
+impl DelegatedTokenSlot {
+    fn new(binding: &DelegatedTokenBinding, caller: &AttestedCaller) -> Self {
+        let identity = caller.identity();
+        Self {
+            binding: binding.clone(),
+            issuer: identity.issuer.to_owned(),
+            subject: identity.subject.to_owned(),
+        }
+    }
+}
+
 /// A delegated token one call holds: injected as `Authorization: Bearer`, and dropped from the
 /// cache by an upstream `401`.
-pub(crate) type DelegatedTokenLease = OAuthTokenLease<DelegatedTokenError, DelegatedTokenBinding>;
+pub(crate) type DelegatedTokenLease = OAuthTokenLease<DelegatedTokenError, DelegatedTokenSlot>;
 
-/// The delegated-token cache. Each entry keeps the binding of the revision it was exchanged under,
-/// so a purged token is revoked at the issuer that issued it, whatever the Connection says now.
-type DelegatedTokenCache = OAuthTokenCache<DelegatedTokenError, DelegatedTokenBinding>;
+/// The delegated-token cache.
+type DelegatedTokenCache = OAuthTokenCache<DelegatedTokenError, DelegatedTokenSlot>;
 
-type RetiredDelegatedToken = RetiredTokenSlot<DelegatedTokenError, DelegatedTokenBinding>;
+type RetiredDelegatedToken = RetiredTokenSlot<DelegatedTokenError, DelegatedTokenSlot>;
 
 /// Why a principal's delegated tokens are purged.
 #[derive(Clone, Debug)]
@@ -231,6 +279,10 @@ pub enum DelegatedTokenPurgeTrigger {
     /// A validator refused one of the principal's credentials because it is revoked. The
     /// credential's signature was verified first, so the principal is the one its issuer named.
     CredentialRevoked,
+    /// A purge recorded at the authority (cluster mode), by another replica or by this one,
+    /// applied here when this replica reconciled the shared security revision it took. Its audit
+    /// names that revision.
+    Replicated,
 }
 
 impl DelegatedTokenPurgeTrigger {
@@ -238,8 +290,241 @@ impl DelegatedTokenPurgeTrigger {
         match self {
             Self::Operator { .. } => "operator",
             Self::CredentialRevoked => "credential_revoked",
+            Self::Replicated => "replicated",
         }
     }
+
+    /// The `request_id`, source address and actor of this purge's audit events: the operator's
+    /// when an operator asked for it, and none when nobody did.
+    pub(crate) fn audit_origin(&self) -> (&str, &str, Option<&Actor>) {
+        match self {
+            Self::Operator {
+                actor,
+                request_id,
+                source_ip,
+            } => (request_id.as_str(), source_ip.as_str(), Some(actor)),
+            Self::CredentialRevoked | Self::Replicated => {
+                (PURGE_AUDIT_REQUEST_ID, "internal", None)
+            }
+        }
+    }
+}
+
+/// Where cluster mode records a purge so that every replica applies it (issue #441).
+///
+/// Each replica caches the tokens it exchanged, so a purge applied on one replica alone leaves the
+/// others serving theirs. The authority's ledger asks the #426 operation gate whether every live
+/// replica applies recorded purges, then commits the record as one shared security revision; every
+/// replica's strict gate reconciles that revision, applying the purge, before it serves another
+/// protected request. Standalone mode has no ledger.
+#[async_trait::async_trait]
+pub(crate) trait DelegatedTokenPurgeLedger: Send + Sync {
+    /// Records a purge of the principal `purge_key` names and returns the shared security
+    /// revision it took. `origin` is what started the purge, for the audit of a refusal.
+    async fn record(
+        &self,
+        purge_key: &str,
+        origin: &DelegatedTokenPurgeTrigger,
+    ) -> Result<i64, PurgeNotRecorded>;
+}
+
+/// Why a purge this replica applied was not recorded for the others.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PurgeNotRecorded {
+    /// The operation gate refused the record, with its stable reason: a live replica does not
+    /// advertise that it applies recorded purges (`members_lack_capability`), or the gate could
+    /// not show that every one does. Nothing was written.
+    #[cfg_attr(not(any(test, feature = "postgres")), allow(dead_code))]
+    Refused {
+        reason: &'static str,
+        detail: String,
+        members_lack_capability: bool,
+    },
+    /// The authority did not take the record.
+    Unavailable,
+}
+
+impl PurgeNotRecorded {
+    /// The stable reason a purge's audit and an operator's refusal carry.
+    pub(crate) fn reason(&self) -> &'static str {
+        match self {
+            Self::Refused { reason, .. } => reason,
+            Self::Unavailable => "purge_not_recorded",
+        }
+    }
+}
+
+/// What an operator's purge did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DelegatedTokenPurgeOutcome {
+    /// Cache entries this replica purged.
+    pub purged_entries: usize,
+    /// The shared security revision the purge was recorded at for every replica to apply; `None`
+    /// in standalone mode, where there is no other replica.
+    pub security_revision: Option<i64>,
+}
+
+/// An operator's purge that this replica applied but could not record for the others.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DelegatedTokenPurgeFailure {
+    /// Cache entries this replica purged anyway.
+    pub purged_entries: usize,
+    pub not_recorded: PurgeNotRecorded,
+}
+
+/// Whether, and where, a purge was recorded for the other replicas: what its audit event's
+/// `replication` says.
+enum PurgeRecord {
+    /// Standalone mode: there is no other replica.
+    NotNeeded,
+    /// A purge a revoked credential of the same principal started was recorded by this replica
+    /// within [`REVOKED_CREDENTIAL_RECORD_WINDOW`], so this one was not recorded again.
+    RecentlyRecorded,
+    /// Recorded at this shared security revision, for every replica to apply.
+    Recorded(i64),
+    /// Not recorded: only this replica's cache was purged.
+    NotRecorded(PurgeNotRecorded),
+    /// The record at this shared security revision, applied on this replica.
+    Applied(i64),
+}
+
+impl PurgeRecord {
+    fn from_result(result: &Result<i64, PurgeNotRecorded>) -> Self {
+        match result {
+            Ok(revision) => Self::Recorded(*revision),
+            Err(not_recorded) => Self::NotRecorded(not_recorded.clone()),
+        }
+    }
+
+    fn audit(&self) -> serde_json::Value {
+        match self {
+            Self::NotNeeded => serde_json::Value::Null,
+            Self::RecentlyRecorded => json!({ "outcome": "recently_recorded" }),
+            Self::Recorded(revision) => {
+                json!({ "outcome": "recorded", "security_revision": revision })
+            }
+            Self::NotRecorded(not_recorded) => {
+                json!({ "outcome": "not_recorded", "reason": not_recorded.reason() })
+            }
+            Self::Applied(revision) => {
+                json!({ "outcome": "applied", "security_revision": revision })
+            }
+        }
+    }
+}
+
+/// The record a purge started: what the authority answered, once it has. Standalone mode, and a
+/// purge that did not need recording, has none.
+type PendingPurgeRecord = tokio::sync::oneshot::Receiver<Result<i64, PurgeNotRecorded>>;
+
+/// Cluster mode's half of the purge: the ledger, the deployment ID purge keys are derived under,
+/// and the principals whose revoked-credential purges were recorded lately.
+struct ClusterPurges {
+    ledger: Arc<dyn DelegatedTokenPurgeLedger>,
+    deployment_id: String,
+    revoked_credential_records: Mutex<HashMap<[u8; 32], Instant>>,
+}
+
+impl ClusterPurges {
+    fn purge_key(&self, principal: &[u8; 32]) -> String {
+        purge_key(&self.deployment_id, principal)
+    }
+
+    async fn record(
+        &self,
+        principal: &[u8; 32],
+        origin: &DelegatedTokenPurgeTrigger,
+    ) -> Result<i64, PurgeNotRecorded> {
+        self.ledger.record(&self.purge_key(principal), origin).await
+    }
+
+    /// Records a purge a revoked credential started, retrying an authority that did not take it.
+    /// A record that never lands is forgotten, so the principal's next refused credential tries
+    /// again; one the gate refused is not retried and stays remembered, because nothing will
+    /// change that within the window.
+    async fn record_revoked_credential(
+        &self,
+        principal: &[u8; 32],
+    ) -> Result<i64, PurgeNotRecorded> {
+        let origin = DelegatedTokenPurgeTrigger::CredentialRevoked;
+        let mut record = self.record(principal, &origin).await;
+        for delay in REVOKED_CREDENTIAL_RECORD_RETRY_DELAYS {
+            if record != Err(PurgeNotRecorded::Unavailable) {
+                break;
+            }
+            tokio::time::sleep(delay).await;
+            record = self.record(principal, &origin).await;
+        }
+        if record == Err(PurgeNotRecorded::Unavailable) {
+            self.records_guard().remove(principal);
+        }
+        record
+    }
+
+    /// Whether a purge `principal`'s revoked credential started should be recorded now: `false`
+    /// when one was recorded within [`REVOKED_CREDENTIAL_RECORD_WINDOW`]. Remembers it otherwise.
+    fn claim_revoked_credential_record(&self, principal: [u8; 32]) -> bool {
+        let now = Instant::now();
+        let fresh =
+            |at: &Instant| now.saturating_duration_since(*at) < REVOKED_CREDENTIAL_RECORD_WINDOW;
+        let mut records = self.records_guard();
+        if records.get(&principal).is_some_and(fresh) {
+            return false;
+        }
+        if records.len() >= MAX_REMEMBERED_REVOKED_CREDENTIAL_RECORDS {
+            records.retain(|_, at| fresh(at));
+        }
+        if records.len() < MAX_REMEMBERED_REVOKED_CREDENTIAL_RECORDS
+            || records.contains_key(&principal)
+        {
+            records.insert(principal, now);
+        }
+        true
+    }
+
+    fn records_guard(&self) -> std::sync::MutexGuard<'_, HashMap<[u8; 32], Instant>> {
+        // Only timestamps live here; a panic mid-update leaves a usable map.
+        self.revoked_credential_records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// One purge as the authority recorded it, for [`DelegatedTokenRuntime::apply_recorded_purges`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RecordedPurge<'a> {
+    /// The shared security revision the record took.
+    pub security_revision: i64,
+    /// The purge key the record carries. `None`, or a key that is not [`is_purge_key`], is a
+    /// record this build cannot read.
+    pub purge_key: Option<&'a str>,
+}
+
+/// The key a recorded purge names its principal by: SHA-256, in lowercase hex, over the deployment
+/// ID and the cache's principal digest. The deployment ID is the HA state model's domain separator,
+/// as it is for a revoked `jti`; the authority never learns the issuer or the subject.
+pub(crate) fn purge_key(deployment_id: &str, principal: &[u8; 32]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"greengateway:delegated-token-purge:v1\0");
+    digest.update((deployment_id.len() as u64).to_be_bytes());
+    digest.update(deployment_id.as_bytes());
+    digest.update(principal);
+    hex::encode(digest.finalize())
+}
+
+/// Whether `value` has the shape of a [`purge_key`]: a SHA-256 digest in lowercase hex.
+pub(crate) fn is_purge_key(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// One purge this replica started: how many entries it took here, and the record it is waiting
+/// on, if it needed one.
+struct StartedPurge {
+    purged: usize,
+    record: Option<PendingPurgeRecord>,
 }
 
 #[derive(Clone)]
@@ -247,6 +532,8 @@ pub(crate) struct DelegatedTokenRuntime {
     control_plane: ConnectionControlPlane,
     cache: Arc<DelegatedTokenCache>,
     audit: Option<AuditLog>,
+    /// Cluster mode's ledger; `None` in standalone mode.
+    cluster: Option<Arc<ClusterPurges>>,
 }
 
 impl fmt::Debug for DelegatedTokenRuntime {
@@ -255,6 +542,7 @@ impl fmt::Debug for DelegatedTokenRuntime {
             .debug_struct("DelegatedTokenRuntime")
             .field("cache_entries", &self.cache.slot_count())
             .field("audit_configured", &self.audit.is_some())
+            .field("cluster_purges", &self.cluster.is_some())
             .finish()
     }
 }
@@ -268,11 +556,28 @@ impl DelegatedTokenRuntime {
                 MAX_DELEGATED_TOKEN_CACHE_ENTRIES,
             )),
             audit: None,
+            cluster: None,
         }
     }
 
     pub(crate) fn with_audit(mut self, audit: AuditLog) -> Self {
         self.audit = Some(audit);
+        self
+    }
+
+    /// Cluster mode: records every purge in `ledger` for the other replicas, under purge keys
+    /// derived with `deployment_id`, and matches the purges they record against the same keys.
+    #[cfg_attr(not(any(test, feature = "postgres")), allow(dead_code))]
+    pub(crate) fn with_cluster_purges(
+        mut self,
+        ledger: Arc<dyn DelegatedTokenPurgeLedger>,
+        deployment_id: &str,
+    ) -> Self {
+        self.cluster = Some(Arc::new(ClusterPurges {
+            ledger,
+            deployment_id: deployment_id.to_owned(),
+            revoked_credential_records: Mutex::new(HashMap::new()),
+        }));
         self
     }
 
@@ -310,8 +615,26 @@ impl DelegatedTokenRuntime {
                 self.exchange(binding, caller).await?,
             ));
         }
+        let runtime = self.clone();
+        let exchanged_for = binding.clone();
+        let caller_for_exchange = caller.clone();
+        self.cache
+            .get_or_mint_with(
+                self.cache_key(binding, caller),
+                || DelegatedTokenSlot::new(binding, caller),
+                move || async move { runtime.exchange(&exchanged_for, &caller_for_exchange).await },
+            )
+            .await
+    }
+
+    /// Where `caller`'s token for `binding`'s upstream is cached.
+    fn cache_key(
+        &self,
+        binding: &DelegatedTokenBinding,
+        caller: &AttestedCaller,
+    ) -> OAuthTokenCacheKey {
         let identity = caller.identity();
-        let key = OAuthTokenCacheKey {
+        OAuthTokenCacheKey {
             connection_id: binding.connection_id.to_string(),
             connection_etag: binding.connection_etag.clone(),
             subject: Some(subject_digest(caller)),
@@ -330,17 +653,32 @@ impl DelegatedTokenRuntime {
                 .control_plane
                 .local_secret_version(&binding.client_secret_id),
             egress_generation: binding.token_client.configuration_generation(),
-        };
-        let runtime = self.clone();
-        let exchanged_for = binding.clone();
-        let caller = caller.clone();
-        self.cache
+        }
+    }
+
+    /// Caches `token` for `caller` under `binding` exactly where an exchange would, without one,
+    /// so a test can fill a replica's cache without an issuer.
+    #[cfg(test)]
+    pub(crate) async fn cache_token_for_test(
+        &self,
+        binding: &DelegatedTokenBinding,
+        caller: &AttestedCaller,
+        token: &'static str,
+    ) {
+        let lease = self
+            .cache
             .get_or_mint_with(
-                key,
-                || binding.clone(),
-                move || async move { runtime.exchange(&exchanged_for, &caller).await },
+                self.cache_key(binding, caller),
+                || DelegatedTokenSlot::new(binding, caller),
+                move || async move {
+                    Ok(MintedOAuthToken {
+                        access_token: Zeroizing::new(token.as_bytes().to_vec()),
+                        lifetime: Duration::from_secs(MAX_DELEGATED_TOKEN_CACHE_SECONDS),
+                    })
+                },
             )
-            .await
+            .await;
+        assert!(lease.is_ok(), "a test token caches");
     }
 
     /// Drops every token cached for the principal `issuer` and `subject` name, under every
@@ -354,40 +692,219 @@ impl DelegatedTokenRuntime {
     /// `delegated_token_unavailable`.
     ///
     /// An operator's purge is audited even when it finds nothing. One a revoked credential started
-    /// is audited only when it purged something, because the same refused credential can be
-    /// presented any number of times.
+    /// is audited only when it purged something or was recorded for the other replicas, because
+    /// the same refused credential can be presented any number of times.
+    ///
+    /// In cluster mode the purge is also recorded for every other replica (see
+    /// [`DelegatedTokenPurgeLedger`]), in the background: this returns once this replica's entries
+    /// are gone. An operator's purge waits for the record instead, through
+    /// [`Self::purge_principal_everywhere`]. A revoked credential's purge is recorded at most once
+    /// per principal per [`REVOKED_CREDENTIAL_RECORD_WINDOW`] on this replica, and retried a
+    /// little when the authority does not take it.
     pub(crate) fn purge_principal(
         &self,
         issuer: &str,
         subject: &str,
         trigger: DelegatedTokenPurgeTrigger,
     ) -> usize {
-        let Some(issuer) = canonical_issuer(issuer) else {
-            return 0;
+        self.start_purge(issuer, subject, trigger)
+            .map_or(0, |started| started.purged)
+    }
+
+    /// An operator's purge: [`Self::purge_principal`], and then, in cluster mode, the record that
+    /// carries it to every other replica, which this waits for.
+    ///
+    /// `Err` means this replica's entries are gone but the others' may not be: the operation gate
+    /// refused the record -- a live replica does not apply recorded purges, or the gate could not
+    /// show that every one does -- or the authority did not take it. Asking again purges again and
+    /// records again; a purge that was recorded is never undone by one that was not.
+    pub(crate) async fn purge_principal_everywhere(
+        &self,
+        issuer: &str,
+        subject: &str,
+        trigger: DelegatedTokenPurgeTrigger,
+    ) -> Result<DelegatedTokenPurgeOutcome, DelegatedTokenPurgeFailure> {
+        let Some(started) = self.start_purge(issuer, subject, trigger) else {
+            // An issuer with no canonical form names nobody any replica could have cached.
+            return Ok(DelegatedTokenPurgeOutcome {
+                purged_entries: 0,
+                security_revision: None,
+            });
         };
+        let purged_entries = started.purged;
+        let Some(record) = started.record else {
+            return Ok(DelegatedTokenPurgeOutcome {
+                purged_entries,
+                security_revision: None,
+            });
+        };
+        // The record runs in a task of its own, so an operator who stops waiting cannot cancel it,
+        // its audit, or the revocations behind it. A task that ended without answering took
+        // nothing.
+        match record.await.unwrap_or(Err(PurgeNotRecorded::Unavailable)) {
+            Ok(revision) => Ok(DelegatedTokenPurgeOutcome {
+                purged_entries,
+                security_revision: Some(revision),
+            }),
+            Err(not_recorded) => Err(DelegatedTokenPurgeFailure {
+                purged_entries,
+                not_recorded,
+            }),
+        }
+    }
+
+    /// Retires the principal's entries here and starts what follows: the record for the other
+    /// replicas, when one is needed, the audit and the revocations. `None` when there was nothing
+    /// to purge and nothing to record or audit.
+    fn start_purge(
+        &self,
+        issuer: &str,
+        subject: &str,
+        trigger: DelegatedTokenPurgeTrigger,
+    ) -> Option<StartedPurge> {
+        let issuer = canonical_issuer(issuer)?;
         let principal = principal_digest(&issuer, subject);
         let retired = self
             .cache
             .retire_where(|key| key.principal == Some(principal));
         let purged = retired.len();
-        if purged == 0 && matches!(trigger, DelegatedTokenPurgeTrigger::CredentialRevoked) {
-            return 0;
+        let revoked_credential = matches!(trigger, DelegatedTokenPurgeTrigger::CredentialRevoked);
+        let pending = match self.cluster.as_ref() {
+            None => Err(PurgeRecord::NotNeeded),
+            Some(cluster)
+                if revoked_credential && !cluster.claim_revoked_credential_record(principal) =>
+            {
+                Err(PurgeRecord::RecentlyRecorded)
+            }
+            Some(cluster) => Ok(Arc::clone(cluster)),
+        };
+        if purged == 0 && revoked_credential && pending.is_err() {
+            return None;
         }
-        let purge = Arc::new(DelegatedTokenPurge {
+        let purge = DelegatedTokenPurge {
             audit: self.audit.clone(),
             purge_id: uuid::Uuid::new_v4().to_string(),
             trigger,
             issuer,
             subject: subject.to_owned(),
+        };
+        let cluster = match pending {
+            Ok(cluster) => cluster,
+            Err(record) => {
+                purge.emit(purged, &record);
+                self.revoke_in_background(purge, retired);
+                return Some(StartedPurge {
+                    purged,
+                    record: None,
+                });
+            }
+        };
+        let (answer, record) = tokio::sync::oneshot::channel();
+        let runtime = self.clone();
+        // Detached, like an exchange: the request that asked for the purge may end before the
+        // authority or the issuers answer, and must not cancel the record, the revocations or
+        // their audit. The purge is audited once the record's fate is known, so its event says
+        // whether the other replicas were told.
+        tokio::spawn(async move {
+            let recorded = if revoked_credential {
+                cluster.record_revoked_credential(&principal).await
+            } else {
+                cluster.record(&principal, &purge.trigger).await
+            };
+            purge.emit(purged, &PurgeRecord::from_result(&recorded));
+            // The operator may have stopped waiting; the outcome is in the audit either way.
+            drop(answer.send(recorded));
+            runtime.revoke_retired(&purge, retired).await;
         });
-        purge.emit(purged);
-        if !retired.is_empty() {
-            let runtime = self.clone();
-            // Detached, like an exchange: the request that asked for the purge may end before the
-            // issuers answer, and must not cancel their revocations or their audit.
-            tokio::spawn(async move { runtime.revoke_retired(&purge, retired).await });
+        Some(StartedPurge {
+            purged,
+            record: Some(record),
+        })
+    }
+
+    /// Applies purges recorded at the authority (cluster mode) to this replica's cache, and returns
+    /// how many entries that took: every token cached for a principal a record names leaves the
+    /// cache and is revoked at its issuer, exactly as a purge started here. The replica that
+    /// recorded a purge applies it too, which takes whatever its principal was exchanged for
+    /// between its own purge and the record.
+    ///
+    /// A record this build cannot read -- no key, or one of the wrong shape -- cannot be matched
+    /// against anyone, so it purges every delegated token this replica caches rather than none.
+    /// Each principal purged is audited once, with the latest record that named them.
+    pub(crate) fn apply_recorded_purges(&self, purges: &[RecordedPurge<'_>]) -> usize {
+        let Some(cluster) = self.cluster.as_ref() else {
+            return 0;
+        };
+        let mut named: HashMap<&str, i64> = HashMap::new();
+        let mut unreadable: Option<i64> = None;
+        for purge in purges {
+            let revision = purge.security_revision;
+            match purge.purge_key.filter(|key| is_purge_key(key)) {
+                Some(key) => {
+                    let latest = named.entry(key).or_insert(revision);
+                    *latest = (*latest).max(revision);
+                }
+                None => unreadable = Some(unreadable.map_or(revision, |seen| seen.max(revision))),
+            }
+        }
+        if let Some(revision) = unreadable {
+            tracing::error!(
+                security_revision = revision,
+                "a recorded delegated-token purge names its principal in a form this build cannot \
+                 read; every delegated token this replica caches is purged instead"
+            );
+        }
+        if named.is_empty() && unreadable.is_none() {
+            return 0;
+        }
+        let retired = self.cache.retire_where(|key| {
+            key.principal.is_some_and(|principal| {
+                unreadable.is_some() || named.contains_key(cluster.purge_key(&principal).as_str())
+            })
+        });
+        let purged = retired.len();
+        let mut by_principal: BTreeMap<(String, String), Vec<RetiredDelegatedToken>> =
+            BTreeMap::new();
+        for slot in retired {
+            let context = slot.context();
+            by_principal
+                .entry((context.issuer.clone(), context.subject.clone()))
+                .or_default()
+                .push(slot);
+        }
+        for ((issuer, subject), retired) in by_principal {
+            let key = cluster.purge_key(&principal_digest(&issuer, &subject));
+            let security_revision = named
+                .get(key.as_str())
+                .copied()
+                .or(unreadable)
+                .unwrap_or_default();
+            let purge = DelegatedTokenPurge {
+                audit: self.audit.clone(),
+                purge_id: uuid::Uuid::new_v4().to_string(),
+                trigger: DelegatedTokenPurgeTrigger::Replicated,
+                issuer,
+                subject,
+            };
+            purge.emit(retired.len(), &PurgeRecord::Applied(security_revision));
+            self.revoke_in_background(purge, retired);
         }
         purged
+    }
+
+    /// Revokes `retired` in a task of its own, as [`Self::revoke_retired`] does.
+    fn revoke_in_background(
+        &self,
+        purge: DelegatedTokenPurge,
+        retired: Vec<RetiredDelegatedToken>,
+    ) {
+        if retired.is_empty() {
+            return;
+        }
+        let runtime = self.clone();
+        // Detached, like an exchange: the request that asked for the purge may end before the
+        // issuers answer, and must not cancel their revocations or their audit.
+        tokio::spawn(async move { runtime.revoke_retired(&purge, retired).await });
     }
 
     /// Revokes each retired token at its issuer, one after another, once any exchange still in
@@ -401,7 +918,7 @@ impl DelegatedTokenRuntime {
             let Some(token) = slot.take_token().await else {
                 continue;
             };
-            let binding = slot.context();
+            let binding = &slot.context().binding;
             let mut attempt = RevocationAttempt::new(purge, binding);
             let result = self.revoke(binding, &token, &mut attempt).await;
             drop(token);
@@ -857,7 +1374,7 @@ struct DelegatedTokenPurge {
 }
 
 impl DelegatedTokenPurge {
-    fn emit(&self, purged: usize) {
+    fn emit(&self, purged: usize, replication: &PurgeRecord) {
         metrics::counter!(
             "connection_delegated_token_purge_total",
             "trigger" => self.trigger.label()
@@ -870,37 +1387,25 @@ impl DelegatedTokenPurge {
                 "trigger": self.trigger.label(),
                 "principal": { "issuer": self.issuer, "subject": self.subject },
                 "purged_entries": purged,
+                "replication": replication.audit(),
             }),
         );
     }
 
     /// An event of this purge: the operator's actor and request when an operator asked for it,
-    /// none when a revoked credential did.
+    /// none when a revoked credential or another replica's record did.
     fn audit_event(&self, event_type: &str, payload: serde_json::Value) {
         let Some(audit) = self.audit.as_ref() else {
             return;
         };
-        let event = match &self.trigger {
-            DelegatedTokenPurgeTrigger::Operator {
-                actor,
-                request_id,
-                source_ip,
-            } => AuditEvent::new(
-                event_type,
-                request_id.as_str(),
-                source_ip.as_str(),
-                Some(actor.clone()),
-                payload,
-            ),
-            DelegatedTokenPurgeTrigger::CredentialRevoked => AuditEvent::new(
-                event_type,
-                PURGE_AUDIT_REQUEST_ID,
-                "internal",
-                None,
-                payload,
-            ),
-        };
-        audit.emit(event);
+        let (request_id, source_ip, actor) = self.trigger.audit_origin();
+        audit.emit(AuditEvent::new(
+            event_type,
+            request_id,
+            source_ip,
+            actor.cloned(),
+            payload,
+        ));
     }
 }
 

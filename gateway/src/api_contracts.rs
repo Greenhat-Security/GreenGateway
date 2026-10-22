@@ -263,9 +263,14 @@ pub(super) struct PrincipalDelegatedTokensRevokeRequest {
 
 #[derive(Serialize)]
 pub(super) struct PrincipalDelegatedTokensRevokeResponse {
-    /// Cache entries purged. Each one holding a token is then revoked at its
-    /// issuer in the background, and audited.
+    /// Cache entries purged on the replica that answered. Each one holding a
+    /// token is then revoked at its issuer in the background, and audited.
     pub(super) purged_entries: usize,
+    /// Cluster mode: the shared security revision the purge was recorded
+    /// at. Every replica applies it before it serves a protected request
+    /// at or past that revision. Absent in standalone mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) security_revision: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -1105,6 +1110,12 @@ pub(super) struct GatewayAppBuildOverrides {
     /// store.
     #[cfg(feature = "postgres")]
     pub(super) pg_service_tokens: Option<ClusterServiceTokenSeed>,
+    /// The cluster-mode record of delegated-token purges and the security
+    /// revision `run()` read before this replica could cache a token (issue
+    /// #441). None in standalone mode, where the one process's cache is the
+    /// only one.
+    #[cfg(feature = "postgres")]
+    pub(super) pg_delegated_token_purges: Option<ClusterDelegatedTokenPurgeSeed>,
     /// The cluster-mode pending-login store: the pool, the deployment ID
     /// the digests and associated data bind, and the loaded login keyring.
     /// None in standalone mode, or when no admin login provider is set.
@@ -1301,6 +1312,17 @@ pub(super) struct ClusterServiceTokenSeed {
     /// the validator chain where only the seed reaches.
     pub(super) pool: deadpool_postgres::Pool,
     pub(super) deployment_id: String,
+}
+
+/// The cluster-mode record of delegated-token purges (issue #441): the
+/// store, the deployment ID purge keys are derived under, and the shared
+/// security revision read before the replica served, below which no
+/// recorded purge can name a token it holds.
+#[cfg(feature = "postgres")]
+pub(super) struct ClusterDelegatedTokenPurgeSeed {
+    pub(super) store: Arc<storage::PostgresDelegatedTokenPurgeStore>,
+    pub(super) deployment_id: String,
+    pub(super) revision: i64,
 }
 
 #[cfg(feature = "postgres")]

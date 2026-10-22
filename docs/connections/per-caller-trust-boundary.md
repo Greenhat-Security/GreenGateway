@@ -62,8 +62,10 @@ From most to least sensitive:
   token is used for, by binding manual tools to a delegated Connection.
   HTTP direct rules and tool policy still apply to every call.
 - **`admin:principals:write`.** It purges a principal's cached tokens and
-  revokes them at the issuer. That costs the user a fresh exchange on their
-  next call; it cannot obtain a token.
+  revokes them at the issuer, on every replica in cluster mode. That costs
+  the user a fresh exchange on their next call, and each purge moves the
+  shared security revision every replica reconciles; it cannot obtain a
+  token.
 - **A gateway replica's memory.** It holds up to 1,024 cached tokens, each for
   at most 900 seconds, and resolved secrets while they are in use. As
   ADR-0006's threat model records, process memory and privileged host
@@ -182,7 +184,7 @@ and enforces nothing.
 | `connection.delegated_token_exchange` | On every exchange: each token the issuer hands out | The caller as `actor`, `connection_id`, outcome and reason, `subject_token.kid` and `subject_token.jti`, issuer status and registered error code. Its `request_id` is the fixed `connection-delegated-token`, because one token serves many calls. |
 | `tool.upstream_request` | On every tool request, cached token or not | The caller as `actor`, `connection_id`, tool, method and outcome; when the request carried an assertion upstream, its `kid` and `jti` (`jti_base` and `count` for a managed MCP session). |
 | `connection.caller_assertion` | On every proxied request on an attested route | The caller as `actor`, the route, outcome, and the `kid` and `jti` or the refusal reason. |
-| `connection.delegated_token_purge` and `connection.delegated_token_revocation` | On every operator purge, on every purge a revoked JWT started that dropped something, and on each token a purge revokes | `purge_id`, trigger, principal, entry count; per token, the revocation outcome and reason. |
+| `connection.delegated_token_purge` and `connection.delegated_token_revocation` | On every operator purge, on every purge a revoked JWT started that dropped something or was recorded for the other replicas, on each replica a recorded purge dropped something on, and on each token a purge revokes | `purge_id`, trigger, principal, entry count and, in cluster mode, `replication` with the shared `security_revision`; per token, the revocation outcome and reason. |
 | `connection.secret_resolution_failed` | When a signing key or client secret cannot be read or loaded | The fixed reason, never the alias or the material. |
 
 A call served from the cache emits no exchange event. Join an exchange to the
@@ -209,19 +211,21 @@ When a user is disabled:
 
 1. Disable the user at their identity provider.
 2. Stop the gateway serving their cached tokens and revoke those tokens at the
-   issuer:
-   - **Standalone:** `POST /v1{ADMIN_PREFIX}/principal/delegated-tokens/revoke`
-     with their issuer and subject (`admin:principals:write`). See
-     [Purging a principal's tokens](operator-guide.md#purging-a-principals-tokens).
-   - **Cluster mode:** that endpoint is refused with `409`, because nothing
-     carries a purge between replicas. Revoke their outstanding JWTs with
-     `gateway revoke-jwt` (see [JWT revocations](../deployment/postgres.md#jwt-revocations));
-     each replica that refuses one purges its own cache for that principal.
-     This needs tokens with a `jti`: set `require_jti: true` on every JWT
-     provider whose tokens you may need to withdraw. To stop every cached
-     token of the Connection on every replica, for all of its users, disable
-     the delegated Connection instead: each replica stops serving them at its
-     next reconcile, and none is revoked at the issuer.
+   issuer: `POST /v1{ADMIN_PREFIX}/principal/delegated-tokens/revoke` with
+   their issuer and subject (`admin:principals:write`). See
+   [Purging a principal's tokens](operator-guide.md#purging-a-principals-tokens).
+   In cluster mode the purge is recorded for every replica, and `200` names
+   the shared `security_revision` each one applies it at before serving
+   again; a `409` or `503` means only the replica that answered was purged,
+   so finish the rollout or restore the authority and ask again. Revoking
+   their outstanding JWTs with `gateway revoke-jwt` (see
+   [JWT revocations](../deployment/postgres.md#jwt-revocations)) purges every
+   replica too, the first time one is refused; it needs tokens with a `jti`,
+   so set `require_jti: true` on every JWT provider whose tokens you may need
+   to withdraw. To stop every cached token of the Connection on every
+   replica, for all of its users, disable the delegated Connection instead:
+   each replica stops serving them at its next reconcile, and none is
+   revoked at the issuer.
 3. Revoke the user's grant at the issuer. A purge does not stop a user whose
    credentials still validate and whose grant the issuer still holds: their
    next call simply exchanges again.

@@ -730,3 +730,145 @@ async fn an_exchange_that_never_finishes_is_audited_as_cancelled_without_token_m
         assert!(!rendered.contains(absent), "audit leaked {absent:?}");
     }
 }
+
+#[test]
+fn a_purge_key_is_a_digest_of_the_principal_under_the_deployment() {
+    let alice = alice();
+    let identity = alice.identity();
+    let principal = principal_digest(identity.issuer, identity.subject);
+    let key = purge_key("deploy-a", &principal);
+    assert!(is_purge_key(&key), "{key}");
+    assert_eq!(key, purge_key("deploy-a", &principal), "the key is stable");
+    // Another deployment, or another principal, is another key; the key
+    // carries neither the issuer nor the subject.
+    assert_ne!(key, purge_key("deploy-b", &principal));
+    assert_ne!(
+        key,
+        purge_key("deploy-a", &principal_digest(identity.issuer, "bob"))
+    );
+    assert!(!key.contains("alice") && !key.contains("idp"));
+    assert!(is_purge_key(&"0".repeat(64)));
+    assert!(is_purge_key(&"f".repeat(64)));
+    for malformed in [
+        String::new(),
+        "F".repeat(64),
+        "g".repeat(64),
+        "a".repeat(63),
+        "a".repeat(65),
+        format!("{} ", "a".repeat(63)),
+    ] {
+        assert!(!is_purge_key(&malformed), "{malformed:?}");
+    }
+}
+
+/// A ledger that takes nothing: the window tests never reach it.
+struct UnreachedLedger;
+
+#[async_trait::async_trait]
+impl DelegatedTokenPurgeLedger for UnreachedLedger {
+    async fn record(
+        &self,
+        _purge_key: &str,
+        _origin: &DelegatedTokenPurgeTrigger,
+    ) -> Result<i64, PurgeNotRecorded> {
+        Err(PurgeNotRecorded::Unavailable)
+    }
+}
+
+fn cluster_purges() -> ClusterPurges {
+    ClusterPurges {
+        ledger: Arc::new(UnreachedLedger),
+        deployment_id: "deploy-window".to_owned(),
+        revoked_credential_records: Mutex::new(HashMap::new()),
+    }
+}
+
+/// The same refused credential can be presented any number of times, so a
+/// replica records its principal's purge once per window, and every other
+/// principal's on their own.
+#[test]
+fn a_revoked_credential_is_recorded_once_per_principal_per_window() {
+    let cluster = cluster_purges();
+    let alice = principal_digest("https://idp.example.test", "alice");
+    let bob = principal_digest("https://idp.example.test", "bob");
+    assert!(cluster.claim_revoked_credential_record(alice));
+    assert!(!cluster.claim_revoked_credential_record(alice));
+    assert!(cluster.claim_revoked_credential_record(bob));
+
+    // Once the window has passed, the principal is recorded again.
+    let expired = Instant::now()
+        .checked_sub(REVOKED_CREDENTIAL_RECORD_WINDOW + Duration::from_secs(1))
+        .expect("the test clock reaches back one window");
+    cluster.records_guard().insert(alice, expired);
+    assert!(cluster.claim_revoked_credential_record(alice));
+    assert!(!cluster.claim_revoked_credential_record(alice));
+}
+
+/// A replica remembers a bounded number of principals. When every slot
+/// holds a fresh record it records the next principal's purge anyway --
+/// never skipping one it cannot remember -- and expired records make room.
+#[test]
+fn a_full_record_window_records_anyway_and_makes_room_from_expired_entries() {
+    let cluster = cluster_purges();
+    for index in 0..MAX_REMEMBERED_REVOKED_CREDENTIAL_RECORDS {
+        assert!(cluster.claim_revoked_credential_record(principal_digest(
+            "https://idp.example.test",
+            &format!("user-{index}"),
+        )));
+    }
+    let late = principal_digest("https://idp.example.test", "late");
+    assert!(cluster.claim_revoked_credential_record(late));
+    assert!(
+        cluster.claim_revoked_credential_record(late),
+        "a principal the full window could not remember is recorded every time"
+    );
+    assert_eq!(
+        cluster.records_guard().len(),
+        MAX_REMEMBERED_REVOKED_CREDENTIAL_RECORDS
+    );
+
+    let expired = Instant::now()
+        .checked_sub(REVOKED_CREDENTIAL_RECORD_WINDOW + Duration::from_secs(1))
+        .expect("the test clock reaches back one window");
+    cluster
+        .records_guard()
+        .values_mut()
+        .for_each(|at| *at = expired);
+    assert!(cluster.claim_revoked_credential_record(late));
+    assert!(!cluster.claim_revoked_credential_record(late));
+    assert_eq!(
+        cluster.records_guard().len(),
+        1,
+        "expired records made room"
+    );
+}
+
+#[test]
+fn a_purges_replication_is_audited_by_outcome() {
+    assert_eq!(PurgeRecord::NotNeeded.audit(), serde_json::Value::Null);
+    assert_eq!(
+        PurgeRecord::Recorded(7).audit(),
+        json!({ "outcome": "recorded", "security_revision": 7 })
+    );
+    assert_eq!(
+        PurgeRecord::Applied(7).audit(),
+        json!({ "outcome": "applied", "security_revision": 7 })
+    );
+    assert_eq!(
+        PurgeRecord::RecentlyRecorded.audit(),
+        json!({ "outcome": "recently_recorded" })
+    );
+    assert_eq!(
+        PurgeRecord::NotRecorded(PurgeNotRecorded::Unavailable).audit(),
+        json!({ "outcome": "not_recorded", "reason": "purge_not_recorded" })
+    );
+    assert_eq!(
+        PurgeRecord::NotRecorded(PurgeNotRecorded::Refused {
+            reason: "capability_not_advertised",
+            detail: "a live member lacks it".to_owned(),
+            members_lack_capability: true,
+        })
+        .audit(),
+        json!({ "outcome": "not_recorded", "reason": "capability_not_advertised" })
+    );
+}

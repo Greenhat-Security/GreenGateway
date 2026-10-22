@@ -36,7 +36,8 @@ use super::{
     store::{ConnectionDependencyKind, StoredConnection},
     token_exchange::{
         DelegatedTokenBinding, DelegatedTokenError, DelegatedTokenLease,
-        DelegatedTokenPurgeTrigger, DelegatedTokenRuntime, SubjectTokenSettings,
+        DelegatedTokenPurgeFailure, DelegatedTokenPurgeLedger, DelegatedTokenPurgeOutcome,
+        DelegatedTokenPurgeTrigger, DelegatedTokenRuntime, RecordedPurge, SubjectTokenSettings,
     },
 };
 
@@ -54,7 +55,8 @@ pub struct ConnectionHttpRuntime {
 
 /// A validator's refusal of a revoked credential purges the principal's delegated tokens: whatever
 /// else that principal still holds, nothing exchanged for them before the revocation is served
-/// again without asking the issuer.
+/// again without asking the issuer. In cluster mode the purge is recorded for every replica, not
+/// only the one the credential was presented to.
 impl crate::auth::RevokedCredentialObserver for ConnectionHttpRuntime {
     fn credential_revoked(&self, issuer: &str, subject: &str) {
         self.purge_delegated_tokens(
@@ -637,10 +639,23 @@ impl ConnectionHttpRuntime {
         self
     }
 
+    /// Cluster mode: records every delegated-token purge in `ledger`, under purge keys derived
+    /// with `deployment_id`, so every replica applies it (issue #441).
+    #[cfg_attr(not(any(test, feature = "postgres")), allow(dead_code))]
+    pub(crate) fn with_delegated_token_purge_ledger(
+        mut self,
+        ledger: Arc<dyn DelegatedTokenPurgeLedger>,
+        deployment_id: &str,
+    ) -> Self {
+        self.delegated = self.delegated.with_cluster_purges(ledger, deployment_id);
+        self
+    }
+
     /// Purges every delegated token this process caches for the principal `issuer` and `subject`
     /// name, under every `delegated_issuer_token` Connection, and revokes each at its issuer in
     /// the background where the Connection names a `revocation_url`. Returns how many cache
-    /// entries were purged. Each replica holds its own cache, so this purges this process's only.
+    /// entries were purged. Each replica holds its own cache: in cluster mode the purge is also
+    /// recorded, in the background, for every other replica to apply.
     pub fn purge_delegated_tokens(
         &self,
         issuer: &str,
@@ -648,6 +663,29 @@ impl ConnectionHttpRuntime {
         trigger: DelegatedTokenPurgeTrigger,
     ) -> usize {
         self.delegated.purge_principal(issuer, subject, trigger)
+    }
+
+    /// [`Self::purge_delegated_tokens`] for an operator, who is told whether the purge was
+    /// recorded for every other replica (cluster mode) or why it was not.
+    pub(crate) async fn purge_delegated_tokens_everywhere(
+        &self,
+        issuer: &str,
+        subject: &str,
+        trigger: DelegatedTokenPurgeTrigger,
+    ) -> Result<DelegatedTokenPurgeOutcome, DelegatedTokenPurgeFailure> {
+        self.delegated
+            .purge_principal_everywhere(issuer, subject, trigger)
+            .await
+    }
+
+    /// Applies purges recorded at the authority to this process's delegated-token cache (cluster
+    /// mode), and returns how many entries that took.
+    #[cfg_attr(not(any(test, feature = "postgres")), allow(dead_code))]
+    pub(crate) fn apply_recorded_delegated_token_purges(
+        &self,
+        purges: &[RecordedPurge<'_>],
+    ) -> usize {
+        self.delegated.apply_recorded_purges(purges)
     }
 
     /// Replaces the delegated-token cache with one of `capacity` entries
@@ -666,6 +704,20 @@ impl ConnectionHttpRuntime {
     #[cfg(test)]
     pub(crate) fn delegated_token_cache_entries(&self) -> usize {
         self.delegated.cache_entry_count()
+    }
+
+    /// Caches `token` for `caller` under `binding` where an exchange would, so a test can fill a
+    /// replica's delegated-token cache without an issuer.
+    #[cfg(test)]
+    pub(crate) async fn cache_delegated_token_for_test(
+        &self,
+        binding: &DelegatedTokenBinding,
+        caller: &AttestedCaller,
+        token: &'static str,
+    ) {
+        self.delegated
+            .cache_token_for_test(binding, caller, token)
+            .await;
     }
 
     #[cfg(test)]

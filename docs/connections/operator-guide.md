@@ -1293,15 +1293,16 @@ start one:
   `admin:principals:write` and answers `200` with `{"purged_entries": N}` once
   the entries are gone, before any issuer answers; the principal directory need
   not be configured. A body that is not exactly those two non-empty strings is
-  refused with `400`. In cluster mode it is refused with `409`: each replica
-  caches its own tokens and nothing would carry the purge to the others, so
-  disable the Connection there instead.
+  refused with `400`. In cluster mode the answer also names the purge's
+  `security_revision`, and comes only once the purge is recorded for every
+  replica; see [Purges in cluster mode](#purges-in-cluster-mode).
 - **A revoked credential.** When a JWT validator refuses a token because its
   `jti` is on the denylist (`gateway revoke-jwt`, cluster mode), it purges the
   principal the token names -- the validator's issuer and the token's `sub`,
-  after its signature has been verified. Every replica that refuses the token
-  purges its own cache. The same refused token presented again finds nothing
-  more to purge.
+  after its signature has been verified -- and records the purge for every
+  other replica, so the replica the token happens to reach is not the only
+  one that drops its tokens. The same refused token presented again finds
+  nothing more to purge.
 
 After a purge:
 
@@ -1323,19 +1324,86 @@ After a purge:
   uses it again, but it stays valid at the issuer and the upstream until its
   own expiry, which the issuer chose.
 
+##### Purges in cluster mode
+
+Each replica caches the tokens it exchanged, in its own memory, so a purge is
+carried to every replica as one shared security revision -- the counter every
+policy, tools and Connection commit moves -- and every replica's strict
+security gate applies it before it serves another protected request:
+
+- The replica that is asked purges its own cache, then asks the operation
+  gate whether every live replica, draining ones included, advertises the
+  `delegated_token_purges` capability (operation
+  `connections.delegated_token_purge`). If they all do, it commits the purge as
+  a `security_outbox` row (`resource_type` `delegated_token_purge`) that takes
+  the next shared security revision. The row names the principal only by a
+  SHA-256 digest under the deployment ID; the authority never holds the issuer
+  or the subject.
+- Every replica's gate sees the counter move on its next protected request, or
+  within 250 ms from its background reconciler, and before it admits anything
+  at that revision it purges every token it holds for the principal and
+  revokes each one at its issuer. No replica serves a protected request -- and
+  so no delegated token -- at or past the purge's revision before it has
+  applied the purge. The replica that recorded the purge applies it too, which
+  takes anything its principal was exchanged for between its own purge and
+  the record.
+- A replica that cannot read the record fails its gate closed with `503`, as
+  it does for any shared security state it cannot read, rather than serve
+  tokens the record may name. A record whose principal key this build cannot
+  read purges every delegated token on the replica that applies it.
+- Each token is revoked at its issuer once, by the replica that holds it:
+  replicas never share a token, and a token leaves a cache once.
+- A call admitted before the purge's revision committed may still finish with
+  the token it already looked up, as a call already holding its token does in
+  standalone mode.
+
+An operator's purge answers `200` with
+`{"purged_entries": N, "security_revision": R}` once the record is committed;
+`purged_entries` counts the answering replica's entries only, and each
+replica's `connection.delegated_token_purge` event counts its own. A purge
+that cannot be recorded is refused, and the answering replica's entries are
+gone anyway: `409` with reason `capability_not_advertised` while a live replica
+does not advertise `delegated_token_purges` (finish the rollout, or wait for
+the older replicas' rows to go stale, and retry); `503` with the gate's reason
+(`roster_unavailable`, `roster_missing_this_replica`, and the other reasons in
+[the operation gate](../deployment/postgres.md#membership-and-maintenance))
+when it cannot decide; and `503` with `purge_not_recorded` when the authority
+did not take the record. The body is
+`{"error": ..., "reason": ..., "purged_entries": N}`, and the gate's refusal is
+also audited as `cluster.operation_refused`. Asking again purges and records
+again: every purge is a revision of its own, so a repeat is safe, and it also
+drops whatever the principal was exchanged for since.
+
+A revoked credential's purge is recorded in the background, after the
+answering replica's cache is purged: at most once per principal per replica
+every 900 seconds (the longest any token is cached), retried twice -- after
+250 ms and then one second -- when the authority does not answer, and not
+retried when the gate refuses. While a replica built before the record is live, a revoked
+credential purges only the replicas it is presented to, and the others keep
+their cached tokens for at most 900 seconds.
+
 Each purge emits `connection.delegated_token_purge` and each token revocation
 `connection.delegated_token_revocation`, joined by `purge_id`. An operator's
 purge carries the operator as `actor` and the admin request's `request_id`; a
-purge a revoked credential started has no actor and the `request_id`
-`connection-delegated-token-purge`, and is emitted only when it purged
+purge a revoked credential started, or one another replica recorded, has no
+actor and the `request_id` `connection-delegated-token-purge`. A revoked
+credential's purge is emitted only when it purged something or was recorded
+for the other replicas, and another replica's record only where it purged
 something. An operator's purge is emitted even when it found nothing.
+`replication` says what became of the other replicas: `null` in standalone
+mode; `recorded` with the `security_revision`, or `not_recorded` with the
+reason, for a purge the replica started; `recently_recorded` for a revoked
+credential's purge this replica already recorded within the window; and
+`applied` with the `security_revision` on a replica applying a record, whose
+`trigger` is then `replicated`.
 
 ```json
 {
   "purge_id": "6b0f3d1e-...",
   "trigger": "operator",
   "principal": { "issuer": "https://idp.example", "subject": "alice" },
-  "purged_entries": 2
+  "purged_entries": 2,
+  "replication": { "outcome": "recorded", "security_revision": 4182 }
 }
 ```
 
@@ -1363,8 +1431,8 @@ something. An operator's purge is emitted even when it found nothing.
 | `failure` | `revocation_failed` | The issuer could not be reached, timed out or answered `503`. |
 | `failure` | `revocation_cancelled` | The process stopped before the issuer answered. |
 
-`connection_delegated_token_purge_total`, labelled by `trigger`, counts purges
-that were audited, and `connection_delegated_token_revocation_total`, labelled
+`connection_delegated_token_purge_total`, labelled by `trigger` (`operator`,
+`credential_revoked` or `replicated`), counts purges that were audited, and `connection_delegated_token_revocation_total`, labelled
 by `result` and `reason`, counts revocations. Neither the token nor anything
 the issuer said in an error body reaches an event, a metric or a log line.
 
