@@ -1,6 +1,7 @@
 pub mod engine;
 pub mod matcher;
 pub mod policy;
+pub mod policy_document;
 pub mod policy_history;
 pub mod rule;
 
