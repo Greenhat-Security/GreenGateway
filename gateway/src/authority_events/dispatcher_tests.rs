@@ -812,6 +812,148 @@ async fn capacity_exhaustion_refuses_the_mutation_and_commits_nothing() {
     assert_eq!((stats.retained, stats.head), (1, 3));
 }
 
+/// Make one table refuse every new row from now on. `NOT VALID` keeps the
+/// rows already there, so only the next insert fails.
+async fn refuse_new_rows(pool: &deadpool_postgres::Pool, table: &str) {
+    pool.get()
+        .await
+        .expect("checkout")
+        .batch_execute(&format!(
+            "ALTER TABLE greengateway.{table} ADD CONSTRAINT refuse_new_rows CHECK (false) NOT VALID"
+        ))
+        .await
+        .expect("the refusing constraint applies");
+}
+
+async fn accept_new_rows(pool: &deadpool_postgres::Pool, table: &str) {
+    pool.get()
+        .await
+        .expect("checkout")
+        .batch_execute(&format!(
+            "ALTER TABLE greengateway.{table} DROP CONSTRAINT refuse_new_rows"
+        ))
+        .await
+        .expect("the refusing constraint drops");
+}
+
+/// The other way required evidence fails to commit: the database refuses
+/// the evidence insert or its journal append. Every producer rolls its
+/// whole change back, and each refused change is counted exactly once, as
+/// an evidence failure and never as a capacity refusal -- the alert rules
+/// page on the two separately.
+#[tokio::test]
+async fn a_refused_evidence_write_rolls_the_mutation_back_and_is_counted_once() {
+    let (_guard, database) = database_or_skip!();
+    let pool = migrated_pool(&database).await;
+    let producers = Producers::new(&pool);
+    let token = producers.token().await;
+    let connection = producers
+        .connections
+        .create(candidate(), "deleting-admin", None)
+        .await
+        .expect("a create journals nothing and is not refused");
+    let journal = || {
+        scalar(
+            &pool,
+            "SELECT count(*) FROM greengateway.authority_event_journal",
+        )
+    };
+    let revision = || {
+        scalar(
+            &pool,
+            "SELECT last_revision FROM greengateway.security_revision_state",
+        )
+    };
+    let journal_before = journal().await;
+    let revision_before = revision().await;
+
+    // The recorder is this thread's, and the test's current-thread runtime
+    // runs every producer on this thread.
+    let recorder = crate::audit::sink::tests::CountingRecorder::default();
+    let _recording = ::metrics::set_default_local_recorder(&recorder);
+    let evidence_failures =
+        || recorder.count(crate::metrics::AUTHORITY_EVENT_EVIDENCE_FAILURES_TOTAL, &[]);
+
+    // A journal that refuses the append refuses every producer.
+    refuse_new_rows(&pool, "authority_event_journal").await;
+    let Err(_) = producers.tokens.rotate(&token, "rotating-admin").await else {
+        panic!("a refused journal append refuses the rotate");
+    };
+    producers
+        .tokens
+        .revoke(&token, "revoking-admin")
+        .await
+        .expect_err("a refused journal append refuses the revoke");
+    producers
+        .jwt
+        .revoke("refused-jti", None, "operator:revoke-jwt")
+        .await
+        .expect_err("a refused journal append refuses the JWT revoke");
+    assert!(producers
+        .connections
+        .delete(&connection.id, &connection.etag(), "deleting-admin")
+        .await
+        .is_err());
+    assert_eq!(evidence_failures(), 4);
+    accept_new_rows(&pool, "authority_event_journal").await;
+
+    // An evidence table that refuses the insert refuses its own producer.
+    refuse_new_rows(&pool, "service_token_change_evidence").await;
+    let Err(_) = producers.tokens.rotate(&token, "rotating-admin").await else {
+        panic!("a refused evidence insert refuses the rotate");
+    };
+    accept_new_rows(&pool, "service_token_change_evidence").await;
+    refuse_new_rows(&pool, "jwt_revocation_evidence").await;
+    producers
+        .jwt
+        .revoke("refused-jti", None, "operator:revoke-jwt")
+        .await
+        .expect_err("a refused evidence insert refuses the JWT revoke");
+    accept_new_rows(&pool, "jwt_revocation_evidence").await;
+    refuse_new_rows(&pool, "connection_change_evidence").await;
+    assert!(producers
+        .connections
+        .delete(&connection.id, &connection.etag(), "deleting-admin")
+        .await
+        .is_err());
+    accept_new_rows(&pool, "connection_change_evidence").await;
+    assert_eq!(evidence_failures(), 7);
+
+    // Nothing any refused change would have written exists.
+    assert_eq!(journal().await, journal_before);
+    assert_eq!(revision().await, revision_before);
+    assert_eq!(
+        scalar(&pool, "SELECT count(*) FROM greengateway.jwt_revocations").await,
+        0
+    );
+    assert_eq!(
+        scalar(
+            &pool,
+            "SELECT count(*) FROM greengateway.connection_records"
+        )
+        .await,
+        1,
+        "the refused delete left the Connection in place"
+    );
+
+    // The same changes commit once the tables accept rows again, and a
+    // success counts nothing.
+    producers.rotate(&token, "rotating-admin").await;
+    producers.revoke_jwt("refused-jti").await;
+    producers
+        .connections
+        .delete(&connection.id, &connection.etag(), "deleting-admin")
+        .await
+        .expect("the delete commits");
+    assert_eq!(journal().await, journal_before + 3);
+    assert_eq!(evidence_failures(), 7);
+    assert_eq!(
+        recorder.count(crate::metrics::AUTHORITY_EVENT_CAPACITY_REFUSALS_TOTAL, &[]),
+        0,
+        "a refused write is not a full journal"
+    );
+}
+
 /// Concurrent producers on two replicas' pools still journal a gapless,
 /// commit-ordered sequence: position order is shared-revision order.
 #[tokio::test]

@@ -199,3 +199,114 @@ groups:
         annotations:
           summary: Cluster gateway scrape is missing database pool gauges
           runbook_url: https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#metrics-availability
+
+  # Durable authority-event evidence (issue #425 metrics, issue #440 PR 4).
+  # Refusal counters page per replica. The journal is shared state whose gauges
+  # only a leader publishes and every former leader keeps at its last value, so
+  # journal rules read the current maintenance leader alone, per deployment.
+  - name: greengateway-authority-events-v1
+    interval: 30s
+    rules:
+      - alert: GreenGatewayAuthorityEventCapacityRefusals
+        expr: |
+          sum by (job, instance, deployment_mode) (increase(greengateway_authority_event_capacity_refusals_total{job="greengateway",deployment_mode="cluster"}[5m])) > 0
+          and on (job, instance) (up{job="greengateway",deployment_mode="cluster"} == 1)
+        for: 2m
+        labels: {severity: critical, owner: gateway-operations}
+        annotations:
+          summary: Authority changes were refused because the authority-event journal is full
+          runbook_url: https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#authority-event-journal
+
+      - alert: GreenGatewayAuthorityEvidenceWriteFailures
+        expr: |
+          sum by (job, instance, deployment_mode) (increase(greengateway_authority_event_evidence_failures_total{job="greengateway",deployment_mode="cluster"}[5m])) > 0
+          and on (job, instance) (up{job="greengateway",deployment_mode="cluster"} == 1)
+        for: 2m
+        labels: {severity: critical, owner: gateway-operations}
+        annotations:
+          summary: Authority changes were refused because their required evidence could not be written
+          runbook_url: https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#authority-evidence-failures
+
+      # Retained rows fall only through retention, so a leader whose retention is
+      # failing still reports a lower bound: capacity rules need no freshness gate.
+      - alert: GreenGatewayAuthorityEventJournalFull
+        expr: |
+          max by (job, deployment_mode) (
+            (greengateway_authority_event_journal_retained{job="greengateway",deployment_mode="cluster"}
+              >= greengateway_authority_event_journal_capacity{job="greengateway",deployment_mode="cluster"})
+            and on (job, instance) (greengateway_cluster_maintenance_leader{job="greengateway",deployment_mode="cluster"} == 1)
+            and on (job, instance) (up{job="greengateway",deployment_mode="cluster"} == 1)
+          )
+        for: 1m
+        labels: {severity: critical, owner: gateway-operations}
+        annotations:
+          summary: Authority-event journal is at capacity and will refuse authority changes
+          runbook_url: https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#authority-event-journal
+
+      - alert: GreenGatewayAuthorityEventJournalFilling
+        expr: |
+          max by (job, deployment_mode) (
+            (greengateway_authority_event_journal_retained{job="greengateway",deployment_mode="cluster"}
+              / greengateway_authority_event_journal_capacity{job="greengateway",deployment_mode="cluster"} > 0.8)
+            and on (job, instance) (greengateway_cluster_maintenance_leader{job="greengateway",deployment_mode="cluster"} == 1)
+            and on (job, instance) (up{job="greengateway",deployment_mode="cluster"} == 1)
+          )
+        for: 5m
+        labels: {severity: warning, owner: gateway-operations}
+        annotations:
+          summary: Authority-event journal retains more than 80 percent of its capacity
+          runbook_url: https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#authority-event-journal
+
+      # The age is trusted only from a leader whose retention step succeeded
+      # recently. Without a dispatcher anywhere (no AUTHORITY_EVENT_SINK) every
+      # retained event is undelivered by design, so delivery is not judged.
+      - alert: GreenGatewayAuthorityEventDeliveryLag
+        expr: |
+          max by (job, deployment_mode) (
+            (greengateway_authority_event_oldest_undelivered_age_seconds{job="greengateway",deployment_mode="cluster"} > 120)
+            and on (job, instance) (greengateway_cluster_maintenance_leader{job="greengateway",deployment_mode="cluster"} == 1)
+            and on (job, instance) (greengateway_leader_task_last_success_age_seconds{job="greengateway",deployment_mode="cluster",task="authority_event_retention"} < 300)
+            and on (job, instance) (up{job="greengateway",deployment_mode="cluster"} == 1)
+          )
+          and on (job, deployment_mode) (
+            count by (job, deployment_mode) (
+              greengateway_cluster_lease_age_seconds{job="greengateway",deployment_mode="cluster",scope="authority_event_dispatcher"}
+              or greengateway_authority_event_delivery_failures_total{job="greengateway",deployment_mode="cluster"}
+            )
+          )
+        for: 5m
+        labels: {severity: warning, owner: gateway-operations}
+        annotations:
+          summary: Committed authority events are waiting for delivery
+          runbook_url: https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#authority-event-delivery
+
+      # A fenced step is a leader handing over, not a failed delivery.
+      - alert: GreenGatewayAuthorityEventDeliveryFailures
+        expr: |
+          sum by (job, instance, deployment_mode) (increase(greengateway_authority_event_delivery_failures_total{job="greengateway",deployment_mode="cluster",kind!="fenced"}[5m])) > 0
+          and on (job, instance) (up{job="greengateway",deployment_mode="cluster"} == 1)
+        for: 10m
+        labels: {severity: warning, owner: gateway-operations}
+        annotations:
+          summary: Authority-event dispatcher steps keep failing
+          runbook_url: https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#authority-event-delivery
+
+      # Every cluster replica takes part in the maintenance election, and the
+      # leader's retention step publishes the journal gauges with or without a sink.
+      - alert: GreenGatewayAuthorityEventJournalUnobserved
+        expr: |
+          count by (job, deployment_mode) (up{job="greengateway",deployment_mode="cluster"} == 1)
+          unless on (job, deployment_mode)
+          count by (job, deployment_mode) (
+            (greengateway_cluster_maintenance_leader{job="greengateway",deployment_mode="cluster"} == 1)
+            and on (job, instance) (greengateway_leader_task_last_success_age_seconds{job="greengateway",deployment_mode="cluster",task="authority_event_retention"} < 300)
+            and on (job, instance) greengateway_authority_event_journal_retained{job="greengateway",deployment_mode="cluster"}
+            and on (job, instance) greengateway_authority_event_journal_capacity{job="greengateway",deployment_mode="cluster"}
+            and on (job, instance) greengateway_authority_event_oldest_undelivered_age_seconds{job="greengateway",deployment_mode="cluster"}
+            and on (job, instance) (up{job="greengateway",deployment_mode="cluster"} == 1)
+          )
+        for: 10m
+        labels: {severity: warning, owner: gateway-operations}
+        annotations:
+          summary: No replica is publishing fresh authority-event journal gauges
+          runbook_url: https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#authority-event-journal

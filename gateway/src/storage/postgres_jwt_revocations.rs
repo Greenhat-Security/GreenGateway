@@ -326,10 +326,14 @@ impl PostgresJwtRevocationStore {
                     ],
                 )
                 .await
-                .map_err(|error| evidence_failure(error, OPERATION_EVIDENCE))?;
+                .map_err(|error| {
+                    super::postgres_authority_events::record_evidence_failure();
+                    evidence_failure(error, OPERATION_EVIDENCE)
+                })?;
             // Exactly the one row written above. Anything else means the
             // evidence does not describe this revoke, and nothing commits.
             if recorded != 1 {
+                super::postgres_authority_events::record_evidence_failure();
                 return Err(RepositoryError::new(
                     RepositoryErrorKind::Internal,
                     OPERATION_EVIDENCE,
