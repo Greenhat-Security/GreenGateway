@@ -14,8 +14,10 @@
 //!
 //! The rows record what they observed with [`UpgradePair::write_evidence`]:
 //! one JSON file per row under the pair directory's `evidence/`, each
-//! carrying both binaries' identities. The release gate retains that
-//! directory as a build artifact.
+//! carrying both binaries' identities. The release gate checks that
+//! directory against `docs/deployment/upgrade-support-matrix.json` with
+//! `scripts/upgrade_pair_evidence.py` and retains it, with the summary that
+//! check writes, as a build artifact.
 
 use std::path::{Path, PathBuf};
 

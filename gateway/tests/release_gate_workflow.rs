@@ -193,3 +193,49 @@ fn the_release_gate_still_guards_against_a_vacuous_pass() {
          reports its whole pass count"
     );
 }
+
+/// The `ha_rolling_upgrade` leg's last check (issue #426, PR 4): its pair
+/// rows' evidence is verified against the published support matrix, and the
+/// summary that check writes is retained with the evidence. Without it a
+/// pair row that was removed, renamed or `#[ignore]`d leaves the leg green,
+/// because the guards above count the rows that did run, and the published
+/// matrix would describe evidence nobody checks.
+#[test]
+fn the_rolling_upgrade_leg_verifies_its_evidence_against_the_published_matrix() {
+    let workflow = workflow();
+    let job_text = {
+        let start = workflow
+            .find(&format!("\n  {GATE_JOB}:\n"))
+            .expect("the gate job should exist");
+        &workflow[start..]
+    };
+    for (needle, why) in [
+        (
+            "python -m unittest discover -s scripts -p 'test_upgrade_pair_evidence.py' -v",
+            "the evidence check's own tests must run before it is trusted",
+        ),
+        (
+            "python scripts/upgrade_pair_evidence.py --pair-dir \"${RUNNER_TEMP}/upgrade-pair\"",
+            "the leg must verify the pair's evidence against docs/deployment/upgrade-support-matrix.json",
+        ),
+        (
+            "${{ runner.temp }}/upgrade-pair/summary.json",
+            "the leg must retain the evidence summary with the evidence",
+        ),
+    ] {
+        assert!(job_text.contains(needle), "{why}: {needle:?} is gone");
+    }
+    let position = |needle: &str| {
+        job_text
+            .find(needle)
+            .unwrap_or_else(|| panic!("the gate job no longer contains {needle:?}"))
+    };
+    let suite = position("- name: Run the release-gate suite\n");
+    let own_tests = position("-p 'test_upgrade_pair_evidence.py'");
+    let verify = position("python scripts/upgrade_pair_evidence.py");
+    assert!(
+        suite < own_tests && own_tests < verify,
+        "the evidence is verified after the suite that records it, by a check whose own tests \
+         ran first"
+    );
+}
