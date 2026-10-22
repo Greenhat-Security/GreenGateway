@@ -42,7 +42,7 @@
       "description": "No corresponding gateway-owned operation/delivery is shipped in this mode; required authority-event delivery cannot be inferred from provider audit or future plans.",
       "sources": [
         {
-          "path": "gateway/src/config.rs",
+          "path": "gateway/src/config/storage.rs",
           "anchor": "fn reject_local_authority_in_postgres_mode("
         }
       ]
@@ -316,7 +316,7 @@
       "follow_up": "Keep this operation refused; do not introduce a local file authority fallback.",
       "sources": [
         {
-          "path": "gateway/src/config.rs",
+          "path": "gateway/src/config/storage.rs",
           "anchor": "fn reject_local_authority_in_postgres_mode("
         }
       ],
@@ -943,7 +943,7 @@
       "follow_up": "Keep local-secret administration unavailable in cluster mode; external provider rotation is a separate authority and cannot share the gateway transaction.",
       "sources": [
         {
-          "path": "gateway/src/config.rs",
+          "path": "gateway/src/config/storage.rs",
           "anchor": "CONNECTION_LOCAL_SECRET_KEYRING,"
         },
         {
@@ -1543,11 +1543,11 @@
           "anchor": "const PRUNE_SESSIONS_SQL: &str"
         },
         {
-          "path": "gateway/src/config.rs",
+          "path": "gateway/src/config/storage.rs",
           "anchor": "standalone_memory is unsupported with {STATE_BACKEND}=postgres"
         },
         {
-          "path": "gateway/src/config.rs",
+          "path": "gateway/src/config/storage.rs",
           "anchor": "cluster_postgres requires {STATE_BACKEND}=postgres"
         }
       ],

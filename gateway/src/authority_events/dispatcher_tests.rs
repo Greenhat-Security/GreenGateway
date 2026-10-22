@@ -897,11 +897,18 @@ async fn a_refused_evidence_write_rolls_the_mutation_back_and_is_counted_once() 
     assert_eq!(evidence_failures(), 4);
     accept_new_rows(&pool, "authority_event_journal").await;
 
-    // An evidence table that refuses the insert refuses its own producer.
+    // An evidence table that refuses the insert refuses its own producer:
+    // both service-token changes write the same evidence table, and each
+    // counts its own refusal.
     refuse_new_rows(&pool, "service_token_change_evidence").await;
     let Err(_) = producers.tokens.rotate(&token, "rotating-admin").await else {
         panic!("a refused evidence insert refuses the rotate");
     };
+    producers
+        .tokens
+        .revoke(&token, "revoking-admin")
+        .await
+        .expect_err("a refused evidence insert refuses the revoke");
     accept_new_rows(&pool, "service_token_change_evidence").await;
     refuse_new_rows(&pool, "jwt_revocation_evidence").await;
     producers
@@ -917,11 +924,20 @@ async fn a_refused_evidence_write_rolls_the_mutation_back_and_is_counted_once() 
         .await
         .is_err());
     accept_new_rows(&pool, "connection_change_evidence").await;
-    assert_eq!(evidence_failures(), 7);
+    assert_eq!(evidence_failures(), 8);
 
     // Nothing any refused change would have written exists.
     assert_eq!(journal().await, journal_before);
     assert_eq!(revision().await, revision_before);
+    assert_eq!(
+        scalar(
+            &pool,
+            "SELECT count(*) FROM greengateway.service_tokens WHERE revoked_at IS NOT NULL"
+        )
+        .await,
+        0,
+        "neither refused revoke left the token revoked"
+    );
     assert_eq!(
         scalar(&pool, "SELECT count(*) FROM greengateway.jwt_revocations").await,
         0
@@ -946,7 +962,7 @@ async fn a_refused_evidence_write_rolls_the_mutation_back_and_is_counted_once() 
         .await
         .expect("the delete commits");
     assert_eq!(journal().await, journal_before + 3);
-    assert_eq!(evidence_failures(), 7);
+    assert_eq!(evidence_failures(), 8);
     assert_eq!(
         recorder.count(crate::metrics::AUTHORITY_EVENT_CAPACITY_REFUSALS_TOTAL, &[]),
         0,
