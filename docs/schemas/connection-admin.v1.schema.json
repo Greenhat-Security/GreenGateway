@@ -3977,6 +3977,81 @@
         }
       }
     },
+    "OpenApiConversionReport": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "How a document that was not OpenAPI 3.x was converted to OpenAPI 3.0 before generation (issue #443).",
+      "required": [
+        "source_format",
+        "warnings"
+      ],
+      "properties": {
+        "source_format": {
+          "enum": [
+            "swagger_2_0"
+          ]
+        },
+        "warnings": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": {
+            "$ref": "#/$defs/OpenApiConversionWarning"
+          }
+        }
+      }
+    },
+    "OpenApiConversionWarning": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "message",
+        "operation_omitted"
+      ],
+      "properties": {
+        "code": {
+          "enum": [
+            "base_path_not_in_paths",
+            "unsupported_document_field",
+            "unsupported_path_item_field",
+            "security_definition_not_converted",
+            "consumes_defaulted",
+            "produces_defaulted",
+            "request_body_not_mapped",
+            "unsupported_operation_field",
+            "invalid_parameter",
+            "unsupported_parameter_location",
+            "unsupported_parameter_field",
+            "unsupported_collection_format",
+            "file_parameter_outside_form",
+            "multiple_body_parameters",
+            "body_and_form_parameters",
+            "warnings_truncated"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Fixed text for the code; it never contains document content."
+        },
+        "operation_omitted": {
+          "type": "boolean",
+          "description": "True when the named operation was left out of the converted document, so no tool was generated for it."
+        },
+        "method": {
+          "type": "string"
+        },
+        "path_template": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "subject": {
+          "type": "string",
+          "maxLength": 256,
+          "description": "The field, parameter, location, security definition or base path the warning names, cut to 256 bytes."
+        }
+      }
+    },
     "OpenApiPreviewResponse": {
       "type": "object",
       "additionalProperties": false,
@@ -4049,6 +4124,10 @@
         },
         "overlay": {
           "$ref": "#/$defs/OpenApiOverlayReport"
+        },
+        "conversion": {
+          "$ref": "#/$defs/OpenApiConversionReport",
+          "description": "Present only when the submitted document was not OpenAPI 3.x and was converted to OpenAPI 3.0 before generation."
         }
       }
     },

@@ -812,6 +812,30 @@ pub(super) fn managed_openapi_preview_response(
             .map(openapi_skipped_operation_response)
             .collect(),
         overlay,
+        conversion: preview
+            .generation
+            .conversion
+            .map(openapi_conversion_report_response),
+    }
+}
+
+pub(super) fn openapi_conversion_report_response(
+    conversion: tools::openapi::OpenApiDocumentConversion,
+) -> OpenApiConversionReportResponse {
+    OpenApiConversionReportResponse {
+        source_format: conversion.source_format.as_str(),
+        warnings: conversion
+            .warnings
+            .into_iter()
+            .map(|warning| OpenApiConversionWarningResponse {
+                code: warning.code.as_str(),
+                message: warning.code.message(),
+                operation_omitted: warning.code.omits_operation(),
+                method: warning.method,
+                path_template: warning.path_template,
+                subject: warning.subject,
+            })
+            .collect(),
     }
 }
 
