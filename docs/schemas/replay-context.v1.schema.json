@@ -1,0 +1,178 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://greengateway.dev/schemas/replay-context.v1.schema.json",
+  "title": "GreenGateway policy replay context",
+  "description": "Draft 2020-12 JSON Schema for a replay-context.v1 record: the facts the policy kernel reads for one retained HTTP request or tool invocation, each stated as recorded, absent or not_recorded, and the bounded policy result the gateway recorded at the time. A context carries nothing the kernel does not read: no source address, user agent, request id, email, headers, query values, bodies, status, latency, upstream details, tool arguments or errors. The gateway's parser is authoritative and also enforces what JSON Schema cannot state here: byte (not character) limits, the exact-path, bare-host and origin predicates, principal shape bounds, reason-code syntax and duplicate member names. Unknown members are refused everywhere.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "source", "facts", "recorded"],
+  "properties": {
+    "schema_version": {"const": "replay-context.v1"},
+    "source": {"enum": ["http_observation", "tool_admission", "tool_rule_decision"]},
+    "facts": {"oneOf": [{"$ref": "#/$defs/http_facts"}, {"$ref": "#/$defs/tool_facts"}]},
+    "recorded": {"$ref": "#/$defs/recorded"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"source": {"const": "http_observation"}}},
+      "then": {"properties": {"facts": {"properties": {"lane": {"const": "http"}}}}},
+      "else": {"properties": {"facts": {"properties": {"lane": {"const": "tool"}}}}}
+    }
+  ],
+  "$defs": {
+    "not_recorded": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state"],
+      "properties": {"state": {"const": "not_recorded"}}
+    },
+    "method": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"},
+    "path": {"type": "string", "minLength": 1, "maxLength": 8192, "pattern": "^/"},
+    "host": {"type": "string", "minLength": 1, "maxLength": 4096},
+    "dispatch_fact": {"type": "string", "minLength": 1, "maxLength": 4096},
+    "principal": {
+      "oneOf": [
+        {"$ref": "#/$defs/not_recorded"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["state"],
+          "properties": {"state": {"const": "anonymous"}}
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["state", "subject", "roles", "auth_method"],
+          "properties": {
+            "state": {"const": "authenticated"},
+            "subject": {"type": "string", "minLength": 1, "maxLength": 4096},
+            "issuer": {"type": "string", "minLength": 1, "maxLength": 4096},
+            "roles": {
+              "type": "array",
+              "maxItems": 256,
+              "items": {"type": "string", "minLength": 1, "maxLength": 256}
+            },
+            "auth_method": {
+              "enum": ["bearer_token", "session_cookie", "service_token", "client_certificate"]
+            }
+          }
+        }
+      ]
+    },
+    "request_host": {
+      "oneOf": [
+        {"$ref": "#/$defs/not_recorded"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["state"],
+          "properties": {"state": {"const": "absent"}}
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["state", "host"],
+          "properties": {"state": {"const": "present"}, "host": {"$ref": "#/$defs/host"}}
+        }
+      ]
+    },
+    "mcp_identity": {
+      "oneOf": [
+        {"$ref": "#/$defs/not_recorded"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["state"],
+          "properties": {"state": {"const": "canonical"}}
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["state", "canonical_path"],
+          "properties": {"state": {"const": "alias"}, "canonical_path": {"$ref": "#/$defs/path"}}
+        }
+      ]
+    },
+    "routing": {
+      "oneOf": [
+        {"$ref": "#/$defs/not_recorded"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["state", "mcp_identity"],
+          "properties": {"state": {"const": "local"}, "mcp_identity": {"$ref": "#/$defs/mcp_identity"}}
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["state", "upstream_origin"],
+          "properties": {
+            "state": {"const": "proxy_dispatch"},
+            "route_id": {"$ref": "#/$defs/dispatch_fact"},
+            "route_host": {"$ref": "#/$defs/host"},
+            "route_path_prefix": {"$ref": "#/$defs/dispatch_fact"},
+            "upstream_origin": {"$ref": "#/$defs/dispatch_fact"}
+          }
+        }
+      ]
+    },
+    "egress": {
+      "oneOf": [
+        {"$ref": "#/$defs/not_recorded"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["state", "scheme", "userinfo", "fragment", "resolution"],
+          "properties": {
+            "state": {"const": "destination"},
+            "scheme": {"type": "string", "minLength": 1, "maxLength": 32, "pattern": "^[a-z][a-z0-9+.-]*$"},
+            "host": {"$ref": "#/$defs/host"},
+            "port": {"type": "integer", "minimum": 0, "maximum": 65535},
+            "userinfo": {"type": "boolean"},
+            "fragment": {"type": "boolean"},
+            "resolution": {"$ref": "#/$defs/not_recorded"}
+          }
+        }
+      ]
+    },
+    "http_facts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lane", "method", "path", "principal", "request_host", "routing", "egress"],
+      "properties": {
+        "lane": {"const": "http"},
+        "method": {"$ref": "#/$defs/method"},
+        "path": {"$ref": "#/$defs/path"},
+        "principal": {"$ref": "#/$defs/principal"},
+        "request_host": {"$ref": "#/$defs/request_host"},
+        "routing": {"$ref": "#/$defs/routing"},
+        "egress": {"$ref": "#/$defs/egress"}
+      }
+    },
+    "tool_facts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lane", "operation", "tool_name", "principal", "egress"],
+      "properties": {
+        "lane": {"const": "tool"},
+        "operation": {"const": "invocation"},
+        "tool_name": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "principal": {"$ref": "#/$defs/principal"},
+        "egress": {"$ref": "#/$defs/egress"}
+      }
+    },
+    "recorded": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policy"],
+      "properties": {
+        "policy": {"enum": ["allowed", "denied", "would_deny", "admitted"]},
+        "reason": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9_.-]+$"},
+        "matched_rule_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "permission": {"type": "string", "minLength": 1, "maxLength": 256},
+        "path_prefix": {"type": "string", "minLength": 1, "maxLength": 8192},
+        "attribution_omitted": {"const": true}
+      }
+    }
+  }
+}
