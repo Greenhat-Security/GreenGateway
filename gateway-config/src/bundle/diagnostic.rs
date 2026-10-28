@@ -21,13 +21,13 @@ use super::source::FileName;
 
 /// How serious a diagnostic is.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Severity {
+pub enum Severity {
     Error,
     Warning,
 }
 
 impl Severity {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Error => "error",
             Self::Warning => "warning",
@@ -37,13 +37,13 @@ impl Severity {
 
 /// A position in a document: 1-based line and character column.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct Position {
-    pub(crate) line: u32,
-    pub(crate) column: u32,
+pub struct Position {
+    pub line: u32,
+    pub column: u32,
 }
 
 impl Position {
-    pub(crate) fn new(line: u32, column: u32) -> Self {
+    pub fn new(line: u32, column: u32) -> Self {
         Self { line, column }
     }
 }
@@ -56,26 +56,26 @@ enum Segment {
 
 /// An RFC 6901 JSON Pointer whose member names are the reader's own.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct Pointer(Vec<Segment>);
+pub struct Pointer(Vec<Segment>);
 
 impl Pointer {
-    pub(crate) fn root() -> Self {
+    pub fn root() -> Self {
         Self(Vec::new())
     }
 
-    pub(crate) fn member(&self, name: &'static str) -> Self {
+    pub fn member(&self, name: &'static str) -> Self {
         let mut segments = self.0.clone();
         segments.push(Segment::Member(name));
         Self(segments)
     }
 
-    pub(crate) fn index(&self, index: usize) -> Self {
+    pub fn index(&self, index: usize) -> Self {
         let mut segments = self.0.clone();
         segments.push(Segment::Index(index));
         Self(segments)
     }
 
-    pub(crate) fn is_root(&self) -> bool {
+    pub fn is_root(&self) -> bool {
         self.0.is_empty()
     }
 }
@@ -106,7 +106,7 @@ impl fmt::Display for Pointer {
 /// The string form (`family.reason`) is the stable contract. A published code
 /// never changes meaning; renaming or removing one needs a new report schema.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Code {
+pub enum Code {
     // The bundle directory and its files.
     RootUnavailable,
     RootNotDirectory,
@@ -185,13 +185,15 @@ pub(crate) enum Code {
     SchemaVersionMismatch,
     ResourceUnknownMember,
     ResourceInvalid,
+    // The deployment profile's invariants.
+    PolicyDefaultAllow,
+    PolicyShadowMode,
+    PolicyWildcardRole,
 }
 
 impl Code {
-    /// Every code, in declaration order, for the uniqueness and
-    /// documentation tests.
-    #[cfg(test)]
-    pub(crate) const ALL: &'static [Code] = &[
+    /// Every code, in declaration order.
+    pub const ALL: &'static [Code] = &[
         Self::RootUnavailable,
         Self::RootNotDirectory,
         Self::UnsafePermissions,
@@ -261,15 +263,18 @@ impl Code {
         Self::SchemaVersionMismatch,
         Self::ResourceUnknownMember,
         Self::ResourceInvalid,
+        Self::PolicyDefaultAllow,
+        Self::PolicyShadowMode,
+        Self::PolicyWildcardRole,
     ];
 
     /// The stable code.
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         self.entry().0
     }
 
     /// Fixed text describing the code. Never a value.
-    pub(crate) fn message(self) -> &'static str {
+    pub fn message(self) -> &'static str {
         self.entry().1
     }
 
@@ -527,23 +532,35 @@ impl Code {
                 "resource.invalid",
                 "the resource document fails its published schema or production validator",
             ),
+            Self::PolicyDefaultAllow => (
+                "profile.policy_default_allow",
+                "the deployment profile requires a deny-by-default policy",
+            ),
+            Self::PolicyShadowMode => (
+                "profile.policy_shadow_mode",
+                "the deployment profile requires the policy to enforce its decisions, not shadow them",
+            ),
+            Self::PolicyWildcardRole => (
+                "profile.wildcard_role",
+                "the deployment profile forbids a role that grants every permission",
+            ),
         }
     }
 }
 
 /// One problem with a bundle, without any value from it.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BundleDiagnostic {
-    pub(crate) code: Code,
-    pub(crate) severity: Severity,
-    pub(crate) file: Option<FileName>,
-    pub(crate) pointer: Pointer,
-    pub(crate) position: Option<Position>,
+pub struct BundleDiagnostic {
+    pub code: Code,
+    pub severity: Severity,
+    pub file: Option<FileName>,
+    pub pointer: Pointer,
+    pub position: Option<Position>,
 }
 
 impl BundleDiagnostic {
     /// An error about the bundle as a whole.
-    pub(crate) fn bundle(code: Code) -> Self {
+    pub fn bundle(code: Code) -> Self {
         Self {
             code,
             severity: Severity::Error,
@@ -554,7 +571,7 @@ impl BundleDiagnostic {
     }
 
     /// An error about one file.
-    pub(crate) fn file(code: Code, file: &FileName) -> Self {
+    pub fn file(code: Code, file: &FileName) -> Self {
         Self {
             file: Some(file.clone()),
             ..Self::bundle(code)
@@ -562,12 +579,7 @@ impl BundleDiagnostic {
     }
 
     /// An error at a place in one file's document.
-    pub(crate) fn at(
-        code: Code,
-        file: &FileName,
-        pointer: Pointer,
-        position: Option<Position>,
-    ) -> Self {
+    pub fn at(code: Code, file: &FileName, pointer: Pointer, position: Option<Position>) -> Self {
         Self {
             pointer,
             position,
@@ -575,12 +587,12 @@ impl BundleDiagnostic {
         }
     }
 
-    pub(crate) fn warning(mut self) -> Self {
+    pub fn warning(mut self) -> Self {
         self.severity = Severity::Warning;
         self
     }
 
-    pub(crate) fn is_error(&self) -> bool {
+    pub fn is_error(&self) -> bool {
         self.severity == Severity::Error
     }
 }
