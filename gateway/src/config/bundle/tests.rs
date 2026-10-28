@@ -13,7 +13,8 @@ use super::{
     },
     json, read_bundle, resource,
     source::{
-        is_portable_file_name, BundleDirectory, FileName, MAX_BUNDLE_BYTES, MAX_DIRECTORY_ENTRIES,
+        is_portable_file_name, owner_is_trusted, BundleDirectory, FileName, MAX_BUNDLE_BYTES,
+        MAX_DIRECTORY_ENTRIES,
     },
     syntax::{
         decode_text, Limits, Node, Numbers, TextRules, Value, DOCUMENT_LIMITS, MAX_ARRAY_ELEMENTS,
@@ -1418,6 +1419,20 @@ fn the_bundle_root_must_be_an_openable_directory() {
 }
 
 #[test]
+fn only_root_or_the_directory_owner_may_own_what_is_read() {
+    assert!(owner_is_trusted(Some(1000), Some(1000)));
+    assert!(owner_is_trusted(Some(0), Some(1000)));
+    assert!(owner_is_trusted(Some(0), Some(0)));
+    // Another account could rewrite the file whatever its mode says.
+    assert!(!owner_is_trusted(Some(1001), Some(1000)));
+    assert!(!owner_is_trusted(Some(1000), Some(0)));
+    assert!(!owner_is_trusted(Some(1000), None));
+    assert!(!owner_is_trusted(None, Some(1000)));
+    // A platform that records no owner (Windows) leaves it to ACLs.
+    assert!(owner_is_trusted(None, None));
+}
+
+#[test]
 fn file_names_must_match_exactly_whatever_the_filesystem_folds() {
     let bundle = TempBundle::empty("case");
     bundle.write("BUNDLE.YAML", b"apiVersion: greengateway.dev/v1alpha1\n");
@@ -1661,14 +1676,92 @@ mod unix {
         set_mode(&bundle.root.join("policy.json"), 0o666);
         assert_eq!(only_codes(&bundle.read()), [Code::UnsafePermissions]);
 
-        let bundle = TempBundle::complete("writable-root");
+        for mode in [0o777, 0o775, 0o757] {
+            let bundle = TempBundle::complete(&format!("writable-root-{mode:o}"));
+            set_mode(&bundle.root, mode);
+            assert_eq!(
+                only_codes(&bundle.read()),
+                [Code::UnsafePermissions],
+                "{mode:o}"
+            );
+        }
+    }
+
+    /// The sticky bit stops another account replacing a file, not adding
+    /// one, so in a flat root it could add the unpinned manifest.
+    #[test]
+    fn a_flat_root_is_never_writable_by_others_even_with_the_sticky_bit() {
+        for mode in [0o1777, 0o1775, 0o1757] {
+            let bundle = TempBundle::complete(&format!("sticky-root-{mode:o}"));
+            set_mode(&bundle.root, mode);
+            assert_eq!(
+                only_codes(&bundle.read()),
+                [Code::UnsafePermissions],
+                "{mode:o}"
+            );
+        }
+        let bundle = TempBundle::complete("sticky-owner-only-root");
+        set_mode(&bundle.root, 0o1755);
+        assert!(bundle.read().bundle.is_some());
+    }
+
+    /// Only root or the directory's owner may own a file read from it.
+    #[test]
+    fn a_file_or_generation_another_account_owns_is_refused() {
+        use std::os::unix::fs::{chown, MetadataExt};
+
+        let bundle = TempBundle::complete("foreign-file");
+        let directory_owner = fs::metadata(&bundle.root).expect("metadata").uid();
+        // Neither root nor the directory's owner.
+        let other = if directory_owner == 1 { 2 } else { 1 };
+        // Giving a file away needs privilege. An unprivileged run checks the
+        // rule itself in `only_root_or_the_directory_owner_may_own_what_is_read`.
+        if chown(bundle.root.join("policy.json"), Some(other), None).is_ok() {
+            assert_eq!(only_codes(&bundle.read()), [Code::UntrustedOwner]);
+
+            let bundle = atomic_writer("foreign-generation");
+            chown(
+                bundle.root.join("..2026_10_21_10_00_00.000000001"),
+                Some(other),
+                None,
+            )
+            .expect("a privileged run can give the generation away");
+            assert_eq!(only_codes(&bundle.read()), [Code::UntrustedOwner]);
+
+            // Root may own what another account's directory holds.
+            let bundle = TempBundle::complete("root-owned-file");
+            chown(&bundle.root, Some(other), None).expect("give the root away");
+            chown(bundle.root.join("policy.json"), Some(0), None).expect("root owns");
+            for name in ["bundle.yaml", "deployment.yaml", "tools.json"] {
+                chown(bundle.root.join(name), Some(other), None).expect("same owner");
+            }
+            assert!(bundle.read().bundle.is_some());
+        }
+    }
+
+    #[test]
+    fn the_atomic_writer_volume_root_alone_may_be_sticky_and_world_writable() {
+        let bundle = atomic_writer("atomic-sticky-root");
+        set_mode(&bundle.root, 0o1777);
+        let report = bundle.read();
+        assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+        assert!(report.bundle.is_some());
+
+        // Without the sticky bit anyone could repoint `..data`.
+        let bundle = atomic_writer("atomic-open-root");
         set_mode(&bundle.root, 0o777);
         assert_eq!(only_codes(&bundle.read()), [Code::UnsafePermissions]);
 
-        // The kubelet's sticky, world-writable volume root is safe.
-        let bundle = TempBundle::complete("sticky-root");
-        set_mode(&bundle.root, 0o1777);
-        assert!(bundle.read().bundle.is_some());
+        // The generation is the volume owner's alone, sticky or not.
+        for mode in [0o1777, 0o775, 0o777] {
+            let bundle = atomic_writer(&format!("atomic-writable-generation-{mode:o}"));
+            set_mode(&bundle.root.join("..2026_10_21_10_00_00.000000001"), mode);
+            assert_eq!(
+                only_codes(&bundle.read()),
+                [Code::UnsafePermissions],
+                "{mode:o}"
+            );
+        }
     }
 
     /// The kubelet's layout: `..data -> ..<timestamp>`, files inside the

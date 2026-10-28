@@ -147,6 +147,7 @@ pub(crate) enum Code {
     // Additional trust anchors.
     CaFileUnreadable,
     CaFileNotRegularFile,
+    CaFileUnsafePermissions,
     CaFileTooLarge,
     CaFileInvalid,
     // The server address and the admin API transport.
@@ -220,6 +221,7 @@ impl Code {
         Self::CredentialInvalid,
         Self::CaFileUnreadable,
         Self::CaFileNotRegularFile,
+        Self::CaFileUnsafePermissions,
         Self::CaFileTooLarge,
         Self::CaFileInvalid,
         Self::InvalidServerUrl,
@@ -349,6 +351,11 @@ impl Code {
             ),
             Self::CaFileUnreadable => ("trust.ca_file_unreadable", "the CA file could not be opened or read", Failure),
             Self::CaFileNotRegularFile => ("trust.ca_file_not_regular_file", "the CA file is not a regular file", Usage),
+            Self::CaFileUnsafePermissions => (
+                "trust.ca_file_unsafe_permissions",
+                "the CA file, or a directory holding it, is writable by group or other",
+                Usage,
+            ),
             Self::CaFileTooLarge => ("trust.ca_file_too_large", "the CA file is larger than 1 MiB", Usage),
             Self::CaFileInvalid => (
                 "trust.ca_file_invalid",

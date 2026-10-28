@@ -1047,6 +1047,7 @@ version = "0.1.0"
 dependencies = [
  "gateway-config",
  "jsonschema",
+ "libc",
  "rcgen",
  "reqwest",
  "serde",

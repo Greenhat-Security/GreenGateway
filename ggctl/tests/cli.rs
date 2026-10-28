@@ -383,6 +383,13 @@ impl TempDirectory {
     fn new(name: &str) -> Self {
         let path = std::env::temp_dir().join(format!("ggctl-cli-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&path).expect("temp directory");
+        // An explicit mode, so the runner's umask cannot decide whether the
+        // CA file's directory passes.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).expect("mode");
+        }
         Self(path)
     }
 }
@@ -410,6 +417,8 @@ fn https_with_an_added_trust_anchor_and_a_token_file() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600))
             .expect("mode");
+        // A trust anchor may be world-readable.
+        std::fs::set_permissions(&ca_file, std::fs::Permissions::from_mode(0o644)).expect("mode");
     }
     let base = gateway.base("https");
     let ca = ca_file.to_str().expect("UTF-8 path");
@@ -462,5 +471,27 @@ fn https_with_an_added_trust_anchor_and_a_token_file() {
         assert_eq!(output.status.code(), Some(2));
         assert!(text(&output.stderr).contains("credential.unsafe_permissions"));
         assert_eq!(gateway.requests().len(), before);
+
+        // A CA file another account can write could add the anchor that
+        // receives the token: refused before any connection is made.
+        std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600))
+            .expect("mode");
+        std::fs::set_permissions(&ca_file, std::fs::Permissions::from_mode(0o664)).expect("mode");
+        let output = ggctl(
+            &[
+                "version",
+                "--server",
+                &base,
+                "--ca-file",
+                ca,
+                "--token-file",
+                token,
+            ],
+            None,
+        );
+        assert_eq!(output.status.code(), Some(2));
+        assert!(text(&output.stderr).contains("trust.ca_file_unsafe_permissions"));
+        assert_eq!(gateway.requests().len(), before);
+        assert_no_canary(&output);
     }
 }

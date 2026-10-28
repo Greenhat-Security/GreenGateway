@@ -82,7 +82,7 @@ When several errors apply, the one that must not be hidden wins: `1` over everyt
 An admin bearer token comes from exactly one of:
 
 - `--token-stdin`: standard input, which must be a pipe or a file. A terminal is refused (`credential.stdin_is_terminal`) because a token typed there is echoed and kept in scrollback.
-- `--token-file PATH`: a regular file of at most 8 KiB. A symbolic link to one is followed, as mounted secrets use them; a FIFO, device or directory is refused without being opened. On Unix the file must grant group and other no access at all (mode `0600` or `0400`); Windows has no mode bits, and the file's ACL is left to the operator.
+- `--token-file PATH`: a regular file of at most 8 KiB. A symbolic link to one is followed, as mounted secrets use them; a FIFO, device or directory is refused without being opened, and the file is opened without blocking, so one swapped in after that check is refused rather than waited on. On Unix the file must grant group and other no access at all (mode `0600` or `0400`); Windows has no mode bits, and the file's ACL is left to the operator.
 
 The token must be one RFC 6750 bearer token, optionally followed by a single line ending; anything else is refused before a request is built. It is held in memory that is zeroed on drop, has a redacted `Debug` form, and is sent only as `Authorization: Bearer` to the named server. An operating-system credential store may follow in a later slice.
 
@@ -94,7 +94,7 @@ printf '%s' "$ADMIN_TOKEN" | ggctl version --server https://gateway.example.test
 
 `--server` takes the admin API base, `https://HOST[:PORT]/v1<ADMIN_PREFIX>` (for the default prefix, `https://HOST/v1/admin`), and `ggctl` never derives or rewrites it:
 
-- HTTPS uses the platform's trust store with normal certificate and hostname verification. `--ca-file PATH` adds the PEM certificates in one regular file of at most 1 MiB as further trust anchors; it does not replace the platform's, and it applies only to an `https` server. On Linux the platform store honors `SSL_CERT_FILE` and `SSL_CERT_DIR`, as every client using it does. There is no option that disables verification.
+- HTTPS uses the platform's trust store with normal certificate and hostname verification. `--ca-file PATH` adds the PEM certificates in one regular file of at most 1 MiB as further trust anchors; it does not replace the platform's, and it applies only to an `https` server. It is read like `--token-file`, and because these anchors decide which server receives the token, on Unix another account must not be able to change it: the file may be world-readable (`0644`), but a file writable by group or other (`0664`, `0666`) is refused, and so is one in a directory writable by group or other without the sticky bit, whether that is the directory the path names or, for a symbolic link, the one holding the file it points to (`trust.ca_file_unsafe_permissions`). Windows leaves the file's ACL to the operator. On Linux the platform store honors `SSL_CERT_FILE` and `SSL_CERT_DIR`, as every client using it does. There is no option that disables verification.
 - Plain `http` is accepted only for a loopback IP literal (`127.0.0.0/8` or `::1`), which covers SSH tunnels and `kubectl port-forward`. `localhost` is a name, not a literal, and needs `https`.
 - A user name or password, a query, a fragment, percent-escapes, backslashes, `.` or `..` segments, and any space, tab, line break or other control character are refused, so the base used is exactly the one written.
 - Redirects are refused, never followed. Ambient proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`) are ignored. Requests use HTTP/1.1 without compression or `Referer`.
@@ -157,6 +157,7 @@ Each code below is stable. The exit column is the exit code the diagnostic produ
 | --- | --- | --- |
 | `trust.ca_file_unreadable` | 1 | The CA file could not be opened or read. |
 | `trust.ca_file_not_regular_file` | 2 | The CA file is not a regular file. |
+| `trust.ca_file_unsafe_permissions` | 2 | The CA file, or a directory holding it, is writable by group or other (Unix); a directory may be only with the sticky bit. |
 | `trust.ca_file_too_large` | 2 | The CA file is larger than 1 MiB. |
 | `trust.ca_file_invalid` | 2 | The CA file holds no PEM certificate that can be used as a trust anchor. |
 
