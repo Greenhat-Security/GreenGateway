@@ -562,7 +562,11 @@ and the issuer as the principal carried it rather than in canonical form.
 issuer or auth mode. Neither table is a journal source, so nothing delivers either
 row; aligning both with this section's columns is a later #425 slice (the
 inventory's `policy_postgres`, `tools_postgres`, `configuration_import` and
-`catalog_postgres` rows keep `missing_metadata`).
+`catalog_postgres` rows keep `missing_metadata`). For `catalog_change_evidence`
+that slice is migration 25, which adds this section's three columns under the same
+CHECK. This release approves it as an additive extension and serves a database
+that holds it, but does not apply it and still writes no metadata into it; only
+its successor applies it ([schema 24 to 25](deployment/postgres.md#prepared-extension-schema-24-to-25)).
 
 ## Next reviewable slices and validation gates
 
