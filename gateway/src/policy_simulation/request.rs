@@ -191,7 +191,12 @@ pub(crate) fn parse_request(bytes: &[u8], value: &Value) -> Result<SimulationReq
     }
 }
 
-fn parse_candidate(value: &Value, diagnostics: &mut Diagnostics) -> Option<CandidateSource> {
+/// Parse a `candidate` member. Historical replay takes the same three
+/// sources, with the same members, so it parses them here.
+pub(crate) fn parse_candidate(
+    value: &Value,
+    diagnostics: &mut Diagnostics,
+) -> Option<CandidateSource> {
     let map = object(value, "/candidate", diagnostics)?;
     let source = required(map, "source", "/candidate", diagnostics)?;
     match source.as_str() {

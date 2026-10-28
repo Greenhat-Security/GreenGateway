@@ -6598,7 +6598,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::routing::add_admin_api_routes#1",
-      "sha256": "3378b12cc3ab34039279255c4554ff825bcf0e2d82ef5d0ed6ed770a694c9b67",
+      "sha256": "c956ed27a80787bf0d30bc34c37eae2febb0f310cfbf074d8cffbb33765a543c",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
@@ -6993,12 +6993,32 @@
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
     {
+      "file": "gateway/src/admin_policy_replays.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::admin_policy_replays::use super :: *#1",
+      "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
       "file": "gateway/src/main.rs",
       "reasons": [
         "capability-import-or-glob"
       ],
       "scope": "gateway::use admin_policy_simulations :: *#1",
       "sha256": "a6b33445074e02cb3fdd3aef5ba8a4cae0ab586a01896760641accd889546470",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/main.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::use admin_policy_replays :: *#1",
+      "sha256": "55c05778c910e2295d719e51e3f3a80748d9b3cc17482432b1ee6b422ff92a05",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
@@ -7051,16 +7071,6 @@
       "sha256": "9176b99ccc2d3c15ca388aec8f5865e042a159e642fb875215f56e10e4e7eafa",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
-    },
-    {
-      "file": "gateway/src/audit/query.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::audit::query::impl  AuditQueryStore::open_read_only#1",
-      "sha256": "b600df922c004821039e7e68c7456e1b6d030e4c0f2fb10eed318dc30cca6bf3",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
     },
     {
       "file": "gateway/src/audit/query.rs",
@@ -10796,9 +10806,9 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::policy_replay::file_attributes#1",
-      "sha256": "9de1b2b2cda39ab5d60a49dee1854db94e0313ace54e8ac0e0df2a10986733e3",
+      "sha256": "bd6d6a86d8c6f7b1896edf24fa8e7be727c837da52523d5a58ee6aae218cfd34",
       "owner": "policy replay contexts (#243)",
-      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the policy replay context module, whose first caller outside tests is the replay job engine (#243 slice 13). The module parses and builds replay contexts in memory and asks the pure policy kernel; dead-code gating only, no I/O and no transport or process capability."
+      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the policy replay context module: the replay job engine (#243 slice 13) now calls the adapters and evaluator, and the serialized form, egress replay and recorded result wait for the impact comparison (#243 slice 14). The module parses and builds replay contexts in memory and asks the pure policy kernel; dead-code gating only, no I/O and no transport or process capability."
     },
     {
       "file": "gateway/src/proxy/admission.rs",

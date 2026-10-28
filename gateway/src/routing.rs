@@ -261,6 +261,9 @@ pub(super) fn add_admin_api_routes(
         admin_api_states.policy.audit.clone(),
         admin_api_states.policy.client_ip_policy.clone(),
     );
+    // One replay job registry per router, shared by the routes that start,
+    // poll and cancel its jobs: its quotas belong to this application.
+    let replay_jobs = Arc::new(PolicyReplayJobs::new());
     // The admin API (minus the pre-authorization auth routes, merged
     // separately below) is one router so cluster mode can gate all of it
     // with one layer: every endpoint here authorizes against the compiled
@@ -390,6 +393,16 @@ pub(super) fn add_admin_api_routes(
                     // to this application, not to the process.
                     post(policy_simulations_endpoint)
                         .layer(Extension(Arc::new(PolicySimulationLimiter::new()))),
+                )
+                .route(
+                    routes.admin.policy_replays_route.as_str(),
+                    post(policy_replay_create_endpoint).layer(Extension(Arc::clone(&replay_jobs))),
+                )
+                .route(
+                    routes.admin.policy_replay_route.as_str(),
+                    get(policy_replay_get_endpoint)
+                        .delete(policy_replay_delete_endpoint)
+                        .layer(Extension(Arc::clone(&replay_jobs))),
                 )
                 .route(
                     routes.admin.policy_rules_route.as_str(),

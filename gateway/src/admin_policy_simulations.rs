@@ -128,7 +128,7 @@ fn simulation_invalid(diagnostics: &policy_testing::suite::Diagnostics) -> Respo
         .into_response()
 }
 
-fn simulation_candidate_invalid(error: &rbac::policy::PolicyError) -> Response {
+pub(super) fn simulation_candidate_invalid(error: &rbac::policy::PolicyError) -> Response {
     (
         StatusCode::UNPROCESSABLE_ENTITY,
         Json(json!({
@@ -143,7 +143,7 @@ fn simulation_candidate_invalid(error: &rbac::policy::PolicyError) -> Response {
 /// The active policy, its ETag and the authority it was read under: the
 /// authoritative document in cluster mode, at the revision it was read, and
 /// the installed snapshot in standalone mode.
-async fn simulation_base(
+pub(super) async fn simulation_base(
     state: &PolicyAdminState,
     rbac_state: &middleware::rbac::RbacState,
 ) -> ResponseResult<(rbac::Policy, String, policy_eval::PolicyAuthority)> {
@@ -185,38 +185,56 @@ async fn simulation_base(
     }
 }
 
-/// The candidate the request describes, validated exactly as a policy write
-/// validates one, or `None` when the candidate is the base itself.
+/// Why a request's candidate could not be built.
+pub(super) enum CandidateRefusal {
+    /// An edit did not apply to the base.
+    Edits(policy_testing::suite::Diagnostics),
+    /// The candidate is not a policy a write would accept.
+    Invalid(rbac::policy::PolicyError),
+    /// The base could not be serialized for editing.
+    Internal,
+}
+
+/// The candidate a request describes, validated exactly as a policy write
+/// validates one, or `None` when the candidate is the base itself. Shared by
+/// simulation and historical replay, which take the same candidate sources.
+pub(super) fn resolve_candidate(
+    rbac_state: &middleware::rbac::RbacState,
+    base: &rbac::Policy,
+    source: &CandidateSource,
+) -> Result<Option<rbac::Policy>, CandidateRefusal> {
+    let document = match source {
+        CandidateSource::Active => return Ok(None),
+        CandidateSource::Inline(document) => document.clone(),
+        CandidateSource::Edits(edits) => {
+            let base_document = serde_json::to_value(base).map_err(|error| {
+                tracing::error!(error = %error, "failed to serialize the candidate base");
+                CandidateRefusal::Internal
+            })?;
+            apply_edits(&base_document, edits, "/candidate/edits")
+                .map_err(CandidateRefusal::Edits)?
+        }
+    };
+    let candidate =
+        rbac::Policy::validate_json_value(document).map_err(CandidateRefusal::Invalid)?;
+    rbac_state
+        .validate_proxy_dispatch_policy(&candidate)
+        .map_err(CandidateRefusal::Invalid)?;
+    Ok(Some(candidate))
+}
+
 fn simulation_candidate(
     rbac_state: &middleware::rbac::RbacState,
     base: &rbac::Policy,
     source: &CandidateSource,
 ) -> ResponseResult<Option<rbac::Policy>> {
-    let document = match source {
-        CandidateSource::Active => return Ok(None),
-        CandidateSource::Inline(document) => document.clone(),
-        CandidateSource::Edits(edits) => {
-            let base_document = match serde_json::to_value(base) {
-                Ok(document) => document,
-                Err(error) => {
-                    tracing::error!(error = %error, "failed to serialize the simulation base");
-                    return Err(Box::new(internal_server_error("policy simulation failed")));
-                }
-            };
-            match apply_edits(&base_document, edits, "/candidate/edits") {
-                Ok(document) => document,
-                Err(diagnostics) => return Err(Box::new(simulation_invalid(&diagnostics))),
-            }
-        }
-    };
-    let candidate = match rbac::Policy::validate_json_value(document) {
-        Ok(candidate) => candidate,
-        Err(error) => return Err(Box::new(simulation_candidate_invalid(&error))),
-    };
-    if let Err(error) = rbac_state.validate_proxy_dispatch_policy(&candidate) {
-        return Err(Box::new(simulation_candidate_invalid(&error)));
-    }
-    Ok(Some(candidate))
+    resolve_candidate(rbac_state, base, source).map_err(|refusal| {
+        Box::new(match refusal {
+            CandidateRefusal::Edits(diagnostics) => simulation_invalid(&diagnostics),
+            CandidateRefusal::Invalid(error) => simulation_candidate_invalid(&error),
+            CandidateRefusal::Internal => internal_server_error("policy simulation failed"),
+        })
+    })
 }
 
 struct SimulationBinding {

@@ -9,7 +9,7 @@ rule preview, endpoint coverage and suggestion coverage (#422, PR 4). With the
 legacy retirement the enum-source precheck and the tool-name coverage check ask
 it too, and it holds the only serving `RuleMatcher`: no serving path matches a
 policy rule beside it. Synthetic simulation is an offline caller, described
-below, and so are replay contexts, which have no endpoint yet.
+below, and so are replay contexts and the replay jobs that decide them.
 
 It now covers contextless HTTP direct rules and permission routes, host-qualified
 routes and dispatch-scoped direct rules, MCP alias identities, and rate-lane
@@ -441,5 +441,22 @@ description of them: requests driven through the real RBAC and observation
 middleware, and invocations through the real tool runtime, are captured,
 adapted and replayed under the same compiled policy, and every replayed answer
 is the live one or `indeterminate` for a stated reason. No live path writes a
-replay context and no job reads one yet; the format and the legacy records
-are in [policy-replay.md](../policy-replay.md).
+replay context; the format and the legacy records are in
+[policy-replay.md](../policy-replay.md).
+
+## Replay jobs (#243, slice 13)
+
+`policy_replay::job` is the bounded engine behind
+`POST /v1{ADMIN_PREFIX}/policy/replays`. It reads one window of the standalone
+audit log, fixed by a high-water row id when the job is created, page by page
+over a read-only connection; adapts each row with `policy_replay::legacy`; and
+asks the candidate's `CompiledPolicy` through `policy_replay::evaluate` --
+`evaluate` (with both MCP readings where the identity was not recorded),
+`select_rate_lane` and `evaluate_tool`. Every answer is folded into counts
+keyed by stable codes: the kernel's logical outcome, effect and reason, its
+limitations for `indeterminate` answers, and its input refusals. An evaluator
+invariant failure fails the job; it is never counted as an answer. The run is
+bounded in records, time and memory, is cancelled between records, records no
+audit event or metric, and returns a result with an ADR-0004 semantic digest
+that depends only on the cutoff, the candidate and the evaluator. The API,
+bounds and lifecycle are in [policy-replay.md](../policy-replay.md#replay-jobs).
