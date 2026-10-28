@@ -1536,9 +1536,10 @@ must enforce because the gateway cannot, and what is out of scope. In short:
   disabled user cannot call the gateway once their sign-in no longer validates,
   but a bearer token issued before keeps validating until it expires unless its
   `jti` is revoked. When you disable a user, also
-  [purge their tokens](#purging-a-principals-tokens) (standalone), or revoke
-  their outstanding JWTs, which purges on each replica the next time one is
-  presented (cluster), and revoke the grant at the issuer. Give the Connection
+  [purge their tokens](#purging-a-principals-tokens), which in cluster mode
+  is recorded for every replica, or revoke their outstanding JWTs, which
+  purges every replica the first time one is refused (cluster), and revoke
+  the grant at the issuer. Give the Connection
   a `revocation_url` so a purge also revokes the tokens at the issuer;
   without one they stay valid there until they expire.
 - **For an immediate stop on every replica, disable the Connection** (or make
