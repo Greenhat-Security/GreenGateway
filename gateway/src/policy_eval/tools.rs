@@ -335,6 +335,25 @@ impl ToolEvaluation {
                 .is_ok_and(|binding| binding == self.binding)
     }
 
+    /// This answer with its decision replaced, for a test that reaches an
+    /// adapter's guards against an answer the kernel never gives. The binding
+    /// and completeness are kept, so it is still a complete answer to the
+    /// question that was asked; only what it says changes.
+    #[cfg(test)]
+    pub(crate) fn crafted(
+        mut self,
+        logical: LogicalDecision,
+        effect: PolicyEffect,
+        reason: ToolReason,
+        matched: Option<RuleReference>,
+    ) -> Self {
+        self.logical = logical;
+        self.effect = effect;
+        self.reason = reason;
+        self.matched = matched;
+        self
+    }
+
     fn deny(mut self, reason: ToolReason) -> Self {
         self.logical = LogicalDecision::Deny;
         self.effect = PolicyEffect::Block;

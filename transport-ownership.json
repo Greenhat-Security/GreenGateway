@@ -6642,7 +6642,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::bootstrap::run#1",
-      "sha256": "816abf3ca37846695768241f81e5789b7ba5aa7f075281b8b8a0276899580cf2",
+      "sha256": "1a8055991766a3d5749418eb0ffb8113e2babf0e308afb0de08586f10ebc9542",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -10660,9 +10660,9 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::middleware::rbac::RbacPolicyState#1",
-      "sha256": "9ce1a716af4f359a8ce1b47c9b5a51f8d3e84a7f62d0d45d15dc1b0fa0166c77",
+      "sha256": "a30db022f49cba05f303e2135003bcd2a232174669c9d8d7d88468fce6a6b4eb",
       "owner": "GreenGateway maintainers",
-      "purpose": "Issue #422 tool-lane cutover: the pre-cutover direct-rule matcher field (rule_matcher) is now #[cfg(test)] and kept only for the frozen differential oracles, so serving snapshots carry only the compiled policy that every HTTP and tool-lane decision reads. cfg gating and a doc comment only; no field, client, socket, TLS, DNS or header authority is added."
+      "purpose": "Issue #422 structural attribution: the pre-cutover permission engine (engine) and route vector (routes) join the direct-rule matcher as #[cfg(test)] fields kept only for the frozen differential oracles, so serving snapshots carry only the compiled policy, whose own routes, direct rules and permission engine every HTTP and tool-lane decision, audit attribution and management permission reads. cfg gating and doc comments only; no field, client, socket, TLS, DNS or header authority is added."
     },
     {
       "file": "gateway/src/middleware/rbac.rs",
@@ -11626,7 +11626,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::migrations::apply_missing_for_startup#1",
-      "sha256": "e7c128e1f1b74466f4e240e5e96b5b27b54a4f8871494bc79aa41fe6f50bf41d",
+      "sha256": "82f494822119e52dc7d89aba273f4c5a8475befc4e745c53bb97b7c47f07ba04",
       "owner": "GreenGateway maintainers",
       "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
     },
