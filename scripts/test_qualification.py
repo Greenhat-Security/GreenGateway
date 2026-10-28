@@ -405,11 +405,16 @@ class NetpolTests(unittest.TestCase):
 
 
 class Target:
-    """A loopback HTTP target: healthy until /__fault makes it answer 503 for a moment."""
+    """A loopback HTTP target: healthy until /__fault makes it answer 503 for a moment.
+
+    As a fake Alertmanager it lists `alerts`, and raises the `armed` ones on the first listing for which
+    `fire_when()` holds, as a rule would once its fault exists.
+    """
 
     def __init__(self, healthy=True, down_seconds=1.0):
         self.healthy, self.down_seconds, self.down_until = healthy, down_seconds, 0.0
         self.faults, self.headers, self.alerts = 0, [], []
+        self.armed, self.fire_when, self.listings = [], None, []
         target = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -430,9 +435,17 @@ class Target:
                     return self.reply(200)
                 target.record(parsed.path, self.headers)
                 if parsed.path == "/api/v2/alerts":
-                    matchers = [re.fullmatch(r'([^=]+)="(.*)"', value).groups()
-                                for key, value in urllib.parse.parse_qsl(parsed.query) if key == "filter"]
-                    found = [a for a in target.alerts if all(a["labels"].get(k) == v for k, v in matchers)]
+                    query = urllib.parse.parse_qsl(parsed.query)
+                    target.listings.append(dict(query))
+                    if target.armed and target.fire_when and target.fire_when():
+                        target.alerts += [dict({"startsAt": q.iso(q.utc_now())}, **alert) for alert in target.armed]
+                        target.armed = []
+                    matchers = [re.fullmatch(r'([^=]+)="(.*)"', value).groups() for key, value in query
+                                if key == "filter"]
+                    muted = [field for field, flag in (("silencedBy", "silenced"), ("inhibitedBy", "inhibited"))
+                             if dict(query).get(flag) == "false"]
+                    found = [a for a in target.alerts if all(a["labels"].get(k) == v for k, v in matchers)
+                             and not any(a["status"].get(field) for field in muted)]
                     return self.reply(200, json.dumps(found).encode())
                 ok = target.healthy and time.monotonic() >= target.down_until
                 self.reply(200 if ok else 503, b"ok")
@@ -647,23 +660,85 @@ class AlertTests(unittest.TestCase):
         finally:
             target.close()
 
+    RULE = ("--expect", "GreenGatewayMetricsTargetDown", "--match-label", "instance=gateway-2")
+
+    @staticmethod
+    def rule_alert(**fields):
+        return dict({"labels": {"alertname": "GreenGatewayMetricsTargetDown", "instance": "gateway-2"},
+                     "status": {"state": "active"}, "receivers": [{"name": "platform-critical"}]}, **fields)
+
+    @staticmethod
+    def fault(marker):
+        """A fault command whose only effect is the marker the fake Alertmanager fires its armed alert on."""
+        return ("--", sys.executable, "-c", "import pathlib, sys; pathlib.Path(sys.argv[1]).write_text('fault')",
+                str(marker))
+
     def test_a_rule_alert_is_awaited_after_the_fault(self):
         target = Target()
         try:
             with tempfile.TemporaryDirectory() as directory:
-                self.assertEqual(self.run_alert(target, directory, "--expect", "GreenGatewayMetricsTargetDown",
-                                                "--timeout-seconds", "0.5"), 1)
-                target.alerts.append({"labels": {"alertname": "GreenGatewayMetricsTargetDown",
-                                                 "instance": "gateway-2"}, "startsAt": q.iso(q.utc_now()),
-                                      "status": {"state": "active"}, "receivers": [{"name": "platform-critical"}]})
-                self.assertEqual(self.run_alert(target, directory, "--expect", "GreenGatewayMetricsTargetDown",
-                                                "--match-label", "instance=gateway-2", "--", sys.executable, "-c",
-                                                "pass"), 0)
+                marker = Path(directory) / "fault"
+                self.assertEqual(self.run_alert(target, directory, *self.RULE, "--timeout-seconds", "0.5"), 1)
+                # The rule fires only once the fault command has run.
+                target.armed, target.fire_when = [self.rule_alert()], marker.exists
+                self.assertEqual(self.run_alert(target, directory, *self.RULE, *self.fault(marker)), 0)
                 record = json.loads((Path(directory) / "alert.json").read_text(encoding="utf-8"))
-                self.assertEqual((record["mode"], record["fault_command_exit"]), ("rule", 0))
-                self.assertIn("rule_fired_after_seconds", record)
+                self.assertEqual((record["mode"], record["fault_command_exit"], record["verdict"]),
+                                 ("rule", 0, "routed"))
+                self.assertGreaterEqual(record["rule_fired_after_seconds"], 0)
+                self.assertLessEqual(record["inactive_checked_at"], record["fault_at"])
+                # The pre-fault check counted silenced and inhibited alerts; the wait did not.
+                rule_listings = target.listings[-2:]
+                self.assertEqual([(listing["silenced"], listing["inhibited"]) for listing in rule_listings],
+                                 [("true", "true"), ("false", "false")])
         finally:
             target.close()
+
+    def test_an_alert_already_active_is_refused_before_the_fault(self):
+        # Still active from an earlier incident or drill, possibly silenced while it was handled: this run's
+        # fault cannot raise a new alert for that label set, so the old one would be reported as proof.
+        for status in ({"state": "active"}, {"state": "suppressed", "silencedBy": ["handled"], "inhibitedBy": []}):
+            for fault in (True, False):
+                with self.subTest(status=status["state"], fault_command=fault):
+                    target = Target()
+                    try:
+                        with tempfile.TemporaryDirectory() as directory:
+                            marker = Path(directory) / "fault"
+                            target.alerts.append(self.rule_alert(
+                                startsAt=q.iso(q.utc_now() - q.timedelta(minutes=4)), status=status))
+                            extra = self.fault(marker) if fault else ()
+                            self.assertEqual(self.run_alert(target, directory, *self.RULE, *extra), 2)
+                            self.assertFalse(marker.exists(), "the fault command must not run")
+                            self.assertFalse((Path(directory) / "alert.json").exists())
+                            self.assertEqual(len(target.listings), 1)
+                    finally:
+                        target.close()
+
+    def test_a_rule_alert_that_started_before_the_drill_fails_it(self):
+        # It surfaces only after the check, as an old alert does when its silence expires mid-drill, but its
+        # own startsAt precedes the drill's reference time.
+        stale = q.iso(q.utc_now() - q.timedelta(minutes=4))
+        cases = (("with a fault command", stale, True,
+                  "the alert was already active before the fault (startsAt precedes fault_at)"),
+                 ("operator-made fault", stale, False,
+                  "the alert was already active before the drill started (startsAt precedes inactive_checked_at)"),
+                 ("no startsAt", None, True, "Alertmanager reported no readable startsAt"))
+        for name, starts_at, fault, reason in cases:
+            with self.subTest(name):
+                target = Target()
+                try:
+                    with tempfile.TemporaryDirectory() as directory:
+                        marker = Path(directory) / "fault"
+                        target.armed = [self.rule_alert(startsAt=starts_at)]
+                        target.fire_when = marker.exists if fault else (lambda: len(target.listings) > 1)
+                        extra = self.fault(marker) if fault else ()
+                        self.assertEqual(self.run_alert(target, directory, *self.RULE, *extra), 1)
+                        record = json.loads((Path(directory) / "alert.json").read_text(encoding="utf-8"))
+                        self.assertEqual((record["verdict"], record["reasons"]), ("failed", [reason]))
+                        if fault and starts_at:
+                            self.assertLess(record["rule_fired_after_seconds"], 0)
+                finally:
+                    target.close()
 
 
 class EvidenceTests(unittest.TestCase):

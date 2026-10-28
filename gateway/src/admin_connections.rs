@@ -913,7 +913,7 @@ pub(super) async fn connection_put_endpoint(
         Err(error) => return connection_mutation_error_response(error),
     };
     state.mcp_catalogs.reconcile_connection(&updated);
-    state.openapi_catalogs.reconcile_connection(&updated);
+    let withdrawn_openapi_catalog = state.openapi_catalogs.reconcile_connection(&updated);
     if !changed_fields.is_empty() {
         emit_connection_changed(
             &state,
@@ -924,6 +924,9 @@ pub(super) async fn connection_put_endpoint(
             &changed_fields,
             credential_changed,
         );
+    }
+    if let Some(withdrawal) = &withdrawn_openapi_catalog {
+        emit_managed_openapi_catalog_withdrawn(&state, &parts, &principal, withdrawal);
     }
     let status = if changed_fields.is_empty() {
         current_status

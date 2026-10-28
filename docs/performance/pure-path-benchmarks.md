@@ -2,7 +2,8 @@
 
 Part of #437. The required `microbench` CI job compares deterministic allocation
 counts for a small set of pure production predicates and for the shared policy
-evaluator's HTTP, tool and rate-lane decisions. Wall-clock timings remain
+evaluator's HTTP, tool and rate-lane decisions. It also measures the static
+egress decision, which no budget lists yet. Wall-clock timings remain
 informational. The existing nightly, HA, failover, load and release workflows
 remain in place; these microbenchmarks do not establish a production SLO.
 
@@ -48,14 +49,15 @@ The egress target measures static host matching; it does not measure URL
 classification, resolution, address policy, HTTP or network transport.
 
 These four targets measure predicates, not policy decisions. The shared
-evaluator's HTTP, tool and rate decisions have kernel targets of their own,
-described from [the HTTP policy decision](#authoritative-http-policy-decision)
-on. Every predicate measured here is still called by production code; the
-static egress lane, for example, matches host patterns with
-`host_glob_matches`. None has been retired, so none of these targets is
-removed; a predicate retired later needs equivalent authoritative coverage
-before its benchmark goes. Cached JWT work is deferred: this harness has no JWT
-verification, keys, cache or cache-lifetime model.
+evaluator's HTTP, tool, rate and static egress decisions have kernel targets
+of their own, described from
+[the HTTP policy decision](#authoritative-http-policy-decision) on. Every
+predicate measured here is still called by production code; the static egress
+lane, for example, matches host patterns with `host_glob_matches`. None has
+been retired, so none of these targets is removed; a predicate retired later
+needs equivalent authoritative coverage before its benchmark goes. Cached JWT
+work is deferred: this harness has no JWT verification, keys, cache or
+cache-lifetime model.
 
 All inputs are public synthetic fixtures. Host cases use reserved test names;
 there are no tokens, real upstream hostnames or external network dependencies.
@@ -217,7 +219,11 @@ test finished in under a second in the
 to a step bound by the two builds. The slowest step, in run 39738214098,
 finished about 11 seconds inside the 480-second comparison budget. That margin
 is the job's main timing risk, and it comes from build time, not from the
-measured decisions.
+measured decisions. The 30 `microbench` jobs of the pull-request and
+main-push CI runs created from 2026-10-22 12:07 to 2026-10-25 20:34 UTC, after
+the lane benchmarks landed, all passed. Their comparison steps took 252 to 438
+seconds, so the slowest finished about 42 seconds inside the budget, and the
+jobs took 297 to 489 seconds.
 
 These are durations on shared hosted runners, not a timing qualification. The
 evidence artifacts have 30-day retention, so this record keeps run and commit
@@ -325,8 +331,8 @@ dataset or harness change now follows the two-hash procedure below for
 `lane_harness_sha256`. A change to the `http_policy` harness, including its
 declaration of the lane module, follows it for `kernel_harness_sha256`.
 
-The static egress lane, `CompiledEgressPolicy::evaluate`, has no kernel target
-yet. Only its host-pattern predicate is measured, as `egress_host`.
+The static egress lane is measured by a further target in the same file,
+[`static_egress`](#static-egress-decision), which no budget lists yet.
 
 ### Lane measurement record
 
@@ -360,6 +366,96 @@ On this host the controller's `run` command passed its pure-path stage and
 then refused the kernel stage, because building the real gateway needs the
 pinned Node; `self-test` needs it too. The processes above shared one binary,
 so an independent rebuild of the same revision is what `self-test` adds.
+
+## Static egress decision
+
+One more target measures the shared evaluator's static egress lane. It runs in
+the same gateway test binary as the lanes above, under the same warmup, sample
+and iteration counts, compiler and Cargo profile:
+
+| Target | Kernel call | Live caller | Cases per iteration | Fact bytes |
+| --- | --- | --- | ---: | ---: |
+| `static_egress` | `CompiledEgressPolicy::evaluate` | the egress adapter's destination checks: `checked_destination` and the DNS-free rebinding and revalidation of a pinned destination | 25 | 550 |
+
+The dataset asks every refusal the lane can reach from a parsed URL, in its
+checking order: missing host, userinfo, fragment, scheme, host, pattern label
+boundary, and default and explicit port. It also asks a static refusal that
+carries resolution facts, and both static admissions, an exact and a pattern
+host, which the lane answers by asking for resolution facts. The rest are
+address questions: an empty answer set and an answer on an unexpected port,
+policy-CIDR exemptions in both address families, IPv4, well-known NAT64 and
+configured NAT64 global exceptions, several admitted answers with the first
+pinned, and non-global, IPv4-mapped, NAT64-embedded, loopback and out-of-CIDR
+IPv6 refusals. Hosts use the reserved `.test` suffix and addresses come from
+documentation and IANA special-purpose blocks. Fact bytes sum the scheme and
+host bytes of the destinations.
+
+The resolution facts are fixed answer sets: nothing is resolved, connected or
+sent. URL parsing and destination and context construction stay outside the
+measured intervals, as in the live adapter, which parses the URL before it
+asks the lane. The target does not measure the DNS lookup, redirect refusal,
+TLS, request and response bounds or transport.
+
+The benchmark is the ignored `static_egress_evaluation` test in
+`gateway/tests/support/lane_benchmark.rs`, so it counts through the same
+allocator as the lanes and changes only the lane harness digest. Each build
+checks that discovery lists it exactly when the revision's lane harness
+declares it. A lane harness from before the test is still valid, so a base
+may lack it; the head must carry it. Its evidence is saved as
+`head.static_egress.kernel.json`, and `base.static_egress.kernel.json` when the
+base carries the test, beside the raw reports and `egress-context.json`, and is
+summarized under `static_egress` in `summary.json`. The self-test also
+requires a neutral rebuild to pass and the deliberate regression fixture to
+fail, under the zero-growth limit a budget would set.
+
+The target is adopted in the lanes' reviewed steps. The pre-approval comes
+first because the lane harness is already enforced:
+
+1. Pre-approval: b5b103f added the next lane harness digest,
+   `c6bceb2b37eef9ebffa02baa24db09ab09a9c9b28c08ff7f4b69ebb7c02d364c`, to
+   `lane_harness_sha256` beside the current one, while the harness itself
+   stayed unchanged.
+2. Harness: the test lands, and `scripts/microbench.py` runs it as a
+   `pending` target: measured on each revision that declares it, reported,
+   never blocking. The `tool_policy` and `rate_lane` comparisons stay enforced
+   across the change, because the base budget approves both lane digests. It
+   must merge after the pre-approval, never in the same merge.
+3. Budget: a later budget schema lists `static_egress` at zero growth, after
+   `rate_lane`. Until then a budget naming the target fails validation.
+
+Steps 1 and 2 have landed; until step 3 lands, allocation growth in this
+target is reported in its comparison but does not fail the job. A missing,
+undiscovered, crashed, timed-out or mislabelled static egress run still fails
+it. The comparison runs one more test process per revision that declares the
+target. In the [hosted CI record](#hosted-ci-record) the slowest comparison
+step finished about 11 seconds inside its 480-second budget, and the slowest
+of the 30 later ones about 42 seconds inside it, so this narrows a margin that
+is already the job's main timing risk.
+
+### Static egress measurement record
+
+On 2026-10-22, before the harness step was merged, the three lane tests were
+run directly from one gateway test binary built from main
+`ebb579e6444d437bf477d0617b8841d1eea34cfc` with the pre-approval and the
+harness edit applied, under the same build and host conditions as the
+[lane measurement record](#lane-measurement-record). Each target ran in three
+separate processes and once more with the regression fixture switch; timing
+ranges and spreads are computed as there.
+
+| Target | Allocation calls | Requested bytes | Median timing range (ms) | Largest within-run spread | Fixture growth (calls / bytes) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `static_egress` | 4,800 | 387,500 | 44.2–60.0 | 54.9% | 2,500 / 160,000 |
+
+Counts are per sample of 100 dataset passes. All 27 samples had identical
+counts, equal to those recorded when the harness digest was pre-approved
+(`LANE_ROWS` in `scripts/test_microbench.py`). Compared with
+`compare_kernel_results` under the zero-growth limit, each pair of neutral
+runs passed and the fixture run failed, by exactly one 64-byte allocation per
+decision. In the same binary `tool_policy` and `rate_lane` still counted 9,000
+calls and 1,007,400 bytes, and 19,600 calls and 909,800 bytes, so the harness
+edit leaves their enforced baselines alone. libtest reported each static
+egress run finishing in about 0.8 seconds; each process, including startup,
+took about 1.9 seconds on this host. Timing stays informational.
 
 ## Base ownership and reviewed updates
 
