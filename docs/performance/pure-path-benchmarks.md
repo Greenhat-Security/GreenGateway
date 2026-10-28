@@ -1,11 +1,12 @@
 # Pure-path microbenchmark budgets
 
-Part of #437. The required `microbench` CI job compares deterministic allocation
-counts for a small set of pure production predicates and for the shared policy
-evaluator's HTTP, tool and rate-lane decisions. It also measures the static
-egress decision, which no budget lists yet. Wall-clock timings remain
-informational. The existing nightly, HA, failover, load and release workflows
-remain in place; these microbenchmarks do not establish a production SLO.
+Part of #437. The `microbench` CI job compares deterministic allocation counts
+for a small set of pure production predicates and for the shared policy
+evaluator's HTTP, tool, rate-lane and static egress decisions. Image promotion
+requires it; see [CI comparison and evidence](#ci-comparison-and-evidence) for
+what it does and does not gate. Wall-clock timings remain informational. The
+existing nightly, HA, failover, load and release workflows remain in place;
+these microbenchmarks do not establish a production SLO.
 
 ## Measured scope
 
@@ -52,12 +53,18 @@ These four targets measure predicates, not policy decisions. The shared
 evaluator's HTTP, tool, rate and static egress decisions have kernel targets
 of their own, described from
 [the HTTP policy decision](#authoritative-http-policy-decision) on. Every
-predicate measured here is still called by production code; the static egress
-lane, for example, matches host patterns with `host_glob_matches`. None has
-been retired, so none of these targets is removed; a predicate retired later
-needs equivalent authoritative coverage before its benchmark goes. Cached JWT
-work is deferred: this harness has no JWT verification, keys, cache or
-cache-lifetime model.
+predicate measured here is still called by production code: on main
+`2280797aef866a6ea5eef8318a9d60bbfec55f2c` the request predicates are called
+by the authentication, RBAC and rate-limit middleware, `path_prefix_matches`
+by the gateway-owned path check, discovery and observation, compiled path
+patterns by the evaluator's rule matcher, and `host_glob_matches` by the
+static egress lane. A kernel target exercises such a predicate only on the
+cases its own dataset reaches, mixed with the rest of the decision, so it is
+not equivalent coverage for a predicate that stays live. None has been
+retired, so none of these targets is stale or removed; a predicate retired
+later needs equivalent authoritative coverage before its benchmark goes.
+Cached JWT work is deferred: this harness has no JWT verification, keys,
+cache or cache-lifetime model.
 
 All inputs are public synthetic fixtures. Host cases use reserved test names;
 there are no tokens, real upstream hostnames or external network dependencies.
@@ -223,7 +230,12 @@ measured decisions. The 30 `microbench` jobs of the pull-request and
 main-push CI runs created from 2026-10-22 12:07 to 2026-10-25 20:34 UTC, after
 the lane benchmarks landed, all passed. Their comparison steps took 252 to 438
 seconds, so the slowest finished about 42 seconds inside the budget, and the
-jobs took 297 to 489 seconds.
+jobs took 297 to 489 seconds. The static egress target first ran on 2026-10-28
+in pull-request run 40746530358 for merge train #655 and in main-push run
+40750474992, which landed it. Both `microbench` jobs passed, with comparison
+steps of 319 and 398 seconds. Their base, main
+`4d28b278304f5b367ba6836a786a15eda4d2e2a9` before #655, lacked the test, so it
+ran on the head only, as a pending target.
 
 These are durations on shared hosted runners, not a timing qualification. The
 evidence artifacts have 30-day retention, so this record keeps run and commit
@@ -332,7 +344,8 @@ dataset or harness change now follows the two-hash procedure below for
 declaration of the lane module, follows it for `kernel_harness_sha256`.
 
 The static egress lane is measured by a further target in the same file,
-[`static_egress`](#static-egress-decision), which no budget lists yet.
+[`static_egress`](#static-egress-decision), which budget schema 4 enforces
+after the lanes.
 
 ### Lane measurement record
 
@@ -406,7 +419,7 @@ may lack it; the head must carry it. Its evidence is saved as
 base carries the test, beside the raw reports and `egress-context.json`, and is
 summarized under `static_egress` in `summary.json`. The self-test also
 requires a neutral rebuild to pass and the deliberate regression fixture to
-fail, under the zero-growth limit a budget would set.
+fail, under the revision's own budget entry.
 
 The target is adopted in the lanes' reviewed steps. The pre-approval comes
 first because the lane harness is already enforced:
@@ -420,17 +433,42 @@ first because the lane harness is already enforced:
    never blocking. The `tool_policy` and `rate_lane` comparisons stay enforced
    across the change, because the base budget approves both lane digests. It
    must merge after the pre-approval, never in the same merge.
-3. Budget: a later budget schema lists `static_egress` at zero growth, after
-   `rate_lane`. Until then a budget naming the target fails validation.
+3. Budget: `microbench-budget.json` moves to schema 4, which lists
+   `static_egress` at zero growth after `rate_lane`. The test lives in the
+   lane harness, so `lane_harness_sha256` approves it and the schema adds no
+   digest list of its own. That change runs `proposed` against its schema-3
+   base: the base must already carry the test, both revisions are measured
+   and compared, and the result is reported without blocking. Every later
+   comparison whose base carries schema 4 is `enforced`, and a head budget
+   cannot retire the target. A schema-3 budget that names the target fails
+   validation.
 
-Steps 1 and 2 have landed; until step 3 lands, allocation growth in this
-target is reported in its comparison but does not fail the job. A missing,
-undiscovered, crashed, timed-out or mislabelled static egress run still fails
-it. The comparison runs one more test process per revision that declares the
-target. In the [hosted CI record](#hosted-ci-record) the slowest comparison
-step finished about 11 seconds inside its 480-second budget, and the slowest
-of the 30 later ones about 42 seconds inside it, so this narrows a margin that
-is already the job's main timing risk.
+All three steps have landed: b5b103f pre-approved the lane harness digest,
+d5c1ddc added the test, and the budget step moved `microbench-budget.json` to
+schema 4, running `proposed` against its schema-3 base. Every comparison whose
+base carries schema 4 enforces `static_egress` as it enforces the lanes. Any
+increase in its allocation count or allocated bytes fails the job. So does a
+static egress run that is missing, undiscovered, crashed, timed out or
+reporting another dataset, a base without the test, and a lane harness digest
+that the governing budget does not approve. While only the head's budget
+lists the target, that budget governs it, so it must approve the base's lane
+harness as well as the head's. A timing change cannot offset an allocation
+regression. The same budget stopped approving
+`9e70d5c545a5cb02316de2922cfb12518ba3fd803032b70ba72383a142018deb`, the lane
+harness from before the test: a head carrying it lacks the test and is
+refused, and a schema-4 base cannot be measured without the test, so that
+digest can no longer pass. Dropping it frees the second slot for the next
+two-hash transition. A static egress dataset or harness change now follows the
+two-hash procedure below for `lane_harness_sha256`, like a lane change.
+
+Enforcement adds no test process: each revision that declares the target runs
+one static egress process, whatever its state. Every schema-4 base declares
+it, while the base of every hosted run so far did not, so an enforced
+comparison runs one more process than those runs did, on the base. In the
+[hosted CI record](#hosted-ci-record) the slowest comparison step finished
+about 11 seconds inside its 480-second budget, and the slowest of the later
+ones about 42 seconds inside it, so this narrows a margin that is already the
+job's main timing risk.
 
 ### Static egress measurement record
 
@@ -456,6 +494,31 @@ calls and 1,007,400 bytes, and 19,600 calls and 909,800 bytes, so the harness
 edit leaves their enforced baselines alone. libtest reported each static
 egress run finishing in about 0.8 seconds; each process, including startup,
 took about 1.9 seconds on this host. Timing stays informational.
+
+On 2026-10-28, for the budget step, the four kernel tests were run the same
+way from one gateway test binary built from main
+`2280797aef866a6ea5eef8318a9d60bbfec55f2c`, which carries the harness step,
+under the same build and host conditions. Each run was compared with
+`compare_kernel_results` under its target's entry in the schema-4 budget.
+
+| Target | Allocation calls | Requested bytes | Median timing range (ms) | Largest within-run spread | Fixture growth (calls / bytes) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `http_policy` | 41,700 | 1,439,000 | 76.0–78.4 | 36.4% | 1,700 / 108,800 |
+| `tool_policy` | 9,000 | 1,007,400 | 63.8–66.7 | 17.2% | 2,700 / 172,800 |
+| `rate_lane` | 19,600 | 909,800 | 52.7–55.1 | 30.1% | 1,400 / 89,600 |
+| `static_egress` | 4,800 | 387,500 | 54.2–56.0 | 24.2% | 2,500 / 160,000 |
+
+All 27 samples of each target had identical counts. The lane and static
+egress counts equal the records above, and the `http_policy` counts equal
+those captured when its harness was added (`kernel_result` in
+`scripts/test_microbench.py`), so the merged harness and the intervening
+evaluator changes left every kernel baseline where it was. Every pair of
+neutral runs passed and
+every fixture run failed, by exactly one 64-byte allocation per decision.
+libtest reported each static egress run finishing in about one second; each
+process took about two. The independent rebuild that `self-test` adds was not
+run, for the reason given in the
+[lane measurement record](#lane-measurement-record).
 
 ## Base ownership and reviewed updates
 
@@ -503,6 +566,10 @@ permission, no persisted checkout credentials and no secrets, so fork pull
 requests use the ordinary unprivileged `pull_request` event. Failure evidence is
 uploaded with `always()` and missing artifacts are an error. Image promotion
 depends on `microbench` succeeding alongside all pre-existing validation jobs.
+It is not one of the status checks that branch protection requires on `main`
+(checked 2026-10-28), so a failing comparison fails the job, is visible on the
+pull request and blocks image promotion, but does not by itself prevent a
+merge. Requiring it is a repository-settings decision outside this document.
 
 Local workflow fixtures exercise real Git revision resolution and reject
 credential persistence, a mutable or shallow checkout, changed event scopes,
@@ -517,3 +584,47 @@ show a usable signal-to-noise margin and a reviewed regression fixture proves
 the proposed threshold. Follow the broader comparison rules in
 [the proxy baseline](proxy-baseline.md); production load qualification remains
 tracked by #389.
+
+## Issue #437 status
+
+PR 3's kernel step is complete: every live lane of the shared evaluator, the
+HTTP, tool, rate and static egress decisions, has a kernel target enforced at
+zero allocation growth. No pure-path target is stale, because every predicate
+they measure is still live (see [Measured scope](#measured-scope)), so none was
+retired. Against the issue's acceptance list, this record shows:
+
+- **Signal and noise.** Allocation counts were identical in every sample of
+  every local record, and the controller rejects a run whose samples differ,
+  so every passing hosted comparison had identical samples too. The largest
+  within-run timing spreads on unchanged source ranged from 17% to 322% by
+  target. Allocation budgets therefore block and timing stays informational,
+  as the issue allows. No controlled runner has been qualified, so no timing
+  threshold exists.
+- **Controlled regression and neutral rebuild.** The pure-path `self-test`
+  passed locally ([initial record](#initial-local-measurement-record)). For
+  the kernel targets the evidence is the fixture runs recorded above, compared
+  with `compare_kernel_results`, and the self-test's fixture tests in
+  `scripts/test_microbench_process.py`; no end-to-end kernel `self-test` run
+  is recorded, because it builds the real gateway and needs the pinned Node.
+  CI runs the comparison, not the self-test.
+- **Failing closed.** Missing base or head results, unknown schemas,
+  mismatched compilers, profiles or datasets, crashed, timed-out or
+  undiscovered benchmarks and incomplete target sets fail the comparison; the
+  fixture tests in `scripts/test_microbench*.py`, which CI runs before the
+  comparison, cover each case.
+- **No production data or network.** Every dataset is synthetic: hosts use
+  the reserved `.test` suffix, addresses come from documentation and
+  special-purpose blocks, there are no tokens, and nothing is resolved,
+  connected or sent.
+- **Time budget.** Hosted comparisons have stayed inside the 480-second budget
+  ([hosted CI record](#hosted-ci-record)), with a margin as small as about 11
+  seconds. The nightly performance, HA, failover and release workflows are
+  unchanged.
+- **Promotion and evidence.** Image promotion depends on `microbench`, and the
+  job uploads base, head, raw and summary evidence even when it fails. It is
+  not a required branch-protection check on `main`
+  ([CI comparison and evidence](#ci-comparison-and-evidence)).
+- **UI bundle analysis.** Not measured, and outside this backend benchmark.
+
+Cached JWT verification remains unmeasured, because this harness has no JWT
+verification, keys or cache model.

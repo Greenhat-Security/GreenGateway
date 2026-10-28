@@ -785,20 +785,10 @@ fn validate_root_permissions(_: &fs::Metadata) -> Result<(), SecretProviderConfi
 /// This is the projected-root counterpart to the leaf rule in
 /// [`read_bounded_file_secret`]: both must tolerate the shape the kubelet
 /// actually publishes, and neither may tolerate anything looser. Every network
-/// secret provider shares this one predicate so the five cannot drift apart.
-#[cfg(unix)]
-pub(crate) fn projected_root_permissions_are_safe(metadata: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    const STICKY: u32 = 0o1000;
-    const GROUP_OTHER_WRITE: u32 = 0o022;
-    let mode = metadata.mode();
-    mode & GROUP_OTHER_WRITE == 0 || mode & STICKY != 0
-}
-
-#[cfg(not(unix))]
-pub(crate) fn projected_root_permissions_are_safe(_: &fs::Metadata) -> bool {
-    true
-}
+/// secret provider shares this one predicate so the five cannot drift apart,
+/// and so does the configuration bundle reader, which is why it is defined in
+/// the shared `gateway-config` crate that `ggctl` links too.
+pub(crate) use gateway_config::permissions::projected_root_permissions_are_safe;
 
 #[cfg(unix)]
 fn validate_file_permissions(
@@ -833,15 +823,9 @@ fn validate_file_permissions(
     Ok(())
 }
 
-pub(crate) fn is_valid_opaque_id(value: &str, maximum: usize) -> bool {
-    !value.is_empty()
-        && value.len() <= maximum
-        && value.bytes().enumerate().all(|(index, byte)| match byte {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' => true,
-            b'.' | b'_' | b'-' => index > 0,
-            _ => false,
-        })
-}
+// ADR-0006's opaque ID grammar, shared with the configuration bundle reader's
+// secret references through `gateway-config`.
+pub(crate) use gateway_config::opaque_id::is_valid_opaque_id;
 
 pub(crate) fn safe_error_alias_id(value: &str) -> String {
     if is_valid_opaque_id(value, MAX_SECRET_ID_BYTES) {
