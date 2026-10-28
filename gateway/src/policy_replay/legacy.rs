@@ -101,8 +101,9 @@ const COVERED_REJECTIONS: &[&str] = &["matched_rule", "precondition_failed"];
 /// What one stored audit event is to replay.
 #[derive(Debug)]
 pub(crate) enum LegacyRecord {
-    /// The one replayable record of its request or invocation.
-    Replayable(ReplayContext),
+    /// The one replayable record of its request or invocation, boxed: a
+    /// context is far larger than every other answer, which is a code.
+    Replayable(Box<ReplayContext>),
     /// Another record of the same request or invocation is the replayable one.
     Duplicate(DuplicateRecord),
     /// The request never reached the policy stage.
@@ -293,7 +294,7 @@ fn observation(
     let principal = principal_record(actor, envelope)?;
     let (request_host, routing) = observed_routing(payload, &path)?;
     let recorded = recorded_result(policy, payload, "policy_reason")?;
-    Ok(LegacyRecord::Replayable(ReplayContext {
+    Ok(LegacyRecord::Replayable(Box::new(ReplayContext {
         source: ReplaySource::HttpObservation,
         facts: ReplayFacts::Http(HttpFacts {
             method,
@@ -304,7 +305,7 @@ fn observation(
             egress: EgressRecord::NotRecorded,
         }),
         recorded,
-    }))
+    })))
 }
 
 /// The host and routing an observation recorded, read exactly as the
@@ -392,7 +393,7 @@ fn decision(
     let tool_name = tool_name(payload)?;
     let principal = principal_record(event.actor.as_ref(), envelope)?;
     let recorded = recorded_result(RecordedPolicy::Denied, payload, "reason")?;
-    Ok(LegacyRecord::Replayable(ReplayContext {
+    Ok(LegacyRecord::Replayable(Box::new(ReplayContext {
         source: ReplaySource::ToolRuleDecision,
         facts: ReplayFacts::Tool(ToolFacts {
             tool_name,
@@ -400,7 +401,7 @@ fn decision(
             egress: EgressRecord::NotRecorded,
         }),
         recorded,
-    }))
+    })))
 }
 
 /// A `tool.invoke_rejected` event, by the reason it carries.
@@ -442,7 +443,7 @@ fn tool_admission(
     if let Some(reason) = reason {
         check_reason_code(reason).map_err(|_| MalformedRecord::RecordedResult)?;
     }
-    Ok(LegacyRecord::Replayable(ReplayContext {
+    Ok(LegacyRecord::Replayable(Box::new(ReplayContext {
         source: ReplaySource::ToolAdmission,
         facts: ReplayFacts::Tool(ToolFacts {
             tool_name,
@@ -457,7 +458,7 @@ fn tool_admission(
             path_prefix: None,
             attribution_omitted: false,
         },
-    }))
+    })))
 }
 
 fn tool_name(payload: &Map<String, Value>) -> Result<String, MalformedRecord> {

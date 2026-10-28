@@ -884,10 +884,10 @@ fn boolean(value: &Value) -> Result<bool, ReplayContextError> {
 
 /// The `state` member of a tagged fact, after checking the object's members
 /// against the ones that state allows.
-fn state<'a>(
-    object: &'a Map<String, Value>,
+fn state(
+    object: &Map<String, Value>,
     allowed: impl Fn(&str) -> Option<&'static [&'static str]>,
-) -> Result<&'a str, ReplayContextError> {
+) -> Result<&str, ReplayContextError> {
     let state = text(required(object, "state")?)?;
     let members_for_state = allowed(state).ok_or(ReplayContextError::InvalidValue)?;
     members(object, members_for_state)?;

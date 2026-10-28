@@ -101,7 +101,7 @@ fn observed_dispatch() -> Value {
 
 fn replayable(event: &AuditEvent) -> ReplayContext {
     match adapt_audit_event(event) {
-        LegacyRecord::Replayable(context) => context,
+        LegacyRecord::Replayable(context) => *context,
         other => panic!("expected a replayable record, got {}", other.code()),
     }
 }
