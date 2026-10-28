@@ -111,12 +111,31 @@ impl fmt::Debug for EgressDestination {
 
 impl EgressDestination {
     pub(crate) fn from_url(url: &Url) -> Self {
+        Self::from_parts(
+            url.scheme().to_owned(),
+            url.host_str().map(str::to_ascii_lowercase),
+            url.port_or_known_default(),
+            !url.username().is_empty() || url.password().is_some(),
+            url.fragment().is_some(),
+        )
+    }
+
+    /// The same facts, from a caller that holds them rather than a URL: policy
+    /// replay (#243) reads them out of a recorded context. Whether the URL had
+    /// userinfo or a fragment is a flag; their values are never facts.
+    pub(crate) fn from_parts(
+        scheme: String,
+        host: Option<String>,
+        port: Option<u16>,
+        userinfo: bool,
+        fragment: bool,
+    ) -> Self {
         Self {
-            scheme: url.scheme().to_owned(),
-            host: url.host_str().map(str::to_ascii_lowercase),
-            port: url.port_or_known_default(),
-            userinfo: !url.username().is_empty() || url.password().is_some(),
-            fragment: url.fragment().is_some(),
+            scheme,
+            host,
+            port,
+            userinfo,
+            fragment,
         }
     }
 

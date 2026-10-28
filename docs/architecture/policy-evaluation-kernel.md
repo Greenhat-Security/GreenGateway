@@ -9,7 +9,7 @@ rule preview, endpoint coverage and suggestion coverage (#422, PR 4). With the
 legacy retirement the enum-source precheck and the tool-name coverage check ask
 it too, and it holds the only serving `RuleMatcher`: no serving path matches a
 policy rule beside it. Synthetic simulation is an offline caller, described
-below; replay endpoints are not added.
+below, and so are replay contexts, which have no endpoint yet.
 
 It now covers contextless HTTP direct rules and permission routes, host-qualified
 routes and dispatch-scoped direct rules, MCP alias identities, and rate-lane
@@ -423,3 +423,34 @@ every shadow made enforcing, compiled for the run; the kernel has no shadow
 switch of its own. Edits are applied to the JSON of the pinned base and the
 result is validated as a policy write would be before anything compiles it. The
 format and API are in [policy-simulation.md](../policy-simulation.md).
+
+## Replay contexts (#243, slice 12)
+
+`policy_replay` is the third offline caller, and the first whose inputs are
+retained records rather than authored cases. A `ReplayContext`
+(`replay-context.v1`) holds the facts the kernel reads for one HTTP request or
+tool invocation, each `recorded`, absent or `not_recorded`, and the result the
+policy stage recorded at the time. `policy_replay::legacy` reads one out of a
+stored audit event and names exactly one event of each request or invocation
+replayable; `policy_replay::evaluate` turns the facts into the kernel's own
+contexts -- one fact to one input, a `not_recorded` fact to the kernel's
+missing state -- and calls `evaluate`, `select_rate_lane`, `evaluate_tool` and
+the static egress lane. Nothing here matches a rule.
+
+Two facts need more than a one-to-one mapping. The MCP alias identity is never
+recorded and the kernel has no missing state for it, so a record whose path
+could have been an alias is evaluated under both `Contextless` and `McpAlias`
+and is decided only when the two agree; otherwise it is `indeterminate` with
+`missing_mcp_identity`. A tool invocation's principal is projected through the
+tool runtime's own `principal_from_tool_actor`, the function the live lane
+projects an actor with, so a client-certificate caller is anonymous in both.
+Egress destinations are evaluated with `ResolutionFact::Missing`, because no
+record carries resolution evidence.
+
+The adapters are proved lossless against the live paths, not against another
+description of them: requests driven through the real RBAC and observation
+middleware, and invocations through the real tool runtime, are captured,
+adapted and replayed under the same compiled policy, and every replayed answer
+is the live one or `indeterminate` for a stated reason. No live path writes a
+replay context and no job reads one yet; the format and the legacy records
+are in [policy-replay.md](../policy-replay.md).
