@@ -3454,7 +3454,7 @@ async fn connection_bound_proxy_uses_stored_destination_and_protects_its_depende
                 }
             }))
             .expect("test Connection should deserialize"),
-            "test-admin",
+            &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
         )
         .await
         .expect("test Connection should create");
@@ -14976,7 +14976,12 @@ async fn connection_admin_crud_enforces_etags_secret_authority_and_redaction() {
     let router = connection_admin_router(&connection_db, &policy, audit_log);
     let reader = test_principal(&["connections-reader"]);
     let editor = test_principal(&["connections-editor"]);
-    let secrets_editor = test_principal(&["connections-secrets-editor"]);
+    // Vouched for by an issuer, written the way a token may carry it, so the
+    // change evidence below shows the endpoints pass the whole principal.
+    let secrets_editor = auth::Principal {
+        issuer: Some(" https://idp.example.test/ ".to_owned()),
+        ..test_principal(&["connections-secrets-editor"])
+    };
 
     let list = router
         .clone()
@@ -15541,13 +15546,21 @@ async fn connection_admin_crud_enforces_etags_secret_authority_and_redaction() {
     assert!(!serialized_events.contains("credentialed.example.test"));
     assert!(!serialized_events.contains("/credentialed-health"));
 
-    // Every committed change recorded the authenticated subject as its actor
-    // in the Connections database's own transaction (issue #425), and no
-    // binding ID, material or destination reached a row.
+    // Every committed change recorded the authenticated principal -- its
+    // subject, canonical issuer, kind and auth mode -- as its actor in the
+    // Connections database's own transaction (issue #425), and no binding
+    // ID, material or destination reached a row.
     let (changes, stored) =
         standalone_change_evidence(&connection_db.path, "connection_change_evidence");
+    let editor_actor = (None, "principal".to_owned(), "bearer_token".to_owned());
+    let secrets_editor_actor = (
+        Some("https://idp.example.test".to_owned()),
+        "principal".to_owned(),
+        "bearer_token".to_owned(),
+    );
     assert!(
-        changes.iter().all(|(_, actor)| actor == "user-123"),
+        changes.iter().all(|change| change.subject == "user-123"
+            && [&editor_actor, &secrets_editor_actor].contains(&&change.metadata())),
         "{changes:?}"
     );
     for action in [
@@ -15556,10 +15569,16 @@ async fn connection_admin_crud_enforces_etags_secret_authority_and_redaction() {
         "connection.delete",
     ] {
         assert!(
-            changes.iter().any(|(recorded, _)| recorded == action),
+            changes.iter().any(|change| change.action == action),
             "{action} was not recorded: {changes:?}"
         );
     }
+    let last = changes.last().expect("the deletes were recorded");
+    assert_eq!(
+        (last.action.as_str(), last.metadata()),
+        ("connection.delete", secrets_editor_actor),
+        "the credentialed Connection's delete names the principal that deleted it"
+    );
     for canary in [
         "credential-secret-id-canary",
         "different-secret-id-canary",
@@ -16278,7 +16297,7 @@ async fn connection_secret_admin_crud_is_safe_permissioned_and_preconditioned() 
         );
     }
 
-    // Every committed secret change recorded the authenticated subject in
+    // Every committed secret change recorded the authenticated principal in
     // the Connections database's own transaction (issue #425), and no
     // material or label reached a row.
     let (changes, stored) = standalone_change_evidence(
@@ -16286,12 +16305,13 @@ async fn connection_secret_admin_crud_is_safe_permissioned_and_preconditioned() 
         "connection_local_secret_change_evidence",
     );
     assert!(
-        changes.iter().all(|(_, actor)| actor == "user-123"),
+        changes.iter().all(|change| change.subject == "user-123"
+            && change.metadata() == (None, "principal".to_owned(), "bearer_token".to_owned())),
         "{changes:?}"
     );
     for action in ["secret.create", "secret.rotate", "secret.delete"] {
         assert!(
-            changes.iter().any(|(recorded, _)| recorded == action),
+            changes.iter().any(|change| change.action == action),
             "{action} was not recorded: {changes:?}"
         );
     }
@@ -16308,28 +16328,58 @@ async fn connection_secret_admin_crud_is_safe_permissioned_and_preconditioned() 
     }
 }
 
-/// The `(action, actor)` pairs of one standalone change-evidence table in
-/// commit order, and every stored value rendered as text for canary checks.
-fn standalone_change_evidence(path: &FsPath, table: &str) -> (Vec<(String, String)>, String) {
+/// One standalone change-evidence row's action and actor.
+#[derive(Debug)]
+struct StandaloneChange {
+    action: String,
+    subject: String,
+    issuer: Option<String>,
+    kind: String,
+    auth_mode: String,
+}
+
+impl StandaloneChange {
+    /// The actor's issuer, kind and auth mode.
+    fn metadata(&self) -> (Option<String>, String, String) {
+        (
+            self.issuer.clone(),
+            self.kind.clone(),
+            self.auth_mode.clone(),
+        )
+    }
+}
+
+/// The actions and actors of one standalone change-evidence table in commit
+/// order, and every stored value rendered as text for canary checks.
+fn standalone_change_evidence(path: &FsPath, table: &str) -> (Vec<StandaloneChange>, String) {
     let connection = rusqlite::Connection::open(path).expect("Connections database should open");
     let mut statement = connection
         .prepare(&format!("SELECT * FROM {table} ORDER BY sequence"))
         .expect("evidence query should prepare");
-    let action = statement
-        .column_index("action")
-        .expect("evidence should have an action");
-    let actor = statement
-        .column_index("actor_user_id")
-        .expect("evidence should have an actor");
+    let [action, subject, issuer, kind, auth_mode] = [
+        "action",
+        "actor_user_id",
+        "actor_issuer",
+        "actor_kind",
+        "actor_auth_mode",
+    ]
+    .map(|name| {
+        statement
+            .column_index(name)
+            .expect("evidence should have the column")
+    });
     let columns = statement.column_count();
     let mut changes = Vec::new();
     let mut stored = String::new();
     let mut rows = statement.query([]).expect("evidence query should run");
     while let Some(row) = rows.next().expect("evidence row should read") {
-        changes.push((
-            row.get(action).expect("action should read"),
-            row.get(actor).expect("actor should read"),
-        ));
+        changes.push(StandaloneChange {
+            action: row.get(action).expect("action should read"),
+            subject: row.get(subject).expect("subject should read"),
+            issuer: row.get(issuer).expect("issuer should read"),
+            kind: row.get(kind).expect("kind should read"),
+            auth_mode: row.get(auth_mode).expect("auth mode should read"),
+        });
         for index in 0..columns {
             stored.push_str(&format!(
                 "{:?}|",

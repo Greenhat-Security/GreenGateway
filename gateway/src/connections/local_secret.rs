@@ -23,6 +23,8 @@ use tokio::sync::Semaphore;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+use crate::auth::change_actor::ChangeActor;
+
 use super::{
     model::{MAX_CREDENTIALS, MAX_DISPLAY_NAME_CHARS, MAX_SECRET_ID_BYTES},
     secret::{
@@ -31,7 +33,10 @@ use super::{
         SecretResolveErrorKind, SecretResolver, SecretRootConfig,
         MAX_CONCURRENT_SECRET_RESOLUTIONS,
     },
-    store::{is_valid_change_actor, SqliteConnectionStore},
+    store::{
+        SqliteConnectionStore, MAX_CHANGE_EVIDENCE_ACTOR_BYTES,
+        MAX_CHANGE_EVIDENCE_ACTOR_ISSUER_BYTES,
+    },
 };
 
 const LOCAL_SECRET_SCHEMA_VERSION: u32 = 1;
@@ -368,8 +373,8 @@ pub enum LocalSecretError {
         maximum: usize,
     },
     IdentifierCollision,
-    /// A change named no actor, or one longer than the principal subject
-    /// bound; refused before anything changed.
+    /// A change named an actor evidence cannot record exactly
+    /// ([`ChangeActor::is_recordable`]); refused before anything changed.
     InvalidChangeActor,
     /// The change's evidence (migration 12's
     /// `connection_local_secret_change_evidence`) could not be written, so
@@ -408,8 +413,9 @@ impl fmt::Display for LocalSecretError {
             Self::IdentifierCollision => formatter.write_str("local secret identifier collision"),
             Self::InvalidChangeActor => write!(
                 formatter,
-                "a local-secret change actor must be between 1 and {} bytes",
-                super::store::MAX_CHANGE_EVIDENCE_ACTOR_BYTES
+                "a local-secret change actor must be between 1 and \
+                 {MAX_CHANGE_EVIDENCE_ACTOR_BYTES} bytes, and only a principal may carry an \
+                 issuer, of at most {MAX_CHANGE_EVIDENCE_ACTOR_ISSUER_BYTES} bytes"
             ),
             Self::ChangeEvidenceFailure => {
                 formatter.write_str("local secret change evidence could not be recorded")
@@ -431,31 +437,33 @@ pub struct MasterKeyRotationProgress {
 /// This contract intentionally has no method that returns stored plaintext.
 /// Runtime resolution is exposed separately through [`SecretResolver`].
 ///
-/// Every mutation is told who is acting: a committed change records
-/// `actor_user_id` as its evidence in the change's own transaction
+/// Every mutation is told who is acting: a committed change records the
+/// actor -- its subject, canonical issuer, kind and auth mode
+/// ([`ChangeActor`]) -- as its evidence in the change's own transaction
 /// (migration 12's `connection_local_secret_change_evidence`), and a change
-/// naming no actor is refused before anything is written.
+/// whose actor evidence cannot record exactly is refused before anything is
+/// written.
 pub trait LocalSecretManager: Send + Sync {
     fn create(
         &self,
         label: &str,
         secret: ResolvedSecret,
-        actor_user_id: &str,
+        actor: &ChangeActor,
     ) -> Result<SecretAliasMetadata, LocalSecretError>;
     fn rotate(
         &self,
         id: &str,
         replacement: ResolvedSecret,
-        actor_user_id: &str,
+        actor: &ChangeActor,
     ) -> Result<SecretAliasMetadata, LocalSecretError>;
-    fn delete(&self, id: &str, actor_user_id: &str) -> Result<(), LocalSecretError>;
+    fn delete(&self, id: &str, actor: &ChangeActor) -> Result<(), LocalSecretError>;
     fn metadata(&self) -> Vec<SecretAliasMetadata>;
     /// A batch that finds nothing to re-encrypt changes nothing and records
     /// nothing.
     fn reencrypt_master_key_batch(
         &self,
         maximum_records: usize,
-        actor_user_id: &str,
+        actor: &ChangeActor,
     ) -> Result<MasterKeyRotationProgress, LocalSecretError>;
     fn ensure_key_unused(&self, key_id: &str) -> Result<(), LocalSecretError>;
 }
@@ -520,9 +528,9 @@ impl LocalSecretProvider {
         &self,
         label: &str,
         secret: ResolvedSecret,
-        actor_user_id: &str,
+        actor: &ChangeActor,
     ) -> Result<SecretAliasMetadata, LocalSecretError> {
-        validate_change_actor(actor_user_id)?;
+        validate_change_actor(actor)?;
         validate_label(label)?;
         let purpose = secret.purpose();
         if !purpose.is_locally_storable() {
@@ -578,7 +586,7 @@ impl LocalSecretProvider {
                 new_version: Some(version),
                 reencrypted_count: None,
                 committed_at: &now,
-                actor_user_id,
+                actor,
             },
         )?;
         transaction
@@ -605,9 +613,9 @@ impl LocalSecretProvider {
         &self,
         id: &str,
         replacement: ResolvedSecret,
-        actor_user_id: &str,
+        actor: &ChangeActor,
     ) -> Result<SecretAliasMetadata, LocalSecretError> {
-        validate_change_actor(actor_user_id)?;
+        validate_change_actor(actor)?;
         if !is_valid_local_secret_id(id) {
             return Err(LocalSecretError::NotFound);
         }
@@ -664,7 +672,7 @@ impl LocalSecretProvider {
                 new_version: Some(next_version),
                 reencrypted_count: None,
                 committed_at: &now,
-                actor_user_id,
+                actor,
             },
         )?;
         transaction
@@ -685,8 +693,8 @@ impl LocalSecretProvider {
         Ok(metadata)
     }
 
-    pub fn delete(&self, id: &str, actor_user_id: &str) -> Result<(), LocalSecretError> {
-        validate_change_actor(actor_user_id)?;
+    pub fn delete(&self, id: &str, actor: &ChangeActor) -> Result<(), LocalSecretError> {
+        validate_change_actor(actor)?;
         if !is_valid_local_secret_id(id) {
             return Err(LocalSecretError::NotFound);
         }
@@ -750,7 +758,7 @@ impl LocalSecretProvider {
                 new_version: None,
                 reencrypted_count: None,
                 committed_at: &now,
-                actor_user_id,
+                actor,
             },
         )?;
         transaction
@@ -767,9 +775,9 @@ impl LocalSecretProvider {
     pub fn reencrypt_master_key_batch(
         &self,
         maximum_records: usize,
-        actor_user_id: &str,
+        actor: &ChangeActor,
     ) -> Result<MasterKeyRotationProgress, LocalSecretError> {
-        validate_change_actor(actor_user_id)?;
+        validate_change_actor(actor)?;
         if maximum_records == 0 || maximum_records > MAX_MASTER_KEY_ROTATION_BATCH {
             return Err(LocalSecretError::InvalidRotationBatch {
                 maximum: MAX_MASTER_KEY_ROTATION_BATCH,
@@ -858,7 +866,7 @@ impl LocalSecretProvider {
                     new_version: None,
                     reencrypted_count: Some(records.len()),
                     committed_at: &utc_timestamp()?,
-                    actor_user_id,
+                    actor,
                 },
             )?;
         }
@@ -1114,22 +1122,22 @@ impl LocalSecretManager for LocalSecretProvider {
         &self,
         label: &str,
         secret: ResolvedSecret,
-        actor_user_id: &str,
+        actor: &ChangeActor,
     ) -> Result<SecretAliasMetadata, LocalSecretError> {
-        LocalSecretProvider::create(self, label, secret, actor_user_id)
+        LocalSecretProvider::create(self, label, secret, actor)
     }
 
     fn rotate(
         &self,
         id: &str,
         replacement: ResolvedSecret,
-        actor_user_id: &str,
+        actor: &ChangeActor,
     ) -> Result<SecretAliasMetadata, LocalSecretError> {
-        LocalSecretProvider::rotate(self, id, replacement, actor_user_id)
+        LocalSecretProvider::rotate(self, id, replacement, actor)
     }
 
-    fn delete(&self, id: &str, actor_user_id: &str) -> Result<(), LocalSecretError> {
-        LocalSecretProvider::delete(self, id, actor_user_id)
+    fn delete(&self, id: &str, actor: &ChangeActor) -> Result<(), LocalSecretError> {
+        LocalSecretProvider::delete(self, id, actor)
     }
 
     fn metadata(&self) -> Vec<SecretAliasMetadata> {
@@ -1139,9 +1147,9 @@ impl LocalSecretManager for LocalSecretProvider {
     fn reencrypt_master_key_batch(
         &self,
         maximum_records: usize,
-        actor_user_id: &str,
+        actor: &ChangeActor,
     ) -> Result<MasterKeyRotationProgress, LocalSecretError> {
-        LocalSecretProvider::reencrypt_master_key_batch(self, maximum_records, actor_user_id)
+        LocalSecretProvider::reencrypt_master_key_batch(self, maximum_records, actor)
     }
 
     fn ensure_key_unused(&self, key_id: &str) -> Result<(), LocalSecretError> {
@@ -1157,8 +1165,8 @@ const EVIDENCE_ACTION_ROTATE: &str = "secret.rotate";
 const EVIDENCE_ACTION_DELETE: &str = "secret.delete";
 const EVIDENCE_ACTION_REENCRYPT: &str = "secret.reencrypt";
 
-fn validate_change_actor(actor_user_id: &str) -> Result<(), LocalSecretError> {
-    if is_valid_change_actor(actor_user_id) {
+fn validate_change_actor(actor: &ChangeActor) -> Result<(), LocalSecretError> {
+    if actor.is_recordable() {
         Ok(())
     } else {
         Err(LocalSecretError::InvalidChangeActor)
@@ -1175,7 +1183,7 @@ struct SecretChangeEvidence<'a> {
     new_version: Option<u64>,
     reencrypted_count: Option<usize>,
     committed_at: &'a str,
-    actor_user_id: &'a str,
+    actor: &'a ChangeActor,
 }
 
 /// Append one evidence row inside the caller's transaction, under event and
@@ -1206,14 +1214,18 @@ fn record_change_evidence(
         .execute(
             r#"
             INSERT INTO connection_local_secret_change_evidence (
-                event_id, operation_id, actor_user_id, action, secret_id,
-                prior_version, new_version, reencrypted_count, committed_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                event_id, operation_id, actor_user_id, actor_issuer, actor_kind,
+                actor_auth_mode, action, secret_id, prior_version, new_version,
+                reencrypted_count, committed_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
             "#,
             params![
                 Uuid::new_v4().to_string(),
                 Uuid::new_v4().to_string(),
-                evidence.actor_user_id,
+                evidence.actor.subject(),
+                evidence.actor.issuer(),
+                evidence.actor.kind().as_str(),
+                evidence.actor.auth_mode(),
                 evidence.action,
                 evidence.secret_id,
                 prior_version,
@@ -1678,7 +1690,7 @@ mod tests {
             provider.create(
                 "Assertion signing key",
                 secret(SecretPurpose::AssertionSigningKey, CANARY),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             ),
             Err(LocalSecretError::InvalidSecret)
         ));
@@ -1697,7 +1709,7 @@ mod tests {
             provider.create(
                 "Authority pseudonym key",
                 secret(SecretPurpose::AuthorityPseudonymKey, CANARY),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             ),
             Err(LocalSecretError::InvalidSecret)
         ));
@@ -1709,7 +1721,7 @@ mod tests {
             .create(
                 "Billing bearer",
                 secret(SecretPurpose::StaticBearer, CANARY),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
             .expect("secret should create");
         let error = provider
@@ -1731,7 +1743,7 @@ mod tests {
             .create(
                 "Billing bearer",
                 secret(SecretPurpose::StaticBearer, CANARY),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
             .expect("secret should create");
         assert_eq!(created.provider, SecretProviderKind::LocalEncrypted);
@@ -1755,7 +1767,7 @@ mod tests {
             .rotate(
                 &created.id,
                 secret(SecretPurpose::StaticBearer, rotated_value),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
             .expect("secret should rotate");
         assert_eq!(rotated.version, Some(2));
@@ -1773,7 +1785,7 @@ mod tests {
         ));
 
         provider
-            .delete(&created.id, "test-admin")
+            .delete(&created.id, &ChangeActor::for_test("test-admin"))
             .expect("unused secret should delete");
         assert!(provider.metadata().is_empty());
         assert!(matches!(
@@ -1796,14 +1808,14 @@ mod tests {
             "x".repeat(MAX_SECRET_ID_BYTES + 512)
         );
         assert_eq!(
-            provider.delete(&untrusted, "test-admin"),
+            provider.delete(&untrusted, &ChangeActor::for_test("test-admin")),
             Err(LocalSecretError::NotFound)
         );
         assert!(matches!(
             provider.rotate(
                 &untrusted,
                 secret(SecretPurpose::StaticBearer, CANARY),
-                "test-admin"
+                &ChangeActor::for_test("test-admin")
             ),
             Err(LocalSecretError::NotFound)
         ));
@@ -1883,14 +1895,14 @@ mod tests {
             .create(
                 "First",
                 secret(SecretPurpose::OAuthClientSecret, CANARY),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
             .expect("first secret should create");
         let second = provider
             .create(
                 "Second",
                 secret(SecretPurpose::OAuthClientSecret, CANARY),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
             .expect("second secret should create");
 
@@ -1948,7 +1960,7 @@ mod tests {
             .create(
                 "Bearer",
                 secret(SecretPurpose::StaticBearer, CANARY),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
             .expect("secret should create");
         drop(provider);
@@ -1990,7 +2002,7 @@ mod tests {
                 .create(
                     "First",
                     secret(SecretPurpose::StaticBearer, CANARY),
-                    "test-admin",
+                    &ChangeActor::for_test("test-admin"),
                 )
                 .expect("first secret should create");
             let second = provider
@@ -2000,7 +2012,7 @@ mod tests {
                         SecretPurpose::StaticBearer,
                         b"greengateway-local-secret-second",
                     ),
-                    "test-admin",
+                    &ChangeActor::for_test("test-admin"),
                 )
                 .expect("second secret should create");
             drop(provider);
@@ -2092,7 +2104,7 @@ mod tests {
                 .create(
                     "Canonical ID",
                     secret(SecretPurpose::StaticBearer, CANARY),
-                    "test-admin",
+                    &ChangeActor::for_test("test-admin"),
                 )
                 .expect("secret should create");
             drop(provider);
@@ -2143,7 +2155,7 @@ mod tests {
             .create(
                 "Shared database",
                 secret(SecretPurpose::StaticBearer, CANARY),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
             .expect("secret should create in the shared database");
         assert_eq!(
@@ -2218,7 +2230,7 @@ mod tests {
             .create(
                 "First",
                 secret(SecretPurpose::StaticBearer, CANARY),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
             .expect("first secret should create");
         let second = old_provider
@@ -2228,7 +2240,7 @@ mod tests {
                     SecretPurpose::HeaderApiKey,
                     b"greengateway-local-key-rotation-second",
                 ),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
             .expect("second secret should create");
         drop(old_provider);
@@ -2255,7 +2267,7 @@ mod tests {
         );
         assert_eq!(
             provider
-                .reencrypt_master_key_batch(1, "test-admin")
+                .reencrypt_master_key_batch(1, &ChangeActor::for_test("test-admin"))
                 .expect("first bounded batch should rotate"),
             MasterKeyRotationProgress {
                 reencrypted: 1,
@@ -2264,7 +2276,10 @@ mod tests {
         );
         assert_eq!(
             provider
-                .reencrypt_master_key_batch(MAX_MASTER_KEY_ROTATION_BATCH, "test-admin")
+                .reencrypt_master_key_batch(
+                    MAX_MASTER_KEY_ROTATION_BATCH,
+                    &ChangeActor::for_test("test-admin")
+                )
                 .expect("second batch should finish"),
             MasterKeyRotationProgress {
                 reencrypted: 1,
@@ -2323,7 +2338,7 @@ mod tests {
             .create(
                 "First",
                 secret(SecretPurpose::StaticBearer, CANARY),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
             .expect("first secret should create");
         old_provider
@@ -2333,7 +2348,7 @@ mod tests {
                     SecretPurpose::StaticBearer,
                     b"greengateway-rotation-rollback-second",
                 ),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
             .expect("second secret should create");
         drop(old_provider);
@@ -2373,7 +2388,10 @@ mod tests {
                 .expect("second ciphertext should tamper");
         }
         assert_eq!(
-            provider.reencrypt_master_key_batch(MAX_MASTER_KEY_ROTATION_BATCH, "test-admin"),
+            provider.reencrypt_master_key_batch(
+                MAX_MASTER_KEY_ROTATION_BATCH,
+                &ChangeActor::for_test("test-admin")
+            ),
             Err(LocalSecretError::EncryptionFailure)
         );
         let connection = Connection::open(&environment.database)
@@ -2402,7 +2420,7 @@ mod tests {
             .create(
                 "Referenced",
                 secret(SecretPurpose::StaticBearer, CANARY),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
             .expect("secret should create");
         let connection =
@@ -2433,7 +2451,7 @@ mod tests {
         drop(connection);
 
         assert_eq!(
-            provider.delete(&created.id, "test-admin"),
+            provider.delete(&created.id, &ChangeActor::for_test("test-admin")),
             Err(LocalSecretError::DependencyConflict {
                 connection_ids: vec!["billing".to_owned()],
                 count: 1,
@@ -2454,7 +2472,7 @@ mod tests {
             .create(
                 "Backup",
                 secret(SecretPurpose::TlsPrivateKey, CANARY),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
             .expect("secret should create");
         provider
@@ -2508,7 +2526,7 @@ mod tests {
             .create(
                 "Metadata",
                 secret(SecretPurpose::TlsCertificate, CANARY),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
             .expect("secret should create");
         let value: Value = serde_json::to_value(metadata).expect("safe metadata should serialize");
@@ -2536,6 +2554,9 @@ mod tests {
         event_id: String,
         operation_id: String,
         actor_user_id: String,
+        actor_issuer: Option<String>,
+        actor_kind: String,
+        actor_auth_mode: String,
         action: String,
         secret_id: Option<String>,
         prior_version: Option<i64>,
@@ -2544,14 +2565,27 @@ mod tests {
         committed_at: String,
     }
 
+    impl SecretEvidenceRow {
+        /// The recorded actor: subject, issuer, kind and auth mode.
+        fn actor(&self) -> (&str, Option<&str>, &str, &str) {
+            (
+                self.actor_user_id.as_str(),
+                self.actor_issuer.as_deref(),
+                self.actor_kind.as_str(),
+                self.actor_auth_mode.as_str(),
+            )
+        }
+    }
+
     /// The evidence as a separate connection to the file reads it.
     fn secret_evidence(database: &std::path::Path) -> Vec<SecretEvidenceRow> {
         let connection = Connection::open(database).expect("database should open");
         let mut statement = connection
             .prepare(
                 r#"
-                SELECT sequence, event_id, operation_id, actor_user_id, action, secret_id,
-                       prior_version, new_version, reencrypted_count, committed_at
+                SELECT sequence, event_id, operation_id, actor_user_id, actor_issuer,
+                       actor_kind, actor_auth_mode, action, secret_id, prior_version,
+                       new_version, reencrypted_count, committed_at
                 FROM connection_local_secret_change_evidence
                 ORDER BY sequence ASC
                 "#,
@@ -2564,12 +2598,15 @@ mod tests {
                     event_id: row.get(1)?,
                     operation_id: row.get(2)?,
                     actor_user_id: row.get(3)?,
-                    action: row.get(4)?,
-                    secret_id: row.get(5)?,
-                    prior_version: row.get(6)?,
-                    new_version: row.get(7)?,
-                    reencrypted_count: row.get(8)?,
-                    committed_at: row.get(9)?,
+                    actor_issuer: row.get(4)?,
+                    actor_kind: row.get(5)?,
+                    actor_auth_mode: row.get(6)?,
+                    action: row.get(7)?,
+                    secret_id: row.get(8)?,
+                    prior_version: row.get(9)?,
+                    new_version: row.get(10)?,
+                    reencrypted_count: row.get(11)?,
+                    committed_at: row.get(12)?,
                 })
             })
             .expect("evidence query should run")
@@ -2610,8 +2647,9 @@ mod tests {
     }
 
     /// Every committed create, rotate, delete and re-encryption batch writes
-    /// one row in its own transaction naming its actor; a batch with nothing
-    /// to rewrite writes none. A row names the secret by its gateway-minted
+    /// one row in its own transaction naming its whole actor -- a principal
+    /// with an issuer, a service token, a principal without one and the
+    /// command's system actor; a batch with nothing to rewrite writes none. A row names the secret by its gateway-minted
     /// ID and its version axis only, never the label, purpose, plaintext,
     /// ciphertext, nonce or key ID, and it outlives the deleted secret and a
     /// restart unchanged.
@@ -2623,11 +2661,16 @@ mod tests {
         let (store, old_provider) = environment
             .provider(&old_primary())
             .expect("provider should open");
+        let creator =
+            ChangeActor::for_test_with_issuer("creating-admin", "https://idp.example.test");
+        let rotator = ChangeActor::service_token_for_test("service-token:token_1");
+        let deleter = ChangeActor::for_test("deleting-admin");
+        let reencryptor = ChangeActor::system("operator:test-reencrypt");
         let created = old_provider
             .create(
                 "Ledger label canary",
                 secret(SecretPurpose::StaticBearer, CANARY),
-                "creating-admin",
+                &creator,
             )
             .expect("secret should create");
         let rotated_value = b"greengateway-evidence-rotated-canary";
@@ -2635,18 +2678,18 @@ mod tests {
             .rotate(
                 &created.id,
                 secret(SecretPurpose::StaticBearer, rotated_value),
-                "rotating-admin",
+                &rotator,
             )
             .expect("secret should rotate");
         let doomed = old_provider
             .create(
                 "Doomed label canary",
                 secret(SecretPurpose::HeaderApiKey, CANARY),
-                "creating-admin",
+                &creator,
             )
             .expect("second secret should create");
         old_provider
-            .delete(&doomed.id, "deleting-admin")
+            .delete(&doomed.id, &deleter)
             .expect("unused secret should delete");
         drop(old_provider);
 
@@ -2659,20 +2702,14 @@ mod tests {
         )
         .expect("rotating provider should open");
         assert_eq!(
-            provider.reencrypt_master_key_batch(
-                MAX_MASTER_KEY_ROTATION_BATCH,
-                "operator:test-reencrypt"
-            ),
+            provider.reencrypt_master_key_batch(MAX_MASTER_KEY_ROTATION_BATCH, &reencryptor),
             Ok(MasterKeyRotationProgress {
                 reencrypted: 1,
                 remaining: 0,
             })
         );
         assert_eq!(
-            provider.reencrypt_master_key_batch(
-                MAX_MASTER_KEY_ROTATION_BATCH,
-                "operator:test-reencrypt"
-            ),
+            provider.reencrypt_master_key_batch(MAX_MASTER_KEY_ROTATION_BATCH, &reencryptor),
             Ok(MasterKeyRotationProgress {
                 reencrypted: 0,
                 remaining: 0,
@@ -2681,12 +2718,26 @@ mod tests {
         );
 
         let rows = secret_evidence(&environment.database);
+        let creating = (
+            "creating-admin",
+            Some("https://idp.example.test"),
+            "principal",
+            "bearer_token",
+        );
+        let rotating = (
+            "service-token:token_1",
+            None,
+            "service_token",
+            "service_token",
+        );
+        let deleting = ("deleting-admin", None, "principal", "bearer_token");
+        let reencrypting = ("operator:test-reencrypt", None, "system", "system");
         let summary = rows
             .iter()
             .map(|row| {
                 (
                     row.action.as_str(),
-                    row.actor_user_id.as_str(),
+                    row.actor(),
                     row.secret_id.as_deref(),
                     row.prior_version,
                     row.new_version,
@@ -2699,7 +2750,7 @@ mod tests {
             vec![
                 (
                     "secret.create",
-                    "creating-admin",
+                    creating,
                     Some(created.id.as_str()),
                     None,
                     Some(1),
@@ -2707,7 +2758,7 @@ mod tests {
                 ),
                 (
                     "secret.rotate",
-                    "rotating-admin",
+                    rotating,
                     Some(created.id.as_str()),
                     Some(1),
                     Some(2),
@@ -2715,7 +2766,7 @@ mod tests {
                 ),
                 (
                     "secret.create",
-                    "creating-admin",
+                    creating,
                     Some(doomed.id.as_str()),
                     None,
                     Some(1),
@@ -2723,20 +2774,13 @@ mod tests {
                 ),
                 (
                     "secret.delete",
-                    "deleting-admin",
+                    deleting,
                     Some(doomed.id.as_str()),
                     Some(1),
                     None,
                     None
                 ),
-                (
-                    "secret.reencrypt",
-                    "operator:test-reencrypt",
-                    None,
-                    None,
-                    None,
-                    Some(1)
-                ),
+                ("secret.reencrypt", reencrypting, None, None, None, Some(1)),
             ],
             "one row per committed change; the empty second batch recorded nothing"
         );
@@ -2775,6 +2819,9 @@ mod tests {
                 "event_id",
                 "operation_id",
                 "actor_user_id",
+                "actor_issuer",
+                "actor_kind",
+                "actor_auth_mode",
                 "action",
                 "secret_id",
                 "prior_version",
@@ -2811,7 +2858,7 @@ mod tests {
             "the evidence survives the deletion and the restart unchanged"
         );
         assert_eq!(
-            reopened.delete(&doomed.id, "deleting-admin"),
+            reopened.delete(&doomed.id, &deleter),
             Err(LocalSecretError::NotFound)
         );
         assert_eq!(secret_evidence(&environment.database), rows);
@@ -2819,9 +2866,10 @@ mod tests {
 
     /// A refused change writes no evidence: a missing secret, a rotation to
     /// another purpose, a delete a binding blocks, a batch with nothing to
-    /// rewrite, and a change that names no actor or one longer than the
-    /// principal subject bound, which is refused before anything else. An
-    /// actor exactly at the bound is recorded.
+    /// rewrite, and a change whose actor evidence cannot record exactly -- no
+    /// subject, a subject or an issuer past the principal bounds, an empty
+    /// issuer, or an issuer on a service token -- which is refused before
+    /// anything else. An actor exactly at both bounds is recorded.
     #[test]
     fn refused_secret_changes_write_no_evidence() {
         let environment = TestEnvironment::new("refused-evidence");
@@ -2833,7 +2881,7 @@ mod tests {
             .create(
                 "Referenced",
                 secret(SecretPurpose::StaticBearer, CANARY),
-                "creating-admin",
+                &ChangeActor::for_test("creating-admin"),
             )
             .expect("secret should create");
         let baseline = secret_evidence(&environment.database);
@@ -2845,13 +2893,13 @@ mod tests {
                 .rotate(
                     &missing,
                     secret(SecretPurpose::StaticBearer, CANARY),
-                    "rotating-admin"
+                    &ChangeActor::for_test("rotating-admin")
                 )
                 .map(|_| ()),
             Err(LocalSecretError::NotFound)
         );
         assert_eq!(
-            provider.delete(&missing, "deleting-admin"),
+            provider.delete(&missing, &ChangeActor::for_test("deleting-admin")),
             Err(LocalSecretError::NotFound)
         );
         assert_eq!(
@@ -2859,13 +2907,16 @@ mod tests {
                 .rotate(
                     &created.id,
                     secret(SecretPurpose::HeaderApiKey, CANARY),
-                    "rotating-admin"
+                    &ChangeActor::for_test("rotating-admin")
                 )
                 .map(|_| ()),
             Err(LocalSecretError::InvalidSecret)
         );
         assert_eq!(
-            provider.reencrypt_master_key_batch(MAX_MASTER_KEY_ROTATION_BATCH, "operator:test"),
+            provider.reencrypt_master_key_batch(
+                MAX_MASTER_KEY_ROTATION_BATCH,
+                &ChangeActor::system("operator:test"),
+            ),
             Ok(MasterKeyRotationProgress {
                 reencrypted: 0,
                 remaining: 0,
@@ -2897,17 +2948,27 @@ mod tests {
             .expect("test binding should insert");
         drop(connection);
         assert!(matches!(
-            provider.delete(&created.id, "deleting-admin"),
+            provider.delete(&created.id, &ChangeActor::for_test("deleting-admin")),
             Err(LocalSecretError::DependencyConflict { .. })
         ));
-        let oversized = "a".repeat(super::super::store::MAX_CHANGE_EVIDENCE_ACTOR_BYTES + 1);
-        for actor in ["", oversized.as_str()] {
+        let oversized = "a".repeat(MAX_CHANGE_EVIDENCE_ACTOR_BYTES + 1);
+        let oversized_issuer = "i".repeat(MAX_CHANGE_EVIDENCE_ACTOR_ISSUER_BYTES + 1);
+        for actor in [
+            ChangeActor::for_test(""),
+            ChangeActor::for_test(&oversized),
+            ChangeActor::for_test_with_issuer("test-admin", ""),
+            ChangeActor::for_test_with_issuer("test-admin", &oversized_issuer),
+            ChangeActor::service_token_with_issuer_for_test(
+                "service-token:token_1",
+                "https://idp.example.test",
+            ),
+        ] {
             assert_eq!(
                 provider
                     .create(
                         "Unattributed",
                         secret(SecretPurpose::StaticBearer, CANARY),
-                        actor
+                        &actor
                     )
                     .map(|_| ()),
                 Err(LocalSecretError::InvalidChangeActor)
@@ -2917,17 +2978,17 @@ mod tests {
                     .rotate(
                         &created.id,
                         secret(SecretPurpose::StaticBearer, CANARY),
-                        actor
+                        &actor
                     )
                     .map(|_| ()),
                 Err(LocalSecretError::InvalidChangeActor)
             );
             assert_eq!(
-                provider.delete(&created.id, actor),
+                provider.delete(&created.id, &actor),
                 Err(LocalSecretError::InvalidChangeActor)
             );
             assert_eq!(
-                provider.reencrypt_master_key_batch(MAX_MASTER_KEY_ROTATION_BATCH, actor),
+                provider.reencrypt_master_key_batch(MAX_MASTER_KEY_ROTATION_BATCH, &actor),
                 Err(LocalSecretError::InvalidChangeActor)
             );
         }
@@ -2938,17 +2999,26 @@ mod tests {
         );
         assert_eq!(provider.metadata(), vec![created.clone()]);
 
-        let longest = "a".repeat(super::super::store::MAX_CHANGE_EVIDENCE_ACTOR_BYTES);
+        let longest = "a".repeat(MAX_CHANGE_EVIDENCE_ACTOR_BYTES);
+        let longest_issuer = "i".repeat(MAX_CHANGE_EVIDENCE_ACTOR_ISSUER_BYTES);
         provider
             .rotate(
                 &created.id,
                 secret(SecretPurpose::StaticBearer, CANARY),
-                &longest,
+                &ChangeActor::for_test_with_issuer(&longest, &longest_issuer),
             )
-            .expect("an actor at the principal bound is recorded");
+            .expect("an actor at the principal bounds is recorded");
         let rows = secret_evidence(&environment.database);
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[1].actor_user_id, longest);
+        assert_eq!(
+            rows[1].actor(),
+            (
+                longest.as_str(),
+                Some(longest_issuer.as_str()),
+                "principal",
+                "bearer_token"
+            )
+        );
     }
 
     /// Evidence is required, not best effort: while its insert fails, a
@@ -2968,7 +3038,7 @@ mod tests {
             .create(
                 "Faulted",
                 secret(SecretPurpose::StaticBearer, CANARY),
-                "creating-admin",
+                &ChangeActor::for_test("creating-admin"),
             )
             .expect("secret should create");
         let before = envelope(&environment.database, &created.id);
@@ -2988,7 +3058,7 @@ mod tests {
                 .create(
                     "Second",
                     secret(SecretPurpose::StaticBearer, CANARY),
-                    "faulted-admin"
+                    &ChangeActor::for_test("faulted-admin")
                 )
                 .map(|_| ()),
             Err(LocalSecretError::ChangeEvidenceFailure)
@@ -3001,13 +3071,13 @@ mod tests {
                         SecretPurpose::StaticBearer,
                         b"greengateway-faulted-rotation"
                     ),
-                    "faulted-admin"
+                    &ChangeActor::for_test("faulted-admin")
                 )
                 .map(|_| ()),
             Err(LocalSecretError::ChangeEvidenceFailure)
         );
         assert_eq!(
-            old_provider.delete(&created.id, "faulted-admin"),
+            old_provider.delete(&created.id, &ChangeActor::for_test("faulted-admin")),
             Err(LocalSecretError::ChangeEvidenceFailure)
         );
         assert_eq!(old_provider.metadata(), vec![created.clone()]);
@@ -3021,7 +3091,10 @@ mod tests {
         )
         .expect("rotating provider should open");
         assert_eq!(
-            provider.reencrypt_master_key_batch(MAX_MASTER_KEY_ROTATION_BATCH, "faulted-operator"),
+            provider.reencrypt_master_key_batch(
+                MAX_MASTER_KEY_ROTATION_BATCH,
+                &ChangeActor::system("faulted-operator"),
+            ),
             Err(LocalSecretError::ChangeEvidenceFailure)
         );
         assert_eq!(
@@ -3037,8 +3110,10 @@ mod tests {
             .execute_batch("DROP TRIGGER fail_secret_change_evidence;")
             .expect("failure trigger should drop");
         assert_eq!(
-            provider
-                .reencrypt_master_key_batch(MAX_MASTER_KEY_ROTATION_BATCH, "recovered-operator"),
+            provider.reencrypt_master_key_batch(
+                MAX_MASTER_KEY_ROTATION_BATCH,
+                &ChangeActor::system("recovered-operator"),
+            ),
             Ok(MasterKeyRotationProgress {
                 reencrypted: 1,
                 remaining: 0,
@@ -3047,7 +3122,10 @@ mod tests {
         let rows = secret_evidence(&environment.database);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].action, "secret.reencrypt");
-        assert_eq!(rows[1].actor_user_id, "recovered-operator");
+        assert_eq!(
+            rows[1].actor(),
+            ("recovered-operator", None, "system", "system")
+        );
         assert_eq!(rows[1].reencrypted_count, Some(1));
     }
 

@@ -7317,30 +7317,10 @@
       "reasons": [
         "unexpanded-attribute"
       ],
-      "scope": "gateway::auth::change_actor::ActorKind#1",
-      "sha256": "6d7c0db13ee2b143fb3f09caf9f4a24c4c446740e933e2d5ed3b12079d646755",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Issue #425 change-actor kind vocabulary for authority evidence. Its cfg_attr only allows dead code for the System variant in builds without the postgres feature, where the cluster-mode revoke-jwt command that records it is absent; plain data, no I/O and no transport or process capability."
-    },
-    {
-      "file": "gateway/src/auth/change_actor.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
       "scope": "gateway::auth::change_actor::impl  ActorKind::from_stored#1",
       "sha256": "bdd791d1a53fcbb5367c2ab2fff92c125433b508697dd8e215ea00aa54bc4c2a",
       "owner": "GreenGateway maintainers",
       "purpose": "Issue #425 parse of a stored actor_kind value against the closed vocabulary, read by the cluster-mode delivery projection. Its cfg_attr only allows dead code in builds without the postgres feature; pure string comparison, no I/O and no transport or process capability."
-    },
-    {
-      "file": "gateway/src/auth/change_actor.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::auth::change_actor::impl  ChangeActor::system#1",
-      "sha256": "2c0efc2af79b1b10eabec1b1078e1d520bfafd8ac21c8fa1a8e55d8987f7150e",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Issue #425 constructor of the system actor the cluster-mode revoke-jwt command records. Its cfg_attr only allows dead code in builds without the postgres feature; builds an in-memory value, no I/O and no transport or process capability."
     },
     {
       "file": "gateway/src/auth/cookie_session_validator.rs",

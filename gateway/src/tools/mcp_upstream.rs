@@ -4845,7 +4845,7 @@ mod tests {
             .create_managed(
                 control_plane.runtime_snapshot().collection_etag(),
                 write,
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("attested MCP Connection should create");

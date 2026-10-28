@@ -233,7 +233,11 @@ async fn create_managed(
         .collection_etag()
         .to_owned();
     control_plane
-        .create_managed(&collection_etag, write, ACCEPTANCE_ACTOR)
+        .create_managed(
+            &collection_etag,
+            write,
+            &crate::auth::change_actor::ChangeActor::for_test(ACCEPTANCE_ACTOR),
+        )
         .await
         .expect("acceptance Connection should create")
 }
@@ -900,7 +904,7 @@ async fn e2e_07_mtls_rotation_preserves_two_origin_ca_and_client_isolation() {
             &connection_a.id,
             &current_a.etag(),
             rotated_write,
-            ACCEPTANCE_ACTOR,
+            &crate::auth::change_actor::ChangeActor::for_test(ACCEPTANCE_ACTOR),
         )
         .await
         .expect("origin A rotation should publish atomically");
@@ -1031,7 +1035,7 @@ async fn e2e_08_barrier_race_rejects_stale_openapi_and_mcp_publications() {
                 &update_openapi_record.id,
                 &update_openapi_record.etag(),
                 openapi_write,
-                ACCEPTANCE_ACTOR,
+                &crate::auth::change_actor::ChangeActor::for_test(ACCEPTANCE_ACTOR),
             )
             .await;
         let mut mcp_write = update_mcp_record.write.clone();
@@ -1041,7 +1045,7 @@ async fn e2e_08_barrier_race_rejects_stale_openapi_and_mcp_publications() {
                 &update_mcp_record.id,
                 &update_mcp_record.etag(),
                 mcp_write,
-                ACCEPTANCE_ACTOR,
+                &crate::auth::change_actor::ChangeActor::for_test(ACCEPTANCE_ACTOR),
             )
             .await;
         update_visible.wait().await;
@@ -1469,7 +1473,7 @@ async fn e2e_09_all_references_disable_atomically_and_block_delete_without_orpha
             &http_connection.id,
             &http_connection.etag(),
             disabled_http_write,
-            ACCEPTANCE_ACTOR,
+            &crate::auth::change_actor::ChangeActor::for_test(ACCEPTANCE_ACTOR),
         )
         .await
         .expect("HTTP Connection disable should publish atomically");
@@ -1482,7 +1486,7 @@ async fn e2e_09_all_references_disable_atomically_and_block_delete_without_orpha
             &mcp_connection.id,
             &mcp_connection.etag(),
             disabled_mcp_write,
-            ACCEPTANCE_ACTOR,
+            &crate::auth::change_actor::ChangeActor::for_test(ACCEPTANCE_ACTOR),
         )
         .await
         .expect("MCP Connection disable should publish atomically");

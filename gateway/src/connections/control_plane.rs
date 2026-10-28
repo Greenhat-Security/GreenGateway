@@ -13,7 +13,7 @@ use tokio::sync::{
     Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, OwnedSemaphorePermit, Semaphore,
 };
 
-use crate::config::Config;
+use crate::{auth::change_actor::ChangeActor, config::Config};
 
 use super::google_delegation::GoogleWorkloadIdentity;
 
@@ -1586,7 +1586,7 @@ impl ConnectionControlPlane {
         &self,
         expected_collection_etag: &str,
         candidate: ConnectionWrite,
-        actor: &str,
+        actor: &ChangeActor,
     ) -> Result<StoredConnection, ConnectionMutationError> {
         let _guard = self.mutation_guard().await;
         let current = self.runtime.load_full();
@@ -1637,7 +1637,7 @@ impl ConnectionControlPlane {
         id: &ConnectionId,
         expected: &ConnectionEtag,
         candidate: ConnectionWrite,
-        actor: &str,
+        actor: &ChangeActor,
     ) -> Result<StoredConnection, ConnectionMutationError> {
         let _guard = self.mutation_guard().await;
         self.ensure_no_reserved_alias(&candidate)?;
@@ -1659,7 +1659,7 @@ impl ConnectionControlPlane {
         &self,
         id: &ConnectionId,
         expected: &ConnectionEtag,
-        actor: &crate::auth::change_actor::ChangeActor,
+        actor: &ChangeActor,
     ) -> Result<(), ConnectionMutationError> {
         let _guard = self.mutation_guard().await;
         // Cluster mode queues dependency guard rows for a background flush;
@@ -3336,10 +3336,10 @@ impl LocalSecretManager for CoordinatedLocalSecretManager {
         &self,
         label: &str,
         secret: ResolvedSecret,
-        actor_user_id: &str,
+        actor: &ChangeActor,
     ) -> Result<SecretAliasMetadata, LocalSecretError> {
         let _guard = self.mutation_guard();
-        let metadata = self.provider.create(label, secret, actor_user_id)?;
+        let metadata = self.provider.create(label, secret, actor)?;
         self.publish_version(&metadata);
         Ok(metadata)
     }
@@ -3348,7 +3348,7 @@ impl LocalSecretManager for CoordinatedLocalSecretManager {
         &self,
         id: &str,
         replacement: ResolvedSecret,
-        actor_user_id: &str,
+        actor: &ChangeActor,
     ) -> Result<SecretAliasMetadata, LocalSecretError> {
         let _guard = self.mutation_guard();
         let snapshot = self.runtime.load_full();
@@ -3361,14 +3361,14 @@ impl LocalSecretManager for CoordinatedLocalSecretManager {
                     BindingActivationError::Unavailable => LocalSecretError::StorageFailure,
                 })?;
         }
-        let metadata = self.provider.rotate(id, replacement, actor_user_id)?;
+        let metadata = self.provider.rotate(id, replacement, actor)?;
         self.publish_version(&metadata);
         Ok(metadata)
     }
 
-    fn delete(&self, id: &str, actor_user_id: &str) -> Result<(), LocalSecretError> {
+    fn delete(&self, id: &str, actor: &ChangeActor) -> Result<(), LocalSecretError> {
         let _guard = self.mutation_guard();
-        self.provider.delete(id, actor_user_id)?;
+        self.provider.delete(id, actor)?;
         self.remove_version(id);
         Ok(())
     }
@@ -3380,11 +3380,11 @@ impl LocalSecretManager for CoordinatedLocalSecretManager {
     fn reencrypt_master_key_batch(
         &self,
         maximum_records: usize,
-        actor_user_id: &str,
+        actor: &ChangeActor,
     ) -> Result<MasterKeyRotationProgress, LocalSecretError> {
         let _guard = self.mutation_guard();
         self.provider
-            .reencrypt_master_key_batch(maximum_records, actor_user_id)
+            .reencrypt_master_key_batch(maximum_records, actor)
     }
 
     fn ensure_key_unused(&self, key_id: &str) -> Result<(), LocalSecretError> {
@@ -3733,7 +3733,7 @@ mod tests {
                     key.serialize_pem().into_bytes(),
                 )
                 .expect("private-key secret should validate"),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
         })
         .expect("private-key secret should create");
@@ -3743,7 +3743,11 @@ mod tests {
         candidate.tls.client_certificate_id = Some("vault-client-cert".to_owned());
         candidate.tls.client_private_key_id = Some(private_key_secret.id.clone());
         control_plane
-            .create_managed(before.collection_etag(), candidate, "test-admin")
+            .create_managed(
+                before.collection_etag(),
+                candidate,
+                &ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("a split mTLS pair should activate");
 
@@ -3884,7 +3888,11 @@ mod tests {
             .expect("the deferred header must resolve with HeaderApiKey purpose");
         let before = control_plane.runtime_snapshot();
         let created = control_plane
-            .create_managed(before.collection_etag(), candidate, "test-admin")
+            .create_managed(
+                before.collection_etag(),
+                candidate,
+                &ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("preflighted deferred header should persist and publish");
         assert_eq!(
@@ -4408,7 +4416,7 @@ mod tests {
                 "Local token",
                 ResolvedSecret::new(SecretPurpose::StaticBearer, canary.to_vec())
                     .expect("test secret should validate"),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
         })
         .expect("local secret should create");
@@ -4451,7 +4459,7 @@ mod tests {
                     b"oauth-client-secret-v1".to_vec(),
                 )
                 .expect("test secret should validate"),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
             .expect("local secret should create");
         assert_eq!(
@@ -4478,7 +4486,7 @@ mod tests {
                     b"oauth-client-secret-v2".to_vec(),
                 )
                 .expect("replacement secret should validate"),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
             .expect("local secret should rotate");
         assert_eq!(
@@ -4489,7 +4497,7 @@ mod tests {
         control_plane
             .local_secret_manager()
             .expect("local secret manager should be enabled")
-            .delete(&created.id, "test-admin")
+            .delete(&created.id, &ChangeActor::for_test("test-admin"))
             .expect("unused local secret should delete");
         assert_eq!(control_plane.local_secret_version(&created.id), None);
     }
@@ -4520,7 +4528,7 @@ mod tests {
                         b"alpha-proxy-token-v1".to_vec(),
                     )
                     .expect("alpha header secret should validate"),
-                    "test-admin",
+                    &ChangeActor::for_test("test-admin"),
                 )
             })
             .expect("alpha header secret should create");
@@ -4532,7 +4540,7 @@ mod tests {
                         b"zeta-proxy-token-v1".to_vec(),
                     )
                     .expect("zeta header secret should validate"),
-                    "test-admin",
+                    &ChangeActor::for_test("test-admin"),
                 )
             })
             .expect("zeta header secret should create");
@@ -4552,7 +4560,11 @@ mod tests {
         ];
         let before = control_plane.runtime_snapshot();
         let created = control_plane
-            .create_managed(before.collection_etag(), candidate, "test-admin")
+            .create_managed(
+                before.collection_etag(),
+                candidate,
+                &ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("additional-header Connection should activate");
         let initial_generation = control_plane
@@ -4595,7 +4607,7 @@ mod tests {
                         b"alpha-proxy-token-v2".to_vec(),
                     )
                     .expect("rotated header secret should validate"),
-                    "test-admin",
+                    &ChangeActor::for_test("test-admin"),
                 )
         })
         .expect("additional header secret should rotate");
@@ -4642,7 +4654,7 @@ mod tests {
                     b"restart-local-secret-canary".to_vec(),
                 )
                 .expect("test secret should validate"),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
             .expect("local secret should create");
         drop(control_plane);
@@ -4678,7 +4690,7 @@ mod tests {
                     b"collision-local-secret-canary".to_vec(),
                 )
                 .expect("test secret should validate"),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
             .expect("local secret should create");
         drop(control_plane);
@@ -4725,7 +4737,7 @@ mod tests {
         }))
         .expect("candidate should deserialize");
         let created = store
-            .create(candidate, "test-admin")
+            .create(candidate, &ChangeActor::for_test("test-admin"))
             .expect("fixture should persist directly");
         drop(store);
 
@@ -4749,7 +4761,7 @@ mod tests {
                     "Header-only secret",
                     ResolvedSecret::new(SecretPurpose::HeaderApiKey, b"header-canary".to_vec())
                         .expect("fixture secret should validate"),
-                    "test-admin",
+                    &ChangeActor::for_test("test-admin"),
                 )
         })
         .expect("fixture secret should create");
@@ -4761,7 +4773,7 @@ mod tests {
 
         assert!(matches!(
             control_plane
-                .create_managed(before.collection_etag(), candidate, "test-admin")
+                .create_managed(before.collection_etag(), candidate, &ChangeActor::for_test("test-admin"))
                 .await,
             Err(ConnectionMutationError::UnresolvableBindings { fields })
                 if fields == vec!["authentication.secret_id"]
@@ -4785,7 +4797,7 @@ mod tests {
                     "Bearer-only secret",
                     ResolvedSecret::new(SecretPurpose::StaticBearer, b"bearer-canary".to_vec())
                         .expect("fixture secret should validate"),
-                    "test-admin",
+                    &ChangeActor::for_test("test-admin"),
                 )
         })
         .expect("fixture secret should create");
@@ -4799,7 +4811,7 @@ mod tests {
             });
         assert!(matches!(
             control_plane
-                .create_managed(before.collection_etag(), candidate, "test-admin")
+                .create_managed(before.collection_etag(), candidate, &ChangeActor::for_test("test-admin"))
                 .await,
             Err(ConnectionMutationError::UnresolvableBindings { fields })
                 if fields == vec!["additional_headers.secret_id"]
@@ -4833,7 +4845,11 @@ mod tests {
 
         assert!(matches!(
             control_plane
-                .create_managed(initial.collection_etag(), candidate, "test-admin")
+                .create_managed(
+                    initial.collection_etag(),
+                    candidate,
+                    &ChangeActor::for_test("test-admin")
+                )
                 .await,
             Err(ConnectionMutationError::BindingUnavailable)
         ));
@@ -4864,7 +4880,7 @@ mod tests {
                 "Access client ID",
                 ResolvedSecret::new(SecretPurpose::HeaderApiKey, original.clone())
                     .expect("header secret should validate"),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
         })
         .expect("header secret should create");
@@ -4877,7 +4893,11 @@ mod tests {
                 secret_id: Some(secret.id.clone()),
             });
         let created = control_plane
-            .create_managed(before.collection_etag(), candidate, "test-admin")
+            .create_managed(
+                before.collection_etag(),
+                candidate,
+                &ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("additional-header Connection should activate");
 
@@ -4889,7 +4909,7 @@ mod tests {
                     b"wrong-purpose-replacement".to_vec(),
                 )
                 .expect("bounded replacement should construct"),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )),
             Err(LocalSecretError::InvalidSecret)
         );
@@ -4933,7 +4953,11 @@ mod tests {
         };
         assert!(matches!(
             control_plane
-                .create_managed(initial.collection_etag(), unavailable_create, "test-admin")
+                .create_managed(
+                    initial.collection_etag(),
+                    unavailable_create,
+                    &ChangeActor::for_test("test-admin")
+                )
                 .await,
             Err(ConnectionMutationError::BindingUnavailable)
         ));
@@ -4948,7 +4972,11 @@ mod tests {
             0
         );
         let created = control_plane
-            .create_managed(initial.collection_etag(), managed_candidate(), "test-admin")
+            .create_managed(
+                initial.collection_etag(),
+                managed_candidate(),
+                &ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("plain connection should create");
         let before = control_plane.runtime_snapshot();
@@ -4959,7 +4987,12 @@ mod tests {
 
         assert!(matches!(
             control_plane
-                .replace_managed(&created.id, &created.etag(), replacement, "test-admin")
+                .replace_managed(
+                    &created.id,
+                    &created.etag(),
+                    replacement,
+                    &ChangeActor::for_test("test-admin")
+                )
                 .await,
             Err(ConnectionMutationError::BindingUnavailable)
         ));
@@ -4995,7 +5028,7 @@ mod tests {
                             .to_vec(),
                     )
                     .expect("bounded invalid-DER PEM fixture should validate"),
-                    "test-admin",
+                    &ChangeActor::for_test("test-admin"),
                 )
         })
         .expect("fixture secret should create");
@@ -5004,7 +5037,11 @@ mod tests {
         candidate.tls.ca_bundle_alias = Some(secret.id);
 
         let result = control_plane
-            .create_managed(before.collection_etag(), candidate, "test-admin")
+            .create_managed(
+                before.collection_etag(),
+                candidate,
+                &ChangeActor::for_test("test-admin"),
+            )
             .await;
         match result {
             Err(ConnectionMutationError::UnresolvableBindings { fields }) => {
@@ -5044,7 +5081,7 @@ mod tests {
                 "CA bundle",
                 ResolvedSecret::new(SecretPurpose::TlsCaBundle, valid_ca_pem.clone())
                     .expect("valid CA secret should construct"),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
         })
         .expect("valid CA secret should create");
@@ -5052,7 +5089,11 @@ mod tests {
         let mut candidate = managed_candidate();
         candidate.tls.ca_bundle_alias = Some(ca_secret.id.clone());
         let created = control_plane
-            .create_managed(before.collection_etag(), candidate, "test-admin")
+            .create_managed(
+                before.collection_etag(),
+                candidate,
+                &ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("valid CA connection should activate");
 
@@ -5065,7 +5106,7 @@ mod tests {
                 &ca_secret.id,
                 ResolvedSecret::new(SecretPurpose::TlsCaBundle, mixed_bundle)
                     .expect("bounded mixed CA fixture should construct"),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )),
             Err(LocalSecretError::InvalidSecret)
         );
@@ -5108,7 +5149,7 @@ mod tests {
                 "Client certificate",
                 ResolvedSecret::new(SecretPurpose::TlsCertificate, certificate_pem.clone())
                     .expect("certificate secret should validate"),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
         })
         .expect("certificate secret should create");
@@ -5117,7 +5158,7 @@ mod tests {
                 "Client private key",
                 ResolvedSecret::new(SecretPurpose::TlsPrivateKey, private_key_pem.clone())
                     .expect("private-key secret should validate"),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
         })
         .expect("private-key secret should create");
@@ -5126,7 +5167,11 @@ mod tests {
         candidate.tls.client_certificate_id = Some(certificate_secret.id.clone());
         candidate.tls.client_private_key_id = Some(private_key_secret.id.clone());
         let created = control_plane
-            .create_managed(before.collection_etag(), candidate, "test-admin")
+            .create_managed(
+                before.collection_etag(),
+                candidate,
+                &ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("valid mTLS connection should activate");
 
@@ -5138,7 +5183,7 @@ mod tests {
                     b"malformed-certificate-canary".to_vec(),
                 )
                 .expect("bounded malformed fixture should construct"),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )),
             Err(LocalSecretError::InvalidSecret)
         );
@@ -5152,7 +5197,7 @@ mod tests {
                     mismatched_key.serialize_pem().into_bytes(),
                 )
                 .expect("mismatched key fixture should construct"),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )),
             Err(LocalSecretError::InvalidSecret)
         );
@@ -5209,7 +5254,7 @@ mod tests {
             secret_id: Some(alias_id),
         };
         let created = store
-            .create(candidate, "test-admin")
+            .create(candidate, &ChangeActor::for_test("test-admin"))
             .expect("fixture should persist directly");
         drop(store);
 
@@ -5242,7 +5287,7 @@ mod tests {
                             format!("race-token-{iteration}").into_bytes(),
                         )
                         .expect("fixture secret should validate"),
-                        "test-admin",
+                        &ChangeActor::for_test("test-admin"),
                     )
             })
             .expect("fixture secret should create");
@@ -5267,11 +5312,15 @@ mod tests {
                 delete_control_plane
                     .local_secret_manager()
                     .expect("local manager should exist")
-                    .delete(&secret_id, "test-admin")
+                    .delete(&secret_id, &ChangeActor::for_test("test-admin"))
             });
             create_barrier.wait();
             let create_result = create_control_plane
-                .create_managed(&expected_collection_etag, candidate, "test-admin")
+                .create_managed(
+                    &expected_collection_etag,
+                    candidate,
+                    &ChangeActor::for_test("test-admin"),
+                )
                 .await;
             let delete_result = delete.join().expect("delete thread should not panic");
 
@@ -5282,7 +5331,7 @@ mod tests {
                         .delete_managed(
                             &created.id,
                             &created.etag(),
-                            &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+                            &ChangeActor::for_test("test-admin"),
                         )
                         .await
                         .expect("fixture connection should delete");
@@ -5290,7 +5339,7 @@ mod tests {
                         control_plane
                             .local_secret_manager()
                             .expect("local manager should exist")
-                            .delete(&secret.id, "test-admin")
+                            .delete(&secret.id, &ChangeActor::for_test("test-admin"))
                     })
                     .expect("fixture secret should delete after dependency removal");
                 }
@@ -5357,7 +5406,7 @@ mod tests {
             .create_managed(
                 before.collection_etag(),
                 bound_to("pseudonym-later"),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("an unreserved alias binds");
@@ -5379,7 +5428,7 @@ mod tests {
             .delete_managed(
                 &stored.id,
                 &stored.etag(),
-                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+                &ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("the stored binding is removed");
@@ -5393,7 +5442,11 @@ mod tests {
         for alias in ["pseudonym-current", "pseudonym-previous"] {
             assert!(matches!(
                 control_plane
-                    .create_managed(initial.collection_etag(), bound_to(alias), "test-admin")
+                    .create_managed(
+                        initial.collection_etag(),
+                        bound_to(alias),
+                        &ChangeActor::for_test("test-admin")
+                    )
                     .await,
                 Err(ConnectionMutationError::Store(
                     ConnectionStoreError::SecretPurposeConflict {
@@ -5405,7 +5458,11 @@ mod tests {
         assert!(control_plane.runtime_snapshot().managed().is_empty());
 
         let created = control_plane
-            .create_managed(initial.collection_etag(), managed_candidate(), "test-admin")
+            .create_managed(
+                initial.collection_etag(),
+                managed_candidate(),
+                &ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("a Connection that binds nothing reserved creates");
         let mut replacement = created.write.clone();
@@ -5415,7 +5472,12 @@ mod tests {
         };
         assert!(matches!(
             control_plane
-                .replace_managed(&created.id, &created.etag(), replacement, "test-admin")
+                .replace_managed(
+                    &created.id,
+                    &created.etag(),
+                    replacement,
+                    &ChangeActor::for_test("test-admin")
+                )
                 .await,
             Err(ConnectionMutationError::Store(
                 ConnectionStoreError::SecretPurposeConflict { .. }
@@ -5436,7 +5498,11 @@ mod tests {
         assert!(initial.managed().is_empty());
 
         let created = control_plane
-            .create_managed(initial.collection_etag(), managed_candidate(), "test-admin")
+            .create_managed(
+                initial.collection_etag(),
+                managed_candidate(),
+                &ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("create should succeed");
         let after_create = control_plane.runtime_snapshot();
@@ -5449,7 +5515,11 @@ mod tests {
 
         assert!(matches!(
             control_plane
-                .create_managed(initial.collection_etag(), managed_candidate(), "test-admin")
+                .create_managed(
+                    initial.collection_etag(),
+                    managed_candidate(),
+                    &ChangeActor::for_test("test-admin")
+                )
                 .await,
             Err(ConnectionMutationError::CollectionConflict { .. })
         ));
@@ -5467,7 +5537,12 @@ mod tests {
         let mut replacement = created.write.clone();
         replacement.display_name = "Billing API v2".to_owned();
         let replaced = control_plane
-            .replace_managed(&created.id, &created.etag(), replacement, "test-admin")
+            .replace_managed(
+                &created.id,
+                &created.etag(),
+                replacement,
+                &ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("replace should succeed");
         let after_replace = control_plane.runtime_snapshot();
@@ -5478,7 +5553,7 @@ mod tests {
             .delete_managed(
                 &created.id,
                 &replaced.etag(),
-                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+                &ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("delete should succeed");
@@ -5506,7 +5581,11 @@ mod tests {
 
         assert!(matches!(
             control_plane
-                .create_managed(before.collection_etag(), invalid, "test-admin")
+                .create_managed(
+                    before.collection_etag(),
+                    invalid,
+                    &ChangeActor::for_test("test-admin")
+                )
                 .await,
             Err(ConnectionMutationError::Store(
                 ConnectionStoreError::Validation { .. }
@@ -5551,7 +5630,7 @@ mod tests {
                 candidate.display_name = format!("Concurrent API {index}");
                 barrier.wait().await;
                 control_plane
-                    .create_managed(&expected, candidate, "test-admin")
+                    .create_managed(&expected, candidate, &ChangeActor::for_test("test-admin"))
                     .await
             }));
         }
@@ -5679,7 +5758,7 @@ mod tests {
             .create_managed(
                 before.collection_etag(),
                 attested_candidate("assertion-key", "gw-1", "rs256", serde_json::json!([])),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
             .await
         else {
@@ -5712,7 +5791,7 @@ mod tests {
                         { "signing_key_id": "assertion-key-next", "kid": "gw-2", "algorithm": "rs256" }
                     ]),
                 ),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
             .await
         else {
@@ -5742,7 +5821,7 @@ mod tests {
                         { "signing_key_id": "assertion-key-next", "kid": "gw-2", "algorithm": "es256" }
                     ]),
                 ),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("keys matching their algorithm should be accepted");
@@ -5779,7 +5858,7 @@ mod tests {
                         { "signing_key_id": "key-a-next", "kid": "gw-a-next", "algorithm": "es256" }
                     ]),
                 ),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("attested Connection should create");
@@ -5787,7 +5866,11 @@ mod tests {
         let mut disabled = attested_candidate("key-b", "gw-b", "es256", serde_json::json!([]));
         disabled.enabled = false;
         control_plane
-            .create_managed(snapshot.collection_etag(), disabled, "test-admin")
+            .create_managed(
+                snapshot.collection_etag(),
+                disabled,
+                &ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("disabled attested Connection should create");
 
@@ -5810,7 +5893,12 @@ mod tests {
         let mut withdrawn = attested.write.clone();
         withdrawn.enabled = false;
         control_plane
-            .replace_managed(&attested.id, &attested.etag(), withdrawn, "test-admin")
+            .replace_managed(
+                &attested.id,
+                &attested.etag(),
+                withdrawn,
+                &ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("disabling should save");
         let after = control_plane
@@ -5899,7 +5987,7 @@ mod tests {
                     .create_managed(
                         snapshot.collection_etag(),
                         attested_candidate(alias, kid, "es256", serde_json::json!([])),
-                        "test-admin",
+                        &ChangeActor::for_test("test-admin"),
                     )
                     .await
                     .expect("attested Connection should create"),
@@ -5960,7 +6048,7 @@ mod tests {
                 &degraded.id,
                 &degraded.etag(),
                 degraded.write.clone(),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
             .await
         else {
@@ -5984,7 +6072,7 @@ mod tests {
                 &degraded.id,
                 &degraded.etag(),
                 degraded.write.clone(),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("a save with a usable key should succeed");
@@ -6002,7 +6090,12 @@ mod tests {
         let mut disabled = placeholder.write.clone();
         disabled.enabled = false;
         let disabled = restarted
-            .replace_managed(&placeholder.id, &placeholder.etag(), disabled, "test-admin")
+            .replace_managed(
+                &placeholder.id,
+                &placeholder.etag(),
+                disabled,
+                &ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("disabling a degraded Connection should save");
         assert_eq!(restarted.caller_assertion_key_problem(&disabled), None);
@@ -6023,7 +6116,7 @@ mod tests {
                     .create_managed(
                         snapshot.collection_etag(),
                         attested_candidate(alias, kid, "es256", serde_json::json!([])),
-                        "test-admin",
+                        &ChangeActor::for_test("test-admin"),
                     )
                     .await
                     .expect("attested Connection should create"),
@@ -6129,7 +6222,7 @@ mod tests {
             .create_managed(
                 snapshot.collection_etag(),
                 attested_candidate("key-a", "gw-a", "es256", serde_json::json!([])),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("attested Connection should create");
@@ -6233,7 +6326,11 @@ mod tests {
             let snapshot = control_plane.runtime_snapshot();
             created.push(
                 control_plane
-                    .create_managed(snapshot.collection_etag(), candidate, "test-admin")
+                    .create_managed(
+                        snapshot.collection_etag(),
+                        candidate,
+                        &ChangeActor::for_test("test-admin"),
+                    )
                     .await
                     .expect("each Connection should create"),
             );
@@ -6370,7 +6467,7 @@ mod tests {
                 .create_managed(
                     snapshot.collection_etag(),
                     attested_candidate("gated-key", "gw-shared", "es256", serde_json::json!([])),
-                    "test-admin",
+                    &ChangeActor::for_test("test-admin"),
                 )
                 .await
                 .expect("attested Connection should create");
@@ -6440,7 +6537,7 @@ mod tests {
             .create_managed(
                 snapshot.collection_etag(),
                 attested_candidate("gated-key", "gw-repaired", "es256", serde_json::json!([])),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("a deferred key is not read on save");
@@ -6474,7 +6571,7 @@ mod tests {
                 &created.id,
                 &created.etag(),
                 created.write.clone(),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("the repaired Connection should save");
@@ -6519,7 +6616,7 @@ mod tests {
             .create_managed(
                 snapshot.collection_etag(),
                 attested_candidate("gated-key", "gw-remote", "es256", serde_json::json!([])),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("a deferred key is not read on save");
@@ -6603,7 +6700,7 @@ mod tests {
             .create_managed(
                 snapshot.collection_etag(),
                 attested_candidate("gated-key", "gw-overlap", "es256", serde_json::json!([])),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("a deferred key is not read on save");
@@ -6732,7 +6829,7 @@ mod tests {
             .create_managed(
                 snapshot.collection_etag(),
                 attested_candidate("gated-key", "gw-busy", "es256", serde_json::json!([])),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("attested Connection should create");
@@ -6749,7 +6846,7 @@ mod tests {
                     &current.id,
                     &current.etag(),
                     current.write.clone(),
-                    "test-admin",
+                    &ChangeActor::for_test("test-admin"),
                 )
                 .await
                 .expect("the Connection should save");
@@ -6789,7 +6886,7 @@ mod tests {
             .create_managed(
                 snapshot.collection_etag(),
                 attested_candidate("key-a", "gw-shared", "es256", serde_json::json!([])),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("the first Connection should create");
@@ -6799,7 +6896,7 @@ mod tests {
             .create_managed(
                 snapshot.collection_etag(),
                 attested_candidate("key-b", "gw-shared", "es256", serde_json::json!([])),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
             .await
         else {
@@ -6826,7 +6923,7 @@ mod tests {
                         { "signing_key_id": "key-b", "kid": "gw-shared", "algorithm": "es256" }
                     ]),
                 ),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
             .await
         else {
@@ -6849,7 +6946,7 @@ mod tests {
             .create_managed(
                 snapshot.collection_etag(),
                 attested_candidate("key-a", "gw-shared", "es256", serde_json::json!([])),
-                "test-admin",
+                &ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("a second Connection may share the same key");

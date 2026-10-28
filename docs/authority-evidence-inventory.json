@@ -519,16 +519,16 @@
           "anchor": "async fn connection_put_endpoint("
         }
       ],
-      "boundary": "SqliteConnectionStore::create/replace refuse an empty or oversized actor before any other work, then run one IMMEDIATE transaction on the CONNECTIONS_SQLITE_PATH database: write the record and bindings, append connection_change_evidence rows (connection.create; connection.replace, plus credential.binding_change under the same operation_id when the credential revision advances) and commit once. The control plane publishes its runtime snapshot only after that commit. An evidence insert failure rolls the whole change back and is reported as a store failure (503), never as a validation problem or conflict; an identical replace commits and records nothing.",
-      "record": "Current records and revisions are atomic. The same database's connection_change_evidence table (Connections schema migration 12, no foreign key) keeps one append-only row per committed create, replace and credential-axis change: actor, action, event/operation UUIDs, Connection ID, the revision before and after on the action's axis (connection_revision; credential_revision for credential.binding_change), a commit-ordered sequence and the change's own committed_at. No specification, endpoint, binding or bound secret ID. Rows are never pruned, and import-standalone does not carry them.",
-      "actor": "The authenticated principal subject the admin endpoints pass through the control plane and the managed-store adapter (1 to 4096 bytes, the principal bound), committed with the change. Issuer, auth mode and a keyed safe actor reference are absent.",
+      "boundary": "SqliteConnectionStore::create/replace refuse an actor the evidence cannot record exactly (ChangeActor::is_recordable) before any other work, then run one IMMEDIATE transaction on the CONNECTIONS_SQLITE_PATH database: write the record and bindings, append connection_change_evidence rows (connection.create; connection.replace, plus credential.binding_change under the same operation_id when the credential revision advances) and commit once. The control plane publishes its runtime snapshot only after that commit. An evidence insert failure rolls the whole change back and is reported as a store failure (503), never as a validation problem or conflict; an identical replace commits and records nothing.",
+      "record": "Current records and revisions are atomic. The same database's connection_change_evidence table (Connections schema migration 12, no foreign key) keeps one append-only row per committed create, replace and credential-axis change: actor (subject, kind, auth mode and, for a principal that has one, canonical issuer, with the same pairing CHECK as PostgreSQL migration 24 and every column required), action, event/operation UUIDs, Connection ID, the revision before and after on the action's axis (connection_revision; credential_revision for credential.binding_change), a commit-ordered sequence and the change's own committed_at. No specification, endpoint, binding or bound secret ID. Rows are never pruned, and import-standalone does not carry them.",
+      "actor": "The authenticated principal the admin endpoints pass through the control plane and the managed-store adapter as a ChangeActor, committed with the change: the subject (1 to 4096 bytes), actor_kind (principal or service_token), actor_auth_mode and the canonical actor_issuer of a principal that has one (1 to 4096 bytes). A keyed safe actor reference is absent.",
       "identity": "Generated event_id/operation_id UUIDs per store call (not bound to a client idempotency key), Connection ID, prior/new revision per axis, store sequence and the process-clock committed_at (the record's updated_at). Standalone mode has no shared security revision and no database clock.",
       "delivery": "post_commit_telemetry",
       "disposition": [
         "missing_metadata",
         "missing_delivery"
       ],
-      "follow_up": "PR4 follow-up: issuer/auth mode and a caller-bound operation identity at the store, and delivery from this same database (standalone mode has no journal or dispatcher), with no audit-database dual write. Catalog/overlay publication in this database is its own row; the PostgreSQL create/replace evidence (connection_postgres) is still open.",
+      "follow_up": "PR4 follow-up: a caller-bound operation identity at the store, and delivery from this same database (standalone mode has no journal or dispatcher), with no audit-database dual write. Catalog/overlay publication in this database is its own row; the PostgreSQL create/replace evidence (connection_postgres) is still open. Issuer, actor kind and auth mode are recorded.",
       "sources": [
         {
           "path": "gateway/src/connections/store.rs",
@@ -587,10 +587,14 @@
         {
           "path": "gateway/src/connections/control_plane.rs",
           "anchor": "async fn failed_mutation_preserves_runtime_and_persisted_state("
+        },
+        {
+          "path": "gateway/src/connections/store_tests.rs",
+          "anchor": "fn change_evidence_bounds_match_the_migration("
         }
       ],
       "required_durability_supported": false,
-      "test_claim": "Standalone regression anchors for the create/replace/credential-change evidence in the Connections database's own transactions: forced insert failure and rollback, restart, refused changes, migration onto an existing database, and the admin endpoints recording the authenticated subject. They do not certify the proposed authority-event contract or delivery."
+      "test_claim": "Standalone regression anchors for the create/replace/credential-change evidence in the Connections database's own transactions: forced insert failure and rollback, restart, refused changes and unrecordable actors, migration onto an existing database, the actor CHECKs pinned to PostgreSQL migration 24, and the admin endpoints recording the authenticated principal with its issuer. They do not certify the proposed authority-event contract or delivery."
     },
     {
       "id": "connection_delete_postgres",
@@ -716,16 +720,16 @@
           "anchor": "async fn connection_delete_endpoint("
         }
       ],
-      "boundary": "SqliteConnectionStore::delete refuses an empty or oversized actor, then in one IMMEDIATE transaction checks bindings, ETag and dependencies, appends one connection_change_evidence row (connection.delete), deletes the record, whose children cascade, and commits once. An evidence insert failure rolls the delete back and is reported as a store failure (503).",
-      "record": "connection_change_evidence (no foreign key) keeps the deletion's actor, action, event/operation UUIDs, Connection ID and prior connection revision with no successor after the record, bindings, catalogs and status have cascaded, beside the record's earlier create/replace rows. Stale ETag, dependency, missing record and invalid actor write no row.",
-      "actor": "The authenticated principal subject passed through the managed-store adapter (1 to 4096 bytes), committed with the delete and retained after it. Issuer and auth mode are absent.",
+      "boundary": "SqliteConnectionStore::delete refuses an actor the evidence cannot record exactly (ChangeActor::is_recordable), then in one IMMEDIATE transaction checks bindings, ETag and dependencies, appends one connection_change_evidence row (connection.delete), deletes the record, whose children cascade, and commits once. An evidence insert failure rolls the delete back and is reported as a store failure (503).",
+      "record": "connection_change_evidence (no foreign key) keeps the deletion's actor (subject, kind, auth mode and, for a principal that has one, canonical issuer, with the same pairing CHECK as PostgreSQL migration 24 and every column required), action, event/operation UUIDs, Connection ID and prior connection revision with no successor after the record, bindings, catalogs and status have cascaded, beside the record's earlier create/replace rows. Stale ETag, dependency, missing record and an unrecordable actor write no row.",
+      "actor": "The authenticated principal passed through the managed-store adapter as a ChangeActor, the same one the PostgreSQL store records: subject (1 to 4096 bytes), actor_kind, actor_auth_mode and canonical actor_issuer, committed with the delete and retained after it.",
       "identity": "Generated event_id/operation_id UUIDs, Connection ID, prior revision, store sequence and process-clock committed_at. A lost delete response is reconciled from the Connection's evidence rows; a blind retry is NotFound and records nothing.",
       "delivery": "post_commit_telemetry",
       "disposition": [
         "missing_metadata",
         "missing_delivery"
       ],
-      "follow_up": "PR4 follow-up: issuer/auth mode, a caller-bound operation identity, and delivery from this same database; standalone mode has no journal.",
+      "follow_up": "PR4 follow-up: a caller-bound operation identity and delivery from this same database; standalone mode has no journal. Issuer, actor kind and auth mode are recorded.",
       "sources": [
         {
           "path": "gateway/src/connections/store.rs",
@@ -938,16 +942,16 @@
           "anchor": "async fn connection_secret_delete_endpoint("
         }
       ],
-      "boundary": "LocalSecretProvider create/rotate/delete and reencrypt_master_key_batch refuse an empty or oversized actor, then each runs one IMMEDIATE transaction in the Connections SQLite database that changes the envelope(s) and appends one connection_local_secret_change_evidence row before it commits; an evidence insert failure rolls the change back (ChangeEvidenceFailure, 503 from the admin API). Control-plane preflights and runtime publication surround the store call; the CLI executes one bounded batch per invocation.",
-      "record": "Current sealed record, version and timestamps; rotation replaces material and deletion removes it. connection_local_secret_change_evidence (Connections schema migration 12, no foreign key) keeps one append-only row per committed create, rotate, delete and non-empty re-encryption batch: actor, action, event/operation UUIDs, the gateway-minted secret ID and its version before/after, or for a batch only how many envelopes it rewrote. Never the label, purpose, plaintext, ciphertext, nonce or key ID. Not found, purpose mismatch, dependency conflict and an empty batch write none.",
-      "actor": "Admin endpoints pass the authenticated principal subject (1 to 4096 bytes); the connection-secrets reencrypt command records the fixed system label operator:connection-secrets-reencrypt, which is not a named human. Issuer and auth mode are absent.",
+      "boundary": "LocalSecretProvider create/rotate/delete and reencrypt_master_key_batch refuse an actor the evidence cannot record exactly (ChangeActor::is_recordable), then each runs one IMMEDIATE transaction in the Connections SQLite database that changes the envelope(s) and appends one connection_local_secret_change_evidence row before it commits; an evidence insert failure rolls the change back (ChangeEvidenceFailure, 503 from the admin API). Control-plane preflights and runtime publication surround the store call; the CLI executes one bounded batch per invocation.",
+      "record": "Current sealed record, version and timestamps; rotation replaces material and deletion removes it. connection_local_secret_change_evidence (Connections schema migration 12, no foreign key) keeps one append-only row per committed create, rotate, delete and non-empty re-encryption batch: actor (subject, kind, auth mode and, for a principal that has one, canonical issuer, with the same pairing CHECK as PostgreSQL migration 24 and every column required), action, event/operation UUIDs, the gateway-minted secret ID and its version before/after, or for a batch only how many envelopes it rewrote. Never the label, purpose, plaintext, ciphertext, nonce or key ID. Not found, purpose mismatch, dependency conflict and an empty batch write none.",
+      "actor": "Admin endpoints pass the authenticated principal as a ChangeActor: subject (1 to 4096 bytes), actor_kind, actor_auth_mode and canonical actor_issuer. The connection-secrets reencrypt command records the fixed label operator:connection-secrets-reencrypt as a system actor (kind and auth mode system, no issuer), which is not a named human.",
       "identity": "Generated event/operation UUIDs per store call, the local secret ID with its version axis (no successor on delete), or the batch count in the maintenance shape with no revision, store sequence and process-clock committed_at (a rotation's rotated_at). The secret ID is an internal identifier; a delivered event would need a keyed reference for it.",
       "delivery": "post_commit_telemetry",
       "disposition": [
         "missing_metadata",
         "missing_delivery"
       ],
-      "follow_up": "PR4 follow-up: issuer/auth mode, an actor kind for the CLI label, a caller-bound operation identity, and delivery from this same database with keyed references for the secret ID. import-standalone does not carry these rows.",
+      "follow_up": "PR4 follow-up: a caller-bound operation identity, and delivery from this same database with keyed references for the secret ID. import-standalone does not carry these rows. Issuer, actor kind and auth mode are recorded.",
       "sources": [
         {
           "path": "gateway/src/connections/store.rs",
@@ -1009,7 +1013,7 @@
         }
       ],
       "required_durability_supported": false,
-      "test_claim": "Standalone regression anchors for the transactional local-secret evidence in the Connections database: forced insert failure and rollback of each change, restart, refused changes, synthetic-marker exclusion, the CLI's operator label and the admin endpoints recording the authenticated subject. They do not certify the proposed authority-event contract or delivery."
+      "test_claim": "Standalone regression anchors for the transactional local-secret evidence in the Connections database: forced insert failure and rollback of each change, restart, refused changes and unrecordable actors, synthetic-marker exclusion, the CLI's system actor and the admin endpoints recording the authenticated principal. They do not certify the proposed authority-event contract or delivery."
     },
     {
       "id": "local_secrets_postgres",

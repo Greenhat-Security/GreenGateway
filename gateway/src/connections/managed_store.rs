@@ -25,6 +25,8 @@ use std::collections::BTreeMap;
 #[cfg(feature = "postgres")]
 use std::sync::{Arc, Mutex};
 
+use crate::auth::change_actor::ChangeActor;
+
 use super::model::ConnectionId;
 use super::model::ConnectionWrite;
 #[cfg(feature = "postgres")]
@@ -231,6 +233,11 @@ impl ManagedConnectionStore {
         }
     }
 
+    /// Create on behalf of `actor`. The SQLite store records the whole actor
+    /// as the create's evidence in the same transaction (migration 12 of the
+    /// Connections database, issue #425); the PostgreSQL store records its
+    /// subject on the version row and writes no create evidence yet.
+    ///
     /// `collection` is the cross-replica half of the caller's `If-Match`
     /// (see [`CollectionCheck`]). The SQLite arm does not consult it: a
     /// standalone process's runtime snapshot is the only writer's view, so
@@ -240,62 +247,69 @@ impl ManagedConnectionStore {
     pub async fn create(
         &self,
         candidate: ConnectionWrite,
-        actor: &str,
+        actor: &ChangeActor,
         collection: Option<CollectionCheck<'_>>,
     ) -> Result<StoredConnection, ConnectionStoreError> {
         match self {
             Self::Sqlite(store) => {
                 let _ = collection;
                 let store = store.clone();
-                let actor = actor.to_owned();
+                let actor = actor.clone();
                 blocking("connection create", move || {
                     ConnectionStore::create(&store, candidate, &actor)
                 })
                 .await
             }
             #[cfg(feature = "postgres")]
-            Self::Postgres { store, .. } => store.create(candidate, actor, collection).await,
+            Self::Postgres { store, .. } => {
+                store.create(candidate, actor.subject(), collection).await
+            }
         }
     }
 
+    /// Replace on behalf of `actor`, recorded as [`Self::create`] records it.
     pub async fn replace(
         &self,
         id: &ConnectionId,
         expected: &ConnectionEtag,
         candidate: ConnectionWrite,
-        actor: &str,
+        actor: &ChangeActor,
     ) -> Result<StoredConnection, ConnectionStoreError> {
         match self {
             Self::Sqlite(store) => {
                 let store = store.clone();
                 let id = id.clone();
                 let expected = expected.clone();
-                let actor = actor.to_owned();
+                let actor = actor.clone();
                 blocking("connection replace", move || {
                     ConnectionStore::replace(&store, &id, &expected, candidate, &actor)
                 })
                 .await
             }
             #[cfg(feature = "postgres")]
-            Self::Postgres { store, .. } => store.replace(id, expected, candidate, actor).await,
+            Self::Postgres { store, .. } => {
+                store
+                    .replace(id, expected, candidate, actor.subject())
+                    .await
+            }
         }
     }
 
-    /// Delete on behalf of `actor`. The PostgreSQL store records the actor as
-    /// the deletion's evidence; the standalone store has no evidence table
-    /// for Connections yet (issue #425), so it takes no actor.
+    /// Delete on behalf of `actor`. Both stores record the whole actor as the
+    /// deletion's evidence in the deleting transaction: PostgreSQL
+    /// migrations 16 and 24, and the SQLite store's migration 12.
     pub async fn delete(
         &self,
         id: &ConnectionId,
         expected: &ConnectionEtag,
-        actor: &crate::auth::change_actor::ChangeActor,
+        actor: &ChangeActor,
     ) -> Result<(), ConnectionStoreError> {
         match self {
             Self::Sqlite(store) => {
                 let store = store.clone();
                 let id = id.clone();
                 let expected = expected.clone();
-                let actor = actor.to_owned();
+                let actor = actor.clone();
                 blocking("connection delete", move || {
                     ConnectionStore::delete(&store, &id, &expected, &actor)
                 })

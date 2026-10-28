@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use uuid::Uuid;
 
-use crate::tools::definitions::ToolDefinition;
+use crate::{auth::change_actor::ChangeActor, tools::definitions::ToolDefinition};
 
 use super::{
     model::{
@@ -760,9 +760,18 @@ ON connection_status_history(connection_id, status_revision DESC);
 //   label, credential binding, bound secret ID, ciphertext, nonce or key ID
 //   is stored. A local secret is named by the gateway-minted UUID this file
 //   already keeps beside its envelope.
-// - actor_user_id is the authenticated principal's subject, or a command's
-//   fixed operator label, bounded by the principal subject bound
-//   (MAX_CHANGE_EVIDENCE_ACTOR_BYTES).
+// - The actor is recorded whole, as PostgreSQL migration 24 records it
+//   (auth::change_actor::ChangeActor): actor_user_id is the authenticated
+//   principal's subject, or a command's fixed operator label; actor_kind is
+//   'principal', 'service_token' or 'system'; actor_auth_mode is the audit
+//   auth mode that agrees with the kind, or 'system'; actor_issuer is the
+//   canonical issuer of a principal that has one and nothing otherwise.
+//   Subject and issuer are bounded by exactly the principal bounds
+//   authentication enforces (MAX_CHANGE_EVIDENCE_ACTOR_BYTES,
+//   MAX_CHANGE_EVIDENCE_ACTOR_ISSUER_BYTES). Unlike migration 24, which had
+//   to accept the rows written before it, every row here records all of it,
+//   so kind and auth mode are NOT NULL and the pairing CHECK is the inner
+//   half of migration 24's.
 // - event_id identifies the row and operation_id the store call that wrote
 //   it. An operation records each action at most once, so a replace that
 //   also changes credential authority writes a connection.replace row and a
@@ -781,8 +790,8 @@ ON connection_status_history(connection_id, status_revision DESC);
 //   (docs/schemas/authority_event.v1.schema.json), as PostgreSQL
 //   migration 16 does. No gateway path updates or deletes these rows.
 //
-// Every comparison in a row CHECK is guarded by IS NOT NULL, because
-// SQLite passes a CHECK whose expression is NULL.
+// Every comparison in a row CHECK is guarded by IS NOT NULL or reads a NOT
+// NULL column, because SQLite passes a CHECK whose expression is NULL.
 const MIGRATION_12_SQL: &str = r#"
 CREATE TABLE connection_change_evidence (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -791,6 +800,11 @@ CREATE TABLE connection_change_evidence (
     actor_user_id TEXT NOT NULL CHECK (
         length(CAST(actor_user_id AS BLOB)) BETWEEN 1 AND 4096
     ),
+    actor_issuer TEXT CHECK (
+        actor_issuer IS NULL OR length(CAST(actor_issuer AS BLOB)) BETWEEN 1 AND 4096
+    ),
+    actor_kind TEXT NOT NULL,
+    actor_auth_mode TEXT NOT NULL,
     action TEXT NOT NULL CHECK (
         action IN (
             'connection.create', 'connection.replace', 'credential.binding_change',
@@ -804,6 +818,13 @@ CREATE TABLE connection_change_evidence (
     new_version INTEGER CHECK (new_version IS NULL OR new_version >= 1),
     committed_at TEXT NOT NULL CHECK (length(CAST(committed_at AS BLOB)) BETWEEN 1 AND 64),
     UNIQUE (operation_id, action),
+    CHECK (
+        (actor_kind = 'principal'
+            AND actor_auth_mode IN ('bearer_token', 'session_cookie', 'client_certificate'))
+        OR (actor_kind = 'service_token'
+            AND actor_auth_mode = 'service_token' AND actor_issuer IS NULL)
+        OR (actor_kind = 'system' AND actor_auth_mode = 'system' AND actor_issuer IS NULL)
+    ),
     CHECK (
         (
             action = 'connection.create'
@@ -831,6 +852,11 @@ CREATE TABLE connection_local_secret_change_evidence (
     actor_user_id TEXT NOT NULL CHECK (
         length(CAST(actor_user_id AS BLOB)) BETWEEN 1 AND 4096
     ),
+    actor_issuer TEXT CHECK (
+        actor_issuer IS NULL OR length(CAST(actor_issuer AS BLOB)) BETWEEN 1 AND 4096
+    ),
+    actor_kind TEXT NOT NULL,
+    actor_auth_mode TEXT NOT NULL,
     action TEXT NOT NULL CHECK (
         action IN ('secret.create', 'secret.rotate', 'secret.delete', 'secret.reencrypt')
     ),
@@ -842,6 +868,13 @@ CREATE TABLE connection_local_secret_change_evidence (
     ),
     committed_at TEXT NOT NULL CHECK (length(CAST(committed_at AS BLOB)) BETWEEN 1 AND 64),
     UNIQUE (operation_id, action),
+    CHECK (
+        (actor_kind = 'principal'
+            AND actor_auth_mode IN ('bearer_token', 'session_cookie', 'client_certificate'))
+        OR (actor_kind = 'service_token'
+            AND actor_auth_mode = 'service_token' AND actor_issuer IS NULL)
+        OR (actor_kind = 'system' AND actor_auth_mode = 'system' AND actor_issuer IS NULL)
+    ),
     CHECK (
         (
             action = 'secret.create'
@@ -966,13 +999,20 @@ const EVIDENCE_ACTION_REPLACE: &str = "connection.replace";
 const EVIDENCE_ACTION_CREDENTIAL_CHANGE: &str = "credential.binding_change";
 const EVIDENCE_ACTION_DELETE: &str = "connection.delete";
 
-/// The longest actor either evidence table of migration 12 records. It is
-/// exactly the principal subject bound authentication enforces, so evidence
-/// never refuses a principal a validator produced; the assertion keeps the
-/// SQL bounds and the Rust bound from drifting apart silently.
+/// The longest actor subject either evidence table of migration 12 records.
+/// It is exactly the principal subject bound authentication enforces, so
+/// evidence never refuses a principal a validator produced; the assertion
+/// keeps the SQL bounds and the Rust bound from drifting apart silently.
 pub(crate) const MAX_CHANGE_EVIDENCE_ACTOR_BYTES: usize = 4096;
 const _: () =
     assert!(MAX_CHANGE_EVIDENCE_ACTOR_BYTES == crate::auth::principal::MAX_PRINCIPAL_SUBJECT_BYTES);
+
+/// The longest actor issuer either evidence table of migration 12 records:
+/// exactly the principal issuer bound, for the same reason.
+pub(crate) const MAX_CHANGE_EVIDENCE_ACTOR_ISSUER_BYTES: usize = 4096;
+const _: () = assert!(
+    MAX_CHANGE_EVIDENCE_ACTOR_ISSUER_BYTES == crate::auth::principal::MAX_PRINCIPAL_ISSUER_BYTES
+);
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -988,10 +1028,11 @@ pub struct SqliteConnectionStore {
 }
 
 /// The standalone record surface. Create, replace and delete are told who is
-/// acting: each committed change records `actor_user_id` as its evidence in
-/// the change's own transaction (migration 12), and a change that names no
-/// actor, or one longer than [`MAX_CHANGE_EVIDENCE_ACTOR_BYTES`], is refused
-/// before anything is written.
+/// acting: each committed change records the actor -- its subject, canonical
+/// issuer, kind and auth mode ([`ChangeActor`]) -- as its evidence in the
+/// change's own transaction (migration 12), and a change whose actor evidence
+/// cannot record exactly ([`ChangeActor::is_recordable`]) is refused before
+/// anything is written.
 pub trait ConnectionStore: Send + Sync {
     fn count(&self) -> Result<usize, ConnectionStoreError>;
     fn list(&self) -> Result<Vec<StoredConnection>, ConnectionStoreError>;
@@ -999,7 +1040,7 @@ pub trait ConnectionStore: Send + Sync {
     fn create(
         &self,
         candidate: ConnectionWrite,
-        actor_user_id: &str,
+        actor: &ChangeActor,
     ) -> Result<StoredConnection, ConnectionStoreError>;
     /// An identical replacement changes nothing and records nothing.
     fn replace(
@@ -1007,13 +1048,13 @@ pub trait ConnectionStore: Send + Sync {
         id: &ConnectionId,
         expected: &ConnectionEtag,
         candidate: ConnectionWrite,
-        actor_user_id: &str,
+        actor: &ChangeActor,
     ) -> Result<StoredConnection, ConnectionStoreError>;
     fn delete(
         &self,
         id: &ConnectionId,
         expected: &ConnectionEtag,
-        actor_user_id: &str,
+        actor: &ChangeActor,
     ) -> Result<(), ConnectionStoreError>;
 }
 
@@ -3535,9 +3576,9 @@ impl ConnectionStore for SqliteConnectionStore {
     fn create(
         &self,
         candidate: ConnectionWrite,
-        actor_user_id: &str,
+        actor: &ChangeActor,
     ) -> Result<StoredConnection, ConnectionStoreError> {
-        validate_change_actor(actor_user_id)?;
+        validate_change_actor(actor)?;
         let candidate = validate_candidate(candidate)?;
         let spec_json =
             serde_json::to_string(&candidate).map_err(|source| ConnectionStoreError::Json {
@@ -3599,7 +3640,7 @@ impl ConnectionStore for SqliteConnectionStore {
                 prior_version: None,
                 new_version: Some(revisions.connection),
                 committed_at: &now,
-                actor_user_id,
+                actor,
             },
         )?;
         transaction
@@ -3620,9 +3661,9 @@ impl ConnectionStore for SqliteConnectionStore {
         id: &ConnectionId,
         expected: &ConnectionEtag,
         candidate: ConnectionWrite,
-        actor_user_id: &str,
+        actor: &ChangeActor,
     ) -> Result<StoredConnection, ConnectionStoreError> {
-        validate_change_actor(actor_user_id)?;
+        validate_change_actor(actor)?;
         let candidate = validate_candidate(candidate)?;
         let spec_json =
             serde_json::to_string(&candidate).map_err(|source| ConnectionStoreError::Json {
@@ -3755,7 +3796,7 @@ impl ConnectionStore for SqliteConnectionStore {
                 prior_version: Some(current.revisions.connection),
                 new_version: Some(revisions.connection),
                 committed_at: &now,
-                actor_user_id,
+                actor,
             },
         )?;
         if revisions.credential != current.revisions.credential {
@@ -3769,7 +3810,7 @@ impl ConnectionStore for SqliteConnectionStore {
                     prior_version: Some(current.revisions.credential),
                     new_version: Some(revisions.credential),
                     committed_at: &now,
-                    actor_user_id,
+                    actor,
                 },
             )?;
         }
@@ -3790,9 +3831,9 @@ impl ConnectionStore for SqliteConnectionStore {
         &self,
         id: &ConnectionId,
         expected: &ConnectionEtag,
-        actor_user_id: &str,
+        actor: &ChangeActor,
     ) -> Result<(), ConnectionStoreError> {
-        validate_change_actor(actor_user_id)?;
+        validate_change_actor(actor)?;
         let now = utc_timestamp()?;
         let mut connection = self.connection_guard();
         let transaction = connection
@@ -3830,7 +3871,7 @@ impl ConnectionStore for SqliteConnectionStore {
                 prior_version: Some(current.revisions.connection),
                 new_version: None,
                 committed_at: &now,
-                actor_user_id,
+                actor,
             },
         )?;
         transaction
@@ -3846,23 +3887,19 @@ impl ConnectionStore for SqliteConnectionStore {
     }
 }
 
-/// An unattributable change has no evidence to record, so the stores of
-/// this database refuse it before they change anything rather than commit
-/// it anonymously. An authenticated principal always satisfies this; the
-/// CHECK constraints of migration 12 are the backstop.
-pub(crate) fn is_valid_change_actor(actor_user_id: &str) -> bool {
-    !actor_user_id.is_empty() && actor_user_id.len() <= MAX_CHANGE_EVIDENCE_ACTOR_BYTES
-}
-
-/// The Connection-store form of [`is_valid_change_actor`], refusing the way
-/// the PostgreSQL store does.
-fn validate_change_actor(actor_user_id: &str) -> Result<(), ConnectionStoreError> {
-    if is_valid_change_actor(actor_user_id) {
+/// An actor evidence cannot record exactly has no evidence to record, so the
+/// stores of this database refuse the change before they change anything
+/// rather than truncate the actor or commit the change anonymously, with the
+/// refusal the PostgreSQL store gives. An authenticated principal always
+/// passes ([`ChangeActor::is_recordable`]); the CHECK constraints of
+/// migration 12 are the backstop.
+fn validate_change_actor(actor: &ChangeActor) -> Result<(), ConnectionStoreError> {
+    if actor.is_recordable() {
         return Ok(());
     }
     Err(ConnectionStoreError::Validation {
         problems: vec![format!(
-            "the change actor must be between 1 and {MAX_CHANGE_EVIDENCE_ACTOR_BYTES} bytes"
+            "the change actor must be between 1 and {MAX_CHANGE_EVIDENCE_ACTOR_BYTES} bytes, and only a principal may carry an issuer, of at most {MAX_CHANGE_EVIDENCE_ACTOR_ISSUER_BYTES} bytes"
         )],
     })
 }
@@ -3877,7 +3914,7 @@ struct ConnectionChangeEvidence<'a> {
     prior_version: Option<u64>,
     new_version: Option<u64>,
     committed_at: &'a str,
-    actor_user_id: &'a str,
+    actor: &'a ChangeActor,
 }
 
 /// Append one evidence row inside the caller's transaction. Its event ID is
@@ -3903,14 +3940,18 @@ fn record_change_evidence(
         .execute(
             r#"
             INSERT INTO connection_change_evidence (
-                event_id, operation_id, actor_user_id, action, connection_id,
-                prior_version, new_version, committed_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                event_id, operation_id, actor_user_id, actor_issuer, actor_kind,
+                actor_auth_mode, action, connection_id, prior_version, new_version,
+                committed_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
             "#,
             params![
                 Uuid::new_v4().to_string(),
                 evidence.operation_id,
-                evidence.actor_user_id,
+                evidence.actor.subject(),
+                evidence.actor.issuer(),
+                evidence.actor.kind().as_str(),
+                evidence.actor.auth_mode(),
                 evidence.action,
                 evidence.id.as_str(),
                 prior_version,
@@ -3998,8 +4039,8 @@ fn validate_schema(connection: &Connection, path: &Path) -> Result<(), Connectio
         "SELECT connection_id, tool_name, operation_id, selected_scheme_names_json, definition_json, ordinal FROM connection_openapi_catalog_entries LIMIT 0",
         "SELECT connection_id, schema_version, overlay_revision, overlay_json, source_reports_json, actor_user_id, updated_at FROM connection_openapi_overlays LIMIT 0",
         "SELECT connection_id, source_id, overlay_revision, source_digest, values_revision, connection_revision, credential_revision, credential_generation_digest, values_json, resolved_at FROM connection_enum_source_values LIMIT 0",
-        "SELECT sequence, event_id, operation_id, actor_user_id, action, connection_id, prior_version, new_version, committed_at FROM connection_change_evidence LIMIT 0",
-        "SELECT sequence, event_id, operation_id, actor_user_id, action, secret_id, prior_version, new_version, reencrypted_count, committed_at FROM connection_local_secret_change_evidence LIMIT 0",
+        "SELECT sequence, event_id, operation_id, actor_user_id, actor_issuer, actor_kind, actor_auth_mode, action, connection_id, prior_version, new_version, committed_at FROM connection_change_evidence LIMIT 0",
+        "SELECT sequence, event_id, operation_id, actor_user_id, actor_issuer, actor_kind, actor_auth_mode, action, secret_id, prior_version, new_version, reencrypted_count, committed_at FROM connection_local_secret_change_evidence LIMIT 0",
     ] {
         connection
             .prepare(query)

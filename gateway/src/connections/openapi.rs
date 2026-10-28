@@ -3625,7 +3625,11 @@ paths:
         }))
         .expect("HTTP Connection should deserialize");
         let record = control_plane
-            .create_managed(snapshot.collection_etag(), candidate, "test-admin")
+            .create_managed(
+                snapshot.collection_etag(),
+                candidate,
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("HTTP Connection should create");
         let egress_config = EgressConfig::from_config(&config);
@@ -3691,7 +3695,11 @@ paths:
         }))
         .expect("managed OpenAPI Connection should deserialize");
         let record = control_plane
-            .create_managed(snapshot.collection_etag(), candidate, "test-admin")
+            .create_managed(
+                snapshot.collection_etag(),
+                candidate,
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("managed OpenAPI Connection should create");
         let egress_config = EgressConfig::from_config(&config);
@@ -3885,7 +3893,11 @@ paths:
         }))
         .expect("attested OpenAPI Connection should deserialize");
         let record = control_plane
-            .create_managed(snapshot.collection_etag(), candidate, "test-admin")
+            .create_managed(
+                snapshot.collection_etag(),
+                candidate,
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("attested OpenAPI Connection should create");
         // The default egress policy denies every host, so a regression that
@@ -4009,7 +4021,11 @@ paths:
         }))
         .expect("delegated OpenAPI Connection should deserialize");
         let record = control_plane
-            .create_managed(snapshot.collection_etag(), candidate, "test-admin")
+            .create_managed(
+                snapshot.collection_etag(),
+                candidate,
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("delegated OpenAPI Connection should create");
         // The default egress policy denies every host, so a regression that
@@ -4112,7 +4128,11 @@ paths:
         }))
         .expect("managed OpenAPI Connection should deserialize");
         let record = control_plane
-            .create_managed(snapshot.collection_etag(), candidate, "test-admin")
+            .create_managed(
+                snapshot.collection_etag(),
+                candidate,
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("managed OpenAPI Connection should create");
         let egress_config = EgressConfig::from_config(&config);
@@ -4159,7 +4179,12 @@ paths:
                 .expect("caller assertion should deserialize"),
         );
         let updated = control_plane
-            .replace_managed(&record.id, &record.etag(), attested, "test-admin")
+            .replace_managed(
+                &record.id,
+                &record.etag(),
+                attested,
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("adding a caller assertion should save");
         service.reconcile_connection(&updated);
@@ -4249,7 +4274,11 @@ paths:
         }))
         .expect("managed OpenAPI Connection should deserialize");
         let record = control_plane
-            .create_managed(snapshot.collection_etag(), candidate, "test-admin")
+            .create_managed(
+                snapshot.collection_etag(),
+                candidate,
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("managed OpenAPI Connection should create");
         let egress_config = EgressConfig::from_config(&config);
@@ -4435,7 +4464,11 @@ paths:
         }))
         .expect("managed OpenAPI Connection should deserialize");
         let record = control_plane
-            .create_managed(snapshot.collection_etag(), candidate, "test-admin")
+            .create_managed(
+                snapshot.collection_etag(),
+                candidate,
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("managed OpenAPI Connection should create");
         let egress_config = EgressConfig::from_config(&config);
@@ -4657,7 +4690,11 @@ paths:
         }))
         .expect("managed OpenAPI Connection should deserialize");
         let record = control_plane
-            .create_managed(snapshot.collection_etag(), candidate, "test-admin")
+            .create_managed(
+                snapshot.collection_etag(),
+                candidate,
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("managed OpenAPI Connection should create");
         let egress_config = EgressConfig::from_config(&config);
@@ -4827,7 +4864,11 @@ paths:
         }))
         .expect("managed OpenAPI Connection should deserialize");
         let record = control_plane
-            .create_managed(snapshot.collection_etag(), candidate, "test-admin")
+            .create_managed(
+                snapshot.collection_etag(),
+                candidate,
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("managed OpenAPI Connection should create");
         let egress_config = EgressConfig::from_config(&config);
@@ -4980,7 +5021,12 @@ paths:
         let mut disabled_write = record.write.clone();
         disabled_write.enabled = false;
         let disabled = control_plane
-            .replace_managed(&record.id, &record.etag(), disabled_write, "test-admin")
+            .replace_managed(
+                &record.id,
+                &record.etag(),
+                disabled_write,
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("registered Connection should be disableable");
         let disabled_registry = ToolRegistry::disabled();
@@ -5078,7 +5124,7 @@ paths:
             .create_managed(
                 control_plane.runtime_snapshot().collection_etag(),
                 candidate,
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("managed OpenAPI Connection should create");
@@ -5565,7 +5611,7 @@ paths:
             .create_managed(
                 control_plane.runtime_snapshot().collection_etag(),
                 candidate,
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("managed OpenAPI Connection should create");
@@ -5647,7 +5693,12 @@ paths:
         let mut endpoint_edit = record.write.clone();
         endpoint_edit.endpoint.base_url = "https://replacement.example.test".to_owned();
         let updated = control_plane
-            .replace_managed(&record.id, &record.etag(), endpoint_edit, "test-admin")
+            .replace_managed(
+                &record.id,
+                &record.etag(),
+                endpoint_edit,
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("a compatible endpoint edit should preserve the durable catalog");
         assert!(updated.revisions.connection > record.revisions.connection);
@@ -5752,7 +5803,7 @@ paths:
             .create_managed(
                 control_plane.runtime_snapshot().collection_etag(),
                 openapi_write.clone(),
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("managed OpenAPI Connection should create");
@@ -5828,7 +5879,12 @@ paths:
         }))
         .expect("managed MCP replacement should deserialize");
         let converted = control_plane
-            .replace_managed(&record.id, &record.etag(), mcp_write, "test-admin")
+            .replace_managed(
+                &record.id,
+                &record.etag(),
+                mcp_write,
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("an empty catalog should permit a supported cross-kind replacement");
         service.reconcile_connection(&converted);
@@ -5843,7 +5899,12 @@ paths:
         assert!(removed_overlay.is_none());
 
         let restored = control_plane
-            .replace_managed(&record.id, &converted.etag(), openapi_write, "test-admin")
+            .replace_managed(
+                &record.id,
+                &converted.etag(),
+                openapi_write,
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("Connection should convert back to managed OpenAPI");
         assert!(restored.revisions.connection > record.revisions.connection);
@@ -5936,7 +5997,7 @@ paths:
             .create_managed(
                 replica_a.runtime_snapshot().collection_etag(),
                 openapi_write.clone(),
-                "replica-a",
+                &crate::auth::change_actor::ChangeActor::for_test("replica-a"),
             )
             .await
             .expect("managed OpenAPI Connection should create");
@@ -6008,11 +6069,21 @@ paths:
         }))
         .expect("managed MCP replacement should deserialize");
         let converted = replica_b
-            .replace_managed(&original.id, &original.etag(), mcp_write, "replica-b")
+            .replace_managed(
+                &original.id,
+                &original.etag(),
+                mcp_write,
+                &crate::auth::change_actor::ChangeActor::for_test("replica-b"),
+            )
             .await
             .expect("an empty OpenAPI catalog should allow conversion to MCP");
         let restored = replica_b
-            .replace_managed(&original.id, &converted.etag(), openapi_write, "replica-b")
+            .replace_managed(
+                &original.id,
+                &converted.etag(),
+                openapi_write,
+                &crate::auth::change_actor::ChangeActor::for_test("replica-b"),
+            )
             .await
             .expect("the Connection should convert back to OpenAPI");
         assert!(restored.revisions.connection > original.revisions.connection);
@@ -6131,7 +6202,7 @@ paths:
             .create_managed(
                 control_plane.runtime_snapshot().collection_etag(),
                 candidate,
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("managed OpenAPI Connection should create");
@@ -6328,7 +6399,11 @@ paths:
         }))
         .expect("refreshable OpenAPI Connection should deserialize");
         let record = control_plane
-            .create_managed(snapshot.collection_etag(), candidate, "test-admin")
+            .create_managed(
+                snapshot.collection_etag(),
+                candidate,
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("refreshable OpenAPI Connection should create");
         let egress_config = EgressConfig::from_config(&config);

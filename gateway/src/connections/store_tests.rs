@@ -22,7 +22,7 @@ fn overlay_etag_maximum_id_and_revisions_fit_the_admin_schema_bound() {
 fn exact_overlay_schema_version_survives_restart_and_future_replay_fails_closed() {
     let (_directory, path, store) = temporary_store("overlay-version-replay");
     let created = store
-        .create(candidate(), "test-admin")
+        .create(candidate(), &ChangeActor::for_test("test-admin"))
         .expect("Connection should create");
     let spec = r#"{"openapi":"3.1.0","info":{"title":"Version","version":"1"}}"#;
     let digest = spec_digest(spec);
@@ -312,7 +312,7 @@ fn persisted_v0_options_profile_survives_restart_but_cannot_be_rewritten() {
         expected_statuses: vec![200, 204],
     });
     let created = store
-        .create(write, "test-admin")
+        .create(write, &ChangeActor::for_test("test-admin"))
         .expect("pre-upgrade Connection fixture should create");
     drop(store);
 
@@ -352,7 +352,7 @@ fn persisted_v0_options_profile_survives_restart_but_cannot_be_rewritten() {
     );
 
     let create_error = reopened
-        .create(loaded.write.clone(), "test-admin")
+        .create(loaded.write.clone(), &ChangeActor::for_test("test-admin"))
         .expect_err("new writes must not accept a legacy OPTIONS profile");
     assert!(matches!(
         create_error,
@@ -364,7 +364,7 @@ fn persisted_v0_options_profile_survives_restart_but_cannot_be_rewritten() {
             &loaded.id,
             &loaded.etag(),
             loaded.write.clone(),
-            "test-admin",
+            &ChangeActor::for_test("test-admin"),
         )
         .expect_err("replacement writes must require GET or HEAD");
     assert!(matches!(
@@ -983,7 +983,12 @@ fn migrations_eight_and_nine_preserve_bindings_and_openapi_catalogs() {
     ]))
     .expect("additional headers should deserialize");
     let replaced = store
-        .replace(&connection_id, &persisted.etag(), replacement, "test-admin")
+        .replace(
+            &connection_id,
+            &persisted.etag(),
+            replacement,
+            &ChangeActor::for_test("test-admin"),
+        )
         .expect("additional headers should persist after migration");
     assert_eq!(replaced.revisions.connection, 2);
     assert_eq!(replaced.revisions.credential, 2);
@@ -1079,7 +1084,7 @@ fn migrations_eight_and_nine_preserve_bindings_and_openapi_catalogs() {
 fn mcp_catalog_replacement_is_atomic_revisioned_and_dependency_aware() {
     let (_directory, path, store) = temporary_store("mcp-catalog");
     let created = store
-        .create(mcp_candidate(), "test-admin")
+        .create(mcp_candidate(), &ChangeActor::for_test("test-admin"))
         .expect("MCP connection should create");
     let mut annotated_alpha = mcp_catalog_entry("alpha", "Alpha");
     annotated_alpha.title = Some("Alpha lookup".to_owned());
@@ -1155,12 +1160,17 @@ fn mcp_catalog_replacement_is_atomic_revisioned_and_dependency_aware() {
             &created.id,
             &created.etag(),
             discovery_removed,
-            "test-admin"
+            &ChangeActor::for_test("test-admin")
         ),
         Err(ConnectionStoreError::DependencyConflict { count: 2, .. })
     ));
     assert!(matches!(
-        store.replace(&created.id, &created.etag(), candidate(), "test-admin"),
+        store.replace(
+            &created.id,
+            &created.etag(),
+            candidate(),
+            &ChangeActor::for_test("test-admin")
+        ),
         Err(ConnectionStoreError::DependencyConflict { count: 2, .. })
     ));
     assert_eq!(
@@ -1225,7 +1235,7 @@ fn mcp_catalog_replacement_is_atomic_revisioned_and_dependency_aware() {
 fn multi_byte_remote_tool_name_rejects_as_invalid_input_not_a_storage_failure() {
     let (_directory, _path, store) = temporary_store("mcp-multi-byte-tool-name");
     let created = store
-        .create(mcp_candidate(), "test-admin")
+        .create(mcp_candidate(), &ChangeActor::for_test("test-admin"))
         .expect("MCP connection should create");
     // 74 CJK characters sit inside the 128-character name limit, but the
     // derived dependency key is 36 + 1 + 222 bytes.
@@ -1270,7 +1280,7 @@ fn multi_byte_remote_tool_name_rejects_as_invalid_input_not_a_storage_failure() 
 fn mcp_catalog_combined_count_and_byte_limits_preserve_last_known_good() {
     let (_directory, _path, store) = temporary_store("mcp-catalog-limits");
     let created = store
-        .create(mcp_candidate(), "test-admin")
+        .create(mcp_candidate(), &ChangeActor::for_test("test-admin"))
         .expect("MCP connection should create");
     let baseline = store
         .replace_mcp_catalog(
@@ -1335,12 +1345,12 @@ fn mcp_catalog_combined_count_and_byte_limits_preserve_last_known_good() {
 fn aggregate_mcp_catalog_byte_bound_preserves_all_last_known_good_catalogs() {
     let (_directory, _path, store) = temporary_store("mcp-aggregate-byte-bound");
     let first = store
-        .create(mcp_candidate(), "test-admin")
+        .create(mcp_candidate(), &ChangeActor::for_test("test-admin"))
         .expect("first MCP Connection should create");
     let mut second_candidate = mcp_candidate();
     second_candidate.display_name = "Second managed MCP".to_owned();
     let second = store
-        .create(second_candidate, "test-admin")
+        .create(second_candidate, &ChangeActor::for_test("test-admin"))
         .expect("second MCP Connection should create");
     let baseline = store
         .replace_mcp_catalog(
@@ -1411,7 +1421,7 @@ fn corrupt_aggregate_mcp_bytes_are_preflighted_on_load_and_restart() {
 
     let (_directory, path, store) = temporary_store("mcp-aggregate-byte-corruption");
     let created = store
-        .create(mcp_candidate(), "test-admin")
+        .create(mcp_candidate(), &ChangeActor::for_test("test-admin"))
         .expect("MCP Connection should create");
     store
         .replace_mcp_catalog(&created.id, &created.etag(), &[], &[], &[])
@@ -1450,7 +1460,7 @@ fn corrupt_aggregate_mcp_bytes_are_preflighted_on_load_and_restart() {
 fn mcp_resource_locators_reject_secret_bearing_components_without_leaking() {
     let (_directory, _path, store) = temporary_store("mcp-catalog-safe-locators");
     let created = store
-        .create(mcp_candidate(), "test-admin")
+        .create(mcp_candidate(), &ChangeActor::for_test("test-admin"))
         .expect("MCP connection should create");
     let baseline = store
         .replace_mcp_catalog(
@@ -1549,7 +1559,7 @@ fn mcp_resource_locators_reject_secret_bearing_components_without_leaking() {
 fn empty_mcp_catalog_is_removed_on_incompatible_update_or_delete() {
     let (_directory, path, store) = temporary_store("empty-mcp-catalog-cleanup");
     let converted_source = store
-        .create(mcp_candidate(), "test-admin")
+        .create(mcp_candidate(), &ChangeActor::for_test("test-admin"))
         .expect("convertible MCP Connection should create");
     store
         .replace_mcp_catalog(
@@ -1565,7 +1575,7 @@ fn empty_mcp_catalog_is_removed_on_incompatible_update_or_delete() {
             &converted_source.id,
             &converted_source.etag(),
             candidate(),
-            "test-admin",
+            &ChangeActor::for_test("test-admin"),
         )
         .expect("empty catalog should permit an incompatible update");
     assert!(
@@ -1576,17 +1586,25 @@ fn empty_mcp_catalog_is_removed_on_incompatible_update_or_delete() {
         "incompatible update must remove the obsolete durable catalog"
     );
     store
-        .delete(&converted.id, &converted.etag(), "test-admin")
+        .delete(
+            &converted.id,
+            &converted.etag(),
+            &ChangeActor::for_test("test-admin"),
+        )
         .expect("converted Connection should delete");
 
     let deleted = store
-        .create(mcp_candidate(), "test-admin")
+        .create(mcp_candidate(), &ChangeActor::for_test("test-admin"))
         .expect("deletable MCP Connection should create");
     store
         .replace_mcp_catalog(&deleted.id, &deleted.etag(), &[], &[], &[])
         .expect("deletable empty MCP catalog should publish");
     store
-        .delete(&deleted.id, &deleted.etag(), "test-admin")
+        .delete(
+            &deleted.id,
+            &deleted.etag(),
+            &ChangeActor::for_test("test-admin"),
+        )
         .expect("empty managed MCP Connection should delete");
     drop(store);
 
@@ -1604,7 +1622,7 @@ fn empty_mcp_catalog_is_removed_on_incompatible_update_or_delete() {
 fn openapi_catalog_replacement_is_atomic_revisioned_and_dependency_aware() {
     let (_directory, path, store) = temporary_store("openapi-catalog");
     let created = store
-        .create(candidate(), "test-admin")
+        .create(candidate(), &ChangeActor::for_test("test-admin"))
         .expect("OpenAPI Connection should create");
     let first_spec = r#"{"openapi":"3.1.0","info":{"title":"First","version":"1"}}"#;
     let first_digest = spec_digest(first_spec);
@@ -1726,7 +1744,12 @@ fn openapi_catalog_replacement_is_atomic_revisioned_and_dependency_aware() {
     let mut compatible = created.write.clone();
     compatible.display_name = "Renamed OpenAPI".to_owned();
     let replaced = store
-        .replace(&created.id, &created.etag(), compatible, "test-admin")
+        .replace(
+            &created.id,
+            &created.etag(),
+            compatible,
+            &ChangeActor::for_test("test-admin"),
+        )
         .expect("compatible OpenAPI update should retain catalog");
     assert_eq!(
         store
@@ -1739,7 +1762,12 @@ fn openapi_catalog_replacement_is_atomic_revisioned_and_dependency_aware() {
     let mut incompatible = replaced.write.clone();
     incompatible.discovery = None;
     assert!(matches!(
-        store.replace(&replaced.id, &replaced.etag(), incompatible, "test-admin"),
+        store.replace(
+            &replaced.id,
+            &replaced.etag(),
+            incompatible,
+            &ChangeActor::for_test("test-admin")
+        ),
         Err(ConnectionStoreError::DependencyConflict { count: 1, .. })
     ));
     drop(store);
@@ -1757,7 +1785,7 @@ fn openapi_catalog_replacement_is_atomic_revisioned_and_dependency_aware() {
 fn openapi_overlay_catalog_reports_and_enum_prune_are_one_atomic_revision() {
     let (_directory, path, store) = temporary_store("openapi-overlay-atomic");
     let created = store
-        .create(candidate(), "test-admin")
+        .create(candidate(), &ChangeActor::for_test("test-admin"))
         .expect("Connection should create");
     let spec = r#"{"openapi":"3.1.0","info":{"title":"Overlay","version":"1"}}"#;
     let digest = spec_digest(spec);
@@ -2126,7 +2154,7 @@ fn openapi_overlay_catalog_reports_and_enum_prune_are_one_atomic_revision() {
 fn enum_source_values_publish_atomically_and_use_exact_generation_cas() {
     let (_directory, path, store) = temporary_store("enum-source-cas");
     let created = store
-        .create(candidate(), "test-admin")
+        .create(candidate(), &ChangeActor::for_test("test-admin"))
         .expect("Connection should create");
     let spec = r#"{"openapi":"3.1.0","info":{"title":"Enums","version":"1"}}"#;
     let digest = spec_digest(spec);
@@ -2317,7 +2345,7 @@ fn enum_source_values_publish_atomically_and_use_exact_generation_cas() {
 fn empty_openapi_catalog_is_removed_on_incompatible_update_and_delete_cascades() {
     let (_directory, path, store) = temporary_store("empty-openapi-catalog-cleanup");
     let source = store
-        .create(candidate(), "test-admin")
+        .create(candidate(), &ChangeActor::for_test("test-admin"))
         .expect("convertible OpenAPI Connection should create");
     let spec = r#"{"openapi":"3.1.0","info":{"title":"Empty","version":"1"}}"#;
     let digest = spec_digest(spec);
@@ -2325,24 +2353,37 @@ fn empty_openapi_catalog_is_removed_on_incompatible_update_and_delete_cascades()
         .replace_openapi_catalog(&source.id, &source.etag(), 0, 0, spec, &digest, &[])
         .expect("empty OpenAPI catalog should publish");
     let converted = store
-        .replace(&source.id, &source.etag(), mcp_candidate(), "test-admin")
+        .replace(
+            &source.id,
+            &source.etag(),
+            mcp_candidate(),
+            &ChangeActor::for_test("test-admin"),
+        )
         .expect("empty OpenAPI catalog should permit cross-kind update");
     assert!(store
         .openapi_catalog(&converted.id)
         .expect("converted catalog lookup should work")
         .is_none());
     store
-        .delete(&converted.id, &converted.etag(), "test-admin")
+        .delete(
+            &converted.id,
+            &converted.etag(),
+            &ChangeActor::for_test("test-admin"),
+        )
         .expect("converted Connection should delete");
 
     let deleted = store
-        .create(candidate(), "test-admin")
+        .create(candidate(), &ChangeActor::for_test("test-admin"))
         .expect("deletable OpenAPI Connection should create");
     store
         .replace_openapi_catalog(&deleted.id, &deleted.etag(), 0, 0, spec, &digest, &[])
         .expect("deletable empty OpenAPI catalog should publish");
     store
-        .delete(&deleted.id, &deleted.etag(), "test-admin")
+        .delete(
+            &deleted.id,
+            &deleted.etag(),
+            &ChangeActor::for_test("test-admin"),
+        )
         .expect("empty OpenAPI catalog should cascade on delete");
     drop(store);
 
@@ -2357,10 +2398,10 @@ fn empty_openapi_catalog_is_removed_on_incompatible_update_and_delete_cascades()
 fn combined_mcp_and_openapi_catalog_bound_is_enforced_in_both_replacements() {
     let (_directory, _path, store) = temporary_store("combined-catalog-bound");
     let mcp = store
-        .create(mcp_candidate(), "test-admin")
+        .create(mcp_candidate(), &ChangeActor::for_test("test-admin"))
         .expect("MCP Connection should create");
     let openapi = store
-        .create(candidate(), "test-admin")
+        .create(candidate(), &ChangeActor::for_test("test-admin"))
         .expect("OpenAPI Connection should create");
     let spec = r#"{"openapi":"3.1.0","info":{"title":"Bound","version":"1"}}"#;
     let digest = spec_digest(spec);
@@ -2421,12 +2462,12 @@ fn combined_mcp_and_openapi_catalog_bound_is_enforced_in_both_replacements() {
 fn aggregate_openapi_definition_byte_bound_preserves_prior_catalogs() {
     let (_directory, _path, store) = temporary_store("openapi-aggregate-byte-bound");
     let first = store
-        .create(candidate(), "test-admin")
+        .create(candidate(), &ChangeActor::for_test("test-admin"))
         .expect("first OpenAPI Connection should create");
     let mut second_candidate = candidate();
     second_candidate.display_name = "Second OpenAPI".to_owned();
     let second = store
-        .create(second_candidate, "test-admin")
+        .create(second_candidate, &ChangeActor::for_test("test-admin"))
         .expect("second OpenAPI Connection should create");
     let spec = r#"{"openapi":"3.1.0","info":{"title":"Bytes","version":"1"}}"#;
     let digest = spec_digest(spec);
@@ -2504,7 +2545,7 @@ fn aggregate_openapi_definition_byte_bound_preserves_prior_catalogs() {
 fn aggregate_openapi_definition_byte_corruption_is_rejected_on_restart() {
     let (_directory, path, store) = temporary_store("openapi-byte-corrupt-restart");
     let created = store
-        .create(candidate(), "test-admin")
+        .create(candidate(), &ChangeActor::for_test("test-admin"))
         .expect("OpenAPI Connection should create");
     let spec = r#"{"openapi":"3.1.0","info":{"title":"Bytes","version":"1"}}"#;
     let digest = spec_digest(spec);
@@ -2572,7 +2613,7 @@ fn aggregate_openapi_definition_byte_corruption_is_rejected_on_restart() {
 fn orphan_managed_tool_dependency_is_rejected_on_restart() {
     let (_directory, path, store) = temporary_store("orphan-managed-tool-restart");
     let created = store
-        .create(candidate(), "test-admin")
+        .create(candidate(), &ChangeActor::for_test("test-admin"))
         .expect("Connection should create");
     drop(store);
 
@@ -2608,7 +2649,7 @@ fn orphan_managed_tool_dependency_is_rejected_on_restart() {
 fn corrupt_openapi_catalog_definition_is_rejected_on_restart() {
     let (_directory, path, store) = temporary_store("openapi-corrupt-restart");
     let created = store
-        .create(candidate(), "test-admin")
+        .create(candidate(), &ChangeActor::for_test("test-admin"))
         .expect("OpenAPI Connection should create");
     let spec = r#"{"openapi":"3.1.0","info":{"title":"Corrupt","version":"1"}}"#;
     let digest = spec_digest(spec);
@@ -2644,7 +2685,7 @@ fn corrupt_openapi_catalog_definition_is_rejected_on_restart() {
 fn corrupt_mcp_resource_catalog_is_rejected_on_restart() {
     let (_directory, path, store) = temporary_store("mcp-resource-corrupt-restart");
     let created = store
-        .create(mcp_candidate(), "test-admin")
+        .create(mcp_candidate(), &ChangeActor::for_test("test-admin"))
         .expect("MCP Connection should create");
     store
         .replace_mcp_catalog(
@@ -2778,7 +2819,7 @@ fn non_contiguous_migration_history_fails_closed() {
 fn create_replace_restart_and_etag_conflict_are_transactional() {
     let (_directory, path, store) = temporary_store("crud");
     let created = store
-        .create(candidate(), "test-admin")
+        .create(candidate(), &ChangeActor::for_test("test-admin"))
         .expect("create should succeed");
     assert_eq!(created.revisions.connection, 1);
     assert_eq!(created.revisions.credential, 1);
@@ -2788,7 +2829,12 @@ fn create_replace_restart_and_etag_conflict_are_transactional() {
     let mut replacement = created.write.clone();
     replacement.description = Some("Updated".to_owned());
     let replaced = store
-        .replace(&created.id, &stale_etag, replacement, "test-admin")
+        .replace(
+            &created.id,
+            &stale_etag,
+            replacement,
+            &ChangeActor::for_test("test-admin"),
+        )
         .expect("replace should succeed");
     assert_eq!(replaced.revisions.connection, 2);
     assert_eq!(replaced.revisions.credential, 1);
@@ -2798,7 +2844,7 @@ fn create_replace_restart_and_etag_conflict_are_transactional() {
             &created.id,
             &stale_etag,
             replaced.write.clone(),
-            "test-admin"
+            &ChangeActor::for_test("test-admin")
         ),
         Err(ConnectionStoreError::Conflict { .. })
     ));
@@ -2818,13 +2864,18 @@ fn create_replace_restart_and_etag_conflict_are_transactional() {
 fn validation_and_sql_failure_leave_prior_record_and_bindings_unchanged() {
     let (_directory, _path, store) = temporary_store("rollback");
     let created = store
-        .create(candidate(), "test-admin")
+        .create(candidate(), &ChangeActor::for_test("test-admin"))
         .expect("create should succeed");
 
     let mut invalid = created.write.clone();
     invalid.endpoint.base_url = "http://billing.example.test".to_owned();
     assert!(matches!(
-        store.replace(&created.id, &created.etag(), invalid, "test-admin"),
+        store.replace(
+            &created.id,
+            &created.etag(),
+            invalid,
+            &ChangeActor::for_test("test-admin")
+        ),
         Err(ConnectionStoreError::Validation { .. })
     ));
 
@@ -2845,7 +2896,12 @@ fn validation_and_sql_failure_leave_prior_record_and_bindings_unchanged() {
     let mut replacement = created.write.clone();
     replacement.display_name = "Replacement".to_owned();
     assert!(matches!(
-        store.replace(&created.id, &created.etag(), replacement, "test-admin"),
+        store.replace(
+            &created.id,
+            &created.etag(),
+            replacement,
+            &ChangeActor::for_test("test-admin")
+        ),
         Err(ConnectionStoreError::Sqlite { .. })
     ));
 
@@ -2869,7 +2925,7 @@ fn validation_and_sql_failure_leave_prior_record_and_bindings_unchanged() {
 fn dependencies_block_delete_without_cascading() {
     let (_directory, _path, store) = temporary_store("dependencies");
     let created = store
-        .create(candidate(), "test-admin")
+        .create(candidate(), &ChangeActor::for_test("test-admin"))
         .expect("create should succeed");
     store
         .add_dependency(
@@ -2880,7 +2936,11 @@ fn dependencies_block_delete_without_cascading() {
         .expect("dependency should insert");
 
     assert!(matches!(
-        store.delete(&created.id, &created.etag(), "test-admin"),
+        store.delete(
+            &created.id,
+            &created.etag(),
+            &ChangeActor::for_test("test-admin")
+        ),
         Err(ConnectionStoreError::DependencyConflict { count: 1, .. })
     ));
     assert!(store
@@ -2896,7 +2956,11 @@ fn dependencies_block_delete_without_cascading() {
         )
         .expect("dependency should remove");
     store
-        .delete(&created.id, &created.etag(), "test-admin")
+        .delete(
+            &created.id,
+            &created.etag(),
+            &ChangeActor::for_test("test-admin"),
+        )
         .expect("unreferenced connection should delete");
     assert!(store
         .get(&created.id)
@@ -2908,12 +2972,12 @@ fn dependencies_block_delete_without_cascading() {
 fn dependency_kind_replacement_is_atomic_and_tracks_current_runtime_consumers() {
     let (_directory, _path, store) = temporary_store("dependency-replacement");
     let first = store
-        .create(candidate(), "test-admin")
+        .create(candidate(), &ChangeActor::for_test("test-admin"))
         .expect("create should succeed");
     let mut second_candidate = candidate();
     second_candidate.display_name = "Second API".to_owned();
     let second = store
-        .create(second_candidate, "test-admin")
+        .create(second_candidate, &ChangeActor::for_test("test-admin"))
         .expect("second create should succeed");
 
     store
@@ -2975,7 +3039,11 @@ fn dependency_kind_replacement_is_atomic_and_tracks_current_runtime_consumers() 
         }]
     );
     assert!(matches!(
-        store.delete(&second.id, &second.etag(), "test-admin"),
+        store.delete(
+            &second.id,
+            &second.etag(),
+            &ChangeActor::for_test("test-admin")
+        ),
         Err(ConnectionStoreError::DependencyConflict { count: 1, .. })
     ));
 }
@@ -2984,12 +3052,12 @@ fn dependency_kind_replacement_is_atomic_and_tracks_current_runtime_consumers() 
 fn dependency_detail_and_counts_are_sorted_bounded_admin_metadata() {
     let (_directory, _path, store) = temporary_store("dependency-detail");
     let first = store
-        .create(candidate(), "test-admin")
+        .create(candidate(), &ChangeActor::for_test("test-admin"))
         .expect("create should succeed");
     let mut second_candidate = candidate();
     second_candidate.display_name = "Second API".to_owned();
     let second = store
-        .create(second_candidate, "test-admin")
+        .create(second_candidate, &ChangeActor::for_test("test-admin"))
         .expect("second create should succeed");
 
     store
@@ -3047,7 +3115,7 @@ fn dependency_detail_and_counts_are_sorted_bounded_admin_metadata() {
 fn dependencies_are_transactionally_bounded_and_idempotent() {
     let (_directory, path, store) = temporary_store("dependency-limit");
     let created = store
-        .create(candidate(), "test-admin")
+        .create(candidate(), &ChangeActor::for_test("test-admin"))
         .expect("create should succeed");
     {
         let mut connection = store.connection_guard();
@@ -3123,7 +3191,7 @@ fn dependencies_are_transactionally_bounded_and_idempotent() {
 fn credential_binding_rows_are_hard_bounded() {
     let (_directory, path, store) = temporary_store("binding-limit");
     let created = store
-        .create(candidate(), "test-admin")
+        .create(candidate(), &ChangeActor::for_test("test-admin"))
         .expect("create should succeed");
     {
         let mut connection = store.connection_guard();
@@ -3153,7 +3221,7 @@ fn credential_binding_rows_are_hard_bounded() {
     }
 
     assert!(matches!(
-        store.create(candidate(), "test-admin"),
+        store.create(candidate(), &ChangeActor::for_test("test-admin")),
         Err(ConnectionStoreError::LimitExceeded {
             resource: "connection credential bindings",
             maximum: MAX_CREDENTIALS,
@@ -3212,7 +3280,7 @@ fn binding_count_includes_each_configured_additional_header() {
 fn status_observations_are_bound_to_the_tested_config_revision() {
     let (_directory, _path, store) = temporary_store("status-etag");
     let created = store
-        .create(candidate(), "test-admin")
+        .create(candidate(), &ChangeActor::for_test("test-admin"))
         .expect("create should succeed");
     let stale_etag = created.etag();
     let healthy = ConnectionStatusUpdate {
@@ -3229,7 +3297,12 @@ fn status_observations_are_bound_to_the_tested_config_revision() {
     let mut replacement = created.write.clone();
     replacement.display_name = "Billing API v2".to_owned();
     let replaced = store
-        .replace(&created.id, &stale_etag, replacement, "test-admin")
+        .replace(
+            &created.id,
+            &stale_etag,
+            replacement,
+            &ChangeActor::for_test("test-admin"),
+        )
         .expect("replacement should succeed");
     assert!(
         store
@@ -3258,7 +3331,7 @@ fn status_observations_are_bound_to_the_tested_config_revision() {
 fn activity_timestamps_track_successes_and_ambiguous_failures_in_the_correct_lane() {
     let (_directory, _path, store) = temporary_store("status-activity-lanes");
     let created = store
-        .create(mcp_candidate(), "test-admin")
+        .create(mcp_candidate(), &ChangeActor::for_test("test-admin"))
         .expect("Connection should create");
 
     let tested = store
@@ -3407,7 +3480,12 @@ fn activity_timestamps_track_successes_and_ambiguous_failures_in_the_correct_lan
     let mut replacement = current.write.clone();
     replacement.display_name = "Managed MCP after edit".to_owned();
     store
-        .replace(&created.id, &current.etag(), replacement, "test-admin")
+        .replace(
+            &created.id,
+            &current.etag(),
+            replacement,
+            &ChangeActor::for_test("test-admin"),
+        )
         .expect("Connection replacement should succeed");
     assert!(
         store
@@ -3433,7 +3511,7 @@ fn malformed_bounded_activity_timestamps_fail_closed_on_restart() {
         let (_database, path, store) =
             temporary_store(&format!("status-activity-corrupt-{column}"));
         let created = store
-            .create(mcp_candidate(), "test-admin")
+            .create(mcp_candidate(), &ChangeActor::for_test("test-admin"))
             .expect("Connection should create");
         store
             .connection_guard()
@@ -3458,7 +3536,7 @@ fn malformed_bounded_activity_timestamps_fail_closed_on_restart() {
 fn bounded_status_append_rejects_expired_and_contended_locks_without_writing() {
     let (_directory, _path, store) = temporary_store("status-bounded-lock");
     let created = store
-        .create(candidate(), "test-admin")
+        .create(candidate(), &ChangeActor::for_test("test-admin"))
         .expect("create should succeed");
     let update = ConnectionStatusUpdate {
         state: ConnectionOperationalState::Healthy,
@@ -3680,7 +3758,7 @@ fn busy_errors_map_to_deadline_exceeded_only_once_the_deadline_has_passed() {
 fn status_history_is_safe_revisioned_and_globally_bounded() {
     let (_directory, path, store) = temporary_store("status");
     let created = store
-        .create(candidate(), "test-admin")
+        .create(candidate(), &ChangeActor::for_test("test-admin"))
         .expect("create should succeed");
     let update = ConnectionStatusUpdate {
         state: ConnectionOperationalState::Healthy,
@@ -3784,12 +3862,12 @@ fn status_history_is_safe_revisioned_and_globally_bounded() {
 fn global_history_pruning_preserves_every_connections_current_status() {
     let (_directory, _path, store) = temporary_store("status-fairness");
     let quiet = store
-        .create(candidate(), "test-admin")
+        .create(candidate(), &ChangeActor::for_test("test-admin"))
         .expect("quiet connection should create");
     let mut noisy_candidate = candidate();
     noisy_candidate.display_name = "Noisy API".to_owned();
     let noisy = store
-        .create(noisy_candidate, "test-admin")
+        .create(noisy_candidate, &ChangeActor::for_test("test-admin"))
         .expect("noisy connection should create");
     let quiet_test = store
         .append_status(
@@ -3955,7 +4033,7 @@ fn global_history_pruning_preserves_every_connections_current_status() {
 fn persisted_status_row_bound_is_enforced_on_restart() {
     let (_directory, path, store) = temporary_store("status-restart-limit");
     let created = store
-        .create(candidate(), "test-admin")
+        .create(candidate(), &ChangeActor::for_test("test-admin"))
         .expect("create should succeed");
     store
         .append_status(
@@ -4030,7 +4108,7 @@ fn persisted_status_row_bound_is_enforced_on_restart() {
 fn persisted_catalog_count_bound_is_enforced_on_restart() {
     let (_directory, path, store) = temporary_store("catalog-restart-limit");
     let created = store
-        .create(candidate(), "test-admin")
+        .create(candidate(), &ChangeActor::for_test("test-admin"))
         .expect("create should succeed");
     store
         .append_status(
@@ -4079,12 +4157,12 @@ fn persisted_catalog_count_bound_is_enforced_on_restart() {
 fn configured_managed_connection_bound_is_enforced_on_restart() {
     let (_directory, path, store) = temporary_store("record-restart-limit");
     store
-        .create(candidate(), "test-admin")
+        .create(candidate(), &ChangeActor::for_test("test-admin"))
         .expect("first record should create");
     let mut second = candidate();
     second.display_name = "Second API".to_owned();
     store
-        .create(second, "test-admin")
+        .create(second, &ChangeActor::for_test("test-admin"))
         .expect("second record should create");
     drop(store);
 
@@ -4101,7 +4179,7 @@ fn configured_managed_connection_bound_is_enforced_on_restart() {
 fn record_and_bindings_are_read_from_one_wal_snapshot() {
     let (_directory, path, first_store) = temporary_store("read-snapshot");
     let created = first_store
-        .create(candidate(), "test-admin")
+        .create(candidate(), &ChangeActor::for_test("test-admin"))
         .expect("connection should create");
     let second_store = SqliteConnectionStore::open(&path).expect("second store handle should open");
 
@@ -4120,7 +4198,12 @@ fn record_and_bindings_are_read_from_one_wal_snapshot() {
         secret_id: Some("billing-token-v2".to_owned()),
     };
     let replaced = second_store
-        .replace(&created.id, &created.etag(), replacement, "test-admin")
+        .replace(
+            &created.id,
+            &created.etag(),
+            replacement,
+            &ChangeActor::for_test("test-admin"),
+        )
         .expect("concurrent replacement should commit in WAL mode");
     validate_record_bindings(&read_transaction, &path, &old_record)
         .expect("binding validation must use the original read snapshot");
@@ -4160,7 +4243,7 @@ fn configured_path_that_cannot_be_opened_fails_closed() {
 fn corrupt_persisted_document_fails_closed_and_is_not_returned() {
     let (_directory, path, store) = temporary_store("corrupt");
     let created = store
-        .create(candidate(), "test-admin")
+        .create(candidate(), &ChangeActor::for_test("test-admin"))
         .expect("create should succeed");
     drop(store);
     let connection = Connection::open(&path).expect("database should open");
@@ -4183,7 +4266,7 @@ fn corrupt_persisted_document_fails_closed_and_is_not_returned() {
 fn mismatched_persisted_binding_fails_closed() {
     let (_directory, path, store) = temporary_store("corrupt-binding");
     let created = store
-        .create(candidate(), "test-admin")
+        .create(candidate(), &ChangeActor::for_test("test-admin"))
         .expect("create should succeed");
     {
         let connection = store.connection_guard();
@@ -4277,7 +4360,10 @@ fn assert_secret_purpose_conflict(
 fn a_token_exchange_client_secret_alias_is_never_bound_under_another_purpose() {
     let (_directory, _path, store) = temporary_store("token-exchange-exclusive");
     let oauth = store
-        .create(oauth_candidate("shared-client-secret"), "test-admin")
+        .create(
+            oauth_candidate("shared-client-secret"),
+            &ChangeActor::for_test("test-admin"),
+        )
         .expect("an OAuth Connection should create");
 
     // An alias an OAuth client already binds cannot become a token-exchange
@@ -4285,7 +4371,7 @@ fn a_token_exchange_client_secret_alias_is_never_bound_under_another_purpose() {
     assert_secret_purpose_conflict(
         store.create(
             delegated_candidate("shared-client-secret", "mail-assertion-key"),
-            "test-admin",
+            &ChangeActor::for_test("test-admin"),
         ),
         "authentication.client_secret_id",
     );
@@ -4296,11 +4382,14 @@ fn a_token_exchange_client_secret_alias_is_never_bound_under_another_purpose() {
     let delegated = store
         .create(
             delegated_candidate("exchange-secret", "mail-assertion-key"),
-            "test-admin",
+            &ChangeActor::for_test("test-admin"),
         )
         .expect("a delegated Connection should create");
     assert_secret_purpose_conflict(
-        store.create(oauth_candidate("exchange-secret"), "test-admin"),
+        store.create(
+            oauth_candidate("exchange-secret"),
+            &ChangeActor::for_test("test-admin"),
+        ),
         "authentication.client_secret_id",
     );
     let mut with_header = oauth.write.clone();
@@ -4309,19 +4398,29 @@ fn a_token_exchange_client_secret_alias_is_never_bound_under_another_purpose() {
     ]))
     .expect("additional headers should deserialize");
     assert_secret_purpose_conflict(
-        store.replace(&oauth.id, &oauth.etag(), with_header, "test-admin"),
+        store.replace(
+            &oauth.id,
+            &oauth.etag(),
+            with_header,
+            &ChangeActor::for_test("test-admin"),
+        ),
         "additional_headers.secret_id",
     );
     let mut with_tls = oauth.write.clone();
     with_tls.tls.ca_bundle_alias = Some("exchange-secret".to_owned());
     assert_secret_purpose_conflict(
-        store.replace(&oauth.id, &oauth.etag(), with_tls, "test-admin"),
+        store.replace(
+            &oauth.id,
+            &oauth.etag(),
+            with_tls,
+            &ChangeActor::for_test("test-admin"),
+        ),
         "tls.ca_bundle_alias",
     );
     assert_secret_purpose_conflict(
         store.create(
             delegated_candidate("calendar-secret", "exchange-secret"),
-            "test-admin",
+            &ChangeActor::for_test("test-admin"),
         ),
         "caller_assertion.signing_key_id",
     );
@@ -4329,7 +4428,7 @@ fn a_token_exchange_client_secret_alias_is_never_bound_under_another_purpose() {
     assert_secret_purpose_conflict(
         store.create(
             delegated_candidate("mail-assertion-key", "calendar-key"),
-            "test-admin",
+            &ChangeActor::for_test("test-admin"),
         ),
         "authentication.client_secret_id",
     );
@@ -4345,13 +4444,18 @@ fn a_token_exchange_client_secret_alias_is_never_bound_under_another_purpose() {
     store
         .create(
             delegated_candidate("exchange-secret", "mail-assertion-key"),
-            "test-admin",
+            &ChangeActor::for_test("test-admin"),
         )
         .expect("delegated Connections may share a client secret");
     let mut renamed = delegated.write.clone();
     renamed.display_name = "Mailbox".to_owned();
     let renamed = store
-        .replace(&delegated.id, &delegated.etag(), renamed, "test-admin")
+        .replace(
+            &delegated.id,
+            &delegated.etag(),
+            renamed,
+            &ChangeActor::for_test("test-admin"),
+        )
         .expect("a delegated Connection replaces itself");
 
     // A replace is held to the rule like a create: the delegated Connection
@@ -4364,7 +4468,12 @@ fn a_token_exchange_client_secret_alias_is_never_bound_under_another_purpose() {
         *client_secret_id = Some("shared-client-secret".to_owned());
     }
     assert_secret_purpose_conflict(
-        store.replace(&delegated.id, &renamed.etag(), moved, "test-admin"),
+        store.replace(
+            &delegated.id,
+            &renamed.etag(),
+            moved,
+            &ChangeActor::for_test("test-admin"),
+        ),
         "authentication.client_secret_id",
     );
 }
@@ -4378,11 +4487,26 @@ struct ChangeEvidenceRow {
     event_id: String,
     operation_id: String,
     actor_user_id: String,
+    actor_issuer: Option<String>,
+    actor_kind: String,
+    actor_auth_mode: String,
     action: String,
     connection_id: String,
     prior_version: Option<i64>,
     new_version: Option<i64>,
     committed_at: String,
+}
+
+impl ChangeEvidenceRow {
+    /// The recorded actor: subject, issuer, kind and auth mode.
+    fn actor(&self) -> (&str, Option<&str>, &str, &str) {
+        (
+            self.actor_user_id.as_str(),
+            self.actor_issuer.as_deref(),
+            self.actor_kind.as_str(),
+            self.actor_auth_mode.as_str(),
+        )
+    }
 }
 
 /// The evidence as a separate connection to the file reads it, the way an
@@ -4392,8 +4516,9 @@ fn change_evidence(path: &Path) -> Vec<ChangeEvidenceRow> {
     let mut statement = connection
         .prepare(
             r#"
-            SELECT sequence, event_id, operation_id, actor_user_id, action,
-                   connection_id, prior_version, new_version, committed_at
+            SELECT sequence, event_id, operation_id, actor_user_id, actor_issuer,
+                   actor_kind, actor_auth_mode, action, connection_id, prior_version,
+                   new_version, committed_at
             FROM connection_change_evidence
             ORDER BY sequence ASC
             "#,
@@ -4406,11 +4531,14 @@ fn change_evidence(path: &Path) -> Vec<ChangeEvidenceRow> {
                 event_id: row.get(1)?,
                 operation_id: row.get(2)?,
                 actor_user_id: row.get(3)?,
-                action: row.get(4)?,
-                connection_id: row.get(5)?,
-                prior_version: row.get(6)?,
-                new_version: row.get(7)?,
-                committed_at: row.get(8)?,
+                actor_issuer: row.get(4)?,
+                actor_kind: row.get(5)?,
+                actor_auth_mode: row.get(6)?,
+                action: row.get(7)?,
+                connection_id: row.get(8)?,
+                prior_version: row.get(9)?,
+                new_version: row.get(10)?,
+                committed_at: row.get(11)?,
             })
         })
         .expect("evidence query should run")
@@ -4430,7 +4558,8 @@ fn rebound(write: &ConnectionWrite, secret_id: &str) -> ConnectionWrite {
 }
 
 /// Every committed change writes one row per action in its own transaction,
-/// naming its actor, and an identical replace writes none. A replace that
+/// naming its whole actor -- a principal with and without an issuer and a
+/// service token -- and an identical replace writes none. A replace that
 /// changes credential authority also records the credential axis, under the
 /// same operation. The delete's row outlives the record and its cascade, a
 /// restart reads every row unchanged, and a blind retry of the delete
@@ -4439,20 +4568,24 @@ fn rebound(write: &ConnectionWrite, secret_id: &str) -> ConnectionWrite {
 #[test]
 fn committed_changes_record_evidence_that_survives_deletion_and_restart() {
     let (_directory, path, store) = temporary_store("change-evidence");
+    let creator = ChangeActor::for_test_with_issuer("creating-admin", "https://idp-a.example.test");
+    let describer = ChangeActor::service_token_for_test("service-token:token_1");
+    let rebinder = ChangeActor::for_test("rebinding-admin");
+    let deleter = ChangeActor::for_test_with_issuer("deleting-admin", "https://idp-b.example.test");
     let created = store
-        .create(candidate(), "creating-admin")
+        .create(candidate(), &creator)
         .expect("create should commit");
     let mut described = created.write.clone();
     described.description = Some("Invoices and refunds".to_owned());
     let described = store
-        .replace(&created.id, &created.etag(), described, "describing-admin")
+        .replace(&created.id, &created.etag(), described, &describer)
         .expect("replace should commit");
     let unchanged = store
         .replace(
             &created.id,
             &described.etag(),
             described.write.clone(),
-            "idle-admin",
+            &ChangeActor::for_test("idle-admin"),
         )
         .expect("an identical replace should answer");
     assert_eq!(unchanged, described);
@@ -4461,13 +4594,13 @@ fn committed_changes_record_evidence_that_survives_deletion_and_restart() {
             &created.id,
             &described.etag(),
             rebound(&described.write, "billing-token-next"),
-            "rebinding-admin",
+            &rebinder,
         )
         .expect("a credential replace should commit");
     assert_eq!(rebound.revisions.connection, 3);
     assert_eq!(rebound.revisions.credential, 2);
     store
-        .delete(&created.id, &rebound.etag(), "deleting-admin")
+        .delete(&created.id, &rebound.etag(), &deleter)
         .expect("delete should commit");
 
     let rows = change_evidence(&path);
@@ -4476,25 +4609,39 @@ fn committed_changes_record_evidence_that_survives_deletion_and_restart() {
         .map(|row| {
             (
                 row.action.as_str(),
-                row.actor_user_id.as_str(),
+                row.actor(),
                 row.prior_version,
                 row.new_version,
             )
         })
         .collect::<Vec<_>>();
+    let creating = (
+        "creating-admin",
+        Some("https://idp-a.example.test"),
+        "principal",
+        "bearer_token",
+    );
+    let describing = (
+        "service-token:token_1",
+        None,
+        "service_token",
+        "service_token",
+    );
+    let rebinding = ("rebinding-admin", None, "principal", "bearer_token");
+    let deleting = (
+        "deleting-admin",
+        Some("https://idp-b.example.test"),
+        "principal",
+        "bearer_token",
+    );
     assert_eq!(
         summary,
         vec![
-            ("connection.create", "creating-admin", None, Some(1)),
-            ("connection.replace", "describing-admin", Some(1), Some(2)),
-            ("connection.replace", "rebinding-admin", Some(2), Some(3)),
-            (
-                "credential.binding_change",
-                "rebinding-admin",
-                Some(1),
-                Some(2)
-            ),
-            ("connection.delete", "deleting-admin", Some(3), None),
+            ("connection.create", creating, None, Some(1)),
+            ("connection.replace", describing, Some(1), Some(2)),
+            ("connection.replace", rebinding, Some(2), Some(3)),
+            ("credential.binding_change", rebinding, Some(1), Some(2)),
+            ("connection.delete", deleting, Some(3), None),
         ]
     );
     assert!(rows
@@ -4553,7 +4700,7 @@ fn committed_changes_record_evidence_that_survives_deletion_and_restart() {
         "the evidence survives the cascade and the restart unchanged"
     );
     assert!(matches!(
-        reopened.delete(&created.id, &rebound.etag(), "deleting-admin"),
+        reopened.delete(&created.id, &rebound.etag(), &deleter),
         Err(ConnectionStoreError::NotFound { .. })
     ));
     assert_eq!(change_evidence(&path), rows);
@@ -4561,53 +4708,51 @@ fn committed_changes_record_evidence_that_survives_deletion_and_restart() {
 
 /// A change the store refuses writes no evidence: the capacity bound, a
 /// stale ETag on replace and delete, a missing record, a failed validation,
-/// a delete a dependency blocks, and a change that names no actor or one
-/// longer than the principal subject bound, which is refused before
-/// anything else is judged. An actor exactly at the bound is recorded.
+/// a delete a dependency blocks, and a change whose actor evidence cannot
+/// record exactly -- no subject, a subject or an issuer past the principal
+/// bounds, an empty issuer, or an issuer on a service token -- which is
+/// refused before anything else is judged. An actor exactly at both bounds
+/// is recorded.
 #[test]
 fn refused_changes_write_no_evidence() {
     let database = TemporaryDatabase::new("refused-evidence");
     let store =
         SqliteConnectionStore::open_with_maximum(&database.path, 1).expect("store should open");
+    let admin = ChangeActor::for_test("test-admin");
     let created = store
-        .create(candidate(), "creating-admin")
+        .create(candidate(), &admin)
         .expect("create should commit");
     let baseline = change_evidence(&database.path);
     assert_eq!(baseline.len(), 1);
 
     assert!(matches!(
-        store.create(mcp_candidate(), "creating-admin"),
+        store.create(mcp_candidate(), &admin),
         Err(ConnectionStoreError::LimitExceeded { .. })
     ));
     let mut changed = created.write.clone();
     changed.description = Some("Refused".to_owned());
     let stale = ConnectionEtag::from_stored("\"connection:stale\"".to_owned());
     assert!(matches!(
-        store.replace(&created.id, &stale, changed.clone(), "replacing-admin"),
+        store.replace(&created.id, &stale, changed.clone(), &admin),
         Err(ConnectionStoreError::Conflict { .. })
     ));
     assert!(matches!(
-        store.delete(&created.id, &stale, "deleting-admin"),
+        store.delete(&created.id, &stale, &admin),
         Err(ConnectionStoreError::Conflict { .. })
     ));
     let missing = ConnectionId::new_managed();
     assert!(matches!(
-        store.replace(
-            &missing,
-            &created.etag(),
-            changed.clone(),
-            "replacing-admin"
-        ),
+        store.replace(&missing, &created.etag(), changed.clone(), &admin),
         Err(ConnectionStoreError::NotFound { .. })
     ));
     assert!(matches!(
-        store.delete(&missing, &created.etag(), "deleting-admin"),
+        store.delete(&missing, &created.etag(), &admin),
         Err(ConnectionStoreError::NotFound { .. })
     ));
     let mut invalid = created.write.clone();
     invalid.endpoint.base_url = "http://billing.example.test".to_owned();
     assert!(matches!(
-        store.replace(&created.id, &created.etag(), invalid, "replacing-admin"),
+        store.replace(&created.id, &created.etag(), invalid, &admin),
         Err(ConnectionStoreError::Validation { .. })
     ));
     store
@@ -4618,21 +4763,31 @@ fn refused_changes_write_no_evidence() {
         )
         .expect("dependency should insert");
     assert!(matches!(
-        store.delete(&created.id, &created.etag(), "deleting-admin"),
+        store.delete(&created.id, &created.etag(), &admin),
         Err(ConnectionStoreError::DependencyConflict { .. })
     ));
     let oversized = "a".repeat(MAX_CHANGE_EVIDENCE_ACTOR_BYTES + 1);
-    for actor in ["", oversized.as_str()] {
+    let oversized_issuer = "i".repeat(MAX_CHANGE_EVIDENCE_ACTOR_ISSUER_BYTES + 1);
+    for actor in [
+        ChangeActor::for_test(""),
+        ChangeActor::for_test(&oversized),
+        ChangeActor::for_test_with_issuer("test-admin", ""),
+        ChangeActor::for_test_with_issuer("test-admin", &oversized_issuer),
+        ChangeActor::service_token_with_issuer_for_test(
+            "service-token:token_1",
+            "https://idp.example.test",
+        ),
+    ] {
         for result in [
-            store.create(mcp_candidate(), actor).map(|_| ()),
+            store.create(mcp_candidate(), &actor).map(|_| ()),
             store
-                .replace(&created.id, &created.etag(), changed.clone(), actor)
+                .replace(&created.id, &created.etag(), changed.clone(), &actor)
                 .map(|_| ()),
-            store.delete(&created.id, &created.etag(), actor),
+            store.delete(&created.id, &created.etag(), &actor),
         ] {
             assert!(
                 matches!(result, Err(ConnectionStoreError::Validation { .. })),
-                "an unattributable change is refused first: {result:?}"
+                "an actor evidence cannot record is refused first: {result:?}"
             );
         }
     }
@@ -4650,12 +4805,26 @@ fn refused_changes_write_no_evidence() {
     );
 
     let longest = "a".repeat(MAX_CHANGE_EVIDENCE_ACTOR_BYTES);
+    let longest_issuer = "i".repeat(MAX_CHANGE_EVIDENCE_ACTOR_ISSUER_BYTES);
     store
-        .replace(&created.id, &created.etag(), changed, &longest)
-        .expect("an actor at the principal bound is recorded");
+        .replace(
+            &created.id,
+            &created.etag(),
+            changed,
+            &ChangeActor::for_test_with_issuer(&longest, &longest_issuer),
+        )
+        .expect("an actor at the principal bounds is recorded");
     let rows = change_evidence(&database.path);
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[1].actor_user_id, longest);
+    assert_eq!(
+        rows[1].actor(),
+        (
+            longest.as_str(),
+            Some(longest_issuer.as_str()),
+            "principal",
+            "bearer_token"
+        )
+    );
 }
 
 /// Evidence is required, not best effort: while its insert fails, a create,
@@ -4667,7 +4836,7 @@ fn refused_changes_write_no_evidence() {
 fn a_failed_evidence_insert_rolls_back_create_replace_and_delete() {
     let (_directory, path, store) = temporary_store("evidence-fault");
     let created = store
-        .create(candidate(), "creating-admin")
+        .create(candidate(), &ChangeActor::for_test("creating-admin"))
         .expect("create should commit");
 
     // Test-only fault injection through a second connection; no production
@@ -4680,18 +4849,14 @@ fn a_failed_evidence_insert_rolls_back_create_replace_and_delete() {
              BEGIN SELECT RAISE(ABORT, 'injected evidence failure'); END;",
         )
         .expect("failure trigger should install");
+    let faulted = ChangeActor::for_test("faulted-admin");
     let replacement = rebound(&created.write, "billing-token-next");
     let failures = [
-        store.create(mcp_candidate(), "faulted-admin").map(|_| ()),
+        store.create(mcp_candidate(), &faulted).map(|_| ()),
         store
-            .replace(
-                &created.id,
-                &created.etag(),
-                replacement.clone(),
-                "faulted-admin",
-            )
+            .replace(&created.id, &created.etag(), replacement.clone(), &faulted)
             .map(|_| ()),
-        store.delete(&created.id, &created.etag(), "faulted-admin"),
+        store.delete(&created.id, &created.etag(), &faulted),
     ];
     for failure in failures {
         assert!(
@@ -4734,11 +4899,12 @@ fn a_failed_evidence_insert_rolls_back_create_replace_and_delete() {
     assert_eq!(binding, "billing-token");
     assert_eq!(change_evidence(&path).len(), 1);
 
+    let recovered = ChangeActor::for_test("recovered-admin");
     let replaced = store
-        .replace(&created.id, &created.etag(), replacement, "recovered-admin")
+        .replace(&created.id, &created.etag(), replacement, &recovered)
         .expect("the replace commits once evidence can be written");
     store
-        .delete(&created.id, &replaced.etag(), "recovered-admin")
+        .delete(&created.id, &replaced.etag(), &recovered)
         .expect("the delete commits once evidence can be written");
     let actions = change_evidence(&path)
         .into_iter()
@@ -4765,7 +4931,7 @@ fn a_failed_evidence_insert_rolls_back_create_replace_and_delete() {
 fn migration_twelve_adds_empty_evidence_tables_to_an_existing_database() {
     let (_directory, path, store) = temporary_store("migration-twelve");
     let created = store
-        .create(candidate(), "creating-admin")
+        .create(candidate(), &ChangeActor::for_test("creating-admin"))
         .expect("create should commit");
     drop(store);
     Connection::open(&path)
@@ -4804,51 +4970,115 @@ fn migration_twelve_adds_empty_evidence_tables_to_an_existing_database() {
     let mut described = created.write.clone();
     described.description = Some("After the upgrade".to_owned());
     reopened
-        .replace(&created.id, &created.etag(), described, "upgrading-admin")
+        .replace(
+            &created.id,
+            &created.etag(),
+            described,
+            &ChangeActor::for_test("upgrading-admin"),
+        )
         .expect("replace should commit");
     let rows = change_evidence(&path);
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].action, "connection.replace");
-    assert_eq!(rows[0].actor_user_id, "upgrading-admin");
+    assert_eq!(
+        rows[0].actor(),
+        ("upgrading-admin", None, "principal", "bearer_token")
+    );
     assert_eq!(
         (rows[0].prior_version, rows[0].new_version),
         (Some(1), Some(2))
     );
 }
 
+/// The actor shapes migration 12's CHECKs accept, as `(issuer, kind, auth
+/// mode)`: exactly the pairs authentication produces.
+const RECORDABLE_ACTOR_SHAPES: [(Option<&str>, Option<&str>, Option<&str>); 6] = [
+    (None, Some("principal"), Some("bearer_token")),
+    (
+        Some("https://idp.example.test"),
+        Some("principal"),
+        Some("session_cookie"),
+    ),
+    (None, Some("principal"), Some("client_certificate")),
+    (None, Some("service_token"), Some("service_token")),
+    (None, Some("system"), Some("system")),
+    (
+        Some("https://idp.example.test"),
+        Some("principal"),
+        Some("bearer_token"),
+    ),
+];
+
+/// Actor shapes migration 12's CHECKs refuse: a missing kind or auth mode
+/// (which PostgreSQL migration 24 tolerates only for rows written before
+/// it), a pairing authentication cannot produce, an issuer on a service
+/// token or a system actor, an unknown kind and an empty issuer.
+const UNRECORDABLE_ACTOR_SHAPES: [(Option<&str>, Option<&str>, Option<&str>); 9] = [
+    (None, None, None),
+    (None, Some("principal"), None),
+    (None, None, Some("bearer_token")),
+    (None, Some("principal"), Some("service_token")),
+    (None, Some("service_token"), Some("bearer_token")),
+    (
+        Some("https://idp.example.test"),
+        Some("service_token"),
+        Some("service_token"),
+    ),
+    (
+        Some("https://idp.example.test"),
+        Some("system"),
+        Some("system"),
+    ),
+    (None, Some("person"), Some("bearer_token")),
+    (Some(""), Some("principal"), Some("bearer_token")),
+];
+
 /// Migration 12's row CHECKs are the backstop behind the store's own
-/// checks: a row whose revisions do not fit its action is refused, so the
-/// evidence cannot claim a transition the schema does not describe. Each
-/// insert below differs from a valid one in one column.
+/// checks: a row whose revisions do not fit its action, or whose actor is
+/// not one authentication produces, is refused, so the evidence cannot
+/// claim a transition the schema does not describe. Each insert below
+/// differs from a valid one in one column, or in its actor shape.
 #[test]
 fn migration_twelve_refuses_evidence_rows_that_do_not_fit_their_action() {
     let (_directory, path, store) = temporary_store("evidence-checks");
     drop(store);
     let connection = Connection::open(&path).expect("database should open");
-    let connection_row = |action: &str, prior: Option<i64>, new: Option<i64>| {
-        connection.execute(
-            r#"
+    let connection_row =
+        |action: &str,
+         prior: Option<i64>,
+         new: Option<i64>,
+         (issuer, kind, mode): (Option<&str>, Option<&str>, Option<&str>)| {
+            connection.execute(
+                r#"
             INSERT INTO connection_change_evidence (
-                event_id, operation_id, actor_user_id, action, connection_id,
-                prior_version, new_version, committed_at
-            ) VALUES (?1, ?2, 'checking-admin', ?3, 'billing', ?4, ?5, '2026-10-22T00:00:00Z')
+                event_id, operation_id, actor_user_id, actor_issuer, actor_kind,
+                actor_auth_mode, action, connection_id, prior_version, new_version,
+                committed_at
+            ) VALUES (
+                ?1, ?2, 'checking-admin', ?3, ?4, ?5, ?6, 'billing', ?7, ?8,
+                '2026-10-22T00:00:00Z'
+            )
             "#,
-            params![
-                Uuid::new_v4().to_string(),
-                Uuid::new_v4().to_string(),
-                action,
-                prior,
-                new
-            ],
-        )
-    };
+                params![
+                    Uuid::new_v4().to_string(),
+                    Uuid::new_v4().to_string(),
+                    issuer,
+                    kind,
+                    mode,
+                    action,
+                    prior,
+                    new
+                ],
+            )
+        };
+    let bearer = RECORDABLE_ACTOR_SHAPES[0];
     for (action, prior, new) in [
         ("connection.create", None, Some(1)),
         ("connection.replace", Some(1), Some(2)),
         ("credential.binding_change", Some(0), Some(1)),
         ("connection.delete", Some(2), None),
     ] {
-        connection_row(action, prior, new).expect("a fitting row is accepted");
+        connection_row(action, prior, new, bearer).expect("a fitting row is accepted");
     }
     for (action, prior, new) in [
         ("connection.create", Some(1), Some(2)),
@@ -4863,35 +5093,54 @@ fn migration_twelve_refuses_evidence_rows_that_do_not_fit_their_action() {
         ("connection.rename", Some(1), Some(2)),
     ] {
         assert!(
-            connection_row(action, prior, new).is_err(),
+            connection_row(action, prior, new, bearer).is_err(),
             "{action} {prior:?} -> {new:?} must be refused"
+        );
+    }
+    for shape in RECORDABLE_ACTOR_SHAPES {
+        connection_row("connection.delete", Some(1), None, shape)
+            .expect("an actor authentication produces is accepted");
+    }
+    for shape in UNRECORDABLE_ACTOR_SHAPES {
+        assert!(
+            connection_row("connection.delete", Some(1), None, shape).is_err(),
+            "{shape:?} must be refused"
         );
     }
 
     let secret_id = Uuid::new_v4().to_string();
-    let secret_row = |action: &str,
-                      secret: Option<&str>,
-                      prior: Option<i64>,
-                      new: Option<i64>,
-                      count: Option<i64>| {
-        connection.execute(
-            r#"
+    let secret_row =
+        |action: &str,
+         secret: Option<&str>,
+         prior: Option<i64>,
+         new: Option<i64>,
+         count: Option<i64>,
+         (issuer, kind, mode): (Option<&str>, Option<&str>, Option<&str>)| {
+            connection.execute(
+                r#"
             INSERT INTO connection_local_secret_change_evidence (
-                event_id, operation_id, actor_user_id, action, secret_id,
-                prior_version, new_version, reencrypted_count, committed_at
-            ) VALUES (?1, ?2, 'checking-admin', ?3, ?4, ?5, ?6, ?7, '2026-10-22T00:00:00Z')
+                event_id, operation_id, actor_user_id, actor_issuer, actor_kind,
+                actor_auth_mode, action, secret_id, prior_version, new_version,
+                reencrypted_count, committed_at
+            ) VALUES (
+                ?1, ?2, 'checking-admin', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                '2026-10-22T00:00:00Z'
+            )
             "#,
-            params![
-                Uuid::new_v4().to_string(),
-                Uuid::new_v4().to_string(),
-                action,
-                secret,
-                prior,
-                new,
-                count
-            ],
-        )
-    };
+                params![
+                    Uuid::new_v4().to_string(),
+                    Uuid::new_v4().to_string(),
+                    issuer,
+                    kind,
+                    mode,
+                    action,
+                    secret,
+                    prior,
+                    new,
+                    count
+                ],
+            )
+        };
     let id = Some(secret_id.as_str());
     for (action, secret, prior, new, count) in [
         ("secret.create", id, None, Some(1), None),
@@ -4899,7 +5148,7 @@ fn migration_twelve_refuses_evidence_rows_that_do_not_fit_their_action() {
         ("secret.delete", id, Some(2), None, None),
         ("secret.reencrypt", None, None, None, Some(64)),
     ] {
-        secret_row(action, secret, prior, new, count).expect("a fitting row is accepted");
+        secret_row(action, secret, prior, new, count, bearer).expect("a fitting row is accepted");
     }
     for (action, secret, prior, new, count) in [
         ("secret.create", None, None, Some(1), None),
@@ -4918,21 +5167,37 @@ fn migration_twelve_refuses_evidence_rows_that_do_not_fit_their_action() {
         ("secret.export", id, None, Some(1), None),
     ] {
         assert!(
-            secret_row(action, secret, prior, new, count).is_err(),
+            secret_row(action, secret, prior, new, count, bearer).is_err(),
             "{action} {secret:?} {prior:?} -> {new:?} ({count:?}) must be refused"
+        );
+    }
+    for shape in RECORDABLE_ACTOR_SHAPES {
+        secret_row("secret.reencrypt", None, None, None, Some(1), shape)
+            .expect("an actor authentication produces is accepted");
+    }
+    for shape in UNRECORDABLE_ACTOR_SHAPES {
+        assert!(
+            secret_row("secret.reencrypt", None, None, None, Some(1), shape).is_err(),
+            "{shape:?} must be refused"
         );
     }
 }
 
-/// The actor bound, the Connection ID bound and the re-encryption batch
+/// The actor bounds, the Connection ID bound and the re-encryption batch
 /// bound are written into migration 12's SQL; pin those literals to the
-/// Rust constants so neither side can drift alone.
+/// Rust constants so neither side can drift alone. The actor pairing CHECK
+/// is written into both tables here and into all three tables of PostgreSQL
+/// migration 24, so the stores cannot disagree about what is recordable.
 #[test]
 fn change_evidence_bounds_match_the_migration() {
     let actor_bound = format!(
         "length(CAST(actor_user_id AS BLOB)) BETWEEN 1 AND {MAX_CHANGE_EVIDENCE_ACTOR_BYTES}"
     );
     assert_eq!(MIGRATION_12_SQL.matches(&actor_bound).count(), 2);
+    let issuer_bound = format!(
+        "actor_issuer IS NULL OR length(CAST(actor_issuer AS BLOB)) BETWEEN 1 AND {MAX_CHANGE_EVIDENCE_ACTOR_ISSUER_BYTES}"
+    );
+    assert_eq!(MIGRATION_12_SQL.matches(&issuer_bound).count(), 2);
     assert!(MIGRATION_12_SQL.contains(&format!(
         "length(CAST(connection_id AS BLOB)) BETWEEN 1 AND {}",
         super::super::model::MAX_CONNECTION_ID_BYTES
@@ -4941,4 +5206,24 @@ fn change_evidence_bounds_match_the_migration() {
         "reencrypted_count BETWEEN 1 AND {}",
         super::super::local_secret::MAX_MASTER_KEY_ROTATION_BATCH
     )));
+
+    let squeeze = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let pairing = squeeze(
+        "(actor_kind = 'principal'
+            AND actor_auth_mode IN ('bearer_token', 'session_cookie', 'client_certificate'))
+        OR (actor_kind = 'service_token'
+            AND actor_auth_mode = 'service_token' AND actor_issuer IS NULL)
+        OR (actor_kind = 'system' AND actor_auth_mode = 'system' AND actor_issuer IS NULL)",
+    );
+    assert_eq!(squeeze(MIGRATION_12_SQL).matches(&pairing).count(), 2);
+    let migration_24 =
+        include_str!("../storage/migrations/0024_authority_evidence_actor_metadata.sql");
+    assert_eq!(squeeze(migration_24).matches(&pairing).count(), 3);
+    assert_eq!(
+        squeeze(MIGRATION_12_SQL)
+            .matches("actor_kind TEXT NOT NULL, actor_auth_mode TEXT NOT NULL")
+            .count(),
+        2,
+        "every row records the whole actor"
+    );
 }

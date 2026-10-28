@@ -2048,7 +2048,11 @@ mod tests {
             .collection_etag()
             .to_owned();
         control_plane
-            .create_managed(&collection_etag, candidate, "test-admin")
+            .create_managed(
+                &collection_etag,
+                candidate,
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("managed inventory Connection should create")
     }
@@ -2840,7 +2844,7 @@ mod tests {
                 &fixture.mcp_record.id,
                 &fixture.mcp_record.etag(),
                 disabled,
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("managed MCP Connection should disable");
