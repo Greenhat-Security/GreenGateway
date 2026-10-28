@@ -184,7 +184,11 @@ async fn upstreams_fetch_the_published_keys_without_a_credential_and_verify_what
         ))
         .expect("attested Connection should deserialize");
         control_plane
-            .create_managed(snapshot.collection_etag(), rotating, "test-admin")
+            .create_managed(
+                snapshot.collection_etag(),
+                rotating,
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("rotating Connection should create");
         let snapshot = control_plane.runtime_snapshot();
@@ -194,7 +198,7 @@ async fn upstreams_fetch_the_published_keys_without_a_credential_and_verify_what
             .create_managed(
                 snapshot.collection_etag(),
                 serde_json::from_value(disabled).expect("disabled Connection should deserialize"),
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("disabled Connection should create");
@@ -352,7 +356,11 @@ async fn a_stored_connection_whose_key_cannot_be_used_does_not_stop_the_gateway(
                 serde_json::from_value(attested(alias, kid, "es256", json!([])))
                     .expect("attested Connection should deserialize");
             control_plane
-                .create_managed(snapshot.collection_etag(), write, "test-admin")
+                .create_managed(
+                    snapshot.collection_etag(),
+                    write,
+                    &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+                )
                 .await
                 .expect("attested Connection should create");
         }

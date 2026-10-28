@@ -2381,7 +2381,7 @@ async fn a_delete_waits_for_an_in_flight_dependency_flush() {
         .create_managed(
             snapshot.collection_etag(),
             http_candidate("Referenced API"),
-            "op-1",
+            &crate::auth::change_actor::ChangeActor::for_test("op-1"),
         )
         .await
         .expect("create");
@@ -2480,7 +2480,7 @@ async fn delete_flushes_queued_dependency_guards_before_it_is_judged() {
         .create_managed(
             snapshot.collection_etag(),
             http_candidate("Referenced API"),
-            "op-1",
+            &crate::auth::change_actor::ChangeActor::for_test("op-1"),
         )
         .await
         .expect("create");
