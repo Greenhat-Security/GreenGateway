@@ -14252,6 +14252,184 @@ async fn attested_connection_catalog_discovery_is_a_conflict_over_http() {
 }
 
 #[tokio::test]
+async fn a_save_to_domain_wide_delegation_withdraws_the_openapi_catalog_and_audits_it() {
+    // Through the real handlers: a save that switches a managed OpenAPI
+    // Connection to domain-wide delegation takes its live catalog off the
+    // tool list and records why, and registering a catalog on it is a 409
+    // naming the reason, audited, rather than the binding mismatch it used
+    // to look like.
+    let connection_db = TempDb::new("connection-openapi-domain-wide-delegation");
+    let policy = TempPolicyFile::new(&connection_policy_document_string());
+    let capture = audit::sink::tests::CaptureSink::new();
+    let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+    let mut config = connection_admin_config(&connection_db, &policy, config::DEFAULT_ADMIN_PREFIX);
+    // Saving an enabled delegating Connection checks only that the profile
+    // is configured; nothing here reads its token file.
+    config.connection_gcp_provider.profiles = vec![connections::gcp_secret::GcpProfileConfig {
+        id: "gateway-wif".to_owned(),
+        audience: "//iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/gateway-pool/providers/gateway-provider".to_owned(),
+        token_root: connection_db
+            .path
+            .with_extension("secrets")
+            .display()
+            .to_string(),
+        token_file: "gcp-token".to_owned(),
+        service_account: None,
+    }];
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let router = app(
+        config,
+        recorder.handle(),
+        audit_log,
+        test_audit_event_sender(),
+    )
+    .expect("delegation connection admin app should build");
+
+    let display_name = "Workspace widgets";
+    let (connection_id, connection_etag) =
+        create_managed_openapi_connection(&router, display_name).await;
+    let spec = widget_openapi_spec();
+    let registered = preview_and_register_managed_openapi(
+        &router,
+        &connection_id,
+        &connection_etag,
+        spec,
+        &["createWidget"],
+    )
+    .await;
+    assert_eq!(registered.status(), StatusCode::CREATED);
+    let preview_uri = format!("{CONNECTIONS_ADMIN_ROUTE}/{connection_id}/openapi/preview");
+    let preview = |router: Router| {
+        let request = connection_admin_request(
+            Method::POST,
+            &preview_uri,
+            Some(test_principal(&["openapi-tools-reader"])),
+            Some(json!({ "spec": spec }).to_string()),
+            None,
+            true,
+        );
+        async move {
+            router
+                .oneshot(request)
+                .await
+                .expect("managed OpenAPI preview should complete")
+        }
+    };
+    let previewed = preview(router.clone()).await;
+    assert_eq!(previewed.status(), StatusCode::OK);
+    let previewed = json_body(previewed).await;
+
+    let mut delegating: Value =
+        serde_json::from_str(&managed_openapi_connection_body(display_name))
+            .expect("managed OpenAPI body should parse");
+    delegating["authentication"] = json!({
+        "type": "google_domain_wide_delegation",
+        "service_account_email": "gateway-delegate@example-project.iam.gserviceaccount.com",
+        "workload_identity_profile": "gateway-wif",
+        "scopes": ["https://www.googleapis.com/auth/gmail.readonly"],
+        "subject_claim": "email",
+        "subject_issuers": ["https://idp.example.test/"]
+    });
+    let saved = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::PUT,
+            &format!("{CONNECTIONS_ADMIN_ROUTE}/{connection_id}"),
+            Some(test_principal(&["connections-secrets-editor"])),
+            Some(delegating.to_string()),
+            Some(&connection_etag),
+            true,
+        ))
+        .await
+        .expect("delegation save should complete");
+    assert_eq!(saved.status(), StatusCode::OK);
+    let saved_etag = saved
+        .headers()
+        .get(header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .expect("saved connection should include ETag")
+        .to_owned();
+
+    let withdrawn = captured_tool_registry_change(&capture, "managed_openapi_catalog_withdrawn");
+    assert_eq!(withdrawn.payload["connection_id"], json!(connection_id));
+    assert_eq!(withdrawn.payload["source"], json!("managed"));
+    assert_eq!(withdrawn.payload["outcome"], json!("success"));
+    assert_eq!(
+        withdrawn.payload["reason"],
+        json!("authentication_not_supported")
+    );
+    assert_eq!(
+        withdrawn.payload["withdrawn_tool_names"],
+        json!(["createWidget"])
+    );
+    assert_eq!(withdrawn.payload["withdrawn_tool_count"], json!(1));
+    assert_eq!(
+        withdrawn.actor.as_ref().map(|actor| actor.user_id.as_str()),
+        Some("user-123")
+    );
+
+    let assert_refused = |status: StatusCode, body: &Value, write: &str| {
+        assert_eq!(status, StatusCode::CONFLICT, "{write}: {body}");
+        assert_eq!(
+            body["reason"],
+            json!("authentication_not_supported"),
+            "{write}: {body}"
+        );
+    };
+    let refused = preview(router.clone()).await;
+    let status = refused.status();
+    assert_refused(status, &json_body(refused).await, "preview");
+
+    let refused = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::POST,
+            &format!("{CONNECTIONS_ADMIN_ROUTE}/{connection_id}/openapi/register"),
+            Some(test_principal(&["openapi-tools-writer"])),
+            Some(
+                json!({
+                    "spec": spec,
+                    "spec_digest": previewed["spec_digest"],
+                    "expected_spec_revision": previewed["spec_revision"],
+                    "expected_catalog_revision": previewed["catalog_revision"],
+                    "selected_tool_names": ["createWidget"],
+                    "security_confirmations": [],
+                })
+                .to_string(),
+            ),
+            Some(&saved_etag),
+            true,
+        ))
+        .await
+        .expect("delegation registration should complete");
+    let status = refused.status();
+    assert_refused(status, &json_body(refused).await, "registration");
+    let rejected =
+        captured_tool_registry_change(&capture, "managed_openapi_catalog_registration_rejected");
+    assert_eq!(rejected.payload["connection_id"], json!(connection_id));
+    assert_eq!(rejected.payload["outcome"], json!("failure"));
+    assert_eq!(
+        rejected.payload["reason"],
+        json!("authentication_not_supported")
+    );
+
+    let refused = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::POST,
+            &format!("{CONNECTIONS_ADMIN_ROUTE}/{connection_id}/refresh"),
+            Some(test_principal(&["connections-refresher"])),
+            None,
+            Some(&saved_etag),
+            true,
+        ))
+        .await
+        .expect("delegation refresh should complete");
+    let status = refused.status();
+    assert_refused(status, &json_body(refused).await, "refresh");
+}
+
+#[tokio::test]
 async fn a_routine_admin_ui_save_keeps_the_caller_assertion_byte_for_byte() {
     // The admin UI shows the block read only and never sends it. Its save is
     // the safe read written back without `caller_assertion`; the gateway has
