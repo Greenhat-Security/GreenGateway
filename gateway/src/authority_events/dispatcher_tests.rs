@@ -288,6 +288,24 @@ async fn keyring_for(store: &PostgresAuthorityEventStore) -> Arc<PseudonymKeyrin
     Arc::new(generated_keyring(authority_id))
 }
 
+/// The membership gate of a replica every live member agrees with.
+fn admitted_gate() -> Arc<ClusterReadiness> {
+    let gate = ClusterReadiness::new();
+    gate.record_fingerprint_agreement();
+    gate
+}
+
+/// Wait, within a budget, until `done` holds.
+async fn eventually(what: &str, mut done: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !done() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{what} within the budget"));
+}
+
 macro_rules! database_or_skip {
     () => {{
         let Some(admin_dsn) = locator() else {
@@ -1211,6 +1229,7 @@ async fn the_running_dispatcher_leads_delivers_and_stops_on_shutdown() {
         Arc::clone(&keyring),
         Arc::clone(&leases) as Arc<dyn ExecutionLeaseStore>,
         Uuid::new_v4(),
+        admitted_gate(),
         test_config(100),
     ));
     let delivered = |count: usize| {
@@ -1244,4 +1263,144 @@ async fn the_running_dispatcher_leads_delivers_and_stops_on_shutdown() {
         "the lease is released on the way out"
     );
     assert_eq!(store.stats().await.expect("stats").cursor, Some(2));
+}
+
+/// A replica the membership has not admitted -- held at the fingerprint door,
+/// or excluded by the durable contract fence -- never tries the dispatcher
+/// lease, so it can never claim the cursor or offer anything to its sink.
+/// Runs without a database: the store is a pool that never connects, and a
+/// held dispatcher must not reach the authority at all.
+#[tokio::test]
+async fn a_replica_the_membership_has_not_admitted_never_contends_for_the_lease() {
+    let pool = deadpool_postgres::Pool::builder(deadpool_postgres::Manager::new(
+        tokio_postgres::Config::new(),
+        tokio_postgres::NoTls,
+    ))
+    .runtime(deadpool_postgres::Runtime::Tokio1)
+    .build()
+    .expect("a lazy pool builds without connecting");
+    let store = Arc::new(PostgresAuthorityEventStore::new(pool));
+    let keyring = Arc::new(generated_keyring(Uuid::new_v4()));
+    let sink = Arc::new(RecordingSink::default());
+    let leases = Arc::new(MemoryLeaseStore::new(Duration::from_secs(5)));
+
+    let held_at_the_door = ClusterReadiness::new();
+    let fenced = admitted_gate();
+    assert!(fenced.record_contract_fenced());
+    for gate in [held_at_the_door, fenced] {
+        let shutdown = CancellationToken::new();
+        let running = tokio::spawn(run_dispatcher(
+            shutdown.clone(),
+            Arc::clone(&store),
+            Arc::clone(&sink) as Arc<dyn AuthorityEventSink>,
+            Arc::clone(&keyring),
+            Arc::clone(&leases) as Arc<dyn ExecutionLeaseStore>,
+            Uuid::new_v4(),
+            gate,
+            test_config(100),
+        ));
+        // Many turns: the contention backoff under this config is under 50 ms.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(leases.held(DISPATCHER_LEASE_SCOPE), 0);
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(10), running)
+            .await
+            .expect("a held dispatcher stops on shutdown")
+            .expect("the dispatcher task completes");
+    }
+
+    assert!(sink.batches().is_empty(), "nothing was offered to the sink");
+    // The lease store hands out fences in order, so the first acquisition
+    // after both held runs getting the first fence proves neither tried it.
+    match leases
+        .try_acquire(DISPATCHER_LEASE_SCOPE, 1, "probe")
+        .await
+        .expect("the memory lease store answers")
+    {
+        LeaseAttempt::Acquired(lease) => assert_eq!(lease.fence, 1, "nobody took the lease"),
+        LeaseAttempt::Full => panic!("the lease is free"),
+    }
+}
+
+/// The fingerprint-door scenario against a real cursor: a replica held at
+/// the door, with a sink and a free lease, leaves the cursor unclaimed and
+/// the journal undelivered; once agreement is recorded it leads and
+/// delivers; and when the durable contract fence then excludes it, it ends
+/// its term, gives the lease back, and delivers nothing committed after.
+#[tokio::test]
+async fn a_dispatcher_leads_only_while_the_membership_admits_its_replica() {
+    let (_guard, database) = database_or_skip!();
+    let pool = migrated_pool(&database).await;
+    let producers = Producers::new(&pool);
+    let token = producers.token().await;
+    producers
+        .rotate(&token, &ChangeActor::for_test("rotating-admin"))
+        .await;
+
+    let store = Arc::new(PostgresAuthorityEventStore::new(pool.clone()));
+    let keyring = keyring_for(&store).await;
+    let sink = Arc::new(RecordingSink::default());
+    let shutdown = CancellationToken::new();
+    let leases = Arc::new(MemoryLeaseStore::new(Duration::from_secs(5)));
+    let gate = ClusterReadiness::new();
+    let running = tokio::spawn(run_dispatcher(
+        shutdown.clone(),
+        Arc::clone(&store),
+        Arc::clone(&sink) as Arc<dyn AuthorityEventSink>,
+        Arc::clone(&keyring),
+        Arc::clone(&leases) as Arc<dyn ExecutionLeaseStore>,
+        Uuid::new_v4(),
+        Arc::clone(&gate),
+        test_config(100),
+    ));
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(leases.held(DISPATCHER_LEASE_SCOPE), 0);
+    assert!(sink.batches().is_empty());
+    let held = store.stats().await.expect("stats");
+    assert_eq!(held.cursor, None, "a held replica never claims the cursor");
+    assert_eq!(held.undelivered(), 1);
+
+    gate.record_fingerprint_agreement();
+    eventually("the admitted replica delivers", || {
+        sink.delivered().len() == 1
+    })
+    .await;
+    assert_eq!(leases.held(DISPATCHER_LEASE_SCOPE), 1);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while store.stats().await.expect("stats").cursor != Some(1) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the cursor commits past the delivered event within the budget");
+
+    assert!(gate.record_contract_fenced());
+    eventually("the fenced leader gives the lease back", || {
+        leases.held(DISPATCHER_LEASE_SCOPE) == 0
+    })
+    .await;
+    producers
+        .revoke(&token, &ChangeActor::for_test("revoking-admin"))
+        .await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        sink.delivered().len(),
+        1,
+        "nothing committed after the fence is delivered by the excluded build"
+    );
+    assert_eq!(leases.held(DISPATCHER_LEASE_SCOPE), 0);
+
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(10), running)
+        .await
+        .expect("the dispatcher stops on shutdown")
+        .expect("the dispatcher task completes");
+    let after = store.stats().await.expect("stats");
+    assert_eq!(after.cursor, Some(1));
+    assert_eq!(
+        after.undelivered(),
+        1,
+        "the revoke waits for an admitted leader"
+    );
 }
