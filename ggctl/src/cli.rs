@@ -67,6 +67,7 @@ impl std::fmt::Debug for CommandSpec {
 
 pub(crate) const FORMAT_HUMAN: &str = "human";
 pub(crate) const FORMAT_JSON: &str = "json";
+pub(crate) const FORMAT_SARIF: &str = "sarif";
 
 pub(crate) const SHELLS: &[&str] = &["bash", "zsh", "fish", "powershell"];
 pub(crate) const SCHEMA_KINDS: &[&str] = &[
@@ -75,12 +76,45 @@ pub(crate) const SCHEMA_KINDS: &[&str] = &[
     gateway_config::documents::CAPABILITIES_KIND,
     gateway_config::documents::REPORT_KIND,
 ];
-const COMMAND_NAMES: &[&str] = &["version", "schema", "completion", "help"];
+const COMMAND_NAMES: &[&str] = &[
+    "version",
+    "schema",
+    "validate",
+    "doctor",
+    "completion",
+    "help",
+];
 
 const FORMAT: OptionSpec = OptionSpec {
     name: "--format",
     value: Some(("FORMAT", ValueKind::Choice(&[FORMAT_HUMAN, FORMAT_JSON]))),
     help: "human (default) or json: one GgctlReport document on standard output",
+};
+/// `validate` alone also offers SARIF (ADR-0008, "Output contract").
+const VALIDATE_FORMAT: OptionSpec = OptionSpec {
+    name: "--format",
+    value: Some((
+        "FORMAT",
+        ValueKind::Choice(&[FORMAT_HUMAN, FORMAT_JSON, FORMAT_SARIF]),
+    )),
+    help: "human (default), json (one GgctlReport document) or sarif (one SARIF 2.1.0 log) on standard output",
+};
+const STRICT: OptionSpec = OptionSpec {
+    name: "--strict",
+    value: None,
+    help:
+        "refuse, rather than warn about, a bundle directory entry the manifest does not reference",
+};
+const WARNINGS_AS_ERRORS: OptionSpec = OptionSpec {
+    name: "--warnings-as-errors",
+    value: None,
+    help: "exit 3 when any warning is reported",
+};
+const BUNDLE: ArgumentSpec = ArgumentSpec {
+    name: "BUNDLE",
+    kind: ValueKind::Path,
+    required: true,
+    help: "the bundle directory, which holds bundle.yaml",
 };
 const SERVER: OptionSpec = OptionSpec {
     name: "--server",
@@ -146,6 +180,39 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         }],
         options: &[API_VERSION, FORMAT],
         run: crate::schema::run,
+    },
+    CommandSpec {
+        name: "validate",
+        summary: "Validate a configuration bundle offline",
+        description: &[
+            "Reads the bundle in the directory BUNDLE with the gateway's own bundle reader and \
+             reports every problem it finds: unsafe files and bounds, the YAML subset and strict \
+             JSON, exact document versions, closed documents, references and SHA-256 pins, the \
+             published policy and tools schemas, and the deployment profile's policy invariants. \
+             It makes no network request, reads no environment variable and writes nothing.",
+            "The gateway's production policy and tools validators are not part of ggctl and do \
+             not run, and the report says so. Exits 0 for a valid bundle, 3 for an invalid one \
+             (or any warning with --warnings-as-errors), and 1 when the bundle could not be read.",
+        ],
+        arguments: &[BUNDLE],
+        options: &[STRICT, WARNINGS_AS_ERRORS, VALIDATE_FORMAT],
+        run: crate::validate::run,
+    },
+    CommandSpec {
+        name: "doctor",
+        summary: "Diagnose a configuration bundle offline",
+        description: &[
+            "Runs the offline checks on the bundle in the directory BUNDLE: each stage of the \
+             gateway's bundle reader as its own check, the deployment profile, and the checks \
+             ggctl cannot run here. Every check has a stable ID, a severity, a status (pass, \
+             warning, fail or skipped), a reason code and a duration; skipped never counts as \
+             pass. It makes no network request, reads no environment variable and writes nothing.",
+            "Exits 0 when no required check failed, 3 when one did, and 1 when the bundle could \
+             not be read.",
+        ],
+        arguments: &[BUNDLE],
+        options: &[FORMAT],
+        run: crate::doctor::run,
     },
     CommandSpec {
         name: "completion",
