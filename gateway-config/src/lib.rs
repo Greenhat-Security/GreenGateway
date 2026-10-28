@@ -15,7 +15,12 @@
 //! - [`canonical_json`]: RFC 8785 canonical JSON and ADR-0004's digest frame;
 //! - [`opaque_id`] and [`permissions`]: the opaque ID grammar and the
 //!   projected-volume permission rule the reader shares with the gateway's
-//!   secret providers.
+//!   secret providers;
+//! - [`archive`]: the entry admission rules ADR-0008 requires of every
+//!   archive GreenGateway reads (no traversal, links, special files,
+//!   duplicate or case-colliding names, and bounded sizes and expansion),
+//!   ahead of the backup archive reader that will apply them, so that reader
+//!   cannot approximate them. Bundles themselves are directories only.
 //!
 //! Still in the gateway crate: the environment configuration compiler
 //! (`Config::from_env_vars`, being extracted by #433) and the production
@@ -25,8 +30,10 @@
 //!
 //! Nothing here touches the environment, a clock, a store or the network. The
 //! bundle reader is the one part that reads files: only beneath the bundle
-//! root it is given, and it never writes.
+//! root it is given, and it never writes. The archive guard reads and writes
+//! only the readers and writers it is handed.
 
+pub mod archive;
 pub mod bundle;
 pub mod canonical_json;
 pub mod capabilities;

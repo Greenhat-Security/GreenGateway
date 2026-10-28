@@ -486,7 +486,14 @@ class KernelConfigurationPolicyTests(unittest.TestCase):
 
 LANE_DECLARATION = bench.LANE_ATTRIBUTES + bench.LANE_MODULE + "\n"
 LANE_HARNESS = (ROOT / bench.LANE_HARNESS_PATH).read_text(encoding="utf-8")
-LANE_CASES = {"tool_policy": 27, "rate_lane": 14}
+LANE_CASES = {"tool_policy": 27, "rate_lane": 14, "static_egress": 25}
+EGRESS_TEST_ITEM = (
+    '#[test]\n#[ignore = "run through scripts/microbench.py, which builds both revisions and '
+    'owns the comparison"]\nfn static_egress_evaluation() {\n    report(run_egress);\n}\n'
+)
+# The lane harness without its static egress test, standing in for a base
+# whose lane harness predates the test.
+LANE_HARNESS_WITHOUT_EGRESS = LANE_HARNESS.replace(EGRESS_TEST_ITEM, "")
 
 
 def schema_three(kernel_digests, lane_digests):
@@ -501,7 +508,7 @@ def schema_three(kernel_digests, lane_digests):
 
 def lane_result(target, allocations=None, regression=False):
     cases = LANE_CASES[target]
-    metadata = bench.LANE_METADATA[target]
+    metadata = bench.KERNEL_TARGET_METADATA[target]
     return {
         "schema_version": 1, "harness": "gateway-test-binary", "regression_fixture": regression,
         "warmup": 10, "iterations": 100, "samples": 9,
@@ -519,6 +526,7 @@ def lane_result(target, allocations=None, regression=False):
 
 
 def lane_results_by_target():
+    """A report for every lane-harness target, static egress included."""
     return {target: lane_result(target) for target in LANE_CASES}
 
 
@@ -631,6 +639,56 @@ class LaneConfigurationPolicyTests(unittest.TestCase):
                     self.configure(directory, **options)
 
 
+class EgressConfigurationTests(unittest.TestCase):
+    def configure(self, directory, *, base_lanes=LANE_HARNESS_WITHOUT_EGRESS, head_lanes=LANE_HARNESS):
+        files = {revision: {} if source is None else {bench.LANE_HARNESS_PATH: source}
+                 for revision, source in ((BASE, base_lanes), (HEAD, head_lanes))}
+
+        def blob(_root, revision, path):
+            if path not in files[revision]:
+                raise ValueError("Git object lookup failed: " + path)
+            return files[revision][path]
+
+        lanes = {"harness_sha256": {"base": None if base_lanes is None else digest(base_lanes),
+                                    "head": None if head_lanes is None else digest(head_lanes)}}
+        with mock.patch.object(bench, "_blob", side_effect=blob):
+            return bench._egress_configuration(ROOT, BASE, HEAD, Path(directory), lanes)
+
+    def test_fixture_removes_exactly_the_repository_egress_test(self):
+        self.assertIn(EGRESS_TEST_ITEM, LANE_HARNESS)
+        self.assertTrue(bench.egress_wiring(LANE_HARNESS))
+        self.assertFalse(bench.egress_wiring(LANE_HARNESS_WITHOUT_EGRESS))
+
+    def test_pending_egress_runs_on_head_over_a_base_that_predates_it(self):
+        for base_lanes in (LANE_HARNESS_WITHOUT_EGRESS, None):
+            with self.subTest(base_lanes=base_lanes is not None):
+                with tempfile.TemporaryDirectory() as directory:
+                    egress = self.configure(directory, base_lanes=base_lanes)
+                    self.assertEqual(egress, {
+                        "state": "pending", "target": "static_egress", "test": bench.EGRESS_TEST,
+                        "budget": {"id": "static_egress", "max_allocation_growth": 0,
+                                   "max_allocated_bytes_growth": 0},
+                        "declared": {"base": False, "head": True}})
+                    self.assertEqual(
+                        json.loads((Path(directory) / "egress-context.json").read_text()), egress)
+
+    def test_a_base_that_declares_the_test_is_measured_and_still_pending(self):
+        with tempfile.TemporaryDirectory() as directory:
+            egress = self.configure(directory, base_lanes=LANE_HARNESS)
+            self.assertEqual(egress["declared"], {"base": True, "head": True})
+            self.assertEqual(egress["state"], "pending")
+
+    def test_head_without_the_test_or_with_a_misdeclared_one_rejects(self):
+        nested = LANE_HARNESS.replace(EGRESS_TEST_ITEM, "mod nested {\n" + EGRESS_TEST_ITEM + "}\n")
+        for options, message in (({"head_lanes": LANE_HARNESS_WITHOUT_EGRESS}, "lacks"),
+                                 ({"head_lanes": None}, "lacks"),
+                                 ({"head_lanes": nested}, "top-level"),
+                                 ({"base_lanes": nested}, "top-level")):
+            with self.subTest(options=sorted(options)), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(ValueError, message):
+                    self.configure(directory, **options)
+
+
 class KernelBuildInputTests(unittest.TestCase):
     def test_cargo_report_must_name_one_gateway_test_executable_in_the_target(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -726,24 +784,63 @@ class KernelTreeTests(unittest.TestCase):
                                     configured, time.monotonic() + 30)
 
 
+def pure_envelope(revision):
+    return {"schema_version": 1, "context": context(), "revision": revision,
+            "regression_fixture": False,
+            "source_sha256": {name: "c" * 64 for name in bench.SOURCE_PATHS},
+            "projection_sha256": {name: "d" * 64 for name in ("path_match.rs", "egress.rs", "rule_path.rs")},
+            "result": measured_result()}
+
+
+def kernel_configuration(state="pending", base_digest=None):
+    return {"state": state, "target": "http_policy", "test": bench.KERNEL_TEST,
+            "budget": {"id": "http_policy", "max_allocation_growth": 0,
+                       "max_allocated_bytes_growth": 0},
+            "harness_sha256": {"base": base_digest, "head": "f" * 64},
+            "cargo": sys.executable, "ui_source": HEAD,
+            "ui_build_inputs": list(bench.UI_BUILD_INPUTS), "context": kernel_context()}
+
+
+def lane_configuration(state="pending", base_digest=None):
+    return {"state": state, "targets": list(bench.LANE_TARGETS), "tests": dict(bench.LANE_TESTS),
+            "budget": {target: {"id": target, "max_allocation_growth": 0,
+                                "max_allocated_bytes_growth": 0}
+                       for target in bench.LANE_TARGETS},
+            "harness_sha256": {"base": base_digest, "head": "e" * 64}}
+
+
+def egress_configuration(base_declared):
+    return {"state": "pending", "target": bench.EGRESS_TARGET, "test": bench.EGRESS_TEST,
+            "budget": {"id": bench.EGRESS_TARGET, "max_allocation_growth": 0,
+                       "max_allocated_bytes_growth": 0},
+            "declared": {"base": base_declared, "head": True}}
+
+
+def build_process_code(executable):
+    artifact = {"reason": "compiler-artifact", "executable": str(executable),
+                "target": {"name": "gateway", "kind": ["bin"]}, "profile": {"test": True}}
+    return "print(" + repr(json.dumps(artifact)) + ")"
+
+
+def report_process_code(report):
+    return "pass" if report is None else (
+        "import os; open(os.environ[" + repr(bench.KERNEL_RESULT_ENV) + "], 'x').write("
+        + repr(json.dumps(report)) + ")")
+
+
 class KernelStageExecutionTests(unittest.TestCase):
     """Real child processes stand in for Cargo, libtest discovery and the test."""
 
-    def pure_envelope(self, revision):
-        return {"schema_version": 1, "context": context(), "revision": revision,
-                "regression_fixture": False,
-                "source_sha256": {name: "c" * 64 for name in bench.SOURCE_PATHS},
-                "projection_sha256": {name: "d" * 64 for name in ("path_match.rs", "egress.rs", "rule_path.rs")},
-                "result": measured_result()}
-
     def run_stage(self, directory, *, state="pending", base_digest=None, base_listing=None,
                   results=None, failures=None, build_executables=1, lane_state="pending",
-                  lane_base_digest=None, lane_base_listing=None, lane_results=None):
+                  lane_base_digest=None, lane_base_listing=None, lane_results=None,
+                  egress_base_declared=False, egress_base_listing=None):
         """Run `run_comparison` with only the kernel processes simulated.
 
         `results` maps base/head to a kernel report (or None for no file), and
-        `lane_results` maps base/head to each lane target's report;
-        `failures` maps a process label to "crash" or "timeout".
+        `lane_results` maps base/head to each lane-harness target's report,
+        static egress included; `failures` maps a process label to "crash" or
+        "timeout".
         """
         directory = Path(directory)
         output, work = directory / "comparison", directory / "work"
@@ -756,18 +853,10 @@ class KernelStageExecutionTests(unittest.TestCase):
             base_listing = base_digest is not None
         if lane_base_listing is None:
             lane_base_listing = lane_base_digest is not None
-        kernel = {"state": state, "target": "http_policy", "test": bench.KERNEL_TEST,
-                  "budget": {"id": "http_policy", "max_allocation_growth": 0,
-                             "max_allocated_bytes_growth": 0},
-                  "harness_sha256": {"base": base_digest, "head": "f" * 64},
-                  "cargo": sys.executable, "ui_source": HEAD,
-                  "ui_build_inputs": list(bench.UI_BUILD_INPUTS), "context": kernel_context()}
-        lanes = {"state": lane_state, "targets": list(bench.LANE_TARGETS),
-                 "tests": dict(bench.LANE_TESTS),
-                 "budget": {target: {"id": target, "max_allocation_growth": 0,
-                                     "max_allocated_bytes_growth": 0}
-                            for target in bench.LANE_TARGETS},
-                 "harness_sha256": {"base": lane_base_digest, "head": "e" * 64}}
+        if egress_base_listing is None:
+            egress_base_listing = egress_base_declared
+        kernel = kernel_configuration(state, base_digest)
+        lanes = lane_configuration(lane_state, lane_base_digest)
         real_bounded = bench._bounded
         self.kernel_calls = []
 
@@ -794,15 +883,15 @@ class KernelStageExecutionTests(unittest.TestCase):
                     listing += f"{bench.KERNEL_TEST}: test\n"
                 if lane_base_listing if side == "base" else True:
                     listing += "".join(f"{test}: test\n" for test in bench.LANE_TESTS.values())
+                if egress_base_listing if side == "base" else True:
+                    listing += f"{bench.EGRESS_TEST}: test\n"
                 code = "print(" + repr(listing) + ")"
             elif label.endswith("-run"):
                 if label == f"{side}-run":
                     report = results.get(side)
                 else:
                     report = lane_results.get(side, {}).get(label[len(side) + 1:-len("-run")])
-                code = "pass" if report is None else (
-                    "import os; open(os.environ[" + repr(bench.KERNEL_RESULT_ENV) + "], 'x').write("
-                    + repr(json.dumps(report)) + ")")
+                code = report_process_code(report)
             else:
                 raise AssertionError(f"unexpected kernel process: {label}")
             return real_bounded([sys.executable, "-c", code], working, label, seconds, deadline, env)
@@ -819,9 +908,12 @@ class KernelStageExecutionTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(bench, "resolve_commit", side_effect=lambda _root, revision: revision))
             stack.enter_context(mock.patch.object(bench, "_configuration", return_value=configuration))
             stack.enter_context(mock.patch.object(
-                bench, "_measure", side_effect=lambda _root, revision, *_args, **_kwargs: self.pure_envelope(revision)))
+                bench, "_measure", side_effect=lambda _root, revision, *_args, **_kwargs: pure_envelope(revision)))
             stack.enter_context(mock.patch.object(bench, "_kernel_configuration", return_value=kernel))
             stack.enter_context(mock.patch.object(bench, "_lane_configuration", return_value=lanes))
+            stack.enter_context(mock.patch.object(
+                bench, "_egress_configuration",
+                return_value=egress_configuration(egress_base_declared)))
             stack.enter_context(mock.patch.object(bench, "_prepare_tree", side_effect=prepare))
             stack.enter_context(mock.patch.object(bench, "_bounded", side_effect=bounded))
             report = bench.run_comparison(BASE, HEAD, output, root=ROOT, work=work)
@@ -975,6 +1067,78 @@ class KernelStageExecutionTests(unittest.TestCase):
                 self.assertIn(message, " ".join(report["errors"]))
                 self.assertNotIn("lanes", report)
 
+    def test_pending_egress_over_a_base_without_it_is_measured_and_informational(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report, output = self.run_stage(directory)
+            self.assertEqual(report["status"], "passed", report["errors"])
+            egress = report["static_egress"]
+            self.assertEqual(
+                (egress["state"], egress["target"], egress["base"], egress["status"],
+                 egress["blocking"], egress["errors"]),
+                ("pending", "static_egress", "absent", "informational", False, []))
+            self.assertEqual(egress["head"],
+                             lane_result("static_egress")["targets"][0]["allocation_samples"][0])
+            self.assertNotIn("comparison", egress)
+            self.assertTrue((output / "head.static_egress.kernel.json").is_file())
+            self.assertTrue((output / "head.static_egress.kernel.raw.json").is_file())
+            self.assertFalse((output / "base.static_egress.kernel.json").exists())
+            for side, listed in (("base", False), ("head", True)):
+                build = json.loads((output / f"{side}-kernel" / "build.json").read_text(encoding="utf-8"))
+                self.assertEqual(build["egress_listed"], listed)
+
+    def test_pending_egress_growth_over_a_declaring_base_is_reported_without_blocking(self):
+        for delta, comparison in ((0, "passed"), (-1, "passed"), (1, "failed")):
+            with self.subTest(delta=delta), tempfile.TemporaryDirectory() as directory:
+                head = lane_results_by_target()
+                head["static_egress"] = lane_result("static_egress", 25000 + delta)
+                # The lanes stay enforced while static egress is pending.
+                report, output = self.run_stage(
+                    directory, lane_state="enforced", lane_base_digest="e" * 64,
+                    egress_base_declared=True,
+                    lane_results={"base": lane_results_by_target(), "head": head})
+                self.assertEqual(report["status"], "passed", report["errors"])
+                self.assertEqual(report["lanes"]["status"], "passed")
+                egress = report["static_egress"]
+                self.assertEqual((egress["base"], egress["status"], egress["blocking"]),
+                                 ("measured", "informational", False))
+                self.assertEqual(egress["comparison"]["status"], comparison)
+                self.assertEqual(egress["comparison"]["growth"]["allocations"], delta)
+                self.assertTrue((output / "base.static_egress.kernel.json").is_file())
+
+    def test_egress_discovery_that_disagrees_with_the_source_wiring_fails(self):
+        for options in ({"egress_base_listing": True},
+                        {"lane_base_digest": "e" * 64, "egress_base_declared": True,
+                         "egress_base_listing": False}):
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as directory:
+                report, _ = self.run_stage(directory, **options)
+                self.assertEqual(report["status"], "failed")
+                self.assertIn("static egress benchmark test discovery", " ".join(report["errors"]))
+                self.assertNotIn("static_egress", report)
+
+    def test_egress_crash_timeout_missing_or_mislabelled_report_fails(self):
+        def head(report):
+            return {"base": lane_results_by_target(),
+                    "head": {**lane_results_by_target(), "static_egress": report}}
+
+        cases = (
+            ({"failures": {"head:head-static_egress-run": "crash"}}, "exit code 23"),
+            ({"failures": {"head:head-static_egress-run": "timeout"}}, "runtime bound"),
+            ({"failures": {"base:base-static_egress-run": "crash"}, "lane_base_digest": "e" * 64,
+              "egress_base_declared": True}, "exit code 23"),
+            ({"lane_results": head(None)}, ""),
+            ({"lane_results": head(lane_result("rate_lane"))}, "schema order"),
+            ({"lane_results": head(lane_result("static_egress", regression=True))},
+             "fixture marker"),
+        )
+        for options, message in cases:
+            with self.subTest(options=sorted(options)), tempfile.TemporaryDirectory() as directory:
+                report, output = self.run_stage(directory, **options)
+                self.assertEqual(report["status"], "failed")
+                self.assertTrue(report["errors"])
+                self.assertIn(message, " ".join(report["errors"]))
+                self.assertNotIn("static_egress", report)
+                self.assertFalse((output / "head.static_egress.kernel.json").exists())
+
     def test_kernel_failure_after_a_passing_pure_comparison_cannot_pass(self):
         with tempfile.TemporaryDirectory() as directory:
             with mock.patch.object(bench, "_kernel_stage", side_effect=ValueError("kernel unavailable")):
@@ -984,12 +1148,120 @@ class KernelStageExecutionTests(unittest.TestCase):
                     stack.enter_context(mock.patch.object(bench, "resolve_commit", side_effect=lambda _root, revision: revision))
                     stack.enter_context(mock.patch.object(bench, "_configuration", return_value=configuration))
                     stack.enter_context(mock.patch.object(
-                        bench, "_measure", side_effect=lambda _root, revision, *_a, **_k: self.pure_envelope(revision)))
+                        bench, "_measure", side_effect=lambda _root, revision, *_a, **_k: pure_envelope(revision)))
                     report = bench.run_comparison(BASE, HEAD, Path(directory) / "out", root=ROOT,
                                                   work=Path(directory) / "work")
             self.assertEqual(report["status"], "failed")
             self.assertEqual([target["status"] for target in report["targets"]], ["passed"] * 4)
             self.assertIn("kernel unavailable", report["errors"])
+
+
+class SelfTestExecutionTests(unittest.TestCase):
+    """The self-test's gateway-binary stages, with real child processes
+    standing in for Cargo, libtest discovery and each benchmark test."""
+
+    def run_self_test(self, directory, reports=None):
+        """`reports` overrides the report one run of one target writes, keyed
+        by (base|regression|neutral, target)."""
+        directory = Path(directory)
+        output, work = directory / "self-test", directory / "work"
+        executable = work / "cargo-target" / "debug" / "deps" / "gateway-test"
+        reports = reports or {}
+        real_bounded = bench._bounded
+
+        def report_for(run, target):
+            if (run, target) in reports:
+                return reports[(run, target)]
+            fixture = run == "regression"
+            if target == "http_policy":
+                return kernel_result(41700 + (1700 if fixture else 0), fixture)
+            cases = LANE_CASES[target]
+            return lane_result(target, cases * 1000 + (cases * 100 if fixture else 0), fixture)
+
+        def bounded(_command, working, label, _seconds, deadline, env=None, cwd=None, max_bytes=None):
+            if label == "clean":
+                code = "pass"
+            elif label == "build":
+                code = build_process_code(executable)
+            elif label == "list":
+                tests = (bench.KERNEL_TEST, *bench.LANE_HARNESS_TESTS.values())
+                code = "print(" + repr("".join(f"{test}: test\n" for test in tests)) + ")"
+            elif label.endswith("-run"):
+                run, _, target = label[:-len("-run")].partition("-")
+                fixture = env.get(bench.KERNEL_REGRESSION_ENV) == "1"
+                if fixture != (run == "regression"):
+                    raise AssertionError(f"{label}: fixture switch differs from the run")
+                code = report_process_code(report_for(run, target or "http_policy"))
+            else:
+                raise AssertionError(f"unexpected kernel process: {label}")
+            return real_bounded([sys.executable, "-c", code], working, label, 2, deadline, env)
+
+        def prepare(_root, _revision, tree, _ui_source, _deadline):
+            tree.mkdir(parents=True, exist_ok=True)
+            executable.parent.mkdir(parents=True, exist_ok=True)
+            executable.write_bytes(b"fixture executable")
+
+        def measure(_root, revision, _label, *_args, regression=False, **_kwargs):
+            value = pure_envelope(revision)
+            if regression:
+                value["regression_fixture"] = True
+                for target in value["result"]["targets"]:
+                    for sample in target["allocation_samples"]:
+                        sample["allocations"] += target["operations_per_iteration"] * 1000
+            return value
+
+        configuration = (sys.executable, harness(), budget(),
+                         {**context(), "budget": budget(), "proposed_budget": budget()})
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(bench, "resolve_commit", side_effect=lambda _root, revision: revision))
+            stack.enter_context(mock.patch.object(bench, "_configuration", return_value=configuration))
+            stack.enter_context(mock.patch.object(bench, "_measure", side_effect=measure))
+            stack.enter_context(mock.patch.object(
+                bench, "_kernel_configuration", return_value=kernel_configuration("enforced", "f" * 64)))
+            stack.enter_context(mock.patch.object(
+                bench, "_lane_configuration", return_value=lane_configuration("enforced", "e" * 64)))
+            stack.enter_context(mock.patch.object(
+                bench, "_egress_configuration", return_value=egress_configuration(True)))
+            stack.enter_context(mock.patch.object(bench, "_prepare_tree", side_effect=prepare))
+            stack.enter_context(mock.patch.object(bench, "_bounded", side_effect=bounded))
+            summary = bench.self_test(HEAD, output, root=ROOT, work=work)
+        self.assertEqual(json.loads((output / "summary.json").read_text(encoding="utf-8")), summary)
+        return summary, output
+
+    def test_neutral_rebuild_passes_and_every_fixture_fails_including_static_egress(self):
+        with tempfile.TemporaryDirectory() as directory:
+            summary, output = self.run_self_test(directory)
+            self.assertEqual(summary["status"], "passed", summary["errors"])
+            self.assertEqual(summary["egress_neutral"]["status"], "passed")
+            self.assertEqual(summary["egress_regression"]["status"], "failed")
+            self.assertTrue(summary["egress_regression"]["deliberate_fixture"])
+            self.assertEqual(summary["egress_regression"]["growth"]["allocations"], 2500)
+            for name in ("egress-neutral-comparison.json", "egress-regression-comparison.json",
+                         "base.static_egress.kernel.json", "regression.static_egress.kernel.json",
+                         "neutral.static_egress.kernel.json"):
+                self.assertTrue((output / name).is_file(), name)
+            self.assertEqual([entry["id"] for entry in summary["lane_neutral"]],
+                             ["tool_policy", "rate_lane"])
+
+    def test_undetected_egress_fixture_or_neutral_growth_fails(self):
+        cases = {
+            "fixture without growth": {("regression", "static_egress"):
+                                       lane_result("static_egress", 25000, regression=True)},
+            "neutral growth": {("neutral", "static_egress"): lane_result("static_egress", 25001)},
+        }
+        for name, reports in cases.items():
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as directory:
+                summary, _ = self.run_self_test(directory, reports)
+                self.assertEqual(summary["status"], "failed")
+                self.assertIn("not detected correctly", " ".join(summary["errors"]))
+                self.assertNotIn("egress_neutral", summary)
+
+    def test_missing_egress_report_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            summary, output = self.run_self_test(directory, {("neutral", "static_egress"): None})
+            self.assertEqual(summary["status"], "failed")
+            self.assertTrue(summary["errors"])
+            self.assertFalse((output / "neutral.static_egress.kernel.json").exists())
 
 
 if __name__ == "__main__":
