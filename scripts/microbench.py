@@ -5,8 +5,10 @@ The head-owned pure-path benchmark is compiled against both immutable Git
 revisions. Its SHA-256 and zero-growth budgets are owned by the base revision.
 The authoritative HTTP policy decision, and the tool-admission and rate-lane
 decisions, are measured inside each revision's own gateway test binary, whose
-benchmark digests the budget approves in the same way. Timings describe this
-runner; only stable allocation counts and allocated bytes block the gate.
+benchmark digests the budget approves in the same way. The static egress
+decision is measured in the same binaries but no budget lists it yet, so it
+never blocks. Timings describe this runner; only stable allocation counts and
+allocated bytes block the gate.
 """
 from __future__ import annotations
 
@@ -94,7 +96,18 @@ LANE_METADATA = {
     "rate_lane": {"input_cases": 14, "input_bytes": 830, "operations_per_iteration": 14,
                   "expected_checksum": 1400},
 }
-KERNEL_TARGET_METADATA = {KERNEL_TARGET: KERNEL_METADATA, **LANE_METADATA}
+# The static egress decision is a test in the same lane harness, added after
+# the tool and rate lanes, so a lane harness without it is still valid. No
+# budget schema lists it: it is pending wherever a revision declares it.
+EGRESS_TARGET = "static_egress"
+EGRESS_FUNCTION = "static_egress_evaluation"
+EGRESS_TEST = "policy_benchmark::lane_benchmark::" + EGRESS_FUNCTION
+# Part of the kernel protocol, like LANE_METADATA.
+EGRESS_METADATA = {"input_cases": 25, "input_bytes": 550, "operations_per_iteration": 25,
+                   "expected_checksum": 2500}
+LANE_HARNESS_TESTS = {**LANE_TESTS, EGRESS_TARGET: EGRESS_TEST}
+KERNEL_TARGET_METADATA = {KERNEL_TARGET: KERNEL_METADATA, **LANE_METADATA,
+                          EGRESS_TARGET: EGRESS_METADATA}
 CARGO_ARGUMENTS = ["test", "-p", "gateway", "--bin", "gateway", "--locked", "--no-run",
                    "--message-format=json"]
 # Cargo's default test profile, without debug info: allocation behaviour is
@@ -686,6 +699,25 @@ def lane_wiring(harness_source):
     return True
 
 
+def egress_wiring(lane_source):
+    """Whether the lane harness declares the static egress benchmark test.
+
+    False only when nothing names the test: the lane harness predates it. Any
+    other mention, a second declaration or a nested one is an error. The built
+    binary's discovery must then agree, so an attribute that disables, renames
+    or un-ignores the test fails the run instead of skipping the target.
+    """
+    masked = mask_rust(lane_source)
+    depths = _depths(masked)
+    mentions = list(re.finditer(r"\b" + EGRESS_FUNCTION + r"\b", masked))
+    if not mentions:
+        return False
+    declarations = list(re.finditer(r"\bfn\s+" + EGRESS_FUNCTION + r"\s*\(", masked))
+    if len(mentions) != 1 or len(declarations) != 1 or depths[declarations[0].start()] != 0:
+        raise ValueError("static egress benchmark test is not one top-level function")
+    return True
+
+
 def repo_root():
     result = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True,
                             text=True, timeout=10, check=True)
@@ -1027,6 +1059,29 @@ def _lane_configuration(root, base, head, output, context):
     return lanes
 
 
+def _egress_configuration(root, base, head, output, lanes):
+    """Adoption state and test wiring of the static egress target.
+
+    The test lives in the lane harness, whose digests `_lane_configuration`
+    has already checked against the governing budgets. No budget schema lists
+    the target, so it is `pending`: measured on each revision whose lane
+    harness declares it, reported, never blocking. The head must declare it; a
+    base may predate it. Budgeting it is a later, reviewed schema change.
+    """
+    declared = {}
+    for label, revision in (("base", base), ("head", head)):
+        declared[label] = (lanes["harness_sha256"][label] is not None
+                           and egress_wiring(_blob(root, revision, LANE_HARNESS_PATH)))
+    if not declared["head"]:
+        raise ValueError("head revision lacks the static egress benchmark test")
+    egress = {"state": "pending", "target": EGRESS_TARGET, "test": EGRESS_TEST,
+              "budget": {"id": EGRESS_TARGET, "max_allocation_growth": 0,
+                         "max_allocated_bytes_growth": 0},
+              "declared": declared}
+    _write_json(output / "egress-context.json", egress)
+    return egress
+
+
 def _extract(root, revision, destination, deadline, paths=()):
     """Write a revision's committed files, or the named subset, into `destination`."""
     if not hasattr(tarfile, "data_filter"):
@@ -1105,8 +1160,8 @@ def _file_digest(path):
     return digest.hexdigest()
 
 
-def _build_kernel(root, revision, label, output, compiler, kernel, digest, lane_digest, work,
-                  deadline):
+def _build_kernel(root, revision, label, output, compiler, kernel, digest, lane_digest,
+                  egress_declared, work, deadline):
     """Build one revision's gateway test binary and check discovery of every
     benchmark test against its source wiring. Returns the binary, environment
     and log directory."""
@@ -1133,9 +1188,9 @@ def _build_kernel(root, revision, label, output, compiler, kernel, digest, lane_
     binary.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(built, binary)
     # Exact matching avoids libtest's successful zero-test behaviour.
-    listing, _ = _bounded([str(binary), KERNEL_TEST, *LANE_TESTS.values(), "--exact", "--ignored",
-                           "--list"], directory, "list", KERNEL_PROCESS_SECONDS, deadline,
-                          environment)
+    listing, _ = _bounded([str(binary), KERNEL_TEST, *LANE_HARNESS_TESTS.values(), "--exact",
+                           "--ignored", "--list"], directory, "list", KERNEL_PROCESS_SECONDS,
+                          deadline, environment)
     lines = listing.splitlines()
     listed = lines.count(KERNEL_TEST + ": test")
     if listed != (0 if digest is None else 1):
@@ -1143,10 +1198,15 @@ def _build_kernel(root, revision, label, output, compiler, kernel, digest, lane_
     lanes_listed = {target: lines.count(test + ": test") for target, test in LANE_TESTS.items()}
     if any(count != (0 if lane_digest is None else 1) for count in lanes_listed.values()):
         raise ValueError(f"{label}: lane benchmark test discovery disagrees with its source wiring")
+    egress_listed = lines.count(EGRESS_TEST + ": test")
+    if egress_listed != (1 if egress_declared else 0):
+        raise ValueError(f"{label}: static egress benchmark test discovery disagrees with its "
+                         "source wiring")
     _write_json(directory / "build.json", {
         "revision": revision, "harness_sha256": digest, "listed": listed == 1,
         "lane_harness_sha256": lane_digest,
         "lanes_listed": {target: count == 1 for target, count in lanes_listed.items()},
+        "egress_listed": egress_listed == 1,
         "command": command, "cargo_env": CARGO_PROFILE_ENV, "tree": str(tree),
         "ui_source": kernel["ui_source"], "ui_build_inputs": kernel["ui_build_inputs"],
         "build_seconds": build_seconds, "binary_sha256": _file_digest(binary)})
@@ -1159,7 +1219,8 @@ def _run_kernel(binary, environment, directory, label, revision, digest, kernel,
     if target == KERNEL_TARGET:
         test, stem, process = KERNEL_TEST, label, label + "-run"
     else:
-        test, stem, process = LANE_TESTS[target], f"{label}.{target}", f"{label}-{target}-run"
+        test, stem, process = (LANE_HARNESS_TESTS[target], f"{label}.{target}",
+                               f"{label}-{target}-run")
     result_path = directory / (stem + ".result.json")
     if result_path.exists():
         raise ValueError("kernel result path is not fresh")
@@ -1215,11 +1276,24 @@ def _lane_report(lanes, before, after):
     return report
 
 
+def _egress_report(egress, before, after):
+    """The static egress stage's result. Pending, it is informational: a base
+    that declares the test is compared and the comparison reported, and
+    nothing blocks."""
+    report = {"state": egress["state"], "target": EGRESS_TARGET, "blocking": False,
+              "status": "informational", "base": "absent" if before is None else "measured",
+              "head": after["result"]["targets"][0]["allocation_samples"][0], "errors": []}
+    if before is not None:
+        report["comparison"] = compare_kernel_results(before, after, egress["budget"])
+    return report
+
+
 def _kernel_stage(root, base, head, output, compiler, context, work, deadline):
-    """Measure http_policy and the lane targets in each revision's own binary.
-    Returns the http_policy report and the lane report."""
+    """Measure http_policy, the lane targets and static egress in each
+    revision's own binary. Returns the http_policy, lane and egress reports."""
     kernel = _kernel_configuration(root, base, head, output, compiler, context, deadline)
     lanes = _lane_configuration(root, base, head, output, context)
+    egress = _egress_configuration(root, base, head, output, lanes)
     digests, lane_digests = kernel["harness_sha256"], lanes["harness_sha256"]
     report = {"state": kernel["state"], "target": KERNEL_TARGET,
               "blocking": kernel["state"] == "enforced", "status": "failed", "base": "absent",
@@ -1228,8 +1302,8 @@ def _kernel_stage(root, base, head, output, compiler, context, work, deadline):
     # record the same two-build cost as an enforced comparison, and discovery
     # proves the test is really absent rather than trusting the source scan.
     binary, environment, directory = _build_kernel(root, base, "base", output, compiler, kernel,
-                                                   digests["base"], lane_digests["base"], work,
-                                                   deadline)
+                                                   digests["base"], lane_digests["base"],
+                                                   egress["declared"]["base"], work, deadline)
     before = None
     if digests["base"] is not None:
         before = _run_kernel(binary, environment, directory, "base", base, digests["base"], kernel,
@@ -1237,18 +1311,26 @@ def _kernel_stage(root, base, head, output, compiler, context, work, deadline):
         report["base"] = "measured"
     lanes_before = _run_lanes(binary, environment, directory, "base", base, lane_digests["base"],
                               kernel, output, deadline)
+    egress_before = None
+    if egress["declared"]["base"]:
+        egress_before = _run_kernel(binary, environment, directory, "base", base,
+                                    lane_digests["base"], kernel, output, deadline,
+                                    target=EGRESS_TARGET)
     binary, environment, directory = _build_kernel(root, head, "head", output, compiler, kernel,
-                                                   digests["head"], lane_digests["head"], work,
-                                                   deadline)
+                                                   digests["head"], lane_digests["head"],
+                                                   egress["declared"]["head"], work, deadline)
     after = _run_kernel(binary, environment, directory, "head", head, digests["head"], kernel,
                         output, deadline)
     lanes_after = _run_lanes(binary, environment, directory, "head", head, lane_digests["head"],
                              kernel, output, deadline)
+    egress_after = _run_kernel(binary, environment, directory, "head", head, lane_digests["head"],
+                               kernel, output, deadline, target=EGRESS_TARGET)
     report["head"] = after["result"]["targets"][0]["allocation_samples"][0]
     lane_report = _lane_report(lanes, lanes_before, lanes_after)
+    egress_report = _egress_report(egress, egress_before, egress_after)
     if before is None:
         report["status"] = "informational"
-        return report, lane_report
+        return report, lane_report, egress_report
     comparison = compare_kernel_results(before, after, kernel["budget"])
     report["comparison"] = comparison
     if not report["blocking"]:
@@ -1257,7 +1339,7 @@ def _kernel_stage(root, base, head, output, compiler, context, work, deadline):
         report["status"] = "passed"
     else:
         report["errors"].append("http_policy: allocation growth exceeds the base-owned budget")
-    return report, lane_report
+    return report, lane_report, egress_report
 
 
 def run_comparison(base, head, output, root=None, work=None):
@@ -1277,10 +1359,12 @@ def run_comparison(base, head, output, root=None, work=None):
         summary["context"] = context
         if time.monotonic() > pure_deadline:
             raise RuntimeError("pure-path comparison exceeded its runtime budget")
-        kernel, lanes = _kernel_stage(root, base, head, output, compiler, context, work, deadline)
+        kernel, lanes, egress = _kernel_stage(root, base, head, output, compiler, context, work,
+                                              deadline)
         summary["kernel"] = kernel
         summary["lanes"] = lanes
-        for stage in (kernel, lanes):
+        summary["static_egress"] = egress
+        for stage in (kernel, lanes, egress):
             if stage["status"] == "failed":
                 summary["status"] = "failed"
                 summary["errors"].extend(stage["errors"])
@@ -1320,14 +1404,16 @@ def self_test(revision, output, root=None, work=None):
             raise RuntimeError("pure-path self-test exceeded its runtime budget")
         # The kernel's neutral side is an independent build of the same revision
         # in another tree; its regression is the baseline binary run with the
-        # fixture switch, which the report must echo. The lanes run in the same
-        # binaries, the same way.
+        # fixture switch, which the report must echo. The lanes and static
+        # egress run in the same binaries, the same way.
         kernel = _kernel_configuration(root, revision, revision, output, compiler, context, deadline)
         lanes = _lane_configuration(root, revision, revision, output, context)
+        egress = _egress_configuration(root, revision, revision, output, lanes)
         digest = kernel["harness_sha256"]["head"]
         lane_digest = lanes["harness_sha256"]["head"]
         binary, environment, directory = _build_kernel(root, revision, "base", output, compiler,
-                                                       kernel, digest, lane_digest, work, deadline)
+                                                       kernel, digest, lane_digest,
+                                                       egress["declared"]["head"], work, deadline)
         kernel_baseline = _run_kernel(binary, environment, directory, "base", revision, digest,
                                       kernel, output, deadline)
         kernel_fixture = _run_kernel(binary, environment, directory, "regression", revision, digest,
@@ -1336,12 +1422,20 @@ def self_test(revision, output, root=None, work=None):
                                    kernel, output, deadline)
         lane_fixture = _run_lanes(binary, environment, directory, "regression", revision,
                                   lane_digest, kernel, output, deadline, regression=True)
+        egress_baseline = _run_kernel(binary, environment, directory, "base", revision,
+                                      lane_digest, kernel, output, deadline, target=EGRESS_TARGET)
+        egress_fixture = _run_kernel(binary, environment, directory, "regression", revision,
+                                     lane_digest, kernel, output, deadline, regression=True,
+                                     target=EGRESS_TARGET)
         binary, environment, directory = _build_kernel(root, revision, "neutral", output, compiler,
-                                                       kernel, digest, lane_digest, work, deadline)
+                                                       kernel, digest, lane_digest,
+                                                       egress["declared"]["head"], work, deadline)
         kernel_neutral = _run_kernel(binary, environment, directory, "neutral", revision, digest,
                                      kernel, output, deadline)
         lane_neutral = _run_lanes(binary, environment, directory, "neutral", revision, lane_digest,
                                   kernel, output, deadline)
+        egress_neutral = _run_kernel(binary, environment, directory, "neutral", revision,
+                                     lane_digest, kernel, output, deadline, target=EGRESS_TARGET)
         kernel_neutral_report = compare_kernel_results(kernel_baseline, kernel_neutral, kernel["budget"])
         kernel_regression_report = compare_kernel_results(kernel_baseline, kernel_fixture,
                                                           kernel["budget"], regression_head=True)
@@ -1355,21 +1449,34 @@ def self_test(revision, output, root=None, work=None):
                                                     limit, regression_head=True)
             fixture_report["deliberate_fixture"] = True
             lane_regression_reports.append(fixture_report)
+        # Pending, static egress has no budget entry; its self-test holds it to
+        # the zero-growth limit a budget would set.
+        egress_neutral_report = compare_kernel_results(egress_baseline, egress_neutral,
+                                                       egress["budget"])
+        egress_regression_report = compare_kernel_results(egress_baseline, egress_fixture,
+                                                          egress["budget"], regression_head=True)
+        egress_regression_report["deliberate_fixture"] = True
         _write_json(output / "kernel-neutral-comparison.json", kernel_neutral_report)
         _write_json(output / "kernel-regression-comparison.json", kernel_regression_report)
         _write_json(output / "lane-neutral-comparison.json", lane_neutral_reports)
         _write_json(output / "lane-regression-comparison.json", lane_regression_reports)
+        _write_json(output / "egress-neutral-comparison.json", egress_neutral_report)
+        _write_json(output / "egress-regression-comparison.json", egress_regression_report)
         if (neutral_report["status"] != "passed" or regression_report["status"] != "failed"
                 or kernel_neutral_report["status"] != "passed"
                 or kernel_regression_report["status"] != "failed"
                 or any(entry["status"] != "passed" for entry in lane_neutral_reports)
-                or any(entry["status"] != "failed" for entry in lane_regression_reports)):
+                or any(entry["status"] != "failed" for entry in lane_regression_reports)
+                or egress_neutral_report["status"] != "passed"
+                or egress_regression_report["status"] != "failed"):
             raise ValueError("neutral rebuild or deliberate allocation regression was not detected correctly")
         summary.update({"status": "passed", "neutral": neutral_report, "regression": regression_report,
                         "kernel_neutral": kernel_neutral_report,
                         "kernel_regression": kernel_regression_report,
                         "lane_neutral": lane_neutral_reports,
-                        "lane_regression": lane_regression_reports, "context": context})
+                        "lane_regression": lane_regression_reports,
+                        "egress_neutral": egress_neutral_report,
+                        "egress_regression": egress_regression_report, "context": context})
     except (ValueError, RuntimeError, OSError, subprocess.SubprocessError, UnicodeError, KeyError) as error:
         summary["status"] = "failed"
         summary["errors"].append(str(error))
