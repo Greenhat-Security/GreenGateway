@@ -38,7 +38,9 @@ use crate::{
     metrics::{
         LOCK_POISON_RECOVERIES_TOTAL, RATE_LIMIT_BUCKETS, RATE_LIMIT_BUCKET_EVICTIONS_TOTAL,
     },
-    middleware::rbac::{pinned_policy_snapshot, refuse_unevaluated, RbacPolicyState},
+    middleware::rbac::{
+        pinned_policy_snapshot, refuse_unevaluated, RbacPolicyState, RecordedRefusal,
+    },
     path_match::is_unsafe_request_path,
     policy_eval::{
         EvaluationError, HostFact, HttpTarget, Limitation, PolicyEvaluationContext, PrincipalFact,
@@ -659,13 +661,15 @@ impl RateLaneRefused {
     /// request it does not evaluate, after a bounded warning for an evaluator
     /// refusal. An unsafe path is not warned about here, because the
     /// authorization stage does not warn about one either; its audit record is
-    /// the same.
+    /// the same. The refusal comes back recorded but unanswered: the caller
+    /// answers it with [`RecordedRefusal::answer`], which waits for its record
+    /// under required audit durability (issue #425).
     fn respond(
         self,
         req: &Request,
         principal: &auth::Principal,
         client_ip_policy: &ClientIpPolicy,
-    ) -> Response {
+    ) -> RecordedRefusal {
         if self.refusal != RateLaneRefusal::UnsafePath {
             tracing::warn!(
                 reason = self.refusal.reason(),
@@ -784,7 +788,10 @@ pub async fn policy_rate_limit_request(
     let matched = match selection {
         Ok(Some(matched)) => matched,
         Ok(None) => return next.run(req).await,
-        Err(refused) => return refused.respond(&req, principal, &state.client_ip_policy),
+        Err(refused) => {
+            let refusal = refused.respond(&req, principal, &state.client_ip_policy);
+            return refusal.answer().await;
+        }
     };
     let key = principal_rate_limit_key(principal);
     let shared = state.shared_policy_gate(&matched, &key);

@@ -68,23 +68,30 @@ below have no application labels; scrape labels identify the replica.
 | --- | --- | --- |
 | `greengateway_gateway_ready`, `greengateway_gateway_draining` | [Lifecycle](../../gateway/src/lifecycle.rs), at construction, transitions and scrape. `(0,0)` means starting, `(1,0)` lifecycle ready, `(0,1)` draining. | Lifecycle ready does **not** mean the authority, security gate or required upstream is ready. |
 | `greengateway_audit_queue_depth`, `greengateway_audit_queue_capacity`, `greengateway_audit_queue_oldest_age_seconds` | [Audit writer](../../gateway/src/audit/mod.rs), sampled on scrape. Includes queued work and asynchronous sink backlog; oldest age also captures an in-flight delivery stuck with an empty channel. | Queue capacity depends on the configured sink. Use the exported capacity, not a hard-coded event count. |
-| `audit_events_dropped_total{reason=...}` | Audit admission and sink delivery failures; `reason` is a fixed classification. | A loss counter, not a recoverable backlog. Lazy series and process restarts limit what a scrape sees. |
-| `greengateway_audit_flush_total{outcome="failure"}` | Audit sink flush failures, including terminal flush. | Failure requires investigation; the rule does not identify which records remain durable. A process may exit before its final counter is scraped. |
+| `audit_events_dropped_total{reason=...}` | Audit admission and sink delivery failures; `reason` is a fixed classification. Every `reason` is exported at `0` from startup (`postgres` only in cluster mode). | A loss counter, not a recoverable backlog. Process restarts limit what a scrape sees. |
+| `greengateway_audit_flush_total{outcome="failure"}` | Audit sink flush failures, including terminal flush. Exported at `0` from startup. | Failure requires investigation; the rule does not identify which records remain durable. A process may exit before its final counter is scraped. |
 | `greengateway_database_pool_size`, `greengateway_database_pool_available`, `greengateway_database_pool_waiting` | [PostgreSQL pool](../../gateway/src/storage/postgres.rs), sampled on scrape when a database pool exists. | Cluster mode only; momentary snapshots can miss short exhaustion bursts. |
-| `greengateway_database_pool_timeouts_total` | Classified pool checkout timeouts since boot. | Lazy counter; no series before the first observed timeout is normal. |
+| `greengateway_database_pool_timeouts_total` | Classified pool checkout timeouts since boot. | Cluster mode only; exported at `0` from startup. |
 | `greengateway_schema_compatible` | [Migration validation](../../gateway/src/storage/migrations.rs) and [readiness](../../gateway/src/ha_status.rs): `1` means a compatible, integrity-checked ledger, `0` means incompatible. | A stopped readiness probe leaves the last verdict exported. A startup refusal may happen before a metrics listener exists. |
 | `greengateway_cluster_heartbeat_age_seconds`, `greengateway_cluster_config_mismatch` | [Membership](../../gateway/src/cluster_membership.rs), at registration and after heartbeat attempts. Age is seconds since the last successful heartbeat; mismatch is `1` until sticky agreement. | A stopped task can leave a frozen value while metrics scraping succeeds. Drain intentionally stops background work. |
 | `greengateway_security_revision_lag` | [Security reconciler](../../gateway/src/security_cluster.rs), after background passes. Difference between observed and compiled watermarks, bounded below by zero. | Optional runtime; neither zero nor nonzero lag proves readiness. Failed counter reads can leave equal watermarks; frequent legitimate commits can sustain lag while admissions succeed. |
-| `greengateway_authority_event_capacity_refusals_total`, `greengateway_authority_event_evidence_failures_total` | [Journal append](../../gateway/src/storage/postgres_authority_events.rs) and each evidence producer, on the replica that refused the change. A Connection delete, service-token rotate or revoke, or JWT revoke whose evidence row or journal entry cannot commit rolls back whole and is refused: the first counter counts a full journal, the second any other refused or failed evidence statement. | Cluster mode only; lazy counters. A failure of the transaction's own `COMMIT` is the mutation's failure and is counted by neither. Admin-session evidence is not journaled and not counted. |
+| `greengateway_authority_event_capacity_refusals_total`, `greengateway_authority_event_evidence_failures_total` | [Journal append](../../gateway/src/storage/postgres_authority_events.rs) and each evidence producer, on the replica that refused the change. A Connection delete, service-token rotate or revoke, or JWT revoke whose evidence row or journal entry cannot commit rolls back whole and is refused: the first counter counts a full journal, the second any other refused or failed evidence statement. | Cluster mode only; both exported at `0` from startup. A failure of the transaction's own `COMMIT` is the mutation's failure and is counted by neither. Admin-session evidence and migration 23's policy, tools and catalog change evidence are not journaled and not counted. |
 | `greengateway_authority_event_journal_retained`, `_capacity`, `_oldest_undelivered_age_seconds` | [Journal statistics](../../gateway/src/authority_events/dispatcher.rs), published by the maintenance leader after every successful retention step and by the dispatcher's leader after every step. | One shared table, so a reading says nothing about the replica exporting it, and a former leader keeps exporting its last reading. Without `AUTHORITY_EVENT_SINK` every retained event counts as undelivered. |
 | `greengateway_cluster_maintenance_leader`, `greengateway_leader_task_last_success_age_seconds{task="authority_event_retention"}` | [Maintenance singleton](../../gateway/src/cluster_maintenance.rs): `1` on the replica holding the maintenance lease and `0` after its term; on that leader, how long ago the retention job last succeeded according to the fenced ledger. | Leader-only, and a job that never succeeded has no age series. They say which journal reading is current, not whether the journal is healthy. |
 | `greengateway_authority_event_delivery_failures_total{kind}`, `greengateway_cluster_lease_age_seconds{scope="authority_event_dispatcher"}` | [Dispatcher](../../gateway/src/authority_events/dispatcher.rs): failed steps by a fixed `kind`, and how long this replica has held the dispatcher lease (`0` after its term). Only a replica with `AUTHORITY_EVENT_SINK` set ever creates either series. | Lazy; their presence is how the rules tell a configured sink from none. `kind="fenced"` is a leadership handover, not a failed delivery. |
 | `up{job="greengateway"}`, `greengateway_monitoring:target_expected` | Scrape success and separately maintained target inventory. | Scrape success is transport evidence. Inventory is operator intent, not application telemetry. |
 
-Counter series are created on their first event. Absence of a failure counter is
-not itself a failure, and `increase(...[5m])` needs enough samples to observe a
-change. An event before the first scrape, a short-lived process or a failure
-during shutdown can escape a counter-based rule. Use retained, access-controlled
+Every counter a single-event rule reads (audit loss, audit flush failure, pool
+timeout and both authority refusals) is exported at `0` as soon as the metrics
+recorder is installed, with every label value the rule can match. A counter
+series that first appeared at `1` would have no earlier sample, and
+`increase(...[5m])` cannot see a change without one: the first event after a
+process start, often the only one, would never page. Other counters, such as
+the dispatcher's failure series, are still created on their first event, and
+an absent failure counter is not itself a failure. `increase(...[5m])` also
+needs enough samples to observe a change: an event before the first scrape, a
+short-lived process or a failure during shutdown can escape a counter-based
+rule. Use retained, access-controlled
 logs and durable audit reconciliation alongside these alerts; do not interpret
 silence as proof that no event was lost.
 
@@ -135,7 +142,7 @@ environment variable that changes a Prometheus threshold.
 
 The cluster rules select `deployment_mode="cluster"`; standalone deployments
 must not be judged against PostgreSQL-only metrics. Optional revision metrics and
-lazy counters are deliberately excluded from mandatory-signal checks. A missing
+failure counters, seeded or not, are deliberately excluded from mandatory-signal checks. A missing
 mandatory gauge produces a monitoring alert instead of being treated as zero.
 Prometheus staleness and lookback behavior can delay missing-series detection;
 the configured `for` interval starts when the expression first detects absence.
@@ -244,6 +251,17 @@ window and document any unrecoverable gap. Do not disable audit, relax admission
 controls, or silently discard the backlog to make monitoring green. Keep raw
 audit payloads, tokens, provider addresses and detailed errors out of alert
 annotations and shared incident summaries.
+
+Under the default `AUDIT_DURABILITY=required`, the same sink failures also
+refuse traffic: a request whose authentication or authorization record cannot
+commit is answered `503 audit_unavailable` and counted on
+`greengateway_audit_durability_refusals_total{reason}` (`admission`, `store`,
+`timeout`), while `/readyz` stays `200`. No rule in this pack selects that
+counter yet; graph it beside the drop and flush counters, and treat a rising
+count as an outage of the audit store that the gateway is answering with
+refusals. Service resumes on its own once the store commits again. Switching to
+`AUDIT_DURABILITY=best_effort` to restore traffic trades the outage for
+unrecorded decisions and needs the audit owner's sign-off.
 
 ### Database capacity
 
@@ -378,7 +396,7 @@ The pack does not yet cover every security-signal category in #440:
 | Authentication and authorization denials | No dedicated bounded denial counter for a complete trend. Audit outcomes remain the investigation source; denial volume alone does not establish an availability incident. Metric design and informational thresholds remain deferred. |
 | Authentication/JWKS dependency availability | No dedicated bounded availability counter for the complete dependency path. Define an appropriate signal separately; do not infer identity-provider health from unrelated errors or expose issuer URLs in labels. |
 | Rate-limit denials | `greengateway_rate_limit_shared_decisions_total` exists in cluster mode, with bounded `lane` labels and `outcome` values `allowed`, `denied`, `unavailable`. It covers shared-authority decisions, not every local rejection or standalone traffic. Informational denial-trend thresholds require a workload baseline and are deferred; `unavailable` is an authority failure, distinct from a deliberate denial. |
-| Durable authority-event evidence outside the journal | The rules cover the cluster-mode journal of [durable delivery](../authority-evidence.md#durable-delivery). Admin-session evidence is not journaled, standalone mode has no journal or dispatcher, and no required-durability mode makes a sink mandatory yet ([issue #425](https://github.com/Greenhat-Security/GreenGateway/issues/425)); none of these has a signal to alert on. The rules prove expression behaviour on synthetic series, not that a downstream system received the events. |
+| Durable authority-event evidence outside the journal | The rules cover the cluster-mode journal of [durable delivery](../authority-evidence.md#durable-delivery). Admin-session evidence and migration 23's policy, tools and catalog change evidence are not journaled (a policy, tools or catalog change whose evidence insert fails is refused and logged with its classified store error, but counted by neither refusal counter), standalone mode has no journal or dispatcher, and no required-durability mode makes a sink mandatory yet ([issue #425](https://github.com/Greenhat-Security/GreenGateway/issues/425)); none of these has a signal to alert on. The rules prove expression behaviour on synthetic series, not that a downstream system received the events. |
 
 The disposable incident rehearsal for #440 is described in
 [the security incident runbook](incident-rehearsal.md#what-the-release-gate-rehearses):

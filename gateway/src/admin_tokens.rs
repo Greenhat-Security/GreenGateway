@@ -150,10 +150,11 @@ pub(super) async fn token_revoke_endpoint(
         Err(error) => return token_admin_authz_error_response(error),
     };
 
-    // The revoking principal is recorded as the change's evidence in the
-    // revoke's own transaction; the audit event below stays post-commit
-    // telemetry.
-    match store.revoke(&token_id, &principal.user_id).await {
+    // The revoking principal -- subject, issuer, kind and auth mode -- is
+    // recorded as the change's evidence in the revoke's own transaction; the
+    // audit event below stays post-commit telemetry.
+    let actor = auth::change_actor::ChangeActor::from_principal(&principal);
+    match store.revoke(&token_id, &actor).await {
         Ok(Some(record)) => {
             if let Some(validator) = state.validator.as_ref() {
                 validator.invalidate_token_id(&token_id);
@@ -217,7 +218,8 @@ pub(super) async fn token_rotate_endpoint(
 
     // As with revoke: the rotating principal is the change's evidence,
     // committed with the rotation or not at all.
-    match store.rotate(&token_id, &principal.user_id).await {
+    let actor = auth::change_actor::ChangeActor::from_principal(&principal);
+    match store.rotate(&token_id, &actor).await {
         Ok(Some(created)) => {
             if let Some(validator) = state.validator.as_ref() {
                 validator.invalidate_token_id(&token_id);

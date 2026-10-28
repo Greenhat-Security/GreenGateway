@@ -92,7 +92,11 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
             &boundary,
         );
         match store
-            .revoke(&jti, expires_at.as_deref(), "operator:revoke-jwt")
+            .revoke(
+                &jti,
+                expires_at.as_deref(),
+                &auth::change_actor::ChangeActor::system("operator:revoke-jwt"),
+            )
             .await
             .map_err(|error| match error.invalid_parameter_name() {
                 Some("jti") => Box::<dyn std::error::Error>::from(
@@ -933,7 +937,10 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => None,
     };
-    let metrics_handle = install_metrics_recorder()?;
+    // Seeds every counter a single-event alert reads at zero (the
+    // cluster-only ones in cluster mode), so the first event moves 0 -> 1.
+    let metrics_handle =
+        install_metrics_recorder(config.state_backend == config::StateBackend::Postgres)?;
     let listen_addr = config.listen_addr;
     let admin_listen_addr = config.admin_listen_addr;
     // Loaded before any listener binds. Certificate and key problems must abort
@@ -2704,8 +2711,9 @@ pub(super) fn validate_connection_bound_tools(
                     continue;
                 }
                 // Its calls sign a caller assertion as a manual tool's do, so
-                // an attesting Connection is accepted; a composite's steps
-                // still refuse one when they run.
+                // an attesting Connection is accepted, delegated ones
+                // included; a composite's steps still refuse a delegated one
+                // when they run.
                 if let Err(error) = runtime.validate_openapi_tool_binding(target_connection_id) {
                     problems.push(format!(
                         "OpenAPI tool '{}' Connection target is unavailable: {}",

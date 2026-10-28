@@ -398,7 +398,7 @@ Current status:
 | Cloudflare deploy path | Implemented for evaluation and guided self-hosting; durable production state is not provided by the ephemeral container filesystem |
 | Multi-instance cluster mode (PostgreSQL) | Implemented; see [docs/deployment/postgres.md](docs/deployment/postgres.md#supported-cluster-operation) for the proved guarantees and the non-goals |
 | Durable audit event store and cross-replica SSE stream | Implemented as a store, a stream and a projector source |
-| Postgres audit sink for multi-instance deployments | Implemented; in cluster mode every serving replica writes its audit events to `greengateway.audit_events` off the request path, and that table is the audit of record — see [the proved guarantee](docs/deployment/postgres.md#what-the-gate-proves) |
+| Postgres audit sink for multi-instance deployments | Implemented; in cluster mode every serving replica writes its audit events to `greengateway.audit_events`, and that table is the audit of record. Under the default `AUDIT_DURABILITY=required` a request's authentication and authorization records commit there before the request is acted on, and a request whose records cannot commit is refused `503`; the rest of its events are written off the request path — see [the proved guarantee](docs/deployment/postgres.md#what-the-gate-proves) and [`AUDIT_DURABILITY`](docs/configuration.md#audit_durability) |
 | Operator setup and configuration lifecycle | Environment-driven operation is implemented; secure setup, versioned bundles, semantic plan/apply, and `ggctl` are tracked in #242 |
 | Authoritative Policy Studio | Rulebase, builder, shadow review, history, and rollback are implemented; shared simulation, replay, optimizer, and signed evidence are tracked in #243 |
 
@@ -423,8 +423,10 @@ For local development, build and run the workspace:
 
 ```sh
 cargo build --workspace
-cargo run
+AUDIT_SQLITE_PATH=target/dev-audit.sqlite cargo run
 ```
+
+The gateway refuses to start without an audit store of record, because it waits for each authentication and authorization decision to be recorded before acting on it ([`AUDIT_DURABILITY=required`](docs/configuration.md#audit_durability), the default). These commands give it a local SQLite file.
 
 Check the gateway:
 
@@ -441,7 +443,7 @@ Expected response:
 Run on a different address:
 
 ```sh
-LISTEN_ADDR=127.0.0.1:9090 cargo run
+LISTEN_ADDR=127.0.0.1:9090 AUDIT_SQLITE_PATH=target/dev-audit.sqlite cargo run
 ```
 
 Local builds require Rust plus Node.js and npm on `PATH`, because `cargo build --workspace` builds and embeds the admin UI.
@@ -455,7 +457,7 @@ For frontend development with hot reload, run the backend and frontend side by s
 Terminal 1:
 
 ```sh
-cargo run
+AUDIT_SQLITE_PATH=target/dev-audit.sqlite cargo run
 ```
 
 Terminal 2:

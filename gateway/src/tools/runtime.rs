@@ -634,14 +634,16 @@ impl ToolRuntime {
         F: FnOnce() -> Fut,
         Fut: Future<Output = T>,
     {
-        self.with_invocation_policy_snapshot(Box::pin(
+        self.with_request_policy_snapshot(Box::pin(
             self.run_with_context(tool_name, context, cancel, work),
         ))
         .await
     }
 
-    /// Run one invocation, from admission through the queue wait to the end of
-    /// its work, with the request's policy snapshot pinned (#422).
+    /// Run `work` with the request's policy snapshot pinned (#422): one
+    /// invocation, from admission through the queue wait to the end of its
+    /// work, or one `tools/list` listing
+    /// ([`ToolExecutor::list_visible_tools`](crate::tools::executor::ToolExecutor::list_visible_tools)).
     ///
     /// Every tool-lane policy read the invocation makes -- admission, the
     /// rendered-HTTP rule, composite leaf enablement, the playground's
@@ -649,15 +651,16 @@ impl ToolRuntime {
     /// mode as in cluster mode, so a revision installed while the call is
     /// queued or running cannot pair one snapshot's admission with another's
     /// rules and allow what neither allows. That revision judges the next
-    /// invocation. In cluster mode the snapshot is the one the revision gate
+    /// invocation. A listing likewise asks every tool's visibility of that one
+    /// snapshot. In cluster mode the snapshot is the one the revision gate
     /// already pinned for the request; without an RBAC state nothing is read.
     ///
-    /// The invocation is boxed before it is wrapped: an executor's work future
+    /// An invocation is boxed before it is wrapped: an executor's work future
     /// is large, and the scope would otherwise hold another copy of it.
-    async fn with_invocation_policy_snapshot<Fut: Future>(&self, invocation: Fut) -> Fut::Output {
+    pub(crate) async fn with_request_policy_snapshot<Fut: Future>(&self, work: Fut) -> Fut::Output {
         match &self.inner.rbac_state {
-            Some(rbac_state) => rbac_state.with_request_policy_snapshot(invocation).await,
-            None => invocation.await,
+            Some(rbac_state) => rbac_state.with_request_policy_snapshot(work).await,
+            None => work.await,
         }
     }
 
@@ -809,7 +812,7 @@ impl ToolRuntime {
 
     /// Every entry point that runs work except `execute_with_context` arrives
     /// here, the executor's included; both run the invocation inside
-    /// [`ToolRuntime::with_invocation_policy_snapshot`].
+    /// [`ToolRuntime::with_request_policy_snapshot`].
     pub(crate) async fn execute_result_with_context_and_outcome<F, Fut, T, E, R, O>(
         &self,
         tool_name: &str,
@@ -826,7 +829,7 @@ impl ToolRuntime {
         R: Fn(&E) -> ToolWorkErrorDisposition,
         O: Fn(&T) -> Option<&'static str>,
     {
-        self.with_invocation_policy_snapshot(Box::pin(self.run_with_context_and_outcome(
+        self.with_request_policy_snapshot(Box::pin(self.run_with_context_and_outcome(
             tool_name,
             context,
             cancel,

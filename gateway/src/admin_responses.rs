@@ -508,7 +508,9 @@ pub(super) fn openapi_catalog_error_response(
         // return it; reaching here means nothing asked, so nothing is stored.
         OpenApiCatalogError::StoreUnavailable
         | OpenApiCatalogError::StorageUnavailable
-        | OpenApiCatalogError::ConvertedCatalogNeedsAdmission => StatusCode::SERVICE_UNAVAILABLE,
+        | OpenApiCatalogError::ConvertedCatalogNeedsAdmission { .. } => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
         OpenApiCatalogError::EgressDenied
         | OpenApiCatalogError::SecretUnavailable
         | OpenApiCatalogError::AuthenticationFailed

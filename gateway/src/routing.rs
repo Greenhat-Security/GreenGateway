@@ -381,6 +381,17 @@ pub(super) fn add_admin_api_routes(
                     post(policy_convert_endpoint),
                 )
                 .route(
+                    routes.admin.policy_test_runs_route.as_str(),
+                    post(policy_test_runs_endpoint),
+                )
+                .route(
+                    routes.admin.policy_simulations_route.as_str(),
+                    // One limiter per router: its concurrency bounds belong
+                    // to this application, not to the process.
+                    post(policy_simulations_endpoint)
+                        .layer(Extension(Arc::new(PolicySimulationLimiter::new()))),
+                )
+                .route(
                     routes.admin.policy_rules_route.as_str(),
                     post(policy_rule_post_endpoint),
                 )
@@ -842,12 +853,26 @@ pub(super) async fn proxy_dispatch_context_middleware(
     response
 }
 
+/// Install the process-wide Prometheus recorder, then describe and seed its
+/// registry. `cluster` is whether this replica runs on the PostgreSQL
+/// authority, which decides the cluster-only counters it seeds.
 pub(super) fn install_metrics_recorder(
+    cluster: bool,
 ) -> Result<PrometheusHandle, metrics_exporter_prometheus::BuildError> {
-    let handle = PrometheusBuilder::new()
-        .with_recommended_naming(true)
-        .install_recorder()?;
+    let handle = metrics_recorder_builder().install_recorder()?;
+    register_metrics(cluster);
+    Ok(handle)
+}
 
+/// The exporter configuration [`install_metrics_recorder`] installs, so a
+/// test can render a fresh registry exactly as `/metrics` would.
+pub(super) fn metrics_recorder_builder() -> PrometheusBuilder {
+    PrometheusBuilder::new().with_recommended_naming(true)
+}
+
+/// Everything [`install_metrics_recorder`] does to the registry once the
+/// recorder is in place.
+pub(super) fn register_metrics(cluster: bool) {
     ::metrics::describe_counter!(REQUEST_COUNTER, "HTTP requests served by GreenGateway");
     ::metrics::describe_counter!(
         audit::AUDIT_EVENTS_DROPPED_TOTAL,
@@ -882,7 +907,45 @@ pub(super) fn install_metrics_recorder(
         "Exact-pinned egress clients currently retained across process caches"
     );
 
-    Ok(handle)
+    seed_alerted_counters(cluster);
+}
+
+/// Export at `0`, from the moment the recorder is installed, every counter
+/// series a single-event alert in `docs/deployment/alerts/greengateway.rules.yml`
+/// reads with `increase(...[5m]) > 0`.
+///
+/// A counter series created by its first event appears at `1` with no
+/// earlier sample, and `increase()` needs two samples of one series to see a
+/// change. Unseeded, the first refused authority change, dropped audit event,
+/// failed audit flush or pool timeout after a process start -- often the only
+/// one, and for a refusal the one that matters -- would never page.
+/// `increment(0)` creates a series without changing it, and every label
+/// value below is one the emitter itself uses, so each family keeps exactly
+/// its bounded vocabulary. `scripts/test_alert_rules.py` fails when a rule
+/// reads a counter that is not seeded here.
+///
+/// `greengateway_authority_event_delivery_failures_total` is deliberately
+/// not seeded: its rule waits for failures sustained over ten minutes, and
+/// the series' presence is how the delivery-lag rule tells a replica with
+/// `AUTHORITY_EVENT_SINK` from one without.
+fn seed_alerted_counters(cluster: bool) {
+    for reason in audit::LOCAL_DROP_REASONS {
+        ::metrics::counter!(audit::AUDIT_EVENTS_DROPPED_TOTAL, "reason" => reason).increment(0);
+    }
+    ::metrics::counter!(metrics::AUDIT_FLUSH_TOTAL, "outcome" => audit::FLUSH_FAILURE).increment(0);
+    #[cfg(feature = "postgres")]
+    if cluster {
+        ::metrics::counter!(
+            audit::AUDIT_EVENTS_DROPPED_TOTAL,
+            "reason" => audit::postgres_sink::POSTGRES_DROP_REASON
+        )
+        .increment(0);
+        ::metrics::counter!(metrics::DATABASE_POOL_TIMEOUTS_TOTAL).increment(0);
+        ::metrics::counter!(metrics::AUTHORITY_EVENT_CAPACITY_REFUSALS_TOTAL).increment(0);
+        ::metrics::counter!(metrics::AUTHORITY_EVENT_EVIDENCE_FAILURES_TOTAL).increment(0);
+    }
+    #[cfg(not(feature = "postgres"))]
+    let _ = cluster;
 }
 
 pub(super) fn cors_layer(config: &config::Config) -> CorsLayer {

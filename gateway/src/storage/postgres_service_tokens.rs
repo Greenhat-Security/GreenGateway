@@ -22,11 +22,12 @@
 //!   row a revoke has closed.
 //! - **Every committed rotate and revoke names who made it.** Beside its
 //!   outbox row, each writes one `service_token_change_evidence` row
-//!   (migration 18): actor, action, generated event and operation IDs, the
-//!   token's row revision before and after, the shared revision the change
-//!   took and the database clock's commit time. It has no foreign key, so
-//!   it outlives the token row, and it holds no token material. The same
-//!   transaction journals it for delivery (migration 21,
+//!   (migration 18): the actor (its subject, and since migration 24 its
+//!   kind, auth mode and canonical issuer), action, generated event and
+//!   operation IDs, the token's row revision before and after, the shared
+//!   revision the change took and the database clock's commit time. It has
+//!   no foreign key, so it outlives the token row, and it holds no token
+//!   material. The same transaction journals it for delivery (migration 21,
 //!   `postgres_authority_events`), reserving journal capacity. If either
 //!   cannot be written, or the journal is full, the change rolls back; a
 //!   repeat revoke or a refused rotate writes none.
@@ -47,6 +48,7 @@
 use async_trait::async_trait;
 use tokio_postgres::types::{FromSql, ToSql};
 
+use crate::auth::change_actor::ChangeActor;
 use crate::auth::tokens::{
     decode_cursor, display_prefix, encode_cursor, generate_plaintext_token, hash_token,
     new_token_id, query_limit, validate_optional_timestamp, CreateTokenRequest, CreatedToken,
@@ -316,9 +318,9 @@ impl ServiceTokenStore for PostgresServiceTokenStore {
     async fn revoke(
         &self,
         id: &str,
-        actor_user_id: &str,
+        actor: &ChangeActor,
     ) -> Result<Option<TokenRecord>, RepositoryError> {
-        validate_change_actor(OPERATION_REVOKE, actor_user_id)?;
+        validate_change_actor(OPERATION_REVOKE, actor)?;
         // One logical operation, minted once per call and never
         // regenerated: its evidence row carries it.
         let operation_id = uuid::Uuid::new_v4();
@@ -367,7 +369,7 @@ impl ServiceTokenStore for PostgresServiceTokenStore {
                     prior_version: current.revision,
                     new_version: revoked.revision,
                     security_revision,
-                    actor_user_id,
+                    actor,
                 },
             )
             .await?;
@@ -380,9 +382,9 @@ impl ServiceTokenStore for PostgresServiceTokenStore {
     async fn rotate(
         &self,
         id: &str,
-        actor_user_id: &str,
+        actor: &ChangeActor,
     ) -> Result<Option<CreatedToken>, RepositoryError> {
-        validate_change_actor(OPERATION_ROTATE, actor_user_id)?;
+        validate_change_actor(OPERATION_ROTATE, actor)?;
         let operation_id = uuid::Uuid::new_v4();
         let plaintext_token = generate_plaintext_token()
             .map_err(|error| map_helper_error(OPERATION_ROTATE, error))?;
@@ -440,7 +442,7 @@ impl ServiceTokenStore for PostgresServiceTokenStore {
                     prior_version: current.revision,
                     new_version: rotated.revision,
                     security_revision,
-                    actor_user_id,
+                    actor,
                 },
             )
             .await?;
@@ -665,13 +667,13 @@ async fn record_revision(
 
 /// Refuse an unattributable change before any connection is taken: there
 /// is no evidence to record for it. An authenticated principal always
-/// passes; migration 18's CHECK is the backstop. Plain `InvalidData`, not a
-/// parameter error: no caller input can produce it.
+/// passes; the CHECKs of migrations 18 and 24 are the backstop. Plain
+/// `InvalidData`, not a parameter error: no caller input can produce it.
 fn validate_change_actor(
     operation: &'static str,
-    actor_user_id: &str,
+    actor: &ChangeActor,
 ) -> Result<(), RepositoryError> {
-    if crate::auth::tokens::is_valid_change_actor(actor_user_id) {
+    if crate::auth::tokens::is_valid_change_actor(actor) {
         Ok(())
     } else {
         Err(invalid_data(operation))
@@ -687,7 +689,7 @@ struct ChangeEvidence<'a> {
     prior_version: i64,
     new_version: i64,
     security_revision: i64,
-    actor_user_id: &'a str,
+    actor: &'a ChangeActor,
 }
 
 /// Append one evidence row inside the caller's transaction, after its
@@ -709,14 +711,18 @@ async fn record_change_evidence(
         .execute(
             r#"
             INSERT INTO greengateway.service_token_change_evidence (
-                event_id, operation_id, actor_user_id, action, token_id,
-                prior_version, new_version, security_revision
-            ) VALUES ($1::text::uuid, $2::text::uuid, $3, $4, $5, $6, $7, $8)
+                event_id, operation_id, actor_user_id, actor_issuer, actor_kind,
+                actor_auth_mode, action, token_id, prior_version, new_version,
+                security_revision
+            ) VALUES ($1::text::uuid, $2::text::uuid, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             "#,
             &[
                 &event_id,
                 &operation_id,
-                &evidence.actor_user_id,
+                &evidence.actor.subject(),
+                &evidence.actor.issuer(),
+                &evidence.actor.kind().as_str(),
+                &evidence.actor.auth_mode(),
                 &evidence.action,
                 &evidence.token_id,
                 &evidence.prior_version,

@@ -67,12 +67,11 @@ fn with_probes(extra: &[&str]) -> Vec<String> {
 }
 
 /// The diagnostic `from_env_vars` reports for a problem about `variable`,
-/// refused under `rule` by an extracted compiler stage or, with `None`, by the
-/// legacy parser.
+/// refused under `rule`.
 fn expected_diagnostic(
     variable: &'static str,
     code: ConfigDiagnosticCode,
-    rule: Option<ConfigRule>,
+    rule: ConfigRule,
 ) -> ConfigDiagnostic {
     let message = match code {
         ConfigDiagnosticCode::Unset => format!("{variable} is not set"),
@@ -94,6 +93,9 @@ fn expected_diagnostic(
 fn admin_login_provider_document() -> &'static str {
     r#"[{"name":"primary","type":"jwt","issuer":"https://issuer.example.test","client_id":"admin-ui","client_secret":"generated-fixture-placeholder","redirect_uri":"https://management.example.test/v1/operations/auth/callback"}]"#
 }
+
+/// A Google Cloud secret provider whose one alias is `billing`.
+const GCP_BILLING_PROVIDER: &str = r#"{"profiles":[{"id":"primary","audience":"//iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/gateway-pool/providers/gateway-provider","token_root":"/var/run/secrets/tokens","token_file":"gcp-token"}],"aliases":[{"id":"billing","label":"Billing","profile":"primary","project":"billing-project","secret":"billing-credential"}]}"#;
 
 /// A complete cluster-mode configuration.
 fn postgres_fixture() -> Vec<(&'static str, &'static str)> {
@@ -333,6 +335,8 @@ const BLANK_IS_REFUSED: &[&str] = &[
     "SHUTDOWN_DRAIN_DELAY_MS",
     "SHUTDOWN_TIMEOUT_MS",
     "AUDIT_DRAIN_TIMEOUT_MS",
+    "AUDIT_DURABILITY",
+    "AUDIT_DURABILITY_TIMEOUT_MS",
     "DISCOVERY_ENDPOINT_LIMIT",
     "PAYLOAD_CAPTURE_ENABLED",
     "PAYLOAD_CAPTURE_SAMPLE_RATE",
@@ -421,7 +425,6 @@ fn every_input_treats_a_blank_value_by_one_of_three_legacy_rules() {
     assert_eq!(classified, inputs, "every input is classified exactly once");
 
     let defaults = accepted(&[]);
-    let extracted = super::stage_tests::extracted_inputs();
     for blank in ["", " \t "] {
         for &name in BLANK_IS_UNSET {
             assert_eq!(accepted(&[(name, blank)]), defaults, "{name}={blank:?}");
@@ -438,7 +441,7 @@ fn every_input_treats_a_blank_value_by_one_of_three_legacy_rules() {
                 [ConfigDiagnostic {
                     variable: Some(name),
                     code: ConfigDiagnosticCode::Empty,
-                    rule: extracted.contains(name).then_some(ConfigRule::Value),
+                    rule: ConfigRule::Value,
                     message: format!("{name} is set but empty"),
                 }],
                 "{name}={blank:?}"
@@ -898,25 +901,28 @@ fn every_problem_is_reported_in_one_pass_in_the_order_the_settings_are_read() {
             expected_diagnostic(
                 "LISTEN_ADDR",
                 ConfigDiagnosticCode::Refused,
-                Some(ConfigRule::Value)
+                ConfigRule::Value
             ),
             expected_diagnostic(
                 "TRUSTED_PROXY_CIDRS",
                 ConfigDiagnosticCode::Unset,
-                Some(ConfigRule::TrustedProxyNetworksRequired)
+                ConfigRule::TrustedProxyNetworksRequired
             ),
             expected_diagnostic(
                 "AUTH_ENABLED",
                 ConfigDiagnosticCode::Refused,
-                Some(ConfigRule::Value)
+                ConfigRule::Value
             ),
             expected_diagnostic(
                 "UPSTREAM_URL",
                 ConfigDiagnosticCode::Refused,
-                Some(ConfigRule::UpstreamRoutingSourcesExclusive)
+                ConfigRule::UpstreamRoutingSourcesExclusive
             ),
-            // Egress is not extracted yet, so the legacy parser reports it.
-            expected_diagnostic("EGRESS_TIMEOUT_MS", ConfigDiagnosticCode::Refused, None),
+            expected_diagnostic(
+                "EGRESS_TIMEOUT_MS",
+                ConfigDiagnosticCode::Refused,
+                ConfigRule::Value
+            ),
         ]
     );
 }
@@ -1042,6 +1048,80 @@ fn a_rule_checked_between_two_reads_is_reported_between_them() {
                 "RBAC_EXEMPT_PATHS entries must be URI paths starting with '/', got 'relative'",
             ][..],
         ),
+        // Connections: each alias and keyring rule right after its input,
+        // before the next input's own refusal; standalone mode's refusal of
+        // the rate-limit keyring comes once the state backend is read.
+        (
+            &[
+                (
+                    "CONNECTION_SECRET_ALIASES",
+                    r#"[{"id":"billing","label":"Billing","source":{"type":"file","key":"billing-file"}}]"#,
+                ),
+                ("CONNECTION_LOCAL_SECRET_KEYRING", "{}"),
+                (
+                    "RATE_LIMIT_KEYRING",
+                    r#"[{"id":"rl-primary","file":"rate-limit-key","role":"primary"}]"#,
+                ),
+                ("CONNECTION_VAULT_PROVIDER", "["),
+            ][..],
+            &[
+                "CONNECTION_SECRET_ALIASES: operator file alias at index 0 requires CONNECTION_SECRETS_ROOT",
+                "CONNECTION_LOCAL_SECRET_KEYRING must be a JSON array of local key objects",
+                "RATE_LIMIT_KEYRING: local secret keyring requires CONNECTION_SECRETS_ROOT",
+                "CONNECTION_VAULT_PROVIDER must be a JSON object with profiles and aliases arrays",
+                "RATE_LIMIT_KEYRING is set while STATE_BACKEND is sqlite",
+            ][..],
+        ),
+        // A provider alias that reuses an operator alias's ID, before the
+        // next provider's own refusal.
+        (
+            &[
+                (
+                    "CONNECTION_SECRET_ALIASES",
+                    r#"[{"id":"billing","label":"Billing","source":{"type":"environment","key":"BILLING_TOKEN"}}]"#,
+                ),
+                ("CONNECTION_GCP_PROVIDER", GCP_BILLING_PROVIDER),
+                ("CONNECTION_AZURE_PROVIDER", "["),
+            ][..],
+            &[
+                "CONNECTION_GCP_PROVIDER: gcp alias at index 0 duplicates an alias ID served by another provider",
+                "CONNECTION_AZURE_PROVIDER must be a JSON object with profiles and aliases arrays",
+            ][..],
+        ),
+        // Standalone mode: a projector setting's own refusal where it is read,
+        // then, once the backend is read, the cluster-only material in read
+        // order, payload capture's destination and the PostgreSQL settings.
+        (
+            &[
+                ("DATABASE_AUTO_MIGRATE", "true"),
+                ("PAYLOAD_CAPTURE_ENABLED", "true"),
+                ("DISCOVERY_PROJECTOR_POLL_MS", "10"),
+                ("EGRESS_TIMEOUT_MS", "0"),
+                ("READINESS_PROBE_CACHE_MS", "500"),
+            ][..],
+            &[
+                "DISCOVERY_PROJECTOR_POLL_MS must be at least 50 milliseconds",
+                "EGRESS_TIMEOUT_MS must be greater than 0",
+                "DISCOVERY_PROJECTOR_POLL_MS is set while STATE_BACKEND is sqlite",
+                "READINESS_PROBE_CACHE_MS is set while STATE_BACKEND is sqlite",
+                "PAYLOAD_CAPTURE_ENABLED=true requires DISCOVERY_SQLITE_PATH",
+                "DATABASE_AUTO_MIGRATE=true while STATE_BACKEND is sqlite",
+            ][..],
+        ),
+        // Cluster mode: a PostgreSQL input's own refusal before the mode's
+        // requirements.
+        (
+            &[
+                ("STATE_BACKEND", "postgres"),
+                ("DATABASE_POOL_MAX", "0"),
+            ][..],
+            &[
+                "DATABASE_POOL_MAX must be between 1 and 256, got '0'",
+                "DEPLOYMENT_ID is required when STATE_BACKEND=postgres",
+                "DATABASE_URL_FILE is required when STATE_BACKEND=postgres",
+                "RATE_LIMIT_KEYRING is required when STATE_BACKEND=postgres",
+            ][..],
+        ),
     ] {
         let error = refused(fixture);
         assert_eq!(error.problems.len(), expected.len(), "{fixture:?}\n{error}");
@@ -1068,6 +1148,59 @@ fn a_rule_checked_between_two_reads_is_reported_between_them() {
         error.problems[1].starts_with("ADMIN_CLIENT_CERT_CRL_FILE must be valid Unicode"),
         "{error}"
     );
+
+    // The cluster's stale window is checked against the heartbeat right
+    // after it is read, before the maintenance interval's own refusal.
+    let mut fixture = postgres_fixture();
+    fixture.extend([
+        ("CLUSTER_HEARTBEAT_MS", "10000"),
+        ("CLUSTER_MEMBER_STALE_MS", "20000"),
+        ("CLUSTER_MAINTENANCE_INTERVAL_MS", "10"),
+    ]);
+    assert_eq!(
+        refused(&fixture).problems,
+        [
+            "CLUSTER_MEMBER_STALE_MS must be at least 3 x CLUSTER_HEARTBEAT_MS (30000 milliseconds) so one slow heartbeat never makes a live replica look stale, got '20000'",
+            "CLUSTER_MAINTENANCE_INTERVAL_MS must be at least 1000 milliseconds, got '10'",
+        ]
+    );
+}
+
+/// The discovery projector's settings count as set in standalone mode even
+/// when their value is not Unicode, while the cluster block's settings read a
+/// value that is not Unicode as unset, so only its own refusal is reported.
+#[test]
+fn a_cluster_setting_that_is_not_unicode_is_refused_once_and_a_projector_setting_twice() {
+    for (name, expected) in [
+        (
+            "DISCOVERY_PROJECTOR_BATCH",
+            &[
+                "DISCOVERY_PROJECTOR_BATCH must be valid Unicode",
+                "DISCOVERY_PROJECTOR_BATCH is set while STATE_BACKEND is sqlite",
+            ][..],
+        ),
+        (
+            "CLUSTER_HEARTBEAT_MS",
+            &["CLUSTER_HEARTBEAT_MS must be valid Unicode"][..],
+        ),
+        (
+            "AUDIT_POSTGRES_RETENTION_DAYS",
+            &["AUDIT_POSTGRES_RETENTION_DAYS must be valid Unicode"][..],
+        ),
+    ] {
+        let error = Config::from_env_vars(|requested| {
+            if requested == name {
+                Err(VarError::NotUnicode(non_unicode_value()))
+            } else {
+                Err(VarError::NotPresent)
+            }
+        })
+        .expect_err("a value that is not Unicode is refused");
+        assert_eq!(error.problems.len(), expected.len(), "{name}: {error}");
+        for (problem, start) in error.problems.iter().zip(expected) {
+            assert!(problem.starts_with(start), "{name}: {error}");
+        }
+    }
 }
 
 #[test]
@@ -1103,9 +1236,21 @@ fn storage_modes_keep_their_requirements_and_refuse_each_others_material() {
     assert_eq!(
         error.diagnostics(),
         [
-            expected_diagnostic("DEPLOYMENT_ID", ConfigDiagnosticCode::Unset, None),
-            expected_diagnostic("DATABASE_URL_FILE", ConfigDiagnosticCode::Unset, None),
-            expected_diagnostic("RATE_LIMIT_KEYRING", ConfigDiagnosticCode::Unset, None),
+            expected_diagnostic(
+                "DEPLOYMENT_ID",
+                ConfigDiagnosticCode::Unset,
+                ConfigRule::ClusterModeRequirements
+            ),
+            expected_diagnostic(
+                "DATABASE_URL_FILE",
+                ConfigDiagnosticCode::Unset,
+                ConfigRule::ClusterModeRequirements
+            ),
+            expected_diagnostic(
+                "RATE_LIMIT_KEYRING",
+                ConfigDiagnosticCode::Unset,
+                ConfigRule::ClusterModeRequirements
+            ),
         ]
     );
 
@@ -1153,6 +1298,229 @@ fn storage_modes_keep_their_requirements_and_refuse_each_others_material() {
         accepted(&[("AUDIT_SQLITE_RETENTION_DAYS", "0")]).audit_sqlite_retention_days,
         None
     );
+}
+
+/// Authority-event delivery (issue #425, PR 3) is read right after the
+/// PostgreSQL settings. Its values are refused as they are read, its alias
+/// shapes and sink rules once the block is read, and all of them before the
+/// rules each mode checks once every input is read, even rules about inputs
+/// read long before it.
+#[test]
+fn authority_event_problems_come_after_the_database_and_before_the_mode_rules() {
+    let alias_shape = "must be a secret alias ID of 1 to 128 letters, digits, '.', '_' or '-', starting with a letter or digit; it names the key, never its material";
+
+    // Cluster mode.
+    let error = refused(&[
+        ("STATE_BACKEND", "postgres"),
+        ("DATABASE_POOL_MAX", "0"),
+        ("AUTHORITY_EVENT_SINK", "file"),
+        ("AUTHORITY_PSEUDONYM_KEY_ALIAS", "bad/../key"),
+        ("AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS", "bad/../key"),
+        ("AUTHORITY_EVENT_JOURNAL_CAPACITY", "0"),
+        ("AUTHORITY_EVENT_RETENTION_HOURS", "87601"),
+    ]);
+    assert_eq!(
+        error.problems,
+        [
+            "DATABASE_POOL_MAX must be between 1 and 256, got '0'".to_owned(),
+            "AUTHORITY_EVENT_JOURNAL_CAPACITY must be between 1 and 1000000000, got '0'".to_owned(),
+            "AUTHORITY_EVENT_RETENTION_HOURS must be at most 87600, got '87601'".to_owned(),
+            format!("AUTHORITY_PSEUDONYM_KEY_ALIAS {alias_shape}"),
+            format!("AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS {alias_shape}"),
+            "AUTHORITY_EVENT_FILE is required when AUTHORITY_EVENT_SINK=file".to_owned(),
+            "AUTHORITY_PSEUDONYM_KEY_ALIAS and AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS must name different aliases".to_owned(),
+            "DEPLOYMENT_ID is required when STATE_BACKEND=postgres; it scopes every authoritative row, lock, lease, and notification of the deployment and is non-secret".to_owned(),
+            "DATABASE_URL_FILE is required when STATE_BACKEND=postgres; the PostgreSQL connection string is supplied as a secret file, never as a raw environment variable".to_owned(),
+            "RATE_LIMIT_KEYRING is required when STATE_BACKEND=postgres; shared rate-limit buckets are keyed by an HMAC under it".to_owned(),
+        ]
+    );
+    assert_eq!(
+        error.diagnostics(),
+        [
+            expected_diagnostic(
+                "DATABASE_POOL_MAX",
+                ConfigDiagnosticCode::Refused,
+                ConfigRule::Value
+            ),
+            expected_diagnostic(
+                "AUTHORITY_EVENT_JOURNAL_CAPACITY",
+                ConfigDiagnosticCode::Refused,
+                ConfigRule::Value
+            ),
+            expected_diagnostic(
+                "AUTHORITY_EVENT_RETENTION_HOURS",
+                ConfigDiagnosticCode::Refused,
+                ConfigRule::Value
+            ),
+            expected_diagnostic(
+                "AUTHORITY_PSEUDONYM_KEY_ALIAS",
+                ConfigDiagnosticCode::Refused,
+                ConfigRule::Value
+            ),
+            expected_diagnostic(
+                "AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS",
+                ConfigDiagnosticCode::Refused,
+                ConfigRule::Value
+            ),
+            expected_diagnostic(
+                "AUTHORITY_EVENT_FILE",
+                ConfigDiagnosticCode::Unset,
+                ConfigRule::AuthorityEventSinkRequirements
+            ),
+            expected_diagnostic(
+                "AUTHORITY_PSEUDONYM_KEY_ALIAS",
+                ConfigDiagnosticCode::Refused,
+                ConfigRule::AuthorityPseudonymKeysDistinct
+            ),
+            expected_diagnostic(
+                "DEPLOYMENT_ID",
+                ConfigDiagnosticCode::Unset,
+                ConfigRule::ClusterModeRequirements
+            ),
+            expected_diagnostic(
+                "DATABASE_URL_FILE",
+                ConfigDiagnosticCode::Unset,
+                ConfigRule::ClusterModeRequirements
+            ),
+            expected_diagnostic(
+                "RATE_LIMIT_KEYRING",
+                ConfigDiagnosticCode::Unset,
+                ConfigRule::ClusterModeRequirements
+            ),
+        ]
+    );
+
+    // Material no sink reads, then a local store read long before the block.
+    let mut fixture = postgres_fixture();
+    fixture.extend([
+        ("POLICY_FILE", "/etc/greengateway/policy.json"),
+        (
+            "AUTHORITY_EVENT_FILE",
+            "/var/lib/greengateway/authority-events.jsonl",
+        ),
+        (
+            "AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS",
+            "pseudonym-2026-04",
+        ),
+    ]);
+    let error = refused(&fixture);
+    assert_eq!(
+        error.problems,
+        [
+            "AUTHORITY_EVENT_FILE is set while AUTHORITY_EVENT_SINK is none; no dispatcher runs and nothing reads it",
+            "AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS is set while AUTHORITY_EVENT_SINK is none; no dispatcher runs and nothing reads it",
+            "POLICY_FILE is set while STATE_BACKEND=postgres; in cluster mode PostgreSQL is the single authority and local stores are rejected (import/bootstrap workflows arrive in a later #241 PR) \u{2014} unset POLICY_FILE",
+        ]
+    );
+    assert_eq!(
+        error.diagnostics(),
+        [
+            expected_diagnostic(
+                "AUTHORITY_EVENT_FILE",
+                ConfigDiagnosticCode::Refused,
+                ConfigRule::AuthorityEventMaterialUnused
+            ),
+            expected_diagnostic(
+                "AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS",
+                ConfigDiagnosticCode::Refused,
+                ConfigRule::AuthorityEventMaterialUnused
+            ),
+            expected_diagnostic(
+                "POLICY_FILE",
+                ConfigDiagnosticCode::Refused,
+                ConfigRule::LocalAuthorityInClusterMode
+            ),
+        ]
+    );
+    let mut fixture = postgres_fixture();
+    fixture.extend([
+        ("AUTHORITY_EVENT_SINK", " log "),
+        ("AUTHORITY_PSEUDONYM_KEY_ALIAS", "pseudonym-2026-10"),
+        (
+            "AUTHORITY_EVENT_FILE",
+            "/var/lib/greengateway/authority-events.jsonl",
+        ),
+    ]);
+    let error = refused(&fixture);
+    assert_eq!(
+        error.problems,
+        ["AUTHORITY_EVENT_FILE is set while AUTHORITY_EVENT_SINK=log; only the file sink writes a file"]
+    );
+    assert_eq!(
+        error.diagnostics(),
+        [expected_diagnostic(
+            "AUTHORITY_EVENT_FILE",
+            ConfigDiagnosticCode::Refused,
+            ConfigRule::AuthorityEventMaterialUnused
+        )]
+    );
+
+    // Standalone mode: a value's own refusal, then each setting nothing
+    // reads, then the other cluster material.
+    let error = refused(&[
+        ("CLUSTER_HEARTBEAT_MS", "5000"),
+        ("DEPLOYMENT_ID", "deploy-prod-eu"),
+        ("AUTHORITY_EVENT_SINK", "syslog"),
+        ("AUTHORITY_EVENT_JOURNAL_CAPACITY", "10"),
+    ]);
+    assert_eq!(
+        error.problems,
+        [
+            "AUTHORITY_EVENT_SINK must be a valid authority event sink, got 'syslog': expected one of none, log, file",
+            "AUTHORITY_EVENT_SINK is set while STATE_BACKEND is sqlite; standalone mode has no authority-event journal or dispatcher and never reads it",
+            "AUTHORITY_EVENT_JOURNAL_CAPACITY is set while STATE_BACKEND is sqlite; standalone mode has no authority-event journal or dispatcher and never reads it",
+            "CLUSTER_HEARTBEAT_MS is set while STATE_BACKEND is sqlite; standalone mode has no cluster membership and never reads it",
+            "DEPLOYMENT_ID is set while STATE_BACKEND is sqlite; a deployment ID scopes a cluster-mode deployment and standalone mode never reads it \u{2014} set STATE_BACKEND=postgres or unset DEPLOYMENT_ID",
+        ]
+    );
+    let rules: Vec<ConfigRule> = error
+        .diagnostics()
+        .iter()
+        .map(|diagnostic| diagnostic.rule)
+        .collect();
+    assert_eq!(
+        rules,
+        [
+            ConfigRule::Value,
+            ConfigRule::ClusterSettingInStandaloneMode,
+            ConfigRule::ClusterSettingInStandaloneMode,
+            ConfigRule::ClusterSettingInStandaloneMode,
+            ConfigRule::ClusterSettingInStandaloneMode,
+        ]
+    );
+
+    // A value that is not Unicode is refused as a value and is not also
+    // reported as material standalone mode never reads.
+    for name in [
+        "AUTHORITY_EVENT_SINK",
+        "AUTHORITY_EVENT_FILE",
+        "AUTHORITY_PSEUDONYM_KEY_ALIAS",
+        "AUTHORITY_EVENT_JOURNAL_CAPACITY",
+        "AUTHORITY_EVENT_RETENTION_HOURS",
+    ] {
+        let error = Config::from_env_vars(|requested| {
+            if requested == name {
+                Err(VarError::NotUnicode(non_unicode_value()))
+            } else {
+                Err(VarError::NotPresent)
+            }
+        })
+        .expect_err("a value that is not Unicode is refused");
+        assert_eq!(error.problems.len(), 1, "{name}: {error}");
+        assert!(
+            error.problems[0].starts_with(&format!("{name} must be valid Unicode")),
+            "{name}: {error}"
+        );
+        assert_eq!(
+            error.diagnostics(),
+            [expected_diagnostic(
+                name,
+                ConfigDiagnosticCode::NotUnicode,
+                ConfigRule::Value
+            )],
+            "{name}"
+        );
+    }
 }
 
 #[test]
@@ -1284,31 +1652,31 @@ fn diagnostics_follow_the_problems_one_for_one_and_describe_the_input() {
             ConfigDiagnostic {
                 variable: Some("LISTEN_ADDR"),
                 code: ConfigDiagnosticCode::Empty,
-                rule: Some(ConfigRule::Value),
+                rule: ConfigRule::Value,
                 message: "LISTEN_ADDR is set but empty".to_owned(),
             },
             ConfigDiagnostic {
                 variable: Some("AUTH_ENABLED"),
                 code: ConfigDiagnosticCode::Refused,
-                rule: Some(ConfigRule::Value),
+                rule: ConfigRule::Value,
                 message: "AUTH_ENABLED is set to a value that was refused".to_owned(),
             },
             ConfigDiagnostic {
                 variable: Some("DEPLOYMENT_ID"),
                 code: ConfigDiagnosticCode::Unset,
-                rule: None,
+                rule: ConfigRule::ClusterModeRequirements,
                 message: "DEPLOYMENT_ID is not set".to_owned(),
             },
             ConfigDiagnostic {
                 variable: Some("DATABASE_URL_FILE"),
                 code: ConfigDiagnosticCode::Unset,
-                rule: None,
+                rule: ConfigRule::ClusterModeRequirements,
                 message: "DATABASE_URL_FILE is not set".to_owned(),
             },
             ConfigDiagnostic {
                 variable: Some("RATE_LIMIT_KEYRING"),
                 code: ConfigDiagnosticCode::Unset,
-                rule: None,
+                rule: ConfigRule::ClusterModeRequirements,
                 message: "RATE_LIMIT_KEYRING is not set".to_owned(),
             },
         ]
@@ -1331,7 +1699,7 @@ fn a_problem_is_attributed_to_the_setting_it_begins_with() {
         [expected_diagnostic(
             "ADMIN_SESSION_TTL_SECS",
             ConfigDiagnosticCode::Unset,
-            Some(ConfigRule::AdminSessionSettingsWithoutMode)
+            ConfigRule::AdminSessionSettingsWithoutMode
         )]
     );
 }
@@ -1354,8 +1722,8 @@ fn non_unicode_value() -> std::ffi::OsString {
 #[test]
 fn a_value_that_is_not_unicode_is_reported_without_its_bytes() {
     for (name, rule) in [
-        ("LISTEN_ADDR", Some(ConfigRule::Value)),
-        ("CONNECTION_SECRET_ALIASES", None),
+        ("LISTEN_ADDR", ConfigRule::Value),
+        ("CONNECTION_SECRET_ALIASES", ConfigRule::Value),
     ] {
         let error = Config::from_env_vars(|requested| {
             if requested == name {

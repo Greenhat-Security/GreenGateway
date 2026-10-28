@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "GreenGateway authority event delivery v1",
-  "description": "What the authority-event dispatcher delivers for one journaled evidence row (issue #425 PR 3). A safe projection of identifiers and revisions; the actor is the issuer-less identifier the evidence row recorded, referenced under the keyed actor.recorded domain. Not the proposed authority_event.v1 contract: the evidence rows do not yet record the actor's issuer or authentication mode.",
+  "description": "What the authority-event dispatcher delivers for one journaled evidence row (issue #425 PR 3). A safe projection of identifiers and revisions; the actor is the identifier the evidence row recorded, referenced under the keyed actor.recorded domain, with the actor kind, authentication mode and issuer reference the row records since migration 24 (null for evidence committed before it, and the issuer reference also null for an actor without an issuer). Not the proposed authority_event.v1 contract: the subject reference is not issuer-scoped, older rows and issuer-less actors cannot name an issuer, and operation identity is not caller-bound.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -62,13 +62,58 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "recorded_ref"
+        "kind",
+        "recorded_ref",
+        "issuer_ref",
+        "auth_mode"
       ],
       "properties": {
+        "kind": {
+          "anyOf": [
+            {
+              "enum": [
+                "principal",
+                "service_token",
+                "system"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "recorded_ref": {
           "type": "string",
           "pattern": "^[0-9a-f]{64}$",
           "maxLength": 64
+        },
+        "issuer_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$",
+              "maxLength": 64
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "auth_mode": {
+          "anyOf": [
+            {
+              "enum": [
+                "bearer_token",
+                "session_cookie",
+                "service_token",
+                "client_certificate",
+                "system"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },

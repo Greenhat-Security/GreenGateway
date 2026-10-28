@@ -7,8 +7,8 @@ use async_trait::async_trait;
 
 use super::*;
 use crate::{
-    auth::tokens::CreateTokenRequest,
-    authority_events::pseudonym::test_support::generated_keyring,
+    auth::{change_actor::ChangeActor, tokens::CreateTokenRequest},
+    authority_events::pseudonym::{test_support::generated_keyring, ReferenceDomain},
     connections::{
         model::{ConnectionWrite, MAX_CONNECTIONS},
         pg_store::PostgresConnectionStore,
@@ -83,6 +83,8 @@ fn every_failure_kind_is_a_distinct_bare_label_value() {
 
 const DEPLOYMENT: &str = "deploy-authority-events";
 const ISSUER: &str = "https://issuer.example.test";
+/// The issuer of an acting principal, distinct from the revoked tokens'.
+const ACTOR_ISSUER: &str = "https://actor-idp.example.test";
 
 /// Records every batch it accepts, and refuses the next `failures` offers.
 #[derive(Default)]
@@ -184,7 +186,7 @@ impl Producers {
             .id
     }
 
-    async fn rotate(&self, id: &str, actor: &str) {
+    async fn rotate(&self, id: &str, actor: &ChangeActor) {
         self.tokens
             .rotate(id, actor)
             .await
@@ -192,7 +194,7 @@ impl Producers {
             .expect("the token exists");
     }
 
-    async fn revoke(&self, id: &str, actor: &str) {
+    async fn revoke(&self, id: &str, actor: &ChangeActor) {
         self.tokens
             .revoke(id, actor)
             .await
@@ -202,15 +204,15 @@ impl Producers {
 
     async fn revoke_jwt(&self, jti: &str) {
         self.jwt
-            .revoke(jti, None, "operator:revoke-jwt")
+            .revoke(jti, None, &ChangeActor::system("operator:revoke-jwt"))
             .await
             .expect("the JWT revoke commits");
     }
 
-    async fn create_and_delete_connection(&self, actor: &str) {
+    async fn create_and_delete_connection(&self, actor: &ChangeActor) {
         let stored = self
             .connections
-            .create(candidate(), actor, None)
+            .create(candidate(), actor.subject(), None)
             .await
             .expect("a Connection creates");
         self.connections
@@ -304,11 +306,24 @@ async fn committed_events_are_delivered_in_commit_order_under_their_evidence_ids
     let producers = Producers::new(&pool);
     let rotated = producers.token().await;
     let revoked = producers.token().await;
-    producers.rotate(&rotated, "rotating-admin").await;
-    producers.revoke(&revoked, "revoking-admin").await;
+    // Each change by a different kind of actor: a principal vouched for by
+    // a provider, a service token, the revoke-jwt command and a principal
+    // without an issuer.
+    producers
+        .rotate(
+            &rotated,
+            &ChangeActor::for_test_with_issuer("rotating-admin", ACTOR_ISSUER),
+        )
+        .await;
+    producers
+        .revoke(
+            &revoked,
+            &ChangeActor::service_token_for_test("service-token:revoking-token"),
+        )
+        .await;
     producers.revoke_jwt("withdrawn-jti").await;
     producers
-        .create_and_delete_connection("deleting-admin")
+        .create_and_delete_connection(&ChangeActor::for_test("deleting-admin"))
         .await;
 
     let store = Arc::new(PostgresAuthorityEventStore::new(pool.clone()));
@@ -359,6 +374,31 @@ async fn committed_events_are_delivered_in_commit_order_under_their_evidence_ids
             .collect::<Vec<_>>(),
         evidence_ids
     );
+    // Each record names its actor's kind and auth mode as the evidence
+    // recorded them, and its issuer only by reference.
+    let actor_issuer_ref = keyring
+        .derive(ReferenceDomain::ActorIssuer, &[ACTOR_ISSUER])
+        .expect("an issuer reference derives");
+    assert_eq!(
+        delivered
+            .iter()
+            .map(|record| (
+                record.actor.kind.as_deref(),
+                record.actor.auth_mode.as_deref(),
+                record.actor.issuer_ref.as_deref()
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (
+                Some("principal"),
+                Some("bearer_token"),
+                Some(actor_issuer_ref.as_str())
+            ),
+            (Some("service_token"), Some("service_token"), None),
+            (Some("system"), Some("system"), None),
+            (Some("principal"), Some("bearer_token"), None),
+        ]
+    );
     for record in &delivered {
         assert_eq!(record.authority_id, keyring.authority_id().to_string());
         // No identifier the evidence holds reaches the delivered record.
@@ -367,10 +407,11 @@ async fn committed_events_are_delivered_in_commit_order_under_their_evidence_ids
             rotated.as_str(),
             revoked.as_str(),
             "rotating-admin",
-            "revoking-admin",
+            "service-token:revoking-token",
             "deleting-admin",
             "operator:revoke-jwt",
             ISSUER,
+            ACTOR_ISSUER,
         ] {
             assert!(!serialized.contains(identifier), "{serialized}");
         }
@@ -405,8 +446,12 @@ async fn a_crash_between_acceptance_and_the_cursor_commit_redelivers_identical_r
     let pool = migrated_pool(&database).await;
     let producers = Producers::new(&pool);
     let token = producers.token().await;
-    producers.rotate(&token, "rotating-admin").await;
-    producers.revoke(&token, "revoking-admin").await;
+    producers
+        .rotate(&token, &ChangeActor::for_test("rotating-admin"))
+        .await;
+    producers
+        .revoke(&token, &ChangeActor::for_test("revoking-admin"))
+        .await;
 
     let store = Arc::new(PostgresAuthorityEventStore::new(pool.clone()));
     let keyring = keyring_for(&store).await;
@@ -451,7 +496,9 @@ async fn a_sink_outage_retries_the_same_batch_and_never_advances_past_it() {
     let producers = Producers::new(&pool);
     for actor in ["first-admin", "second-admin", "third-admin"] {
         let token = producers.token().await;
-        producers.rotate(&token, actor).await;
+        producers
+            .rotate(&token, &ChangeActor::for_test(actor))
+            .await;
     }
 
     let store = Arc::new(PostgresAuthorityEventStore::new(pool.clone()));
@@ -518,7 +565,9 @@ async fn a_fenced_out_leader_cannot_move_the_cursor() {
     let pool = migrated_pool(&database).await;
     let producers = Producers::new(&pool);
     let token = producers.token().await;
-    producers.revoke(&token, "revoking-admin").await;
+    producers
+        .revoke(&token, &ChangeActor::for_test("revoking-admin"))
+        .await;
 
     let store = Arc::new(PostgresAuthorityEventStore::new(pool.clone()));
     let keyring = keyring_for(&store).await;
@@ -573,7 +622,10 @@ async fn retention_never_prunes_an_undelivered_event() {
     for index in 0..4 {
         let token = producers.token().await;
         producers
-            .rotate(&token, &format!("rotating-admin-{index}"))
+            .rotate(
+                &token,
+                &ChangeActor::for_test(&format!("rotating-admin-{index}")),
+            )
             .await;
     }
     let client = pool.get().await.expect("maintenance session");
@@ -692,8 +744,12 @@ async fn capacity_exhaustion_refuses_the_mutation_and_commits_nothing() {
         })
         .await
         .expect("a create journals nothing and is not refused");
-    producers.rotate(&first, "rotating-admin").await;
-    producers.rotate(&second, "rotating-admin").await;
+    producers
+        .rotate(&first, &ChangeActor::for_test("rotating-admin"))
+        .await;
+    producers
+        .rotate(&second, &ChangeActor::for_test("rotating-admin"))
+        .await;
     let connection = producers
         .connections
         .create(candidate(), "deleting-admin", None)
@@ -721,7 +777,7 @@ async fn capacity_exhaustion_refuses_the_mutation_and_commits_nothing() {
     // Debug, so the refusal is matched rather than unwrapped.
     let Err(error) = producers
         .tokens
-        .rotate(&refused.record.id, "rotating-admin")
+        .rotate(&refused.record.id, &ChangeActor::for_test("rotating-admin"))
         .await
     else {
         panic!("a full journal refuses the rotate");
@@ -729,20 +785,28 @@ async fn capacity_exhaustion_refuses_the_mutation_and_commits_nothing() {
     assert_eq!(error.kind(), RepositoryErrorKind::Unavailable);
     let error = producers
         .tokens
-        .revoke(&refused.record.id, "revoking-admin")
+        .revoke(&refused.record.id, &ChangeActor::for_test("revoking-admin"))
         .await
         .expect_err("a full journal refuses the revoke");
     assert_eq!(error.kind(), RepositoryErrorKind::Unavailable);
     let error = producers
         .jwt
-        .revoke("refused-jti", None, "operator:revoke-jwt")
+        .revoke(
+            "refused-jti",
+            None,
+            &ChangeActor::system("operator:revoke-jwt"),
+        )
         .await
         .expect_err("a full journal refuses the JWT revoke");
     assert_eq!(error.kind(), RepositoryErrorKind::Unavailable);
     assert!(matches!(
         producers
             .connections
-            .delete(&connection.id, &connection.etag(), "deleting-admin")
+            .delete(
+                &connection.id,
+                &connection.etag(),
+                &ChangeActor::for_test("deleting-admin")
+            )
             .await,
         Err(ConnectionStoreError::Unavailable { operation }) if operation == OPERATION_JOURNAL_APPEND
     ));
@@ -807,7 +871,9 @@ async fn capacity_exhaustion_refuses_the_mutation_and_commits_nothing() {
             .expect("retention runs"),
         2
     );
-    producers.rotate(&refused.record.id, "rotating-admin").await;
+    producers
+        .rotate(&refused.record.id, &ChangeActor::for_test("rotating-admin"))
+        .await;
     let stats = store.stats().await.expect("stats");
     assert_eq!((stats.retained, stats.head), (1, 3));
 }
@@ -866,6 +932,10 @@ async fn a_refused_evidence_write_rolls_the_mutation_back_and_is_counted_once() 
     };
     let journal_before = journal().await;
     let revision_before = revision().await;
+    let rotating = ChangeActor::for_test("rotating-admin");
+    let revoking = ChangeActor::for_test("revoking-admin");
+    let deleting = ChangeActor::for_test("deleting-admin");
+    let command = ChangeActor::system("operator:revoke-jwt");
 
     // The recorder is this thread's, and the test's current-thread runtime
     // runs every producer on this thread.
@@ -876,52 +946,68 @@ async fn a_refused_evidence_write_rolls_the_mutation_back_and_is_counted_once() 
 
     // A journal that refuses the append refuses every producer.
     refuse_new_rows(&pool, "authority_event_journal").await;
-    let Err(_) = producers.tokens.rotate(&token, "rotating-admin").await else {
+    let Err(_) = producers.tokens.rotate(&token, &rotating).await else {
         panic!("a refused journal append refuses the rotate");
     };
     producers
         .tokens
-        .revoke(&token, "revoking-admin")
+        .revoke(&token, &revoking)
         .await
         .expect_err("a refused journal append refuses the revoke");
     producers
         .jwt
-        .revoke("refused-jti", None, "operator:revoke-jwt")
+        .revoke("refused-jti", None, &command)
         .await
         .expect_err("a refused journal append refuses the JWT revoke");
     assert!(producers
         .connections
-        .delete(&connection.id, &connection.etag(), "deleting-admin")
+        .delete(&connection.id, &connection.etag(), &deleting)
         .await
         .is_err());
     assert_eq!(evidence_failures(), 4);
     accept_new_rows(&pool, "authority_event_journal").await;
 
-    // An evidence table that refuses the insert refuses its own producer.
+    // An evidence table that refuses the insert refuses its own producer:
+    // both service-token changes write the same evidence table, and each
+    // counts its own refusal.
     refuse_new_rows(&pool, "service_token_change_evidence").await;
-    let Err(_) = producers.tokens.rotate(&token, "rotating-admin").await else {
+    let Err(_) = producers.tokens.rotate(&token, &rotating).await else {
         panic!("a refused evidence insert refuses the rotate");
     };
+    producers
+        .tokens
+        .revoke(&token, &ChangeActor::for_test("revoking-admin"))
+        .await
+        .expect_err("a refused evidence insert refuses the revoke");
     accept_new_rows(&pool, "service_token_change_evidence").await;
     refuse_new_rows(&pool, "jwt_revocation_evidence").await;
     producers
         .jwt
-        .revoke("refused-jti", None, "operator:revoke-jwt")
+        .revoke("refused-jti", None, &command)
         .await
         .expect_err("a refused evidence insert refuses the JWT revoke");
     accept_new_rows(&pool, "jwt_revocation_evidence").await;
     refuse_new_rows(&pool, "connection_change_evidence").await;
     assert!(producers
         .connections
-        .delete(&connection.id, &connection.etag(), "deleting-admin")
+        .delete(&connection.id, &connection.etag(), &deleting)
         .await
         .is_err());
     accept_new_rows(&pool, "connection_change_evidence").await;
-    assert_eq!(evidence_failures(), 7);
+    assert_eq!(evidence_failures(), 8);
 
     // Nothing any refused change would have written exists.
     assert_eq!(journal().await, journal_before);
     assert_eq!(revision().await, revision_before);
+    assert_eq!(
+        scalar(
+            &pool,
+            "SELECT count(*) FROM greengateway.service_tokens WHERE revoked_at IS NOT NULL"
+        )
+        .await,
+        0,
+        "neither refused revoke left the token revoked"
+    );
     assert_eq!(
         scalar(&pool, "SELECT count(*) FROM greengateway.jwt_revocations").await,
         0
@@ -938,15 +1024,15 @@ async fn a_refused_evidence_write_rolls_the_mutation_back_and_is_counted_once() 
 
     // The same changes commit once the tables accept rows again, and a
     // success counts nothing.
-    producers.rotate(&token, "rotating-admin").await;
+    producers.rotate(&token, &rotating).await;
     producers.revoke_jwt("refused-jti").await;
     producers
         .connections
-        .delete(&connection.id, &connection.etag(), "deleting-admin")
+        .delete(&connection.id, &connection.etag(), &deleting)
         .await
         .expect("the delete commits");
     assert_eq!(journal().await, journal_before + 3);
-    assert_eq!(evidence_failures(), 7);
+    assert_eq!(evidence_failures(), 8);
     assert_eq!(
         recorder.count(crate::metrics::AUTHORITY_EVENT_CAPACITY_REFUSALS_TOTAL, &[]),
         0,
@@ -975,7 +1061,7 @@ async fn concurrent_producers_journal_gapless_commit_ordered_positions() {
         let store = Arc::clone(&stores[index % 2]);
         tasks.push(tokio::spawn(async move {
             store
-                .rotate(&token, "racing-admin")
+                .rotate(&token, &ChangeActor::for_test("racing-admin"))
                 .await
                 .expect("the rotate commits")
                 .expect("the token exists");
@@ -1028,7 +1114,9 @@ async fn an_aborted_append_leaves_no_gap() {
 
     let producers = Producers::new(&pool);
     let token = producers.token().await;
-    producers.revoke(&token, "revoking-admin").await;
+    producers
+        .revoke(&token, &ChangeActor::for_test("revoking-admin"))
+        .await;
     let stats = PostgresAuthorityEventStore::new(pool.clone())
         .stats()
         .await
@@ -1048,8 +1136,12 @@ async fn a_journaled_event_without_its_evidence_stalls_delivery() {
     let producers = Producers::new(&pool);
     let first = producers.token().await;
     let second = producers.token().await;
-    producers.rotate(&first, "rotating-admin").await;
-    producers.rotate(&second, "rotating-admin").await;
+    producers
+        .rotate(&first, &ChangeActor::for_test("rotating-admin"))
+        .await;
+    producers
+        .rotate(&second, &ChangeActor::for_test("rotating-admin"))
+        .await;
     pool.get()
         .await
         .expect("checkout")
@@ -1103,7 +1195,9 @@ async fn the_running_dispatcher_leads_delivers_and_stops_on_shutdown() {
     let pool = migrated_pool(&database).await;
     let producers = Producers::new(&pool);
     let token = producers.token().await;
-    producers.rotate(&token, "rotating-admin").await;
+    producers
+        .rotate(&token, &ChangeActor::for_test("rotating-admin"))
+        .await;
 
     let store = Arc::new(PostgresAuthorityEventStore::new(pool.clone()));
     let keyring = keyring_for(&store).await;
@@ -1134,7 +1228,9 @@ async fn the_running_dispatcher_leads_delivers_and_stops_on_shutdown() {
     delivered(1).await;
     assert_eq!(leases.held(DISPATCHER_LEASE_SCOPE), 1);
 
-    producers.revoke(&token, "revoking-admin").await;
+    producers
+        .revoke(&token, &ChangeActor::for_test("revoking-admin"))
+        .await;
     delivered(2).await;
 
     shutdown.cancel();

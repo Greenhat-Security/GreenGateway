@@ -360,6 +360,7 @@ struct Harness {
     google: Arc<StubGoogle>,
     identity: Arc<StubIdentity>,
     clock: Arc<ManualTokenClock>,
+    audit: AuditLog,
     capture: CaptureSink,
 }
 
@@ -411,7 +412,7 @@ impl Harness {
             Arc::new(EgressClient::new(egress_config.clone()).expect("egress client builds"));
         let runtime =
             ConnectionHttpRuntime::new(control_plane.clone(), egress_config, egress_client)
-                .with_audit(audit)
+                .with_audit(audit.clone())
                 .with_google_delegation_for_test(google.clone(), clock.clone(), capacity);
         Self {
             root,
@@ -421,6 +422,7 @@ impl Harness {
             google,
             identity,
             clock,
+            audit,
             capture,
         }
     }
@@ -448,26 +450,50 @@ impl Harness {
         Ok(value.to_str().expect("visible ASCII").to_owned())
     }
 
-    async fn mint_events(&self, count: usize) -> Vec<AuditEvent> {
-        let started = Instant::now();
-        loop {
-            let events: Vec<AuditEvent> = self
-                .capture
-                .events()
-                .into_iter()
-                .filter(|event| {
-                    event.event_type == audit::event::CONNECTION_GOOGLE_DELEGATION_TOKEN
-                })
-                .collect();
-            if events.len() >= count || started.elapsed() > Duration::from_secs(2) {
-                return events;
+    fn events_of(&self, event_type: &str) -> Vec<AuditEvent> {
+        self.capture
+            .events()
+            .into_iter()
+            .filter(|event| event.event_type == event_type)
+            .collect()
+    }
+
+    /// Audit delivery is asynchronous: a record is queued for the writer
+    /// thread and can reach the capture after the call that emitted it has
+    /// returned. Wait, bounded, for `count` records of `event_type`.
+    async fn wait_for_events(&self, event_type: &str, count: usize) -> Vec<AuditEvent> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let events = self.events_of(event_type);
+                if events.len() >= count {
+                    return events;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "expected {count} {event_type} audit records, saw {}",
+                self.events_of(event_type).len()
+            )
+        })
+    }
+
+    async fn mint_events(&self, count: usize) -> Vec<AuditEvent> {
+        self.wait_for_events(audit::event::CONNECTION_GOOGLE_DELEGATION_TOKEN, count)
+            .await
     }
 
     /// Everything a caller, an operator or a log could ever see of a run.
-    fn rendered_audit(&self) -> String {
+    /// Closes the log and waits, bounded, until every queued record is
+    /// delivered, so the check covers the whole run; only for the end of a
+    /// test.
+    async fn rendered_audit(&self) -> String {
+        self.audit
+            .close_and_drain(Duration::from_secs(5))
+            .await
+            .expect("the audit log drains");
         serde_json::to_string(&self.capture.events()).expect("audit serializes")
     }
 }
@@ -572,7 +598,7 @@ async fn two_principals_are_signed_for_as_themselves_and_get_tokens_of_their_own
         assert_eq!(event.payload["scopes"], json!([CALENDAR_READ, GMAIL_READ]));
         assert_eq!(event.payload["google_status"], json!(200));
     }
-    assert_no_token_material(&harness.rendered_audit());
+    assert_no_token_material(&harness.rendered_audit().await);
 }
 
 #[tokio::test]
@@ -664,7 +690,7 @@ async fn google_refusals_fail_closed_with_reasons_of_their_own_and_are_not_cache
     );
     // An unregistered code is never recorded verbatim.
     assert_eq!(events[2].payload["google_error"], json!("unregistered"));
-    assert_no_token_material(&harness.rendered_audit());
+    assert_no_token_material(&harness.rendered_audit().await);
 }
 
 #[tokio::test]
@@ -714,7 +740,7 @@ async fn a_refused_federated_token_is_replaced_once_and_a_wrong_assertion_is_nev
     let events = harness.mint_events(3).await;
     assert_eq!(events[1].payload["stage"], json!("sign"));
     assert_eq!(events[1].payload["google_status"], json!(403));
-    assert_no_token_material(&harness.rendered_audit());
+    assert_no_token_material(&harness.rendered_audit().await);
 }
 
 #[tokio::test]
@@ -828,10 +854,10 @@ async fn a_principal_purge_drops_their_google_tokens_and_counts_them() {
         Ok("Bearer google-bob@example.test-2".to_owned())
     );
     let purge = harness
-        .capture
-        .events()
+        .wait_for_events(audit::event::CONNECTION_DELEGATED_TOKEN_PURGE, 1)
+        .await
         .into_iter()
-        .find(|event| event.event_type == audit::event::CONNECTION_DELEGATED_TOKEN_PURGE)
+        .next()
         .expect("the purge is audited");
     assert_eq!(purge.payload["purged_entries"], json!(1));
     assert_eq!(purge.payload["google_delegation_entries"], json!(1));
@@ -930,7 +956,7 @@ async fn a_domain_wide_delegation_serves_its_callers_own_lanes_and_no_other() {
             "as the tester"
         );
     }
-    assert_no_token_material(&harness.rendered_audit());
+    assert_no_token_material(&harness.rendered_audit().await);
 }
 
 #[tokio::test]

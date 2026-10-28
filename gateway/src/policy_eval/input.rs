@@ -28,10 +28,17 @@ pub(super) fn parse(source: &[u8]) -> Result<Value, CompileError> {
     serde_json::from_slice(source).map_err(|_| CompileError::InvalidJson)
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "offline duplicate-rejecting parser")
-)]
+/// Whether `source` is JSON whose objects never repeat a member name.
+///
+/// `serde_json::Value` keeps the last of two equal member names and says
+/// nothing, so a document read through it can mean something different from
+/// what a reviewer read in the first assignment. Callers that bind a digest or
+/// a decision to a document check this first. The same visitor backs
+/// [`parse`], so the two cannot disagree about what a duplicate is.
+pub(crate) fn has_unique_members(source: &[u8]) -> bool {
+    serde_json::from_slice::<UniqueValue>(source).is_ok()
+}
+
 struct UniqueValue;
 
 impl<'de> Deserialize<'de> for UniqueValue {
