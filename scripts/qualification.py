@@ -1510,6 +1510,9 @@ def command_reconcile(args):
 DRILL_ALERT = "GreenGatewayQualificationDrill"
 ALERT_NAME = re.compile(r"[A-Za-z_:][A-Za-z0-9_:]{0,199}")
 RECORDED_LABELS = ("alertname", "severity", "owner", "job", "instance", "deployment_mode", "qualification_run")
+# How far a rule alert's startsAt (the Prometheus clock) may precede the drill's own reference time (this host's
+# clock) and still count as caused by the fault. Keep both clocks synchronised; a larger gap fails the drill.
+ALERT_CLOCK_SKEW_SECONDS = 2.0
 
 
 class Alertmanager:
@@ -1538,9 +1541,11 @@ class Alertmanager:
         except ValueError as error:
             raise InputError(f"Alertmanager returned no JSON for {method} {path.split('?')[0]}") from error
 
-    def active(self, matchers):
+    def active(self, matchers, include_muted=False):
+        """Active alerts matching every matcher; silenced and inhibited ones only with include_muted."""
+        muted = "true" if include_muted else "false"
         query = urllib.parse.urlencode([("filter", f'{key}="{value}"') for key, value in matchers]
-                                       + [("active", "true"), ("silenced", "false"), ("inhibited", "false")])
+                                       + [("active", "true"), ("silenced", muted), ("inhibited", muted)])
         alerts = self.request("GET", "/api/v2/alerts?" + query)
         if not isinstance(alerts, list):
             raise InputError("Alertmanager returned an unexpected alert listing")
@@ -1604,6 +1609,13 @@ def command_alert(args):
         name = DRILL_ALERT
     else:
         name = args.expect
+        # A rule alert carries no per-run label, and Alertmanager keeps one alert per label set: while an earlier
+        # incident's or drill's alert is still active, this fault cannot raise a new one, and the old one would be
+        # reported as proof. Muted alerts count too, since one whose silence expires mid-drill would be seen.
+        if manager.active([("alertname", name)] + matchers, include_muted=True):
+            raise InputError(f"{name} is already active for these matchers; wait for it to resolve or narrow "
+                             "--match-label")
+        record["inactive_checked_at"] = iso(utc_now())
         if args.fault_command:
             record["fault_at"] = iso(utc_now())
             record["fault_command_exit"], record["fault_command_seconds"] = run_fault_command(args.fault_command)
@@ -1615,13 +1627,20 @@ def command_alert(args):
         facts = alert_facts(found[0])
         record.update({"alert": facts, "seen_active_at": iso(utc_now()),
                        "seen_after_seconds": round(time.monotonic() - started, 3)})
-        if record.get("fault_at") and facts["starts_at"]:
+        if args.expect:
+            # The rule's own startsAt, not when it was seen, decides whether this run caused it.
+            reference, before = (("fault_at", "the fault") if "fault_at" in record
+                                 else ("inactive_checked_at", "the drill started"))
             try:
-                record["rule_fired_after_seconds"] = round(
-                    (parse_iso(facts["starts_at"], "startsAt") - parse_iso(record["fault_at"], "fault_at"))
-                    .total_seconds(), 3)
+                fired_after = (parse_iso(facts["starts_at"], "startsAt")
+                               - parse_iso(record[reference], reference)).total_seconds()
             except InputError:
-                reasons.append("Alertmanager reported an unreadable startsAt")
+                reasons.append("Alertmanager reported no readable startsAt")
+            else:
+                if reference == "fault_at":
+                    record["rule_fired_after_seconds"] = round(fired_after, 3)
+                if fired_after < -ALERT_CLOCK_SKEW_SECONDS:
+                    reasons.append(f"the alert was already active before {before} (startsAt precedes {reference})")
         missing = set(args.expect_receiver) - set(facts["receivers"])
         if missing:
             reasons.append(f"the alert did not route to {', '.join(sorted(missing))}")

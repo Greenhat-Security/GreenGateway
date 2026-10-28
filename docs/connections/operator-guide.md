@@ -1728,6 +1728,21 @@ answers `authentication_not_supported`. A save refuses kind
 no assertion of the gateway's, and one sent there would be a statement about
 the caller handed to a third party.
 
+So no managed OpenAPI catalog is served on such a Connection; bind the
+operations it should serve as manual HTTP tools. A preview, a registration
+that selects a tool, a refresh and an overlay edit on one are answered `409`
+with `authentication_not_supported` before anything is fetched or minted, and
+a refused registration is audited as `tool_registry.changed` with action
+`managed_openapi_catalog_registration_rejected` and that `reason`. A save
+that switches a Connection with a live catalog to this credential takes the
+catalog's tools off the tool list and keeps the catalog stored, as disabling
+does, and records `tool_registry.changed` with action
+`managed_openapi_catalog_withdrawn`, `reason` `authentication_not_supported`
+and the withdrawn tool names. A restart or a cluster reconcile never
+installs a stored catalog on such a Connection. Switching the credential back
+leaves the stored catalog stale for the new revision: refresh it, or register
+it again.
+
 Only a caller the Connection can name is served. Before anything is read or
 sent, a call with no principal, a service token included, is refused with
 `delegated_token_no_principal`; a caller whose attested issuer is not in
@@ -2186,7 +2201,10 @@ every caller can never be that token, so they bind only to a Connection whose
 credential is obtained for each caller. In this release that is
 `delegated_issuer_token`: the gateway sends each caller's own token, obtained
 from the Connection's issuer as described under
-[Delegated issuer tokens](#delegated-issuer-tokens), and nobody else's.
+[Delegated issuer tokens](#delegated-issuer-tokens), and nobody else's. A
+`google_domain_wide_delegation` Connection is per caller too, but no managed
+OpenAPI tool sends its credential, so no catalog is registered on one; see
+[Google domain-wide delegation](#google-domain-wide-delegation).
 
 - The document's `authorizationUrl`, `tokenUrl`, `refreshUrl` and
   `openIdConnectUrl` are never contacted and never compared with the
@@ -2676,6 +2694,18 @@ the advertised tool list and reports `disabled/disabled` rather than a catalog
 freshness state, so it never raises the `degraded/catalog_stale` alert above.
 The retained catalog is republished at the next refresh or gateway restart once
 the Connection is re-enabled.
+
+Every save that takes a live managed OpenAPI catalog off the tool list records
+`tool_registry.changed` with action `managed_openapi_catalog_withdrawn`, the
+Connection, the withdrawn `withdrawn_tool_names` and `withdrawn_tool_count`,
+and the `reason` the Connection can no longer serve it: `connection_disabled`,
+`caller_assertion_not_enforced` for a stored block no lane honours,
+`authentication_not_supported` for a `google_domain_wide_delegation`
+credential, or `connection_kind_mismatch` and `discovery_not_configured` when
+it stops being a managed OpenAPI Connection. `outcome` is `failure` only when
+the tool registry refused the removal; the tools then stay listed, but this
+replica no longer serves the catalog and refuses every call to them. The
+event is recorded by the replica that applies the save.
 
 For an operator-visible regression:
 

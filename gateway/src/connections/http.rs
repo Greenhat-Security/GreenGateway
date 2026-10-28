@@ -2247,24 +2247,52 @@ fn refuse_unenforced_caller_assertion(
 /// Those are the lanes a `delegated_issuer_token` Connection is served on
 /// (see [`caller_assertion_servable_on`]) except the managed OpenAPI tool
 /// lane: a catalog's user-consent schemes bind to a delegated issuer token
-/// alone (issue #443), so this Connection stays refused there. A delegated
+/// alone (issue #443), so this Connection stays refused there, and the
+/// catalog lifecycle neither registers nor keeps a catalog on it. A delegated
 /// issuer token is kept off the other lanes by the caller assertion it must
-/// carry; this Connection carries none, so the rule is stated here. `lane` is
-/// `None` for a lane that attests nobody.
+/// carry; this Connection carries none, so the rule is stated in
+/// [`credential_servable_on`]. `lane` is `None` for a lane that attests
+/// nobody.
 fn refuse_google_delegation_off_caller_lanes(
     record: &StoredConnection,
     lane: Option<AttestingLane>,
 ) -> Result<(), ConnectionHttpError> {
-    if matches!(
-        record.write.authentication,
-        ConnectionAuthentication::GoogleDomainWideDelegation { .. }
-    ) && !matches!(
-        lane,
-        Some(AttestingLane::ManualTool | AttestingLane::ConnectionTest)
-    ) {
+    if !credential_servable(&record.write, lane) {
         return Err(ConnectionHttpError::UnsupportedAuthentication);
     }
     Ok(())
+}
+
+/// Whether `write`'s credential can be sent on `lane` at all, whatever its
+/// caller assertion says (see [`caller_assertion_servable_on`] for that).
+///
+/// A Connection this answers `false` for is refused on `lane` with
+/// `authentication_not_supported`, before anything is resolved. Only a
+/// `google_domain_wide_delegation` Connection is refused here, on every lane
+/// but a manual tool call and a stored test, the two that obtain a caller's
+/// own Google token. The managed OpenAPI catalog lifecycle asks it for
+/// [`AttestingLane::OpenApiTool`], so a catalog is never registered on, nor
+/// left live on, a Connection whose tools could not send a request.
+pub fn credential_servable_on(write: &ConnectionWrite, lane: AttestingLane) -> bool {
+    credential_servable(write, Some(lane))
+}
+
+/// [`credential_servable_on`], with `None` for a lane that attests nobody.
+/// Exhaustive on purpose: a new credential type must decide here.
+fn credential_servable(write: &ConnectionWrite, lane: Option<AttestingLane>) -> bool {
+    match &write.authentication {
+        ConnectionAuthentication::GoogleDomainWideDelegation { .. } => matches!(
+            lane,
+            Some(AttestingLane::ManualTool | AttestingLane::ConnectionTest)
+        ),
+        // A delegated issuer token is kept off the lanes that cannot obtain
+        // a caller's token by the caller assertion it must carry.
+        ConnectionAuthentication::None
+        | ConnectionAuthentication::HeaderApiKey { .. }
+        | ConnectionAuthentication::StaticBearer { .. }
+        | ConnectionAuthentication::OAuth2ClientCredentials { .. }
+        | ConnectionAuthentication::DelegatedIssuerToken { .. } => true,
+    }
 }
 
 /// A lane that signs a caller assertion on every request it sends for a
