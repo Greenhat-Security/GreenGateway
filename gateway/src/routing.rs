@@ -382,14 +382,20 @@ pub(super) fn add_admin_api_routes(
                 )
                 .route(
                     routes.admin.policy_test_runs_route.as_str(),
-                    post(policy_test_runs_endpoint),
+                    // One limiter per route and router: its concurrency
+                    // bounds belong to this endpoint of this application,
+                    // not to the process.
+                    post(policy_test_runs_endpoint).layer(Extension(Arc::new(
+                        PolicyEvaluationLimiter::new(MAX_CONCURRENT_POLICY_TEST_RUNS),
+                    ))),
                 )
                 .route(
                     routes.admin.policy_simulations_route.as_str(),
-                    // One limiter per router: its concurrency bounds belong
-                    // to this application, not to the process.
-                    post(policy_simulations_endpoint)
-                        .layer(Extension(Arc::new(PolicySimulationLimiter::new()))),
+                    // Its own limiter, so simulations and test runs never
+                    // take each other's slots.
+                    post(policy_simulations_endpoint).layer(Extension(Arc::new(
+                        PolicyEvaluationLimiter::new(MAX_CONCURRENT_POLICY_SIMULATIONS),
+                    ))),
                 )
                 .route(
                     routes.admin.policy_rules_route.as_str(),
