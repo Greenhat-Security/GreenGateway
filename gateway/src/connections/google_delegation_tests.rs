@@ -23,7 +23,7 @@ use crate::{
     connections::{
         control_plane::ConnectionControlPlane,
         gcp_secret::GcpProfileConfig,
-        http::{ConnectionHttpError, ConnectionHttpRuntime},
+        http::{credential_servable_on, AttestingLane, ConnectionHttpError, ConnectionHttpRuntime},
         model::{
             ConnectionAuthentication, ConnectionEndpoint, ConnectionKind, ConnectionTestProfile,
             ConnectionWrite, GoogleSubjectClaim, TlsProfile,
@@ -906,6 +906,21 @@ async fn a_domain_wide_delegation_serves_its_callers_own_lanes_and_no_other() {
         .cloned()
         .expect("the Connection is stored");
     let etag = record.etag().to_string();
+
+    // The rule each lane applies, and the managed OpenAPI catalog lifecycle
+    // asks, so that no catalog is registered on, or left live on, this
+    // Connection.
+    for lane in [AttestingLane::ManualTool, AttestingLane::ConnectionTest] {
+        assert!(credential_servable_on(&record.write, lane), "{lane:?}");
+    }
+    for lane in [
+        AttestingLane::OpenApiTool,
+        AttestingLane::CompositeLeaf,
+        AttestingLane::ProxyRoute,
+        AttestingLane::ManagedMcpTool,
+    ] {
+        assert!(!credential_servable_on(&record.write, lane), "{lane:?}");
+    }
 
     // A test that names nobody is refused before the egress preflight, and
     // before anything is asked of Google.
