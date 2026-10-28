@@ -55,8 +55,9 @@ of their own, described from
 predicate measured here is still called by production code; the static egress
 lane, for example, matches host patterns with `host_glob_matches`. None has
 been retired, so none of these targets is removed; a predicate retired later
-needs equivalent authoritative coverage before its benchmark goes. Cached JWT work is deferred: this harness has no JWT
-verification, keys, cache or cache-lifetime model.
+needs equivalent authoritative coverage before its benchmark goes. Cached JWT
+work is deferred: this harness has no JWT verification, keys, cache or
+cache-lifetime model.
 
 All inputs are public synthetic fixtures. Host cases use reserved test names;
 there are no tokens, real upstream hostnames or external network dependencies.
@@ -218,7 +219,11 @@ test finished in under a second in the
 to a step bound by the two builds. The slowest step, in run 39738214098,
 finished about 11 seconds inside the 480-second comparison budget. That margin
 is the job's main timing risk, and it comes from build time, not from the
-measured decisions.
+measured decisions. The 30 `microbench` jobs of the pull-request and
+main-push CI runs created from 2026-10-22 12:07 to 2026-10-25 20:34 UTC, after
+the lane benchmarks landed, all passed. Their comparison steps took 252 to 438
+seconds, so the slowest finished about 42 seconds inside the budget, and the
+jobs took 297 to 489 seconds.
 
 These are durations on shared hosted runners, not a timing qualification. The
 evidence artifacts have 30-day retention, so this record keeps run and commit
@@ -422,9 +427,10 @@ Steps 1 and 2 have landed; until step 3 lands, allocation growth in this
 target is reported in its comparison but does not fail the job. A missing,
 undiscovered, crashed, timed-out or mislabelled static egress run still fails
 it. The comparison runs one more test process per revision that declares the
-target. The [hosted CI record](#hosted-ci-record) puts the slowest comparison
-step about 11 seconds inside its 480-second budget, so this narrows a margin
-that is already the job's main timing risk.
+target. In the [hosted CI record](#hosted-ci-record) the slowest comparison
+step finished about 11 seconds inside its 480-second budget, and the slowest
+of the 30 later ones about 42 seconds inside it, so this narrows a margin that
+is already the job's main timing risk.
 
 ### Static egress measurement record
 
