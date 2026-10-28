@@ -38,7 +38,8 @@ use crate::{
 use super::{
     control_plane::{CatalogLifecycleError, CatalogMutationGuard, ConnectionControlPlane},
     http::{
-        caller_assertion_servable_on, AttestingLane, ConnectionHttpError, ConnectionHttpRuntime,
+        caller_assertion_servable_on, credential_servable_on, AttestingLane, ConnectionHttpError,
+        ConnectionHttpRuntime,
     },
     model::{
         normalize_origin_relative_path, ConnectionId, ConnectionKind, DiscoveryConfig,
@@ -260,6 +261,24 @@ pub struct OpenApiCatalogPublishResult {
     pub removed_count: usize,
 }
 
+/// A live catalog that [`OpenApiConnectionCatalogService::reconcile_connection`]
+/// took off the tool list because its Connection can no longer serve it. The
+/// stored catalog is kept: it is stale for the saved revision, and a refresh
+/// or a new registration publishes it again once the Connection can.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenApiCatalogWithdrawal {
+    pub connection_id: ConnectionId,
+    /// Why the Connection cannot serve it, as a registration on it would be
+    /// refused.
+    pub reason: OpenApiCatalogError,
+    /// The names its tools were listed under.
+    pub tool_names: Vec<String>,
+    /// Whether the registry dropped them. When it refused, the names stay
+    /// listed, but this replica no longer serves the catalog, so every call
+    /// to them is refused before anything is sent.
+    pub unlisted: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpenApiCatalogError {
     StoreUnavailable,
@@ -281,6 +300,12 @@ pub enum OpenApiCatalogError {
     /// caller to attest, and a block only an earlier release accepted is
     /// honoured by no OpenAPI lane. Nothing is fetched or published for it.
     CallerAssertionNotEnforced,
+    /// The Connection's credential is one no managed OpenAPI tool sends: a
+    /// `google_domain_wide_delegation` Connection is served by manual tool
+    /// calls and stored tests alone, so no catalog can be registered on it,
+    /// and a live one is withdrawn when a save switches its Connection to
+    /// it. Nothing is fetched, minted or published for it.
+    AuthenticationNotSupported,
     ToolConflict,
     EgressDenied,
     SecretUnavailable,
@@ -315,6 +340,7 @@ impl OpenApiCatalogError {
             Self::InvalidSelection => "invalid_selection",
             Self::AuthenticationMismatch => "authentication_mismatch",
             Self::CallerAssertionNotEnforced => "caller_assertion_not_enforced",
+            Self::AuthenticationNotSupported => "authentication_not_supported",
             Self::ToolConflict => "tool_name_conflict",
             Self::EgressDenied => "egress_denied",
             Self::SecretUnavailable => "secret_unavailable",
@@ -410,6 +436,15 @@ impl OpenApiConnectionCatalogRuntime {
             .load()
             .get(connection_id)
             .map(|catalog| catalog.catalog_revision)
+    }
+
+    /// The tool names of the catalog this replica currently serves for a
+    /// Connection.
+    fn tool_names(&self, connection_id: &ConnectionId) -> Option<Vec<String>> {
+        self.state
+            .load()
+            .get(connection_id)
+            .map(|catalog| catalog.definition_digests.keys().cloned().collect())
     }
 
     fn current_generation(&self, connection_id: &ConnectionId) -> Option<(u64, String, u64)> {
@@ -873,10 +908,25 @@ impl OpenApiConnectionCatalogService {
             .map_err(catalog_lifecycle_error)
     }
 
-    pub fn reconcile_connection(&self, record: &StoredConnection) {
-        if !serves_managed_openapi_catalog(record) {
-            self.discard_runtime_catalog(&record.id);
-        }
+    /// Withdraw `record`'s catalog from the tool list when the saved
+    /// Connection can no longer serve one, keeping it stored. Returns what was
+    /// withdrawn, for the save to audit, or `None` when the catalog stays
+    /// live or this replica served none for the Connection. The caller holds
+    /// the Connection's catalog mutation guard, so no publish runs between
+    /// reading the served names and withdrawing them.
+    pub fn reconcile_connection(
+        &self,
+        record: &StoredConnection,
+    ) -> Option<OpenApiCatalogWithdrawal> {
+        let reason = managed_openapi_catalog_withdrawal_reason(record)?;
+        let tool_names = self.runtime.tool_names(&record.id);
+        let unlisted = self.discard_runtime_catalog(&record.id);
+        tool_names.map(|tool_names| OpenApiCatalogWithdrawal {
+            connection_id: record.id.clone(),
+            reason,
+            tool_names,
+            unlisted,
+        })
     }
 
     pub fn remove_connection(&self, connection_id: &ConnectionId) {
@@ -1856,8 +1906,11 @@ impl OpenApiConnectionCatalogService {
     ) -> Result<(ConnectionId, StoredConnection), OpenApiCatalogError> {
         let (connection_id, record) =
             self.managed_openapi_record_identity(raw_connection_id, expected_etag)?;
-        if !record.write.enabled {
-            return Err(OpenApiCatalogError::ConnectionDisabled);
+        // A Connection whose catalog would be withdrawn from the tool list is
+        // refused for the same reason, before anything is fetched or minted:
+        // what cannot be registered is exactly what cannot stay live.
+        if let Some(reason) = managed_openapi_catalog_withdrawal_reason(&record) {
+            return Err(reason);
         }
         // The catalog's tools are what this record is for, so it is judged as
         // their binding is: an attesting Connection is accepted. Fetching the
@@ -1900,25 +1953,31 @@ impl OpenApiConnectionCatalogService {
         Ok((connection_id, record))
     }
 
-    fn discard_runtime_catalog(&self, connection_id: &ConnectionId) {
-        if let Err(error) = self.registry.replace_openapi_connection_catalog(
+    /// Stop serving a Connection's catalog on this replica. Returns whether
+    /// the registry dropped its tools; this replica stops serving them
+    /// either way.
+    fn discard_runtime_catalog(&self, connection_id: &ConnectionId) -> bool {
+        let unlisted = match self.registry.replace_openapi_connection_catalog(
             connection_id.as_str(),
             Vec::new(),
             || Ok::<(), Infallible>(()),
         ) {
-            match error {
-                McpCatalogPublishError::Registry(error) => tracing::error!(
+            Ok(()) => true,
+            Err(McpCatalogPublishError::Registry(error)) => {
+                tracing::error!(
                     connection_id = %connection_id,
                     error = %error,
                     "failed to remove an inactive OpenAPI catalog from the tool registry"
-                ),
-                McpCatalogPublishError::Persist(error) => match error {},
+                );
+                false
             }
-        }
+            Err(McpCatalogPublishError::Persist(error)) => match error {},
+        };
         self.runtime.remove(connection_id);
         if let Some(enum_runtime) = self.enum_source_runtime.as_ref() {
             enum_runtime.remove_plan(connection_id);
         }
+        unlisted
     }
 
     async fn publish_candidate(
@@ -2925,19 +2984,43 @@ fn supports_managed_openapi_catalog(record: &StoredConnection) -> bool {
 }
 
 /// Whether a Connection's stored OpenAPI catalog may be live in the registry.
+fn serves_managed_openapi_catalog(record: &StoredConnection) -> bool {
+    managed_openapi_catalog_withdrawal_reason(record).is_none()
+}
+
+/// Why a Connection's stored OpenAPI catalog may not be live in the registry,
+/// or `None` when it may. Registration, refresh and overlay edits refuse a
+/// Connection with the same reason.
 ///
 /// Its tools sign a caller assertion on every call, so a Connection that
 /// attests its caller keeps its catalog, and so does a
 /// `delegated_issuer_token` Connection, whose tools obtain each caller's own
-/// token (issue #443). One whose block no OpenAPI tool can honour -- a block
-/// only an earlier release accepted -- is withdrawn like one on a disabled
-/// Connection: every call would be refused, and the binding validation each
-/// registry change runs refuses its tools, so leaving them installed would
-/// fail every later change to any lane, and a restart.
-fn serves_managed_openapi_catalog(record: &StoredConnection) -> bool {
-    record.write.enabled
-        && caller_assertion_servable_on(&record.write, AttestingLane::OpenApiTool)
-        && supports_managed_openapi_catalog(record)
+/// token (issue #443). One whose tools could not send a request is withdrawn
+/// like one on a disabled Connection: one with a block no OpenAPI tool can
+/// honour -- a block only an earlier release accepted -- and a
+/// `google_domain_wide_delegation` one, whose credential the managed OpenAPI
+/// tool lane never sends. Every call would be refused, and the binding
+/// validation each registry change runs refuses its tools, so leaving them
+/// installed would fail every later change to any lane, and a restart.
+fn managed_openapi_catalog_withdrawal_reason(
+    record: &StoredConnection,
+) -> Option<OpenApiCatalogError> {
+    if record.write.kind != ConnectionKind::HttpApi {
+        return Some(OpenApiCatalogError::ConnectionKindMismatch);
+    }
+    if !supports_managed_openapi_catalog(record) {
+        return Some(OpenApiCatalogError::DiscoveryNotConfigured);
+    }
+    if !record.write.enabled {
+        return Some(OpenApiCatalogError::ConnectionDisabled);
+    }
+    if !caller_assertion_servable_on(&record.write, AttestingLane::OpenApiTool) {
+        return Some(OpenApiCatalogError::CallerAssertionNotEnforced);
+    }
+    if !credential_servable_on(&record.write, AttestingLane::OpenApiTool) {
+        return Some(OpenApiCatalogError::AuthenticationNotSupported);
+    }
+    None
 }
 
 fn catalog_change_counts(
@@ -4217,6 +4300,307 @@ paths:
                 crate::bootstrap::validate_connection_bound_tools(&validator_http, definitions)
             }))
             .expect("the remaining lanes should still validate");
+    }
+
+    /// The workload identity profile a `google_domain_wide_delegation`
+    /// Connection signs through. Saving an enabled one checks only that the
+    /// profile is configured; nothing here reads its token file.
+    fn delegation_profile() -> crate::connections::gcp_secret::GcpProfileConfig {
+        crate::connections::gcp_secret::GcpProfileConfig {
+            id: "gateway-wif".to_owned(),
+            audience: "//iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/gateway-pool/providers/gateway-provider".to_owned(),
+            token_root: std::env::temp_dir().display().to_string(),
+            token_file: "gcp-token".to_owned(),
+            service_account: None,
+        }
+    }
+
+    fn domain_wide_delegation() -> crate::connections::model::ConnectionAuthentication {
+        crate::connections::model::ConnectionAuthentication::GoogleDomainWideDelegation {
+            service_account_email: "gateway-delegate@example-project.iam.gserviceaccount.com"
+                .to_owned(),
+            workload_identity_profile: "gateway-wif".to_owned(),
+            scopes: vec!["https://www.googleapis.com/auth/gmail.readonly".to_owned()],
+            subject_claim: crate::connections::model::GoogleSubjectClaim::Email,
+            // Canonical, as a save stores it.
+            subject_issuers: vec!["https://idp.example.test".to_owned()],
+        }
+    }
+
+    /// A federated identity that only counts what it is asked: a catalog
+    /// operation on a domain-wide delegation must never mint anything.
+    #[derive(Default)]
+    struct CountingWorkloadIdentity(std::sync::atomic::AtomicUsize);
+
+    impl CountingWorkloadIdentity {
+        fn calls(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::Acquire)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::connections::google_delegation::GoogleWorkloadIdentity for CountingWorkloadIdentity {
+        async fn access_token(
+            &self,
+            _profile_id: &str,
+            _minimum_generation: u64,
+        ) -> Result<
+            crate::connections::google_delegation::FederatedAccessToken,
+            crate::connections::google_delegation::FederatedIdentityError,
+        > {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            Err(crate::connections::google_delegation::FederatedIdentityError::EgressDenied)
+        }
+    }
+
+    /// A managed OpenAPI Connection without authentication whose discovery
+    /// `path` is set, with `get_invoice` registered from an uploaded
+    /// specification, beside a domain-wide delegation profile.
+    struct DelegationCatalogFixture {
+        _database: TemporaryDatabase,
+        control_plane: ConnectionControlPlane,
+        http: ConnectionHttpRuntime,
+        registry: ToolRegistry,
+        service: OpenApiConnectionCatalogService,
+        identity: Arc<CountingWorkloadIdentity>,
+        record: StoredConnection,
+    }
+
+    impl DelegationCatalogFixture {
+        async fn registered() -> Self {
+            let database = TemporaryDatabase::new();
+            let mut config = Config::test_defaults();
+            config.connections_sqlite_path = Some(database.0.display().to_string());
+            config.connection_gcp_provider.profiles = vec![delegation_profile()];
+            let control_plane =
+                ConnectionControlPlane::from_config(&config).expect("control plane should build");
+            let identity = Arc::new(CountingWorkloadIdentity::default());
+            control_plane.install_google_workload_identity(identity.clone());
+            let snapshot = control_plane.runtime_snapshot();
+            let candidate: ConnectionWrite = serde_json::from_value(json!({
+                "display_name": "Workspace Billing OpenAPI",
+                "enabled": true,
+                "kind": "http_api",
+                "endpoint": {
+                    "base_url": "https://billing.example.test",
+                    "base_path": "/v1"
+                },
+                "authentication": {"type": "none"},
+                "tls": {},
+                "discovery": {
+                    "type": "managed_openapi",
+                    "path": "/openapi.json",
+                    "use_connection_authentication": false
+                }
+            }))
+            .expect("managed OpenAPI Connection should deserialize");
+            let record = control_plane
+                .create_managed(snapshot.collection_etag(), candidate, "test-admin")
+                .await
+                .expect("managed OpenAPI Connection should create");
+            // The default egress policy denies every host, so a regression
+            // that reached the spec fetch would fail as `egress_denied`, and
+            // one that reached a mint would be counted by `identity`.
+            let egress_config = EgressConfig::from_config(&config);
+            let egress_client =
+                Arc::new(EgressClient::new(egress_config.clone()).expect("egress should build"));
+            let http =
+                ConnectionHttpRuntime::new(control_plane.clone(), egress_config, egress_client);
+            let registry = ToolRegistry::disabled();
+            let service = OpenApiConnectionCatalogService::load(
+                control_plane.clone(),
+                http.clone(),
+                registry.clone(),
+            )
+            .expect("managed OpenAPI service should load");
+            let spec = CALLER_ASSERTION_TEST_SPEC;
+            let preview = service
+                .preview(record.id.as_str(), spec)
+                .await
+                .expect("an uploaded specification should preview");
+            service
+                .register(
+                    record.id.as_str(),
+                    record.etag().as_str(),
+                    preview.spec_revision,
+                    preview.catalog_revision,
+                    &preview.spec_digest,
+                    spec,
+                    &["get_invoice".to_owned()],
+                    &preview.binding.security_selections,
+                    "test-admin",
+                )
+                .await
+                .expect("an uploaded catalog should register");
+            assert!(registry.get("get_invoice").is_some());
+            assert!(service.runtime().current_revision(&record.id).is_some());
+            Self {
+                _database: database,
+                control_plane,
+                http,
+                registry,
+                service,
+                identity,
+                record,
+            }
+        }
+
+        async fn stored_entry_count(&self) -> Option<usize> {
+            let (catalog, _) = self
+                .control_plane
+                .managed_store()
+                .expect("managed store should exist")
+                .openapi_catalog_with_overlay(&self.record.id)
+                .await
+                .expect("the stored catalog should read");
+            catalog.map(|catalog| catalog.entries.len())
+        }
+
+        fn validate_every_lane(&self) {
+            let validator_http = self.http.clone();
+            self.registry
+                .set_definition_validator(Arc::new(move |definitions| {
+                    crate::bootstrap::validate_connection_bound_tools(&validator_http, definitions)
+                }))
+                .expect("every remaining lane should validate");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_save_to_domain_wide_delegation_withdraws_the_live_catalog_and_refuses_a_new_one() {
+        let fixture = DelegationCatalogFixture::registered().await;
+        let record = &fixture.record;
+        let service = &fixture.service;
+        let mut delegating = record.write.clone();
+        delegating.authentication = domain_wide_delegation();
+        let updated = fixture
+            .control_plane
+            .replace_managed(&record.id, &record.etag(), delegating, "test-admin")
+            .await
+            .expect("switching the credential to domain-wide delegation should save");
+
+        // Its tools could never send a request: the OpenAPI tool lane never
+        // sends this credential. Left installed, they would also fail the
+        // binding validation every later registry change runs, for every
+        // lane, so the save withdraws them and keeps the catalog stored.
+        assert_eq!(
+            service.reconcile_connection(&updated),
+            Some(OpenApiCatalogWithdrawal {
+                connection_id: record.id.clone(),
+                reason: OpenApiCatalogError::AuthenticationNotSupported,
+                tool_names: vec!["get_invoice".to_owned()],
+                unlisted: true,
+            })
+        );
+        assert!(fixture.registry.get("get_invoice").is_none());
+        assert_eq!(service.runtime().current_revision(&record.id), None);
+        assert_eq!(fixture.stored_entry_count().await, Some(1));
+        fixture.validate_every_lane();
+        assert_eq!(
+            service.reconcile_connection(&updated),
+            None,
+            "nothing is left to withdraw"
+        );
+
+        // Every catalog write is refused with the same stable reason before
+        // anything is fetched or minted: a preview, a registration that
+        // selects a tool, a refresh, though the discovery `path` would fetch,
+        // and an overlay edit.
+        let refused = Some(OpenApiCatalogError::AuthenticationNotSupported);
+        let spec = CALLER_ASSERTION_TEST_SPEC;
+        assert_eq!(
+            service.preview(record.id.as_str(), spec).await.err(),
+            refused
+        );
+        assert_eq!(
+            service
+                .register(
+                    record.id.as_str(),
+                    updated.etag().as_str(),
+                    1,
+                    1,
+                    &spec_digest(spec),
+                    spec,
+                    &["get_invoice".to_owned()],
+                    &[],
+                    "test-admin",
+                )
+                .await
+                .err(),
+            refused
+        );
+        assert_eq!(
+            service
+                .refresh(record.id.as_str(), updated.etag().as_str(), "test-admin")
+                .await
+                .err(),
+            refused
+        );
+        let overlay = service
+            .put_overlay(
+                record.id.as_str(),
+                OverlayEtag::for_revisions(record.id.as_str(), updated.revisions.connection, 1, 0)
+                    .as_str(),
+                &json!({
+                    "schema_version": "0.1.0",
+                    "tools": {"get_invoice": {"rename": "read_invoice"}}
+                }),
+                "test-admin",
+            )
+            .await
+            .err();
+        assert!(matches!(
+            overlay,
+            Some(OpenApiOverlayOperationError::Catalog(
+                OpenApiCatalogError::AuthenticationNotSupported
+            ))
+        ));
+        assert_eq!(
+            OpenApiCatalogError::AuthenticationNotSupported.safe_reason(),
+            "authentication_not_supported"
+        );
+        assert_eq!(fixture.identity.calls(), 0, "nothing is minted");
+        assert!(fixture.registry.get("get_invoice").is_none());
+        assert_eq!(fixture.stored_entry_count().await, Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_stored_catalog_current_for_a_domain_wide_delegation_is_never_installed() {
+        let fixture = DelegationCatalogFixture::registered().await;
+        let record = &fixture.record;
+        // The authority hands this replica the same revision with the
+        // credential a catalog cannot be served on, as a restart reads it or
+        // a cluster reconcile applies it: the stored catalog is current for
+        // that revision, so only the credential keeps it off the tool list.
+        let mut delegating = record.clone();
+        delegating.write.authentication = domain_wide_delegation();
+        assert_eq!(delegating.etag(), record.etag());
+        fixture
+            .control_plane
+            .publish_authoritative_records(vec![delegating])
+            .await
+            .expect("a domain-wide delegation with a configured profile should load");
+
+        let restarted_registry = ToolRegistry::disabled();
+        let restarted = OpenApiConnectionCatalogService::load(
+            fixture.control_plane.clone(),
+            fixture.http.clone(),
+            restarted_registry.clone(),
+        )
+        .expect("a stored catalog on a domain-wide delegation must not fail a restart");
+        assert!(restarted_registry.get("get_invoice").is_none());
+        assert_eq!(restarted.runtime().current_revision(&record.id), None);
+
+        fixture
+            .service
+            .reconcile_from_authority()
+            .await
+            .expect("a stored catalog on a domain-wide delegation must not fail a reconcile");
+        assert!(fixture.registry.get("get_invoice").is_none());
+        assert_eq!(fixture.service.runtime().current_revision(&record.id), None);
+        fixture.validate_every_lane();
+        assert_eq!(fixture.stored_entry_count().await, Some(1));
+        assert_eq!(fixture.identity.calls(), 0, "nothing is minted");
     }
 
     #[tokio::test]
