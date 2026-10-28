@@ -1105,9 +1105,15 @@
         "checksum": null,
         "features": [],
         "dependencies": [
+          "cap-fs-ext@4.0.3|registry+https://github.com/rust-lang/crates.io-index",
+          "cap-std@4.0.3|registry+https://github.com/rust-lang/crates.io-index",
+          "hex@0.4.3|registry+https://github.com/rust-lang/crates.io-index",
           "jsonschema@0.58.6|registry+https://github.com/rust-lang/crates.io-index",
+          "proptest@1.11.0|registry+https://github.com/rust-lang/crates.io-index",
           "serde@1.0.229|registry+https://github.com/rust-lang/crates.io-index",
-          "serde_json@1.0.154|registry+https://github.com/rust-lang/crates.io-index"
+          "serde_json@1.0.154|registry+https://github.com/rust-lang/crates.io-index",
+          "sha2@0.11.0|registry+https://github.com/rust-lang/crates.io-index",
+          "uuid@1.26.1|registry+https://github.com/rust-lang/crates.io-index"
         ]
       },
       {
@@ -6172,7 +6178,7 @@
           {
             "name": "jsonschema",
             "rename": null,
-            "kind": "dev",
+            "kind": null,
             "target": null,
             "req": "^0.58.6",
             "optional": false,
@@ -6207,6 +6213,74 @@
             "features": [
               "derive"
             ],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "uuid",
+            "rename": null,
+            "kind": "dev",
+            "target": null,
+            "req": "^1.20.0",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [
+              "v4"
+            ],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "proptest",
+            "rename": null,
+            "kind": "dev",
+            "target": null,
+            "req": "^1.9.0",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "cap-fs-ext",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "^4.0.2",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "cap-std",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "^4.0.2",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "hex",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "^0.4.3",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "sha2",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "^0.11.0",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [],
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           }
         ],
@@ -7754,54 +7828,64 @@
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
     {
-      "file": "gateway/src/config/bundle/source.rs",
+      "file": "gateway-config/src/bundle/source.rs",
       "reasons": [
         "capability-import-or-glob"
       ],
-      "scope": "gateway::config::bundle::source::use std :: { ffi :: OsStr , fs , io :: { self , Read as _ } , path :: { Component , Path } , }#1",
+      "scope": "gateway_config::bundle::source::use std :: { ffi :: OsStr , fs , io :: { self , Read as _ } , path :: { Component , Path } , }#1",
       "sha256": "2e0ff740827a8be877c4e9e4bf7936c8001bfea168a1f4e2ec43b9910a9293a2",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed for #242 PR 4: the configuration bundle reader's contained, read-only filesystem access (canonicalized root opened as a cap-std directory, no-follow opens, link count, reparse attribute and Unix mode read from the opened handle). It adds no network or process capability; constructor bodies require separate scope review."
     },
     {
-      "file": "gateway/src/config/bundle/source.rs",
+      "file": "gateway-config/src/bundle/source.rs",
       "reasons": [
         "capability-import-or-glob"
       ],
-      "scope": "gateway::config::bundle::source::use cap_fs_ext :: { DirExt as _ , FollowSymlinks , MetadataExt as CapabilityMetadataExt , OpenOptionsFollowExt as _ , OpenOptionsSyncExt as _ , }#1",
+      "scope": "gateway_config::bundle::source::use cap_fs_ext :: { DirExt as _ , FollowSymlinks , MetadataExt as CapabilityMetadataExt , OpenOptionsFollowExt as _ , OpenOptionsSyncExt as _ , }#1",
       "sha256": "2f7e6c8c421f86038c184491f0f85e0d1aa00ac960e89c1e03e79a3d8c19b4df",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed for #242 PR 4: the configuration bundle reader's contained, read-only filesystem access (canonicalized root opened as a cap-std directory, no-follow opens, link count, reparse attribute and Unix mode read from the opened handle). It adds no network or process capability; constructor bodies require separate scope review."
     },
     {
-      "file": "gateway/src/config/bundle/source.rs",
+      "file": "gateway-config/src/bundle/source.rs",
       "reasons": [
         "capability-import-or-glob"
       ],
-      "scope": "gateway::config::bundle::source::use cap_std :: { ambient_authority , fs :: { Dir , OpenOptions as CapabilityOpenOptions } , }#1",
+      "scope": "gateway_config::bundle::source::use cap_std :: { ambient_authority , fs :: { Dir , OpenOptions as CapabilityOpenOptions } , }#1",
       "sha256": "195f6c89077f4e307f3177b3c7d3c177e0e7b8004353c1e9b857d2d1b820e3aa",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed for #242 PR 4: the configuration bundle reader's contained, read-only filesystem access (canonicalized root opened as a cap-std directory, no-follow opens, link count, reparse attribute and Unix mode read from the opened handle). It adds no network or process capability; constructor bodies require separate scope review."
     },
     {
-      "file": "gateway/src/config/bundle/source.rs",
+      "file": "gateway-config/src/bundle/source.rs",
       "reasons": [
         "capability-import-or-glob"
       ],
-      "scope": "gateway::config::bundle::source::file_permissions_are_safe#1",
+      "scope": "gateway_config::bundle::source::file_permissions_are_safe#1",
       "sha256": "cc98ef622850697a82d4d193e72b206f2ecca69f2fb3751ffd0b9d3886e39f3f",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed for #242 PR 4: the configuration bundle reader's contained, read-only filesystem access (canonicalized root opened as a cap-std directory, no-follow opens, link count, reparse attribute and Unix mode read from the opened handle). It adds no network or process capability; constructor bodies require separate scope review."
     },
     {
-      "file": "gateway/src/config/bundle/source.rs",
+      "file": "gateway-config/src/bundle/source.rs",
       "reasons": [
         "capability-import-or-glob"
       ],
-      "scope": "gateway::config::bundle::source::is_reparse_point#1",
+      "scope": "gateway_config::bundle::source::is_reparse_point#1",
       "sha256": "b38daad4bb5a2611dccf7b648e45aa79aa9af9944222f0319f6ec5b8b24f642b",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed for #242 PR 4: the configuration bundle reader's contained, read-only filesystem access (canonicalized root opened as a cap-std directory, no-follow opens, link count, reparse attribute and Unix mode read from the opened handle). It adds no network or process capability; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway-config/src/bundle/value.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway_config::bundle::value::file_attributes#1",
+      "sha256": "f35344af05310ce62d71cb4418df23165a4f4b7fe61773cdaa9b146fec815541",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the bundle reader's secret-reference, placeholder and decimal value forms, which the field catalog (#242 PR 3) will call; pure parsing of an in-memory tree with no I/O and no transport or process capability."
     },
     {
       "file": "gateway/src/config.rs",
@@ -8835,12 +8919,12 @@
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
     {
-      "file": "gateway/src/connections/secret.rs",
+      "file": "gateway-config/src/permissions.rs",
       "reasons": [
         "capability-import-or-glob"
       ],
-      "scope": "gateway::connections::secret::projected_root_permissions_are_safe#1",
-      "sha256": "efd5f4c7b211920a86f57771097e126ec2ac277efd0bb953aadac8cab254e289",
+      "scope": "gateway_config::permissions::projected_root_permissions_are_safe#1",
+      "sha256": "531f313a0883db82809b4028d4db3566138936321fa328cc9879c8cbe105dd20",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
@@ -14535,6 +14619,16 @@
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
     {
+      "file": "gateway/src/config/bundle.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::config::bundle::file_attributes#1",
+      "sha256": "6651893f61abaf3a3a584a1a4bf787888b6316908097bba4afe06cbd13196060",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the gateway's production validators passed to the shared bundle reader, which bundle mode (a later #242 slice) will call; it only calls the existing policy and tools validators and has no transport or process capability."
+    },
+    {
       "file": "gateway/src/connections/control_plane.rs",
       "reasons": [
         "unexpanded-attribute"
@@ -14823,16 +14917,6 @@
       "sha256": "e4bfa7df187811ce65092898177761a846fc06fb7c728b97f4913bc46666e6bd",
       "owner": "GreenGateway maintainers: operator CLI (#242)",
       "purpose": "Reviewed for #242 PR 5: ggctl's admin API client, its only network capability. One reqwest client, built in admin_http_client with no proxy, no redirects, no transparent retries, HTTP/1.1, platform certificate and hostname verification plus optional --ca-file trust anchors, and bounded time and response size. It talks only to the operator-named admin API base, is not linked into the gateway, and scripts/check-egress-only.sh pins its builder."
-    },
-    {
-      "file": "ggctl/src/sarif.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "ggctl::sarif::file_attributes#1",
-      "sha256": "b00904082cc65a1f3303a0ba6a7be66e26e8fbdb8f97bf07a7f5bb17a2d02b5f",
-      "owner": "GreenGateway maintainers: operator CLI (#242)",
-      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the SARIF writer, which ggctl validate (#242 PR 8) will call; it builds JSON in memory only, with no I/O and no transport or process capability."
     },
     {
       "file": "ggctl/src/main.rs",

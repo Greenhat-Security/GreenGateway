@@ -464,3 +464,141 @@ fn https_with_an_added_trust_anchor_and_a_token_file() {
         assert_eq!(gateway.requests().len(), before);
     }
 }
+
+/// A configuration bundle under the system temporary directory, removed on
+/// drop.
+struct Bundle(std::path::PathBuf);
+
+impl Drop for Bundle {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+impl Bundle {
+    /// A production bundle pinning `policy`, the empty tools document and a
+    /// deployment document.
+    fn new(policy: &str) -> Self {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "ggctl-cli-bundle-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("the bundle directory should create");
+        let bundle = Self(root);
+        bundle.write(
+            "deployment.yaml",
+            "apiVersion: greengateway.dev/v1alpha1\nkind: GatewayDeployment\nspec:\n  profile: production\n",
+        );
+        bundle.write("policy.json", policy);
+        bundle.write(
+            "tools.json",
+            "{\"schema_version\": \"0.1.0\", \"tools\": []}\n",
+        );
+        let pin = |name: &str| {
+            gateway_config::bundle::sha256_pin(
+                &std::fs::read(bundle.0.join(name)).expect("the bundle file should read"),
+            )
+        };
+        let manifest = format!(
+            "apiVersion: greengateway.dev/v1alpha1\nkind: GatewayBundle\nmetadata:\n  name: payments-production\nspec:\n  deployment:\n    path: deployment.yaml\n    sha256: \"{}\"\n  resources:\n    policy:\n      source: bundle\n      path: policy.json\n      schema_version: \"0.1.0\"\n      sha256: \"{}\"\n    tools:\n      source: bundle\n      path: tools.json\n      schema_version: \"0.1.0\"\n      sha256: \"{}\"\n",
+            pin("deployment.yaml"),
+            pin("policy.json"),
+            pin("tools.json"),
+        );
+        bundle.write("bundle.yaml", &manifest);
+        bundle
+    }
+
+    fn write(&self, name: &str, contents: &str) {
+        let path = self.0.join(name);
+        std::fs::write(&path, contents).expect("the bundle file should write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for (path, mode) in [(&self.0, 0o755), (&path, 0o644)] {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+                    .expect("permissions should set");
+            }
+        }
+    }
+
+    fn path(&self) -> &str {
+        self.0
+            .to_str()
+            .expect("the temporary directory should be UTF-8")
+    }
+}
+
+fn assert_path_not_echoed(output: &Output, path: &str) {
+    let all = format!("{}{}", text(&output.stdout), text(&output.stderr));
+    assert!(
+        !all.contains(path),
+        "the bundle path reached the output: {all}"
+    );
+}
+
+#[test]
+fn validate_and_doctor_read_a_bundle_offline_with_their_exit_codes() {
+    let bundle = Bundle::new("{\"schema_version\": \"0.1.0\", \"default_action\": \"deny\"}\n");
+
+    let output = ggctl(&["validate", bundle.path()], None);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(text(&output.stdout)
+        .starts_with("bundle payments-production (greengateway.dev/v1alpha1): valid\n"));
+    assert!(
+        text(&output.stderr).starts_with("ggctl: info: validate.production_validators_not_run: ")
+    );
+    assert_path_not_echoed(&output, bundle.path());
+
+    for command in ["validate", "doctor"] {
+        let output = ggctl(&[command, bundle.path(), "--format", "json"], None);
+        assert_eq!(output.status.code(), Some(0), "{command}");
+        let report = report(&output);
+        assert_eq!(report["command"], command);
+        assert!(output.stderr.is_empty(), "{command}");
+        assert_path_not_echoed(&output, bundle.path());
+    }
+
+    let output = ggctl(&["validate", bundle.path(), "--format", "sarif"], None);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    let log: Value = serde_json::from_slice(&output.stdout).expect("one SARIF log");
+    assert_eq!(log["version"], "2.1.0");
+    assert_eq!(
+        log["runs"][0]["results"][0]["ruleId"],
+        "validate.production_validators_not_run"
+    );
+
+    // A production bundle with an allow-by-default policy is invalid, and
+    // the policy's values never reach the output.
+    let allow = Bundle::new(&format!(
+        "{{\"schema_version\": \"0.1.0\", \"id\": \"{CANARY}\", \"default_action\": \"allow\"}}\n"
+    ));
+    for command in ["validate", "doctor"] {
+        let output = ggctl(&[command, allow.path(), "--format", "json"], None);
+        assert_eq!(output.status.code(), Some(3), "{command}");
+        let report = report(&output);
+        assert_eq!(
+            report["diagnostics"][0]["code"],
+            "profile.policy_default_allow"
+        );
+        assert_eq!(
+            report["diagnostics"][0]["location"],
+            json!({"file": "policy.json", "pointer": "/default_action", "line": 1, "column": 79})
+        );
+        assert_no_canary(&output);
+    }
+
+    // A bundle that cannot be read at all is an I/O failure.
+    let missing = bundle.0.join("missing");
+    let missing = missing.to_str().expect("UTF-8");
+    for command in ["validate", "doctor"] {
+        let output = ggctl(&[command, missing], None);
+        assert_eq!(output.status.code(), Some(1), "{command}");
+        assert!(text(&output.stderr).contains("bundle.root_unavailable"));
+        assert_path_not_echoed(&output, missing);
+    }
+}
