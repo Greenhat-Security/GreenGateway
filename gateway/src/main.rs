@@ -123,6 +123,7 @@ mod path_match;
 #[path = "../tests/support/policy_benchmark.rs"]
 mod policy_benchmark;
 mod policy_eval;
+mod policy_replay;
 mod policy_simulation;
 mod policy_testing;
 mod proxy;

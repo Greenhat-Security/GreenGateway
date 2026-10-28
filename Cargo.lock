@@ -970,9 +970,15 @@ dependencies = [
 name = "gateway-config"
 version = "0.1.0"
 dependencies = [
+ "cap-fs-ext",
+ "cap-std",
+ "hex",
  "jsonschema",
+ "proptest",
  "serde",
  "serde_json",
+ "sha2",
+ "uuid",
 ]
 
 [[package]]

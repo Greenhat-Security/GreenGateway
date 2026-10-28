@@ -10,10 +10,22 @@
 //! outage can delay delivery but never a mutation (until the journal reaches
 //! its capacity, which refuses mutations rather than dropping events).
 //!
+//! Only a replica the cluster membership has admitted may lead. The sink
+//! kind, the key aliases and the journal settings are part of the
+//! static-configuration fingerprint precisely so that a replica configured
+//! to deliver elsewhere, or to derive references under another key, never
+//! moves the shared cursor; but the fingerprint door holds such a replica
+//! out of `/readyz` only, and this task runs regardless. So every turn asks
+//! the membership's [`ClusterReadiness`] gate first: a replica still held at
+//! the door (`config_fingerprint_mismatch`) or excluded by the durable
+//! contract fence (`contract_fenced`) does not contend for the lease, and
+//! never claims the cursor.
+//!
 //! The term of one leader:
 //!
-//! 1. Acquire the single slot of the dispatcher scope. `Full` means another
-//!    replica leads; wait with jitter and retry.
+//! 1. Acquire the single slot of the dispatcher scope, once the gate has
+//!    admitted this replica. `Full` means another replica leads; wait with
+//!    jitter and retry.
 //! 2. Claim the cursor at the lease's fence. A newer fence there means this
 //!    lease is stale; release and retry.
 //! 3. Renew the lease at a third of its TTL; a renewal that reports the lease
@@ -21,7 +33,9 @@
 //! 4. Deliver: read at most `batch_size` rows after the committed position,
 //!    project them all (any row that cannot be projected faithfully stops the
 //!    batch -- it is never skipped), offer the batch to the sink, and advance
-//!    the cursor to the batch's last position.
+//!    the cursor to the batch's last position. Before each step the gate is
+//!    asked again; agreement is sticky, so only the contract fence can end a
+//!    term this way, and it does so before anything more is offered.
 //!
 //! Failures and what they cost:
 //!
@@ -60,6 +74,7 @@ use super::{
     sink::{AuthorityEventSink, SinkError},
 };
 use crate::{
+    ha::ClusterReadiness,
     lifecycle::GatewayLifecycle,
     storage::{
         postgres_authority_events::{JournalStats, PostgresAuthorityEventStore, MAX_READ_BATCH},
@@ -445,9 +460,11 @@ impl DispatcherTerm {
     }
 }
 
-/// Run the dispatcher for the life of the process: contend for the lease,
+/// Run the dispatcher for the life of the process: wait until the
+/// membership gate `readiness` admits this replica, contend for the lease,
 /// lead while it holds, and contend again when it is lost. The task ends
 /// when the lifecycle's background cancellation fires.
+#[allow(clippy::too_many_arguments)] // One per collaborator, passed straight through.
 pub(crate) fn spawn_authority_event_dispatcher(
     lifecycle: &GatewayLifecycle,
     store: Arc<PostgresAuthorityEventStore>,
@@ -455,15 +472,28 @@ pub(crate) fn spawn_authority_event_dispatcher(
     keyring: Arc<PseudonymKeyring>,
     leases: Arc<dyn ExecutionLeaseStore>,
     holder: Uuid,
+    readiness: Arc<ClusterReadiness>,
     config: DispatcherConfig,
 ) {
     let shutdown = lifecycle.background_cancellation();
     let handle = tokio::spawn(async move {
-        run_dispatcher(shutdown, store, sink, keyring, leases, holder, config).await;
+        run_dispatcher(
+            shutdown, store, sink, keyring, leases, holder, readiness, config,
+        )
+        .await;
     });
     lifecycle.register_background_task(handle);
 }
 
+/// The dispatcher task. `readiness` is the cluster membership's gate, the
+/// one `/readyz` consults: while it refuses this replica (held at the
+/// fingerprint door, or excluded by the durable contract fence), the task
+/// neither tries the lease nor claims the cursor, so a replica whose sink,
+/// key aliases or journal settings disagree with the serving fleet's can
+/// never deliver the fleet's events to its own sink or advance the cursor
+/// past them. There is no ungated form: a dispatcher only runs on a cluster
+/// replica, and every cluster replica has the gate.
+#[allow(clippy::too_many_arguments)] // One per collaborator; see the spawn wrapper.
 pub(crate) async fn run_dispatcher(
     shutdown: CancellationToken,
     store: Arc<PostgresAuthorityEventStore>,
@@ -471,10 +501,30 @@ pub(crate) async fn run_dispatcher(
     keyring: Arc<PseudonymKeyring>,
     leases: Arc<dyn ExecutionLeaseStore>,
     holder: Uuid,
+    readiness: Arc<ClusterReadiness>,
     config: DispatcherConfig,
 ) {
     let poll = config.poll_interval.max(Duration::from_millis(1));
+    // The reason last logged for holding delivery back, so a replica waiting
+    // at the door says so once per reason rather than once per turn.
+    let mut held_for: Option<&'static str> = None;
     while !shutdown.is_cancelled() {
+        if let Some(reason) = readiness.blocked_reason() {
+            if held_for != Some(reason) {
+                tracing::warn!(
+                    reason,
+                    "authority event delivery is held: this replica has not been admitted to the cluster, so it does not contend for the dispatcher lease or claim the cursor"
+                );
+                held_for = Some(reason);
+            }
+            sleep_or_stop(&shutdown, contention_backoff(poll)).await;
+            continue;
+        }
+        if held_for.take().is_some() {
+            tracing::info!(
+                "authority event delivery admitted: this replica now contends for the dispatcher lease"
+            );
+        }
         let lease = match leases
             .try_acquire(DISPATCHER_LEASE_SCOPE, 1, DISPATCHER_LEASE_INVOCATION)
             .await
@@ -550,6 +600,16 @@ pub(crate) async fn run_dispatcher(
 
         let mut failures = 0_u32;
         loop {
+            // Agreement is sticky, so the fence is the one admission fact
+            // that can change under a running term: a build it excludes
+            // offers nothing more and gives the slot back.
+            if readiness.contract_fenced() {
+                tracing::warn!(
+                    fence = lease.fence,
+                    "authority event dispatcher ends its term: the durable contract fence excludes this gateway build"
+                );
+                break;
+            }
             match term.step(&stop).await {
                 Ok(StepOutcome::Delivered { .. }) => failures = 0,
                 Ok(StepOutcome::Idle) => {

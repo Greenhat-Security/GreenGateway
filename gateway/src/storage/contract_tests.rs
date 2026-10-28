@@ -2545,6 +2545,11 @@ pub(crate) mod postgres_audit_tests {
             .expect("the schema should migrate");
         let pool = foundation.pool().clone();
         let (schema_minimum, schema_maximum) = migrations::schema_version_range();
+        // The newest migration this binary's own migrator applies. A prepared
+        // build also serves an approved extension above it (schema_maximum),
+        // which only its successor applies.
+        let newest_migration =
+            i32::try_from(migrations::manifest_len()).expect("the manifest is short");
         let authority = PostgresReadinessAuthority::new(pool.clone());
 
         // A migrated database on a writable session: the ledger covers
@@ -2552,7 +2557,7 @@ pub(crate) mod postgres_audit_tests {
         assert_eq!(
             authority.observe().await,
             AuthorityObservation::Writable {
-                schema_version: schema_maximum
+                schema_version: newest_migration
             }
         );
         let readiness = ClusterReadiness::new();
@@ -2573,18 +2578,17 @@ pub(crate) mod postgres_audit_tests {
         let client = pool.get().await.expect("client checkout");
         // The ledger's `version` column is bigint; the manifest range is
         // the i32 a member row advertises.
-        let newest_migration = i64::from(schema_maximum);
         client
             .execute(
                 "DELETE FROM greengateway.schema_migrations WHERE version = $1",
-                &[&newest_migration],
+                &[&i64::from(newest_migration)],
             )
             .await
             .expect("the ledger row should delete");
         assert_eq!(
             authority.observe().await,
             AuthorityObservation::IncompatibleSchema {
-                schema_version: schema_maximum - 1
+                schema_version: newest_migration - 1
             }
         );
         assert_eq!(probe.blocked_reason().await, Some(SCHEMA_INCOMPATIBLE));
@@ -10157,6 +10161,110 @@ pub(crate) mod postgres_audit_tests {
             fourth.register_boot().await.expect("boot"),
             FingerprintAgreement::Agreed,
             "the same fingerprint as every live member is admitted at once"
+        );
+    }
+
+    /// The authority-event journal capacity is one row every producer in
+    /// the deployment reserves against (issue #425), so a replica writes
+    /// its configured value only as part of being admitted. A replica held
+    /// at the fingerprint door with a lower capacity -- an old pod
+    /// restarting mid-rollout after the fleet raised it, or a misconfigured
+    /// one -- leaves the capacity the serving replicas enforce alone, at
+    /// boot and on every heartbeat while it is held, and producers keep
+    /// committing under it. Only once it is admitted (the serving replica
+    /// drained) is its value the deployment's, and applied.
+    #[tokio::test]
+    async fn a_replica_held_at_the_fingerprint_door_never_rewrites_the_journal_capacity() {
+        use crate::audit::{sink::tests::CaptureSink, AuditLog};
+        use crate::cluster_membership::JournalCapacity;
+        use crate::storage::postgres_authority_events::{
+            append_to_journal, JournalSource, PostgresAuthorityEventStore,
+        };
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let heartbeat = Duration::from_secs(1);
+        let window = Duration::from_secs(30);
+        let audit = AuditLog::new(Arc::new(CaptureSink::new()));
+        let lifecycle = crate::lifecycle::GatewayLifecycle::new();
+        let journal = Arc::new(PostgresAuthorityEventStore::new(pool.clone()));
+        let journal_capacity = |capacity: u64| JournalCapacity {
+            store: Arc::clone(&journal),
+            capacity,
+        };
+        let enforced = || async { journal.stats().await.expect("journal stats").capacity };
+
+        let serving_store = member_store(&pool);
+        let serving = ClusterMembership::with_journal_capacity(
+            serving_store.clone(),
+            registration('a'),
+            heartbeat,
+            window,
+            journal_capacity(2),
+        );
+        assert_eq!(
+            serving.register_boot().await.expect("boot"),
+            FingerprintAgreement::Agreed
+        );
+        assert_eq!(
+            enforced().await,
+            2,
+            "an admitted replica applies its capacity before it serves"
+        );
+
+        let held_store = member_store(&pool);
+        let held = ClusterMembership::with_journal_capacity(
+            held_store,
+            registration('b'),
+            heartbeat,
+            window,
+            journal_capacity(1),
+        );
+        assert_eq!(
+            held.register_boot().await.expect("boot"),
+            FingerprintAgreement::Disagreeing(vec![serving_store.instance_id()])
+        );
+        assert_eq!(
+            enforced().await,
+            2,
+            "a held replica's boot leaves the serving capacity alone"
+        );
+        held.tick_once(&lifecycle, None, &audit).await;
+        held.tick_once(&lifecycle, None, &audit).await;
+        assert_eq!(
+            held.readiness().blocked_reason(),
+            Some("config_fingerprint_mismatch")
+        );
+        assert_eq!(
+            enforced().await,
+            2,
+            "so does every heartbeat while it is held"
+        );
+        // Producers reserve against the serving value: a second event still
+        // commits where the held replica's capacity of 1 would refuse it.
+        let client = pool.get().await.expect("client");
+        for _ in 0..2 {
+            append_to_journal(
+                &client,
+                JournalSource::ServiceTokenChange,
+                &uuid::Uuid::new_v4().to_string(),
+            )
+            .await
+            .expect("the serving capacity admits the event");
+        }
+        drop(client);
+
+        serving_store.mark_draining().await.expect("drain");
+        held.tick_once(&lifecycle, None, &audit).await;
+        assert_eq!(held.readiness().blocked_reason(), None);
+        assert_eq!(
+            enforced().await,
+            1,
+            "admission applies the capacity the deployment now agrees on"
         );
     }
 

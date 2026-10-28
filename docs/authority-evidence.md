@@ -416,8 +416,11 @@ migration 21; `gateway/src/storage/postgres_authority_events.rs` and
   fewer than `AUTHORITY_EVENT_JOURNAL_CAPACITY` rows are retained. When the
   journal is full, the mutation rolls back as a whole and is answered `503` (a CLI
   `revoke-jwt` exits with a store error); nothing is committed and no accepted
-  event is evicted. This applies whatever `AUTHORITY_EVENT_SINK` says. The cost is
-  deliberate and has to be watched: a refused service-token revoke or JWT revoke
+  event is evicted. This applies whatever `AUTHORITY_EVENT_SINK` says. The capacity
+  is one value for the deployment, written by a replica only when the membership
+  admits it, so a replica held at the fingerprint door with another value never
+  changes the one the serving replicas enforce. The cost is deliberate and has to
+  be watched: a refused service-token revoke or JWT revoke
   leaves the credential live until the change can commit.
 - **Dispatch, outside every authority transaction.** With `AUTHORITY_EVENT_SINK`
   set, one replica at a time (the holder of the `authority-event-dispatcher`
@@ -425,7 +428,12 @@ migration 21; `gateway/src/storage/postgres_authority_events.rs` and
   after it, projects each into an `authority_event_delivery.v1` record
   ([schema](schemas/authority_event_delivery.v1.schema.json)), offers the batch to
   the sink, and only then advances the cursor with a compare-and-set on
-  `(fence, position)`. A fenced-out leader's advance commits nothing. A refused
+  `(fence, position)`. A fenced-out leader's advance commits nothing. Only a
+  replica the cluster membership has admitted contends for the lease: one held at
+  the fingerprint door (`config_fingerprint_mismatch`), whose sink kind, key
+  aliases or journal settings differ from the serving fleet's, or one the durable
+  contract fence excludes, never takes the lease or claims the cursor, and a leader
+  the fence excludes ends its term before its next batch. A refused
   batch is offered again after an exponential backoff from 0.5 s to 60 s and is
   never skipped; a row whose evidence cannot be projected faithfully stalls
   delivery at that row. A crash between the sink's acceptance and the cursor
@@ -438,7 +446,10 @@ migration 21; `gateway/src/storage/postgres_authority_events.rs` and
   pipeline rather than a durable store. `file` appends JSON lines to
   `AUTHORITY_EVENT_FILE` and calls `fsync` before a batch counts as accepted; a
   crash mid-write leaves at most one partial final line, which a reader skips and
-  whose records are delivered again. Neither opens a network connection. A sink is
+  whose records are delivered again. The path is not part of the fingerprint, and
+  whichever replica leads appends to its own, so every replica's file must be
+  shared storage or shipped to the same consumer; a pod-local file nothing collects
+  keeps the batches delivered while that replica led. Neither opens a network connection. A sink is
   a small trait (`authority_events::sink::AuthorityEventSink`); a network sink is
   future work and would carry its own transport review.
 - **Retention floors.** The maintenance leader's `authority_event_retention` job
@@ -562,7 +573,11 @@ and the issuer as the principal carried it rather than in canonical form.
 issuer or auth mode. Neither table is a journal source, so nothing delivers either
 row; aligning both with this section's columns is a later #425 slice (the
 inventory's `policy_postgres`, `tools_postgres`, `configuration_import` and
-`catalog_postgres` rows keep `missing_metadata`).
+`catalog_postgres` rows keep `missing_metadata`). For `catalog_change_evidence`
+that slice is migration 25, which adds this section's three columns under the same
+CHECK. This release approves it as an additive extension and serves a database
+that holds it, but does not apply it and still writes no metadata into it; only
+its successor applies it ([schema 24 to 25](deployment/postgres.md#prepared-extension-schema-24-to-25)).
 
 ## Next reviewable slices and validation gates
 

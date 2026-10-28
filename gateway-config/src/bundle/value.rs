@@ -8,8 +8,10 @@
 //! every fractional field only a [`Decimal`]. The forms are fixed here, with
 //! the reader, so the published schema and the canonical form can define them
 //! before any field uses them.
+// The field catalog (#242 PR 3) is the caller; until then only the tests are.
+#![cfg_attr(not(test), expect(dead_code))]
 
-use crate::connections::{model::MAX_SECRET_ID_BYTES, secret::is_valid_opaque_id};
+use crate::opaque_id::{is_valid_opaque_id, MAX_SECRET_ALIAS_ID_BYTES};
 
 use super::{
     diagnostic::Code,
@@ -50,9 +52,11 @@ impl SecretReference {
         }
         match members.as_slice() {
             [member] if member.key == SECRET_MEMBER => match member.value.as_str() {
-                Some(alias_id) if is_valid_opaque_id(alias_id, MAX_SECRET_ID_BYTES) => Ok(Self {
-                    alias_id: alias_id.to_owned(),
-                }),
+                Some(alias_id) if is_valid_opaque_id(alias_id, MAX_SECRET_ALIAS_ID_BYTES) => {
+                    Ok(Self {
+                        alias_id: alias_id.to_owned(),
+                    })
+                }
                 _ => Err(Code::InvalidSecretReference),
             },
             _ => Err(Code::InvalidSecretReference),

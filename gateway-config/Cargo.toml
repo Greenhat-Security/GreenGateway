@@ -5,13 +5,26 @@ edition.workspace = true
 license-file.workspace = true
 
 # The configuration contracts `gateway` and `ggctl` share (issue #242,
-# ADR-0008). No build script, no I/O and no network: both binaries link it, and
-# `ggctl` must build without Node or the admin UI.
+# ADR-0008). No build script and no network: both binaries link it, and
+# `ggctl` must build without Node or the admin UI. The one I/O it performs is
+# the bundle reader's contained, read-only file access beneath the bundle root
+# it is given. Every dependency below is already in the workspace graph
+# through the gateway, at the same version and features.
 [dependencies]
+# The bundle reader opens files beneath one directory capability, without
+# following links, and reads link counts from open handles.
+cap-fs-ext.workspace = true
+cap-std.workspace = true
+hex.workspace = true
+# Referenced policy and tools documents must pass their published schemas.
+jsonschema.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Pinned file digests and the ADR-0004 digest frame.
+sha2.workspace = true
 
 [dev-dependencies]
-# Holds each published schema to the documents this crate defines. Already in
-# the graph through the gateway; this is a test-only edge, not a crate.
-jsonschema.workspace = true
+# The bundle reader's seeded, bounded property tests.
+proptest.workspace = true
+# Unique temporary bundle directories for the reader's tests.
+uuid.workspace = true
