@@ -2,13 +2,14 @@
 
 **Status: alpha format, not yet selectable.** This page is the reference for the
 versioned configuration bundle format and the reader that validates it (issue
-#242, PR 4). Nothing in a released gateway reads a bundle yet: there is no
-startup mode, environment variable, admin route, or `ggctl` command that selects
-one. Bundle mode, the field catalog that fills the deployment document, and
-`ggctl validate` are later #242 slices. Until they land, environment
-configuration ([configuration.md](configuration.md)) is the only way to configure
-a gateway, and the format below may still gain deployment settings before it is
-released.
+#242). The reader lives in the shared `gateway-config` crate, so the gateway and
+[`ggctl validate` and `ggctl doctor`](ggctl.md#validate) run the same code, and
+`ggctl` checks a bundle offline today. Nothing in a released gateway reads a
+bundle yet: there is no startup mode, environment variable, or admin route that
+selects one. Bundle mode and the field catalog that fills the deployment
+document are later #242 slices. Until they land, environment configuration
+([configuration.md](configuration.md)) is the only way to configure a gateway,
+and the format below may still gain deployment settings before it is released.
 
 The design this follows is
 [ADR-0008](adr/0008-setup-cli-and-configuration-bundles.md) (setup, operator
@@ -151,11 +152,39 @@ this reader implements (`resource.unsupported_schema_version`). Then:
   about and drop (`resource.unknown_member`), and must pass both
   [`policy.v0.schema.json`](schemas/policy.v0.schema.json) and the production
   policy validator;
-- a tools document must pass the production tools validator, which applies
-  [`tools.v0.schema.json`](schemas/tools.v0.schema.json).
+- a tools document must pass both
+  [`tools.v0.schema.json`](schemas/tools.v0.schema.json) and the production tools
+  validator, which applies the same schema first.
 
 A failure of either is `resource.invalid`. Validator messages can quote document
 values, so they are not repeated.
+
+The production validators are the gateway's own and depend on the rest of the
+gateway, so the reader takes them from its caller. The gateway passes them;
+`ggctl`, which cannot link them, applies everything above except the production
+validators and says so in every report about a bundled policy or tools document
+(`validate.production_validators_not_run`). A document `ggctl validate` accepts can
+therefore still be refused by the gateway.
+
+## Deployment profiles
+
+A bundled policy is held to the deployment profile's policy invariants
+([ADR-0008](adr/0008-setup-cli-and-configuration-bundles.md#initialization-profiles))
+once it has passed its schema:
+
+| Profile | Policy invariants |
+| --- | --- |
+| `production` | Deny by default (`profile.policy_default_allow` for `default_action: allow`), enforce mode (`profile.policy_shadow_mode` for `enforcement_mode: shadow` at the top level or on any route), and no role granting the `*` wildcard permission (`profile.wildcard_role`). |
+| `migration` | The production invariants. ADR-0008 lets a migration bundle keep each of those compatibility behaviors once its deployment document acknowledges it, but `v1alpha1` has no acknowledgment list yet (it arrives with the field catalog), so none can be acknowledged and none is allowed. |
+| `development` | None. |
+
+An absent `default_action` is `deny` and an absent `enforcement_mode` is
+`enforce`, as in environment mode. Role names are policy values, so a wildcard
+role is reported at `/roles` and the line of its `*`, never by name. A policy left
+to the server's store (`source: server`) is not checked by the reader. The
+profiles' other invariants (authentication, egress, CSRF, audit durability,
+listeners) concern deployment settings that join `spec` with the field catalog,
+and are enforced from then on.
 
 ## Digests
 
@@ -399,3 +428,6 @@ can appear in one. A published code never changes meaning.
 | `resource.schema_version_mismatch` | The resource's `schema_version` differs from the declared one. |
 | `resource.unknown_member` | A policy top-level member the loader would drop. |
 | `resource.invalid` | The resource fails its published schema or production validator. |
+| `profile.policy_default_allow` | The profile requires a deny-by-default policy. |
+| `profile.policy_shadow_mode` | The profile requires the policy to enforce its decisions, not shadow them. |
+| `profile.wildcard_role` | The profile forbids a role that grants every permission. |
