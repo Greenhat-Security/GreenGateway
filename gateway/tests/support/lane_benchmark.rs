@@ -1,8 +1,10 @@
-//! Allocation-counted benchmarks of the tool-admission and rate-lane decisions.
+//! Allocation-counted benchmarks of the tool-admission, rate-lane and static
+//! egress decisions.
 //!
-//! `scripts/microbench.py` runs the ignored `tool_policy_evaluation` and
-//! `rate_lane_selection` tests in the gateway test binary it builds for each
-//! compared revision, under the same protocol as `http_policy`:
+//! `scripts/microbench.py` runs the ignored `tool_policy_evaluation`,
+//! `rate_lane_selection` and `static_egress_evaluation` tests in the gateway
+//! test binary it builds for each compared revision, under the same protocol as
+//! `http_policy`:
 //!
 //! - `tool_policy` measures `CompiledPolicy::evaluate_tool`, the call the live
 //!   tool adapters make, across every tool operation.
@@ -10,6 +12,10 @@
 //!   live rate stage makes to choose an override. The token buckets and their
 //!   remaining capacity are mutable state outside the kernel, so they are not
 //!   measured.
+//! - `static_egress` measures `CompiledEgressPolicy::evaluate`, the call the
+//!   live egress adapter makes before and after it resolves a destination. The
+//!   resolution facts are supplied, never looked up: nothing is resolved or
+//!   connected, and URL parsing stays outside the kernel, as in the adapter.
 //!
 //! Policy validation, compilation, context construction, expected-decision
 //! checks and report serialization are all outside the measured intervals.
@@ -19,15 +25,25 @@
 //! file, and so its own digest: changing a lane dataset does not change the
 //! enforced `http_policy` harness.
 
-use std::{env::VarError, fs::OpenOptions, hint::black_box, io::Write, time::Instant};
+use std::{
+    collections::HashSet, env::VarError, fs::OpenOptions, hint::black_box, io::Write,
+    net::SocketAddr, time::Instant,
+};
 
 use http::Method;
+use ipnet::IpNet;
 use serde_json::{json, Value};
+use url::Url;
 
 use super::{count_allocations, ITERATIONS, REGRESSION_ENV, RESULT_ENV, SAMPLES, WARMUP};
 use crate::{
     auth::{AuthMethod, Principal},
     policy_eval::{
+        egress::{
+            CompiledEgressPolicy, EgressControls, EgressDenial, EgressDestination,
+            EgressEvaluation, EgressEvaluationContext, EgressLimitation, EgressOutcome,
+            ResolutionFact, EGRESS_CONTEXT_VERSION,
+        },
         tools::{
             ToolEvaluation, ToolEvaluationContext, ToolLimitation, ToolOperation, ToolReason,
             TOOL_CONTEXT_VERSION,
@@ -41,6 +57,7 @@ use crate::{
 
 const TOOL_TARGET_ID: &str = "tool_policy";
 const RATE_TARGET_ID: &str = "rate_lane";
+const EGRESS_TARGET_ID: &str = "static_egress";
 const ISSUER: &str = "https://idp.example.test";
 
 const LONG_ORDER_PATH: &str = concat!(
@@ -773,6 +790,328 @@ fn rate_iteration(compiled: &CompiledPolicy, cases: &[PreparedRate], regression:
     checksum
 }
 
+/// Public, synthetic static egress controls, in the form `EgressConfig` hands
+/// them to the lane: exact hosts already lowercased, host patterns, a port
+/// allowlist, non-global blocking with one configured NAT64 prefix, and policy
+/// CIDRs that exempt part of the documentation ranges. Every host uses the
+/// reserved `.test` suffix and every address comes from a documentation or
+/// IANA special-purpose block, so no value names a real upstream.
+fn egress_controls() -> Result<EgressControls, String> {
+    let network = |value: &str| {
+        value
+            .parse::<IpNet>()
+            .map_err(|error| format!("synthetic network {value} is invalid: {error}"))
+    };
+    Ok(EgressControls {
+        allowed_hosts: HashSet::from([
+            "api.example.test".to_owned(),
+            "reports.example.test".to_owned(),
+        ]),
+        allowed_host_globs: vec![
+            "*.svc.example.test".to_owned(),
+            "*.cdn.example.test".to_owned(),
+        ],
+        allowed_ports: HashSet::from([443, 8443]),
+        deny_private_ips: true,
+        nat64_prefixes: vec![network("2001:db8:64::/96")?],
+        private_ip_allow_cidrs: vec![network("203.0.113.0/24")?, network("2001:db8:a::/48")?],
+    })
+}
+
+struct EgressCase {
+    name: &'static str,
+    url: &'static str,
+    /// `None` asks the static question, with no resolution facts. `Some` is
+    /// the complete answer set, in resolver order, that the address question
+    /// supplies.
+    answers: Option<&'static [&'static str]>,
+    expected: EgressOutcome,
+}
+
+/// Every refusal the lane can reach from a parsed URL, in its checking order;
+/// a static refusal that supplied resolution facts cannot change; the static
+/// question admitting exact and pattern hosts by asking for resolution facts;
+/// and the address question over IPv4, IPv6, IPv4-mapped and NAT64 answers,
+/// with policy-CIDR exemptions, global exceptions, every answer judged and the
+/// first pinned. A missing port is unreachable here: both admitted schemes
+/// have a default port.
+fn egress_cases() -> Vec<EgressCase> {
+    use EgressDenial::{
+        EmptyResolution, Fragment, HostNotAllowed, MissingHost, NonGlobalAddress, PortNotAllowed,
+        SchemeNotAllowed, UnexpectedResolvedPort, Userinfo,
+    };
+    use EgressOutcome::{Allow, Deny};
+    let awaits_resolution = EgressOutcome::Indeterminate(EgressLimitation::MissingResolution);
+    let unresolved = |name, url, expected| EgressCase {
+        name,
+        url,
+        answers: None,
+        expected,
+    };
+    let resolved = |name, url, answers: &'static [&'static str], expected| EgressCase {
+        name,
+        url,
+        answers: Some(answers),
+        expected,
+    };
+    vec![
+        unresolved(
+            "missing_host",
+            "data:text/plain,synthetic",
+            Deny(MissingHost),
+        ),
+        unresolved(
+            "userinfo",
+            "https://operator@api.example.test/",
+            Deny(Userinfo),
+        ),
+        unresolved(
+            "fragment",
+            "https://api.example.test/orders#summary",
+            Deny(Fragment),
+        ),
+        unresolved(
+            "scheme_not_allowed",
+            "ftp://api.example.test/exports",
+            Deny(SchemeNotAllowed),
+        ),
+        unresolved(
+            "host_not_allowed",
+            "https://other.example.test/",
+            Deny(HostNotAllowed),
+        ),
+        unresolved(
+            "pattern_keeps_label_boundary",
+            "https://badsvc.example.test/",
+            Deny(HostNotAllowed),
+        ),
+        unresolved(
+            "default_port_not_allowed",
+            "http://api.example.test/",
+            Deny(PortNotAllowed),
+        ),
+        unresolved(
+            "explicit_port_not_allowed",
+            "https://reports.example.test:9443/",
+            Deny(PortNotAllowed),
+        ),
+        resolved(
+            "static_refusal_ignores_resolution",
+            "https://other.example.test/",
+            &["203.0.113.10:443"],
+            Deny(HostNotAllowed),
+        ),
+        unresolved(
+            "exact_host_awaits_resolution",
+            "https://api.example.test/v1/orders?page=2",
+            awaits_resolution,
+        ),
+        unresolved(
+            "folded_pattern_host_awaits_resolution",
+            "https://Orders.SVC.example.test:8443/",
+            awaits_resolution,
+        ),
+        resolved(
+            "empty_resolution",
+            "https://api.example.test/",
+            &[],
+            Deny(EmptyResolution),
+        ),
+        resolved(
+            "unexpected_resolved_port",
+            "https://api.example.test/",
+            &["203.0.113.10:8443"],
+            Deny(UnexpectedResolvedPort),
+        ),
+        resolved(
+            "policy_cidr_exempts_ipv4",
+            "https://api.example.test/",
+            &["203.0.113.10:443"],
+            Allow { pinned: 0 },
+        ),
+        resolved(
+            "policy_cidr_exempts_ipv6",
+            "https://orders.svc.example.test:8443/",
+            &["[2001:db8:a::10]:8443"],
+            Allow { pinned: 0 },
+        ),
+        resolved(
+            "second_pattern_global_exception",
+            "https://edge.cdn.example.test/",
+            &["192.0.0.9:443"],
+            Allow { pinned: 0 },
+        ),
+        resolved(
+            "well_known_nat64_global_exception",
+            "https://reports.example.test/",
+            &["[64:ff9b::c000:9]:443"],
+            Allow { pinned: 0 },
+        ),
+        resolved(
+            "configured_nat64_global_exception",
+            "https://reports.example.test/",
+            &["[2001:db8:64::c000:a]:443"],
+            Allow { pinned: 0 },
+        ),
+        resolved(
+            "every_answer_admitted_first_pinned",
+            "https://api.example.test/",
+            &["203.0.113.10:443", "[2001:db8:a::10]:443", "192.0.0.10:443"],
+            Allow { pinned: 0 },
+        ),
+        resolved(
+            "non_global_address",
+            "https://api.example.test/",
+            &["198.51.100.7:443"],
+            Deny(NonGlobalAddress { index: 0 }),
+        ),
+        resolved(
+            "non_global_behind_exempt_answer",
+            "https://api.example.test/",
+            &["203.0.113.10:443", "192.0.2.25:443"],
+            Deny(NonGlobalAddress { index: 1 }),
+        ),
+        resolved(
+            "mapped_address_not_exempted_by_ipv4_cidr",
+            "https://api.example.test/",
+            &["[::ffff:203.0.113.10]:443"],
+            Deny(NonGlobalAddress { index: 0 }),
+        ),
+        resolved(
+            "nat64_embedded_non_global",
+            "https://api.example.test/",
+            &["[64:ff9b::c633:6407]:443"],
+            Deny(NonGlobalAddress { index: 0 }),
+        ),
+        resolved(
+            "loopback_address",
+            "https://api.example.test/",
+            &["127.0.0.1:443"],
+            Deny(NonGlobalAddress { index: 0 }),
+        ),
+        resolved(
+            "ipv6_documentation_outside_cidr",
+            "https://orders.svc.example.test/",
+            &["[2001:db8:b::7]:443"],
+            Deny(NonGlobalAddress { index: 0 }),
+        ),
+    ]
+}
+
+struct EgressFacts {
+    name: &'static str,
+    destination: EgressDestination,
+    answers: Option<Vec<SocketAddr>>,
+    expected: EgressOutcome,
+}
+
+/// Parses every URL and answer once, before any measurement, as the live
+/// adapter parses a URL before it asks the lane. Also returns the total bytes
+/// of the scheme and host facts the destinations carry.
+fn prepare_egress() -> Result<(Vec<EgressFacts>, usize), String> {
+    let mut prepared = Vec::new();
+    let mut input_bytes = 0;
+    for case in egress_cases() {
+        let url = Url::parse(case.url).map_err(|error| format!("{}: {error}", case.name))?;
+        let destination = EgressDestination::from_url(&url);
+        input_bytes += url.scheme().len() + destination.host().map_or(0, str::len);
+        let answers = case
+            .answers
+            .map(|answers| {
+                answers
+                    .iter()
+                    .map(|answer| answer.parse::<SocketAddr>())
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()
+            .map_err(|error| format!("{}: {error}", case.name))?;
+        prepared.push(EgressFacts {
+            name: case.name,
+            destination,
+            answers,
+            expected: case.expected,
+        });
+    }
+    Ok((prepared, input_bytes))
+}
+
+struct EgressQuestion<'a> {
+    name: &'static str,
+    context: EgressEvaluationContext<'a>,
+    expected: EgressOutcome,
+}
+
+/// Builds every question once, before any measurement, in the shape the live
+/// adapter asks it: the current snapshot and context version, and the answer
+/// set as the resolution facts when there is one.
+fn egress_questions<'a>(
+    policy: &CompiledEgressPolicy,
+    facts: &'a [EgressFacts],
+) -> Vec<EgressQuestion<'a>> {
+    facts
+        .iter()
+        .map(|case| EgressQuestion {
+            name: case.name,
+            context: EgressEvaluationContext {
+                version: EGRESS_CONTEXT_VERSION,
+                snapshot: policy.snapshot(),
+                destination: &case.destination,
+                resolution: case
+                    .answers
+                    .as_deref()
+                    .map_or(ResolutionFact::Missing, ResolutionFact::Resolved),
+            },
+            expected: case.expected,
+        })
+        .collect()
+}
+
+/// Whether the lane gave the expected answer. The live adapter matches on the
+/// outcome and on nothing narrower, so neither does this.
+fn egress_matches(
+    expected: EgressOutcome,
+    result: &Result<EgressEvaluation, EvaluationError>,
+) -> bool {
+    result
+        .as_ref()
+        .is_ok_and(|evaluation| evaluation.outcome() == expected)
+}
+
+fn preflight_egress(
+    policy: &CompiledEgressPolicy,
+    cases: &[EgressQuestion<'_>],
+) -> Result<(), String> {
+    for case in cases {
+        let result = policy.evaluate(&case.context);
+        if !egress_matches(case.expected, &result) {
+            let actual = result.map(|evaluation| evaluation.outcome());
+            return Err(format!(
+                "{}: expected {:?}, evaluated {actual:?}",
+                case.name, case.expected
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// One pass over the egress questions; the checksum counts correct answers.
+fn egress_iteration(
+    policy: &CompiledEgressPolicy,
+    cases: &[EgressQuestion<'_>],
+    regression: bool,
+) -> u64 {
+    let mut checksum = 0;
+    for case in cases {
+        let result = black_box(policy).evaluate(black_box(&case.context));
+        if regression {
+            let allocation = vec![black_box(0_u8); black_box(64_usize)];
+            black_box(allocation);
+        }
+        checksum += u64::from(egress_matches(case.expected, &black_box(result)));
+    }
+    checksum
+}
+
 /// Measures one prepared dataset exactly as the parent measures `http_policy`:
 /// warmup, then allocation samples, then separately timed samples with
 /// counting disabled. `pass` evaluates the whole dataset once and returns how
@@ -875,6 +1214,20 @@ fn run_rates(regression: bool) -> Result<Value, String> {
     )
 }
 
+fn run_egress(regression: bool) -> Result<Value, String> {
+    let policy = CompiledEgressPolicy::new(egress_controls()?);
+    let (facts, input_bytes) = prepare_egress()?;
+    let cases = egress_questions(&policy, &facts);
+    preflight_egress(&policy, &cases)?;
+    measure(
+        EGRESS_TARGET_ID,
+        cases.len(),
+        input_bytes,
+        regression,
+        |fixture| egress_iteration(&policy, &cases, fixture),
+    )
+}
+
 /// The controller's side of a run: the fresh result path, the fixture switch
 /// and a report that must not overwrite an existing one, as in the parent.
 fn report(run: fn(bool) -> Result<Value, String>) {
@@ -909,6 +1262,12 @@ fn rate_lane_selection() {
 }
 
 #[test]
+#[ignore = "run through scripts/microbench.py, which builds both revisions and owns the comparison"]
+fn static_egress_evaluation() {
+    report(run_egress);
+}
+
+#[test]
 fn tool_policy_dataset_matches_its_expected_decisions() {
     let compiled = compile(tool_policy_document()).unwrap();
     let (cases, input_bytes) = prepare_tools(&compiled);
@@ -930,6 +1289,20 @@ fn rate_lane_dataset_matches_its_expected_selections() {
     assert!(input_bytes > 0);
     assert_eq!(
         rate_iteration(&compiled, &cases, false),
+        u64::try_from(cases.len()).unwrap()
+    );
+}
+
+#[test]
+fn static_egress_dataset_matches_its_expected_decisions() {
+    let policy = CompiledEgressPolicy::new(egress_controls().unwrap());
+    let (facts, input_bytes) = prepare_egress().unwrap();
+    let cases = egress_questions(&policy, &facts);
+    preflight_egress(&policy, &cases).unwrap();
+    assert_eq!(cases.len(), 25);
+    assert!(input_bytes > 0);
+    assert_eq!(
+        egress_iteration(&policy, &cases, false),
         u64::try_from(cases.len()).unwrap()
     );
 }
