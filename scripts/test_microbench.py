@@ -607,11 +607,13 @@ def lane_budget():
 
 
 # Captured from the gateway test binary (unoptimized test profile) on the lane
-# harness this change adds: cases, fact bytes, checksum, then the calls and
-# requested bytes of one sample of 100 passes.
+# harness each target arrived with: cases, fact bytes, checksum, then the calls
+# and requested bytes of one sample of 100 passes. The static egress fact bytes
+# are the scheme and host bytes of its destinations.
 LANE_ROWS = {
     "tool_policy": (27, 1409, 2700, 9000, 1007400),
     "rate_lane": (14, 830, 1400, 19600, 909800),
+    "static_egress": (25, 550, 2500, 4800, 387500),
 }
 
 
@@ -647,6 +649,8 @@ def lane_limit(target):
 
 
 LANES = ("tool_policy", "rate_lane")
+# Every target the lane harness can carry: the budgeted lanes and static egress.
+LANE_HARNESS_TARGETS = tuple(LANE_ROWS)
 
 
 class LaneBudgetSchemaTests(unittest.TestCase):
@@ -713,6 +717,20 @@ class LaneBudgetSchemaTests(unittest.TestCase):
                 committed = bench._digest((ROOT / path).read_text(encoding="utf-8"))
                 self.assertIn(committed, repository[key])
 
+    def test_no_budget_schema_lists_static_egress_yet(self):
+        # Budgeting static_egress is a later, reviewed schema change; until
+        # then a budget that names it is invalid rather than silently ignored.
+        value = lane_budget()
+        value["targets"].append(lane_limit("static_egress"))
+        with self.assertRaises(ValueError):
+            bench.validate_budget(value)
+        value = lane_budget()
+        value["targets"][-1] = lane_limit("static_egress")
+        with self.assertRaises(ValueError):
+            bench.validate_budget(value)
+        repository = json.loads((ROOT / bench.BUDGET_PATH).read_text(encoding="utf-8"))
+        self.assertNotIn("static_egress", [entry["id"] for entry in repository["targets"]])
+
     def test_lane_adoption_follows_the_base_budget_and_keeps_http_policy_enforced(self):
         self.assertEqual(bench.lane_policy(kernel_budget(), kernel_budget()), "pending")
         self.assertEqual(bench.lane_policy(kernel_budget(), lane_budget()), "proposed")
@@ -727,7 +745,7 @@ class LaneBudgetSchemaTests(unittest.TestCase):
 
 class LaneResultTests(unittest.TestCase):
     def test_each_lane_report_validates_only_as_its_own_target(self):
-        for target in LANES:
+        for target in LANE_HARNESS_TARGETS:
             with self.subTest(target=target):
                 bench.validate_kernel_result(lane_result(target), target=target)
                 bench.validate_kernel_result(lane_result(target, True), True, target)
@@ -738,13 +756,17 @@ class LaneResultTests(unittest.TestCase):
             (lane_result("rate_lane"), "http_policy"),
             (lane_result("tool_policy"), "egress_host"),
             (lane_result("tool_policy"), "unlisted_lane"),
+            (lane_result("static_egress"), "egress_host"),
+            (lane_result("static_egress"), "rate_lane"),
+            (lane_result("tool_policy"), "static_egress"),
+            (kernel_result(), "static_egress"),
         )
         for value, target in mismatches:
             with self.subTest(target=target), self.assertRaises(ValueError):
                 bench.validate_kernel_result(value, target=target)
 
     def test_lane_protocol_dataset_fixture_and_stability_drift_reject(self):
-        for target in LANES:
+        for target in LANE_HARNESS_TARGETS:
             for field in ("input_cases", "input_bytes", "operations_per_iteration",
                           "expected_checksum"):
                 with self.subTest(target=target, field=field):
@@ -766,7 +788,7 @@ class LaneResultTests(unittest.TestCase):
 
 class LaneComparisonTests(unittest.TestCase):
     def test_neutral_counts_pass_and_growth_or_fixture_fails_per_lane(self):
-        for target in LANES:
+        for target in LANE_HARNESS_TARGETS:
             with self.subTest(target=target):
                 report = bench.compare_kernel_results(lane_envelope(target), lane_envelope(target),
                                                       lane_limit(target))
@@ -796,6 +818,11 @@ class LaneComparisonTests(unittest.TestCase):
             (kernel_envelope(), kernel_envelope(), lane_limit("tool_policy")),
             (lane_envelope("rate_lane"), lane_envelope("rate_lane"), kernel_limit()),
             (lane_envelope("rate_lane"), lane_envelope("rate_lane"), lane_limit("egress_host")),
+            (lane_envelope("static_egress"), lane_envelope("static_egress"), lane_limit("rate_lane")),
+            (lane_envelope("tool_policy"), lane_envelope("static_egress"),
+             lane_limit("tool_policy")),
+            (lane_envelope("static_egress"), lane_envelope("static_egress"),
+             lane_limit("egress_host")),
         )
         for base, head, limit in cases:
             with self.subTest(limit=limit["id"]), self.assertRaises(ValueError):
@@ -837,6 +864,50 @@ class LaneWiringTests(unittest.TestCase):
                 source = self.harness_source().replace(LANE_DECLARATION, replacement)
                 with self.assertRaises(ValueError):
                     bench.lane_wiring(source)
+
+
+EGRESS_TEST_ITEM = (
+    '#[test]\n#[ignore = "run through scripts/microbench.py, which builds both revisions and '
+    'owns the comparison"]\nfn static_egress_evaluation() {\n    report(run_egress);\n}\n'
+)
+
+
+class EgressWiringTests(unittest.TestCase):
+    def lane_source(self):
+        return (ROOT / bench.LANE_HARNESS_PATH).read_text(encoding="utf-8")
+
+    def test_repository_lane_harness_declares_the_static_egress_test(self):
+        self.assertIn(EGRESS_TEST_ITEM, self.lane_source())
+        self.assertTrue(bench.egress_wiring(self.lane_source()))
+        self.assertEqual(bench.EGRESS_TEST,
+                         "policy_benchmark::lane_benchmark::static_egress_evaluation")
+
+    def test_lane_harness_without_the_test_is_absent(self):
+        # The tool and rate-lane harness predates the egress test.
+        source = self.lane_source().replace(EGRESS_TEST_ITEM, "")
+        self.assertFalse(bench.egress_wiring(source))
+        commented = self.lane_source().replace(
+            EGRESS_TEST_ITEM, "".join("// " + line + "\n" for line in EGRESS_TEST_ITEM.splitlines()))
+        self.assertFalse(bench.egress_wiring(commented))
+        quoted = source + 'const NAME: &str = "static_egress_evaluation";\n'
+        self.assertFalse(bench.egress_wiring(quoted))
+
+    def test_nested_duplicated_or_aliased_tests_are_rejected(self):
+        # A disabled or un-ignored declaration still counts as declared here;
+        # discovery in the built binary then disagrees and fails the run.
+        replacements = {
+            "nested": "mod nested {\n" + EGRESS_TEST_ITEM + "}\n",
+            "duplicated": EGRESS_TEST_ITEM + "#[cfg(any())]\nfn static_egress_evaluation() {}\n",
+            "aliased": "use crate::decoy as static_egress_evaluation;\n",
+            "called elsewhere": (EGRESS_TEST_ITEM
+                                 + "fn decoy() {\n    static_egress_evaluation();\n}\n"),
+            "method": "struct Decoy;\nimpl Decoy {\n    fn static_egress_evaluation() {}\n}\n",
+        }
+        for name, replacement in replacements.items():
+            with self.subTest(change=name):
+                source = self.lane_source().replace(EGRESS_TEST_ITEM, replacement)
+                with self.assertRaises(ValueError):
+                    bench.egress_wiring(source)
 
 
 if __name__ == '__main__':
