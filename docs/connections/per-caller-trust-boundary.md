@@ -374,7 +374,8 @@ and exchanges it at Google's token endpoint.
   is refused with `google_delegation_issuer_not_trusted`, a caller with no
   single plain email address with `google_delegation_no_email`, and a call
   with no principal, a service token included, with
-  `delegated_token_no_principal`, all before anything is read or sent.
+  `delegated_token_no_principal`, all before anything is read or sent, the
+  upstream's egress preflight and DNS lookup included.
 - **No key at rest, fixed endpoints.** The account must be a dedicated
   `{name}@{project}.iam.gserviceaccount.com` account, and the only
   caller-independent value that reaches a URL. `iamcredentials.googleapis.com`

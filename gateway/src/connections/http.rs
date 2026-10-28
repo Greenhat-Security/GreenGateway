@@ -1816,6 +1816,37 @@ impl ConnectionHttpTarget {
         )
     }
 
+    /// Refuses a call whose caller this target's credential cannot be
+    /// obtained for, from the target alone: nothing is resolved, read or
+    /// sent to answer, so a lane asks before its egress preflight. A
+    /// credential that belongs to the caller refuses a call that names
+    /// nobody with [`ConnectionHttpError::DelegatedTokenNoPrincipal`], and a
+    /// domain-wide delegation also refuses a caller it cannot act as (see
+    /// [`GoogleDelegationBinding::admit_caller`]). Every other credential is
+    /// the Connection's own and admits any call.
+    pub fn admit_credential_caller(
+        &self,
+        caller: Option<&AttestedCaller>,
+    ) -> Result<(), ConnectionHttpError> {
+        let Some(caller) = caller else {
+            return if self.credential_belongs_to_caller() {
+                Err(ConnectionHttpError::DelegatedTokenNoPrincipal)
+            } else {
+                Ok(())
+            };
+        };
+        match &self.authentication {
+            HttpAuthenticationBinding::GoogleDomainWideDelegation(binding) => binding
+                .admit_caller(caller)
+                .map_err(ConnectionHttpError::GoogleDelegation),
+            HttpAuthenticationBinding::None
+            | HttpAuthenticationBinding::HeaderApiKey { .. }
+            | HttpAuthenticationBinding::StaticBearer { .. }
+            | HttpAuthenticationBinding::OAuth2ClientCredentials(_)
+            | HttpAuthenticationBinding::DelegatedIssuerToken(_) => Ok(()),
+        }
+    }
+
     /// The header the caller assertion travels in, when this target attests
     /// its caller. A lane strips it from anything a caller supplied, like the
     /// credential headers, before the gateway writes its own.

@@ -530,13 +530,11 @@ impl ConnectionTestService {
         };
         let target = test_target.target();
         // A delegated credential is the tester's own token, so a test that
-        // names nobody is refused before the egress preflight resolves
-        // anything or any secret is read, as a tool call would be.
-        if target.credential_belongs_to_caller() && caller.is_none() {
-            return failed_connection_execution(
-                started,
-                ConnectionHttpError::DelegatedTokenNoPrincipal,
-            );
+        // names nobody, or a tester a domain-wide delegation cannot act as,
+        // is refused before the egress preflight resolves anything or any
+        // secret is read, as a tool call would be.
+        if let Err(error) = target.admit_credential_caller(caller) {
+            return failed_connection_execution(started, error);
         }
         // The issuer verifies the tester's subject token against the keys
         // this replica publishes, so a test is refused, before any I/O but

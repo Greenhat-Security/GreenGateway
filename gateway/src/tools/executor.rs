@@ -2717,15 +2717,15 @@ impl ToolExecutor {
             request.headers.remove(header_name);
         }
         // A credential that is the caller's own cannot be obtained for a call
-        // that names nobody, a service token included. Refused here, ahead of
-        // the caller-assertion admission a delegated Connection also carries,
-        // so the reason says which of the two could not be honoured.
-        if target.credential_belongs_to_caller() && context.caller.is_none() {
+        // that names nobody, a service token included, nor, on a domain-wide
+        // delegation, for a caller from an issuer it does not trust or with
+        // no plain email. Refused here, before the egress preflight resolves
+        // anything or any secret is read, and ahead of the caller-assertion
+        // admission a delegated Connection also carries, so the reason says
+        // which of the two could not be honoured.
+        if let Err(error) = target.admit_credential_caller(context.caller.as_deref()) {
             return Err(ClassifiedConnectionError {
-                error: Box::new(connection_tool_error(
-                    tool,
-                    ConnectionHttpError::DelegatedTokenNoPrincipal,
-                )),
+                error: Box::new(connection_tool_error(tool, error)),
                 request_sent: false,
             });
         }
