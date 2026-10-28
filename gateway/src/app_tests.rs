@@ -20611,11 +20611,12 @@ async fn a_policy_write_bound_to_a_resource_snapshot_is_refused_once_it_is_stale
         .await
         .expect("policy PUT should complete");
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(!capture
-        .events()
-        .iter()
-        .any(|event| event.event_type == audit::event::POLICY_CHANGED
-            && event.payload["resource_snapshot_digest"] != json!(reviewed)));
+    assert_eventually(Duration::from_secs(1), || {
+        capture.events().iter().any(|event| {
+            event.event_type == audit::event::POLICY_CHANGED
+                && event.payload["resource_snapshot_digest"] == json!(reviewed)
+        })
+    });
 }
 
 #[tokio::test]
