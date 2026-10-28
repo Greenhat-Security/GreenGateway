@@ -610,7 +610,10 @@ pub(super) enum StartupFailure {
 ///   seeds: the metrics recorder, the listeners' TLS material, the audit
 ///   sinks, every store, client and background task, and the routers. It
 ///   binds nothing.
-/// * **Serving** binds the listeners and serves until shutdown.
+/// * **Serving** binds the listeners and serves until shutdown. Once a
+///   listener has served, shutdown is serving's own; until then, a failure
+///   to bind or to announce readiness is a startup failure like the stages'
+///   before it.
 ///
 /// [`ProcessStartup`] is the gateway's; the bootstrap tests run the same
 /// sequence against a recording double.
@@ -635,12 +638,35 @@ pub(super) trait StartupStages {
         seeds: Self::Seeds,
     ) -> Result<Self::Activated, Box<dyn std::error::Error>>;
 
-    /// Withdraw what preflight published, after preflight or activation
-    /// failed.
+    /// Withdraw what preflight published, after preflight, activation or
+    /// serving failed before the gateway served.
     async fn withdraw(&mut self, published: Self::Published);
 
-    async fn serve(&mut self, activated: Self::Activated)
-        -> Result<(), Box<dyn std::error::Error>>;
+    async fn serve(&mut self, activated: Self::Activated) -> Result<(), ServingFailure>;
+}
+
+/// How serving ended when it did not end in an orderly shutdown.
+#[derive(Debug)]
+pub(super) enum ServingFailure {
+    /// No listener served: a listener could not be bound or readiness could
+    /// not be announced. Startup failed, so what preflight published is
+    /// withdrawn.
+    NeverServed(Box<dyn std::error::Error>),
+    /// Serving ended on an error after the gateway became ready. Serving's
+    /// own shutdown has already run.
+    AfterServing(Box<dyn std::error::Error>),
+}
+
+impl ServingFailure {
+    /// Classify an error `serve_gateway` returned by the phase it left the
+    /// lifecycle in: still starting means no listener ever served.
+    fn from_lifecycle(error: Box<dyn std::error::Error>, lifecycle: &GatewayLifecycle) -> Self {
+        if lifecycle.startup_complete() {
+            Self::AfterServing(error)
+        } else {
+            Self::NeverServed(error)
+        }
+    }
 }
 
 /// Serving startup: the configuration compiler, then the stages.
@@ -655,9 +681,10 @@ pub(super) trait StartupStages {
 /// startup that fails still fails with the same error.
 ///
 /// Serving starts only with a gateway activation built in full. When
-/// preflight or activation fails, what preflight published is withdrawn
-/// before the error is returned, so a gateway that will not serve leaves
-/// nothing behind that says it might.
+/// preflight or activation fails, or serving fails before any listener
+/// served, what preflight published is withdrawn before the error is
+/// returned, so a gateway that will not serve leaves nothing behind that
+/// says it might.
 pub(super) async fn start_serving<S: StartupStages>(
     stages: &mut S,
     get_var: impl FnMut(&str) -> Result<String, std::env::VarError>,
@@ -686,9 +713,16 @@ pub(super) async fn start_serving<S: StartupStages>(
             return Err(StartupFailure::Stage(error));
         }
     };
-    Box::pin(stages.serve(activated))
-        .await
-        .map_err(StartupFailure::Stage)
+    match Box::pin(stages.serve(activated)).await {
+        Ok(()) => Ok(()),
+        Err(ServingFailure::NeverServed(error)) => {
+            if let Some(published) = published {
+                Box::pin(stages.withdraw(published)).await;
+            }
+            Err(StartupFailure::Stage(error))
+        }
+        Err(ServingFailure::AfterServing(error)) => Err(StartupFailure::Stage(error)),
+    }
 }
 
 /// The gateway process's startup stages.
@@ -738,6 +772,7 @@ pub(super) struct ActivatedGateway {
     audit_log: audit::AuditLog,
     lifecycle: GatewayLifecycle,
     shutdown_config: ShutdownConfig,
+    shutdown_budget: Duration,
     ha_foundation: Option<ha::HaFoundation>,
     #[cfg(feature = "postgres")]
     database_foundation: Option<storage::postgres::PostgresFoundation>,
@@ -878,7 +913,7 @@ impl StartupStages for ProcessStartup {
                 // lifecycle -- reload watchers, the membership heartbeat,
                 // the projector and maintenance leaders, the reconciler.
                 // None of it may outlive an activation that will not serve.
-                stop_failed_activation(&lifecycle, shutdown_budget).await;
+                stop_unserved_gateway(&lifecycle, shutdown_budget).await;
                 return Err(error);
             }
         };
@@ -891,7 +926,7 @@ impl StartupStages for ProcessStartup {
             let mut apps = apps;
             if let Some(startup) = apps.authority_events.take() {
                 if let Err(error) = Box::pin(startup.start(&lifecycle, &audit_log)).await {
-                    stop_failed_activation(&lifecycle, shutdown_budget).await;
+                    stop_unserved_gateway(&lifecycle, shutdown_budget).await;
                     return Err(Box::new(error));
                 }
             }
@@ -904,6 +939,7 @@ impl StartupStages for ProcessStartup {
             audit_log,
             lifecycle,
             shutdown_config,
+            shutdown_budget,
             ha_foundation,
             #[cfg(feature = "postgres")]
             database_foundation,
@@ -917,10 +953,7 @@ impl StartupStages for ProcessStartup {
         let _ = published;
     }
 
-    async fn serve(
-        &mut self,
-        activated: ActivatedGateway,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn serve(&mut self, activated: ActivatedGateway) -> Result<(), ServingFailure> {
         let ActivatedGateway {
             apps,
             listen,
@@ -928,13 +961,15 @@ impl StartupStages for ProcessStartup {
             audit_log,
             lifecycle,
             shutdown_config,
+            shutdown_budget,
             // Held, not used: the foundations live as long as serving does.
             ha_foundation: _ha_foundation,
             #[cfg(feature = "postgres")]
                 database_foundation: _database_foundation,
         } = activated;
         let background_lifecycle = lifecycle.clone();
-        serve_gateway(
+        let phase = lifecycle.clone();
+        let served = serve_gateway(
             apps.http,
             apps.grpc,
             listen.data,
@@ -947,21 +982,33 @@ impl StartupStages for ProcessStartup {
                 background_lifecycle.shutdown_background_tasks().await;
             }),
         )
-        .await?;
-        Ok(())
+        .await;
+        match served {
+            Ok(()) => Ok(()),
+            Err(error) => match ServingFailure::from_lifecycle(Box::new(error), &phase) {
+                // A listener that could not be bound leaves the background
+                // work activation started running, with no shutdown of
+                // serving's to stop it.
+                ServingFailure::NeverServed(error) => {
+                    stop_unserved_gateway(&phase, shutdown_budget).await;
+                    Err(ServingFailure::NeverServed(error))
+                }
+                after_serving => Err(after_serving),
+            },
+        }
     }
 }
 
-/// Stop the background work a failed activation started, within the
-/// shutdown budget: a task that will not stop must not hold the process
-/// that is about to report the failure.
-async fn stop_failed_activation(lifecycle: &GatewayLifecycle, budget: Duration) {
+/// Stop the background work activation started for a gateway that will
+/// never serve, within the shutdown budget: a task that will not stop must
+/// not hold the process that is about to report the failure.
+async fn stop_unserved_gateway(lifecycle: &GatewayLifecycle, budget: Duration) {
     if tokio::time::timeout(budget, lifecycle.shutdown_background_tasks())
         .await
         .is_err()
     {
         tracing::warn!(
-            "background tasks started by the failed activation did not stop within SHUTDOWN_TIMEOUT_MS"
+            "background tasks started for a gateway that never served did not stop within SHUTDOWN_TIMEOUT_MS"
         );
     }
 }
@@ -1285,8 +1332,8 @@ async fn preflight_cluster_authority(
             );
             // Published before registration, which may write the boot row
             // and then fail: from here on, a startup that fails before it
-            // serves -- registration, the journal below, activation --
-            // has the row withdrawn.
+            // serves -- registration, the journal below, activation,
+            // binding a listener -- has the row withdrawn.
             *published = Some(Arc::clone(&membership));
             membership.register_boot().await.map_err(|error| {
                 Box::new(ClusterMembershipStartupError(error)) as Box<dyn std::error::Error>

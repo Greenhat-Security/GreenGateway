@@ -7,8 +7,8 @@
 //! every variable the compiler asks the environment for. That shows the
 //! compiler runs first and alone, that every stage receives its one result,
 //! that a refused configuration reaches no stage at all, and that a stage
-//! that fails stops the ones after it -- with a preflight or activation
-//! failure withdrawing what preflight had published.
+//! that fails stops the ones after it -- with a failure before the gateway
+//! served withdrawing what preflight had published.
 
 use std::{cell::RefCell, env::VarError, rc::Rc};
 
@@ -33,7 +33,10 @@ enum Stage {
     /// Preflight, after it published this boot's membership row.
     PreflightAfterPublishing,
     Activation,
+    /// Serving, before any listener served: a bind failure.
     Serving,
+    /// Serving, after the gateway became ready.
+    ServingAfterReady,
 }
 
 /// What the double's preflight hands activation and what it publishes, so
@@ -96,13 +99,18 @@ impl StartupStages for RecordingStages {
         self.withdrawn = Some(published);
     }
 
-    async fn serve(&mut self, activated: u64) -> Result<(), Box<dyn std::error::Error>> {
+    async fn serve(&mut self, activated: u64) -> Result<(), ServingFailure> {
         self.calls.borrow_mut().push(Call::Serve);
         assert_eq!(activated, SEEDS + 1, "serving gets what activation built");
-        if self.fail_at == Some(Stage::Serving) {
-            return Err("the data listener address is in use".into());
+        match self.fail_at {
+            Some(Stage::Serving) => Err(ServingFailure::NeverServed(
+                "the data listener address is in use".into(),
+            )),
+            Some(Stage::ServingAfterReady) => Err(ServingFailure::AfterServing(
+                "the data listener stopped accepting connections".into(),
+            )),
+            _ => Ok(()),
         }
-        Ok(())
     }
 }
 
@@ -280,16 +288,66 @@ fn an_activation_failure_withdraws_what_preflight_published_and_never_serves() {
 }
 
 #[test]
-fn a_serving_failure_is_returned_as_it_is() {
-    // Serving owns its own shutdown once it has the gateway, so nothing is
-    // withdrawn on its behalf.
+fn a_listener_that_cannot_be_bound_withdraws_what_preflight_published() {
+    // No listener served, so this is a startup failure like activation's:
+    // a replica crash-looping on an address in use must not keep a row
+    // that holds every newcomer at the fingerprint door.
     let (result, stages) = start(STANDALONE, Some(Stage::Serving), nothing_to_check());
     assert_eq!(stage_error(result), "the data listener address is in use");
+    assert_eq!(
+        stage_calls(&stages),
+        [Call::Preflight, Call::Activate, Call::Serve, Call::Withdraw]
+    );
+    assert_eq!(stages.withdrawn, Some(PUBLISHED));
+}
+
+#[test]
+fn a_failure_after_serving_is_returned_as_it_is() {
+    // Serving owns its own shutdown once a listener has served, so nothing
+    // is withdrawn on its behalf.
+    let (result, stages) = start(
+        STANDALONE,
+        Some(Stage::ServingAfterReady),
+        nothing_to_check(),
+    );
+    assert_eq!(
+        stage_error(result),
+        "the data listener stopped accepting connections"
+    );
     assert_eq!(
         stage_calls(&stages),
         [Call::Preflight, Call::Activate, Call::Serve]
     );
     assert_eq!(stages.withdrawn, None);
+}
+
+/// The gateway's serving stage tells the two apart by the lifecycle phase
+/// `serve_gateway` left: it marks the gateway ready only once every
+/// listener is bound and readiness is announced, so an error while it is
+/// still starting means nothing served.
+#[test]
+fn a_serving_error_is_classified_by_whether_the_gateway_became_ready() {
+    let classify = |lifecycle: &GatewayLifecycle| {
+        ServingFailure::from_lifecycle("the listener failed".into(), lifecycle)
+    };
+
+    let lifecycle = GatewayLifecycle::new();
+    assert!(matches!(
+        classify(&lifecycle),
+        ServingFailure::NeverServed(error) if error.to_string() == "the listener failed"
+    ));
+
+    lifecycle.mark_ready();
+    assert!(matches!(
+        classify(&lifecycle),
+        ServingFailure::AfterServing(_)
+    ));
+
+    lifecycle.begin_draining();
+    assert!(matches!(
+        classify(&lifecycle),
+        ServingFailure::AfterServing(_)
+    ));
 }
 
 /// Compiling a configuration opens, creates, resolves, connects to and
