@@ -14685,6 +14685,16 @@
       "purpose": "Reviewed for #242 PR 5: reads the Unix mode bits of token-file metadata through PermissionsExt to refuse a credential readable or writable by group or other; read-only metadata, no network or process capability."
     },
     {
+      "file": "ggctl/src/diff.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "ggctl::diff::file_attributes#1",
+      "sha256": "bb9bfcc445be6ebfab4edbe08ee2284c78b43c67baa183cd266cdd21061d5a06",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the semantic diff renderers (human, JSON result, SARIF), which ggctl diff (#242 PR 8) will call; they build strings and JSON in memory only, with no I/O and no transport or process capability."
+    },
+    {
       "file": "ggctl/src/help.rs",
       "reasons": [
         "capability-import-or-glob"
@@ -14810,7 +14820,7 @@
         "unexpanded-attribute"
       ],
       "scope": "ggctl::sarif::file_attributes#1",
-      "sha256": "b00904082cc65a1f3303a0ba6a7be66e26e8fbdb8f97bf07a7f5bb17a2d02b5f",
+      "sha256": "dd61dbe3781fb4e1269b80e7462b7936aa4dea766040b37b41c8eff093a7b238",
       "owner": "GreenGateway maintainers: operator CLI (#242)",
       "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the SARIF writer, which ggctl validate (#242 PR 8) will call; it builds JSON in memory only, with no I/O and no transport or process capability."
     },

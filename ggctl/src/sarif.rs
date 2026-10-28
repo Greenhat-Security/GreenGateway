@@ -1,7 +1,8 @@
 //! SARIF 2.1.0 output for validation results.
 //!
-//! ADR-0008 gives `--format sarif` to `ggctl validate` only, so CI systems
-//! that ingest SARIF can annotate a bundle review. `validate` arrives with
+//! ADR-0008 gives `--format sarif` to `ggctl validate`, so CI systems that
+//! ingest SARIF can annotate a bundle review, and `ggctl diff` uses the same
+//! run for its risk codes (`diff.rs`). `validate` arrives with
 //! the bundle reader's move into the shared library (#242 PR 8); until then
 //! no command offers this format and the writer is exercised by its tests.
 //! It is built from the same value-free diagnostics as the JSON report, so
@@ -52,6 +53,12 @@ pub(crate) fn log(diagnostics: &[Diagnostic]) -> Value {
             })
         })
         .collect();
+    envelope(rule_values, results)
+}
+
+/// One SARIF 2.1.0 run by ggctl with these rules and results; the semantic
+/// diff's SARIF form (`diff.rs`) shares it.
+pub(crate) fn envelope(rules: Vec<Value>, results: Vec<Value>) -> Value {
     json!({
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
         "version": "2.1.0",
@@ -60,7 +67,7 @@ pub(crate) fn log(diagnostics: &[Diagnostic]) -> Value {
                 "driver": {
                     "name": "ggctl",
                     "version": env!("CARGO_PKG_VERSION"),
-                    "rules": rule_values,
+                    "rules": rules,
                 }
             },
             "results": results,

@@ -10,7 +10,10 @@
 //!   for, and those schemas;
 //! - [`capabilities`]: the `GatewayCapabilities` document a gateway serves at
 //!   `GET /v1{ADMIN_PREFIX}/config/capabilities`, which `ggctl` reads before
-//!   any configuration operation and refuses to proceed without.
+//!   any configuration operation and refuses to proceed without;
+//! - [`semantic_diff`]: the semantic diff between two compiled
+//!   configurations and its risk classification, which `ggctl diff` and the
+//!   gateway's plans will report (nothing reports it yet).
 //!
 //! [`archive`] holds the entry admission rules ADR-0008 requires of every
 //! archive GreenGateway reads (no traversal, links, special files, duplicate
@@ -30,3 +33,4 @@
 pub mod archive;
 pub mod capabilities;
 pub mod documents;
+pub mod semantic_diff;

@@ -14,6 +14,7 @@ mod cli;
 mod completion;
 mod credential;
 mod diagnostic;
+mod diff;
 mod help;
 mod remote;
 mod report;

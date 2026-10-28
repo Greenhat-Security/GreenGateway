@@ -15,7 +15,7 @@ cargo build --locked --release -p ggctl
 
 It is not yet part of the release artifacts or the container image; packaging, checksums, SBOM and signing for Linux, macOS and Windows come with #242 PR 18. CI builds and tests it on all three platforms.
 
-The configuration contracts it shares with the gateway live in the `gateway-config` library crate, which both binaries link: today the published document schemas and the `GatewayCapabilities` handshake document. The bundle reader and the configuration compiler move there when `ggctl validate` arrives (#242 PR 8).
+The configuration contracts it shares with the gateway live in the `gateway-config` library crate, which both binaries link: today the published document schemas, the `GatewayCapabilities` handshake document, and the [semantic diff and its risk codes](semantic-diff.md) that `ggctl diff` will report. The bundle reader and the configuration compiler move there when `ggctl validate` arrives (#242 PR 8).
 
 ## Commands
 
@@ -57,7 +57,7 @@ Writes a completion script to standard output. It completes commands, options, f
 
 A report always has `apiVersion: greengateway.dev/v1alpha1`, `kind: GgctlReport`, the `command`, the process `exitCode` and its stable `outcome` name, the `diagnostics`, and a command-specific `result`. Every diagnostic has a stable `code`, a `severity`, fixed `message` text, an optional fixed `hint`, a `remediation` anchor in this document and, when it concerns one argument, that argument's 1-based `location.argument` position. Diagnostics are value-free by construction: they never contain an argument, token, URL, path, address, server response or library error text. An unknown option is reported by its position, never by its spelling, because the spelling may be a mistyped secret. A published code never changes meaning; renaming or removing one needs a new report version.
 
-SARIF 2.1.0 output belongs to `validate`, the one command ADR-0008 gives it, and arrives with it; the writer is part of this foundation, and no current command offers `--format sarif`.
+SARIF 2.1.0 output belongs to `validate`, which ADR-0008 gives it, and to `diff`, which reports its [risk codes](semantic-diff.md#risk-codes) as SARIF results so CI can annotate a review; each arrives with its command. The writers are part of this build, and no current command offers `--format sarif`.
 
 ## Exit codes
 
