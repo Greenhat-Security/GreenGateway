@@ -56,15 +56,18 @@
 //! Three gates decide, and each one has a row here.
 //!
 //! 1. **The schema ledger.** `storage::migrations::schema_version_range()`
-//!    returns `(len, len)` — a single point, not a window. A replica
-//!    refuses a ledger behind its manifest *and* one ahead of it, so there
-//!    is no version pair that tolerates the same database. A migration
-//!    applied mid-rollout makes every not-yet-upgraded replica
-//!    `schema_incompatible` the moment it lands
-//!    ([`an_expand_migration_has_no_overlap_window_so_it_cannot_roll`]).
-//!    No schema extension has been approved, so this is still true of
-//!    every pair, the pinned one included: its two builds share one
-//!    schema point rather than an overlap.
+//!    returns `(len, len + 1)`: the schema this binary's manifest ends at,
+//!    and the one migration above it that this build approved by its exact
+//!    checksum (migration 25, `catalog_change_evidence_actor_metadata`),
+//!    which only a successor applies. A replica refuses a ledger behind its
+//!    manifest and every other one ahead of it, so a migration nobody
+//!    prepared for, applied mid-rollout, makes every not-yet-upgraded
+//!    replica `schema_incompatible` the moment it lands, while the approved
+//!    one leaves them serving
+//!    ([`an_unapproved_migration_has_no_overlap_window_so_it_cannot_roll`]).
+//!    That is one prepared side, not a qualified pair: no successor that
+//!    applies migration 25 has been run against this build, and the pinned
+//!    pair's two builds share one schema point rather than an overlap.
 //! 2. **The static-configuration fingerprint.** PR 13 holds a replica
 //!    unready while any *live* member runs a different fingerprint, and
 //!    agreement is sticky once granted. So an incumbent keeps serving when
@@ -699,14 +702,6 @@ struct LedgerRow {
 }
 
 impl LedgerRow {
-    /// Add a migration row above this binary's manifest: what a newer
-    /// gateway's `migrate up` leaves behind.
-    async fn insert_above_the_manifest(dsn: &str, highest: i64) -> Self {
-        // Far enough above the manifest that no future migration count
-        // can accidentally make this compatible.
-        Self::insert_version(dsn, highest + 1_000).await
-    }
-
     /// Add one ledger row at exactly `version`, with a checksum no build
     /// carries: the next migration, as a successor nobody prepared for
     /// would apply it.
@@ -1341,35 +1336,62 @@ async fn restarting_an_incumbent_while_a_new_configuration_is_live_costs_it_its_
 // Row 3 — the migration that stalls
 // =====================================================================
 
-/// **A migration applied mid-rollout has no overlap window.**
+/// Migration 25, the one extension this binary approves (issue #426): the
+/// reviewed SQL its successor carries byte for byte, recognized by the
+/// SHA-256 `storage::migrations` pins for it.
+const APPROVED_EXTENSION_VERSION: i64 = 25;
+const APPROVED_EXTENSION_NAME: &str = "catalog_change_evidence_actor_metadata";
+const APPROVED_EXTENSION_SQL: &str =
+    include_str!("../../src/storage/migrations/0025_catalog_change_evidence_actor_metadata.sql");
+
+/// Apply the approved extension as its successor's `migrate up` applies a
+/// migration: the SQL and its ledger row in one transaction, as the
+/// migration role. This binary's own migrator never carries it.
+async fn apply_the_approved_extension(migrator_dsn: &str) {
+    use sha2::Digest;
+
+    let checksum = hex::encode(sha2::Sha256::digest(APPROVED_EXTENSION_SQL.as_bytes()));
+    run_sql(
+        migrator_dsn,
+        &format!(
+            "BEGIN;\n{APPROVED_EXTENSION_SQL}\n\
+             INSERT INTO {LEDGER_TABLE} (version, name, checksum) \
+             VALUES ({APPROVED_EXTENSION_VERSION}, '{APPROVED_EXTENSION_NAME}', '{checksum}');\n\
+             COMMIT;"
+        ),
+    )
+    .await;
+}
+
+/// **A migration applied mid-rollout has no overlap window unless this
+/// build approved it.**
 ///
-/// `storage::migrations::schema_version_range()` answers `(len, len)`: the
-/// accepted range is a single point, and the module says why — the ledger
-/// rules admit exactly one shape, a checksum-matching prefix covering the
-/// whole manifest, so a replica tolerates neither a ledger behind its
-/// manifest nor one ahead of it.
+/// `storage::migrations::schema_version_range()` answers `(len, len + 1)`:
+/// the schema the manifest ends at, and above it only the one migration
+/// this build approved by its exact checksum and never applies itself.
+/// The ledger rules admit nothing else: a checksum-matching prefix of the
+/// manifest, extended by nothing or by exactly the approved extension, so a
+/// replica tolerates neither a ledger behind its manifest nor any other one
+/// ahead of it.
 ///
-/// The consequence for a rolling upgrade is total: the instant the new
-/// version's `migrate up` commits, every replica still running the old
-/// version is `schema_incompatible` and serves nothing. There is no
-/// ordering that avoids it, because no pair of versions on either side of
-/// a migration accepts the same ledger. The pinned pair below shares one
-/// ledger only because its successor adds no migration.
+/// So the approved extension, committed by the migration role while both
+/// replicas serve, leaves every replica ready and serving: that is the
+/// prepared side of an expand step. Any other migration is total, as
+/// before: the instant it commits, every replica of this binary is
+/// `schema_incompatible` and serves nothing, because nothing prepared them
+/// for it. The pinned pair below shares one ledger only because its
+/// successor adds no migration, and no successor that applies migration 25
+/// has been run against this build, so this row is not a qualified pair
+/// across a schema change (`docs/architecture/ha-state-model.md` §7).
+/// The day the approved extensions change, step 1 fails and says so.
 ///
-/// `docs/architecture/ha-state-model.md` §7 says the same: no pair has
-/// been qualified across a schema change, so the contract stays a point.
-/// This row asserts the code: the range is a point, and the stall is
-/// total. The advertised range is a *pair* precisely so a future release
-/// can widen it without a schema change — and the day it widens, this row
-/// fails and says so.
-///
-/// The row also pins that this is a **readiness** refusal, not a request
-/// refusal. A replica whose ledger it does not accept keeps serving
-/// whatever is still routed to it. See step 3b, which asserts that and
-/// explains why it makes the load balancer's `/readyz` wiring
+/// The row also pins that the stall is a **readiness** refusal, not a
+/// request refusal. A replica whose ledger it does not accept keeps
+/// serving whatever is still routed to it. See step 4b, which asserts that
+/// and explains why it makes the load balancer's `/readyz` wiring
 /// load-bearing rather than advisory.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_expand_migration_has_no_overlap_window_so_it_cannot_roll() {
+async fn an_unapproved_migration_has_no_overlap_window_so_it_cannot_roll() {
     let Some(mut cluster) = start_rollout_cluster(2).await else {
         return skipped();
     };
@@ -1377,8 +1399,15 @@ async fn an_expand_migration_has_no_overlap_window_so_it_cannot_roll() {
     cluster.balancer.round_robin();
 
     // 1. The structural reason, read from the product rather than assumed:
-    //    the accepted schema range this binary advertises is one number
-    //    wide.
+    //    the accepted schema range is the ledger this binary migrated to
+    //    plus the one extension it approved.
+    let highest: i64 = cluster
+        .database
+        .query_one(&format!(
+            "SELECT coalesce(max(version), 0)::bigint FROM {LEDGER_TABLE}"
+        ))
+        .await
+        .get(0);
     let status = cluster_status(&cluster, "a", &admin).await;
     let minimum = status["schema"]["binary_min"]
         .as_i64()
@@ -1387,34 +1416,69 @@ async fn an_expand_migration_has_no_overlap_window_so_it_cannot_roll() {
         .as_i64()
         .unwrap_or_else(|| panic!("the binary maximum should be reported: {status}"));
     assert_eq!(
-        minimum, maximum,
-        "this binary advertises a schema range of [{minimum}, {maximum}]. A range wider than \
-         one point would mean a rolling upgrade across a migration is possible, and this row \
-         — which asserts that it is not — is the thing to rewrite"
+        (minimum, maximum),
+        (highest, APPROVED_EXTENSION_VERSION),
+        "this binary advertises a schema range of [{minimum}, {maximum}] over a ledger it \
+         migrated to {highest}: its manifest and the one extension it approved. Another \
+         width means the approved extensions changed, and this row is the thing to rewrite"
     );
+    assert_eq!(APPROVED_EXTENSION_VERSION, highest + 1);
+
+    // 2. The approved extension: the migration role commits migration 25
+    //    while both replicas serve, as the successor's `migrate up` would.
+    //    Every replica stays ready through it, reports the ledger as
+    //    compatible at 25, and serves.
+    apply_the_approved_extension(&cluster.database.migrator_dsn).await;
+    assert_ready_across(
+        &cluster,
+        Duration::from_millis(PROBE_CACHE_MS * 8),
+        "after the approved extension committed",
+    )
+    .await;
+    for name in ["a", "b"] {
+        let status = cluster_status(&cluster, name, &admin).await;
+        assert_eq!(
+            (
+                status["schema"]["current_version"].as_i64(),
+                status["schema"]["compatible"].as_bool(),
+            ),
+            (Some(APPROVED_EXTENSION_VERSION), Some(true)),
+            "replica {name} serves the approved extension: {status}"
+        );
+    }
+    for _ in 0..4 {
+        let response = harness::http_client()
+            .get(format!("{}{PROXIED_PATH}", cluster.balancer.base_url))
+            .bearer_auth(&admin)
+            .send()
+            .await
+            .expect("the balancer should answer");
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "the deployment serves on the approved extension"
+        );
+    }
 
     let dispatched_before = proxied_count(&cluster);
-    let highest: i64 = cluster
-        .database
-        .query_one(&format!(
-            "SELECT coalesce(max(version), 0)::bigint FROM {LEDGER_TABLE}"
-        ))
-        .await
-        .get(0);
 
-    // 2. The newer version migrates the shared database. Nothing else
-    //    about the deployment changes.
-    let mut ledger =
-        LedgerRow::insert_above_the_manifest(&cluster.database.migrator_dsn, highest).await;
+    // 3. The migration after it, with a checksum no build carries: what a
+    //    successor nobody prepared this build for would apply. Nothing
+    //    else about the deployment changes.
+    let mut ledger = LedgerRow::insert_version(
+        &cluster.database.migrator_dsn,
+        APPROVED_EXTENSION_VERSION + 1,
+    )
+    .await;
 
-    // 3. Every replica still on the old binary refuses readiness — every
-    //    one of them, because the range is a point and they all share the
-    //    ledger. There is no surviving member for a rollout to lean on.
+    // 4. Every replica still on this binary refuses readiness — every one
+    //    of them, because they all share the ledger and none was prepared
+    //    for it. There is no surviving member for a rollout to lean on.
     for replica in &cluster.replicas {
         wait_for_reason(replica, SCHEMA_INCOMPATIBLE, AUTHORITY_BUDGET).await;
     }
 
-    // 3b. And the part that is worth stating precisely, because it is not
+    // 4b. And the part that is worth stating precisely, because it is not
     //     what a reader of the state model would assume: this is a
     //     *readiness* refusal and not a request refusal. The authority is
     //     perfectly reachable, the security-revision gate is satisfied,
@@ -1463,9 +1527,9 @@ async fn an_expand_migration_has_no_overlap_window_so_it_cannot_roll() {
         "the status should report the schema as incompatible: {status}"
     );
 
-    // 4. Recovery is the operator finishing the upgrade — here, removing
+    // 5. Recovery is the operator finishing the upgrade — here, removing
     //    the row the newer binary would have left. The deployment comes
-    //    back without a restart.
+    //    back on the approved extension without a restart.
     ledger.revert().await;
     for replica in &cluster.replicas {
         wait_until_ready(replica, AUTHORITY_BUDGET).await;
@@ -1479,7 +1543,7 @@ async fn an_expand_migration_has_no_overlap_window_so_it_cannot_roll() {
     assert_eq!(
         response.status().as_u16(),
         200,
-        "the deployment should serve again once the ledger matches the manifest"
+        "the deployment should serve again once the ledger is one this build serves"
     );
 
     cluster.shutdown();

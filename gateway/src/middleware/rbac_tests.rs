@@ -3575,3 +3575,376 @@ async fn required_durability_holds_the_revision_gate_refusal_to_its_record() {
         assert_eq!(body["error"], json!(expected_error));
     }
 }
+
+const TOOL_REASONS: [ToolReason; 12] = [
+    ToolReason::UnknownTool,
+    ToolReason::Disabled,
+    ToolReason::RoleNotAllowed,
+    ToolReason::MatchedRule,
+    ToolReason::Allowed,
+    ToolReason::NotInPolicy,
+    ToolReason::PolicyDisabled,
+    ToolReason::PrincipalNotEligible,
+    ToolReason::PolicyDenied,
+    ToolReason::Eligible,
+    ToolReason::NoHttpRule,
+    ToolReason::Incomplete,
+];
+const EFFECTS: [PolicyEffect; 3] = [
+    PolicyEffect::Allow,
+    PolicyEffect::Block,
+    PolicyEffect::Observe,
+];
+const LOGICAL_DECISIONS: [LogicalDecision; 3] = [
+    LogicalDecision::Allow,
+    LogicalDecision::Deny,
+    LogicalDecision::Indeterminate,
+];
+/// A direct rule the snapshot has, one past its direct rules, and a route
+/// reference, which no tool answer carries.
+const TOOL_REFERENCES: [Option<RuleReference>; 4] = [
+    None,
+    Some(RuleReference::Direct(0)),
+    Some(RuleReference::Direct(1)),
+    Some(RuleReference::Route(0)),
+];
+
+/// The action a matched rule's answer is enforced as, for the three pairs of
+/// effect and logical decision the kernel gives; `None` for every other pair.
+fn rule_action_for(effect: PolicyEffect, logical: LogicalDecision) -> Option<RuleAction> {
+    match (effect, logical) {
+        (PolicyEffect::Allow, LogicalDecision::Allow) => Some(RuleAction::Allow),
+        (PolicyEffect::Block, LogicalDecision::Deny) => Some(RuleAction::Deny),
+        (PolicyEffect::Observe, LogicalDecision::Deny) => Some(RuleAction::Shadow),
+        _ => None,
+    }
+}
+
+fn tool_rule(id: &str, tool_name: Option<&str>, path: &str, action: RuleAction) -> Rule {
+    Rule {
+        id: Some(id.to_owned()),
+        enabled: true,
+        methods: Vec::new(),
+        path: path.to_owned(),
+        tool_name: tool_name.map(str::to_owned),
+        dispatch: None,
+        principal: PrincipalMatcher::default(),
+        action,
+    }
+}
+
+/// The invocation adapter admits only an answer the kernel gives: its own
+/// unmatched allow for a tool the snapshot has an entry for, or a matched
+/// rule the snapshot can attribute whose effect and logical decision agree.
+/// Every answer naming an admitting reason in any other shape is refused as
+/// an internal invariant, and every other reason is the refusal it names.
+/// The kernel gives none of the crafted shapes (#422), so a served call
+/// cannot reach these guards; this test is what keeps them exercised.
+#[test]
+fn an_invocation_answer_the_kernel_never_gives_is_refused() {
+    let mut policy = test_policy(DefaultAction::Allow, &[], &[]);
+    policy.tools.insert(
+        "reports.open".to_owned(),
+        tool_policy_entry(true, &[], &[], &[]),
+    );
+    policy.tools.insert(
+        "reports.closed".to_owned(),
+        tool_policy_entry(false, &[], &[], &[]),
+    );
+    policy.rules = vec![tool_rule(
+        "tool-rule",
+        Some("reports.open"),
+        "",
+        RuleAction::Allow,
+    )];
+    let snapshot = RbacPolicyState::from_policy(policy);
+    let mut admitted = 0;
+    for name in ["reports.open", "reports.closed", "reports.absent"] {
+        let has_entry = name != "reports.absent";
+        let genuine = snapshot
+            .evaluate_tool(
+                ToolOperation::Invocation,
+                name,
+                PrincipalFact::Anonymous,
+                None,
+            )
+            .expect("the kernel answers a bounded question");
+        for reason in TOOL_REASONS {
+            for effect in EFFECTS {
+                for logical in LOGICAL_DECISIONS {
+                    for matched in TOOL_REFERENCES {
+                        let answer = genuine.clone().crafted(logical, effect, reason, matched);
+                        let shape = format!("{name} {reason:?} {effect:?} {logical:?} {matched:?}");
+                        let unmatched_allow = reason == ToolReason::Allowed
+                            && effect == PolicyEffect::Allow
+                            && logical == LogicalDecision::Allow
+                            && matched.is_none();
+                        let attributable_rule = reason == ToolReason::MatchedRule
+                            && matched == Some(RuleReference::Direct(0))
+                            && rule_action_for(effect, logical).is_some();
+                        let verdict = snapshot.invocation_verdict(name, &answer);
+                        match &verdict {
+                            ToolInvocationVerdict::Entry {
+                                rule_decision: None,
+                                ..
+                            } => {
+                                assert!(has_entry && unmatched_allow, "{shape}");
+                                admitted += 1;
+                            }
+                            ToolInvocationVerdict::Entry {
+                                rule_decision: Some(decision),
+                                ..
+                            } => {
+                                assert!(has_entry && attributable_rule, "{shape}");
+                                assert_eq!(
+                                    Some(decision.action.clone()),
+                                    rule_action_for(effect, logical),
+                                    "{shape}"
+                                );
+                                assert_eq!(decision.matched_rule_id, "tool-rule", "{shape}");
+                                admitted += 1;
+                            }
+                            ToolInvocationVerdict::UnknownTool => {
+                                assert!(reason == ToolReason::UnknownTool && !has_entry, "{shape}");
+                            }
+                            ToolInvocationVerdict::Disabled => {
+                                assert!(reason == ToolReason::Disabled && has_entry, "{shape}");
+                            }
+                            ToolInvocationVerdict::RoleNotAllowed { .. } => {
+                                assert!(
+                                    reason == ToolReason::RoleNotAllowed && has_entry,
+                                    "{shape}"
+                                );
+                            }
+                            ToolInvocationVerdict::Refused(refusal) => {
+                                assert_eq!(
+                                    *refusal,
+                                    ToolPolicyRefusal::Error(EvaluationError::InternalInvariant),
+                                    "{shape}"
+                                );
+                            }
+                        }
+                        if matches!(reason, ToolReason::Allowed | ToolReason::MatchedRule)
+                            && !(has_entry && (unmatched_allow || attributable_rule))
+                        {
+                            assert_eq!(
+                                verdict,
+                                ToolInvocationVerdict::Refused(ToolPolicyRefusal::Error(
+                                    EvaluationError::InternalInvariant
+                                )),
+                                "{shape}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Two tools with an entry, each admitted by one unmatched allow and by
+    // the three rule answers.
+    assert_eq!(admitted, 8);
+}
+
+/// The rendered-HTTP adapter answers only the kernel's own no-rule allow and
+/// a matched rule it can attribute whose effect and logical decision agree.
+/// Every other answer -- a block or an observation with no rule, a rule
+/// reference without `MatchedRule`, a reason another operation gives -- is
+/// refused as an internal invariant rather than let the rendered request
+/// through. The kernel gives none of them (#422); they are crafted here.
+#[test]
+fn a_rendered_http_answer_the_kernel_never_gives_is_refused() {
+    let mut policy = test_policy(DefaultAction::Deny, &[], &[]);
+    policy.tools.insert(
+        "reports.open".to_owned(),
+        tool_policy_entry(true, &[], &[], &[]),
+    );
+    policy.rules = vec![tool_rule(
+        "http-rule",
+        None,
+        "/reports/**",
+        RuleAction::Deny,
+    )];
+    let snapshot = RbacPolicyState::from_policy(policy);
+    let genuine = snapshot
+        .evaluate_tool(
+            ToolOperation::RenderedHttp,
+            "reports.open",
+            PrincipalFact::Anonymous,
+            Some((Method::GET, "/elsewhere".to_owned())),
+        )
+        .expect("the kernel answers a bounded question");
+    assert_eq!(snapshot.rendered_http_rule(&genuine), Ok(None));
+    let mut answered = 0;
+    for reason in TOOL_REASONS {
+        for effect in EFFECTS {
+            for logical in LOGICAL_DECISIONS {
+                for matched in TOOL_REFERENCES {
+                    let answer = genuine.clone().crafted(logical, effect, reason, matched);
+                    let shape = format!("{reason:?} {effect:?} {logical:?} {matched:?}");
+                    match snapshot.rendered_http_rule(&answer) {
+                        Ok(None) => {
+                            assert!(
+                                reason == ToolReason::NoHttpRule
+                                    && effect == PolicyEffect::Allow
+                                    && logical == LogicalDecision::Allow
+                                    && matched.is_none(),
+                                "{shape}"
+                            );
+                            answered += 1;
+                        }
+                        Ok(Some(decision)) => {
+                            assert!(
+                                reason == ToolReason::MatchedRule
+                                    && matched == Some(RuleReference::Direct(0)),
+                                "{shape}"
+                            );
+                            assert_eq!(
+                                Some(decision.action),
+                                rule_action_for(effect, logical),
+                                "{shape}"
+                            );
+                            assert_eq!(decision.matched_rule_id, "http-rule", "{shape}");
+                            answered += 1;
+                        }
+                        Err(refusal) => assert_eq!(
+                            refusal,
+                            ToolPolicyRefusal::Error(EvaluationError::InternalInvariant),
+                            "{shape}"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+    // One unmatched allow and the three rule answers.
+    assert_eq!(answered, 4);
+}
+
+/// The HTTP adapter resolves the evaluator's route and rule references on the
+/// compiled instance that returned them (#422), so the permission and path
+/// prefix a decision records are those of the route that matched, and a
+/// reference that instance does not have is refused before anything is
+/// audited. The kernel returns no such reference, so those answers are
+/// crafted over a genuine one.
+#[tokio::test]
+async fn http_attribution_resolves_references_on_the_instance_that_decided() {
+    use crate::policy_eval::{Evaluation, HostFact, HttpTarget, PolicyEvaluationContext, Reason};
+
+    let policy = test_policy_with_rules(
+        DefaultAction::Deny,
+        &[("reader", &["first:read", "second:read"])],
+        &[
+            route(&["GET"], "/first", "first:read"),
+            route(&["GET"], "/second", "second:read"),
+        ],
+        &[direct_rule(
+            Some("named"),
+            &["GET"],
+            "/direct",
+            RuleAction::Shadow,
+        )],
+    );
+    let capture = CaptureSink::new();
+    let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+    let state = RbacState::new(policy, Vec::new(), false, audit.clone());
+    let snapshot = state.installed_compiled_policy();
+    let compiled = snapshot.compiled();
+    let principal = test_principal(&["reader"]);
+    let context = AuditContext {
+        request_id: "attribution-fixture".to_owned(),
+        source_ip: "192.0.2.10".to_owned(),
+        path: "/second/item".to_owned(),
+        method: "GET".to_owned(),
+        security_revision: None,
+    };
+    let input = PolicyEvaluationContext {
+        version: crate::policy_eval::CONTEXT_VERSION,
+        snapshot: compiled.snapshot(),
+        method: Some(Method::GET),
+        path: Some("/second/item".to_owned()),
+        principal: PrincipalFact::Authenticated(PrincipalIdentity::from_principal(&principal)),
+        target: HttpTarget::Contextless,
+        request_host: HostFact::Absent,
+        dispatch: None,
+    };
+    let genuine = compiled.evaluate(&input).expect("evaluates");
+    assert_eq!(genuine.matched(), Some(RuleReference::Route(1)));
+    assert_eq!(genuine.effect(), PolicyEffect::Allow);
+    // A best-effort log settles every receipt at once, so there is nothing
+    // to confirm; the records are read back from the sink below.
+    let attribute = |answer: &Evaluation| {
+        apply_http_evaluation(&state, &snapshot, &context, Some(&principal), None, answer)
+            .map(|(decision, _records)| decision)
+    };
+
+    let decision = attribute(&genuine).expect("a genuine answer is attributed");
+    assert_eq!(decision.permission.as_deref(), Some("second:read"));
+    assert_eq!(decision.path_prefix.as_deref(), Some("/second"));
+    for (index, route) in compiled.routes().iter().enumerate() {
+        let answer =
+            genuine
+                .clone()
+                .crafted(Reason::MatchedRule, Some(RuleReference::Route(index)), None);
+        let decision = attribute(&answer).expect("every route the instance has resolves");
+        assert_eq!(
+            decision.permission.as_deref(),
+            Some(route.permission.as_str())
+        );
+        assert_eq!(
+            decision.path_prefix.as_deref(),
+            Some(route.path_prefix.as_str())
+        );
+    }
+    let route_count = compiled.routes().len();
+    for (reason, matched, observation) in [
+        (
+            Reason::MatchedRule,
+            Some(RuleReference::Route(route_count)),
+            None,
+        ),
+        (Reason::MatchedRule, Some(RuleReference::Direct(1)), None),
+        (
+            Reason::MatchedRule,
+            Some(RuleReference::Route(0)),
+            Some(RuleReference::Route(0)),
+        ),
+        (
+            Reason::MatchedRule,
+            Some(RuleReference::Route(0)),
+            Some(RuleReference::Direct(1)),
+        ),
+        // A host-policy refusal is only ever answered for a selected upstream.
+        (Reason::HostPolicyRequired, None, None),
+    ] {
+        let answer = genuine.clone().crafted(reason, matched, observation);
+        assert_eq!(
+            attribute(&answer).err(),
+            Some(EvaluationError::InternalInvariant),
+            "{reason:?} {matched:?} {observation:?}"
+        );
+    }
+
+    audit
+        .close_and_drain(Duration::from_secs(5))
+        .await
+        .expect("audit drains");
+    let events: Vec<_> = capture
+        .events()
+        .iter()
+        .map(|event| {
+            (
+                event.event_type.clone(),
+                event.payload["permission"].as_str().map(str::to_owned),
+            )
+        })
+        .collect();
+    // One record per attributed answer, none for a refused one.
+    assert_eq!(
+        events,
+        [
+            (AUTHZ_ALLOWED.to_owned(), Some("second:read".to_owned())),
+            (AUTHZ_ALLOWED.to_owned(), Some("first:read".to_owned())),
+            (AUTHZ_ALLOWED.to_owned(), Some("second:read".to_owned())),
+        ]
+    );
+}

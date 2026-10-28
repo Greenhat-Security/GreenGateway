@@ -335,35 +335,82 @@ impl SchemaCompatibility {
     }
 }
 
-// No adjacent release pair has been qualified across a schema change. Do
-// not widen these bounds or add an extension without the pinned SQL and
-// two-binary gate in issue #426. Moving the point from 23 to 24 (the actor
-// metadata of the journaled authority evidence, #425) is not an overlap: a
-// schema-23 binary refuses schema 24 and this binary refuses schema 23, so
-// that upgrade is a coordinated drain/migrate/restart, as the moves from 15
-// to 16 (#425), from 16 to 17 (member capability advertisements, #426 PR
-// 1), from 17 to 18 (service-token and JWT revocation change evidence, #425
-// PR 2b), from 18 to 19 (shared admin sessions, #424), from 19 to 20 (the
-// durable contract fence, #426 PR 3), from 20 to 21 (the authority-event
-// journal, #425 PR 3), from 21 to 22 (server-side policy drafts, #243
-// slice 9) and from 22 to 23 (policy, tools and catalog change evidence,
-// #425 PR 2c) were. A schema-23 binary must not keep writing evidence after
-// migration 24: its Connection, service-token and JWT revocation rows would
-// record no actor kind, auth mode or issuer. A schema-22 binary would also
-// commit policy, tools and catalog changes without their evidence, and a
-// schema-20 one would write evidence that is never journaled. The fence
-// keeps covering every binary that can serve this database: none that
-// predates it accepts this ledger either.
-const BINARY_SCHEMA_COMPATIBILITY: SchemaCompatibility = SchemaCompatibility {
-    read: (24, 24),
-    write: (24, 24),
-    approved_extensions: &[],
+/// Migration 25 (`catalog_change_evidence_actor_metadata`: the actor kind,
+/// auth mode and issuer on catalog change evidence, #425), approved before
+/// any build applies it (issue #426, requirement 1). Its reviewed SQL is
+/// checked in as `migrations/0025_catalog_change_evidence_actor_metadata.sql`
+/// but is not in [`MANIFEST`]: this build recognizes a ledger row carrying
+/// exactly that file's SHA-256 and never executes it. The successor adds the
+/// same bytes to its manifest; `the_approved_extension_is_the_reviewed_sql`
+/// keeps this digest and the file in step until then.
+const CATALOG_EVIDENCE_ACTOR_METADATA: ApprovedExtension = ApprovedExtension {
+    version: 25,
+    checksum: "7d7458311798be0ee0346fff70581300a4d29984ba90d51cd3bccbd00a9ee84f",
 };
+
+// The prepared release for migration 25. This build serves schema 24, where
+// its manifest ends, and schema 25, which only its successor applies. Widening
+// both contracts to 25 is a claim about this build's own readers and writers,
+// not about the SQL: the one table the migration changes is written here only
+// by `connections::pg_store::record_catalog_change_evidence`, which names
+// every column it sets, so the rows it writes record none of the new columns,
+// which the migration's CHECK admits; nothing here reads them or depends on
+// the table's shape. `a_prepared_build_serves_the_approved_extension_only`
+// and the connection store's
+// `a_prepared_store_publishes_catalog_evidence_on_the_approved_extension`
+// prove that against a real database. The migrator and import preflight still
+// require the executable manifest, so a ledger at 25 is the successor's to
+// manage, and every other version or checksum above 24 is still refused. No
+// pair has been qualified across the extension yet: that needs the successor
+// and the two-binary gate, so this overlap is prepared, not a supported
+// rolling upgrade.
+//
+// The schema point itself moved from 23 to 24 (the actor metadata of the
+// journaled authority evidence, #425) without an overlap: a schema-23 binary
+// refuses schema 24 and this binary refuses schema 23, so that upgrade is a
+// coordinated drain/migrate/restart, as the moves from 15 to 16 (#425), from
+// 16 to 17 (member capability advertisements, #426 PR 1), from 17 to 18
+// (service-token and JWT revocation change evidence, #425 PR 2b), from 18 to
+// 19 (shared admin sessions, #424), from 19 to 20 (the durable contract
+// fence, #426 PR 3), from 20 to 21 (the authority-event journal, #425 PR 3),
+// from 21 to 22 (server-side policy drafts, #243 slice 9) and from 22 to 23
+// (policy, tools and catalog change evidence, #425 PR 2c) were. A schema-23
+// binary must not keep writing evidence after migration 24: its Connection,
+// service-token and JWT revocation rows would record no actor kind, auth mode
+// or issuer. A schema-22 binary would also commit policy, tools and catalog
+// changes without their evidence, and a schema-20 one would write evidence
+// that is never journaled. The fence keeps covering every binary that can
+// serve this database: none that predates it accepts this ledger either.
+const BINARY_SCHEMA_COMPATIBILITY: SchemaCompatibility = SchemaCompatibility {
+    read: (24, 25),
+    write: (24, 25),
+    approved_extensions: &[CATALOG_EVIDENCE_ACTOR_METADATA],
+};
+
+/// The reviewed source of an approved extension: what its successor adds to
+/// its manifest byte for byte. Test-only, so this build's binary never carries
+/// SQL its migrator must not run.
+#[cfg(test)]
+struct ExtensionSource {
+    version: i64,
+    name: &'static str,
+    sql: &'static str,
+}
+
+/// The sources of [`BINARY_SCHEMA_COMPATIBILITY`]'s approved extensions, in
+/// the same order.
+#[cfg(test)]
+const APPROVED_EXTENSION_SOURCES: &[ExtensionSource] = &[ExtensionSource {
+    version: 25,
+    name: "catalog_change_evidence_actor_metadata",
+    sql: include_str!("migrations/0025_catalog_change_evidence_actor_metadata.sql"),
+}];
 
 /// The intersection of the explicit read/write contracts, advertised to the
 /// roster. This is a summary, not proof of ledger integrity, permission to
 /// write a gated operation (`storage/compatibility.rs`), or permission to
-/// contract the schema. The shipped contract accepts only schema 24.
+/// contract the schema. The shipped contract accepts schema 24 and, through
+/// the one approved extension, schema 25.
 pub(crate) fn schema_version_range() -> (i32, i32) {
     BINARY_SCHEMA_COMPATIBILITY.serving_range()
 }
@@ -1053,12 +1100,38 @@ pub(crate) fn manifest_len() -> usize {
 /// the serving process. Production pods validate only; this path exists for
 /// single-process development databases and is opt-in through
 /// `DATABASE_AUTO_MIGRATE`.
+///
+/// A ledger this build already serves is left alone. A prepared build serves
+/// its approved extension without carrying its SQL, so the strict migrator
+/// would refuse a database the serving validation after it accepts, and
+/// auto-migration must not refuse what validate-only startup serves. Every
+/// other ledger takes the migrator's path, refusals included.
 #[cfg(feature = "postgres")]
 pub(crate) async fn apply_missing_for_startup(
     pool: &deadpool_postgres::Pool,
     settings: &DatabaseSettings,
 ) -> Result<(), MigrateError> {
+    if read_and_validate_runtime(pool).await? == SchemaStatus::Current {
+        return Ok(());
+    }
     apply_missing(pool, settings).await.map(|_| ())
+}
+
+/// Apply every approved extension exactly as the successor's `migrate up`
+/// will: through [`apply_one`], each in one transaction with its ledger row
+/// and the migration timeouts, from the reviewed bytes this build pins by
+/// checksum. Test support only: this build's migrator never carries the SQL.
+#[cfg(test)]
+pub(crate) async fn apply_approved_extensions_as_the_successor(
+    pool: &deadpool_postgres::Pool,
+    settings: &DatabaseSettings,
+) -> Result<(), MigrateError> {
+    let client = acquire(pool).await?;
+    for source in APPROVED_EXTENSION_SOURCES {
+        let extension = Migration::new(source.version, source.name, source.sql).finalize();
+        apply_one(&client, &extension, settings).await?;
+    }
+    Ok(())
 }
 
 /// Translate an auto-migration failure into the foundation's startup error.
@@ -1140,79 +1213,122 @@ mod tests {
     }
 
     #[test]
-    fn the_shipped_contract_has_no_unproved_overlap() {
+    fn the_shipped_contract_overlaps_only_the_approved_extension() {
         assert_eq!(
             MANIFEST.len(),
             24,
             "review the compatibility contract when adding SQL"
         );
-        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.read, (24, 24));
-        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.write, (24, 24));
-        assert_eq!(schema_version_range(), (24, 24));
-        assert!(BINARY_SCHEMA_COMPATIBILITY.approved_extensions.is_empty());
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.read, (24, 25));
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.write, (24, 25));
+        assert_eq!(schema_version_range(), (24, 25));
+        let approved: Vec<(i64, &str)> = BINARY_SCHEMA_COMPATIBILITY
+            .approved_extensions
+            .iter()
+            .map(|extension| (extension.version, extension.checksum))
+            .collect();
         assert_eq!(
-            validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len(), "")),
+            approved,
+            vec![(25, CATALOG_EVIDENCE_ACTOR_METADATA.checksum)],
+            "migration 25 is the one approved extension"
+        );
+        // Readiness samples the manifest, the extension and one row more.
+        assert_eq!(runtime_ledger_row_limit(), 26);
+
+        let schema_24 = ledger_for(&MANIFEST, MANIFEST.len(), "");
+        assert_eq!(
+            validate_runtime_ledger(&schema_24),
             Ok(SchemaStatus::Current)
         );
-        // The previous release's schema is not served: moving the point is
-        // a coordinated upgrade, never an overlap window.
+        // The reviewed migration 25, by its exact checksum, is served...
+        let mut schema_25 = schema_24.clone();
+        schema_25.push((25, hex_checksum(APPROVED_EXTENSION_SOURCES[0].sql)));
         assert_eq!(
-            validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 1, "")),
-            Ok(SchemaStatus::NeedsUpgrade {
-                applied: 23,
-                missing: 1
-            })
+            validate_runtime_ledger(&schema_25),
+            Ok(SchemaStatus::Current)
         );
-        // And the releases before that are further behind, not somehow
-        // inside a widened window.
+        // ...but never managed by this build: `migrate check`, `migrate up`
+        // and import preflight read only the executable manifest.
         assert_eq!(
-            validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 2, "")),
-            Ok(SchemaStatus::NeedsUpgrade {
-                applied: 22,
-                missing: 2
-            })
+            validate_ledger(&schema_25, &MANIFEST),
+            Err(LedgerProblem::UnknownVersion)
         );
+        // Any other migration 25 is refused although 25 is inside the range,
+        // and so is anything above it or a ledger that skips 24.
+        let mut unapproved = schema_24.clone();
+        unapproved.push((25, hex_checksum("-- another migration 25")));
         assert_eq!(
-            validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 3, "")),
-            Ok(SchemaStatus::NeedsUpgrade {
-                applied: 21,
-                missing: 3
-            })
+            validate_runtime_ledger(&unapproved),
+            Err(LedgerProblem::ChecksumMismatch)
         );
+        let mut beyond = schema_25.clone();
+        beyond.push((26, hex_checksum("-- migration 26")));
         assert_eq!(
-            validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 4, "")),
-            Ok(SchemaStatus::NeedsUpgrade {
-                applied: 20,
-                missing: 4
-            })
+            validate_runtime_ledger(&beyond),
+            Err(LedgerProblem::UnknownVersion)
         );
+        let mut gapped = ledger_for(&MANIFEST, MANIFEST.len() - 1, "");
+        gapped.push((25, CATALOG_EVIDENCE_ACTOR_METADATA.checksum.to_owned()));
         assert_eq!(
-            validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 5, "")),
-            Ok(SchemaStatus::NeedsUpgrade {
-                applied: 19,
-                missing: 5
-            })
+            validate_runtime_ledger(&gapped),
+            Err(LedgerProblem::NotAPrefix)
         );
+
+        // The previous releases' schemas are not served: moving the point
+        // from one of them was a coordinated upgrade, never an overlap
+        // window.
+        for behind in 1..=8 {
+            assert_eq!(
+                validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - behind, "")),
+                Ok(SchemaStatus::NeedsUpgrade {
+                    applied: MANIFEST.len() - behind,
+                    missing: behind
+                }),
+                "{behind} behind"
+            );
+        }
+    }
+
+    /// Each approved extension pins the exact bytes checked in for it, numbers
+    /// the next migration after the manifest without a gap, and is SQL no
+    /// manifest entry carries. The successor moves the same file into its
+    /// manifest, so the approved checksum is what its ledger row will record.
+    #[test]
+    fn the_approved_extension_is_the_reviewed_sql() {
+        let extensions = BINARY_SCHEMA_COMPATIBILITY.approved_extensions;
+        assert_eq!(extensions.len(), APPROVED_EXTENSION_SOURCES.len());
+        let mut next = MANIFEST.last().map_or(1, |migration| migration.version + 1);
+        for (extension, source) in extensions.iter().zip(APPROVED_EXTENSION_SOURCES) {
+            assert_eq!(
+                (extension.version, source.version),
+                (next, next),
+                "approved extensions continue the manifest without a gap"
+            );
+            assert_eq!(
+                hex_checksum(source.sql),
+                extension.checksum,
+                "migration {} ({}) changed after its checksum was approved; the approved \
+                 bytes are immutable",
+                source.version,
+                source.name
+            );
+            assert!(
+                !source.sql.contains('\r'),
+                "migration SQL is checked out byte for byte (.gitattributes)"
+            );
+            assert!(
+                MANIFEST
+                    .iter()
+                    .all(|migration| migration.name != source.name
+                        && migration.current_checksum() != extension.checksum),
+                "an approved extension is not executable SQL of this build"
+            );
+            next += 1;
+        }
         assert_eq!(
-            validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 6, "")),
-            Ok(SchemaStatus::NeedsUpgrade {
-                applied: 18,
-                missing: 6
-            })
-        );
-        assert_eq!(
-            validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 7, "")),
-            Ok(SchemaStatus::NeedsUpgrade {
-                applied: 17,
-                missing: 7
-            })
-        );
-        assert_eq!(
-            validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 8, "")),
-            Ok(SchemaStatus::NeedsUpgrade {
-                applied: 16,
-                missing: 8
-            })
+            i64::from(BINARY_SCHEMA_COMPATIBILITY.serving_range().1),
+            next - 1,
+            "the contract reaches exactly the last approved extension"
         );
     }
 
@@ -1220,7 +1336,9 @@ mod tests {
     /// issue #426 PR 4) describes this binary: its read/write contracts, its
     /// manifest, its document format, what it advertises and every operation
     /// it gates, plus one coordinated step per schema point the deployment
-    /// guide documents, ending at this binary's. A migration, a capability or
+    /// guide documents, ending at this binary's manifest, then one prepared
+    /// step per approved extension, ending at the highest schema it serves.
+    /// A migration, an extension, a capability or
     /// a gated operation that leaves the published matrix behind fails here,
     /// in the pull request that adds it. The pinned qualified pair is checked
     /// against its evidence by `scripts/upgrade_pair_evidence.py`.
@@ -1301,15 +1419,14 @@ mod tests {
             .collect();
         assert_eq!(published["operations"], Value::Array(operations), "{stale}");
 
-        // Until an extension is approved, every schema step is a coordinated
+        // Every schema step up to this binary's manifest is a coordinated
         // drain, migrate, restart, and the guide must say how to perform it.
-        // An approved extension is the first step that could roll, and it
-        // changes what this test has to check.
-        assert!(
-            contract.approved_extensions.is_empty(),
-            "publish the first approved extension's expand step and its qualified pair in the \
-             matrix's schema_steps, then teach this test what that step must say"
-        );
+        // Each approved extension follows as a prepared step: this build
+        // serves that schema without being able to apply it, the step pins
+        // the descriptor's checksum, and the guide says what a prepared
+        // deployment does there. No pair is qualified across one yet, so no
+        // prepared step names a pair; the first that does changes what this
+        // test has to check.
         let steps = matrix["schema_steps"]
             .as_array()
             .expect("the matrix lists its schema steps");
@@ -1317,6 +1434,7 @@ mod tests {
             .first()
             .and_then(|step| step["from"].as_i64())
             .expect("the matrix lists at least one schema step");
+        let manifest_versions = i64::try_from(MANIFEST.len()).expect("the manifest is short");
         for step in steps {
             let (from, to) = (step["from"].as_i64(), step["to"].as_i64());
             assert_eq!(
@@ -1325,28 +1443,57 @@ mod tests {
                 "schema steps are contiguous, one migration each: {step}"
             );
             let version = expected_from + 1;
-            let migration = MANIFEST
+            if let Some(migration) = MANIFEST
                 .iter()
                 .find(|migration| migration.version == version)
-                .unwrap_or_else(|| {
-                    panic!("the matrix names schema {version}, which is not in the manifest")
-                });
-            assert_eq!(step["migration"], json!(migration.name), "{step}");
-            assert_eq!(step["procedure"], "coordinated", "{step}");
-            let heading =
-                format!("\n### Coordinated upgrade: schema {expected_from} to {version}\n");
-            assert!(
-                guide.contains(&heading),
-                "docs/deployment/postgres.md must document the coordinated upgrade the matrix \
-                 publishes: {heading:?}"
-            );
+            {
+                assert_eq!(step["migration"], json!(migration.name), "{step}");
+                assert_eq!(step["procedure"], "coordinated", "{step}");
+                let heading =
+                    format!("\n### Coordinated upgrade: schema {expected_from} to {version}\n");
+                assert!(
+                    guide.contains(&heading),
+                    "docs/deployment/postgres.md must document the coordinated upgrade the \
+                     matrix publishes: {heading:?}"
+                );
+            } else {
+                let position = usize::try_from(version - manifest_versions - 1)
+                    .expect("a step beyond the manifest follows it");
+                let (Some(extension), Some(source)) = (
+                    contract.approved_extensions.get(position),
+                    APPROVED_EXTENSION_SOURCES.get(position),
+                ) else {
+                    panic!(
+                        "the matrix names schema {version}, which is neither in the manifest \
+                         nor an approved extension"
+                    );
+                };
+                assert_eq!(extension.version, version, "{step}");
+                assert_eq!(step["migration"], json!(source.name), "{step}");
+                assert_eq!(step["procedure"], "prepared", "{step}");
+                assert_eq!(step["checksum"], json!(extension.checksum), "{step}");
+                assert_eq!(
+                    step["qualified_pair"],
+                    Value::Null,
+                    "no pair is qualified across an extension yet; teach this test what a \
+                     qualified step must say when one is: {step}"
+                );
+                let heading =
+                    format!("\n### Prepared extension: schema {expected_from} to {version}\n");
+                assert!(
+                    guide.contains(&heading),
+                    "docs/deployment/postgres.md must document the prepared extension the \
+                     matrix publishes: {heading:?}"
+                );
+            }
             expected_from = version;
         }
         assert_eq!(
-            i64::try_from(MANIFEST.len()).ok(),
             Some(expected_from),
-            "the matrix's last schema step must reach this binary's schema; add a coordinated \
-             step for every new migration, with its section in the deployment guide"
+            Some(i64::from(contract.serving_range().1)),
+            "the matrix's schema steps must reach this binary's highest served schema: a \
+             coordinated step for every migration, with its section in the deployment guide, \
+             then a prepared step for every approved extension"
         );
         assert!(
             guide.contains("\n## Upgrading a cluster\n"),
@@ -3090,6 +3237,331 @@ mod tests {
         }
         drop(client);
         clean_database(foundation.pool()).await;
+    }
+
+    /// Migration 25, the approved extension, applied by its successor's
+    /// migrator path to a schema-24 database: catalog evidence committed
+    /// before it keeps every other column and records none of the new three,
+    /// a row written the way this build writes one still commits and records
+    /// none, and from then on the table holds migration 24's rule.
+    #[tokio::test]
+    async fn migration_twenty_five_adds_catalog_actor_metadata_and_guesses_none() {
+        let Some(dsn) = real_dsn() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = REAL_DATABASE.lock().await;
+        let dsn_file = write_dsn_file(&dsn);
+        let config = migration_config(&dsn_file);
+        let foundation = establish(&config).await;
+        clean_database(foundation.pool()).await;
+        apply_missing(foundation.pool(), &test_settings())
+            .await
+            .expect("schema 24 should apply");
+        let client = foundation.pool().get().await.expect("checkout");
+
+        // The column list `record_catalog_change_evidence` writes.
+        const PREPARED_INSERT: &str = "INSERT INTO greengateway.catalog_change_evidence \
+                 (event_id, operation_id, actor_user_id, action, connection_id, \
+                  prior_version, new_version, overlay_revision, security_revision) \
+             VALUES (gen_random_uuid(), gen_random_uuid(), $1, 'catalog.mcp.publish', \
+                     gen_random_uuid(), NULL, 1, NULL, $2)";
+        client
+            .execute(PREPARED_INSERT, &[&"schema-24-publisher", &1_i64])
+            .await
+            .expect("schema-24 catalog evidence");
+        let snapshot = |without_metadata: bool| {
+            let client = &client;
+            async move {
+                let projection = if without_metadata {
+                    "row_to_json(t)::jsonb - 'actor_kind' - 'actor_auth_mode' - 'actor_issuer'"
+                } else {
+                    "row_to_json(t)::jsonb"
+                };
+                client
+                    .query(
+                        &format!(
+                            "SELECT ({projection})::text \
+                             FROM greengateway.catalog_change_evidence t \
+                             ORDER BY security_revision"
+                        ),
+                        &[],
+                    )
+                    .await
+                    .expect("evidence snapshot")
+                    .iter()
+                    .map(|row| row.get::<_, String>(0))
+                    .collect::<Vec<_>>()
+            }
+        };
+        let before = snapshot(false).await;
+        assert_eq!(before.len(), 1);
+
+        apply_approved_extensions_as_the_successor(foundation.pool(), &test_settings())
+            .await
+            .expect("migration 25 should apply");
+        let recorded: (i64, String, String) = client
+            .query_one(
+                &format!("SELECT version, name, checksum FROM {LEDGER_TABLE} WHERE version = 25"),
+                &[],
+            )
+            .await
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .expect("the ledger records migration 25");
+        assert_eq!(
+            recorded,
+            (
+                25,
+                "catalog_change_evidence_actor_metadata".to_owned(),
+                CATALOG_EVIDENCE_ACTOR_METADATA.checksum.to_owned()
+            ),
+            "the successor's ledger row carries exactly the approved checksum"
+        );
+        assert_eq!(snapshot(true).await, before, "no other column changed");
+
+        // A prepared replica keeps writing during the overlap, and its rows
+        // say "not recorded", like the older one.
+        client
+            .execute(PREPARED_INSERT, &[&"prepared-publisher", &2_i64])
+            .await
+            .expect("the prepared writer's row commits on schema 25");
+        let unrecorded: i64 = client
+            .query_one(
+                "SELECT count(*) FROM greengateway.catalog_change_evidence \
+                 WHERE actor_kind IS NULL AND actor_auth_mode IS NULL AND actor_issuer IS NULL",
+                &[],
+            )
+            .await
+            .expect("the new columns read")
+            .get(0);
+        assert_eq!(unrecorded, 2, "nothing is guessed into either row");
+
+        // Migration 24's rule, on the table it left out.
+        const INSERT: &str = "INSERT INTO greengateway.catalog_change_evidence \
+                 (event_id, operation_id, actor_user_id, action, connection_id, \
+                  prior_version, new_version, overlay_revision, security_revision, \
+                  actor_kind, actor_auth_mode, actor_issuer) \
+             VALUES (gen_random_uuid(), gen_random_uuid(), 'schema-25-publisher', \
+                     'catalog.openapi.publish', gen_random_uuid(), 1, 2, 0, 3, $1, $2, $3)";
+        let issuer = "https://idp.example.test";
+        let longest_issuer = "i".repeat(crate::auth::principal::MAX_PRINCIPAL_ISSUER_BYTES);
+        let oversized_issuer = format!("{longest_issuer}i");
+        for (kind, mode, actor_issuer) in [
+            (Some("principal"), Some("session_cookie"), Some(issuer)),
+            (Some("principal"), Some("bearer_token"), None),
+            (
+                Some("principal"),
+                Some("client_certificate"),
+                Some(longest_issuer.as_str()),
+            ),
+            (Some("service_token"), Some("service_token"), None),
+            (Some("system"), Some("system"), None),
+        ] {
+            client
+                .execute(INSERT, &[&kind, &mode, &actor_issuer])
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("accepts {kind:?} {mode:?} {actor_issuer:?}: {error}")
+                });
+        }
+        for (kind, mode, actor_issuer) in [
+            (Some("principal"), None, None),
+            (None, Some("bearer_token"), None),
+            (None, None, Some(issuer)),
+            (Some("person"), Some("bearer_token"), None),
+            (Some("principal"), Some("password"), None),
+            (Some("principal"), Some("service_token"), None),
+            (Some("principal"), Some("system"), None),
+            (Some("service_token"), Some("bearer_token"), None),
+            (Some("system"), Some("session_cookie"), None),
+            (Some("service_token"), Some("service_token"), Some(issuer)),
+            (Some("system"), Some("system"), Some(issuer)),
+            (Some("principal"), Some("bearer_token"), Some("")),
+            (
+                Some("principal"),
+                Some("bearer_token"),
+                Some(oversized_issuer.as_str()),
+            ),
+        ] {
+            assert!(
+                client
+                    .execute(INSERT, &[&kind, &mode, &actor_issuer])
+                    .await
+                    .is_err(),
+                "refuses {kind:?} {mode:?} {actor_issuer:?}"
+            );
+        }
+        drop(client);
+        clean_database(foundation.pool()).await;
+    }
+
+    /// The prepared release serves a ledger that holds its approved
+    /// extension: validate-only and auto-migrating startup both serve it and
+    /// readiness reports it writable at 25. Its own migrator still refuses to
+    /// manage that ledger, and changes nothing. Any other migration 25, and
+    /// anything above 25, refuses startup, auto-migration and readiness alike.
+    #[tokio::test]
+    async fn a_prepared_build_serves_the_approved_extension_only() {
+        use super::super::postgres::{PostgresFoundation, PostgresFoundationError};
+        use crate::ha_status::{
+            AuthorityObservation, PostgresReadinessAuthority, ReadinessAuthority,
+        };
+
+        let Some(dsn) = real_dsn() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = REAL_DATABASE.lock().await;
+        let dsn_file = write_dsn_file(&dsn);
+        let mut strict = migration_config(&dsn_file);
+        strict.database.auto_migrate = false;
+        let mut dev = migration_config(&dsn_file);
+        dev.database.auto_migrate = true;
+        let foundation = establish(&strict).await;
+        let pool = foundation.pool();
+        clean_database(pool).await;
+        apply_missing(pool, &test_settings())
+            .await
+            .expect("schema 24 should apply");
+        apply_approved_extensions_as_the_successor(pool, &test_settings())
+            .await
+            .expect("the successor applies migration 25");
+        let client = pool.get().await.expect("checkout");
+        let ledger = || {
+            let client = &client;
+            async move {
+                client
+                    .query(
+                        &format!("SELECT version, checksum FROM {LEDGER_TABLE} ORDER BY version"),
+                        &[],
+                    )
+                    .await
+                    .expect("the ledger reads")
+                    .iter()
+                    .map(|row| (row.get::<_, i64>(0), row.get::<_, String>(1)))
+                    .collect::<Vec<_>>()
+            }
+        };
+        let expanded = ledger().await;
+        assert_eq!(expanded.len(), 25);
+
+        // Served.
+        assert_eq!(
+            read_and_validate_runtime(pool).await,
+            Ok(SchemaStatus::Current)
+        );
+        for config in [&strict, &dev] {
+            let started = PostgresFoundation::start_if_selected(config)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "auto_migrate={}: a prepared build serves its approved extension: {error}",
+                        config.database.auto_migrate
+                    )
+                });
+            assert!(started.is_some(), "cluster mode was selected");
+        }
+        let authority = PostgresReadinessAuthority::new(pool.clone());
+        assert_eq!(
+            authority.observe().await,
+            AuthorityObservation::Writable { schema_version: 25 }
+        );
+
+        // Not managed: `migrate check` and `migrate up` read the executable
+        // manifest only, refuse, and leave the ledger as they found it.
+        let unmanaged = MigrateError::LedgerInvalid(LedgerProblem::UnknownVersion);
+        assert_eq!(read_and_validate(pool).await, Err(unmanaged.clone()));
+        assert_eq!(execute(&strict, true).await, Err(unmanaged.clone()));
+        assert_eq!(execute(&strict, false).await, Err(unmanaged));
+        assert_eq!(
+            ledger().await,
+            expanded,
+            "the prepared migrator changed nothing"
+        );
+
+        // Any other migration 25: the same version, other bytes.
+        let other = hex_checksum(&format!("{}-- edited\n", APPROVED_EXTENSION_SOURCES[0].sql));
+        client
+            .execute(
+                &format!("UPDATE {LEDGER_TABLE} SET checksum = $1 WHERE version = 25"),
+                &[&other],
+            )
+            .await
+            .expect("plant an unapproved migration 25");
+        assert_eq!(
+            read_and_validate_runtime(pool).await,
+            Err(MigrateError::LedgerInvalid(LedgerProblem::ChecksumMismatch))
+        );
+        for config in [&strict, &dev] {
+            let error = expect_startup_failure(PostgresFoundation::start_if_selected(config).await);
+            assert!(
+                matches!(
+                    error,
+                    PostgresFoundationError::SchemaInvalid {
+                        problem: LedgerProblem::ChecksumMismatch
+                    }
+                ),
+                "auto_migrate={}: {error}",
+                config.database.auto_migrate
+            );
+        }
+        assert_eq!(
+            authority.observe().await,
+            AuthorityObservation::IncompatibleSchema { schema_version: 25 }
+        );
+        client
+            .execute(
+                &format!("UPDATE {LEDGER_TABLE} SET checksum = $1 WHERE version = 25"),
+                &[&CATALOG_EVIDENCE_ACTOR_METADATA.checksum],
+            )
+            .await
+            .expect("restore the approved checksum");
+
+        // Anything above the approved extension.
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {LEDGER_TABLE} (version, name, checksum) \
+                     VALUES (26, 'from_the_future', $1)"
+                ),
+                &[&hex_checksum("-- migration 26")],
+            )
+            .await
+            .expect("plant migration 26");
+        assert_eq!(
+            read_and_validate_runtime(pool).await,
+            Err(MigrateError::LedgerInvalid(LedgerProblem::UnknownVersion))
+        );
+        for config in [&strict, &dev] {
+            let error = expect_startup_failure(PostgresFoundation::start_if_selected(config).await);
+            assert!(
+                matches!(
+                    error,
+                    PostgresFoundationError::SchemaInvalid {
+                        problem: LedgerProblem::UnknownVersion
+                    }
+                ),
+                "auto_migrate={}: {error}",
+                config.database.auto_migrate
+            );
+        }
+        assert_eq!(
+            authority.observe().await,
+            AuthorityObservation::IncompatibleSchema { schema_version: 26 }
+        );
+        client
+            .execute(
+                &format!("DELETE FROM {LEDGER_TABLE} WHERE version = 26"),
+                &[],
+            )
+            .await
+            .expect("remove migration 26");
+        assert_eq!(
+            authority.observe().await,
+            AuthorityObservation::Writable { schema_version: 25 }
+        );
+        drop(client);
+        clean_database(pool).await;
     }
 
     #[tokio::test]

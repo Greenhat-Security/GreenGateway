@@ -506,6 +506,14 @@ def schema_three(kernel_digests, lane_digests):
     return value
 
 
+def schema_four(kernel_digests, lane_digests):
+    value = schema_three(kernel_digests, lane_digests)
+    value["schema_version"] = 4
+    value["targets"].append({"id": "static_egress", "max_allocation_growth": 0,
+                             "max_allocated_bytes_growth": 0})
+    return value
+
+
 def lane_result(target, allocations=None, regression=False):
     cases = LANE_CASES[target]
     metadata = bench.KERNEL_TARGET_METADATA[target]
@@ -640,7 +648,8 @@ class LaneConfigurationPolicyTests(unittest.TestCase):
 
 
 class EgressConfigurationTests(unittest.TestCase):
-    def configure(self, directory, *, base_lanes=LANE_HARNESS_WITHOUT_EGRESS, head_lanes=LANE_HARNESS):
+    def configure(self, directory, *, base_lanes=LANE_HARNESS_WITHOUT_EGRESS, head_lanes=LANE_HARNESS,
+                  base_budget=None, proposed_budget=None):
         files = {revision: {} if source is None else {bench.LANE_HARNESS_PATH: source}
                  for revision, source in ((BASE, base_lanes), (HEAD, head_lanes))}
 
@@ -651,8 +660,11 @@ class EgressConfigurationTests(unittest.TestCase):
 
         lanes = {"harness_sha256": {"base": None if base_lanes is None else digest(base_lanes),
                                     "head": None if head_lanes is None else digest(head_lanes)}}
+        current = schema_three(["f" * 64], [digest(LANE_HARNESS)])
+        state = {"budget": current if base_budget is None else base_budget,
+                 "proposed_budget": current if proposed_budget is None else proposed_budget}
         with mock.patch.object(bench, "_blob", side_effect=blob):
-            return bench._egress_configuration(ROOT, BASE, HEAD, Path(directory), lanes)
+            return bench._egress_configuration(ROOT, BASE, HEAD, Path(directory), lanes, state)
 
     def test_fixture_removes_exactly_the_repository_egress_test(self):
         self.assertIn(EGRESS_TEST_ITEM, LANE_HARNESS)
@@ -677,6 +689,80 @@ class EgressConfigurationTests(unittest.TestCase):
             egress = self.configure(directory, base_lanes=LANE_HARNESS)
             self.assertEqual(egress["declared"], {"base": True, "head": True})
             self.assertEqual(egress["state"], "pending")
+
+    def test_proposed_budget_needs_the_test_on_the_base_and_approves_both_harnesses(self):
+        current = schema_three(["f" * 64], [digest(LANE_HARNESS)])
+        proposed = schema_four(["f" * 64], [digest(LANE_HARNESS)])
+        with tempfile.TemporaryDirectory() as directory:
+            egress = self.configure(directory, base_lanes=LANE_HARNESS, base_budget=current,
+                                    proposed_budget=proposed)
+            self.assertEqual(egress["state"], "proposed")
+            self.assertEqual(egress["declared"], {"base": True, "head": True})
+            self.assertEqual(egress["budget"], bench._budget_entry(proposed, "static_egress"))
+            self.assertEqual(
+                json.loads((Path(directory) / "egress-context.json").read_text()), egress)
+        for base_lanes in (LANE_HARNESS_WITHOUT_EGRESS, None):
+            with self.subTest(base_lanes=base_lanes is not None):
+                with tempfile.TemporaryDirectory() as directory:
+                    with self.assertRaisesRegex(ValueError, "test before its budget"):
+                        self.configure(directory, base_lanes=base_lanes, base_budget=current,
+                                       proposed_budget=proposed)
+        # The proposal governs this comparison, so it must approve the base's
+        # lane harness as well as the head's, even where the lanes' own base
+        # budget approves it.
+        other = LANE_HARNESS + "\n// another declaring workload\n"
+        rejected = (
+            {"base_lanes": other,
+             "base_budget": schema_three(["f" * 64], [digest(LANE_HARNESS), digest(other)])},
+            {"base_lanes": LANE_HARNESS, "head_lanes": other},
+            {"base_lanes": LANE_HARNESS,
+             "proposed_budget": schema_four(["f" * 64], ["a" * 64])},
+        )
+        for options in rejected:
+            options = {"base_budget": current, "proposed_budget": proposed, **options}
+            with self.subTest(options=sorted(options)), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(ValueError, "approved lane harness digests"):
+                    self.configure(directory, **options)
+
+    def test_enforced_egress_needs_the_two_step_lane_harness_transition(self):
+        current = digest(LANE_HARNESS)
+        changed = LANE_HARNESS + "\n// reviewed next workload\n"
+        with tempfile.TemporaryDirectory() as directory:
+            egress = self.configure(directory, base_lanes=LANE_HARNESS,
+                                    base_budget=schema_four(["f" * 64], [current]),
+                                    proposed_budget=schema_four(["f" * 64], [current]))
+            self.assertEqual(egress["state"], "enforced")
+            self.assertEqual(egress["budget"], {"id": "static_egress", "max_allocation_growth": 0,
+                                                "max_allocated_bytes_growth": 0})
+        with tempfile.TemporaryDirectory() as directory:
+            egress = self.configure(directory, base_lanes=LANE_HARNESS, head_lanes=changed,
+                                    base_budget=schema_four(["f" * 64], [current, digest(changed)]),
+                                    proposed_budget=schema_four(["f" * 64], [digest(changed)]))
+            self.assertEqual(egress["state"], "enforced")
+        rejected = (
+            {"head_lanes": changed, "base_budget": schema_four(["f" * 64], [current]),
+             "proposed_budget": schema_four(["f" * 64], [current, digest(changed)])},
+            {"head_lanes": changed,
+             "base_budget": schema_four(["f" * 64], [current, digest(changed)]),
+             "proposed_budget": schema_four(["f" * 64], [current])},
+            {"base_lanes": changed, "base_budget": schema_four(["f" * 64], [current]),
+             "proposed_budget": schema_four(["f" * 64], [current])},
+        )
+        for options in rejected:
+            options = {"base_lanes": LANE_HARNESS, **options}
+            with self.subTest(options=sorted(options)), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(ValueError, "approved lane harness digests"):
+                    self.configure(directory, **options)
+
+    def test_enforced_egress_cannot_be_retired_or_measured_over_a_base_without_it(self):
+        enforced = schema_four(["f" * 64], [digest(LANE_HARNESS)])
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "retire"):
+                self.configure(directory, base_lanes=LANE_HARNESS, base_budget=enforced,
+                               proposed_budget=schema_three(["f" * 64], [digest(LANE_HARNESS)]))
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "test before its budget"):
+                self.configure(directory, base_budget=enforced, proposed_budget=enforced)
 
     def test_head_without_the_test_or_with_a_misdeclared_one_rejects(self):
         nested = LANE_HARNESS.replace(EGRESS_TEST_ITEM, "mod nested {\n" + EGRESS_TEST_ITEM + "}\n")
@@ -809,8 +895,8 @@ def lane_configuration(state="pending", base_digest=None):
             "harness_sha256": {"base": base_digest, "head": "e" * 64}}
 
 
-def egress_configuration(base_declared):
-    return {"state": "pending", "target": bench.EGRESS_TARGET, "test": bench.EGRESS_TEST,
+def egress_configuration(base_declared, state="pending"):
+    return {"state": state, "target": bench.EGRESS_TARGET, "test": bench.EGRESS_TEST,
             "budget": {"id": bench.EGRESS_TARGET, "max_allocation_growth": 0,
                        "max_allocated_bytes_growth": 0},
             "declared": {"base": base_declared, "head": True}}
@@ -834,7 +920,7 @@ class KernelStageExecutionTests(unittest.TestCase):
     def run_stage(self, directory, *, state="pending", base_digest=None, base_listing=None,
                   results=None, failures=None, build_executables=1, lane_state="pending",
                   lane_base_digest=None, lane_base_listing=None, lane_results=None,
-                  egress_base_declared=False, egress_base_listing=None):
+                  egress_base_declared=False, egress_base_listing=None, egress_state="pending"):
         """Run `run_comparison` with only the kernel processes simulated.
 
         `results` maps base/head to a kernel report (or None for no file), and
@@ -913,7 +999,7 @@ class KernelStageExecutionTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(bench, "_lane_configuration", return_value=lanes))
             stack.enter_context(mock.patch.object(
                 bench, "_egress_configuration",
-                return_value=egress_configuration(egress_base_declared)))
+                return_value=egress_configuration(egress_base_declared, egress_state)))
             stack.enter_context(mock.patch.object(bench, "_prepare_tree", side_effect=prepare))
             stack.enter_context(mock.patch.object(bench, "_bounded", side_effect=bounded))
             report = bench.run_comparison(BASE, HEAD, output, root=ROOT, work=work)
@@ -1086,24 +1172,67 @@ class KernelStageExecutionTests(unittest.TestCase):
                 build = json.loads((output / f"{side}-kernel" / "build.json").read_text(encoding="utf-8"))
                 self.assertEqual(build["egress_listed"], listed)
 
-    def test_pending_egress_growth_over_a_declaring_base_is_reported_without_blocking(self):
-        for delta, comparison in ((0, "passed"), (-1, "passed"), (1, "failed")):
-            with self.subTest(delta=delta), tempfile.TemporaryDirectory() as directory:
-                head = lane_results_by_target()
-                head["static_egress"] = lane_result("static_egress", 25000 + delta)
-                # The lanes stay enforced while static egress is pending.
-                report, output = self.run_stage(
-                    directory, lane_state="enforced", lane_base_digest="e" * 64,
-                    egress_base_declared=True,
-                    lane_results={"base": lane_results_by_target(), "head": head})
-                self.assertEqual(report["status"], "passed", report["errors"])
-                self.assertEqual(report["lanes"]["status"], "passed")
-                egress = report["static_egress"]
-                self.assertEqual((egress["base"], egress["status"], egress["blocking"]),
-                                 ("measured", "informational", False))
-                self.assertEqual(egress["comparison"]["status"], comparison)
-                self.assertEqual(egress["comparison"]["growth"]["allocations"], delta)
-                self.assertTrue((output / "base.static_egress.kernel.json").is_file())
+    def test_unenforced_egress_growth_over_a_declaring_base_is_reported_without_blocking(self):
+        for egress_state in ("pending", "proposed"):
+            for delta, comparison in ((0, "passed"), (-1, "passed"), (1, "failed")):
+                with self.subTest(egress_state=egress_state, delta=delta), \
+                        tempfile.TemporaryDirectory() as directory:
+                    head = lane_results_by_target()
+                    head["static_egress"] = lane_result("static_egress", 25000 + delta)
+                    # The lanes stay enforced while static egress is not.
+                    report, output = self.run_stage(
+                        directory, lane_state="enforced", lane_base_digest="e" * 64,
+                        egress_base_declared=True, egress_state=egress_state,
+                        lane_results={"base": lane_results_by_target(), "head": head})
+                    self.assertEqual(report["status"], "passed", report["errors"])
+                    self.assertEqual(report["lanes"]["status"], "passed")
+                    egress = report["static_egress"]
+                    self.assertEqual(
+                        (egress["state"], egress["base"], egress["status"], egress["blocking"]),
+                        (egress_state, "measured", "informational", False))
+                    self.assertEqual(egress["comparison"]["status"], comparison)
+                    self.assertEqual(egress["comparison"]["growth"]["allocations"], delta)
+                    self.assertTrue((output / "base.static_egress.kernel.json").is_file())
+
+    def test_enforced_egress_growth_blocks_and_neutral_counts_pass(self):
+        for field in ("allocations", "allocated_bytes"):
+            for delta, status in ((0, "passed"), (-1, "passed"), (1, "failed")):
+                with self.subTest(field=field, delta=delta), \
+                        tempfile.TemporaryDirectory() as directory:
+                    head = lane_results_by_target()
+                    for sample in head["static_egress"]["targets"][0]["allocation_samples"]:
+                        sample[field] += delta
+                    report, output = self.run_stage(
+                        directory, lane_state="enforced", lane_base_digest="e" * 64,
+                        egress_base_declared=True, egress_state="enforced",
+                        lane_results={"base": lane_results_by_target(), "head": head})
+                    self.assertEqual(report["status"], status, report["errors"])
+                    self.assertEqual(report["lanes"]["status"], "passed")
+                    egress = report["static_egress"]
+                    self.assertEqual((egress["state"], egress["base"], egress["blocking"]),
+                                     ("enforced", "measured", True))
+                    self.assertEqual((egress["status"], egress["comparison"]["status"]),
+                                     (status, status))
+                    self.assertEqual(egress["comparison"]["growth"][field], delta)
+                    if status == "failed":
+                        self.assertIn("static_egress: allocation growth", " ".join(report["errors"]))
+                    else:
+                        self.assertEqual(egress["errors"], [])
+                    self.assertTrue((output / "base.static_egress.kernel.json").is_file())
+
+    def test_enforced_egress_without_a_base_measurement_fails(self):
+        # The configuration refuses this before any build; the report still
+        # fails closed rather than treating a missing base as informational.
+        with tempfile.TemporaryDirectory() as directory:
+            report, output = self.run_stage(directory, lane_state="enforced",
+                                            lane_base_digest="e" * 64, egress_state="enforced")
+            self.assertEqual(report["status"], "failed")
+            egress = report["static_egress"]
+            self.assertEqual((egress["base"], egress["status"], egress["blocking"]),
+                             ("absent", "failed", True))
+            self.assertNotIn("comparison", egress)
+            self.assertIn("base was not measured", " ".join(report["errors"]))
+            self.assertFalse((output / "base.static_egress.kernel.json").exists())
 
     def test_egress_discovery_that_disagrees_with_the_source_wiring_fails(self):
         for options in ({"egress_base_listing": True},
@@ -1125,6 +1254,12 @@ class KernelStageExecutionTests(unittest.TestCase):
             ({"failures": {"head:head-static_egress-run": "timeout"}}, "runtime bound"),
             ({"failures": {"base:base-static_egress-run": "crash"}, "lane_base_digest": "e" * 64,
               "egress_base_declared": True}, "exit code 23"),
+            ({"failures": {"head:head-static_egress-run": "crash"}, "lane_state": "enforced",
+              "lane_base_digest": "e" * 64, "egress_base_declared": True,
+              "egress_state": "enforced"}, "exit code 23"),
+            ({"lane_results": head(lane_result("static_egress", regression=True)),
+              "lane_state": "enforced", "lane_base_digest": "e" * 64,
+              "egress_base_declared": True, "egress_state": "enforced"}, "fixture marker"),
             ({"lane_results": head(None)}, ""),
             ({"lane_results": head(lane_result("rate_lane"))}, "schema order"),
             ({"lane_results": head(lane_result("static_egress", regression=True))},
@@ -1221,7 +1356,8 @@ class SelfTestExecutionTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(
                 bench, "_lane_configuration", return_value=lane_configuration("enforced", "e" * 64)))
             stack.enter_context(mock.patch.object(
-                bench, "_egress_configuration", return_value=egress_configuration(True)))
+                bench, "_egress_configuration",
+                return_value=egress_configuration(True, "enforced")))
             stack.enter_context(mock.patch.object(bench, "_prepare_tree", side_effect=prepare))
             stack.enter_context(mock.patch.object(bench, "_bounded", side_effect=bounded))
             summary = bench.self_test(HEAD, output, root=ROOT, work=work)

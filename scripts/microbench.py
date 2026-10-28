@@ -6,9 +6,9 @@ revisions. Its SHA-256 and zero-growth budgets are owned by the base revision.
 The authoritative HTTP policy decision, and the tool-admission and rate-lane
 decisions, are measured inside each revision's own gateway test binary, whose
 benchmark digests the budget approves in the same way. The static egress
-decision is measured in the same binaries but no budget lists it yet, so it
-never blocks. Timings describe this runner; only stable allocation counts and
-allocated bytes block the gate.
+decision is measured in the same binaries and budgeted like the lanes, since
+its benchmark is a test in their harness. Timings describe this runner; only
+stable allocation counts and allocated bytes block the gate.
 """
 from __future__ import annotations
 
@@ -97,8 +97,8 @@ LANE_METADATA = {
                   "expected_checksum": 1400},
 }
 # The static egress decision is a test in the same lane harness, added after
-# the tool and rate lanes, so a lane harness without it is still valid. No
-# budget schema lists it: it is pending wherever a revision declares it.
+# the tool and rate lanes, so a lane harness without it is still valid. Budget
+# schema 4 lists it after the lanes; the lane harness digest approves it.
 EGRESS_TARGET = "static_egress"
 EGRESS_FUNCTION = "static_egress_evaluation"
 EGRESS_TEST = "policy_benchmark::lane_benchmark::" + EGRESS_FUNCTION
@@ -183,7 +183,9 @@ def _harness_digests(digests, label):
 def validate_budget(raw):
     """Schema 1 budgets the four pure paths. Schema 2 also budgets `http_policy`
     and approves the digests of the gateway test-binary benchmark. Schema 3 also
-    budgets the tool and rate lanes and approves the digests of their benchmark."""
+    budgets the tool and rate lanes and approves the digests of their benchmark.
+    Schema 4 also budgets `static_egress`, a test in that same lane benchmark,
+    so it adds a target but no digest list."""
     if not isinstance(raw, dict) or type(raw.get("schema_version")) is not int:
         raise ValueError("unsupported budget schema")
     if raw["schema_version"] == 1:
@@ -193,12 +195,14 @@ def validate_budget(raw):
         _keys(raw, ("schema_version", "harness_sha256", "kernel_harness_sha256", "targets"), "budget")
         _harness_digests(raw["kernel_harness_sha256"], "kernel harness")
         identifiers = TARGET_IDS + (KERNEL_TARGET,)
-    elif raw["schema_version"] == 3:
+    elif raw["schema_version"] in (3, 4):
         _keys(raw, ("schema_version", "harness_sha256", "kernel_harness_sha256",
                     "lane_harness_sha256", "targets"), "budget")
         _harness_digests(raw["kernel_harness_sha256"], "kernel harness")
         _harness_digests(raw["lane_harness_sha256"], "lane harness")
         identifiers = TARGET_IDS + (KERNEL_TARGET,) + LANE_TARGETS
+        if raw["schema_version"] == 4:
+            identifiers += (EGRESS_TARGET,)
     else:
         raise ValueError("unsupported budget schema")
     _harness_digests(raw["harness_sha256"], "harness")
@@ -216,11 +220,15 @@ def validate_budget(raw):
 
 
 def budgets_kernel(budget):
-    return budget["schema_version"] in (2, 3)
+    return budget["schema_version"] in (2, 3, 4)
 
 
 def budgets_lanes(budget):
-    return budget["schema_version"] == 3
+    return budget["schema_version"] in (3, 4)
+
+
+def budgets_egress(budget):
+    return budget["schema_version"] == 4
 
 
 def _budget_entry(budget, target):
@@ -941,6 +949,13 @@ def lane_policy(base_budget, proposed_budget):
                            "tool and rate-lane targets")
 
 
+def egress_policy(base_budget, proposed_budget):
+    """The adoption state of `static_egress`, decided as for `http_policy`. A
+    budget that lists it also lists the lanes, so enforcing it implies them."""
+    return _adoption_state(budgets_egress(base_budget), budgets_egress(proposed_budget),
+                           "static_egress target")
+
+
 def _kernel_harness(root, revision):
     """The revision's benchmark digest, or None when it predates the harness."""
     declared = kernel_wiring(_blob(root, revision, KERNEL_MAIN_PATH))
@@ -1059,24 +1074,44 @@ def _lane_configuration(root, base, head, output, context):
     return lanes
 
 
-def _egress_configuration(root, base, head, output, lanes):
-    """Adoption state and test wiring of the static egress target.
+def _egress_configuration(root, base, head, output, lanes, context):
+    """Adoption state, approvals, budget and test wiring of the static egress
+    target.
 
-    The test lives in the lane harness, whose digests `_lane_configuration`
-    has already checked against the governing budgets. No budget schema lists
-    the target, so it is `pending`: measured on each revision whose lane
-    harness declares it, reported, never blocking. The head must declare it; a
-    base may predate it. Budgeting it is a later, reviewed schema change.
+    The rules are http_policy's. The head must declare the test; a `pending`
+    target may run over a base that predates it, but a budget cannot land
+    before the base declares it. The test lives in the lane harness, so the
+    lane harness digests are the ones its governing budget must approve:
+    `_lane_configuration` checked them for the lanes, and this checks them
+    again for the budget that governs static egress, which differs while only
+    the head's budget lists it.
     """
+    budget, proposed = context["budget"], context["proposed_budget"]
+    state = egress_policy(budget, proposed)
     declared = {}
     for label, revision in (("base", base), ("head", head)):
         declared[label] = (lanes["harness_sha256"][label] is not None
                            and egress_wiring(_blob(root, revision, LANE_HARNESS_PATH)))
     if not declared["head"]:
         raise ValueError("head revision lacks the static egress benchmark test")
-    egress = {"state": "pending", "target": EGRESS_TARGET, "test": EGRESS_TEST,
-              "budget": {"id": EGRESS_TARGET, "max_allocation_growth": 0,
-                         "max_allocated_bytes_growth": 0},
+    if state != "pending" and not declared["base"]:
+        raise ValueError("static_egress is budgeted, but the base revision lacks its benchmark "
+                         "test; land the test before its budget")
+    if state == "enforced":
+        approvals, governing = (("base", budget), ("head", budget), ("head", proposed)), budget
+    elif state == "proposed":
+        approvals, governing = (("base", proposed), ("head", proposed)), proposed
+    else:
+        approvals, governing = (), None
+    for label, policy in approvals:
+        if lanes["harness_sha256"][label] not in policy["lane_harness_sha256"]:
+            raise ValueError(f"{label} static egress benchmark differs from its budget's "
+                             "approved lane harness digests")
+    if governing is None:
+        limit = {"id": EGRESS_TARGET, "max_allocation_growth": 0, "max_allocated_bytes_growth": 0}
+    else:
+        limit = _budget_entry(governing, EGRESS_TARGET)
+    egress = {"state": state, "target": EGRESS_TARGET, "test": EGRESS_TEST, "budget": limit,
               "declared": declared}
     _write_json(output / "egress-context.json", egress)
     return egress
@@ -1277,14 +1312,26 @@ def _lane_report(lanes, before, after):
 
 
 def _egress_report(egress, before, after):
-    """The static egress stage's result. Pending, it is informational: a base
-    that declares the test is compared and the comparison reported, and
-    nothing blocks."""
-    report = {"state": egress["state"], "target": EGRESS_TARGET, "blocking": False,
-              "status": "informational", "base": "absent" if before is None else "measured",
+    """The static egress stage's result, judged as the lanes' is:
+    informational unless the base budget enforces the target. An enforced
+    target is never judged without a base measurement."""
+    report = {"state": egress["state"], "target": EGRESS_TARGET,
+              "blocking": egress["state"] == "enforced", "status": "failed",
+              "base": "absent" if before is None else "measured",
               "head": after["result"]["targets"][0]["allocation_samples"][0], "errors": []}
-    if before is not None:
-        report["comparison"] = compare_kernel_results(before, after, egress["budget"])
+    if before is None:
+        if report["blocking"]:
+            report["errors"].append("static_egress is enforced, but the base was not measured")
+        else:
+            report["status"] = "informational"
+        return report
+    report["comparison"] = compare_kernel_results(before, after, egress["budget"])
+    if not report["blocking"]:
+        report["status"] = "informational"
+    elif report["comparison"]["status"] == "passed":
+        report["status"] = "passed"
+    else:
+        report["errors"].append("static_egress: allocation growth exceeds the base-owned budget")
     return report
 
 
@@ -1293,7 +1340,7 @@ def _kernel_stage(root, base, head, output, compiler, context, work, deadline):
     revision's own binary. Returns the http_policy, lane and egress reports."""
     kernel = _kernel_configuration(root, base, head, output, compiler, context, deadline)
     lanes = _lane_configuration(root, base, head, output, context)
-    egress = _egress_configuration(root, base, head, output, lanes)
+    egress = _egress_configuration(root, base, head, output, lanes, context)
     digests, lane_digests = kernel["harness_sha256"], lanes["harness_sha256"]
     report = {"state": kernel["state"], "target": KERNEL_TARGET,
               "blocking": kernel["state"] == "enforced", "status": "failed", "base": "absent",
@@ -1408,7 +1455,7 @@ def self_test(revision, output, root=None, work=None):
         # egress run in the same binaries, the same way.
         kernel = _kernel_configuration(root, revision, revision, output, compiler, context, deadline)
         lanes = _lane_configuration(root, revision, revision, output, context)
-        egress = _egress_configuration(root, revision, revision, output, lanes)
+        egress = _egress_configuration(root, revision, revision, output, lanes, context)
         digest = kernel["harness_sha256"]["head"]
         lane_digest = lanes["harness_sha256"]["head"]
         binary, environment, directory = _build_kernel(root, revision, "base", output, compiler,
@@ -1449,7 +1496,7 @@ def self_test(revision, output, root=None, work=None):
                                                     limit, regression_head=True)
             fixture_report["deliberate_fixture"] = True
             lane_regression_reports.append(fixture_report)
-        # Pending, static egress has no budget entry; its self-test holds it to
+        # The revision's own budget entry, or, while static egress is pending,
         # the zero-growth limit a budget would set.
         egress_neutral_report = compare_kernel_results(egress_baseline, egress_neutral,
                                                        egress["budget"])
