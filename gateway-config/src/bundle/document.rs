@@ -16,16 +16,16 @@ use super::{
 
 /// The one document version this reader implements.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ApiVersion {
+pub enum ApiVersion {
     V1Alpha1,
 }
 
 impl ApiVersion {
-    pub(crate) const ALL: &'static [Self] = &[Self::V1Alpha1];
+    pub const ALL: &'static [Self] = &[Self::V1Alpha1];
 
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
-            Self::V1Alpha1 => gateway_config::documents::API_VERSION_V1ALPHA1,
+            Self::V1Alpha1 => crate::documents::API_VERSION_V1ALPHA1,
         }
     }
 
@@ -37,30 +37,29 @@ impl ApiVersion {
     }
 }
 
-// The names come from the shared `gateway-config` crate, where `ggctl schema`
-// publishes the same documents' schemas.
-pub(crate) const BUNDLE_KIND: &str = gateway_config::documents::BUNDLE_KIND;
-pub(crate) const DEPLOYMENT_KIND: &str = gateway_config::documents::DEPLOYMENT_KIND;
+// The names `ggctl schema` publishes the same documents' schemas under.
+pub(crate) const BUNDLE_KIND: &str = crate::documents::BUNDLE_KIND;
+pub(crate) const DEPLOYMENT_KIND: &str = crate::documents::DEPLOYMENT_KIND;
 
 /// The resource document versions a `v1alpha1` bundle may declare. The
 /// environment-mode validators accept any `0.` version; the bundle boundary
 /// pins the exact versions that exist.
-pub(crate) const POLICY_SCHEMA_VERSIONS: &[&str] = &["0.1.0"];
-pub(crate) const TOOLS_SCHEMA_VERSIONS: &[&str] = &["0.1.0"];
+pub const POLICY_SCHEMA_VERSIONS: &[&str] = &["0.1.0"];
+pub const TOOLS_SCHEMA_VERSIONS: &[&str] = &["0.1.0"];
 
 /// A deployment profile. The compiler enforces each profile's invariants;
 /// the reader only fixes the names.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Profile {
+pub enum Profile {
     Production,
     Migration,
     Development,
 }
 
 impl Profile {
-    pub(crate) const ALL: &'static [Self] = &[Self::Production, Self::Migration, Self::Development];
+    pub const ALL: &'static [Self] = &[Self::Production, Self::Migration, Self::Development];
 
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Production => "production",
             Self::Migration => "migration",
