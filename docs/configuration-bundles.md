@@ -242,7 +242,8 @@ reopened. Specifically:
 
 Bundles are directories only. There is no archive form of a bundle, so no
 archive reader sits in the configuration path; the backup archive (a later #242
-slice) has its own reader.
+slice) has its own reader, which must apply the
+[archive entry admission rules](archive-admission.md).
 
 ## The YAML subset
 
