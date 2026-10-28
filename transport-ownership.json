@@ -6815,6 +6815,16 @@
     {
       "file": "gateway/src/admin_observability.rs",
       "reasons": [
+        "capability-in-macro-input"
+      ],
+      "scope": "gateway::admin_observability::reauthorized_audit_stream#1",
+      "sha256": "e52cbd76ed05ee7db73eb984bd29d64c4d132419d1ee48234e859e10f26b1fe2",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed tokio::select! over two tokio::time::sleep_until deadlines and the next frame of an already-built audit event stream; the tokio paths in the macro input are timers, and the re-check it awaits judges an existing credential through the configured validators. The item constructs no client, socket, listener or process and adds no transport authority."
+    },
+    {
+      "file": "gateway/src/admin_observability.rs",
+      "reasons": [
         "unexpanded-macro"
       ],
       "scope": "gateway::admin_observability::record_audit_stream_outcome#1",
