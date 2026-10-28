@@ -1671,9 +1671,8 @@ pub(super) fn reauthorized_audit_stream(
                         }
                     }
                     frame = events.next() => {
-                        let Some(frame) = frame else {
-                            return None;
-                        };
+                        // A source that ends on its own ends this stream.
+                        let frame = frame?;
                         if !authorization.permits() {
                             break AuditStreamClose::PermissionRevoked;
                         }
