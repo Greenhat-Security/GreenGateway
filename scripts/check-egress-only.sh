@@ -189,7 +189,33 @@ fi
 # file, inside OPERATOR_CLIENT_BUILDER, with proxies, redirects and transparent
 # retries off and HTTP/1.1 and a timeout set, and no option anywhere in the file
 # that weakens certificate verification or adds a proxy.
+#
+# "Exactly one construction" counts every spelling that yields a client, each
+# occurrence rather than each line: the builders, the constructors including
+# `default()`, and `reqwest::get`, which builds a default client -- proxies
+# from the environment, redirects followed -- on every call. A construction
+# the count cannot see is as much a second client as one it can, so the ways
+# to hide one from it are refused outright: an import or a type alias renames
+# `Client` or `get` out of the pattern's sight, and the Default trait builds a
+# client without naming a constructor at all (`#[derive(Default)]` on a struct
+# holding one, `Default::default()`, `unwrap_or_default()`, `mem::take`).
+#
+# What a text search canNOT see, stated plainly: a client built through
+# another crate's generic code or a macro defined elsewhere. Using one still
+# adds or changes a syntax scope in this file that names reqwest, so
+# `scripts/transport_guard.py check` (the structural ownership check,
+# `transport-ownership.json`) fails until it is reviewed; this check is the
+# cheap, readable pin on top of that one.
+OPERATOR_CLIENT_CONSTRUCTION='\b(Client|ClientBuilder)[[:space:]]*>?[[:space:]]*::[[:space:]]*(builder|new|default)\b|\breqwest[[:space:]]*::[[:space:]]*get\b'
 operator_problems=""
+
+# Records a problem when the operator client file's code matches `$1`.
+refuse_in_operator_client() {
+    if printf '%s\n' "$operator_code" | grep -qE "$1"; then
+        operator_problems="$operator_problems|$OPERATOR_CLIENT_FILE $2"
+    fi
+}
+
 if [ ! -f "$OPERATOR_CLIENT_FILE" ]; then
     operator_problems="|$OPERATOR_CLIENT_FILE does not exist; update OPERATOR_CLIENT_FILE"
 else
@@ -214,14 +240,12 @@ else
         done
     fi
     constructions="$(
-        printf '%s
-' "$operator_code" | grep -cE 'Client::builder\(\)|ClientBuilder::new\(\)|Client::new\(\)' || true
+        printf '%s\n' "$operator_code" | grep -oE "$OPERATOR_CLIENT_CONSTRUCTION" | wc -l
     )"
     in_builder="$(
-        printf '%s
-' "$operator_body" | grep -cE 'Client::builder\(\)' || true
+        printf '%s\n' "$operator_body" | grep -oE "$OPERATOR_CLIENT_CONSTRUCTION" | wc -l
     )"
-    if [ "$constructions" != 1 ] || [ "$in_builder" != 1 ]; then
+    if [ "$constructions" -ne 1 ] || [ "$in_builder" -ne 1 ]; then
         operator_problems="$operator_problems|$OPERATOR_CLIENT_FILE must build exactly one client, in $OPERATOR_CLIENT_BUILDER()"
     fi
     for forbidden in 'danger_accept_invalid' 'tls_certs_only' 'tls_backend_preconfigured' 'use_preconfigured_tls' 'tls_sslkeylogfile' '\.proxy\('; do
@@ -230,6 +254,12 @@ else
             operator_problems="$operator_problems|$OPERATOR_CLIENT_FILE uses $forbidden"
         fi
     done
+    refuse_in_operator_client '\buse\b[^;]*\breqwest\b|\bextern[[:space:]]+crate[[:space:]]+reqwest\b' \
+        'imports from reqwest; name each reqwest item by its full path so every construction is counted'
+    refuse_in_operator_client '\btype[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[^=;]*=[^;]*\b(Client|ClientBuilder)\b' \
+        'aliases a reqwest client type, which hides its constructions from the count'
+    refuse_in_operator_client '\bDefault\b|\b(unwrap_or|or)_default\b|\bmem\b[^;]*\btake\b' \
+        'uses the Default trait, which can build a client without naming a constructor'
 fi
 
 if [ -n "$operator_problems" ]; then
