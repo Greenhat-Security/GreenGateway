@@ -499,6 +499,7 @@ pub(super) fn openapi_catalog_error_response(
         | OpenApiCatalogError::ConnectionKindMismatch
         | OpenApiCatalogError::DiscoveryNotConfigured
         | OpenApiCatalogError::CallerAssertionNotEnforced
+        | OpenApiCatalogError::AuthenticationNotSupported
         | OpenApiCatalogError::ToolConflict => StatusCode::CONFLICT,
         OpenApiCatalogError::SpecTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
         OpenApiCatalogError::InvalidSpec
