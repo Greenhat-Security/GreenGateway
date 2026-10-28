@@ -10791,6 +10791,16 @@
       "purpose": "Per-method cfg_attr(not(test), expect(dead_code)) for a rate-lane selection accessor that offline analysis and the differential tests read; the live rate adapter (#422 PR 3a) matches on the outcome instead. Dead-code gating only; no transport or process capability is introduced."
     },
     {
+      "file": "gateway/src/policy_replay/mod.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::policy_replay::file_attributes#1",
+      "sha256": "9de1b2b2cda39ab5d60a49dee1854db94e0313ace54e8ac0e0df2a10986733e3",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the policy replay context module, whose first caller outside tests is the replay job engine (#243 slice 13). The module parses and builds replay contexts in memory and asks the pure policy kernel; dead-code gating only, no I/O and no transport or process capability."
+    },
+    {
       "file": "gateway/src/proxy/admission.rs",
       "reasons": [
         "unexpanded-macro"
