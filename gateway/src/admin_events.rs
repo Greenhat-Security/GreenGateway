@@ -472,6 +472,35 @@ pub(super) fn emit_managed_openapi_catalog_rejected(
     ));
 }
 
+/// A Connection save took a live managed OpenAPI catalog off the tool list,
+/// because the saved Connection can no longer serve it. The save itself is
+/// `connection.changed`; this records what it did to the tool list, and why.
+pub(super) fn emit_managed_openapi_catalog_withdrawn(
+    state: &ConnectionAdminState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    withdrawal: &connections::openapi::OpenApiCatalogWithdrawal,
+) {
+    let request_id = client_ip::request_id(&parts.headers, &parts.extensions);
+    let source_ip =
+        client_ip::canonical_client_ip(&parts.headers, &parts.extensions, &state.client_ip_policy);
+    state.audit.emit(audit::AuditEvent::new(
+        audit::event::TOOL_REGISTRY_CHANGED,
+        request_id,
+        source_ip,
+        Some(auth::actor_from_principal(principal)),
+        json!({
+            "action": "managed_openapi_catalog_withdrawn",
+            "connection_id": &withdrawal.connection_id,
+            "source": "managed",
+            "outcome": if withdrawal.unlisted { "success" } else { "failure" },
+            "reason": withdrawal.reason.safe_reason(),
+            "withdrawn_tool_names": &withdrawal.tool_names,
+            "withdrawn_tool_count": withdrawal.tool_names.len(),
+        }),
+    ));
+}
+
 pub(super) fn emit_traffic_endpoint_review_changed(
     state: &TrafficAdminState,
     parts: &http::request::Parts,
