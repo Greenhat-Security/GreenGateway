@@ -942,11 +942,9 @@ impl DelegatedTokenRuntime {
         let matches = |principal: &[u8; 32]| {
             unreadable.is_some() || named.contains_key(cluster.purge_key(principal).as_str())
         };
-        let retired = self.cache.retire_where(|key| {
-            key.principal
-                .as_ref()
-                .is_some_and(|principal| matches(principal))
-        });
+        let retired = self
+            .cache
+            .retire_where(|key| key.principal.as_ref().is_some_and(&matches));
         let google = purge_google(&matches);
         let purged = retired.len().saturating_add(google.len());
         let mut by_principal: BTreeMap<(String, String), (Vec<RetiredDelegatedToken>, usize)> =

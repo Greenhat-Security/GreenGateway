@@ -374,11 +374,7 @@ impl GoogleDelegationRuntime {
         matches: &dyn Fn(&[u8; 32]) -> bool,
     ) -> Vec<(String, String)> {
         self.cache
-            .retire_where(|key| {
-                key.principal
-                    .as_ref()
-                    .is_some_and(|principal| matches(principal))
-            })
+            .retire_where(|key| key.principal.as_ref().is_some_and(matches))
             .iter()
             .map(|slot| {
                 let principal = slot.context();
