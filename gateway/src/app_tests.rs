@@ -1,8 +1,12 @@
 use super::*;
+#[path = "admin_config_app_tests.rs"]
+mod admin_config_app_tests;
 #[path = "admin_policy_drafts_tests.rs"]
 mod admin_policy_drafts_tests;
 #[path = "admin_session_app_tests.rs"]
 mod admin_session_app_tests;
+#[path = "audit_durability_app_tests.rs"]
+mod audit_durability_app_tests;
 use crate::auth::TokenStore;
 use axum::{body::Body, http::StatusCode};
 use futures_util::StreamExt;
@@ -122,6 +126,8 @@ fn test_config(cors_allow_origins: Vec<&str>) -> config::Config {
         shutdown_drain_delay_ms: config::DEFAULT_SHUTDOWN_DRAIN_DELAY_MS,
         shutdown_timeout_ms: config::DEFAULT_SHUTDOWN_TIMEOUT_MS,
         audit_drain_timeout_ms: config::DEFAULT_AUDIT_DRAIN_TIMEOUT_MS,
+        audit_durability: config::DEFAULT_AUDIT_DURABILITY,
+        audit_durability_timeout_ms: config::DEFAULT_AUDIT_DURABILITY_TIMEOUT_MS,
         discovery_sqlite_path: None,
         discovery_endpoint_limit: config::DEFAULT_DISCOVERY_ENDPOINT_LIMIT,
         discovery_projector_lease_ttl_ms: config::DEFAULT_DISCOVERY_PROJECTOR_LEASE_TTL_MS,
@@ -1711,6 +1717,10 @@ fn admin_routes_keep_default_api_prefix_and_remap_custom_api_under_v1() {
         AUDIT_EVENTS_STREAM_ROUTE
     );
     assert_eq!(default_routes.status_route, STATUS_ADMIN_ROUTE);
+    assert_eq!(
+        default_routes.config_capabilities_route,
+        CONFIG_CAPABILITIES_ADMIN_ROUTE
+    );
     assert_eq!(default_routes.cluster_route, CLUSTER_ADMIN_ROUTE);
     assert_eq!(
         default_routes.cluster_replicas_route,
@@ -1842,6 +1852,10 @@ fn admin_routes_keep_default_api_prefix_and_remap_custom_api_under_v1() {
     assert_eq!(custom_routes.audit_route, "/v1/ops/audit");
     assert_eq!(custom_routes.events_stream_route, "/v1/ops/events/stream");
     assert_eq!(custom_routes.status_route, "/v1/ops/status");
+    assert_eq!(
+        custom_routes.config_capabilities_route,
+        "/v1/ops/config/capabilities"
+    );
     assert_eq!(custom_routes.cluster_route, "/v1/ops/cluster");
     assert_eq!(
         custom_routes.cluster_replicas_route,
@@ -3484,7 +3498,11 @@ async fn connection_bound_proxy_uses_stored_destination_and_protects_its_depende
     );
 
     let dependency_protected = control_plane
-        .delete_managed(&created.id, &created.etag(), "test-admin")
+        .delete_managed(
+            &created.id,
+            &created.etag(),
+            &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+        )
         .await;
     assert!(matches!(
         dependency_protected,
@@ -8604,6 +8622,7 @@ fn expected_ha_metric_names() -> Vec<&'static str> {
         metrics::AUDIT_QUEUE_CAPACITY,
         metrics::AUDIT_QUEUE_OLDEST_AGE_SECONDS,
         metrics::AUDIT_FLUSH_TOTAL,
+        metrics::AUDIT_DURABILITY_REFUSALS_TOTAL,
         metrics::EXECUTION_LEASE_FAILURES_TOTAL,
     ];
     #[cfg(feature = "postgres")]
@@ -8651,6 +8670,11 @@ fn ha_label_vocabularies() -> Vec<(&'static str, &'static str, Vec<&'static str>
             metrics::AUDIT_FLUSH_TOTAL,
             "outcome",
             audit::AUDIT_FLUSH_OUTCOMES.to_vec(),
+        ),
+        (
+            metrics::AUDIT_DURABILITY_REFUSALS_TOTAL,
+            "reason",
+            audit::durable::AUDIT_DURABILITY_REFUSAL_REASONS.to_vec(),
         ),
         (
             metrics::EXECUTION_LEASE_FAILURES_TOTAL,
@@ -8850,6 +8874,50 @@ async fn synthetic_ha_run() {
         .expect("hostile request should complete");
     // What it answered does not matter; that it was *observed* does.
     let _ = hostile.status();
+
+    // The same hostile request against a gateway that requires durable
+    // audit and whose store of record refuses every record (issue #425):
+    // it is refused `503`, and the refusal counter it moves must carry
+    // nothing of it but a fixed reason.
+    let refusing_store = audit::sink::tests::DurableCaptureSink::new();
+    refusing_store.set(audit::sink::tests::DurableBehaviour::Refuse);
+    let required_app = gateway_app_with_process_started_at_and_overrides(
+        test_config(Vec::new()),
+        recorder.handle(),
+        audit::AuditLog::new_required(
+            Arc::new(refusing_store) as Arc<dyn audit::AuditSink>,
+            Duration::from_secs(5),
+        ),
+        test_audit_event_sender(),
+        Instant::now(),
+        GatewayAppBuildOverrides {
+            disable_proxy_health_checks: true,
+            ..GatewayAppBuildOverrides::default()
+        },
+    )
+    .expect("required-durability gateway app should build");
+    let required_router = match required_app.http {
+        GatewayApp::Unified(router) => router,
+        GatewayApp::Split { .. } => panic!("test app should be unified"),
+    };
+    let refused = required_router
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("{CANARY_ROUTE}?{CANARY_QUERY}"))
+                .header(header::HOST, CANARY_HOST)
+                .header(header::AUTHORIZATION, format!("Bearer {CANARY_TOKEN_ID}"))
+                .header("x-forwarded-for", "10.11.12.13")
+                .body(Body::empty())
+                .expect("hostile request should build"),
+        )
+        .await
+        .expect("hostile request should complete");
+    assert_eq!(
+        refused.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a decision record the store refuses must refuse the request"
+    );
 
     // A scrape, which is what publishes the sampled gauges.
     let scrape = router
@@ -9078,6 +9146,74 @@ fn the_ha_metric_registry_never_labels_by_a_caller_influenced_value() {
                 );
             }
         }
+    }
+}
+
+/// Every counter series a single-event alert reads is exported at `0`
+/// right after the recorder is installed, so the first event after a
+/// process start moves it `0 -> 1` and `increase(...[5m]) > 0` sees it.
+///
+/// A series that first appears at `1` has no earlier sample to compare
+/// against, so before this a single refused authority change after a
+/// restart never paged (issue #440 review). The registry is built and
+/// registered exactly as `install_metrics_recorder` does, minus making it
+/// process-global. Each family exports exactly its emitters' vocabulary,
+/// cluster-only series only in cluster mode, and the dispatcher's failure
+/// counter stays lazy because its presence marks a configured sink.
+#[test]
+fn single_event_alert_counters_are_exported_at_zero_right_after_install() {
+    for cluster in [false, true] {
+        let recorder = metrics_recorder_builder().build_recorder();
+        let handle = recorder.handle();
+        ::metrics::with_local_recorder(&recorder, || register_metrics(cluster));
+        let rendered = handle.render();
+        let samples: Vec<&str> = rendered
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .collect();
+        let family = |name: &str| {
+            samples
+                .iter()
+                .copied()
+                .filter(|line| rendered_metric_name(line) == name)
+                .collect::<Vec<&str>>()
+        };
+        let cluster_seeded = cluster && cfg!(feature = "postgres");
+
+        let mut drop_reasons = audit::LOCAL_DROP_REASONS.to_vec();
+        if cluster_seeded {
+            drop_reasons.push("postgres");
+        }
+        let mut drops = family("audit_events_dropped_total");
+        drops.sort_unstable();
+        let mut expected_drops: Vec<String> = drop_reasons
+            .iter()
+            .map(|reason| format!("audit_events_dropped_total{{reason=\"{reason}\"}} 0"))
+            .collect();
+        expected_drops.sort_unstable();
+        assert_eq!(drops, expected_drops, "cluster={cluster}:\n{rendered}");
+        assert_eq!(
+            family("greengateway_audit_flush_total"),
+            ["greengateway_audit_flush_total{outcome=\"failure\"} 0"],
+            "cluster={cluster}:\n{rendered}"
+        );
+
+        for name in [
+            "greengateway_database_pool_timeouts_total",
+            "greengateway_authority_event_capacity_refusals_total",
+            "greengateway_authority_event_evidence_failures_total",
+        ] {
+            let expected = if cluster_seeded {
+                vec![format!("{name} 0")]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(family(name), expected, "cluster={cluster}:\n{rendered}");
+        }
+        assert!(
+            family("greengateway_authority_event_delivery_failures_total").is_empty(),
+            "a seeded dispatcher failure series would mark every replica as having a sink:\n{rendered}"
+        );
     }
 }
 
@@ -13149,6 +13285,218 @@ async fn managed_openapi_gated_swagger2_writes_fail_closed_without_a_roster() {
     );
 }
 
+/// A small Google Discovery document (issue #443): one unscoped method that
+/// binds to a Connection without authentication, one scoped method, one
+/// method left out, and Google's system parameters.
+fn widget_discovery_document() -> String {
+    json!({
+        "kind": "discovery#restDescription",
+        "discoveryVersion": "v1",
+        "name": "widgets",
+        "version": "v1",
+        "rootUrl": "https://widgets.example.test/",
+        "servicePath": "widgets/v1/",
+        "parameters": { "key": { "type": "string", "location": "query" } },
+        "auth": { "oauth2": { "scopes": { "https://widgets.example.test/read": { "description": "Read widgets" } } } },
+        "schemas": {
+            "Widget": { "id": "Widget", "type": "object", "properties": { "id": { "type": "string" } } }
+        },
+        "resources": {
+            "widgets": {
+                "methods": {
+                    "get": {
+                        "id": "widgets.widgets.get",
+                        "path": "widgets/{widgetId}",
+                        "httpMethod": "GET",
+                        "parameters": {
+                            "widgetId": { "type": "string", "location": "path", "required": true }
+                        },
+                        "response": { "$ref": "Widget" }
+                    },
+                    "list": {
+                        "id": "widgets.widgets.list",
+                        "path": "widgets",
+                        "httpMethod": "GET",
+                        "scopes": ["https://widgets.example.test/read"]
+                    },
+                    "move": {
+                        "id": "widgets.widgets.move",
+                        "path": "{+name}:move",
+                        "httpMethod": "POST",
+                        "parameters": {
+                            "name": { "type": "string", "location": "path", "required": true }
+                        }
+                    }
+                }
+            }
+        }
+    })
+    .to_string()
+}
+
+#[tokio::test]
+async fn managed_openapi_preview_reports_google_discovery_conversion_and_registers_converted_tools()
+{
+    let connection_db = TempDb::new("connection-openapi-discovery-preview");
+    let policy = TempPolicyFile::new(&connection_policy_document_string());
+    let router = connection_admin_router(&connection_db, &policy, test_audit_log());
+    let (connection_id, connection_etag) =
+        create_managed_openapi_connection(&router, "Managed Discovery").await;
+    let spec = widget_discovery_document();
+    let preview = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::POST,
+            &format!("{CONNECTIONS_ADMIN_ROUTE}/{connection_id}/openapi/preview"),
+            Some(test_principal(&["openapi-tools-reader"])),
+            Some(json!({ "spec": spec }).to_string()),
+            None,
+            true,
+        ))
+        .await
+        .expect("Discovery preview should complete");
+    assert_eq!(preview.status(), StatusCode::OK);
+    let preview = json_body(preview).await;
+    assert_eq!(
+        preview["conversion"],
+        json!({
+            "source_format": "google_discovery_v1",
+            "warnings": [
+                {
+                    "code": "base_path_not_in_paths",
+                    "message": "basePath is not part of generated path templates; include it in the Connection base path",
+                    "operation_omitted": false,
+                    "subject": "/widgets/v1"
+                },
+                {
+                    "code": "global_parameter_not_mapped",
+                    "message": "this document-level parameter is not a tool argument, and generated tools never send it",
+                    "operation_omitted": false,
+                    "subject": "key"
+                },
+                {
+                    "code": "unsupported_path_expansion",
+                    "message": "the method path uses a URI template expansion other than a plain {name}, such as {+name}, which has no OpenAPI 3.0 form; it was left out",
+                    "operation_omitted": true,
+                    "method": "POST",
+                    "path_template": "/{+name}:move",
+                    "subject": "+name"
+                }
+            ]
+        })
+    );
+    assert_eq!(
+        preview["tools"]
+            .as_array()
+            .expect("preview should list tools")
+            .iter()
+            .map(|tool| tool["name"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!("widgets.widgets.get")],
+        "tools are named by their Discovery method IDs; the omitted method generates none"
+    );
+    // A scoped method needs a token for the user, which this Connection's
+    // shared credential is not, and the preview says so per alternative.
+    let incompatibilities = preview["incompatibilities"]
+        .as_array()
+        .expect("preview should list incompatibilities");
+    assert_eq!(
+        incompatibilities
+            .iter()
+            .find(|incompatibility| incompatibility["tool_name"] == json!("widgets.widgets.list")),
+        Some(&json!({
+            "tool_name": "widgets.widgets.list",
+            "reason": "no_compatible_security_alternative",
+            "security_alternatives": [{
+                "scheme_names": ["Oauth2"],
+                "reason": "oauth2_without_client_credentials",
+                "message": "the OAuth 2.0 scheme has no clientCredentials flow, so it needs a token for the user; bind it with a per-caller Connection such as delegated_issuer_token"
+            }]
+        })),
+        "{preview}"
+    );
+    let schema: Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../docs/schemas/connection-admin.v1.schema.json"),
+        )
+        .expect("the admin schema should read"),
+    )
+    .expect("the admin schema should parse");
+    let incompatibility_schema = jsonschema::validator_for(&json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": schema["$defs"].clone(),
+        "$ref": "#/$defs/OpenApiIncompatibility"
+    }))
+    .expect("the incompatibility schema should compile");
+    for incompatibility in incompatibilities {
+        assert!(
+            incompatibility_schema.is_valid(incompatibility),
+            "{incompatibility} should match the published schema"
+        );
+    }
+
+    let registered = preview_and_register_managed_openapi(
+        &router,
+        &connection_id,
+        &connection_etag,
+        &spec,
+        &["widgets.widgets.get"],
+    )
+    .await;
+    assert_eq!(registered.status(), StatusCode::CREATED);
+    assert_eq!(
+        json_body(registered).await["registered_tool_names"],
+        json!(["widgets.widgets.get"])
+    );
+}
+
+/// A Discovery catalog is a gated converted catalog like a Swagger 2.0 one:
+/// without a roster its registration is refused and stores nothing.
+#[tokio::test]
+async fn managed_openapi_gated_discovery_registration_fails_closed_without_a_roster() {
+    let connection_db = TempDb::new("connection-openapi-discovery-gated");
+    let policy = TempPolicyFile::new(&connection_policy_document_string());
+    let router = gated_connection_admin_router(
+        &connection_db,
+        &policy,
+        test_audit_log(),
+        GatewayAppBuildOverrides::default(),
+    );
+    let (connection_id, connection_etag) =
+        create_managed_openapi_connection(&router, "Gated Discovery").await;
+    let refused = preview_and_register_managed_openapi(
+        &router,
+        &connection_id,
+        &connection_etag,
+        &widget_discovery_document(),
+        &["widgets.widgets.get"],
+    )
+    .await;
+    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        json_body(refused).await["reason"],
+        json!("roster_unavailable")
+    );
+    let preview = router
+        .oneshot(connection_admin_request(
+            Method::POST,
+            &format!("{CONNECTIONS_ADMIN_ROUTE}/{connection_id}/openapi/preview"),
+            Some(test_principal(&["openapi-tools-reader"])),
+            Some(json!({ "spec": widget_discovery_document() }).to_string()),
+            None,
+            true,
+        ))
+        .await
+        .expect("Discovery preview should complete");
+    assert_eq!(preview.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(preview).await["catalog_revision"],
+        json!(0),
+        "a refused registration stores no catalog"
+    );
+}
+
 #[test]
 fn stored_overlay_source_response_projects_only_a_strict_typed_envelope() {
     let mut reports = connections::store::StoredOpenApiSourceReports::empty();
@@ -17176,6 +17524,229 @@ async fn token_rotation_delegation_contract_postgres() {
     let store =
         storage::postgres_service_tokens::PostgresServiceTokenStore::new(foundation.pool().clone());
     assert_token_rotation_delegation_contract(Arc::new(store)).await;
+}
+
+/// One service-token change evidence row as the admin endpoints' test reads
+/// it: action, token, actor subject, actor issuer, actor kind, auth mode.
+type TokenChangeActorRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// Issue #425: the admin rotate and revoke endpoints pass the authenticated
+/// principal to the store, which records it -- subject, canonical issuer,
+/// actor kind and auth mode -- as the change's evidence. Neither the token's
+/// creator nor a fixed label stands in for it. A person signed in through
+/// one provider rotates, a bearer principal from a second provider revokes
+/// that token, and a service token revokes another; the rows the store
+/// recorded are returned beside the evidence each should be.
+async fn admin_token_changes_record_the_authenticated_actor(
+    store: Arc<dyn storage::ServiceTokenStore>,
+) -> Vec<TokenChangeActorRow> {
+    let policy = parse_policy_body(&Bytes::from(token_policy_document_string()))
+        .expect("token policy should parse");
+    let config = test_config(Vec::new());
+    let audit_log = test_audit_log();
+    let state = TokenAdminState {
+        store: Some(Arc::clone(&store)),
+        validator: None,
+        rbac_state: Some(middleware::rbac::RbacState::new(
+            policy,
+            Vec::new(),
+            false,
+            audit_log.clone(),
+        )),
+        audit: audit_log,
+        client_ip_policy: client_ip::ClientIpPolicy::from_config(&config),
+        max_body_size: config.max_body_size,
+    };
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        ids.push(
+            store
+                .create(auth::tokens::CreateTokenRequest {
+                    scopes: vec!["probe-reader".to_owned()],
+                    created_by: "bootstrap-admin".to_owned(),
+                    expires_at: None,
+                })
+                .await
+                .expect("fixture token should create")
+                .record
+                .id,
+        );
+    }
+    let principal = |user_id: &str, issuer: Option<&str>, auth_method| auth::Principal {
+        user_id: user_id.to_owned(),
+        issuer: issuer.map(str::to_owned),
+        auth_method,
+        ..test_principal(&["superadmin"])
+    };
+
+    let rotated = token_rotate_endpoint(
+        State(state.clone()),
+        Path(ids[0].clone()),
+        token_admin_request(
+            Method::POST,
+            &format!("{TOKENS_ADMIN_ROUTE}/{}/rotate", ids[0]),
+            Some(principal(
+                "rotating-admin",
+                Some(" https://idp.example.test/ "),
+                auth::AuthMethod::Cookie,
+            )),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(rotated.status(), StatusCode::OK);
+    for (id, actor) in [
+        (
+            &ids[0],
+            principal(
+                "revoking-admin",
+                Some("https://other-idp.example.test"),
+                auth::AuthMethod::Bearer,
+            ),
+        ),
+        (
+            &ids[1],
+            principal(
+                "service-token:token_admin",
+                None,
+                auth::AuthMethod::ServiceToken,
+            ),
+        ),
+    ] {
+        let revoked = token_revoke_endpoint(
+            State(state.clone()),
+            Path(id.clone()),
+            token_admin_request(
+                Method::DELETE,
+                &format!("{TOKENS_ADMIN_ROUTE}/{id}"),
+                Some(actor),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(revoked.status(), StatusCode::OK);
+    }
+
+    let owned = |value: &str| value.to_owned();
+    vec![
+        (
+            owned("service_token.rotate"),
+            ids[0].clone(),
+            owned("rotating-admin"),
+            Some(owned("https://idp.example.test")),
+            Some(owned("principal")),
+            Some(owned("session_cookie")),
+        ),
+        (
+            owned("service_token.revoke"),
+            ids[0].clone(),
+            owned("revoking-admin"),
+            Some(owned("https://other-idp.example.test")),
+            Some(owned("principal")),
+            Some(owned("bearer_token")),
+        ),
+        (
+            owned("service_token.revoke"),
+            ids[1].clone(),
+            owned("service-token:token_admin"),
+            None,
+            Some(owned("service_token")),
+            Some(owned("service_token")),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn admin_token_rotate_and_revoke_record_the_authenticated_subject_and_issuer_sqlite() {
+    let token_db = TempDb::new("token-change-actor-evidence");
+    let store =
+        auth::tokens::SqliteTokenStore::open(&token_db.path).expect("token store should open");
+    let expected = admin_token_changes_record_the_authenticated_actor(Arc::new(store)).await;
+    let connection = Connection::open(&token_db.path).expect("token database should open");
+    let mut statement = connection
+        .prepare(
+            "SELECT action, token_id, actor_user_id, actor_issuer, actor_kind, actor_auth_mode \
+             FROM service_token_change_evidence ORDER BY sequence",
+        )
+        .expect("evidence query should prepare");
+    let recorded = statement
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })
+        .expect("evidence query should run")
+        .collect::<Result<Vec<TokenChangeActorRow>, _>>()
+        .expect("evidence rows should decode");
+    assert_eq!(recorded, expected);
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_token_rotate_and_revoke_record_the_authenticated_subject_and_issuer_postgres() {
+    use storage::contract_tests::postgres_audit_tests::{
+        create_test_database, locator, write_dsn_file, DATABASE,
+    };
+
+    let Some(admin_dsn) = locator() else {
+        eprintln!("skipping PostgreSQL change-actor evidence: no test database locator");
+        return;
+    };
+    let _serial = DATABASE.lock().await;
+    let database = create_test_database(&admin_dsn).await;
+    let dsn_file = write_dsn_file(&database.dsn);
+    let mut config = config::Config::test_defaults();
+    config.state_backend = config::StateBackend::Postgres;
+    config.deployment_id = Some("deploy-token-change-actor".to_owned());
+    config.database.url_file = Some(dsn_file.path.clone());
+    config.database.tls_mode = config::DatabaseTlsMode::LoopbackDev;
+    let foundation = storage::postgres::PostgresFoundation::establish(&config)
+        .await
+        .expect("test database should establish");
+    storage::migrations::apply_missing_for_startup(foundation.pool(), &config.database)
+        .await
+        .expect("test database should migrate");
+    let store =
+        storage::postgres_service_tokens::PostgresServiceTokenStore::new(foundation.pool().clone());
+    let expected = admin_token_changes_record_the_authenticated_actor(Arc::new(store)).await;
+    let recorded = foundation
+        .pool()
+        .get()
+        .await
+        .expect("evidence checkout")
+        .query(
+            "SELECT action, token_id, actor_user_id, actor_issuer, actor_kind, actor_auth_mode \
+             FROM greengateway.service_token_change_evidence \
+             ORDER BY security_revision",
+            &[],
+        )
+        .await
+        .expect("evidence rows should read")
+        .iter()
+        .map(|row| {
+            (
+                row.get(0),
+                row.get(1),
+                row.get(2),
+                row.get(3),
+                row.get(4),
+                row.get(5),
+            )
+        })
+        .collect::<Vec<TokenChangeActorRow>>();
+    assert_eq!(recorded, expected);
 }
 
 /// Pins the narrowed create mapping restored from the #340 review: a
@@ -22000,6 +22571,9 @@ async fn audit_events_stream_delivers_signal_opened_events_from_discovery() {
         .rbac_exempt_paths
         .push("/signal-stream-opened".to_owned());
     let recorder = PrometheusBuilder::new().build_recorder();
+    // No audit store of record here: this test is not about durability,
+    // so it runs the explicit best-effort opt-out (issue #425).
+    config.audit_durability = config::AuditDurability::BestEffort;
     let (audit_log, audit_event_sender) =
         audit::AuditLog::from_config(&config).expect("audit log should build");
     // Keep a handle on the audit pipeline so the observation can be driven
@@ -23481,6 +24055,9 @@ paths:
     config
         .rbac_exempt_paths
         .push(TRAFFIC_ENDPOINT_DETAIL_ADMIN_ROUTE.to_owned());
+    // No audit store of record here: this test is not about durability,
+    // so it runs the explicit best-effort opt-out (issue #425).
+    config.audit_durability = config::AuditDurability::BestEffort;
     let (audit_log, audit_event_sender) =
         audit::AuditLog::from_config(&config).expect("audit log should build");
     let recorder = PrometheusBuilder::new().build_recorder();
@@ -30185,6 +30762,9 @@ async fn mcp_inventory_test_harness(
     config.egress_allowed_hosts = harness_config.egress_allowed_hosts;
     config.egress_deny_private_ips = false;
 
+    // No audit store of record here: this test is not about durability,
+    // so it runs the explicit best-effort opt-out (issue #425).
+    config.audit_durability = config::AuditDurability::BestEffort;
     let (sink, audit_event_sender) =
         audit::sink::build_sink_from_config(&config).expect("audit sink should build");
     let capture = audit::sink::tests::CaptureSink::new();
@@ -34333,7 +34913,7 @@ mod cluster_policy_tests {
             PolicyCommitRequest {
                 precondition: PolicyCommitPrecondition::Initialize,
                 candidate: &cluster_policy(id),
-                actor_user_id: "seed",
+                change: crate::storage::DocumentChange::test_policy("seed"),
                 diff_summary: &DIFF,
             },
         )
@@ -34782,7 +35362,7 @@ mod cluster_policy_tests {
                     etag: active.etag.clone(),
                 },
                 candidate: &candidate,
-                actor_user_id: "test",
+                change: crate::storage::DocumentChange::test_policy("test"),
                 diff_summary: &DIFF,
             },
         )
@@ -34979,6 +35559,163 @@ mod cluster_policy_tests {
         );
     }
 
+    /// Google Discovery catalogs (issue #443) through the register endpoint
+    /// against a real roster: a member built with Swagger 2.0 import but
+    /// before Discovery import advertises `openapi_swagger2_catalogs` only,
+    /// which admits Swagger 2.0 catalogs and not Discovery ones.
+    #[tokio::test]
+    async fn cluster_discovery_catalogs_wait_for_members_built_before_discovery_import() {
+        use crate::storage::{MemberRegistration, PostgresMembershipStore};
+
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (_, pool) = migrated_policy_foundation(&database.dsn).await;
+        let deployment = "deploy-cluster-discovery";
+        let membership = cluster_membership::ClusterMembership::new(
+            PostgresMembershipStore::new(
+                pool.clone(),
+                deployment,
+                crate::ha::InstanceIdentity::generate(),
+            ),
+            MemberRegistration {
+                binary_version: env!("CARGO_PKG_VERSION").to_owned(),
+                schema_version: migrations::schema_version_range(),
+                document_version: cluster_membership::DOCUMENT_VERSION_RANGE,
+                fingerprint: "b".repeat(64),
+                capabilities: storage::compatibility::BINARY_CAPABILITIES.to_vec(),
+            },
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+        );
+        membership.register_boot().await.expect("boot row");
+        let swagger_only = uuid::Uuid::new_v4();
+        pool.get()
+            .await
+            .expect("client")
+            .execute(
+                "INSERT INTO greengateway.cluster_members
+                     (deployment_id, instance_id, boot_id, binary_version,
+                      schema_version_min, schema_version_max,
+                      document_version_min, document_version_max, fingerprint,
+                      capabilities)
+                 VALUES ($1, $2::text::uuid, $3::text::uuid, '1.0.1', 18, 18, 0, 0,
+                         repeat('b', 64),
+                         'openapi_swagger2_catalogs,operation_requirements,policy_role_descriptions')",
+                &[
+                    &deployment,
+                    &swagger_only.to_string(),
+                    &uuid::Uuid::new_v4().to_string(),
+                ],
+            )
+            .await
+            .expect("a Swagger-only member row inserts");
+
+        let connection_db = TempDb::new("cluster-openapi-discovery-gate");
+        let policy = TempPolicyFile::new(&connection_policy_document_string());
+        let capture = audit::sink::tests::CaptureSink::new();
+        let router = gated_connection_admin_router(
+            &connection_db,
+            &policy,
+            audit::AuditLog::new(Arc::new(capture.clone())),
+            GatewayAppBuildOverrides {
+                pg_membership: Some(membership),
+                ..GatewayAppBuildOverrides::default()
+            },
+        );
+        let (connection_id, connection_etag) =
+            create_managed_openapi_connection(&router, "Cluster Discovery").await;
+        let refusals = || {
+            capture
+                .events()
+                .into_iter()
+                .filter(|event| event.event_type == "cluster.operation_refused")
+                .collect::<Vec<_>>()
+        };
+
+        let swagger = preview_and_register_managed_openapi(
+            &router,
+            &connection_id,
+            &connection_etag,
+            &json!({
+                "swagger": "2.0",
+                "info": { "title": "Widget API", "version": "1.0.0" },
+                "paths": {
+                    "/widgets": {
+                        "get": {
+                            "operationId": "listWidgets",
+                            "responses": { "200": { "description": "Widgets" } }
+                        }
+                    }
+                }
+            })
+            .to_string(),
+            &["listWidgets"],
+        )
+        .await;
+        assert_eq!(
+            swagger.status(),
+            StatusCode::CREATED,
+            "the Swagger-only member admits a Swagger 2.0 catalog"
+        );
+
+        let (status, body) = refusal_of(
+            preview_and_register_managed_openapi(
+                &router,
+                &connection_id,
+                &connection_etag,
+                &widget_discovery_document(),
+                &["widgets.widgets.get"],
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["reason"], "capability_not_advertised");
+        let started = std::time::Instant::now();
+        while refusals().is_empty() && started.elapsed() < Duration::from_secs(5) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let refused = refusals();
+        assert_eq!(refused.len(), 1, "one refusal, one gate audit event");
+        assert_eq!(
+            refused[0].payload["operation"],
+            "connections.openapi_discovery_catalog"
+        );
+        assert_eq!(
+            refused[0].payload["capability"],
+            "openapi_discovery_catalogs"
+        );
+        assert_eq!(refused[0].payload["lacking_members"], 1);
+
+        pool.get()
+            .await
+            .expect("client")
+            .execute(
+                "UPDATE greengateway.cluster_members
+                 SET last_heartbeat_at = now() - interval '60 seconds'
+                 WHERE instance_id = $1::text::uuid",
+                &[&swagger_only.to_string()],
+            )
+            .await
+            .expect("backdate the Swagger-only member");
+        let admitted = preview_and_register_managed_openapi(
+            &router,
+            &connection_id,
+            &connection_etag,
+            &widget_discovery_document(),
+            &["widgets.widgets.get"],
+        )
+        .await;
+        assert_eq!(admitted.status(), StatusCode::CREATED);
+        assert_eq!(
+            json_body(admitted).await["registered_tool_names"],
+            json!(["widgets.widgets.get"])
+        );
+    }
+
     #[tokio::test]
     async fn cluster_policy_endpoints_commit_versions_and_reject_stale_preconditions() {
         let Some(admin_dsn) = locator() else {
@@ -35093,6 +35830,48 @@ mod cluster_policy_tests {
             row.get(0)
         };
         assert_eq!(documents, 3, "two commits plus the rollback version");
+
+        // Each committed change recorded itself (issue #425): the endpoint
+        // named its operation and the authenticated principal that made it;
+        // the stale PUT recorded nothing.
+        let evidence: Vec<(String, String, String, Option<String>, String)> = pool
+            .get()
+            .await
+            .expect("evidence checkout")
+            .query(
+                "SELECT action, actor_kind, actor_user_id, actor_issuer, actor_auth_mode \
+                 FROM greengateway.document_change_evidence ORDER BY security_revision",
+                &[],
+            )
+            .await
+            .expect("evidence rows")
+            .iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4)))
+            .collect();
+        let principal = admin_principal();
+        let by_admin = |action: &str| {
+            (
+                action.to_owned(),
+                "principal".to_owned(),
+                principal.user_id.clone(),
+                None,
+                principal.auth_method.audit_mode().to_owned(),
+            )
+        };
+        assert_eq!(
+            evidence,
+            vec![
+                (
+                    "policy.publish".to_owned(),
+                    "principal".to_owned(),
+                    "seed".to_owned(),
+                    None,
+                    "bearer_token".to_owned(),
+                ),
+                by_admin("policy.publish"),
+                by_admin("policy.rollback"),
+            ]
+        );
     }
 
     /// Server-side drafts in cluster mode (issue #243, slice 9): a draft is
@@ -35220,6 +35999,40 @@ mod cluster_policy_tests {
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
         assert_eq!(body["reason"], "policy_draft_base_stale");
         assert_eq!(policy_version_count(&pool).await, versions_before + 1);
+
+        // The publication is a `policy.publish` like `PUT /policy` (issue
+        // #425): it recorded the publishing principal in its own commit,
+        // after the seed's row, and the refused stale publish recorded
+        // nothing.
+        let evidence: Vec<(String, String, String)> = pool
+            .get()
+            .await
+            .expect("evidence checkout")
+            .query(
+                "SELECT action, actor_kind, actor_user_id \
+                 FROM greengateway.document_change_evidence ORDER BY security_revision",
+                &[],
+            )
+            .await
+            .expect("evidence rows")
+            .iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect();
+        assert_eq!(
+            evidence,
+            vec![
+                (
+                    "policy.publish".to_owned(),
+                    "principal".to_owned(),
+                    "seed".to_owned()
+                ),
+                (
+                    "policy.publish".to_owned(),
+                    "principal".to_owned(),
+                    admin_principal().user_id
+                ),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -35348,7 +36161,7 @@ mod cluster_policy_tests {
             PolicyCommitRequest {
                 precondition: PolicyCommitPrecondition::Expected { etag: current.etag },
                 candidate: &candidate,
-                actor_user_id: "other-replica",
+                change: crate::storage::DocumentChange::test_policy("other-replica"),
                 diff_summary: &DIFF,
             },
         )
@@ -35484,7 +36297,7 @@ mod cluster_policy_tests {
                     etag: current.expect("active").etag,
                 },
                 candidate: &revoked,
-                actor_user_id: "other-replica",
+                change: crate::storage::DocumentChange::test_policy("other-replica"),
                 diff_summary: &DIFF,
             },
         )
@@ -35575,7 +36388,7 @@ mod cluster_policy_tests {
                     etag: active.etag.clone(),
                 },
                 candidate: &updated,
-                actor_user_id: "other-replica",
+                change: crate::storage::DocumentChange::test_policy("other-replica"),
                 diff_summary: &DIFF,
             },
         )
@@ -35835,7 +36648,7 @@ mod cluster_tools_tests {
             PolicyCommitRequest {
                 precondition: PolicyCommitPrecondition::Initialize,
                 candidate: &cluster_policy("tools-cas"),
-                actor_user_id: "seed",
+                change: crate::storage::DocumentChange::test_policy("seed"),
                 diff_summary: &DIFF,
             },
         )
@@ -35873,7 +36686,7 @@ mod cluster_tools_tests {
                     etag: active.etag.clone(),
                 },
                 &tools_document_with("cluster_echo"),
-                "op-1",
+                crate::storage::DocumentChange::test_tools("op-1"),
                 &DIFF,
             )
             .await
@@ -35885,7 +36698,7 @@ mod cluster_tools_tests {
                     etag: active.etag.clone(),
                 },
                 &tools_document_with("cluster_other"),
-                "op-2",
+                crate::storage::DocumentChange::test_tools("op-2"),
                 &DIFF,
             )
             .await
@@ -35930,7 +36743,7 @@ mod cluster_tools_tests {
             PolicyCommitRequest {
                 precondition: PolicyCommitPrecondition::Initialize,
                 candidate: &cluster_policy("gate-tools"),
-                actor_user_id: "seed",
+                change: crate::storage::DocumentChange::test_policy("seed"),
                 diff_summary: &DIFF,
             },
         )
@@ -36018,7 +36831,7 @@ mod cluster_tools_tests {
                     etag: boot_tools.etag.clone(),
                 },
                 &tools_document_with("post_boot_tool"),
-                "op",
+                crate::storage::DocumentChange::test_tools("op"),
                 &DIFF,
             )
             .await
@@ -36094,10 +36907,14 @@ mod cluster_tools_tests {
             .expect("replica B accepts and caches");
 
         // The revoke commits through replica A's admin path.
-        storage::ServiceTokenStore::revoke(&*store, &created.record.id, "revoking-admin")
-            .await
-            .expect("revoke should commit")
-            .expect("token exists");
+        storage::ServiceTokenStore::revoke(
+            &*store,
+            &created.record.id,
+            &auth::change_actor::ChangeActor::for_test("revoking-admin"),
+        )
+        .await
+        .expect("revoke should commit")
+        .expect("token exists");
 
         // Replica B's very next request, 60 s of TTL to spare.
         let refused = auth::SessionValidator::validate_session(&*replica_b, &bearer)
@@ -36181,7 +36998,7 @@ mod cluster_tools_tests {
             PolicyCommitRequest {
                 precondition: PolicyCommitPrecondition::Initialize,
                 candidate: &cluster_policy("gate-late-register"),
-                actor_user_id: "seed",
+                change: crate::storage::DocumentChange::test_policy("seed"),
                 diff_summary: &DIFF,
             },
         )
@@ -36275,7 +37092,7 @@ mod cluster_tools_tests {
             PolicyCommitRequest {
                 precondition: PolicyCommitPrecondition::Initialize,
                 candidate: &cluster_policy("gate-budget"),
-                actor_user_id: "seed",
+                change: crate::storage::DocumentChange::test_policy("seed"),
                 diff_summary: &DIFF,
             },
         )
@@ -36435,7 +37252,7 @@ mod cluster_tools_tests {
             PolicyCommitRequest {
                 precondition: PolicyCommitPrecondition::Initialize,
                 candidate: &cluster_policy("gate-connections"),
-                actor_user_id: "seed",
+                change: crate::storage::DocumentChange::test_policy("seed"),
                 diff_summary: &DIFF,
             },
         )
@@ -36461,7 +37278,7 @@ mod cluster_tools_tests {
                 .commit_tools(
                     PolicyCommitPrecondition::Expected { etag: tools_etag },
                     &tools_document_with(&format!("counter_mover_{index}")),
-                    "op",
+                    crate::storage::DocumentChange::test_tools("op"),
                     &DIFF,
                 )
                 .await
@@ -36630,7 +37447,7 @@ mod cluster_tools_tests {
             PolicyCommitRequest {
                 precondition: PolicyCommitPrecondition::Initialize,
                 candidate: &cluster_policy("gate-invalid"),
-                actor_user_id: "seed",
+                change: crate::storage::DocumentChange::test_policy("seed"),
                 diff_summary: &DIFF,
             },
         )
@@ -36675,7 +37492,7 @@ mod cluster_tools_tests {
                     etag: boot_tools.etag.clone(),
                 },
                 &tools_document_with("reconciled_tool"),
-                "op",
+                crate::storage::DocumentChange::test_tools("op"),
                 &DIFF,
             )
             .await
@@ -36712,7 +37529,7 @@ mod cluster_tools_tests {
                     etag: active.etag.clone(),
                 },
                 &invalid,
-                "op",
+                crate::storage::DocumentChange::test_tools("op"),
                 &DIFF,
             )
             .await
@@ -36746,7 +37563,7 @@ mod cluster_tools_tests {
             PolicyCommitRequest {
                 precondition: PolicyCommitPrecondition::Initialize,
                 candidate: &cluster_policy("register-tools"),
-                actor_user_id: "seed",
+                change: crate::storage::DocumentChange::test_policy("seed"),
                 diff_summary: &DIFF,
             },
         )
@@ -36956,13 +37773,13 @@ mod cluster_discovery_tests {
         }
     }
 
-    const DEPLOYMENT_ID: &str = "deploy-cluster-discovery";
+    const CLUSTER_DISCOVERY_DEPLOYMENT_ID: &str = "deploy-cluster-discovery";
 
     async fn migrated_pool(dsn: &str) -> deadpool_postgres::Pool {
         let dsn_file = write_dsn_file(dsn);
         let mut config = test_config(Vec::new());
         config.state_backend = config::StateBackend::Postgres;
-        config.deployment_id = Some(DEPLOYMENT_ID.to_owned());
+        config.deployment_id = Some(CLUSTER_DISCOVERY_DEPLOYMENT_ID.to_owned());
         config.database.url_file = Some(dsn_file.path.clone());
         config.database.tls_mode = config::DatabaseTlsMode::LoopbackDev;
         let foundation = PostgresFoundation::establish(&config)
@@ -37046,7 +37863,7 @@ mod cluster_discovery_tests {
             .commit(storage::PolicyCommitRequest {
                 precondition: storage::PolicyCommitPrecondition::Initialize,
                 candidate: &policy,
-                actor_user_id: "installer",
+                change: crate::storage::DocumentChange::test_policy("installer"),
                 diff_summary: &json!({"action": "seed"}),
             })
             .await
@@ -37054,7 +37871,7 @@ mod cluster_discovery_tests {
         let mut config = test_config(Vec::new());
         config.auth_enabled = false;
         config.state_backend = config::StateBackend::Postgres;
-        config.deployment_id = Some(DEPLOYMENT_ID.to_owned());
+        config.deployment_id = Some(CLUSTER_DISCOVERY_DEPLOYMENT_ID.to_owned());
         config
             .rbac_exempt_paths
             .extend([AUDIT_ADMIN_ROUTE.to_owned(), POLICY_ADMIN_ROUTE.to_owned()]);
@@ -37208,7 +38025,7 @@ mod cluster_discovery_tests {
         let lifecycle = GatewayLifecycle::new();
         let mut config = test_config(Vec::new());
         config.state_backend = config::StateBackend::Postgres;
-        config.deployment_id = Some(DEPLOYMENT_ID.to_owned());
+        config.deployment_id = Some(CLUSTER_DISCOVERY_DEPLOYMENT_ID.to_owned());
         config.discovery_projector_poll_ms = 50;
         let recorder = PrometheusBuilder::new().build_recorder();
         let app = gateway_app_with_process_started_at_and_overrides(
@@ -37222,7 +38039,7 @@ mod cluster_discovery_tests {
                 pg_audit: Some(audit_store.clone()),
                 pg_discovery: Some(ClusterDiscoverySeed {
                     pool: pool.clone(),
-                    deployment_id: DEPLOYMENT_ID.to_owned(),
+                    deployment_id: CLUSTER_DISCOVERY_DEPLOYMENT_ID.to_owned(),
                     instance_id,
                     audit: audit_store.clone(),
                 }),
@@ -37368,7 +38185,7 @@ mod cluster_discovery_tests {
             storage::PolicyCommitRequest {
                 precondition: storage::PolicyCommitPrecondition::Initialize,
                 candidate: &policy,
-                actor_user_id: "installer",
+                change: crate::storage::DocumentChange::test_policy("installer"),
                 diff_summary: &seed_diff,
             },
         )
@@ -38220,7 +39037,7 @@ mod cluster_discovery_tests {
                     etag: active.etag.clone(),
                 },
                 candidate: &covering,
-                actor_user_id: "other-replica",
+                change: crate::storage::DocumentChange::test_policy("other-replica"),
                 diff_summary: &diff_summary,
             },
         )
@@ -38513,7 +39330,7 @@ mod cluster_discovery_tests {
                     etag: before.active_etag.clone(),
                 },
                 candidate: &interfering_candidate,
-                actor_user_id: "peer",
+                change: crate::storage::DocumentChange::test_policy("peer"),
                 diff_summary: &interfering_diff,
             },
         )
@@ -38679,3 +39496,9 @@ fn every_mcp_route_path_is_gateway_owned_so_an_alias_is_never_a_classified_dispa
         }
     }
 }
+
+#[path = "admin_policy_test_runs_tests.rs"]
+mod admin_policy_test_runs_tests;
+
+#[path = "admin_policy_simulations_tests.rs"]
+mod admin_policy_simulations_tests;

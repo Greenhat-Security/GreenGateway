@@ -605,6 +605,9 @@ function gatewayFiles(gateway) {
     policy: path.join(directory, 'policy.json'),
     tokens: path.join(directory, 'tokens.sqlite'),
     audit: path.join(directory, 'audit.jsonl'),
+    // The audit store of record the default AUDIT_DURABILITY=required needs;
+    // without one the gateway refuses to start.
+    auditStore: path.join(directory, 'audit.sqlite'),
     output: path.join(directory, 'gateway.log'),
   };
 }
@@ -634,6 +637,7 @@ function gatewayEnvironment(gateway, files) {
     POLICY_FILE: files.policy,
     SERVICE_TOKEN_SQLITE_PATH: files.tokens,
     AUDIT_LOG_FILE: files.audit,
+    AUDIT_SQLITE_PATH: files.auditStore,
     AUTH_ENABLED: 'true',
     AUTH_MODE: 'required',
     AUTH_PROVIDERS: JSON.stringify([

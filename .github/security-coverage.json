@@ -8,5 +8,8 @@
   "gateway/src/rbac/rule.rs": { "lines": 100, "branches": 100, "min_line_count": 90, "min_branch_count": 18 },
   "gateway/src/rbac/engine.rs": { "lines": 100, "branches": 100, "min_line_count": 42, "min_branch_count": 4 },
   "gateway/src/admin_authorization.rs": { "lines": 75, "branches": 75, "min_line_count": 386, "min_branch_count": 46 },
-  "gateway/src/egress.rs": { "lines": 87, "branches": 74, "min_line_count": 1754, "min_branch_count": 230 }
+  "gateway/src/egress.rs": { "lines": 87, "branches": 74, "min_line_count": 1754, "min_branch_count": 230 },
+  "ggctl/src/cli.rs": { "lines": 94, "branches": 94, "min_line_count": 169, "min_branch_count": 56 },
+  "ggctl/src/credential.rs": { "lines": 87, "branches": 90, "min_line_count": 107, "min_branch_count": 24 },
+  "ggctl/src/remote.rs": { "lines": 95, "branches": 87, "min_line_count": 272, "min_branch_count": 56 }
 }

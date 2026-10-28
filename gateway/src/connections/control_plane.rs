@@ -1659,7 +1659,7 @@ impl ConnectionControlPlane {
         &self,
         id: &ConnectionId,
         expected: &ConnectionEtag,
-        actor: &str,
+        actor: &crate::auth::change_actor::ChangeActor,
     ) -> Result<(), ConnectionMutationError> {
         let _guard = self.mutation_guard().await;
         // Cluster mode queues dependency guard rows for a background flush;
@@ -5279,7 +5279,11 @@ mod tests {
                 (Ok(created), Err(LocalSecretError::DependencyConflict { connection_ids, .. })) => {
                     assert_eq!(connection_ids, vec![created.id.to_string()]);
                     control_plane
-                        .delete_managed(&created.id, &created.etag(), "test-admin")
+                        .delete_managed(
+                            &created.id,
+                            &created.etag(),
+                            &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+                        )
                         .await
                         .expect("fixture connection should delete");
                     blocking_secret_mutation(|| {
@@ -5372,7 +5376,11 @@ mod tests {
         let plain = ConnectionControlPlane::from_config(&temporary.config())
             .expect("control plane should build");
         plain
-            .delete_managed(&stored.id, &stored.etag(), "test-admin")
+            .delete_managed(
+                &stored.id,
+                &stored.etag(),
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("the stored binding is removed");
         drop(plain);
@@ -5467,7 +5475,11 @@ mod tests {
         assert_eq!(after_replace.managed().get(&created.id), Some(&replaced));
 
         control_plane
-            .delete_managed(&created.id, &replaced.etag(), "test-admin")
+            .delete_managed(
+                &created.id,
+                &replaced.etag(),
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("delete should succeed");
         let after_delete = control_plane.runtime_snapshot();

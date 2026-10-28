@@ -1,7 +1,7 @@
 {
   "version": 1,
   "issue": 425,
-  "reviewed_revision": "146d5063801270fe23852fb6caa946862fb4390f",
+  "reviewed_revision": "ebb579e6444d437bf477d0617b8841d1eea34cfc",
   "storage_modes": [
     "postgres",
     "standalone"
@@ -42,13 +42,13 @@
       "description": "No corresponding gateway-owned operation/delivery is shipped in this mode; required authority-event delivery cannot be inferred from provider audit or future plans.",
       "sources": [
         {
-          "path": "gateway/src/config.rs",
+          "path": "gateway/src/config/storage.rs",
           "anchor": "fn reject_local_authority_in_postgres_mode("
         }
       ]
     },
     "journaled_dispatch": {
-      "description": "Cluster mode (migration 21): the evidence row is journaled in authority_event_journal in its own transaction under its own event_id, reserving one unit of bounded capacity; a full journal refuses the mutation and evicts nothing. With AUTHORITY_EVENT_SINK=log or file, one leased dispatcher reads the journal after a fenced, persisted cursor in bounded batches, delivers authority_event_delivery.v1 records whose actor and resource are keyed safe references, and advances the cursor only after the sink accepted: at least once, deduplicated on (authority_id, event_id). Retention prunes only delivered rows past AUTHORITY_EVENT_RETENTION_HOURS and never an evidence row. With AUTHORITY_EVENT_SINK=none nothing is delivered. The delivered record is not the proposed authority_event.v1: the evidence does not record the actor's issuer or auth mode.",
+      "description": "Cluster mode (migration 21): the evidence row is journaled in authority_event_journal in its own transaction under its own event_id, reserving one unit of bounded capacity; a full journal refuses the mutation and evicts nothing. With AUTHORITY_EVENT_SINK=log or file, one leased dispatcher reads the journal after a fenced, persisted cursor in bounded batches, delivers authority_event_delivery.v1 records whose actor and resource are keyed safe references, and advances the cursor only after the sink accepted: at least once, deduplicated on (authority_id, event_id). Retention prunes only delivered rows past AUTHORITY_EVENT_RETENTION_HOURS and never an evidence row. With AUTHORITY_EVENT_SINK=none nothing is delivered. Since migration 24 the record also carries the actor's kind and auth mode and a keyed reference to a principal's issuer, each null where the evidence row recorded none. It is still not the proposed authority_event.v1: the subject reference is not issuer-scoped, actors without an issuer and rows committed before migration 24 cannot name one, and the operation identity is not caller-bound.",
       "sources": [
         {
           "path": "gateway/src/storage/postgres_authority_events.rs",
@@ -114,16 +114,16 @@
           "anchor": "async fn policy_draft_publish_endpoint("
         }
       ],
-      "boundary": "persist_policy_mutation -> PolicyControlPlane::commit -> commit_policy_in / postgres_documents::commit_in; active row lock and expected ETag guard; document/history, shared revision, active pointer and security_outbox commit together. Discovery acceptance invokes commit_policy_in inside its suggestion transaction.",
-      "record": "Immutable policy_documents retain actor, diff/action, document ETag and version. security_outbox retains committed revision/from/to; history is already an atomic record.",
-      "actor": "actor_user_id retained per document; issuer/auth method and an unambiguous operation identity are not captured by the shared commit request.",
-      "identity": "Version + deployment-scoped security revision identify committed authority; diff_summary carries handler action (including rollback). No persisted client operation/idempotency ID.",
+      "boundary": "persist_policy_mutation -> PolicyControlPlane::commit -> commit_policy_in / postgres_documents::commit_in; active row lock and expected ETag guard; document/history, shared revision, active pointer, security_outbox and one document_change_evidence row commit together. Discovery acceptance invokes commit_policy_in inside its suggestion transaction, so its evidence row shares that transaction. An empty or oversized actor, or an action that cannot describe the resource, is refused before anything is written; an evidence insert failure rolls the whole commit (and an acceptance's transition) back.",
+      "record": "Immutable policy_documents retain actor subject, diff/action, document ETag and version; security_outbox retains committed revision/from/to. document_change_evidence (migration 23) has no foreign key and holds one row per committed change: operation code, event/operation UUIDs, actor kind/subject/issuer/auth mode, prior/new version, the outbox row's shared revision and database-clock committed_at. Stale ETag, lost initialize race and refused acceptance write none.",
+      "actor": "The handler names the operation and passes the authenticated principal: subject (1 to 4096 bytes), issuer (1 to 4096 bytes, or none) and auth mode (session_cookie, bearer_token, service_token, client_certificate), the principal bounds. The import's activation is the system actor import-standalone with auth mode system. No keyed safe actor reference yet. The kind vocabulary is migration 23's own, not migration 24's: a service-token caller is actor_kind principal with auth mode service_token (migration 24 records actor_kind service_token), and the issuer is stored as the principal carried it, not in canonical form.",
+      "identity": "Generated event_id and operation_id UUIDs; operation code policy.publish, policy.rollback, policy.rule.create/update/delete/reorder or policy.suggestion.accept (configuration.import for the import); prior/new version and shared security revision equal to the outbox row's; exactly one row per activated version. operation_id is minted per commit, not bound to a client idempotency key; a lost response is reconciled from the version's evidence row.",
       "delivery": "post_commit_telemetry",
       "disposition": [
         "missing_metadata",
         "missing_delivery"
       ],
-      "follow_up": "PR2: add scoped actor and stable operation/event identity at the existing document transaction boundary; preserve suggestion transaction composition. PR3: delivery cursor and retention contract.",
+      "follow_up": "PR2 follow-up: caller-bound operation identity at the commit boundary and keyed safe actor references, and the actor columns aligned with migration 24's (service_token kind, canonical issuer) before the rows are journaled. Journal document_change_evidence (it is not a migration 21 journal source yet) so the dispatcher delivers it, with the journal's capacity reservation in the same transaction.",
       "sources": [
         {
           "path": "gateway/src/admin_policy.rs",
@@ -131,11 +131,19 @@
         },
         {
           "path": "gateway/src/storage/postgres_documents.rs",
-          "anchor": "INSERT INTO greengateway.security_outbox"
+          "anchor": "INSERT INTO greengateway.document_change_evidence"
+        },
+        {
+          "path": "gateway/src/storage/postgres_documents.rs",
+          "anchor": "fn validate_change("
         },
         {
           "path": "gateway/src/storage/postgres_discovery_lifecycle.rs",
           "anchor": "commit_policy_in"
+        },
+        {
+          "path": "gateway/src/storage/migrations/0023_document_and_catalog_change_evidence.sql",
+          "anchor": "CREATE TABLE greengateway.document_change_evidence ("
         }
       ],
       "tests": [
@@ -148,12 +156,24 @@
           "anchor": "async fn policy_control_plane_concurrent_same_etag_commits_produce_exactly_one_winner("
         },
         {
+          "path": "gateway/src/storage/postgres_documents_tests.rs",
+          "anchor": "async fn committed_document_changes_record_attributed_evidence_and_refusals_record_none("
+        },
+        {
+          "path": "gateway/src/storage/postgres_documents_tests.rs",
+          "anchor": "async fn a_failed_document_evidence_insert_rolls_back_the_whole_commit("
+        },
+        {
+          "path": "gateway/src/storage/postgres_documents_tests.rs",
+          "anchor": "async fn unattributable_or_mislabeled_changes_are_refused_and_principal_bounds_are_recorded("
+        },
+        {
           "path": "gateway/src/storage/contract_tests.rs",
-          "anchor": "async fn policy_control_plane_aborted_commit_writes_nothing("
+          "anchor": "async fn an_accepted_suggestion_records_its_evidence_in_the_acceptance_transaction("
         }
       ],
       "required_durability_supported": false,
-      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+      "test_claim": "PostgreSQL-gated regression anchors for the transactional document evidence. They do not certify the proposed authority-event contract, delivery or retention."
     },
     {
       "id": "policy_standalone",
@@ -296,7 +316,7 @@
       "follow_up": "Keep this operation refused; do not introduce a local file authority fallback.",
       "sources": [
         {
-          "path": "gateway/src/config.rs",
+          "path": "gateway/src/config/storage.rs",
           "anchor": "fn reject_local_authority_in_postgres_mode("
         }
       ],
@@ -323,16 +343,16 @@
           "anchor": "async fn tools_openapi_register_endpoint("
         }
       ],
-      "boundary": "register_tools_via_control_plane -> commit_tools -> shared document transaction with CAS, name reservations, immutable version, pointer, revision and outbox.",
-      "record": "tool_documents retain actor and action/diff with version and ETag; outbox is atomic. A later failed local install does not undo that commit.",
-      "actor": "actor_user_id per immutable version; no issuer/auth method.",
-      "identity": "tools version and security revision, action openapi_tools_registered; no operation ID.",
+      "boundary": "register_tools_via_control_plane -> commit_tools -> shared document transaction with CAS, name reservations, immutable version, pointer, revision, outbox and one document_change_evidence row. The first-boot seed and the import's activation use the same transaction.",
+      "record": "tool_documents retain actor subject and action/diff with version and ETag; the outbox row and the non-cascading document_change_evidence row (migration 23) commit with them. A later failed local install does not undo that commit, and its evidence row keeps describing the committed version. A tool name another lane holds writes none.",
+      "actor": "Authenticated principal kind/subject/issuer/auth mode for registration; the system actors bootstrap (first-boot seed) and import-standalone (import), auth mode system. No keyed safe actor reference yet. Same migration 23 vocabulary as policy: a service-token caller is actor_kind principal, and the issuer is not canonicalized.",
+      "identity": "Generated event/operation UUIDs, tools.publish (configuration.import for the import), prior/new tools version and the outbox row's shared security revision; operation_id minted per commit, no client-bound operation ID.",
       "delivery": "post_commit_telemetry",
       "disposition": [
         "missing_metadata",
         "missing_delivery"
       ],
-      "follow_up": "PR2: extend shared document contract once for policy/tools; preserve tool-name locks and committed-but-not-locally-installed semantics.",
+      "follow_up": "PR2 follow-up: caller-bound operation identity and keyed safe actor references, shared with policy; preserve tool-name locks and committed-but-not-locally-installed semantics. Journal the rows for dispatch, as for policy.",
       "sources": [
         {
           "path": "gateway/src/admin_tools.rs",
@@ -343,8 +363,12 @@
           "anchor": "async fn commit_tools("
         },
         {
-          "path": "gateway/src/storage/migrations/0005_tools_control_plane.sql",
-          "anchor": "CREATE TABLE greengateway.tool_documents"
+          "path": "gateway/src/storage/postgres_tools.rs",
+          "anchor": "pub(crate) const SEED_ACTOR"
+        },
+        {
+          "path": "gateway/src/storage/postgres_documents.rs",
+          "anchor": "async fn record_document_change("
         }
       ],
       "tests": [
@@ -355,10 +379,18 @@
         {
           "path": "gateway/src/app_tests.rs",
           "anchor": "async fn a_stale_tools_install_never_rolls_the_live_lane_back("
+        },
+        {
+          "path": "gateway/src/storage/postgres_documents_tests.rs",
+          "anchor": "async fn committed_document_changes_record_attributed_evidence_and_refusals_record_none("
+        },
+        {
+          "path": "gateway/src/storage/postgres_documents_tests.rs",
+          "anchor": "async fn a_failed_document_evidence_insert_rolls_back_the_whole_commit("
         }
       ],
       "required_durability_supported": false,
-      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+      "test_claim": "PostgreSQL-gated regression anchors for the transactional document evidence. They do not certify the proposed authority-event contract, delivery or retention."
     },
     {
       "id": "tools_standalone",
@@ -574,15 +606,15 @@
           "anchor": "async fn connection_delete_endpoint("
         }
       ],
-      "boundary": "PostgresConnectionStore::delete refuses an empty or oversized actor before opening a transaction, then locks shared Connection state and the record, checks ETag and dependencies, appends the outbox tombstone to_version=0 and one connection_change_evidence row carrying the same shared revision, releases names, deletes the parent and commits once. An evidence insert failure rolls the whole delete back.",
+      "boundary": "PostgresConnectionStore::delete refuses an actor the evidence cannot record exactly (ChangeActor::is_recordable: an empty or oversized subject or issuer, or an issuer on an actor that has none) before opening a transaction, then locks shared Connection state and the record, checks ETag and dependencies, appends the outbox tombstone to_version=0 and one connection_change_evidence row carrying the same shared revision, releases names, deletes the parent and commits once. An evidence insert failure rolls the whole delete back.",
       "record": "Outbox tombstone unchanged; connection_documents and bindings cascade. connection_change_evidence (migration 16) has no foreign key, so it survives the cascade; it holds identifiers, revisions and the actor only. Stale ETag, dependency, missing record and lost race write no row.",
-      "actor": "actor_user_id (the authenticated principal subject, 1 to 4096 bytes, the principal bound) committed with the delete and retained after it. Issuer, auth mode and a keyed safe actor reference are still absent.",
+      "actor": "The deleting principal as the admin endpoint builds it from the authenticated Principal (ChangeActor::from_principal), committed with the delete and retained after it: actor_user_id (the subject, 1 to 4096 bytes, the principal bound) and, since migration 24, actor_kind (principal or service_token), actor_auth_mode (the audit auth mode) and actor_issuer (the canonical issuer of a principal that has one, 1 to 4096 bytes). Rows committed before migration 24 record none of the three. No credential, session, role or email; a keyed safe actor reference exists only in what is delivered.",
       "identity": "Generated event_id and operation_id UUIDs, Connection ID, prior version, shared security revision equal to the tombstone's revision, database-clock committed_at. operation_id is minted per store call, not bound to a client idempotency key; a lost response is reconciled by the Connection's evidence row, and a blind retry is NotFound.",
       "delivery": "journaled_dispatch",
       "disposition": [
         "missing_metadata"
       ],
-      "follow_up": "PR2 follow-up: carry issuer/auth mode and a caller-bound operation identity to the store, so the delivered record can become authority_event.v1. Delivery (PR3) journals each row in the delete's transaction and dispatches it as authority_event_delivery.v1 behind a persisted cursor; required-durability mode, which would make a configured sink mandatory, is still not implemented.",
+      "follow_up": "PR2 follow-up: carry a caller-bound operation identity to the store and derive an issuer-scoped subject reference, so the delivered record can become authority_event.v1. Issuer, actor kind and auth mode are recorded since migration 24. Delivery (PR3) journals each row in the delete's transaction and dispatches it as authority_event_delivery.v1 behind a persisted cursor; required-durability mode, which would make a configured sink mandatory, is still not implemented.",
       "sources": [
         {
           "path": "gateway/src/storage/migrations/0016_connection_change_evidence.sql",
@@ -590,7 +622,7 @@
         },
         {
           "path": "gateway/src/connections/pg_store.rs",
-          "anchor": "validate_evidence_actor(actor_user_id)?;"
+          "anchor": "validate_evidence_actor(actor)?;"
         },
         {
           "path": "gateway/src/connections/pg_store.rs",
@@ -603,6 +635,14 @@
         {
           "path": "gateway/src/connections/pg_store.rs",
           "anchor": "JournalSource::ConnectionChange"
+        },
+        {
+          "path": "gateway/src/storage/migrations/0024_authority_evidence_actor_metadata.sql",
+          "anchor": "ALTER TABLE greengateway.connection_change_evidence"
+        },
+        {
+          "path": "gateway/src/admin_connections.rs",
+          "anchor": "&auth::change_actor::ChangeActor::from_principal(&principal),"
         }
       ],
       "tests": [
@@ -649,6 +689,14 @@
         {
           "path": "gateway/src/storage/migrations.rs",
           "anchor": "async fn migration_twenty_one_journals_existing_evidence_in_commit_order("
+        },
+        {
+          "path": "gateway/src/storage/migrations.rs",
+          "anchor": "async fn migration_twenty_four_adds_actor_metadata_and_guesses_none_for_existing_evidence("
+        },
+        {
+          "path": "gateway/src/authority_events/delivery_tests.rs",
+          "anchor": "fn the_actor_is_projected_as_the_evidence_recorded_it("
         }
       ],
       "required_durability_supported": false,
@@ -746,16 +794,16 @@
           "anchor": "async fn connection_openapi_overlay_delete_endpoint("
         }
       ],
-      "boundary": "MCP/OpenAPI replacements and overlay updates share Connection-state transaction and revision/CAS checks; entries, reservations, dependencies and outbox commit together. Includes scheduled refresh through store methods.",
-      "record": "Current catalogs/overlay actor fields and catalog-specific outbox revisions; replacing catalogs deletes old rows and deleting Connection cascades them.",
-      "actor": "Actor supplied to catalog writers; replaced/deleted current rows do not retain historical actor linkage.",
-      "identity": "Connection ID, catalog revision (distinct from specification revision), shared revision; no operation ID.",
+      "boundary": "MCP/OpenAPI replacements and overlay updates share the Connection-state transaction and revision/CAS checks; entries, reservations, dependencies, outbox and one catalog_change_evidence row commit together. Registration, refresh and overlay put/delete all reach the OpenAPI replacement. An empty or oversized actor is refused before the transaction opens; an evidence insert failure rolls the publication back.",
+      "record": "Current catalog/overlay rows keep their actor and are still replaced or cascaded. catalog_change_evidence (migration 23) has no foreign key and keeps one row per publication: action, event/operation UUIDs, actor subject, Connection ID, prior/new catalog revision, the overlay revision the catalog was compiled from, the outbox row's shared revision and committed_at. A stale catalog or overlay revision, a conflict or a limit writes none.",
+      "actor": "actor_user_id (the authenticated principal subject, 1 to 4096 bytes, the principal bound) survives replacement and Connection deletion. Every catalog writer is an admin endpoint. Actor kind, issuer, auth mode and a keyed safe actor reference are still absent: migration 24 adds the first three to connection_change_evidence for Connection deletion, not to catalog_change_evidence, whose writers still pass the subject alone.",
+      "identity": "Generated event/operation UUIDs; catalog.mcp.publish, catalog.openapi.publish, catalog.overlay.replace or catalog.overlay.delete, derived from the write; the catalog revision transition of the connection_catalog outbox row (its 0 stored as NULL), overlay revision and shared revision. Catalog revisions restart when a Connection re-enters a managed kind, so evidence is ordered by security revision. No client-bound operation ID.",
       "delivery": "post_commit_telemetry",
       "disposition": [
         "missing_metadata",
         "missing_delivery"
       ],
-      "follow_up": "PR2: preserve actor/action/revision evidence before replacement/cascade, including system refresh attribution; keep catalog outbox resource_type and version axis unchanged.",
+      "follow_up": "PR2 follow-up: carry the whole ChangeActor (kind, issuer and auth mode, as Connection deletion records them since migration 24) and a caller-bound operation identity to the Connection store's catalog writers; a scheduled refresh, if one is added, needs a system actor this table cannot express yet. Catalogs removed by a Connection kind change are connection.replace evidence. Journal catalog_change_evidence (not a migration 21 journal source yet) so the dispatcher delivers it.",
       "sources": [
         {
           "path": "gateway/src/connections/pg_store.rs",
@@ -768,6 +816,14 @@
         {
           "path": "gateway/src/connections/pg_store.rs",
           "anchor": "async fn write_openapi_overlay("
+        },
+        {
+          "path": "gateway/src/connections/pg_store.rs",
+          "anchor": "async fn record_catalog_change_evidence("
+        },
+        {
+          "path": "gateway/src/storage/migrations/0023_document_and_catalog_change_evidence.sql",
+          "anchor": "CREATE TABLE greengateway.catalog_change_evidence ("
         }
       ],
       "tests": [
@@ -778,10 +834,22 @@
         {
           "path": "gateway/src/connections/pg_store_tests.rs",
           "anchor": "async fn openapi_overlay_catalog_cas_prune_and_restart_are_atomic("
+        },
+        {
+          "path": "gateway/src/connections/pg_store_tests.rs",
+          "anchor": "async fn catalog_evidence_survives_replacement_cascade_and_restart("
+        },
+        {
+          "path": "gateway/src/connections/pg_store_tests.rs",
+          "anchor": "async fn openapi_publication_evidence_names_the_overlay_change("
+        },
+        {
+          "path": "gateway/src/connections/pg_store_tests.rs",
+          "anchor": "async fn a_failed_catalog_evidence_insert_rolls_back_the_publication("
         }
       ],
       "required_durability_supported": false,
-      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+      "test_claim": "PostgreSQL-gated regression anchors for the transactional catalog evidence. They do not certify the proposed authority-event contract, delivery or retention."
     },
     {
       "id": "catalog_standalone",
@@ -979,7 +1047,7 @@
       "follow_up": "Keep local-secret administration unavailable in cluster mode; external provider rotation is a separate authority and cannot share the gateway transaction.",
       "sources": [
         {
-          "path": "gateway/src/config.rs",
+          "path": "gateway/src/config/storage.rs",
           "anchor": "CONNECTION_LOCAL_SECRET_KEYRING,"
         },
         {
@@ -1139,15 +1207,15 @@
           "anchor": "async fn token_revoke_endpoint("
         }
       ],
-      "boundary": "rotate/revoke refuse an empty or oversized actor before checkout, then serialize on the token high-water mark and row, change the token row, reserve the shared revision, append the outbox row and one service_token_change_evidence row carrying the same revision and row-revision step, and commit once. An evidence insert failure rolls the whole change back and is reported as a store failure, never as the rotate conflict. Repeated revoke, rotate of a revoked token (a conflict) and an unknown ID write no outbox or evidence row.",
-      "record": "Outbox revision chain unchanged. service_token_change_evidence (migration 18) has no foreign key, so it survives removal of the token row and a restart; it holds the actor, action, event/operation UUIDs, prior/new row revision, shared revision and database-clock committed_at, never the plaintext, hash, display prefix or scopes. The token row still names only its creator.",
-      "actor": "actor_user_id: the authenticated principal subject the admin endpoint passes through ServiceTokenStore (1 to 4096 bytes, the principal bound), committed with each rotate and revoke and retained after it. Issuer, auth mode and a keyed safe actor reference are still absent.",
+      "boundary": "rotate/revoke refuse an actor the evidence cannot record exactly (ChangeActor::is_recordable) before checkout, then serialize on the token high-water mark and row, change the token row, reserve the shared revision, append the outbox row and one service_token_change_evidence row carrying the same revision and row-revision step, and commit once. An evidence insert failure rolls the whole change back and is reported as a store failure, never as the rotate conflict. Repeated revoke, rotate of a revoked token (a conflict) and an unknown ID write no outbox or evidence row.",
+      "record": "Outbox revision chain unchanged. service_token_change_evidence (migration 18) has no foreign key, so it survives removal of the token row and a restart; it holds the actor (subject and, since migration 24, kind, auth mode and canonical issuer), action, event/operation UUIDs, prior/new row revision, shared revision and database-clock committed_at, never the plaintext, hash, display prefix or scopes. The token row still names only its creator.",
+      "actor": "The authenticated principal the admin endpoint passes through ServiceTokenStore as a ChangeActor, committed with each rotate and revoke and retained after it: actor_user_id (the subject, 1 to 4096 bytes, the principal bound) and, since migration 24, actor_kind (principal for a session cookie, bearer JWT or client certificate; service_token for a service token, whose service-token:<id> subject would otherwise read like a person's), actor_auth_mode and actor_issuer (the canonical issuer of a principal that has one, 1 to 4096 bytes). Rows committed before migration 24 record none of the three. A keyed safe actor reference exists only in what is delivered.",
       "identity": "Generated event_id and operation_id UUIDs per store call (not bound to a client idempotency key), token ID, from/to row revisions and shared revision equal to the outbox row, database-clock committed_at; the action distinguishes rotate from revoke. A lost revoke response is reconciled from the token's evidence, and the repeat revoke records nothing. A lost rotate response cannot return its plaintext: the evidence shows the rotation committed, and rotating again records a second row.",
       "delivery": "journaled_dispatch",
       "disposition": [
         "missing_metadata"
       ],
-      "follow_up": "PR2 follow-up: carry issuer/auth mode and a caller-bound operation identity to the store; token issue still records only created_by and is not journaled. Delivery (PR3) journals each row in the change's transaction and dispatches it as authority_event_delivery.v1 behind a persisted cursor; required-durability mode is still not implemented.",
+      "follow_up": "PR2 follow-up: carry a caller-bound operation identity to the store and derive an issuer-scoped subject reference; token issue still records only created_by and is not journaled. Issuer, actor kind and auth mode are recorded since migration 24. Delivery (PR3) journals each row in the change's transaction and dispatches it as authority_event_delivery.v1 behind a persisted cursor; required-durability mode is still not implemented.",
       "sources": [
         {
           "path": "gateway/src/storage/migrations/0018_service_token_and_jwt_evidence.sql",
@@ -1155,11 +1223,11 @@
         },
         {
           "path": "gateway/src/storage/postgres_service_tokens.rs",
-          "anchor": "validate_change_actor(OPERATION_REVOKE, actor_user_id)?;"
+          "anchor": "validate_change_actor(OPERATION_REVOKE, actor)?;"
         },
         {
           "path": "gateway/src/storage/postgres_service_tokens.rs",
-          "anchor": "validate_change_actor(OPERATION_ROTATE, actor_user_id)?;"
+          "anchor": "validate_change_actor(OPERATION_ROTATE, actor)?;"
         },
         {
           "path": "gateway/src/storage/postgres_service_tokens.rs",
@@ -1171,15 +1239,27 @@
         },
         {
           "path": "gateway/src/admin_tokens.rs",
-          "anchor": "store.revoke(&token_id, &principal.user_id)"
+          "anchor": "store.revoke(&token_id, &actor)"
         },
         {
           "path": "gateway/src/admin_tokens.rs",
-          "anchor": "store.rotate(&token_id, &principal.user_id)"
+          "anchor": "store.rotate(&token_id, &actor)"
         },
         {
           "path": "gateway/src/storage/postgres_service_tokens.rs",
           "anchor": "JournalSource::ServiceTokenChange"
+        },
+        {
+          "path": "gateway/src/storage/migrations/0024_authority_evidence_actor_metadata.sql",
+          "anchor": "ALTER TABLE greengateway.service_token_change_evidence"
+        },
+        {
+          "path": "gateway/src/admin_tokens.rs",
+          "anchor": "auth::change_actor::ChangeActor::from_principal(&principal);"
+        },
+        {
+          "path": "gateway/src/auth/change_actor.rs",
+          "anchor": "pub(crate) fn from_principal(principal: &Principal) -> Self {"
         }
       ],
       "tests": [
@@ -1230,6 +1310,18 @@
         {
           "path": "gateway/src/storage/migrations.rs",
           "anchor": "async fn migration_twenty_one_journals_existing_evidence_in_commit_order("
+        },
+        {
+          "path": "gateway/src/app_tests.rs",
+          "anchor": "async fn admin_token_rotate_and_revoke_record_the_authenticated_subject_and_issuer_postgres("
+        },
+        {
+          "path": "gateway/src/storage/migrations.rs",
+          "anchor": "async fn migration_twenty_four_adds_actor_metadata_and_guesses_none_for_existing_evidence("
+        },
+        {
+          "path": "gateway/src/auth/change_actor.rs",
+          "anchor": "fn the_recordable_bounds_are_the_principal_bounds_exactly("
         }
       ],
       "required_durability_supported": false,
@@ -1254,16 +1346,16 @@
           "anchor": "async fn token_revoke_endpoint("
         }
       ],
-      "boundary": "SqliteTokenStore rotate/revoke refuse an empty or oversized actor, then run one IMMEDIATE transaction on the SERVICE_TOKEN_SQLITE_PATH database: read the revoked guard, update the guarded row, append one service_token_change_evidence row, reload and commit. An evidence insert failure rolls the change back and is reported as a store failure, never as the rotate conflict. A second connection to the file waits rather than interleaving.",
-      "record": "Current hash/revoked_at replaces earlier state and the creator is unchanged. The same database's service_token_change_evidence table (created on open, no foreign key) keeps one append-only row per committed rotate/revoke: actor, action, event/operation UUIDs and committed_at, never token material. Repeated revoke, rotate of a revoked token and an unknown ID write none. import-standalone does not carry these rows.",
-      "actor": "The authenticated principal subject the admin endpoint passes through ServiceTokenStore (1 to 4096 bytes), committed with the change. Issuer and auth mode are absent.",
+      "boundary": "SqliteTokenStore rotate/revoke refuse an actor the evidence cannot record exactly (ChangeActor::is_recordable), then run one IMMEDIATE transaction on the SERVICE_TOKEN_SQLITE_PATH database: read the revoked guard, update the guarded row, append one service_token_change_evidence row, reload and commit. An evidence insert failure rolls the change back and is reported as a store failure, never as the rotate conflict. A second connection to the file waits rather than interleaving.",
+      "record": "Current hash/revoked_at replaces earlier state and the creator is unchanged. The same database's service_token_change_evidence table (created on open, no foreign key) keeps one append-only row per committed rotate/revoke: actor (subject, kind, auth mode and canonical issuer, the last three in columns the store adds to an older database on open, with the same CHECK as PostgreSQL migration 24), action, event/operation UUIDs and committed_at, never token material. Repeated revoke, rotate of a revoked token and an unknown ID write none. import-standalone does not carry these rows.",
+      "actor": "The authenticated principal the admin endpoint passes through ServiceTokenStore as a ChangeActor, committed with the change: the subject (1 to 4096 bytes), actor_kind (principal or service_token), actor_auth_mode and the canonical actor_issuer of a principal that has one (1 to 4096 bytes). Rows written before the store added those columns record none of the three, and none is guessed.",
       "identity": "Generated event_id/operation_id UUIDs, token ID, a store sequence and the process-clock committed_at (the revoke's own revoked_at). SQLite token rows have no revision chain, so the row records no prior/new revision; no caller-bound operation ID.",
       "delivery": "post_commit_telemetry",
       "disposition": [
         "missing_metadata",
         "missing_delivery"
       ],
-      "follow_up": "PR4: issuer/auth mode and a store-owned revision per change; delivery from this same database, with no audit-database dual write. Token issue evidence remains open.",
+      "follow_up": "PR4: a store-owned revision per change; delivery from this same database, with no audit-database dual write. Token issue evidence remains open. Issuer, actor kind and auth mode are recorded.",
       "sources": [
         {
           "path": "gateway/src/auth/tokens.rs",
@@ -1280,6 +1372,14 @@
         {
           "path": "gateway/src/auth/tokens.rs",
           "anchor": "assert!(MAX_TOKEN_CHANGE_ACTOR_BYTES == crate::auth::principal::MAX_PRINCIPAL_SUBJECT_BYTES)"
+        },
+        {
+          "path": "gateway/src/auth/tokens.rs",
+          "anchor": "const CHANGE_EVIDENCE_ACTOR_COLUMNS: [(&str, &str); 3] = ["
+        },
+        {
+          "path": "gateway/src/auth/tokens.rs",
+          "anchor": "fn add_change_evidence_actor_columns(connection: &Connection)"
         }
       ],
       "tests": [
@@ -1310,6 +1410,18 @@
         {
           "path": "gateway/src/auth/tokens.rs",
           "anchor": "fn rotate_preserves_record_metadata_and_invalidates_old_plaintext("
+        },
+        {
+          "path": "gateway/src/app_tests.rs",
+          "anchor": "async fn admin_token_rotate_and_revoke_record_the_authenticated_subject_and_issuer_sqlite("
+        },
+        {
+          "path": "gateway/src/auth/tokens.rs",
+          "anchor": "fn change_evidence_actor_metadata_matches_both_schemas("
+        },
+        {
+          "path": "gateway/src/auth/tokens.rs",
+          "anchor": "fn an_older_evidence_table_gains_the_actor_columns_once_and_keeps_its_rows("
         }
       ],
       "required_durability_supported": false,
@@ -1324,19 +1436,19 @@
         "postgres"
       ],
       "entrypoints": [],
-      "boundary": "CLI revoke-jwt -> PostgresJwtRevocationStore::revoke; an empty or oversized actor is refused first. The revoke row, shared revision, outbox row and one jwt_revocation_evidence row copied from the row just written commit together; an already-effective duplicate rolls the reserved revision back and writes no evidence. An evidence insert failure rolls the revoke back.",
+      "boundary": "CLI revoke-jwt -> PostgresJwtRevocationStore::revoke with a ChangeActor::system actor; an actor the evidence cannot record exactly is refused first. The revoke row, shared revision, outbox row and one jwt_revocation_evidence row copied from the row just written commit together; an already-effective duplicate rolls the reserved revision back and writes no evidence. An evidence insert failure rolls the revoke back.",
       "record": "Outbox keeps scoped JTI digest/revision. The revocation row's actor is still overwritten by an extension or reactivation and the row is deleted by expiry cleanup, but jwt_revocation_evidence (migration 18, no foreign key, never touched by cleanup) keeps one append-only row per effective revoke: actor, action, issuer, JTI digest, the expiry the row then carried, shared revision and database-clock committed_at. No raw JTI.",
-      "actor": "The CLI records its literal system label operator:revoke-jwt on the row and in the evidence: system provenance, not an authenticated human identity. Each extension or reactivation keeps its own actor in its own evidence row. No actor kind, issuer or auth mode column yet.",
+      "actor": "The CLI records its literal system label operator:revoke-jwt on the row and in the evidence, and since migration 24 the evidence also says so: actor_kind system, actor_auth_mode system, no actor_issuer. It is system provenance, not an authenticated human identity, and can no longer be read as one. Each extension or reactivation keeps its own actor in its own evidence row; a principal actor would record its own canonical issuer in actor_issuer, beside (never in place of) the revoked token's issuer column. Rows committed before migration 24 record none of the three.",
       "identity": "Deployment+issuer-scoped JTI digest, generated event_id/operation_id UUIDs and the committed shared revision, equal to the outbox row's; outbox to_version=1 is still not a per-JWT version chain. No caller-bound operation ID.",
       "delivery": "journaled_dispatch",
       "disposition": [
         "missing_metadata"
       ],
-      "follow_up": "PR2 follow-up: an explicit system/principal actor kind if an authenticated revoke path ships; do not pretend the CLI authenticates a named operator. Delivery (PR3) journals each effective revoke in its transaction and dispatches it independently of denylist cleanup; required-durability mode is still not implemented.",
+      "follow_up": "PR2 follow-up: a caller-bound operation identity; an authenticated revoke path, if one ships, records a principal actor through the same ChangeActor, and the CLI must still never pretend to authenticate a named operator. Delivery (PR3) journals each effective revoke in its transaction and dispatches it independently of denylist cleanup; required-durability mode is still not implemented.",
       "sources": [
         {
           "path": "gateway/src/bootstrap.rs",
-          "anchor": ".revoke(&jti, expires_at.as_deref(), \"operator:revoke-jwt\")"
+          "anchor": "&auth::change_actor::ChangeActor::system(\"operator:revoke-jwt\"),"
         },
         {
           "path": "gateway/src/storage/postgres_jwt_revocations.rs",
@@ -1357,6 +1469,10 @@
         {
           "path": "gateway/src/storage/postgres_jwt_revocations.rs",
           "anchor": "JournalSource::JwtRevocation"
+        },
+        {
+          "path": "gateway/src/storage/migrations/0024_authority_evidence_actor_metadata.sql",
+          "anchor": "ALTER TABLE greengateway.jwt_revocation_evidence"
         }
       ],
       "tests": [
@@ -1399,6 +1515,14 @@
         {
           "path": "gateway/src/storage/migrations.rs",
           "anchor": "async fn migration_twenty_one_journals_existing_evidence_in_commit_order("
+        },
+        {
+          "path": "gateway/src/storage/migrations.rs",
+          "anchor": "async fn migration_twenty_four_adds_actor_metadata_and_guesses_none_for_existing_evidence("
+        },
+        {
+          "path": "gateway/src/authority_events/delivery_tests.rs",
+          "anchor": "fn actor_metadata_that_cannot_be_projected_faithfully_is_refused("
         }
       ],
       "required_durability_supported": false,
@@ -1579,11 +1703,11 @@
           "anchor": "const PRUNE_SESSIONS_SQL: &str"
         },
         {
-          "path": "gateway/src/config.rs",
+          "path": "gateway/src/config/storage.rs",
           "anchor": "standalone_memory is unsupported with {STATE_BACKEND}=postgres"
         },
         {
-          "path": "gateway/src/config.rs",
+          "path": "gateway/src/config/storage.rs",
           "anchor": "cluster_postgres requires {STATE_BACKEND}=postgres"
         }
       ],
@@ -1714,8 +1838,8 @@
       ],
       "entrypoints": [],
       "boundary": "import-standalone apply is offline and commits each section separately. Policy/tools activation reuse document transactions; Connection/token imports preserve state and intentionally do not replay old outbox entries.",
-      "record": "Imported durable state and policy/tools activation records; JSON stdout report carries section counts/checksums. The entire import/report has no single transaction or immutable operator-operation ledger.",
-      "actor": "IMPORT_ACTOR marks migration provenance; historic actors retained for imported policy history. It is not authenticated human attribution.",
+      "record": "Imported durable state and policy/tools activation records; each activation also writes one configuration.import document_change_evidence row (migration 23), which the import's validation counts. JSON stdout report carries section counts/checksums. The entire import/report has no single transaction or immutable operator-operation ledger.",
+      "actor": "IMPORT_ACTOR marks migration provenance, recorded as a system actor (auth mode system) on the activation evidence; historic actors retained for imported policy history. It is not authenticated human attribution.",
       "identity": "Natural-key idempotence per section and canonical checksums support resume; report has no persisted whole-import operation ID.",
       "delivery": "operator_output",
       "disposition": [

@@ -475,7 +475,10 @@ mod tests {
             .await
             .expect("token should create");
         store
-            .revoke(&revoked.record.id, "revoking-admin")
+            .revoke(
+                &revoked.record.id,
+                &crate::auth::change_actor::ChangeActor::for_test("revoking-admin"),
+            )
             .await
             .expect("token should revoke")
             .expect("token should exist");
@@ -727,7 +730,7 @@ mod tests {
         async fn revoke(
             &self,
             _id: &str,
-            _actor_user_id: &str,
+            _actor: &crate::auth::change_actor::ChangeActor,
         ) -> Result<Option<TokenRecord>, RepositoryError> {
             unimplemented!("not needed by this validator test")
         }
@@ -735,7 +738,7 @@ mod tests {
         async fn rotate(
             &self,
             _id: &str,
-            _actor_user_id: &str,
+            _actor: &crate::auth::change_actor::ChangeActor,
         ) -> Result<Option<CreatedToken>, RepositoryError> {
             unimplemented!("not needed by this validator test")
         }
@@ -780,7 +783,7 @@ mod tests {
         async fn revoke(
             &self,
             _id: &str,
-            _actor_user_id: &str,
+            _actor: &crate::auth::change_actor::ChangeActor,
         ) -> Result<Option<TokenRecord>, RepositoryError> {
             unimplemented!("not needed by this validator test")
         }
@@ -788,7 +791,7 @@ mod tests {
         async fn rotate(
             &self,
             _id: &str,
-            _actor_user_id: &str,
+            _actor: &crate::auth::change_actor::ChangeActor,
         ) -> Result<Option<CreatedToken>, RepositoryError> {
             unimplemented!("not needed by this validator test")
         }
@@ -853,7 +856,7 @@ mod tests {
         async fn revoke(
             &self,
             _id: &str,
-            _actor_user_id: &str,
+            _actor: &crate::auth::change_actor::ChangeActor,
         ) -> Result<Option<TokenRecord>, RepositoryError> {
             unimplemented!("not needed by this validator test")
         }
@@ -861,7 +864,7 @@ mod tests {
         async fn rotate(
             &self,
             _id: &str,
-            _actor_user_id: &str,
+            _actor: &crate::auth::change_actor::ChangeActor,
         ) -> Result<Option<CreatedToken>, RepositoryError> {
             unimplemented!("not needed by this validator test")
         }
@@ -913,7 +916,7 @@ mod tests {
         async fn revoke(
             &self,
             _id: &str,
-            _actor_user_id: &str,
+            _actor: &crate::auth::change_actor::ChangeActor,
         ) -> Result<Option<TokenRecord>, RepositoryError> {
             unimplemented!("not needed by this validator test")
         }
@@ -921,7 +924,7 @@ mod tests {
         async fn rotate(
             &self,
             _id: &str,
-            _actor_user_id: &str,
+            _actor: &crate::auth::change_actor::ChangeActor,
         ) -> Result<Option<CreatedToken>, RepositoryError> {
             unimplemented!("not needed by this validator test")
         }
@@ -979,7 +982,7 @@ mod tests {
             async fn revoke(
                 &self,
                 _id: &str,
-                _actor_user_id: &str,
+                _actor: &crate::auth::change_actor::ChangeActor,
             ) -> Result<Option<TokenRecord>, RepositoryError> {
                 unimplemented!("not needed by this validator test")
             }
@@ -987,7 +990,7 @@ mod tests {
             async fn rotate(
                 &self,
                 _id: &str,
-                _actor_user_id: &str,
+                _actor: &crate::auth::change_actor::ChangeActor,
             ) -> Result<Option<CreatedToken>, RepositoryError> {
                 unimplemented!("not needed by this validator test")
             }

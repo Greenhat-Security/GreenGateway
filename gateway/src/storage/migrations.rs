@@ -289,6 +289,20 @@ static MANIFEST: LazyLock<Vec<Migration>> = LazyLock::new(|| {
         )
         .finalize()
         .with_pinned_checksum("eeecf38667f534033fbfff0a1496ab591e904b19554fef096e6eddf0c523864e"),
+        Migration::new(
+            23,
+            "document_and_catalog_change_evidence",
+            include_str!("migrations/0023_document_and_catalog_change_evidence.sql"),
+        )
+        .finalize()
+        .with_pinned_checksum("884cd1b1a65f58a4efc0a11564cc8d84a27bce9c4f4c228d69e6d4479f7ce07b"),
+        Migration::new(
+            24,
+            "authority_evidence_actor_metadata",
+            include_str!("migrations/0024_authority_evidence_actor_metadata.sql"),
+        )
+        .finalize()
+        .with_pinned_checksum("5e85125a700f116dcc4b1b922d00322d40ed2253b77d6e7638198918a1238688"),
     ]
 });
 
@@ -323,28 +337,33 @@ impl SchemaCompatibility {
 
 // No adjacent release pair has been qualified across a schema change. Do
 // not widen these bounds or add an extension without the pinned SQL and
-// two-binary gate in issue #426. Moving the point from 21 to 22
-// (server-side policy drafts, #243 slice 9) is not an overlap: a schema-21
-// binary refuses schema 22 and this binary refuses schema 21, so that
-// upgrade is a coordinated drain/migrate/restart, as the moves from 15 to
-// 16 (#425), from 16 to 17 (member capability advertisements, #426 PR 1),
-// from 17 to 18 (service-token and JWT revocation change evidence, #425 PR
-// 2b), from 18 to 19 (shared admin sessions, #424), from 19 to 20 (the
-// durable contract fence, #426 PR 3) and from 20 to 21 (the authority-event
-// journal, #425 PR 3) were. A schema-20 binary must still not write
-// evidence after migration 21: its rows would never be journaled. The fence
+// two-binary gate in issue #426. Moving the point from 23 to 24 (the actor
+// metadata of the journaled authority evidence, #425) is not an overlap: a
+// schema-23 binary refuses schema 24 and this binary refuses schema 23, so
+// that upgrade is a coordinated drain/migrate/restart, as the moves from 15
+// to 16 (#425), from 16 to 17 (member capability advertisements, #426 PR
+// 1), from 17 to 18 (service-token and JWT revocation change evidence, #425
+// PR 2b), from 18 to 19 (shared admin sessions, #424), from 19 to 20 (the
+// durable contract fence, #426 PR 3), from 20 to 21 (the authority-event
+// journal, #425 PR 3), from 21 to 22 (server-side policy drafts, #243
+// slice 9) and from 22 to 23 (policy, tools and catalog change evidence,
+// #425 PR 2c) were. A schema-23 binary must not keep writing evidence after
+// migration 24: its Connection, service-token and JWT revocation rows would
+// record no actor kind, auth mode or issuer. A schema-22 binary would also
+// commit policy, tools and catalog changes without their evidence, and a
+// schema-20 one would write evidence that is never journaled. The fence
 // keeps covering every binary that can serve this database: none that
 // predates it accepts this ledger either.
 const BINARY_SCHEMA_COMPATIBILITY: SchemaCompatibility = SchemaCompatibility {
-    read: (22, 22),
-    write: (22, 22),
+    read: (24, 24),
+    write: (24, 24),
     approved_extensions: &[],
 };
 
 /// The intersection of the explicit read/write contracts, advertised to the
 /// roster. This is a summary, not proof of ledger integrity, permission to
 /// write a gated operation (`storage/compatibility.rs`), or permission to
-/// contract the schema. The shipped contract accepts only schema 22.
+/// contract the schema. The shipped contract accepts only schema 24.
 pub(crate) fn schema_version_range() -> (i32, i32) {
     BINARY_SCHEMA_COMPATIBILITY.serving_range()
 }
@@ -1124,12 +1143,12 @@ mod tests {
     fn the_shipped_contract_has_no_unproved_overlap() {
         assert_eq!(
             MANIFEST.len(),
-            22,
+            24,
             "review the compatibility contract when adding SQL"
         );
-        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.read, (22, 22));
-        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.write, (22, 22));
-        assert_eq!(schema_version_range(), (22, 22));
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.read, (24, 24));
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.write, (24, 24));
+        assert_eq!(schema_version_range(), (24, 24));
         assert!(BINARY_SCHEMA_COMPATIBILITY.approved_extensions.is_empty());
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len(), "")),
@@ -1140,7 +1159,7 @@ mod tests {
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 1, "")),
             Ok(SchemaStatus::NeedsUpgrade {
-                applied: 21,
+                applied: 23,
                 missing: 1
             })
         );
@@ -1149,43 +1168,50 @@ mod tests {
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 2, "")),
             Ok(SchemaStatus::NeedsUpgrade {
-                applied: 20,
+                applied: 22,
                 missing: 2
             })
         );
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 3, "")),
             Ok(SchemaStatus::NeedsUpgrade {
-                applied: 19,
+                applied: 21,
                 missing: 3
             })
         );
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 4, "")),
             Ok(SchemaStatus::NeedsUpgrade {
-                applied: 18,
+                applied: 20,
                 missing: 4
             })
         );
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 5, "")),
             Ok(SchemaStatus::NeedsUpgrade {
-                applied: 17,
+                applied: 19,
                 missing: 5
             })
         );
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 6, "")),
             Ok(SchemaStatus::NeedsUpgrade {
-                applied: 16,
+                applied: 18,
                 missing: 6
             })
         );
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 7, "")),
             Ok(SchemaStatus::NeedsUpgrade {
-                applied: 15,
+                applied: 17,
                 missing: 7
+            })
+        );
+        assert_eq!(
+            validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 8, "")),
+            Ok(SchemaStatus::NeedsUpgrade {
+                applied: 16,
+                missing: 8
             })
         );
     }
@@ -1782,7 +1808,7 @@ mod tests {
         let authority = PostgresReadinessAuthority::new(foundation.pool().clone());
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::Writable { schema_version: 22 }
+            AuthorityObservation::Writable { schema_version: 24 }
         );
         let client = foundation.pool().get().await.expect("fixture client");
         client
@@ -1794,7 +1820,7 @@ mod tests {
             .expect("change fixture checksum without changing extent");
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::IncompatibleSchema { schema_version: 22 }
+            AuthorityObservation::IncompatibleSchema { schema_version: 24 }
         );
         client
             .execute(
@@ -1805,7 +1831,7 @@ mod tests {
             .expect("restore fixture checksum");
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::Writable { schema_version: 22 }
+            AuthorityObservation::Writable { schema_version: 24 }
         );
         client
             .execute(
@@ -1816,7 +1842,7 @@ mod tests {
             .expect("remove a fixture history row");
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::IncompatibleSchema { schema_version: 22 }
+            AuthorityObservation::IncompatibleSchema { schema_version: 24 }
         );
         drop(client);
         clean_database(foundation.pool()).await;
@@ -2091,6 +2117,8 @@ mod tests {
                  DROP TABLE greengateway.authority_event_journal; \
                  DROP TABLE greengateway.authority_event_state; \
                  DROP TABLE greengateway.policy_drafts; \
+                 DROP TABLE greengateway.document_change_evidence; \
+                 DROP TABLE greengateway.catalog_change_evidence; \
                  DELETE FROM {LEDGER_TABLE} WHERE version >= 13;"
             ))
             .await
@@ -2386,7 +2414,10 @@ mod tests {
         assert!(snapshot("jwt_revocation_evidence").await.is_empty());
 
         store
-            .rotate(&live.record.id, "schema-18-admin")
+            .rotate(
+                &live.record.id,
+                &crate::auth::change_actor::ChangeActor::for_test("schema-18-admin"),
+            )
             .await
             .expect("rotate after the migration")
             .expect("the token exists");
@@ -2762,14 +2793,11 @@ mod tests {
         };
         let evidence_before = evidence_snapshot().await;
 
-        assert_eq!(
-            apply_missing(foundation.pool(), &test_settings())
-                .await
-                .expect("migrations 21 onward should apply"),
-            MigrateOutput::Applied {
-                applied: MANIFEST.len() - through_v20
-            }
-        );
+        // Migration 21 alone, so a later migration's columns cannot read as
+        // a change to the evidence it journals.
+        apply_one(&client, &MANIFEST[through_v20], &test_settings())
+            .await
+            .expect("migration 21 should apply");
         assert_eq!(evidence_snapshot().await, evidence_before);
 
         // Commit order, each row journaled at its own commit time (the
@@ -2832,6 +2860,14 @@ mod tests {
             .get(0);
         assert_eq!(cursors, 0, "no consumer exists until a dispatcher claims");
         drop(client);
+        assert_eq!(
+            apply_missing(foundation.pool(), &test_settings())
+                .await
+                .expect("the migrations after 21 should apply"),
+            MigrateOutput::Applied {
+                applied: MANIFEST.len() - through_v20 - 1
+            }
+        );
 
         let store = crate::storage::postgres_service_tokens::PostgresServiceTokenStore::new(
             foundation.pool().clone(),
@@ -2845,7 +2881,10 @@ mod tests {
             .await
             .expect("a token creates");
         store
-            .revoke(&token.record.id, "schema-21-admin")
+            .revoke(
+                &token.record.id,
+                &crate::auth::change_actor::ChangeActor::for_test("schema-21-admin"),
+            )
             .await
             .expect("the revoke commits")
             .expect("the token exists");
@@ -2862,6 +2901,195 @@ mod tests {
             .expect("the journal reads")
             .get(0);
         assert_eq!(head, Some(4));
+    }
+
+    /// Migration 24 adds the actor's kind, auth mode and issuer to the three
+    /// journaled evidence tables and backfills nothing: evidence committed before it
+    /// keeps every other column as it was and records none of the three. From
+    /// then on each table refuses a row that records some but not all of
+    /// them, a pairing authentication cannot produce, or an issuer for an
+    /// actor that has none.
+    #[tokio::test]
+    async fn migration_twenty_four_adds_actor_metadata_and_guesses_none_for_existing_evidence() {
+        let Some(dsn) = real_dsn() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = REAL_DATABASE.lock().await;
+        let dsn_file = write_dsn_file(&dsn);
+        let config = migration_config(&dsn_file);
+        let foundation = establish(&config).await;
+        clean_database(foundation.pool()).await;
+        let client = foundation.pool().get().await.expect("checkout");
+        bootstrap_ledger(&client)
+            .await
+            .expect("migration ledger should bootstrap");
+        let through_v23 = MANIFEST
+            .iter()
+            .take_while(|migration| migration.version <= 23)
+            .count();
+        for migration in &MANIFEST[..through_v23] {
+            apply_one(&client, migration, &test_settings())
+                .await
+                .expect("migrations through 23 should apply");
+        }
+
+        // One row in each table, as a schema-23 gateway wrote it.
+        client
+            .batch_execute(
+                "INSERT INTO greengateway.connection_change_evidence \
+                     (event_id, operation_id, actor_user_id, action, connection_id, \
+                      prior_version, security_revision) \
+                 VALUES (gen_random_uuid(), gen_random_uuid(), 'schema-23-admin', \
+                         'connection.delete', gen_random_uuid(), 2, 3); \
+                 INSERT INTO greengateway.service_token_change_evidence \
+                     (event_id, operation_id, actor_user_id, action, token_id, \
+                      prior_version, new_version, security_revision) \
+                 VALUES (gen_random_uuid(), gen_random_uuid(), 'schema-23-admin', \
+                         'service_token.revoke', 'tok-schema-23', 1, 2, 2); \
+                 INSERT INTO greengateway.jwt_revocation_evidence \
+                     (event_id, operation_id, actor_user_id, action, issuer, jti_hash, \
+                      security_revision) \
+                 VALUES (gen_random_uuid(), gen_random_uuid(), 'operator:revoke-jwt', \
+                         'jwt.revoke', 'https://issuer.example', repeat('d', 64), 1);",
+            )
+            .await
+            .expect("schema-23 evidence");
+        const TABLES: [&str; 3] = [
+            "connection_change_evidence",
+            "service_token_change_evidence",
+            "jwt_revocation_evidence",
+        ];
+        let snapshot = |without_metadata: bool| {
+            let client = &client;
+            async move {
+                let mut rows = Vec::new();
+                for table in TABLES {
+                    let projection = if without_metadata {
+                        "row_to_json(t)::jsonb - 'actor_kind' - 'actor_auth_mode' - 'actor_issuer'"
+                    } else {
+                        "row_to_json(t)::jsonb"
+                    };
+                    rows.extend(
+                        client
+                            .query(
+                                &format!("SELECT ({projection})::text FROM greengateway.{table} t"),
+                                &[],
+                            )
+                            .await
+                            .expect("evidence snapshot")
+                            .iter()
+                            .map(|row| row.get::<_, String>(0)),
+                    );
+                }
+                rows
+            }
+        };
+        let before = snapshot(false).await;
+        assert_eq!(before.len(), 3);
+
+        apply_one(&client, &MANIFEST[through_v23], &test_settings())
+            .await
+            .expect("migration 24 should apply");
+        assert_eq!(snapshot(true).await, before, "no other column changed");
+        for table in TABLES {
+            let unrecorded: i64 = client
+                .query_one(
+                    &format!(
+                        "SELECT count(*) FROM greengateway.{table} \
+                         WHERE actor_kind IS NULL AND actor_auth_mode IS NULL \
+                           AND actor_issuer IS NULL"
+                    ),
+                    &[],
+                )
+                .await
+                .expect("the new columns read")
+                .get(0);
+            assert_eq!(
+                unrecorded, 1,
+                "{table}: nothing is guessed into an older row"
+            );
+        }
+
+        // Every table holds the same rule.
+        let insert = |table: &'static str| match table {
+            "connection_change_evidence" => {
+                "INSERT INTO greengateway.connection_change_evidence \
+                     (event_id, operation_id, actor_user_id, action, connection_id, \
+                      prior_version, security_revision, actor_kind, actor_auth_mode, \
+                      actor_issuer) \
+                 VALUES (gen_random_uuid(), gen_random_uuid(), 'schema-24-admin', \
+                         'connection.delete', gen_random_uuid(), 2, 4, $1, $2, $3)"
+            }
+            "service_token_change_evidence" => {
+                "INSERT INTO greengateway.service_token_change_evidence \
+                     (event_id, operation_id, actor_user_id, action, token_id, \
+                      prior_version, new_version, security_revision, actor_kind, \
+                      actor_auth_mode, actor_issuer) \
+                 VALUES (gen_random_uuid(), gen_random_uuid(), 'schema-24-admin', \
+                         'service_token.revoke', 'tok-schema-24', 1, 2, 4, $1, $2, $3)"
+            }
+            _ => {
+                "INSERT INTO greengateway.jwt_revocation_evidence \
+                     (event_id, operation_id, actor_user_id, action, issuer, jti_hash, \
+                      security_revision, actor_kind, actor_auth_mode, actor_issuer) \
+                 VALUES (gen_random_uuid(), gen_random_uuid(), 'schema-24-admin', \
+                         'jwt.revoke', 'https://issuer.example', repeat('e', 64), 4, \
+                         $1, $2, $3)"
+            }
+        };
+        let issuer = "https://idp.example.test";
+        let longest_issuer = "i".repeat(crate::auth::principal::MAX_PRINCIPAL_ISSUER_BYTES);
+        let oversized_issuer = format!("{longest_issuer}i");
+        for table in TABLES {
+            for (kind, mode, actor_issuer) in [
+                (Some("principal"), Some("session_cookie"), Some(issuer)),
+                (Some("principal"), Some("bearer_token"), None),
+                (
+                    Some("principal"),
+                    Some("client_certificate"),
+                    Some(longest_issuer.as_str()),
+                ),
+                (Some("service_token"), Some("service_token"), None),
+                (Some("system"), Some("system"), None),
+            ] {
+                client
+                    .execute(insert(table), &[&kind, &mode, &actor_issuer])
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("{table} accepts {kind:?} {mode:?} {actor_issuer:?}: {error}")
+                    });
+            }
+            for (kind, mode, actor_issuer) in [
+                (Some("principal"), None, None),
+                (None, Some("bearer_token"), None),
+                (None, None, Some(issuer)),
+                (Some("person"), Some("bearer_token"), None),
+                (Some("principal"), Some("password"), None),
+                (Some("principal"), Some("service_token"), None),
+                (Some("principal"), Some("system"), None),
+                (Some("service_token"), Some("bearer_token"), None),
+                (Some("system"), Some("session_cookie"), None),
+                (Some("service_token"), Some("service_token"), Some(issuer)),
+                (Some("system"), Some("system"), Some(issuer)),
+                (Some("principal"), Some("bearer_token"), Some("")),
+                (
+                    Some("principal"),
+                    Some("bearer_token"),
+                    Some(oversized_issuer.as_str()),
+                ),
+            ] {
+                assert!(
+                    client
+                        .execute(insert(table), &[&kind, &mode, &actor_issuer])
+                        .await
+                        .is_err(),
+                    "{table} refuses {kind:?} {mode:?} {actor_issuer:?}"
+                );
+            }
+        }
+        drop(client);
+        clean_database(foundation.pool()).await;
     }
 
     #[tokio::test]

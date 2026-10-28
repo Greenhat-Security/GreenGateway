@@ -1704,3 +1704,136 @@ async fn a_disabled_delegated_connection_is_not_tested_because_its_keys_are_not_
     assert_eq!(harness.deployment.exchange_count(), 0);
     assert_eq!(harness.deployment.upstream_count(), 0);
 }
+
+/// A managed OpenAPI tool as a catalog registers it once its user-consent
+/// scheme binds to the delegated Connection (#443).
+fn list_messages_openapi_definition(connection_id: &str) -> ToolDefinition {
+    let mapping: crate::tools::definitions::HttpToolMapping = serde_json::from_value(json!({
+        "method": "GET",
+        "path_template": "/messages"
+    }))
+    .expect("the OpenAPI tool mapping deserializes");
+    ToolDefinition {
+        name: "list_messages".to_owned(),
+        title: None,
+        description: "Lists the caller's own messages through a delegated Connection.".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }),
+        target: Some(ToolTarget::Http {
+            connection_id: connection_id.to_owned(),
+            mapping: mapping.clone(),
+        }),
+        source: ToolSource::OpenApi {
+            connection_id: connection_id.to_owned(),
+            operation_id: Some("listMessages".to_owned()),
+            catalog_revision: Some(1),
+        },
+        upstream: mapping,
+        composite: None,
+        visibility: crate::tools::definitions::ToolVisibility::Listed,
+        transform: None,
+        enum_bindings: Vec::new(),
+        annotations: None,
+    }
+}
+
+#[tokio::test]
+async fn a_managed_openapi_tool_reaches_the_upstream_as_each_caller_with_their_own_token() {
+    let harness = harness(Issuer::Grant { expires_in: 3_600 }).await;
+    // The registry validates a catalog's binding with the lane's own
+    // constructor on every change, so the catalog stays installed.
+    assert!(harness
+        .connection
+        .runtime
+        .validate_openapi_tool_binding(&harness.connection.connection_id)
+        .is_ok());
+    let (executor, _) = executor_for_composite_definitions(
+        vec![list_messages_openapi_definition(
+            &harness.connection.connection_id,
+        )],
+        &harness.connection,
+        ["list_messages"],
+    );
+    let alice = bearer("alice", &["mail:read"]);
+    let bob = bearer("bob", &["mail:read"]);
+
+    for (caller, request_id) in [
+        (&alice, "openapi-alice-1"),
+        (&bob, "openapi-bob-1"),
+        (&alice, "openapi-alice-2"),
+    ] {
+        let result = executor
+            .execute(
+                "list_messages",
+                json!({}),
+                context_for(caller, request_id),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("a delegated OpenAPI tool call succeeds");
+        let response = http_response(result);
+        assert_eq!(response.status, StatusCode::OK);
+        let mailbox: Value =
+            serde_json::from_slice(&response.body).expect("the upstream answers JSON");
+        assert_eq!(mailbox, json!({ "mailbox": caller.user_id }));
+    }
+
+    // The same exchange and cache as a manual tool: one exchange per caller,
+    // and each upstream request carries that caller's own token and no
+    // assertion, which went to the issuer only.
+    assert_eq!(harness.deployment.exchange_count(), 2);
+    assert_eq!(harness.deployment.upstream_count(), 3);
+    harness.deployment.with_requests(|requests| {
+        for request in requests
+            .iter()
+            .filter(|request| request.target != EXCHANGE_PATH)
+        {
+            assert_eq!(request.target, "/v1/messages");
+            assert!(request
+                .header("authorization")
+                .is_some_and(|value| value.starts_with("Bearer delegated-")));
+            assert_eq!(request.header_count("x-caller-assertion"), 0);
+        }
+    });
+    harness
+        .wait_for(audit::event::CONNECTION_DELEGATED_TOKEN_EXCHANGE, 2)
+        .await;
+    for (exchange, caller) in harness
+        .events_of(audit::event::CONNECTION_DELEGATED_TOKEN_EXCHANGE)
+        .iter()
+        .zip([&alice, &bob])
+    {
+        assert_eq!(exchange.payload["outcome"], json!("success"));
+        assert_eq!(
+            exchange.actor.as_ref().map(|actor| actor.user_id.as_str()),
+            Some(caller.user_id.as_str())
+        );
+    }
+
+    // A call that names nobody has no token to obtain and no shared identity
+    // to fall back to: refused before anything is read, asked or sent.
+    let saved = harness.secrets.resolutions();
+    let anonymous = ToolInvocationContext {
+        caller: None,
+        ..context_for(&alice, "openapi-anonymous")
+    };
+    let refused = executor
+        .execute(
+            "list_messages",
+            json!({}),
+            anonymous,
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("nobody to exchange a token for");
+    assert_eq!(
+        work_failure_reason(refused).as_deref(),
+        Some("delegated_token_no_principal")
+    );
+    assert_eq!(harness.secrets.resolutions(), saved);
+    assert_eq!(harness.deployment.exchange_count(), 2);
+    assert_eq!(harness.deployment.upstream_count(), 3);
+}

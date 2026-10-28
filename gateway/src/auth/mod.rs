@@ -1,5 +1,6 @@
 pub mod admin_session;
 pub mod chain;
+pub(crate) mod change_actor;
 pub mod claims;
 pub mod client_certificate;
 pub mod cookie_session_validator;

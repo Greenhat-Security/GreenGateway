@@ -1,16 +1,27 @@
-//! Authority-event delivery settings (issue #425, PR 3).
+//! Authority-event delivery settings (issue #425, PR 3), compiled in a pure
+//! stage (issue #433, PR 2).
 //!
 //! Cluster mode journals every committed evidence row in its own transaction
 //! whatever these say; they choose where the dispatcher delivers the journal,
 //! the key its safe references are derived under, how much the journal may
 //! hold, and how long delivered rows stay. Standalone mode has no journal and
 //! no dispatcher, so every setting here is refused there rather than ignored.
+//!
+//! One block, [`AuthorityEventInputs`], read right after PostgreSQL's. Which
+//! rules apply depends on the state backend, so the storage stage compiles
+//! the block once the backend is parsed, into the same findings as its own
+//! rules: everything found here is reported before them, which is where the
+//! legacy parser reported it. Nothing here opens the event file or resolves
+//! a pseudonym key alias; the cluster wiring does both at startup.
 
 use std::{env::VarError, fmt, str::FromStr, time::Duration};
 
 use super::{
-    blank_as_unset, parse_optional_string, parse_var, validate_maximum_u64,
-    validate_positive_bounded_u64, StateBackend, STATE_BACKEND,
+    blank_as_unset,
+    diagnostic::ConfigRule,
+    parse_optional_string, parse_var,
+    stage::{Findings, Provenance, RawInput},
+    validate_maximum_u64, validate_positive_bounded_u64, StateBackend, STATE_BACKEND,
 };
 use crate::connections::{model::MAX_SECRET_ID_BYTES, secret::is_valid_opaque_id};
 
@@ -128,75 +139,150 @@ impl fmt::Display for UnknownSink {
     }
 }
 
-/// Read and validate the settings, in the order `CONFIG_INPUTS` lists them.
-pub(super) fn parse(
-    get_var: &mut impl FnMut(&str) -> Result<String, VarError>,
-    state_backend: StateBackend,
-    problems: &mut Vec<String>,
-) -> AuthorityEventSettings {
-    let sink_raw = blank_as_unset(get_var(AUTHORITY_EVENT_SINK));
-    let sink_set = sink_raw.is_ok();
-    let sink_kind = parse_var(
-        AUTHORITY_EVENT_SINK,
-        sink_raw,
-        SinkKind::None,
-        "authority event sink",
-        problems,
-    );
-    let file = parse_optional_string(
-        AUTHORITY_EVENT_FILE,
-        get_var(AUTHORITY_EVENT_FILE),
-        problems,
-    );
-    let key = parse_optional_string(
-        AUTHORITY_PSEUDONYM_KEY_ALIAS,
-        get_var(AUTHORITY_PSEUDONYM_KEY_ALIAS),
-        problems,
-    );
-    let previous = parse_optional_string(
-        AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS,
-        get_var(AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS),
-        problems,
-    );
-    let capacity_raw = blank_as_unset(get_var(AUTHORITY_EVENT_JOURNAL_CAPACITY));
-    let capacity_set = capacity_raw.is_ok();
-    let journal_capacity = validate_positive_bounded_u64(
-        AUTHORITY_EVENT_JOURNAL_CAPACITY,
-        parse_var(
-            AUTHORITY_EVENT_JOURNAL_CAPACITY,
-            capacity_raw,
-            DEFAULT_AUTHORITY_EVENT_JOURNAL_CAPACITY,
-            "event count",
-            problems,
-        ),
-        MAX_AUTHORITY_EVENT_JOURNAL_CAPACITY,
-        DEFAULT_AUTHORITY_EVENT_JOURNAL_CAPACITY,
-        problems,
-    );
-    let retention_raw = blank_as_unset(get_var(AUTHORITY_EVENT_RETENTION_HOURS));
-    let retention_set = retention_raw.is_ok();
-    let retention_hours = validate_maximum_u64(
-        AUTHORITY_EVENT_RETENTION_HOURS,
-        parse_var(
-            AUTHORITY_EVENT_RETENTION_HOURS,
-            retention_raw,
-            DEFAULT_AUTHORITY_EVENT_RETENTION_HOURS,
-            "hour count",
-            problems,
-        ),
-        MAX_AUTHORITY_EVENT_RETENTION_HOURS,
-        DEFAULT_AUTHORITY_EVENT_RETENTION_HOURS,
-        problems,
-    );
+/// The authority-event block's inputs, as the reader returned them.
+pub(super) struct AuthorityEventInputs {
+    sink: RawInput,
+    file: RawInput,
+    pseudonym_key_alias: RawInput,
+    previous_pseudonym_key_alias: RawInput,
+    journal_capacity: RawInput,
+    retention_hours: RawInput,
+}
 
+impl AuthorityEventInputs {
+    /// Requests every input of the block once, in the inventory's order.
+    pub(super) fn read(mut get_var: impl FnMut(&str) -> Result<String, VarError>) -> Self {
+        Self {
+            sink: RawInput::new(AUTHORITY_EVENT_SINK, get_var(AUTHORITY_EVENT_SINK)),
+            file: RawInput::new(AUTHORITY_EVENT_FILE, get_var(AUTHORITY_EVENT_FILE)),
+            pseudonym_key_alias: RawInput::new(
+                AUTHORITY_PSEUDONYM_KEY_ALIAS,
+                get_var(AUTHORITY_PSEUDONYM_KEY_ALIAS),
+            ),
+            previous_pseudonym_key_alias: RawInput::new(
+                AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS,
+                get_var(AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS),
+            ),
+            journal_capacity: RawInput::new(
+                AUTHORITY_EVENT_JOURNAL_CAPACITY,
+                get_var(AUTHORITY_EVENT_JOURNAL_CAPACITY),
+            ),
+            retention_hours: RawInput::new(
+                AUTHORITY_EVENT_RETENTION_HOURS,
+                get_var(AUTHORITY_EVENT_RETENTION_HOURS),
+            ),
+        }
+    }
+
+    pub(super) fn provenance(&self) -> Vec<Provenance> {
+        [
+            &self.sink,
+            &self.file,
+            &self.pseudonym_key_alias,
+            &self.previous_pseudonym_key_alias,
+            &self.journal_capacity,
+            &self.retention_hours,
+        ]
+        .into_iter()
+        .map(RawInput::provenance)
+        .collect()
+    }
+}
+
+/// Parses every input of the block, then checks the rules between them and
+/// the state backend, recording each problem in `findings`.
+///
+/// Each value is refused on its own once it is read. The alias shapes and
+/// every rule are reported once the block's last input is read, in the order
+/// below; the storage stage records its own rules after them.
+pub(super) fn compile(
+    inputs: &AuthorityEventInputs,
+    state_backend: StateBackend,
+    findings: &mut Findings,
+) -> AuthorityEventSettings {
+    // Set means set to anything but whitespace. A value that is not Unicode
+    // is refused as a value, and is not also reported as material the
+    // backend never reads.
+    let sink_raw = blank_as_unset(inputs.sink.value());
+    let sink_set = sink_raw.is_ok();
+    let sink_kind = findings.input(AUTHORITY_EVENT_SINK, |problems| {
+        parse_var(
+            AUTHORITY_EVENT_SINK,
+            sink_raw,
+            SinkKind::None,
+            "authority event sink",
+            problems,
+        )
+    });
+    let file = findings.input(AUTHORITY_EVENT_FILE, |problems| {
+        parse_optional_string(AUTHORITY_EVENT_FILE, inputs.file.value(), problems)
+    });
+    let key = findings.input(AUTHORITY_PSEUDONYM_KEY_ALIAS, |problems| {
+        parse_optional_string(
+            AUTHORITY_PSEUDONYM_KEY_ALIAS,
+            inputs.pseudonym_key_alias.value(),
+            problems,
+        )
+    });
+    let previous = findings.input(AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS, |problems| {
+        parse_optional_string(
+            AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS,
+            inputs.previous_pseudonym_key_alias.value(),
+            problems,
+        )
+    });
+    let capacity_raw = blank_as_unset(inputs.journal_capacity.value());
+    let capacity_set = capacity_raw.is_ok();
+    let journal_capacity = findings.input(AUTHORITY_EVENT_JOURNAL_CAPACITY, |problems| {
+        validate_positive_bounded_u64(
+            AUTHORITY_EVENT_JOURNAL_CAPACITY,
+            parse_var(
+                AUTHORITY_EVENT_JOURNAL_CAPACITY,
+                capacity_raw,
+                DEFAULT_AUTHORITY_EVENT_JOURNAL_CAPACITY,
+                "event count",
+                problems,
+            ),
+            MAX_AUTHORITY_EVENT_JOURNAL_CAPACITY,
+            DEFAULT_AUTHORITY_EVENT_JOURNAL_CAPACITY,
+            problems,
+        )
+    });
+    let retention_raw = blank_as_unset(inputs.retention_hours.value());
+    let retention_set = retention_raw.is_ok();
+    let retention_hours = findings.input(AUTHORITY_EVENT_RETENTION_HOURS, |problems| {
+        validate_maximum_u64(
+            AUTHORITY_EVENT_RETENTION_HOURS,
+            parse_var(
+                AUTHORITY_EVENT_RETENTION_HOURS,
+                retention_raw,
+                DEFAULT_AUTHORITY_EVENT_RETENTION_HOURS,
+                "hour count",
+                problems,
+            ),
+            MAX_AUTHORITY_EVENT_RETENTION_HOURS,
+            DEFAULT_AUTHORITY_EVENT_RETENTION_HOURS,
+            problems,
+        )
+    });
+
+    // Every check below is reported once the block's last input is read.
+    let after = AUTHORITY_EVENT_RETENTION_HOURS;
+
+    // An alias's shape is a property of its own value, but the legacy parser
+    // checks it once the whole block is read, so it is reported there.
     for (name, alias) in [
         (AUTHORITY_PSEUDONYM_KEY_ALIAS, key.as_deref()),
         (AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS, previous.as_deref()),
     ] {
         if alias.is_some_and(|alias| !is_valid_opaque_id(alias, MAX_SECRET_ID_BYTES)) {
-            problems.push(format!(
-                "{name} must be a secret alias ID of 1 to {MAX_SECRET_ID_BYTES} letters, digits, '.', '_' or '-', starting with a letter or digit; it names the key, never its material"
-            ));
+            findings.refuse(
+                after,
+                ConfigRule::Value,
+                format!(
+                    "{name} must be a secret alias ID of 1 to {MAX_SECRET_ID_BYTES} letters, digits, '.', '_' or '-', starting with a letter or digit; it names the key, never its material"
+                ),
+            );
         }
     }
 
@@ -211,9 +297,13 @@ pub(super) fn parse(
                 (AUTHORITY_EVENT_RETENTION_HOURS, retention_set),
             ] {
                 if set {
-                    problems.push(format!(
-                        "{name} is set while {STATE_BACKEND} is sqlite; standalone mode has no authority-event journal or dispatcher and never reads it"
-                    ));
+                    findings.refuse(
+                        after,
+                        ConfigRule::ClusterSettingInStandaloneMode,
+                        format!(
+                            "{name} is set while {STATE_BACKEND} is sqlite; standalone mode has no authority-event journal or dispatcher and never reads it"
+                        ),
+                    );
                 }
             }
         }
@@ -226,34 +316,52 @@ pub(super) fn parse(
                         (AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS, previous.is_some()),
                     ] {
                         if set {
-                            problems.push(format!(
-                                "{name} is set while {AUTHORITY_EVENT_SINK} is none; no dispatcher runs and nothing reads it"
-                            ));
+                            findings.refuse(
+                                after,
+                                ConfigRule::AuthorityEventMaterialUnused,
+                                format!(
+                                    "{name} is set while {AUTHORITY_EVENT_SINK} is none; no dispatcher runs and nothing reads it"
+                                ),
+                            );
                         }
                     }
                 }
                 SinkKind::Log | SinkKind::File => {
                     if key.is_none() {
-                        problems.push(format!(
-                            "{AUTHORITY_PSEUDONYM_KEY_ALIAS} is required when {AUTHORITY_EVENT_SINK} is set; delivered events name every actor and resource by a reference keyed under it, and there is no unkeyed mode"
-                        ));
+                        findings.refuse(
+                            after,
+                            ConfigRule::AuthorityEventSinkRequirements,
+                            format!(
+                                "{AUTHORITY_PSEUDONYM_KEY_ALIAS} is required when {AUTHORITY_EVENT_SINK} is set; delivered events name every actor and resource by a reference keyed under it, and there is no unkeyed mode"
+                            ),
+                        );
                     }
                 }
             }
             if sink_kind == SinkKind::File && file.is_none() {
-                problems.push(format!(
-                    "{AUTHORITY_EVENT_FILE} is required when {AUTHORITY_EVENT_SINK}=file"
-                ));
+                findings.refuse(
+                    after,
+                    ConfigRule::AuthorityEventSinkRequirements,
+                    format!("{AUTHORITY_EVENT_FILE} is required when {AUTHORITY_EVENT_SINK}=file"),
+                );
             }
             if sink_kind == SinkKind::Log && file.is_some() {
-                problems.push(format!(
-                    "{AUTHORITY_EVENT_FILE} is set while {AUTHORITY_EVENT_SINK}=log; only the file sink writes a file"
-                ));
+                findings.refuse(
+                    after,
+                    ConfigRule::AuthorityEventMaterialUnused,
+                    format!(
+                        "{AUTHORITY_EVENT_FILE} is set while {AUTHORITY_EVENT_SINK}=log; only the file sink writes a file"
+                    ),
+                );
             }
             if key.is_some() && key == previous {
-                problems.push(format!(
-                    "{AUTHORITY_PSEUDONYM_KEY_ALIAS} and {AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS} must name different aliases"
-                ));
+                findings.refuse(
+                    after,
+                    ConfigRule::AuthorityPseudonymKeysDistinct,
+                    format!(
+                        "{AUTHORITY_PSEUDONYM_KEY_ALIAS} and {AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS} must name different aliases"
+                    ),
+                );
             }
         }
     }

@@ -8,6 +8,11 @@
 //! the bindings for each authentication profile, and the error text for
 //! rejected documents. A difference here is a behaviour change for stored
 //! catalogs and needs its own review, not a fixture refresh.
+//!
+//! It was re-recorded once, when user-consent schemes started binding to
+//! per-caller Connections (issue #443): only the typed security model's
+//! text and the `delegated_issuer_token` profile's bindings changed, and
+//! every other profile's output is byte-for-byte the earlier recording.
 
 use serde_json::{json, Map, Value};
 

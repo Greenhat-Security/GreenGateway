@@ -1548,7 +1548,11 @@ async fn e2e_04_authenticated_mcp_stream_refresh_lkg_and_delete_workflow() {
         .install_mcp_connection_catalog(record.id.as_str(), Vec::new())
         .expect("cleared managed MCP catalog should install");
     control_plane
-        .delete_managed(&record.id, &record.etag(), ACCEPTANCE_ACTOR)
+        .delete_managed(
+            &record.id,
+            &record.etag(),
+            &crate::auth::change_actor::ChangeActor::for_test(ACCEPTANCE_ACTOR),
+        )
         .await
         .expect("managed MCP connection should delete");
     service.remove_connection(&record.id);

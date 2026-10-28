@@ -16,10 +16,10 @@
 //!
 //! The code describes the input, not the rule that refused it. The rule is a
 //! separate field, assigned by the configuration compiler's stages where each
-//! rule is checked (issue #433, PR 2): a problem one of those stages reports
-//! carries the [`ConfigRule`] that refused it, and a problem the legacy parser
-//! still reports directly carries none until its domain is extracted. Neither
-//! changes a word of the problems themselves.
+//! rule is checked (issue #433, PR 2). Every problem is now found by one of
+//! those stages and reaches the [`Report`] with the [`ConfigRule`] that
+//! refused it, so every diagnostic names its rule. Neither changes a word of
+//! the problems themselves.
 
 use std::{collections::BTreeMap, env::VarError};
 
@@ -139,27 +139,91 @@ pub(crate) enum ConfigRule {
     UpstreamRoutingSourcesExclusive,
     /// A host-bound upstream route is configured without `POLICY_FILE`.
     HostRoutesRequirePolicy,
+    /// A file-backed operator secret alias, or a keyring, is set without
+    /// `CONNECTION_SECRETS_ROOT`, the directory its files are read from.
+    SecretsRootRequired,
+    /// `CONNECTION_LOCAL_SECRET_KEYRING` is set without
+    /// `CONNECTIONS_SQLITE_PATH`, the store whose secrets it encrypts.
+    LocalKeyringRequiresConnectionsStore,
+    /// A secret provider's alias reuses the ID of an operator secret alias;
+    /// the providers share one alias namespace.
+    SecretAliasIdReserved,
+    /// `CLUSTER_MEMBER_STALE_MS` is shorter than the heartbeats a live
+    /// replica must be allowed to miss, a multiple of `CLUSTER_HEARTBEAT_MS`.
+    ClusterMemberStaleWindow,
+    /// `STATE_BACKEND=postgres` without a setting cluster mode requires: the
+    /// deployment ID, the database URL file, the rate-limit keyring, or the
+    /// admin login keyring while an admin login provider is set.
+    ClusterModeRequirements,
+    /// A local file or SQLite store is set while `STATE_BACKEND=postgres`,
+    /// where PostgreSQL is the single authority.
+    LocalAuthorityInClusterMode,
+    /// `ADMIN_SESSION_MODE` names a session store the state backend cannot
+    /// host.
+    AdminSessionStoreBackend,
+    /// A setting only cluster mode reads is set while `STATE_BACKEND` is
+    /// `sqlite`.
+    ClusterSettingInStandaloneMode,
+    /// `PAYLOAD_CAPTURE_ENABLED` is on in standalone mode without
+    /// `DISCOVERY_SQLITE_PATH` to store the captured shapes.
+    PayloadCaptureDestination,
+    /// An authority-event sink is configured without what it needs:
+    /// `AUTHORITY_PSEUDONYM_KEY_ALIAS` for either sink, and
+    /// `AUTHORITY_EVENT_FILE` for the file sink.
+    AuthorityEventSinkRequirements,
+    /// Authority-event delivery material is set that the configured sink
+    /// never reads: the event file or a pseudonym key alias while
+    /// `AUTHORITY_EVENT_SINK` is `none`, or the event file while it is `log`.
+    AuthorityEventMaterialUnused,
+    /// `AUTHORITY_PSEUDONYM_KEY_ALIAS` and
+    /// `AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS` name the same alias.
+    AuthorityPseudonymKeysDistinct,
 }
 
-/// The rule behind each problem a compiler stage reported, by the problem's
-/// position in the report.
+/// The problems the compiler's stages found, each with the rule that refused
+/// it, in the order they are reported.
 ///
-/// A side table rather than a field of the problem, because the legacy parser
-/// still pushes plain problems for the domains not extracted yet. A stage
-/// records the rule as it appends the problem, and nothing is ever inserted
-/// before an existing problem, so a recorded position never moves.
+/// The one way in is [`Report::push`], which takes a problem and its rule
+/// together, so the two lists stay one for one.
 #[derive(Default)]
-pub(super) struct Rules {
-    by_problem: BTreeMap<usize, ConfigRule>,
+pub(super) struct Report {
+    problems: Vec<String>,
+    rules: Vec<ConfigRule>,
 }
 
-impl Rules {
-    pub(super) fn record(&mut self, problem: usize, rule: ConfigRule) {
-        self.by_problem.insert(problem, rule);
+impl Report {
+    pub(super) fn push(&mut self, rule: ConfigRule, problem: String) {
+        self.rules.push(rule);
+        self.problems.push(problem);
     }
 
-    pub(super) fn rule(&self, problem: usize) -> Option<ConfigRule> {
-        self.by_problem.get(&problem).copied()
+    pub(super) fn is_empty(&self) -> bool {
+        self.problems.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(super) fn problems(&self) -> &[String] {
+        &self.problems
+    }
+
+    #[cfg(test)]
+    pub(super) fn rules(&self) -> &[ConfigRule] {
+        &self.rules
+    }
+
+    /// The operator-facing problems, and one diagnostic per problem in the
+    /// same order.
+    pub(super) fn into_problems_and_diagnostics(
+        self,
+        lookups: &Lookups,
+    ) -> (Vec<String>, Vec<ConfigDiagnostic>) {
+        let diagnostics = self
+            .problems
+            .iter()
+            .zip(&self.rules)
+            .map(|(problem, rule)| diagnostic(problem, lookups, *rule))
+            .collect();
+        (self.problems, diagnostics)
     }
 }
 
@@ -171,28 +235,13 @@ pub(crate) struct ConfigDiagnostic {
     /// begins with none.
     pub(crate) variable: Option<&'static str>,
     pub(crate) code: ConfigDiagnosticCode,
-    /// The rule that refused the problem when an extracted compiler stage
-    /// reported it, or `None` for a problem the legacy parser still reports
-    /// directly.
-    pub(crate) rule: Option<ConfigRule>,
+    /// The rule that refused the problem.
+    pub(crate) rule: ConfigRule,
     /// Built from `variable`, `code` and fixed text only.
     pub(crate) message: String,
 }
 
-/// One diagnostic per problem, in the same order.
-pub(super) fn diagnose(
-    problems: &[String],
-    lookups: &Lookups,
-    rules: &Rules,
-) -> Vec<ConfigDiagnostic> {
-    problems
-        .iter()
-        .enumerate()
-        .map(|(index, problem)| diagnostic(problem, lookups, rules.rule(index)))
-        .collect()
-}
-
-fn diagnostic(problem: &str, lookups: &Lookups, rule: Option<ConfigRule>) -> ConfigDiagnostic {
+fn diagnostic(problem: &str, lookups: &Lookups, rule: ConfigRule) -> ConfigDiagnostic {
     let Some(variable) = attributed_variable(problem) else {
         return ConfigDiagnostic {
             variable: None,
@@ -249,22 +298,30 @@ mod tests {
 
     #[test]
     fn a_problem_that_names_no_inventoried_setting_is_reported_without_its_text() {
-        let problems = [
+        let mut report = Report::default();
+        report.push(
+            ConfigRule::Value,
             "lowercase lead quoting 'zqcanary-value'".to_owned(),
+        );
+        report.push(
+            ConfigRule::ClusterModeRequirements,
             "NOT_A_GATEWAY_SETTING must be 'zqcanary-value'".to_owned(),
-        ];
-        let diagnostics = diagnose(&problems, &Lookups::default(), &Rules::default());
+        );
+        let (problems, diagnostics) = report.into_problems_and_diagnostics(&Lookups::default());
 
+        assert_eq!(problems.len(), 2);
         assert_eq!(diagnostics.len(), 2);
         for diagnostic in &diagnostics {
             assert_eq!(diagnostic.variable, None);
             assert_eq!(diagnostic.code, ConfigDiagnosticCode::Unattributed);
-            assert_eq!(diagnostic.rule, None);
             assert_eq!(
                 diagnostic.message,
                 "a configuration problem names no inventoried setting"
             );
         }
+        // The rule travels with its problem.
+        assert_eq!(diagnostics[0].rule, ConfigRule::Value);
+        assert_eq!(diagnostics[1].rule, ConfigRule::ClusterModeRequirements);
     }
 
     #[test]

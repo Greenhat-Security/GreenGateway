@@ -281,11 +281,14 @@ impl ManagedConnectionStore {
         }
     }
 
+    /// Delete on behalf of `actor`. The PostgreSQL store records the actor as
+    /// the deletion's evidence; the standalone store has no evidence table
+    /// for Connections yet (issue #425), so it takes no actor.
     pub async fn delete(
         &self,
         id: &ConnectionId,
         expected: &ConnectionEtag,
-        actor: &str,
+        actor: &crate::auth::change_actor::ChangeActor,
     ) -> Result<(), ConnectionStoreError> {
         match self {
             Self::Sqlite(store) => {

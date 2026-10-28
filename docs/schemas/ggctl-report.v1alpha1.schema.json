@@ -1,0 +1,153 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://greengateway.dev/schemas/ggctl-report.v1alpha1.schema.json",
+  "title": "ggctl Report",
+  "description": "The one document ggctl writes to standard output with --format json, for every command that does not write an artifact. exitCode and outcome are the process exit status and its stable name. Diagnostics are value-free: a stable family.reason code, fixed message text, an optional fixed hint, a documentation anchor, and at most the 1-based position of the command-line argument concerned; never an argument, token, URL, path, server response, or library error. A published diagnostic code never changes meaning; renaming or removing one requires a new report version. An argument error found before a command runs writes no report (exit 2, standard error only).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "kind", "command", "exitCode", "outcome", "diagnostics", "result"],
+  "properties": {
+    "apiVersion": {
+      "description": "Exact document version. No other version, prefix, or spelling is accepted.",
+      "const": "greengateway.dev/v1alpha1"
+    },
+    "kind": {
+      "const": "GgctlReport"
+    },
+    "command": {
+      "enum": ["version", "schema"]
+    },
+    "exitCode": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 8
+    },
+    "outcome": {
+      "enum": ["success", "failure", "usage", "invalid", "drift", "conflict", "unavailable", "integrity", "denied"]
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/diagnostic"
+      }
+    },
+    "result": {
+      "type": "object"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"command": {"const": "version"}}
+      },
+      "then": {
+        "properties": {"result": {"$ref": "#/$defs/versionResult"}}
+      }
+    },
+    {
+      "if": {
+        "properties": {"command": {"const": "schema"}}
+      },
+      "then": {
+        "properties": {"result": {"$ref": "#/$defs/schemaResult"}}
+      }
+    }
+  ],
+  "$defs": {
+    "diagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "severity", "message", "remediation"],
+      "properties": {
+        "code": {
+          "description": "The stable family.reason code. docs/ggctl.md lists every code by family.",
+          "type": "string",
+          "pattern": "^(usage|credential|trust|remote|compat|schema|output|internal)\\.[a-z][a-z0-9_]*$"
+        },
+        "severity": {
+          "enum": ["error", "warning", "info"]
+        },
+        "message": {
+          "description": "Fixed text chosen by the code.",
+          "type": "string"
+        },
+        "hint": {
+          "description": "Fixed guidance chosen by ggctl, never derived from input.",
+          "type": "string"
+        },
+        "remediation": {
+          "description": "A repository documentation anchor.",
+          "type": "string",
+          "pattern": "^docs/ggctl\\.md#[a-z]+-diagnostics$"
+        },
+        "location": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["argument"],
+          "properties": {
+            "argument": {
+              "description": "The 1-based position of the command-line argument after ggctl.",
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        }
+      }
+    },
+    "documentVersion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["apiVersion", "kind"],
+      "properties": {
+        "apiVersion": {"type": "string"},
+        "kind": {"type": "string"}
+      }
+    },
+    "versionResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["client", "schemas"],
+      "properties": {
+        "client": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "version"],
+          "properties": {
+            "name": {"const": "ggctl"},
+            "version": {"type": "string"}
+          }
+        },
+        "schemas": {
+          "description": "The document versions this ggctl publishes schemas for.",
+          "type": "array",
+          "items": {"$ref": "#/$defs/documentVersion"}
+        },
+        "server": {
+          "description": "Present only with --server. compatible is true only when the server's capability document was read and is one this ggctl implements; gatewayVersion appears when the server stated a well-formed one, and capabilities only when compatible.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["compatible"],
+          "properties": {
+            "compatible": {"type": "boolean"},
+            "gatewayVersion": {"type": "string"},
+            "capabilities": {
+              "description": "The server's GatewayCapabilities document as ggctl read it; gateway-capabilities.v1alpha1.schema.json is its schema.",
+              "type": "object"
+            }
+          }
+        }
+      }
+    },
+    "schemaResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemas"],
+      "properties": {
+        "schemas": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/documentVersion"}
+        }
+      }
+    }
+  }
+}
