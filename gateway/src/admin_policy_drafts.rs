@@ -29,7 +29,8 @@
 //! - **Validated like a policy write.** A candidate is parsed and checked
 //!   exactly as `PUT .../policy` checks one (schema, proxy dispatch, and no
 //!   egress change) when it is saved, and again against the current
-//!   authority when it is published.
+//!   authority when it is published, where the cross-resource checks of
+//!   [`persist_policy_mutation`] also run.
 
 use super::*;
 
