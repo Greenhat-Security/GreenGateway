@@ -2545,6 +2545,11 @@ pub(crate) mod postgres_audit_tests {
             .expect("the schema should migrate");
         let pool = foundation.pool().clone();
         let (schema_minimum, schema_maximum) = migrations::schema_version_range();
+        // The newest migration this binary's own migrator applies. A prepared
+        // build also serves an approved extension above it (schema_maximum),
+        // which only its successor applies.
+        let newest_migration =
+            i32::try_from(migrations::manifest_len()).expect("the manifest is short");
         let authority = PostgresReadinessAuthority::new(pool.clone());
 
         // A migrated database on a writable session: the ledger covers
@@ -2552,7 +2557,7 @@ pub(crate) mod postgres_audit_tests {
         assert_eq!(
             authority.observe().await,
             AuthorityObservation::Writable {
-                schema_version: schema_maximum
+                schema_version: newest_migration
             }
         );
         let readiness = ClusterReadiness::new();
@@ -2573,18 +2578,17 @@ pub(crate) mod postgres_audit_tests {
         let client = pool.get().await.expect("client checkout");
         // The ledger's `version` column is bigint; the manifest range is
         // the i32 a member row advertises.
-        let newest_migration = i64::from(schema_maximum);
         client
             .execute(
                 "DELETE FROM greengateway.schema_migrations WHERE version = $1",
-                &[&newest_migration],
+                &[&i64::from(newest_migration)],
             )
             .await
             .expect("the ledger row should delete");
         assert_eq!(
             authority.observe().await,
             AuthorityObservation::IncompatibleSchema {
-                schema_version: schema_maximum - 1
+                schema_version: newest_migration - 1
             }
         );
         assert_eq!(probe.blocked_reason().await, Some(SCHEMA_INCOMPATIBLE));

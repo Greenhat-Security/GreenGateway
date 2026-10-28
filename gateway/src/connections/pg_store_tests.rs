@@ -4376,6 +4376,107 @@ async fn catalog_evidence_survives_replacement_cascade_and_restart() {
     }
 }
 
+/// Migration 25 is approved by this build, not applied by it (issue #426):
+/// its successor adds the actor columns to `catalog_change_evidence` while
+/// this build's replicas still publish. Every publication writes its
+/// evidence through one function, which names each column it sets, so on the
+/// expanded table a publication still commits with its evidence row, the row
+/// records none of the new columns (which the migration's CHECK admits), and
+/// a restart on the expanded schema serves what was published.
+#[tokio::test]
+async fn a_prepared_store_publishes_catalog_evidence_on_the_approved_extension() {
+    let Some(admin_dsn) = locator() else {
+        eprintln!("skipping: no test database locator; CI runs this test");
+        return;
+    };
+    let database = create_test_database(&admin_dsn).await;
+    let (store, pool) = migrated_store(&database.dsn, 64).await;
+    crate::storage::migrations::apply_approved_extensions_as_the_successor(
+        &pool,
+        &crate::config::DatabaseSettings::default(),
+    )
+    .await
+    .expect("the successor applies migration 25");
+    let created = store
+        .create(mcp_candidate(), "creator", None)
+        .await
+        .expect("MCP connection should create");
+    store
+        .replace_mcp_catalog(
+            &created.id,
+            &created.etag(),
+            &[mcp_entry("alpha")],
+            &[],
+            &[],
+            0,
+            "publisher-a",
+        )
+        .await
+        .expect("a prepared publication commits on schema 25");
+    store
+        .replace_mcp_catalog(
+            &created.id,
+            &created.etag(),
+            &[mcp_entry("beta")],
+            &[],
+            &[],
+            1,
+            "publisher-b",
+        )
+        .await
+        .expect("and so does the next");
+    let rows = catalog_evidence_rows(&pool).await;
+    assert_eq!(
+        rows.iter()
+            .map(|row| (
+                row.action.as_str(),
+                row.actor_user_id.as_str(),
+                row.prior_version,
+                row.new_version,
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            ("catalog.mcp.publish", "publisher-a", None, 1),
+            ("catalog.mcp.publish", "publisher-b", Some(1), 2),
+        ]
+    );
+    assert_evidence_matches_outbox(&rows, &catalog_outbox(&pool, &created.id).await);
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT COUNT(*) FROM greengateway.catalog_change_evidence \
+             WHERE actor_kind IS NULL AND actor_auth_mode IS NULL AND actor_issuer IS NULL"
+        )
+        .await,
+        2,
+        "a prepared replica records no actor metadata, and guesses none"
+    );
+    drop(store);
+    drop(pool);
+
+    // A fresh process on the expanded schema: the auto-migrating startup
+    // path applies and removes nothing, and serves the published catalog.
+    let (restarted, pool) = migrated_store(&database.dsn, 64).await;
+    assert_eq!(
+        count(&pool, "SELECT COUNT(*) FROM greengateway.schema_migrations").await,
+        25
+    );
+    let catalog = restarted
+        .mcp_catalog(&created.id)
+        .await
+        .expect("the catalog reads")
+        .expect("the catalog is there");
+    assert_eq!(catalog.catalog_revision, 2);
+    assert_eq!(
+        catalog
+            .entries
+            .iter()
+            .map(|entry| entry.remote_tool_name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["beta"]
+    );
+}
+
 /// Every OpenAPI publication goes through one replacement, and its evidence
 /// names what the write did to the overlay: a put is
 /// `catalog.overlay.replace`, a delete `catalog.overlay.delete` (overlay

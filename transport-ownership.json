@@ -11532,7 +11532,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::migrations::apply_missing_for_startup#1",
-      "sha256": "e7c128e1f1b74466f4e240e5e96b5b27b54a4f8871494bc79aa41fe6f50bf41d",
+      "sha256": "82f494822119e52dc7d89aba273f4c5a8475befc4e745c53bb97b7c47f07ba04",
       "owner": "GreenGateway maintainers",
       "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
     },
