@@ -372,6 +372,8 @@ jobs:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Enforce egress-only outbound HTTP
         run: bash scripts/check-egress-only.sh
+      - name: Test the egress-only operator client pin
+        run: python -m unittest discover -s scripts -p test_egress_only.py -v
       - name: Enforce structural transport ownership
         run: python scripts/transport_guard.py check
       - name: Test structural transport guard
