@@ -10160,6 +10160,110 @@ pub(crate) mod postgres_audit_tests {
         );
     }
 
+    /// The authority-event journal capacity is one row every producer in
+    /// the deployment reserves against (issue #425), so a replica writes
+    /// its configured value only as part of being admitted. A replica held
+    /// at the fingerprint door with a lower capacity -- an old pod
+    /// restarting mid-rollout after the fleet raised it, or a misconfigured
+    /// one -- leaves the capacity the serving replicas enforce alone, at
+    /// boot and on every heartbeat while it is held, and producers keep
+    /// committing under it. Only once it is admitted (the serving replica
+    /// drained) is its value the deployment's, and applied.
+    #[tokio::test]
+    async fn a_replica_held_at_the_fingerprint_door_never_rewrites_the_journal_capacity() {
+        use crate::audit::{sink::tests::CaptureSink, AuditLog};
+        use crate::cluster_membership::JournalCapacity;
+        use crate::storage::postgres_authority_events::{
+            append_to_journal, JournalSource, PostgresAuthorityEventStore,
+        };
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let heartbeat = Duration::from_secs(1);
+        let window = Duration::from_secs(30);
+        let audit = AuditLog::new(Arc::new(CaptureSink::new()));
+        let lifecycle = crate::lifecycle::GatewayLifecycle::new();
+        let journal = Arc::new(PostgresAuthorityEventStore::new(pool.clone()));
+        let journal_capacity = |capacity: u64| JournalCapacity {
+            store: Arc::clone(&journal),
+            capacity,
+        };
+        let enforced = || async { journal.stats().await.expect("journal stats").capacity };
+
+        let serving_store = member_store(&pool);
+        let serving = ClusterMembership::with_journal_capacity(
+            serving_store.clone(),
+            registration('a'),
+            heartbeat,
+            window,
+            journal_capacity(2),
+        );
+        assert_eq!(
+            serving.register_boot().await.expect("boot"),
+            FingerprintAgreement::Agreed
+        );
+        assert_eq!(
+            enforced().await,
+            2,
+            "an admitted replica applies its capacity before it serves"
+        );
+
+        let held_store = member_store(&pool);
+        let held = ClusterMembership::with_journal_capacity(
+            held_store,
+            registration('b'),
+            heartbeat,
+            window,
+            journal_capacity(1),
+        );
+        assert_eq!(
+            held.register_boot().await.expect("boot"),
+            FingerprintAgreement::Disagreeing(vec![serving_store.instance_id()])
+        );
+        assert_eq!(
+            enforced().await,
+            2,
+            "a held replica's boot leaves the serving capacity alone"
+        );
+        held.tick_once(&lifecycle, None, &audit).await;
+        held.tick_once(&lifecycle, None, &audit).await;
+        assert_eq!(
+            held.readiness().blocked_reason(),
+            Some("config_fingerprint_mismatch")
+        );
+        assert_eq!(
+            enforced().await,
+            2,
+            "so does every heartbeat while it is held"
+        );
+        // Producers reserve against the serving value: a second event still
+        // commits where the held replica's capacity of 1 would refuse it.
+        let client = pool.get().await.expect("client");
+        for _ in 0..2 {
+            append_to_journal(
+                &client,
+                JournalSource::ServiceTokenChange,
+                &uuid::Uuid::new_v4().to_string(),
+            )
+            .await
+            .expect("the serving capacity admits the event");
+        }
+        drop(client);
+
+        serving_store.mark_draining().await.expect("drain");
+        held.tick_once(&lifecycle, None, &audit).await;
+        assert_eq!(held.readiness().blocked_reason(), None);
+        assert_eq!(
+            enforced().await,
+            1,
+            "admission applies the capacity the deployment now agrees on"
+        );
+    }
+
     /// Write a roster row the way a gateway that predates migration 17
     /// does: its heartbeat names no capabilities, so the row advertises
     /// nothing. Returns the row's instance ID.

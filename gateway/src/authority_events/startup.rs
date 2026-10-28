@@ -21,6 +21,7 @@ use crate::{
     audit,
     config::{AuthorityEventSettings, AuthorityEventSinkSetting},
     connections::secret::SecretResolver,
+    ha::ClusterReadiness,
     lifecycle::GatewayLifecycle,
     storage::{postgres_authority_events::PostgresAuthorityEventStore, RepositoryError},
     tools::lease::ExecutionLeaseStore,
@@ -36,6 +37,10 @@ pub(crate) struct AuthorityEventStartup {
     pub(crate) settings: AuthorityEventSettings,
     pub(crate) leases: Arc<dyn ExecutionLeaseStore>,
     pub(crate) holder: Uuid,
+    /// The cluster membership's readiness gate. The dispatcher contends for
+    /// its lease only while the gate admits this replica, so a replica held
+    /// at the fingerprint door never delivers or moves the cursor.
+    pub(crate) readiness: Arc<ClusterReadiness>,
 }
 
 /// Why delivery could not start. None carries key material, a path or an
@@ -76,7 +81,10 @@ impl std::error::Error for AuthorityEventStartupError {}
 impl AuthorityEventStartup {
     /// Resolve the keyring under the persisted authority ID, prove the sink
     /// can accept, record the keyring in the audit log by key ID, and spawn
-    /// the dispatcher. Nothing is spawned unless every step succeeded.
+    /// the dispatcher. Nothing is spawned unless every step succeeded. The
+    /// spawned dispatcher leads only once `readiness` admits this replica:
+    /// startup runs on a replica held at the fingerprint door too, and its
+    /// sink and keyring must still be proven, but it may not deliver.
     pub(crate) async fn start(
         self,
         lifecycle: &GatewayLifecycle,
@@ -141,6 +149,7 @@ impl AuthorityEventStartup {
             Arc::new(keyring),
             self.leases,
             self.holder,
+            self.readiness,
             DispatcherConfig::default(),
         );
         Ok(())
@@ -229,6 +238,7 @@ mod tests {
             },
             leases: Arc::new(MemoryLeaseStore::new(Duration::from_secs(5))),
             holder: Uuid::new_v4(),
+            readiness: ClusterReadiness::new(),
         }
     }
 
