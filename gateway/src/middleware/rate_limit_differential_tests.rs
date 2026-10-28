@@ -21,7 +21,10 @@ use tower::ServiceExt;
 
 use super::{legacy, *};
 use crate::{
-    audit::{sink::tests::CaptureSink, AuditSink},
+    audit::{
+        sink::tests::{CaptureSink, DurableBehaviour, DurableCaptureSink},
+        AuditSink,
+    },
     auth::{AuthMethod, Principal},
     middleware::{
         decision::{PolicyDecision, PolicyDecisionOutcome},
@@ -578,6 +581,69 @@ async fn a_refused_path_is_answered_and_audited_as_the_authorization_stage_answe
         vec![Some(f64::from(10 - REFUSED_PATHS.len() as u32))]
     );
     assert_eq!(charged(&new.state, &key), vec![None]);
+}
+
+/// Required audit durability (issue #425): the live stage's own refusal of a
+/// path the evaluator does not accept is answered `403` only once its record
+/// has committed, and as the audit outage while it cannot be. Neither answer
+/// lets the request past the stage.
+#[tokio::test]
+async fn a_refused_path_is_answered_only_once_its_record_commits_under_required_durability() {
+    let policy = generated_policy(false, true, &[(0, 0, 0, 10, 0)]);
+    let durable = DurableCaptureSink::new();
+    let audit = AuditLog::new_required(
+        Arc::new(durable.clone()) as Arc<dyn AuditSink>,
+        Duration::from_secs(5),
+    );
+    let state = unattached_state();
+    let rbac = RbacState::new(policy, Vec::new(), false, audit.clone())
+        .with_rate_limit_state(state.clone());
+    let downstream = Arc::new(AtomicUsize::new(0));
+    let reached = Arc::clone(&downstream);
+    let router = Router::new()
+        .fallback(axum::routing::any(move || {
+            let reached = Arc::clone(&reached);
+            async move {
+                reached.fetch_add(1, Ordering::SeqCst);
+                "downstream"
+            }
+        }))
+        .layer(from_fn_with_state(state.clone(), policy_rate_limit_request));
+    let live = Side {
+        state,
+        rbac,
+        router,
+        audit,
+        capture: CaptureSink::new(),
+        downstream,
+    };
+    let identity = principal(
+        "subject-a",
+        "https://idp-a.example.test",
+        &["reader"],
+        AuthMethod::Bearer,
+    );
+
+    durable.set(DurableBehaviour::Refuse);
+    let (status, decision) = send(&live, &Method::GET, "/data/../x", Some(&identity)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        decision.map(|decision| decision.reason),
+        Some("audit_unavailable")
+    );
+
+    durable.set(DurableBehaviour::Store);
+    let (status, decision) = send(&live, &Method::GET, "/data/../x", Some(&identity)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        decision.map(|decision| decision.reason),
+        Some("unsafe_path")
+    );
+    let stored = durable.events();
+    assert_eq!(stored.len(), 1, "only the committed refusal is stored");
+    assert_eq!(stored[0].event_type, "authz.denied");
+    assert_eq!(stored[0].payload["reason"], json!("unsafe_path"));
+    assert_eq!(live.downstream.load(Ordering::SeqCst), 0);
 }
 
 /// The stage selects with the snapshot the RBAC lane installed, the same

@@ -64,7 +64,7 @@ use super::{
         CallerAssertionConfig, PrincipalClaim,
     },
     control_plane::ConnectionControlPlane,
-    model::ConnectionId,
+    model::{ConnectionAuthentication, ConnectionId},
     oauth::{
         connection_test_owns_token_requests, duration_millis, is_json_content_type,
         token_request_headers, MintedOAuthToken, OAuthTokenCache, OAuthTokenCacheKey,
@@ -101,15 +101,18 @@ const EXCHANGE_AUDIT_REQUEST_ID: &str = "connection-delegated-token";
 /// each other, and a recorded purge's `security_revision` joins every replica's events of it.
 const PURGE_AUDIT_REQUEST_ID: &str = "connection-delegated-token-purge";
 
-/// How long a purge a revoked credential started stays recorded for its principal (cluster mode):
-/// the same principal's refused credentials record nothing more on this replica until it ends.
-/// Every token exchanged before the record has expired by then, whatever its issuer said, and one
-/// exchanged after it came from a call whose credential still validated.
+/// How long this replica remembers that it recorded the purge one revoked credential started
+/// (cluster mode): the same credential, refused again, records nothing more here until it ends.
+/// Nothing is lost by that. The record retired every token its principal held on every replica,
+/// and a revoked credential is refused before it can start an exchange of its own, so whatever
+/// the principal holds afterwards came from a credential that still validated. Another of the
+/// principal's credentials, revoked later, is another record. The window bounds how often one
+/// refused credential, presented over and over, moves the shared security revision.
 const REVOKED_CREDENTIAL_RECORD_WINDOW: Duration =
     Duration::from_secs(MAX_DELEGATED_TOKEN_CACHE_SECONDS);
 
-/// Most principals whose revoked-credential records this replica remembers at once. A replica
-/// that remembers this many fresh ones records the next purge anyway, unremembered.
+/// Most revoked credentials whose records this replica remembers at once. A replica that
+/// remembers this many fresh ones records the next purge anyway, unremembered.
 const MAX_REMEMBERED_REVOKED_CREDENTIAL_RECORDS: usize = MAX_DELEGATED_TOKEN_CACHE_ENTRIES;
 
 /// The waits before a revoked credential's purge is offered again to an authority that did not
@@ -278,7 +281,9 @@ pub enum DelegatedTokenPurgeTrigger {
     },
     /// A validator refused one of the principal's credentials because it is revoked. The
     /// credential's signature was verified first, so the principal is the one its issuer named.
-    CredentialRevoked,
+    /// `credential` tells this credential from the principal's others (see
+    /// [`Self::credential_revoked`]) without its `jti`.
+    CredentialRevoked { credential: [u8; 32] },
     /// A purge recorded at the authority (cluster mode), by another replica or by this one,
     /// applied here when this replica reconciled the shared security revision it took. Its audit
     /// names that revision.
@@ -286,11 +291,34 @@ pub enum DelegatedTokenPurgeTrigger {
 }
 
 impl DelegatedTokenPurgeTrigger {
+    /// The purge a validator's refusal of the principal's revoked credential `jti` starts. Only a
+    /// digest of the issuer, subject and `jti` is kept, length-prefixed so no two credentials
+    /// share an encoding.
+    pub(crate) fn credential_revoked(issuer: &str, subject: &str, jti: &str) -> Self {
+        let mut digest = Sha256::new();
+        digest.update(b"greengateway:delegated-token-revoked-credential:v1\0");
+        for part in [issuer, subject, jti] {
+            digest.update((part.len() as u64).to_be_bytes());
+            digest.update(part.as_bytes());
+        }
+        Self::CredentialRevoked {
+            credential: digest.finalize().into(),
+        }
+    }
+
     const fn label(&self) -> &'static str {
         match self {
             Self::Operator { .. } => "operator",
-            Self::CredentialRevoked => "credential_revoked",
+            Self::CredentialRevoked { .. } => "credential_revoked",
             Self::Replicated => "replicated",
+        }
+    }
+
+    /// The digest of the revoked credential that started this purge, if one did.
+    const fn revoked_credential(&self) -> Option<[u8; 32]> {
+        match self {
+            Self::CredentialRevoked { credential } => Some(*credential),
+            Self::Operator { .. } | Self::Replicated => None,
         }
     }
 
@@ -303,7 +331,7 @@ impl DelegatedTokenPurgeTrigger {
                 request_id,
                 source_ip,
             } => (request_id.as_str(), source_ip.as_str(), Some(actor)),
-            Self::CredentialRevoked | Self::Replicated => {
+            Self::CredentialRevoked { .. } | Self::Replicated => {
                 (PURGE_AUDIT_REQUEST_ID, "internal", None)
             }
         }
@@ -377,8 +405,11 @@ pub(crate) struct DelegatedTokenPurgeFailure {
 enum PurgeRecord {
     /// Standalone mode: there is no other replica.
     NotNeeded,
-    /// A purge a revoked credential of the same principal started was recorded by this replica
-    /// within [`REVOKED_CREDENTIAL_RECORD_WINDOW`], so this one was not recorded again.
+    /// A revoked credential's purge on a replica none of whose Connections caches tokens per
+    /// principal: no replica serving the same Connections holds one to purge.
+    NoPrincipalTokens,
+    /// A purge the same revoked credential started was recorded by this replica within
+    /// [`REVOKED_CREDENTIAL_RECORD_WINDOW`], so this one was not recorded again.
     RecentlyRecorded,
     /// Recorded at this shared security revision, for every replica to apply.
     Recorded(i64),
@@ -399,6 +430,7 @@ impl PurgeRecord {
     fn audit(&self) -> serde_json::Value {
         match self {
             Self::NotNeeded => serde_json::Value::Null,
+            Self::NoPrincipalTokens => json!({ "outcome": "not_needed" }),
             Self::RecentlyRecorded => json!({ "outcome": "recently_recorded" }),
             Self::Recorded(revision) => {
                 json!({ "outcome": "recorded", "security_revision": revision })
@@ -418,7 +450,7 @@ impl PurgeRecord {
 type PendingPurgeRecord = tokio::sync::oneshot::Receiver<Result<i64, PurgeNotRecorded>>;
 
 /// Cluster mode's half of the purge: the ledger, the deployment ID purge keys are derived under,
-/// and the principals whose revoked-credential purges were recorded lately.
+/// and the revoked credentials whose purges were recorded lately.
 struct ClusterPurges {
     ledger: Arc<dyn DelegatedTokenPurgeLedger>,
     deployment_id: String,
@@ -438,46 +470,50 @@ impl ClusterPurges {
         self.ledger.record(&self.purge_key(principal), origin).await
     }
 
-    /// Records a purge a revoked credential started, retrying an authority that did not take it.
-    /// A record that never lands is forgotten, so the principal's next refused credential tries
-    /// again; one the gate refused is not retried and stays remembered, because nothing will
-    /// change that within the window.
+    /// Records a purge the revoked credential `credential` started, retrying an authority that
+    /// did not take it. A record that never lands is forgotten, so the credential's next refusal
+    /// tries again. One the gate refused is not retried and stays remembered for the window: a
+    /// refused credential presented over and over then does not ask the gate, and audit its
+    /// refusal, every time, and the docs tell an operator to purge by principal once the rollout
+    /// is finished.
     async fn record_revoked_credential(
         &self,
         principal: &[u8; 32],
+        credential: &[u8; 32],
+        origin: &DelegatedTokenPurgeTrigger,
     ) -> Result<i64, PurgeNotRecorded> {
-        let origin = DelegatedTokenPurgeTrigger::CredentialRevoked;
-        let mut record = self.record(principal, &origin).await;
+        let mut record = self.record(principal, origin).await;
         for delay in REVOKED_CREDENTIAL_RECORD_RETRY_DELAYS {
             if record != Err(PurgeNotRecorded::Unavailable) {
                 break;
             }
             tokio::time::sleep(delay).await;
-            record = self.record(principal, &origin).await;
+            record = self.record(principal, origin).await;
         }
         if record == Err(PurgeNotRecorded::Unavailable) {
-            self.records_guard().remove(principal);
+            self.records_guard().remove(credential);
         }
         record
     }
 
-    /// Whether a purge `principal`'s revoked credential started should be recorded now: `false`
-    /// when one was recorded within [`REVOKED_CREDENTIAL_RECORD_WINDOW`]. Remembers it otherwise.
-    fn claim_revoked_credential_record(&self, principal: [u8; 32]) -> bool {
+    /// Whether the purge the revoked credential `credential` started should be recorded now:
+    /// `false` when one it started was recorded within [`REVOKED_CREDENTIAL_RECORD_WINDOW`].
+    /// Remembers it otherwise.
+    fn claim_revoked_credential_record(&self, credential: [u8; 32]) -> bool {
         let now = Instant::now();
         let fresh =
             |at: &Instant| now.saturating_duration_since(*at) < REVOKED_CREDENTIAL_RECORD_WINDOW;
         let mut records = self.records_guard();
-        if records.get(&principal).is_some_and(fresh) {
+        if records.get(&credential).is_some_and(fresh) {
             return false;
         }
         if records.len() >= MAX_REMEMBERED_REVOKED_CREDENTIAL_RECORDS {
             records.retain(|_, at| fresh(at));
         }
         if records.len() < MAX_REMEMBERED_REVOKED_CREDENTIAL_RECORDS
-            || records.contains_key(&principal)
+            || records.contains_key(&credential)
         {
-            records.insert(principal, now);
+            records.insert(credential, now);
         }
         true
     }
@@ -705,7 +741,7 @@ impl DelegatedTokenRuntime {
     /// [`DelegatedTokenPurgeLedger`]), in the background: this returns once this replica's entries
     /// are gone. An operator's purge waits for the record instead, through
     /// [`Self::purge_principal_everywhere`]. A revoked credential's purge is recorded at most once
-    /// per principal per [`REVOKED_CREDENTIAL_RECORD_WINDOW`] on this replica, and retried a
+    /// per credential per [`REVOKED_CREDENTIAL_RECORD_WINDOW`] on this replica, and retried a
     /// little when the authority does not take it.
     pub(crate) fn purge_principal(
         &self,
@@ -777,17 +813,25 @@ impl DelegatedTokenRuntime {
             .cache
             .retire_where(|key| key.principal == Some(principal));
         let purged = retired.len().saturating_add(google_purged);
-        let revoked_credential = matches!(trigger, DelegatedTokenPurgeTrigger::CredentialRevoked);
+        let revoked_credential = trigger.revoked_credential();
         let pending = match self.cluster.as_ref() {
             None => Err(PurgeRecord::NotNeeded),
+            // A revoked credential can be refused on any request, so where no Connection caches
+            // tokens per principal its record would move the shared revision, and make every
+            // replica reconcile, for nothing.
+            Some(_) if revoked_credential.is_some() && !self.caches_principal_tokens() => {
+                Err(PurgeRecord::NoPrincipalTokens)
+            }
             Some(cluster)
-                if revoked_credential && !cluster.claim_revoked_credential_record(principal) =>
+                if revoked_credential.is_some_and(|credential| {
+                    !cluster.claim_revoked_credential_record(credential)
+                }) =>
             {
                 Err(PurgeRecord::RecentlyRecorded)
             }
             Some(cluster) => Ok(Arc::clone(cluster)),
         };
-        if purged == 0 && revoked_credential && pending.is_err() {
+        if purged == 0 && revoked_credential.is_some() && pending.is_err() {
             return None;
         }
         let purge = DelegatedTokenPurge {
@@ -815,10 +859,13 @@ impl DelegatedTokenRuntime {
         // their audit. The purge is audited once the record's fate is known, so its event says
         // whether the other replicas were told.
         tokio::spawn(async move {
-            let recorded = if revoked_credential {
-                cluster.record_revoked_credential(&principal).await
-            } else {
-                cluster.record(&principal, &purge.trigger).await
+            let recorded = match revoked_credential {
+                Some(credential) => {
+                    cluster
+                        .record_revoked_credential(&principal, &credential, &purge.trigger)
+                        .await
+                }
+                None => cluster.record(&principal, &purge.trigger).await,
             };
             purge.emit(purged, google_purged, &PurgeRecord::from_result(&recorded));
             // The operator may have stopped waiting; the outcome is in the audit either way.
@@ -829,6 +876,23 @@ impl DelegatedTokenRuntime {
             purged,
             record: Some(record),
         })
+    }
+
+    /// Whether this replica's Connections include one that caches tokens per principal: a
+    /// `delegated_issuer_token` or `google_domain_wide_delegation` Connection, enabled or not.
+    /// Without one, no replica serving the same Connections holds a token a purge could name.
+    fn caches_principal_tokens(&self) -> bool {
+        self.control_plane
+            .runtime_snapshot()
+            .managed()
+            .values()
+            .any(|record| {
+                matches!(
+                    record.write.authentication,
+                    ConnectionAuthentication::DelegatedIssuerToken { .. }
+                        | ConnectionAuthentication::GoogleDomainWideDelegation { .. }
+                )
+            })
     }
 
     /// Applies purges recorded at the authority (cluster mode) to this replica's caches, and

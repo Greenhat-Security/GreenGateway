@@ -17,6 +17,12 @@ pub const POLICY_DRAFT_PUBLISH_REFUSED: &str = "policy.draft_publish_refused";
 pub const SIGNAL_OPENED: &str = "signal.opened";
 pub const SIGNAL_LIFECYCLE_CHANGED: &str = "signal.lifecycle_changed";
 pub const SUGGESTION_LIFECYCLE_CHANGED: &str = "suggestion.lifecycle_changed";
+/// A policy test suite was run (issue #243, slice 11). Records the policy
+/// ETag, suite digest and counts of a completed run, never its cases.
+pub const POLICY_TESTS_RUN: &str = "policy.tests_run";
+/// A policy simulation completed (issue #243, slice 10). Records the base
+/// and candidate ETags, the request digest and counts, never its cases.
+pub const POLICY_SIMULATION_RUN: &str = "policy.simulation_run";
 pub const SERVICE_TOKEN_CHANGED: &str = "service_token.changed";
 pub const SERVICE_TOKEN_DELEGATION_REJECTED: &str = "service_token.delegation_rejected";
 /// A write of an operation gated on member capabilities was refused because

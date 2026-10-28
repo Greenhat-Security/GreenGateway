@@ -638,21 +638,23 @@ async fn revoked_jti_is_rejected_and_noop_revocation_allows() {
     assert_eq!(principal.session_id, "session-123");
 }
 
-/// Every principal a validator reported as presenting a revoked credential.
+/// Every principal a validator reported as presenting a revoked credential, with the credential's
+/// `jti`.
 #[derive(Default)]
-struct RecordingRevokedCredentials(std::sync::Mutex<Vec<(String, String)>>);
+struct RecordingRevokedCredentials(std::sync::Mutex<Vec<(String, String, String)>>);
 
 impl RevokedCredentialObserver for RecordingRevokedCredentials {
-    fn credential_revoked(&self, issuer: &str, subject: &str) {
-        self.0
-            .lock()
-            .expect("observer lock")
-            .push((issuer.to_owned(), subject.to_owned()));
+    fn credential_revoked(&self, issuer: &str, subject: &str, jti: &str) {
+        self.0.lock().expect("observer lock").push((
+            issuer.to_owned(),
+            subject.to_owned(),
+            jti.to_owned(),
+        ));
     }
 }
 
 impl RecordingRevokedCredentials {
-    fn reported(&self) -> Vec<(String, String)> {
+    fn reported(&self) -> Vec<(String, String, String)> {
         self.0.lock().expect("observer lock").clone()
     }
 }
@@ -678,12 +680,13 @@ async fn a_revoked_jti_reports_the_principal_it_names_and_nothing_else_does() {
         .await
         .expect_err("a revoked jti is refused");
     assert_invalid_session(error, "revoked_token");
-    // The validator's own issuer boundary, normalized, and the token's subject.
+    // The validator's own issuer boundary, normalized, the token's subject and its jti.
     assert_eq!(
         observer.reported(),
         [(
             "https://issuer.example.test".to_owned(),
-            "user-123".to_owned()
+            "user-123".to_owned(),
+            "session-123".to_owned()
         )]
     );
 
@@ -1608,6 +1611,8 @@ fn test_config(jwks_url: Option<&str>) -> Config {
         shutdown_drain_delay_ms: crate::config::DEFAULT_SHUTDOWN_DRAIN_DELAY_MS,
         shutdown_timeout_ms: crate::config::DEFAULT_SHUTDOWN_TIMEOUT_MS,
         audit_drain_timeout_ms: crate::config::DEFAULT_AUDIT_DRAIN_TIMEOUT_MS,
+        audit_durability: crate::config::DEFAULT_AUDIT_DURABILITY,
+        audit_durability_timeout_ms: crate::config::DEFAULT_AUDIT_DURABILITY_TIMEOUT_MS,
         discovery_sqlite_path: None,
         discovery_endpoint_limit: crate::config::DEFAULT_DISCOVERY_ENDPOINT_LIMIT,
         discovery_projector_lease_ttl_ms: crate::config::DEFAULT_DISCOVERY_PROJECTOR_LEASE_TTL_MS,

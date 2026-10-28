@@ -67,7 +67,7 @@ async fn deployment() -> Option<(
         .commit(PolicyCommitRequest {
             precondition: PolicyCommitPrecondition::Initialize,
             candidate: &policy(),
-            actor_user_id: "installer",
+            change: crate::storage::DocumentChange::test_policy("installer"),
             diff_summary: &json!({ "action": "seed" }),
         })
         .await

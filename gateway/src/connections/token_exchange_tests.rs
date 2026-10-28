@@ -783,44 +783,60 @@ fn cluster_purges() -> ClusterPurges {
     }
 }
 
+/// Which revoked credential a validator refused, as the purge's trigger
+/// carries it.
+fn revoked_credential(subject: &str, jti: &str) -> [u8; 32] {
+    DelegatedTokenPurgeTrigger::credential_revoked("https://idp.example.test", subject, jti)
+        .revoked_credential()
+        .expect("a revoked credential's purge names the credential")
+}
+
 /// The same refused credential can be presented any number of times, so a
-/// replica records its principal's purge once per window, and every other
-/// principal's on their own.
+/// replica records the purge it starts once per window. Another credential
+/// of the same principal, revoked later, may have been used meanwhile on any
+/// replica, so it is recorded on its own, as is every other principal's.
 #[test]
-fn a_revoked_credential_is_recorded_once_per_principal_per_window() {
+fn a_revoked_credential_is_recorded_once_per_credential_per_window() {
     let cluster = cluster_purges();
-    let alice = principal_digest("https://idp.example.test", "alice");
-    let bob = principal_digest("https://idp.example.test", "bob");
-    assert!(cluster.claim_revoked_credential_record(alice));
-    assert!(!cluster.claim_revoked_credential_record(alice));
+    let alice_laptop = revoked_credential("alice", "session-laptop");
+    let alice_phone = revoked_credential("alice", "session-phone");
+    let bob = revoked_credential("bob", "session-laptop");
+    assert_ne!(alice_laptop, alice_phone);
+    assert_ne!(alice_laptop, bob);
+    assert_eq!(
+        DelegatedTokenPurgeTrigger::Replicated.revoked_credential(),
+        None
+    );
+    assert!(cluster.claim_revoked_credential_record(alice_laptop));
+    assert!(!cluster.claim_revoked_credential_record(alice_laptop));
+    assert!(cluster.claim_revoked_credential_record(alice_phone));
+    assert!(!cluster.claim_revoked_credential_record(alice_phone));
     assert!(cluster.claim_revoked_credential_record(bob));
 
-    // Once the window has passed, the principal is recorded again.
+    // Once the window has passed, the credential is recorded again.
     let expired = Instant::now()
         .checked_sub(REVOKED_CREDENTIAL_RECORD_WINDOW + Duration::from_secs(1))
         .expect("the test clock reaches back one window");
-    cluster.records_guard().insert(alice, expired);
-    assert!(cluster.claim_revoked_credential_record(alice));
-    assert!(!cluster.claim_revoked_credential_record(alice));
+    cluster.records_guard().insert(alice_laptop, expired);
+    assert!(cluster.claim_revoked_credential_record(alice_laptop));
+    assert!(!cluster.claim_revoked_credential_record(alice_laptop));
 }
 
-/// A replica remembers a bounded number of principals. When every slot
-/// holds a fresh record it records the next principal's purge anyway --
+/// A replica remembers a bounded number of credentials. When every slot
+/// holds a fresh record it records the next credential's purge anyway --
 /// never skipping one it cannot remember -- and expired records make room.
 #[test]
 fn a_full_record_window_records_anyway_and_makes_room_from_expired_entries() {
     let cluster = cluster_purges();
     for index in 0..MAX_REMEMBERED_REVOKED_CREDENTIAL_RECORDS {
-        assert!(cluster.claim_revoked_credential_record(principal_digest(
-            "https://idp.example.test",
-            &format!("user-{index}"),
-        )));
+        assert!(cluster
+            .claim_revoked_credential_record(revoked_credential(&format!("user-{index}"), "jti")));
     }
-    let late = principal_digest("https://idp.example.test", "late");
+    let late = revoked_credential("late", "jti");
     assert!(cluster.claim_revoked_credential_record(late));
     assert!(
         cluster.claim_revoked_credential_record(late),
-        "a principal the full window could not remember is recorded every time"
+        "a credential the full window could not remember is recorded every time"
     );
     assert_eq!(
         cluster.records_guard().len(),
@@ -843,9 +859,94 @@ fn a_full_record_window_records_anyway_and_makes_room_from_expired_entries() {
     );
 }
 
+/// A ledger that takes every record, in order.
+#[derive(Default)]
+struct RecordingLedger(Mutex<Vec<String>>);
+
+#[async_trait::async_trait]
+impl DelegatedTokenPurgeLedger for RecordingLedger {
+    async fn record(
+        &self,
+        purge_key: &str,
+        _origin: &DelegatedTokenPurgeTrigger,
+    ) -> Result<i64, PurgeNotRecorded> {
+        let mut records = self.0.lock().expect("ledger lock");
+        records.push(purge_key.to_owned());
+        Ok(i64::try_from(records.len()).expect("a test ledger stays small"))
+    }
+}
+
+/// Where no Connection caches tokens per principal, no replica serving the
+/// same Connections can hold one, so a revoked credential, which can be
+/// refused on any request, records nothing for the others. An operator's
+/// purge still records: the operator is told the revision every replica
+/// applies it at.
+#[tokio::test]
+async fn a_revoked_credential_records_nothing_where_no_connection_caches_principal_tokens() {
+    let ledger = Arc::new(RecordingLedger::default());
+    let runtime = DelegatedTokenRuntime::new(
+        ConnectionControlPlane::from_config(&crate::config::Config::test_defaults())
+            .expect("control plane builds"),
+    )
+    .with_cluster_purges(
+        Arc::clone(&ledger) as Arc<dyn DelegatedTokenPurgeLedger>,
+        "deploy-no-delegation",
+    );
+    assert!(!runtime.caches_principal_tokens());
+
+    let purged = runtime.purge_principal(
+        "https://idp.example.test",
+        "alice",
+        DelegatedTokenPurgeTrigger::credential_revoked(
+            "https://idp.example.test",
+            "alice",
+            "session-alice",
+        ),
+        0,
+    );
+    assert_eq!(purged, 0);
+    assert!(
+        runtime
+            .cluster
+            .as_ref()
+            .expect("cluster mode")
+            .records_guard()
+            .is_empty(),
+        "nothing is remembered either, so a later delegated Connection records the next refusal"
+    );
+
+    let outcome = runtime
+        .purge_principal_everywhere(
+            "https://idp.example.test",
+            "alice",
+            DelegatedTokenPurgeTrigger::Operator {
+                actor: crate::auth::actor_from_principal(&Principal {
+                    user_id: "operator".to_owned(),
+                    issuer: Some("https://idp.example.test".to_owned()),
+                    email: None,
+                    org_id: None,
+                    roles: vec!["admin".to_owned()],
+                    session_id: "session-operator".to_owned(),
+                    auth_method: AuthMethod::Bearer,
+                }),
+                request_id: "request-purge".to_owned(),
+                source_ip: "203.0.113.20".to_owned(),
+            },
+            0,
+        )
+        .await
+        .expect("an operator's purge records");
+    assert_eq!(outcome.security_revision, Some(1));
+    assert_eq!(ledger.0.lock().expect("ledger lock").len(), 1);
+}
+
 #[test]
 fn a_purges_replication_is_audited_by_outcome() {
     assert_eq!(PurgeRecord::NotNeeded.audit(), serde_json::Value::Null);
+    assert_eq!(
+        PurgeRecord::NoPrincipalTokens.audit(),
+        json!({ "outcome": "not_needed" })
+    );
     assert_eq!(
         PurgeRecord::Recorded(7).audit(),
         json!({ "outcome": "recorded", "security_revision": 7 })

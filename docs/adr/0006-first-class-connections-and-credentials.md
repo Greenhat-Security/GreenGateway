@@ -306,12 +306,21 @@ is explicit.
 - `token_exchange_url` follows the token-URL rule (HTTPS, no userinfo, query
   or fragment) and passes the token client's egress check before any key or
   secret is read.
-- Only the manual HTTP tool-call lane obtains a caller's own token, so only it
-  serves such a Connection among the call lanes; every other one, the ones
-  that attest an ordinary Connection's caller included, refuses it through the
-  caller-assertion refusal. A call with no principal, or a service token's, is
-  refused with `delegated_token_no_principal`. There is no fallback to a
-  service identity.
+- Only the manual HTTP and managed OpenAPI tool-call lanes obtain a caller's
+  own token, so only they serve such a Connection among the call lanes; every
+  other one, the ones that attest an ordinary Connection's caller included,
+  refuses it through the caller-assertion refusal. A call with no principal,
+  or a service token's, is refused with `delegated_token_no_principal`. There
+  is no fallback to a service identity.
+- A managed OpenAPI catalog binds to such a Connection through the schemes
+  that describe a token issued for a user: the user-consent `oauth2` flows
+  (`authorizationCode`, `implicit`, `password`) and `openIdConnect` (issue
+  #443). A credential shared by every caller never binds them. The binder
+  cannot inspect the token the issuer will return, so an alternative binds
+  only when every scope it requires is among the Connection's
+  `requested_scopes`; the document's authorization, token and discovery URLs
+  are never contacted. Each alternative that does not bind is explained in
+  the preview by a closed reason code with a fixed message.
 - A stored Connection test has no caller of its own, so it is run as the
   administrator who asks for it, as the admin playground already calls tools:
   the test exchanges that principal's token inline, under the test deadline

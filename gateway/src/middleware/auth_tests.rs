@@ -18,7 +18,10 @@ use tower::ServiceExt;
 
 use super::*;
 use crate::{
-    audit::{sink::tests::CaptureSink, AuditSink},
+    audit::{
+        sink::tests::{CaptureSink, DurableBehaviour, DurableCaptureSink},
+        AuditSink,
+    },
     auth::AuthMethod,
 };
 
@@ -835,4 +838,197 @@ async fn body_string(response: Response) -> String {
             .to_vec(),
     )
     .expect("body should be UTF-8")
+}
+
+// ---------------------------------------------------------------------------
+// Required audit durability (issue #425).
+// ---------------------------------------------------------------------------
+
+/// An auth state whose audit log waits for a store of record the test
+/// controls.
+fn required_state(
+    mode: AuthMode,
+    validator: Option<Arc<dyn SessionValidator>>,
+) -> (AuthState, DurableCaptureSink) {
+    let (mut state, _) = test_state_with_mode(mode, validator);
+    let durable = DurableCaptureSink::new();
+    state.audit = AuditLog::new_required(
+        Arc::new(durable.clone()) as Arc<dyn AuditSink>,
+        Duration::from_secs(5),
+    );
+    (state, durable)
+}
+
+/// One protected route whose handler counts how often it ran and, each
+/// time, whether the authentication record was already in the store.
+fn handler_probe(
+    state: AuthState,
+    durable: &DurableCaptureSink,
+) -> (Router, Arc<std::sync::Mutex<Vec<bool>>>) {
+    let runs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = Arc::clone(&runs);
+    let store = durable.clone();
+    let router = Router::new()
+        .route(
+            "/protected",
+            get(move || {
+                let seen = Arc::clone(&seen);
+                let store = store.clone();
+                async move {
+                    let recorded = store
+                        .events()
+                        .iter()
+                        .any(|event| event.event_type == AUTH_SUCCESS);
+                    seen.lock().expect("runs lock").push(recorded);
+                    "ok"
+                }
+            }),
+        )
+        .layer(from_fn_with_state(state, auth_middleware));
+    (router, runs)
+}
+
+fn protected_request(bearer: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder().uri("/protected");
+    if let Some(token) = bearer {
+        builder = builder.header(AUTHORIZATION, format!("Bearer {token}"));
+    }
+    builder.body(Body::empty()).expect("request should build")
+}
+
+async fn assert_audit_unavailable(response: Response) {
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        response.headers().get(WWW_AUTHENTICATE).is_none(),
+        "an audit outage is not a reason to re-authenticate"
+    );
+    let outcome = response
+        .extensions()
+        .get::<AuthOutcome>()
+        .cloned()
+        .expect("the refusal should carry an auth outcome");
+    assert!(!outcome.authenticated);
+    assert!(outcome.principal.is_none());
+    assert_eq!(outcome.reason.as_deref(), Some(AUDIT_UNAVAILABLE_REASON));
+    assert_eq!(
+        to_json(response).await,
+        json!({ "error": "audit unavailable", "reason": "audit_unavailable" })
+    );
+}
+
+/// The principal is acted on only after its record has committed: the
+/// handler finds the record already stored every time it runs.
+#[tokio::test]
+async fn required_durability_admits_an_authenticated_request_only_after_its_record_commits() {
+    let (state, durable) = required_state(
+        AuthMode::Required,
+        Some(validator(MockOutcome::Principal(test_principal()))),
+    );
+    let (router, runs) = handler_probe(state, &durable);
+
+    let response = router
+        .oneshot(protected_request(Some("token-123")))
+        .await
+        .expect("request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(*runs.lock().expect("runs lock"), vec![true]);
+}
+
+/// A store that cannot commit the record refuses the request before the
+/// handler runs, and the next request after the store recovers is served.
+#[tokio::test]
+async fn required_durability_refuses_an_authenticated_request_whose_record_cannot_commit() {
+    let (state, durable) = required_state(
+        AuthMode::Required,
+        Some(validator(MockOutcome::Principal(test_principal()))),
+    );
+    let (router, runs) = handler_probe(state, &durable);
+
+    durable.set(DurableBehaviour::Refuse);
+    let response = router
+        .clone()
+        .oneshot(protected_request(Some("token-123")))
+        .await
+        .expect("request should complete");
+    assert_audit_unavailable(response).await;
+    assert!(
+        runs.lock().expect("runs lock").is_empty(),
+        "nothing past authentication may run without its record"
+    );
+
+    durable.set(DurableBehaviour::Store);
+    let response = router
+        .oneshot(protected_request(Some("token-123")))
+        .await
+        .expect("request should complete");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "recovery needs no restart"
+    );
+    assert_eq!(*runs.lock().expect("runs lock"), vec![true]);
+}
+
+/// A rejected credential is answered `401` only once its failure record
+/// has committed; while it cannot, the answer is the outage, not a
+/// challenge that would send the caller back to its identity provider.
+#[tokio::test]
+async fn required_durability_answers_a_rejected_credential_only_after_its_record_commits() {
+    let (state, durable) = required_state(
+        AuthMode::Required,
+        Some(validator(MockOutcome::InvalidSession("token_expired"))),
+    );
+    let (router, runs) = handler_probe(state, &durable);
+
+    durable.set(DurableBehaviour::Refuse);
+    let response = router
+        .clone()
+        .oneshot(protected_request(Some("token-123")))
+        .await
+        .expect("request should complete");
+    assert_audit_unavailable(response).await;
+
+    durable.set(DurableBehaviour::Store);
+    let response = router
+        .clone()
+        .oneshot(protected_request(None))
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let failure = durable
+        .events()
+        .into_iter()
+        .find(|event| event.event_type == AUTH_FAILURE)
+        .expect("the failure record should be stored before the 401");
+    assert_eq!(failure.payload["reason"], json!("missing_credential"));
+    assert!(runs.lock().expect("runs lock").is_empty());
+}
+
+/// Observe mode forwards a failed credential only once its record has
+/// committed, and forwards nothing while the record cannot.
+#[tokio::test]
+async fn required_durability_forwards_an_observed_failure_only_after_its_record_commits() {
+    let (state, durable) = required_state(
+        AuthMode::Observe,
+        Some(validator(MockOutcome::Principal(test_principal()))),
+    );
+    let (router, runs) = handler_probe(state, &durable);
+
+    durable.set(DurableBehaviour::Refuse);
+    let response = router
+        .clone()
+        .oneshot(protected_request(None))
+        .await
+        .expect("request should complete");
+    assert_audit_unavailable(response).await;
+    assert!(runs.lock().expect("runs lock").is_empty());
+
+    durable.set(DurableBehaviour::Store);
+    let response = router
+        .oneshot(protected_request(None))
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(runs.lock().expect("runs lock").len(), 1);
 }

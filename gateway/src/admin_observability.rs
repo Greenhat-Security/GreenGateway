@@ -688,7 +688,10 @@ pub(super) async fn accept_suggestion_in_cluster(
                         etag: prepared.current_etag.clone(),
                     },
                     candidate: &prepared.candidate,
-                    actor_user_id: &principal.user_id,
+                    change: storage::DocumentChange::by_principal(
+                        storage::DocumentAction::PolicySuggestionAccept,
+                        principal,
+                    ),
                     diff_summary: &prepared.diff_summary,
                 },
             },

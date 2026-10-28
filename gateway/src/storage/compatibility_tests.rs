@@ -39,8 +39,8 @@ fn this_binary_advertises_a_bounded_canonical_set_it_recognizes() {
     let rendered = advertisement(BINARY_CAPABILITIES).expect("the shipped set fits the column");
     assert_eq!(
         rendered,
-        "delegated_token_purges,openapi_swagger2_catalogs,operation_requirements,\
-         policy_role_descriptions"
+        "delegated_token_purges,openapi_discovery_catalogs,openapi_swagger2_catalogs,\
+         operation_requirements,policy_role_descriptions"
     );
     let recognized = RecognizedCapabilities::parse(&rendered);
     assert_eq!(recognized.unrecognized(), 0);
@@ -51,6 +51,7 @@ fn this_binary_advertises_a_bounded_canonical_set_it_recognizes() {
         recognized.names(),
         vec![
             "delegated_token_purges",
+            "openapi_discovery_catalogs",
             "openapi_swagger2_catalogs",
             "operation_requirements",
             "policy_role_descriptions"
@@ -68,6 +69,7 @@ fn a_prepared_members_advertisement_lacks_the_successors_capability() {
     assert!(!prepared.contains(Capability::PolicyRoleDescriptions));
     assert!(!prepared.contains(Capability::OpenApiSwagger2Catalogs));
     assert!(!prepared.contains(Capability::DelegatedTokenPurges));
+    assert!(!prepared.contains(Capability::OpenApiDiscoveryCatalogs));
     assert_eq!(prepared.unrecognized(), 0);
 }
 
@@ -260,6 +262,7 @@ mod gate_tests {
             &[
                 POLICY_ROLE_DESCRIPTIONS,
                 OPENAPI_SWAGGER2_CATALOGS,
+                OPENAPI_DISCOVERY_CATALOGS,
                 DELEGATED_TOKEN_PURGES
             ],
             "registering an operation is a protocol change: review its requirement, its new \
@@ -283,6 +286,17 @@ mod gate_tests {
                 minimum_schema: 17,
                 document_format: None,
                 capability: Capability::OpenApiSwagger2Catalogs,
+                backfill: Backfill::NotRequired,
+                activation: Activation::LiveMembers,
+            }
+        );
+        assert_eq!(
+            OPENAPI_DISCOVERY_CATALOGS,
+            OperationRequirement {
+                operation: "connections.openapi_discovery_catalog",
+                minimum_schema: 17,
+                document_format: None,
+                capability: Capability::OpenApiDiscoveryCatalogs,
                 backfill: Backfill::NotRequired,
                 activation: Activation::LiveMembers,
             }
@@ -436,6 +450,61 @@ mod gate_tests {
         ));
     }
 
+    /// Google Discovery catalogs against a member built with Swagger 2.0
+    /// import but before Discovery import: its Swagger capability admits
+    /// nothing here, and the operation is admitted once only members of
+    /// this build remain.
+    #[test]
+    fn discovery_catalogs_wait_for_every_member_built_before_discovery_import() {
+        let swagger_only = member(
+            PEER,
+            true,
+            "openapi_swagger2_catalogs,operation_requirements,policy_role_descriptions",
+        );
+        let current = member(
+            OWN,
+            true,
+            "openapi_discovery_catalogs,openapi_swagger2_catalogs,operation_requirements,\
+             policy_role_descriptions",
+        );
+        assert_eq!(
+            gate(
+                &OPENAPI_DISCOVERY_CATALOGS,
+                &BinaryContract::shipped(),
+                OWN,
+                &[current.clone(), swagger_only.clone()]
+            ),
+            Err(OperationRefusal::MembersLackRequirement {
+                lacking: vec![PEER],
+                live: 2
+            })
+        );
+        assert_eq!(
+            gate(
+                &OPENAPI_SWAGGER2_CATALOGS,
+                &BinaryContract::shipped(),
+                OWN,
+                &[current.clone(), swagger_only]
+            ),
+            Ok(OperationAdmission { live_members: 2 }),
+            "the Swagger 2.0 operation still admits the earlier member"
+        );
+        let departed = member(
+            PEER,
+            false,
+            "openapi_swagger2_catalogs,operation_requirements",
+        );
+        assert_eq!(
+            gate(
+                &OPENAPI_DISCOVERY_CATALOGS,
+                &BinaryContract::shipped(),
+                OWN,
+                &[current, departed]
+            ),
+            Ok(OperationAdmission { live_members: 1 })
+        );
+    }
+
     /// Issue #441's operation against what the release before the purge
     /// record advertises: refused while such a member is live, because it
     /// would not apply the record, and admitted once only members of this
@@ -445,13 +514,14 @@ mod gate_tests {
         let earlier = member(
             PEER,
             true,
-            "openapi_swagger2_catalogs,operation_requirements,policy_role_descriptions",
+            "openapi_discovery_catalogs,openapi_swagger2_catalogs,operation_requirements,\
+             policy_role_descriptions",
         );
         let current = member(
             OWN,
             true,
-            "delegated_token_purges,openapi_swagger2_catalogs,operation_requirements,\
-             policy_role_descriptions",
+            "delegated_token_purges,openapi_discovery_catalogs,openapi_swagger2_catalogs,\
+             operation_requirements,policy_role_descriptions",
         );
         assert_eq!(
             gate(
@@ -465,20 +535,21 @@ mod gate_tests {
                 live: 2
             })
         );
-        // The earlier member still admits what it advertises.
         assert_eq!(
             gate(
-                &OPENAPI_SWAGGER2_CATALOGS,
+                &OPENAPI_DISCOVERY_CATALOGS,
                 &BinaryContract::shipped(),
                 OWN,
                 &[current.clone(), earlier]
             ),
-            Ok(OperationAdmission { live_members: 2 })
+            Ok(OperationAdmission { live_members: 2 }),
+            "the earlier member still admits what it advertises"
         );
         let departed = member(
             PEER,
             false,
-            "openapi_swagger2_catalogs,operation_requirements,policy_role_descriptions",
+            "openapi_discovery_catalogs,openapi_swagger2_catalogs,operation_requirements,\
+             policy_role_descriptions",
         );
         assert_eq!(
             gate(
