@@ -1,3 +1,38 @@
+use axum::{
+    response::{IntoResponse, Response},
+    Json,
+};
+use http::StatusCode;
+use serde::Serialize;
+
+/// The stable reason a request carries when it is refused because a
+/// security decision it depended on could not be durably recorded under
+/// `AUDIT_DURABILITY=required` (issue #425). It is the response's `reason`,
+/// the observation's `auth_reason` or `policy_reason`, and nothing else: the
+/// store's error never crosses the response boundary.
+pub const AUDIT_UNAVAILABLE_REASON: &str = "audit_unavailable";
+
+#[derive(Serialize)]
+struct AuditUnavailableBody {
+    error: &'static str,
+    reason: &'static str,
+}
+
+/// `503 {"error":"audit unavailable","reason":"audit_unavailable"}`: the
+/// gateway made a decision it cannot evidence, so it does not act on it.
+/// The same answer from the authentication and authorization stages, so a
+/// client and an operator see one outage, not two.
+pub fn audit_unavailable_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(AuditUnavailableBody {
+            error: "audit unavailable",
+            reason: AUDIT_UNAVAILABLE_REASON,
+        }),
+    )
+        .into_response()
+}
+
 #[derive(Clone, Debug)]
 pub struct AuthOutcome {
     pub principal: Option<crate::auth::Principal>,

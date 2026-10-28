@@ -628,9 +628,9 @@ impl PostgresConnectionStore {
         &self,
         id: &ConnectionId,
         expected: &ConnectionEtag,
-        actor_user_id: &str,
+        actor: &crate::auth::change_actor::ChangeActor,
     ) -> Result<(), ConnectionStoreError> {
-        validate_evidence_actor(actor_user_id)?;
+        validate_evidence_actor(actor)?;
         // One logical operation, minted once per call: every evidence row
         // this transaction writes carries it, and nothing regenerates it.
         let operation_id = uuid::Uuid::new_v4();
@@ -664,11 +664,12 @@ impl PostgresConnectionStore {
             // deletion (specification versions start at 1). The version
             // rows cascade with the record, as they do in the standalone
             // store, so they cannot attribute the deletion; its evidence
-            // row -- actor, action, event and operation identity, prior
-            // version, and the shared revision the outbox row took -- has
-            // no foreign key and outlives the record. Both commit with the
-            // delete or not at all. Any tool names the record's catalogs
-            // held are released in the same transaction.
+            // row -- the actor (subject, issuer, kind and auth mode), action,
+            // event and operation identity, prior version, and the shared
+            // revision the outbox row took -- has no foreign key and
+            // outlives the record. Both commit with the delete or not at
+            // all. Any tool names the record's catalogs held are released in
+            // the same transaction.
             let security_revision = bump_connection_state(
                 &client,
                 RESOURCE_CONNECTION,
@@ -685,7 +686,7 @@ impl PostgresConnectionStore {
                     id,
                     prior_version: current.revisions.connection,
                     security_revision,
-                    actor_user_id,
+                    actor,
                 },
             )
             .await?;
@@ -766,7 +767,12 @@ impl PostgresConnectionStore {
     /// global entry/byte capacity checks, catalog-revision increment, the
     /// per-entry managed-tool dependency replacement, and -- the cluster
     /// addition -- the shared security revision, the connections
-    /// high-water mark, and the outbox row, all in the one transaction.
+    /// high-water mark, the outbox row and the replacement's durable
+    /// evidence (`catalog_change_evidence`, migration 23), all in the one
+    /// transaction. The evidence outlives the catalog row it describes,
+    /// which the next replacement deletes and a Connection delete cascades;
+    /// a refused or failed replacement writes none, and a replacement whose
+    /// evidence cannot be written does not commit.
     #[allow(clippy::too_many_arguments)]
     pub async fn replace_mcp_catalog(
         &self,
@@ -778,8 +784,10 @@ impl PostgresConnectionStore {
         expected_catalog_revision: u64,
         actor_user_id: &str,
     ) -> Result<StoredMcpCatalog, ConnectionStoreError> {
+        validate_catalog_evidence_actor(actor_user_id)?;
         let validated = validate_mcp_catalog(id, entries, resources, resource_templates)?;
         let now = utc_timestamp()?;
+        let operation_id = uuid::Uuid::new_v4();
         let client = self
             .pool
             .get()
@@ -1037,12 +1045,26 @@ impl PostgresConnectionStore {
                 OPERATION_MCP_CATALOG,
             )
             .await?;
-            bump_connection_state(
+            let security_revision = bump_connection_state(
                 &client,
                 RESOURCE_CONNECTION_CATALOG,
                 id,
                 Some(previous_revision),
                 catalog_revision,
+            )
+            .await?;
+            record_catalog_change_evidence(
+                &client,
+                &CatalogChangeEvidence {
+                    operation_id,
+                    action: CATALOG_EVIDENCE_ACTION_MCP_PUBLISH,
+                    id,
+                    prior_version: previous_revision,
+                    new_version: catalog_revision,
+                    overlay_revision: None,
+                    security_revision,
+                    actor_user_id,
+                },
             )
             .await?;
             Ok(StoredMcpCatalog {
@@ -1545,6 +1567,14 @@ impl PostgresConnectionStore {
         .await
     }
 
+    /// The OpenAPI catalog replacement every OpenAPI publication goes
+    /// through: a registration, a refresh, and an overlay put or delete.
+    /// Like the MCP replacement it commits its durable evidence
+    /// (`catalog_change_evidence`, migration 23) in the same transaction,
+    /// named by what the write did to the overlay: an overlay put is
+    /// `catalog.overlay.replace`, an overlay delete `catalog.overlay.delete`,
+    /// and anything else (no overlay change, or only refreshed source
+    /// reports) `catalog.openapi.publish`.
     #[allow(clippy::too_many_arguments)]
     pub async fn replace_openapi_catalog_with_overlay_and_enum_values(
         &self,
@@ -1561,6 +1591,15 @@ impl PostgresConnectionStore {
         policy_protected_names: &[String],
         enum_values: &[StoredEnumSourceValueWrite],
     ) -> Result<StoredOpenApiCatalog, ConnectionStoreError> {
+        validate_catalog_evidence_actor(actor_user_id)?;
+        let evidence_action = match overlay {
+            Some(StoredOverlayWrite::Put { .. }) => CATALOG_EVIDENCE_ACTION_OVERLAY_REPLACE,
+            Some(StoredOverlayWrite::Delete { .. }) => CATALOG_EVIDENCE_ACTION_OVERLAY_DELETE,
+            Some(StoredOverlayWrite::Reports { .. }) | None => {
+                CATALOG_EVIDENCE_ACTION_OPENAPI_PUBLISH
+            }
+        };
+        let operation_id = uuid::Uuid::new_v4();
         validate_openapi_spec(spec, spec_digest)?;
         if let Some(overlay) = overlay {
             validate_openapi_overlay_write(overlay)?;
@@ -1868,12 +1907,26 @@ impl PostgresConnectionStore {
                 OPERATION_OPENAPI_CATALOG,
             )
             .await?;
-            bump_connection_state(
+            let security_revision = bump_connection_state(
                 &client,
                 RESOURCE_CONNECTION_CATALOG,
                 id,
                 Some(previous_catalog_revision),
                 catalog_revision,
+            )
+            .await?;
+            record_catalog_change_evidence(
+                &client,
+                &CatalogChangeEvidence {
+                    operation_id,
+                    action: evidence_action,
+                    id,
+                    prior_version: previous_catalog_revision,
+                    new_version: catalog_revision,
+                    overlay_revision: Some(overlay_revision),
+                    security_revision,
+                    actor_user_id,
+                },
             )
             .await?;
             Ok(StoredOpenApiCatalog {
@@ -4915,10 +4968,10 @@ async fn bump_connection_state(
 /// anything else.
 const EVIDENCE_ACTION_DELETE: &str = "connection.delete";
 
-/// The longest actor migration 16 accepts. It is exactly the principal
-/// subject bound authentication enforces, so evidence never refuses a
-/// principal a validator produced; the assertion keeps the immutable SQL
-/// bound and the Rust bound from drifting apart silently.
+/// The longest actor migrations 16 and 23 accept. It is exactly the
+/// principal subject bound authentication enforces, so evidence never
+/// refuses a principal a validator produced; the assertion keeps the
+/// immutable SQL bounds and the Rust bound from drifting apart silently.
 const EVIDENCE_ACTOR_MAX_BYTES: usize = 4096;
 const _: () =
     assert!(EVIDENCE_ACTOR_MAX_BYTES == crate::auth::principal::MAX_PRINCIPAL_SUBJECT_BYTES);
@@ -4927,9 +4980,27 @@ const OPERATION_CHANGE_EVIDENCE: &str = "change_evidence_append";
 
 /// An unattributable change has no evidence to record, so it is refused
 /// before any transaction opens rather than committed anonymously. An
-/// authenticated principal always satisfies this; the CHECK in migration
-/// 16 is the backstop.
-fn validate_evidence_actor(actor_user_id: &str) -> Result<(), ConnectionStoreError> {
+/// authenticated principal always satisfies this
+/// ([`crate::auth::change_actor::ChangeActor::is_recordable`]); the CHECKs
+/// in migrations 16 and 24 are the backstop.
+fn validate_evidence_actor(
+    actor: &crate::auth::change_actor::ChangeActor,
+) -> Result<(), ConnectionStoreError> {
+    if !actor.is_recordable() {
+        return Err(ConnectionStoreError::Validation {
+            problems: vec![format!(
+                "the change actor must be between 1 and {EVIDENCE_ACTOR_MAX_BYTES} bytes, and only a principal may carry an issuer, of at most {} bytes",
+                crate::auth::principal::MAX_PRINCIPAL_ISSUER_BYTES
+            )],
+        });
+    }
+    Ok(())
+}
+
+/// The same refusal for a catalog change, whose evidence (migration 23)
+/// records the actor's subject alone. An authenticated principal always
+/// satisfies this; the CHECK in migration 23 is the backstop.
+fn validate_catalog_evidence_actor(actor_user_id: &str) -> Result<(), ConnectionStoreError> {
     if actor_user_id.is_empty() || actor_user_id.len() > EVIDENCE_ACTOR_MAX_BYTES {
         return Err(ConnectionStoreError::Validation {
             problems: vec![format!(
@@ -4948,7 +5019,7 @@ struct ChangeEvidence<'a> {
     id: &'a ConnectionId,
     prior_version: u64,
     security_revision: i64,
-    actor_user_id: &'a str,
+    actor: &'a crate::auth::change_actor::ChangeActor,
 }
 
 /// Append one evidence row inside the caller's transaction, and journal it
@@ -4970,14 +5041,19 @@ async fn record_change_evidence(
         .execute(
             r#"
             INSERT INTO greengateway.connection_change_evidence (
-                event_id, operation_id, actor_user_id, action, connection_id,
-                prior_version, security_revision
-            ) VALUES ($1::text::uuid, $2::text::uuid, $3, $4, $5::text::uuid, $6, $7)
+                event_id, operation_id, actor_user_id, actor_issuer, actor_kind,
+                actor_auth_mode, action, connection_id, prior_version, security_revision
+            ) VALUES (
+                $1::text::uuid, $2::text::uuid, $3, $4, $5, $6, $7, $8::text::uuid, $9, $10
+            )
             "#,
             &[
                 &event_id,
                 &operation_id,
-                &evidence.actor_user_id,
+                &evidence.actor.subject(),
+                &evidence.actor.issuer(),
+                &evidence.actor.kind().as_str(),
+                &evidence.actor.auth_mode(),
                 &evidence.action,
                 &evidence.id.as_str(),
                 &prior_version,
@@ -5006,6 +5082,81 @@ async fn record_change_evidence(
             JournalAppendError::Store(error) => pg_error(OPERATION_JOURNAL_APPEND, error),
         }
     })
+}
+
+/// The closed action vocabulary of `catalog_change_evidence` (migration
+/// 23), in the same proposed authority-event operation codes as
+/// [`EVIDENCE_ACTION_DELETE`]; the migration's CHECK refuses anything else.
+const CATALOG_EVIDENCE_ACTION_MCP_PUBLISH: &str = "catalog.mcp.publish";
+const CATALOG_EVIDENCE_ACTION_OPENAPI_PUBLISH: &str = "catalog.openapi.publish";
+const CATALOG_EVIDENCE_ACTION_OVERLAY_REPLACE: &str = "catalog.overlay.replace";
+const CATALOG_EVIDENCE_ACTION_OVERLAY_DELETE: &str = "catalog.overlay.delete";
+
+const OPERATION_CATALOG_CHANGE_EVIDENCE: &str = "catalog_change_evidence_append";
+
+/// One committed catalog change's evidence: identifiers, revisions and the
+/// actor, never specification, overlay, tool definition, endpoint or
+/// secret material.
+struct CatalogChangeEvidence<'a> {
+    operation_id: uuid::Uuid,
+    action: &'static str,
+    id: &'a ConnectionId,
+    /// The catalog revision the change replaced; `0` (no catalog of this
+    /// kind yet) is stored as NULL, the authority event's "no prior
+    /// revision".
+    prior_version: u64,
+    new_version: u64,
+    /// The OpenAPI overlay revision the published catalog was compiled
+    /// from (`0` for none); `None` for MCP catalogs, which have no overlay.
+    overlay_revision: Option<u64>,
+    security_revision: i64,
+    actor_user_id: &'a str,
+}
+
+/// Append one catalog evidence row inside the caller's transaction. The
+/// row's `event_id` is minted here, once; `committed_at` is the database
+/// clock's. Any failure is returned for the caller to roll back, so the
+/// publication it describes never commits without it.
+async fn record_catalog_change_evidence(
+    client: &deadpool_postgres::Object,
+    evidence: &CatalogChangeEvidence<'_>,
+) -> Result<(), ConnectionStoreError> {
+    let event_id = uuid::Uuid::new_v4().to_string();
+    let operation_id = evidence.operation_id.to_string();
+    let prior_version = match evidence.prior_version {
+        0 => None,
+        version => Some(u64_to_i64(evidence.id, version)?),
+    };
+    let new_version = u64_to_i64(evidence.id, evidence.new_version)?;
+    let overlay_revision = evidence
+        .overlay_revision
+        .map(|revision| u64_to_i64(evidence.id, revision))
+        .transpose()?;
+    client
+        .execute(
+            r#"
+            INSERT INTO greengateway.catalog_change_evidence (
+                event_id, operation_id, actor_user_id, action, connection_id,
+                prior_version, new_version, overlay_revision, security_revision
+            ) VALUES (
+                $1::text::uuid, $2::text::uuid, $3, $4, $5::text::uuid, $6, $7, $8, $9
+            )
+            "#,
+            &[
+                &event_id,
+                &operation_id,
+                &evidence.actor_user_id,
+                &evidence.action,
+                &evidence.id.as_str(),
+                &prior_version,
+                &new_version,
+                &overlay_revision,
+                &evidence.security_revision,
+            ],
+        )
+        .await
+        .map_err(|error| pg_error(OPERATION_CATALOG_CHANGE_EVIDENCE, error))?;
+    Ok(())
 }
 
 /// Open a mutating transaction: `BEGIN`, then immediately take the one

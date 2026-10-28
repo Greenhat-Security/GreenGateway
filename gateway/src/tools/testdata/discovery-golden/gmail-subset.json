@@ -1,0 +1,454 @@
+{
+  "kind": "discovery#restDescription",
+  "discoveryVersion": "v1",
+  "id": "gmail:v1",
+  "name": "gmail",
+  "version": "v1",
+  "revision": "20260901",
+  "title": "Gmail API",
+  "description": "A trimmed, hand-written subset shaped like the Gmail v1 Discovery document, for golden tests.",
+  "ownerDomain": "google.com",
+  "ownerName": "Google",
+  "protocol": "rest",
+  "rootUrl": "https://gmail.googleapis.com/",
+  "mtlsRootUrl": "https://gmail.mtls.googleapis.com/",
+  "servicePath": "",
+  "baseUrl": "https://gmail.googleapis.com/",
+  "basePath": "",
+  "batchPath": "batch",
+  "fullyEncodeReservedExpansion": true,
+  "parameters": {
+    "$.xgafv": {
+      "description": "V1 error format.",
+      "enum": ["1", "2"],
+      "enumDescriptions": ["v1 error format", "v2 error format"],
+      "location": "query",
+      "type": "string"
+    },
+    "access_token": {
+      "description": "OAuth access token.",
+      "location": "query",
+      "type": "string"
+    },
+    "alt": {
+      "default": "json",
+      "description": "Data format for response.",
+      "enum": ["json", "media", "proto"],
+      "location": "query",
+      "type": "string"
+    },
+    "fields": {
+      "description": "Selector specifying which fields to include in a partial response.",
+      "location": "query",
+      "type": "string"
+    },
+    "key": {
+      "description": "API key.",
+      "location": "query",
+      "type": "string"
+    },
+    "prettyPrint": {
+      "default": "true",
+      "description": "Returns response with indentations and line breaks.",
+      "location": "query",
+      "type": "boolean"
+    },
+    "quotaUser": {
+      "description": "An arbitrary string that identifies a user for quota purposes.",
+      "location": "query",
+      "type": "string"
+    },
+    "uploadType": {
+      "description": "Legacy upload protocol for media.",
+      "location": "query",
+      "type": "string"
+    }
+  },
+  "auth": {
+    "oauth2": {
+      "scopes": {
+        "https://mail.google.com/": {
+          "description": "Read, compose, send, and permanently delete all your email"
+        },
+        "https://www.googleapis.com/auth/gmail.metadata": {
+          "description": "View your email message metadata such as labels and headers"
+        },
+        "https://www.googleapis.com/auth/gmail.modify": {
+          "description": "Read, compose, and send emails"
+        },
+        "https://www.googleapis.com/auth/gmail.readonly": {
+          "description": "View your email messages and settings"
+        },
+        "https://www.googleapis.com/auth/gmail.send": {
+          "description": "Send email on your behalf"
+        }
+      }
+    }
+  },
+  "schemas": {
+    "ListMessagesResponse": {
+      "id": "ListMessagesResponse",
+      "type": "object",
+      "properties": {
+        "messages": {
+          "description": "Messages on this page.",
+          "type": "array",
+          "items": { "$ref": "Message" }
+        },
+        "nextPageToken": { "description": "Token for the next page.", "type": "string" },
+        "resultSizeEstimate": { "description": "Estimated total.", "type": "integer", "format": "uint32" }
+      }
+    },
+    "ListThreadsResponse": {
+      "id": "ListThreadsResponse",
+      "type": "object",
+      "properties": {
+        "nextPageToken": { "type": "string" },
+        "resultSizeEstimate": { "type": "integer", "format": "uint32" },
+        "threads": { "type": "array", "items": { "$ref": "Thread" } }
+      }
+    },
+    "Message": {
+      "id": "Message",
+      "description": "An email message.",
+      "type": "object",
+      "properties": {
+        "historyId": { "type": "string", "format": "uint64" },
+        "id": { "readOnly": true, "type": "string" },
+        "internalDate": { "type": "string", "format": "int64" },
+        "labelIds": { "type": "array", "items": { "type": "string" } },
+        "payload": { "$ref": "MessagePart", "description": "The parsed email structure." },
+        "raw": { "type": "string", "format": "byte" },
+        "sizeEstimate": { "type": "integer", "format": "int32" },
+        "snippet": { "type": "string" },
+        "threadId": { "type": "string" }
+      }
+    },
+    "MessagePart": {
+      "id": "MessagePart",
+      "type": "object",
+      "properties": {
+        "body": { "$ref": "MessagePartBody" },
+        "filename": { "type": "string" },
+        "headers": { "type": "array", "items": { "$ref": "MessagePartHeader" } },
+        "mimeType": { "type": "string" },
+        "partId": { "type": "string" },
+        "parts": { "type": "array", "items": { "$ref": "MessagePart" } }
+      }
+    },
+    "MessagePartBody": {
+      "id": "MessagePartBody",
+      "type": "object",
+      "properties": {
+        "attachmentId": { "type": "string" },
+        "data": { "type": "string", "format": "byte" },
+        "size": { "type": "integer", "format": "int32" }
+      }
+    },
+    "MessagePartHeader": {
+      "id": "MessagePartHeader",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "value": { "type": "string" }
+      }
+    },
+    "ModifyMessageRequest": {
+      "id": "ModifyMessageRequest",
+      "type": "object",
+      "properties": {
+        "addLabelIds": { "type": "array", "items": { "type": "string" } },
+        "removeLabelIds": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "ModifyThreadRequest": {
+      "id": "ModifyThreadRequest",
+      "type": "object",
+      "properties": {
+        "addLabelIds": { "type": "array", "items": { "type": "string" } },
+        "removeLabelIds": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "Profile": {
+      "id": "Profile",
+      "type": "object",
+      "properties": {
+        "emailAddress": { "type": "string" },
+        "historyId": { "type": "string", "format": "uint64" },
+        "messagesTotal": { "type": "integer", "format": "int32" },
+        "threadsTotal": { "type": "integer", "format": "int32" }
+      }
+    },
+    "Thread": {
+      "id": "Thread",
+      "type": "object",
+      "properties": {
+        "historyId": { "type": "string", "format": "uint64" },
+        "id": { "type": "string" },
+        "messages": { "type": "array", "items": { "$ref": "Message" } },
+        "snippet": { "type": "string" }
+      }
+    }
+  },
+  "resources": {
+    "users": {
+      "methods": {
+        "getProfile": {
+          "id": "gmail.users.getProfile",
+          "path": "gmail/v1/users/{userId}/profile",
+          "flatPath": "gmail/v1/users/{userId}/profile",
+          "httpMethod": "GET",
+          "description": "Gets the current user's Gmail profile.",
+          "parameters": {
+            "userId": {
+              "default": "me",
+              "description": "The user's email address. The special value `me` can be used to indicate the authenticated user.",
+              "location": "path",
+              "required": true,
+              "type": "string"
+            }
+          },
+          "parameterOrder": ["userId"],
+          "response": { "$ref": "Profile" },
+          "scopes": [
+            "https://mail.google.com/",
+            "https://www.googleapis.com/auth/gmail.metadata",
+            "https://www.googleapis.com/auth/gmail.modify",
+            "https://www.googleapis.com/auth/gmail.readonly"
+          ]
+        }
+      },
+      "resources": {
+        "messages": {
+          "methods": {
+            "delete": {
+              "id": "gmail.users.messages.delete",
+              "path": "gmail/v1/users/{userId}/messages/{id}",
+              "httpMethod": "DELETE",
+              "description": "Immediately and permanently deletes the specified message.",
+              "parameters": {
+                "id": { "description": "The ID of the message to delete.", "location": "path", "required": true, "type": "string" },
+                "userId": { "default": "me", "location": "path", "required": true, "type": "string" }
+              },
+              "parameterOrder": ["userId", "id"],
+              "scopes": ["https://mail.google.com/"]
+            },
+            "get": {
+              "id": "gmail.users.messages.get",
+              "path": "gmail/v1/users/{userId}/messages/{id}",
+              "httpMethod": "GET",
+              "description": "Gets the specified message.",
+              "parameters": {
+                "format": {
+                  "default": "full",
+                  "description": "The format to return the message in.",
+                  "enum": ["minimal", "full", "raw", "metadata"],
+                  "enumDescriptions": ["Ids and labels only.", "The full message.", "The raw message.", "Ids, labels and headers."],
+                  "location": "query",
+                  "type": "string"
+                },
+                "id": { "description": "The ID of the message to retrieve.", "location": "path", "required": true, "type": "string" },
+                "metadataHeaders": {
+                  "description": "When given and format is METADATA, only include headers specified.",
+                  "location": "query",
+                  "repeated": true,
+                  "type": "string"
+                },
+                "userId": { "default": "me", "location": "path", "required": true, "type": "string" }
+              },
+              "parameterOrder": ["userId", "id"],
+              "response": { "$ref": "Message" },
+              "scopes": [
+                "https://mail.google.com/",
+                "https://www.googleapis.com/auth/gmail.metadata",
+                "https://www.googleapis.com/auth/gmail.modify",
+                "https://www.googleapis.com/auth/gmail.readonly"
+              ]
+            },
+            "list": {
+              "id": "gmail.users.messages.list",
+              "path": "gmail/v1/users/{userId}/messages",
+              "httpMethod": "GET",
+              "description": "Lists the messages in the user's mailbox.",
+              "parameters": {
+                "includeSpamTrash": { "default": "false", "location": "query", "type": "boolean" },
+                "labelIds": { "location": "query", "repeated": true, "type": "string" },
+                "maxResults": {
+                  "default": "100",
+                  "description": "Maximum number of messages to return.",
+                  "format": "uint32",
+                  "location": "query",
+                  "maximum": "500",
+                  "minimum": "1",
+                  "type": "integer"
+                },
+                "pageToken": { "location": "query", "type": "string" },
+                "q": { "description": "Only return messages matching the specified query.", "location": "query", "type": "string" },
+                "userId": { "default": "me", "location": "path", "required": true, "type": "string" }
+              },
+              "parameterOrder": ["userId"],
+              "response": { "$ref": "ListMessagesResponse" },
+              "scopes": [
+                "https://mail.google.com/",
+                "https://www.googleapis.com/auth/gmail.metadata",
+                "https://www.googleapis.com/auth/gmail.modify",
+                "https://www.googleapis.com/auth/gmail.readonly"
+              ]
+            },
+            "modify": {
+              "id": "gmail.users.messages.modify",
+              "path": "gmail/v1/users/{userId}/messages/{id}/modify",
+              "httpMethod": "POST",
+              "description": "Modifies the labels on the specified message.",
+              "parameters": {
+                "id": { "location": "path", "required": true, "type": "string" },
+                "userId": { "default": "me", "location": "path", "required": true, "type": "string" }
+              },
+              "parameterOrder": ["userId", "id"],
+              "request": { "$ref": "ModifyMessageRequest" },
+              "response": { "$ref": "Message" },
+              "scopes": ["https://mail.google.com/", "https://www.googleapis.com/auth/gmail.modify"]
+            },
+            "send": {
+              "id": "gmail.users.messages.send",
+              "path": "gmail/v1/users/{userId}/messages/send",
+              "httpMethod": "POST",
+              "description": "Sends the specified message to the recipients.",
+              "parameters": {
+                "userId": { "default": "me", "location": "path", "required": true, "type": "string" }
+              },
+              "parameterOrder": ["userId"],
+              "request": { "$ref": "Message" },
+              "response": { "$ref": "Message" },
+              "scopes": [
+                "https://mail.google.com/",
+                "https://www.googleapis.com/auth/gmail.modify",
+                "https://www.googleapis.com/auth/gmail.send"
+              ],
+              "supportsMediaUpload": true,
+              "mediaUpload": {
+                "accept": ["message/*"],
+                "maxSize": "36700160",
+                "protocols": {
+                  "simple": { "multipart": true, "path": "/upload/gmail/v1/users/{userId}/messages/send" }
+                }
+              }
+            },
+            "trash": {
+              "id": "gmail.users.messages.trash",
+              "path": "gmail/v1/users/{userId}/messages/{id}/trash",
+              "httpMethod": "POST",
+              "description": "Moves the specified message to the trash.",
+              "parameters": {
+                "id": { "location": "path", "required": true, "type": "string" },
+                "userId": { "default": "me", "location": "path", "required": true, "type": "string" }
+              },
+              "parameterOrder": ["userId", "id"],
+              "response": { "$ref": "Message" },
+              "scopes": ["https://mail.google.com/", "https://www.googleapis.com/auth/gmail.modify"]
+            }
+          }
+        },
+        "threads": {
+          "methods": {
+            "delete": {
+              "id": "gmail.users.threads.delete",
+              "path": "gmail/v1/users/{userId}/threads/{id}",
+              "httpMethod": "DELETE",
+              "parameters": {
+                "id": { "location": "path", "required": true, "type": "string" },
+                "userId": { "default": "me", "location": "path", "required": true, "type": "string" }
+              },
+              "parameterOrder": ["userId", "id"],
+              "scopes": ["https://mail.google.com/"]
+            },
+            "get": {
+              "id": "gmail.users.threads.get",
+              "path": "gmail/v1/users/{userId}/threads/{id}",
+              "httpMethod": "GET",
+              "description": "Gets the specified thread.",
+              "parameters": {
+                "format": {
+                  "default": "full",
+                  "enum": ["full", "metadata", "minimal"],
+                  "location": "query",
+                  "type": "string"
+                },
+                "id": { "location": "path", "required": true, "type": "string" },
+                "metadataHeaders": { "location": "query", "repeated": true, "type": "string" },
+                "userId": { "default": "me", "location": "path", "required": true, "type": "string" }
+              },
+              "parameterOrder": ["userId", "id"],
+              "response": { "$ref": "Thread" },
+              "scopes": [
+                "https://mail.google.com/",
+                "https://www.googleapis.com/auth/gmail.metadata",
+                "https://www.googleapis.com/auth/gmail.modify",
+                "https://www.googleapis.com/auth/gmail.readonly"
+              ]
+            },
+            "list": {
+              "id": "gmail.users.threads.list",
+              "path": "gmail/v1/users/{userId}/threads",
+              "httpMethod": "GET",
+              "description": "Lists the threads in the user's mailbox.",
+              "parameters": {
+                "includeSpamTrash": { "default": "false", "location": "query", "type": "boolean" },
+                "labelIds": { "location": "query", "repeated": true, "type": "string" },
+                "maxResults": { "default": "100", "format": "uint32", "location": "query", "type": "integer" },
+                "pageToken": { "location": "query", "type": "string" },
+                "q": { "location": "query", "type": "string" },
+                "userId": { "default": "me", "location": "path", "required": true, "type": "string" }
+              },
+              "parameterOrder": ["userId"],
+              "response": { "$ref": "ListThreadsResponse" },
+              "scopes": [
+                "https://mail.google.com/",
+                "https://www.googleapis.com/auth/gmail.metadata",
+                "https://www.googleapis.com/auth/gmail.modify",
+                "https://www.googleapis.com/auth/gmail.readonly"
+              ]
+            },
+            "modify": {
+              "id": "gmail.users.threads.modify",
+              "path": "gmail/v1/users/{userId}/threads/{id}/modify",
+              "httpMethod": "POST",
+              "parameters": {
+                "id": { "location": "path", "required": true, "type": "string" },
+                "userId": { "default": "me", "location": "path", "required": true, "type": "string" }
+              },
+              "parameterOrder": ["userId", "id"],
+              "request": { "$ref": "ModifyThreadRequest" },
+              "response": { "$ref": "Thread" },
+              "scopes": ["https://mail.google.com/", "https://www.googleapis.com/auth/gmail.modify"]
+            },
+            "trash": {
+              "id": "gmail.users.threads.trash",
+              "path": "gmail/v1/users/{userId}/threads/{id}/trash",
+              "httpMethod": "POST",
+              "parameters": {
+                "id": { "location": "path", "required": true, "type": "string" },
+                "userId": { "default": "me", "location": "path", "required": true, "type": "string" }
+              },
+              "parameterOrder": ["userId", "id"],
+              "response": { "$ref": "Thread" },
+              "scopes": ["https://mail.google.com/", "https://www.googleapis.com/auth/gmail.modify"]
+            },
+            "untrash": {
+              "id": "gmail.users.threads.untrash",
+              "path": "gmail/v1/users/{userId}/threads/{id}/untrash",
+              "httpMethod": "POST",
+              "parameters": {
+                "id": { "location": "path", "required": true, "type": "string" },
+                "userId": { "default": "me", "location": "path", "required": true, "type": "string" }
+              },
+              "parameterOrder": ["userId", "id"],
+              "response": { "$ref": "Thread" },
+              "scopes": ["https://mail.google.com/", "https://www.googleapis.com/auth/gmail.modify"]
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -2,11 +2,13 @@ use serde_json::{json, Value};
 
 use super::*;
 use crate::{
-    connections::model::{ConnectionAuthentication, ConnectionId, OAuthClientAuthMethod},
+    connections::model::{
+        ConnectionAuthentication, ConnectionId, OAuthClientAuthMethod, SubjectTokenSource,
+    },
     tools::openapi::{
         bind_generated_openapi_tools, generate_tools_from_api_document_str,
-        generate_tools_from_openapi_str, OpenApiSourceFormat, OpenApiToolGeneration,
-        OpenApiToolIncompatibilityReason,
+        generate_tools_from_openapi_str, OpenApiSecurityMismatch, OpenApiSecurityMismatchReason,
+        OpenApiSourceFormat, OpenApiToolGeneration, OpenApiToolIncompatibilityReason,
     },
 };
 
@@ -1258,9 +1260,8 @@ fn warnings_are_bounded_and_truncation_is_reported() {
         .is_some_and(|subject| subject.len() <= 256)));
 }
 
-#[test]
-fn slack_style_document_generates_its_query_operations() {
-    let generation = generate_tools_from_api_document_str(
+fn slack_style_generation() -> OpenApiToolGeneration {
+    generate_tools_from_api_document_str(
         "slack-style.json",
         &conversion_source(json!({
             "swagger": "2.0",
@@ -1313,7 +1314,12 @@ fn slack_style_document_generates_its_query_operations() {
             }
         })),
     )
-    .expect("Slack-style Swagger 2.0 document should generate");
+    .expect("Slack-style Swagger 2.0 document should generate")
+}
+
+#[test]
+fn slack_style_document_generates_its_query_operations() {
+    let generation = slack_style_generation();
     assert_eq!(
         tool_names(&generation),
         vec!["conversations_history", "chat_postMessage"]
@@ -1353,6 +1359,68 @@ fn slack_style_document_generates_its_query_operations() {
             ),
         ]
     );
+}
+
+/// The acceptance case of issue #443 for Swagger 2.0: an `accessCode` flow
+/// becomes a user-consent `authorizationCode` flow, which a delegated
+/// Connection binds for the scopes it requests, so a read-only Connection
+/// registers the history read and is told why posting does not bind.
+#[test]
+fn slack_style_read_operations_bind_to_a_delegated_connection() {
+    let generation = slack_style_generation();
+    let delegated = |requested_scopes: &[&str]| ConnectionAuthentication::DelegatedIssuerToken {
+        token_exchange_url: "https://issuer.example.test/oauth2/token-exchange".to_owned(),
+        client_id: "greengateway".to_owned(),
+        client_secret_id: Some("chat-exchange-secret".to_owned()),
+        requested_scopes: requested_scopes
+            .iter()
+            .map(|scope| (*scope).to_owned())
+            .collect(),
+        audience: None,
+        resource: None,
+        revocation_url: None,
+        subject_token_source: SubjectTokenSource::CallerAssertion,
+    };
+    let connection_id = ConnectionId::parse("chat").expect("connection ID should be valid");
+    let binding = bind_generated_openapi_tools(
+        &generation,
+        &connection_id,
+        &delegated(&["channels:history"]),
+    )
+    .expect("binding should report incompatibilities, not fail");
+    assert_eq!(
+        binding
+            .definitions
+            .iter()
+            .map(|definition| definition.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["conversations_history"]
+    );
+    assert_eq!(
+        binding.security_selections[0].selected_scheme_names,
+        vec!["chatAuth"]
+    );
+    assert_eq!(binding.incompatibilities.len(), 1);
+    let post = &binding.incompatibilities[0];
+    assert_eq!(post.tool_name, "chat_postMessage");
+    assert_eq!(
+        post.security_mismatches,
+        vec![OpenApiSecurityMismatch {
+            scheme_names: vec!["chatAuth".to_owned()],
+            reason: OpenApiSecurityMismatchReason::MissingScopes {
+                scopes: vec!["chat:write".to_owned()],
+            },
+        }]
+    );
+
+    let both = bind_generated_openapi_tools(
+        &generation,
+        &connection_id,
+        &delegated(&["channels:history", "chat:write"]),
+    )
+    .expect("binding should succeed");
+    assert_eq!(both.definitions.len(), 2);
+    assert!(both.incompatibilities.is_empty());
 }
 
 #[test]

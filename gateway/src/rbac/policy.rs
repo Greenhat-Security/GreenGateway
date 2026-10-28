@@ -3391,6 +3391,8 @@ mod tests {
             shutdown_drain_delay_ms: crate::config::DEFAULT_SHUTDOWN_DRAIN_DELAY_MS,
             shutdown_timeout_ms: crate::config::DEFAULT_SHUTDOWN_TIMEOUT_MS,
             audit_drain_timeout_ms: crate::config::DEFAULT_AUDIT_DRAIN_TIMEOUT_MS,
+            audit_durability: crate::config::DEFAULT_AUDIT_DURABILITY,
+            audit_durability_timeout_ms: crate::config::DEFAULT_AUDIT_DURABILITY_TIMEOUT_MS,
             discovery_sqlite_path: None,
             discovery_endpoint_limit: crate::config::DEFAULT_DISCOVERY_ENDPOINT_LIMIT,
             discovery_projector_lease_ttl_ms:

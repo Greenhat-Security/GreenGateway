@@ -23,6 +23,7 @@ use crate::audit::{
     Actor, AuditEvent,
 };
 use crate::auth::{
+    change_actor::ChangeActor,
     principal_directory::{
         PrincipalDirectory, PrincipalDirectoryKey, PrincipalDirectoryListFilters,
         PrincipalObservation,
@@ -504,7 +505,10 @@ async fn service_token_store_contract(store: &dyn ServiceTokenStore) {
 
     // Revoke is idempotent and keeps the first revoked_at.
     let first_revoke = store
-        .revoke(&created.record.id, "contract-revoker")
+        .revoke(
+            &created.record.id,
+            &ChangeActor::for_test("contract-revoker"),
+        )
         .await
         .expect("revoke should query")
         .expect("revoked token should exist");
@@ -513,7 +517,10 @@ async fn service_token_store_contract(store: &dyn ServiceTokenStore) {
         .clone()
         .expect("revoke must set revoked_at");
     let second_revoke = store
-        .revoke(&created.record.id, "contract-revoker")
+        .revoke(
+            &created.record.id,
+            &ChangeActor::for_test("contract-revoker"),
+        )
         .await
         .expect("second revoke should query")
         .expect("revoked token should still exist");
@@ -533,7 +540,13 @@ async fn service_token_store_contract(store: &dyn ServiceTokenStore) {
     );
 
     // Rotating a revoked token is a conflict, not a silent success.
-    let rotate_error = match store.rotate(&created.record.id, "contract-rotator").await {
+    let rotate_error = match store
+        .rotate(
+            &created.record.id,
+            &ChangeActor::for_test("contract-rotator"),
+        )
+        .await
+    {
         // `CreatedToken` deliberately has no `Debug`: the plaintext token
         // must never be formattable into a panic message.
         Ok(_) => panic!("rotating a revoked token must fail"),
@@ -556,7 +569,7 @@ async fn service_token_store_contract(store: &dyn ServiceTokenStore) {
         .await
         .expect("live token should create");
     let rotated = store
-        .rotate(&live.record.id, "contract-rotator")
+        .rotate(&live.record.id, &ChangeActor::for_test("contract-rotator"))
         .await
         .expect("live rotate should query")
         .expect("live token should exist");
@@ -592,14 +605,36 @@ async fn sqlite_service_token_store_satisfies_the_contract() {
 // ---------------------------------------------------------------------------
 
 /// One change-evidence row as both stores record it: the generated
-/// identifiers, who acted, what they did and to which token.
+/// identifiers, who acted (subject, issuer, kind and auth mode), what they
+/// did and to which token.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TokenChangeEvidence {
     event_id: String,
     operation_id: String,
     actor_user_id: String,
+    actor_issuer: Option<String>,
+    actor_kind: Option<String>,
+    actor_auth_mode: Option<String>,
     action: String,
     token_id: String,
+}
+
+/// The actor an admin endpoint would build for a principal authenticated
+/// by `auth_method`, optionally vouched for by `issuer`.
+fn principal_actor(
+    subject: &str,
+    issuer: Option<&str>,
+    auth_method: crate::auth::AuthMethod,
+) -> ChangeActor {
+    ChangeActor::from_principal(&crate::auth::Principal {
+        user_id: subject.to_owned(),
+        issuer: issuer.map(str::to_owned),
+        email: Some("evidence-actor@example.test".to_owned()),
+        org_id: Some("org-evidence".to_owned()),
+        roles: vec!["token-admin".to_owned()],
+        session_id: "session-evidence".to_owned(),
+        auth_method,
+    })
 }
 
 /// How the shared contract reads a store's evidence. Test-only: nothing in
@@ -634,7 +669,8 @@ fn sqlite_token_evidence(path: &PathBuf) -> Vec<TokenChangeEvidence> {
     let connection = rusqlite::Connection::open(path).expect("evidence database should open");
     let mut statement = connection
         .prepare(
-            "SELECT event_id, operation_id, actor_user_id, action, token_id \
+            "SELECT event_id, operation_id, actor_user_id, actor_issuer, actor_kind, \
+                    actor_auth_mode, action, token_id \
              FROM service_token_change_evidence ORDER BY sequence",
         )
         .expect("evidence query should prepare");
@@ -644,8 +680,11 @@ fn sqlite_token_evidence(path: &PathBuf) -> Vec<TokenChangeEvidence> {
                 event_id: row.get(0)?,
                 operation_id: row.get(1)?,
                 actor_user_id: row.get(2)?,
-                action: row.get(3)?,
-                token_id: row.get(4)?,
+                actor_issuer: row.get(3)?,
+                actor_kind: row.get(4)?,
+                actor_auth_mode: row.get(5)?,
+                action: row.get(6)?,
+                token_id: row.get(7)?,
             })
         })
         .expect("evidence query should run")
@@ -684,15 +723,18 @@ fn sqlite_token_evidence_text(path: &PathBuf) -> Vec<String> {
 }
 
 /// Assert the change-evidence contract both service-token stores share
-/// (issue #425): every committed rotate and revoke records its actor and
-/// action exactly once, in commit order and under its own operation; a call
-/// that changes nothing records nothing; an unattributable change is
-/// refused before anything changes; the creator stays the creator; and no
-/// row carries token material.
+/// (issue #425): every committed rotate and revoke records its actor --
+/// subject, canonical issuer, kind and auth mode -- and action exactly once,
+/// in commit order and under its own operation; a call that changes nothing
+/// records nothing; an actor evidence cannot record exactly is refused
+/// before anything changes; the creator stays the creator; and no row
+/// carries token material.
 async fn service_token_change_evidence_contract(
     store: &dyn ServiceTokenStore,
     evidence: &dyn TokenChangeEvidenceReader,
 ) {
+    use crate::auth::AuthMethod;
+
     let created = store
         .create(CreateTokenRequest {
             scopes: vec!["admin:tokens:read".to_owned()],
@@ -707,13 +749,29 @@ async fn service_token_change_evidence_contract(
         "issuing a token is not a rotate or a revoke"
     );
 
+    // A person signed in through a provider rotates (its issuer recorded in
+    // the canonical form audit and policy use); a service token revokes.
     let rotated = store
-        .rotate(&id, "rotating-admin")
+        .rotate(
+            &id,
+            &principal_actor(
+                "rotating-admin",
+                Some(" https://idp.example.test/ "),
+                AuthMethod::Cookie,
+            ),
+        )
         .await
         .expect("rotate should commit")
         .expect("token should exist");
     let revoked = store
-        .revoke(&id, "revoking-admin")
+        .revoke(
+            &id,
+            &principal_actor(
+                "service-token:token_revoker",
+                None,
+                AuthMethod::ServiceToken,
+            ),
+        )
         .await
         .expect("revoke should commit")
         .expect("token should exist");
@@ -722,23 +780,28 @@ async fn service_token_change_evidence_contract(
     // Calls that change nothing record nothing: a repeat revoke, a rotate
     // of a revoked token, and either change against an unknown token.
     let repeat = store
-        .revoke(&id, "second-revoker")
+        .revoke(&id, &ChangeActor::for_test("second-revoker"))
         .await
         .expect("a repeat revoke should answer")
         .expect("token should still exist");
     assert_eq!(repeat.revoked_at.as_deref(), Some(revoked_at.as_str()));
-    let refused = match store.rotate(&id, "late-rotator").await {
+    let refused = match store
+        .rotate(&id, &ChangeActor::for_test("late-rotator"))
+        .await
+    {
         Ok(_) => panic!("rotating a revoked token must fail"),
         Err(error) => error,
     };
     assert_eq!(refused.kind(), RepositoryErrorKind::Conflict, "{refused}");
     assert!(store
-        .revoke("token_absent", "revoking-admin")
+        .revoke("token_absent", &ChangeActor::for_test("revoking-admin"))
         .await
         .expect("an unknown revoke should answer")
         .is_none());
     assert!(matches!(
-        store.rotate("token_absent", "rotating-admin").await,
+        store
+            .rotate("token_absent", &ChangeActor::for_test("rotating-admin"))
+            .await,
         Ok(None)
     ));
 
@@ -748,14 +811,31 @@ async fn service_token_change_evidence_contract(
             .map(|row| (
                 row.action.as_str(),
                 row.actor_user_id.as_str(),
+                row.actor_issuer.as_deref(),
+                row.actor_kind.as_deref(),
+                row.actor_auth_mode.as_deref(),
                 row.token_id.as_str()
             ))
             .collect::<Vec<_>>(),
         [
-            ("service_token.rotate", "rotating-admin", id.as_str()),
-            ("service_token.revoke", "revoking-admin", id.as_str()),
+            (
+                "service_token.rotate",
+                "rotating-admin",
+                Some("https://idp.example.test"),
+                Some("principal"),
+                Some("session_cookie"),
+                id.as_str()
+            ),
+            (
+                "service_token.revoke",
+                "service-token:token_revoker",
+                None,
+                Some("service_token"),
+                Some("service_token"),
+                id.as_str()
+            ),
         ],
-        "one row per committed change, naming who made it"
+        "one row per committed change, naming who made it and how they authenticated"
     );
     for row in &rows {
         for generated in [&row.event_id, &row.operation_id] {
@@ -789,15 +869,26 @@ async fn service_token_change_evidence_contract(
         .await
         .expect("live token should create");
     let oversized = "a".repeat(crate::auth::tokens::MAX_TOKEN_CHANGE_ACTOR_BYTES + 1);
-    for actor in ["", oversized.as_str()] {
-        let rotate_error = match store.rotate(&live.record.id, actor).await {
-            Ok(_) => panic!("an unattributable rotate must be refused"),
+    let oversized_issuer = "i".repeat(crate::auth::tokens::MAX_TOKEN_CHANGE_ACTOR_ISSUER_BYTES + 1);
+    for actor in [
+        ChangeActor::for_test(""),
+        ChangeActor::for_test(&oversized),
+        ChangeActor::for_test_with_issuer("issuing-admin", ""),
+        ChangeActor::for_test_with_issuer("issuing-admin", &oversized_issuer),
+        // Only a principal is vouched for by an issuer.
+        ChangeActor::service_token_with_issuer_for_test(
+            "service-token:token_revoker",
+            "https://idp.example.test",
+        ),
+    ] {
+        let rotate_error = match store.rotate(&live.record.id, &actor).await {
+            Ok(_) => panic!("an unrecordable rotate must be refused: {actor:?}"),
             Err(error) => error,
         };
         let revoke_error = store
-            .revoke(&live.record.id, actor)
+            .revoke(&live.record.id, &actor)
             .await
-            .expect_err("an unattributable revoke must be refused");
+            .expect_err("an unrecordable revoke must be refused");
         for error in [rotate_error, revoke_error] {
             assert_eq!(error.kind(), RepositoryErrorKind::InvalidData, "{error}");
             assert_eq!(error.invalid_parameter_name(), None);
@@ -815,14 +906,29 @@ async fn service_token_change_evidence_contract(
     );
     assert_eq!(evidence.rows().await.len(), 2);
     let longest = "a".repeat(crate::auth::tokens::MAX_TOKEN_CHANGE_ACTOR_BYTES);
+    let longest_issuer = "i".repeat(crate::auth::tokens::MAX_TOKEN_CHANGE_ACTOR_ISSUER_BYTES);
     let rerotated = store
-        .rotate(&live.record.id, &longest)
+        .rotate(
+            &live.record.id,
+            &ChangeActor::for_test_with_issuer(&longest, &longest_issuer),
+        )
         .await
-        .expect("an actor at the principal bound is recorded")
+        .expect("an actor at the principal bounds is recorded")
         .expect("token should exist");
     let rows = evidence.rows().await;
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[2].actor_user_id, longest);
+    assert_eq!(
+        rows[2].actor_issuer.as_deref(),
+        Some(longest_issuer.as_str())
+    );
+    assert_eq!(
+        (
+            rows[2].actor_kind.as_deref(),
+            rows[2].actor_auth_mode.as_deref()
+        ),
+        (Some("principal"), Some("bearer_token"))
+    );
 
     // Identifiers and actors only: no plaintext, hash, display prefix or
     // scope reaches a row.
@@ -844,6 +950,19 @@ async fn service_token_change_evidence_contract(
     }
     assert!(!stored.contains("ggw_"), "no display prefix: {stored}");
     assert!(!stored.contains("admin:tokens:read"), "no scopes: {stored}");
+    // The actor is its subject, issuer, kind and auth mode, never the rest
+    // of the principal it came from.
+    for principal_detail in [
+        "evidence-actor@example.test",
+        "org-evidence",
+        "token-admin",
+        "session-evidence",
+    ] {
+        assert!(
+            !stored.contains(principal_detail),
+            "no email, organization, role or session in evidence: {stored}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -878,20 +997,23 @@ async fn sqlite_change_evidence_survives_token_deletion_and_restart() {
         .expect("token should create");
     let id = created.record.id.clone();
     store
-        .rotate(&id, "rotating-admin")
+        .rotate(&id, &ChangeActor::for_test("rotating-admin"))
         .await
         .expect("rotate should commit")
         .expect("token should exist");
     let revoked = store
-        .revoke(&id, "revoking-admin")
+        .revoke(&id, &ChangeActor::for_test("revoking-admin"))
         .await
         .expect("revoke should commit")
         .expect("token should exist");
     let before = sqlite_token_evidence_text(&db.path);
     assert_eq!(before.len(), 2, "{before:?}");
     let revoked_at = revoked.revoked_at.expect("revoke sets revoked_at");
+    // The commit time is followed by the actor metadata columns the store
+    // adds on open: kind, auth mode and (for this issuer-less principal) no
+    // issuer.
     assert!(
-        before[1].ends_with(&format!("|{revoked_at}")),
+        before[1].ends_with(&format!("|{revoked_at}|principal|bearer_token|NULL")),
         "the revoke's evidence carries the revoke's own instant: {before:?}"
     );
     drop(store);
@@ -910,7 +1032,7 @@ async fn sqlite_change_evidence_survives_token_deletion_and_restart() {
         "the evidence survives the token row and the restart unchanged"
     );
     assert!(reopened
-        .revoke(&id, "revoking-admin")
+        .revoke(&id, &ChangeActor::for_test("revoking-admin"))
         .await
         .expect("a retry should answer")
         .is_none());
@@ -957,12 +1079,15 @@ async fn sqlite_failed_evidence_insert_rolls_back_rotate_and_revoke() {
              BEGIN SELECT RAISE(ABORT, 'injected evidence failure'); END;",
         )
         .expect("failure trigger should install");
-    let rotate_error = match store.rotate(&id, "faulted-admin").await {
+    let rotate_error = match store
+        .rotate(&id, &ChangeActor::for_test("faulted-admin"))
+        .await
+    {
         Ok(_) => panic!("a rotate whose evidence cannot commit must fail"),
         Err(error) => error,
     };
     let revoke_error = store
-        .revoke(&id, "faulted-admin")
+        .revoke(&id, &ChangeActor::for_test("faulted-admin"))
         .await
         .expect_err("a revoke whose evidence cannot commit must fail");
     for error in [rotate_error, revoke_error] {
@@ -995,7 +1120,7 @@ async fn sqlite_failed_evidence_insert_rolls_back_rotate_and_revoke() {
     );
 
     store
-        .revoke(&id, "recovered-admin")
+        .revoke(&id, &ChangeActor::for_test("recovered-admin"))
         .await
         .expect("the revoke commits once evidence can be written")
         .expect("token should exist");
@@ -1037,7 +1162,7 @@ fn sqlite_rotate_and_revoke_race_records_exactly_the_committed_changes() {
             let barrier = barrier.clone();
             std::thread::spawn(move || {
                 barrier.wait();
-                TokenStore::revoke(&store, &id, "revoking-admin")
+                TokenStore::revoke(&store, &id, &ChangeActor::for_test("revoking-admin"))
             })
         };
         let rotate = {
@@ -1046,7 +1171,7 @@ fn sqlite_rotate_and_revoke_race_records_exactly_the_committed_changes() {
             let barrier = barrier.clone();
             std::thread::spawn(move || {
                 barrier.wait();
-                TokenStore::rotate(&store, &id, "rotating-admin")
+                TokenStore::rotate(&store, &id, &ChangeActor::for_test("rotating-admin"))
             })
         };
         let revoked = revoke
@@ -1148,7 +1273,7 @@ async fn sqlite_store_adds_change_evidence_to_a_database_written_without_it() {
         TokenVerification::Valid(_)
     ));
     upgraded
-        .revoke(&created.record.id, "upgraded-admin")
+        .revoke(&created.record.id, &ChangeActor::for_test("upgraded-admin"))
         .await
         .expect("revoke should commit")
         .expect("token should exist");
@@ -2072,7 +2197,7 @@ impl ServiceTokenStore for GatedTokenStore {
     async fn revoke(
         &self,
         _id: &str,
-        _actor_user_id: &str,
+        _actor: &ChangeActor,
     ) -> Result<Option<crate::auth::tokens::TokenRecord>, RepositoryError> {
         unimplemented!("not needed by the executor proof")
     }
@@ -2080,7 +2205,7 @@ impl ServiceTokenStore for GatedTokenStore {
     async fn rotate(
         &self,
         _id: &str,
-        _actor_user_id: &str,
+        _actor: &ChangeActor,
     ) -> Result<Option<crate::auth::tokens::CreatedToken>, RepositoryError> {
         unimplemented!("not needed by the executor proof")
     }
@@ -3084,7 +3209,7 @@ pub(crate) mod postgres_audit_tests {
         assert!(!replica_b.is_revoked("jti-1").await.expect("lookup"));
         let before = scalar_i64(&pool_a, SHARED).await;
         let first = replica_a
-            .revoke("jti-1", None, "operator")
+            .revoke("jti-1", None, &ChangeActor::system("operator"))
             .await
             .expect("revoke");
         let JwtRevocationOutcome::Revoked { security_revision } = first else {
@@ -3105,7 +3230,7 @@ pub(crate) mod postgres_audit_tests {
         );
         assert_eq!(
             replica_b
-                .revoke("jti-1", None, "operator")
+                .revoke("jti-1", None, &ChangeActor::system("operator"))
                 .await
                 .expect("revoke again"),
             JwtRevocationOutcome::AlreadyRevoked
@@ -3142,7 +3267,11 @@ pub(crate) mod postgres_audit_tests {
             .format(&time::format_description::well_known::Rfc3339)
             .expect("rfc3339");
         short_lived
-            .revoke("jti-expired", Some(&in_one_second), "operator")
+            .revoke(
+                "jti-expired",
+                Some(&in_one_second),
+                &ChangeActor::system("operator"),
+            )
             .await
             .expect("revoke with a short expiry");
         tokio::time::sleep(std::time::Duration::from_millis(1800)).await;
@@ -4280,7 +4409,7 @@ pub(crate) mod postgres_audit_tests {
             .format(&time::format_description::well_known::Rfc3339)
             .expect("rfc3339");
         store
-            .revoke("jti-leeway", Some(&exp), "operator")
+            .revoke("jti-leeway", Some(&exp), &ChangeActor::system("operator"))
             .await
             .expect("revoke");
 
@@ -4334,7 +4463,11 @@ pub(crate) mod postgres_audit_tests {
 
         // Lapsed row, then an unbounded revoke: reactivated, with a new revision.
         store
-            .revoke("jti-lapsed", Some(&in_one_second()), "operator")
+            .revoke(
+                "jti-lapsed",
+                Some(&in_one_second()),
+                &ChangeActor::system("operator"),
+            )
             .await
             .expect("revoke");
         tokio::time::sleep(std::time::Duration::from_millis(2300)).await;
@@ -4349,7 +4482,7 @@ pub(crate) mod postgres_audit_tests {
             .format(&time::format_description::well_known::Rfc3339)
             .expect("rfc3339");
         let refused = store
-            .revoke("jti-lapsed", Some(&past), "operator")
+            .revoke("jti-lapsed", Some(&past), &ChangeActor::system("operator"))
             .await
             .expect_err("an expiry in the past is refused");
         assert_eq!(refused.invalid_parameter_name(), Some("expires_at"));
@@ -4358,7 +4491,11 @@ pub(crate) mod postgres_audit_tests {
         // the caller's error, not a server-dependent lifetime.
         for spelling in ["tomorrow", "infinity", "2030-01-01", "2030-01-01 00:00:00"] {
             let refused = store
-                .revoke("jti-grammar", Some(spelling), "operator")
+                .revoke(
+                    "jti-grammar",
+                    Some(spelling),
+                    &ChangeActor::system("operator"),
+                )
                 .await
                 .expect_err("a non-RFC-3339 expiry is refused");
             assert_eq!(
@@ -4371,13 +4508,13 @@ pub(crate) mod postgres_audit_tests {
         // An empty jti names no token; the validator never asks about one.
         for empty in ["", "   "] {
             let refused = store
-                .revoke(empty, None, "operator")
+                .revoke(empty, None, &ChangeActor::system("operator"))
                 .await
                 .expect_err("an empty jti is refused");
             assert_eq!(refused.invalid_parameter_name(), Some("jti"));
         }
         let again = store
-            .revoke("jti-lapsed", None, "operator")
+            .revoke("jti-lapsed", None, &ChangeActor::system("operator"))
             .await
             .expect("repeat revoke");
         assert!(
@@ -4387,7 +4524,7 @@ pub(crate) mod postgres_audit_tests {
         assert!(store.is_revoked("jti-lapsed").await.expect("lookup"));
         assert_eq!(
             store
-                .revoke("jti-lapsed", None, "operator")
+                .revoke("jti-lapsed", None, &ChangeActor::system("operator"))
                 .await
                 .expect("repeat"),
             JwtRevocationOutcome::AlreadyRevoked,
@@ -4396,11 +4533,19 @@ pub(crate) mod postgres_audit_tests {
 
         // A shorter row inside its window, then a longer expiry: extended.
         store
-            .revoke("jti-short", Some(&in_one_second()), "operator")
+            .revoke(
+                "jti-short",
+                Some(&in_one_second()),
+                &ChangeActor::system("operator"),
+            )
             .await
             .expect("revoke");
         let extended = store
-            .revoke("jti-short", Some(&in_one_minute), "operator")
+            .revoke(
+                "jti-short",
+                Some(&in_one_minute),
+                &ChangeActor::system("operator"),
+            )
             .await
             .expect("extend");
         assert!(
@@ -4409,7 +4554,11 @@ pub(crate) mod postgres_audit_tests {
         );
         assert_eq!(
             store
-                .revoke("jti-short", Some(&in_one_second()), "operator")
+                .revoke(
+                    "jti-short",
+                    Some(&in_one_second()),
+                    &ChangeActor::system("operator")
+                )
                 .await
                 .expect("repeat"),
             JwtRevocationOutcome::AlreadyRevoked,
@@ -4446,7 +4595,11 @@ pub(crate) mod postgres_audit_tests {
         .format(&time::format_description::well_known::Rfc3339)
         .expect("rfc3339");
         let outcome = store
-            .revoke("jti-recent", Some(&ten_seconds_ago), "operator")
+            .revoke(
+                "jti-recent",
+                Some(&ten_seconds_ago),
+                &ChangeActor::system("operator"),
+            )
             .await
             .expect("an expiry inside the leeway window is accepted");
         assert!(matches!(
@@ -4463,7 +4616,11 @@ pub(crate) mod postgres_audit_tests {
             .format(&time::format_description::well_known::Rfc3339)
             .expect("rfc3339");
         let refused = store
-            .revoke("jti-stale", Some(&a_minute_ago), "operator")
+            .revoke(
+                "jti-stale",
+                Some(&a_minute_ago),
+                &ChangeActor::system("operator"),
+            )
             .await
             .expect_err("an expiry past the window is refused");
         assert_eq!(refused.invalid_parameter_name(), Some("expires_at"));
@@ -4606,7 +4763,11 @@ pub(crate) mod postgres_audit_tests {
             .format(&time::format_description::well_known::Rfc3339)
             .expect("rfc3339");
         let refused = store
-            .revoke("jti-lockwait", Some(&soon), "operator")
+            .revoke(
+                "jti-lockwait",
+                Some(&soon),
+                &ChangeActor::system("operator"),
+            )
             .await
             .expect_err("an expiry that lapsed during the lock wait is refused");
         assert_eq!(refused.invalid_parameter_name(), Some("expires_at"));
@@ -4884,7 +5045,10 @@ pub(crate) mod postgres_audit_tests {
         );
 
         store
-            .rotate(&created.record.id, "contract-rotator")
+            .rotate(
+                &created.record.id,
+                &ChangeActor::for_test("contract-rotator"),
+            )
             .await
             .expect("rotate");
         let after_rotate = scalar_i64(&pool, SHARED).await;
@@ -4892,7 +5056,10 @@ pub(crate) mod postgres_audit_tests {
         assert_eq!(store.state_revision().await.expect("mark"), after_rotate);
 
         store
-            .revoke(&created.record.id, "contract-revoker")
+            .revoke(
+                &created.record.id,
+                &ChangeActor::for_test("contract-revoker"),
+            )
             .await
             .expect("revoke");
         let after_revoke = scalar_i64(&pool, SHARED).await;
@@ -4901,7 +5068,10 @@ pub(crate) mod postgres_audit_tests {
 
         // A second revoke is idempotent: no revision, no outbox row.
         store
-            .revoke(&created.record.id, "contract-revoker")
+            .revoke(
+                &created.record.id,
+                &ChangeActor::for_test("contract-revoker"),
+            )
             .await
             .expect("revoke again");
         assert_eq!(scalar_i64(&pool, SHARED).await, after_revoke);
@@ -4969,7 +5139,7 @@ pub(crate) mod postgres_audit_tests {
             let barrier = barrier.clone();
             tokio::spawn(async move {
                 barrier.wait().await;
-                store.rotate(&id, actor).await
+                store.rotate(&id, &ChangeActor::for_test(actor)).await
             })
         };
         let (first, second) = tokio::join!(
@@ -5070,7 +5240,9 @@ pub(crate) mod postgres_audit_tests {
                 let barrier = barrier.clone();
                 tokio::spawn(async move {
                     barrier.wait().await;
-                    store.revoke(&id, "revoking-replica").await
+                    store
+                        .revoke(&id, &ChangeActor::for_test("revoking-replica"))
+                        .await
                 })
             };
             let rotate = {
@@ -5079,7 +5251,9 @@ pub(crate) mod postgres_audit_tests {
                 let barrier = barrier.clone();
                 tokio::spawn(async move {
                     barrier.wait().await;
-                    store.rotate(&id, "rotating-replica").await
+                    store
+                        .rotate(&id, &ChangeActor::for_test("rotating-replica"))
+                        .await
                 })
             };
             let (revoke, rotate) = tokio::join!(revoke, rotate);
@@ -5158,6 +5332,9 @@ pub(crate) mod postgres_audit_tests {
         event_id: String,
         operation_id: String,
         actor_user_id: String,
+        actor_issuer: Option<String>,
+        actor_kind: Option<String>,
+        actor_auth_mode: Option<String>,
         action: String,
         token_id: String,
         prior_version: i64,
@@ -5174,7 +5351,8 @@ pub(crate) mod postgres_audit_tests {
             .query(
                 r#"
                 SELECT event_id::text, operation_id::text, actor_user_id, action, token_id,
-                       prior_version, new_version, security_revision, committed_at::text
+                       prior_version, new_version, security_revision, committed_at::text,
+                       actor_issuer, actor_kind, actor_auth_mode
                 FROM greengateway.service_token_change_evidence
                 ORDER BY security_revision, event_id
                 "#,
@@ -5187,6 +5365,9 @@ pub(crate) mod postgres_audit_tests {
                 event_id: row.get(0),
                 operation_id: row.get(1),
                 actor_user_id: row.get(2),
+                actor_issuer: row.get(9),
+                actor_kind: row.get(10),
+                actor_auth_mode: row.get(11),
                 action: row.get(3),
                 token_id: row.get(4),
                 prior_version: row.get(5),
@@ -5247,6 +5428,9 @@ pub(crate) mod postgres_audit_tests {
                     event_id: row.event_id,
                     operation_id: row.operation_id,
                     actor_user_id: row.actor_user_id,
+                    actor_issuer: row.actor_issuer,
+                    actor_kind: row.actor_kind,
+                    actor_auth_mode: row.actor_auth_mode,
                     action: row.action,
                     token_id: row.token_id,
                 })
@@ -5296,7 +5480,10 @@ pub(crate) mod postgres_audit_tests {
                 "prior_version",
                 "new_version",
                 "security_revision",
-                "committed_at"
+                "committed_at",
+                "actor_kind",
+                "actor_auth_mode",
+                "actor_issuer"
             ],
             "evidence holds identifiers, revisions and the actor; a new column needs review"
         );
@@ -5304,12 +5491,12 @@ pub(crate) mod postgres_audit_tests {
         let created = store.create(token_request(&["a"])).await.expect("create");
         let id = created.record.id.clone();
         store
-            .rotate(&id, "rotating-admin")
+            .rotate(&id, &ChangeActor::for_test("rotating-admin"))
             .await
             .expect("rotate")
             .expect("exists");
         store
-            .revoke(&id, "revoking-admin")
+            .revoke(&id, &ChangeActor::for_test("revoking-admin"))
             .await
             .expect("revoke")
             .expect("exists");
@@ -5317,7 +5504,7 @@ pub(crate) mod postgres_audit_tests {
             "SELECT last_revision FROM greengateway.security_revision_state WHERE singleton";
         let shared = scalar_i64(&pool, SHARED).await;
         store
-            .revoke(&id, "second-revoker")
+            .revoke(&id, &ChangeActor::for_test("second-revoker"))
             .await
             .expect("repeat revoke")
             .expect("exists");
@@ -5420,7 +5607,7 @@ pub(crate) mod postgres_audit_tests {
             "the evidence survives the token row and the restart unchanged"
         );
         assert!(restarted
-            .revoke(&id, "revoking-admin")
+            .revoke(&id, &ChangeActor::for_test("revoking-admin"))
             .await
             .expect("a retry should answer")
             .is_none());
@@ -5484,12 +5671,15 @@ pub(crate) mod postgres_audit_tests {
         let tokens_before = table_json(&pool, "service_tokens").await;
 
         let restore = fail_inserts_into(&pool, "service_token_change_evidence").await;
-        let rotate_error = match store.rotate(&id, "faulted-admin").await {
+        let rotate_error = match store
+            .rotate(&id, &ChangeActor::for_test("faulted-admin"))
+            .await
+        {
             Ok(_) => panic!("a rotate whose evidence cannot commit must fail"),
             Err(error) => error,
         };
         let revoke_error = store
-            .revoke(&id, "faulted-admin")
+            .revoke(&id, &ChangeActor::for_test("faulted-admin"))
             .await
             .expect_err("a revoke whose evidence cannot commit must fail");
         for error in [rotate_error, revoke_error] {
@@ -5531,7 +5721,7 @@ pub(crate) mod postgres_audit_tests {
         );
 
         store
-            .revoke(&id, "recovered-admin")
+            .revoke(&id, &ChangeActor::for_test("recovered-admin"))
             .await
             .expect("the revoke commits once evidence can be written")
             .expect("exists");
@@ -5552,6 +5742,11 @@ pub(crate) mod postgres_audit_tests {
         event_id: String,
         operation_id: String,
         actor_user_id: String,
+        /// The acting principal's issuer (migration 24), not the revoked
+        /// token's, which is `issuer`.
+        actor_issuer: Option<String>,
+        actor_kind: Option<String>,
+        actor_auth_mode: Option<String>,
         action: String,
         issuer: String,
         jti_hash: String,
@@ -5568,7 +5763,8 @@ pub(crate) mod postgres_audit_tests {
                 r#"
                 SELECT event_id::text, operation_id::text, actor_user_id, action, issuer,
                        jti_hash, EXTRACT(EPOCH FROM expires_at)::double precision,
-                       security_revision, committed_at::text
+                       security_revision, committed_at::text,
+                       actor_issuer, actor_kind, actor_auth_mode
                 FROM greengateway.jwt_revocation_evidence
                 ORDER BY security_revision, event_id
                 "#,
@@ -5581,6 +5777,9 @@ pub(crate) mod postgres_audit_tests {
                 event_id: row.get(0),
                 operation_id: row.get(1),
                 actor_user_id: row.get(2),
+                actor_issuer: row.get(9),
+                actor_kind: row.get(10),
+                actor_auth_mode: row.get(11),
                 action: row.get(3),
                 issuer: row.get(4),
                 jti_hash: row.get(5),
@@ -5620,7 +5819,10 @@ pub(crate) mod postgres_audit_tests {
                 "jti_hash",
                 "expires_at",
                 "security_revision",
-                "committed_at"
+                "committed_at",
+                "actor_kind",
+                "actor_auth_mode",
+                "actor_issuer"
             ],
             "evidence holds the key, the expiry, the revision and the actor; a new column needs review"
         );
@@ -5642,22 +5844,37 @@ pub(crate) mod postgres_audit_tests {
         };
 
         // An extension by a second actor: the row now names only that
-        // actor, and the evidence keeps both.
+        // actor, and the evidence keeps both. The second is a principal
+        // vouched for by its own provider, so the evidence shows the actor's
+        // issuer beside, never in place of, the revoked token's.
         let first = revoked(
             store
-                .revoke("jti-extended", Some(&in_seconds(1)), "operator:revoke-jwt")
+                .revoke(
+                    "jti-extended",
+                    Some(&in_seconds(1)),
+                    &ChangeActor::system("operator:revoke-jwt"),
+                )
                 .await
                 .expect("revoke"),
         );
+        let operator_issuer = "https://operator-idp.example.test";
         let extended = revoked(
             store
-                .revoke("jti-extended", Some(&in_seconds(60)), "second-operator")
+                .revoke(
+                    "jti-extended",
+                    Some(&in_seconds(60)),
+                    &ChangeActor::for_test_with_issuer("second-operator", operator_issuer),
+                )
                 .await
                 .expect("extend"),
         );
         assert_eq!(
             store
-                .revoke("jti-extended", Some(&in_seconds(1)), "third-operator")
+                .revoke(
+                    "jti-extended",
+                    Some(&in_seconds(1)),
+                    &ChangeActor::system("third-operator")
+                )
                 .await
                 .expect("repeat"),
             JwtRevocationOutcome::AlreadyRevoked
@@ -5682,13 +5899,31 @@ pub(crate) mod postgres_audit_tests {
         assert_eq!(
             evidence
                 .iter()
-                .map(|row| (row.actor_user_id.as_str(), row.security_revision))
+                .map(|row| (
+                    row.actor_user_id.as_str(),
+                    row.actor_kind.as_deref(),
+                    row.actor_auth_mode.as_deref(),
+                    row.actor_issuer.as_deref(),
+                    row.security_revision
+                ))
                 .collect::<Vec<_>>(),
             [
-                ("operator:revoke-jwt", first),
-                ("second-operator", extended)
+                (
+                    "operator:revoke-jwt",
+                    Some("system"),
+                    Some("system"),
+                    None,
+                    first
+                ),
+                (
+                    "second-operator",
+                    Some("principal"),
+                    Some("bearer_token"),
+                    Some(operator_issuer),
+                    extended
+                )
             ],
-            "the extension is a second row, and the first actor is kept"
+            "the extension is a second row, and the first actor is kept as system provenance"
         );
         for row in &evidence {
             assert_eq!(row.action, "jwt.revoke");
@@ -5725,18 +5960,25 @@ pub(crate) mod postgres_audit_tests {
             .expect("rfc3339");
         for (jti, expires_at) in [("jti-stale", Some(past.as_str())), ("  ", None)] {
             store
-                .revoke(jti, expires_at, "operator:revoke-jwt")
+                .revoke(jti, expires_at, &ChangeActor::system("operator:revoke-jwt"))
                 .await
                 .expect_err("a refused revoke");
         }
         for actor in [
-            String::new(),
-            "a".repeat(crate::auth::tokens::MAX_TOKEN_CHANGE_ACTOR_BYTES + 1),
+            ChangeActor::for_test(""),
+            ChangeActor::for_test(
+                &"a".repeat(crate::auth::tokens::MAX_TOKEN_CHANGE_ACTOR_BYTES + 1),
+            ),
+            ChangeActor::for_test_with_issuer(
+                "issuing-operator",
+                &"i".repeat(crate::auth::tokens::MAX_TOKEN_CHANGE_ACTOR_ISSUER_BYTES + 1),
+            ),
+            ChangeActor::service_token_with_issuer_for_test("service-token:token_1", issuer),
         ] {
             let refused = store
                 .revoke("jti-unattributed", None, &actor)
                 .await
-                .expect_err("an unattributable revoke is refused");
+                .expect_err("an unrecordable revoke is refused");
             assert_eq!(refused.kind(), RepositoryErrorKind::InvalidData);
         }
         assert!(!store.is_revoked("jti-unattributed").await.expect("lookup"));
@@ -5749,14 +5991,18 @@ pub(crate) mod postgres_audit_tests {
                 .revoke(
                     "jti-reactivated",
                     Some(&in_seconds(1)),
-                    "operator:revoke-jwt",
+                    &ChangeActor::system("operator:revoke-jwt"),
                 )
                 .await
                 .expect("revoke"),
         );
         let cleaned = revoked(
             store
-                .revoke("jti-cleaned", Some(&in_seconds(1)), "operator:revoke-jwt")
+                .revoke(
+                    "jti-cleaned",
+                    Some(&in_seconds(1)),
+                    &ChangeActor::system("operator:revoke-jwt"),
+                )
                 .await
                 .expect("revoke"),
         );
@@ -5764,7 +6010,11 @@ pub(crate) mod postgres_audit_tests {
         assert!(!store.is_revoked("jti-reactivated").await.expect("lookup"));
         let reactivated = revoked(
             store
-                .revoke("jti-reactivated", None, "reactivating-operator")
+                .revoke(
+                    "jti-reactivated",
+                    None,
+                    &ChangeActor::system("reactivating-operator"),
+                )
                 .await
                 .expect("reactivate"),
         );
@@ -5859,7 +6109,11 @@ pub(crate) mod postgres_audit_tests {
 
         let restore = fail_inserts_into(&pool, "jwt_revocation_evidence").await;
         let refused = store
-            .revoke("jti-faulted", None, "operator:revoke-jwt")
+            .revoke(
+                "jti-faulted",
+                None,
+                &ChangeActor::system("operator:revoke-jwt"),
+            )
             .await
             .expect_err("a revoke whose evidence cannot commit must fail");
         assert_eq!(refused.kind(), RepositoryErrorKind::Internal, "{refused}");
@@ -5883,7 +6137,11 @@ pub(crate) mod postgres_audit_tests {
         assert!(jwt_evidence_rows(&pool).await.is_empty());
 
         let outcome = store
-            .revoke("jti-faulted", None, "operator:revoke-jwt")
+            .revoke(
+                "jti-faulted",
+                None,
+                &ChangeActor::system("operator:revoke-jwt"),
+            )
             .await
             .expect("the revoke commits once evidence can be written");
         assert_eq!(
@@ -5925,7 +6183,10 @@ pub(crate) mod postgres_audit_tests {
             .expect("exists");
         assert!(before.last_used_at.is_some());
         store
-            .revoke(&created.record.id, "contract-revoker")
+            .revoke(
+                &created.record.id,
+                &ChangeActor::for_test("contract-revoker"),
+            )
             .await
             .expect("revoke");
 
@@ -5982,7 +6243,7 @@ pub(crate) mod postgres_audit_tests {
         PolicyCommitRequest {
             precondition,
             candidate: policy,
-            actor_user_id: actor,
+            change: crate::storage::DocumentChange::test_policy(actor),
             diff_summary: &TEST_DIFF_SUMMARY,
         }
     }
@@ -9949,7 +10210,8 @@ pub(crate) mod postgres_audit_tests {
         let members = store.members(window).await.expect("members");
         assert_eq!(
             members[0].capabilities,
-            "openapi_swagger2_catalogs,operation_requirements,policy_role_descriptions"
+            "openapi_discovery_catalogs,openapi_swagger2_catalogs,operation_requirements,\
+             policy_role_descriptions"
         );
         assert!(RecognizedCapabilities::parse(&members[0].capabilities)
             .contains(Capability::OperationRequirements));
@@ -9957,6 +10219,8 @@ pub(crate) mod postgres_audit_tests {
             .contains(Capability::PolicyRoleDescriptions));
         assert!(RecognizedCapabilities::parse(&members[0].capabilities)
             .contains(Capability::OpenApiSwagger2Catalogs));
+        assert!(RecognizedCapabilities::parse(&members[0].capabilities)
+            .contains(Capability::OpenApiDiscoveryCatalogs));
 
         // A newer gateway on the same instance would write names this one
         // does not know; the next heartbeat writes this binary's own set
@@ -9982,7 +10246,8 @@ pub(crate) mod postgres_audit_tests {
             .expect("refresh");
         assert_eq!(
             store.members(window).await.expect("members")[0].capabilities,
-            "openapi_swagger2_catalogs,operation_requirements,policy_role_descriptions"
+            "openapi_discovery_catalogs,openapi_swagger2_catalogs,operation_requirements,\
+             policy_role_descriptions"
         );
 
         let older = insert_pre_protocol_member(&pool).await;
@@ -12019,7 +12284,7 @@ pub(crate) mod postgres_audit_tests {
             .format(&time::format_description::well_known::Rfc3339)
             .expect("rfc3339");
         for jti in ["jti-1", "jti-2", "jti-3"] {
-            jwt.revoke(jti, Some(&far), "operator")
+            jwt.revoke(jti, Some(&far), &ChangeActor::system("operator"))
                 .await
                 .expect("revoke");
         }
@@ -12030,7 +12295,7 @@ pub(crate) mod postgres_audit_tests {
             )
             .await
             .expect("backdate");
-        jwt.revoke("jti-live", Some(&far), "operator")
+        jwt.revoke("jti-live", Some(&far), &ChangeActor::system("operator"))
             .await
             .expect("revoke");
         let job = JwtRevocationCleanup {
@@ -13078,7 +13343,7 @@ pub(crate) mod postgres_audit_tests {
 
     /// The policy-side facts an acceptance must leave untouched when it
     /// does not commit: active version/ETag/revision, history rows,
-    /// outbox rows.
+    /// outbox rows, change-evidence rows (migration 23).
     #[derive(Debug, PartialEq)]
     struct PolicyFootprint {
         active_version: i64,
@@ -13086,6 +13351,7 @@ pub(crate) mod postgres_audit_tests {
         security_revision: i64,
         document_rows: i64,
         outbox_rows: i64,
+        evidence_rows: i64,
     }
 
     async fn policy_footprint(
@@ -13102,6 +13368,7 @@ pub(crate) mod postgres_audit_tests {
             security_revision: active.security_revision,
             document_rows: count_rows(pool, "policy_documents").await,
             outbox_rows: count_rows(pool, "security_outbox").await,
+            evidence_rows: count_rows(pool, "document_change_evidence").await,
         }
     }
 
@@ -13274,6 +13541,7 @@ pub(crate) mod postgres_audit_tests {
                 security_revision: before.security_revision + 1,
                 document_rows: 2,
                 outbox_rows: 2,
+                evidence_rows: 2,
             }
         );
         let stored = lifecycle
@@ -13374,6 +13642,7 @@ pub(crate) mod postgres_audit_tests {
                 security_revision: before.security_revision + 1,
                 document_rows: 2,
                 outbox_rows: 2,
+                evidence_rows: 2,
             }
         );
         assert_eq!(
@@ -13574,7 +13843,144 @@ pub(crate) mod postgres_audit_tests {
                 security_revision: before.security_revision + 1,
                 document_rows: 2,
                 outbox_rows: 2,
+                evidence_rows: 2,
             }
+        );
+    }
+
+    /// An acceptance's change evidence (issue #425, PR 2c) is written by
+    /// the policy commit it composes, so it shares the suggestion's
+    /// transaction: an accepted suggestion leaves one
+    /// `policy.suggestion.accept` row naming the accepting principal, and an
+    /// acceptance whose evidence cannot be written transitions nothing and
+    /// commits nothing.
+    #[tokio::test]
+    async fn an_accepted_suggestion_records_its_evidence_in_the_acceptance_transaction() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_discovery_pool(&database).await;
+        let policy_store = PostgresPolicyStore::new(pool.clone());
+        let lifecycle = PostgresDiscoveryLifecycleStore::new(pool.clone());
+        let current_etag = initialize_policy(&policy_store).await;
+        seed_open_suggestion(&pool, "faulted", true).await;
+        seed_open_suggestion(&pool, "evidenced", true).await;
+        let principal = crate::auth::Principal {
+            user_id: "admin-a".to_owned(),
+            issuer: Some("https://issuer.example".to_owned()),
+            email: None,
+            org_id: None,
+            roles: vec!["admin".to_owned()],
+            session_id: "session-a".to_owned(),
+            auth_method: crate::auth::AuthMethod::Cookie,
+        };
+        let candidate = contract_policy_variant("accept-evidenced", "reader");
+        let request = |suggestion_id| AcceptSuggestionRequest {
+            suggestion_id,
+            expected_revision: Some(1),
+            actor: "admin-a",
+            policy_commit: PolicyCommitRequest {
+                precondition: PolicyCommitPrecondition::Expected {
+                    etag: current_etag.clone(),
+                },
+                candidate: &candidate,
+                change: crate::storage::DocumentChange::by_principal(
+                    crate::storage::DocumentAction::PolicySuggestionAccept,
+                    &principal,
+                ),
+                diff_summary: &TEST_DIFF_SUMMARY,
+            },
+        };
+        let before = policy_footprint(&policy_store, &pool).await;
+        assert_eq!(
+            before.evidence_rows, 1,
+            "the initial policy recorded itself"
+        );
+
+        let client = pool.get().await.expect("failure trigger checkout");
+        client
+            .batch_execute(
+                r#"
+                CREATE FUNCTION greengateway.fail_document_change_evidence()
+                RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN
+                    RAISE EXCEPTION 'injected evidence failure';
+                END;
+                $$;
+                CREATE TRIGGER fail_document_change_evidence
+                BEFORE INSERT ON greengateway.document_change_evidence
+                FOR EACH ROW EXECUTE FUNCTION greengateway.fail_document_change_evidence();
+                "#,
+            )
+            .await
+            .expect("failure trigger should install");
+        let failed = lifecycle
+            .accept_suggestion(request("faulted"))
+            .await
+            .expect_err("an acceptance whose evidence cannot commit fails");
+        assert!(
+            matches!(failed, AcceptRefused::Policy(PolicyCommitError::Store(_))),
+            "got {failed:?}"
+        );
+        client
+            .batch_execute(
+                r#"
+                DROP TRIGGER fail_document_change_evidence
+                    ON greengateway.document_change_evidence;
+                DROP FUNCTION greengateway.fail_document_change_evidence();
+                "#,
+            )
+            .await
+            .expect("failure trigger should drop");
+        drop(client);
+        assert_eq!(policy_footprint(&policy_store, &pool).await, before);
+        let untouched = lifecycle
+            .get_suggestion("faulted")
+            .await
+            .expect("reload")
+            .expect("exists");
+        assert_eq!(untouched.state, RuleSuggestionLifecycleState::Open);
+        assert_eq!(untouched.revision, 1);
+
+        let accepted = lifecycle
+            .accept_suggestion(request("evidenced"))
+            .await
+            .expect("the acceptance commits with its evidence");
+        assert_eq!(
+            accepted.suggestion.state,
+            RuleSuggestionLifecycleState::Accepted
+        );
+        let row = pool
+            .get()
+            .await
+            .expect("evidence checkout")
+            .query_one(
+                "SELECT action, resource_type, actor_kind, actor_user_id, actor_issuer, \
+                        actor_auth_mode, prior_version, new_version, security_revision \
+                 FROM greengateway.document_change_evidence \
+                 WHERE action = 'policy.suggestion.accept'",
+                &[],
+            )
+            .await
+            .expect("exactly one acceptance evidence row");
+        assert_eq!(row.get::<_, String>(0), "policy.suggestion.accept");
+        assert_eq!(row.get::<_, String>(1), "policy");
+        assert_eq!(row.get::<_, String>(2), "principal");
+        assert_eq!(row.get::<_, String>(3), "admin-a");
+        assert_eq!(
+            row.get::<_, Option<String>>(4).as_deref(),
+            Some("https://issuer.example")
+        );
+        assert_eq!(row.get::<_, String>(5), "session_cookie");
+        assert_eq!(row.get::<_, Option<i64>>(6), Some(before.active_version));
+        assert_eq!(row.get::<_, i64>(7), accepted.policy.version);
+        assert_eq!(row.get::<_, i64>(8), accepted.policy.security_revision);
+        assert_eq!(
+            policy_footprint(&policy_store, &pool).await.evidence_rows,
+            before.evidence_rows + 1
         );
     }
 

@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://greengateway.dev/schemas/gateway-capabilities.v1alpha1.schema.json",
+  "title": "GreenGateway Configuration Capabilities",
+  "description": "What a running gateway reports at GET /v1{ADMIN_PREFIX}/config/capabilities (admin:config:read) and what ggctl reads before any configuration operation. The document is closed: a member this version does not define, a duplicate member, or a value outside its grammar makes it unreadable, and a reader that does not implement this exact apiVersion and kind treats the server as incompatible. The documents and operations lists are open sets: a reader asks only whether the one document version and operation it is about to use are listed, and refuses anything that is not. A gateway in environment mode lists no documents and no operations. This schema is necessary but not sufficient: the shared reader in the gateway-config crate is authoritative.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "kind", "gatewayVersion", "sourceMode", "documents", "operations"],
+  "properties": {
+    "apiVersion": {
+      "description": "Exact document version. No other version, prefix, or spelling is accepted.",
+      "const": "greengateway.dev/v1alpha1"
+    },
+    "kind": {
+      "const": "GatewayCapabilities"
+    },
+    "gatewayVersion": {
+      "description": "The gateway binary's release version: MAJOR.MINOR.PATCH with an optional pre-release or build suffix of ASCII letters, digits, dots, and hyphens.",
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[0-9]{1,9}\\.[0-9]{1,9}\\.[0-9]{1,9}([-+][0-9A-Za-z]+([.+-][0-9A-Za-z]+)*)?$"
+    },
+    "sourceMode": {
+      "description": "Where the gateway's deployment configuration comes from. Only environment mode exists in this version.",
+      "enum": ["environment"]
+    },
+    "documents": {
+      "description": "The configuration document versions the server accepts in configuration requests.",
+      "type": "array",
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["apiVersion", "kind"],
+        "properties": {
+          "apiVersion": {
+            "type": "string",
+            "pattern": "^[a-z0-9.-]{1,63}/[a-z0-9]{1,63}$"
+          },
+          "kind": {
+            "type": "string",
+            "pattern": "^[A-Z][A-Za-z0-9]{0,63}$"
+          }
+        }
+      }
+    },
+    "operations": {
+      "description": "The configuration operations the server has enabled.",
+      "type": "array",
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_]{0,63}$"
+      }
+    }
+  }
+}

@@ -19,7 +19,10 @@ use tower::ServiceExt;
 use super::legacy::matching_route;
 use super::*;
 use crate::{
-    audit::{sink::tests::CaptureSink, AuditSink},
+    audit::{
+        sink::tests::{CaptureSink, DurableBehaviour, DurableCaptureSink},
+        AuditSink,
+    },
     auth::{AuthMethod, Principal},
     rbac::{
         policy::{EgressPolicy, PolicyError, RoleEntry, ToolPolicyEntry},
@@ -3265,4 +3268,324 @@ async fn kernel_adapter_preserves_absent_host_as_a_known_fact() {
 
 async fn unreachable_downstream() -> &'static str {
     panic!("rejected admission reached downstream effects")
+}
+
+// ---------------------------------------------------------------------------
+// Required audit durability (issue #425).
+// ---------------------------------------------------------------------------
+
+/// An RBAC state whose audit log waits for a store of record the test
+/// controls, with a short bound so a held record times out promptly.
+fn required_test_state(policy: Policy) -> (RbacState, DurableCaptureSink) {
+    let durable = DurableCaptureSink::new();
+    let audit = AuditLog::new_required(
+        Arc::new(durable.clone()) as Arc<dyn AuditSink>,
+        Duration::from_millis(500),
+    );
+    (
+        RbacState::new_with_mcp_route_paths(
+            policy,
+            Vec::new(),
+            ClientIpPolicy::default(),
+            audit,
+            vec![protected_resource::MCP_RESOURCE_PATH.to_owned()],
+        ),
+        durable,
+    )
+}
+
+/// The event types each downstream run found already stored.
+type DownstreamRuns = Arc<std::sync::Mutex<Vec<Vec<String>>>>;
+
+/// A router whose downstream records, each time it runs, the event types
+/// the store already held -- so a test can see the decision was durable
+/// before anything past this stage happened.
+fn durable_probe_router(
+    state: RbacState,
+    principal: Option<Principal>,
+    durable: &DurableCaptureSink,
+) -> (Router, DownstreamRuns) {
+    let runs: DownstreamRuns = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = Arc::clone(&runs);
+    let store = durable.clone();
+    let router = Router::new()
+        .fallback(any(move || {
+            let seen = Arc::clone(&seen);
+            let store = store.clone();
+            async move {
+                seen.lock().expect("runs lock").push(
+                    store
+                        .events()
+                        .iter()
+                        .map(|event| event.event_type.clone())
+                        .collect(),
+                );
+                "ok"
+            }
+        }))
+        .layer(from_fn_with_state(state, rbac_middleware))
+        .layer(from_fn_with_state(principal, inject_principal))
+        .layer(from_fn(mark_routing_classified));
+    (router, runs)
+}
+
+/// A router whose downstream must never run.
+fn unreachable_router(state: RbacState, principal: Option<Principal>) -> Router {
+    Router::new()
+        .fallback(any(unreachable_downstream))
+        .layer(from_fn_with_state(state, rbac_middleware))
+        .layer(from_fn_with_state(principal, inject_principal))
+        .layer(from_fn(mark_routing_classified))
+}
+
+async fn assert_audit_unavailable(response: Response) {
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let decision = response
+        .extensions()
+        .get::<PolicyDecision>()
+        .cloned()
+        .expect("the refusal should carry a policy decision");
+    assert_eq!(decision.outcome, PolicyDecisionOutcome::Denied);
+    assert_eq!(decision.reason, AUDIT_UNAVAILABLE_REASON);
+    assert_eq!(
+        body_string(response).await,
+        r#"{"error":"audit unavailable","reason":"audit_unavailable"}"#
+    );
+}
+
+fn reader_policy() -> Policy {
+    test_policy(
+        DefaultAction::Deny,
+        &[("reader", &["data:read"])],
+        &[route(&[], "/data", "data:read")],
+    )
+}
+
+/// An allowed request is forwarded only once its decision is in the store
+/// of record; a decision the store cannot take refuses the request with no
+/// downstream work at all; and the first request after the store recovers
+/// is served again, with nothing to reset.
+#[tokio::test]
+async fn required_durability_forwards_an_allowed_request_only_after_its_decision_commits() {
+    let (state, durable) = required_test_state(reader_policy());
+    let (router, runs) = durable_probe_router(state, Some(test_principal(&["reader"])), &durable);
+
+    let response = router
+        .clone()
+        .oneshot(request(Method::GET, "/data/items"))
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        *runs.lock().expect("runs lock"),
+        vec![vec![AUTHZ_ALLOWED.to_owned()]],
+        "the decision must already be stored when downstream runs"
+    );
+
+    durable.set(DurableBehaviour::Refuse);
+    let response = router
+        .clone()
+        .oneshot(request(Method::GET, "/data/items"))
+        .await
+        .expect("request should complete");
+    assert_audit_unavailable(response).await;
+    assert_eq!(
+        runs.lock().expect("runs lock").len(),
+        1,
+        "a decision that is not durable must not reach downstream"
+    );
+
+    durable.set(DurableBehaviour::Store);
+    let response = router
+        .oneshot(request(Method::GET, "/data/items"))
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(runs.lock().expect("runs lock").len(), 2);
+}
+
+/// A store that never answers costs the request its bound, then the same
+/// refusal, still with no downstream work.
+#[tokio::test]
+async fn required_durability_refuses_when_the_decision_does_not_commit_in_time() {
+    let (state, durable) = required_test_state(reader_policy());
+    durable.set(DurableBehaviour::Hold);
+
+    let started = Instant::now();
+    let response = unreachable_router(state, Some(test_principal(&["reader"])))
+        .oneshot(request(Method::GET, "/data/items"))
+        .await
+        .expect("request should complete");
+    assert_audit_unavailable(response).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the wait is bounded by AUDIT_DURABILITY_TIMEOUT_MS, took {:?}",
+        started.elapsed()
+    );
+    durable.release();
+}
+
+/// A denial is answered `403` only once it is recorded; while it cannot
+/// be, the answer is the outage rather than a policy answer the gateway
+/// cannot evidence.
+#[tokio::test]
+async fn required_durability_answers_a_denial_only_after_its_record_commits() {
+    let (state, durable) = required_test_state(reader_policy());
+    let router = unreachable_router(state, Some(test_principal(&["writer"])));
+
+    durable.set(DurableBehaviour::Refuse);
+    let response = router
+        .clone()
+        .oneshot(request(Method::GET, "/data/items"))
+        .await
+        .expect("request should complete");
+    assert_audit_unavailable(response).await;
+
+    durable.set(DurableBehaviour::Store);
+    let response = router
+        .oneshot(request(Method::GET, "/data/items"))
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(durable
+        .events()
+        .iter()
+        .any(|event| event.event_type == AUTHZ_DENIED));
+}
+
+/// A direct shadow rule in front of a host-bound route writes two records
+/// -- the observation, then the route verdict -- and the request is
+/// forwarded only once both are stored. Either one failing refuses it.
+#[tokio::test]
+async fn required_durability_confirms_both_records_of_a_shadowed_decision() {
+    let policy = test_policy_with_rules(
+        DefaultAction::Deny,
+        &[("admin", &["admin:read"])],
+        &[host_route(
+            &["GET"],
+            &["admin.example.test"],
+            "/data",
+            "admin:read",
+        )],
+        &[direct_rule(
+            Some("shadow-data"),
+            &["GET"],
+            "/data/**",
+            RuleAction::Shadow,
+        )],
+    );
+    let (state, durable) = required_test_state(policy);
+    let (router, runs) = durable_probe_router(state, Some(test_principal(&["admin"])), &durable);
+
+    let response = router
+        .clone()
+        .oneshot(proxy_request(
+            Method::GET,
+            "/data/report",
+            "admin.example.test",
+        ))
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        *runs.lock().expect("runs lock"),
+        vec![vec![AUTHZ_WOULD_DENY.to_owned(), AUTHZ_ALLOWED.to_owned()]],
+        "both records must be stored, in order, before downstream runs"
+    );
+
+    durable.set(DurableBehaviour::Refuse);
+    let response = router
+        .oneshot(proxy_request(
+            Method::GET,
+            "/data/report",
+            "admin.example.test",
+        ))
+        .await
+        .expect("request should complete");
+    assert_audit_unavailable(response).await;
+    assert_eq!(runs.lock().expect("runs lock").len(), 1);
+}
+
+/// The refusals this stage makes before it has a verdict -- an unsafe
+/// path, an evaluation that cannot complete, an evaluator error -- wait
+/// for their records too.
+#[tokio::test]
+async fn required_durability_holds_every_early_refusal_to_its_record() {
+    // Unsafe path.
+    let (state, durable) = required_test_state(reader_policy());
+    durable.set(DurableBehaviour::Refuse);
+    let response = unreachable_router(state, Some(test_principal(&["reader"])))
+        .oneshot(request(Method::GET, "/data/../admin"))
+        .await
+        .expect("request should complete");
+    assert_audit_unavailable(response).await;
+
+    // Incomplete evaluation: no routing facts.
+    let (state, durable) = required_test_state(reader_policy());
+    durable.set(DurableBehaviour::Refuse);
+    let response = Router::new()
+        .fallback(any(unreachable_downstream))
+        .layer(from_fn_with_state(state, rbac_middleware))
+        .oneshot(request(Method::GET, "/data"))
+        .await
+        .expect("request should complete");
+    assert_audit_unavailable(response).await;
+
+    // Evaluator error: a host-binding context with no observation.
+    let (state, durable) = required_test_state(reader_policy());
+    durable.set(DurableBehaviour::Refuse);
+    let mut req = request(Method::GET, "/data");
+    req.extensions_mut()
+        .insert(ProxyRouteClassificationCompleted);
+    req.extensions_mut()
+        .insert(ProxyRouteAuthorizationContext::new(
+            "api.example.test".to_owned(),
+            None,
+            "https://api.example.test".to_owned(),
+        ));
+    let response = Router::new()
+        .fallback(any(unreachable_downstream))
+        .layer(from_fn_with_state(state, rbac_middleware))
+        .oneshot(req)
+        .await
+        .expect("request should complete");
+    assert_audit_unavailable(response).await;
+
+    // And with the store healthy the same refusal keeps its own answer.
+    let (state, _durable) = required_test_state(reader_policy());
+    let response = unreachable_router(state, Some(test_principal(&["reader"])))
+        .oneshot(request(Method::GET, "/data/../admin"))
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+/// The cluster gate refusal is recorded before it is answered: a healthy
+/// store keeps its `503 policy state unavailable`, a failing one turns it
+/// into the audit outage it also is.
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn required_durability_holds_the_revision_gate_refusal_to_its_record() {
+    for (behaviour, expected_error) in [
+        (DurableBehaviour::Store, "policy state unavailable"),
+        (DurableBehaviour::Refuse, "audit unavailable"),
+    ] {
+        let (state, durable) = required_test_state(reader_policy());
+        state
+            .install_revision_snapshot(reader_policy(), 3)
+            .await
+            .expect("the revision installs");
+        let state = state.with_revision_gate(Arc::new(MockRevisionGate(Err(
+            SecurityRevisionCheckError::Unavailable,
+        ))));
+        durable.set(behaviour);
+        let response = unreachable_router(state, Some(test_principal(&["reader"])))
+            .oneshot(request(Method::GET, "/data/items"))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value =
+            serde_json::from_str(&body_string(response).await).expect("the body is JSON");
+        assert_eq!(body["error"], json!(expected_error));
+    }
 }

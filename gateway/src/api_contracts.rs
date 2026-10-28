@@ -708,6 +708,23 @@ pub(super) struct ManagedOpenApiIncompatibilityResponse {
     pub(super) path_template: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) detail: Option<String>,
+    /// Why each security alternative does not bind, for
+    /// `no_compatible_security_alternative` only (issue #443), in document
+    /// order and for at most the first 16 alternatives.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) security_alternatives: Vec<ManagedOpenApiSecurityMismatchResponse>,
+    /// How many alternatives beyond that bound are not explained.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) unexplained_security_alternatives: Option<usize>,
+}
+
+#[derive(Serialize)]
+pub(super) struct ManagedOpenApiSecurityMismatchResponse {
+    pub(super) scheme_names: Vec<String>,
+    pub(super) reason: &'static str,
+    pub(super) message: &'static str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) missing_scopes: Vec<String>,
 }
 
 #[derive(Serialize)]

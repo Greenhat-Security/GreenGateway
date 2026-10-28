@@ -25,7 +25,7 @@ impl ApiVersion {
 
     pub(crate) fn as_str(self) -> &'static str {
         match self {
-            Self::V1Alpha1 => "greengateway.dev/v1alpha1",
+            Self::V1Alpha1 => gateway_config::documents::API_VERSION_V1ALPHA1,
         }
     }
 
@@ -37,8 +37,10 @@ impl ApiVersion {
     }
 }
 
-pub(crate) const BUNDLE_KIND: &str = "GatewayBundle";
-pub(crate) const DEPLOYMENT_KIND: &str = "GatewayDeployment";
+// The names come from the shared `gateway-config` crate, where `ggctl schema`
+// publishes the same documents' schemas.
+pub(crate) const BUNDLE_KIND: &str = gateway_config::documents::BUNDLE_KIND;
+pub(crate) const DEPLOYMENT_KIND: &str = gateway_config::documents::DEPLOYMENT_KIND;
 
 /// The resource document versions a `v1alpha1` bundle may declare. The
 /// environment-mode validators accept any `0.` version; the bundle boundary

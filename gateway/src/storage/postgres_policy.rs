@@ -317,7 +317,7 @@ pub(crate) async fn commit_policy_in(
         postgres_documents::DocumentCommit {
             document_json: &document_json,
             document_etag: &etag,
-            actor_user_id: request.actor_user_id,
+            change: request.change,
             diff_summary_json: &diff_summary_json,
             tool_names: None,
         },

@@ -135,6 +135,16 @@ pub(super) fn audit_rbac_not_configured() -> Response {
         .into_response()
 }
 
+pub(super) fn config_rbac_not_configured() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "configuration API requires POLICY_FILE to be configured".to_owned(),
+        }),
+    )
+        .into_response()
+}
+
 pub(super) fn status_rbac_not_configured() -> Response {
     (
         StatusCode::NOT_FOUND,
@@ -498,7 +508,9 @@ pub(super) fn openapi_catalog_error_response(
         // return it; reaching here means nothing asked, so nothing is stored.
         OpenApiCatalogError::StoreUnavailable
         | OpenApiCatalogError::StorageUnavailable
-        | OpenApiCatalogError::ConvertedCatalogNeedsAdmission => StatusCode::SERVICE_UNAVAILABLE,
+        | OpenApiCatalogError::ConvertedCatalogNeedsAdmission { .. } => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
         OpenApiCatalogError::EgressDenied
         | OpenApiCatalogError::SecretUnavailable
         | OpenApiCatalogError::AuthenticationFailed

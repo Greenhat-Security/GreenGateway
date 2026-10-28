@@ -678,6 +678,8 @@ fn connection_admin_json_schema_is_strict_resolvable_and_secret_safe() {
         "OpenApiPreviewResponse",
         "OpenApiConversionReport",
         "OpenApiConversionWarning",
+        "OpenApiIncompatibility",
+        "OpenApiSecurityMismatch",
         "SecretList",
         "SafeSecretAlias",
         "SecretDeleted",
@@ -1404,5 +1406,118 @@ fn connection_admin_preview_schema_describes_swagger_conversion_reports() {
     assert!(
         !validates("OpenApiConversionReport", &widened),
         "conversion warnings stay closed and never echo document content"
+    );
+}
+
+#[test]
+fn connection_admin_preview_schema_describes_discovery_conversion_reports() {
+    let schema = load_json(&docs_root().join(SCHEMA_RELATIVE_PATH));
+    let envelope = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": schema["$defs"].clone(),
+        "$ref": "#/$defs/OpenApiConversionReport"
+    });
+    let validator = jsonschema::validator_for(&envelope)
+        .unwrap_or_else(|error| panic!("$defs/OpenApiConversionReport should compile: {error}"));
+    let report = json!({
+        "source_format": "google_discovery_v1",
+        "warnings": [
+            {
+                "code": "global_parameter_not_mapped",
+                "message": "this document-level parameter is not a tool argument, and generated tools never send it",
+                "operation_omitted": false,
+                "subject": "key"
+            },
+            {
+                "code": "recursive_request_schema",
+                "message": "the method's request schema refers to itself, which the generator cannot expand; it was left out",
+                "operation_omitted": true,
+                "method": "POST",
+                "path_template": "/gmail/v1/users/{userId}/messages/send",
+                "subject": "Message"
+            }
+        ]
+    });
+    assert!(validator.is_valid(&report));
+    for code in [
+        "unsupported_schema_keyword",
+        "media_upload_not_mapped",
+        "invalid_method_definition",
+        "unsupported_http_method",
+        "unsupported_path_expansion",
+        "repeated_path_parameter",
+        "duplicate_operation",
+    ] {
+        let mut coded = report.clone();
+        coded["warnings"][0]["code"] = json!(code);
+        assert!(validator.is_valid(&coded), "{code} should be a known code");
+    }
+    let mut unknown_format = report;
+    unknown_format["source_format"] = json!("google_discovery_v2");
+    assert!(
+        !validator.is_valid(&unknown_format),
+        "source formats are a closed set"
+    );
+}
+
+#[test]
+fn connection_admin_preview_schema_explains_security_mismatches() {
+    let schema = load_json(&docs_root().join(SCHEMA_RELATIVE_PATH));
+    let envelope = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": schema["$defs"].clone(),
+        "$ref": "#/$defs/OpenApiIncompatibility"
+    });
+    let validator = jsonschema::validator_for(&envelope)
+        .unwrap_or_else(|error| panic!("$defs/OpenApiIncompatibility should compile: {error}"));
+    let mismatch = |reason: &str| {
+        json!({
+            "scheme_names": ["Oauth2"],
+            "reason": reason,
+            "message": "a fixed explanation"
+        })
+    };
+    let incompatibility = json!({
+        "tool_name": "gmail.users.messages.trash",
+        "reason": "no_compatible_security_alternative",
+        "security_alternatives": [
+            {
+                "scheme_names": ["Oauth2"],
+                "reason": "missing_scopes",
+                "message": "the Connection does not request every scope the operation requires",
+                "missing_scopes": ["https://mail.google.com/"]
+            },
+            mismatch("oauth2_without_client_credentials"),
+            mismatch("open_id_connect")
+        ]
+    });
+    assert!(validator.is_valid(&incompatibility));
+    // An incompatibility without explanations keeps its earlier shape.
+    assert!(validator.is_valid(&json!({
+        "tool_name": "listWidgets",
+        "reason": "missing_security_metadata"
+    })));
+    let mut truncated = incompatibility.clone();
+    truncated["security_alternatives"] = json!(vec![mismatch("multiple_schemes"); 16]);
+    truncated["unexplained_security_alternatives"] = json!(4);
+    assert!(validator.is_valid(&truncated));
+
+    let mut too_many = truncated.clone();
+    too_many["security_alternatives"] = json!(vec![mismatch("multiple_schemes"); 17]);
+    assert!(
+        !validator.is_valid(&too_many),
+        "at most 16 alternatives are explained"
+    );
+    let mut unknown = incompatibility.clone();
+    unknown["security_alternatives"][1]["reason"] = json!("close_enough");
+    assert!(
+        !validator.is_valid(&unknown),
+        "mismatch reasons are a closed set"
+    );
+    let mut widened = incompatibility;
+    widened["security_alternatives"][0]["scheme"] = json!({ "type": "oauth2" });
+    assert!(
+        !validator.is_valid(&widened),
+        "an explanation stays closed and never echoes document content"
     );
 }

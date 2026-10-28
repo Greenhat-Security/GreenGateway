@@ -24,6 +24,7 @@ use crate::{
 };
 
 use super::{
+    google_discovery::{self, DiscoveryConversionError},
     swagger2::{self, Swagger2ConversionError},
     transforms::DeclaredResponseSchema,
 };
@@ -39,6 +40,11 @@ const MAX_OPENAPI_SCHEMA_EXPANSION_NODES: usize = 65_536;
 /// `dereference_schema` off the end of the worker stack.
 const MAX_OPENAPI_SCHEMA_EXPANSION_DEPTH: usize = 256;
 const MAX_OPENAPI_SECURITY_SIZE_CACHE_ENTRIES: usize = MAX_CATALOG_ENTRIES * 2;
+/// How many security alternatives of one incompatible operation the preview
+/// explains. Each explanation carries a fixed message, so an operation with
+/// thousands of tiny alternatives must not multiply the response; the rest
+/// are only counted.
+pub const MAX_EXPLAINED_SECURITY_ALTERNATIVES: usize = 16;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpenApiToolGeneration {
@@ -69,12 +75,14 @@ pub struct OpenApiDocumentConversion {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenApiSourceFormat {
     Swagger2,
+    GoogleDiscovery,
 }
 
 impl OpenApiSourceFormat {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Swagger2 => "swagger_2_0",
+            Self::GoogleDiscovery => "google_discovery_v1",
         }
     }
 }
@@ -107,6 +115,15 @@ pub enum OpenApiConversionWarningCode {
     FileParameterOutsideForm,
     MultipleBodyParameters,
     BodyAndFormParameters,
+    GlobalParameterNotMapped,
+    UnsupportedSchemaKeyword,
+    MediaUploadNotMapped,
+    InvalidMethodDefinition,
+    UnsupportedHttpMethod,
+    UnsupportedPathExpansion,
+    RepeatedPathParameter,
+    DuplicateOperation,
+    RecursiveRequestSchema,
     WarningsTruncated,
 }
 
@@ -128,6 +145,15 @@ impl OpenApiConversionWarningCode {
             Self::FileParameterOutsideForm => "file_parameter_outside_form",
             Self::MultipleBodyParameters => "multiple_body_parameters",
             Self::BodyAndFormParameters => "body_and_form_parameters",
+            Self::GlobalParameterNotMapped => "global_parameter_not_mapped",
+            Self::UnsupportedSchemaKeyword => "unsupported_schema_keyword",
+            Self::MediaUploadNotMapped => "media_upload_not_mapped",
+            Self::InvalidMethodDefinition => "invalid_method_definition",
+            Self::UnsupportedHttpMethod => "unsupported_http_method",
+            Self::UnsupportedPathExpansion => "unsupported_path_expansion",
+            Self::RepeatedPathParameter => "repeated_path_parameter",
+            Self::DuplicateOperation => "duplicate_operation",
+            Self::RecursiveRequestSchema => "recursive_request_schema",
             Self::WarningsTruncated => "warnings_truncated",
         }
     }
@@ -139,7 +165,7 @@ impl OpenApiConversionWarningCode {
                 "basePath is not part of generated path templates; include it in the Connection base path"
             }
             Self::UnsupportedDocumentField => {
-                "this top-level field is not part of Swagger 2.0 and was ignored"
+                "this top-level field is not part of the document's format and was ignored"
             }
             Self::UnsupportedPathItemField => {
                 "this path item field is not part of Swagger 2.0 and was ignored"
@@ -157,16 +183,16 @@ impl OpenApiConversionWarningCode {
                 "the request body has no JSON media type, so its fields are not tool arguments and the tool sends no body"
             }
             Self::UnsupportedOperationField => {
-                "the operation uses a field that is not part of Swagger 2.0; it was left out"
+                "the operation uses a field that is not part of the document's format; it was left out"
             }
             Self::InvalidParameter => {
                 "the operation has a parameter without a usable name, location, schema or items; it was left out"
             }
             Self::UnsupportedParameterLocation => {
-                "the operation has a parameter in a location Swagger 2.0 does not define; it was left out"
+                "the operation has a parameter in a location the document's format does not define; it was left out"
             }
             Self::UnsupportedParameterField => {
-                "the operation has a parameter field that is not part of Swagger 2.0; it was left out"
+                "the operation has a parameter field that is not part of the document's format; it was left out"
             }
             Self::UnsupportedCollectionFormat => {
                 "the operation has an array parameter whose collectionFormat has no OpenAPI 3.0 style; it was left out"
@@ -179,6 +205,33 @@ impl OpenApiConversionWarningCode {
             }
             Self::BodyAndFormParameters => {
                 "the operation mixes body and formData parameters; it was left out"
+            }
+            Self::GlobalParameterNotMapped => {
+                "this document-level parameter is not a tool argument, and generated tools never send it"
+            }
+            Self::UnsupportedSchemaKeyword => {
+                "this schema keyword has no OpenAPI 3.0 form and was ignored, so the gateway does not check it"
+            }
+            Self::MediaUploadNotMapped => {
+                "the method also accepts a media upload at a separate upload path; the tool sends only the JSON request"
+            }
+            Self::InvalidMethodDefinition => {
+                "the method has no usable path, httpMethod or scopes; it was left out"
+            }
+            Self::UnsupportedHttpMethod => {
+                "the method uses an HTTP method that OpenAPI 3.0 does not define; it was left out"
+            }
+            Self::UnsupportedPathExpansion => {
+                "the method path uses a URI template expansion other than a plain {name}, such as {+name}, which has no OpenAPI 3.0 form; it was left out"
+            }
+            Self::RepeatedPathParameter => {
+                "the method has a repeated path parameter, which has no OpenAPI 3.0 form; it was left out"
+            }
+            Self::DuplicateOperation => {
+                "an earlier method already uses this HTTP method and path; it was left out"
+            }
+            Self::RecursiveRequestSchema => {
+                "the method's request schema refers to itself, which the generator cannot expand; it was left out"
             }
             Self::WarningsTruncated => "further conversion warnings were not reported",
         }
@@ -197,6 +250,12 @@ impl OpenApiConversionWarningCode {
                 | Self::FileParameterOutsideForm
                 | Self::MultipleBodyParameters
                 | Self::BodyAndFormParameters
+                | Self::InvalidMethodDefinition
+                | Self::UnsupportedHttpMethod
+                | Self::UnsupportedPathExpansion
+                | Self::RepeatedPathParameter
+                | Self::DuplicateOperation
+                | Self::RecursiveRequestSchema
         )
     }
 }
@@ -313,6 +372,26 @@ pub enum OpenApiSecuritySchemeRequirement {
         scheme_name: String,
         token_url: String,
         required_scopes: Vec<String>,
+        /// Whether the scheme also declares a well-formed flow that obtains a
+        /// token for a user (`authorizationCode`, `implicit` or `password`)
+        /// listing every required scope, so a per-caller Connection binds it
+        /// as well.
+        user_consent: bool,
+    },
+    /// An `oauth2` scheme without a `clientCredentials` flow: every flow it
+    /// declares obtains a token for a user. Only a Connection whose
+    /// credential is obtained for each caller binds it; the flows' URLs are
+    /// never contacted.
+    OAuth2UserConsent {
+        scheme_name: String,
+        required_scopes: Vec<String>,
+    },
+    /// An `openIdConnect` scheme: an access token an OpenID Connect provider
+    /// issued for a user. Only a Connection whose credential is obtained for
+    /// each caller binds it; the discovery URL is never fetched.
+    OpenIdConnect {
+        scheme_name: String,
+        required_scopes: Vec<String>,
     },
     Unsupported {
         scheme_name: String,
@@ -327,6 +406,8 @@ impl OpenApiSecuritySchemeRequirement {
             Self::HeaderApiKey { scheme_name, .. }
             | Self::HttpBearer { scheme_name }
             | Self::OAuth2ClientCredentials { scheme_name, .. }
+            | Self::OAuth2UserConsent { scheme_name, .. }
+            | Self::OpenIdConnect { scheme_name, .. }
             | Self::Unsupported { scheme_name, .. } => Some(scheme_name),
         }
     }
@@ -341,8 +422,8 @@ pub enum OpenApiUnsupportedSecurityScheme {
     ApiKeyUnsupportedLocation,
     HttpBasic,
     HttpUnsupportedScheme,
-    OAuth2WithoutClientCredentials,
-    OpenIdConnect,
+    /// An `oauth2` scheme that declares none of the flows OpenAPI defines.
+    OAuth2WithoutSupportedFlow,
     MutualTls,
     UnsupportedType,
 }
@@ -364,6 +445,160 @@ pub struct OpenApiToolSecuritySelection {
 pub struct OpenApiToolIncompatibility {
     pub tool_name: String,
     pub reason: OpenApiToolIncompatibilityReason,
+    /// For [`OpenApiToolIncompatibilityReason::NoCompatibleSecurityAlternative`]:
+    /// why each of the operation's security alternatives does not bind to
+    /// the Connection's credential, in document order, for at most
+    /// [`MAX_EXPLAINED_SECURITY_ALTERNATIVES`] of them. Empty otherwise.
+    pub security_mismatches: Vec<OpenApiSecurityMismatch>,
+    /// The alternatives beyond that bound, which are not explained.
+    pub unexplained_security_alternatives: usize,
+}
+
+/// Why one security alternative of an operation does not bind to a
+/// Connection's credential.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenApiSecurityMismatch {
+    /// The alternative's scheme names, sorted, as a confirmation names them.
+    pub scheme_names: Vec<String>,
+    pub reason: OpenApiSecurityMismatchReason,
+}
+
+/// A closed set of reasons, each with a fixed explanation that never
+/// contains document or Connection content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenApiSecurityMismatchReason {
+    /// The alternative requires more than one scheme at once; a Connection
+    /// sends one credential.
+    MultipleSchemes,
+    /// No Connection credential satisfies a scheme of this kind.
+    UnsupportedScheme(OpenApiUnsupportedSecurityScheme),
+    RequiresHeaderApiKey,
+    ApiKeyHeaderMismatch,
+    RequiresStaticBearer,
+    /// The scheme declares only a `clientCredentials` flow, which a
+    /// credential obtained for each caller does not satisfy.
+    RequiresOAuth2ClientCredentials,
+    TokenUrlMismatch,
+    /// The Connection does not obtain these required scopes, sorted.
+    MissingScopes {
+        scopes: Vec<String>,
+    },
+    /// A user-consent `oauth2` scheme, and the Connection's credential is
+    /// not obtained for each caller.
+    OAuth2WithoutClientCredentials,
+    /// An `openIdConnect` scheme, and the Connection's credential is not
+    /// obtained for each caller.
+    OpenIdConnect,
+}
+
+impl OpenApiSecurityMismatchReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::MultipleSchemes => "multiple_schemes",
+            Self::UnsupportedScheme(category) => match category {
+                OpenApiUnsupportedSecurityScheme::MissingDefinition => "missing_security_scheme",
+                OpenApiUnsupportedSecurityScheme::InvalidDefinition => "invalid_security_scheme",
+                OpenApiUnsupportedSecurityScheme::ApiKeyQuery => "api_key_query",
+                OpenApiUnsupportedSecurityScheme::ApiKeyCookie => "api_key_cookie",
+                OpenApiUnsupportedSecurityScheme::ApiKeyUnsupportedLocation => {
+                    "api_key_unsupported_location"
+                }
+                OpenApiUnsupportedSecurityScheme::HttpBasic => "http_basic",
+                OpenApiUnsupportedSecurityScheme::HttpUnsupportedScheme => {
+                    "http_unsupported_scheme"
+                }
+                OpenApiUnsupportedSecurityScheme::OAuth2WithoutSupportedFlow => {
+                    "oauth2_without_supported_flow"
+                }
+                OpenApiUnsupportedSecurityScheme::MutualTls => "mutual_tls",
+                OpenApiUnsupportedSecurityScheme::UnsupportedType => {
+                    "unsupported_security_scheme_type"
+                }
+            },
+            Self::RequiresHeaderApiKey => "requires_header_api_key",
+            Self::ApiKeyHeaderMismatch => "api_key_header_mismatch",
+            Self::RequiresStaticBearer => "requires_static_bearer",
+            Self::RequiresOAuth2ClientCredentials => "requires_oauth2_client_credentials",
+            Self::TokenUrlMismatch => "token_url_mismatch",
+            Self::MissingScopes { .. } => "missing_scopes",
+            Self::OAuth2WithoutClientCredentials => "oauth2_without_client_credentials",
+            Self::OpenIdConnect => "open_id_connect",
+        }
+    }
+
+    /// A fixed explanation; it never contains document or Connection content.
+    pub fn message(&self) -> &'static str {
+        match self {
+            Self::MultipleSchemes => {
+                "the alternative requires several schemes at once, and a Connection sends one credential"
+            }
+            Self::UnsupportedScheme(category) => match category {
+                OpenApiUnsupportedSecurityScheme::MissingDefinition => {
+                    "the document does not define this security scheme"
+                }
+                OpenApiUnsupportedSecurityScheme::InvalidDefinition => {
+                    "the security scheme or the requirement naming it is malformed, or requires a scope its flows do not declare"
+                }
+                OpenApiUnsupportedSecurityScheme::ApiKeyQuery => {
+                    "an API key sent in the query string is not supported; only header API keys are"
+                }
+                OpenApiUnsupportedSecurityScheme::ApiKeyCookie => {
+                    "an API key sent in a cookie is not supported; only header API keys are"
+                }
+                OpenApiUnsupportedSecurityScheme::ApiKeyUnsupportedLocation => {
+                    "the API key's location is not one OpenAPI defines"
+                }
+                OpenApiUnsupportedSecurityScheme::HttpBasic => {
+                    "HTTP basic authentication is not supported"
+                }
+                OpenApiUnsupportedSecurityScheme::HttpUnsupportedScheme => {
+                    "only the bearer HTTP authentication scheme is supported"
+                }
+                OpenApiUnsupportedSecurityScheme::OAuth2WithoutSupportedFlow => {
+                    "the OAuth 2.0 scheme declares none of the flows OpenAPI defines"
+                }
+                OpenApiUnsupportedSecurityScheme::MutualTls => {
+                    "mutual TLS as a security scheme is not supported"
+                }
+                OpenApiUnsupportedSecurityScheme::UnsupportedType => {
+                    "the security scheme type is not one OpenAPI defines"
+                }
+            },
+            Self::RequiresHeaderApiKey => {
+                "the scheme is a header API key; bind it with a header_api_key Connection"
+            }
+            Self::ApiKeyHeaderMismatch => {
+                "the scheme's API key header is not the header the Connection sends"
+            }
+            Self::RequiresStaticBearer => {
+                "the scheme is HTTP bearer authentication; bind it with a static_bearer Connection"
+            }
+            Self::RequiresOAuth2ClientCredentials => {
+                "the scheme declares only a clientCredentials flow; bind it with an oauth2_client_credentials Connection"
+            }
+            Self::TokenUrlMismatch => {
+                "the scheme's clientCredentials token URL is not the Connection's token URL"
+            }
+            Self::MissingScopes { .. } => {
+                "the Connection does not request every scope the operation requires"
+            }
+            Self::OAuth2WithoutClientCredentials => {
+                "the OAuth 2.0 scheme has no clientCredentials flow, so it needs a token for the user; bind it with a per-caller Connection such as delegated_issuer_token"
+            }
+            Self::OpenIdConnect => {
+                "the scheme is OpenID Connect, which needs a token for the user; bind it with a per-caller Connection such as delegated_issuer_token"
+            }
+        }
+    }
+
+    /// The required scopes the Connection does not obtain, for
+    /// [`Self::MissingScopes`]; empty otherwise.
+    pub fn missing_scopes(&self) -> &[String] {
+        match self {
+            Self::MissingScopes { scopes } => scopes,
+            _ => &[],
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -423,6 +658,9 @@ pub enum OpenApiToolGenerationError {
     },
     Swagger2 {
         source: Swagger2ConversionError,
+    },
+    GoogleDiscovery {
+        source: DiscoveryConversionError,
     },
 }
 
@@ -795,6 +1033,7 @@ impl fmt::Display for OpenApiToolGenerationError {
                 ),
             },
             Self::Swagger2 { source } => write!(formatter, "{source}"),
+            Self::GoogleDiscovery { source } => write!(formatter, "{source}"),
         }
     }
 }
@@ -852,6 +1091,7 @@ impl Error for OpenApiToolGenerationError {
             Self::Reference { .. } => None,
             Self::GenerationLimit { .. } => None,
             Self::Swagger2 { source } => Some(source),
+            Self::GoogleDiscovery { source } => Some(source),
         }
     }
 }
@@ -877,7 +1117,7 @@ pub fn generate_tools_from_openapi_path(
 ///
 /// The legacy tools-file import uses this entry point. Managed OpenAPI
 /// Connections use [`generate_tools_from_api_document_str`], which also
-/// imports Swagger 2.0.
+/// imports Swagger 2.0 and Google Discovery documents.
 pub fn generate_tools_from_openapi_str(
     source: &str,
     contents: &str,
@@ -888,14 +1128,16 @@ pub fn generate_tools_from_openapi_str(
     generate_tools_from_document(parsed_spec, document, None)
 }
 
-/// Generate tools from an OpenAPI 3.x document, or from a Swagger 2.0
-/// document converted to OpenAPI 3.0 first (issue #443).
+/// Generate tools from an OpenAPI 3.x document, or from a Swagger 2.0 or
+/// Google Discovery document converted to OpenAPI 3.0 first (issue #443).
 ///
 /// An OpenAPI 3.x document takes exactly the
 /// [`generate_tools_from_openapi_str`] path, errors included. Conversion is
 /// attempted only after that path rejected the document, and only when the
-/// document has a `swagger` field and no `openapi` field; any other rejected
-/// document keeps its original error.
+/// document has no `openapi` field and either a `swagger` field (Swagger
+/// 2.0) or a `discoveryVersion` or `discovery#` kind (see
+/// [`google_discovery::is_discovery_document`]); any other rejected document
+/// keeps its original error.
 pub fn generate_tools_from_api_document_str(
     source: &str,
     contents: &str,
@@ -911,19 +1153,32 @@ pub fn generate_tools_from_api_document_str(
     let Ok(document) = parse_document_value(source, contents) else {
         return Err(openapi_error.into());
     };
-    if !swagger2::is_swagger_document(&document) {
+    let (source_format, converted, warnings) = if swagger2::is_swagger_document(&document) {
+        let conversion = swagger2::convert(&document)?;
+        (
+            OpenApiSourceFormat::Swagger2,
+            conversion.document,
+            conversion.warnings,
+        )
+    } else if google_discovery::is_discovery_document(&document) {
+        let conversion = google_discovery::convert(&document)?;
+        (
+            OpenApiSourceFormat::GoogleDiscovery,
+            conversion.document,
+            conversion.warnings,
+        )
+    } else {
         return Err(openapi_error.into());
-    }
-    let conversion = swagger2::convert(&document)?;
+    };
     drop(document);
-    let parsed_spec = OpenApiSpec::from_document_value(source, &conversion.document)?;
+    let parsed_spec = OpenApiSpec::from_document_value(source, &converted)?;
     check_operation_count(&parsed_spec)?;
     generate_tools_from_document(
         parsed_spec,
-        conversion.document,
+        converted,
         Some(OpenApiDocumentConversion {
-            source_format: OpenApiSourceFormat::Swagger2,
-            warnings: conversion.warnings,
+            source_format,
+            warnings,
         }),
     )
 }
@@ -1186,6 +1441,8 @@ fn bind_generated_openapi_tools_internal(
             incompatibilities.push(OpenApiToolIncompatibility {
                 tool_name: definition.name.clone(),
                 reason: OpenApiToolIncompatibilityReason::MissingSecurityMetadata,
+                security_mismatches: Vec::new(),
+                unexplained_security_alternatives: 0,
             });
             continue;
         };
@@ -1196,7 +1453,7 @@ fn bind_generated_openapi_tools_internal(
         let selected = security.alternatives.iter().find(|alternative| {
             let selected_scheme_names = alternative_scheme_names(alternative);
             confirmed_scheme_names.is_none_or(|confirmed| confirmed == &selected_scheme_names)
-                && security_alternative_matches(alternative, authentication)
+                && security_alternative_mismatch(alternative, authentication).is_ok()
         });
         let Some(selected) = selected else {
             if let Some(selected_scheme_names) = confirmed_scheme_names {
@@ -1205,9 +1462,28 @@ fn bind_generated_openapi_tools_internal(
                     selected_scheme_names: selected_scheme_names.clone(),
                 });
             }
+            // No alternative binds, so each one has a reason.
+            let security_mismatches = security
+                .alternatives
+                .iter()
+                .take(MAX_EXPLAINED_SECURITY_ALTERNATIVES)
+                .filter_map(|alternative| {
+                    security_alternative_mismatch(alternative, authentication)
+                        .err()
+                        .map(|reason| OpenApiSecurityMismatch {
+                            scheme_names: alternative_scheme_names(alternative),
+                            reason,
+                        })
+                })
+                .collect();
             incompatibilities.push(OpenApiToolIncompatibility {
                 tool_name: definition.name.clone(),
                 reason: OpenApiToolIncompatibilityReason::NoCompatibleSecurityAlternative,
+                security_mismatches,
+                unexplained_security_alternatives: security
+                    .alternatives
+                    .len()
+                    .saturating_sub(MAX_EXPLAINED_SECURITY_ALTERNATIVES),
             });
             continue;
         };
@@ -1231,6 +1507,8 @@ fn bind_generated_openapi_tools_internal(
                         path_template: definition.upstream.path_template.clone(),
                         message: error.message,
                     },
+                    security_mismatches: Vec::new(),
+                    unexplained_security_alternatives: 0,
                 });
                 continue;
             }
@@ -1275,63 +1553,121 @@ fn alternative_scheme_names(alternative: &OpenApiSecurityAlternative) -> Vec<Str
     names
 }
 
-fn security_alternative_matches(
+/// `Ok` when the Connection's one credential satisfies the whole
+/// alternative, otherwise the first reason it does not.
+fn security_alternative_mismatch(
     alternative: &OpenApiSecurityAlternative,
     authentication: &ConnectionAuthentication,
-) -> bool {
-    if alternative.members.len() == 1
-        && matches!(
-            alternative.members.first(),
-            Some(OpenApiSecuritySchemeRequirement::Anonymous)
-        )
-    {
-        return true;
-    }
-    if alternative.members.len() != 1
-        || alternative
-            .members
-            .iter()
-            .any(|member| matches!(member, OpenApiSecuritySchemeRequirement::Anonymous))
-    {
-        return false;
-    }
+) -> Result<(), OpenApiSecurityMismatchReason> {
+    let member = match alternative.members.as_slice() {
+        [OpenApiSecuritySchemeRequirement::Anonymous] => return Ok(()),
+        [member] => member,
+        _ => return Err(OpenApiSecurityMismatchReason::MultipleSchemes),
+    };
 
-    alternative
-        .members
-        .iter()
-        .all(|member| match (member, authentication) {
-            (
-                OpenApiSecuritySchemeRequirement::HeaderApiKey { header_name, .. },
+    match member {
+        // Unreachable: an anonymous alternative has no other member.
+        OpenApiSecuritySchemeRequirement::Anonymous => {
+            Err(OpenApiSecurityMismatchReason::MultipleSchemes)
+        }
+        OpenApiSecuritySchemeRequirement::HeaderApiKey { header_name, .. } => {
+            match authentication {
                 ConnectionAuthentication::HeaderApiKey {
                     header_name: configured_header_name,
                     ..
-                },
-            ) => header_name.eq_ignore_ascii_case(configured_header_name),
-            (
-                OpenApiSecuritySchemeRequirement::HttpBearer { .. },
-                ConnectionAuthentication::StaticBearer { .. },
-            ) => true,
-            (
-                OpenApiSecuritySchemeRequirement::OAuth2ClientCredentials {
-                    token_url,
-                    required_scopes,
-                    ..
-                },
-                ConnectionAuthentication::OAuth2ClientCredentials {
-                    token_url: configured_token_url,
-                    scopes: configured_scopes,
-                    ..
-                },
-            ) => {
-                normalized_token_url(token_url)
+                } if header_name.eq_ignore_ascii_case(configured_header_name) => Ok(()),
+                ConnectionAuthentication::HeaderApiKey { .. } => {
+                    Err(OpenApiSecurityMismatchReason::ApiKeyHeaderMismatch)
+                }
+                _ => Err(OpenApiSecurityMismatchReason::RequiresHeaderApiKey),
+            }
+        }
+        OpenApiSecuritySchemeRequirement::HttpBearer { .. } => match authentication {
+            ConnectionAuthentication::StaticBearer { .. } => Ok(()),
+            _ => Err(OpenApiSecurityMismatchReason::RequiresStaticBearer),
+        },
+        OpenApiSecuritySchemeRequirement::OAuth2ClientCredentials {
+            token_url,
+            required_scopes,
+            user_consent,
+            ..
+        } => match authentication {
+            ConnectionAuthentication::OAuth2ClientCredentials {
+                token_url: configured_token_url,
+                scopes: configured_scopes,
+                ..
+            } => {
+                if !normalized_token_url(token_url)
                     .zip(normalized_token_url(configured_token_url))
                     .is_some_and(|(required, configured)| required == configured)
-                    && required_scopes
-                        .iter()
-                        .all(|required| configured_scopes.contains(required))
+                {
+                    return Err(OpenApiSecurityMismatchReason::TokenUrlMismatch);
+                }
+                require_scopes(required_scopes, configured_scopes)
             }
-            _ => false,
-        })
+            _ => match per_caller_requested_scopes(authentication) {
+                Some(requested_scopes) if *user_consent => {
+                    require_scopes(required_scopes, requested_scopes)
+                }
+                _ => Err(OpenApiSecurityMismatchReason::RequiresOAuth2ClientCredentials),
+            },
+        },
+        OpenApiSecuritySchemeRequirement::OAuth2UserConsent {
+            required_scopes, ..
+        } => match per_caller_requested_scopes(authentication) {
+            Some(requested_scopes) => require_scopes(required_scopes, requested_scopes),
+            None => Err(OpenApiSecurityMismatchReason::OAuth2WithoutClientCredentials),
+        },
+        OpenApiSecuritySchemeRequirement::OpenIdConnect {
+            required_scopes, ..
+        } => match per_caller_requested_scopes(authentication) {
+            Some(requested_scopes) => require_scopes(required_scopes, requested_scopes),
+            None => Err(OpenApiSecurityMismatchReason::OpenIdConnect),
+        },
+        OpenApiSecuritySchemeRequirement::Unsupported { category, .. } => {
+            Err(OpenApiSecurityMismatchReason::UnsupportedScheme(*category))
+        }
+    }
+}
+
+/// The scopes a Connection asks for when its credential is a token
+/// obtained for each caller, or `None` when it is one credential shared by
+/// every caller.
+///
+/// Such a token is the caller's own, so it can satisfy a user-consent
+/// `oauth2` flow or `openIdConnect`. The gateway does not inspect the token
+/// the issuer returns, so the scopes the Connection requests are the only
+/// evidence of what it may do, and every required scope must be among them.
+/// Exhaustive on purpose: a new credential type must decide here.
+fn per_caller_requested_scopes(authentication: &ConnectionAuthentication) -> Option<&[String]> {
+    match authentication {
+        ConnectionAuthentication::DelegatedIssuerToken {
+            requested_scopes, ..
+        } => Some(requested_scopes),
+        // Per caller too, but the managed OpenAPI tool lane refuses it
+        // (`authentication_not_supported`), so a catalog never binds to it.
+        ConnectionAuthentication::GoogleDomainWideDelegation { .. }
+        | ConnectionAuthentication::None
+        | ConnectionAuthentication::HeaderApiKey { .. }
+        | ConnectionAuthentication::StaticBearer { .. }
+        | ConnectionAuthentication::OAuth2ClientCredentials { .. } => None,
+    }
+}
+
+fn require_scopes(
+    required_scopes: &[String],
+    configured_scopes: &[String],
+) -> Result<(), OpenApiSecurityMismatchReason> {
+    let missing = required_scopes
+        .iter()
+        .filter(|required| !configured_scopes.contains(required))
+        .cloned()
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(OpenApiSecurityMismatchReason::MissingScopes { scopes: missing })
+    }
 }
 
 fn normalized_token_url(value: &str) -> Option<String> {
@@ -2352,14 +2688,27 @@ fn security_scheme_requirement(
     }
 
     if scheme_type.eq_ignore_ascii_case("oauth2") {
-        let client_credentials = scheme
-            .get("flows")
+        let flows = scheme.get("flows").and_then(Value::as_object);
+        let user_consent = flows.and_then(|flows| user_consent_flows(flows, &required_scopes));
+        let client_credentials = flows
             .and_then(|flows| flows.get("clientCredentials"))
             .and_then(Value::as_object);
         let Some(client_credentials) = client_credentials else {
-            return Ok(OpenApiSecuritySchemeRequirement::Unsupported {
-                scheme_name: scheme_name.to_owned(),
-                category: OpenApiUnsupportedSecurityScheme::OAuth2WithoutClientCredentials,
+            return Ok(match user_consent {
+                Some(UserConsentFlows::Valid) => {
+                    OpenApiSecuritySchemeRequirement::OAuth2UserConsent {
+                        scheme_name: scheme_name.to_owned(),
+                        required_scopes,
+                    }
+                }
+                Some(UserConsentFlows::Invalid) => OpenApiSecuritySchemeRequirement::Unsupported {
+                    scheme_name: scheme_name.to_owned(),
+                    category: OpenApiUnsupportedSecurityScheme::InvalidDefinition,
+                },
+                None => OpenApiSecuritySchemeRequirement::Unsupported {
+                    scheme_name: scheme_name.to_owned(),
+                    category: OpenApiUnsupportedSecurityScheme::OAuth2WithoutSupportedFlow,
+                },
             });
         };
         let token_url = client_credentials
@@ -2389,19 +2738,90 @@ fn security_scheme_requirement(
             scheme_name: scheme_name.to_owned(),
             token_url: token_url.to_owned(),
             required_scopes,
+            user_consent: user_consent == Some(UserConsentFlows::Valid),
+        });
+    }
+
+    if scheme_type.eq_ignore_ascii_case("openIdConnect") {
+        // The discovery document lists the provider's scopes, and it is never
+        // fetched, so required scopes are checked against the Connection
+        // alone when it binds.
+        let has_url = scheme
+            .get("openIdConnectUrl")
+            .and_then(Value::as_str)
+            .is_some_and(|url| !url.trim().is_empty());
+        return Ok(if has_url {
+            OpenApiSecuritySchemeRequirement::OpenIdConnect {
+                scheme_name: scheme_name.to_owned(),
+                required_scopes,
+            }
+        } else {
+            OpenApiSecuritySchemeRequirement::Unsupported {
+                scheme_name: scheme_name.to_owned(),
+                category: OpenApiUnsupportedSecurityScheme::InvalidDefinition,
+            }
         });
     }
 
     Ok(OpenApiSecuritySchemeRequirement::Unsupported {
         scheme_name: scheme_name.to_owned(),
-        category: if scheme_type.eq_ignore_ascii_case("openIdConnect") {
-            OpenApiUnsupportedSecurityScheme::OpenIdConnect
-        } else if scheme_type.eq_ignore_ascii_case("mutualTLS") {
+        category: if scheme_type.eq_ignore_ascii_case("mutualTLS") {
             OpenApiUnsupportedSecurityScheme::MutualTls
         } else {
             OpenApiUnsupportedSecurityScheme::UnsupportedType
         },
     })
+}
+
+/// The `oauth2` flows that obtain a token for a user rather than for the
+/// client itself.
+const USER_CONSENT_OAUTH2_FLOWS: [&str; 3] = ["authorizationCode", "implicit", "password"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UserConsentFlows {
+    /// Every user-consent flow present is an object with a `scopes` map, and
+    /// each required scope is declared by at least one of them.
+    Valid,
+    Invalid,
+}
+
+/// How the user-consent flows of an `oauth2` scheme's `flows` admit
+/// `required_scopes`, or `None` when it declares none. Their URLs are not
+/// checked: a per-caller credential is obtained from the Connection's own
+/// issuer, so the gateway never contacts them.
+fn user_consent_flows(
+    flows: &Map<String, Value>,
+    required_scopes: &[String],
+) -> Option<UserConsentFlows> {
+    let mut present = false;
+    let mut declared = BTreeSet::new();
+    for flow in USER_CONSENT_OAUTH2_FLOWS
+        .iter()
+        .filter_map(|name| flows.get(*name))
+    {
+        present = true;
+        let Some(scopes) = flow
+            .as_object()
+            .and_then(|flow| flow.get("scopes"))
+            .and_then(Value::as_object)
+        else {
+            return Some(UserConsentFlows::Invalid);
+        };
+        declared.extend(scopes.keys().map(String::as_str));
+    }
+    if !present {
+        return None;
+    }
+    Some(
+        if required_scopes
+            .iter()
+            .all(|required| declared.contains(required.as_str()))
+        {
+            UserConsentFlows::Valid
+        } else {
+            UserConsentFlows::Invalid
+        },
+    )
 }
 
 fn api_key_header_requirements(
@@ -2515,13 +2935,17 @@ pub(super) fn is_json_media_type(media_type: &str) -> bool {
     subtype.to_ascii_lowercase().ends_with("+json")
 }
 
-fn json_pointer_escape(value: &str) -> String {
+pub(super) fn json_pointer_escape(value: &str) -> String {
     value.replace('~', "~0").replace('/', "~1")
 }
 
 #[cfg(test)]
 #[path = "openapi_golden_tests.rs"]
 mod golden_tests;
+
+#[cfg(test)]
+#[path = "openapi_security_binding_tests.rs"]
+mod security_binding_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3669,7 +4093,39 @@ paths:
                 OpenApiUnsupportedSecurityScheme::ApiKeyQuery,
                 OpenApiUnsupportedSecurityScheme::ApiKeyCookie,
                 OpenApiUnsupportedSecurityScheme::HttpBasic,
-                OpenApiUnsupportedSecurityScheme::OpenIdConnect,
+            ])
+        );
+        // OpenID Connect is a scheme only a per-caller credential binds, so
+        // a shared static bearer still does not.
+        assert!(generation.security_requirements.iter().any(|security| {
+            security.tool_name == "openidOnly"
+                && security.alternatives[0].members
+                    == vec![OpenApiSecuritySchemeRequirement::OpenIdConnect {
+                        scheme_name: "OpenId".to_owned(),
+                        required_scopes: Vec::new(),
+                    }]
+        }));
+        let reasons = binding
+            .incompatibilities
+            .iter()
+            .map(|incompatibility| {
+                (
+                    incompatibility.tool_name.as_str(),
+                    incompatibility
+                        .security_mismatches
+                        .iter()
+                        .map(|mismatch| mismatch.reason.as_str())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            reasons,
+            BTreeMap::from([
+                ("basicOnly", vec!["http_basic"]),
+                ("cookieOnly", vec!["api_key_cookie"]),
+                ("openidOnly", vec!["open_id_connect"]),
+                ("queryOnly", vec!["api_key_query"]),
             ])
         );
     }

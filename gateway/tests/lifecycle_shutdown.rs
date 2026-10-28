@@ -200,6 +200,10 @@ fn sigterm_exits_cleanly_and_persists_terminal_audit_event() {
         .env("AUTH_ENABLED", "false")
         .env("CSRF_ENABLED", "false")
         .env("AUDIT_LOG_FILE", &audit_path)
+        // These rows are about the drain, which reads the JSONL file; the
+        // file is not an audit store of record, so they opt out of the
+        // default required durability rather than add a SQLite store.
+        .env("AUDIT_DURABILITY", "best_effort")
         .env("UPSTREAM_URL", format!("http://{upstream_addr}"))
         .env("EGRESS_ALLOWED_HOSTS", "127.0.0.1")
         .env("EGRESS_DENY_PRIVATE_IPS", "false")
@@ -317,6 +321,10 @@ fn sigint_ctrl_c_path_exits_cleanly_and_persists_terminal_audit_event() {
         .env("AUTH_ENABLED", "false")
         .env("CSRF_ENABLED", "false")
         .env("AUDIT_LOG_FILE", &audit_path)
+        // These rows are about the drain, which reads the JSONL file; the
+        // file is not an audit store of record, so they opt out of the
+        // default required durability rather than add a SQLite store.
+        .env("AUDIT_DURABILITY", "best_effort")
         .env("SHUTDOWN_DRAIN_DELAY_MS", "0")
         .env("SHUTDOWN_TIMEOUT_MS", "2000")
         .env("AUDIT_DRAIN_TIMEOUT_MS", "2000")
@@ -464,6 +472,10 @@ fn hard_shutdown_cancels_sse_before_persisted_audit_drain() {
         .env("AUTH_ENABLED", "false")
         .env("CSRF_ENABLED", "false")
         .env("AUDIT_LOG_FILE", &audit_path)
+        // These rows are about the drain, which reads the JSONL file; the
+        // file is not an audit store of record, so they opt out of the
+        // default required durability rather than add a SQLite store.
+        .env("AUDIT_DURABILITY", "best_effort")
         .env("UPSTREAM_ROUTES", upstream_routes)
         .env("EGRESS_ALLOWED_HOSTS", "127.0.0.1")
         .env("EGRESS_DENY_PRIVATE_IPS", "false")

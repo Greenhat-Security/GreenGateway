@@ -26,7 +26,7 @@ use tokio::sync::{mpsc, Mutex, MutexGuard};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    audit::{AuditEvent, AuditLog},
+    audit::{AuditEvent, AuditLog, AuditReceipt, AuditUnavailable},
     auth::{self, actor_from_principal, protected_resource},
     client_ip::{canonical_client_ip, request_id, ClientIpPolicy},
     config::Config,
@@ -52,7 +52,9 @@ use crate::{
 use url::Url;
 
 use super::{
-    decision::{PolicyDecision, PolicyDecisionOutcome},
+    decision::{
+        audit_unavailable_response, PolicyDecision, PolicyDecisionOutcome, AUDIT_UNAVAILABLE_REASON,
+    },
     rate_limit::RateLimitState,
 };
 
@@ -1575,17 +1577,10 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
     if is_unsafe_request_path(path) {
         let context = audit_context(&req, &state.client_ip_policy);
         let principal = req.extensions().get::<auth::Principal>().cloned();
-        emit_denied(&state, &context, principal.as_ref(), "unsafe_path", None);
-        return with_policy_decision(
-            forbidden(),
-            PolicyDecision {
-                outcome: PolicyDecisionOutcome::Denied,
-                reason: "unsafe_path",
-                permission: None,
-                path_prefix: None,
-                matched_rule_id: None,
-            },
-        );
+        let receipt = emit_denied(&state, &context, principal.as_ref(), "unsafe_path", None);
+        return RecordedRefusal::forbidden(&state.audit, receipt, "unsafe_path")
+            .answer()
+            .await;
     }
 
     if proxy_context.is_none() && auth::protected_resource::is_well_known_path(path) {
@@ -1622,17 +1617,16 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
                 admitted_bundle = admission.bundle;
             }
             Err(error) => {
-                emit_revision_check_failed(&state, &context, principal.as_ref(), error);
-                return with_policy_decision(
-                    service_unavailable_response(),
-                    PolicyDecision {
-                        outcome: PolicyDecisionOutcome::Denied,
-                        reason: error.as_str(),
-                        permission: None,
-                        path_prefix: None,
-                        matched_rule_id: None,
-                    },
-                );
+                let receipt =
+                    emit_revision_check_failed(&state, &context, principal.as_ref(), error);
+                return RecordedRefusal {
+                    audit: state.audit.clone(),
+                    receipt,
+                    response: service_unavailable_response(),
+                    decision: denied_decision(error.as_str()),
+                }
+                .answer()
+                .await;
             }
         }
     }
@@ -1732,7 +1726,7 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
             result
         }
         Ok(result) => {
-            return evaluation_failed(
+            let refusal = evaluation_failed(
                 &state,
                 &context,
                 principal.as_ref(),
@@ -1740,9 +1734,11 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
                 result.limitation(),
                 None,
             );
+            drop(policy);
+            return refusal.answer().await;
         }
         Err(error) => {
-            return evaluation_failed(
+            let refusal = evaluation_failed(
                 &state,
                 &context,
                 principal.as_ref(),
@@ -1750,9 +1746,11 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
                 None,
                 Some(error),
             );
+            drop(policy);
+            return refusal.answer().await;
         }
     };
-    let decision = match apply_http_evaluation(
+    let (decision, records) = match apply_http_evaluation(
         &state,
         &policy,
         &context,
@@ -1760,24 +1758,103 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
         proxy_context.as_ref(),
         &evaluation,
     ) {
-        Ok(decision) => decision,
+        Ok(evaluated) => evaluated,
         Err(error) => {
-            return evaluation_failed(
+            let refusal = evaluation_failed(
                 &state,
                 &context,
                 principal.as_ref(),
                 "policy_evaluation_error",
                 None,
                 Some(error),
-            )
+            );
+            drop(policy);
+            return refusal.answer().await;
         }
     };
     drop(policy);
+    // Required audit durability (issue #425): the decision is acted on --
+    // forwarded, or answered with its 403 -- only once its records are in
+    // the audit store of record. Nothing upstream has been touched yet, so
+    // a record that cannot commit refuses the request with no upstream I/O.
+    if records.confirm(&state.audit).await.is_err() {
+        return audit_unavailable();
+    }
     if evaluation.effect() == crate::policy_eval::PolicyEffect::Block {
         return with_policy_decision(forbidden(), decision);
     }
     let response = run_pinned(pinned_connections, admitted_bundle, next, req).await;
     with_policy_decision(response, decision)
+}
+
+/// The records one HTTP evaluation wrote: a direct shadow rule's
+/// observation, when one matched, then the verdict. Both are confirmed
+/// before the stage acts on the verdict; they were queued together, so they
+/// share one deadline and, normally, one commit.
+struct DecisionRecords {
+    observed: Option<AuditReceipt>,
+    verdict: AuditReceipt,
+}
+
+impl DecisionRecords {
+    async fn confirm(self, audit: &AuditLog) -> Result<(), AuditUnavailable> {
+        if let Some(observed) = self.observed {
+            audit.confirm(observed).await?;
+        }
+        audit.confirm(self.verdict).await
+    }
+}
+
+/// A refusal this stage has decided and recorded but not yet answered. It
+/// is answered with its own response once its record is durable, and with
+/// [`audit_unavailable`] when it is not: a refusal the gateway cannot
+/// evidence is reported as the outage it is, not as a policy answer.
+///
+/// It owns everything it needs, so a caller can let go of the request and
+/// the policy snapshot before waiting on the store.
+pub(crate) struct RecordedRefusal {
+    audit: AuditLog,
+    receipt: AuditReceipt,
+    response: Response,
+    decision: PolicyDecision,
+}
+
+impl RecordedRefusal {
+    fn forbidden(audit: &AuditLog, receipt: AuditReceipt, reason: &'static str) -> Self {
+        Self {
+            audit: audit.clone(),
+            receipt,
+            response: forbidden(),
+            decision: denied_decision(reason),
+        }
+    }
+
+    pub(crate) async fn answer(self) -> Response {
+        match self.audit.confirm(self.receipt).await {
+            Ok(()) => with_policy_decision(self.response, self.decision),
+            Err(_) => audit_unavailable(),
+        }
+    }
+}
+
+fn denied_decision(reason: &'static str) -> PolicyDecision {
+    PolicyDecision {
+        outcome: PolicyDecisionOutcome::Denied,
+        reason,
+        permission: None,
+        path_prefix: None,
+        matched_rule_id: None,
+    }
+}
+
+/// `503 audit_unavailable`, carrying a denied decision with the same reason
+/// so the request's own observation (when it can still be written) says
+/// why it was refused.
+fn audit_unavailable() -> Response {
+    with_policy_decision(
+        audit_unavailable_response(),
+        denied_decision(AUDIT_UNAVAILABLE_REASON),
+    )
 }
 
 /// Translate a complete verdict without re-evaluating any policy predicate.
@@ -1790,7 +1867,7 @@ fn apply_http_evaluation(
     principal: Option<&auth::Principal>,
     proxy_context: Option<&ProxyRouteAuthorizationContext>,
     evaluation: &crate::policy_eval::Evaluation,
-) -> Result<PolicyDecision, crate::policy_eval::EvaluationError> {
+) -> Result<(PolicyDecision, DecisionRecords), crate::policy_eval::EvaluationError> {
     use crate::policy_eval::{EvaluationError, PolicyEffect, Reason, RuleReference};
 
     let observed = match evaluation.observation() {
@@ -1832,27 +1909,28 @@ fn apply_http_evaluation(
         PolicyEffect::Observe => PolicyDecisionOutcome::WouldDeny,
     };
     let reason = evaluation.reason().as_str();
-    if let Some(id) = observed {
-        emit_rule_would_deny(state, context, principal, id);
-    }
+    let observed = observed.map(|id| emit_rule_would_deny(state, context, principal, id));
     if let Some(id) = direct {
-        match evaluation.effect() {
+        let verdict = match evaluation.effect() {
             PolicyEffect::Allow => emit_rule_allowed(state, context, principal, id),
             PolicyEffect::Block => emit_rule_denied(state, context, principal, id),
             PolicyEffect::Observe => emit_rule_would_deny(state, context, principal, id),
-        }
-        return Ok(decision_for_direct_rule(outcome, reason, id.clone()));
+        };
+        return Ok((
+            decision_for_direct_rule(outcome, reason, id.clone()),
+            DecisionRecords { observed, verdict },
+        ));
     }
-    if let Some(proxy_context) = host_denial {
-        emit_host_policy_required(state, context, principal, proxy_context);
+    let verdict = if let Some(proxy_context) = host_denial {
+        emit_host_policy_required(state, context, principal, proxy_context)
     } else {
         match evaluation.effect() {
             PolicyEffect::Allow => emit_allowed(state, context, principal, route, Some(reason)),
             PolicyEffect::Block => emit_denied(state, context, principal, reason, route),
             PolicyEffect::Observe => emit_would_deny(state, context, principal, reason, route),
         }
-    }
-    Ok(match route {
+    };
+    let decision = match route {
         Some(route) => decision_for_rule(outcome, reason, route),
         None => PolicyDecision {
             outcome,
@@ -1861,7 +1939,8 @@ fn apply_http_evaluation(
             path_prefix: None,
             matched_rule_id: None,
         },
-    })
+    };
+    Ok((decision, DecisionRecords { observed, verdict }))
 }
 
 /// Incomplete input and evaluator errors block even in shadow mode. Diagnostics
@@ -1873,24 +1952,15 @@ fn evaluation_failed(
     reason: &'static str,
     limitation: Option<crate::policy_eval::Limitation>,
     error: Option<crate::policy_eval::EvaluationError>,
-) -> Response {
+) -> RecordedRefusal {
     tracing::warn!(
         reason,
         ?limitation,
         ?error,
         "HTTP policy evaluation refused"
     );
-    emit_denied(state, context, principal, reason, None);
-    with_policy_decision(
-        forbidden(),
-        PolicyDecision {
-            outcome: PolicyDecisionOutcome::Denied,
-            reason,
-            permission: None,
-            path_prefix: None,
-            matched_rule_id: None,
-        },
-    )
+    let receipt = emit_denied(state, context, principal, reason, None);
+    RecordedRefusal::forbidden(&state.audit, receipt, reason)
 }
 
 /// Refuse a request that no policy evaluation answered, the way this stage
@@ -1905,25 +1975,21 @@ fn evaluation_failed(
 /// path, or a path the evaluator does not accept -- is answered and audited
 /// exactly as before. No upstream, credential or DNS work has started, and the
 /// cluster revision gate has not run, so the record carries no served revision.
+///
+/// The refusal comes back recorded but unanswered: the caller lets go of the
+/// request and answers it with [`RecordedRefusal::answer`], which waits for
+/// the record under required audit durability exactly as this stage's own
+/// refusals do.
 pub(crate) fn refuse_unevaluated(
     audit: &AuditLog,
     client_ip_policy: &ClientIpPolicy,
     req: &Request,
     principal: Option<&auth::Principal>,
     reason: &'static str,
-) -> Response {
+) -> RecordedRefusal {
     let context = audit_context(req, client_ip_policy);
-    emit_denial_event(audit, &context, principal, reason, None, AUTHZ_DENIED);
-    with_policy_decision(
-        forbidden(),
-        PolicyDecision {
-            outcome: PolicyDecisionOutcome::Denied,
-            reason,
-            permission: None,
-            path_prefix: None,
-            matched_rule_id: None,
-        },
-    )
+    let receipt = emit_denial_event(audit, &context, principal, reason, None, AUTHZ_DENIED);
+    RecordedRefusal::forbidden(audit, receipt, reason)
 }
 
 fn audit_context(req: &Request, client_ip_policy: &ClientIpPolicy) -> AuditContext {
@@ -1942,7 +2008,7 @@ fn emit_allowed(
     principal: Option<&auth::Principal>,
     rule: Option<&RouteRule>,
     reason: Option<&'static str>,
-) {
+) -> AuditReceipt {
     let actor = principal.map(actor_from_principal);
     let mut payload = match rule {
         Some(rule) => json!({
@@ -1960,13 +2026,13 @@ fn emit_allowed(
     };
     apply_security_revision(&mut payload, context);
 
-    state.audit.emit(AuditEvent::new(
+    state.audit.record(AuditEvent::new(
         AUTHZ_ALLOWED,
         &context.request_id,
         &context.source_ip,
         actor,
         payload,
-    ));
+    ))
 }
 
 fn emit_denied(
@@ -1975,8 +2041,8 @@ fn emit_denied(
     principal: Option<&auth::Principal>,
     reason: &'static str,
     rule: Option<&RouteRule>,
-) {
-    emit_denial_event(&state.audit, context, principal, reason, rule, AUTHZ_DENIED);
+) -> AuditReceipt {
+    emit_denial_event(&state.audit, context, principal, reason, rule, AUTHZ_DENIED)
 }
 
 fn emit_would_deny(
@@ -1985,7 +2051,7 @@ fn emit_would_deny(
     principal: Option<&auth::Principal>,
     reason: &'static str,
     rule: Option<&RouteRule>,
-) {
+) -> AuditReceipt {
     emit_denial_event(
         &state.audit,
         context,
@@ -1993,7 +2059,7 @@ fn emit_would_deny(
         reason,
         rule,
         AUTHZ_WOULD_DENY,
-    );
+    )
 }
 
 fn emit_rule_allowed(
@@ -2001,7 +2067,7 @@ fn emit_rule_allowed(
     context: &AuditContext,
     principal: Option<&auth::Principal>,
     matched_rule_id: &str,
-) {
+) -> AuditReceipt {
     emit_direct_rule_event(
         state,
         context,
@@ -2009,7 +2075,7 @@ fn emit_rule_allowed(
         "matched_rule",
         matched_rule_id,
         AUTHZ_ALLOWED,
-    );
+    )
 }
 
 fn emit_rule_denied(
@@ -2017,7 +2083,7 @@ fn emit_rule_denied(
     context: &AuditContext,
     principal: Option<&auth::Principal>,
     matched_rule_id: &str,
-) {
+) -> AuditReceipt {
     emit_direct_rule_event(
         state,
         context,
@@ -2025,7 +2091,7 @@ fn emit_rule_denied(
         "matched_rule",
         matched_rule_id,
         AUTHZ_DENIED,
-    );
+    )
 }
 
 fn emit_rule_would_deny(
@@ -2033,7 +2099,7 @@ fn emit_rule_would_deny(
     context: &AuditContext,
     principal: Option<&auth::Principal>,
     matched_rule_id: &str,
-) {
+) -> AuditReceipt {
     emit_direct_rule_event(
         state,
         context,
@@ -2041,7 +2107,7 @@ fn emit_rule_would_deny(
         "matched_rule",
         matched_rule_id,
         AUTHZ_WOULD_DENY,
-    );
+    )
 }
 
 fn emit_direct_rule_event(
@@ -2051,7 +2117,7 @@ fn emit_direct_rule_event(
     reason: &'static str,
     matched_rule_id: &str,
     event_type: &'static str,
-) {
+) -> AuditReceipt {
     let actor = principal.map(actor_from_principal);
     let mut payload = json!({
         "path": &context.path,
@@ -2061,13 +2127,13 @@ fn emit_direct_rule_event(
     });
     apply_security_revision(&mut payload, context);
 
-    state.audit.emit(AuditEvent::new(
+    state.audit.record(AuditEvent::new(
         event_type,
         &context.request_id,
         &context.source_ip,
         actor,
         payload,
-    ));
+    ))
 }
 
 fn emit_denial_event(
@@ -2077,7 +2143,7 @@ fn emit_denial_event(
     reason: &'static str,
     rule: Option<&RouteRule>,
     event_type: &'static str,
-) {
+) -> AuditReceipt {
     let actor = principal.map(actor_from_principal);
     let mut payload = match rule {
         Some(rule) => json!({
@@ -2095,13 +2161,13 @@ fn emit_denial_event(
     };
     apply_security_revision(&mut payload, context);
 
-    audit.emit(AuditEvent::new(
+    audit.record(AuditEvent::new(
         event_type,
         &context.request_id,
         &context.source_ip,
         actor,
         payload,
-    ));
+    ))
 }
 
 fn emit_host_policy_required(
@@ -2109,7 +2175,7 @@ fn emit_host_policy_required(
     context: &AuditContext,
     principal: Option<&auth::Principal>,
     proxy_context: &ProxyRouteAuthorizationContext,
-) {
+) -> AuditReceipt {
     let actor = principal.map(actor_from_principal);
     let mut payload = json!({
         "path": &context.path,
@@ -2121,13 +2187,13 @@ fn emit_host_policy_required(
     });
     apply_security_revision(&mut payload, context);
 
-    state.audit.emit(AuditEvent::new(
+    state.audit.record(AuditEvent::new(
         AUTHZ_DENIED,
         &context.request_id,
         &context.source_ip,
         actor,
         payload,
-    ));
+    ))
 }
 
 fn forbidden() -> Response {
@@ -2171,7 +2237,7 @@ fn emit_revision_check_failed(
     context: &AuditContext,
     principal: Option<&auth::Principal>,
     error: SecurityRevisionCheckError,
-) {
+) -> AuditReceipt {
     let actor = principal.map(actor_from_principal);
     let mut payload = json!({
         "path": &context.path,
@@ -2181,13 +2247,13 @@ fn emit_revision_check_failed(
     });
     apply_security_revision(&mut payload, context);
 
-    state.audit.emit(AuditEvent::new(
+    state.audit.record(AuditEvent::new(
         AUTHZ_REVISION_CHECK_FAILED,
         &context.request_id,
         &context.source_ip,
         actor,
         payload,
-    ));
+    ))
 }
 
 fn decision_for_rule(

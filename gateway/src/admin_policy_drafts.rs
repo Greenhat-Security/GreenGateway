@@ -939,6 +939,9 @@ pub(super) async fn policy_draft_publish_endpoint(
         "draft_revision": draft.summary.revision,
         "base_etag": draft.summary.base_etag,
     });
+    // Publishing a draft replaces the whole live document, exactly as
+    // `PUT /admin/policy` does, so its change evidence names the same
+    // operation; the diff summary is what records the draft it came from.
     let commit = match persist_policy_mutation(
         PolicyMutationCommitContext {
             state: &state,
@@ -947,6 +950,7 @@ pub(super) async fn policy_draft_publish_endpoint(
             parts: &parts,
             principal: &principal,
         },
+        storage::DocumentAction::PolicyPublish,
         &live_policy,
         &live_etag,
         &candidate,
