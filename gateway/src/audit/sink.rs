@@ -11,9 +11,9 @@ use std::{
 use crate::{
     audit::{
         sqlite_sink::{SqliteSink, SqliteSinkConfig},
-        AuditEvent, AuditEventSender, AUDIT_EVENTS_DROPPED_TOTAL,
+        AuditEvent, AuditEventSender, DurableAck, AUDIT_EVENTS_DROPPED_TOTAL,
     },
-    config::{Config, StateBackend},
+    config::{AuditDurability, Config, StateBackend},
     discovery::aggregator::{EndpointAggregatorSink, EndpointAggregatorSinkConfig},
     discovery::signals::SignalDetectorConfig,
     metrics::LOCK_POISON_RECOVERIES_TOTAL,
@@ -44,6 +44,26 @@ pub trait AuditSink: Send + Sync {
     }
 
     fn emit(&self, event: &AuditEvent);
+
+    /// Whether this sink is an audit store of record: one that can report,
+    /// per event, that the transaction carrying it committed. The SQLite and
+    /// PostgreSQL sinks are; stdout, the file, the broadcast and the
+    /// discovery aggregator are not, and neither is anything that only
+    /// accepts into memory. Required durability (issue #425) needs one.
+    fn is_durable(&self) -> bool {
+        false
+    }
+
+    /// [`Self::emit`] for a record a request is waiting on: deliver `event`
+    /// and report through `ack` once it is durably stored, or once it cannot
+    /// be. Called on the audit writer thread, so it must not block on I/O
+    /// beyond what [`Self::emit`] already does. A sink that is not a store of
+    /// record emits and reports `not_stored`; it can never be the one a
+    /// waiter relies on.
+    fn emit_durable(&self, event: &AuditEvent, ack: DurableAck) {
+        self.emit(event);
+        ack.not_stored();
+    }
 
     /// Finish any sink-owned background work and durably flush accepted events.
     ///
@@ -375,9 +395,34 @@ impl AuditSink for CompositeSink {
         "composite"
     }
 
+    fn is_durable(&self) -> bool {
+        self.sinks.iter().any(|sink| sink.is_durable())
+    }
+
     fn emit(&self, event: &AuditEvent) {
         for sink in &self.sinks {
             sink.emit(event);
+        }
+    }
+
+    /// The acknowledgement goes to the first durable member in fan-out
+    /// order -- a configuration has one store of record, the SQLite file or
+    /// the shared PostgreSQL store, never both -- and every other member
+    /// gets the plain emit it always got. With no durable member the record
+    /// is reported not stored, which refuses the request waiting on it.
+    fn emit_durable(&self, event: &AuditEvent, ack: DurableAck) {
+        let mut ack = Some(ack);
+        for sink in &self.sinks {
+            if sink.is_durable() {
+                if let Some(ack) = ack.take() {
+                    sink.emit_durable(event, ack);
+                    continue;
+                }
+            }
+            sink.emit(event);
+        }
+        if let Some(ack) = ack {
+            ack.not_stored();
         }
     }
 
@@ -491,9 +536,41 @@ fn build_configured_sink(
 ) -> Result<ConfiguredAuditSink, Box<dyn Error>> {
     let (broadcast_sender, _) = tokio::sync::broadcast::channel(AUDIT_BROADCAST_CAPACITY);
     let members = configured_sink_members(config, durable, &broadcast_sender)?;
-    let sink = Arc::new(CompositeSink::new(members)) as Arc<dyn AuditSink>;
+    let sink = CompositeSink::new(members);
+    check_audit_durability(config, &sink)?;
 
-    Ok((sink, broadcast_sender))
+    Ok((Arc::new(sink) as Arc<dyn AuditSink>, broadcast_sender))
+}
+
+/// Refuse at startup a required-durability configuration with no audit
+/// store of record (issue #425), rather than serve a mode that would refuse
+/// every request -- or, worse, quietly run as best effort. The opt-out is
+/// announced once, so a deployment that chose it says so in its own log.
+fn check_audit_durability(config: &Config, sink: &CompositeSink) -> Result<(), Box<dyn Error>> {
+    match config.audit_durability {
+        AuditDurability::Required if !sink.is_durable() => {
+            Err(if config.state_backend == StateBackend::Postgres {
+                "AUDIT_DURABILITY=required needs the shared PostgreSQL audit store, and this \
+                 replica has none; set AUDIT_DURABILITY=best_effort only if requests may be \
+                 served when their audit records are lost"
+                    .into()
+            } else {
+                "AUDIT_DURABILITY=required needs a durable audit store: set AUDIT_SQLITE_PATH, \
+                 or set AUDIT_DURABILITY=best_effort to serve requests whose audit records may be \
+                 lost"
+                    .into()
+            })
+        }
+        AuditDurability::Required => Ok(()),
+        AuditDurability::BestEffort => {
+            tracing::warn!(
+                "AUDIT_DURABILITY=best_effort: requests are served without waiting for their audit \
+                 records, and a record the audit store later loses is only counted on \
+                 audit_events_dropped_total"
+            );
+            Ok(())
+        }
+    }
 }
 
 /// Every sink a configuration gets, flat and in fan-out order: stdout, the
@@ -591,6 +668,113 @@ pub mod tests {
     impl AuditSink for CaptureSink {
         fn emit(&self, event: &AuditEvent) {
             self.events_guard().push(event.clone());
+        }
+    }
+
+    /// What a [`DurableCaptureSink`] does with the next required record.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum DurableBehaviour {
+        /// Capture it and report it stored, like a healthy store of record.
+        Store,
+        /// Capture nothing and report it not stored, like a failed commit.
+        Refuse,
+        /// Capture it and hold the acknowledgement unreported, like a
+        /// commit stuck behind a lock; [`DurableCaptureSink::release`]
+        /// reports the held ones stored.
+        Hold,
+    }
+
+    /// A store of record for tests of required audit durability (issue
+    /// #425): it is durable as far as the composite is concerned, captures
+    /// what it stores, and does with each acknowledgement what the test set.
+    #[derive(Clone)]
+    pub struct DurableCaptureSink {
+        stored: CaptureSink,
+        behaviour: Arc<Mutex<DurableBehaviour>>,
+        held: Arc<Mutex<Vec<DurableAck>>>,
+    }
+
+    impl Default for DurableCaptureSink {
+        fn default() -> Self {
+            Self {
+                stored: CaptureSink::new(),
+                behaviour: Arc::new(Mutex::new(DurableBehaviour::Store)),
+                held: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl DurableCaptureSink {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        pub fn set(&self, behaviour: DurableBehaviour) {
+            *self
+                .behaviour
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = behaviour;
+        }
+
+        /// Everything this sink stored (or holds), in arrival order.
+        pub fn events(&self) -> Vec<AuditEvent> {
+            self.stored.events()
+        }
+
+        pub fn held(&self) -> usize {
+            self.held
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len()
+        }
+
+        /// Report every held acknowledgement stored.
+        pub fn release(&self) {
+            let held = std::mem::take(
+                &mut *self
+                    .held
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            );
+            for ack in held {
+                ack.stored();
+            }
+        }
+
+        fn behaviour(&self) -> DurableBehaviour {
+            *self
+                .behaviour
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+    }
+
+    impl AuditSink for DurableCaptureSink {
+        fn is_durable(&self) -> bool {
+            true
+        }
+
+        fn emit(&self, event: &AuditEvent) {
+            if self.behaviour() != DurableBehaviour::Refuse {
+                self.stored.emit(event);
+            }
+        }
+
+        fn emit_durable(&self, event: &AuditEvent, ack: DurableAck) {
+            match self.behaviour() {
+                DurableBehaviour::Store => {
+                    self.stored.emit(event);
+                    ack.stored();
+                }
+                DurableBehaviour::Refuse => ack.not_stored(),
+                DurableBehaviour::Hold => {
+                    self.stored.emit(event);
+                    self.held
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push(ack);
+                }
+            }
         }
     }
 
@@ -1130,6 +1314,152 @@ pub mod tests {
             configured_member_names(&config, None),
             ["stdout", "broadcast"]
         );
+    }
+
+    /// The acknowledgement of a required record reaches the store of record
+    /// and nobody else, and every member still sees the event (issue #425).
+    #[test]
+    fn composite_hands_the_acknowledgement_to_its_durable_member_only() {
+        use crate::audit::durable::DurableOutcome;
+
+        let before = CaptureSink::new();
+        let durable = DurableCaptureSink::new();
+        let after = CaptureSink::new();
+        let sink = CompositeSink::new(vec![
+            Arc::new(before.clone()) as Arc<dyn AuditSink>,
+            Arc::new(durable.clone()) as Arc<dyn AuditSink>,
+            Arc::new(after.clone()) as Arc<dyn AuditSink>,
+        ]);
+        assert!(sink.is_durable());
+
+        let (ack, mut outcome) = DurableAck::channel();
+        sink.emit_durable(&test_event("audit.composite.durable"), ack);
+
+        assert_eq!(outcome.try_recv(), Ok(DurableOutcome::Stored));
+        for (name, events) in [
+            ("before", before.events()),
+            ("durable", durable.events()),
+            ("after", after.events()),
+        ] {
+            assert_eq!(events.len(), 1, "the {name} member must see the event once");
+        }
+
+        // The store of record refusing is what the waiter hears, whatever
+        // the other members did with the event.
+        durable.set(DurableBehaviour::Refuse);
+        let (ack, mut outcome) = DurableAck::channel();
+        sink.emit_durable(&test_event("audit.composite.refused"), ack);
+        assert_eq!(outcome.try_recv(), Ok(DurableOutcome::NotStored));
+        assert_eq!(before.len(), 2);
+        assert_eq!(after.len(), 2);
+    }
+
+    /// With no store of record nothing can vouch for the record, so it is
+    /// reported not stored rather than taken on stdout's word.
+    #[test]
+    fn composite_without_a_durable_member_reports_the_record_not_stored() {
+        use crate::audit::durable::DurableOutcome;
+
+        let capture = CaptureSink::new();
+        let sink = CompositeSink::new(vec![
+            Arc::new(StdoutSink::with_target(
+                Arc::new(RecordingTarget::default()),
+            )) as Arc<dyn AuditSink>,
+            Arc::new(capture.clone()) as Arc<dyn AuditSink>,
+        ]);
+        assert!(!sink.is_durable());
+
+        let (ack, mut outcome) = DurableAck::channel();
+        sink.emit_durable(&test_event("audit.composite.no_store"), ack);
+
+        assert_eq!(outcome.try_recv(), Ok(DurableOutcome::NotStored));
+        assert_eq!(capture.len(), 1, "the event is still delivered");
+    }
+
+    /// `AUDIT_DURABILITY=required`, the default, with no audit store of
+    /// record is a startup error that names both ways out, never a gateway
+    /// that silently runs best effort.
+    #[test]
+    fn required_durability_without_a_store_of_record_is_refused_at_startup() {
+        let mut config = Config::test_defaults();
+        assert_eq!(
+            config.audit_durability,
+            AuditDurability::Required,
+            "required is the default"
+        );
+        config.state_backend = StateBackend::Sqlite;
+        config.audit_sqlite_path = None;
+        config.audit_log_file = None;
+
+        let error = build_sink_from_config(&config)
+            .err()
+            .expect("required durability over stdout alone must not build")
+            .to_string();
+        assert!(error.contains("AUDIT_DURABILITY=required"), "{error}");
+        assert!(error.contains("AUDIT_SQLITE_PATH"), "{error}");
+        assert!(error.contains("AUDIT_DURABILITY=best_effort"), "{error}");
+
+        // A JSONL file is not a store of record either.
+        let file = std::env::temp_dir().join(format!(
+            "greengateway-audit-durability-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        config.audit_log_file = Some(file.to_string_lossy().into_owned());
+        assert!(build_sink_from_config(&config).is_err());
+        let _ = fs::remove_file(&file);
+    }
+
+    #[test]
+    fn required_durability_builds_over_the_sqlite_store_and_best_effort_builds_without_one() {
+        let audit_db = temp_sqlite_path("required-sqlite");
+        let mut config = Config::test_defaults();
+        config.state_backend = StateBackend::Sqlite;
+        config.audit_sqlite_path = Some(
+            audit_db
+                .to_str()
+                .expect("test path should be valid UTF-8")
+                .to_owned(),
+        );
+        let (sink, _) =
+            build_sink_from_config(&config).expect("required durability over SQLite builds");
+        assert!(sink.is_durable());
+        drop(sink);
+        remove_sqlite(&audit_db);
+
+        config.audit_sqlite_path = None;
+        config.audit_durability = AuditDurability::BestEffort;
+        let (sink, _) =
+            build_sink_from_config(&config).expect("the explicit opt-out builds without a store");
+        assert!(!sink.is_durable());
+    }
+
+    /// A cluster replica without the shared store has no store of record
+    /// either; the refusal names the store it is missing.
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn required_durability_in_cluster_mode_without_the_shared_store_is_refused() {
+        let mut config = Config::test_defaults();
+        config.state_backend = StateBackend::Postgres;
+        let error = build_sink_from_config_with_durable_store(&config, None)
+            .err()
+            .expect("a cluster replica with no audit store cannot be required")
+            .to_string();
+        assert!(error.contains("shared PostgreSQL audit store"), "{error}");
+        assert!(error.contains("AUDIT_DURABILITY=best_effort"), "{error}");
+    }
+
+    /// The audit log refuses the same mismatch on its own, so a sink built
+    /// some other way cannot leave required mode with nothing to settle it.
+    #[test]
+    fn a_required_audit_log_refuses_a_sink_with_no_store_of_record() {
+        let error = crate::audit::AuditLog::try_new_with_durability(
+            Arc::new(CaptureSink::new()),
+            AuditDurability::Required,
+            Duration::from_secs(1),
+        )
+        .err()
+        .expect("required durability needs a durable sink");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     /// Cluster mode's members with and without the durable store. A pool

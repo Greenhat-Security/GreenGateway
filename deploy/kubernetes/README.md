@@ -25,6 +25,15 @@ Supply real identity settings before deployment; the checked-in identity URLs
 are explicit placeholders. The image pin below contains the audit fixes and
 patched JWT validation.
 
+Audit durability: builds after the pinned image default to
+`AUDIT_DURABILITY=required`, which refuses to start a standalone gateway that
+has no `AUDIT_SQLITE_PATH`. These examples run with a read-only root filesystem
+and no writable audit path, so before advancing the image pin, mount a volume
+writable by UID 10001 (a PersistentVolumeClaim keeps the history across pod
+replacement), set `AUDIT_SQLITE_PATH` to a file on it, or choose
+`AUDIT_DURABILITY=best_effort` deliberately. See
+[the configuration reference](../../docs/configuration.md#audit_durability).
+
 ## Verified image
 
 Both examples pin the promoted image from revision

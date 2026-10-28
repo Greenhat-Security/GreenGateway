@@ -7,11 +7,14 @@
 //! and leave nothing behind. When one of those assumptions breaks, the
 //! failure belongs here and not scattered across the matrix.
 //!
-//! Two rows here are not about the harness but about the audit of record
+//! Three rows here are not about the harness but about the audit of record
 //! (issue #11's PostgreSQL audit sink), and they live in this leg because
 //! it is the cheapest one a pull request pays for:
 //! [`every_served_request_leaves_exactly_one_durable_audit_row`] is the
-//! non-ignored twin of the nightly `audit_enqueue` experiment, and
+//! non-ignored twin of the nightly `audit_enqueue` experiment, run with the
+//! `AUDIT_DURABILITY=best_effort` opt-out whose budget that experiment
+//! measures; [`a_stalled_audit_store_refuses_requests_until_it_recovers`]
+//! is the same stall under the default `required` (issue #425); and
 //! [`a_stopped_replicas_last_events_land_within_the_drain_budget`] is the
 //! shutdown drain against the shared store.
 //!
@@ -351,6 +354,11 @@ const STALL_BUDGET: Duration = Duration::from_secs(10);
 /// The counter every shed audit event lands on, whichever sink shed it,
 /// read off `/metrics` the way an operator reads it.
 const AUDIT_EVENTS_DROPPED_TOTAL: &str = "audit_events_dropped_total";
+/// The path the required-durability row is driven through.
+const REQUIRED_PATH: &str = "/echo/smoke-audit-required";
+/// `AUDIT_DURABILITY_TIMEOUT_MS` for the required-durability row: short,
+/// so a request refused for want of its record is refused quickly.
+const REQUIRED_TIMEOUT_MS: &str = "1000";
 
 /// The pre-authentication read lane is keyed by client address, and every
 /// request in these bursts comes from the same loopback one; at the
@@ -471,10 +479,16 @@ async fn audit_rows(cluster: &Cluster, path: &str) -> AuditRows {
 ///    store. A request path that did wait would deadlock against a lock
 ///    this test holds until the burst completes.
 /// 3. Nothing was dropped on the way, and both replicas still serve.
+///
+/// Run with `AUDIT_DURABILITY=best_effort`: point 2 is that opt-out's
+/// property. Under the default `required` the same stall refuses requests,
+/// which [`a_stalled_audit_store_refuses_requests_until_it_recovers`] proves.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_served_request_leaves_exactly_one_durable_audit_row() {
+    let mut shared_env = lifted_rate_limits();
+    shared_env.push(("AUDIT_DURABILITY".to_owned(), "best_effort".to_owned()));
     let Some(mut cluster) = Cluster::start(ClusterOptions {
-        shared_env: lifted_rate_limits(),
+        shared_env,
         ..ClusterOptions::default()
     })
     .await
@@ -619,6 +633,147 @@ async fn every_served_request_leaves_exactly_one_durable_audit_row() {
             "replica {name} should serve after the stall"
         );
     }
+}
+
+/// The authorization decisions the shared store holds for [`REQUIRED_PATH`].
+async fn required_decision_rows(cluster: &Cluster) -> i64 {
+    cluster
+        .database
+        .count(&format!(
+            "SELECT count(*)::bigint FROM greengateway.audit_events \
+             WHERE event_type = 'authz.allowed' AND payload_path = '{REQUIRED_PATH}'"
+        ))
+        .await
+}
+
+/// Under the default `AUDIT_DURABILITY=required` (issue #425) a stalled
+/// audit store refuses protected traffic instead of serving it on records
+/// that may never land, and the deployment recovers without a restart.
+///
+/// 1. With the sink running, a request is served and its decision row is
+///    already in the shared store when the answer arrives: it was written
+///    ahead, not after.
+/// 2. With `ACCESS EXCLUSIVE` held on `audit_events`, so no batch can land,
+///    every protected request is answered `503 audit_unavailable` within its
+///    bound, on both replicas, and the upstream sees none of them.
+/// 3. Once the lock goes, both replicas serve again, and each served
+///    request's decision row is in the store before its answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stalled_audit_store_refuses_requests_until_it_recovers() {
+    let mut shared_env = lifted_rate_limits();
+    shared_env.push((
+        "AUDIT_DURABILITY_TIMEOUT_MS".to_owned(),
+        REQUIRED_TIMEOUT_MS.to_owned(),
+    ));
+    let Some(mut cluster) = Cluster::start(ClusterOptions {
+        shared_env,
+        ..ClusterOptions::default()
+    })
+    .await
+    else {
+        eprintln!("skipping: no test database locator, or this run is not the gate; the ha-release-gate CI job runs this suite");
+        return;
+    };
+    cluster.wait_until_all_ready().await;
+    // 1. Written ahead.
+    for name in ["a", "b"] {
+        let before = required_decision_rows(&cluster).await;
+        let response = cluster.get_pinned(name, REQUIRED_PATH).await;
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "replica {name} should serve with the sink running"
+        );
+        assert_eq!(
+            required_decision_rows(&cluster).await,
+            before + 1,
+            "replica {name}'s decision row must be in the shared store before its answer"
+        );
+    }
+
+    // 2. The stall. A request on each replica first, so both sinks have a
+    //    batch wedged behind the lock before the burst is measured.
+    let lock = cluster.database.hold_audit_events_exclusively().await;
+    cluster.upstream.clear();
+    for name in ["a", "b"] {
+        let response = cluster.get_pinned(name, REQUIRED_PATH).await;
+        assert_eq!(
+            response.status().as_u16(),
+            503,
+            "replica {name} must refuse a request whose decision cannot be recorded"
+        );
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .expect("the refusal body should be JSON");
+        assert_eq!(
+            body,
+            serde_json::json!({ "error": "audit unavailable", "reason": "audit_unavailable" }),
+            "the refusal names the outage and nothing about the store"
+        );
+    }
+    cluster
+        .database
+        .wait_for_blocked_audit_writer(STALL_BUDGET)
+        .await;
+    let stalled = tokio::time::timeout(
+        STALL_BUDGET,
+        burst(&cluster, REQUIRED_PATH, CONCURRENCY, None),
+    )
+    .await;
+    let dispatched_while_stalled = cluster
+        .upstream
+        .requests()
+        .iter()
+        .filter(|request| request.path.starts_with(REQUIRED_PATH))
+        .count();
+    lock.release().await;
+    let stalled = stalled.unwrap_or_else(|_| {
+        panic!(
+            "{CONCURRENCY} requests did not complete within {STALL_BUDGET:?} while the audit \
+             table was locked: a required record must be refused at its \
+             {REQUIRED_TIMEOUT_MS} ms bound, not waited on for the length of the lock"
+        )
+    });
+    assert!(
+        stalled.iter().all(|status| *status == 503),
+        "every request during the stall must be refused, got {stalled:?}"
+    );
+    assert_eq!(
+        dispatched_while_stalled, 0,
+        "a request whose decision could not be recorded reached the upstream"
+    );
+
+    // 3. Recovery, with no restart: the same processes serve again once the
+    //    backlog the stall left behind has landed.
+    for name in ["a", "b"] {
+        let deadline = Instant::now() + AUDIT_CONVERGENCE;
+        loop {
+            let before = required_decision_rows(&cluster).await;
+            let status = cluster
+                .get_pinned(name, REQUIRED_PATH)
+                .await
+                .status()
+                .as_u16();
+            if status == 200 {
+                assert!(
+                    required_decision_rows(&cluster).await > before,
+                    "replica {name} served a request whose decision row is not in the store"
+                );
+                break;
+            }
+            assert_eq!(
+                status, 503,
+                "replica {name} answered neither served nor refused"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "replica {name} still refused {AUDIT_CONVERGENCE:?} after the lock went"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+    cluster.wait_until_all_ready().await;
 }
 
 /// A replica that is stopped cleanly lands its last audit events — the

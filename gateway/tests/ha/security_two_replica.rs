@@ -3135,6 +3135,8 @@ async fn a_security_incident_rehearsal_holds_through_a_replica_replacement() {
             "greengateway.connection_change_evidence",
             "security_revision",
         ),
+        ("greengateway.document_change_evidence", "security_revision"),
+        ("greengateway.catalog_change_evidence", "security_revision"),
     ] {
         evidence.push((
             format!("the {table} rows"),

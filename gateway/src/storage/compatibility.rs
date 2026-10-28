@@ -53,22 +53,24 @@
 //!
 //! Schema presence alone never enables an operation.
 //!
-//! The registry ([`OPERATION_REQUIREMENTS`]) holds two operations. The
+//! The registry ([`OPERATION_REQUIREMENTS`]) holds three operations. The
 //! first (issue #426, PR 2) is committing a policy document in which a role
 //! carries a `description` ([`POLICY_ROLE_DESCRIPTIONS`]). A gateway built
 //! before the field refuses such a document outright -- the role's fields
 //! are closed -- so the write waits until every live member advertises
 //! [`Capability::PolicyRoleDescriptions`], and a member that lacks it and
 //! returns later fails closed on the document rather than misreading it.
-//! The second (issue #443) is storing a managed OpenAPI catalog whose
-//! specification is a Swagger 2.0 document
-//! ([`OPENAPI_SWAGGER2_CATALOGS`]), which a gateway built before Swagger 2.0
-//! import cannot generate from; it waits for
-//! [`Capability::OpenApiSwagger2Catalogs`] the same way. The
-//! approved-extension list in `migrations.rs` stays empty: neither operation
+//! The second and third (issue #443) are storing a managed OpenAPI catalog
+//! whose specification is a Swagger 2.0 document
+//! ([`OPENAPI_SWAGGER2_CATALOGS`]) or a Google Discovery document
+//! ([`OPENAPI_DISCOVERY_CATALOGS`]), which a gateway built before that
+//! format's import cannot generate from; each waits for its own capability
+//! ([`Capability::OpenApiSwagger2Catalogs`],
+//! [`Capability::OpenApiDiscoveryCatalogs`]) the same way. The
+//! approved-extension list in `migrations.rs` stays empty: no operation
 //! changes the schema, and no schema overlap has been qualified. Every other
-//! operation this binary performs belongs to the schema-22 contract, which
-//! every schema-22 member shares. No shipped operation declares a durable
+//! operation this binary performs belongs to the schema-24 contract, which
+//! every schema-24 member shares. No shipped operation declares a durable
 //! fence or a backfill, so in this release nothing raises the fence and
 //! the backfill ledger is empty; both are checked everywhere they apply.
 
@@ -96,6 +98,11 @@ const SEPARATOR: char = ',';
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum Capability {
     /// The member generates, refreshes and replays a managed OpenAPI
+    /// catalog whose specification is a Google Discovery document (issue
+    /// #443). A member without it cannot generate from one, so
+    /// [`OPENAPI_DISCOVERY_CATALOGS`] waits for it.
+    OpenApiDiscoveryCatalogs,
+    /// The member generates, refreshes and replays a managed OpenAPI
     /// catalog whose specification is a Swagger 2.0 document (issue #443).
     /// A member without it cannot generate from one, so
     /// [`OPENAPI_SWAGGER2_CATALOGS`] waits for it.
@@ -114,7 +121,8 @@ pub(crate) enum Capability {
 
 impl Capability {
     /// Every capability, in name order.
-    pub(crate) const KNOWN: [Self; 3] = [
+    pub(crate) const KNOWN: [Self; 4] = [
+        Self::OpenApiDiscoveryCatalogs,
         Self::OpenApiSwagger2Catalogs,
         Self::OperationRequirements,
         Self::PolicyRoleDescriptions,
@@ -122,6 +130,7 @@ impl Capability {
 
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
+            Self::OpenApiDiscoveryCatalogs => "openapi_discovery_catalogs",
             Self::OpenApiSwagger2Catalogs => "openapi_swagger2_catalogs",
             Self::OperationRequirements => "operation_requirements",
             Self::PolicyRoleDescriptions => "policy_role_descriptions",
@@ -137,6 +146,7 @@ impl Capability {
 
 /// What this binary advertises: every capability it implements.
 pub(crate) const BINARY_CAPABILITIES: &[Capability] = &[
+    Capability::OpenApiDiscoveryCatalogs,
     Capability::OpenApiSwagger2Catalogs,
     Capability::OperationRequirements,
     Capability::PolicyRoleDescriptions,
@@ -217,8 +227,8 @@ impl RecognizedCapabilities {
 pub(crate) use gate::{
     evaluate, fence_target, Activation, Backfill, BackfillState, BinaryContract, ContractFence,
     FenceExclusion, FenceTarget, MemberAdvertisement, OperationAdmission, OperationRefusal,
-    OperationRequirement, OPENAPI_SWAGGER2_CATALOGS, OPERATION_REQUIREMENTS,
-    POLICY_ROLE_DESCRIPTIONS,
+    OperationRequirement, OPENAPI_DISCOVERY_CATALOGS, OPENAPI_SWAGGER2_CATALOGS,
+    OPERATION_REQUIREMENTS, POLICY_ROLE_DESCRIPTIONS,
 };
 
 #[cfg(feature = "postgres")]
@@ -291,7 +301,7 @@ mod gate {
     /// schema object and no migration, and the document format stays
     /// major 0. `minimum_schema` is 17 because that is the first schema
     /// whose members advertise capabilities at all; the policy tables it
-    /// writes are older. Every member that shares this binary's schema-22
+    /// writes are older. Every member that shares this binary's schema-24
     /// contract meets it, so among those the capability alone decides.
     pub(crate) const POLICY_ROLE_DESCRIPTIONS: OperationRequirement = OperationRequirement {
         operation: "policy.role_descriptions",
@@ -329,11 +339,33 @@ mod gate {
         activation: Activation::LiveMembers,
     };
 
+    /// Storing a managed OpenAPI catalog whose specification is a Google
+    /// Discovery document (issue #443): registering one, refreshing to one,
+    /// or writing an overlay over one.
+    ///
+    /// The same reasoning as [`OPENAPI_SWAGGER2_CATALOGS`], with its own
+    /// capability: a gateway built with Swagger 2.0 import but before
+    /// Discovery import advertises `openapi_swagger2_catalogs` and still
+    /// cannot generate from a Discovery document. It fails closed the same
+    /// way (refresh `catalog_stale`, and with an overlay a failed startup or
+    /// held reconciliation), so live-roster agreement is enough.
+    pub(crate) const OPENAPI_DISCOVERY_CATALOGS: OperationRequirement = OperationRequirement {
+        operation: "connections.openapi_discovery_catalog",
+        minimum_schema: 17,
+        document_format: None,
+        capability: Capability::OpenApiDiscoveryCatalogs,
+        backfill: Backfill::NotRequired,
+        activation: Activation::LiveMembers,
+    };
+
     /// Every operation this binary gates. An operation added later
     /// registers here, advertises a new capability, and calls the gate
     /// before its write.
-    pub(crate) const OPERATION_REQUIREMENTS: &[OperationRequirement] =
-        &[POLICY_ROLE_DESCRIPTIONS, OPENAPI_SWAGGER2_CATALOGS];
+    pub(crate) const OPERATION_REQUIREMENTS: &[OperationRequirement] = &[
+        POLICY_ROLE_DESCRIPTIONS,
+        OPENAPI_SWAGGER2_CATALOGS,
+        OPENAPI_DISCOVERY_CATALOGS,
+    ];
 
     /// What this binary serves and advertises: the left-hand side of every
     /// requirement.

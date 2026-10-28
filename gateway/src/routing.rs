@@ -280,6 +280,10 @@ pub(super) fn add_admin_api_routes(
             Router::new()
                 .route(routes.admin.status_route.as_str(), get(status_endpoint))
                 .route(
+                    routes.admin.config_capabilities_route.as_str(),
+                    get(config_capabilities_endpoint),
+                )
+                .route(
                     &format!("{}/capabilities", routes.admin.api_prefix),
                     get(admin_capabilities_endpoint),
                 )
@@ -375,6 +379,17 @@ pub(super) fn add_admin_api_routes(
                 .route(
                     routes.admin.policy_convert_route.as_str(),
                     post(policy_convert_endpoint),
+                )
+                .route(
+                    routes.admin.policy_test_runs_route.as_str(),
+                    post(policy_test_runs_endpoint),
+                )
+                .route(
+                    routes.admin.policy_simulations_route.as_str(),
+                    // One limiter per router: its concurrency bounds belong
+                    // to this application, not to the process.
+                    post(policy_simulations_endpoint)
+                        .layer(Extension(Arc::new(PolicySimulationLimiter::new()))),
                 )
                 .route(
                     routes.admin.policy_rules_route.as_str(),

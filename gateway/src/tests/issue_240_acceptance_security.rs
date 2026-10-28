@@ -1611,7 +1611,11 @@ async fn e2e_09_all_references_disable_atomically_and_block_delete_without_orpha
     for disabled in [&disabled_http, &disabled_mcp] {
         let delete_error = fixture
             .control_plane
-            .delete_managed(&disabled.id, &disabled.etag(), ACCEPTANCE_ACTOR)
+            .delete_managed(
+                &disabled.id,
+                &disabled.etag(),
+                &crate::auth::change_actor::ChangeActor::for_test(ACCEPTANCE_ACTOR),
+            )
             .await
             .expect_err("referenced disabled Connection deletion must conflict");
         assert!(matches!(

@@ -29,24 +29,25 @@ use super::{
     validate_payload_capture_sample_rate, validate_positive_bounded_u64,
     validate_positive_timeout_ms, validate_positive_u64, validate_positive_usize,
     validate_range_usize, validate_rule_suggestion_baseline_window_hours,
-    validate_signal_multiple_threshold, validate_signal_ratio_threshold, AUDIT_DRAIN_TIMEOUT_MS,
-    CORS_ALLOW_ORIGINS, DEFAULT_AUDIT_DRAIN_TIMEOUT_MS, DEFAULT_MAX_BODY_SIZE,
-    DEFAULT_MAX_REQUEST_PATH_BYTES, DEFAULT_PAYLOAD_CAPTURE_SAMPLE_RATE,
+    validate_signal_multiple_threshold, validate_signal_ratio_threshold, AuditDurability,
+    AUDIT_DRAIN_TIMEOUT_MS, AUDIT_DURABILITY, AUDIT_DURABILITY_TIMEOUT_MS, CORS_ALLOW_ORIGINS,
+    DEFAULT_AUDIT_DRAIN_TIMEOUT_MS, DEFAULT_AUDIT_DURABILITY, DEFAULT_AUDIT_DURABILITY_TIMEOUT_MS,
+    DEFAULT_MAX_BODY_SIZE, DEFAULT_MAX_REQUEST_PATH_BYTES, DEFAULT_PAYLOAD_CAPTURE_SAMPLE_RATE,
     DEFAULT_RATE_LIMIT_BUCKET_TTL_MS, DEFAULT_RATE_LIMIT_MAX_BUCKETS,
     DEFAULT_RATE_LIMIT_READ_BURST, DEFAULT_RATE_LIMIT_READ_RPS, DEFAULT_RATE_LIMIT_WRITE_BURST,
     DEFAULT_RATE_LIMIT_WRITE_RPS, DEFAULT_SHUTDOWN_DRAIN_DELAY_MS, DEFAULT_SHUTDOWN_TIMEOUT_MS,
     DEFAULT_TOOL_RUNTIME_DEFAULT_TIMEOUT_MS, DEFAULT_TOOL_RUNTIME_GLOBAL_CONCURRENCY,
     DEFAULT_TOOL_RUNTIME_QUEUE_DEPTH, DEFAULT_TOOL_RUNTIME_QUEUE_TIMEOUT_MS,
     DEFAULT_VALIDATION_ALLOWED_CONTENT_TYPES, ERROR_RATE_SPIKE_SIGNAL_THRESHOLD,
-    MAX_AUDIT_DRAIN_TIMEOUT_MS, MAX_BODY_SIZE, MAX_REQUEST_PATH_BYTES, MAX_SHUTDOWN_DRAIN_DELAY_MS,
-    MAX_SHUTDOWN_TIMEOUT_MS, MIN_MAX_REQUEST_PATH_BYTES, PAYLOAD_CAPTURE_ENABLED,
-    PAYLOAD_CAPTURE_SAMPLE_RATE, PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD,
-    RATE_LIMIT_BUCKET_TTL_MS, RATE_LIMIT_MAX_BUCKETS, RATE_LIMIT_READ_BURST, RATE_LIMIT_READ_RPS,
-    RATE_LIMIT_WRITE_BURST, RATE_LIMIT_WRITE_RPS, RULE_SUGGESTION_BASELINE_WINDOW_HOURS,
-    SCHEMA_MISMATCH_SIGNAL_THRESHOLD, SHUTDOWN_DRAIN_DELAY_MS, SHUTDOWN_TIMEOUT_MS,
-    TOOL_RUNTIME_DEFAULT_TIMEOUT_MS, TOOL_RUNTIME_GLOBAL_CONCURRENCY, TOOL_RUNTIME_QUEUE_DEPTH,
-    TOOL_RUNTIME_QUEUE_TIMEOUT_MS, VALIDATION_ALLOWED_CONTENT_TYPES,
-    VOLUME_OUTLIER_SIGNAL_THRESHOLD,
+    MAX_AUDIT_DRAIN_TIMEOUT_MS, MAX_AUDIT_DURABILITY_TIMEOUT_MS, MAX_BODY_SIZE,
+    MAX_REQUEST_PATH_BYTES, MAX_SHUTDOWN_DRAIN_DELAY_MS, MAX_SHUTDOWN_TIMEOUT_MS,
+    MIN_MAX_REQUEST_PATH_BYTES, PAYLOAD_CAPTURE_ENABLED, PAYLOAD_CAPTURE_SAMPLE_RATE,
+    PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD, RATE_LIMIT_BUCKET_TTL_MS, RATE_LIMIT_MAX_BUCKETS,
+    RATE_LIMIT_READ_BURST, RATE_LIMIT_READ_RPS, RATE_LIMIT_WRITE_BURST, RATE_LIMIT_WRITE_RPS,
+    RULE_SUGGESTION_BASELINE_WINDOW_HOURS, SCHEMA_MISMATCH_SIGNAL_THRESHOLD,
+    SHUTDOWN_DRAIN_DELAY_MS, SHUTDOWN_TIMEOUT_MS, TOOL_RUNTIME_DEFAULT_TIMEOUT_MS,
+    TOOL_RUNTIME_GLOBAL_CONCURRENCY, TOOL_RUNTIME_QUEUE_DEPTH, TOOL_RUNTIME_QUEUE_TIMEOUT_MS,
+    VALIDATION_ALLOWED_CONTENT_TYPES, VOLUME_OUTLIER_SIGNAL_THRESHOLD,
 };
 use crate::discovery::{
     signals::{
@@ -57,11 +58,15 @@ use crate::discovery::{
     suggestions::DEFAULT_RULE_SUGGESTION_BASELINE_WINDOW_HOURS,
 };
 
-/// The shutdown drain's inputs, as the reader returned them.
+/// The shutdown drain's inputs, and the request path's audit durability
+/// (issue #425) the legacy parser read right after them, as the reader
+/// returned them.
 pub(super) struct ShutdownInputs {
     drain_delay_ms: RawInput,
     timeout_ms: RawInput,
     audit_drain_timeout_ms: RawInput,
+    audit_durability: RawInput,
+    audit_durability_timeout_ms: RawInput,
 }
 
 impl ShutdownInputs {
@@ -77,15 +82,22 @@ impl ShutdownInputs {
                 AUDIT_DRAIN_TIMEOUT_MS,
                 get_var(AUDIT_DRAIN_TIMEOUT_MS),
             ),
+            audit_durability: RawInput::new(AUDIT_DURABILITY, get_var(AUDIT_DURABILITY)),
+            audit_durability_timeout_ms: RawInput::new(
+                AUDIT_DURABILITY_TIMEOUT_MS,
+                get_var(AUDIT_DURABILITY_TIMEOUT_MS),
+            ),
         }
     }
 }
 
-/// The shutdown drain, parsed.
+/// The shutdown drain and the audit durability, parsed.
 pub(super) struct Shutdown {
     shutdown_drain_delay_ms: u64,
     shutdown_timeout_ms: u64,
     audit_drain_timeout_ms: u64,
+    audit_durability: AuditDurability,
+    audit_durability_timeout_ms: u64,
     provenance: Vec<Provenance>,
 }
 
@@ -139,15 +151,44 @@ pub(super) fn compile_shutdown(inputs: ShutdownInputs) -> Checked<Shutdown> {
             problems,
         )
     });
+    let audit_durability = findings.input(AUDIT_DURABILITY, |problems| {
+        parse_var(
+            AUDIT_DURABILITY,
+            inputs.audit_durability.value(),
+            DEFAULT_AUDIT_DURABILITY,
+            "audit durability mode",
+            problems,
+        )
+    });
+    let audit_durability_timeout_ms = findings.input(AUDIT_DURABILITY_TIMEOUT_MS, |problems| {
+        let timeout_ms = parse_var(
+            AUDIT_DURABILITY_TIMEOUT_MS,
+            inputs.audit_durability_timeout_ms.value(),
+            DEFAULT_AUDIT_DURABILITY_TIMEOUT_MS,
+            "millisecond duration",
+            problems,
+        );
+        validate_positive_bounded_u64(
+            AUDIT_DURABILITY_TIMEOUT_MS,
+            timeout_ms,
+            MAX_AUDIT_DURABILITY_TIMEOUT_MS,
+            DEFAULT_AUDIT_DURABILITY_TIMEOUT_MS,
+            problems,
+        )
+    });
     Checked::new(
         Shutdown {
             shutdown_drain_delay_ms,
             shutdown_timeout_ms,
             audit_drain_timeout_ms,
+            audit_durability,
+            audit_durability_timeout_ms,
             provenance: vec![
                 inputs.drain_delay_ms.provenance(),
                 inputs.timeout_ms.provenance(),
                 inputs.audit_drain_timeout_ms.provenance(),
+                inputs.audit_durability.provenance(),
+                inputs.audit_durability_timeout_ms.provenance(),
             ],
         },
         findings,
@@ -730,6 +771,8 @@ pub(crate) struct RuntimePlan {
     pub(crate) shutdown_drain_delay_ms: u64,
     pub(crate) shutdown_timeout_ms: u64,
     pub(crate) audit_drain_timeout_ms: u64,
+    pub(crate) audit_durability: AuditDurability,
+    pub(crate) audit_durability_timeout_ms: u64,
     pub(crate) payload_capture_enabled: bool,
     pub(crate) payload_capture_sample_rate: f64,
     pub(crate) schema_mismatch_signal_threshold: u64,
@@ -783,6 +826,8 @@ pub(super) fn compile(inputs: ToolTimeoutInputs, blocks: RuntimeBlocks) -> Check
                 shutdown_drain_delay_ms,
                 shutdown_timeout_ms,
                 audit_drain_timeout_ms,
+                audit_durability,
+                audit_durability_timeout_ms,
                 provenance: shutdown_provenance,
             },
         signals:
@@ -837,6 +882,8 @@ pub(super) fn compile(inputs: ToolTimeoutInputs, blocks: RuntimeBlocks) -> Check
             shutdown_drain_delay_ms,
             shutdown_timeout_ms,
             audit_drain_timeout_ms,
+            audit_durability,
+            audit_durability_timeout_ms,
             payload_capture_enabled,
             payload_capture_sample_rate,
             schema_mismatch_signal_threshold,

@@ -14,6 +14,8 @@ an exit code. Implementation is grouped by responsibility:
 | `admin_connections`, `admin_tools`, `admin_tokens`, `admin_policy`, `admin_policy_drafts` | Domain-specific handlers and mutations; policy drafts publish only through `admin_policy`'s mutation path |
 | `admin_observability`, `admin_events` | Audit, traffic, signals, suggestions and change telemetry |
 | `admin_responses`, `admin_ui` | Shared error mapping and embedded UI serving |
+| `admin_policy_test_runs`, `policy_testing` | Policy test suites: the run endpoint, and the state-free suite parser, evaluator-backed runner and JSON/SARIF/JUnit reports |
+| `admin_policy_simulations`, `policy_simulation` | Synthetic policy simulation: the simulation endpoint and its concurrency bound, and the state-free request parser, position-aware edits, shadow projections and evaluator-backed runner |
 
 Sibling modules share crate-private contracts through the composition root.
 The extraction preserves the previous effective visibility and middleware order;

@@ -286,6 +286,9 @@ impl ProcessFixture {
             .env("LISTEN_ADDR", listen_addr.to_string())
             .env("AUTH_ENABLED", "false")
             .env("CSRF_ENABLED", "false")
+            // Key handling is under test here, not audit durability, and
+            // this gateway has no audit store of record.
+            .env("AUDIT_DURABILITY", "best_effort")
             .env("SHUTDOWN_DRAIN_DELAY_MS", "0")
             .env("SHUTDOWN_TIMEOUT_MS", "1000")
             .env("AUDIT_DRAIN_TIMEOUT_MS", "1000");

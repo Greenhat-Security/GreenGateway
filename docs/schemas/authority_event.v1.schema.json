@@ -92,6 +92,7 @@
         "kind": {
           "enum": [
             "principal",
+            "service_token",
             "system"
           ]
         },

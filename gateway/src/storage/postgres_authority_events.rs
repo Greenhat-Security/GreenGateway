@@ -206,6 +206,13 @@ pub(crate) struct JournaledEvidence {
     pub(crate) security_revision: Option<i64>,
     /// RFC 3339 UTC with microseconds, from the evidence row.
     pub(crate) committed_at: Option<String>,
+    /// The actor's canonical issuer, kind and auth mode (migration 24). All
+    /// three are `None` for evidence committed before migration 24, which
+    /// recorded none of them; the issuer is also `None` for an actor that
+    /// has none.
+    pub(crate) actor_issuer: Option<String>,
+    pub(crate) actor_kind: Option<String>,
+    pub(crate) actor_auth_mode: Option<String>,
 }
 
 /// The journal and the cursor, as one read sees them.
@@ -444,7 +451,10 @@ SELECT j.position,
        t.new_version,
        coalesce(c.security_revision, t.security_revision, r.security_revision),
        to_char(coalesce(c.committed_at, t.committed_at, r.committed_at) AT TIME ZONE 'UTC',
-               'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+               'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+       coalesce(c.actor_issuer, t.actor_issuer, r.actor_issuer),
+       coalesce(c.actor_kind, t.actor_kind, r.actor_kind),
+       coalesce(c.actor_auth_mode, t.actor_auth_mode, r.actor_auth_mode)
 FROM greengateway.authority_event_journal j
 LEFT JOIN greengateway.connection_change_evidence c
     ON j.source = 'connection_change_evidence' AND c.event_id = j.event_id
@@ -538,6 +548,9 @@ fn journaled_evidence_from_row(
         new_version: column(row, 9, OPERATION_READ)?,
         security_revision: column(row, 10, OPERATION_READ)?,
         committed_at: column(row, 11, OPERATION_READ)?,
+        actor_issuer: column(row, 12, OPERATION_READ)?,
+        actor_kind: column(row, 13, OPERATION_READ)?,
+        actor_auth_mode: column(row, 14, OPERATION_READ)?,
     })
 }
 

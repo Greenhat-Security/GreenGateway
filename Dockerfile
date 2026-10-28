@@ -18,14 +18,26 @@ RUN test "$(node --version)" = "v$(cat .node-version)" \
     && test "$(npm --version)" = "$(cat .npm-version)" \
     && rustc --version | grep -E '^rustc 1\.99\.0 '
 COPY gateway/Cargo.toml gateway/Cargo.toml
+# Cargo loads the whole workspace, so every member's manifest must be here.
+# The image ships only the gateway: `ggctl`, the operator CLI, keeps a stub
+# target and is never built into it. The stub `gateway-config` library is
+# cleaned after the dependency build because a copied source file can be older
+# than the stub's artifacts, which Cargo's modification-time check would take
+# as fresh.
+COPY gateway-config/Cargo.toml gateway-config/Cargo.toml
+COPY ggctl/Cargo.toml ggctl/Cargo.toml
 
-RUN mkdir -p gateway/src \
+RUN mkdir -p gateway/src gateway-config/src ggctl/src \
     && printf 'fn main() {}\n' > gateway/src/main.rs \
+    && : > gateway-config/src/lib.rs \
+    && printf 'fn main() {}\n' > ggctl/src/main.rs \
     && cargo build --locked --release -p gateway \
-    && rm -rf gateway/src
+    && cargo clean --locked --release -p gateway-config \
+    && rm -rf gateway/src gateway-config/src
 
 COPY admin-ui admin-ui
 COPY docs/schemas docs/schemas
+COPY gateway-config gateway-config
 COPY gateway gateway
 
 RUN cargo build --locked --release -p gateway

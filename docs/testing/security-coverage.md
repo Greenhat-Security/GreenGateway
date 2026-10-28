@@ -16,12 +16,24 @@ whole-gateway mutation score.
 
 The gate checks each file in `.github/security-coverage.json` separately:
 JWT handling, authentication and RBAC middleware, CSRF, response headers,
-validation, role evaluation, admin authorization and egress. Their inline test
-suites are separate test files, so test implementation lines cannot
-inflate these production-file percentages. Missing files, absent branch
+validation, role evaluation, admin authorization and egress, and for the
+`ggctl` operator CLI (issue #242) its refusal of secret-carrying and
+verification-disabling options (`ggctl/src/cli.rs`), its bearer-token input
+(`ggctl/src/credential.rs`) and its admin API client (`ggctl/src/remote.rs`).
+Their inline test suites are separate test files, so test implementation lines
+cannot inflate these production-file percentages. Missing files, absent branch
 instrumentation, results below either floor and a shrunken denominator (below)
 fail the job. Evidence is uploaded even when a floor fails, and image promotion
 depends on the coverage job.
+
+`ggctl` is its own workspace package with its own tests, so it is measured in
+its own run, before the gateway's, and the gateway run stays exactly the command
+its floors were set against. Its integration tests run the instrumented `ggctl`
+binary itself, so exit codes, standard streams, token files and loopback HTTPS
+count. The floor check reads both reports as one: every gated file must appear
+in exactly one of them, so a file measured twice fails instead of passing on its
+better run. A failed `ggctl` run skips the gateway run, and with it the floor
+check and the evidence upload.
 
 Reproduce on the same compiler/platform:
 
@@ -32,8 +44,9 @@ The offline gate regression suite imports PyYAML to inspect the CI workflow.
 python -m pip install PyYAML==6.0.3
 rustup toolchain install nightly-2026-09-01 --profile minimal --component llvm-tools-preview
 cargo install cargo-llvm-cov --version 0.9.0 --locked
+cargo +nightly-2026-09-01 llvm-cov --no-rustc-wrapper --branch --json --output-path target/ggctl-security-coverage.json -p ggctl --locked --jobs 4
 cargo +nightly-2026-09-01 llvm-cov --no-rustc-wrapper --branch --json --output-path target/security-coverage.json -p gateway --bin gateway --locked --jobs 4 -- --test-threads=8 --skip audit::sqlite_sink::tests::moderate_scale_batched_inserts_complete_quickly
-python scripts/check-security-coverage.py target/security-coverage.json
+python scripts/check-security-coverage.py target/security-coverage.json target/ggctl-security-coverage.json
 python scripts/test_security_gates.py
 ```
 
@@ -103,8 +116,11 @@ When the gate reports that a denominator shrank:
   pull request which code went. Raising a minimum after code is added is
   optional but keeps the guard tight.
 
-The current minimums are the counts the `main` CI run 39717886274 measured on
-October 22, 2026 (commit `6fc83e9`).
+The current gateway minimums are the counts the `main` CI run 39717886274
+measured on October 22, 2026 (commit `6fc83e9`). The `ggctl` minimums are the
+counts of a Windows run of the same `ggctl` command with the same pinned
+compiler and `cargo-llvm-cov` on October 22, 2026, before the files first
+reached `main`; see [the operator CLI baseline](#operator-cli-baseline).
 
 ## Initial measured baseline
 
@@ -126,6 +142,28 @@ floors.
 | `rbac/engine.rs` | 100.00% | 100.00% | 100% / 100% |
 | `admin_authorization.rs` | 78.50% | 78.26% | 75% / 75% |
 | `egress.rs` | 89.91% | 76.42% | 87% / 74% |
+
+### Operator CLI baseline
+
+The October 22, 2026 Windows measurement of `ggctl` (issue #242, PR 5), with
+`nightly-2026-09-01` and `cargo-llvm-cov` 0.9.0, ran its 47 unit tests and 6
+integration tests. Windows compiles no Unix-only code, so the Unix mode check
+on token files is outside these counts; the Linux and macOS legs of the `ggctl`
+CI job run its tests.
+
+| File (under `ggctl/src/`) | Lines | Branches | Line / branch floors |
+|---|---:|---:|---:|
+| `cli.rs` | 96.45% (163/169) | 98.21% (55/56) | 94% / 94% |
+| `credential.rs` | 89.72% (96/107) | 95.83% (23/24) | 87% / 90% |
+| `remote.rs` | 97.06% (264/272) | 91.07% (51/56) | 95% / 87% |
+
+What stays uncovered is code Windows does not reach or no test can provoke on
+demand: the refusal of a token file that group or other can access (its
+mapping is compiled on Windows, where the check always passes), a read error
+from standard input or from a file after it opened, the UTF-8 conversion of
+bytes already checked as ASCII, a client builder or response body that fails,
+the mapping of a redirect error that the client's no-redirect policy never
+raises, and the `Debug` form of a command table entry.
 
 These are initial per-file minimums, not evidence that every security outcome is
 tested. Use uncovered branches to choose the next tests, raise floors as coverage

@@ -34,6 +34,7 @@ The default deploy is intentionally conservative:
 - `ADMIN_PREFIX=/admin`
 - `EGRESS_DENY_PRIVATE_IPS=true`
 - `UPSTREAM_URL=` left blank
+- `AUDIT_SQLITE_PATH=/tmp/greengateway-audit.sqlite`, the audit store of record the default `AUDIT_DURABILITY=required` needs: without one the gateway refuses to start. It is on the container's ephemeral disk, so the audit history it holds is lost when the container is replaced; see [Important Limitations](#important-limitations)
 
 Set `UPSTREAM_URL` or `UPSTREAM_ROUTES` during deploy, or later in the Cloudflare dashboard, when you want GreenGateway to proxy to origin APIs. Pool JSON is forwarded unchanged after the normal GreenGateway startup validation. After the first deploy, set `GATEWAY_PUBLIC_URL` to the deployed Worker URL if you use MCP OAuth protected-resource metadata.
 
@@ -44,7 +45,7 @@ The wrapper forwards non-empty string Worker variables and secrets whose names m
 - the inbound TLS settings (`TLS_CERT_FILE`, `TLS_KEY_FILE`, `ADMIN_TLS_CERT_FILE`, `ADMIN_TLS_KEY_FILE`, `TLS_MIN_VERSION`, `TLS_HANDSHAKE_TIMEOUT_MS`, `TLS_MAX_CONCURRENT_HANDSHAKES`), because Cloudflare terminates TLS at its edge and reaches the container over plain HTTP/1.1. There is also nowhere to mount a certificate and key in this deployment shape.
 - the gRPC settings (`GRPC_LISTEN_ADDR`, `GRPC_MAX_CONCURRENT_STREAMS`, `GRPC_MAX_METADATA_BYTES`), because **Cloudflare Containers can never carry gRPC**. See [gRPC cannot work on Cloudflare Containers](#grpc-cannot-work-on-cloudflare-containers) below.
 
-An automated parity test compares this forwarding allowlist to GreenGateway's runtime environment reads, so a newly supported key cannot silently be omitted. `SHUTDOWN_DRAIN_DELAY_MS`, `SHUTDOWN_TIMEOUT_MS`, and `AUDIT_DRAIN_TIMEOUT_MS` are forwarded; keep their sum within the Cloudflare container termination budget used by the selected platform plan.
+An automated parity test compares this forwarding allowlist to GreenGateway's runtime environment reads, so a newly supported key cannot silently be omitted. `SHUTDOWN_DRAIN_DELAY_MS`, `SHUTDOWN_TIMEOUT_MS`, and `AUDIT_DRAIN_TIMEOUT_MS` are forwarded; keep their sum within the Cloudflare container termination budget used by the selected platform plan. `AUDIT_DURABILITY` and `AUDIT_DURABILITY_TIMEOUT_MS` are forwarded too; see [the configuration reference](../configuration.md#audit_durability).
 
 Secrets such as OIDC client secrets should be configured as Worker secrets or embedded inside a secret-backed `AUTH_PROVIDERS` value, not committed to the repository.
 
@@ -94,6 +95,7 @@ To proxy gRPC through GreenGateway, run it somewhere the container is reached ov
 ## Important Limitations
 
 - Cloudflare Containers use an ephemeral container filesystem by default. GreenGateway settings such as `AUDIT_SQLITE_PATH`, `DISCOVERY_SQLITE_PATH`, `PRINCIPAL_SQLITE_PATH`, `SERVICE_TOKEN_SQLITE_PATH`, and `CONNECTIONS_SQLITE_PATH` can work for evaluation, but their contents are lost on container replacement unless the deployment explicitly supplies durable storage. A redeploy must be treated as potential state loss, not as a persistence mechanism.
+- The default `AUDIT_SQLITE_PATH` above lets the gateway wait for each authentication and authorization record to commit before acting on it, and refuse the request with `503 audit_unavailable` when it cannot, but the committed records live only as long as the container. Treat a container replacement as the loss of that audit history, collect stdout if you need the events beyond it, and do not read this deployment's audit store as a durable record. Setting `AUDIT_DURABILITY=best_effort` does not make it more durable; it only stops the gateway waiting for the record.
 - File-backed settings such as `POLICY_FILE`, `TOOLS_FILE`, `OPENAPI_SPEC_PATH`, `CONNECTION_SECRETS_ROOT`, CA bundles, and mTLS client identities must point at files that exist inside the image or are otherwise created at runtime. The one-click wrapper does not create a secure mount. A plain or secret Worker variable is not a mounted private-key file; do not put PEM key material, local encryption keys, or resolved Connection secrets in `wrangler.jsonc`, public variables, image layers, or inline route JSON.
 - The one-click wrapper does not expose `ADMIN_LISTEN_ADDR`; use the shared `ADMIN_PREFIX` surface with normal authentication/RBAC.
 - The one-click wrapper does not expose the inbound TLS settings; TLS is terminated by Cloudflare and the container is reached over HTTP/1.1.
