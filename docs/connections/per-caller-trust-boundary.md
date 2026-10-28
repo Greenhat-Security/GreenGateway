@@ -38,7 +38,9 @@ tools send each caller's own token through the same exchange, cache and
 audit as manual tools; see
 [Security binding and read-only selection](operator-guide.md#security-binding-and-read-only-selection).
 A `google_domain_wide_delegation` Connection is not served on the managed
-OpenAPI lane, so no catalog binds to one.
+OpenAPI lane, so no catalog is registered on one, and a save that switches a
+Connection to it takes the Connection's live catalog off the tool list,
+audited as `managed_openapi_catalog_withdrawn`, and keeps it stored.
 
 ## What each component can do in the wrong hands
 
@@ -314,11 +316,13 @@ provide:
 - **Consent flows and refresh tokens.** No Connection runs an
   authorization-code, PKCE or device-code flow, and the gateway stores no
   upstream refresh token. Users connect their accounts at the issuer.
-- **User-consent OAuth scheme binding for imported specifications (#443)** is
-  not implemented.
-- **Delegated tokens on other lanes.** Managed OpenAPI and composite tools,
-  proxied requests, managed MCP, discovery, enum and label sources refuse a
-  delegated Connection with `caller_assertion_not_enforced`. A stored
+- **Domain-wide delegation on managed OpenAPI catalogs.** An imported
+  specification's user-consent schemes bind to a delegated issuer token
+  Connection only (#443); the managed OpenAPI lane never sends a
+  `google_domain_wide_delegation` Connection's tokens.
+- **Delegated tokens on other lanes.** Composite tools, proxied requests,
+  managed MCP, discovery, enum and label sources refuse a delegated
+  Connection with `caller_assertion_not_enforced`. A stored
   Connection test is served, as the administrator who asks, with that
   administrator's own token exchanged inline and cached nowhere.
 - **Attesting every lane.** OpenAPI and MCP discovery, enum and label sources
@@ -384,7 +388,11 @@ and exchanges it at Google's token endpoint.
   without a `caller_assertion`. A stored test runs as the principal who asks
   for it, with a token minted for that one request and cached nowhere, as for
   a delegated issuer token. Every other lane answers
-  `authentication_not_supported`.
+  `authentication_not_supported`, and the managed OpenAPI catalog lifecycle
+  applies the same rule: a preview, registration, refresh or overlay edit on
+  such a Connection is refused with that reason before anything is fetched or
+  minted, and a live catalog is withdrawn from the tool list when a save
+  switches its Connection to this credential.
 - **The same bounded, per-caller cache** as delegated tokens, keyed on the
   caller's issuer, subject and email: at most 1,024 callers per replica and
   900 seconds per token, dropped on an upstream `401`, a save of the
