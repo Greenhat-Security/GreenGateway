@@ -365,13 +365,20 @@ python scripts/qualification.py alert --expect GreenGatewayMetricsTargetDown --w
   -- kubectl --namespace <namespace> scale deployment/greengateway --replicas=1
 ```
 
-Restore the replica count once the alert is seen. The record holds the fault
-time, the rule's own `startsAt`, when the alert was seen active, its receivers
-and whether it resolved. **Delivery to a person is proved only by the paging
-system's own record**: copy its notification and acknowledgement times into the
-record's `notified_at` and `acknowledged_at` and the evidence's
-`alert_delivery.measured`. See [operational alerts](operational-alerts.md) for
-the rules and their owners.
+Restore the replica count once the alert is seen. A rule alert carries no
+per-run label, so the drill first requires that no alert with that name and
+`--match-label` values is active, silenced and inhibited ones included. If one
+is, it refuses without running the fault command: an alert still active from
+an earlier incident or drill would otherwise be reported as this fault's. Wait
+for it to resolve, or narrow `--match-label`. The drill also fails if the rule's
+own `startsAt` is more than 2 seconds before the fault time (or, without a fault
+command, before that check), so keep this host's clock synchronised with
+Prometheus. The record holds the fault time, the rule's own `startsAt`, when
+the alert was seen active, its receivers and whether it resolved. **Delivery to
+a person is proved only by the paging system's own record**: copy its
+notification and acknowledgement times into the record's `notified_at` and
+`acknowledged_at` and the evidence's `alert_delivery.measured`. See
+[operational alerts](operational-alerts.md) for the rules and their owners.
 
 ## 9. Audit delivery during a sustained database outage
 
