@@ -146,7 +146,7 @@ jobs:
           node: 'true'
       # One dependency cache serves every job that builds the default-feature
       # test graph without RUSTFLAGS; see postgres-foundation-pg.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: postgres-foundation
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
@@ -180,7 +180,7 @@ jobs:
         with:
           rust: coverage
           node: 'true'
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: ". -> target/llvm-cov-target"
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
@@ -366,7 +366,7 @@ jobs:
       # a cold dependency build per run. It is the default-feature test
       # graph, so it shares postgres-foundation-pg's cache.
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: postgres-foundation
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
@@ -419,7 +419,7 @@ jobs:
           rust: ci
           node: 'true'
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
@@ -447,7 +447,7 @@ jobs:
           rust: ci
           node: 'true'
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
@@ -491,7 +491,7 @@ jobs:
           rust: ci
           node: 'true'
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
@@ -548,7 +548,7 @@ jobs:
           rust: ci
           node: 'true'
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           # The dependency cache of the default-feature test graph built
           # without RUSTFLAGS, under the key this pass has always used. The
@@ -604,7 +604,7 @@ jobs:
           rust: ci
           node: 'true'
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
@@ -625,7 +625,7 @@ jobs:
           rust: ci
           node: 'true'
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
@@ -689,7 +689,7 @@ jobs:
           rust: ci
           node: 'true'
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
@@ -1159,7 +1159,7 @@ jobs:
           node: 'true'
       # The default-feature test graph again; see postgres-foundation-pg.
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: postgres-foundation
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
@@ -1263,7 +1263,7 @@ jobs:
       # to start from. It is only restored here, never saved: this job's
       # target directory also holds the two pinned builds.
       - name: Restore the gateway build's Rust dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: admin-ui
           save-if: false
@@ -1767,7 +1767,7 @@ jobs:
         with:
           rust: production
           node: 'true'
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - run: cargo check --workspace --all-targets --locked
