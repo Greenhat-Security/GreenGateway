@@ -234,7 +234,7 @@ fn version_label(version: Option<&Value>) -> String {
     }
 }
 
-fn json_type_name(value: &Value) -> &'static str {
+pub(super) fn json_type_name(value: &Value) -> &'static str {
     match value {
         Value::Null => "null",
         Value::Bool(_) => "boolean",
@@ -245,7 +245,7 @@ fn json_type_name(value: &Value) -> &'static str {
     }
 }
 
-fn bounded_subject(value: &str) -> String {
+pub(super) fn bounded_subject(value: &str) -> String {
     if value.len() <= MAX_WARNING_SUBJECT_BYTES {
         return value.to_owned();
     }
@@ -256,15 +256,16 @@ fn bounded_subject(value: &str) -> String {
     value[..end].to_owned()
 }
 
+/// Conversion warnings, bounded; shared with the Google Discovery converter.
 #[derive(Default)]
-struct Warnings {
+pub(super) struct Warnings {
     entries: Vec<OpenApiConversionWarning>,
     document_codes: BTreeSet<OpenApiConversionWarningCode>,
     truncated: bool,
 }
 
 impl Warnings {
-    fn push(&mut self, warning: OpenApiConversionWarning) {
+    pub(super) fn push(&mut self, warning: OpenApiConversionWarning) {
         if self.entries.len() + 1 >= MAX_CONVERSION_WARNINGS {
             self.truncated = true;
             return;
@@ -272,7 +273,7 @@ impl Warnings {
         self.entries.push(warning);
     }
 
-    fn document(&mut self, code: OpenApiConversionWarningCode, subject: Option<&str>) {
+    pub(super) fn document(&mut self, code: OpenApiConversionWarningCode, subject: Option<&str>) {
         self.push(OpenApiConversionWarning {
             code,
             method: None,
@@ -282,13 +283,13 @@ impl Warnings {
     }
 
     /// A document-level note that applies however many operations caused it.
-    fn document_once(&mut self, code: OpenApiConversionWarningCode) {
+    pub(super) fn document_once(&mut self, code: OpenApiConversionWarningCode) {
         if self.document_codes.insert(code) {
             self.document(code, None);
         }
     }
 
-    fn operation(
+    pub(super) fn operation(
         &mut self,
         code: OpenApiConversionWarningCode,
         method: &str,
@@ -303,7 +304,7 @@ impl Warnings {
         });
     }
 
-    fn finish(mut self) -> Vec<OpenApiConversionWarning> {
+    pub(super) fn finish(mut self) -> Vec<OpenApiConversionWarning> {
         if self.truncated {
             self.entries.push(OpenApiConversionWarning {
                 code: OpenApiConversionWarningCode::WarningsTruncated,

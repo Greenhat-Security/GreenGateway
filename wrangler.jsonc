@@ -28,6 +28,7 @@
   ],
   "vars": {
     "ADMIN_PREFIX": "/admin",
+    "AUDIT_SQLITE_PATH": "/tmp/greengateway-audit.sqlite",
     "AUTH_ENABLED": "true",
     "AUTH_MODE": "required",
     "EGRESS_DENY_PRIVATE_IPS": "true",

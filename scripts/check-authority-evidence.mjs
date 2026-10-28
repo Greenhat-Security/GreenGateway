@@ -119,7 +119,11 @@ const resourceFor = (operation) => ({
 export function validateEvent(event) {
   validateSchemaValue(event, schema);
   check(event.resource.kind === resourceFor(event.operation), "operation/resource mismatch");
+  // Kind and auth mode agree as the evidence records them (migration 24): a
+  // system actor is exactly the system mode, a service token exactly the
+  // service_token mode, and every other mode is a principal's.
   check((event.actor.kind === "system") === (event.actor.auth_mode === "system"), "actor/auth mode mismatch");
+  check((event.actor.kind === "service_token") === (event.actor.auth_mode === "service_token"), "actor/auth mode mismatch");
   const timestamp = event.committed_at.replace(/\.\d+Z$/, "Z");
   const instant = new Date(timestamp);
   check(Number.isFinite(instant.valueOf()) && instant.toISOString().replace(".000Z", "Z") === timestamp, "invalid calendar instant");

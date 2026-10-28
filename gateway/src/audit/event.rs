@@ -5,9 +5,24 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 pub const SCHEMA_VERSION: &str = "0.2.0";
 pub const POLICY_CHANGED: &str = "policy.changed";
 pub const POLICY_SHADOW_TRANSITION_REFUSED: &str = "policy.shadow_transition_refused";
+/// A server-side policy draft was created, changed or deleted (issue #243,
+/// slice 9). Drafts are inactive, so this records workspace activity, not an
+/// authorization change.
+pub const POLICY_DRAFT_CHANGED: &str = "policy.draft_changed";
+/// A draft was published: its candidate became the live policy. Emitted in
+/// addition to the `policy.changed` event of the commit itself.
+pub const POLICY_DRAFT_PUBLISHED: &str = "policy.draft_published";
+/// A publication of a draft its owner holds was refused without writing.
+pub const POLICY_DRAFT_PUBLISH_REFUSED: &str = "policy.draft_publish_refused";
 pub const SIGNAL_OPENED: &str = "signal.opened";
 pub const SIGNAL_LIFECYCLE_CHANGED: &str = "signal.lifecycle_changed";
 pub const SUGGESTION_LIFECYCLE_CHANGED: &str = "suggestion.lifecycle_changed";
+/// A policy test suite was run (issue #243, slice 11). Records the policy
+/// ETag, suite digest and counts of a completed run, never its cases.
+pub const POLICY_TESTS_RUN: &str = "policy.tests_run";
+/// A policy simulation completed (issue #243, slice 10). Records the base
+/// and candidate ETags, the request digest and counts, never its cases.
+pub const POLICY_SIMULATION_RUN: &str = "policy.simulation_run";
 pub const SERVICE_TOKEN_CHANGED: &str = "service_token.changed";
 pub const SERVICE_TOKEN_DELEGATION_REJECTED: &str = "service_token.delegation_rejected";
 /// A write of an operation gated on member capabilities was refused because

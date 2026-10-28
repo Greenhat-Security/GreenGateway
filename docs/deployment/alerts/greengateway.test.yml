@@ -7,7 +7,7 @@ evaluation_interval: 30s
 tests:
 
   # Startup ends at 2m; drain begins at 8m. Neither transition reaches its 10m hold at the checked times.
-  - name: 'ordinary standalone startup and drain; lazy counters and cluster metrics absent'
+  - name: 'ordinary standalone startup and drain; failure counters and cluster metrics absent'
     interval: 30s
     input_series:
       - &series_up_gateway_1_standalone
@@ -72,8 +72,9 @@ tests:
       - {eval_time: 12m, alertname: GreenGatewayAuthorityEventDeliveryFailures, exp_alerts: []}
       - {eval_time: 12m, alertname: GreenGatewayAuthorityEventJournalUnobserved, exp_alerts: []}
 
-  # Pool gauges exist. Optional security reconciliation and lazy failure counters need not emit series.
-  - name: 'healthy cluster; optional revision gauge and all lazy failure counters absent'
+  # Pool gauges exist. Optional security reconciliation need not emit series, and an absent failure
+  # counter (an exporter from before startup seeding, or one dropped by relabeling) is not a failure.
+  - name: 'healthy cluster; optional revision gauge and all failure counters absent'
     interval: 30s
     input_series:
       - &series_up_gateway_1_cluster
@@ -1306,7 +1307,7 @@ tests:
 
   # Authority-event journal rules (issue #440 PR 4). gateway-1 leads maintenance
   # and so publishes the journal gauges; gateway-2 leads the dispatcher.
-  - name: 'authority-event journal healthy with a dispatcher; lazy refusal and failure counters absent'
+  - name: 'authority-event journal healthy with a dispatcher; refusal and failure counters absent'
     interval: 30s
     input_series:
       - *series_up_gateway_1_cluster
@@ -1594,3 +1595,63 @@ tests:
       - {eval_time: 2m30s, alertname: GreenGatewayAuthorityEvidenceWriteFailures, exp_alerts: [*fires_authority_evidence_write_failures_gateway_1_cluster]}
       - {eval_time: 12m, alertname: GreenGatewayAuthorityEvidenceWriteFailures, exp_alerts: [*fires_authority_evidence_write_failures_gateway_1_cluster]}
       - {eval_time: 18m, alertname: GreenGatewayAuthorityEvidenceWriteFailures, exp_alerts: []}
+
+  # Startup seeding (issue #440 review). The gateway exports every counter a
+  # single-event rule reads at 0 from the moment its recorder is installed, so
+  # one event after a restart is a 0 -> 1 increase: gateway-1 counts a single
+  # event at 2m30s and pages after the 2m hold, then recovers once the window
+  # holds only the 1. gateway-2 counts the same single event on a lazy series
+  # that first appears at 1, which increase() cannot see, so it never pages.
+  - name: 'one event on a counter seeded at zero pages; the same event on a lazy series cannot'
+    interval: 30s
+    input_series:
+      - *series_up_gateway_1_cluster
+      - *series_ready_gateway_1_cluster
+      - *series_up_gateway_2_cluster
+      - *series_ready_gateway_2_cluster
+      - series: 'audit_events_dropped_total{job="greengateway",instance="gateway-1",deployment_mode="cluster",reason="full"}'
+        values: '0+0x4 1+0x35'
+      - series: 'audit_events_dropped_total{job="greengateway",instance="gateway-2",deployment_mode="cluster",reason="full"}'
+        values: '_x5 1+0x35'
+      - series: 'greengateway_audit_flush_total{job="greengateway",instance="gateway-1",deployment_mode="cluster",outcome="failure"}'
+        values: '0+0x4 1+0x35'
+      - series: 'greengateway_audit_flush_total{job="greengateway",instance="gateway-2",deployment_mode="cluster",outcome="failure"}'
+        values: '_x5 1+0x35'
+      - series: 'greengateway_database_pool_timeouts_total{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '0+0x4 1+0x35'
+      - series: 'greengateway_database_pool_timeouts_total{job="greengateway",instance="gateway-2",deployment_mode="cluster"}'
+        values: '_x5 1+0x35'
+      - series: 'greengateway_authority_event_capacity_refusals_total{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '0+0x4 1+0x35'
+      - series: 'greengateway_authority_event_capacity_refusals_total{job="greengateway",instance="gateway-2",deployment_mode="cluster"}'
+        values: '_x5 1+0x35'
+      - series: 'greengateway_authority_event_evidence_failures_total{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '0+0x4 1+0x35'
+      - series: 'greengateway_authority_event_evidence_failures_total{job="greengateway",instance="gateway-2",deployment_mode="cluster"}'
+        values: '_x5 1+0x35'
+    alert_rule_test:
+      - {eval_time: 2m, alertname: GreenGatewayAuditLoss, exp_alerts: []}
+      - {eval_time: 4m, alertname: GreenGatewayAuditLoss, exp_alerts: []}
+      - {eval_time: 4m30s, alertname: GreenGatewayAuditLoss, exp_alerts: [*fires_audit_loss_gateway_1_cluster]}
+      - {eval_time: 6m, alertname: GreenGatewayAuditLoss, exp_alerts: [*fires_audit_loss_gateway_1_cluster]}
+      - {eval_time: 9m, alertname: GreenGatewayAuditLoss, exp_alerts: []}
+      - {eval_time: 2m, alertname: GreenGatewayAuditFlushFailures, exp_alerts: []}
+      - {eval_time: 4m, alertname: GreenGatewayAuditFlushFailures, exp_alerts: []}
+      - {eval_time: 4m30s, alertname: GreenGatewayAuditFlushFailures, exp_alerts: [*fires_audit_flush_failures_gateway_1_cluster]}
+      - {eval_time: 6m, alertname: GreenGatewayAuditFlushFailures, exp_alerts: [*fires_audit_flush_failures_gateway_1_cluster]}
+      - {eval_time: 9m, alertname: GreenGatewayAuditFlushFailures, exp_alerts: []}
+      - {eval_time: 2m, alertname: GreenGatewayDatabasePoolTimeouts, exp_alerts: []}
+      - {eval_time: 4m, alertname: GreenGatewayDatabasePoolTimeouts, exp_alerts: []}
+      - {eval_time: 4m30s, alertname: GreenGatewayDatabasePoolTimeouts, exp_alerts: [*fires_database_pool_timeouts_gateway_1_cluster]}
+      - {eval_time: 6m, alertname: GreenGatewayDatabasePoolTimeouts, exp_alerts: [*fires_database_pool_timeouts_gateway_1_cluster]}
+      - {eval_time: 9m, alertname: GreenGatewayDatabasePoolTimeouts, exp_alerts: []}
+      - {eval_time: 2m, alertname: GreenGatewayAuthorityEventCapacityRefusals, exp_alerts: []}
+      - {eval_time: 4m, alertname: GreenGatewayAuthorityEventCapacityRefusals, exp_alerts: []}
+      - {eval_time: 4m30s, alertname: GreenGatewayAuthorityEventCapacityRefusals, exp_alerts: [*fires_authority_event_capacity_refusals_gateway_1_cluster]}
+      - {eval_time: 6m, alertname: GreenGatewayAuthorityEventCapacityRefusals, exp_alerts: [*fires_authority_event_capacity_refusals_gateway_1_cluster]}
+      - {eval_time: 9m, alertname: GreenGatewayAuthorityEventCapacityRefusals, exp_alerts: []}
+      - {eval_time: 2m, alertname: GreenGatewayAuthorityEvidenceWriteFailures, exp_alerts: []}
+      - {eval_time: 4m, alertname: GreenGatewayAuthorityEvidenceWriteFailures, exp_alerts: []}
+      - {eval_time: 4m30s, alertname: GreenGatewayAuthorityEvidenceWriteFailures, exp_alerts: [*fires_authority_evidence_write_failures_gateway_1_cluster]}
+      - {eval_time: 6m, alertname: GreenGatewayAuthorityEvidenceWriteFailures, exp_alerts: [*fires_authority_evidence_write_failures_gateway_1_cluster]}
+      - {eval_time: 9m, alertname: GreenGatewayAuthorityEvidenceWriteFailures, exp_alerts: []}

@@ -7,6 +7,10 @@ setting that drops the coverage records of uncovered code would raise the
 percentage without any new test. Every entry therefore also records the
 smallest line and branch counts the file may report. A smaller count fails the
 gate; a larger one (new code) passes.
+
+Several reports (one per measured package) are checked as one: every gated file
+must appear in exactly one of them, so a file measured twice fails rather than
+passing on its better run.
 """
 import argparse
 import json
@@ -70,11 +74,18 @@ def check(report, requirements):
     return errors
 
 
+def merged(reports):
+    """The files of several cargo llvm-cov JSON reports, as one report."""
+    return {'data': [unit for report in reports for unit in report.get('data', [])]}
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('report', type=Path)
+    parser.add_argument('reports', type=Path, nargs='+', metavar='report',
+                        help='a cargo llvm-cov JSON report; give one per measured package')
     parser.add_argument('--requirements', type=Path, default=Path(__file__).resolve().parents[1] / REQUIREMENTS)
     args = parser.parse_args()
-    errors = check(json.loads(args.report.read_text(encoding='utf-8')), json.loads(args.requirements.read_text(encoding='utf-8')))
+    report = merged([json.loads(path.read_text(encoding='utf-8')) for path in args.reports])
+    errors = check(report, json.loads(args.requirements.read_text(encoding='utf-8')))
     if errors:
         raise SystemExit('\n'.join(errors))

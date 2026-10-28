@@ -1,8 +1,11 @@
 //! Service-token repository contract and its standalone SQLite adapter.
 
-use crate::auth::tokens::{
-    CreateTokenRequest, CreatedToken, SqliteTokenStore, TokenListFilters, TokenPage, TokenRecord,
-    TokenStore, TokenStoreError, TokenVerification,
+use crate::auth::{
+    change_actor::ChangeActor,
+    tokens::{
+        CreateTokenRequest, CreatedToken, SqliteTokenStore, TokenListFilters, TokenPage,
+        TokenRecord, TokenStore, TokenStoreError, TokenVerification,
+    },
 };
 use async_trait::async_trait;
 
@@ -21,14 +24,17 @@ use super::{
 /// is a conflict.
 ///
 /// Rotate and revoke are told who is acting. Each committed change records
-/// that actor and its action as append-only change evidence in the same
-/// transaction as the change itself (issue #425): if the evidence cannot be
-/// written, the change rolls back and the call fails. A call that changes
+/// that actor -- its subject, canonical issuer, actor kind and auth mode
+/// ([`ChangeActor`]) -- and its action as append-only change evidence in the
+/// same transaction as the change itself (issue #425): if the evidence cannot
+/// be written, the change rolls back and the call fails. A call that changes
 /// nothing -- a repeat revoke, a rotate refused as a conflict, an unknown
-/// token -- records nothing. An empty or oversized actor
-/// ([`crate::auth::tokens::MAX_TOKEN_CHANGE_ACTOR_BYTES`]) is refused
-/// before anything changes. The evidence never holds the plaintext, the
-/// hash, the display prefix or the scopes.
+/// token -- records nothing. An actor evidence cannot record exactly (an
+/// empty or oversized subject,
+/// [`crate::auth::tokens::MAX_TOKEN_CHANGE_ACTOR_BYTES`], or an issuer outside
+/// [`ChangeActor::is_recordable`]) is refused before anything changes. The
+/// evidence never holds the plaintext, the hash, the display prefix or the
+/// scopes.
 #[async_trait]
 pub trait ServiceTokenStore: Send + Sync {
     async fn create(&self, request: CreateTokenRequest) -> Result<CreatedToken, RepositoryError>;
@@ -40,13 +46,13 @@ pub trait ServiceTokenStore: Send + Sync {
     async fn revoke(
         &self,
         id: &str,
-        actor_user_id: &str,
+        actor: &ChangeActor,
     ) -> Result<Option<TokenRecord>, RepositoryError>;
 
     async fn rotate(
         &self,
         id: &str,
-        actor_user_id: &str,
+        actor: &ChangeActor,
     ) -> Result<Option<CreatedToken>, RepositoryError>;
 
     async fn verify(&self, plaintext_token: &str) -> Result<TokenVerification, RepositoryError>;
@@ -97,13 +103,13 @@ impl ServiceTokenStore for SqliteTokenStore {
     async fn revoke(
         &self,
         id: &str,
-        actor_user_id: &str,
+        actor: &ChangeActor,
     ) -> Result<Option<TokenRecord>, RepositoryError> {
         let store = self.clone();
         let id = id.to_owned();
-        let actor_user_id = actor_user_id.to_owned();
+        let actor = actor.clone();
         run_blocking(move || {
-            TokenStore::revoke(&store, &id, &actor_user_id)
+            TokenStore::revoke(&store, &id, &actor)
                 .map_err(|error| map_token_store_error("service_token_revoke", error))
         })
         .await
@@ -112,13 +118,13 @@ impl ServiceTokenStore for SqliteTokenStore {
     async fn rotate(
         &self,
         id: &str,
-        actor_user_id: &str,
+        actor: &ChangeActor,
     ) -> Result<Option<CreatedToken>, RepositoryError> {
         let store = self.clone();
         let id = id.to_owned();
-        let actor_user_id = actor_user_id.to_owned();
+        let actor = actor.clone();
         run_blocking(move || {
-            TokenStore::rotate(&store, &id, &actor_user_id)
+            TokenStore::rotate(&store, &id, &actor)
                 .map_err(|error| map_token_store_error("service_token_rotate", error))
         })
         .await
@@ -176,9 +182,9 @@ fn map_token_store_error(operation: &'static str, error: TokenStoreError) -> Rep
         TokenStoreError::RevokedToken { .. } => {
             RepositoryError::new(RepositoryErrorKind::Conflict, operation)
         }
-        // Only an authenticated principal reaches a store, so a missing or
-        // oversized actor is the gateway's defect, not the caller's input:
-        // refused, and not answered as a parameter error.
+        // Only an authenticated principal reaches a store, so an actor
+        // evidence cannot record is the gateway's defect, not the caller's
+        // input: refused, and not answered as a parameter error.
         TokenStoreError::InvalidChangeActor => {
             RepositoryError::new(RepositoryErrorKind::InvalidData, operation)
         }

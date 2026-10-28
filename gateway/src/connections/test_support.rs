@@ -128,6 +128,14 @@ impl AssertionSigningKeyRoot {
     pub(crate) fn pem(&self) -> &str {
         &self.pem
     }
+
+    /// Writes `value` into this root as the file behind `alias` and binds that
+    /// alias in `config`, beside the signing key [`Self::configure`] binds.
+    pub(crate) fn bind_secret(&self, config: &mut Config, alias: &str, value: &[u8]) {
+        config
+            .connection_secret_aliases
+            .push(write_secret_file(&self.root, alias, value));
+    }
 }
 
 impl Drop for AssertionSigningKeyRoot {

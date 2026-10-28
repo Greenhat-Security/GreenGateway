@@ -430,6 +430,194 @@ impl PostgresAuditEventStore {
         }
         Ok(accumulator.finish())
     }
+
+    /// A pooled connection for [`Self::insert_events_on`]. The request-path
+    /// sink checks out first and only then takes its batch from the buffer,
+    /// so a batch formed after a wait for the pool carries every record that
+    /// arrived during that wait instead of leaving them for another commit.
+    pub(crate) async fn checkout_for_insert(
+        &self,
+    ) -> Result<deadpool_postgres::Object, RepositoryError> {
+        self.pool.get().await.map_err(classify_pool_error)
+    }
+
+    /// [`AuditEventStore::insert_events`] on a connection the caller already
+    /// holds: the same single transaction, the same statements.
+    pub(crate) async fn insert_events_on(
+        &self,
+        client: &mut deadpool_postgres::Object,
+        events: &[AuditEvent],
+    ) -> Result<(), RepositoryError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        let mut event_ids: Vec<String> = Vec::with_capacity(events.len());
+        let mut event_types: Vec<String> = Vec::with_capacity(events.len());
+        let mut occurred_at: Vec<String> = Vec::with_capacity(events.len());
+        let mut instance_ids: Vec<Option<String>> = Vec::with_capacity(events.len());
+        let mut boot_ids: Vec<Option<String>> = Vec::with_capacity(events.len());
+        let mut schema_versions: Vec<String> = Vec::with_capacity(events.len());
+        let mut request_ids: Vec<String> = Vec::with_capacity(events.len());
+        let mut source_ips: Vec<String> = Vec::with_capacity(events.len());
+        let mut user_agents: Vec<Option<String>> = Vec::with_capacity(events.len());
+        let mut actor_user_ids: Vec<Option<String>> = Vec::with_capacity(events.len());
+        let mut actor_issuers: Vec<Option<String>> = Vec::with_capacity(events.len());
+        let mut actor_auth_modes: Vec<Option<String>> = Vec::with_capacity(events.len());
+        let mut actor_jsons: Vec<Option<String>> = Vec::with_capacity(events.len());
+        let mut payload_methods: Vec<Option<String>> = Vec::with_capacity(events.len());
+        let mut payload_paths: Vec<Option<String>> = Vec::with_capacity(events.len());
+        let mut payload_statuses: Vec<Option<i32>> = Vec::with_capacity(events.len());
+        let mut payload_rule_ids: Vec<Option<String>> = Vec::with_capacity(events.len());
+        let mut payload_jsons: Vec<String> = Vec::with_capacity(events.len());
+
+        for event in events {
+            event_ids.push(event.event_id.clone());
+            event_types.push(event.event_type.clone());
+            occurred_at.push(event.timestamp.clone());
+            instance_ids.push(
+                self.identity
+                    .map(|identity| identity.instance_id.to_string()),
+            );
+            boot_ids.push(self.identity.map(|identity| identity.boot_id.to_string()));
+            schema_versions.push(event.schema_version.clone());
+            request_ids.push(event.request_id.clone());
+            source_ips.push(event.source_ip.clone());
+            user_agents.push(event.user_agent.clone());
+            actor_user_ids.push(event.actor.as_ref().map(|actor| actor.user_id.clone()));
+            actor_issuers.push(event.actor.as_ref().and_then(|actor| actor.issuer.clone()));
+            actor_auth_modes.push(event.actor.as_ref().map(|actor| actor.auth_mode.clone()));
+            actor_jsons.push(
+                event
+                    .actor
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|_| {
+                        RepositoryError::new(RepositoryErrorKind::InvalidData, "audit_event_insert")
+                    })?,
+            );
+            payload_methods.push(
+                event
+                    .payload
+                    .get("method")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+            );
+            payload_paths.push(
+                event
+                    .payload
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+            );
+            payload_statuses.push(payload_status(&event.payload));
+            payload_rule_ids.push(
+                event
+                    .payload
+                    .get("matched_rule_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+            );
+            payload_jsons.push(serde_json::to_string(&event.payload).map_err(|_| {
+                RepositoryError::new(RepositoryErrorKind::InvalidData, "audit_event_insert")
+            })?);
+        }
+
+        // One transaction: the advisory lock (released at commit or
+        // rollback) serializes stream-position assignment so position order
+        // is commit order; both statements roll back together, so an
+        // aborted batch leaves no event rows and no stream rows.
+        //
+        // It is a `tokio_postgres` transaction rather than a hand-driven
+        // `BEGIN`/`COMMIT`, and the difference is cancellation. Every
+        // `await` below is a point the caller may drop this future at: the
+        // request-path sink bounds each store call with a timeout, and a
+        // runtime tearing down drops whatever is in flight. A dropped
+        // future runs no code of its own, so a transaction opened with a
+        // bare `BEGIN` would go back to the pool still open, holding the
+        // stream lock until the pool happened to recycle that connection
+        // (checkouts are FIFO, so behind up to `pool_max - 1` others), and
+        // every writer on every replica would queue behind it -- the wedge
+        // #359 closed for the maintenance session. `Transaction`'s `Drop`
+        // queues a `ROLLBACK` on the connection the instant the future is
+        // dropped; the server runs it as soon as the abandoned statement
+        // finishes, and the lock goes with it. Pinned by
+        // `postgres_audit_a_cancelled_batch_releases_the_stream_lock_and_leaves_no_rows`.
+        //
+        // The three statements are prepared once per pooled connection and
+        // cached on it (`prepare_cached`), not re-parsed and re-planned for
+        // every batch: under `AUDIT_DURABILITY=required` this transaction
+        // runs once per group of request decisions, and a prepared statement
+        // costs one round trip where SQL text costs two.
+        let transaction = client
+            .transaction()
+            .await
+            .map_err(|error| classify_query(error, "audit_event_insert"))?;
+        let result: Result<(), RepositoryError> = async {
+            let insert = transaction
+                .prepare_cached(INSERT_EVENTS_SQL)
+                .await
+                .map_err(|error| classify_query(error, "audit_event_insert"))?;
+            transaction
+                .execute(
+                    &insert,
+                    &[
+                        &event_ids,
+                        &event_types,
+                        &occurred_at,
+                        &instance_ids,
+                        &boot_ids,
+                        &schema_versions,
+                        &request_ids,
+                        &source_ips,
+                        &user_agents,
+                        &actor_user_ids,
+                        &actor_issuers,
+                        &actor_auth_modes,
+                        &actor_jsons,
+                        &payload_methods,
+                        &payload_paths,
+                        &payload_statuses,
+                        &payload_rule_ids,
+                        &payload_jsons,
+                    ],
+                )
+                .await
+                .map_err(|error| classify_query(error, "audit_event_insert"))?;
+            let lock = transaction
+                .prepare_cached(LOCK_STREAM_SQL)
+                .await
+                .map_err(|error| classify_query(error, "audit_event_insert"))?;
+            transaction
+                .execute(&lock, &[&*AUDIT_STREAM_LOCK_KEY])
+                .await
+                .map_err(|error| classify_query(error, "audit_event_insert"))?;
+            let append = transaction
+                .prepare_cached(APPEND_STREAM_SQL)
+                .await
+                .map_err(|error| classify_query(error, "audit_event_insert"))?;
+            transaction
+                .execute(&append, &[&event_ids])
+                .await
+                .map_err(|error| classify_query(error, "audit_event_insert"))?;
+            Ok(())
+        }
+        .await;
+        match result {
+            Ok(()) => transaction
+                .commit()
+                .await
+                .map_err(|error| classify_query(error, "audit_event_insert")),
+            Err(error) => {
+                // Awaited, so the connection is clean before it is returned
+                // on the ordinary failure path; a cancellation anywhere in
+                // between gets `Drop`'s queued rollback instead.
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
 }
 
 /// Decode one scanned `http.request_observed` row into the shape the
@@ -589,155 +777,8 @@ impl AuditEventStore for PostgresAuditEventStore {
         if events.is_empty() {
             return Ok(());
         }
-        let mut client = self.pool.get().await.map_err(classify_pool_error)?;
-
-        let mut event_ids: Vec<String> = Vec::with_capacity(events.len());
-        let mut event_types: Vec<String> = Vec::with_capacity(events.len());
-        let mut occurred_at: Vec<String> = Vec::with_capacity(events.len());
-        let mut instance_ids: Vec<Option<String>> = Vec::with_capacity(events.len());
-        let mut boot_ids: Vec<Option<String>> = Vec::with_capacity(events.len());
-        let mut schema_versions: Vec<String> = Vec::with_capacity(events.len());
-        let mut request_ids: Vec<String> = Vec::with_capacity(events.len());
-        let mut source_ips: Vec<String> = Vec::with_capacity(events.len());
-        let mut user_agents: Vec<Option<String>> = Vec::with_capacity(events.len());
-        let mut actor_user_ids: Vec<Option<String>> = Vec::with_capacity(events.len());
-        let mut actor_issuers: Vec<Option<String>> = Vec::with_capacity(events.len());
-        let mut actor_auth_modes: Vec<Option<String>> = Vec::with_capacity(events.len());
-        let mut actor_jsons: Vec<Option<String>> = Vec::with_capacity(events.len());
-        let mut payload_methods: Vec<Option<String>> = Vec::with_capacity(events.len());
-        let mut payload_paths: Vec<Option<String>> = Vec::with_capacity(events.len());
-        let mut payload_statuses: Vec<Option<i32>> = Vec::with_capacity(events.len());
-        let mut payload_rule_ids: Vec<Option<String>> = Vec::with_capacity(events.len());
-        let mut payload_jsons: Vec<String> = Vec::with_capacity(events.len());
-
-        for event in events {
-            event_ids.push(event.event_id.clone());
-            event_types.push(event.event_type.clone());
-            occurred_at.push(event.timestamp.clone());
-            instance_ids.push(
-                self.identity
-                    .map(|identity| identity.instance_id.to_string()),
-            );
-            boot_ids.push(self.identity.map(|identity| identity.boot_id.to_string()));
-            schema_versions.push(event.schema_version.clone());
-            request_ids.push(event.request_id.clone());
-            source_ips.push(event.source_ip.clone());
-            user_agents.push(event.user_agent.clone());
-            actor_user_ids.push(event.actor.as_ref().map(|actor| actor.user_id.clone()));
-            actor_issuers.push(event.actor.as_ref().and_then(|actor| actor.issuer.clone()));
-            actor_auth_modes.push(event.actor.as_ref().map(|actor| actor.auth_mode.clone()));
-            actor_jsons.push(
-                event
-                    .actor
-                    .as_ref()
-                    .map(serde_json::to_string)
-                    .transpose()
-                    .map_err(|_| {
-                        RepositoryError::new(RepositoryErrorKind::InvalidData, "audit_event_insert")
-                    })?,
-            );
-            payload_methods.push(
-                event
-                    .payload
-                    .get("method")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned),
-            );
-            payload_paths.push(
-                event
-                    .payload
-                    .get("path")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned),
-            );
-            payload_statuses.push(payload_status(&event.payload));
-            payload_rule_ids.push(
-                event
-                    .payload
-                    .get("matched_rule_id")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned),
-            );
-            payload_jsons.push(serde_json::to_string(&event.payload).map_err(|_| {
-                RepositoryError::new(RepositoryErrorKind::InvalidData, "audit_event_insert")
-            })?);
-        }
-
-        // One transaction: the advisory lock (released at commit or
-        // rollback) serializes stream-position assignment so position order
-        // is commit order; both statements roll back together, so an
-        // aborted batch leaves no event rows and no stream rows.
-        //
-        // It is a `tokio_postgres` transaction rather than a hand-driven
-        // `BEGIN`/`COMMIT`, and the difference is cancellation. Every
-        // `await` below is a point the caller may drop this future at: the
-        // request-path sink bounds each store call with a timeout, and a
-        // runtime tearing down drops whatever is in flight. A dropped
-        // future runs no code of its own, so a transaction opened with a
-        // bare `BEGIN` would go back to the pool still open, holding the
-        // stream lock until the pool happened to recycle that connection
-        // (checkouts are FIFO, so behind up to `pool_max - 1` others), and
-        // every writer on every replica would queue behind it -- the wedge
-        // #359 closed for the maintenance session. `Transaction`'s `Drop`
-        // queues a `ROLLBACK` on the connection the instant the future is
-        // dropped; the server runs it as soon as the abandoned statement
-        // finishes, and the lock goes with it. Pinned by
-        // `postgres_audit_a_cancelled_batch_releases_the_stream_lock_and_leaves_no_rows`.
-        let transaction = client
-            .transaction()
-            .await
-            .map_err(|error| classify_query(error, "audit_event_insert"))?;
-        let result: Result<(), RepositoryError> = async {
-            transaction
-                .execute(
-                    INSERT_EVENTS_SQL,
-                    &[
-                        &event_ids,
-                        &event_types,
-                        &occurred_at,
-                        &instance_ids,
-                        &boot_ids,
-                        &schema_versions,
-                        &request_ids,
-                        &source_ips,
-                        &user_agents,
-                        &actor_user_ids,
-                        &actor_issuers,
-                        &actor_auth_modes,
-                        &actor_jsons,
-                        &payload_methods,
-                        &payload_paths,
-                        &payload_statuses,
-                        &payload_rule_ids,
-                        &payload_jsons,
-                    ],
-                )
-                .await
-                .map_err(|error| classify_query(error, "audit_event_insert"))?;
-            transaction
-                .execute(LOCK_STREAM_SQL, &[&*AUDIT_STREAM_LOCK_KEY])
-                .await
-                .map_err(|error| classify_query(error, "audit_event_insert"))?;
-            transaction
-                .execute(APPEND_STREAM_SQL, &[&event_ids])
-                .await
-                .map_err(|error| classify_query(error, "audit_event_insert"))?;
-            Ok(())
-        }
-        .await;
-        match result {
-            Ok(()) => transaction
-                .commit()
-                .await
-                .map_err(|error| classify_query(error, "audit_event_insert")),
-            Err(error) => {
-                // Awaited, so the connection is clean before it is returned
-                // on the ordinary failure path; a cancellation anywhere in
-                // between gets `Drop`'s queued rollback instead.
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
+        let mut client = self.checkout_for_insert().await?;
+        self.insert_events_on(&mut client, events).await
     }
 
     async fn query_events(

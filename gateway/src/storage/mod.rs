@@ -17,6 +17,9 @@
 //!   contract.
 
 mod audit;
+/// What a policy or tools document commit's durable evidence records about
+/// it (issue #425, PR 2c): the closed action vocabulary and the actor.
+mod change_evidence;
 /// Member capability advertisements and per-operation requirements
 /// (issue #426, PR 1): the closed vocabulary every build can recognize, and
 /// in cluster mode the gate a write of a registered operation passes first,
@@ -28,6 +31,9 @@ pub(crate) mod compatibility;
 /// than treating it as an unknown word.
 #[cfg(feature = "postgres")]
 pub mod migrations;
+/// Server-side policy drafts (issue #243, slice 9): the owner-scoped,
+/// expiring candidate workspace and its standalone SQLite adapter.
+pub mod policy_drafts;
 mod policy_history;
 #[cfg(feature = "postgres")]
 pub mod postgres;
@@ -58,6 +64,8 @@ pub mod postgres_pending_logins;
 #[cfg(feature = "postgres")]
 pub mod postgres_policy;
 #[cfg(feature = "postgres")]
+pub mod postgres_policy_drafts;
+#[cfg(feature = "postgres")]
 pub mod postgres_rate_limits;
 #[cfg(feature = "postgres")]
 pub mod postgres_service_tokens;
@@ -76,6 +84,10 @@ mod service_token;
 pub(crate) mod contract_tests;
 
 pub use audit::{AuditEventStore, SqliteAuditEventStore};
+pub use change_evidence::DocumentAction;
+#[cfg(feature = "postgres")]
+pub use change_evidence::{ChangeActor, DocumentChange};
+pub use policy_drafts::{PolicyDraftStore, SqlitePolicyDraftStore};
 pub use policy_history::PolicyHistory;
 #[cfg(feature = "postgres")]
 pub use policy_history::{

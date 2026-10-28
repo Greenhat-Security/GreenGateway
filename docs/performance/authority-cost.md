@@ -31,8 +31,11 @@ authority.
   What it costs depends on how it is sent:
   - Every parameterized or row-returning statement on these paths is passed
     to tokio-postgres as SQL text, through `query`, `query_one`, `query_opt` or
-    `execute`. Nothing in `gateway/src/storage` prepares a statement ahead of
-    time or uses `prepare_cached`. For SQL text, tokio-postgres 0.7 first
+    `execute`. Nothing on these paths prepares a statement ahead of time or
+    uses `prepare_cached`; the audit sink's batch insert does, and it is not
+    a request-path checkout (see [Work that shares the pool but is not a
+    request](#work-that-shares-the-pool-but-is-not-a-request)). For SQL text,
+    tokio-postgres 0.7 first
     prepares the statement (`Parse`, `Describe`, `Sync`) and waits for its
     parameter and row descriptions, then binds and executes it (`Bind`,
     `Execute`, `Sync`) and waits for the rows. That is **two** round trips,
@@ -232,7 +235,24 @@ Per replica, independent of request rate unless noted:
 - The PostgreSQL audit sink: one batched store call per 200 events or 250 ms
   ([`audit/postgres_sink.rs`](../../gateway/src/audit/postgres_sink.rs)).
   Every audited request adds to these batches, so audit volume is pool load
-  even though no request waits for it.
+  even though, with `AUDIT_DURABILITY=best_effort`, no request waits for it.
+  Under the default `required`, a request's authentication and authorization
+  records also wake the flusher, so it commits whenever such records are
+  waiting -- still one store call and one connection at a time per replica --
+  and the request does wait for that commit. The flusher group-commits: it
+  takes its batch only once it holds a connection, so records that arrived
+  while it waited for the pool share the commit, during a burst it waits up
+  to the last store call's duration (at most 25 ms) for the records behind
+  the first, and events nobody waits on ride the next required commit or the
+  interval. Its three statements are prepared once per pooled connection
+  (`prepare_cached`), so a batch is one checkout and six round trips: the
+  recycle, `BEGIN`, one per statement and `COMMIT`. Each commit ends in a WAL
+  flush that the request path's own commits queue behind -- on the shared
+  rate-limit bucket's hot row every request's decision is a serialized
+  commit -- so a commit per record would lengthen that queue and, with it,
+  the pool wait of the revision checks behind it. The nightly matrix runs
+  `best_effort` (`performance_options` in `gateway/tests/ha/performance.rs`),
+  so its numbers do not include that wait.
 - The cluster conformance snapshot refresher in
   [`middleware/observation.rs`](../../gateway/src/middleware/observation.rs).
 - The singleton leases: every replica keeps trying the maintenance and

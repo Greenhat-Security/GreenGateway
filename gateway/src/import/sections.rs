@@ -42,8 +42,9 @@ use crate::{
         },
         postgres_service_tokens::import_service_tokens_in,
         postgres_tools::PostgresToolStore,
-        AuditEventStore, PolicyCommitError, PolicyCommitPrecondition, PolicyCommitRequest,
-        PolicyControlPlane, RepositoryError, ToolControlPlane,
+        AuditEventStore, ChangeActor, DocumentAction, DocumentChange, PolicyCommitError,
+        PolicyCommitPrecondition, PolicyCommitRequest, PolicyControlPlane, RepositoryError,
+        ToolControlPlane,
     },
 };
 
@@ -62,6 +63,19 @@ const POLICY_OPERATION: &str = "import_policy_section";
 const CONNECTIONS_OPERATION: &str = "import_connections_section";
 const DISCOVERY_OPERATION: &str = "import_discovery_section";
 const PRINCIPALS_OPERATION: &str = "import_principals_section";
+
+/// What the import's policy and tools activations record as their change
+/// evidence: the import operation, by the gateway under its fixed label, not
+/// by a principal. The history versions it copies keep their own actors and
+/// write no evidence; they were committed by the standalone deployment.
+fn import_change() -> DocumentChange<'static> {
+    DocumentChange {
+        action: DocumentAction::ConfigurationImport,
+        actor: ChangeActor::System {
+            label: IMPORT_ACTOR,
+        },
+    }
+}
 
 /// Step 2: the policy document and its history.
 ///
@@ -208,7 +222,7 @@ impl PolicySection {
             PolicyCommitRequest {
                 precondition: PolicyCommitPrecondition::Initialize,
                 candidate: &self.policy,
-                actor_user_id: IMPORT_ACTOR,
+                change: import_change(),
                 diff_summary,
             },
         )
@@ -314,7 +328,7 @@ impl ToolsSection {
             .commit_tools(
                 PolicyCommitPrecondition::Initialize,
                 &self.document,
-                IMPORT_ACTOR,
+                import_change(),
                 &diff_summary,
             )
             .await

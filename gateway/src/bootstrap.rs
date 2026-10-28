@@ -92,7 +92,11 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
             &boundary,
         );
         match store
-            .revoke(&jti, expires_at.as_deref(), "operator:revoke-jwt")
+            .revoke(
+                &jti,
+                expires_at.as_deref(),
+                &auth::change_actor::ChangeActor::system("operator:revoke-jwt"),
+            )
             .await
             .map_err(|error| match error.invalid_parameter_name() {
                 Some("jti") => Box::<dyn std::error::Error>::from(
@@ -803,7 +807,10 @@ impl StartupStages for ProcessStartup {
             #[cfg(feature = "postgres")]
             cluster,
         } = seeds;
-        let metrics_handle = install_metrics_recorder()?;
+        // Seeds every counter a single-event alert reads at zero (the
+        // cluster-only ones in cluster mode), so the first event moves 0 -> 1.
+        let metrics_handle =
+            install_metrics_recorder(config.state_backend == config::StateBackend::Postgres)?;
         let listen = ListenAddresses::from_config(&config);
         // Loaded before any listener binds. Certificate and key problems must abort
         // startup rather than leave a listener serving plaintext that an operator
@@ -1693,6 +1700,26 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
             .map(rbac::PolicyHistoryStore::open)
             .transpose()?
             .map(|store| Arc::new(store) as Arc<dyn storage::PolicyHistory>);
+    // Policy drafts (issue #243, slice 9) live beside the history they will
+    // join once published: migration 22's table in cluster mode, and a
+    // `policy_drafts` table in the same SQLite database as `policy_versions`
+    // in standalone mode. A database that cannot be opened fails startup,
+    // exactly as the history store does.
+    #[cfg(feature = "postgres")]
+    let policy_draft_store: Option<Arc<dyn storage::PolicyDraftStore>> =
+        match build_overrides.pg_policy.as_ref() {
+            Some(seed) => Some(Arc::new(seed.store.draft_store())),
+            None => policy_history_sqlite_path(&config)
+                .map(storage::SqlitePolicyDraftStore::open)
+                .transpose()?
+                .map(|store| Arc::new(store) as Arc<dyn storage::PolicyDraftStore>),
+        };
+    #[cfg(not(feature = "postgres"))]
+    let policy_draft_store: Option<Arc<dyn storage::PolicyDraftStore>> =
+        policy_history_sqlite_path(&config)
+            .map(storage::SqlitePolicyDraftStore::open)
+            .transpose()?
+            .map(|store| Arc::new(store) as Arc<dyn storage::PolicyDraftStore>);
     let observation_state =
         middleware::observation::ObservationState::from_config(&config, audit_log.clone())
             .with_conformance(schema_conformance_state);
@@ -2481,6 +2508,7 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
         policy_file: config.policy_file.as_ref().map(PathBuf::from),
         rbac_state: rbac_state.clone(),
         history_store: policy_history_store,
+        draft_store: policy_draft_store,
         #[cfg(feature = "postgres")]
         control_plane: policy_control_plane,
         #[cfg(feature = "postgres")]
@@ -3000,8 +3028,9 @@ pub(super) fn validate_connection_bound_tools(
                     continue;
                 }
                 // Its calls sign a caller assertion as a manual tool's do, so
-                // an attesting Connection is accepted; a composite's steps
-                // still refuse one when they run.
+                // an attesting Connection is accepted, delegated ones
+                // included; a composite's steps still refuse a delegated one
+                // when they run.
                 if let Err(error) = runtime.validate_openapi_tool_binding(target_connection_id) {
                     problems.push(format!(
                         "OpenAPI tool '{}' Connection target is unavailable: {}",

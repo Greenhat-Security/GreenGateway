@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use super::{
+    change_evidence::{ChangeActor, DocumentAction, DocumentChange},
     policy_history::{PolicyCommitError, PolicyCommitPrecondition},
     postgres_documents::{self, DocumentResource},
     RepositoryError, RepositoryErrorKind,
@@ -46,12 +47,12 @@ pub trait ToolControlPlane: Send + Sync {
 
     /// Commit a new version of the document under a compare-and-swap
     /// precondition, advancing the shared security revision and writing
-    /// the outbox record in the same transaction.
+    /// the outbox record and the change's evidence in the same transaction.
     async fn commit_tools(
         &self,
         precondition: PolicyCommitPrecondition,
         document: &Value,
-        actor_user_id: &str,
+        change: DocumentChange<'_>,
         diff_summary: &Value,
     ) -> Result<ActiveToolDocument, PolicyCommitError>;
 }
@@ -64,6 +65,11 @@ const TOOLS_DOCUMENT_RESOURCE: DocumentResource = DocumentResource {
 };
 
 const OPERATION_TOOLS_ACTIVE: &str = "tool_document_active_read";
+
+/// The system label the first-boot seed commits under: the document's
+/// version row has always named it, and its evidence row now says it is
+/// the gateway, not a principal.
+pub(crate) const SEED_ACTOR: &str = "bootstrap";
 
 /// The empty document seeded at first boot. Its schema version matches
 /// the tools file schema the registry validates.
@@ -124,7 +130,10 @@ impl PostgresToolStore {
             postgres_documents::DocumentCommit {
                 document_json: &document.to_string(),
                 document_etag: &etag,
-                actor_user_id: "bootstrap",
+                change: DocumentChange {
+                    action: DocumentAction::ToolsPublish,
+                    actor: ChangeActor::System { label: SEED_ACTOR },
+                },
                 diff_summary_json: r#"{"action":"tools_seeded"}"#,
                 tool_names: None,
             },
@@ -205,7 +214,7 @@ impl ToolControlPlane for PostgresToolStore {
         &self,
         precondition: PolicyCommitPrecondition,
         document: &Value,
-        actor_user_id: &str,
+        change: DocumentChange<'_>,
         diff_summary: &Value,
     ) -> Result<ActiveToolDocument, PolicyCommitError> {
         let etag = crate::tools_file_etag(document).map_err(|_| {
@@ -226,7 +235,7 @@ impl ToolControlPlane for PostgresToolStore {
             postgres_documents::DocumentCommit {
                 document_json: &document.to_string(),
                 document_etag: &etag,
-                actor_user_id,
+                change,
                 diff_summary_json: &diff_summary.to_string(),
                 tool_names: Some(&tool_names),
             },

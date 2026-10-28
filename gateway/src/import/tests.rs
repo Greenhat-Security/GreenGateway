@@ -994,8 +994,12 @@ mod database {
             },
         )
         .expect("the revoked fixture token should mint");
-        TokenStore::revoke(&token_store, &revoked.record.id, "operator@example.test")
-            .expect("the fixture token should revoke");
+        TokenStore::revoke(
+            &token_store,
+            &revoked.record.id,
+            &crate::auth::change_actor::ChangeActor::for_test("operator@example.test"),
+        )
+        .expect("the fixture token should revoke");
         drop(live);
         drop(revoked);
         let exported = token_store
@@ -2334,6 +2338,7 @@ mod database {
             "admin_session_logins",
             "admin_sessions",
             "jwt_revocations",
+            "policy_drafts",
         ] {
             assert_eq!(
                 count_of(&pool, &format!("SELECT count(*) FROM greengateway.{table}")).await,
@@ -2341,6 +2346,56 @@ mod database {
                 "{table} is runtime state a replica rebuilds; the import must not write it"
             );
         }
+        // The policy and tools activations are the import's own commits, so
+        // each records itself as the gateway's `configuration.import`; the
+        // copied history versions and the imported catalogs record nothing.
+        let document_evidence: Vec<(String, String, String, String, Option<String>, String)> = pool
+            .get()
+            .await
+            .expect("evidence checkout")
+            .query(
+                "SELECT resource_type, action, actor_kind, actor_user_id, actor_issuer, \
+                            actor_auth_mode \
+                     FROM greengateway.document_change_evidence ORDER BY security_revision",
+                &[],
+            )
+            .await
+            .expect("document evidence reads")
+            .iter()
+            .map(|row| {
+                (
+                    row.get(0),
+                    row.get(1),
+                    row.get(2),
+                    row.get(3),
+                    row.get(4),
+                    row.get(5),
+                )
+            })
+            .collect();
+        let import_row = |resource: &str| {
+            (
+                resource.to_owned(),
+                "configuration.import".to_owned(),
+                "system".to_owned(),
+                crate::import::IMPORT_ACTOR.to_owned(),
+                None,
+                "system".to_owned(),
+            )
+        };
+        assert_eq!(
+            document_evidence,
+            vec![import_row("policy"), import_row("tools")]
+        );
+        assert_eq!(
+            count_of(
+                &pool,
+                "SELECT count(*) FROM greengateway.catalog_change_evidence"
+            )
+            .await,
+            0
+        );
+
         // No admin session is imported, so no session evidence is either: a
         // grant row would claim a sign-in this cluster never saw.
         assert_eq!(
