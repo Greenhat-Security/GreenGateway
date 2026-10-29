@@ -4376,27 +4376,33 @@ async fn catalog_evidence_survives_replacement_cascade_and_restart() {
     }
 }
 
-/// Migration 25 is approved by this build, not applied by it (issue #426):
-/// its successor adds the actor columns to `catalog_change_evidence` while
-/// this build's replicas still publish. Every publication writes its
-/// evidence through one function, which names each column it sets, so on the
-/// expanded table a publication still commits with its evidence row, the row
-/// records none of the new columns (which the migration's CHECK admits), and
-/// a restart on the expanded schema serves what was published.
+/// Migration 25 adds the actor columns to `catalog_change_evidence`, and the
+/// step to it rolls (issue #426): this build applies it while replicas of its
+/// prepared release, which never applies it, still publish. Both builds write
+/// that evidence through one function, which names each column it sets, so
+/// on the expanded table a publication commits with its evidence row and the
+/// row records none of the new columns (which the migration's CHECK admits),
+/// whichever of the two builds published it. Recording the actor there is a
+/// later #425 slice. A restart on the expanded schema serves what was
+/// published.
 #[tokio::test]
-async fn a_prepared_store_publishes_catalog_evidence_on_the_approved_extension() {
+async fn catalog_evidence_on_the_expanded_schema_records_no_actor_metadata_yet() {
     let Some(admin_dsn) = locator() else {
         eprintln!("skipping: no test database locator; CI runs this test");
         return;
     };
     let database = create_test_database(&admin_dsn).await;
     let (store, pool) = migrated_store(&database.dsn, 64).await;
-    crate::storage::migrations::apply_approved_extensions_as_the_successor(
-        &pool,
-        &crate::config::DatabaseSettings::default(),
-    )
-    .await
-    .expect("the successor applies migration 25");
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT COUNT(*) FROM greengateway.schema_migrations \
+             WHERE version = 25 AND name = 'catalog_change_evidence_actor_metadata'"
+        )
+        .await,
+        1,
+        "the store runs on the expanded schema"
+    );
     let created = store
         .create(mcp_candidate(), "creator", None)
         .await
@@ -4412,7 +4418,7 @@ async fn a_prepared_store_publishes_catalog_evidence_on_the_approved_extension()
             "publisher-a",
         )
         .await
-        .expect("a prepared publication commits on schema 25");
+        .expect("a publication commits on schema 25");
     store
         .replace_mcp_catalog(
             &created.id,
@@ -4449,7 +4455,7 @@ async fn a_prepared_store_publishes_catalog_evidence_on_the_approved_extension()
         )
         .await,
         2,
-        "a prepared replica records no actor metadata, and guesses none"
+        "the writer both builds share records no actor metadata, and guesses none"
     );
     drop(store);
     drop(pool);
@@ -4652,6 +4658,12 @@ async fn a_failed_catalog_evidence_insert_rolls_back_the_publication() {
         .expect("MCP connection should create");
     let revision_before = security_revision(&pool).await;
     let outbox_before = count(&pool, "SELECT COUNT(*) FROM greengateway.security_outbox").await;
+    // The recorder is this thread's, and the test's current-thread runtime
+    // runs the store on this thread.
+    let recorder = crate::audit::sink::tests::CountingRecorder::default();
+    let _recording = ::metrics::set_default_local_recorder(&recorder);
+    let evidence_failures =
+        || recorder.count(crate::metrics::AUTHORITY_EVENT_EVIDENCE_FAILURES_TOTAL, &[]);
 
     pool.get()
         .await
@@ -4687,6 +4699,8 @@ async fn a_failed_catalog_evidence_insert_rolls_back_the_publication() {
         matches!(failed, ConnectionStoreError::Postgres { .. }),
         "{failed}"
     );
+    // Counted once, on the counter the evidence write-failure alert pages on.
+    assert_eq!(evidence_failures(), 1);
     pool.get()
         .await
         .expect("failure trigger cleanup checkout")
@@ -4735,4 +4749,9 @@ async fn a_failed_catalog_evidence_insert_rolls_back_the_publication() {
         .await
         .expect("the publication commits once evidence can be written");
     assert_eq!(catalog_evidence_rows(&pool).await.len(), 1);
+    assert_eq!(
+        evidence_failures(),
+        1,
+        "a recorded publication counts nothing"
+    );
 }

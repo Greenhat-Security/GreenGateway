@@ -2,14 +2,20 @@
   "schema": 1,
   "issue": 426,
   "prepared": {
-    "commit": "b4c663ad128b4a8c1c8f3fac590cb43aed5c1254",
-    "describes": "main after round B of the merge train (#606): the compatibility protocol (#594) and migration 18 (#602). Serves exactly schema 18, advertises operation_requirements, registers no operation."
+    "commit": "ffa61edfddbd1f2a31be5affe996bc2f0bde344a",
+    "describes": "main immediately before migration 25 was applied (#666, the first parent of the apply merge): it carries the prepared release (28174a3, merged by 69d09ca in #659), whose manifest ends at 24 and which approves migration 25 by its exact checksum. Serves schema 24 and, as that approved extension, 25."
   },
   "successor": {
-    "commit": "cd5331ab03c46de73910289c4847052920c866f7",
-    "describes": "The prepared release plus one change and no migration (the merge of the prepared commit into this change): roles may carry a description, and committing such a document is the registered operation policy.role_descriptions, gated on the policy_role_descriptions capability."
+    "commit": "48eb65329c1d44f2b3a35484d91c933c45c224e4",
+    "describes": "The prepared commit plus one change: the merge of lane/426b/apply-first-extension (merge train #668), whose manifest ends at 25 and which applies migration 25 and serves exactly schema 25. It adds no capability and registers no operation."
   },
-  "schema_version": 18,
-  "operation": "policy.role_descriptions",
-  "capability": "policy_role_descriptions"
+  "schema_version": 24,
+  "schema_step": {
+    "from": 24,
+    "to": 25,
+    "migration": "catalog_change_evidence_actor_metadata",
+    "checksum": "7d7458311798be0ee0346fff70581300a4d29984ba90d51cd3bccbd00a9ee84f"
+  },
+  "operation": null,
+  "capability": null
 }

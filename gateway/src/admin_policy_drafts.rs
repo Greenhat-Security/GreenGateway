@@ -27,12 +27,21 @@
 //!   publish) as exactly one strong entity tag; the store applies the write
 //!   as a compare-and-set on the revision that tag was computed from.
 //! - **Validated like a policy write.** A candidate is parsed and checked
-//!   exactly as `PUT .../policy` checks one (schema, proxy dispatch, and no
-//!   egress change) when it is saved, and again against the current
-//!   authority when it is published.
+//!   exactly as `PUT .../policy` checks one -- from the bytes it was sent
+//!   as, so a v1 document's exact-source rules apply; schema; proxy
+//!   dispatch; no egress change; and a document format this deployment can
+//!   commit -- when it is saved, and again against the current authority
+//!   when it is published, where the cross-resource and lockout checks of
+//!   [`commit_policy_mutation`] also run (issue #243, slice 8).
+//! - **Every refused publication is audited.** A publication refused before
+//!   the commit, or by the commit itself (the cross-resource checks, another
+//!   replica's write, the cluster's operation gate, an authority that could
+//!   not write), emits `policy.draft_publish_refused`. One whose commit was
+//!   written is not a refusal and is not reported as one.
 
 use super::*;
 
+use serde_json::value::RawValue;
 use storage::policy_drafts::{
     is_policy_draft_id, NewPolicyDraft, PolicyDraftChange, PolicyDraftCreated, PolicyDraftOwner,
     PolicyDraftRecord, PolicyDraftSummary, MAX_POLICY_DRAFT_CANDIDATE_BYTES,
@@ -43,19 +52,20 @@ use storage::policy_drafts::{
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PolicyDraftCreateRequest {
-    /// The candidate document. Absent, the draft starts as a copy of the
-    /// live policy `If-Match` names.
+    /// The candidate document, as the exact bytes it was sent as. Absent
+    /// (or `null`), the draft starts as a copy of the live policy `If-Match`
+    /// names.
     #[serde(default)]
-    policy: Option<Value>,
+    policy: Option<Box<RawValue>>,
 }
 
 /// `PATCH .../policy/drafts/{id}`. At least one field is required.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PolicyDraftPatchRequest {
-    /// A replacement candidate document.
+    /// A replacement candidate document, as the exact bytes it was sent as.
     #[serde(default)]
-    policy: Option<Value>,
+    policy: Option<Box<RawValue>>,
     /// Re-pin the draft to this live policy ETag. It must be the current
     /// one; this is the only way a draft's base ever moves.
     #[serde(default)]
@@ -397,9 +407,32 @@ fn presented_policy_etag(headers: &HeaderMap) -> ResponseResult<String> {
     })
 }
 
-fn parse_draft_candidate(value: Value) -> ResponseResult<rbac::Policy> {
-    rbac::Policy::validate_json_value(value)
-        .map_err(|error| Box::new(policy_validation_failed(vec![policy_error_message(&error)])))
+/// The candidate a draft request carries, read from the member's own bytes
+/// by the parser `PUT .../policy` reads its body with. A `Value` would
+/// already have kept the last of two repeated members and read serde_json's
+/// private number tag as a number, so a v1 candidate that `PUT` refuses
+/// could be saved, and later published, meaning something other than what
+/// its author's bytes say at their first reading.
+fn parse_draft_candidate(source: &RawValue) -> ResponseResult<rbac::Policy> {
+    parse_policy_body(source.get().as_bytes())
+        .map_err(|errors| Box::new(policy_validation_failed(errors)))
+}
+
+/// The `policy.draft_publish_refused` reason for a publication the commit
+/// itself refused.
+fn commit_refusal_reason(refusal: PolicyCommitRefusal) -> &'static str {
+    match refusal {
+        PolicyCommitRefusal::CandidateInvalid => "policy_draft_candidate_invalid",
+        PolicyCommitRefusal::ResourcesRefused => "policy_resources_refused",
+        #[cfg(feature = "postgres")]
+        PolicyCommitRefusal::EtagMismatch => PolicyDraftRefusal::PolicyEtagMismatch.reason(),
+        #[cfg(feature = "postgres")]
+        PolicyCommitRefusal::OperationRefused => "policy_operation_refused",
+        PolicyCommitRefusal::AuthorityEvidenceUnsupported => {
+            authority_events::required::REFUSAL_REASON
+        }
+        PolicyCommitRefusal::Failed => "policy_commit_failed",
+    }
 }
 
 /// The per-draft size bound, judged on the candidate as the store will
@@ -580,14 +613,15 @@ pub(super) async fn policy_draft_create_endpoint(
     if base_etag != live_etag {
         return PolicyDraftRefusal::PolicyEtagMismatch.response();
     }
-    let candidate = match request.policy {
-        Some(value) => match parse_draft_candidate(value) {
+    let candidate = match request.policy.as_deref() {
+        Some(source) => match parse_draft_candidate(source) {
             Ok(candidate) => candidate,
             Err(response) => return *response,
         },
         None => live_policy.clone(),
     };
-    if let Err(response) = validate_policy_mutation_candidate(rbac_state, &live_policy, &candidate)
+    if let Err(response) =
+        validate_policy_write_candidate(&state, rbac_state, &live_policy, &candidate)
     {
         return *response;
     }
@@ -710,14 +744,15 @@ pub(super) async fn policy_draft_patch_endpoint(
         None => draft.summary.base_etag.clone(),
     };
     let rebased = base_etag != draft.summary.base_etag;
-    let candidate = match request.policy {
-        Some(value) => match parse_draft_candidate(value) {
+    let candidate = match request.policy.as_deref() {
+        Some(source) => match parse_draft_candidate(source) {
             Ok(candidate) => candidate,
             Err(response) => return *response,
         },
         None => draft.candidate,
     };
-    if let Err(response) = validate_policy_mutation_candidate(rbac_state, &live_policy, &candidate)
+    if let Err(response) =
+        validate_policy_write_candidate(&state, rbac_state, &live_policy, &candidate)
     {
         return *response;
     }
@@ -807,10 +842,11 @@ pub(super) async fn policy_draft_delete_endpoint(
 /// refuses a draft whose pinned base is no longer live (checked before an
 /// `If-Match` mismatch, so the usual stale case gets the binding's reason),
 /// re-validates the candidate against the current authority, and commits it
-/// through [`persist_policy_mutation`] -- the same transaction, history,
-/// audit and replica install as `PUT .../policy`, whose `If-Match`
-/// compare-and-swap still decides a race with another replica. Nothing is
-/// written on any refusal, and the draft is kept.
+/// through [`commit_policy_mutation`] -- the same cross-resource and lockout
+/// checks, transaction, history, audit and replica install as
+/// `PUT .../policy`, whose `If-Match` compare-and-swap still decides a race
+/// with another replica. Nothing is written on any refusal, the draft is
+/// kept, and the refusal is audited as `policy.draft_publish_refused`.
 ///
 /// After the commit the draft is marked published, which freezes it. That
 /// second write is not in the policy transaction: if it fails, the response
@@ -846,6 +882,12 @@ pub(super) async fn policy_draft_publish_endpoint(
         Ok(etag) => etag,
         Err(response) => return *response,
     };
+    // The optional resource snapshot binding is read like the two
+    // preconditions, before any work: a malformed one is the request's
+    // fault, not a refusal of the draft. The commit compares it.
+    if let Err(response) = expected_resource_snapshot(&parts.headers) {
+        return *response;
+    }
     // Everything a publication acts on is named by the two preconditions;
     // a body could only be an option this endpoint does not have.
     match read_request_body(body, state.max_body_size).await {
@@ -917,7 +959,8 @@ pub(super) async fn policy_draft_publish_endpoint(
     // The candidate was validated when it was saved, but publication is
     // judged against this binary and the resources current now.
     let validated = validate_policy_candidate(&draft.candidate).and_then(|candidate| {
-        validate_policy_mutation_candidate(rbac_state, &live_policy, &candidate).map(|()| candidate)
+        validate_policy_write_candidate(&state, rbac_state, &live_policy, &candidate)
+            .map(|()| candidate)
     });
     let candidate = match validated {
         Ok(candidate) => candidate,
@@ -941,7 +984,7 @@ pub(super) async fn policy_draft_publish_endpoint(
     // Publishing a draft replaces the whole live document, exactly as
     // `PUT /admin/policy` does, so its change evidence names the same
     // operation; the diff summary is what records the draft it came from.
-    let commit = match persist_policy_mutation(
+    let commit = match commit_policy_mutation(
         PolicyMutationCommitContext {
             state: &state,
             rbac_state,
@@ -958,7 +1001,20 @@ pub(super) async fn policy_draft_publish_endpoint(
     .await
     {
         Ok(commit) => commit,
-        Err(response) => return *response,
+        // The authority refused the commit and wrote nothing: as much a
+        // decision not to change enforcement as a refusal before it.
+        Err(PolicyMutationFailure::Refused(refusal, response)) => {
+            return refuse_publication(
+                &context,
+                &draft.summary,
+                commit_refusal_reason(refusal),
+                Some(&live_etag),
+                *response,
+            );
+        }
+        // Something was written before a later step failed, so this is not
+        // a refusal and is not recorded as one.
+        Err(PolicyMutationFailure::Incomplete(response)) => return *response,
     };
 
     let marked = store

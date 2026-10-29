@@ -6,8 +6,10 @@ rotate/revoke and JWT revocation evidence; policy, tools and catalog publication
 evidence), the keyed safe-reference derivation
 ([Keyed safe references](#keyed-safe-references)), PR 3's durable delivery
 ([Durable delivery](#durable-delivery)), the journaled evidence's actor metadata
-([Actor metadata](#actor-metadata)) and the first PR 4 slice (standalone
-Connection and local-secret evidence, [Standalone evidence](#standalone-evidence)).
+([Actor metadata](#actor-metadata)), the first PR 4 slice (standalone
+Connection and local-secret evidence, [Standalone evidence](#standalone-evidence))
+and PR 4's refusal of unsupported changes
+([Required-durability mode](#required-durability-mode)).
 Reviewed source: `ebb579e6444d437bf477d0617b8841d1eea34cfc`.
 
 This inventory identifies existing atomic records and the work needed for required
@@ -29,19 +31,22 @@ database gains the same columns. The first PR 4 slice adds migration 12 of the
 standalone Connections database: Connection create/replace/delete and local-secret
 create/rotate/delete/re-encryption write its `connection_change_evidence` and
 `connection_local_secret_change_evidence` rows, with the whole actor, in their own
-SQLite transactions. None of them implements or enables the authority-evidence
-required-durability mode or a standalone revision ledger, and no row is qualified
-for that future mode. Storage selection is unchanged.
+SQLite transactions. None of them is a standalone revision ledger, and no row is
+qualified for the required-durability contract.
+`AUTHORITY_EVIDENCE_DURABILITY=required` ([Required-durability mode](#required-durability-mode))
+refuses the rows that cannot be evidenced rather than qualifying any. Storage
+selection is unchanged.
 
 `AUDIT_DURABILITY=required`, the default since the request-path slice of this issue,
 is a different and narrower guarantee: the authentication and authorization stages
 wait for their own decision records to commit to the audit store of record, and
 refuse the request with `503 audit_unavailable` when they cannot (see
 [the configuration reference](configuration.md#audit_durability)). It does not
-make any authority-change row below qualified, which is why the inventory's
-`required_durability_mode` stays `not_implemented`: an admin mutation's evidence is
+make any authority-change row below qualified: an admin mutation's evidence is
 still its own transaction's rows, its journal entry, or the ordinary audit event its
-handler emits after the commit.
+handler emits after the commit. The inventory's `required_durability_mode` is
+`refuses_unsupported`: the separate, opt-in `AUTHORITY_EVIDENCE_DURABILITY=required`
+refuses every row whose `required_mode` is not `admitted`, and still qualifies none.
 
 Run the executable inventory and proposed event-contract tests with the pinned
 Node version from `build-tools.json`:
@@ -480,7 +485,8 @@ migration 21; `gateway/src/storage/postgres_authority_events.rs` and
   `_undelivered`, `_oldest_undelivered_age_seconds`, `_delivered_total`,
   `_delivery_failures_total{kind}`, `_capacity_refusals_total` and
   `_evidence_failures_total` (a change refused because the database refused its
-  evidence row or journal entry for any other reason), every label from a fixed
+  evidence row or journal entry for any other reason, including the unjournaled
+  policy, tools and catalog evidence below), every label from a fixed
   vocabulary ([metrics](deployment/postgres.md#metrics)). The
   [operational rule pack](deployment/operational-alerts.md#alert-policy) pages on
   either refusal counter and on a full journal, warns on a filling journal,
@@ -506,8 +512,10 @@ key derives the same references.
 
 Not covered by PR 3, and still open:
 
-- **Required-durability mode.** Nothing makes a sink mandatory, so a deployment
-  with `AUTHORITY_EVENT_SINK=none` journals and retains evidence but delivers none.
+- **Delivery by default.** Under `AUTHORITY_EVIDENCE_DURABILITY=best_effort`, the
+  default, a deployment with `AUTHORITY_EVENT_SINK=none` journals and retains
+  evidence but delivers none. `required` refuses to start such a replica
+  ([Required-durability mode](#required-durability-mode)).
 - **Admin sessions.** Migration 19's `admin_session_evidence` is not journaled and
   not delivered. A withdrawal must stay possible when the journal is full, so
   journaling it needs its own capacity decision first.
@@ -522,8 +530,8 @@ Not covered by PR 3, and still open:
   retained and not delivered. Journaling them adds the journal's capacity
   reservation to every policy, tools and catalog commit, and to the first-boot
   tools seed. A change refused because its evidence insert failed is logged with
-  its classified store error but is not counted by `_evidence_failures_total`, so
-  the rule pack does not page on it.
+  its classified store error and counted by `_evidence_failures_total`, so the
+  rule pack pages on it like any other refused authority change.
 - **Every other operation.** PostgreSQL Connection create/replace, credential
   bindings and token issue have no evidence rows to journal yet.
 
@@ -583,10 +591,11 @@ issuer or auth mode. Neither table is a journal source, so nothing delivers eith
 row; aligning both with this section's columns is a later #425 slice (the
 inventory's `policy_postgres`, `tools_postgres`, `configuration_import` and
 `catalog_postgres` rows keep `missing_metadata`). For `catalog_change_evidence`
-that slice is migration 25, which adds this section's three columns under the same
-CHECK. This release approves it as an additive extension and serves a database
-that holds it, but does not apply it and still writes no metadata into it; only
-its successor applies it ([schema 24 to 25](deployment/postgres.md#prepared-extension-schema-24-to-25)).
+that slice starts with migration 25, which adds this section's three columns under
+the same CHECK. This release applies it, as a rolling step from the release that
+approved it ([schema 24 to 25](deployment/postgres.md#rolling-upgrade-schema-24-to-25)),
+but still writes no metadata into it: catalog publications record the subject
+alone, and every row says "not recorded" until a later #425 slice fills them.
 
 ## Standalone evidence
 
@@ -657,6 +666,105 @@ What standalone evidence lacks compared with cluster mode:
 - **Not covered:** managed catalog, overlay and enum-source publication in the
   same database, service-token issue, and the file-backed policy, tools and
   configuration authorities, which wait for #242's ledger.
+
+## Required-durability mode
+
+`AUTHORITY_EVIDENCE_DURABILITY=required` ([configuration](configuration.md#authority_evidence_durability))
+is the mode PR 4 asks for: it refuses the authority changes a deployment mode cannot
+evidence instead of performing them and leaving no durable record. It does not
+make any change better evidenced, so it qualifies no row (`required_durability_supported`
+stays `false` everywhere); it decides, per row, what runs. The default,
+`best_effort`, performs every change as before. The setting is separate from
+`AUDIT_DURABILITY`, whose `required` default covers request decisions only: tying
+this contract to that default would have stopped every standalone gateway from
+editing its policy and every cluster replica without a pseudonym key from starting.
+
+The contract is the inventory's `required_mode` for each row, and
+`gateway/src/authority_events/required.rs` enforces it. A change is `admitted` only
+where the row's record shows that the change's own transaction durably names who
+made it, beside the change; the evidence may still lack metadata or delivery, and
+the row's other dispositions say what. Every other row is refused, unavailable or
+outside the gateway:
+
+| `required_mode` | Rows | What required mode does |
+| --- | --- | --- |
+| `admitted` | Every cluster row the gateway performs (policy, tools, Connection create, replace and delete, catalogs, token issue and change, JWT revocation, admin sessions, the import), and standalone Connection create, replace and delete, local-secret create, rotate, delete and re-encryption, and token issue and rotate/revoke | Runs it. Its evidence is the row's `record` |
+| `refused` | Standalone policy mutations, policy file reloads, tools publication (admin API and file reloads), catalog publication and overlays | Refuses it when asked, before anything is written |
+| `refused_at_startup` | Standalone admin sessions (`ADMIN_SESSION_MODE=standalone_memory`) | Refuses to start |
+| `unavailable` | Cluster policy file reload and local secrets, standalone JWT revocation and import, configuration export | Nothing to refuse: the mode or the build has no such operation. A gate that is asked anyway refuses it |
+| `outside_gateway` | External secret-provider rotation | Not covered: the provider owns the write and the gateway cannot refuse it |
+| `not_refused` | Configuration activation at startup | Runs it: refusing it would refuse every start. Startup configuration has no durable activation evidence until #242's ledger |
+
+Enforcement:
+
+- **Startup.** The configuration compiler refuses `required` with
+  `STATE_BACKEND=postgres` and `AUTHORITY_EVENT_SINK=none` (rule
+  `AuthorityEvidenceDeliveryRequired`): the replica would journal evidence that is
+  retained but never delivered. It refuses `required` with
+  `ADMIN_SESSION_MODE=standalone_memory` (rule
+  `AuthorityEvidenceUnsupportedConfiguration`). Both problems name
+  `AUTHORITY_EVIDENCE_DURABILITY`, so the value-free diagnostics attribute them to it.
+- **Admin API.** Each standalone endpoint of a `refused` row asks the gate once the
+  caller is authorized. A refusal is `409 {"error":"...","reason":"authority_evidence_unsupported","operation":"<code>"}`,
+  naming the inventory operation code and nothing from the request. Every policy
+  mutation asks at `commit_policy_mutation`, the commit path they share (so draft
+  publication asks as `policy.publish`, and its own `policy.draft_publish_refused`
+  record carries the same reason), and suggestion acceptance asks as
+  `policy.suggestion.accept` before its rule is written. A catalog refresh asks as
+  the MCP or OpenAPI publication its discovery names; an OpenAPI catalog
+  registration asks as `catalog.openapi.publish`, an overlay write or removal as
+  `catalog.overlay.replace` or `catalog.overlay.delete`. Connection and local-secret
+  changes, and the `connection-secrets reencrypt` command, never ask: the
+  Connections database records each of them in the change's own transaction
+  ([Standalone evidence](#standalone-evidence)).
+- **Background activations.** A watched or `SIGHUP` reload of `POLICY_FILE` or
+  `TOOLS_FILE` asks the gate first; a refused reload keeps the active policy or
+  registry, MCP proxy tools included, until a restart activates the file.
+- **Audit.** Every refusal is logged and audited as
+  `authority_evidence.operation_refused` with `operation`, `deployment_mode`,
+  `trigger` (`admin_api`, `file_watch`, `signal`) and `reason`; an admin API
+  refusal also carries the request ID, source address and caller.
+
+The gate reads two configuration values and nothing else. It never waits on a
+store, the dispatcher or a sink, so proxy admission and every admin change still
+wait only on their own local commits, never on a downstream acknowledgement. In
+cluster mode the dispatcher delivers after the commit, outside every authority
+transaction, exactly as under `best_effort`; required mode only makes sure a sink is
+configured to deliver to. `required` is part of the static configuration
+fingerprint (absent under `best_effort`, so the default leaves fingerprints
+unchanged), and a replica with a different value is not ready in that deployment.
+
+What required mode does not do:
+
+- It refuses no `admitted` row. Several of them are retained but not delivered: the
+  policy, tools, catalog and admin-session evidence rows are not journal sources,
+  cluster Connection create and replace and token issue have no evidence row of
+  their own (their immutable version or token row names the actor), and the
+  standalone token, Connection and local-secret evidence has no dispatcher. A
+  cluster Connection's version history still cascades with the Connection, whose
+  deletion has its own evidence row.
+- It does not refuse configuration activation, external provider rotation or
+  anything outside the inventory's matrix (status observations, verification and
+  last-use updates, cleanup).
+- A standalone gateway in required mode therefore changes its policy and tools only
+  through its startup files, and its managed catalogs and overlays not at all: a
+  managed OpenAPI or MCP Connection keeps the catalog it was created with until
+  the gateway runs under `best_effort`. Connections, local secrets, master-key
+  re-encryption and service tokens are changed as usual. The standalone evidence
+  slices that write catalog, policy and tools records in their owning stores change
+  those rows to `admitted` as they land.
+
+Tests: `gateway/src/authority_events/required_tests.rs` holds the gate's table to the
+inventory (every `refused` row has a gate that refuses it in that mode, every gate
+agrees with its row, and the only startup refusals are the two above), checks both
+modes and the refusal's audit event, and holds the evidenced standalone Connection
+and local-secret rows `admitted` and ungated; `authority_evidence_app_tests.rs`
+drives every refused standalone admin endpoint through the real handlers and asserts
+the `409`, the audit event and that nothing changed, and that Connection,
+local-secret and token changes are admitted and write their evidence rows; the
+reload helpers in `middleware/rbac_tests.rs` and `tools/definitions.rs` refuse a
+reload and keep the active document; `config_tests.rs`, `config/stage_tests.rs` and
+`ha.rs` cover the startup rules, their diagnostics and the fingerprint.
 
 ## Next reviewable slices and validation gates
 
@@ -758,7 +866,9 @@ What standalone evidence lacks compared with cluster mode:
    parent revision/CAS, actor/operation intent, atomic activation/evidence or
    recoverable staging, authoritative replay after interruption, and export
    intent accepted before artifact release. Until all are demonstrated,
-   required mode must reject unsupported configurations/operations.
+   required mode rejects unsupported configurations and operations; it does so
+   since PR 4 ([Required-durability mode](#required-durability-mode)), and each
+   row that gains evidence changes its `required_mode` with it.
 
 The inventory's source anchors can become stale as those slices land; update the
 classification, proofs and reviewed revision in the same PR. Do not close #425

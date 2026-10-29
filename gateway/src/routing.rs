@@ -261,6 +261,9 @@ pub(super) fn add_admin_api_routes(
         admin_api_states.policy.audit.clone(),
         admin_api_states.policy.client_ip_policy.clone(),
     );
+    // One replay job registry per router, shared by the routes that start,
+    // poll and cancel its jobs: its quotas belong to this application.
+    let replay_jobs = Arc::new(PolicyReplayJobs::new());
     // The admin API (minus the pre-authorization auth routes, merged
     // separately below) is one router so cluster mode can gate all of it
     // with one layer: every endpoint here authorizes against the compiled
@@ -396,6 +399,16 @@ pub(super) fn add_admin_api_routes(
                     post(policy_simulations_endpoint).layer(Extension(Arc::new(
                         PolicyEvaluationLimiter::new(MAX_CONCURRENT_POLICY_SIMULATIONS),
                     ))),
+                )
+                .route(
+                    routes.admin.policy_replays_route.as_str(),
+                    post(policy_replay_create_endpoint).layer(Extension(Arc::clone(&replay_jobs))),
+                )
+                .route(
+                    routes.admin.policy_replay_route.as_str(),
+                    get(policy_replay_get_endpoint)
+                        .delete(policy_replay_delete_endpoint)
+                        .layer(Extension(Arc::clone(&replay_jobs))),
                 )
                 .route(
                     routes.admin.policy_rules_route.as_str(),
@@ -922,13 +935,18 @@ pub(super) fn register_metrics(cluster: bool) {
 ///
 /// A counter series created by its first event appears at `1` with no
 /// earlier sample, and `increase()` needs two samples of one series to see a
-/// change. Unseeded, the first refused authority change, dropped audit event,
-/// failed audit flush or pool timeout after a process start -- often the only
-/// one, and for a refusal the one that matters -- would never page.
-/// `increment(0)` creates a series without changing it, and every label
-/// value below is one the emitter itself uses, so each family keeps exactly
-/// its bounded vocabulary. `scripts/test_alert_rules.py` fails when a rule
-/// reads a counter that is not seeded here.
+/// change. Unseeded, the first refused authority change, request refused for
+/// its audit record, dropped audit event, failed audit flush or pool timeout
+/// after a process start -- often the only one, and for a refusal the one
+/// that matters -- would never page. `increment(0)` creates a series without
+/// changing it, and every label value below is one the emitter itself uses,
+/// so each family keeps exactly its bounded vocabulary.
+/// `scripts/test_alert_rules.py` fails when a rule reads a counter that is
+/// not seeded here.
+///
+/// The durability refusal reasons are seeded whatever `AUDIT_DURABILITY`
+/// says: under `best_effort` nothing is ever refused, and a series that
+/// stays at `0` says exactly that.
 ///
 /// `greengateway_authority_event_delivery_failures_total` is deliberately
 /// not seeded: its rule waits for failures sustained over ten minutes, and
@@ -939,6 +957,10 @@ fn seed_alerted_counters(cluster: bool) {
         ::metrics::counter!(audit::AUDIT_EVENTS_DROPPED_TOTAL, "reason" => reason).increment(0);
     }
     ::metrics::counter!(metrics::AUDIT_FLUSH_TOTAL, "outcome" => audit::FLUSH_FAILURE).increment(0);
+    for reason in audit::durable::AUDIT_DURABILITY_REFUSAL_REASONS {
+        ::metrics::counter!(metrics::AUDIT_DURABILITY_REFUSALS_TOTAL, "reason" => reason)
+            .increment(0);
+    }
     #[cfg(feature = "postgres")]
     if cluster {
         ::metrics::counter!(

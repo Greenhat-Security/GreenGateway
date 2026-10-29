@@ -83,6 +83,7 @@ impl Stage {
             Code::RootUnavailable
             | Code::RootNotDirectory
             | Code::UnsafePermissions
+            | Code::UntrustedOwner
             | Code::TooManyEntries
             | Code::ManifestMissing
             | Code::SymlinkForbidden

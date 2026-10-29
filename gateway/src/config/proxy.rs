@@ -155,7 +155,7 @@ pub(crate) struct ProxyPlan {
     pub(crate) upstream_connect_timeout_ms: Option<u64>,
     /// Where each of the two blocks' inputs came from, in the order they are
     /// read.
-    #[allow(dead_code)] // Read by the stage tests until startup consumes the plan (#433 PR 3).
+    #[allow(dead_code)] // Read by the stage tests; startup builds from the values alone.
     pub(crate) provenance: Vec<Provenance>,
 }
 

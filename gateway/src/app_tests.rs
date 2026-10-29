@@ -9,6 +9,8 @@ mod admin_session_app_tests;
 mod audit_durability_app_tests;
 #[path = "audit_stream_app_tests.rs"]
 mod audit_stream_app_tests;
+#[path = "authority_evidence_app_tests.rs"]
+mod authority_evidence_app_tests;
 use crate::auth::TokenStore;
 use axum::{body::Body, http::StatusCode};
 use futures_util::StreamExt;
@@ -489,17 +491,12 @@ async fn spawn_router(router: Router) -> std::net::SocketAddr {
 struct MockOidcDiscoveryEndpoint {
     issuer: String,
     authorization_endpoint: String,
-    handle: std::thread::JoinHandle<usize>,
+    server: BlockingJsonServer,
 }
 
 impl MockOidcDiscoveryEndpoint {
     fn finish(self) {
-        assert_eq!(
-            self.handle
-                .join()
-                .expect("mock OIDC discovery endpoint should finish"),
-            1
-        );
+        assert_eq!(self.server.finish(), 1);
     }
 }
 
@@ -565,7 +562,7 @@ fn spawn_mock_oidc_discovery_endpoint(token_endpoint: Option<String>) -> MockOid
         "authorization_endpoint": authorization_endpoint.clone(),
         "token_endpoint": token_endpoint
     });
-    let handle = spawn_blocking_json_server(
+    let server = spawn_blocking_json_server(
         listener,
         vec![(
             "/.well-known/openid-configuration".to_owned(),
@@ -577,7 +574,7 @@ fn spawn_mock_oidc_discovery_endpoint(token_endpoint: Option<String>) -> MockOid
     MockOidcDiscoveryEndpoint {
         issuer,
         authorization_endpoint,
-        handle,
+        server,
     }
 }
 
@@ -673,6 +670,15 @@ fn admin_oidc_login_router_from_config(mut config: config::Config) -> Router {
     .expect("admin OIDC login app should build")
 }
 
+/// Discovery, JWKS and token-exchange deadline of the admin login test provider.
+///
+/// The 2 s production default bounds a real identity provider. Here every
+/// provider endpoint is a local mock that answers at once, so the deadline only
+/// bounds how long a loaded, coverage-instrumented test process takes to make
+/// the request; at 2 s that scheduling delay surfaced as
+/// `Upstream("OIDC discovery fetch failed")`. A wrong answer still fails at once.
+const ADMIN_OIDC_TEST_FETCH_TIMEOUT_MS: u64 = 30_000;
+
 fn admin_oidc_login_config(issuer: &str) -> config::Config {
     let mut config = test_config(Vec::new());
     config.admin_login_provider = Some("oidc".to_owned());
@@ -686,7 +692,7 @@ fn admin_oidc_login_config(issuer: &str) -> config::Config {
         jwks_url: None,
         issuer: Some(issuer.to_owned()),
         audience: None,
-        jwks_timeout_ms: 2000,
+        jwks_timeout_ms: ADMIN_OIDC_TEST_FETCH_TIMEOUT_MS,
         jwks_max_key_age_secs: 300,
         require_jti: false,
         roles_claim: "roles".to_owned(),
@@ -4301,6 +4307,31 @@ async fn proxy_uses_upstream_timeout_override_for_timed_out_upstream() {
     server.abort();
 }
 
+/// Reads one request head from a raw upstream fixture connection and returns
+/// its request line, or `None` when the peer closes or sends no valid head
+/// (the fixture then answers nothing). A raw fixture must not answer before
+/// this returns: hyper's HTTP/1.1 client rejects bytes that arrive on a
+/// connection it has not yet written a request to ("unexpected message"),
+/// which the proxy reports as a 502. Since tokio 1.54 an accepted socket starts
+/// out writable, so a fixture that writes straight after `accept` wins that
+/// race instead of waiting for the reactor's first event.
+async fn read_raw_http_request_line(stream: &mut tokio::net::TcpStream) -> Option<String> {
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while buffer.len() <= 16 * 1024 {
+        let read = stream.read(&mut chunk).await.ok()?;
+        if read == 0 {
+            return None;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if let Some(end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+            let head = std::str::from_utf8(&buffer[..end]).ok()?;
+            return head.split("\r\n").next().map(str::to_owned);
+        }
+    }
+    None
+}
+
 #[tokio::test]
 async fn proxy_returns_504_when_streaming_upstream_body_idles_before_first_chunk() {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -4309,19 +4340,28 @@ async fn proxy_returns_504_when_streaming_upstream_body_idles_before_first_chunk
     let upstream_addr = listener
         .local_addr()
         .expect("listener address should be available");
+    let (request_lines, mut received_request_lines) = tokio::sync::mpsc::unbounded_channel();
     let server = tokio::spawn(async move {
         loop {
             let (mut stream, _) = listener
                 .accept()
                 .await
                 .expect("test server should accept a connection");
+            let request_lines = request_lines.clone();
             tokio::spawn(async move {
+                // Headers go out only once a request head has arrived (the
+                // proxied request, or the app's own `HEAD /` health probe),
+                // then the body idles before its first chunk.
+                let Some(request_line) = read_raw_http_request_line(&mut stream).await else {
+                    return;
+                };
+                let _ = request_lines.send(request_line);
                 stream
-                        .write_all(
-                            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
-                        )
-                        .await
-                        .expect("test server should write response headers");
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .expect("test server should write response headers");
                 tokio::time::sleep(Duration::from_secs(10)).await;
             });
         }
@@ -4350,6 +4390,18 @@ async fn proxy_returns_504_when_streaming_upstream_body_idles_before_first_chunk
     assert_eq!(
         body_string(response).await,
         r#"{"error":"gateway_timeout"}"#
+    );
+    // The fixture sends a request's line before answering it, and the 504
+    // needs those headers, so the proxied request is already recorded here.
+    let mut request_lines = Vec::new();
+    while let Ok(request_line) = received_request_lines.try_recv() {
+        request_lines.push(request_line);
+    }
+    assert!(
+        request_lines
+            .iter()
+            .any(|request_line| request_line == "GET /slow-body HTTP/1.1"),
+        "the idle response should answer the proxied request: {request_lines:?}"
     );
     server.abort();
 }
@@ -5284,12 +5336,7 @@ async fn mcp_cookie_session_is_rejected_when_public_url_is_configured() {
     let non_mcp_body = json_body(non_mcp_response).await;
     assert_eq!(non_mcp_body["user_id"], json!("cookie-user"));
     assert_eq!(non_mcp_body["auth_method"], json!("session_cookie"));
-    assert_eq!(
-        introspection_server
-            .join()
-            .expect("cookie-session introspection server should finish"),
-        1
-    );
+    assert_eq!(introspection_server.finish(), 1);
 }
 
 #[tokio::test]
@@ -7342,6 +7389,8 @@ async fn principal_delegated_token_revocation_needs_principals_write_and_a_well_
         json!({ "issuer": "https://idp.example.test", "subject": "alice" })
     );
     assert_eq!(purge.payload["purged_entries"], json!(0));
+    // Standalone mode has no other replica to tell.
+    assert_eq!(purge.payload["replication"], json!(null));
 
     for malformed in [
         "not json".to_owned(),
@@ -7365,7 +7414,8 @@ async fn principal_delegated_token_revocation_needs_principals_write_and_a_well_
 }
 
 #[tokio::test]
-async fn principal_delegated_token_revocation_is_refused_where_replicas_cache_their_own() {
+async fn principal_delegated_token_revocation_is_refused_where_the_purge_cannot_reach_every_replica(
+) {
     let policy = parse_policy_body(&Bytes::from(principal_policy_document_string()))
         .expect("principal policy should parse");
     let state = PrincipalAdminState {
@@ -7378,7 +7428,7 @@ async fn principal_delegated_token_revocation_is_refused_where_replicas_cache_th
             false,
             test_audit_log(),
         )),
-        // What cluster mode builds.
+        // What a cluster-mode build with no purge record builds.
         delegated_tokens: None,
         client_ip_policy: client_ip::ClientIpPolicy::from_config(&test_config(Vec::new())),
         max_body_size: 1_024,
@@ -7394,7 +7444,126 @@ async fn principal_delegated_token_revocation_is_refused_where_replicas_cache_th
     )
     .await;
     assert_eq!(response.status(), StatusCode::CONFLICT);
-    assert!(body_string(response).await.contains("cluster mode"));
+    assert!(body_string(response)
+        .await
+        .contains("cannot record the purge for the other replicas"));
+}
+
+/// A purge ledger that answers as `answer` says: what the endpoint sees of
+/// cluster mode's record, without a roster or a database behind it.
+struct ScriptedPurgeLedger {
+    answer: Result<i64, connections::token_exchange::PurgeNotRecorded>,
+}
+
+#[async_trait::async_trait]
+impl connections::token_exchange::DelegatedTokenPurgeLedger for ScriptedPurgeLedger {
+    async fn record(
+        &self,
+        _purge_key: &str,
+        _origin: &connections::token_exchange::DelegatedTokenPurgeTrigger,
+    ) -> Result<i64, connections::token_exchange::PurgeNotRecorded> {
+        self.answer.clone()
+    }
+}
+
+/// Cluster mode's contract (issue #441): `200` names the shared security
+/// revision every replica applies the purge at; a purge that could not be
+/// recorded for the other replicas is `409` while a live replica predates
+/// the record and `503` when the authority did not answer, each saying how
+/// many entries the answering replica purged anyway.
+#[tokio::test]
+async fn principal_delegated_token_revocation_in_cluster_mode_reports_the_record() {
+    use connections::token_exchange::PurgeNotRecorded;
+
+    let policy = parse_policy_body(&Bytes::from(principal_policy_document_string()))
+        .expect("principal policy should parse");
+    let state_with = |answer: Result<i64, PurgeNotRecorded>| {
+        let egress = egress::EgressConfig::default();
+        let client =
+            Arc::new(egress::EgressClient::new(egress.clone()).expect("egress client builds"));
+        PrincipalAdminState {
+            directory: auth::PrincipalDirectory::disabled(),
+            audit_query_store: None,
+            discovery_store: None,
+            rbac_state: Some(middleware::rbac::RbacState::new(
+                policy.clone(),
+                Vec::new(),
+                false,
+                test_audit_log(),
+            )),
+            delegated_tokens: Some(
+                connections::http::ConnectionHttpRuntime::new(
+                    connections::control_plane::ConnectionControlPlane::from_config(&test_config(
+                        Vec::new(),
+                    ))
+                    .expect("control plane builds"),
+                    egress,
+                    client,
+                )
+                .with_delegated_token_purge_ledger(
+                    Arc::new(ScriptedPurgeLedger { answer }),
+                    "deploy-endpoint",
+                ),
+            ),
+            client_ip_policy: client_ip::ClientIpPolicy::from_config(&test_config(Vec::new())),
+            max_body_size: 1_024,
+        }
+    };
+    let purge = |state: PrincipalAdminState| {
+        principal_delegated_tokens_revoke_endpoint(
+            State(state),
+            traffic_admin_json_request(
+                Method::POST,
+                PRINCIPAL_DELEGATED_TOKENS_REVOKE_ADMIN_ROUTE,
+                Some(test_principal(&["principal-writer"])),
+                Some(
+                    json!({ "issuer": "https://idp.example.test", "subject": "alice" }).to_string(),
+                ),
+            ),
+        )
+    };
+
+    let recorded = purge(state_with(Ok(42))).await;
+    assert_eq!(recorded.status(), StatusCode::OK);
+    assert_eq!(recorded.headers()[header::CACHE_CONTROL], "no-store");
+    assert_eq!(
+        json_body(recorded).await,
+        json!({ "purged_entries": 0, "security_revision": 42 })
+    );
+
+    let lacking = purge(state_with(Err(PurgeNotRecorded::Refused {
+        reason: "capability_not_advertised",
+        detail: "a live member does not advertise delegated_token_purges".to_owned(),
+        members_lack_capability: true,
+    })))
+    .await;
+    assert_eq!(lacking.status(), StatusCode::CONFLICT);
+    assert_eq!(lacking.headers()[header::CACHE_CONTROL], "no-store");
+    let body = json_body(lacking).await;
+    assert_eq!(body["reason"], json!("capability_not_advertised"));
+    assert_eq!(body["purged_entries"], json!(0));
+    assert!(body["error"]
+        .as_str()
+        .is_some_and(|error| error.contains("not recorded for the other replicas")));
+
+    let roster = purge(state_with(Err(PurgeNotRecorded::Refused {
+        reason: "roster_unavailable",
+        detail: "cluster membership could not be read".to_owned(),
+        members_lack_capability: false,
+    })))
+    .await;
+    assert_eq!(roster.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        json_body(roster).await["reason"],
+        json!("roster_unavailable")
+    );
+
+    let unavailable = purge(state_with(Err(PurgeNotRecorded::Unavailable))).await;
+    assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        json_body(unavailable).await["reason"],
+        json!("purge_not_recorded")
+    );
 }
 
 #[tokio::test]
@@ -7643,12 +7812,7 @@ async fn real_cookie_session_authenticates_through_full_stack() {
     assert_eq!(body["user_id"], json!("cookie-user"));
     assert_eq!(body["auth_method"], json!("session_cookie"));
     assert_eq!(body["roles"], json!(["admin", "member"]));
-    assert_eq!(
-        introspection_server
-            .join()
-            .expect("cookie-session introspection server should finish"),
-        1
-    );
+    assert_eq!(introspection_server.finish(), 1);
 }
 
 #[tokio::test]
@@ -7680,12 +7844,7 @@ async fn cookie_session_introspection_host_is_auto_seeded_for_cross_host_egress(
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(json_body(response).await["user_id"], json!("cookie-user"));
-    assert_eq!(
-        introspection_server
-            .join()
-            .expect("cookie-session introspection server should finish"),
-        1
-    );
+    assert_eq!(introspection_server.finish(), 1);
 }
 
 #[test]
@@ -9197,6 +9356,21 @@ fn single_event_alert_counters_are_exported_at_zero_right_after_install() {
         assert_eq!(
             family("greengateway_audit_flush_total"),
             ["greengateway_audit_flush_total{outcome=\"failure\"} 0"],
+            "cluster={cluster}:\n{rendered}"
+        );
+        // Both modes, and whatever AUDIT_DURABILITY says: a refusal needs
+        // only an audit store of record, which standalone mode has too.
+        let mut refusals = family("greengateway_audit_durability_refusals_total");
+        refusals.sort_unstable();
+        let mut expected_refusals: Vec<String> = audit::durable::AUDIT_DURABILITY_REFUSAL_REASONS
+            .iter()
+            .map(|reason| {
+                format!("greengateway_audit_durability_refusals_total{{reason=\"{reason}\"}} 0")
+            })
+            .collect();
+        expected_refusals.sort_unstable();
+        assert_eq!(
+            refusals, expected_refusals,
             "cluster={cluster}:\n{rendered}"
         );
 
@@ -20326,7 +20500,24 @@ async fn policy_validate_accepts_valid_candidate_without_changing_live_policy_or
 
     assert_eq!(response.status(), StatusCode::OK);
     let candidate = policy_document_string("validated-only", "test:new");
-    let body = json_body(response).await;
+    let mut body = json_body(response).await;
+    // The resources the cross-resource checks read: every one of them, so
+    // the snapshot is complete and digested.
+    let snapshot = body
+        .as_object_mut()
+        .and_then(|body| body.remove("resource_snapshot"))
+        .expect("a document that parses is validated against a resource snapshot");
+    assert_eq!(snapshot["complete"], json!(true), "{snapshot}");
+    assert_eq!(snapshot["schema_version"], json!("1.0.0"));
+    assert!(snapshot["digest"]
+        .as_str()
+        .is_some_and(|digest| digest.starts_with("sha256:") && digest.len() == 71));
+    for component in ["configuration", "egress", "tools", "connections"] {
+        assert!(
+            snapshot["components"][component].is_string(),
+            "{component}: {snapshot}"
+        );
+    }
     // A 0.x document: valid, a source digest over the bytes sent, no
     // semantic digest (0.x defines no normalization), and the one stated
     // limitation of a document whose routes carry no stable id.
@@ -20581,6 +20772,466 @@ async fn policy_validate_reports_v1_diagnostics_and_both_digests() {
     assert_eq!(body["errors"].as_array().map(Vec::len), Some(3));
     assert!(body.get("source_digest").is_none(), "{body}");
     assert!(body.get("semantic_digest").is_none(), "{body}");
+}
+
+/// The test policy with `admin` reduced to reading: no role grants
+/// `admin:policy:write` any more.
+fn policy_document_without_policy_write(id: &str) -> Value {
+    let mut policy = policy_document(id, "test:new");
+    policy["roles"]["admin"]["permissions"] = json!([ADMIN_POLICY_READ_PERMISSION]);
+    policy
+}
+
+fn diagnostic_codes(body: &Value) -> Vec<(String, String)> {
+    body["diagnostics"]
+        .as_array()
+        .map(|diagnostics| {
+            diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    (
+                        diagnostic["code"].as_str().unwrap_or_default().to_owned(),
+                        diagnostic["pointer"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn policy_validate_reports_lockout_for_the_caller_and_everyone() {
+    let policy = TempPolicyFile::new(&policy_document_string("initial-policy", "test:old"));
+    let router = policy_admin_router(Some(&policy), test_audit_log());
+    let candidate = policy_document_without_policy_write("locked-out").to_string();
+
+    // The administrator would lose the permission, and so would everyone.
+    let response = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::POST,
+            POLICY_VALIDATE_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            Some(candidate.clone()),
+            None,
+        ))
+        .await
+        .expect("policy validate should complete");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert_eq!(body["valid"], json!(false));
+    let codes = diagnostic_codes(&body);
+    assert!(
+        codes.contains(&("policy_write_unreachable".to_owned(), "/roles".to_owned())),
+        "{body}"
+    );
+    assert!(
+        codes.contains(&(
+            "publisher_policy_write_lost".to_owned(),
+            "/roles".to_owned()
+        )),
+        "{body}"
+    );
+    assert_eq!(body["errors"].as_array().map(Vec::len), Some(2), "{body}");
+    let lockout = body["diagnostics"]
+        .as_array()
+        .and_then(|diagnostics| {
+            diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic["code"] == json!("policy_write_unreachable"))
+        })
+        .expect("lockout diagnostic");
+    assert_eq!(
+        lockout["blocks"],
+        json!({ "simulation": false, "tests": false, "publication": true, "evidence": false })
+    );
+    assert_eq!(body["resource_snapshot"]["complete"], json!(true));
+
+    // A reader has no write to lose; nobody could write afterwards either way.
+    // (The routes that required the permission are also reported, as
+    // warnings: no role grants it any more.)
+    let body = json_body(
+        router
+            .oneshot(policy_admin_request(
+                Method::POST,
+                POLICY_VALIDATE_ADMIN_ROUTE,
+                Some(test_principal(&["policy-reader"])),
+                Some(candidate),
+                None,
+            ))
+            .await
+            .expect("policy validate should complete"),
+    )
+    .await;
+    let errors: Vec<&Value> = body["diagnostics"]
+        .as_array()
+        .expect("diagnostics")
+        .iter()
+        .filter(|diagnostic| diagnostic["severity"] == json!("error"))
+        .collect();
+    assert_eq!(errors.len(), 1, "{body}");
+    assert_eq!(errors[0]["code"], json!("policy_write_unreachable"));
+    assert!(diagnostic_codes(&body).contains(&(
+        "route_permission_ungranted".to_owned(),
+        "/routes/1/permission".to_owned()
+    )));
+}
+
+#[tokio::test]
+async fn policy_put_refuses_an_administrator_lockout_without_writing_and_audits_it() {
+    let initial_policy = policy_document_string("initial-policy", "test:old");
+    let policy = TempPolicyFile::new(&initial_policy);
+    let capture = audit::sink::tests::CaptureSink::new();
+    let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+    let router = policy_admin_router(Some(&policy), audit_log);
+    let before_contents = fs::read_to_string(&policy.path).expect("policy file should read");
+    let (etag, _) = current_policy(&router).await;
+
+    let response = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::PUT,
+            POLICY_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            Some(policy_document_without_policy_write("locked-out").to_string()),
+            Some(&etag),
+        ))
+        .await
+        .expect("policy PUT should complete");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert_eq!(body["valid"], json!(false));
+    assert_eq!(body["errors"].as_array().map(Vec::len), Some(2), "{body}");
+    assert!(diagnostic_codes(&body)
+        .iter()
+        .any(|(code, _)| code == "publisher_policy_write_lost"));
+    let snapshot_digest = body["resource_snapshot"]["digest"].clone();
+    assert!(snapshot_digest.is_string(), "{body}");
+
+    assert_eq!(
+        fs::read_to_string(&policy.path).expect("policy file should read"),
+        before_contents
+    );
+    let (after_etag, after_policy) = current_policy(&router).await;
+    assert_eq!(after_etag, etag);
+    assert_eq!(after_policy["id"], json!("initial-policy"));
+
+    assert_eventually(Duration::from_secs(1), || {
+        capture
+            .events()
+            .iter()
+            .any(|event| event.event_type == audit::event::POLICY_PUBLICATION_REFUSED)
+    });
+    let events = capture.events();
+    assert!(!events
+        .iter()
+        .any(|event| event.event_type == audit::event::POLICY_CHANGED));
+    let refusal = events
+        .iter()
+        .find(|event| event.event_type == audit::event::POLICY_PUBLICATION_REFUSED)
+        .expect("the refusal is audited");
+    assert_eq!(
+        refusal.payload,
+        json!({
+            "action": "policy_replaced",
+            "codes": ["policy_write_unreachable", "publisher_policy_write_lost"],
+            "policy_etag": etag,
+            "resource_snapshot_digest": snapshot_digest,
+        })
+    );
+    assert_eq!(
+        refusal.actor.as_ref().map(|actor| actor.user_id.as_str()),
+        Some("user-123")
+    );
+}
+
+#[tokio::test]
+async fn policy_put_refuses_a_rule_that_would_deny_the_publisher_its_own_put() {
+    let policy = TempPolicyFile::new(&policy_document_string("initial-policy", "test:old"));
+    // The policy route is judged by the RBAC route lane here, not exempt.
+    let mut config = policy_admin_config_with_sqlite(Some(&policy), None);
+    config
+        .rbac_exempt_paths
+        .retain(|path| path != POLICY_ADMIN_ROUTE);
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let router = app(
+        config,
+        recorder.handle(),
+        test_audit_log(),
+        test_audit_event_sender(),
+    )
+    .expect("app should build");
+    let (etag, _) = current_policy(&router).await;
+
+    let locking = policy_document_with_rules_string(
+        "locking-policy",
+        json!([direct_rule_json(
+            Some("lock-admin"),
+            &["PUT"],
+            "/v1/admin/**",
+            "deny"
+        )]),
+    );
+    let response = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::PUT,
+            POLICY_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            Some(locking),
+            Some(&etag),
+        ))
+        .await
+        .expect("policy PUT should complete");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    let lost = body["diagnostics"]
+        .as_array()
+        .and_then(|diagnostics| {
+            diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic["code"] == json!("publisher_policy_write_lost"))
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("expected a publisher lockout: {body}"));
+    assert_eq!(lost["pointer"], json!("/rules/0"));
+    assert_eq!(lost["element_id"], json!("lock-admin"));
+    assert_eq!(current_policy(&router).await.0, etag);
+
+    // The same rule bound to another method takes nothing from the
+    // publisher and is published.
+    let harmless = policy_document_with_rules_string(
+        "harmless-policy",
+        json!([direct_rule_json(
+            Some("lock-admin"),
+            &["DELETE"],
+            "/v1/admin/**",
+            "deny"
+        )]),
+    );
+    let response = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::PUT,
+            POLICY_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            Some(harmless),
+            Some(&etag),
+        ))
+        .await
+        .expect("policy PUT should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_policy_write_bound_to_a_resource_snapshot_is_refused_once_it_is_stale() {
+    let policy = TempPolicyFile::new(&policy_document_string("initial-policy", "test:old"));
+    let capture = audit::sink::tests::CaptureSink::new();
+    let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+    let router = policy_admin_router(Some(&policy), audit_log);
+    let (etag, _) = current_policy(&router).await;
+    let candidate = policy_document_string("bound-policy", "test:new");
+    let validated = json_body(
+        router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::POST,
+                POLICY_VALIDATE_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                Some(candidate.clone()),
+                None,
+            ))
+            .await
+            .expect("policy validate should complete"),
+    )
+    .await;
+    let reviewed = validated["resource_snapshot"]["digest"]
+        .as_str()
+        .expect("a reviewed snapshot digest")
+        .to_owned();
+    let bound_put = |snapshot: &[&str], etag: &str| {
+        let mut request = policy_admin_request(
+            Method::PUT,
+            POLICY_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            Some(candidate.clone()),
+            Some(etag),
+        );
+        for value in snapshot {
+            request.headers_mut().append(
+                "x-greengateway-resource-snapshot",
+                HeaderValue::from_str(value).expect("header value"),
+            );
+        }
+        request
+    };
+
+    // A snapshot that is not the current one: refused, nothing written.
+    let stale = format!("sha256:{}", "0".repeat(64));
+    let response = router
+        .clone()
+        .oneshot(bound_put(&[&stale], &etag))
+        .await
+        .expect("policy PUT should complete");
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = json_body(response).await;
+    assert_eq!(body["reason"], json!("resource_snapshot_stale"));
+    assert_eq!(body["resource_snapshot"]["digest"], json!(reviewed));
+    assert_eq!(current_policy(&router).await.0, etag);
+    assert_eventually(Duration::from_secs(1), || {
+        capture.events().iter().any(|event| {
+            event.event_type == audit::event::POLICY_PUBLICATION_REFUSED
+                && event.payload["codes"] == json!(["resource_snapshot_stale"])
+        })
+    });
+
+    // Naming it twice is ambiguous and refused before anything is judged.
+    let response = router
+        .clone()
+        .oneshot(bound_put(&[&reviewed, &reviewed], &etag))
+        .await
+        .expect("policy PUT should complete");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // The snapshot that was reviewed is still current: published.
+    let response = router
+        .clone()
+        .oneshot(bound_put(&[&reviewed], &etag))
+        .await
+        .expect("policy PUT should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eventually(Duration::from_secs(1), || {
+        capture.events().iter().any(|event| {
+            event.event_type == audit::event::POLICY_CHANGED
+                && event.payload["resource_snapshot_digest"] == json!(reviewed)
+        })
+    });
+}
+
+#[tokio::test]
+async fn policy_writes_record_their_risks_and_resource_snapshot_in_policy_changed() {
+    let policy = TempPolicyFile::new(&policy_document_string("initial-policy", "test:old"));
+    let capture = audit::sink::tests::CaptureSink::new();
+    let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+    let router = policy_admin_router(Some(&policy), audit_log);
+    let (etag, _) = current_policy(&router).await;
+    let mut risky = policy_document("risky-policy", "test:new");
+    risky["default_action"] = json!("allow");
+    risky["roles"]["operator"] = json!({ "permissions": ["*"] });
+    risky["tools"] = json!({ "unregistered-tool": {} });
+
+    let validated = json_body(
+        router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::POST,
+                POLICY_VALIDATE_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                Some(risky.to_string()),
+                None,
+            ))
+            .await
+            .expect("policy validate should complete"),
+    )
+    .await;
+    assert_eq!(validated["valid"], json!(true), "{validated}");
+    // The live tool registry was asked, and holds no such tool.
+    assert!(diagnostic_codes(&validated).contains(&(
+        "tool_not_registered".to_owned(),
+        "/tools/unregistered-tool".to_owned()
+    )));
+    let risks: Vec<(String, String)> = validated["diagnostics"]
+        .as_array()
+        .expect("diagnostics")
+        .iter()
+        .filter(|diagnostic| diagnostic["severity"] == json!("risk"))
+        .map(|diagnostic| {
+            (
+                diagnostic["code"].as_str().unwrap_or_default().to_owned(),
+                diagnostic["pointer"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        risks,
+        vec![
+            (
+                "default_action_allow".to_owned(),
+                "/default_action".to_owned()
+            ),
+            (
+                "wildcard_permission".to_owned(),
+                "/roles/operator/permissions/0".to_owned()
+            ),
+        ]
+    );
+
+    let response = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::PUT,
+            POLICY_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            Some(risky.to_string()),
+            Some(&etag),
+        ))
+        .await
+        .expect("policy PUT should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let new_etag = policy_etag_header(&response);
+
+    // A rule write is reviewed the same way.
+    let response = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::POST,
+            POLICY_RULES_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            Some(json!({ "id": "reviewed", "path": "/reviewed", "action": "deny" }).to_string()),
+            Some(&new_etag),
+        ))
+        .await
+        .expect("rule POST should complete");
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    assert_eventually(Duration::from_secs(1), || {
+        capture
+            .events()
+            .iter()
+            .filter(|event| event.event_type == audit::event::POLICY_CHANGED)
+            .count()
+            == 2
+    });
+    let changes: Vec<Value> = capture
+        .events()
+        .into_iter()
+        .filter(|event| event.event_type == audit::event::POLICY_CHANGED)
+        .map(|event| event.payload)
+        .collect();
+    assert_eq!(changes.len(), 2);
+    for change in &changes {
+        assert_eq!(
+            change["risks"],
+            json!(["default_action_allow", "wildcard_permission"])
+        );
+        assert_eq!(
+            change["resource_snapshot_digest"],
+            validated["resource_snapshot"]["digest"]
+        );
+    }
+    assert_eq!(
+        changes[0]["diff_summary"]["action"],
+        json!("policy_replaced")
+    );
+    assert_eq!(changes[1]["diff_summary"]["action"], json!("rule_created"));
 }
 
 #[tokio::test]
@@ -25661,6 +26312,8 @@ async fn suggestions_admin_without_engine_answers_not_configured() {
                 membership: None,
                 event_store: None,
                 query_store: None,
+                authority_evidence: authority_events::required::AuthorityEvidenceGate::best_effort(
+                ),
                 audit: test_audit_log(),
                 client_ip_policy: client_ip::ClientIpPolicy::default(),
                 max_body_size: 1024 * 1024,
@@ -27373,9 +28026,7 @@ async fn auth_validator_resolves_oidc_discovery_for_issuer_only_provider() {
         .expect("token should validate through discovered JWKS URI");
 
     assert_eq!(principal.user_id, "oidc-user");
-    server
-        .join()
-        .expect("OIDC discovery test server should finish");
+    server.finish();
 }
 
 /// Startup hands every JWT validator that has a denylist the observer it
@@ -27397,7 +28048,7 @@ async fn a_denylisted_jwt_validator_reports_the_principal_of_a_revoked_token() {
     struct RecordingObserver(std::sync::Mutex<Vec<(String, String)>>);
 
     impl auth::RevokedCredentialObserver for RecordingObserver {
-        fn credential_revoked(&self, issuer: &str, subject: &str) {
+        fn credential_revoked(&self, issuer: &str, subject: &str, _jti: &str) {
             self.0
                 .lock()
                 .expect("observer lock")
@@ -27470,9 +28121,7 @@ async fn a_denylisted_jwt_validator_reports_the_principal_of_a_revoked_token() {
         *observer.0.lock().expect("observer lock"),
         [(issuer, "oidc-user".to_owned())]
     );
-    server
-        .join()
-        .expect("OIDC discovery test server should finish");
+    server.finish();
 }
 
 /// A deployment whose only credential is a client certificate still gets an
@@ -27554,9 +28203,7 @@ async fn auth_validator_accepts_slashless_oidc_issuer_when_config_has_trailing_s
         json_body(response).await["user_id"],
         json!("slashless-oidc-user")
     );
-    server
-        .join()
-        .expect("OIDC discovery and JWKS test server should finish");
+    server.finish();
 }
 
 #[tokio::test]
@@ -27586,9 +28233,7 @@ async fn auth_validator_accepts_slash_retained_oidc_issuer_and_token() {
         json_body(response).await["user_id"],
         json!("slash-retained-oidc-user")
     );
-    server
-        .join()
-        .expect("OIDC discovery and JWKS test server should finish");
+    server.finish();
 }
 
 #[test]
@@ -27636,9 +28281,7 @@ fn auth_validator_rejects_oidc_discovery_with_mismatched_issuer() {
         auth::AuthError::Upstream(message)
             if message.contains("OIDC discovery issuer mismatch")
     ));
-    server
-        .join()
-        .expect("OIDC discovery test server should finish");
+    server.finish();
 }
 
 #[test]
@@ -27685,9 +28328,7 @@ fn auth_validator_rejects_oidc_discovery_without_issuer() {
         auth::AuthError::Upstream(message)
             if message.contains("OIDC discovery response missing issuer")
     ));
-    server
-        .join()
-        .expect("OIDC discovery test server should finish");
+    server.finish();
 }
 
 #[tokio::test]
@@ -27749,13 +28390,8 @@ async fn oidc_discovery_allowlists_jwks_uri_host_when_it_differs_from_issuer() {
         json_body(response).await["user_id"],
         json!("split-oidc-user")
     );
-    assert_eq!(
-        discovery_server
-            .join()
-            .expect("OIDC discovery server should finish"),
-        1
-    );
-    assert_eq!(jwks_server.join().expect("JWKS server should finish"), 1);
+    assert_eq!(discovery_server.finish(), 1);
+    assert_eq!(jwks_server.finish(), 1);
 }
 
 #[tokio::test]
@@ -28517,9 +29153,7 @@ fn admin_oidc_login_provider_rejects_discovery_with_mismatched_issuer() {
     .expect_err("admin login discovery with mismatched issuer should fail startup");
 
     assert!(error.to_string().contains("OIDC discovery issuer mismatch"));
-    server
-        .join()
-        .expect("OIDC discovery test server should finish");
+    server.finish();
 }
 
 #[test]
@@ -28547,9 +29181,7 @@ fn admin_oidc_login_provider_rejects_discovery_without_issuer() {
     assert!(error
         .to_string()
         .contains("OIDC discovery response missing issuer"));
-    server
-        .join()
-        .expect("OIDC discovery test server should finish");
+    server.finish();
 }
 
 #[test]
@@ -28579,9 +29211,7 @@ fn admin_oidc_login_provider_requires_discovered_authorize_and_token_endpoints()
     assert!(error
         .to_string()
         .contains("OIDC discovery response missing token_endpoint"));
-    server
-        .join()
-        .expect("OIDC discovery test server should finish");
+    server.finish();
 }
 
 #[tokio::test]
@@ -28680,13 +29310,8 @@ async fn oidc_discovery_jwks_uri_auto_seed_still_blocks_private_ip() {
     // The property this test defends is that the blocked JWKS host is never
     // contacted, asserted below.
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(
-        discovery_server
-            .join()
-            .expect("OIDC discovery server should finish"),
-        1
-    );
-    assert_eq!(jwks_server.join().expect("JWKS server should finish"), 0);
+    assert_eq!(discovery_server.finish(), 1);
+    assert_eq!(jwks_server.finish(), 0);
 }
 
 #[test]
@@ -28730,9 +29355,7 @@ fn auth_validator_reports_construction_error_when_oidc_discovery_lacks_jwks_uri(
         auth::AuthError::Upstream(message)
             if message.contains("OIDC discovery response missing jwks_uri")
     ));
-    server
-        .join()
-        .expect("OIDC discovery test server should finish");
+    server.finish();
 }
 
 #[tokio::test]
@@ -33108,7 +33731,7 @@ async fn spawn_test_jwks_server() -> std::net::SocketAddr {
     .await
 }
 
-fn spawn_oidc_jwks_server() -> (String, std::thread::JoinHandle<()>) {
+fn spawn_oidc_jwks_server() -> (String, BlockingJsonServer) {
     let jwks = json!({
         "keys": [{
             "kty": "RSA",
@@ -33137,7 +33760,7 @@ fn spawn_oidc_jwks_server() -> (String, std::thread::JoinHandle<()>) {
 
 fn spawn_oidc_jwks_server_with_document_issuer(
     document_issuer: impl FnOnce(&str) -> String,
-) -> (String, String, std::thread::JoinHandle<()>) {
+) -> (String, String, BlockingJsonServer) {
     let jwks = json!({
         "keys": [{
             "kty": "RSA",
@@ -33170,14 +33793,14 @@ fn spawn_oidc_jwks_server_with_document_issuer(
 fn spawn_oidc_discovery_server(
     discovery: Value,
     request_count: usize,
-) -> (String, std::thread::JoinHandle<()>) {
+) -> (String, BlockingJsonServer) {
     spawn_oidc_discovery_server_with(|_| discovery, request_count)
 }
 
 fn spawn_oidc_discovery_server_with(
     discovery: impl FnOnce(&str) -> Value,
     request_count: usize,
-) -> (String, std::thread::JoinHandle<()>) {
+) -> (String, BlockingJsonServer) {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
         .expect("OIDC discovery test server should bind");
     let issuer = format!(
@@ -33194,7 +33817,7 @@ fn spawn_oidc_discovery_server_with(
 fn spawn_blocking_jwks_server(
     host: Ipv4Addr,
     request_count: usize,
-) -> (String, std::thread::JoinHandle<usize>) {
+) -> (String, BlockingJsonServer) {
     let listener =
         std::net::TcpListener::bind((host, 0)).expect("JWKS split-host test server should bind");
     let jwks_url = format!(
@@ -33227,7 +33850,7 @@ fn spawn_blocking_jwks_server(
 fn spawn_blocking_cookie_session_server(
     host: Ipv4Addr,
     request_count: usize,
-) -> (String, std::thread::JoinHandle<usize>) {
+) -> (String, BlockingJsonServer) {
     let listener = std::net::TcpListener::bind((host, 0))
         .expect("cookie-session introspection test server should bind");
     let introspection_url = format!(
@@ -33255,9 +33878,7 @@ fn spawn_blocking_cookie_session_server(
     (introspection_url, server)
 }
 
-fn spawn_blocking_oidc_discovery_server(
-    jwks_url: String,
-) -> (String, std::thread::JoinHandle<usize>) {
+fn spawn_blocking_oidc_discovery_server(jwks_url: String) -> (String, BlockingJsonServer) {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
         .expect("OIDC split-host discovery test server should bind");
     let issuer = format!(
@@ -33283,21 +33904,68 @@ fn spawn_blocking_oidc_discovery_server(
     (issuer, server)
 }
 
+/// A blocking HTTP/1.1 test server that answers fixed JSON bodies by path.
+///
+/// It serves until it has answered `request_count` requests or until the test
+/// calls [`BlockingJsonServer::finish`] (or drops it). It deliberately has no
+/// wall-clock lifetime: the time between spawning it and the first request
+/// (signing a test token, building the app) has no bound on a loaded runner,
+/// and a listener that closed a fixed 2 s after spawn refused the gateway's
+/// OIDC discovery fetch on the instrumented Windows coverage job.
+struct BlockingJsonServer {
+    finishing: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<usize>>,
+}
+
+impl BlockingJsonServer {
+    /// Answers every connection already queued, closes the listener and
+    /// returns how many requests were served.
+    ///
+    /// Call it after the test has seen the outcome of the requests it caused.
+    /// Each of them was sent before this call, so it has been answered or is
+    /// queued and is answered now: the count is exact without waiting.
+    fn finish(mut self) -> usize {
+        self.finishing.store(true, Ordering::SeqCst);
+        let thread = self
+            .thread
+            .take()
+            .expect("blocking JSON test server should finish once");
+        thread
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    }
+}
+
+impl Drop for BlockingJsonServer {
+    fn drop(&mut self) {
+        // A test that fails before `finish` must not leave the thread polling.
+        self.finishing.store(true, Ordering::SeqCst);
+    }
+}
+
 fn spawn_blocking_json_server(
     listener: std::net::TcpListener,
     routes: Vec<(String, String)>,
     request_count: usize,
-) -> std::thread::JoinHandle<usize> {
-    std::thread::spawn(move || {
-        listener
-            .set_nonblocking(true)
-            .expect("blocking JSON test server should set nonblocking mode");
-        let deadline = Instant::now() + Duration::from_secs(2);
+) -> BlockingJsonServer {
+    listener
+        .set_nonblocking(true)
+        .expect("blocking JSON test server should set nonblocking mode");
+    let finishing = Arc::new(AtomicBool::new(false));
+    let finish_flag = Arc::clone(&finishing);
+    let thread = std::thread::spawn(move || {
         let mut handled = 0;
-        while handled < request_count && Instant::now() < deadline {
-            let Ok((mut stream, _)) = listener.accept() else {
-                std::thread::sleep(Duration::from_millis(10));
-                continue;
+        while handled < request_count {
+            // Read the flag before accepting: an empty accept that follows a
+            // `finish` request proves no connection made before it is left.
+            let finish_requested = finish_flag.load(Ordering::SeqCst);
+            let mut stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(_) if finish_requested => break,
+                Err(_) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
             };
             stream
                 .set_nonblocking(false)
@@ -33321,7 +33989,12 @@ fn spawn_blocking_json_server(
             handled += 1;
         }
         handled
-    })
+    });
+
+    BlockingJsonServer {
+        finishing,
+        thread: Some(thread),
+    }
 }
 
 fn spawn_oidc_server(
@@ -33329,7 +34002,7 @@ fn spawn_oidc_server(
     discovery: Value,
     jwks: Option<Value>,
     request_count: usize,
-) -> (String, std::thread::JoinHandle<()>) {
+) -> (String, BlockingJsonServer) {
     let issuer = format!(
         "http://127.0.0.1:{}",
         listener
@@ -33337,40 +34010,21 @@ fn spawn_oidc_server(
             .expect("OIDC discovery test server address should be available")
             .port()
     );
-    let discovery = discovery.to_string();
-    let jwks = jwks.map(|jwks| jwks.to_string());
-    let server = std::thread::spawn(move || {
-        listener
-            .set_nonblocking(true)
-            .expect("OIDC discovery test server should set nonblocking mode");
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let mut handled = 0;
-        while handled < request_count && Instant::now() < deadline {
-            let Ok((mut stream, _)) = listener.accept() else {
-                std::thread::sleep(Duration::from_millis(10));
-                continue;
-            };
-            stream
-                .set_nonblocking(false)
-                .expect("OIDC discovery test stream should use blocking reads");
-            let path = read_blocking_http_path(&mut stream);
-            let (status, body) = match path.as_str() {
-                "/.well-known/openid-configuration" => ("200 OK", discovery.as_str()),
-                "/jwks.json" => ("200 OK", jwks.as_deref().unwrap_or("{}")),
-                _ => ("404 Not Found", "{}"),
-            };
-            let response = format!(
-                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-            stream
-                .write_all(response.as_bytes())
-                .expect("OIDC discovery test response should write");
-            handled += 1;
-        }
-    });
+    let routes = vec![
+        (
+            "/.well-known/openid-configuration".to_owned(),
+            discovery.to_string(),
+        ),
+        (
+            "/jwks.json".to_owned(),
+            jwks.map_or_else(|| "{}".to_owned(), |jwks| jwks.to_string()),
+        ),
+    ];
 
-    (issuer, server)
+    (
+        issuer,
+        spawn_blocking_json_server(listener, routes, request_count),
+    )
 }
 
 fn read_blocking_http_path(stream: &mut std::net::TcpStream) -> String {
@@ -35383,6 +36037,12 @@ mod cluster_policy_tests {
                 POLICY_DRAFT_PUBLISH_ADMIN_ROUTE,
                 post(policy_draft_publish_endpoint),
             )
+            .route(
+                POLICY_SIMULATIONS_ADMIN_ROUTE,
+                post(policy_simulations_endpoint).layer(Extension(Arc::new(
+                    PolicyEvaluationLimiter::new(MAX_CONCURRENT_POLICY_SIMULATIONS),
+                ))),
+            )
             .with_state(PolicyAdminState {
                 policy_file: None,
                 rbac_state: Some(rbac_state.clone().with_revision_gate(gate.clone())),
@@ -35394,6 +36054,8 @@ mod cluster_policy_tests {
                 membership,
                 event_store: None,
                 query_store: None,
+                authority_evidence: authority_events::required::AuthorityEvidenceGate::best_effort(
+                ),
                 audit,
                 client_ip_policy: client_ip::ClientIpPolicy::default(),
                 max_body_size: 1024 * 1024,
@@ -35752,6 +36414,255 @@ mod cluster_policy_tests {
             .expect("PUT should complete");
         assert_eq!(committed.status(), StatusCode::OK);
         assert_eq!(policy_version_count(&pool).await, before + 1);
+    }
+
+    /// What cluster mode cannot commit it does not save or simulate either
+    /// (issue #243 review). A draft whose candidate is policy v1 is refused
+    /// on create and on patch with the `400` a `PUT` of the same document
+    /// gets, and a simulation of an inline v1 candidate with the `422`
+    /// `POST /policy/validate` and a test run give it, as soon as the
+    /// candidate is read rather than when someone tries to commit it. Nothing
+    /// is committed, and a 0.x candidate on the same paths still is
+    /// accepted.
+    #[tokio::test]
+    async fn cluster_drafts_and_simulations_refuse_a_candidate_the_cluster_cannot_commit() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_policy_foundation(&database.dsn).await;
+        let simulating = r#"{
+            "schema_version": "0.1.0",
+            "id": "simulate-init",
+            "default_action": "deny",
+            "roles": { "admin": { "permissions":
+                ["admin:policy:read", "admin:policy:write", "admin:policy:simulate"] } }
+        }"#;
+        let active = PolicyControlPlane::commit(
+            store.as_ref(),
+            PolicyCommitRequest {
+                precondition: PolicyCommitPrecondition::Initialize,
+                candidate: &parse_policy_body(simulating.as_bytes())
+                    .expect("seed policy should parse"),
+                change: crate::storage::DocumentChange::test_policy("seed"),
+                diff_summary: &DIFF,
+            },
+        )
+        .await
+        .expect("deployment should initialize");
+        let (router, rbac_state) = cluster_policy_router(store.clone());
+        rbac_state
+            .install_revision_snapshot(active.policy.clone(), active.security_revision)
+            .await
+            .expect("the authority's revision should install");
+        let versions_before = policy_version_count(&pool).await;
+        let v1 = r#"{"schema_version":"1.0.0","id":"v1-held","default_action":"deny"}"#;
+        let refuses_format = |body: &Value| {
+            body["errors"][0]
+                .as_str()
+                .is_some_and(|error| error.contains("cannot be committed in cluster mode"))
+        };
+        let request = |method: Method, uri: &str, if_match: &str, body: String| {
+            let mut request = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::IF_MATCH, if_match)
+                .body(Body::from(body))
+                .expect("request should build");
+            request.extensions_mut().insert(admin_principal());
+            request
+        };
+
+        let (status, body) = refusal_of(
+            router
+                .clone()
+                .oneshot(request(
+                    Method::POST,
+                    POLICY_DRAFTS_ADMIN_ROUTE,
+                    &active.etag,
+                    format!(r#"{{"policy":{v1}}}"#),
+                ))
+                .await
+                .expect("create should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(refuses_format(&body), "{body}");
+
+        let created = router
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                POLICY_DRAFTS_ADMIN_ROUTE,
+                &active.etag,
+                "{}".to_owned(),
+            ))
+            .await
+            .expect("create should complete");
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let draft_etag = created
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("draft ETag")
+            .to_owned();
+        let (_, draft) = refusal_of(created).await;
+        let draft_uri = format!(
+            "{POLICY_DRAFTS_ADMIN_ROUTE}/{}",
+            draft["draft_id"].as_str().expect("draft id")
+        );
+        let (status, body) = refusal_of(
+            router
+                .clone()
+                .oneshot(request(
+                    Method::PATCH,
+                    &draft_uri,
+                    &draft_etag,
+                    format!(r#"{{"policy":{v1}}}"#),
+                ))
+                .await
+                .expect("patch should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(refuses_format(&body), "{body}");
+        let (status, kept) = refusal_of(
+            router
+                .clone()
+                .oneshot(request(Method::GET, &draft_uri, "*", String::new()))
+                .await
+                .expect("draft read should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(kept["revision"], 1, "the refused patch saved nothing");
+
+        let simulation = |policy: &str| {
+            format!(
+                r#"{{"schema_version":"policy-simulation.v1","base_etag":{},"candidate":{{"source":"inline","policy":{policy}}},"cases":[{{"id":"anonymous","kind":"http","request":{{"method":"GET","path":"/x"}},"principal":"anonymous"}}]}}"#,
+                json!(active.etag)
+            )
+        };
+        let (status, body) = refusal_of(
+            router
+                .clone()
+                .oneshot(request(
+                    Method::POST,
+                    POLICY_SIMULATIONS_ADMIN_ROUTE,
+                    &active.etag,
+                    simulation(v1),
+                ))
+                .await
+                .expect("simulation should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["reason"], "policy_candidate_invalid");
+        assert!(refuses_format(&body), "{body}");
+        let simulated = router
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                POLICY_SIMULATIONS_ADMIN_ROUTE,
+                &active.etag,
+                simulation(&cluster_policy_json("v0-simulated")),
+            ))
+            .await
+            .expect("simulation should complete");
+        assert_eq!(simulated.status(), StatusCode::OK);
+        assert_eq!(policy_version_count(&pool).await, versions_before);
+    }
+
+    /// A draft publication the commit itself refuses is recorded like one
+    /// refused before it (issue #243 review): here the candidate gives a
+    /// role a `description`, the operation gate has no roster to ask, and
+    /// the publication is the gate's `503` with nothing committed, the draft
+    /// kept open, and a `policy.draft_publish_refused` naming
+    /// `policy_operation_refused`.
+    #[tokio::test]
+    async fn cluster_draft_publications_the_commit_refuses_are_audited() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_policy_foundation(&database.dsn).await;
+        let active = initialize(&store, "refused-init").await;
+        let capture = audit::sink::tests::CaptureSink::new();
+        let (router, rbac_state) = cluster_policy_router_with(
+            store.clone(),
+            None,
+            audit::AuditLog::new(Arc::new(capture.clone())),
+        );
+        rbac_state
+            .install_revision_snapshot(active.policy.clone(), active.security_revision)
+            .await
+            .expect("the authority's revision should install");
+        let versions_before = policy_version_count(&pool).await;
+
+        let mut create = Request::builder()
+            .method(Method::POST)
+            .uri(POLICY_DRAFTS_ADMIN_ROUTE)
+            .header(header::IF_MATCH, &active.etag)
+            .body(Body::from(format!(
+                r#"{{"policy":{}}}"#,
+                described_cluster_policy_json("refused-described")
+            )))
+            .expect("request should build");
+        create.extensions_mut().insert(admin_principal());
+        let created = router
+            .clone()
+            .oneshot(create)
+            .await
+            .expect("create should complete");
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let draft_etag = created
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("draft ETag")
+            .to_owned();
+        let (_, draft) = refusal_of(created).await;
+        let draft_id = draft["draft_id"].as_str().expect("draft id").to_owned();
+
+        let mut publish = Request::builder()
+            .method(Method::POST)
+            .uri(format!("{POLICY_DRAFTS_ADMIN_ROUTE}/{draft_id}/publish"))
+            .header(POLICY_DRAFT_ETAG_HEADER, &draft_etag)
+            .header(header::IF_MATCH, &active.etag)
+            .body(Body::empty())
+            .expect("request should build");
+        publish.extensions_mut().insert(admin_principal());
+        let (status, body) = refusal_of(
+            router
+                .clone()
+                .oneshot(publish)
+                .await
+                .expect("publish should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["reason"], "roster_unavailable");
+        assert_eq!(policy_version_count(&pool).await, versions_before);
+
+        let refused = |capture: &audit::sink::tests::CaptureSink| {
+            capture
+                .events()
+                .into_iter()
+                .filter(|event| event.event_type == audit::event::POLICY_DRAFT_PUBLISH_REFUSED)
+                .map(|event| event.payload)
+                .collect::<Vec<_>>()
+        };
+        assert_eventually(Duration::from_secs(1), || refused(&capture).len() == 1);
+        let refused = refused(&capture);
+        assert_eq!(refused[0]["draft_id"], json!(draft_id));
+        assert_eq!(refused[0]["reason"], "policy_operation_refused");
+        assert_eq!(refused[0]["current_policy_etag"], json!(active.etag));
+        assert!(!capture.events().into_iter().any(|event| {
+            event.event_type == audit::event::POLICY_DRAFT_PUBLISHED
+                || event.event_type == audit::event::POLICY_CHANGED
+        }));
     }
 
     /// Issue #443's registered operation through the managed OpenAPI
@@ -38611,6 +39522,8 @@ mod cluster_discovery_tests {
                     membership: None,
                     event_store: None,
                     query_store: None,
+                    authority_evidence:
+                        authority_events::required::AuthorityEvidenceGate::best_effort(),
                     audit: audit_log,
                     client_ip_policy: client_ip::ClientIpPolicy::default(),
                     max_body_size: 1024 * 1024,
@@ -39871,3 +40784,6 @@ mod admin_policy_test_runs_tests;
 
 #[path = "admin_policy_simulations_tests.rs"]
 mod admin_policy_simulations_tests;
+
+#[path = "admin_policy_replays_tests.rs"]
+mod admin_policy_replays_tests;

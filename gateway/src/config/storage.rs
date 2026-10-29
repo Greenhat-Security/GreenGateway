@@ -36,7 +36,8 @@ use std::{env::VarError, path::PathBuf};
 
 use super::{
     authority_events::{
-        self, AuthorityEventInputs, AuthorityEventSettings, AUTHORITY_EVENT_RETENTION_HOURS,
+        self, AuthorityEventInputs, AuthorityEventSettings, AuthorityEvidenceDurability,
+        AUTHORITY_EVENT_RETENTION_HOURS, AUTHORITY_EVIDENCE_DURABILITY,
     },
     blank_as_unset,
     connections::ConnectionsPlan,
@@ -893,7 +894,7 @@ pub(crate) struct StoragePlan {
     pub(crate) authority_events: AuthorityEventSettings,
     /// Where each of the six blocks' inputs came from, in the order they are
     /// read.
-    #[allow(dead_code)] // Read by the stage tests until startup consumes the plan (#433 PR 3).
+    #[allow(dead_code)] // Read by the stage tests; startup builds from the values alone.
     pub(crate) provenance: Vec<Provenance>,
 }
 
@@ -1028,6 +1029,21 @@ pub(super) fn compile(
                     ConfigRule::AdminSessionStoreBackend,
                     format!(
                         "{ADMIN_SESSION_MODE}=cluster_postgres requires {STATE_BACKEND}=postgres; standalone mode keeps admin sessions in process memory (standalone_memory)"
+                    ),
+                );
+            }
+            // A standalone admin session is granted and withdrawn in process
+            // memory, so no store exists that could record either (the
+            // evidence inventory's `admin_session_standalone` row). Cluster
+            // mode refuses the mode outright, above.
+            if authority_events.durability == AuthorityEvidenceDurability::Required
+                && session_storage == Some(AdminSessionStorage::StandaloneMemory)
+            {
+                findings.refuse(
+                    after,
+                    ConfigRule::AuthorityEvidenceUnsupportedConfiguration,
+                    format!(
+                        "{AUTHORITY_EVIDENCE_DURABILITY}=required refuses {ADMIN_SESSION_MODE}=standalone_memory; process-local admin sessions leave no durable record of who was granted or withdrawn a session"
                     ),
                 );
             }

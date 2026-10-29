@@ -1225,6 +1225,15 @@ impl EgressClient {
         )
     }
 
+    /// The static egress lane this client decides every destination by: the
+    /// instance itself, not a recompilation of its controls, for a consumer
+    /// that must judge a destination exactly as this client would. The
+    /// policy resource checks ask it about Connection endpoints, with no
+    /// resolution facts, so nothing is resolved or connected.
+    pub(crate) fn static_egress_policy(&self) -> Arc<CompiledEgressPolicy> {
+        Arc::clone(&self.static_policy)
+    }
+
     /// Derives a client that additionally trusts the given PEM CA bundle when
     /// verifying server certificates (for providers whose endpoints chain to a
     /// private CA) and/or presents the given combined certificate-chain and

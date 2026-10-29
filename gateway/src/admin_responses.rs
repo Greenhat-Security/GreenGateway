@@ -589,6 +589,52 @@ pub(super) fn operation_refused(refusal: &storage::compatibility::OperationRefus
         .into_response()
 }
 
+/// A change `AUTHORITY_EVIDENCE_DURABILITY=required` refused because this
+/// deployment mode records no evidence of it (issue #425, PR 4). It
+/// conflicts with how the deployment is configured and will until that
+/// changes, so it is a `409`, not a `503`. Nothing was read from or written
+/// to the authority. The body names the refused operation and the stable
+/// reason, never anything from the request.
+pub(super) fn authority_evidence_unsupported(
+    refusal: &authority_events::required::EvidenceRefusal,
+) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": refusal.message(),
+            "reason": authority_events::required::REFUSAL_REASON,
+            "operation": refusal.operation().code(),
+        })),
+    )
+        .into_response()
+}
+
+/// Ask the authority-evidence gate before an admin change, and record a
+/// refusal against the caller and the request that asked.
+pub(super) fn admit_authority_change(
+    gate: &authority_events::required::AuthorityEvidenceGate,
+    operation: authority_events::required::AuthorityOperation,
+    audit: &audit::AuditLog,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    client_ip_policy: &client_ip::ClientIpPolicy,
+) -> ResponseResult<()> {
+    gate.admit(
+        operation,
+        audit,
+        authority_events::required::RefusalOrigin::Request {
+            request_id: client_ip::request_id(&parts.headers, &parts.extensions),
+            source_ip: client_ip::canonical_client_ip(
+                &parts.headers,
+                &parts.extensions,
+                client_ip_policy,
+            ),
+            actor: Some(auth::actor_from_principal(principal)),
+        },
+    )
+    .map_err(|refusal| Box::new(authority_evidence_unsupported(&refusal)))
+}
+
 pub(super) fn service_unavailable(error: &str) -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,

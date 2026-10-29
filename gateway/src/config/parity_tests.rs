@@ -337,6 +337,7 @@ const BLANK_IS_REFUSED: &[&str] = &[
     "AUDIT_DRAIN_TIMEOUT_MS",
     "AUDIT_DURABILITY",
     "AUDIT_DURABILITY_TIMEOUT_MS",
+    "AUTHORITY_EVIDENCE_DURABILITY",
     "DISCOVERY_ENDPOINT_LIMIT",
     "PAYLOAD_CAPTURE_ENABLED",
     "PAYLOAD_CAPTURE_SAMPLE_RATE",
@@ -390,8 +391,9 @@ const BLANK_IS_REFUSED: &[&str] = &[
 ];
 
 /// Variables for which an empty value replaces a non-empty default list with
-/// an empty one.
-const BLANK_CLEARS_THE_DEFAULT: &[&str] = &[
+/// an empty one. The compiler contract lists them too, because an adapter
+/// that drops blank values changes what they mean (see `stage_tests`).
+pub(super) const BLANK_CLEARS_THE_DEFAULT: &[&str] = &[
     "RBAC_EXEMPT_PATHS",
     "VALIDATION_ALLOWED_CONTENT_TYPES",
     "AUTH_EXEMPT_PATHS",
@@ -454,6 +456,20 @@ fn every_input_treats_a_blank_value_by_one_of_three_legacy_rules() {
                 list_with_a_default(&config, name).is_empty(),
                 "{name}={blank:?}"
             );
+        }
+    }
+}
+
+/// A list ignores its empty entries, so a value of nothing but commas is the
+/// same empty list a blank value is, without being blank. That is how a list
+/// is cleared through an adapter that drops blank values, as the Cloudflare
+/// wrapper does, and its documentation tells operators so.
+#[test]
+fn a_lone_comma_clears_a_list_as_a_blank_value_does() {
+    for &name in BLANK_CLEARS_THE_DEFAULT {
+        let blank = accepted(&[(name, "")]);
+        for commas in [",", " , ", ",,"] {
+            assert_eq!(accepted(&[(name, commas)]), blank, "{name}={commas:?}");
         }
     }
 }

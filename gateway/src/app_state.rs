@@ -38,6 +38,10 @@ pub(super) const POLICY_TEST_RUNS_ADMIN_ROUTE: &str = "/v1/admin/policy/tests/ru
 /// Simulate synthetic cases against the active policy and a candidate
 /// (issue #243, slice 10).
 pub(super) const POLICY_SIMULATIONS_ADMIN_ROUTE: &str = "/v1/admin/policy/simulations";
+/// Start a historical replay job (issue #243, slice 13).
+pub(super) const POLICY_REPLAYS_ADMIN_ROUTE: &str = "/v1/admin/policy/replays";
+/// Poll or cancel one replay job.
+pub(super) const POLICY_REPLAY_ADMIN_ROUTE: &str = "/v1/admin/policy/replays/{id}";
 pub(super) const POLICY_RULES_ADMIN_ROUTE: &str = "/v1/admin/policy/rules";
 pub(super) const POLICY_RULE_ADMIN_ROUTE: &str = "/v1/admin/policy/rules/{id}";
 pub(super) const POLICY_RULES_ORDER_ADMIN_ROUTE: &str = "/v1/admin/policy/rules/order";
@@ -239,6 +243,8 @@ pub(super) struct AdminRoutes {
     pub(super) policy_convert_route: String,
     pub(super) policy_test_runs_route: String,
     pub(super) policy_simulations_route: String,
+    pub(super) policy_replays_route: String,
+    pub(super) policy_replay_route: String,
     pub(super) policy_rules_route: String,
     pub(super) policy_rule_route: String,
     pub(super) policy_rules_order_route: String,
@@ -349,6 +355,8 @@ impl AdminRoutes {
             policy_convert_route: format!("{api_prefix}/policy/convert"),
             policy_test_runs_route: format!("{api_prefix}/policy/tests/runs"),
             policy_simulations_route: format!("{api_prefix}/policy/simulations"),
+            policy_replays_route: format!("{api_prefix}/policy/replays"),
+            policy_replay_route: format!("{api_prefix}/policy/replays/{{id}}"),
             policy_rules_route: format!("{api_prefix}/policy/rules"),
             policy_rule_route: format!("{api_prefix}/policy/rules/{{id}}"),
             policy_rules_order_route: format!("{api_prefix}/policy/rules/order"),
@@ -480,6 +488,9 @@ pub(super) struct PolicyAdminState {
     pub(super) membership: Option<Arc<cluster_membership::ClusterMembership>>,
     pub(super) event_store: Option<Arc<dyn storage::AuditEventStore>>,
     pub(super) query_store: Option<Arc<storage::SqliteAuditEventStore>>,
+    /// Asked before every policy mutation (issue #425, PR 4): standalone
+    /// mode records no evidence of one, so required mode refuses it.
+    pub(super) authority_evidence: authority_events::required::AuthorityEvidenceGate,
     pub(super) audit: audit::AuditLog,
     pub(super) client_ip_policy: client_ip::ClientIpPolicy,
     pub(super) max_body_size: usize,
@@ -503,6 +514,9 @@ pub(super) struct ConnectionAdminState {
     pub(super) openapi_catalogs: connections::openapi::OpenApiConnectionCatalogService,
     pub(super) tests: connections::test::ConnectionTestService,
     pub(super) rbac_state: Option<middleware::rbac::RbacState>,
+    /// Asked before every Connection, catalog and local-secret change
+    /// (issue #425, PR 4).
+    pub(super) authority_evidence: authority_events::required::AuthorityEvidenceGate,
     pub(super) audit: audit::AuditLog,
     pub(super) client_ip_policy: client_ip::ClientIpPolicy,
     pub(super) max_body_size: usize,
@@ -524,6 +538,8 @@ pub(super) struct ToolAdminState {
     pub(super) inventory: tools::inventory::CapabilityInventory,
     pub(super) executor: tools::executor::ToolExecutor,
     pub(super) rbac_state: Option<middleware::rbac::RbacState>,
+    /// Asked before an OpenAPI tools registration (issue #425, PR 4).
+    pub(super) authority_evidence: authority_events::required::AuthorityEvidenceGate,
     pub(super) audit: audit::AuditLog,
     pub(super) client_ip_policy: client_ip::ClientIpPolicy,
     pub(super) max_body_size: usize,

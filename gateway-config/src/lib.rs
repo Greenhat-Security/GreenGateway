@@ -26,8 +26,9 @@
 //!   for two bundles and the gateway's plans will report.
 //!
 //! Still in the gateway crate: the environment configuration compiler
-//! (`Config::from_env_vars`, being extracted by #433) and the production
-//! policy and tools validators. The bundle reader takes those validators as a
+//! (`config::compile`, extracted by #433 and described in
+//! `docs/architecture/configuration-compiler.md`) and the production policy
+//! and tools validators. The bundle reader takes those validators as a
 //! [`bundle::ResourceValidators`] argument, so the gateway runs them and
 //! `ggctl`, which cannot link the gateway crate, reports that it did not.
 //!

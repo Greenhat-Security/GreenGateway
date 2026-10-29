@@ -91,6 +91,16 @@ describe("buildGreenGatewayContainerEnv", () => {
     });
   });
 
+  it("forwards the authority evidence durability mode", () => {
+    const env = buildGreenGatewayContainerEnv({
+      AUTHORITY_EVIDENCE_DURABILITY: "required",
+    });
+
+    expect(env).toMatchObject({
+      AUTHORITY_EVIDENCE_DURABILITY: "required",
+    });
+  });
+
   it("forwards bounded login, session, discovery, and NAT64 settings", () => {
     const env = buildGreenGatewayContainerEnv({
       ADMIN_LOGIN_PENDING_TTL_SECS: "600",
@@ -151,6 +161,28 @@ describe("buildGreenGatewayContainerEnv", () => {
 
     for (const key of CONNECTION_ENV_KEYS) {
       expect(env).not.toHaveProperty(key);
+    }
+  });
+
+  it("forwards a lone comma, which the gateway reads as an explicit empty list", () => {
+    const lists = [
+      "AUTH_EXEMPT_PATHS",
+      "RBAC_EXEMPT_PATHS",
+      "CSRF_EXEMPT_PATHS",
+      "VALIDATION_ALLOWED_CONTENT_TYPES",
+    ] as const;
+
+    const blank = buildGreenGatewayContainerEnv(
+      Object.fromEntries(lists.map((key) => [key, " "])),
+    );
+    const cleared = buildGreenGatewayContainerEnv(
+      Object.fromEntries(lists.map((key) => [key, ","])),
+    );
+
+    for (const key of lists) {
+      expect(GREEN_GATEWAY_ENV_KEYS).toContain(key);
+      expect(blank).not.toHaveProperty(key);
+      expect(cleared[key]).toBe(",");
     }
   });
 

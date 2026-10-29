@@ -1189,6 +1189,11 @@ impl SecurityRevisionGate for ClusterSecurityRuntime {
     }
 }
 
+/// Delegated-token purges as a reconciled resource, and the ledger that
+/// records them (issue #441).
+#[path = "security_cluster_delegated_tokens.rs"]
+pub(crate) mod delegated_tokens;
+
 #[cfg(test)]
 mod metric_tests {
     use super::*;

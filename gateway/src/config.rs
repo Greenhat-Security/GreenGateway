@@ -56,7 +56,19 @@ mod stage;
 mod stage_tests;
 mod storage;
 
-pub use authority_events::AuthorityEventSettings;
+/// The configuration compiler (issue #433). Serving startup calls it
+/// directly and builds from the plan it returns (`bootstrap::start_serving`);
+/// the one-shot commands reach it through [`Config::from_env`].
+pub(crate) use plan::compile;
+
+/// The process environment as the configuration compiler reads it. Serving
+/// startup and [`Config::from_env`] both read their configuration inputs
+/// through this one reader.
+pub(crate) fn process_environment(name: &str) -> Result<String, VarError> {
+    env::var(name)
+}
+
+pub use authority_events::{AuthorityEventSettings, AuthorityEvidenceDurability};
 // Named only by the cluster wiring and by tests.
 #[cfg(any(feature = "postgres", test))]
 pub use authority_events::AuthorityEventSinkSetting;
@@ -1531,7 +1543,7 @@ pub struct ConfigError {
 
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
-        Self::from_env_vars(|name| env::var(name))
+        Self::from_env_vars(process_environment)
     }
 
     #[cfg(test)]
@@ -1542,7 +1554,8 @@ impl Config {
 
     // pub(crate) so sibling modules' tests can build configurations from
     // environment maps without going through process environment mutation;
-    // production reaches it only through `from_env`.
+    // production reaches it only through `from_env`. Serving startup calls
+    // `compile` itself, which is this function without the conversion.
     //
     // The configuration compiler (issue #433) reads every input block where
     // the legacy parser read it, parses and validates each block from those

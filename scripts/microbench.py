@@ -120,6 +120,12 @@ CARGO_PROFILE_ENV = {"CARGO_INCREMENTAL": "0", "CARGO_PROFILE_DEV_DEBUG": "0"}
 UI_BUILD_INPUTS = ("admin-ui", ".node-version", ".npm-version", "build-tools.json",
                    "npm-script-policy.json", "scripts/npm-script-policy.mjs")
 CARGO_CONFIG_PATHS = (".cargo/config", ".cargo/config.toml")
+# Each tree holds its revision's complete committed files. The workspace built
+# from it is whatever that revision's root manifest declares, as Cargo resolves
+# it (listed members, globs and path dependencies beneath the root), so a
+# member added later, as gateway-config and ggctl were, needs no change here.
+WORKSPACE_INPUTS = ("Cargo.toml", "Cargo.lock")
+METADATA_ARGUMENTS = ["metadata", "--no-deps", "--format-version", "1", "--locked"]
 STRIPPED_ENV = ("RUSTFLAGS", "RUSTDOCFLAGS", "RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER",
                 "RUSTC_BOOTSTRAP", "RUSTUP_TOOLCHAIN", "CARGO_INCREMENTAL", "LD_PRELOAD",
                 "DYLD_INSERT_LIBRARIES")
@@ -1187,6 +1193,79 @@ def _test_executable(messages, target_dir):
     return executable
 
 
+def _workspace_members(root, revision, tree, cargo, environment, directory, deadline):
+    """The revision's Cargo workspace members, mapped to their manifests.
+
+    Cargo resolves them from the tree's root manifest; each must be a package
+    committed at that revision, beside the root manifest and lockfile, so a
+    member that is missing or not the revision's own fails closed instead of
+    building against some other copy."""
+    for path in WORKSPACE_INPUTS:
+        if not _has_blob(root, revision, path) or not (tree / path).is_file():
+            raise ValueError(f"{revision}: workspace input {path} is missing")
+    text, _ = _bounded([cargo, *METADATA_ARGUMENTS], directory, "metadata",
+                       KERNEL_PROCESS_SECONDS, deadline, environment, cwd=tree)
+    metadata = _json_text(text)
+    resolved = Path(tree).resolve()
+    if (not isinstance(metadata, dict) or not isinstance(metadata.get("workspace_root"), str)
+            or Path(metadata["workspace_root"]).resolve() != resolved):
+        raise ValueError(f"{revision}: Cargo resolved a workspace other than the benchmark tree")
+    ids, packages = metadata.get("workspace_members"), metadata.get("packages")
+    if (not isinstance(ids, list) or not isinstance(packages, list)
+            or any(not isinstance(member, str) for member in ids)
+            or len(set(ids)) != len(ids) or len(packages) != len(ids)):
+        raise ValueError(f"{revision}: Cargo reported an inconsistent workspace member list")
+    members = {}
+    for package in packages:
+        if not isinstance(package, dict) or package.get("id") not in ids:
+            raise ValueError(f"{revision}: Cargo reported a package outside the workspace")
+        name, manifest = package.get("name"), package.get("manifest_path")
+        if not isinstance(name, str) or not isinstance(manifest, str) or name in members:
+            raise ValueError(f"{revision}: Cargo reported an unnamed or duplicate workspace member")
+        manifest = Path(manifest).resolve()
+        if manifest.name != "Cargo.toml" or not manifest.is_relative_to(resolved):
+            raise ValueError(f"{revision}: workspace member {name} is outside the benchmark tree")
+        relative = manifest.relative_to(resolved).as_posix()
+        if not _has_blob(root, revision, relative):
+            raise ValueError(f"{revision}: workspace member {name} is not committed at this revision")
+        members[name] = relative
+    if "gateway" not in members:
+        raise ValueError(f"{revision}: the workspace has no gateway package")
+    return dict(sorted(members.items()))
+
+
+def _local_packages(messages, tree, members):
+    """The workspace members this build compiled. Every package Cargo took from
+    a local path must be one of the tree's members and must have been compiled
+    now: Cargo judges a member fresh by modification times and names its
+    artifacts without the tree's path, so a fresh member is another revision's."""
+    resolved = Path(tree).resolve()
+    manifests = {resolved / path: name for name, path in members.items()}
+    built = set()
+    for line in messages.splitlines():
+        if not line.strip():
+            continue
+        message = _json_text(line)
+        if not isinstance(message, dict) or message.get("reason") != "compiler-artifact":
+            continue
+        package, manifest = message.get("package_id"), message.get("manifest_path")
+        if not isinstance(package, str) or not isinstance(manifest, str):
+            raise ValueError("Cargo reported an artifact without its package")
+        if not package.startswith("path+"):
+            continue
+        name = manifests.get(Path(manifest).resolve())
+        if name is None:
+            raise ValueError("Cargo compiled a local package that is not a member of the "
+                             "revision's workspace: " + manifest)
+        if message.get("fresh") is not False:
+            raise ValueError(f"workspace member {name} was reused from an earlier build "
+                             "instead of compiled from this revision")
+        built.add(name)
+    if "gateway" not in built:
+        raise ValueError("Cargo did not compile the revision's gateway package")
+    return sorted(built)
+
+
 def _file_digest(path):
     digest = hashlib.sha256()
     with Path(path).open("rb") as stream:
@@ -1208,15 +1287,21 @@ def _build_kernel(root, revision, label, output, compiler, kernel, digest, lane_
     target_dir.mkdir(parents=True, exist_ok=True)
     environment = _cargo_environment(compiler, kernel["context"]["rust_ci"], target_dir)
     # The revisions share one target directory so dependencies build once, but
-    # Cargo names a workspace member's artifacts without its source path: left
-    # alone, the second tree is judged fresh and reuses the first revision's
-    # gateway binary. Cleaning the gateway package makes each revision compile
-    # its own source.
-    _bounded([kernel["cargo"], "clean", "-p", "gateway", "--locked"], directory, "clean",
-             KERNEL_PROCESS_SECONDS, deadline, environment, cwd=tree)
+    # Cargo names a workspace member's artifacts without its source path and
+    # judges them by modification time, which extraction sets to the commit's:
+    # left alone, the second tree is judged fresh and reuses the first
+    # revision's gateway binary, or its gateway-config library under its own
+    # gateway. Cleaning every member of the revision's workspace makes each
+    # revision compile all of its own source; the build must then report it.
+    members = _workspace_members(root, revision, tree, kernel["cargo"], environment, directory,
+                                 deadline)
+    clean = [kernel["cargo"], "clean", *(item for name in members for item in ("-p", name)),
+             "--locked"]
+    _bounded(clean, directory, "clean", KERNEL_PROCESS_SECONDS, deadline, environment, cwd=tree)
     command = [kernel["cargo"], *CARGO_ARGUMENTS]
     messages, build_seconds = _bounded(command, directory, "build", BUILD_SECONDS, deadline,
                                        environment, cwd=tree, max_bytes=MAX_BUILD_LOG_BYTES)
+    local_packages = _local_packages(messages, tree, members)
     built = _test_executable(messages, target_dir)
     # The next revision's clean removes this artifact, so measure a private copy.
     binary = Path(work) / "binaries" / label / built.name
@@ -1243,6 +1328,7 @@ def _build_kernel(root, revision, label, output, compiler, kernel, digest, lane_
         "lanes_listed": {target: count == 1 for target, count in lanes_listed.items()},
         "egress_listed": egress_listed == 1,
         "command": command, "cargo_env": CARGO_PROFILE_ENV, "tree": str(tree),
+        "workspace_members": members, "clean_command": clean, "local_packages": local_packages,
         "ui_source": kernel["ui_source"], "ui_build_inputs": kernel["ui_build_inputs"],
         "build_seconds": build_seconds, "binary_sha256": _file_digest(binary)})
     return binary, environment, directory
