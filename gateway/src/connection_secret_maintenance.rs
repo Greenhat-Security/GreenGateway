@@ -1,6 +1,7 @@
 use std::{error::Error, ffi::OsString, fmt};
 
 use crate::{
+    auth::change_actor::ChangeActor,
     config::Config,
     connections::{
         control_plane::ConnectionControlPlane,
@@ -9,6 +10,12 @@ use crate::{
         secret::is_valid_opaque_id,
     },
 };
+
+/// The label each committed re-encryption batch records as its change
+/// evidence's actor (issue #425), with kind and auth mode `system` and no
+/// issuer. Nobody authenticated the command, so it records the command, not
+/// a person, as `revoke-jwt` records `operator:revoke-jwt`.
+pub(crate) const REENCRYPT_ACTOR: &str = "operator:connection-secrets-reencrypt";
 
 const INVALID_ARGUMENTS: &str = "invalid arguments; expected either no arguments, \
     `connection-secrets reencrypt --batch-size N`, or \
@@ -180,7 +187,7 @@ fn execute(
     match command {
         MaintenanceCommand::Reencrypt { batch_size } => {
             let progress = manager
-                .reencrypt_master_key_batch(batch_size)
+                .reencrypt_master_key_batch(batch_size, &ChangeActor::system(REENCRYPT_ACTOR))
                 .map_err(map_operation_error)?;
             Ok(MaintenanceOutput::Reencrypted {
                 reencrypted: progress.reencrypted,
@@ -284,6 +291,7 @@ mod tests {
                         &format!("historical secret {index}"),
                         ResolvedSecret::new(SecretPurpose::StaticBearer, SECRET_VALUE.to_vec())
                             .expect("test secret should validate"),
+                        &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
                     )
                     .expect("historical test secret should create");
             }
@@ -416,6 +424,41 @@ mod tests {
                 remaining: 0,
             }
         );
+
+        // Each batch that rewrote envelopes recorded itself, with its count,
+        // under the command's fixed operator label as a system actor with no
+        // issuer; the empty third batch recorded nothing (issue #425).
+        let batches = rusqlite::Connection::open(&store.database)
+            .expect("database should open")
+            .prepare(
+                "SELECT actor_user_id, actor_kind, actor_auth_mode, actor_issuer, \
+                        reencrypted_count \
+                 FROM connection_local_secret_change_evidence \
+                 WHERE action = 'secret.reencrypt' ORDER BY sequence",
+            )
+            .expect("evidence query should prepare")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .expect("evidence query should run")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("evidence should read");
+        let batch = |count| {
+            (
+                REENCRYPT_ACTOR.to_owned(),
+                "system".to_owned(),
+                "system".to_owned(),
+                None,
+                count,
+            )
+        };
+        assert_eq!(batches, [batch(2), batch(1)]);
     }
 
     #[test]

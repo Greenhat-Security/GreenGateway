@@ -149,5 +149,11 @@ sources, with networking disabled and no dependency files changed or compiled.
 A clean native control prevents a broken fixture from masquerading as rejection.
 Other regressions cover expired/unowned/broad/stale exceptions, duplicate-parent
 changes, graph pruning, hidden overrides, missing tools/config, and required CI
-wiring. Reports bind their lockfile, config, review metadata and tool contract by
+wiring. Those rule regressions start from a baseline that is valid by
+construction -- an inert graph fixture, and a review date derived from the
+committed expiries rather than the clock -- so each fails only for the rule it
+mutates. Exactly one graph self-test, `test_complete_current_graph`, compares the
+committed inventory with the live lockfile; after a dependency update it fails,
+naming the drifted crate, until step 3 is done (the native control fails too
+when cargo-deny itself rejects the new graph). Reports bind their lockfile, config, review metadata and tool contract by
 SHA-256 and retain exact exceptions, including their ownership and expiry.
