@@ -543,7 +543,9 @@ async fn edits_that_do_not_apply_or_do_not_validate_are_refused_without_a_record
 
 #[test]
 fn the_limiter_admits_one_simulation_per_actor_within_a_bounded_total() {
-    let limiter = Arc::new(PolicySimulationLimiter::new());
+    let limiter = Arc::new(PolicyEvaluationLimiter::new(
+        MAX_CONCURRENT_POLICY_SIMULATIONS,
+    ));
     let first = limiter.try_acquire("issuer\u{0}alice".to_owned());
     assert!(first.is_some());
     assert!(
@@ -560,6 +562,61 @@ fn the_limiter_admits_one_simulation_per_actor_within_a_bounded_total() {
     );
     drop(first);
     assert!(limiter.try_acquire("issuer\u{0}alice".to_owned()).is_some());
+}
+
+/// A client that goes away drops its request at the next `.await`, but the
+/// blocking evaluation it started runs on. The slot belongs to that work, so
+/// it stays taken -- for the actor and against the replica's bound -- until
+/// the work ends, and a caller cannot stack evaluations on the blocking pool
+/// past the bound by cancelling each request once its work has started.
+#[tokio::test]
+async fn a_cancelled_request_keeps_its_slot_until_its_blocking_work_ends() {
+    let limiter = Arc::new(PolicyEvaluationLimiter::new(1));
+    let slot = limiter
+        .try_acquire("issuer\u{0}alice".to_owned())
+        .expect("the first evaluation is admitted");
+    let (started, started_signal) = tokio::sync::oneshot::channel();
+    let (release, release_signal) = std::sync::mpsc::channel::<()>();
+    let request = tokio::spawn(slot.run_blocking(move || {
+        let _ = started.send(());
+        // Stands in for an evaluation still deciding cases.
+        let _ = release_signal.recv();
+    }));
+    started_signal
+        .await
+        .expect("the blocking work starts and signals");
+
+    // The request is dropped, as a disconnect drops it.
+    request.abort();
+    assert!(request
+        .await
+        .expect_err("the request was cancelled")
+        .is_cancelled());
+    assert!(
+        limiter.try_acquire("issuer\u{0}alice".to_owned()).is_none(),
+        "the actor's slot is held while its work runs"
+    );
+    assert!(
+        limiter.try_acquire("issuer\u{0}bob".to_owned()).is_none(),
+        "the replica's slot is held while the work runs"
+    );
+
+    release
+        .send(())
+        .expect("the blocking work is still waiting");
+    let readmitted = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Some(slot) = limiter.try_acquire("issuer\u{0}alice".to_owned()) {
+                return slot;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(
+        readmitted.is_ok(),
+        "the slot comes back once the blocking work ends"
+    );
 }
 
 /// The acceptance criterion of #243 slice 10: a simulation produces no audit

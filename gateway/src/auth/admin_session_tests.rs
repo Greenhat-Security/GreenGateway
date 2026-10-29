@@ -430,6 +430,74 @@ pub(crate) async fn contract_capacity_is_shared_and_never_evicts(
     a.revoke(&next, None).await.unwrap();
 }
 
+/// What an open audit event stream asks of its session: the same judgement
+/// as a request -- live, accepted by the provider for the same identity,
+/// still live afterwards -- with no CSRF token. A logout on either replica,
+/// a rejection or an identity change ends it, an unavailable provider is
+/// reported as unavailable without ending the session, and a logout during
+/// the provider check wins.
+pub(crate) async fn contract_reauthentication_follows_the_session(
+    a: &AdminSessions,
+    b: &AdminSessions,
+    authority: &Authority,
+) {
+    let headers = cookie_headers(&issue_across(a, b, &HeaderMap::new()).await.unwrap());
+    let admitted = read(a, &headers).await.unwrap();
+    let value = a.credential(&headers).unwrap();
+    let rechecked = b.reauthenticate(&value).await.unwrap();
+    assert_eq!(rechecked.auth_method, AuthMethod::Cookie);
+    assert_eq!(rechecked.user_id, admitted.user_id);
+    assert_eq!(
+        rechecked.session_id, admitted.session_id,
+        "the same session, on either replica"
+    );
+    authority.outcome.store(2, Ordering::SeqCst);
+    assert!(matches!(
+        a.reauthenticate(&value).await,
+        Err(AuthError::Upstream(_))
+    ));
+    authority.outcome.store(0, Ordering::SeqCst);
+    a.reauthenticate(&value).await.unwrap();
+    b.revoke(&headers, None).await.unwrap();
+    assert!(matches!(
+        a.reauthenticate(&value).await,
+        Err(AuthError::InvalidSession(_))
+    ));
+
+    for withdrawing in [1, 3] {
+        let headers = cookie_headers(&issue_across(a, a, &HeaderMap::new()).await.unwrap());
+        read(a, &headers).await.unwrap();
+        let value = a.credential(&headers).unwrap();
+        authority.outcome.store(withdrawing, Ordering::SeqCst);
+        assert!(matches!(
+            a.reauthenticate(&value).await,
+            Err(AuthError::InvalidSession(_))
+        ));
+        authority.outcome.store(0, Ordering::SeqCst);
+        assert!(
+            is_invalid(&read(b, &headers).await),
+            "a re-check the provider refuses withdraws the session everywhere"
+        );
+    }
+
+    let headers = cookie_headers(&issue_across(a, a, &HeaderMap::new()).await.unwrap());
+    read(a, &headers).await.unwrap();
+    let value = a.credential(&headers).unwrap();
+    authority.pause.store(1, Ordering::SeqCst);
+    let work = tokio::spawn({
+        let a = a.clone();
+        async move { a.reauthenticate(&value).await }
+    });
+    authority.entered.notified().await;
+    b.revoke(&headers, None).await.unwrap();
+    authority.pause.store(0, Ordering::SeqCst);
+    authority.resume.notify_one();
+    assert!(matches!(
+        work.await.unwrap(),
+        Err(AuthError::InvalidSession(_))
+    ));
+}
+
 /// Every contract case a store with room for at least four sessions must
 /// pass. Capacity is checked separately, with a store of one.
 pub(crate) async fn run_session_contract(
@@ -438,6 +506,7 @@ pub(crate) async fn run_session_contract(
     authority: &Authority,
 ) {
     contract_sessions_are_shared_and_revalidated(a, b, authority).await;
+    contract_reauthentication_follows_the_session(a, b, authority).await;
     contract_outage_preserves_but_rejection_and_identity_change_withdraw(a, b, authority).await;
     contract_unsafe_requests_need_the_bound_csrf_token(a, b, authority).await;
     contract_logout_wins_over_validation_in_flight(a, b, authority).await;
@@ -572,6 +641,57 @@ async fn admin_session_idle_deadline_moves_with_use_but_never_past_the_absolute_
     assert!(is_invalid(&read(&sessions, &headers).await));
     assert_eq!(authority.calls.load(Ordering::SeqCst), calls);
     assert!(store.state.lock().unwrap().entries.is_empty());
+}
+
+#[tokio::test]
+async fn admin_session_reauthentication_is_not_use_and_never_moves_a_deadline() {
+    let authority = Arc::new(Authority::default());
+    let mut config = session_config(AdminSessionStorage::StandaloneMemory, 8);
+    config.idle_timeout = Duration::from_secs(20);
+    let store = Arc::new(MemoryAdminSessionStore::new(config.clone()));
+    let sessions = front(
+        &authority,
+        Arc::clone(&store) as Arc<dyn AdminSessionStore>,
+        config,
+    );
+    let headers = cookie_headers(&issue(&sessions).await);
+    read(&sessions, &headers).await.unwrap();
+    let value = sessions.credential(&headers).unwrap();
+    let soon = Instant::now() + Duration::from_secs(2);
+    for entry in store.state.lock().unwrap().entries.values_mut() {
+        entry.idle_expires_at = soon;
+    }
+    let deadlines = || {
+        let state = store.state.lock().unwrap();
+        let entry = state.entries.values().next().unwrap();
+        (entry.idle_expires_at, entry.expires_at)
+    };
+    let before = deadlines();
+
+    sessions.reauthenticate(&value).await.unwrap();
+    sessions.reauthenticate(&value).await.unwrap();
+
+    assert_eq!(
+        deadlines(),
+        before,
+        "an open stream cannot keep an idle session alive"
+    );
+    // Once the idle deadline passes, the re-check is refused without asking
+    // the provider, as a request would be.
+    for entry in store.state.lock().unwrap().entries.values_mut() {
+        entry.idle_expires_at = Instant::now();
+    }
+    let calls = authority.calls.load(Ordering::SeqCst);
+    assert!(matches!(
+        sessions.reauthenticate(&value).await,
+        Err(AuthError::InvalidSession(_))
+    ));
+    assert_eq!(authority.calls.load(Ordering::SeqCst), calls);
+    // A malformed cookie value is refused before the store is consulted.
+    assert!(matches!(
+        sessions.reauthenticate("not-a-session").await,
+        Err(AuthError::InvalidSession(_))
+    ));
 }
 
 #[tokio::test]
