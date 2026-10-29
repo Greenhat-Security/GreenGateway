@@ -86,7 +86,7 @@ groups:
           summary: Gateway lifecycle has remained in drain
           runbook_url: https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#lifecycle-stalls
 
-      # Audit loss and flush failures are not suppressed during startup/drain.
+      # Audit loss, flush failures and durability refusals are not suppressed during startup/drain.
       - alert: GreenGatewayAuditLoss
         expr: |
           sum by (job, instance, deployment_mode) (increase(audit_events_dropped_total{job="greengateway"}[5m])) > 0
@@ -120,6 +120,18 @@ groups:
         annotations:
           summary: Gateway audit sink flushes are failing
           runbook_url: https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#audit-delivery
+
+      # Under AUDIT_DURABILITY=required (the default) every increase is a request
+      # answered 503 because its decision record could not commit; /readyz stays 200.
+      - alert: GreenGatewayAuditDurabilityRefusals
+        expr: |
+          sum by (job, instance, deployment_mode) (increase(greengateway_audit_durability_refusals_total{job="greengateway"}[5m])) > 0
+          and on (job, instance) (up{job="greengateway"} == 1)
+        for: 2m
+        labels: {severity: critical, owner: gateway-operations}
+        annotations:
+          summary: Gateway requests were refused because their audit records could not be committed
+          runbook_url: https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#audit-durability-refusals
 
       - alert: GreenGatewayDatabasePoolSaturated
         expr: |

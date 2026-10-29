@@ -6705,7 +6705,7 @@
         "unexpanded-macro"
       ],
       "scope": "gateway::routing::seed_alerted_counters#1",
-      "sha256": "bf3b4e44a877038429a11b9d15c8afafc13b015488c5d93e330771cdab28857c",
+      "sha256": "c0354a22e022d899ed445491be182defc8f3b52db387a81bf72d37e46ff36ca5",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
@@ -7038,16 +7038,6 @@
       "sha256": "f53cc1ea96259993ea9f1eecc8b0046ea2a55cac44a32052f8d1fe78f6b0247c",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
-    },
-    {
-      "file": "gateway/src/audit/durable.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::audit::durable::AUDIT_DURABILITY_REFUSAL_REASONS#1",
-      "sha256": "1045a913c8b4a4c973cc926eb25c6fd8aed944ab5b48ce4dd831ada427a1afff",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
     },
     {
       "file": "gateway/src/audit/durable.rs",
@@ -8767,9 +8757,9 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::record_catalog_change_evidence#1",
-      "sha256": "b9b7b591233ada0d85f9446b0a9811900e204c20e72220f5a6cb8606a580dff1",
+      "sha256": "7703bb8317269a4a230827f47c4761d4f810735be51a5ca044ed1adb1db13c24",
       "owner": "GreenGateway maintainers",
-      "purpose": "Appends one catalog change-evidence row through the caller's open PostgreSQL transaction (issue #425); no new connection, endpoint or transport."
+      "purpose": "Appends one catalog change-evidence row through the caller's open PostgreSQL transaction (issue #425) and counts a refused insert on the in-process evidence-failure counter (issue #440); no new connection, endpoint or transport."
     },
     {
       "file": "gateway/src/connections/pg_store.rs",
@@ -12771,9 +12761,9 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_documents::record_document_change#1",
-      "sha256": "ee12343618666614c8b914f5e3e1e5eee83171525128e4b07c9e65b5e88dec34",
+      "sha256": "d5fac8172a2fc6224dbc15208e622d484aa294b4383609faa5cf0cdc2e12d2c7",
       "owner": "GreenGateway maintainers",
-      "purpose": "Appends one document change-evidence row through the caller's open PostgreSQL transaction (issue #425); no new connection, endpoint or transport."
+      "purpose": "Appends one document change-evidence row through the caller's open PostgreSQL transaction (issue #425) and counts a refused insert on the in-process evidence-failure counter (issue #440); no new connection, endpoint or transport."
     },
     {
       "file": "gateway/src/storage/postgres_documents.rs",
@@ -14988,7 +14978,7 @@
         "unexpanded-macro"
       ],
       "scope": "gateway::storage::postgres_authority_events::record_evidence_failure#1",
-      "sha256": "2f61a3ef4e1fd26c84368c0da60683b9e21fb3e22ea1678e6bd7f533392b130e",
+      "sha256": "20384981a436de131afe8257495ef57025659ae96bdcbd9cde301e0cae28d20d",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     }

@@ -9234,6 +9234,21 @@ fn single_event_alert_counters_are_exported_at_zero_right_after_install() {
             ["greengateway_audit_flush_total{outcome=\"failure\"} 0"],
             "cluster={cluster}:\n{rendered}"
         );
+        // Both modes, and whatever AUDIT_DURABILITY says: a refusal needs
+        // only an audit store of record, which standalone mode has too.
+        let mut refusals = family("greengateway_audit_durability_refusals_total");
+        refusals.sort_unstable();
+        let mut expected_refusals: Vec<String> = audit::durable::AUDIT_DURABILITY_REFUSAL_REASONS
+            .iter()
+            .map(|reason| {
+                format!("greengateway_audit_durability_refusals_total{{reason=\"{reason}\"}} 0")
+            })
+            .collect();
+        expected_refusals.sort_unstable();
+        assert_eq!(
+            refusals, expected_refusals,
+            "cluster={cluster}:\n{rendered}"
+        );
 
         for name in [
             "greengateway_database_pool_timeouts_total",
