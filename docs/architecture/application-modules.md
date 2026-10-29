@@ -16,7 +16,7 @@ an exit code. Implementation is grouped by responsibility:
 | `admin_responses`, `admin_ui` | Shared error mapping and embedded UI serving |
 | `admin_policy_test_runs`, `policy_testing` | Policy test suites: the run endpoint, and the state-free suite parser, evaluator-backed runner and JSON/SARIF/JUnit reports |
 | `admin_policy_simulations`, `policy_simulation` | Synthetic policy simulation: the simulation endpoint and its concurrency bound, and the state-free request parser, position-aware edits, shadow projections and evaluator-backed runner |
-| `policy_replay` | Policy replay contexts: the state-free `replay-context.v1` record and parser, the legacy adapters that read one out of a stored audit event, and their evaluator-backed replay; no endpoint yet |
+| `admin_policy_replays`, `policy_replay` | Historical policy replay: the replay job endpoints, their process-local job registry and quotas, and the state-free `replay-context.v1` record and parser, the legacy adapters that read one out of a stored audit event, their evaluator-backed replay, the `policy-replay.v1` request parser and the bounded job engine |
 
 Sibling modules share crate-private contracts through the composition root.
 The extraction preserves the previous effective visibility and middleware order;

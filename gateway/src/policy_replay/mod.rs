@@ -11,7 +11,8 @@
 //! [`crate::policy_eval::egress::EgressEvaluationContext`] -- and asks the
 //! compiled policy, so a replayed decision is the decision production makes
 //! for the same facts. [`legacy`] reads the facts out of the audit events the
-//! gateway writes today. The published form is
+//! gateway writes today, and [`job`] is the bounded engine that replays a
+//! window of them. The published form is
 //! `docs/schemas/replay-context.v1.schema.json`.
 //!
 //! ## Facts, not guesses
@@ -51,23 +52,28 @@
 //!
 //! ## What is not here yet
 //!
-//! No live path writes a `replay-context.v1` record and no job reads one: the
-//! bounded replay job engine (slice 13) is the first consumer, and the
-//! recorded-versus-candidate comparison (slice 14) the second. Every context
-//! today comes from [`legacy`].
+//! No live path writes a `replay-context.v1` record. The replay job engine
+//! ([`job`], slice 13) reads contexts the legacy adapters build in memory and
+//! never a serialized one; the recorded-versus-candidate comparison (slice 14)
+//! is the first reader of the recorded result. Every context today comes from
+//! [`legacy`].
 
 #![cfg_attr(
     not(test),
     expect(
         dead_code,
-        reason = "the replay job engine (#243 slice 13) is the first caller outside tests"
+        reason = "the serialized form, egress replay and the recorded result wait for the impact comparison (#243 slice 14)"
     )
 )]
 
 pub(crate) mod evaluate;
+pub(crate) mod job;
+#[cfg(test)]
+mod job_tests;
 pub(crate) mod legacy;
 #[cfg(test)]
 mod live_tests;
+pub(crate) mod request;
 #[cfg(test)]
 mod tests;
 
