@@ -146,6 +146,44 @@ mod tests {
     }
 
     #[test]
+    fn bundles_are_diffed_by_their_production_documents() {
+        let read = |bundle: &TempBundle| {
+            read_bundle(&bundle.0, ReadOptions::default())
+                .bundle
+                .expect("the bundle should be read")
+        };
+        let tools = repository_text("docs/examples/tools.starter.json");
+        let deny = "{\"schema_version\": \"0.1.0\", \"default_action\": \"deny\"}\n";
+        let base = read(&write_bundle("production", deny, &tools));
+        assert!(crate::config::semantic_diff::bundles(&base, &base).is_empty());
+
+        // The validator fills in every default, so spelling one out is no
+        // change; only the pin moves.
+        let spelled = "{\"schema_version\": \"0.1.0\", \"default_action\": \"deny\", \"enforcement_mode\": \"enforce\", \"roles\": {}}\n";
+        let diff = crate::config::semantic_diff::bundles(
+            &base,
+            &read(&write_bundle("production", spelled, &tools)),
+        );
+        let fields: Vec<_> = diff.changes().iter().map(|change| change.field()).collect();
+        assert_eq!(fields, ["resources.policy.sha256"]);
+
+        // The starter policy allows by default, which only a development
+        // bundle may do: moving to it is a profile and a policy weakening.
+        let starter = read(&write_bundle(
+            "development",
+            &repository_text("docs/examples/policy.starter.json"),
+            &tools,
+        ));
+        let diff = crate::config::semantic_diff::bundles(&base, &starter);
+        let codes: Vec<_> = diff.risks().into_iter().map(|code| code.as_str()).collect();
+        assert!(codes.contains(&"risk.policy_default_allow"), "{codes:?}");
+        assert!(codes.contains(&"risk.profile_changed"), "{codes:?}");
+        assert!(!serde_json::to_string(&diff)
+            .expect("a diff serializes")
+            .contains(CANARY));
+    }
+
+    #[test]
     fn a_bundle_is_read_into_the_production_policy_and_tools() {
         // The starter policy allows by default, which only a development
         // bundle may do.

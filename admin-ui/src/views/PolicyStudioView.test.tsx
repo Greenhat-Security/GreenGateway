@@ -312,7 +312,7 @@ describe('PolicyStudioView', () => {
     expect((screen.getByRole('button', { name: 'Save draft' }) as HTMLButtonElement).disabled).toBe(true);
 
     fireEvent.click(screen.getByRole('tab', { name: /Egress/ }));
-    const panel = screen.getByRole('tabpanel');
+    const panel = screen.getByRole('tabpanel', { name: /Egress/ });
     expect(within(panel).getByText('api.example.com')).toBeTruthy();
     expect(within(panel).queryAllByRole('textbox')).toHaveLength(0);
     expect(within(panel).getByText('Read-only here')).toBeTruthy();

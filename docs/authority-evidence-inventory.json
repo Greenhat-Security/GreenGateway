@@ -1333,7 +1333,7 @@
           "anchor": "async fn migration_twenty_one_journals_existing_evidence_in_commit_order("
         },
         {
-          "path": "gateway/src/app_tests.rs",
+          "path": "gateway/src/admin_tokens_app_tests.rs",
           "anchor": "async fn admin_token_rotate_and_revoke_record_the_authenticated_subject_and_issuer_postgres("
         },
         {
@@ -1434,7 +1434,7 @@
           "anchor": "fn rotate_preserves_record_metadata_and_invalidates_old_plaintext("
         },
         {
-          "path": "gateway/src/app_tests.rs",
+          "path": "gateway/src/admin_tokens_app_tests.rs",
           "anchor": "async fn admin_token_rotate_and_revoke_record_the_authenticated_subject_and_issuer_sqlite("
         },
         {

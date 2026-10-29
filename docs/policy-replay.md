@@ -6,13 +6,14 @@ replay can run, each retained record has to be turned into the facts the
 policy evaluator reads, with every fact the record does not carry stated as
 missing rather than guessed. A **replay context** is that record, and this
 page describes its format, `replay-context.v1`, and how the gateway reads one
-out of the audit events it writes today (issue #243, slice 12), and the
+out of the audit events it writes today (issue #243, slice 12), the
 bounded [replay jobs](#replay-jobs) that decide a window of them again under
-a candidate policy (slice 13).
+a candidate policy (slice 13), and the [impact comparison](#impact-comparison)
+that compares those answers with the active policy the candidate was written
+against and with what was recorded (slice 14).
 
-The recorded-versus-candidate comparison (slice 14) is a later slice. Nothing
-on the request path writes a replay context: every context comes from the
-legacy adapters described below, is built in memory, and is never stored.
+Nothing on the request path writes a replay context: every context comes from
+the legacy adapters described below, is built in memory, and is never stored.
 
 ## What a replay context is, and what it is not
 
@@ -24,7 +25,8 @@ A replay context carries, for one HTTP request or one tool invocation:
   as recorded, absent or `not_recorded`;
 - the **recorded result**: what the gateway's policy stage recorded at the
   time, under the evaluator and resources it ran then. It is a comparison
-  aid, never an input to a replayed decision.
+  aid, never an input to a replayed decision; the
+  [impact comparison](#recorded-against-base) is what compares it.
 
 It does not carry anything the evaluator does not read. Source address, user
 agent, request id, email, organization, session, headers, query values,
@@ -251,8 +253,9 @@ refused it. No replay performs a lookup.
 ## Replay jobs
 
 `POST /v1{ADMIN_PREFIX}/policy/replays` starts a bounded job that decides one
-window of the standalone audit log again under a candidate policy, through the
-same evaluator the live adapters call, and reports what it decided as counts.
+window of the standalone audit log again under a candidate policy and under
+the active policy it was written against, through the same evaluator the live
+adapters call, and reports what each decided and how they differ as counts.
 `GET /v1{ADMIN_PREFIX}/policy/replays/{id}` reads the job, its progress and,
 once it has finished, its result; `DELETE` on the same path cancels a job that
 has not finished and discards one that has.
@@ -279,6 +282,7 @@ refuses unknown, repeated and credential-shaped members.
       "value": { "id": "lockdown", "methods": ["GET"], "path": "/orders/**", "action": "deny" } }
   ] },
   "window": { "from": "2026-10-27T00:00:00Z", "to": "2026-10-28T00:00:00Z" },
+  "projections": ["as_authored", "enforce_all_shadow"],
   "max_records": 50000,
   "idempotency_key": "nightly"
 }
@@ -289,6 +293,7 @@ refuses unknown, repeated and credential-shaped members.
 | `base_etag` | Required. The active policy's ETag the request was written against. A different active policy is `412 policy_replay_base_stale`, never a rebase |
 | `candidate` | Required. `active` (the base itself), `edits` (1 to 64 position-aware edits over the base) or `inline` (a complete policy document), with exactly the members a [simulation](policy-simulation.md) candidate has. An edited or inline candidate is validated like a policy write and never stored |
 | `window` | Required. `from` and optional `to`, RFC 3339 date-times with an offset; the window is `[from, to)` over audit timestamps. `to` defaults to the moment the job is created and may not be later; the window must begin before it ends and may cover at most 31 days |
+| `projections` | Optional. The [simulation](policy-simulation.md)'s projections the [impact comparison](#impact-comparison) is reported under, each named once: `as_authored`, `enforce_all_shadow` or both. `["as_authored"]` when omitted |
 | `max_records` | Optional. The most records the job reads, 1 to 100,000; 100,000 when omitted |
 | `idempotency_key` | Optional. 1 to 128 ASCII letters, digits, `.`, `_`, `:` and `-`. A retry by the same principal with the same key and the same request bytes answers `200` with the job it already started, and starts nothing; the same key with a different request is `409 policy_replay_idempotency_conflict`. A key is remembered as long as its job is |
 
@@ -329,6 +334,8 @@ simply holds fewer rows; the cutoff's count says how many.
 | Finished job kept | 15 minutes after it finishes | The job reads `expired`, with no result |
 | Expired job remembered | 1 hour after that | `404` |
 | Request body | 2 MiB, or `MAX_BODY_SIZE` if lower | `413` |
+| Impact rows | 64 transition-matrix rows and 32 changed-element rows per lane and projection; 64 rows per lane of the recorded comparison | Further rows are counted in `matrix_omitted` or `changed_elements_omitted`; every transition count stays complete |
+| Result | 512 KiB rendered | `failed` with `result_too_large`, never a cut result |
 
 No job is ever evicted to make room for another. A stopped scan is still a
 result, an incomplete one whose counts cover what was read; it is never a
@@ -363,10 +370,13 @@ evaluator refused are all counted, by code.
 Every job leaves exactly its own lifecycle records: `policy.replay_started`
 when it is admitted, and one of `policy.replay_completed`,
 `policy.replay_cancelled` or `policy.replay_failed` when it ends. They carry
-the job id, the base and candidate ETags, the request digest, the window and
-cutoff, counts, limitation codes and the result digest -- never a record, a
-principal, a path or policy content -- and the envelope of the request that
-started the job. A job is queued only once the audit log accepts its start
+the job id, the base and candidate ETags, the request digest, the projections,
+the window and cutoff, counts (the completion's `impact` member counts newly
+allowed, newly denied, enforcement-only, newly forwarded, newly blocked,
+indeterminate and unsupported records per projection), limitation codes and
+the result digest -- never a record, a principal, a path, an element id or
+other policy content -- and the envelope of the request that started the
+job. A job is queued only once the audit log accepts its start
 (otherwise `503 policy_replay_audit_unavailable`, and no job), and its result
 is published only once the audit log accepts its completion: a result whose
 completion is not accepted is `failed` with `audit_unavailable`. "Accepted"
@@ -397,10 +407,9 @@ A job's representation is always sent with `Cache-Control: no-store`.
 
 A job's representation (`policy-replay-job.v1`) states its state, the
 evaluator and gateway versions, the base ETag and whether it is still the
-active one (`base.current`: a result stays the answer for the policies it was
-pinned to, and is stale for the live one once that changes), the candidate's
-source and ETag, the window, the cutoff, the limits applied and its progress.
-A finished job adds `result_digest` and `result`, a
+active one (`base.current`), its `freshness`, the candidate's source and
+ETag, the projections, the window, the cutoff, the limits applied and its
+progress. A finished job adds `result_digest` and `result`, a
 `policy-replay-results.v1` document:
 
 ```json
@@ -439,22 +448,37 @@ A finished job adds `result_digest` and `result`, a
               "outcomes": [], "limitations": {}, "refusals": {},
               "egress_not_replayed": 0 }
   },
+  "impact": {
+    "candidate_is_base": false,
+    "projections": { "as_authored": { "statement": {}, "http": {}, "tool": {} } },
+    "rate": {},
+    "recorded": { "http": {}, "tool": {} }
+  },
   "not_replayed": ["authentication", "request_admission", "rate_capacity",
                    "tool_leases", "egress", "transport", "upstream"]
 }
 ```
 
 (The tool lane's `outcomes` are abbreviated above; they have the HTTP lane's
-shape.)
+shape. `impact` is described in [Impact comparison](#impact-comparison).)
+
+`freshness` says whether the result describes the live policy:
+
+| `freshness.state` | Meaning |
+| --- | --- |
+| `current` | The active policy is still the job's base |
+| `stale` | `reason: base_changed`: the active policy changed after the job was pinned. The result stays the answer for the policies it was pinned to, but it is not evidence about the live policy, and must not be reused to justify a change to it: start a new job |
+| `unknown` | This response did not check (a cancellation's `202`, or a retry that raced its job's admission) |
 
 - **`records`** classifies every row read: the adapter code of each, as in
   [Reading the audit records the gateway writes today](#reading-the-audit-records-the-gateway-writes-today),
   plus `unreadable_record` (actor or payload JSON that does not parse) and
   `oversized_record`.
-- **`replayed`** is the candidate's answer for every replayable record, per
-  lane: decided outcomes counted by logical decision, enforcement, effective
-  action and reason, in the [simulation](policy-simulation.md)'s vocabulary,
-  so a shadowed deny is never counted as an allow; `indeterminate` answers by
+- **`replayed`** is the candidate's answer, as authored, for every
+  replayable record, per lane: decided outcomes counted by logical decision,
+  enforcement, effective action and reason, in the
+  [simulation](policy-simulation.md)'s vocabulary, so a shadowed deny is never
+  counted as an allow; `indeterminate` answers by
   limitation code (`missing_principal_fact`, `missing_dispatch_fact`,
   `missing_mcp_identity` and the rest); and `refused` records, whose facts
   the evaluator refused because no served request could have left them.
@@ -463,21 +487,17 @@ shape.)
 - **`not_replayed`** names the stages a replay does not include. v1 records
   carry no egress destination, so egress is never replayed.
 
-A result holds counts and stable codes only. It repeats no subject, issuer,
-path, host, request id, source address, user agent, rule id or other value
-from a record. Every count is keyed by a code from a closed set and rendered
-sorted, and `result_digest` is the ADR-0004 semantic digest
-(`application/vnd.greengateway.policy-replay-results+json`,
+A result holds counts and stable codes, and names policy elements only as
+the [impact comparison](#privacy-projection) does: by position in the base or
+the candidate, with the element's own id. It repeats no subject, issuer,
+path, host, request id, source address, user agent, recorded rule id or other
+value from a record. Every count is keyed by a code from a closed set or by a
+policy element and rendered sorted, and `result_digest` is the ADR-0004
+semantic digest (`application/vnd.greengateway.policy-replay-results+json`,
 `policy-replay-results.v1`) of the result: two complete jobs over the same
-cutoff, candidate and evaluator produce byte-identical results, however the
-log was paged. A job stopped by its deadline is the one exception, and says
-so.
-
-A result reports what the candidate decides for the records. It does not yet
-compare that with what was recorded or with the active policy: that is the
-impact comparison (slice 14), and only it can support the statement "No newly
-allowed decisions were observed among N replayable events". No replay result
-says a policy is safe.
+cutoff, base, candidate, projections and evaluator produce byte-identical
+results, however the log was paged. A job stopped by its deadline is the one
+exception, and says so. No replay result says a policy is safe.
 
 ### Standalone only, and process-local
 
@@ -492,6 +512,19 @@ PostgreSQL, which no replay reader covers yet. Without a
 standalone audit log (`AUDIT_SQLITE_PATH` unset) the start route is
 `503 audit_evidence_unavailable`, never an empty result.
 
+### In the admin UI
+
+The Policy Studio's Impact view (#243 slice 18) starts jobs over the live
+policy or the open draft's text, polls them, cancels or discards them, and
+shows a result's records by classification and its decisions per lane. It
+lists only the jobs started in the page. A start whose answer was lost is
+checked by sending the same request under the same idempotency key, never
+retried as a new job. An incomplete result is labelled as satisfying no gate,
+`no_data` is shown as no decisions rather than as zero, and the view states
+that a replay does not compare its decisions with recorded ones yet. See
+**Policy Studio workbench** in
+[the configuration reference](configuration.md#policy_file).
+
 ### Side effects
 
 A job reads the audit log, and that is all it does outside its own memory. It
@@ -503,6 +536,177 @@ record a would-deny, admit a tool and reach an upstream, and checks that the
 job left only its two lifecycle records, moved no metric beyond its requests'
 own, charged no bucket, reached no upstream and wrote no row to the log --
 then sends the same request live to show each of those checks can fail.
+
+## Impact comparison
+
+A replay job decides every replayable record three ways, and the result's
+`impact` member compares them (issue #243, slice 14):
+
+- **Recorded**: what the gateway's policy stage recorded when the request was
+  served, under the evaluator and resources it ran then.
+- **Base**: the active policy the job was pinned to (`base_etag`), decided
+  again now.
+- **Candidate**: the candidate, decided again by the same evaluator.
+
+Base against candidate is the impact of the change, reported per projection.
+Recorded against base says how far the base, decided today, is from what was
+recorded. The two are never folded into one answer: a difference between
+recorded and base says nothing about the candidate, and because a v1 record
+does not say which revision or evaluator recorded it, it cannot say whether
+the policy, the configuration or the evaluator changed since.
+
+When the candidate is `active`, the base is the candidate: one compiled
+policy answers both, every transition is unchanged, and
+`candidate_is_base` is `true`. The recorded comparison is still made.
+
+### Transitions
+
+Under each requested projection, every HTTP record and every tool invocation
+is given one transition:
+
+| Transition | Base, then candidate |
+| --- | --- |
+| `newly_allowed` | deny, then allow |
+| `enforcement_only_change` | the same logical decision with a different effect: a deny enforced under one and shadowed under the other |
+| `newly_denied` | allow, then deny, enforced or shadowed |
+| `attribution_only_change` | the same decision and effect, decided by a different element or for a different reason, or with a different shadow observation |
+| `unchanged_deny`, `unchanged_allow` | the same decision, effect, reason, deciding element and observation |
+| `indeterminate` | either policy could not answer for want of a fact; each side's limitation is counted under `limitations.base` and `limitations.candidate` |
+| `unsupported_context` | the evaluator refused the record's facts, counted by code under `refusals` |
+
+Each decided pair also has a `forwarding` change, counted separately:
+`newly_forwarded` when the base would block the request and the candidate
+would forward it -- a newly allowed request, or a deny that is now only
+shadowed -- and `newly_blocked` for the reverse. A shadowed deny is a deny
+that forwards: a deny that became shadowed is an `enforcement_only_change`
+that is `newly_forwarded`, never "unchanged".
+
+Elements are compared by identity, not position. Two rules, routes or rate
+overrides are the same element when they carry the same stable id, or, for
+entries without one (a 0.x document's routes and overrides, and its rules
+that set none), when their content is identical. An edit that inserts a rule
+ahead of others moves them without changing them. Tool entries are the same
+when they are the same tool name.
+
+A lane's comparison:
+
+```json
+{
+  "records": 10, "compared": 10,
+  "transitions": { "newly_allowed": 1, "enforcement_only_change": 1,
+                   "newly_denied": 3, "attribution_only_change": 1,
+                   "unchanged_deny": 0, "unchanged_allow": 4,
+                   "indeterminate": 0, "unsupported_context": 0 },
+  "forwarding": { "newly_forwarded": 1, "newly_blocked": 4 },
+  "matrix": [
+    { "transition": "newly_allowed", "forwarding": "newly_forwarded",
+      "base": { "logical": "deny", "enforcement": "enforced",
+                "effective_action": "would_block", "reason": "default_deny" },
+      "candidate": { "logical": "allow", "enforcement": "not_applicable",
+                     "effective_action": "would_forward", "reason": "default_allow" },
+      "count": 1 }
+  ],
+  "matrix_omitted": 0,
+  "changed_elements": [
+    { "transition": "newly_denied", "forwarding": "newly_blocked",
+      "base": { "kind": "route", "position": 0 },
+      "candidate": { "kind": "rule", "position": 0, "id": "lockdown" },
+      "count": 3 }
+  ],
+  "changed_elements_omitted": 0,
+  "limitations": { "base": {}, "candidate": {} },
+  "refusals": {}
+}
+```
+
+(The matrix and the changed elements are abbreviated.) `transitions` lists
+every code, zeros included. `matrix` counts every decided pair by the two
+decisions in the simulation's vocabulary; `changed_elements` counts the
+changed records -- the first four transitions -- by the element that decided
+under each policy: `rule` and `route` by position in that policy (with
+`id`, or `id_omitted` for one over 128 bytes), `default`, `host_binding` (a
+selected upstream no host-bound route authorized), `tool_entry` with the
+policy's own tool name, or `no_tool_entry` for a tool the policy does not
+list. Both lists are ordered for review: newly allowed first, then
+enforcement-only changes, newly denied, attribution-only changes and the
+unchanged; within a transition, newly forwarded first; and among changed
+elements, the most records first.
+
+`projections.as_authored` also carries a `statement`, the one thing the
+comparison establishes, as a stable code:
+
+| `statement.code` | When |
+| --- | --- |
+| `newly_allowed_observed` | At least one compared record was newly allowed or newly forwarded; the counts are `newly_allowed`, `newly_forwarded` and `replayable_events` (the compared records) |
+| `no_newly_allowed_observed` | The result is complete, at least one record was compared, and none was newly allowed or newly forwarded. Only then is `text` given: "No newly allowed decisions were observed among N replayable events." N counts the compared records only; `indeterminate` and `unsupported_context` records are not among them |
+| `not_established` | `reason: incomplete` for an incomplete result, `nothing_compared` when no record was decided under both policies |
+
+The statement never says a policy is safe, and a replay cannot support one:
+the stages outside the policy verdict were not replayed, and the window
+holds only the traffic that was retained. `enforce_all_shadow` carries no
+statement, because it describes a hypothetical, not the policy as it would
+be served.
+
+### Projections
+
+`as_authored` compares the base and the candidate as written.
+`enforce_all_shadow` compares them with every shadow made enforcing in both --
+each direct `shadow` rule a `deny`, the global enforcement mode `enforce` and
+every per-route `shadow` override `enforce` -- exactly as a
+[simulation](policy-simulation.md)'s projection does. It answers "what would
+this change block if every shadow were promoted", and never previews an
+intended allow. Projections are in-memory copies compiled for the job;
+nothing is rewritten, stored or activated.
+
+### Rate selection
+
+`impact.rate` compares which rate-limit override the base and the candidate
+select for each HTTP record, for the policies as authored (a projection
+changes no override): `unchanged`, `override_added`, `override_removed`,
+`override_changed`, `indeterminate` or `unsupported_context`. An
+`override_changed` record is also counted by how the candidate's configured
+limits compare with the base's -- `looser`, `tighter`, `mixed` or `same`
+(another override with the same limits) -- and changed records are named by
+override (`rate_override` by position, with its id) or `no_override`. It is
+selection only: whether a bucket had capacity was never recorded and is not
+reconstructed.
+
+### Recorded against base
+
+`impact.recorded.http` and `impact.recorded.tool` compare each recorded
+result with the base's answer as authored, the policy the gateway serves:
+
+| Comparison | Meaning |
+| --- | --- |
+| `outcome_differs` | The base decides differently from what was recorded: `allowed`, `denied` or `would_deny` for a request, `admitted` or `denied` for an invocation |
+| `attribution_differs` | The same outcome, for a different reason or by a different element than the record names |
+| `agrees` | The same outcome and, when the record states a reason, the same reason and element |
+| `recorded_not_policy_verdict` | The recorded reason is not a policy verdict -- `policy_evaluation_incomplete`, a revision-check code -- because the policy stage did not answer the request |
+| `base_indeterminate`, `base_refused` | The base could not answer, or the evaluator refused the record's facts |
+
+The element a record names is compared the way the live adapters record it:
+a direct rule by its id, or its position when it has none; a route by its
+permission and path prefix; a default or tool-entry decision by none. A
+record that dropped an over-long attribution (`attribution_omitted`) is
+compared without it, and a record that states no reason -- a tool invocation
+policy admitted -- by outcome only. `matrix` counts the compared records by
+recorded policy and reason against the base's.
+
+A difference here is a reason to look before reading the base-to-candidate
+transitions as a forecast: the base, decided today, is not what served those
+requests.
+
+### Privacy projection
+
+The comparison holds counts keyed by codes from closed sets and by policy
+elements, and names a policy element only as the policy that decided names
+it: its position, its own stable id when it is at most 128 bytes, and a tool
+entry by the name in that policy's own tool map. It never repeats a value
+only a record carries. A recorded rule id, permission or path prefix is
+compared and never copied; a recorded reason is rendered only as the code it
+matched in the closed set of verdict reasons; and a tool a record names that
+the policy does not list is `no_tool_entry`, never its name. Paths, hosts,
+principals, roles, route permissions and dispatch facts never appear.
 
 ## How this is verified
 
@@ -537,4 +741,28 @@ then sends the same request live to show each of those checks can fail.
   body, admitting a job, recording a lifecycle event or consulting the
   cluster authority; and the side-effect test above holds.
 - The `policy-replay.v1` parser and its published schema accept and refuse
-  the same requests.
+  the same requests, projections included.
+- The impact comparison is run over a window that touches every transition,
+  lane and recorded comparison: a candidate that inserts a rule, changes the
+  default, enables a tool and loosens an override is counted transition by
+  transition, with its forwarding changes, matrix and changed elements;
+  elements that only moved, including an id-less one, are unchanged; the
+  shadow projection is its own comparison and leaves the as-authored one as
+  it was; a candidate that is its base changes nothing and gives the
+  statement's sentence only when the result is complete; a record neither
+  policy can answer is indeterminate on both sides; rows past their cap are
+  counted; the comparison is byte-identical however the log is paged; and no
+  record value -- subject, request id, address, user agent, path, recorded
+  rule id, unlisted tool name, issuer, permission or non-verdict reason --
+  appears in a result or completion record.
+- Real requests through the live RBAC middleware, and real invocations
+  through the tool runtime, are compared with the policy that decided them:
+  every recorded verdict `agrees` -- including a rule without an id, which the
+  gateway records by position -- a request the policy stage could not
+  classify is `recorded_not_policy_verdict`, and an MCP alias whose identity
+  was not recorded is `base_indeterminate`.
+- Through the application, a job reports the impact of its candidate and the
+  statement, records the impact counts in its completion event without an
+  element id, reports the shadow projection on request, refuses an unknown
+  projection before any job exists, and reads `stale` once the active policy
+  changes.

@@ -2441,3 +2441,42 @@ fn number_domains_and_byte_bounds_are_fixed() {
     assert_eq!(MAX_MANIFEST_BYTES, 64 * 1024);
     assert_eq!(resource::MAX_RESOURCE_BYTES, 1024 * 1024);
 }
+
+// --- the semantic diff of two read bundles -----------------------------------
+
+#[test]
+fn read_bundles_are_diffed_by_their_documents() {
+    use crate::semantic_diff::compare_read_bundles;
+
+    let read = |bundle: &TempBundle| bundle.read().bundle.expect("bundle should be read");
+    let base = read(&TempBundle::complete("diff-base"));
+    assert!(compare_read_bundles(&base, &base).is_empty());
+
+    // The same policy spelled out with its defaults changes only its pin.
+    let respelled = TempBundle::complete("diff-respelled");
+    respelled.write(
+        "policy.json",
+        b"{\"default_action\": \"deny\", \"enforcement_mode\": \"enforce\", \"schema_version\": \"0.1.0\"}\n",
+    );
+    respelled.write("bundle.yaml", respelled.manifest().as_bytes());
+    let diff = compare_read_bundles(&base, &read(&respelled));
+    let fields: Vec<_> = diff.changes().iter().map(|change| change.field()).collect();
+    assert_eq!(fields, ["resources.policy.sha256"]);
+    assert!(diff.risks().is_empty());
+
+    // A broadened policy carries its codes, and no value reaches the report.
+    let broadened = TempBundle::complete("diff-broadened");
+    broadened.write(
+        "policy.json",
+        format!(
+            "{{\"schema_version\": \"0.1.0\", \"default_action\": \"deny\", \"roles\": {{\"{CANARY}\": {{\"permissions\": [\"admin:policy:write\"]}}}}, \"egress\": {{\"hosts\": [\"{CANARY}.example.test\"]}}}}\n"
+        )
+        .as_bytes(),
+    );
+    broadened.write("bundle.yaml", broadened.manifest().as_bytes());
+    let diff = compare_read_bundles(&base, &read(&broadened));
+    let codes: Vec<_> = diff.risks().into_iter().map(|code| code.as_str()).collect();
+    assert_eq!(codes, ["risk.egress_broadened", "risk.policy_broadened"]);
+    let report = serde_json::to_string(&diff).expect("a diff serializes");
+    assert!(!report.contains(CANARY), "{report}");
+}
