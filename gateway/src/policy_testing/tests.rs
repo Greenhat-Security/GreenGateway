@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use serde_json::{json, Value};
 
 use super::{
@@ -5,6 +7,7 @@ use super::{
     run_against_policy,
     runner::{CaseStatus, RunStatus, Summary},
     suite::{parse_suite, Diagnostics, MAX_CASES, SUITE_SCHEMA_VERSION},
+    RunError,
 };
 use crate::{policy_eval::PolicyAuthority, rbac::Policy};
 
@@ -250,11 +253,22 @@ fn binding() -> PolicyBinding {
     }
 }
 
+/// A deadline no test run comes near: these tests are about verdicts, and
+/// `a_run_past_its_deadline_returns_nothing` about the bound.
+fn far_deadline() -> Instant {
+    Instant::now() + Duration::from_secs(600)
+}
+
 fn run(document: &Value) -> RunReport {
     let suite = parse_suite(document).expect("the suite is valid");
     let digest = suite.digest.clone();
-    let outcome =
-        run_against_policy(policy(), PolicyAuthority::Standalone, &suite).expect("policy compiles");
+    let outcome = run_against_policy(
+        policy(),
+        PolicyAuthority::Standalone,
+        &suite,
+        far_deadline(),
+    )
+    .expect("policy compiles and the run finishes");
     RunReport::new(digest, binding(), outcome)
 }
 
@@ -365,6 +379,30 @@ fn run_status_is_the_worst_outcome_and_never_passes_an_empty_run() {
     assert_eq!(summary(1, 1, 1, 0).status(), RunStatus::Incomplete);
     assert_eq!(summary(1, 1, 1, 1).status(), RunStatus::Error);
     assert_eq!(summary(0, 0, 0, 0).status(), RunStatus::Failed);
+}
+
+/// A run is a cooperative bound on CPU time, like a simulation: past its
+/// deadline it decides no further case and returns no partial report, which
+/// could read as a smaller suite that passed.
+#[test]
+fn a_run_past_its_deadline_returns_nothing() {
+    let suite = parse_suite(&suite(passing_cases())).expect("the suite is valid");
+    let past = Instant::now()
+        .checked_sub(Duration::from_millis(1))
+        .unwrap_or_else(Instant::now);
+    assert!(matches!(
+        run_against_policy(policy(), PolicyAuthority::Standalone, &suite, past),
+        Err(RunError::DeadlineExceeded)
+    ));
+    // The same suite inside its deadline decides every case.
+    let outcome = run_against_policy(
+        policy(),
+        PolicyAuthority::Standalone,
+        &suite,
+        far_deadline(),
+    )
+    .expect("the run finishes");
+    assert_eq!(outcome.summary.total, passing_cases().len());
 }
 
 #[test]

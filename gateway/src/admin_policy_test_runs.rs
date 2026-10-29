@@ -7,46 +7,29 @@
 //! and emits one `policy.tests_run` audit record that carries digests, the
 //! policy ETag and counts -- never a case, fixture value or policy content.
 //! The evaluation itself is the pure runner in `policy_testing`, on a blocking
-//! thread so a large suite cannot stall the async workers, behind a
-//! deployment-wide bound on concurrent runs.
-use std::sync::atomic::{AtomicUsize, Ordering};
-
+//! thread so a large suite cannot stall the async workers, under a deadline,
+//! and behind the same per-replica and per-actor bound simulations use
+//! ([`PolicyEvaluationLimiter`]).
 use super::*;
 
-/// Most runs evaluating at once across the process. A run is CPU-only and
-/// bounded by its body and case limits; this bounds how many of those can
-/// compete with the data plane at the same moment. A run over the bound is
-/// refused with `429`, never queued and never allowed to displace another.
+/// Most runs evaluating at once on this replica. A run is CPU-only and
+/// bounded by its body, case and deadline limits; this bounds how many of
+/// those can compete with the data plane at the same moment. A run over the
+/// bound is refused with `429`, never queued and never allowed to displace
+/// another.
 pub(super) const MAX_CONCURRENT_POLICY_TEST_RUNS: usize = 4;
+/// Largest test-run request body, in bytes: room for a complete inline
+/// candidate at the policy compiler's 1 MiB bound plus its suite.
+pub(super) const MAX_POLICY_TEST_RUN_BODY_BYTES: usize = 2 * 1024 * 1024;
+/// How long a run's body may take to arrive. A run is admitted only once its
+/// body is in hand, so a trickled upload holds no slot; this also stops it
+/// holding the request open indefinitely.
+pub(super) const POLICY_TEST_RUN_BODY_DEADLINE: Duration = Duration::from_secs(5);
+/// The wall-clock bound on one run's evaluation, compilation included.
+pub(super) const POLICY_TEST_RUN_DEADLINE: Duration = Duration::from_secs(5);
 /// The run's overall result, for callers that only need a gate: `passed`,
 /// `failed`, `incomplete` or `error`. Present on every completed run.
 pub(super) const POLICY_TESTS_STATUS_HEADER: &str = "x-greengateway-policy-tests-status";
-
-static ACTIVE_POLICY_TEST_RUNS: AtomicUsize = AtomicUsize::new(0);
-
-/// One admitted run. Releasing it is tied to drop, so a run that ends by any
-/// path -- a refusal, a panic on the blocking thread, a cancelled request --
-/// gives its slot back.
-pub(super) struct PolicyTestRunSlot {
-    counter: &'static AtomicUsize,
-}
-
-impl PolicyTestRunSlot {
-    pub(super) fn try_acquire(counter: &'static AtomicUsize, limit: usize) -> Option<Self> {
-        counter
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < limit).then_some(active + 1)
-            })
-            .ok()
-            .map(|_| Self { counter })
-    }
-}
-
-impl Drop for PolicyTestRunSlot {
-    fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::AcqRel);
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PolicyTestFormat {
@@ -354,6 +337,7 @@ fn policy_tests_response(
 
 pub(super) async fn policy_test_runs_endpoint(
     State(state): State<PolicyAdminState>,
+    Extension(limiter): Extension<Arc<PolicyEvaluationLimiter>>,
     request: AxumRequest,
 ) -> Response {
     record_request(POLICY_TEST_RUNS_ADMIN_ROUTE);
@@ -370,19 +354,27 @@ pub(super) async fn policy_test_runs_endpoint(
     if !rbac_state.principal_has_permission(&principal, ADMIN_POLICY_SIMULATE_PERMISSION) {
         return admin_permission_denied_response(ADMIN_POLICY_SIMULATE_PERMISSION.to_owned());
     }
-    let Some(_slot) =
-        PolicyTestRunSlot::try_acquire(&ACTIVE_POLICY_TEST_RUNS, MAX_CONCURRENT_POLICY_TEST_RUNS)
-    else {
+    let body_limit = state.max_body_size.min(MAX_POLICY_TEST_RUN_BODY_BYTES);
+    let body_deadline = tokio::time::Instant::now() + POLICY_TEST_RUN_BODY_DEADLINE;
+    let body = match read_request_body_before(body, body_limit, body_deadline).await {
+        Ok(body) => body,
+        Err(TimedBodyReadError::Rejected(response)) => return *response,
+        Err(TimedBodyReadError::DeadlineExceeded) => {
+            return policy_tests_refusal(
+                StatusCode::REQUEST_TIMEOUT,
+                "the policy test run body did not arrive within its deadline",
+                "policy_tests_request_timeout",
+            );
+        }
+    };
+    // Admitted once the body is in hand, so a slot bounds runs doing work
+    // rather than uploads in flight, and one caller holds at most one.
+    let Some(slot) = limiter.try_acquire(policy_evaluation_actor(&principal)) else {
         return policy_tests_refusal(
             StatusCode::TOO_MANY_REQUESTS,
             "too many policy test runs are in progress; retry later",
             "policy_tests_busy",
         );
-    };
-
-    let body = match read_request_body(body, state.max_body_size).await {
-        Ok(body) => body,
-        Err(response) => return *response,
     };
     let run_request = match parse_policy_test_run_request(&body) {
         Ok(run_request) => run_request,
@@ -410,16 +402,28 @@ pub(super) async fn policy_test_runs_endpoint(
         };
 
     let suite_digest = suite.digest.clone();
-    let outcome = match tokio::task::spawn_blocking(move || {
-        policy_testing::run_against_policy(policy, authority, &suite)
-    })
-    .await
+    // The blocking thread owns the slot, so a request dropped mid-run keeps
+    // its slot until the run it started has ended. The deadline starts
+    // before compilation, so compiling counts against it.
+    let outcome = match slot
+        .run_blocking(move || {
+            let deadline = Instant::now() + POLICY_TEST_RUN_DEADLINE;
+            policy_testing::run_against_policy(policy, authority, &suite, deadline)
+        })
+        .await
     {
         Ok(Ok(outcome)) => outcome,
+        Ok(Err(policy_testing::RunError::DeadlineExceeded)) => {
+            return policy_tests_refusal(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the policy test run did not finish within its deadline; run fewer cases",
+                "policy_tests_deadline_exceeded",
+            );
+        }
         // A policy the authority holds that the kernel will not compile, or
         // a runner that did not finish, is a failed run: no partial result
         // and nothing that could read as a pass.
-        Ok(Err(error)) => {
+        Ok(Err(policy_testing::RunError::Compile(error))) => {
             tracing::error!(error = ?error, "policy under test could not be compiled");
             return internal_server_error("policy test run failed");
         }

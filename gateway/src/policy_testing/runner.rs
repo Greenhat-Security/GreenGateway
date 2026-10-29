@@ -7,11 +7,13 @@
 //! what production decides for the same facts.
 //!
 //! The run is pure. It reads the compiled policy and the suite and returns a
-//! report; it performs no I/O, takes no lock, emits no audit event, and
-//! touches no rate bucket, tool permit or upstream. Fixture values live only
-//! in the suite while the run reads them: the report carries case ids,
-//! expectations and stable outcome codes, never a path, host, subject, role or
-//! tool name a case supplied.
+//! report, or nothing once its deadline passes; it performs no I/O, takes no
+//! lock, emits no audit event, and touches no rate bucket, tool permit or
+//! upstream. Fixture values live only in the suite while the run reads them:
+//! the report carries case ids, expectations and stable outcome codes, never
+//! a path, host, subject, role or tool name a case supplied.
+
+use std::time::Instant;
 
 use serde::Serialize;
 
@@ -207,11 +209,26 @@ impl RunOutcome {
     }
 }
 
-/// Run every case of `suite` against `policy`, in suite order.
-pub(crate) fn run_suite(policy: &PolicyUnderTest, suite: &Suite) -> RunOutcome {
+/// The run passed its deadline before every case was decided. Nothing of it
+/// is returned: a partial report could read as a smaller suite that passed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DeadlineExceeded;
+
+/// Run every case of `suite` against `policy`, in suite order, deciding no
+/// case once `deadline` has passed.
+pub(crate) fn run_suite(
+    policy: &PolicyUnderTest,
+    suite: &Suite,
+    deadline: Instant,
+) -> Result<RunOutcome, DeadlineExceeded> {
     let mut summary = Summary::default();
     let mut cases = Vec::with_capacity(suite.cases.len());
     for case in &suite.cases {
+        // A cooperative bound on CPU time: cases are cheap, but a run is
+        // never allowed to occupy a blocking thread without limit.
+        if Instant::now() > deadline {
+            return Err(DeadlineExceeded);
+        }
         let result = run_case(policy, case);
         summary.total += 1;
         match result.status {
@@ -222,7 +239,7 @@ pub(crate) fn run_suite(policy: &PolicyUnderTest, suite: &Suite) -> RunOutcome {
         }
         cases.push(result);
     }
-    RunOutcome { summary, cases }
+    Ok(RunOutcome { summary, cases })
 }
 
 fn principal_fact(principal: &SyntheticPrincipal) -> PrincipalFact {
