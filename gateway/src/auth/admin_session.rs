@@ -362,17 +362,10 @@ impl AdminSessions {
         method: &Method,
         headers: &HeaderMap,
     ) -> Result<Principal, SessionRefusal> {
-        let invalid = || SessionRefusal::Auth(AuthError::InvalidSession(INVALID.to_owned()));
-        if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err(invalid());
-        }
-        let key = self.digest(PURPOSE_SESSION, value);
-        let session = self
-            .store
-            .lookup(&key)
+        let (key, session) = self
+            .live_session(value)
             .await
-            .map_err(SessionRefusal::Auth)?
-            .ok_or_else(invalid)?;
+            .map_err(SessionRefusal::Auth)?;
         if !is_safe_method(method)
             && self
                 .presented_csrf(headers)
@@ -381,36 +374,84 @@ impl AdminSessions {
         {
             return Err(SessionRefusal::CsrfUnbound);
         }
+        let mut principal = self
+            .provider_principal(&key, &session)
+            .await
+            .map_err(SessionRefusal::Auth)?;
+        // Recheck after the await: logout/expiry during validation wins.
+        // The request is admitted only while its session still exists.
+        if !self
+            .store
+            .admit(&key, &session.id)
+            .await
+            .map_err(SessionRefusal::Auth)?
+        {
+            return Err(SessionRefusal::Auth(AuthError::InvalidSession(
+                INVALID.to_owned(),
+            )));
+        }
+        principal.auth_method = AuthMethod::Cookie;
+        principal.session_id = session.id;
+        Ok(principal)
+    }
+
+    /// Judge the session cookie `value` again for a request that was already
+    /// admitted with it and is still answering: the admin audit event stream.
+    ///
+    /// The same checks as [`AdminSessions::authenticate`] -- the session is
+    /// live, the provider still accepts its token for the same identity, and
+    /// it is still live afterwards, so a logout during validation wins -- but
+    /// it is not a new request: it needs no CSRF token, and it does not move
+    /// the idle deadline. Watching a stream is not activity, so an open
+    /// stream cannot keep an idle session alive.
+    pub async fn reauthenticate(&self, value: &str) -> Result<Principal, AuthError> {
+        let (key, session) = self.live_session(value).await?;
+        let mut principal = self.provider_principal(&key, &session).await?;
+        match self.store.lookup(&key).await? {
+            Some(current) if current.id == session.id => {}
+            _ => return Err(AuthError::InvalidSession(INVALID.to_owned())),
+        }
+        principal.auth_method = AuthMethod::Cookie;
+        principal.session_id = session.id;
+        Ok(principal)
+    }
+
+    /// The live session for cookie `value`, with its store key.
+    async fn live_session(&self, value: &str) -> Result<(SessionDigest, StoredSession), AuthError> {
+        if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(AuthError::InvalidSession(INVALID.to_owned()));
+        }
+        let key = self.digest(PURPOSE_SESSION, value);
+        let session = self
+            .store
+            .lookup(&key)
+            .await?
+            .ok_or_else(|| AuthError::InvalidSession(INVALID.to_owned()))?;
+        Ok((key, session))
+    }
+
+    /// Ask the provider about `session`'s token. A rejection, or a token
+    /// that now names another identity, withdraws the session; an
+    /// unavailable provider leaves it alone.
+    async fn provider_principal(
+        &self,
+        key: &SessionDigest,
+        session: &StoredSession,
+    ) -> Result<Principal, AuthError> {
         let result = self
             .authority
             .validate_session(&SessionCredential::Bearer(session.token.to_string()))
             .await;
         match result {
-            Ok(mut principal)
+            Ok(principal)
                 if principal.user_id == session.user_id && principal.issuer == session.issuer =>
             {
-                // Recheck after the await: logout/expiry during validation
-                // wins. The request is admitted only while its session still
-                // exists.
-                if !self
-                    .store
-                    .admit(&key, &session.id)
-                    .await
-                    .map_err(SessionRefusal::Auth)?
-                {
-                    return Err(invalid());
-                }
-                principal.auth_method = AuthMethod::Cookie;
-                principal.session_id = session.id;
                 Ok(principal)
             }
-            Err(error @ AuthError::Upstream(_)) => Err(SessionRefusal::Auth(error)),
+            Err(error @ AuthError::Upstream(_)) => Err(error),
             _ => {
-                self.store
-                    .reject(&key, &session.id)
-                    .await
-                    .map_err(SessionRefusal::Auth)?;
-                Err(invalid())
+                self.store.reject(key, &session.id).await?;
+                Err(AuthError::InvalidSession(INVALID.to_owned()))
             }
         }
     }

@@ -4,6 +4,16 @@ import { AuditEvent } from './audit';
 import { authHeaders, adminRequestCredentials, assertAdminRequestOrigin } from './auth';
 import { adminApiUrl } from './config';
 
+/**
+ * The event name of the frame the gateway ends a stream with when it stops
+ * the stream itself: the caller's session ended or could not be checked,
+ * the stream permission was revoked, or the stream reached its maximum
+ * lifetime. It carries `{"reason": ...}`, not an audit event, so it is
+ * never handed to `onEvent`; the stream ends right after it, and a
+ * reconnect either resumes or reports why it cannot.
+ */
+export const AUDIT_STREAM_CLOSED_EVENT = 'stream.closed';
+
 export type AuditEventStreamFilters = {
   eventType: string;
   path: string;
@@ -131,7 +141,7 @@ function emitFrame(
     }
   }
 
-  if (dataLines.length === 0) {
+  if (dataLines.length === 0 || eventName === AUDIT_STREAM_CLOSED_EVENT) {
     return;
   }
 

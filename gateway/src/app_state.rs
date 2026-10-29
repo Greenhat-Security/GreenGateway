@@ -403,6 +403,9 @@ pub(super) struct AuditAdminState {
     pub(super) query_store: Option<Arc<dyn storage::AuditEventStore>>,
     pub(super) event_sender: audit::AuditEventSender,
     pub(super) rbac_state: Option<middleware::rbac::RbacState>,
+    /// How often an open event stream re-checks its caller, and how long it
+    /// may stay open: [`AuditStreamLimits::SERVED`] outside tests.
+    pub(super) stream_limits: AuditStreamLimits,
     /// The durable PostgreSQL audit store, present only in cluster mode.
     /// Its stream cursor is what the SSE endpoint serves: committed events
     /// from every replica, replayable from a client's `Last-Event-ID`,
