@@ -67,7 +67,7 @@ use super::{
     identity_mappings::IdentityMapping,
     policy::{
         DefaultAction, EgressPolicy, EnforcementMode, Policy, PolicyError, RoleEntry,
-        ToolPolicyEntry, V0Rejection, KNOWN_TOP_LEVEL_KEYS, MAX_POLICY_FILE_BYTES,
+        ToolPolicyEntry, V0Rejection, MAX_POLICY_FILE_BYTES, V1_TOP_LEVEL_KEYS,
     },
     RateLimitRule, RouteRule, Rule,
 };
@@ -1218,7 +1218,7 @@ fn check_v1_structure(document: &Value, issues: &mut IssueList) {
         return;
     };
     for name in sorted_names(object) {
-        if !KNOWN_TOP_LEVEL_KEYS.contains(&name.as_str()) {
+        if !V1_TOP_LEVEL_KEYS.contains(&name.as_str()) {
             issues.push(PolicyIssue::located(
                 IssueCode::UnknownMember,
                 format!("/{}", pointer_token(name)),

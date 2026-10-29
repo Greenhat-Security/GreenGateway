@@ -19,7 +19,10 @@ use crate::{
         PrincipalFact, PrincipalIdentity, CONTEXT_VERSION,
     },
     rbac::{
-        policy::{DEFAULT_TOOL_POLICY_MAX_CONCURRENT, DEFAULT_TOOL_POLICY_TIMEOUT_MS},
+        policy::{
+            DEFAULT_TOOL_POLICY_MAX_CONCURRENT, DEFAULT_TOOL_POLICY_TIMEOUT_MS,
+            KNOWN_TOP_LEVEL_KEYS, V1_ONLY_TOP_LEVEL_KEYS,
+        },
         PrincipalMatcher, RuleAction, RuleDispatchMatcher,
     },
 };
@@ -1278,11 +1281,18 @@ fn the_member_vocabularies_match_the_parser() {
         .keys()
         .cloned()
         .collect();
-    let known: BTreeSet<String> = KNOWN_TOP_LEVEL_KEYS
+    let known: BTreeSet<String> = V1_TOP_LEVEL_KEYS
         .iter()
         .map(|key| (*key).to_owned())
         .collect();
     assert_eq!(written, known);
+    // v1's top level is the 0.x vocabulary and the members only v1 defines.
+    let mut both: BTreeSet<&str> = KNOWN_TOP_LEVEL_KEYS.iter().copied().collect();
+    both.extend(V1_ONLY_TOP_LEVEL_KEYS);
+    assert_eq!(
+        both,
+        V1_TOP_LEVEL_KEYS.iter().copied().collect::<BTreeSet<_>>()
+    );
 }
 
 #[test]
@@ -1373,10 +1383,7 @@ fn the_published_v1_schema_matches_the_member_vocabularies() {
         .collect();
     assert_eq!(
         top_level,
-        KNOWN_TOP_LEVEL_KEYS
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>()
+        V1_TOP_LEVEL_KEYS.iter().copied().collect::<BTreeSet<_>>()
     );
     assert_eq!(schema["additionalProperties"], json!(false));
     // A condition node names exactly one operator, from the same vocabulary.

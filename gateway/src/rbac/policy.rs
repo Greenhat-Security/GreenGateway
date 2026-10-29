@@ -27,7 +27,26 @@ use crate::{
     request_bounds::MAX_TOOL_NAME_BYTES,
 };
 
+/// The top-level members a 0.x document may have. A 0.x reader warns about
+/// any other member and drops it, except one of [`V1_ONLY_TOP_LEVEL_KEYS`],
+/// which it refuses.
 pub(crate) const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
+    "schema_version",
+    "id",
+    "default_action",
+    "enforcement_mode",
+    "roles",
+    "routes",
+    "rules",
+    "egress",
+    "rate_limits",
+    "tools",
+];
+/// The top-level members only policy v1 defines.
+pub(crate) const V1_ONLY_TOP_LEVEL_KEYS: &[&str] = &["identity_mappings"];
+/// The closed top-level vocabulary of policy v1, in the order the gateway
+/// writes the members.
+pub(crate) const V1_TOP_LEVEL_KEYS: &[&str] = &[
     "schema_version",
     "id",
     "default_action",
@@ -1261,9 +1280,14 @@ pub(super) fn unknown_top_level_keys(value: &Value) -> Vec<String> {
         return Vec::new();
     };
 
+    // A member only v1 defines is not ignored but refused, as
+    // `validate_v0_has_no_v1_members` does, so it is not reported as dropped.
     object
         .keys()
-        .filter(|key| !KNOWN_TOP_LEVEL_KEYS.contains(&key.as_str()))
+        .filter(|key| {
+            !KNOWN_TOP_LEVEL_KEYS.contains(&key.as_str())
+                && !V1_ONLY_TOP_LEVEL_KEYS.contains(&key.as_str())
+        })
         .cloned()
         .collect()
 }
