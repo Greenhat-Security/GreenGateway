@@ -1142,6 +1142,7 @@ async fn e2e_03_oauth_single_flight_expiry_and_secret_rotation_workflow() {
                     FIRST_SECRET.as_bytes().to_vec(),
                 )
                 .expect("first OAuth secret should validate"),
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .expect("first OAuth secret should create")
     });
@@ -1168,7 +1169,11 @@ async fn e2e_03_oauth_single_flight_expiry_and_secret_rotation_workflow() {
     }))
     .expect("OAuth acceptance connection should deserialize");
     let record = control_plane
-        .create_managed(snapshot.collection_etag(), candidate, ACCEPTANCE_ACTOR)
+        .create_managed(
+            snapshot.collection_etag(),
+            candidate,
+            &crate::auth::change_actor::ChangeActor::for_test(ACCEPTANCE_ACTOR),
+        )
         .await
         .expect("OAuth acceptance connection should create");
     let capture = audit::sink::tests::CaptureSink::new();
@@ -1219,6 +1224,7 @@ async fn e2e_03_oauth_single_flight_expiry_and_secret_rotation_workflow() {
                     ROTATED_SECRET.as_bytes().to_vec(),
                 )
                 .expect("rotated OAuth secret should validate"),
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .expect("OAuth client secret should rotate");
     });
@@ -1429,7 +1435,11 @@ async fn e2e_04_authenticated_mcp_stream_refresh_lkg_and_delete_workflow() {
     }))
     .expect("managed MCP acceptance connection should deserialize");
     let record = control_plane
-        .create_managed(snapshot.collection_etag(), candidate, ACCEPTANCE_ACTOR)
+        .create_managed(
+            snapshot.collection_etag(),
+            candidate,
+            &crate::auth::change_actor::ChangeActor::for_test(ACCEPTANCE_ACTOR),
+        )
         .await
         .expect("managed MCP acceptance connection should create");
     let egress_config = egress::EgressConfig::from_config(&config);

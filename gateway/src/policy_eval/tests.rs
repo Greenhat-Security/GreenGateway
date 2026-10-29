@@ -2036,14 +2036,10 @@ fn parity_router(state: RbacState, legacy: bool) -> Router {
     }
 }
 
-/// Since the #422 legacy retirement the evaluator holds the only serving
-/// `RuleMatcher`, one per compiled snapshot. Every other construction must be
-/// test code: a test file, an in-file `#[cfg(test)] mod tests` block, or a
-/// statement gated by its own `#[cfg(test)]`. A new serving construction
-/// would be a second rule-matching authority beside the evaluator, so it fails
-/// here rather than relying on review to notice it.
-#[test]
-fn the_evaluator_holds_the_only_serving_rule_matcher() {
+/// The gateway source files outside test code that contain `needle`: every
+/// `.rs` file under `src` except test files, an in-file `#[cfg(test)] mod
+/// tests` block, and a statement gated by its own `#[cfg(test)]`.
+fn serving_sources_containing(needle: &str) -> Vec<String> {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut serving = Vec::new();
     let mut pending = vec![root.clone()];
@@ -2073,12 +2069,41 @@ fn the_evaluator_holds_the_only_serving_rule_matcher() {
                 if previous == "#[cfg(test)]" && line.starts_with("mod tests {") {
                     break;
                 }
-                if trimmed.contains("RuleMatcher::new(") && previous != "#[cfg(test)]" {
+                if trimmed.contains(needle) && previous != "#[cfg(test)]" {
                     serving.push(relative.clone());
                 }
                 previous = trimmed;
             }
         }
     }
-    assert_eq!(serving, ["policy_eval/mod.rs"]);
+    serving
+}
+
+/// Since the #422 legacy retirement the evaluator holds the only serving
+/// `RuleMatcher`, one per compiled snapshot. Every other construction must be
+/// test code: a test file, an in-file `#[cfg(test)] mod tests` block, or a
+/// statement gated by its own `#[cfg(test)]`. A new serving construction
+/// would be a second rule-matching authority beside the evaluator, so it fails
+/// here rather than relying on review to notice it.
+#[test]
+fn the_evaluator_holds_the_only_serving_rule_matcher() {
+    assert_eq!(
+        serving_sources_containing("RuleMatcher::new("),
+        ["policy_eval/mod.rs"]
+    );
+}
+
+/// The evaluator also holds the only serving `PolicyEngine`, one per compiled
+/// snapshot. The live lane's management permissions, delegated-role checks
+/// and policy copies ask that engine, and the HTTP adapter resolves route
+/// references on the same instance, so route attribution and management
+/// permissions agree with the decision structurally rather than by
+/// construction. A second serving engine would bring back a copy that could
+/// describe another policy than the one that decided.
+#[test]
+fn the_evaluator_holds_the_only_serving_policy_engine() {
+    assert_eq!(
+        serving_sources_containing("PolicyEngine::new("),
+        ["policy_eval/mod.rs"]
+    );
 }
