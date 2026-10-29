@@ -489,17 +489,12 @@ async fn spawn_router(router: Router) -> std::net::SocketAddr {
 struct MockOidcDiscoveryEndpoint {
     issuer: String,
     authorization_endpoint: String,
-    handle: std::thread::JoinHandle<usize>,
+    server: BlockingJsonServer,
 }
 
 impl MockOidcDiscoveryEndpoint {
     fn finish(self) {
-        assert_eq!(
-            self.handle
-                .join()
-                .expect("mock OIDC discovery endpoint should finish"),
-            1
-        );
+        assert_eq!(self.server.finish(), 1);
     }
 }
 
@@ -565,7 +560,7 @@ fn spawn_mock_oidc_discovery_endpoint(token_endpoint: Option<String>) -> MockOid
         "authorization_endpoint": authorization_endpoint.clone(),
         "token_endpoint": token_endpoint
     });
-    let handle = spawn_blocking_json_server(
+    let server = spawn_blocking_json_server(
         listener,
         vec![(
             "/.well-known/openid-configuration".to_owned(),
@@ -577,7 +572,7 @@ fn spawn_mock_oidc_discovery_endpoint(token_endpoint: Option<String>) -> MockOid
     MockOidcDiscoveryEndpoint {
         issuer,
         authorization_endpoint,
-        handle,
+        server,
     }
 }
 
@@ -673,6 +668,15 @@ fn admin_oidc_login_router_from_config(mut config: config::Config) -> Router {
     .expect("admin OIDC login app should build")
 }
 
+/// Discovery, JWKS and token-exchange deadline of the admin login test provider.
+///
+/// The 2 s production default bounds a real identity provider. Here every
+/// provider endpoint is a local mock that answers at once, so the deadline only
+/// bounds how long a loaded, coverage-instrumented test process takes to make
+/// the request; at 2 s that scheduling delay surfaced as
+/// `Upstream("OIDC discovery fetch failed")`. A wrong answer still fails at once.
+const ADMIN_OIDC_TEST_FETCH_TIMEOUT_MS: u64 = 30_000;
+
 fn admin_oidc_login_config(issuer: &str) -> config::Config {
     let mut config = test_config(Vec::new());
     config.admin_login_provider = Some("oidc".to_owned());
@@ -686,7 +690,7 @@ fn admin_oidc_login_config(issuer: &str) -> config::Config {
         jwks_url: None,
         issuer: Some(issuer.to_owned()),
         audience: None,
-        jwks_timeout_ms: 2000,
+        jwks_timeout_ms: ADMIN_OIDC_TEST_FETCH_TIMEOUT_MS,
         jwks_max_key_age_secs: 300,
         require_jti: false,
         roles_claim: "roles".to_owned(),
@@ -5284,12 +5288,7 @@ async fn mcp_cookie_session_is_rejected_when_public_url_is_configured() {
     let non_mcp_body = json_body(non_mcp_response).await;
     assert_eq!(non_mcp_body["user_id"], json!("cookie-user"));
     assert_eq!(non_mcp_body["auth_method"], json!("session_cookie"));
-    assert_eq!(
-        introspection_server
-            .join()
-            .expect("cookie-session introspection server should finish"),
-        1
-    );
+    assert_eq!(introspection_server.finish(), 1);
 }
 
 #[tokio::test]
@@ -7643,12 +7642,7 @@ async fn real_cookie_session_authenticates_through_full_stack() {
     assert_eq!(body["user_id"], json!("cookie-user"));
     assert_eq!(body["auth_method"], json!("session_cookie"));
     assert_eq!(body["roles"], json!(["admin", "member"]));
-    assert_eq!(
-        introspection_server
-            .join()
-            .expect("cookie-session introspection server should finish"),
-        1
-    );
+    assert_eq!(introspection_server.finish(), 1);
 }
 
 #[tokio::test]
@@ -7680,12 +7674,7 @@ async fn cookie_session_introspection_host_is_auto_seeded_for_cross_host_egress(
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(json_body(response).await["user_id"], json!("cookie-user"));
-    assert_eq!(
-        introspection_server
-            .join()
-            .expect("cookie-session introspection server should finish"),
-        1
-    );
+    assert_eq!(introspection_server.finish(), 1);
 }
 
 #[test]
@@ -27373,9 +27362,7 @@ async fn auth_validator_resolves_oidc_discovery_for_issuer_only_provider() {
         .expect("token should validate through discovered JWKS URI");
 
     assert_eq!(principal.user_id, "oidc-user");
-    server
-        .join()
-        .expect("OIDC discovery test server should finish");
+    server.finish();
 }
 
 /// Startup hands every JWT validator that has a denylist the observer it
@@ -27470,9 +27457,7 @@ async fn a_denylisted_jwt_validator_reports_the_principal_of_a_revoked_token() {
         *observer.0.lock().expect("observer lock"),
         [(issuer, "oidc-user".to_owned())]
     );
-    server
-        .join()
-        .expect("OIDC discovery test server should finish");
+    server.finish();
 }
 
 /// A deployment whose only credential is a client certificate still gets an
@@ -27554,9 +27539,7 @@ async fn auth_validator_accepts_slashless_oidc_issuer_when_config_has_trailing_s
         json_body(response).await["user_id"],
         json!("slashless-oidc-user")
     );
-    server
-        .join()
-        .expect("OIDC discovery and JWKS test server should finish");
+    server.finish();
 }
 
 #[tokio::test]
@@ -27586,9 +27569,7 @@ async fn auth_validator_accepts_slash_retained_oidc_issuer_and_token() {
         json_body(response).await["user_id"],
         json!("slash-retained-oidc-user")
     );
-    server
-        .join()
-        .expect("OIDC discovery and JWKS test server should finish");
+    server.finish();
 }
 
 #[test]
@@ -27636,9 +27617,7 @@ fn auth_validator_rejects_oidc_discovery_with_mismatched_issuer() {
         auth::AuthError::Upstream(message)
             if message.contains("OIDC discovery issuer mismatch")
     ));
-    server
-        .join()
-        .expect("OIDC discovery test server should finish");
+    server.finish();
 }
 
 #[test]
@@ -27685,9 +27664,7 @@ fn auth_validator_rejects_oidc_discovery_without_issuer() {
         auth::AuthError::Upstream(message)
             if message.contains("OIDC discovery response missing issuer")
     ));
-    server
-        .join()
-        .expect("OIDC discovery test server should finish");
+    server.finish();
 }
 
 #[tokio::test]
@@ -27749,13 +27726,8 @@ async fn oidc_discovery_allowlists_jwks_uri_host_when_it_differs_from_issuer() {
         json_body(response).await["user_id"],
         json!("split-oidc-user")
     );
-    assert_eq!(
-        discovery_server
-            .join()
-            .expect("OIDC discovery server should finish"),
-        1
-    );
-    assert_eq!(jwks_server.join().expect("JWKS server should finish"), 1);
+    assert_eq!(discovery_server.finish(), 1);
+    assert_eq!(jwks_server.finish(), 1);
 }
 
 #[tokio::test]
@@ -28517,9 +28489,7 @@ fn admin_oidc_login_provider_rejects_discovery_with_mismatched_issuer() {
     .expect_err("admin login discovery with mismatched issuer should fail startup");
 
     assert!(error.to_string().contains("OIDC discovery issuer mismatch"));
-    server
-        .join()
-        .expect("OIDC discovery test server should finish");
+    server.finish();
 }
 
 #[test]
@@ -28547,9 +28517,7 @@ fn admin_oidc_login_provider_rejects_discovery_without_issuer() {
     assert!(error
         .to_string()
         .contains("OIDC discovery response missing issuer"));
-    server
-        .join()
-        .expect("OIDC discovery test server should finish");
+    server.finish();
 }
 
 #[test]
@@ -28579,9 +28547,7 @@ fn admin_oidc_login_provider_requires_discovered_authorize_and_token_endpoints()
     assert!(error
         .to_string()
         .contains("OIDC discovery response missing token_endpoint"));
-    server
-        .join()
-        .expect("OIDC discovery test server should finish");
+    server.finish();
 }
 
 #[tokio::test]
@@ -28680,13 +28646,8 @@ async fn oidc_discovery_jwks_uri_auto_seed_still_blocks_private_ip() {
     // The property this test defends is that the blocked JWKS host is never
     // contacted, asserted below.
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(
-        discovery_server
-            .join()
-            .expect("OIDC discovery server should finish"),
-        1
-    );
-    assert_eq!(jwks_server.join().expect("JWKS server should finish"), 0);
+    assert_eq!(discovery_server.finish(), 1);
+    assert_eq!(jwks_server.finish(), 0);
 }
 
 #[test]
@@ -28730,9 +28691,7 @@ fn auth_validator_reports_construction_error_when_oidc_discovery_lacks_jwks_uri(
         auth::AuthError::Upstream(message)
             if message.contains("OIDC discovery response missing jwks_uri")
     ));
-    server
-        .join()
-        .expect("OIDC discovery test server should finish");
+    server.finish();
 }
 
 #[tokio::test]
@@ -33108,7 +33067,7 @@ async fn spawn_test_jwks_server() -> std::net::SocketAddr {
     .await
 }
 
-fn spawn_oidc_jwks_server() -> (String, std::thread::JoinHandle<()>) {
+fn spawn_oidc_jwks_server() -> (String, BlockingJsonServer) {
     let jwks = json!({
         "keys": [{
             "kty": "RSA",
@@ -33137,7 +33096,7 @@ fn spawn_oidc_jwks_server() -> (String, std::thread::JoinHandle<()>) {
 
 fn spawn_oidc_jwks_server_with_document_issuer(
     document_issuer: impl FnOnce(&str) -> String,
-) -> (String, String, std::thread::JoinHandle<()>) {
+) -> (String, String, BlockingJsonServer) {
     let jwks = json!({
         "keys": [{
             "kty": "RSA",
@@ -33170,14 +33129,14 @@ fn spawn_oidc_jwks_server_with_document_issuer(
 fn spawn_oidc_discovery_server(
     discovery: Value,
     request_count: usize,
-) -> (String, std::thread::JoinHandle<()>) {
+) -> (String, BlockingJsonServer) {
     spawn_oidc_discovery_server_with(|_| discovery, request_count)
 }
 
 fn spawn_oidc_discovery_server_with(
     discovery: impl FnOnce(&str) -> Value,
     request_count: usize,
-) -> (String, std::thread::JoinHandle<()>) {
+) -> (String, BlockingJsonServer) {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
         .expect("OIDC discovery test server should bind");
     let issuer = format!(
@@ -33194,7 +33153,7 @@ fn spawn_oidc_discovery_server_with(
 fn spawn_blocking_jwks_server(
     host: Ipv4Addr,
     request_count: usize,
-) -> (String, std::thread::JoinHandle<usize>) {
+) -> (String, BlockingJsonServer) {
     let listener =
         std::net::TcpListener::bind((host, 0)).expect("JWKS split-host test server should bind");
     let jwks_url = format!(
@@ -33227,7 +33186,7 @@ fn spawn_blocking_jwks_server(
 fn spawn_blocking_cookie_session_server(
     host: Ipv4Addr,
     request_count: usize,
-) -> (String, std::thread::JoinHandle<usize>) {
+) -> (String, BlockingJsonServer) {
     let listener = std::net::TcpListener::bind((host, 0))
         .expect("cookie-session introspection test server should bind");
     let introspection_url = format!(
@@ -33255,9 +33214,7 @@ fn spawn_blocking_cookie_session_server(
     (introspection_url, server)
 }
 
-fn spawn_blocking_oidc_discovery_server(
-    jwks_url: String,
-) -> (String, std::thread::JoinHandle<usize>) {
+fn spawn_blocking_oidc_discovery_server(jwks_url: String) -> (String, BlockingJsonServer) {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
         .expect("OIDC split-host discovery test server should bind");
     let issuer = format!(
@@ -33283,21 +33240,68 @@ fn spawn_blocking_oidc_discovery_server(
     (issuer, server)
 }
 
+/// A blocking HTTP/1.1 test server that answers fixed JSON bodies by path.
+///
+/// It serves until it has answered `request_count` requests or until the test
+/// calls [`BlockingJsonServer::finish`] (or drops it). It deliberately has no
+/// wall-clock lifetime: the time between spawning it and the first request
+/// (signing a test token, building the app) has no bound on a loaded runner,
+/// and a listener that closed a fixed 2 s after spawn refused the gateway's
+/// OIDC discovery fetch on the instrumented Windows coverage job.
+struct BlockingJsonServer {
+    finishing: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<usize>>,
+}
+
+impl BlockingJsonServer {
+    /// Answers every connection already queued, closes the listener and
+    /// returns how many requests were served.
+    ///
+    /// Call it after the test has seen the outcome of the requests it caused.
+    /// Each of them was sent before this call, so it has been answered or is
+    /// queued and is answered now: the count is exact without waiting.
+    fn finish(mut self) -> usize {
+        self.finishing.store(true, Ordering::SeqCst);
+        let thread = self
+            .thread
+            .take()
+            .expect("blocking JSON test server should finish once");
+        thread
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    }
+}
+
+impl Drop for BlockingJsonServer {
+    fn drop(&mut self) {
+        // A test that fails before `finish` must not leave the thread polling.
+        self.finishing.store(true, Ordering::SeqCst);
+    }
+}
+
 fn spawn_blocking_json_server(
     listener: std::net::TcpListener,
     routes: Vec<(String, String)>,
     request_count: usize,
-) -> std::thread::JoinHandle<usize> {
-    std::thread::spawn(move || {
-        listener
-            .set_nonblocking(true)
-            .expect("blocking JSON test server should set nonblocking mode");
-        let deadline = Instant::now() + Duration::from_secs(2);
+) -> BlockingJsonServer {
+    listener
+        .set_nonblocking(true)
+        .expect("blocking JSON test server should set nonblocking mode");
+    let finishing = Arc::new(AtomicBool::new(false));
+    let finish_flag = Arc::clone(&finishing);
+    let thread = std::thread::spawn(move || {
         let mut handled = 0;
-        while handled < request_count && Instant::now() < deadline {
-            let Ok((mut stream, _)) = listener.accept() else {
-                std::thread::sleep(Duration::from_millis(10));
-                continue;
+        while handled < request_count {
+            // Read the flag before accepting: an empty accept that follows a
+            // `finish` request proves no connection made before it is left.
+            let finish_requested = finish_flag.load(Ordering::SeqCst);
+            let mut stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(_) if finish_requested => break,
+                Err(_) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
             };
             stream
                 .set_nonblocking(false)
@@ -33321,7 +33325,12 @@ fn spawn_blocking_json_server(
             handled += 1;
         }
         handled
-    })
+    });
+
+    BlockingJsonServer {
+        finishing,
+        thread: Some(thread),
+    }
 }
 
 fn spawn_oidc_server(
@@ -33329,7 +33338,7 @@ fn spawn_oidc_server(
     discovery: Value,
     jwks: Option<Value>,
     request_count: usize,
-) -> (String, std::thread::JoinHandle<()>) {
+) -> (String, BlockingJsonServer) {
     let issuer = format!(
         "http://127.0.0.1:{}",
         listener
@@ -33337,40 +33346,21 @@ fn spawn_oidc_server(
             .expect("OIDC discovery test server address should be available")
             .port()
     );
-    let discovery = discovery.to_string();
-    let jwks = jwks.map(|jwks| jwks.to_string());
-    let server = std::thread::spawn(move || {
-        listener
-            .set_nonblocking(true)
-            .expect("OIDC discovery test server should set nonblocking mode");
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let mut handled = 0;
-        while handled < request_count && Instant::now() < deadline {
-            let Ok((mut stream, _)) = listener.accept() else {
-                std::thread::sleep(Duration::from_millis(10));
-                continue;
-            };
-            stream
-                .set_nonblocking(false)
-                .expect("OIDC discovery test stream should use blocking reads");
-            let path = read_blocking_http_path(&mut stream);
-            let (status, body) = match path.as_str() {
-                "/.well-known/openid-configuration" => ("200 OK", discovery.as_str()),
-                "/jwks.json" => ("200 OK", jwks.as_deref().unwrap_or("{}")),
-                _ => ("404 Not Found", "{}"),
-            };
-            let response = format!(
-                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-            stream
-                .write_all(response.as_bytes())
-                .expect("OIDC discovery test response should write");
-            handled += 1;
-        }
-    });
+    let routes = vec![
+        (
+            "/.well-known/openid-configuration".to_owned(),
+            discovery.to_string(),
+        ),
+        (
+            "/jwks.json".to_owned(),
+            jwks.map_or_else(|| "{}".to_owned(), |jwks| jwks.to_string()),
+        ),
+    ];
 
-    (issuer, server)
+    (
+        issuer,
+        spawn_blocking_json_server(listener, routes, request_count),
+    )
 }
 
 fn read_blocking_http_path(stream: &mut std::net::TcpStream) -> String {
