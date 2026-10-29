@@ -20,7 +20,8 @@
 //! policy document, read-only). Cases are `policy-tests.v1` cases without
 //! `expect`, parsed by the same functions.
 
-use serde_json::Value;
+use serde::Deserialize;
+use serde_json::{value::RawValue, Value};
 
 use super::{
     edits::{parse_edits, PolicyEdit},
@@ -48,8 +49,11 @@ pub(crate) enum CandidateSource {
     Active,
     /// Position-aware edits over the pinned base.
     Edits(Vec<PolicyEdit>),
-    /// A complete policy document submitted with the request, never stored.
-    Inline(Value),
+    /// A complete policy document submitted with the request, never
+    /// stored: the exact bytes of `/candidate/policy`, so it is read by the
+    /// parser a policy write reads its body with, not from a `Value` that
+    /// has already settled repeated members and number spellings.
+    Inline(Box<RawValue>),
 }
 
 impl CandidateSource {
@@ -127,7 +131,7 @@ pub(crate) fn parse_request(bytes: &[u8], value: &Value) -> Result<SimulationReq
         bounded_string(value, "/base_etag", MAX_BASE_ETAG_BYTES, &mut diagnostics)
     });
     let candidate = required(root, "candidate", "", &mut diagnostics)
-        .and_then(|value| parse_candidate(value, &mut diagnostics));
+        .and_then(|value| parse_candidate(bytes, value, &mut diagnostics));
     let trace = match root.get("trace") {
         None => Some(TraceLevel::Terminal),
         Some(value) => {
@@ -191,7 +195,28 @@ pub(crate) fn parse_request(bytes: &[u8], value: &Value) -> Result<SimulationReq
     }
 }
 
-fn parse_candidate(value: &Value, diagnostics: &mut Diagnostics) -> Option<CandidateSource> {
+/// The request bytes' `/candidate/policy` member, unread.
+#[derive(Deserialize)]
+struct InlineCandidateBytes<'a> {
+    #[serde(borrow)]
+    candidate: InlinePolicyBytes<'a>,
+}
+
+#[derive(Deserialize)]
+struct InlinePolicyBytes<'a> {
+    #[serde(borrow)]
+    policy: &'a RawValue,
+}
+
+/// Parse the top-level `candidate` member of a request read as `value` from
+/// `bytes`. Historical replay takes the same three sources, with the same
+/// members, so it parses them here, and an inline candidate keeps its exact
+/// bytes for either.
+pub(crate) fn parse_candidate(
+    bytes: &[u8],
+    value: &Value,
+    diagnostics: &mut Diagnostics,
+) -> Option<CandidateSource> {
     let map = object(value, "/candidate", diagnostics)?;
     let source = required(map, "source", "/candidate", diagnostics)?;
     match source.as_str() {
@@ -208,7 +233,20 @@ fn parse_candidate(value: &Value, diagnostics: &mut Diagnostics) -> Option<Candi
         Some("inline") => {
             check_members(map, "/candidate", &["source", "policy"], diagnostics);
             match required(map, "policy", "/candidate", diagnostics)? {
-                policy @ Value::Object(_) => Some(CandidateSource::Inline(policy.clone())),
+                // `value` was read from `bytes`, so the member is there; the
+                // `Value` only says it is an object.
+                Value::Object(_) => match serde_json::from_slice::<InlineCandidateBytes<'_>>(bytes)
+                {
+                    Ok(inline) => Some(CandidateSource::Inline(inline.candidate.policy.to_owned())),
+                    Err(_) => {
+                        diagnostics.push(
+                            "invalid_request",
+                            "/candidate/policy",
+                            "the candidate policy could not be read from the request",
+                        );
+                        None
+                    }
+                },
                 _ => {
                     diagnostics.push(
                         "invalid_type",

@@ -117,7 +117,10 @@ In this alpha `spec` has exactly one member, `profile`: `production`,
 enforce each profile's invariants. The deployment settings themselves join
 `spec` from the field catalog before a gateway can start from a bundle, so a
 document that sets anything else today is refused (`schema.unknown_member`)
-rather than having the setting silently dropped.
+rather than having the setting silently dropped. The compiler compiles
+environment configuration only today; [its
+contract](architecture/configuration-compiler.md#extension-points-for-242)
+says what a bundle front end must add.
 
 The value forms those settings will use are fixed now, with the reader and the
 schema's `$defs`:
@@ -227,12 +230,25 @@ reopened. Specifically:
 - **Dot entries** (`.git`, `.gitattributes`) are ignored and never opened. Any
   other entry the manifest does not reference is a warning
   (`bundle.unreferenced_entry`) and, when reading strictly, an error.
-- **Permissions (Unix).** The root, the directory files are read from, and each
-  file must not be writable by group or other (`bundle.unsafe_permissions`). A
-  world-writable directory is accepted only with the sticky bit, which is how the
-  kubelet publishes volume roots. A read-only mount does not relax this check in
-  this alpha. Windows ACLs remain an operator and platform
-  responsibility, as they are for `CONNECTION_SECRETS_ROOT`.
+- **Permissions (Unix).** The directory files are read from (a flat bundle's
+  root, or the generation directory of the layout below) and each file must not
+  be writable by group or other (`bundle.unsafe_permissions`). The sticky bit
+  does not relax this: it stops another account replacing an entry, not adding
+  one, so in a sticky world-writable directory such as `/tmp` that account could
+  add a `bundle.yaml` or a referenced file before the operator does. Only the
+  root of the Kubernetes layout below may be world-writable, and only with the
+  sticky bit, which is how the kubelet publishes volume roots; nothing is read
+  from it but `..data` and the generation it names. A read-only mount does not
+  relax these checks in this alpha.
+- **Ownership (Unix).** Each file must be owned by root or by the account that
+  owns the directory it is read from, and the generation directory by root or
+  by the owner of the volume root (`bundle.untrusted_owner`): any other owner
+  could change a file whatever its mode says. Files the kubelet writes, a
+  checkout or copy made by one account, and a bind mount whose files and
+  directory belong to one host account all pass; an archive unpacked as root
+  that kept another account's ownership does not until it is `chown`ed. Windows
+  ACLs remain an operator and platform responsibility, as they are for
+  `CONNECTION_SECRETS_ROOT`.
 - **Kubernetes ConfigMap and projected volumes.** When the root contains
   `..data`, it must be a symbolic link to one sibling directory whose name starts
   with `..`, and every other non-dot entry at the root must be one of the
@@ -362,6 +378,7 @@ can appear in one. A published code never changes meaning.
 | `bundle.root_unavailable` | The bundle directory cannot be opened. |
 | `bundle.root_not_directory` | The bundle location is not a directory. |
 | `bundle.unsafe_permissions` | A bundle directory or file is writable by group or other. |
+| `bundle.untrusted_owner` | A bundle file or generation directory is owned by an account other than root or the owner of the directory holding it. |
 | `bundle.too_many_entries` | The directory holds more than 256 entries. |
 | `bundle.manifest_missing` | There is no `bundle.yaml`. |
 | `bundle.file_missing` | A referenced file is not in the bundle. |

@@ -72,6 +72,11 @@
       "permission": "admin:policy:simulate"
     },
     {
+      "methods": ["POST", "DELETE"],
+      "path_prefix": "/v1/admin/policy/replays",
+      "permission": "admin:policy:simulate"
+    },
+    {
       "methods": ["PUT", "POST", "PATCH", "DELETE"],
       "path_prefix": "/v1/admin/policy",
       "permission": "admin:policy:write"

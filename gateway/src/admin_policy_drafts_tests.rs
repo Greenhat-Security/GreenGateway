@@ -20,6 +20,19 @@ fn draft_request(
     body: Option<Value>,
     headers: &[(&str, &str)],
 ) -> Request<Body> {
+    let body = body.map(|body| body.to_string());
+    raw_draft_request(method, uri, principal, body.as_deref(), headers)
+}
+
+/// [`draft_request`] with the body's exact bytes, for documents a `Value`
+/// cannot spell, such as one that repeats a member.
+fn raw_draft_request(
+    method: Method,
+    uri: &str,
+    principal: Option<auth::Principal>,
+    body: Option<&str>,
+    headers: &[(&str, &str)],
+) -> Request<Body> {
     let mut builder = Request::builder().method(method.clone()).uri(uri);
     // Request validation wants an allowed media type on every POST, PUT
     // and PATCH, a body-less publication included.
@@ -35,7 +48,7 @@ fn draft_request(
     for (name, value) in headers {
         builder = builder.header(*name, *value);
     }
-    let body = body.map_or_else(Body::empty, |body| Body::from(body.to_string()));
+    let body = body.map_or_else(Body::empty, |body| Body::from(body.to_owned()));
     let mut request = builder.body(body).expect("draft request should build");
     if let Some(principal) = principal {
         request.extensions_mut().insert(principal);
@@ -835,6 +848,107 @@ async fn a_draft_candidate_is_validated_like_a_policy_write() {
     assert_eq!(listed["drafts"][0]["revision"], 1);
 }
 
+/// A draft candidate is read from the bytes it was sent as, by the parser
+/// `PUT /policy` reads its body with. Read through a `Value` first, a v1
+/// rule naming `action` twice would keep its last copy, and a number spelled
+/// through serde_json's private tag would read as a number: a reviewer of
+/// the submitted bytes would read `deny` where the gateway enforced
+/// `allow`. Both are refused on create and on patch with exactly the errors
+/// `PUT` gives the same document, and nothing is saved; spelled once and
+/// plainly, the same candidate is.
+#[tokio::test]
+async fn a_draft_candidate_is_read_from_its_bytes_like_a_policy_write() {
+    let policy = TempPolicyFile::new(&policy_document_string("exact-source-policy", "test:old"));
+    let (router, _capture) = captured_router(&policy);
+    let (live_etag, _) = current_policy(&router).await;
+    let (draft_id, draft_etag, _) = create_draft(&router, &live_etag, None).await;
+
+    let repeated = r#"{"schema_version":"1.0.0","rules":[{"id":"r1","path":"/x","action":"deny","action":"allow"}]}"#;
+    let tagged = r#"{"schema_version":"1.0.0","rate_limits":[{"id":"l","requests_per_second":{"$serde_json::private::Number":"0.5"},"burst":1}]}"#;
+    for (candidate, detail) in [
+        (repeated, "/rules/0/action"),
+        (tagged, "not one this location accepts"),
+    ] {
+        let (status, put) = refusal(
+            send(
+                &router,
+                raw_draft_request(
+                    Method::PUT,
+                    POLICY_ADMIN_ROUTE,
+                    admin(),
+                    Some(candidate),
+                    &[("if-match", &live_etag)],
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{put}");
+        assert!(
+            put["errors"][0]
+                .as_str()
+                .is_some_and(|error| error.contains(detail)),
+            "{put}"
+        );
+        let body = format!(r#"{{"policy":{candidate}}}"#);
+        for (method, uri, precondition) in [
+            (
+                Method::POST,
+                POLICY_DRAFTS_ADMIN_ROUTE.to_owned(),
+                &live_etag,
+            ),
+            (Method::PATCH, draft_uri(&draft_id), &draft_etag),
+        ] {
+            let (status, refused) = refusal(
+                send(
+                    &router,
+                    raw_draft_request(
+                        method.clone(),
+                        &uri,
+                        admin(),
+                        Some(&body),
+                        &[("if-match", precondition)],
+                    ),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {refused}");
+            assert_eq!(refused, put, "{method}: refused exactly as PUT refuses it");
+        }
+    }
+
+    let plain = json!({
+        "schema_version": "1.0.0",
+        "rules": [{ "id": "r1", "path": "/x", "action": "deny" }],
+        "rate_limits": [{ "id": "l", "requests_per_second": 0.5, "burst": 1 }]
+    });
+    let patched = send(
+        &router,
+        draft_request(
+            Method::PATCH,
+            &draft_uri(&draft_id),
+            admin(),
+            Some(json!({ "policy": plain })),
+            &[("if-match", &draft_etag)],
+        ),
+    )
+    .await;
+    assert_eq!(patched.status(), StatusCode::OK);
+    let patched = json_body(patched).await;
+    assert_eq!(patched["revision"], 2, "no refused candidate was saved");
+    assert_eq!(patched["policy"]["rules"][0]["action"], "deny");
+    let listed = json_body(
+        send(
+            &router,
+            draft_request(Method::GET, POLICY_DRAFTS_ADMIN_ROUTE, admin(), None, &[]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(listed["drafts"].as_array().map(Vec::len), Some(1));
+}
+
 #[tokio::test]
 async fn an_owner_holds_a_bounded_number_of_drafts_and_deleting_frees_one() {
     let policy = TempPolicyFile::new(&policy_document_string("quota-policy", "test:old"));
@@ -1015,6 +1129,46 @@ async fn draft_routes_without_a_policy_authority_answer_like_the_policy_api() {
     }
 }
 
+/// The draft routes over a file authority at `policy_file` whose live policy
+/// is `policy_document(policy_id, ..)`, and `store`, without history.
+fn direct_draft_router(
+    policy_file: std::path::PathBuf,
+    policy_id: &str,
+    store: Arc<dyn storage::PolicyDraftStore>,
+    audit_log: audit::AuditLog,
+) -> Router {
+    let live_policy = parse_policy_body(policy_document_string(policy_id, "test:old").as_bytes())
+        .expect("policy should parse");
+    let rbac_state =
+        middleware::rbac::RbacState::new(live_policy, Vec::new(), false, audit_log.clone());
+    Router::new()
+        .route(POLICY_ADMIN_ROUTE, get(policy_get_endpoint))
+        .route(
+            POLICY_DRAFTS_ADMIN_ROUTE,
+            post(policy_draft_create_endpoint),
+        )
+        .route(POLICY_DRAFT_ADMIN_ROUTE, get(policy_draft_get_endpoint))
+        .route(
+            POLICY_DRAFT_PUBLISH_ADMIN_ROUTE,
+            post(policy_draft_publish_endpoint),
+        )
+        .with_state(PolicyAdminState {
+            policy_file: Some(policy_file),
+            rbac_state: Some(rbac_state),
+            history_store: None,
+            draft_store: Some(store),
+            #[cfg(feature = "postgres")]
+            control_plane: None,
+            #[cfg(feature = "postgres")]
+            membership: None,
+            event_store: None,
+            query_store: None,
+            audit: audit_log,
+            client_ip_policy: client_ip::ClientIpPolicy::default(),
+            max_body_size: 1024 * 1024,
+        })
+}
+
 /// A draft store that cannot record a publication, standing in for one that
 /// fails, or loses a race with its owner's edit, after the policy committed.
 struct UnmarkableDraftStore(storage::SqlitePolicyDraftStore);
@@ -1089,43 +1243,14 @@ async fn a_publication_whose_draft_cannot_be_marked_still_reports_the_commit() {
     let drafts_db = TempDb::new("policy-drafts-unmarkable");
     let capture = audit::sink::tests::CaptureSink::new();
     let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
-    let live_policy = parse_policy_body(&axum::body::Bytes::from(policy_document_string(
-        "unmarked-policy",
-        "test:old",
-    )))
-    .expect("policy should parse");
-    let rbac_state =
-        middleware::rbac::RbacState::new(live_policy, Vec::new(), false, audit_log.clone());
     let store =
         storage::SqlitePolicyDraftStore::open(&drafts_db.path).expect("draft store should open");
-    let router = Router::new()
-        .route(POLICY_ADMIN_ROUTE, get(policy_get_endpoint))
-        .route(
-            POLICY_DRAFTS_ADMIN_ROUTE,
-            post(policy_draft_create_endpoint),
-        )
-        .route(POLICY_DRAFT_ADMIN_ROUTE, get(policy_draft_get_endpoint))
-        .route(
-            POLICY_DRAFT_PUBLISH_ADMIN_ROUTE,
-            post(policy_draft_publish_endpoint),
-        )
-        .with_state(PolicyAdminState {
-            policy_file: Some(policy.path.clone()),
-            rbac_state: Some(rbac_state),
-            history_store: None,
-            draft_store: Some(
-                Arc::new(UnmarkableDraftStore(store)) as Arc<dyn storage::PolicyDraftStore>
-            ),
-            #[cfg(feature = "postgres")]
-            control_plane: None,
-            #[cfg(feature = "postgres")]
-            membership: None,
-            event_store: None,
-            query_store: None,
-            audit: audit_log,
-            client_ip_policy: client_ip::ClientIpPolicy::default(),
-            max_body_size: 1024 * 1024,
-        });
+    let router = direct_draft_router(
+        policy.path.clone(),
+        "unmarked-policy",
+        Arc::new(UnmarkableDraftStore(store)),
+        audit_log,
+    );
     let (base_etag, _) = current_policy(&router).await;
     let (draft_id, draft_etag, created) = create_draft(
         &router,
@@ -1172,4 +1297,69 @@ async fn a_publication_whose_draft_cannot_be_marked_still_reports_the_commit() {
     assert_eq!(publications[0]["draft_state_recorded"], false);
     assert_eq!(publications[0]["policy_etag"], json!(new_etag));
     assert_eq!(events_of(&capture, audit::event::POLICY_CHANGED).len(), 1);
+}
+
+/// A publication the commit itself refuses -- here the policy file cannot be
+/// replaced, so nothing is written -- is audited as a refused publication
+/// exactly like one refused before the commit, and keeps the draft and the
+/// live policy as they were.
+#[tokio::test]
+async fn a_publication_the_commit_refuses_is_audited_as_refused() {
+    let drafts_db = TempDb::new("policy-drafts-commit-refused");
+    let capture = audit::sink::tests::CaptureSink::new();
+    let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+    let store =
+        storage::SqlitePolicyDraftStore::open(&drafts_db.path).expect("draft store should open");
+    // A policy file in a directory that does not exist: the authority
+    // cannot create its temporary file, so the persist fails before the
+    // rename that would replace anything.
+    let unwritable = std::env::temp_dir()
+        .join(format!("greengateway-missing-{}", uuid::Uuid::new_v4()))
+        .join("policy.json");
+    let router = direct_draft_router(
+        unwritable.clone(),
+        "commit-refused-policy",
+        Arc::new(store),
+        audit_log,
+    );
+    let (base_etag, _) = current_policy(&router).await;
+    let (draft_id, draft_etag, created) = create_draft(
+        &router,
+        &base_etag,
+        Some(policy_document("commit-refused-candidate", "test:new")),
+    )
+    .await;
+
+    let (status, body) = refusal(publish(&router, &draft_id, &draft_etag, &base_etag).await).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["error"], "policy persist failed");
+    assert!(!unwritable.exists());
+    let (live_etag, live) = current_policy(&router).await;
+    assert_eq!(live_etag, base_etag);
+    assert_eq!(live["id"], "commit-refused-policy");
+    let kept = send(
+        &router,
+        draft_request(Method::GET, &draft_uri(&draft_id), admin(), None, &[]),
+    )
+    .await;
+    assert_eq!(policy_etag_header(&kept), draft_etag);
+    assert_eq!(json_body(kept).await["state"], "open");
+
+    assert_eventually(Duration::from_secs(1), || {
+        events_of(&capture, audit::event::POLICY_DRAFT_PUBLISH_REFUSED).len() == 1
+    });
+    let refused = events_of(&capture, audit::event::POLICY_DRAFT_PUBLISH_REFUSED);
+    assert_eq!(
+        refused[0],
+        json!({
+            "draft_id": draft_id,
+            "draft_revision": 1,
+            "reason": "policy_commit_failed",
+            "base_etag": base_etag,
+            "candidate_etag": created["candidate_etag"],
+            "current_policy_etag": base_etag,
+        })
+    );
+    assert!(events_of(&capture, audit::event::POLICY_DRAFT_PUBLISHED).is_empty());
+    assert!(events_of(&capture, audit::event::POLICY_CHANGED).is_empty());
 }

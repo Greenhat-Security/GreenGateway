@@ -104,7 +104,7 @@ pub(crate) enum Source {
 ///
 /// Both fields are fixed text chosen by the gateway, so a provenance record
 /// cannot carry a value or a secret locator however it is printed.
-#[allow(dead_code)] // Read by the stage tests until startup consumes the plan (#433 PR 3).
+#[allow(dead_code)] // Read by the stage tests; startup builds from the values alone.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Provenance {
     pub(crate) setting: &'static str,

@@ -90,6 +90,8 @@ mod admin_policy_test_runs;
 use admin_policy_test_runs::*;
 mod admin_policy_simulations;
 use admin_policy_simulations::*;
+mod admin_policy_replays;
+use admin_policy_replays::*;
 
 mod audit;
 mod auth;
@@ -141,7 +143,8 @@ mod upstream_route;
 #[cfg(test)]
 use lifecycle::serve_router;
 use lifecycle::{
-    serve_gateway, GatewayApp, GatewayApps, GatewayLifecycle, GrpcApp, ShutdownConfig,
+    serve_gateway, GatewayApp, GatewayApps, GatewayLifecycle, GrpcApp, ListenAddresses,
+    ShutdownConfig,
 };
 use proxy::{ProxyClassifier, ProxyState};
 #[cfg(all(test, feature = "postgres"))]

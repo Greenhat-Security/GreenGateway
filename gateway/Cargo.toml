@@ -42,7 +42,12 @@ rust-embed.workspace = true
 rustls-platform-verifier.workspace = true
 rustls-webpki.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+# `raw_value` is already active in the resolved graph (axum's default `json`
+# feature requests it), so naming it compiles nothing new. It lets the policy
+# draft, simulation and test-run endpoints read a candidate policy from the
+# exact bytes of its request member, the way `PUT /policy` reads a body,
+# instead of from a `Value` that has already dropped repeated members.
+serde_json = { workspace = true, features = ["raw_value"] }
 sha2.workspace = true
 sse-stream = "0.2"
 time.workspace = true

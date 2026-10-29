@@ -484,6 +484,53 @@ async fn an_inline_candidate_is_validated_like_a_policy_write_and_never_stored()
     assert_eq!(simulation_run_events(&harness).len(), 1);
 }
 
+/// An inline candidate is read from its own bytes by the parser
+/// `PUT /policy` reads a body with. Through a `Value`, a v1 number spelled as
+/// serde_json's private tag reads as the number; read as bytes it is an
+/// object where a number belongs, and the candidate is refused with the
+/// error `PUT` gives it. Spelled plainly, the same candidate is simulated.
+/// (A repeated member anywhere in the body is refused before the request is
+/// read at all; see the next test.)
+#[tokio::test]
+async fn an_inline_candidate_is_read_from_its_bytes_like_a_policy_write() {
+    let harness = harness();
+    let etag = current_etag(&harness).await;
+    let cases = json!([{
+        "id": "limited",
+        "kind": "http",
+        "request": { "method": "GET", "path": "/limited/a" },
+        "principal": caller()
+    }]);
+    let request = |requests_per_second: &str| {
+        format!(
+            r#"{{"schema_version":"policy-simulation.v1","base_etag":{},"candidate":{{"source":"inline","policy":{{"schema_version":"1.0.0","default_action":"deny","rate_limits":[{{"id":"limited","path":"/limited/**","requests_per_second":{requests_per_second},"burst":1}}]}}}},"cases":{}}}"#,
+            json!(etag),
+            cases
+        )
+    };
+
+    let response = simulate_request(
+        &harness,
+        simulator(),
+        request(r#"{"$serde_json::private::Number":"0.5"}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = json_body(response).await;
+    assert_eq!(body["reason"], json!("policy_candidate_invalid"));
+    assert_eq!(
+        body["errors"],
+        json!(["the value is not one this location accepts"])
+    );
+
+    let response = simulate_request(&harness, simulator(), request("0.5")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(response).await["candidate"]["source"],
+        json!("inline")
+    );
+}
+
 #[tokio::test]
 async fn edits_that_do_not_apply_or_do_not_validate_are_refused_without_a_record() {
     let harness = harness();

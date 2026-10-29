@@ -672,7 +672,7 @@ pub(crate) struct IdentityPlan {
     pub(crate) csrf_exempt_paths: Vec<String>,
     /// Where each of the four blocks' inputs came from, in the order they
     /// are read.
-    #[allow(dead_code)] // Read by the stage tests until startup consumes the plan (#433 PR 3).
+    #[allow(dead_code)] // Read by the stage tests; startup builds from the values alone.
     pub(crate) provenance: Vec<Provenance>,
 }
 

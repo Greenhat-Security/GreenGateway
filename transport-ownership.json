@@ -1269,6 +1269,7 @@
         "dependencies": [
           "gateway-config@0.1.0|workspace",
           "jsonschema@0.60.2|registry+https://github.com/rust-lang/crates.io-index",
+          "libc@0.2.189|registry+https://github.com/rust-lang/crates.io-index",
           "rcgen@0.14.10|registry+https://github.com/rust-lang/crates.io-index",
           "reqwest@0.13.5|registry+https://github.com/rust-lang/crates.io-index",
           "serde@1.0.229|registry+https://github.com/rust-lang/crates.io-index",
@@ -5335,7 +5336,8 @@
             "optional": false,
             "uses_default_features": true,
             "features": [
-              "arbitrary_precision"
+              "arbitrary_precision",
+              "raw_value"
             ],
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
@@ -6411,6 +6413,17 @@
             "source": null
           },
           {
+            "name": "libc",
+            "rename": null,
+            "kind": null,
+            "target": "cfg(unix)",
+            "req": "^0.2.189",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
             "name": "url",
             "rename": null,
             "kind": null,
@@ -6644,7 +6657,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::bootstrap::run#1",
-      "sha256": "1a8055991766a3d5749418eb0ffb8113e2babf0e308afb0de08586f10ebc9542",
+      "sha256": "472210ce4d2b59a4ea19965ca4066285c8b6c76d6dd4bf0017e2ff0073d186e9",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -6674,7 +6687,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::routing::add_admin_api_routes#1",
-      "sha256": "2eb373d9f215064e03600e9b0685f0f124c797672dc0f38462c78a705b7d9c31",
+      "sha256": "bedbc6c9d2bd97d381a4b0e489af80a6b16e9c1938cd9379387c9d4f294e7f5a",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
@@ -7079,12 +7092,32 @@
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
     {
+      "file": "gateway/src/admin_policy_replays.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::admin_policy_replays::use super :: *#1",
+      "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
       "file": "gateway/src/main.rs",
       "reasons": [
         "capability-import-or-glob"
       ],
       "scope": "gateway::use admin_policy_simulations :: *#1",
       "sha256": "a6b33445074e02cb3fdd3aef5ba8a4cae0ab586a01896760641accd889546470",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/main.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::use admin_policy_replays :: *#1",
+      "sha256": "55c05778c910e2295d719e51e3f3a80748d9b3cc17482432b1ee6b422ff92a05",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
@@ -7137,16 +7170,6 @@
       "sha256": "9176b99ccc2d3c15ca388aec8f5865e042a159e642fb875215f56e10e4e7eafa",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
-    },
-    {
-      "file": "gateway/src/audit/query.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::audit::query::impl  AuditQueryStore::open_read_only#1",
-      "sha256": "b600df922c004821039e7e68c7456e1b6d030e4c0f2fb10eed318dc30cca6bf3",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
     },
     {
       "file": "gateway/src/audit/query.rs",
@@ -7844,10 +7867,20 @@
       "reasons": [
         "capability-import-or-glob"
       ],
-      "scope": "gateway_config::bundle::source::file_permissions_are_safe#1",
-      "sha256": "cc98ef622850697a82d4d193e72b206f2ecca69f2fb3751ffd0b9d3886e39f3f",
+      "scope": "gateway_config::bundle::source::owner_alone_can_write#1",
+      "sha256": "883c7bc2df1e7e55e2f949cb36672f01335ae7b6d513c750e80c228f8667698b",
       "owner": "GreenGateway maintainers",
-      "purpose": "Reviewed for #242 PR 4: the configuration bundle reader's contained, read-only filesystem access (canonicalized root opened as a cap-std directory, no-follow opens, link count, reparse attribute and Unix mode read from the opened handle). It adds no network or process capability; constructor bodies require separate scope review."
+      "purpose": "Reviewed for #242 (bundle and operator file safety): reads the Unix mode bits of bundle file and directory metadata taken from the opened handle, through MetadataExt, to refuse an entry group or other can write. Read-only metadata; it adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/bundle/source.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway_config::bundle::source::owner#1",
+      "sha256": "b9c66eb7910d4d7ad2ceec623808eff6840856b064d5c1c5b810f1020a168c6d",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 (bundle and operator file safety): reads the Unix owner ID of bundle file and directory metadata taken from the opened handle, through MetadataExt, so only root or the directory's owner may own what is read. Read-only metadata; it adds no network or process capability."
     },
     {
       "file": "gateway-config/src/bundle/source.rs",
@@ -10872,9 +10905,9 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::policy_replay::file_attributes#1",
-      "sha256": "9de1b2b2cda39ab5d60a49dee1854db94e0313ace54e8ac0e0df2a10986733e3",
+      "sha256": "bd6d6a86d8c6f7b1896edf24fa8e7be727c837da52523d5a58ee6aae218cfd34",
       "owner": "policy replay contexts (#243)",
-      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the policy replay context module, whose first caller outside tests is the replay job engine (#243 slice 13). The module parses and builds replay contexts in memory and asks the pure policy kernel; dead-code gating only, no I/O and no transport or process capability."
+      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the policy replay context module: the replay job engine (#243 slice 13) now calls the adapters and evaluator, and the serialized form, egress replay and recorded result wait for the impact comparison (#243 slice 14). The module parses and builds replay contexts in memory and asks the pure policy kernel; dead-code gating only, no I/O and no transport or process capability."
     },
     {
       "file": "gateway/src/proxy/admission.rs",
@@ -14775,10 +14808,41 @@
       "reasons": [
         "capability-import-or-glob"
       ],
-      "scope": "ggctl::credential::permissions_are_owner_only#1",
-      "sha256": "93ff7585a3de003ce522965c8b37e7eccea29bf2b7270b83cf280a0c4e86cf41",
+      "scope": "ggctl::credential::permissions_are_safe#1",
+      "sha256": "89ed74d874fd8a97b8e53e21a01d241e093c87470cf01791d988caeb63111e7a",
       "owner": "GreenGateway maintainers: operator CLI (#242)",
-      "purpose": "Reviewed for #242 PR 5: reads the Unix mode bits of token-file metadata through PermissionsExt to refuse a credential readable or writable by group or other; read-only metadata, no network or process capability."
+      "purpose": "Reviewed for #242 (operator file safety): reads the Unix mode bits of --token-file and --ca-file metadata through PermissionsExt to refuse a credential group or other can access, or a trust anchor they can write. Read-only metadata; no network or process capability."
+    },
+    {
+      "file": "ggctl/src/credential.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "ggctl::credential::check_directories#1",
+      "sha256": "ce92a7e3857cf8330034aed6bc5e575d4bc75e5fcf7723da2e216c97b9300f95",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 (operator file safety): canonicalizes the --ca-file path and reads the Unix mode bits of the directories holding it and its link target through PermissionsExt, refusing one group or other can write without the sticky bit. Read-only metadata; no network or process capability."
+    },
+    {
+      "file": "ggctl/src/credential.rs",
+      "reasons": [
+        "capability-import-or-glob",
+        "network-or-process-reference"
+      ],
+      "scope": "ggctl::credential::open_without_blocking#1",
+      "sha256": "411a115863e2166a5b96790d8531a4c7458f059d357399ea72ff559cef40b846",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 (operator file safety): opens --token-file and --ca-file read-only through OpenOptionsExt with the libc::O_NONBLOCK constant (no libc function is called), so a FIFO swapped in for the checked path cannot block the open. A local read-only open; no network or process capability."
+    },
+    {
+      "file": "ggctl/src/credential.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "ggctl::credential::check_same_file#1",
+      "sha256": "369d55c0d0c6d8522939885ff704cbff0c917c5d1dbf4ca44f85822223ffbc23",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 (operator file safety): compares the Unix device and inode of the checked path's metadata and the opened handle's through MetadataExt, refusing a path swapped between the two. Read-only metadata; no network or process capability."
     },
     {
       "file": "ggctl/src/help.rs",
