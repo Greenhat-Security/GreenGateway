@@ -10,6 +10,7 @@ pub mod oidc_login;
 pub mod principal;
 pub mod principal_directory;
 pub mod protected_resource;
+pub mod reauthentication;
 pub mod service_token_validator;
 pub mod tokens;
 pub mod validator;
@@ -33,6 +34,7 @@ pub use oidc_login::{OidcLoginConfig, OidcLoginState, PendingLoginLimits};
 pub use principal::{actor_from_principal, AuthMethod, Principal};
 #[allow(unused_imports)] // Public principal directory handle is wired by gateway startup.
 pub use principal_directory::PrincipalDirectory;
+pub use reauthentication::{CredentialJudge, Reauthentication};
 #[allow(unused_imports)] // Public service-token validator is wired by gateway startup.
 pub use service_token_validator::ServiceTokenValidator;
 #[allow(unused_imports)] // Public token-store API is consumed by admin endpoints and tests.
