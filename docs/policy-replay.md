@@ -362,6 +362,25 @@ completion is not accepted is `failed` with `audit_unavailable`. "Accepted"
 is what `AUDIT_DURABILITY` makes it: committed to the audit store under
 `required`, queued for the writer under `best_effort`.
 
+### Status codes
+
+| Status | When |
+| --- | --- |
+| `202` | `POST`: the job is queued. `DELETE`: cancellation of a queued or running job was requested |
+| `200` | `GET`: the job. `POST`: an idempotent retry, naming the job it already started |
+| `204` | `DELETE`: a finished job was discarded |
+| `400` | A body that is not JSON, or repeats a member (`policy_replay_request_invalid`) |
+| `401`, `403` | Not authenticated, or missing one of the three permissions; nothing is read or started |
+| `404` | No such job for this principal (`policy_replay_job_not_found`) |
+| `409` | An idempotency key reused for a different request |
+| `412` | `base_etag` is not the active policy's ETag |
+| `413` | The body is over its bound |
+| `422` | An invalid request, window, edit or candidate |
+| `429` | `policy_replay_busy` or `policy_replay_quota_exhausted` |
+| `503` | `audit_evidence_unavailable` (no standalone audit log, or it could not be read), `policy_replay_audit_unavailable` (the start was not recorded), or `policy_replay_unsupported_in_cluster` |
+
+A job's representation is always sent with `Cache-Control: no-store`.
+
 ### The result
 
 A job's representation (`policy-replay-job.v1`) states its state, the

@@ -759,6 +759,8 @@ fn the_audit_log_reader_never_loads_an_oversized_or_unreadable_row() {
     assert_eq!(kinds, [(1, "event"), (2, "oversized"), (3, "unreadable")]);
 
     // The page's byte budget ends a page after its first row, never before.
+    // An oversized row costs the budget nothing, since none of it is read:
+    // the next row that would be read ends the page.
     let page = store
         .replay_page(&ReplayPageQuery {
             from_epoch_us: WINDOW_START_US,
@@ -770,7 +772,8 @@ fn the_audit_log_reader_never_loads_an_oversized_or_unreadable_row() {
             max_page_bytes: 1,
         })
         .expect("page reads");
-    assert_eq!(page.len(), 1);
+    let ids = page.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    assert_eq!(ids, [1, 2]);
 }
 
 #[test]

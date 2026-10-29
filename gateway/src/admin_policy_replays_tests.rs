@@ -462,7 +462,12 @@ async fn a_replay_job_runs_to_an_aggregate_deterministic_result_and_audits_its_l
     let harness = harness();
     seed(&harness.audit_db.path, &retained_window());
     let etag = current_policy(&harness.router).await.0;
-    let body = replay_body(&etag, lockdown_edits()).to_string();
+    // A closed window, so a second job over it states the same window.
+    let mut body = replay_body(&etag, lockdown_edits());
+    body["window"]["to"] = json!(OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .expect("a window bound formats"));
+    let body = body.to_string();
 
     let response = start(&harness.router, replayer(), body.clone()).await;
     assert_eq!(response.status(), StatusCode::ACCEPTED);
