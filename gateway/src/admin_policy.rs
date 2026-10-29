@@ -2290,6 +2290,9 @@ pub(super) enum PolicyCommitRefusal {
     /// live member cannot read, or had no roster to ask.
     #[cfg(feature = "postgres")]
     OperationRefused,
+    /// `AUTHORITY_EVIDENCE_DURABILITY=required` refused a change this
+    /// deployment mode records no evidence of (issue #425, PR 4).
+    AuthorityEvidenceUnsupported,
     /// No authority is configured, or it could not write the candidate.
     Failed,
 }
@@ -2354,7 +2357,20 @@ pub(super) async fn commit_policy_mutation(
     diff_summary: Value,
 ) -> Result<PolicyMutationCommitResult, PolicyMutationFailure> {
     // Standalone writes record no change evidence (#425 PR 4): the file,
-    // the reload and the optional history are separate steps.
+    // the reload and the optional history are separate steps. Required
+    // authority evidence refuses them here, the one commit path every
+    // policy mutation shares, before anything is validated or written.
+    admit_authority_change(
+        &context.state.authority_evidence,
+        authority_events::required::AuthorityOperation::from(action),
+        &context.state.audit,
+        context.parts,
+        context.principal,
+        &context.state.client_ip_policy,
+    )
+    .map_err(|response| {
+        PolicyMutationFailure::Refused(PolicyCommitRefusal::AuthorityEvidenceUnsupported, response)
+    })?;
     #[cfg(not(feature = "postgres"))]
     let _ = action;
     validate_policy_mutation_candidate(context.rbac_state, before_policy, candidate).map_err(
