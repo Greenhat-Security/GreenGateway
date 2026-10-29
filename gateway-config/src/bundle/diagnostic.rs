@@ -171,6 +171,7 @@ pub enum Code {
     InvalidValue,
     InvalidName,
     InvalidDecimal,
+    NotApplicable,
     // References between bundle files.
     InvalidPath,
     ReservedPath,
@@ -253,6 +254,7 @@ impl Code {
         Self::InvalidValue,
         Self::InvalidName,
         Self::InvalidDecimal,
+        Self::NotApplicable,
         Self::InvalidPath,
         Self::ReservedPath,
         Self::DuplicatePath,
@@ -489,6 +491,10 @@ impl Code {
             Self::InvalidDecimal => (
                 "schema.invalid_decimal",
                 "a decimal is not a string of up to 16 integer and 6 fraction digits",
+            ),
+            Self::NotApplicable => (
+                "schema.not_applicable",
+                "a member does not apply given the value of another member",
             ),
             Self::InvalidPath => (
                 "reference.invalid_path",

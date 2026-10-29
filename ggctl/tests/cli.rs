@@ -633,3 +633,82 @@ fn validate_and_doctor_read_a_bundle_offline_with_their_exit_codes() {
         assert_path_not_echoed(&output, missing);
     }
 }
+
+#[test]
+fn init_writes_a_bundle_that_validates_strictly_and_converts_to_itself() {
+    // An empty parent: init creates the bundle directory in it.
+    let parent = Bundle::new("{\"schema_version\": \"0.1.0\"}\n");
+    let output_directory = parent.0.join("generated");
+    let generated = output_directory.to_str().expect("UTF-8");
+
+    let output = ggctl(
+        &[
+            "init",
+            "--profile",
+            "production",
+            "--output",
+            generated,
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    let found = report(&output);
+    assert_eq!(found["command"], "init");
+    assert_eq!(found["result"]["created"], true);
+    assert_eq!(
+        found["result"]["bundle"]["deployment"]["profile"],
+        "production"
+    );
+    assert_path_not_echoed(&output, generated);
+
+    let output = ggctl(
+        &["validate", generated, "--strict", "--warnings-as-errors"],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+
+    // A second init into the same directory is refused and changes nothing.
+    let before = std::fs::read(output_directory.join("bundle.yaml")).expect("the manifest");
+    let output = ggctl(
+        &["init", "--profile", "development", "--output", generated],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(5));
+    assert!(text(&output.stderr).contains("output.destination_exists"));
+    assert_eq!(
+        std::fs::read(output_directory.join("bundle.yaml")).expect("the manifest"),
+        before
+    );
+
+    let copy = parent.0.join("copy");
+    let output = ggctl(
+        &[
+            "convert",
+            generated,
+            "--to",
+            "greengateway.dev/v1alpha1",
+            "--output",
+            copy.to_str().expect("UTF-8"),
+        ],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert_eq!(
+        std::fs::read(copy.join("bundle.yaml")).expect("the copied manifest"),
+        before
+    );
+    let output = ggctl(
+        &[
+            "convert",
+            generated,
+            "--to",
+            "greengateway.dev/v1alpha0",
+            "--in-place",
+        ],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(3));
+    assert!(text(&output.stderr).contains("convert.unsupported_version"));
+}

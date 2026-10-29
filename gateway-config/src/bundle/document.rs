@@ -9,7 +9,7 @@
 //! in the document is reported, not just the first.
 
 use super::{
-    diagnostic::{BundleDiagnostic, Code, Pointer},
+    diagnostic::{BundleDiagnostic, Code, Pointer, Position},
     source::{FileName, MANIFEST_FILE_NAME},
     syntax::{Member, Node},
 };
@@ -29,7 +29,7 @@ impl ApiVersion {
         }
     }
 
-    fn parse(text: &str) -> Option<Self> {
+    pub(crate) fn parse(text: &str) -> Option<Self> {
         Self::ALL
             .iter()
             .copied()
@@ -121,26 +121,35 @@ pub(crate) struct Deployment {
 }
 
 /// Collects one document's diagnostics.
-struct Checker<'a> {
-    file: &'a FileName,
-    diagnostics: &'a mut Vec<BundleDiagnostic>,
-    failed: bool,
+///
+/// `file` is the bundle file the document is; `None` for a document that is
+/// not part of a bundle (the `GatewayInitAnswers` document `ggctl init`
+/// reads), whose diagnostics carry a pointer and a position only.
+pub(super) struct Checker<'a> {
+    pub(super) file: Option<&'a FileName>,
+    pub(super) diagnostics: &'a mut Vec<BundleDiagnostic>,
+    pub(super) failed: bool,
 }
 
 impl Checker<'_> {
-    fn report(&mut self, code: Code, pointer: Pointer, node: &Node) {
-        self.failed = true;
-        self.diagnostics.push(BundleDiagnostic::at(
-            code,
-            self.file,
+    fn diagnostic(&self, code: Code, pointer: Pointer, position: Position) -> BundleDiagnostic {
+        BundleDiagnostic {
+            file: self.file.cloned(),
             pointer,
-            Some(node.position),
-        ));
+            position: Some(position),
+            ..BundleDiagnostic::bundle(code)
+        }
+    }
+
+    pub(super) fn report(&mut self, code: Code, pointer: Pointer, node: &Node) {
+        self.failed = true;
+        let diagnostic = self.diagnostic(code, pointer, node.position);
+        self.diagnostics.push(diagnostic);
     }
 
     /// The members of an object, after refusing the ones `allowed` does not
     /// name and reporting the `required` ones that are missing.
-    fn object<'n>(
+    pub(super) fn object<'n>(
         &mut self,
         node: &'n Node,
         pointer: &Pointer,
@@ -156,12 +165,9 @@ impl Checker<'_> {
                 // Reported at the parent and the key's own position: the
                 // unknown name itself is document content and never echoed.
                 self.failed = true;
-                self.diagnostics.push(BundleDiagnostic::at(
-                    Code::UnknownMember,
-                    self.file,
-                    pointer.clone(),
-                    Some(member.key_position),
-                ));
+                let diagnostic =
+                    self.diagnostic(Code::UnknownMember, pointer.clone(), member.key_position);
+                self.diagnostics.push(diagnostic);
             }
         }
         for name in required {
@@ -172,7 +178,7 @@ impl Checker<'_> {
         Some(members)
     }
 
-    fn string<'n>(&mut self, node: &'n Node, pointer: &Pointer) -> Option<&'n str> {
+    pub(super) fn string<'n>(&mut self, node: &'n Node, pointer: &Pointer) -> Option<&'n str> {
         let text = node.as_str();
         if text.is_none() {
             self.report(Code::WrongType, pointer.clone(), node);
@@ -181,7 +187,7 @@ impl Checker<'_> {
     }
 }
 
-fn member<'n>(members: &'n [Member], name: &str) -> Option<&'n Node> {
+pub(super) fn member<'n>(members: &'n [Member], name: &str) -> Option<&'n Node> {
     members
         .iter()
         .find(|member| member.key == name)
@@ -192,7 +198,7 @@ fn member<'n>(members: &'n [Member], name: &str) -> Option<&'n Node> {
 /// `kind`, before any other member is interpreted. Returns the root's
 /// members and the version, or `None` when the rest of the document cannot
 /// be interpreted.
-fn envelope<'n>(
+pub(super) fn envelope<'n>(
     checker: &mut Checker<'_>,
     node: &'n Node,
     kind: &str,
@@ -228,7 +234,7 @@ fn envelope<'n>(
 pub(crate) fn manifest(node: &Node, diagnostics: &mut Vec<BundleDiagnostic>) -> Option<Manifest> {
     let file = FileName::manifest();
     let mut checker = Checker {
-        file: &file,
+        file: Some(&file),
         diagnostics,
         failed: false,
     };
@@ -505,7 +511,7 @@ pub(crate) fn deployment(
     diagnostics: &mut Vec<BundleDiagnostic>,
 ) -> Option<Deployment> {
     let mut checker = Checker {
-        file,
+        file: Some(file),
         diagnostics,
         failed: false,
     };
@@ -543,7 +549,7 @@ pub(crate) fn deployment(
 }
 
 /// `^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`, the Kubernetes object-name label.
-fn is_dns_label(name: &str) -> bool {
+pub(super) fn is_dns_label(name: &str) -> bool {
     let bytes = name.as_bytes();
     let alphanumeric = |byte: &u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
     match bytes {

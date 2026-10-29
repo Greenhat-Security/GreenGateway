@@ -36,11 +36,18 @@
 //!    invariants -- deny by default, enforce mode, no wildcard role for
 //!    `production` and, until acknowledgments exist, `migration`.
 //!
+//! Two modules build on the reader: [`init`] generates the bundle `ggctl
+//! init` writes, and [`convert`] plans the explicit conversion of a bundle
+//! between document versions that `ggctl convert` performs. Both hand their
+//! output to this reader before anything treats it as a bundle.
+//!
 //! Nothing selects a bundle for startup yet: bundle mode and the field
 //! catalog that fills the deployment document are later #242 slices.
 
+pub mod convert;
 mod diagnostic;
 mod document;
+pub mod init;
 mod json;
 mod profile;
 mod resource;
@@ -200,6 +207,29 @@ pub struct Bundle<P, T> {
     /// Connections are server-managed in `v1alpha1`; `true` when the
     /// manifest says so.
     pub connections_from_server: bool,
+    /// The exact bytes of every file the bundle consists of, as read and
+    /// checked: the manifest first, then each file it references in the
+    /// order it references them. Unreferenced and dot entries are not part
+    /// of a bundle and are not here.
+    pub files: Vec<BundleFile>,
+}
+
+/// One file of a bundle: its name and exact bytes.
+#[derive(Clone, Eq, PartialEq)]
+pub struct BundleFile {
+    pub name: FileName,
+    pub bytes: Vec<u8>,
+}
+
+/// The name and length only: a file's bytes are document content.
+impl std::fmt::Debug for BundleFile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BundleFile")
+            .field("name", &self.name)
+            .field("bytes", &self.bytes.len())
+            .finish()
+    }
 }
 
 /// The deployment document.
@@ -271,6 +301,7 @@ fn read<V: ResourceValidators>(
     };
     let manifest = parse_document(&manifest_bytes, &manifest_file, diagnostics)
         .and_then(|node| document::manifest(&node, diagnostics))?;
+    let mut files = Vec::new();
     *summary = Some(ManifestSummary::of(&manifest));
     let source_digest = canonical_json::source_digest(
         MANIFEST_MEDIA_TYPE,
@@ -278,7 +309,12 @@ fn read<V: ResourceValidators>(
         &manifest_bytes,
     );
 
-    let deployment = read_deployment(&mut directory, &manifest.deployment, diagnostics);
+    let deployment = read_deployment(
+        &mut directory,
+        &manifest.deployment,
+        &mut files,
+        diagnostics,
+    );
     // The profile's policy invariants apply once the deployment document says
     // which profile it is; without one the bundle is refused anyway.
     let profile = deployment.as_ref().map(|deployment| deployment.profile);
@@ -286,6 +322,7 @@ fn read<V: ResourceValidators>(
         read_resource(
             &mut directory,
             source,
+            &mut files,
             diagnostics,
             |text, version, file, found| {
                 resource::policy(text, version, profile, file, found)
@@ -297,6 +334,7 @@ fn read<V: ResourceValidators>(
         read_resource(
             &mut directory,
             source,
+            &mut files,
             diagnostics,
             |text, version, file, found| {
                 resource::tools(text, version, file, found)
@@ -312,6 +350,13 @@ fn read<V: ResourceValidators>(
         connections_from_server,
         ..
     } = manifest;
+    files.insert(
+        0,
+        BundleFile {
+            name: manifest_file,
+            bytes: manifest_bytes,
+        },
+    );
     Some(Bundle {
         api_version,
         name,
@@ -320,6 +365,7 @@ fn read<V: ResourceValidators>(
         policy: declared(policy)?,
         tools: declared(tools)?,
         connections_from_server,
+        files,
     })
 }
 
@@ -379,10 +425,15 @@ fn read_pinned(
 fn read_deployment(
     directory: &mut BundleDirectory,
     reference: &FileReference,
+    files: &mut Vec<BundleFile>,
     diagnostics: &mut Vec<BundleDiagnostic>,
 ) -> Option<DeploymentDocument> {
     let bytes = read_pinned(directory, reference, MAX_DEPLOYMENT_BYTES, diagnostics)?;
     let node = parse_document(&bytes, &reference.file, diagnostics)?;
+    files.push(BundleFile {
+        name: reference.file.clone(),
+        bytes,
+    });
     let Deployment { profile, .. } = document::deployment(&node, &reference.file, diagnostics)?;
     // Bundle documents hold safe integers only, so this cannot fail; if it
     // ever did, the document is refused rather than given no canonical form.
@@ -405,6 +456,7 @@ fn read_deployment(
 fn read_resource<T>(
     directory: &mut BundleDirectory,
     source: &ResourceSource,
+    files: &mut Vec<BundleFile>,
     diagnostics: &mut Vec<BundleDiagnostic>,
     validate: impl FnOnce(&str, &str, &FileName, &mut Vec<BundleDiagnostic>) -> Option<T>,
 ) -> Option<BundledResource<T>> {
@@ -418,6 +470,10 @@ fn read_resource<T>(
     let bytes = read_pinned(directory, reference, MAX_RESOURCE_BYTES, diagnostics)?;
     let text = decode(&bytes, TextRules::Resource, &reference.file, diagnostics)?;
     let document = validate(text, schema_version, &reference.file, diagnostics)?;
+    files.push(BundleFile {
+        name: reference.file.clone(),
+        bytes,
+    });
     Some(BundledResource::Bundle {
         file: reference.file.clone(),
         schema_version,

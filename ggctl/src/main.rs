@@ -14,11 +14,14 @@
 
 mod cli;
 mod completion;
+mod convert;
 mod credential;
 mod diagnostic;
 mod diff;
 mod doctor;
 mod help;
+mod init;
+mod output;
 mod remote;
 mod report;
 mod sarif;
@@ -130,6 +133,7 @@ mod tests {
             captured.stdout(),
             "greengateway.dev/v1alpha1  GatewayBundle\n\
              greengateway.dev/v1alpha1  GatewayDeployment\n\
+             greengateway.dev/v1alpha1  GatewayInitAnswers\n\
              greengateway.dev/v1alpha1  GatewayCapabilities\n\
              greengateway.dev/v1alpha1  GgctlReport\n"
         );

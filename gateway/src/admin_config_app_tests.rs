@@ -168,3 +168,83 @@ async fn config_capabilities_follow_a_custom_prefix_on_the_admin_listener_only()
         assert_eq!(response.status(), status, "{uri}");
     }
 }
+
+/// The policy `ggctl init` writes (issue #242 PR 6) is enforced as written
+/// when it is the gateway's policy: it denies by default, and the operator
+/// role it generates reaches the version handshake and the status read only
+/// for a principal of the bound issuer and authentication method. No gateway
+/// reads a bundle yet, so the policy is loaded as `POLICY_FILE`.
+#[tokio::test]
+async fn the_policy_ggctl_init_writes_admits_only_its_bound_operator() {
+    use gateway_config::bundle::{
+        init::{read_answers, scaffold, Answers, AnswersSyntax, POLICY_FILE},
+        Profile,
+    };
+    let operator = read_answers(
+        b"apiVersion: greengateway.dev/v1alpha1\nkind: GatewayInitAnswers\nspec:\n  operator:\n    issuer: \"provider:corporate\"\n    auth_methods: [bearer_token]\n",
+        AnswersSyntax::Yaml,
+    )
+    .expect("the answers should be read");
+    let policy_of = |answers: &Answers| {
+        let files = scaffold(Profile::Production, answers);
+        let file = files
+            .iter()
+            .find(|file| file.name.as_str() == POLICY_FILE)
+            .expect("a standalone bundle has a policy");
+        String::from_utf8(file.bytes.clone()).expect("the policy is UTF-8")
+    };
+    let principal = |issuer: &str, auth_method| auth::Principal {
+        user_id: "operator-1".to_owned(),
+        issuer: Some(issuer.to_owned()),
+        email: None,
+        org_id: None,
+        roles: vec!["operator".to_owned()],
+        session_id: "session-1".to_owned(),
+        auth_method,
+    };
+    for (answers, issuer, auth_method, expected) in [
+        (
+            &operator,
+            "provider:corporate",
+            auth::AuthMethod::Bearer,
+            StatusCode::OK,
+        ),
+        (
+            &operator,
+            "provider:other",
+            auth::AuthMethod::Bearer,
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            &operator,
+            "provider:corporate",
+            auth::AuthMethod::Cookie,
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            &Answers::default(),
+            "provider:corporate",
+            auth::AuthMethod::Bearer,
+            StatusCode::FORBIDDEN,
+        ),
+    ] {
+        let policy = TempPolicyFile::new(&policy_of(answers));
+        let mut config = test_config(Vec::new());
+        config.auth_enabled = false;
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        for uri in [CONFIG_CAPABILITIES_ADMIN_ROUTE, STATUS_ADMIN_ROUTE] {
+            let response = status_router(config.clone(), Instant::now())
+                .oneshot(audit_query_request(
+                    uri,
+                    Some(principal(issuer, auth_method.clone())),
+                ))
+                .await
+                .expect("request should complete");
+            assert_eq!(
+                response.status(),
+                expected,
+                "{uri} {issuer} {auth_method:?}"
+            );
+        }
+    }
+}

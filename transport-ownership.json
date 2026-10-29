@@ -14975,6 +14975,46 @@
       "purpose": "Reviewed for #242 PR 5: the in-memory string formatting trait for generated help text; no I/O, network or process capability."
     },
     {
+      "file": "ggctl/src/output.rs",
+      "reasons": [
+        "capability-in-macro-input"
+      ],
+      "scope": "ggctl::output::impl  Staging::create#1",
+      "sha256": "8446a2b2dcb2c66b7715f1e3a0caf83874aa62c154021d103018b645c20198f6",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 6 (ggctl init and convert): names the hidden staging directory beside the --output directory from the parent path, the destination's name, this process's own ID (std::process::id, read only, inside format!) and an attempt counter, and creates it exclusively through create_private_directory. Local filesystem only; no process is spawned or signalled and no network capability."
+    },
+    {
+      "file": "ggctl/src/output.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "ggctl::output::create_private_directory#1",
+      "sha256": "e1670dcb7e37b51a30944edc8e8a42e3ee0a29631068339838799456590395d0",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 6 (ggctl init and convert): imports DirBuilderExt to create the staging directory with mode 0700 on Unix, exclusively (create fails if it exists). Local filesystem only; no network or process capability."
+    },
+    {
+      "file": "ggctl/src/output.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "ggctl::output::owner_only#1",
+      "sha256": "29e10e1e2d0d1c1007e04707a14336f88c1af4564961dca384bd0c2e05df63a9",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 6 (ggctl init and convert): imports OpenOptionsExt to give each new bundle file mode 0600 on Unix when it is created with create_new. Local filesystem only; no network or process capability."
+    },
+    {
+      "file": "ggctl/src/output.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "ggctl::output::is_owner_only#1",
+      "sha256": "a4872bdbd542b847b24ed2891eeb1a7ffeb0953e934926070bc3bce7898f7546",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 6 (ggctl init and convert): reads the Unix mode bits of the staging directory and its entries through PermissionsExt, without following links, to refuse a filesystem that did not keep owner-only modes. Read-only metadata; no network or process capability."
+    },
+    {
       "file": "ggctl/src/remote.rs",
       "reasons": [
         "capability-import-or-glob"

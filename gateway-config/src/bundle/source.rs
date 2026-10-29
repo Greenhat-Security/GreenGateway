@@ -77,6 +77,12 @@ impl FileName {
         Self(MANIFEST_FILE_NAME.to_owned())
     }
 
+    /// A name this crate fixes, such as each file `init` writes; a test
+    /// holds every one to the grammar.
+    pub(crate) fn fixed(name: &'static str) -> Self {
+        Self(name.to_owned())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
