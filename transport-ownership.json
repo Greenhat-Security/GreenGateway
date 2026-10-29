@@ -10914,16 +10914,6 @@
       "reasons": [
         "unexpanded-attribute"
       ],
-      "scope": "gateway::policy_eval::impl  RateLaneSelection::matched#1",
-      "sha256": "702d6a3838f7f20f294e36f410df95e216bfcda2a58b499729e49a9a01e46f7d",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Per-method cfg_attr(not(test), expect(dead_code)) for a rate-lane selection accessor that offline analysis and the differential tests read; the live rate adapter (#422 PR 3a) matches on the outcome instead. Dead-code gating only; no transport or process capability is introduced."
-    },
-    {
-      "file": "gateway/src/policy_eval/mod.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
       "scope": "gateway::policy_eval::impl  RateLaneSelection::limit#1",
       "sha256": "c309ec491de24254205bae6753f4aea422b809fa7c85b09e16a41174712cdf37",
       "owner": "GreenGateway maintainers",
