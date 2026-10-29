@@ -29,9 +29,10 @@
 //!   stable, compile-time constant, so two migration jobs started
 //!   simultaneously produce exactly one applier and one no-op observer.
 //!   The lock is taken under the session's `lock_timeout`, and it is held on
-//!   a connection the migrator then detaches from the pool, so the lock dies
-//!   with the session the moment the migrator returns -- on success and on
-//!   every error path alike, with nothing to forget.
+//!   a connection the migrator detaches from the pool before it runs
+//!   anything on it, so the lock dies with the session the moment the
+//!   migrator returns or is cancelled -- on success, on every error path
+//!   and mid-wait alike, with nothing to forget.
 //! - **Migration statements run under their own bounded timeout**
 //!   (`DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS`), set with `SET LOCAL`
 //!   inside each migration's transaction: long enough for real DDL, still
@@ -1000,10 +1001,14 @@ async fn apply_missing(
 /// advisory lock. `manifest` is [`MANIFEST`] everywhere but the contraction
 /// fixture's tests.
 ///
-/// The lock lives on a connection that is then **detached from the pool**
-/// (`Object::take`), so it is released by the session closing the moment
-/// this function returns -- success or error -- rather than by remembering
-/// to unlock on every path. A second migrator started simultaneously waits
+/// The lock lives on a connection **detached from the pool**
+/// (`Object::take`) the moment it is checked out, before its session
+/// budgets are widened or the lock is asked for, so it is released by the
+/// session closing the moment this function returns or its future is
+/// dropped -- success, error or cancellation, the lock wait included --
+/// rather than by remembering to unlock on every path, and no connection
+/// that ran the migrator's session settings or asked for its lock is ever
+/// recycled. A second migrator started simultaneously waits
 /// on the lock under the session's `lock_timeout`, then re-reads the ledger
 /// and finds nothing left to do. Each migration runs in one transaction
 /// with its ledger row and its own `SET LOCAL` statement/lock timeouts, so
@@ -1021,17 +1026,28 @@ pub(super) async fn apply_manifest(
     manifest: &[Migration],
     member_stale_window: std::time::Duration,
 ) -> Result<MigrateOutput, MigrateError> {
-    let connection = acquire(pool).await?;
+    // The connection leaves the pool before anything runs on it, and never
+    // comes back. `take` returns the bare client with no `await` after the
+    // checkout, and dropping that client closes the session (deadpool's
+    // wrapper aborts its connection task), which releases the advisory
+    // lock: at every return below, and at every `await` this future can be
+    // cancelled at, the budget setup and the lock wait included. A pooled
+    // connection held here until the lock was granted would go back to the
+    // pool by its own `Drop` on both of those: after a failed wait with the
+    // widened budgets still set on it, and after a cancelled one with the
+    // lock statement still queued, so that pooled session would take the
+    // lock when the server granted it and keep it for as long as the pool
+    // lived. The `lock_session` tests below stop the migrator there.
+    let client = deadpool_postgres::Object::take(acquire(pool).await?);
 
-    // Method calls auto-deref the pooled object to the underlying client.
-    // This session is about to be detached from the pool, so widening its
-    // budgets is safe: they die with the connection. The advisory lock
-    // wait and the bootstrap DDL run under the migration budget
-    // (N migrations could legitimately hold the lock for N times the
-    // per-migration timeout), not the pooled session's request-path
-    // lock_timeout -- a second migrator waiting behind a slow first one
-    // must observe, not spuriously fail.
-    connection
+    // This session never returns to the pool, so widening its budgets is
+    // safe: they die with the connection. The advisory lock wait and the
+    // bootstrap DDL run under the migration budget (N migrations could
+    // legitimately hold the lock for N times the per-migration timeout),
+    // not the pooled session's request-path lock_timeout -- a second
+    // migrator waiting behind a slow first one must observe, not
+    // spuriously fail.
+    client
         .simple_query(&format!(
             "SET lock_timeout = {}; SET statement_timeout = {};",
             settings.migration_statement_timeout_ms * (manifest.len() as u64),
@@ -1047,7 +1063,7 @@ pub(super) async fn apply_manifest(
     // failed wait is recorded too: an operator sizing the migration budget
     // needs the attempts that hit the timeout most of all.
     let lock_wait = std::time::Instant::now();
-    let locked = connection
+    let locked = client
         .simple_query(&format!("SELECT pg_advisory_lock({})", *MIGRATION_LOCK_KEY))
         .await;
     record_migration_lock_wait(lock_wait.elapsed());
@@ -1055,12 +1071,6 @@ pub(super) async fn apply_manifest(
         tracing::error!(error = %error, "migration advisory lock failed");
         MigrateError::ApplyFailed
     })?;
-    // Detach the connection from the pool: `take` consumes the wrapper and
-    // returns the client itself, marked so the pool will never recycle it.
-    // When `client` drops -- at every return below, success or error -- the
-    // session closes and PostgreSQL releases the advisory lock. Nothing to
-    // remember, nothing left dangling in the pool holding a lock.
-    let client = deadpool_postgres::Object::take(connection);
 
     bootstrap_ledger(&client).await?;
 
@@ -4301,5 +4311,300 @@ mod tests {
             super::super::RepositoryErrorKind::Unavailable,
             "42501 must classify as unavailable"
         );
+    }
+
+    // --- the migrator's lock session -------------------------------------
+    //
+    // The migrator widens its session's budgets and waits for its advisory
+    // lock on a connection that must never go back to the pool: a pooled
+    // connection that ran those `SET`s serves the next request with them,
+    // and one that holds -- or is still queued for -- the lock keeps it
+    // for as long as the pool lives, so every later `migrate up` waits it
+    // out and fails. These tests stop the migrator at the moments a
+    // pooled connection could leak and ask the server what it holds.
+    //
+    // Each runs in a database of its own: an advisory lock belongs to a
+    // database, the migrator's key is fixed, and every other test database
+    // has a migrator taking it. The pool's connections run behind the
+    // dedicated-session tests' reply gate (`postgres_session::tests`), so
+    // a cancellation lands where the test says -- after the lock statement
+    // was sent -- rather than wherever scheduling puts it.
+    mod lock_session {
+        use std::{future::Future, pin::Pin, time::Duration};
+
+        use super::*;
+        use crate::storage::{
+            contract_tests::postgres_audit_tests::{create_test_database, TestDatabase, DATABASE},
+            postgres_session::tests::{
+                assert_released, drive_into_window, gated_pool, holders, observer, waiters,
+                ReplyGate, ANSWER_BUDGET, QUERY,
+            },
+        };
+
+        /// The migrator's simple queries on a new connection are its
+        /// session budgets and then the lock statement, so the lock is the
+        /// second. A gate that stops anywhere else fails the tests'
+        /// preconditions rather than passing them.
+        const LOCK_STATEMENT: usize = 2;
+
+        struct Harness {
+            gate: ReplyGate,
+            /// Shaped like the production pool where it matters here: it
+            /// recycles with `ROLLBACK`, which ends a transaction and resets
+            /// nothing else -- not a session setting, not a session lock.
+            pool: deadpool_postgres::Pool,
+            /// Outside the pool, so the observation is never made by the
+            /// thing being observed.
+            observer: tokio_postgres::Client,
+            /// After the connections, so they close before the database
+            /// drops.
+            database: TestDatabase,
+            /// Held until the database has dropped, as every test on a
+            /// database of its own does.
+            _serial: tokio::sync::MutexGuard<'static, ()>,
+        }
+
+        async fn harness() -> Option<Harness> {
+            let admin_dsn = real_dsn()?;
+            let serial = DATABASE.lock().await;
+            let database = create_test_database(&admin_dsn).await;
+            let gate = ReplyGate::new();
+            let pool = gated_pool(&database.dsn, &gate);
+            let observer = observer(&database.dsn).await;
+            Some(Harness {
+                gate,
+                pool,
+                observer,
+                database,
+                _serial: serial,
+            })
+        }
+
+        /// The first shipped migration: enough for a migrator that gets
+        /// the lock to have something to apply, and its lock budget is one
+        /// migration's.
+        fn one_migration() -> &'static [Migration] {
+            &MANIFEST[..1]
+        }
+
+        fn stale_window() -> Duration {
+            Duration::from_millis(crate::config::DEFAULT_CLUSTER_MEMBER_STALE_MS)
+        }
+
+        /// Hold the migrator's key on a connection of its own, as a
+        /// migrator already running would.
+        async fn hold_the_key(harness: &Harness) -> tokio_postgres::Client {
+            let holder = observer(&harness.database.dsn).await;
+            holder
+                .execute("SELECT pg_advisory_lock($1)", &[&*MIGRATION_LOCK_KEY])
+                .await
+                .expect("the holder takes the migrator's key");
+            holder
+        }
+
+        /// Drive `future` until the server shows a backend queued for `key`
+        /// behind its holder: the lock statement has been sent and is
+        /// waiting. The condition is stable -- nothing grants the key while
+        /// the holder keeps it, and the gate withholds a grant anyway -- so
+        /// asking until it holds overshoots nothing.
+        async fn drive_until_queued<F: Future>(
+            observer: &tokio_postgres::Client,
+            key: i64,
+            future: Pin<&mut F>,
+            what: &str,
+        ) {
+            let queued = async {
+                while waiters(observer, key).await.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            };
+            let parked = tokio::time::timeout(ANSWER_BUDGET, async {
+                tokio::select! {
+                    biased;
+                    _ = future => false,
+                    () = queued => true,
+                }
+            })
+            .await;
+            match parked {
+                Ok(true) => {}
+                Ok(false) => panic!("{what} completed while another session held its lock"),
+                Err(_) => panic!("{what} was not queued for its lock within {ANSWER_BUDGET:?}"),
+            }
+        }
+
+        /// Cancelling `migrate up` once the server has granted its lock,
+        /// before the migrator has heard, must not leave the lock held.
+        ///
+        /// The migrator is a future like any other: a job runner's
+        /// shutdown, a startup that gives up, or a caller's `select!`
+        /// drops it wherever it is parked. The gate withholds the answer
+        /// to the lock statement, so the migrator is parked in the window
+        /// from the moment the server grants the lock until the test drops
+        /// it there.
+        #[tokio::test]
+        async fn a_migrator_cancelled_with_its_lock_granted_does_not_keep_it() {
+            let Some(harness) = harness().await else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let key = *MIGRATION_LOCK_KEY;
+            let settings = test_settings();
+
+            harness.gate.hold_replies_from_nth(QUERY, LOCK_STATEMENT);
+            // `Box::pin`, not `tokio::pin!`: the macro shadows the future
+            // with a `Pin<&mut _>`, and dropping *that* cancels nothing.
+            let mut migrate = Box::pin(apply_manifest(
+                &harness.pool,
+                &settings,
+                one_migration(),
+                stale_window(),
+            ));
+            drive_into_window(&harness.gate, migrate.as_mut(), "the migrator").await;
+            assert!(
+                !holders(&harness.observer, key).await.is_empty(),
+                "the server has answered the lock statement, so it must be holding the key; \
+                 the gate stopped the migrator somewhere other than the window this test covers"
+            );
+
+            drop(migrate);
+            // The answer was delayed, not lost: let it arrive, as the
+            // network would, at whatever is still listening.
+            harness.gate.open();
+            let elapsed = assert_released(
+                &harness.observer,
+                key,
+                "the migrator was cancelled with its lock granted",
+            )
+            .await;
+            eprintln!("cancelled migrator (granted): key released after {elapsed:?}");
+            assert_eq!(
+                harness.pool.status().size,
+                0,
+                "the cancelled migrator's connection must be closed, not recycled into the pool"
+            );
+
+            // The consequence, stated directly: the next `migrate up` takes
+            // the lock and applies, and it too leaves nothing in the pool.
+            let applied = apply_manifest(&harness.pool, &settings, one_migration(), stale_window())
+                .await
+                .expect("a later migrator must be able to take the lock a cancelled one left");
+            assert_eq!(applied, MigrateOutput::Applied { applied: 1 });
+            assert_eq!(
+                harness.pool.status().size,
+                0,
+                "a finished migrator's connection is closed, not recycled into the pool"
+            );
+            assert_released(&harness.observer, key, "the later migrator returned").await;
+        }
+
+        /// Cancelling `migrate up` while it waits behind another migrator
+        /// must not leave a session that takes the lock once that one
+        /// finishes and then keeps it.
+        ///
+        /// A migrator queued in `pg_advisory_lock` is the second of two
+        /// jobs started together, and it can wait for as long as the
+        /// first one migrates. Its lock statement stays queued on the
+        /// server after the client gives up, so the server grants the
+        /// lock to that session when the holder lets go; only a session
+        /// that has ended gives it straight back.
+        #[tokio::test]
+        async fn a_migrator_cancelled_while_queued_for_its_lock_does_not_take_it_later() {
+            let Some(harness) = harness().await else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let key = *MIGRATION_LOCK_KEY;
+            let settings = test_settings();
+            let holder = hold_the_key(&harness).await;
+
+            // The gate is belt and braces here: the holder already keeps
+            // the migrator waiting, and the gate keeps it from hearing a
+            // grant even if the key were let go early.
+            harness.gate.hold_replies_from_nth(QUERY, LOCK_STATEMENT);
+            let mut migrate = Box::pin(apply_manifest(
+                &harness.pool,
+                &settings,
+                one_migration(),
+                stale_window(),
+            ));
+            drive_until_queued(&harness.observer, key, migrate.as_mut(), "the migrator").await;
+
+            drop(migrate);
+            harness.gate.open();
+            // The holder lets go: the server grants the key to whatever is
+            // queued for it, the cancelled migrator's session first.
+            holder
+                .execute("SELECT pg_advisory_unlock($1)", &[&key])
+                .await
+                .expect("the holder gives the key back");
+            let elapsed = assert_released(
+                &harness.observer,
+                key,
+                "the migrator was cancelled while queued for its lock",
+            )
+            .await;
+            eprintln!("cancelled migrator (queued): key released after {elapsed:?}");
+            assert_eq!(
+                harness.pool.status().size,
+                0,
+                "the cancelled migrator's connection must be closed, not recycled into the pool"
+            );
+        }
+
+        /// A lock wait that times out must not hand the session it widened
+        /// back to the pool.
+        ///
+        /// The migrator raises its session's `lock_timeout` and
+        /// `statement_timeout` to the migration budget before it waits.
+        /// Recycled, that session would serve the next pooled request
+        /// with the migration job's budgets instead of the request path's.
+        #[tokio::test]
+        async fn a_failed_lock_wait_does_not_return_the_widened_session_to_the_pool() {
+            let Some(harness) = harness().await else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let key = *MIGRATION_LOCK_KEY;
+            let _holder = hold_the_key(&harness).await;
+            // One migration's budget: the lock wait gives up after 200 ms.
+            let settings = DatabaseSettings {
+                migration_statement_timeout_ms: 200,
+                ..test_settings()
+            };
+
+            let error = apply_manifest(&harness.pool, &settings, one_migration(), stale_window())
+                .await
+                .expect_err("the lock wait must time out while another session holds the key");
+            assert_eq!(error, MigrateError::ApplyFailed);
+            assert!(
+                waiters(&harness.observer, key).await.is_empty(),
+                "the timed-out lock statement must have left the queue"
+            );
+            assert_eq!(
+                harness.pool.status().size,
+                0,
+                "the migrator's widened session must be closed, not recycled into the pool"
+            );
+
+            // What the next pooled request runs under: the pool's own
+            // session defaults, never the migrator's budgets.
+            let next = harness
+                .pool
+                .get()
+                .await
+                .expect("the pool reaches the database");
+            for setting in ["lock_timeout", "statement_timeout"] {
+                let shown: String = next
+                    .query_one("SELECT current_setting($1)", &[&setting])
+                    .await
+                    .expect("a pooled session shows its settings")
+                    .get(0);
+                assert_ne!(
+                    shown, "200ms",
+                    "a pooled session must not inherit the migrator's {setting}"
+                );
+            }
+        }
     }
 }
