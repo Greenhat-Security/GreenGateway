@@ -120,7 +120,12 @@ The current gateway minimums are the counts the `main` CI run 39717886274
 measured on October 22, 2026 (commit `6fc83e9`). The `ggctl` minimums are the
 counts of a Windows run of the same `ggctl` command with the same pinned
 compiler and `cargo-llvm-cov` on October 22, 2026, before the files first
-reached `main`; see [the operator CLI baseline](#operator-cli-baseline).
+reached `main`; see [the operator CLI baseline](#operator-cli-baseline). The
+one exception is the branch minimum of `credential.rs`, 22 since October 28,
+2026: its permission check took an `owner_only` flag and tested it with `&&`,
+two conditions, and now takes one permission mode, one condition, so that
+branch pair is gone without any test or check going with it (the same Windows
+run measured 95.45%, 21/22).
 
 ## Initial measured baseline
 
@@ -158,8 +163,9 @@ CI job run its tests.
 | `remote.rs` | 97.06% (264/272) | 91.07% (51/56) | 95% / 87% |
 
 What stays uncovered is code Windows does not reach or no test can provoke on
-demand: the refusal of a token file that group or other can access (its
-mapping is compiled on Windows, where the check always passes), a read error
+demand: the refusal of a token file that group or other can access, or of a
+CA file they can write (both mappings are compiled on Windows, where the mode
+checks always pass; the Linux and macOS legs run those tests), a read error
 from standard input or from a file after it opened, the UTF-8 conversion of
 bytes already checked as ASCII, a client builder or response body that fails,
 the mapping of a redirect error that the client's no-redirect policy never

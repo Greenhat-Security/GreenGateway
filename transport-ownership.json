@@ -1269,6 +1269,7 @@
         "dependencies": [
           "gateway-config@0.1.0|workspace",
           "jsonschema@0.58.6|registry+https://github.com/rust-lang/crates.io-index",
+          "libc@0.2.189|registry+https://github.com/rust-lang/crates.io-index",
           "rcgen@0.14.10|registry+https://github.com/rust-lang/crates.io-index",
           "reqwest@0.13.5|registry+https://github.com/rust-lang/crates.io-index",
           "serde@1.0.229|registry+https://github.com/rust-lang/crates.io-index",
@@ -6409,6 +6410,17 @@
             "source": null
           },
           {
+            "name": "libc",
+            "rename": null,
+            "kind": null,
+            "target": "cfg(unix)",
+            "req": "^0.2.189",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
             "name": "url",
             "rename": null,
             "kind": null,
@@ -7842,10 +7854,20 @@
       "reasons": [
         "capability-import-or-glob"
       ],
-      "scope": "gateway_config::bundle::source::file_permissions_are_safe#1",
-      "sha256": "cc98ef622850697a82d4d193e72b206f2ecca69f2fb3751ffd0b9d3886e39f3f",
+      "scope": "gateway_config::bundle::source::owner_alone_can_write#1",
+      "sha256": "883c7bc2df1e7e55e2f949cb36672f01335ae7b6d513c750e80c228f8667698b",
       "owner": "GreenGateway maintainers",
-      "purpose": "Reviewed for #242 PR 4: the configuration bundle reader's contained, read-only filesystem access (canonicalized root opened as a cap-std directory, no-follow opens, link count, reparse attribute and Unix mode read from the opened handle). It adds no network or process capability; constructor bodies require separate scope review."
+      "purpose": "Reviewed for #242 (bundle and operator file safety): reads the Unix mode bits of bundle file and directory metadata taken from the opened handle, through MetadataExt, to refuse an entry group or other can write. Read-only metadata; it adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/bundle/source.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway_config::bundle::source::owner#1",
+      "sha256": "b9c66eb7910d4d7ad2ceec623808eff6840856b064d5c1c5b810f1020a168c6d",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 (bundle and operator file safety): reads the Unix owner ID of bundle file and directory metadata taken from the opened handle, through MetadataExt, so only root or the directory's owner may own what is read. Read-only metadata; it adds no network or process capability."
     },
     {
       "file": "gateway-config/src/bundle/source.rs",
@@ -14773,10 +14795,41 @@
       "reasons": [
         "capability-import-or-glob"
       ],
-      "scope": "ggctl::credential::permissions_are_owner_only#1",
-      "sha256": "93ff7585a3de003ce522965c8b37e7eccea29bf2b7270b83cf280a0c4e86cf41",
+      "scope": "ggctl::credential::permissions_are_safe#1",
+      "sha256": "89ed74d874fd8a97b8e53e21a01d241e093c87470cf01791d988caeb63111e7a",
       "owner": "GreenGateway maintainers: operator CLI (#242)",
-      "purpose": "Reviewed for #242 PR 5: reads the Unix mode bits of token-file metadata through PermissionsExt to refuse a credential readable or writable by group or other; read-only metadata, no network or process capability."
+      "purpose": "Reviewed for #242 (operator file safety): reads the Unix mode bits of --token-file and --ca-file metadata through PermissionsExt to refuse a credential group or other can access, or a trust anchor they can write. Read-only metadata; no network or process capability."
+    },
+    {
+      "file": "ggctl/src/credential.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "ggctl::credential::check_directories#1",
+      "sha256": "ce92a7e3857cf8330034aed6bc5e575d4bc75e5fcf7723da2e216c97b9300f95",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 (operator file safety): canonicalizes the --ca-file path and reads the Unix mode bits of the directories holding it and its link target through PermissionsExt, refusing one group or other can write without the sticky bit. Read-only metadata; no network or process capability."
+    },
+    {
+      "file": "ggctl/src/credential.rs",
+      "reasons": [
+        "capability-import-or-glob",
+        "network-or-process-reference"
+      ],
+      "scope": "ggctl::credential::open_without_blocking#1",
+      "sha256": "411a115863e2166a5b96790d8531a4c7458f059d357399ea72ff559cef40b846",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 (operator file safety): opens --token-file and --ca-file read-only through OpenOptionsExt with the libc::O_NONBLOCK constant (no libc function is called), so a FIFO swapped in for the checked path cannot block the open. A local read-only open; no network or process capability."
+    },
+    {
+      "file": "ggctl/src/credential.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "ggctl::credential::check_same_file#1",
+      "sha256": "369d55c0d0c6d8522939885ff704cbff0c917c5d1dbf4ca44f85822223ffbc23",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 (operator file safety): compares the Unix device and inode of the checked path's metadata and the opened handle's through MetadataExt, refusing a path swapped between the two. Read-only metadata; no network or process capability."
     },
     {
       "file": "ggctl/src/help.rs",
