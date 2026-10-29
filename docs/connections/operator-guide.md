@@ -1364,9 +1364,11 @@ security gate applies it before it serves another protected request:
   read purges every delegated token on the replica that applies it.
 - Each token is revoked at its issuer once, by the replica that holds it:
   replicas never share a token, and a token leaves a cache once.
-- A call admitted before the purge's revision committed may still finish with
-  the token it already looked up, as a call already holding its token does in
-  standalone mode.
+- A call a replica admitted before the purge's revision committed is not
+  stopped: it may still be served with a token that replica cached for the
+  principal, until the replica applies the purge (on its next protected
+  request, or on its background reconciler's next tick, every 250 ms), and one
+  that already holds its token finishes with it, as in standalone mode.
 
 An operator's purge answers `200` with
 `{"purged_entries": N, "security_revision": R}` once the record is committed;

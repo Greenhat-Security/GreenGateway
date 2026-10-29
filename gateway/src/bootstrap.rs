@@ -1544,10 +1544,12 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
         ),
         None => connection_http_runtime,
     };
+    // Set once this replica also applies the purges the others record;
+    // only then may it offer the principal purge in cluster mode.
     #[cfg(feature = "postgres")]
-    let delegated_token_purges_recorded = build_overrides.pg_delegated_token_purges.is_some();
+    let mut delegated_token_purges_applied = false;
     #[cfg(not(feature = "postgres"))]
-    let delegated_token_purges_recorded = false;
+    let delegated_token_purges_applied = false;
     let proxy_egress_client = Arc::new(egress_client_for_build(
         proxy_egress_config.clone(),
         &build_overrides,
@@ -2002,6 +2004,7 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
                 seed.revision,
             ),
         );
+        delegated_token_purges_applied = true;
     }
     // Every resource is registered; only now may the background reconciler
     // start. A pass that ran before tools or Connections registered would
@@ -2406,10 +2409,11 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
         audit_query_store: audit_query_store.clone(),
         discovery_store: discovery_read_store.clone(),
         rbac_state: rbac_state.clone(),
-        // Cluster mode purges by principal only where the purge can be
-        // recorded for the other replicas; a build with no record refuses.
+        // Cluster mode purges by principal only where the purge is recorded
+        // for the other replicas and this replica applies theirs; a build
+        // without both refuses.
         delegated_tokens: (config.state_backend == config::StateBackend::Sqlite
-            || delegated_token_purges_recorded)
+            || delegated_token_purges_applied)
             .then(|| connection_http_runtime.clone()),
         client_ip_policy: client_ip_policy.clone(),
         max_body_size: config.max_body_size,
