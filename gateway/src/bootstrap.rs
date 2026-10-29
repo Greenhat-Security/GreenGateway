@@ -760,6 +760,7 @@ pub(super) struct ClusterBootSeeds {
     tools: Option<ClusterToolsSeed>,
     connections: Option<ClusterConnectionsSeed>,
     service_tokens: Option<ClusterServiceTokenSeed>,
+    delegated_token_purges: Option<ClusterDelegatedTokenPurgeSeed>,
     pending_logins: Option<ClusterPendingLoginSeed>,
     limits: Option<ClusterLimitsSeed>,
     membership: Option<Arc<cluster_membership::ClusterMembership>>,
@@ -874,6 +875,8 @@ impl StartupStages for ProcessStartup {
             pg_connections: cluster.connections,
             #[cfg(feature = "postgres")]
             pg_service_tokens: cluster.service_tokens,
+            #[cfg(feature = "postgres")]
+            pg_delegated_token_purges: cluster.delegated_token_purges,
             #[cfg(feature = "postgres")]
             pg_pending_logins: cluster.pending_logins,
             #[cfg(feature = "postgres")]
@@ -1241,6 +1244,35 @@ async fn preflight_cluster_authority(
         }
         None => None,
     };
+    // Delegated-token purges ride the same pool (issue #441). The revision
+    // is read here, before activation builds the cache, so nothing recorded
+    // at or below it can name a token the replica holds; the gate's
+    // resource applies only what is recorded above it.
+    let delegated_token_purges = match database_foundation {
+        Some(foundation) => {
+            let revisions = storage::SecurityRevisionSource::new(foundation.pool().clone());
+            let revision = revisions.current().await.map_err(|error| {
+                Box::<dyn std::error::Error>::from(format!(
+                    "the shared security revision could not be read for the delegated-token \
+                         purge record: {error}"
+                ))
+            })?;
+            let deployment_id = config.deployment_id.clone().ok_or_else(|| {
+                Box::<dyn std::error::Error>::from(
+                    "STATE_BACKEND=postgres requires DEPLOYMENT_ID for the delegated-token purge \
+                     record",
+                )
+            })?;
+            Some(ClusterDelegatedTokenPurgeSeed {
+                store: Arc::new(storage::PostgresDelegatedTokenPurgeStore::new(
+                    foundation.pool().clone(),
+                )),
+                deployment_id,
+                revision,
+            })
+        }
+        None => None,
+    };
     // Pending admin logins ride the same pool when an admin login provider
     // is configured. The keyring is loaded here, from files beneath the
     // secrets root, with the connections keyring's reader.
@@ -1411,6 +1443,7 @@ async fn preflight_cluster_authority(
         tools,
         connections,
         service_tokens,
+        delegated_token_purges,
         pending_logins,
         limits,
         membership,
@@ -1517,6 +1550,17 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
     let lifecycle = build_overrides.lifecycle.clone().unwrap_or_default();
     let split_admin_listener = config.admin_listen_addr.is_some();
     let csrf_config = middleware::csrf::CsrfConfig::from_config(&config);
+    // Required authority evidence (issue #425, PR 4): every admin change and
+    // file reload this deployment mode records no evidence of asks this gate.
+    // What the configuration enables on its own was refused before this ran.
+    let authority_evidence =
+        authority_events::required::AuthorityEvidenceGate::from_config(&config);
+    if config.authority_events.durability == config::AuthorityEvidenceDurability::Required {
+        tracing::info!(
+            state_backend = ?config.state_backend,
+            "AUTHORITY_EVIDENCE_DURABILITY=required: authority changes this deployment mode records no evidence of are refused, and reported as authority_evidence.operation_refused"
+        );
+    }
     let audit_query_store = config
         .audit_sqlite_path
         .as_deref()
@@ -1859,6 +1903,27 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
         Arc::clone(&egress_client),
     )
     .with_audit(audit_log.clone());
+    // Cluster mode: a delegated-token purge is recorded for every replica,
+    // through the operation gate, before it is reported done (issue #441).
+    // Wired before the runtime is cloned into anything that purges.
+    #[cfg(feature = "postgres")]
+    let connection_http_runtime = match build_overrides.pg_delegated_token_purges.as_ref() {
+        Some(seed) => connection_http_runtime.with_delegated_token_purge_ledger(
+            security_cluster::delegated_tokens::ClusterDelegatedTokenPurgeLedger::new(
+                Arc::clone(&seed.store),
+                build_overrides.pg_membership.clone(),
+                audit_log.clone(),
+            ),
+            &seed.deployment_id,
+        ),
+        None => connection_http_runtime,
+    };
+    // Set once this replica also applies the purges the others record;
+    // only then may it offer the principal purge in cluster mode.
+    #[cfg(feature = "postgres")]
+    let mut delegated_token_purges_applied = false;
+    #[cfg(not(feature = "postgres"))]
+    let delegated_token_purges_applied = false;
     let proxy_egress_client = Arc::new(egress_client_for_build(
         proxy_egress_config.clone(),
         &build_overrides,
@@ -2145,6 +2210,10 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
         middleware::rbac::spawn_policy_reload_tasks_with_lifecycle(
             policy_file.clone(),
             rbac_state.clone(),
+            authority_events::required::BackgroundEvidenceGate::new(
+                authority_evidence,
+                audit_log.clone(),
+            ),
             &lifecycle,
         )?;
     }
@@ -2157,6 +2226,23 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
     let mcp_upstream_definitions =
         tools::mcp_upstream::discover_upstream_tools_blocking(&config, Arc::clone(&egress_client))?;
     tool_registry.merge_definitions(mcp_upstream_definitions)?;
+    // What a candidate policy is validated against before it is published
+    // (issue #243, slice 8): the live tool registry and Connection control
+    // plane, the egress lane the egress client decides by, and this
+    // process's configuration fingerprint. Attached before any admin state
+    // takes its copy of the RBAC state.
+    let rbac_state = rbac_state.map(|state| {
+        state.with_policy_resources(rbac::policy_resources::PolicyResourceSources {
+            tools: tool_registry.clone(),
+            connections: connection_control_plane.clone(),
+            egress: egress_client.static_egress_policy(),
+            configuration_fingerprint: format!(
+                "sha256:{}",
+                ha::static_config_fingerprint(&config).hex()
+            ),
+            policy_route: routes.admin.policy_route.clone(),
+        })
+    });
     // Cluster mode: the registry's local lane belongs to the authoritative
     // tools document (not TOOLS_FILE, which cluster mode rejects). Install
     // the boot document -- validating it exactly as a file load would, and
@@ -2299,6 +2385,22 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
             seed.revision,
         ));
     }
+    // Every replica applies each recorded delegated-token purge to its own
+    // cache before it serves another protected request (issue #441).
+    #[cfg(feature = "postgres")]
+    if let (Some(seed), Some(runtime)) = (
+        build_overrides.pg_delegated_token_purges.as_ref(),
+        cluster_security_runtime.as_ref(),
+    ) {
+        runtime.register_resource(
+            security_cluster::delegated_tokens::DelegatedTokenPurgesResource::new(
+                Arc::clone(&seed.store),
+                connection_http_runtime.clone(),
+                seed.revision,
+            ),
+        );
+        delegated_token_purges_applied = true;
+    }
     // Every resource is registered; only now may the background reconciler
     // start. A pass that ran before tools or Connections registered would
     // confirm policy alone and advance the watermark past any commit those
@@ -2424,6 +2526,10 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
             tools_file.clone(),
             tool_registry.clone(),
             mcp_proxy_definitions_provider.clone(),
+            authority_events::required::BackgroundEvidenceGate::new(
+                authority_evidence,
+                audit_log.clone(),
+            ),
             &lifecycle,
         )?;
     }
@@ -2564,6 +2670,7 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
         membership: build_overrides.pg_membership.clone(),
         event_store: audit_event_store.clone(),
         query_store: audit_query_store.clone(),
+        authority_evidence,
         audit: audit_log.clone(),
         client_ip_policy: client_ip_policy.clone(),
         max_body_size: config.max_body_size,
@@ -2588,6 +2695,7 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
         openapi_catalogs: openapi_catalog_service,
         tests: connections::test::ConnectionTestService::new(connection_http_runtime.clone()),
         rbac_state: rbac_state.clone(),
+        authority_evidence,
         audit: audit_log.clone(),
         client_ip_policy: client_ip_policy.clone(),
         max_body_size: config.max_body_size,
@@ -2601,6 +2709,7 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
         inventory: capability_inventory,
         executor: tool_executor,
         rbac_state: rbac_state.clone(),
+        authority_evidence,
         audit: audit_log.clone(),
         client_ip_policy: client_ip_policy.clone(),
         max_body_size: config.max_body_size,
@@ -2703,7 +2812,11 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
         audit_query_store: audit_query_store.clone(),
         discovery_store: discovery_read_store.clone(),
         rbac_state: rbac_state.clone(),
-        delegated_tokens: (config.state_backend == config::StateBackend::Sqlite)
+        // Cluster mode purges by principal only where the purge is recorded
+        // for the other replicas and this replica applies theirs; a build
+        // without both refuses.
+        delegated_tokens: (config.state_backend == config::StateBackend::Sqlite
+            || delegated_token_purges_applied)
             .then(|| connection_http_runtime.clone()),
         client_ip_policy: client_ip_policy.clone(),
         max_body_size: config.max_body_size,

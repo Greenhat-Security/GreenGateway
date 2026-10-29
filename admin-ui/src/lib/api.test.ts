@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   AdminApiError,
   adminFetchJson,
+  adminFetchJsonResponse,
   adminFetchResource,
 } from './api';
 import { clearMemoryToken, setMemoryToken } from './auth';
@@ -362,6 +363,58 @@ describe('admin API transport', () => {
 
     expect(error).toBeInstanceOf(AdminApiError);
     expect((error as AdminApiError).details).toEqual({});
+  });
+
+  it('returns an answer status the caller named, and still fails every other one', async () => {
+    const answers = [
+      jsonResponse(400, { valid: false, diagnostics: [] }),
+      jsonResponse(401, { error: 'sign in' }),
+      jsonResponse(403, { error: 'forbidden' }),
+      jsonResponse(422, { error: 'unprocessable' }),
+    ];
+    const fetch = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+      expect(init).not.toHaveProperty('answerStatuses');
+      return Promise.resolve(answers.shift() as Response);
+    });
+    vi.stubGlobal('fetch', fetch);
+    const options = {
+      method: 'POST',
+      body: '{}',
+      answerStatuses: [400, 401, 403],
+    } as const;
+
+    await expect(adminFetchJsonResponse('/validate', options)).resolves.toMatchObject({
+      status: 400,
+      body: { valid: false, diagnostics: [] },
+    });
+    for (const status of [401, 403, 422]) {
+      const error = await adminFetchJsonResponse('/validate', options).catch(
+        (caught: unknown) => caught,
+      );
+      expect(error).toBeInstanceOf(AdminApiError);
+      expect((error as AdminApiError).status).toBe(status);
+    }
+  });
+
+  it('keeps bounded validation error strings from a refused document write', async () => {
+    const errors = Array.from({ length: 80 }, (_, index) => `problem ${index}`);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() =>
+        Promise.resolve(
+          jsonResponse(400, {
+            valid: false,
+            errors: [{ nested: true }, 'x'.repeat(5_000), ...errors],
+          }),
+        ),
+      ),
+    );
+
+    const error = await adminFetchJson('/policy', { method: 'PUT' }).catch(
+      (caught: unknown) => caught,
+    );
+
+    expect((error as AdminApiError).validationErrors).toEqual(errors.slice(0, 64));
   });
 
   it('reads dynamic CSRF names and sends the matching cookie on session mutations', async () => {

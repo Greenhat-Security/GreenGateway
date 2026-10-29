@@ -74,6 +74,9 @@ test("a document cannot enable required durability or relabel a gap sufficient",
   const qualified = inventory();
   qualified.groups[0].required_durability_supported = true;
   assert.throws(() => validateInventory(qualified), /unproven durability claim/);
+  const enabled = inventory();
+  enabled.required_durability_mode = "implemented";
+  assert.throws(() => validateInventory(enabled), /cannot enable runtime durability/);
   const contradictory = inventory();
   contradictory.groups[0].disposition.push("already_sufficient");
   assert.throws(() => validateInventory(contradictory), /sufficient contradicts/);
@@ -142,6 +145,33 @@ test("the in-memory session authority stays unsupported and the shared one recor
   assert.equal(byMode.standalone.delivery, "post_commit_telemetry");
   assert.ok(byMode.postgres.sources.some((ref) => ref.anchor.includes("admin_session_evidence")));
   assert.ok(byMode.postgres.sources.some((ref) => ref.anchor.includes("reserved_withdrawals")));
+});
+
+test("required mode never admits an unsupported row or waves through a reachable one", () => {
+  const groups = inventory().groups;
+  for (const group of groups) {
+    if (group.disposition.includes("unsupported_future_operation")) assert.notEqual(group.required_mode, "admitted", group.id);
+  }
+  const byId = Object.fromEntries(groups.map((group) => [group.id, group.required_mode]));
+  assert.equal(byId.admin_session_standalone, "refused_at_startup");
+  assert.equal(byId.policy_standalone, "refused");
+  assert.equal(byId.token_change_standalone, "admitted");
+  // The standalone Connections database records these in the change's own transaction.
+  assert.equal(byId.connection_standalone, "admitted");
+  assert.equal(byId.connection_delete_standalone, "admitted");
+  assert.equal(byId.local_secrets, "admitted");
+  assert.equal(byId.catalog_standalone, "refused");
+  assert.equal(byId.configuration_activation, "not_refused");
+
+  const unknown = inventory();
+  unknown.groups[0].required_mode = "ignored";
+  assert.throws(() => validateInventory(unknown), /unknown required mode/);
+  const admitted = inventory();
+  admitted.groups.find((group) => group.id === "policy_standalone").required_mode = "admitted";
+  assert.throws(() => validateInventory(admitted), /admits an unsupported operation/);
+  const waved = inventory();
+  waved.groups.find((group) => group.id === "connection_standalone").required_mode = "not_refused";
+  assert.throws(() => validateInventory(waved), /reachable entry point/);
 });
 
 test("export evidence binds an existing configuration revision without inventing a mutation", () => {

@@ -159,6 +159,8 @@ pub const AUDIT_FLUSH_TOTAL: &str = "greengateway_audit_flush_total";
 /// count is an outage of the audit store of record that the gateway is
 /// answering with `503` rather than serving without evidence; the cause is
 /// on the sink's flush metrics and in its log line, never in a label.
+/// Every reason is exported at `0` from install, so the first refusal after
+/// a start is an increase an alert rule can see.
 pub const AUDIT_DURABILITY_REFUSALS_TOTAL: &str = "greengateway_audit_durability_refusals_total";
 
 /// Execution-lease failures by classified kind (`lost`, `renew_expired`,
@@ -464,6 +466,12 @@ pub const AUTHORITY_EVENT_CAPACITY_REFUSALS_TOTAL: &str =
 /// Like a capacity refusal, every one is a security change that did not
 /// happen. A failure of the transaction's own `COMMIT` is the mutation's
 /// failure, not the evidence's, and is not counted here.
+///
+/// It counts every PostgreSQL producer whose change commits only with its
+/// evidence row: the journaled ones (Connection delete, service-token
+/// rotate and revoke, JWT revoke) and migration 23's policy, tools and
+/// catalog commits, which are not journaled yet. The producer is not a
+/// label; the refusing replica's log names the failed operation.
 #[cfg(feature = "postgres")]
 pub const AUTHORITY_EVENT_EVIDENCE_FAILURES_TOTAL: &str =
     "greengateway_authority_event_evidence_failures_total";

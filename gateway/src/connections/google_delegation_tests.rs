@@ -969,7 +969,7 @@ async fn a_principal_purge_drops_their_google_tokens_and_counts_them() {
     let purged = harness.runtime.purge_delegated_tokens(
         &format!("{TRUSTED_ISSUER}/"),
         "alice",
-        DelegatedTokenPurgeTrigger::CredentialRevoked,
+        DelegatedTokenPurgeTrigger::credential_revoked(TRUSTED_ISSUER, "alice", "session-alice"),
     );
     assert_eq!(purged, 1);
     assert_eq!(harness.runtime.google_delegation_cache_entries(), 1);
@@ -990,6 +990,88 @@ async fn a_principal_purge_drops_their_google_tokens_and_counts_them() {
         .expect("the purge is audited");
     assert_eq!(purge.payload["purged_entries"], json!(1));
     assert_eq!(purge.payload["google_delegation_entries"], json!(1));
+}
+
+/// A ledger that records nothing: this test applies a record by hand, as another replica's
+/// would be read back.
+struct UnusedPurgeLedger;
+
+#[async_trait::async_trait]
+impl crate::connections::token_exchange::DelegatedTokenPurgeLedger for UnusedPurgeLedger {
+    async fn record(
+        &self,
+        _purge_key: &str,
+        _origin: &DelegatedTokenPurgeTrigger,
+    ) -> Result<i64, crate::connections::token_exchange::PurgeNotRecorded> {
+        Err(crate::connections::token_exchange::PurgeNotRecorded::Unavailable)
+    }
+}
+
+/// Cluster mode (issue #441): a purge another replica recorded names its principal by digest
+/// only, and applying it drops this replica's Google tokens for that principal too, audited with
+/// the principal it dropped.
+#[tokio::test]
+async fn a_recorded_purge_drops_this_replicas_google_tokens_for_its_principal() {
+    use crate::connections::token_exchange::{principal_digest, purge_key, RecordedPurge};
+
+    let harness = Harness::new().await;
+    let replica = harness
+        .runtime
+        .clone()
+        .with_delegated_token_purge_ledger(Arc::new(UnusedPurgeLedger), "deploy-google-replicas");
+    harness
+        .bearer_for(Some(&alice()))
+        .await
+        .expect("alice mints");
+    harness.bearer_for(Some(&bob())).await.expect("bob mints");
+
+    let key = purge_key(
+        "deploy-google-replicas",
+        &principal_digest(TRUSTED_ISSUER, "alice"),
+    );
+    let purged = replica.apply_recorded_delegated_token_purges(&[RecordedPurge {
+        security_revision: 7,
+        purge_key: Some(key.as_str()),
+    }]);
+    assert_eq!(purged, 1);
+    assert_eq!(harness.runtime.google_delegation_cache_entries(), 1);
+    assert_eq!(
+        harness.bearer_for(Some(&alice())).await,
+        Ok("Bearer google-alice@example.test-3".to_owned()),
+        "the next call asks Google again"
+    );
+    assert_eq!(
+        harness.bearer_for(Some(&bob())).await,
+        Ok("Bearer google-bob@example.test-2".to_owned())
+    );
+
+    let started = std::time::Instant::now();
+    let purge = loop {
+        let found = harness
+            .capture
+            .events()
+            .into_iter()
+            .find(|event| event.event_type == audit::event::CONNECTION_DELEGATED_TOKEN_PURGE);
+        if let Some(found) = found {
+            break found;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the purge is audited"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(purge.payload["trigger"], json!("replicated"));
+    assert_eq!(
+        purge.payload["principal"],
+        json!({ "issuer": TRUSTED_ISSUER, "subject": "alice" })
+    );
+    assert_eq!(purge.payload["purged_entries"], json!(1));
+    assert_eq!(purge.payload["google_delegation_entries"], json!(1));
+    assert_eq!(
+        purge.payload["replication"],
+        json!({ "outcome": "applied", "security_revision": 7 })
+    );
 }
 
 #[tokio::test]

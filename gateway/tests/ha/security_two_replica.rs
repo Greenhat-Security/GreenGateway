@@ -41,6 +41,16 @@ use harness::{
 /// route — the per-permission checks are unit-tested in `main.rs`.
 const ADMIN_ROLE: &str = "ha-admin";
 
+/// The permission that lets a principal replace the policy.
+const POLICY_WRITE_PERMISSION: &str = "admin:policy:write";
+
+/// The role of a second administrator, who may replace the policy and do
+/// nothing else. A test that withdraws [`ADMIN_ROLE`]'s grants publishes as
+/// this role. The policy API refuses a write that would leave its own
+/// author, or every principal, unable to replace the policy again (issue
+/// #243), and those tests are about the withdrawal, not a lockout.
+const POLICY_WRITER_ROLE: &str = "ha-policy-writer";
+
 /// How long a cross-replica effect may take before the test calls it a
 /// failure. Generous on purpose: this machine runs other builds, and every
 /// wait here is a bounded poll that returns as soon as the condition holds.
@@ -57,6 +67,23 @@ fn admin_policy() -> String {
         "default_action": "allow",
         "enforcement_mode": "enforce",
         "roles": { ADMIN_ROLE: { "permissions": ["*"] } },
+        "routes": [],
+        "rules": [],
+        "schema_version": "0.1.0",
+    })
+    .to_string()
+}
+
+/// [`admin_policy`] with a [`POLICY_WRITER_ROLE`] administrator beside
+/// [`ADMIN_ROLE`].
+fn admin_and_policy_writer_policy() -> String {
+    json!({
+        "default_action": "allow",
+        "enforcement_mode": "enforce",
+        "roles": {
+            ADMIN_ROLE: { "permissions": ["*"] },
+            POLICY_WRITER_ROLE: { "permissions": [POLICY_WRITE_PERMISSION] },
+        },
         "routes": [],
         "rules": [],
         "schema_version": "0.1.0",
@@ -91,6 +118,17 @@ fn admin_token(issuer: &FakeOidcIssuer, subject: &str) -> String {
         subject,
         &format!("jti-{}", uuid::Uuid::new_v4().simple()),
         &[ADMIN_ROLE],
+        3_600,
+    )
+}
+
+/// A token that carries only [`POLICY_WRITER_ROLE`].
+fn policy_writer_token(issuer: &FakeOidcIssuer, subject: &str) -> String {
+    issuer.mint_role_token(
+        oidc::PRIMARY_KID,
+        subject,
+        &format!("jti-{}", uuid::Uuid::new_v4().simple()),
+        &[POLICY_WRITER_ROLE],
         3_600,
     )
 }
@@ -1295,10 +1333,16 @@ async fn wait_until_display_name(
 /// permission keep working, and nothing in the response would say so.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_request_after_a_mutation_uses_the_new_revision_or_fails_closed() {
-    let Some(cluster) = start_secure_cluster(ClusterOptions::default()).await else {
+    let Some(cluster) = start_secure_cluster(ClusterOptions {
+        seed_policy: Some(admin_and_policy_writer_policy()),
+        ..ClusterOptions::default()
+    })
+    .await
+    else {
         return skipped();
     };
     let admin = admin_token(&cluster.oidc, "admin@ha.test");
+    let writer = policy_writer_token(&cluster.oidc, "policy-writer@ha.test");
 
     // Both replicas authorize this principal today.
     for replica in ["a", "b"] {
@@ -1310,11 +1354,17 @@ async fn a_request_after_a_mutation_uses_the_new_revision_or_fails_closed() {
         );
     }
 
-    // Withdraw every permission the role grants, on A.
+    // Withdraw every permission the admin role grants, on A. The other
+    // administrator makes the change and keeps its own grant: the policy
+    // API refuses a write that would leave nobody, or its own author, able
+    // to replace the policy afterwards.
     let stripped = json!({
         "default_action": "allow",
         "enforcement_mode": "enforce",
-        "roles": { ADMIN_ROLE: { "permissions": [] } },
+        "roles": {
+            ADMIN_ROLE: { "permissions": [] },
+            POLICY_WRITER_ROLE: { "permissions": [POLICY_WRITE_PERMISSION] },
+        },
         "routes": [],
         "rules": [],
         "schema_version": "0.1.0",
@@ -1322,7 +1372,7 @@ async fn a_request_after_a_mutation_uses_the_new_revision_or_fails_closed() {
     let (status, _, body) = send_settled(|| {
         cluster
             .put("a", POLICY_ROUTE)
-            .bearer(&admin)
+            .bearer(&writer)
             .if_match(&cluster.seed_policy_etag)
             .json(&stripped)
     })
@@ -1350,12 +1400,21 @@ const PROXIED_PATH: &str = "/echo/partition-probe";
 
 /// A policy that refuses everything the data plane could dispatch, while
 /// leaving the admin role's permissions intact.
+///
+/// The default deny reaches the admin API too, so one route keeps the
+/// policy's `PUT` open to its writers. Without it the admin who publishes
+/// this could never replace it again, and the policy API refuses that
+/// write (issue #243).
 fn dispatch_denying_policy() -> Value {
     json!({
         "default_action": "deny",
         "enforcement_mode": "enforce",
         "roles": { ADMIN_ROLE: { "permissions": ["*"] } },
-        "routes": [],
+        "routes": [{
+            "methods": ["PUT"],
+            "path_prefix": POLICY_ROUTE,
+            "permission": POLICY_WRITE_PERMISSION,
+        }],
         "rules": [],
         "schema_version": "0.1.0",
     })

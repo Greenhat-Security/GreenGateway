@@ -40,6 +40,7 @@ tests:
       - {eval_time: 1m30s, alertname: GreenGatewayAuditLoss, exp_alerts: []}
       - {eval_time: 1m30s, alertname: GreenGatewayAuditBacklog, exp_alerts: []}
       - {eval_time: 1m30s, alertname: GreenGatewayAuditFlushFailures, exp_alerts: []}
+      - {eval_time: 1m30s, alertname: GreenGatewayAuditDurabilityRefusals, exp_alerts: []}
       - {eval_time: 1m30s, alertname: GreenGatewayDatabasePoolSaturated, exp_alerts: []}
       - {eval_time: 1m30s, alertname: GreenGatewayDatabasePoolTimeouts, exp_alerts: []}
       - {eval_time: 1m30s, alertname: GreenGatewaySchemaIncompatible, exp_alerts: []}
@@ -57,6 +58,7 @@ tests:
       - {eval_time: 12m, alertname: GreenGatewayAuditLoss, exp_alerts: []}
       - {eval_time: 12m, alertname: GreenGatewayAuditBacklog, exp_alerts: []}
       - {eval_time: 12m, alertname: GreenGatewayAuditFlushFailures, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayAuditDurabilityRefusals, exp_alerts: []}
       - {eval_time: 12m, alertname: GreenGatewayDatabasePoolSaturated, exp_alerts: []}
       - {eval_time: 12m, alertname: GreenGatewayDatabasePoolTimeouts, exp_alerts: []}
       - {eval_time: 12m, alertname: GreenGatewaySchemaIncompatible, exp_alerts: []}
@@ -127,6 +129,7 @@ tests:
       - {eval_time: 12m, alertname: GreenGatewayAuditLoss, exp_alerts: []}
       - {eval_time: 12m, alertname: GreenGatewayAuditBacklog, exp_alerts: []}
       - {eval_time: 12m, alertname: GreenGatewayAuditFlushFailures, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayAuditDurabilityRefusals, exp_alerts: []}
       - {eval_time: 12m, alertname: GreenGatewayDatabasePoolSaturated, exp_alerts: []}
       - {eval_time: 12m, alertname: GreenGatewayDatabasePoolTimeouts, exp_alerts: []}
       - {eval_time: 12m, alertname: GreenGatewaySchemaIncompatible, exp_alerts: []}
@@ -495,6 +498,46 @@ tests:
     alert_rule_test:
       - {eval_time: 12m, alertname: GreenGatewayDrainStalled, exp_alerts: [*fires_drain_stalled_gateway_1_cluster]}
       - {eval_time: 13m, alertname: GreenGatewayDrainStalled, exp_alerts: []}
+
+  # AUDIT_DURABILITY=required (the default) refuses a request whose decision record cannot commit,
+  # in either mode, and /readyz stays 200 meanwhile. gateway-1 is a standalone replica draining
+  # throughout: refusals are consequences, not lifecycle noise. gateway-2 exports the seeded zeros.
+  # Exact expected labels exclude reason and detail.
+  - name: 'audit durability refusals page per replica in either mode, even while draining, then recover'
+    interval: 30s
+    input_series:
+      - *series_up_gateway_1_standalone
+      - series: 'greengateway_gateway_ready{job="greengateway",instance="gateway-1",deployment_mode="standalone"}'
+        values: '0+0x40'
+      - series: 'greengateway_gateway_draining{job="greengateway",instance="gateway-1",deployment_mode="standalone"}'
+        values: '1+0x40'
+      - series: 'greengateway_audit_durability_refusals_total{job="greengateway",instance="gateway-1",deployment_mode="standalone",reason="admission"}'
+        values: '0+0x40'
+      - series: 'greengateway_audit_durability_refusals_total{job="greengateway",instance="gateway-1",deployment_mode="standalone",reason="store",detail="fixture-detail"}'
+        values: '0+1x24 24+0x15'
+      - series: 'greengateway_audit_durability_refusals_total{job="greengateway",instance="gateway-1",deployment_mode="standalone",reason="timeout"}'
+        values: '0+2x24 48+0x15'
+      - *series_up_gateway_2_cluster
+      - *series_ready_gateway_2_cluster
+      - *series_draining_gateway_2_cluster
+      - series: 'greengateway_audit_durability_refusals_total{job="greengateway",instance="gateway-2",deployment_mode="cluster",reason="admission"}'
+        values: '0+0x40'
+      - series: 'greengateway_audit_durability_refusals_total{job="greengateway",instance="gateway-2",deployment_mode="cluster",reason="store"}'
+        values: '0+0x40'
+      - series: 'greengateway_audit_durability_refusals_total{job="greengateway",instance="gateway-2",deployment_mode="cluster",reason="timeout"}'
+        values: '0+0x40'
+    alert_rule_test:
+      - {eval_time: 2m, alertname: GreenGatewayAuditDurabilityRefusals, exp_alerts: []}
+      - eval_time: 2m30s
+        alertname: GreenGatewayAuditDurabilityRefusals
+        exp_alerts:
+          - &fires_audit_durability_refusals_gateway_1_standalone
+            exp_labels: {job: 'greengateway', instance: 'gateway-1', deployment_mode: 'standalone', severity: 'critical', owner: 'gateway-operations'}
+            exp_annotations: &annotations_audit_durability_refusals
+              summary: 'Gateway requests were refused because their audit records could not be committed'
+              runbook_url: 'https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#audit-durability-refusals'
+      - {eval_time: 12m, alertname: GreenGatewayAuditDurabilityRefusals, exp_alerts: [*fires_audit_durability_refusals_gateway_1_standalone]}
+      - {eval_time: 18m, alertname: GreenGatewayAuditDurabilityRefusals, exp_alerts: []}
 
   # Exporter values retained during a failed scrape cannot borrow up=1 from gateway-2.
   - name: 'failed scrape alerts only for the down replica and recovers'
@@ -1225,6 +1268,8 @@ tests:
         values: '10+0x5 0+0x34'
       - series: 'greengateway_authority_event_evidence_failures_total{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
         values: '10+0x5 0+0x34'
+      - series: 'greengateway_audit_durability_refusals_total{job="greengateway",instance="gateway-1",deployment_mode="cluster",reason="store"}'
+        values: '10+0x5 0+0x34'
     alert_rule_test:
       - {eval_time: 2m30s, alertname: GreenGatewayAuditLoss, exp_alerts: []}
       - {eval_time: 2m30s, alertname: GreenGatewayAuditFlushFailures, exp_alerts: []}
@@ -1241,6 +1286,9 @@ tests:
       - {eval_time: 6m, alertname: GreenGatewayAuthorityEvidenceWriteFailures, exp_alerts: []}
       - {eval_time: 12m, alertname: GreenGatewayAuthorityEventCapacityRefusals, exp_alerts: []}
       - {eval_time: 12m, alertname: GreenGatewayAuthorityEvidenceWriteFailures, exp_alerts: []}
+      - {eval_time: 2m30s, alertname: GreenGatewayAuditDurabilityRefusals, exp_alerts: []}
+      - {eval_time: 6m, alertname: GreenGatewayAuditDurabilityRefusals, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayAuditDurabilityRefusals, exp_alerts: []}
 
   # Reset at 3m is healthy; first post-reset increase at 3m30s starts the 2m hold.
   - name: 'new failures after a counter reset still fire and later recover'
@@ -1268,6 +1316,8 @@ tests:
       - series: 'greengateway_authority_event_capacity_refusals_total{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
         values: '10+0x5 0+1x14 14+0x20'
       - series: 'greengateway_authority_event_evidence_failures_total{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '10+0x5 0+1x14 14+0x20'
+      - series: 'greengateway_audit_durability_refusals_total{job="greengateway",instance="gateway-1",deployment_mode="cluster",reason="store"}'
         values: '10+0x5 0+1x14 14+0x20'
     alert_rule_test:
       - {eval_time: 5m, alertname: GreenGatewayAuditLoss, exp_alerts: []}
@@ -1304,6 +1354,15 @@ tests:
               runbook_url: 'https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#authority-evidence-failures'
       - {eval_time: 8m, alertname: GreenGatewayAuthorityEvidenceWriteFailures, exp_alerts: [*fires_authority_evidence_write_failures_gateway_1_cluster]}
       - {eval_time: 16m, alertname: GreenGatewayAuthorityEvidenceWriteFailures, exp_alerts: []}
+      - {eval_time: 5m, alertname: GreenGatewayAuditDurabilityRefusals, exp_alerts: []}
+      - eval_time: 5m30s
+        alertname: GreenGatewayAuditDurabilityRefusals
+        exp_alerts:
+          - &fires_audit_durability_refusals_gateway_1_cluster
+            exp_labels: {job: 'greengateway', instance: 'gateway-1', deployment_mode: 'cluster', severity: 'critical', owner: 'gateway-operations'}
+            exp_annotations: *annotations_audit_durability_refusals
+      - {eval_time: 8m, alertname: GreenGatewayAuditDurabilityRefusals, exp_alerts: [*fires_audit_durability_refusals_gateway_1_cluster]}
+      - {eval_time: 16m, alertname: GreenGatewayAuditDurabilityRefusals, exp_alerts: []}
 
   # Authority-event journal rules (issue #440 PR 4). gateway-1 leads maintenance
   # and so publishes the journal gauges; gateway-2 leads the dispatcher.
@@ -1629,6 +1688,10 @@ tests:
         values: '0+0x4 1+0x35'
       - series: 'greengateway_authority_event_evidence_failures_total{job="greengateway",instance="gateway-2",deployment_mode="cluster"}'
         values: '_x5 1+0x35'
+      - series: 'greengateway_audit_durability_refusals_total{job="greengateway",instance="gateway-1",deployment_mode="cluster",reason="timeout"}'
+        values: '0+0x4 1+0x35'
+      - series: 'greengateway_audit_durability_refusals_total{job="greengateway",instance="gateway-2",deployment_mode="cluster",reason="timeout"}'
+        values: '_x5 1+0x35'
     alert_rule_test:
       - {eval_time: 2m, alertname: GreenGatewayAuditLoss, exp_alerts: []}
       - {eval_time: 4m, alertname: GreenGatewayAuditLoss, exp_alerts: []}
@@ -1655,3 +1718,8 @@ tests:
       - {eval_time: 4m30s, alertname: GreenGatewayAuthorityEvidenceWriteFailures, exp_alerts: [*fires_authority_evidence_write_failures_gateway_1_cluster]}
       - {eval_time: 6m, alertname: GreenGatewayAuthorityEvidenceWriteFailures, exp_alerts: [*fires_authority_evidence_write_failures_gateway_1_cluster]}
       - {eval_time: 9m, alertname: GreenGatewayAuthorityEvidenceWriteFailures, exp_alerts: []}
+      - {eval_time: 2m, alertname: GreenGatewayAuditDurabilityRefusals, exp_alerts: []}
+      - {eval_time: 4m, alertname: GreenGatewayAuditDurabilityRefusals, exp_alerts: []}
+      - {eval_time: 4m30s, alertname: GreenGatewayAuditDurabilityRefusals, exp_alerts: [*fires_audit_durability_refusals_gateway_1_cluster]}
+      - {eval_time: 6m, alertname: GreenGatewayAuditDurabilityRefusals, exp_alerts: [*fires_audit_durability_refusals_gateway_1_cluster]}
+      - {eval_time: 9m, alertname: GreenGatewayAuditDurabilityRefusals, exp_alerts: []}

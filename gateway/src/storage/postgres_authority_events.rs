@@ -200,7 +200,8 @@ pub(crate) fn record_capacity_refusal() {
 /// could not be written for a reason other than capacity. Called once per
 /// refused mutation, where the evidence statement failed: the journal
 /// append counts its own failures, each producer counts its evidence
-/// insert's.
+/// insert's -- including the policy, tools and catalog producers, whose
+/// evidence is not journaled.
 pub(crate) fn record_evidence_failure() {
     ::metrics::counter!(crate::metrics::AUTHORITY_EVENT_EVIDENCE_FAILURES_TOTAL).increment(1);
 }

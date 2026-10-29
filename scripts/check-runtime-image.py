@@ -63,8 +63,8 @@ def runtime_check(image, output):
                 # replacing only the version label must never pass this gate.
                 tzdata_status = filesystem.extractfile(paths['var/lib/dpkg/status.d/tzdata']).read().decode()
                 tzdata_source = filesystem.extractfile(paths['usr/share/zoneinfo/tzdata.zi']).read().decode()
-                require('Version: 2026c-0+deb13u1\n' in tzdata_status)
-                require(tzdata_source.startswith('# version 2026c\n'))
+                require('Version: 2026e-0+deb13u1\n' in tzdata_status)
+                require(tzdata_source.startswith('# version 2026e\n'))
                 passwd = filesystem.extractfile(paths['etc/passwd']).read().decode()
                 require('greengateway:x:10001:10001::/nonexistent:' in passwd)
         # The loader exits nonzero for a missing shared library or ABI mismatch.

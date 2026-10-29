@@ -6,7 +6,7 @@
     "postgres",
     "standalone"
   ],
-  "required_durability_mode": "not_implemented",
+  "required_durability_mode": "refuses_unsupported",
   "delivery_profiles": {
     "post_commit_telemetry": {
       "description": "HTTP handlers emit ordinary audit after mutation; stdout/file/SQLite/PostgreSQL request sinks remain optional/bounded asynchronous telemetry. Some CLI/startup operations only print or trace. security_outbox has a bounded read API, but no production dispatcher with persisted consumer cursor exists.",
@@ -48,7 +48,7 @@
       ]
     },
     "journaled_dispatch": {
-      "description": "Cluster mode (migration 21): the evidence row is journaled in authority_event_journal in its own transaction under its own event_id, reserving one unit of bounded capacity; a full journal refuses the mutation and evicts nothing. Since migration 26 an admin session grant takes two units, one held for its withdrawal, and a withdrawal spends that unit and is never refused for capacity. With AUTHORITY_EVENT_SINK=log or file, one leased dispatcher reads the journal after a fenced, persisted cursor in bounded batches, delivers authority_event_delivery.v1 records whose actor and resource are keyed safe references, and advances the cursor only after the sink accepted: at least once, deduplicated on (authority_id, event_id). Retention prunes only delivered rows past AUTHORITY_EVENT_RETENTION_HOURS and never an evidence row. With AUTHORITY_EVENT_SINK=none nothing is delivered. Since migration 24 the record also carries the actor's kind and auth mode and a keyed reference to a principal's issuer, each null where the evidence row recorded none. It is still not the proposed authority_event.v1: the subject reference is not issuer-scoped, actors without an issuer and rows committed before migration 24 cannot name one, and the operation identity is not caller-bound.",
+      "description": "Cluster mode (migration 21): the evidence row is journaled in authority_event_journal in its own transaction under its own event_id, reserving one unit of bounded capacity; a full journal refuses the mutation and evicts nothing. Since migration 26 an admin session grant takes two units, one held for its withdrawal, and a withdrawal spends that unit and is never refused for capacity. With AUTHORITY_EVENT_SINK=log or file, one leased dispatcher reads the journal after a fenced, persisted cursor in bounded batches, delivers authority_event_delivery.v1 records whose actor and resource are keyed safe references, and advances the cursor only after the sink accepted: at least once, deduplicated on (authority_id, event_id). Retention prunes only delivered rows past AUTHORITY_EVENT_RETENTION_HOURS and never an evidence row. With AUTHORITY_EVENT_SINK=none nothing is delivered, and AUTHORITY_EVIDENCE_DURABILITY=required refuses to start such a replica. Since migration 24 the record also carries the actor's kind and auth mode and a keyed reference to a principal's issuer, each null where the evidence row recorded none. It is still not the proposed authority_event.v1: the subject reference is not issuer-scoped, actors without an issuer and rows committed before migration 24 cannot name one, and the operation identity is not caller-bound.",
       "sources": [
         {
           "path": "gateway/src/storage/postgres_authority_events.rs",
@@ -173,6 +173,7 @@
         }
       ],
       "required_durability_supported": false,
+      "required_mode": "admitted",
       "test_claim": "PostgreSQL-gated regression anchors for the transactional document evidence. They do not certify the proposed authority-event contract, delivery or retention."
     },
     {
@@ -257,6 +258,7 @@
         }
       ],
       "required_durability_supported": false,
+      "required_mode": "refused",
       "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
     },
     {
@@ -294,6 +296,7 @@
         }
       ],
       "required_durability_supported": false,
+      "required_mode": "refused",
       "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
     },
     {
@@ -327,6 +330,7 @@
         }
       ],
       "required_durability_supported": false,
+      "required_mode": "unavailable",
       "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
     },
     {
@@ -390,6 +394,7 @@
         }
       ],
       "required_durability_supported": false,
+      "required_mode": "admitted",
       "test_claim": "PostgreSQL-gated regression anchors for the transactional document evidence. They do not certify the proposed authority-event contract, delivery or retention."
     },
     {
@@ -436,6 +441,7 @@
         }
       ],
       "required_durability_supported": false,
+      "required_mode": "refused",
       "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
     },
     {
@@ -497,6 +503,7 @@
         }
       ],
       "required_durability_supported": false,
+      "required_mode": "admitted",
       "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
     },
     {
@@ -594,6 +601,7 @@
         }
       ],
       "required_durability_supported": false,
+      "required_mode": "admitted",
       "test_claim": "Standalone regression anchors for the create/replace/credential-change evidence in the Connections database's own transactions: forced insert failure and rollback, restart, refused changes and unrecordable actors, migration onto an existing database, the actor CHECKs pinned to PostgreSQL migration 24, and the admin endpoints recording the authenticated principal with its issuer. They do not certify the proposed authority-event contract or delivery."
     },
     {
@@ -618,7 +626,7 @@
       "disposition": [
         "missing_metadata"
       ],
-      "follow_up": "PR2 follow-up: carry a caller-bound operation identity to the store and derive an issuer-scoped subject reference, so the delivered record can become authority_event.v1. Issuer, actor kind and auth mode are recorded since migration 24. Delivery (PR3) journals each row in the delete's transaction and dispatches it as authority_event_delivery.v1 behind a persisted cursor; required-durability mode, which would make a configured sink mandatory, is still not implemented.",
+      "follow_up": "PR2 follow-up: carry a caller-bound operation identity to the store and derive an issuer-scoped subject reference, so the delivered record can become authority_event.v1. Issuer, actor kind and auth mode are recorded since migration 24. Delivery (PR3) journals each row in the delete's transaction and dispatches it as authority_event_delivery.v1 behind a persisted cursor; AUTHORITY_EVIDENCE_DURABILITY=required makes a configured sink mandatory and admits this row; nothing qualifies it yet.",
       "sources": [
         {
           "path": "gateway/src/storage/migrations/0016_connection_change_evidence.sql",
@@ -704,6 +712,7 @@
         }
       ],
       "required_durability_supported": false,
+      "required_mode": "admitted",
       "test_claim": "PostgreSQL-gated regression anchors for the transactional deletion evidence and its journaled delivery: commit order, crash redelivery under the same event IDs, retention floors and capacity refusal. They do not certify the proposed authority_event.v1 contract."
     },
     {
@@ -767,6 +776,7 @@
         }
       ],
       "required_durability_supported": false,
+      "required_mode": "admitted",
       "test_claim": "Standalone regression anchors for the transactional deletion evidence: survival of the cascade and a restart, refused deletes, forced insert failure and rollback. They do not certify the proposed authority-event contract or delivery."
     },
     {
@@ -853,6 +863,7 @@
         }
       ],
       "required_durability_supported": false,
+      "required_mode": "admitted",
       "test_claim": "PostgreSQL-gated regression anchors for the transactional catalog evidence. They do not certify the proposed authority-event contract, delivery or retention."
     },
     {
@@ -915,6 +926,7 @@
         }
       ],
       "required_durability_supported": false,
+      "required_mode": "refused",
       "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
     },
     {
@@ -1013,6 +1025,7 @@
         }
       ],
       "required_durability_supported": false,
+      "required_mode": "admitted",
       "test_claim": "Standalone regression anchors for the transactional local-secret evidence in the Connections database: forced insert failure and rollback of each change, restart, refused changes and unrecordable actors, synthetic-marker exclusion, the CLI's system actor and the admin endpoints recording the authenticated principal. They do not certify the proposed authority-event contract or delivery."
     },
     {
@@ -1066,6 +1079,7 @@
         }
       ],
       "required_durability_supported": false,
+      "required_mode": "unavailable",
       "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
     },
     {
@@ -1104,6 +1118,7 @@
         }
       ],
       "required_durability_supported": false,
+      "required_mode": "outside_gateway",
       "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
     },
     {
@@ -1147,6 +1162,7 @@
         }
       ],
       "required_durability_supported": false,
+      "required_mode": "admitted",
       "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
     },
     {
@@ -1190,6 +1206,7 @@
         }
       ],
       "required_durability_supported": false,
+      "required_mode": "admitted",
       "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
     },
     {
@@ -1219,7 +1236,7 @@
       "disposition": [
         "missing_metadata"
       ],
-      "follow_up": "PR2 follow-up: carry a caller-bound operation identity to the store and derive an issuer-scoped subject reference; token issue still records only created_by and is not journaled. Issuer, actor kind and auth mode are recorded since migration 24. Delivery (PR3) journals each row in the change's transaction and dispatches it as authority_event_delivery.v1 behind a persisted cursor; required-durability mode is still not implemented.",
+      "follow_up": "PR2 follow-up: carry a caller-bound operation identity to the store and derive an issuer-scoped subject reference; token issue still records only created_by and is not journaled. Issuer, actor kind and auth mode are recorded since migration 24. Delivery (PR3) journals each row in the change's transaction and dispatches it as authority_event_delivery.v1 behind a persisted cursor; AUTHORITY_EVIDENCE_DURABILITY=required makes a configured sink mandatory and admits this row; nothing qualifies it yet.",
       "sources": [
         {
           "path": "gateway/src/storage/migrations/0018_service_token_and_jwt_evidence.sql",
@@ -1329,6 +1346,7 @@
         }
       ],
       "required_durability_supported": false,
+      "required_mode": "admitted",
       "test_claim": "PostgreSQL-gated regression anchors for the transactional rotate/revoke evidence and its journaled delivery: commit order, crash redelivery under the same event IDs, retention floors and capacity refusal. They do not certify the proposed authority_event.v1 contract."
     },
     {
@@ -1429,6 +1447,7 @@
         }
       ],
       "required_durability_supported": false,
+      "required_mode": "admitted",
       "test_claim": "Standalone regression anchors for the transactional rotate/revoke evidence in the token store's own database. They do not certify the proposed authority-event contract or delivery."
     },
     {
@@ -1448,7 +1467,7 @@
       "disposition": [
         "missing_metadata"
       ],
-      "follow_up": "PR2 follow-up: a caller-bound operation identity; an authenticated revoke path, if one ships, records a principal actor through the same ChangeActor, and the CLI must still never pretend to authenticate a named operator. Delivery (PR3) journals each effective revoke in its transaction and dispatches it independently of denylist cleanup; required-durability mode is still not implemented.",
+      "follow_up": "PR2 follow-up: a caller-bound operation identity; an authenticated revoke path, if one ships, records a principal actor through the same ChangeActor, and the CLI must still never pretend to authenticate a named operator. Delivery (PR3) journals each effective revoke in its transaction and dispatches it independently of denylist cleanup; AUTHORITY_EVIDENCE_DURABILITY=required makes a configured sink mandatory and admits this row; nothing qualifies it yet.",
       "sources": [
         {
           "path": "gateway/src/bootstrap.rs",
@@ -1530,6 +1549,7 @@
         }
       ],
       "required_durability_supported": false,
+      "required_mode": "admitted",
       "test_claim": "PostgreSQL-gated regression anchors for the transactional JWT revocation evidence and its journaled delivery: commit order, crash redelivery under the same event IDs, retention floors and capacity refusal. They do not certify the proposed authority_event.v1 contract."
     },
     {
@@ -1567,6 +1587,7 @@
         }
       ],
       "required_durability_supported": false,
+      "required_mode": "unavailable",
       "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
     },
     {
@@ -1596,7 +1617,7 @@
       "disposition": [
         "unsupported_future_operation"
       ],
-      "follow_up": "#425: the standalone session authority is process-local memory by design, so no store exists that could own atomic evidence. Required-durability mode must refuse ADMIN_SESSION_MODE=standalone_memory rather than relabel the post-change audit event as durable. Cluster mode's shared store records grant and withdrawal evidence in its own transactions (admin_session_postgres).",
+      "follow_up": "#425: the standalone session authority is process-local memory by design, so no store exists that could own atomic evidence. AUTHORITY_EVIDENCE_DURABILITY=required refuses ADMIN_SESSION_MODE=standalone_memory at startup rather than relabel the post-change audit event as durable. Cluster mode's shared store records grant and withdrawal evidence in its own transactions (admin_session_postgres).",
       "sources": [
         {
           "path": "gateway/src/auth/admin_session.rs",
@@ -1654,6 +1675,7 @@
         }
       ],
       "required_durability_supported": false,
+      "required_mode": "refused_at_startup",
       "test_claim": "Existing behavior regression anchors for the in-memory session authority only; no durable session evidence exists for a test to certify."
     },
     {
@@ -1785,6 +1807,7 @@
         }
       ],
       "required_durability_supported": false,
+      "required_mode": "admitted",
       "test_claim": "PostgreSQL-gated regression anchors for the shared session contract, its transactional grant and withdrawal evidence, and since migration 26 its journaled delivery: a full journal refusing grants while logout, rejection and the expiry prune still commit journaled, the dispatcher delivering every session event in commit order without an identifier, retention freeing only delivered rows, a refused journal write rolling the withdrawal back, and the migration's backfill. They do not certify the proposed authority_event.v1 contract."
     },
     {
@@ -1835,6 +1858,7 @@
         }
       ],
       "required_durability_supported": false,
+      "required_mode": "not_refused",
       "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
     },
     {
@@ -1877,6 +1901,7 @@
         }
       ],
       "required_durability_supported": false,
+      "required_mode": "unavailable",
       "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
     },
     {
@@ -1923,6 +1948,7 @@
         }
       ],
       "required_durability_supported": false,
+      "required_mode": "admitted",
       "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
     },
     {
@@ -1956,6 +1982,7 @@
         }
       ],
       "required_durability_supported": false,
+      "required_mode": "unavailable",
       "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
     }
   ]

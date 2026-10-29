@@ -10508,8 +10508,8 @@ pub(crate) mod postgres_audit_tests {
         let members = store.members(window).await.expect("members");
         assert_eq!(
             members[0].capabilities,
-            "openapi_discovery_catalogs,openapi_swagger2_catalogs,operation_requirements,\
-             policy_role_descriptions"
+            "delegated_token_purges,openapi_discovery_catalogs,openapi_swagger2_catalogs,\
+             operation_requirements,policy_role_descriptions"
         );
         assert!(RecognizedCapabilities::parse(&members[0].capabilities)
             .contains(Capability::OperationRequirements));
@@ -10517,6 +10517,8 @@ pub(crate) mod postgres_audit_tests {
             .contains(Capability::PolicyRoleDescriptions));
         assert!(RecognizedCapabilities::parse(&members[0].capabilities)
             .contains(Capability::OpenApiSwagger2Catalogs));
+        assert!(RecognizedCapabilities::parse(&members[0].capabilities)
+            .contains(Capability::DelegatedTokenPurges));
         assert!(RecognizedCapabilities::parse(&members[0].capabilities)
             .contains(Capability::OpenApiDiscoveryCatalogs));
 
@@ -10544,8 +10546,8 @@ pub(crate) mod postgres_audit_tests {
             .expect("refresh");
         assert_eq!(
             store.members(window).await.expect("members")[0].capabilities,
-            "openapi_discovery_catalogs,openapi_swagger2_catalogs,operation_requirements,\
-             policy_role_descriptions"
+            "delegated_token_purges,openapi_discovery_catalogs,openapi_swagger2_catalogs,\
+             operation_requirements,policy_role_descriptions"
         );
 
         let older = insert_pre_protocol_member(&pool).await;
