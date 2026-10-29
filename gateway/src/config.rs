@@ -50,6 +50,7 @@ mod parity_tests;
 mod plan;
 mod proxy;
 mod runtime;
+mod semantic_diff;
 mod stage;
 #[cfg(test)]
 mod stage_tests;

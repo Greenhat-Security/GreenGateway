@@ -15,7 +15,7 @@
       "const": "GgctlReport"
     },
     "command": {
-      "enum": ["version", "schema", "validate", "doctor"]
+      "enum": ["version", "schema", "validate", "doctor", "diff"]
     },
     "exitCode": {
       "type": "integer",
@@ -67,6 +67,14 @@
       "then": {
         "properties": {"result": {"$ref": "#/$defs/doctorResult"}}
       }
+    },
+    {
+      "if": {
+        "properties": {"command": {"const": "diff"}}
+      },
+      "then": {
+        "properties": {"result": {"$ref": "#/$defs/diffCommandResult"}}
+      }
     }
   ],
   "$defs": {
@@ -78,7 +86,7 @@
         "code": {
           "description": "The stable family.reason code. docs/ggctl.md lists every ggctl code by family, and docs/configuration-bundles.md every bundle reader code.",
           "type": "string",
-          "pattern": "^(usage|credential|trust|remote|compat|schema|validate|doctor|output|internal|bundle|syntax|json|yaml|reference|secret|resource|profile)\\.[a-z][a-z0-9_]*$"
+          "pattern": "^(usage|credential|trust|remote|compat|schema|validate|doctor|diff|output|internal|bundle|syntax|json|yaml|reference|secret|resource|profile)\\.[a-z][a-z0-9_]*$"
         },
         "severity": {
           "enum": ["error", "warning", "info"]
@@ -297,6 +305,200 @@
           "items": {"$ref": "#/$defs/documentVersion"}
         }
       }
+    },
+    "diffCommandResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["valid"],
+      "properties": {
+        "valid": {
+          "description": "Both bundles were read with no error, so they were compared. The gateway's production policy and tools validators are not part of ggctl and did not run.",
+          "type": "boolean"
+        },
+        "bundle": {
+          "description": "BUNDLE, the candidate, once its manifest was read.",
+          "$ref": "#/$defs/bundle"
+        },
+        "against": {
+          "description": "The --against bundle, the base, once its manifest was read.",
+          "$ref": "#/$defs/bundle"
+        },
+        "diff": {
+          "description": "The changes from the --against bundle to BUNDLE, present when valid.",
+          "$ref": "#/$defs/diffResult"
+        }
+      }
+    },
+    "diffResult": {
+      "description": "A semantic diff between two compiled configurations, as gateway-config computes it (docs/semantic-diff.md); ggctl diff reports it for two bundles. Value-free by construction: only booleans, fixed words and numbers are ever shown; every other value is withheld, and a secret, secret reference or locator is reported only as a changed reference.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["changed", "severity", "riskCodes", "sections", "changes"],
+      "properties": {
+        "changed": {
+          "description": "true when any field differs.",
+          "type": "boolean"
+        },
+        "severity": {
+          "description": "The highest severity of any risk code, none when no change carries one.",
+          "$ref": "#/$defs/riskSeverity"
+        },
+        "riskCodes": {
+          "description": "Every change's risk codes, sorted and without duplicates.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/riskCode"}
+        },
+        "sections": {
+          "description": "The sections with a change.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/configSection"}
+        },
+        "changes": {
+          "description": "One entry per field that differs, ordered by section and field.",
+          "type": "array",
+          "items": {"$ref": "#/$defs/configChange"}
+        }
+      }
+    },
+    "riskSeverity": {
+      "enum": ["none", "low", "medium", "high"]
+    },
+    "riskCode": {
+      "description": "A stable risk code. A published code never changes meaning; renaming or removing one requires a new report version.",
+      "enum": [
+        "risk.admin_access_path_removed",
+        "risk.audit_durability_reduced",
+        "risk.auth_disabled",
+        "risk.auth_observe_only",
+        "risk.auth_trust_changed",
+        "risk.cookie_or_csrf_weakened",
+        "risk.cors_broadened",
+        "risk.credential_binding_changed",
+        "risk.data_exposure_increased",
+        "risk.egress_broadened",
+        "risk.exemptions_broadened",
+        "risk.limits_loosened",
+        "risk.listener_exposed",
+        "risk.plaintext_transport",
+        "risk.policy_broadened",
+        "risk.policy_default_allow",
+        "risk.private_egress_allowed",
+        "risk.profile_changed",
+        "risk.public_origin_changed",
+        "risk.routing_changed",
+        "risk.shadow_enabled",
+        "risk.storage_changed",
+        "risk.tls_weakened",
+        "risk.tool_surface_broadened",
+        "risk.trusted_proxies_changed",
+        "risk.unknown_impact"
+      ]
+    },
+    "configSection": {
+      "enum": [
+        "bundle",
+        "listeners",
+        "tls",
+        "authentication",
+        "admin",
+        "browser_security",
+        "proxy_trust",
+        "routing",
+        "egress",
+        "limits",
+        "audit",
+        "observability",
+        "storage",
+        "cluster",
+        "connections",
+        "lifecycle",
+        "policy",
+        "tools"
+      ]
+    },
+    "configChange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["field", "section", "kind", "class", "effect", "severity", "riskCodes", "value"],
+      "properties": {
+        "field": {
+          "description": "The stable field identifier: an environment setting name for a deployment setting, or a dotted document path for a bundle or resource member.",
+          "type": "string",
+          "pattern": "^(?:[A-Z][A-Z0-9_]*|[a-z][a-z0-9_]*(?:[.][a-z][a-z0-9_]*)+)$"
+        },
+        "section": {"$ref": "#/$defs/configSection"},
+        "kind": {
+          "enum": ["added", "removed", "modified"]
+        },
+        "class": {
+          "description": "How the change can take effect (ADR-0008, Change classes).",
+          "enum": ["live", "restart", "coordinated_cutover", "bootstrap", "connection_or_secret", "cluster_operation", "unsupported"]
+        },
+        "effect": {
+          "description": "loosened when any facet weakens a control, otherwise unknown when no detector can tell, otherwise tightened or neutral.",
+          "enum": ["loosened", "unknown", "tightened", "neutral"]
+        },
+        "severity": {"$ref": "#/$defs/riskSeverity"},
+        "riskCodes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/riskCode"}
+        },
+        "value": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["display", "before", "after"],
+              "properties": {
+                "display": {"const": "shown"},
+                "before": {"$ref": "#/$defs/shownValue"},
+                "after": {"$ref": "#/$defs/shownValue"}
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["display"],
+              "properties": {
+                "display": {"enum": ["withheld", "reference"]}
+              }
+            }
+          ]
+        },
+        "entries": {
+          "description": "For a collection: how many entries were added, removed and changed. Entry names are never reported.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["added", "removed", "changed"],
+          "properties": {
+            "added": {"type": "integer", "minimum": 0},
+            "removed": {"type": "integer", "minimum": 0},
+            "changed": {"type": "integer", "minimum": 0}
+          }
+        }
+      },
+      "if": {
+        "properties": {"effect": {"enum": ["tightened", "neutral"]}}
+      },
+      "then": {
+        "properties": {
+          "riskCodes": {"maxItems": 0},
+          "severity": {"const": "none"}
+        }
+      },
+      "else": {
+        "properties": {
+          "riskCodes": {"minItems": 1},
+          "severity": {"enum": ["low", "medium", "high"]}
+        }
+      }
+    },
+    "shownValue": {
+      "description": "A boolean, a fixed word, a number, or the word unbounded.",
+      "type": ["boolean", "string", "number"]
     }
   }
 }

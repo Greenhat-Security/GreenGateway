@@ -439,7 +439,7 @@ mod tests {
             powershell.matches('(').count(),
             powershell.matches(')').count()
         );
-        assert!(powershell.contains("$previous -in @('--ca-file', '--token-file')"));
+        assert!(powershell.contains("$previous -in @('--against', '--ca-file', '--token-file')"));
         // A bundle directory completes directory names.
         assert!(bash
             .contains("            COMPREPLY=($(compgen -d -- \"$cur\") $(compgen -W '--strict"));
@@ -447,7 +447,7 @@ mod tests {
         assert!(fish.contains(
             "complete -c ggctl -n '__fish_seen_subcommand_from doctor' -a '(__fish_complete_directories)'\n"
         ));
-        assert!(powershell.contains("$command -in @('validate', 'doctor')"));
+        assert!(powershell.contains("$command -in @('validate', 'doctor', 'diff')"));
         for script in [&bash, &zsh, &fish] {
             // Single quotes pair up once escaped quotes are removed.
             assert_eq!(script.replace(r"'\''", "").matches('\'').count() % 2, 0);

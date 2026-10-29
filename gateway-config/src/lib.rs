@@ -20,7 +20,10 @@
 //!   archive GreenGateway reads (no traversal, links, special files,
 //!   duplicate or case-colliding names, and bounded sizes and expansion),
 //!   ahead of the backup archive reader that will apply them, so that reader
-//!   cannot approximate them. Bundles themselves are directories only.
+//!   cannot approximate them. Bundles themselves are directories only;
+//! - [`semantic_diff`]: the semantic diff between two compiled
+//!   configurations and its risk classification, which `ggctl diff` reports
+//!   for two bundles and the gateway's plans will report.
 //!
 //! Still in the gateway crate: the environment configuration compiler
 //! (`Config::from_env_vars`, being extracted by #433) and the production
@@ -40,3 +43,4 @@ pub mod capabilities;
 pub mod documents;
 pub mod opaque_id;
 pub mod permissions;
+pub mod semantic_diff;
