@@ -13,9 +13,10 @@
 /// Each code is exactly one of the values migration 23's `action` CHECK
 /// accepts.
 ///
-/// Standalone policy writes pass one too, and ignore it: their file and
-/// optional SQLite history are separate steps with no evidence row until the
-/// #242 revision ledger lands.
+/// Standalone policy writes pass one too. They record no evidence row: their
+/// file and optional SQLite history are separate steps until the #242
+/// revision ledger lands, so the action only names the operation
+/// `AUTHORITY_EVIDENCE_DURABILITY=required` refuses (issue #425, PR 4).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
 pub enum DocumentAction {

@@ -564,6 +564,18 @@ pub(super) async fn rule_suggestion_accept_endpoint(
         .await;
     }
 
+    // The standalone policy write records no evidence (issue #425, PR 4);
+    // asked as the acceptance it is, before the rule is written.
+    if let Err(response) = admit_authority_change(
+        &state.policy.authority_evidence,
+        authority_events::required::AuthorityOperation::PolicySuggestionAccept,
+        &state.policy.audit,
+        &parts,
+        &principal,
+        &state.policy.client_ip_policy,
+    ) {
+        return *response;
+    }
     let created = match create_policy_rule(
         &state.policy,
         &parts,

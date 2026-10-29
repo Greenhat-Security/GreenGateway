@@ -1,11 +1,17 @@
 //! Authority-event delivery settings (issue #425, PR 3), compiled in a pure
-//! stage (issue #433, PR 2).
+//! stage (issue #433, PR 2), and the required-evidence mode (issue #425, PR 4).
 //!
 //! Cluster mode journals every committed evidence row in its own transaction
 //! whatever these say; they choose where the dispatcher delivers the journal,
 //! the key its safe references are derived under, how much the journal may
 //! hold, and how long delivered rows stay. Standalone mode has no journal and
-//! no dispatcher, so every setting here is refused there rather than ignored.
+//! no dispatcher, so every delivery setting here is refused there rather than
+//! ignored.
+//!
+//! `AUTHORITY_EVIDENCE_DURABILITY` is read in both modes. Under `required` a
+//! cluster replica must deliver what it journals, so a sink is mandatory; the
+//! storage stage adds the rule that needs the admin session store, and the
+//! changes refused at runtime are `authority_events::required`'s.
 //!
 //! One block, [`AuthorityEventInputs`], read right after PostgreSQL's. Which
 //! rules apply depends on the state backend, so the storage stage compiles
@@ -25,6 +31,7 @@ use super::{
 };
 use crate::connections::{model::MAX_SECRET_ID_BYTES, secret::is_valid_opaque_id};
 
+pub(super) const AUTHORITY_EVIDENCE_DURABILITY: &str = "AUTHORITY_EVIDENCE_DURABILITY";
 pub(super) const AUTHORITY_EVENT_SINK: &str = "AUTHORITY_EVENT_SINK";
 pub(super) const AUTHORITY_EVENT_FILE: &str = "AUTHORITY_EVENT_FILE";
 pub(super) const AUTHORITY_PSEUDONYM_KEY_ALIAS: &str = "AUTHORITY_PSEUDONYM_KEY_ALIAS";
@@ -42,6 +49,45 @@ pub const MAX_AUTHORITY_EVENT_JOURNAL_CAPACITY: u64 = 1_000_000_000;
 pub const DEFAULT_AUTHORITY_EVENT_RETENTION_HOURS: u64 = 168;
 /// Ten years.
 pub const MAX_AUTHORITY_EVENT_RETENTION_HOURS: u64 = 87_600;
+
+/// What the gateway requires of the evidence of an authority change
+/// (`AUTHORITY_EVIDENCE_DURABILITY`, issue #425, PR 4).
+///
+/// `BestEffort`, the default, performs every change the configuration
+/// enables and keeps whatever evidence its store records, which for some
+/// changes is nothing durable. `Required` refuses every change the evidence
+/// inventory says this deployment mode cannot record in the change's own
+/// transaction -- at startup when the configuration itself enables it, and
+/// otherwise when it is asked for -- and refuses a cluster replica that would
+/// journal evidence without delivering it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AuthorityEvidenceDurability {
+    #[default]
+    BestEffort,
+    Required,
+}
+
+impl AuthorityEvidenceDurability {
+    /// The value as `AUTHORITY_EVIDENCE_DURABILITY` spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BestEffort => "best_effort",
+            Self::Required => "required",
+        }
+    }
+}
+
+impl FromStr for AuthorityEvidenceDurability {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "required" => Ok(Self::Required),
+            "best_effort" => Ok(Self::BestEffort),
+            _ => Err("expected `required` or `best_effort`"),
+        }
+    }
+}
 
 /// Where delivered authority events go.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -67,9 +113,11 @@ impl AuthorityEventSinkSetting {
 }
 
 /// The validated settings. Defaults are standalone mode's: nothing to
-/// deliver.
+/// deliver, and no change refused for its evidence.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthorityEventSettings {
+    /// Whether a change this deployment cannot evidence is refused.
+    pub durability: AuthorityEvidenceDurability,
     pub sink: AuthorityEventSinkSetting,
     /// The secret alias of the current pseudonym key; required when a sink
     /// is configured.
@@ -83,6 +131,7 @@ pub struct AuthorityEventSettings {
 impl Default for AuthorityEventSettings {
     fn default() -> Self {
         Self {
+            durability: AuthorityEvidenceDurability::BestEffort,
             sink: AuthorityEventSinkSetting::None,
             pseudonym_key_alias: None,
             previous_pseudonym_key_alias: None,
@@ -141,6 +190,7 @@ impl fmt::Display for UnknownSink {
 
 /// The authority-event block's inputs, as the reader returned them.
 pub(super) struct AuthorityEventInputs {
+    durability: RawInput,
     sink: RawInput,
     file: RawInput,
     pseudonym_key_alias: RawInput,
@@ -153,6 +203,10 @@ impl AuthorityEventInputs {
     /// Requests every input of the block once, in the inventory's order.
     pub(super) fn read(mut get_var: impl FnMut(&str) -> Result<String, VarError>) -> Self {
         Self {
+            durability: RawInput::new(
+                AUTHORITY_EVIDENCE_DURABILITY,
+                get_var(AUTHORITY_EVIDENCE_DURABILITY),
+            ),
             sink: RawInput::new(AUTHORITY_EVENT_SINK, get_var(AUTHORITY_EVENT_SINK)),
             file: RawInput::new(AUTHORITY_EVENT_FILE, get_var(AUTHORITY_EVENT_FILE)),
             pseudonym_key_alias: RawInput::new(
@@ -176,6 +230,7 @@ impl AuthorityEventInputs {
 
     pub(super) fn provenance(&self) -> Vec<Provenance> {
         [
+            &self.durability,
             &self.sink,
             &self.file,
             &self.pseudonym_key_alias,
@@ -200,6 +255,17 @@ pub(super) fn compile(
     state_backend: StateBackend,
     findings: &mut Findings,
 ) -> AuthorityEventSettings {
+    // Like `AUDIT_DURABILITY`, a blank value is refused rather than read as
+    // the weaker default.
+    let durability = findings.input(AUTHORITY_EVIDENCE_DURABILITY, |problems| {
+        parse_var(
+            AUTHORITY_EVIDENCE_DURABILITY,
+            inputs.durability.value(),
+            AuthorityEvidenceDurability::BestEffort,
+            "authority evidence durability mode",
+            problems,
+        )
+    });
     // Set means set to anything but whitespace. A value that is not Unicode
     // is refused as a value, and is not also reported as material the
     // backend never reads.
@@ -363,6 +429,19 @@ pub(super) fn compile(
                     ),
                 );
             }
+            // Every change this replica journals is evidence the deployment
+            // undertook to deliver. With no sink no dispatcher runs and the
+            // journal only retains it. A configured sink's own requirements
+            // are the rules above.
+            if durability == AuthorityEvidenceDurability::Required && sink_kind == SinkKind::None {
+                findings.refuse(
+                    after,
+                    ConfigRule::AuthorityEvidenceDeliveryRequired,
+                    format!(
+                        "{AUTHORITY_EVIDENCE_DURABILITY}=required needs {AUTHORITY_EVENT_SINK}=log or file when {STATE_BACKEND}=postgres; with none, the authority evidence this replica journals is retained but never delivered"
+                    ),
+                );
+            }
         }
     }
 
@@ -372,6 +451,7 @@ pub(super) fn compile(
         SinkKind::File => AuthorityEventSinkSetting::File(file.unwrap_or_default()),
     };
     AuthorityEventSettings {
+        durability,
         sink,
         pseudonym_key_alias: key,
         previous_pseudonym_key_alias: previous,
