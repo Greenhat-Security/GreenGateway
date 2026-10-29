@@ -893,7 +893,7 @@ pub(crate) struct StoragePlan {
     pub(crate) authority_events: AuthorityEventSettings,
     /// Where each of the six blocks' inputs came from, in the order they are
     /// read.
-    #[allow(dead_code)] // Read by the stage tests until startup consumes the plan (#433 PR 3).
+    #[allow(dead_code)] // Read by the stage tests; startup builds from the values alone.
     pub(crate) provenance: Vec<Provenance>,
 }
 

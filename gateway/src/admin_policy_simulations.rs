@@ -174,12 +174,16 @@ fn simulation_invalid(diagnostics: &policy_testing::suite::Diagnostics) -> Respo
 }
 
 fn simulation_candidate_invalid(error: &rbac::policy::PolicyError) -> Response {
+    simulation_candidate_refused(vec![policy_error_message(error)])
+}
+
+fn simulation_candidate_refused(errors: Vec<String>) -> Response {
     (
         StatusCode::UNPROCESSABLE_ENTITY,
         Json(json!({
             "error": "candidate policy is invalid",
             "reason": "policy_candidate_invalid",
-            "errors": [policy_error_message(error)],
+            "errors": errors,
         })),
     )
         .into_response()
@@ -232,14 +236,27 @@ async fn simulation_base(
 
 /// The candidate the request describes, validated exactly as a policy write
 /// validates one, or `None` when the candidate is the base itself.
+///
+/// An inline candidate is read from its own bytes by the parser
+/// `PUT .../policy` reads a body with, so a v1 document is held to the same
+/// exact-source rules. An edited candidate has no bytes of its own -- it is
+/// the base with the edits applied -- and is validated as the document that
+/// produces. Either is then refused, as `POST .../policy/validate` and a
+/// test run refuse it, when this deployment could not commit its document
+/// format.
 fn simulation_candidate(
+    state: &PolicyAdminState,
     rbac_state: &middleware::rbac::RbacState,
     base: &rbac::Policy,
     source: &CandidateSource,
 ) -> ResponseResult<Option<rbac::Policy>> {
     let document = match source {
         CandidateSource::Active => return Ok(None),
-        CandidateSource::Inline(document) => document.clone(),
+        CandidateSource::Inline(source) => {
+            let candidate = parse_policy_body(source.get().as_bytes())
+                .map_err(|errors| Box::new(simulation_candidate_refused(errors)))?;
+            return admitted_simulation_candidate(state, rbac_state, candidate).map(Some);
+        }
         CandidateSource::Edits(edits) => {
             let base_document = match serde_json::to_value(base) {
                 Ok(document) => document,
@@ -258,10 +275,23 @@ fn simulation_candidate(
         Ok(candidate) => candidate,
         Err(error) => return Err(Box::new(simulation_candidate_invalid(&error))),
     };
+    admitted_simulation_candidate(state, rbac_state, candidate).map(Some)
+}
+
+/// What a parsed candidate must also satisfy before it is simulated: proxy
+/// dispatch this deployment can serve, and a document format it can commit.
+fn admitted_simulation_candidate(
+    state: &PolicyAdminState,
+    rbac_state: &middleware::rbac::RbacState,
+    candidate: rbac::Policy,
+) -> ResponseResult<rbac::Policy> {
     if let Err(error) = rbac_state.validate_proxy_dispatch_policy(&candidate) {
         return Err(Box::new(simulation_candidate_invalid(&error)));
     }
-    Ok(Some(candidate))
+    if let Some(detail) = deployment_document_format_refusal(state, &candidate) {
+        return Err(Box::new(simulation_candidate_refused(vec![detail])));
+    }
+    Ok(candidate)
 }
 
 struct SimulationBinding {
@@ -433,7 +463,7 @@ pub(super) async fn policy_simulations_endpoint(
         )
             .into_response();
     }
-    let candidate = match simulation_candidate(rbac_state, &base, &simulation.candidate) {
+    let candidate = match simulation_candidate(&state, rbac_state, &base, &simulation.candidate) {
         Ok(candidate) => candidate,
         Err(response) => return *response,
     };

@@ -289,6 +289,25 @@ impl ClusterMembership {
         agreement.map_err(BootRegistrationError::Store)
     }
 
+    /// Withdraw a boot that will never serve (issue #433, PR 3): startup
+    /// failed after [`Self::register_boot`] may have written the boot row,
+    /// so the row is stamped draining now rather than left `starting` until
+    /// it goes stale. A live, non-draining row is one every newcomer has to
+    /// agree with on fingerprint, and a crash-looping replica would
+    /// otherwise keep one fresh. Stamping a row that was never written
+    /// changes nothing; the stamp is bounded like the shutdown stamp and,
+    /// like it, skipped when the durable contract fence excludes this
+    /// binary.
+    pub(crate) async fn withdraw_unserved_boot(&self) {
+        if self.readiness.contract_fenced() {
+            return;
+        }
+        tracing::warn!(
+            "cluster mode: startup failed after this boot joined the membership roster; withdrawing the boot row"
+        );
+        self.stamp_draining().await;
+    }
+
     /// Compare the live roster with this replica's fingerprint, granting
     /// (sticky) agreement when nobody live disagrees. Already-agreed
     /// replicas answer without a read. The admission writes are applied

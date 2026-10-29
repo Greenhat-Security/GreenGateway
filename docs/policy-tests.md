@@ -166,8 +166,11 @@ If-Match: "sha256:..."            (optional)
   admin capabilities endpoint lists `admin:policy:simulate` when it is held.
 - `format` is `json` (the default), `sarif` or `junit`.
 - `policy` (optional) is a candidate policy document. It is validated as
-  `POST /v1{ADMIN_PREFIX}/policy/validate` validates one and judged without
-  being stored. Without it the run judges the active policy: the policy file's
+  `POST /v1{ADMIN_PREFIX}/policy/validate` validates one, from the exact bytes
+  of the member, so a v1 document is held to the same exact-source rules
+  (size, and no number spelled through serde_json's private number tag), and
+  judged without being stored. `"policy": null` is a candidate, and invalid.
+  Without it the run judges the active policy: the policy file's
   current snapshot in standalone mode, or the authoritative active document in
   cluster mode.
 - `If-Match` (optional, active policy only) pins the run to the policy ETag you

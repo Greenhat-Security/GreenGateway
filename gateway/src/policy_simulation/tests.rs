@@ -136,9 +136,11 @@ fn refused(document: &Value) -> Diagnostics {
 fn candidate_of(request: &SimulationRequest, base: &Policy) -> Option<Policy> {
     match &request.candidate {
         CandidateSource::Active => None,
-        CandidateSource::Inline(document) => {
-            Some(Policy::validate_json_value(document.clone()).expect("candidate validates"))
-        }
+        CandidateSource::Inline(source) => Some(
+            crate::rbac::policy_document::inspect_source(source.get().as_bytes())
+                .into_policy()
+                .expect("candidate validates"),
+        ),
         CandidateSource::Edits(edits) => {
             let document = apply_edits(
                 &serde_json::to_value(base).expect("base serializes"),
@@ -284,6 +286,26 @@ fn every_request_member_is_bounded_and_typed() {
         codes(&refused(&request)),
         [("too_long", "/base_etag".to_owned())]
     );
+}
+
+/// An inline candidate is kept as the exact bytes of `/candidate/policy`,
+/// not as the `Value` the request was checked with: the endpoint reads it
+/// with the parser a policy write uses, which sees what a `Value` drops.
+#[test]
+fn an_inline_candidate_keeps_its_exact_bytes() {
+    let policy = r#"{ "schema_version": "1.0.0",  "default_action": "deny" }"#;
+    let bytes = format!(
+        r#"{{"schema_version":"{SIMULATION_SCHEMA_VERSION}","base_etag":"\"sha256:base\"","candidate":{{"source":"inline","policy":{policy}}},"cases":{}}}"#,
+        cases()
+    );
+    let value: Value = serde_json::from_str(&bytes).expect("request JSON");
+    let request = parse_request(bytes.as_bytes(), &value).unwrap_or_else(|diagnostics| {
+        panic!("request parses: {:?}", codes(&diagnostics));
+    });
+    let CandidateSource::Inline(source) = &request.candidate else {
+        panic!("the candidate should be inline");
+    };
+    assert_eq!(source.get(), policy);
 }
 
 #[test]
