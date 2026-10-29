@@ -1418,8 +1418,8 @@ mod tests {
         }
     }
 
-    /// The step from 24 to 25 rolls only because the release before this one
-    /// approved migration 25 by its exact checksum before this build applied
+    /// The step from 24 to 25 rolls only because migration 25's prepared
+    /// release approved it by its exact checksum before any build applied
     /// it. The bytes this manifest executes must be exactly those: the
     /// checksum the prepared release carries is what this build's migrator
     /// records in the ledger, and any other checksum at 25 makes every
@@ -1533,8 +1533,11 @@ mod tests {
     /// prepared step per approved extension, ending at the highest schema it
     /// serves. A migration, an extension, a capability or
     /// a gated operation that leaves the published matrix behind fails here,
-    /// in the pull request that adds it. The pinned qualified pair is checked
-    /// against its evidence by `scripts/upgrade_pair_evidence.py`.
+    /// in the pull request that adds it, and so does one that leaves behind
+    /// the sentences of the deployment guide and the HA state model naming
+    /// this binary's schema point and how its own step is taken. The pinned
+    /// qualified pair is checked against its evidence by
+    /// `scripts/upgrade_pair_evidence.py`.
     #[test]
     fn the_published_upgrade_matrix_describes_this_binary() {
         use crate::storage::compatibility::{
@@ -1730,6 +1733,72 @@ mod tests {
              coordinated or rolling step for every migration, with its section in the \
              deployment guide, then a prepared step for every approved extension"
         );
+
+        // The prose naming this binary's schema point moves with it, in both
+        // documents: migration 26 once left them saying schema 25 and pointing
+        // this release at the step from 24 to 25 (#426).
+        let (low, high) = contract.serving_range();
+        assert!(
+            contract.read == contract.write
+                && low == high
+                && contract.approved_extensions.is_empty(),
+            "the sentences below state a single-point contract; a prepared build serves a \
+             range, so state its contract in both documents and pin those sentences here"
+        );
+        let last = steps
+            .last()
+            .expect("the matrix lists at least one schema step");
+        let own_step = format!(
+            "this release's step from {} to {} is {}",
+            last["from"],
+            last["to"],
+            last["procedure"]
+                .as_str()
+                .expect("every schema step names its procedure")
+        );
+        let guide_text = guide.to_lowercase();
+        let architecture = include_str!("../../../docs/architecture/ha-state-model.md")
+            .replace("\r\n", "\n")
+            .to_lowercase();
+        for (path, document, sentence) in [
+            (
+                "docs/deployment/postgres.md",
+                &guide_text,
+                format!(
+                    "the shipped contracts each cover exactly schema {high}, where this \
+                     build's manifest ends"
+                ),
+            ),
+            (
+                "docs/deployment/postgres.md",
+                &guide_text,
+                format!("currently `({low}, {high})`"),
+            ),
+            ("docs/deployment/postgres.md", &guide_text, own_step.clone()),
+            (
+                "docs/architecture/ha-state-model.md",
+                &architecture,
+                format!(
+                    "the shipped read and write contracts each cover exactly schema {high}, \
+                     which this build's manifest ends at"
+                ),
+            ),
+            (
+                "docs/architecture/ha-state-model.md",
+                &architecture,
+                format!("both bounds are exactly {high}, where the manifest ends"),
+            ),
+            (
+                "docs/architecture/ha-state-model.md",
+                &architecture,
+                own_step,
+            ),
+        ] {
+            assert!(
+                document.contains(&sentence),
+                "{path} must state this binary's schema point and its own step: {sentence:?}"
+            );
+        }
         assert!(
             guide.contains("\n## Upgrading a cluster\n"),
             "the deployment guide carries the procedure the matrix names"
