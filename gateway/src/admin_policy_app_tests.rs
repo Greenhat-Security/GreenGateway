@@ -1,3 +1,9 @@
+//! Policy administration in `admin_policy.rs`: policy and rule CRUD, history
+//! and rollback, validate and convert, the rule preview, rule hits and the
+//! shadow review with its bound promotions, and the startup refusal of an
+//! invalid policy file. Cluster-mode publication against a real
+//! PostgreSQL is the `cluster_policy_tests` module at the end. Shared
+//! fixtures stay in `app_tests.rs`.
 use super::*;
 
 #[tokio::test]

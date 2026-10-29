@@ -1,3 +1,10 @@
+//! The observability admin API in `admin_observability.rs` and
+//! `admin_events.rs`: audit query and stream, status, traffic, signals,
+//! suggestions, principals, schema coverage and inference, and the startup
+//! refusal of a missing or broken OpenAPI spec. The durable audit stream
+//! and the cluster-mode discovery wiring against a real PostgreSQL are the
+//! `durable_sse_tests` and `cluster_discovery_tests` modules. Shared
+//! fixtures stay in `app_tests.rs`.
 use super::*;
 
 fn test_audit_log_with_broadcast() -> (audit::AuditLog, audit::AuditEventSender) {

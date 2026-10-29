@@ -1,3 +1,7 @@
+//! Listeners, routing and proxying (`routing.rs`, `probes.rs`, `proxy/`,
+//! `middleware/`): the listener split, the admin prefix, admin UI serving,
+//! health probes, the routing table, proxying, rate limits, CORS and the
+//! middleware order. Shared fixtures stay in `app_tests.rs`.
 use super::*;
 
 fn gateway_app_for_test(config: config::Config) -> GatewayApps {

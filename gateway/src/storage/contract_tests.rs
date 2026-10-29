@@ -3290,7 +3290,7 @@ pub(crate) mod postgres_audit_tests {
     /// its call site names, and starts its statement clock only once it
     /// holds the connection (issue #439).
     ///
-    /// The registry audit in `app_tests.rs` drives the emitter directly,
+    /// The registry audit in `cluster_app_tests.rs` drives the emitter directly,
     /// so it proves the label space and nothing about who records into
     /// it. This is the other half, against a real pool. Served, each call
     /// lands one acquisition sample under its class and one statement

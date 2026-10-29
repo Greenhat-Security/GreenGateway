@@ -317,7 +317,7 @@ read the `cancelled` rate beside them, and remember that a `cancelled` sample is
 itself only a lower bound on how long that caller would have waited.
 
 No label carries a principal, token, route, key, statement or request ID. The
-registry audit in `app_tests.rs` holds every rendered value to its declared
+registry audit in `cluster_app_tests.rs` holds every rendered value to its declared
 list and the family to exactly one series per class and outcome: seven classes
 by eight outcomes today (six classified kinds, `none` and `cancelled`), with
 the class list capped at eight.

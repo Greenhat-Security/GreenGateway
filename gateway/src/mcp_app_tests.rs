@@ -1,3 +1,7 @@
+//! The MCP endpoint in `mcp.rs` and `tools/`: `/mcp` and how it
+//! authenticates, protected-resource metadata, tool listing and calls,
+//! upstream MCP tools, the MCP route's streaming body limit, and the traffic
+//! inventory rows MCP calls record. Shared fixtures stay in `app_tests.rs`.
 use super::*;
 
 #[tokio::test]

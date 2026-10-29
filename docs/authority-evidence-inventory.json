@@ -245,11 +245,11 @@
       ],
       "tests": [
         {
-          "path": "gateway/src/app_tests.rs",
+          "path": "gateway/src/admin_policy_app_tests.rs",
           "anchor": "async fn policy_put_succeeds_with_warning_when_history_append_fails_after_commit("
         },
         {
-          "path": "gateway/src/app_tests.rs",
+          "path": "gateway/src/admin_policy_app_tests.rs",
           "anchor": "async fn policy_history_records_every_policy_mutation_path_once("
         },
         {
@@ -377,11 +377,11 @@
       ],
       "tests": [
         {
-          "path": "gateway/src/app_tests.rs",
+          "path": "gateway/src/admin_tools_app_tests.rs",
           "anchor": "async fn tools_control_plane_seeds_once_and_commits_with_cas("
         },
         {
-          "path": "gateway/src/app_tests.rs",
+          "path": "gateway/src/admin_tools_app_tests.rs",
           "anchor": "async fn a_stale_tools_install_never_rolls_the_live_lane_back("
         },
         {
@@ -432,7 +432,7 @@
       ],
       "tests": [
         {
-          "path": "gateway/src/app_tests.rs",
+          "path": "gateway/src/admin_tools_app_tests.rs",
           "anchor": "async fn openapi_tools_register_persists_selection_reloads_registry_and_audits("
         },
         {
@@ -588,7 +588,7 @@
           "anchor": "fn migration_twelve_refuses_evidence_rows_that_do_not_fit_their_action("
         },
         {
-          "path": "gateway/src/app_tests.rs",
+          "path": "gateway/src/admin_connections_app_tests.rs",
           "anchor": "async fn connection_admin_crud_enforces_etags_secret_authority_and_redaction("
         },
         {
@@ -1020,7 +1020,7 @@
           "anchor": "fn one_batch_per_command_is_bounded_resumable_and_reports_progress("
         },
         {
-          "path": "gateway/src/app_tests.rs",
+          "path": "gateway/src/admin_connections_app_tests.rs",
           "anchor": "async fn connection_secret_admin_crud_is_safe_permissioned_and_preconditioned("
         }
       ],

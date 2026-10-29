@@ -1,3 +1,7 @@
+//! Cluster status and readiness: the cluster routes in `cluster_status.rs`,
+//! the readiness gates of `/readyz` (`probes.rs`, `ha_status.rs`) and the
+//! label audit of the HA metric registry. Shared fixtures stay in
+//! `app_tests.rs`.
 use super::*;
 
 /// Cluster mode's fingerprint gate (issue #241, PR 13): a replica that

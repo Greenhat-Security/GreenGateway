@@ -1,3 +1,6 @@
+//! The Connection admin API in `admin_connections.rs`: Connection and
+//! local-secret CRUD, test and refresh, managed OpenAPI preview, register and
+//! overlays, and caller assertions. Shared fixtures stay in `app_tests.rs`.
 use super::*;
 
 fn testable_connection_body(display_name: &str, enabled: bool) -> String {

@@ -1,3 +1,7 @@
+//! The tools admin API in `admin_tools.rs`: the capability inventory, the
+//! tool playground and OpenAPI tool registration. The cluster-mode tools
+//! control plane against a real PostgreSQL is the `cluster_tools_tests`
+//! module at the end. Shared fixtures stay in `app_tests.rs`.
 use super::*;
 
 #[tokio::test]
