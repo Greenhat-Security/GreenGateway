@@ -10,7 +10,9 @@
 //! the database URL file as `SecretLocator`s, and the Connections aliases,
 //! keyrings and providers in types that print them redacted. Nothing here or
 //! in the stages opens a file, resolves a name or reaches a store, a provider
-//! or the network; preflight and activation stay with startup (#433 PR 3).
+//! or the network; preflight and activation stay with startup, which runs
+//! them as stages of their own after this compiler has returned
+//! (`bootstrap::start_serving`, #433 PR 3).
 //!
 //! `Config::from_env_vars` is this compiler followed by
 //! [`ConfigPlan::into_config`], which is why its behaviour has not changed.
@@ -175,8 +177,9 @@ pub(super) fn compile_blocks(
 
 impl ConfigPlan {
     /// The legacy `Config` the plan describes: the same values, with the
-    /// locators handed over as the paths startup opens.
-    pub(super) fn into_config(self) -> Config {
+    /// locators handed over as the paths startup opens. Serving startup
+    /// converts the plan once, before its first stage that does I/O.
+    pub(crate) fn into_config(self) -> Config {
         let ConfigPlan {
             listeners,
             identity,
