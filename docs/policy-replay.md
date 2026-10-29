@@ -492,6 +492,19 @@ PostgreSQL, which no replay reader covers yet. Without a
 standalone audit log (`AUDIT_SQLITE_PATH` unset) the start route is
 `503 audit_evidence_unavailable`, never an empty result.
 
+### In the admin UI
+
+The Policy Studio's Impact view (#243 slice 18) starts jobs over the live
+policy or the open draft's text, polls them, cancels or discards them, and
+shows a result's records by classification and its decisions per lane. It
+lists only the jobs started in the page. A start whose answer was lost is
+checked by sending the same request under the same idempotency key, never
+retried as a new job. An incomplete result is labelled as satisfying no gate,
+`no_data` is shown as no decisions rather than as zero, and the view states
+that a replay does not compare its decisions with recorded ones yet. See
+**Policy Studio workbench** in
+[the configuration reference](configuration.md#policy_file).
+
 ### Side effects
 
 A job reads the audit log, and that is all it does outside its own memory. It
