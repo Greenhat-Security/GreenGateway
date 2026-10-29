@@ -166,12 +166,25 @@ pub(crate) enum IssueCode {
     DispatchNotConfigured,
     DocumentFormatUnsupportedInCluster,
     ConversionRequiresV0,
+    PolicyWriteUnreachable,
+    PublisherPolicyWriteLost,
+    EgressChangeRequiresRestart,
+    RoleNotDefined,
+    RoutePermissionUngranted,
+    ToolRuleNeverDecides,
+    ToolNotRegistered,
+    ConnectionEndpointEgressDenied,
+    NameCaseCollision,
+    ResourceUnavailable,
+    DefaultActionAllow,
+    EnforcementModeShadow,
+    WildcardPermission,
 }
 
 impl IssueCode {
     /// Every code, so tests can check the vocabulary as a whole.
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 41] = [
+    pub(crate) const ALL: [Self; 54] = [
         Self::InvalidJson,
         Self::DocumentTooLarge,
         Self::DuplicateMember,
@@ -213,6 +226,19 @@ impl IssueCode {
         Self::DispatchNotConfigured,
         Self::DocumentFormatUnsupportedInCluster,
         Self::ConversionRequiresV0,
+        Self::PolicyWriteUnreachable,
+        Self::PublisherPolicyWriteLost,
+        Self::EgressChangeRequiresRestart,
+        Self::RoleNotDefined,
+        Self::RoutePermissionUngranted,
+        Self::ToolRuleNeverDecides,
+        Self::ToolNotRegistered,
+        Self::ConnectionEndpointEgressDenied,
+        Self::NameCaseCollision,
+        Self::ResourceUnavailable,
+        Self::DefaultActionAllow,
+        Self::EnforcementModeShadow,
+        Self::WildcardPermission,
     ];
 
     pub(crate) const fn as_str(self) -> &'static str {
@@ -258,6 +284,19 @@ impl IssueCode {
             Self::DispatchNotConfigured => "dispatch_not_configured",
             Self::DocumentFormatUnsupportedInCluster => "document_format_unsupported_in_cluster",
             Self::ConversionRequiresV0 => "conversion_requires_v0",
+            Self::PolicyWriteUnreachable => "policy_write_unreachable",
+            Self::PublisherPolicyWriteLost => "publisher_policy_write_lost",
+            Self::EgressChangeRequiresRestart => "egress_change_requires_restart",
+            Self::RoleNotDefined => "role_not_defined",
+            Self::RoutePermissionUngranted => "route_permission_ungranted",
+            Self::ToolRuleNeverDecides => "tool_rule_never_decides",
+            Self::ToolNotRegistered => "tool_not_registered",
+            Self::ConnectionEndpointEgressDenied => "connection_endpoint_egress_denied",
+            Self::NameCaseCollision => "name_case_collision",
+            Self::ResourceUnavailable => "resource_unavailable",
+            Self::DefaultActionAllow => "default_action_allow",
+            Self::EnforcementModeShadow => "enforcement_mode_shadow",
+            Self::WildcardPermission => "wildcard_permission",
         }
     }
 
@@ -330,6 +369,49 @@ impl IssueCode {
                 "cluster mode does not yet commit documents of this schema_version"
             }
             Self::ConversionRequiresV0 => "only a 0.x document is converted to policy v1",
+            Self::PolicyWriteUnreachable => {
+                "no role grants admin:policy:write, so after this change no principal could \
+                 change the policy through the policy API"
+            }
+            Self::PublisherPolicyWriteLost => {
+                "the principal making this change could not replace the policy through the \
+                 policy API after it"
+            }
+            Self::EgressChangeRequiresRestart => {
+                "the egress section differs from the live policy's, and egress changes apply \
+                 only when the gateway starts"
+            }
+            Self::RoleNotDefined => {
+                "the role is not defined under roles; it matches only principals that carry \
+                 it, and grants them no permission"
+            }
+            Self::RoutePermissionUngranted => {
+                "no role grants the permission this route requires, so the route refuses \
+                 every principal"
+            }
+            Self::ToolRuleNeverDecides => {
+                "the tool has no enabled tools entry, so the tool lane refuses every call to \
+                 it before this rule is consulted"
+            }
+            Self::ToolNotRegistered => "no tool of this name is registered with this gateway",
+            Self::ConnectionEndpointEgressDenied => {
+                "the effective egress controls refuse the endpoint of at least one enabled \
+                 Connection"
+            }
+            Self::NameCaseCollision => {
+                "the name differs from another name in the same map only in ASCII case"
+            }
+            Self::ResourceUnavailable => {
+                "a resource the cross-resource checks read was unavailable, so the checks \
+                 that need it did not run"
+            }
+            Self::DefaultActionAllow => "requests that no rule or route matches are allowed",
+            Self::EnforcementModeShadow => {
+                "denials by routes and the default action are observed, not enforced"
+            }
+            Self::WildcardPermission => {
+                "the role grants every permission, policy and token administration included"
+            }
         }
     }
 
@@ -436,6 +518,66 @@ impl IssueCode {
             Self::ConversionRequiresV0 => {
                 "The document already is policy v1; validate it instead of converting it."
             }
+            Self::PolicyWriteUnreachable => {
+                "Keep at least one role that grants admin:policy:write, or \"*\", to the \
+                 principals who administer the policy."
+            }
+            Self::PublisherPolicyWriteLost => {
+                "Keep the role, routes, and rules that let you replace the policy, or have \
+                 another administrator make the change."
+            }
+            Self::EgressChangeRequiresRestart => {
+                "Keep the live policy's egress section; edit POLICY_FILE and restart the \
+                 gateway to change egress."
+            }
+            Self::RoleNotDefined => "Define the role under roles, or correct its spelling.",
+            Self::RoutePermissionUngranted => {
+                "Grant the permission to a role, or correct its spelling."
+            }
+            Self::ToolRuleNeverDecides => {
+                "Add an enabled tools entry for the tool, or remove the rule."
+            }
+            Self::ToolNotRegistered => {
+                "Register the tool, or correct the name; tool names are case-sensitive."
+            }
+            Self::ConnectionEndpointEgressDenied => {
+                "Admit each enabled Connection's host and port in EGRESS_ALLOWED_HOSTS or the \
+                 policy egress section, or disable the Connection."
+            }
+            Self::NameCaseCollision => {
+                "Use one spelling; role and tool names compare exactly, case included."
+            }
+            Self::ResourceUnavailable => {
+                "Validate again; resource_snapshot.unavailable names what could not be read."
+            }
+            Self::DefaultActionAllow => {
+                "Set default_action to deny and add routes for what should be reachable, \
+                 unless allowing unmatched requests is intended."
+            }
+            Self::EnforcementModeShadow => {
+                "Set enforcement_mode to enforce once the shadow observations are reviewed."
+            }
+            Self::WildcardPermission => "Grant the role the permissions it needs instead of \"*\".",
+        }
+    }
+}
+
+impl IssueCode {
+    /// The severity of a finding `policy_resources` reports. Every other code
+    /// is an error when it is reported as a finding at all.
+    const fn finding_severity(self) -> DiagnosticSeverity {
+        match self {
+            Self::RoleNotDefined
+            | Self::RoutePermissionUngranted
+            | Self::ToolRuleNeverDecides
+            | Self::ToolNotRegistered
+            | Self::ConnectionEndpointEgressDenied
+            | Self::NameCaseCollision
+            | Self::ResourceUnavailable => DiagnosticSeverity::Warning,
+            Self::DefaultActionAllow | Self::EnforcementModeShadow | Self::WildcardPermission => {
+                DiagnosticSeverity::Risk
+            }
+            _ => DiagnosticSeverity::Error,
         }
     }
 }
@@ -492,6 +634,10 @@ pub(crate) enum DiagnosticSeverity {
     Error,
     /// The document is accepted, with a limitation stated.
     Warning,
+    /// The document is accepted, and publishing it carries an exposure the
+    /// publisher should review. Nothing in this release requires an
+    /// acknowledgement of one; a publication records the risks it carried.
+    Risk,
 }
 
 /// Which later uses a diagnostic stands in the way of.
@@ -504,11 +650,32 @@ pub(crate) struct DiagnosticBlocks {
 }
 
 impl DiagnosticBlocks {
+    const NONE: Self = Self {
+        simulation: false,
+        tests: false,
+        publication: false,
+        evidence: false,
+    };
+
     fn of(code: IssueCode, severity: DiagnosticSeverity) -> Self {
         match (severity, code) {
             // The document itself is sound; only this deployment cannot
             // commit it.
             (DiagnosticSeverity::Error, IssueCode::DocumentFormatUnsupportedInCluster) => Self {
+                simulation: false,
+                tests: false,
+                publication: true,
+                evidence: false,
+            },
+            // The policy is sound and can be simulated and tested; publishing
+            // it here would lock its administrators out, or would change what
+            // only a restart applies.
+            (
+                DiagnosticSeverity::Error,
+                IssueCode::PolicyWriteUnreachable
+                | IssueCode::PublisherPolicyWriteLost
+                | IssueCode::EgressChangeRequiresRestart,
+            ) => Self {
                 simulation: false,
                 tests: false,
                 publication: true,
@@ -520,6 +687,25 @@ impl DiagnosticBlocks {
                 publication: true,
                 evidence: true,
             },
+            // A snapshot that could not read every resource cannot back
+            // complete evidence.
+            (DiagnosticSeverity::Warning, IssueCode::ResourceUnavailable) => Self {
+                simulation: false,
+                tests: false,
+                publication: false,
+                evidence: true,
+            },
+            // What another resource says about a reference is a finding about
+            // this deployment, not a limit on what the document proves.
+            (
+                DiagnosticSeverity::Warning,
+                IssueCode::RoleNotDefined
+                | IssueCode::RoutePermissionUngranted
+                | IssueCode::ToolRuleNeverDecides
+                | IssueCode::ToolNotRegistered
+                | IssueCode::ConnectionEndpointEgressDenied
+                | IssueCode::NameCaseCollision,
+            ) => Self::NONE,
             // A warning states a limitation of what the document can prove
             // about itself, never of what it enforces.
             (DiagnosticSeverity::Warning, _) => Self {
@@ -528,6 +714,7 @@ impl DiagnosticBlocks {
                 publication: false,
                 evidence: true,
             },
+            (DiagnosticSeverity::Risk, _) => Self::NONE,
         }
     }
 }
@@ -549,6 +736,22 @@ pub(crate) struct PolicyDiagnostic {
 }
 
 impl PolicyDiagnostic {
+    /// A finding a check outside the document made about it: the
+    /// cross-resource, lockout and risk checks of `policy_resources`. The
+    /// code decides the severity, so one code always means one thing.
+    pub(crate) fn finding(code: IssueCode, pointer: String, element_id: Option<String>) -> Self {
+        let severity = code.finding_severity();
+        Self {
+            code: code.as_str(),
+            severity,
+            pointer,
+            element_id,
+            message: code.message(),
+            remediation: code.remediation(),
+            blocks: DiagnosticBlocks::of(code, severity),
+        }
+    }
+
     fn new(
         code: IssueCode,
         severity: DiagnosticSeverity,
@@ -641,6 +844,18 @@ impl PolicyInspection {
             None,
         ));
         self.details.push(detail);
+    }
+
+    /// Records a finding a check outside the document made. An error carries
+    /// the detail the caller who sent the document is told, which keeps
+    /// [`Self::error_details`] in diagnostic order; a warning or risk has
+    /// none.
+    pub(crate) fn record_finding(&mut self, diagnostic: PolicyDiagnostic, detail: Option<String>) {
+        if diagnostic.severity == DiagnosticSeverity::Error {
+            self.details
+                .push(detail.unwrap_or_else(|| diagnostic.message.to_owned()));
+        }
+        self.diagnostics.push(diagnostic);
     }
 
     /// Records every error `derived` found as a refusal of this document. For

@@ -157,7 +157,8 @@ fn validate_change(
 /// Append the commit's evidence row inside the caller's transaction. Its
 /// `event_id` and `operation_id` are minted here, once; `committed_at` is
 /// the database clock's. Any failure is returned for the caller to roll
-/// back, so the commit it describes never happens without it.
+/// back, so the commit it describes never happens without it, and is
+/// counted here like every other producer's refused evidence insert.
 async fn record_document_change(
     client: &deadpool_postgres::Object,
     resource: DocumentResource,
@@ -194,8 +195,10 @@ async fn record_document_change(
             ],
         )
         .await
-        .map_err(|error| classify_query(error, OPERATION_DOCUMENT_EVIDENCE))
-        .map_err(store_error)?;
+        .map_err(|error| {
+            super::postgres_authority_events::record_evidence_failure();
+            store_error(classify_query(error, OPERATION_DOCUMENT_EVIDENCE))
+        })?;
     Ok(())
 }
 

@@ -99,8 +99,10 @@ From most to least sensitive. The domain-wide delegation's own list is
   OpenAPI catalog, of those the Connection's requested scopes bind. HTTP
   direct rules and tool policy still apply to every call.
 - **`admin:principals:write`.** It purges a principal's cached tokens and
-  revokes them at the issuer. That costs the user a fresh exchange on their
-  next call; it cannot obtain a token.
+  revokes them at the issuer, on every replica in cluster mode. That costs
+  the user a fresh exchange on their next call, and in cluster mode each
+  purge moves the shared security revision every replica reconciles; it
+  cannot obtain a token.
 - **`admin:connections:test`.** On a per-caller Connection it obtains the
   tester's own token, never another user's: the test names the tester, sends
   the saved `GET` or `HEAD` test request with the token and drops it. The test
@@ -261,7 +263,7 @@ advisory client metadata and enforces nothing.
 | `tool.upstream_request` | On every tool request, each leaf request of a composite tool included, cached token or not | The caller as `actor`, `connection_id`, tool, method and outcome; when the request carried an assertion upstream, its `kid` and `jti` (`jti_base` and `count` for a managed MCP session). |
 | `connection.tested` | On every stored test | The tester as `actor`, `connection_id`, outcome and the stage outcomes. A per-caller Connection's test also emits its exchange or mint event. |
 | `connection.caller_assertion` | On every proxied request on an attested route | The caller as `actor`, the route, outcome, and the `kid` and `jti` or the refusal reason. |
-| `connection.delegated_token_purge` and `connection.delegated_token_revocation` | On every operator purge, on every purge a revoked JWT started that dropped something, and on each token a purge revokes | `purge_id`, trigger, principal, entry count (Google tokens counted as `google_delegation_entries`); per delegated token, the revocation outcome and reason. |
+| `connection.delegated_token_purge` and `connection.delegated_token_revocation` | On every operator purge, on every purge a revoked JWT started that dropped something or was recorded for the other replicas, on each replica a recorded purge dropped something on, and on each token a purge revokes | `purge_id`, trigger, principal, entry count (Google tokens counted as `google_delegation_entries`) and, in cluster mode, `replication` with the shared `security_revision`; per delegated token, the revocation outcome and reason. |
 | `connection.secret_resolution_failed` | When a signing key or client secret cannot be read or loaded | The fixed reason, never the alias or the material. |
 
 A call served from the cache emits no exchange or mint event. Join an
@@ -296,13 +298,11 @@ When a user is disabled:
 1. Disable the user at their identity provider, and suspend them in
    Workspace if a domain-wide delegation names them.
 2. Stop the gateway serving their cached tokens and revoke those tokens at the
-   issuer:
-   - **Standalone:** `POST /v1{ADMIN_PREFIX}/principal/delegated-tokens/revoke`
-     with their issuer and subject (`admin:principals:write`). It drops their
-     delegated and Google tokens alike. See
-     [Purging a principal's tokens](operator-guide.md#purging-a-principals-tokens).
-   - **Cluster mode:** that endpoint is refused with `409`; see
-     [Cluster mode](#cluster-mode) for what to do instead.
+   issuer: `POST /v1{ADMIN_PREFIX}/principal/delegated-tokens/revoke` with
+   their issuer and subject (`admin:principals:write`). It drops their
+   delegated and Google tokens alike, on every replica in cluster mode. See
+   [Purging a principal's tokens](operator-guide.md#purging-a-principals-tokens),
+   and [Cluster mode](#cluster-mode) for what a `409` or `503` there means.
 3. Revoke the user's grant at the issuer. A purge does not stop a user whose
    credentials still validate and whose grant the issuer still holds: their
    next call simply exchanges again.
@@ -392,16 +392,33 @@ Everything above holds on every replica. What changes with several replicas:
   caches, of up to 1,024 callers each, and nothing shares tokens between
   replicas, so the issuer or Google can see one exchange or mint per caller
   per replica.
-- **No purge crosses replicas.** The operator purge endpoint answers `409`.
-  Revoke the user's outstanding JWTs with `gateway revoke-jwt` instead (see
-  [JWT revocations](../deployment/postgres.md#jwt-revocations)): each replica
-  the revoked token is presented to refuses it and purges its own caches for
-  that principal, delegated and Google tokens alike, and revokes the delegated
-  ones at the issuer. This needs tokens with a `jti`: set `require_jti: true`
-  on every JWT provider whose tokens you may need to withdraw. A replica the
-  revoked token never reaches keeps that principal's cached tokens, served
-  only while another credential of theirs still authenticates there, until
-  they age out after at most 900 seconds.
+- **A purge reaches every replica.** The replica that serves the operator
+  purge drops its own caches, then records the purge as one shared security
+  revision (the gated operation `connections.delegated_token_purge`, admitted
+  only while every live replica advertises `delegated_token_purges`). The
+  record names the principal only by a SHA-256 digest under the deployment
+  ID. Every replica's strict gate applies it before it admits a protected
+  request at or past that revision: it drops that principal's delegated and
+  Google tokens and revokes the delegated ones at the issuer, each once, by
+  the replica that held it. A replica that cannot read the record fails its
+  gate closed with `503` rather than serve them. `200` names the purge's
+  `security_revision`. A `409` (`capability_not_advertised`, while a live
+  replica predates the record) or `503` (the gate or the authority could not
+  answer) means only the replica that answered was purged: finish the
+  rollout or restore the authority and ask again. See
+  [Purges in cluster mode](operator-guide.md#purges-in-cluster-mode).
+- **A revoked JWT purges every replica too.** When a replica refuses a token
+  whose `jti` was revoked with `gateway revoke-jwt` (see
+  [JWT revocations](../deployment/postgres.md#jwt-revocations)), it records
+  the same purge for every replica, at most once per refused token per
+  replica every 900 seconds. This needs tokens with a `jti`: set
+  `require_jti: true` on every JWT provider whose tokens you may need to
+  withdraw. While a replica built before the record is live, such a purge
+  is not recorded, and replicas the revoked token never reaches keep that
+  principal's cached tokens, served only while another credential of theirs
+  still authenticates there, for at most 900 seconds. A replica of an
+  earlier build that was paused past `CLUSTER_MEMBER_STALE_MS` when a purge
+  was admitted can likewise keep the tokens it held for at most 900 seconds.
 - **To stop every cached token of one Connection on every replica**, for all
   of its users, disable the Connection or make any other real change to it.
   That moves its cache key, so each replica stops serving the tokens it cached
@@ -627,7 +644,7 @@ through the setup step by step.
   delegated refuse the Connection rather than send a request without the
   assertion.
 - **Learning that a user was disabled**, for example through SCIM or an
-  identity-provider webhook, and **carrying a purge between cluster replicas**.
+  identity-provider webhook.
 - **Verifying issued tokens**: no introspection, scope, audience or subject
   check of the token the issuer returns.
 - **Retrying a failed revocation**, and any revocation at Google.
@@ -652,7 +669,8 @@ through the setup step by step.
 | Swagger 2.0 and Discovery conversion | `gateway/src/tools/swagger2.rs`, `gateway/src/tools/google_discovery.rs` |
 | Catalogs a Connection may keep live | `gateway/src/connections/openapi.rs` (`managed_openapi_catalog_withdrawal_reason`) |
 | Inbound `Authorization` and `Cookie` removed on proxy routes | `gateway/src/proxy/forward.rs` (`strip_gateway_credentials`) |
-| Operator purge, refused in cluster mode | `gateway/src/admin_observability.rs` (`principal_delegated_tokens_revoke_endpoint`) |
+| Operator purge | `gateway/src/admin_observability.rs` (`principal_delegated_tokens_revoke_endpoint`) |
+| A purge recorded for every replica, and each replica's gate applying it | `gateway/src/security_cluster_delegated_tokens.rs`, `gateway/src/storage/postgres_delegated_token_purges.rs` |
 | Purge on a revoked JWT | `gateway/src/auth/jwt.rs`, `gateway/src/connections/http.rs` (`RevokedCredentialObserver`) |
 
 The regression `no_token_material_reaches_an_error_a_log_line_or_an_audit_event`
@@ -663,3 +681,7 @@ stored test. `every_composite_leaf_signs_its_own_assertion_with_a_distinct_jti`
 in `gateway/src/tools/executor_caller_assertion_tests.rs` covers composite
 leaves, and `gateway/src/connections/google_delegation_tests.rs` checks that
 no Google token material reaches the audit trail.
+`a_purge_on_replica_a_retires_replica_bs_tokens_before_b_serves_again` in
+`gateway/src/security_cluster_delegated_tokens_tests.rs` checks against
+PostgreSQL that a purge on one replica retires another's cached tokens before
+that replica serves again.

@@ -32,6 +32,10 @@ npm run build
 
 The gateway Cargo build script also runs the reviewed npm installer (`scripts/npm-script-policy.mjs`) and `npm run build` so `cargo build --workspace` can produce a binary with embedded admin assets from a fresh checkout.
 
+## Policy Studio
+
+The Policy Studio (`/admin/policy/studio`) edits a whole policy in one of the operator's server-side drafts. Every edit is validated by the gateway as it is typed, the draft is saved and published under its strong ETags, and the candidate stays in page memory only. Its behavior, permissions and conflict handling are described under [Server-side policy drafts](../docs/configuration.md#policy_file) in the configuration reference.
+
 ## Connections, Inventory, and Playground
 
 The embedded UI includes the managed Connections inventory/editor, unified
