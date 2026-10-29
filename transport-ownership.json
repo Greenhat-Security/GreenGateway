@@ -6890,6 +6890,16 @@
     {
       "file": "gateway/src/admin_observability.rs",
       "reasons": [
+        "capability-in-macro-input"
+      ],
+      "scope": "gateway::admin_observability::reauthorized_audit_stream#1",
+      "sha256": "d6c45c0a807c62f599f43fea987eea7b4861bcc641841d94473e2345adb0d9dc",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed tokio::select! over two tokio::time::sleep_until deadlines and the next frame of an already-built audit event stream; the tokio paths in the macro input are timers, and the re-check it awaits judges an existing credential through the configured validators. The item constructs no client, socket, listener or process and adds no transport authority."
+    },
+    {
+      "file": "gateway/src/admin_observability.rs",
+      "reasons": [
         "unexpanded-macro"
       ],
       "scope": "gateway::admin_observability::record_audit_stream_outcome#1",
@@ -13209,7 +13219,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_rate_limits::PostgresRateLimitStore#1",
-      "sha256": "42fe1a9d57886fa0693bbabd39c11a6b15016e72ab077e1fead7608b5c645bad",
+      "sha256": "82f5cb264db14cecf2364e2404130c4c1faf08db04874784661a0f3a71ffd2ac",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -13219,7 +13229,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_rate_limits::impl  PostgresRateLimitStore::new#1",
-      "sha256": "386b1666e1dc517309eae638bf32bc0e68cec50f3d071e7b432a009a1af80a97",
+      "sha256": "3e8a5a7e2de7db4c05ffce12cc9c587145d9fe43207cd3dfd388355b2bf30145",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },

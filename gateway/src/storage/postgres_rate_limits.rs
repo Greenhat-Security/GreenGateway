@@ -36,6 +36,16 @@
 //!   the order the row lock serializes them, as the local bucket judges
 //!   its own. `t` never runs ahead of the database clock, so the clamp
 //!   never admits more than the configured burst and rate.
+//! - **One decision per bucket waits on its row, per replica.** The row
+//!   lock serializes a bucket's decisions in the database, each held to its
+//!   commit; a decision waiting for it holds a pooled connection that
+//!   cannot make progress. A burst from one caller would therefore park
+//!   the replica's whole pool on one row, and the revision gate (250 ms for
+//!   its checkout and read together), the audit sink and every other
+//!   caller would queue behind a line that moves one commit at a time.
+//!   `BucketTurns` lines a bucket's decisions up in the process instead,
+//!   holding nothing, so at most one connection per bucket per replica
+//!   waits on the row. Each request is still decided by its own statement.
 //! - **Cardinality is bounded exactly.** `rate_limit_cardinality` counts
 //!   live buckets per deployment and moves in the same statement that
 //!   inserts or deletes rows, so it cannot drift; when a new key pushes
@@ -47,6 +57,12 @@
 //! A store that cannot be consulted is a [`RepositoryError`]; the
 //! middleware answers `503` with zero upstream attempts. It is never a
 //! silent allow and never a `429`.
+
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
@@ -127,6 +143,8 @@ pub struct PostgresRateLimitStore {
     deployment_id: String,
     keyring: LocalSecretKeyring,
     max_buckets: i64,
+    /// Shared by every clone: one replica's store, one line per bucket.
+    turns: Arc<BucketTurns>,
 }
 
 impl PostgresRateLimitStore {
@@ -141,7 +159,15 @@ impl PostgresRateLimitStore {
             deployment_id: deployment_id.to_owned(),
             keyring,
             max_buckets: i64::try_from(max_buckets.max(1)).unwrap_or(i64::MAX),
+            turns: Arc::new(BucketTurns::default()),
         }
+    }
+
+    /// Buckets with a decision in flight on this store, for the tests that
+    /// prove the lines are torn down.
+    #[cfg(test)]
+    pub(crate) fn buckets_in_flight(&self) -> usize {
+        self.turns.buckets_in_flight()
     }
 
     /// The digest a caller key is stored under: an HMAC under the primary
@@ -176,6 +202,15 @@ impl PostgresRateLimitStore {
         let digest = self.key_digest(lane, key)?;
         let emission = limit.emission_interval_secs();
         let tolerance = limit.tolerance_secs();
+        // The bucket's turn on this replica comes before a connection (see
+        // `BucketTurns`). It waits no longer than a checkout may wait for
+        // the pool, and a decision that cannot get it in time is a
+        // `Timeout`: the middleware's 503, as an exhausted pool would be.
+        let turn = self
+            .turns
+            .take(&digest, self.pool.timeouts().wait)
+            .await
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorKind::Timeout, OPERATION_DECIDE))?;
         let client = checkout(&self.pool, CheckoutClass::RateLimit).await?;
         let (allowed, inserted, live) = timed_operation(OPERATION_DECIDE, async {
             let row = client
@@ -233,6 +268,9 @@ impl PostgresRateLimitStore {
             Ok((allowed, inserted, live))
         })
         .await?;
+        // The statement committed and let go of the row: the bucket's next
+        // decision may take its connection now, not after the eviction.
+        drop(turn);
         if inserted {
             if let Some(live) = live {
                 if live > self.max_buckets {
@@ -361,6 +399,117 @@ impl PostgresRateLimitStore {
     }
 }
 
+/// One replica's lines of shared decisions, one line per bucket: at most one
+/// decision per bucket holds a pooled connection at a time.
+///
+/// Every decision for a bucket takes that bucket's row lock and keeps it to
+/// its commit, so concurrent decisions for one bucket finish one after
+/// another in the database whatever this process does. What the process
+/// chooses is what they hold while they wait. Without a line, each waiter
+/// holds a pooled connection on which it can do nothing until the decision
+/// ahead of it commits. One caller's burst (one client address on a global
+/// lane, one principal under one rule on the policy lane: the case a limiter
+/// is for) then parks up to the whole pool on one row, and the rest of the
+/// replica's authority work queues behind a line that advances one commit,
+/// one WAL flush, at a time. The security-revision gate gives its checkout
+/// and read 250 ms together, so it is refused first: every caller's request
+/// on that replica answers `503 policy state unavailable` while one caller
+/// is limited. In the line, the waiters hold nothing, and the pool stays
+/// free for the rest of that work.
+///
+/// Nothing about a decision changes. Each request is still decided by its
+/// own statement on database time and judged in the order the row lock
+/// admits it. Replicas still meet on the row, with at most one connection
+/// each. The line removes only waits that could not have made progress, and
+/// it is FIFO, as the pool's own queue is.
+///
+/// The map holds only buckets that have a decision in flight here. An entry
+/// is created by the first decision to arrive and removed by the last to
+/// leave, including one whose wait was abandoned, so its size is bounded by
+/// the requests in flight, not by the callers ever seen.
+#[derive(Default)]
+struct BucketTurns {
+    lines: Mutex<HashMap<Vec<u8>, BucketLine>>,
+}
+
+/// One bucket's line.
+struct BucketLine {
+    turn: Arc<tokio::sync::Mutex<()>>,
+    /// Decisions holding or waiting for the turn.
+    members: usize,
+}
+
+impl BucketTurns {
+    fn lines(&self) -> std::sync::MutexGuard<'_, HashMap<Vec<u8>, BucketLine>> {
+        // Nothing panics under this lock (a map lookup and a counter), and
+        // the map stays structurally valid if something ever did.
+        self.lines
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Join `digest`'s line and wait for its turn: at most `wait`, or for as
+    /// long as it takes when there is no bound. `None` when the bound ran
+    /// out first; the place in the line is given up either way.
+    async fn take(&self, digest: &[u8], wait: Option<Duration>) -> Option<BucketTurn<'_>> {
+        let (turn, member) = {
+            let mut lines = self.lines();
+            let line = lines.entry(digest.to_vec()).or_insert_with(|| BucketLine {
+                turn: Arc::new(tokio::sync::Mutex::new(())),
+                members: 0,
+            });
+            line.members += 1;
+            (
+                Arc::clone(&line.turn),
+                LineMember {
+                    turns: self,
+                    digest: digest.to_vec(),
+                },
+            )
+        };
+        let guard = match wait {
+            Some(wait) => tokio::time::timeout(wait, turn.lock_owned()).await.ok()?,
+            None => turn.lock_owned().await,
+        };
+        Some(BucketTurn {
+            _guard: guard,
+            _member: member,
+        })
+    }
+
+    #[cfg(test)]
+    fn buckets_in_flight(&self) -> usize {
+        self.lines().len()
+    }
+}
+
+/// A place in one bucket's line, given up on drop: the last member to leave
+/// removes the line.
+struct LineMember<'a> {
+    turns: &'a BucketTurns,
+    digest: Vec<u8>,
+}
+
+impl Drop for LineMember<'_> {
+    fn drop(&mut self) {
+        let mut lines = self.turns.lines();
+        if let Some(line) = lines.get_mut(&self.digest) {
+            line.members = line.members.saturating_sub(1);
+            if line.members == 0 {
+                lines.remove(&self.digest);
+            }
+        }
+    }
+}
+
+/// A bucket's turn. The fields drop in declaration order, so the turn is
+/// handed on before the place in the line is given up, and a line is never
+/// removed while its turn is still held.
+struct BucketTurn<'a> {
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+    _member: LineMember<'a>,
+}
+
 fn classify_query(error: tokio_postgres::Error, operation: &'static str) -> RepositoryError {
     let kind = super::postgres::classify_postgres_error(&error);
     log_classified(operation, &error, RepositoryError::new(kind, operation))
@@ -399,5 +548,71 @@ mod tests {
             burst: 2,
         };
         assert_eq!(never.emission_interval_secs(), NEVER_REFILLS_SECS);
+    }
+
+    /// A bucket's decisions take turns; another bucket's never wait on
+    /// them; and the line is gone once the last decision has left.
+    #[tokio::test]
+    async fn a_buckets_decisions_take_turns_and_other_buckets_do_not_wait() {
+        use futures_util::FutureExt as _;
+
+        let turns = BucketTurns::default();
+        let first = turns.take(b"bucket-a", None).await.expect("unbounded");
+        let mut second = Box::pin(turns.take(b"bucket-a", None));
+        assert!(
+            (&mut second).now_or_never().is_none(),
+            "a second decision for the same bucket waits for the first"
+        );
+        let other = turns
+            .take(b"bucket-b", None)
+            .now_or_never()
+            .expect("another bucket's decision does not wait")
+            .expect("unbounded");
+        assert_eq!(turns.buckets_in_flight(), 2);
+
+        drop(first);
+        let second = second.await.expect("the turn is handed on");
+        drop(other);
+        assert_eq!(turns.buckets_in_flight(), 1, "bucket-a is still in flight");
+        drop(second);
+        assert_eq!(
+            turns.buckets_in_flight(),
+            0,
+            "a line is removed by the last decision to leave it"
+        );
+    }
+
+    /// A wait past its bound gives up its place, as does a wait whose
+    /// request went away: neither leaves a line behind, and neither stops
+    /// the bucket's next decision.
+    #[tokio::test]
+    async fn an_abandoned_wait_gives_up_its_place_in_the_line() {
+        use futures_util::FutureExt as _;
+
+        let turns = BucketTurns::default();
+        let held = turns.take(b"bucket-a", None).await.expect("unbounded");
+        assert!(
+            turns
+                .take(b"bucket-a", Some(Duration::from_millis(20)))
+                .await
+                .is_none(),
+            "a wait past its bound answers None"
+        );
+        let mut dropped = Box::pin(turns.take(b"bucket-a", None));
+        assert!((&mut dropped).now_or_never().is_none());
+        drop(dropped);
+        assert_eq!(
+            turns.buckets_in_flight(),
+            1,
+            "only the holder is left in the line"
+        );
+
+        drop(held);
+        assert_eq!(turns.buckets_in_flight(), 0);
+        let next = turns
+            .take(b"bucket-a", Some(Duration::from_millis(20)))
+            .now_or_never()
+            .expect("nobody is ahead of the next decision");
+        assert!(next.is_some());
     }
 }
