@@ -252,9 +252,24 @@ fixed synthetic policy and request set in
 `gateway/tests/support/policy_benchmark.rs`. The benchmark is an ignored test
 in the gateway test binary, behind a counting global allocator that exists
 only in `cfg(test)` builds, so production binaries are unaffected.
-`scripts/microbench.py` builds each revision's own test binary: it cleans the
-gateway package before each build, so a shared target directory cannot hand
-one revision's binary to the other.
+`scripts/microbench.py` builds each revision's own test binary, in a tree
+holding that revision's complete committed files. Only the admin UI build
+inputs (`admin-ui/`, the Node and npm pins and the npm script policy) come
+from the head, like the compiler; no Rust source is replaced and the measured
+decisions never read them. Before each build it asks Cargo for the workspace members the
+revision's root `Cargo.toml` declares (today `gateway`, `gateway-config` and
+`ggctl`; a member added later needs no harness change). The root manifest,
+`Cargo.lock` and every member must be committed at that revision and present
+in its tree, or the comparison fails before building. It then cleans every
+member, because both revisions share one target directory and Cargo judges a
+member fresh by modification times, which extraction sets to the commit's:
+cleaning only the gateway once let a head gateway link the base's
+`gateway-config` and fail to resolve a module the head had added (merge train
+#667). The build fails unless Cargo reports compiling the gateway, and every
+other local package it took, from that tree rather than reusing an earlier
+build, so a shared target directory cannot hand one revision's binary or
+library to the other. `build.json` records the members, the clean command and
+the local packages compiled.
 
 The target was adopted in two reviewed steps. First, the harness landed with no
 budget entry (`pending`: measured, never blocking). Then
