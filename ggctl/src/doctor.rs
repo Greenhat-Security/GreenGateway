@@ -137,6 +137,7 @@ impl Stage {
             | Code::InvalidValue
             | Code::InvalidName
             | Code::InvalidDecimal
+            | Code::NotApplicable
             | Code::InlineSecretValue
             | Code::InvalidSecretReference => Self::Structure,
             Code::FileMissing

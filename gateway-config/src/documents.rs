@@ -13,6 +13,8 @@ pub const API_VERSION_V1ALPHA1: &str = "greengateway.dev/v1alpha1";
 pub const BUNDLE_KIND: &str = "GatewayBundle";
 /// The deployment document a bundle pins.
 pub const DEPLOYMENT_KIND: &str = "GatewayDeployment";
+/// The answers `ggctl init` builds a bundle from: ordinary values only.
+pub const INIT_ANSWERS_KIND: &str = "GatewayInitAnswers";
 /// What a running gateway tells `ggctl` before any configuration operation.
 pub const CAPABILITIES_KIND: &str = "GatewayCapabilities";
 /// The machine-readable report `ggctl --format json` writes.
@@ -43,6 +45,12 @@ pub const PUBLISHED_SCHEMAS: &[PublishedSchema] = &[
         kind: DEPLOYMENT_KIND,
         file_name: "gateway-deployment.v1alpha1.schema.json",
         json: include_str!("../../docs/schemas/gateway-deployment.v1alpha1.schema.json"),
+    },
+    PublishedSchema {
+        api_version: API_VERSION_V1ALPHA1,
+        kind: INIT_ANSWERS_KIND,
+        file_name: "gateway-init-answers.v1alpha1.schema.json",
+        json: include_str!("../../docs/schemas/gateway-init-answers.v1alpha1.schema.json"),
     },
     PublishedSchema {
         api_version: API_VERSION_V1ALPHA1,

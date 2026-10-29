@@ -4,7 +4,9 @@
 versioned configuration bundle format and the reader that validates it (issue
 #242). The reader lives in the shared `gateway-config` crate, so the gateway and
 [`ggctl validate` and `ggctl doctor`](ggctl.md#validate) run the same code, and
-`ggctl` checks a bundle offline today. Nothing in a released gateway reads a
+`ggctl` checks a bundle offline today. [`ggctl init`](ggctl.md#init) creates a
+new bundle for a deployment profile ([generated bundles](#generated-bundles)) and
+[`ggctl convert`](ggctl.md#convert) converts one between document versions. Nothing in a released gateway reads a
 bundle yet: there is no startup mode, environment variable, or admin route that
 selects one. Bundle mode and the field catalog that fills the deployment
 document are later #242 slices. Until they land, environment configuration
@@ -85,6 +87,17 @@ validation before any other member is read (`compat.unsupported_api_version`),
 and a `kind` other than the one expected is `compat.unsupported_kind`. Changing
 a document version is an explicit conversion; a release that adds a version
 keeps reading the previous one for at least one minor release.
+
+The conversion is `ggctl convert BUNDLE --to VERSION`. Every version has one
+place on an ordered ladder, and one step converts each version to the next: a
+bundle the reader accepts is converted step by step from its own version up to
+the target, so the result depends only on the bundle and the target, and a
+bundle already at the target is returned byte for byte, so converting twice is
+converting once. A target older than the bundle is refused
+(`convert.downgrade_refused`), and so is any version the ladder does not hold
+(`convert.unsupported_version`). `greengateway.dev/v1alpha1` is the only version
+today, so the only conversion is the identity: `--output` writes an unchanged
+copy and `--in-place` changes nothing.
 
 Environment-mode policy and tools loading is unchanged: it still accepts any
 `0.` schema version, and the policy loader still warns about unknown top-level
@@ -188,6 +201,60 @@ to the server's store (`source: server`) is not checked by the reader. The
 profiles' other invariants (authentication, egress, CSRF, audit durability,
 listeners) concern deployment settings that join `spec` with the field catalog,
 and are enforced from then on.
+
+## Generated bundles
+
+`ggctl init --profile PROFILE --output DIR` writes a bundle that the reader
+accepts strictly, and the gateway's own tests hold every one it can write to the
+production policy and tools validators and to the policy enforcement it
+configures. The output is deterministic: the same profile and answers always
+give the same bytes, and so the same digests. A `v1alpha1` deployment document
+carries the profile and nothing else, so what `init` can write is the same safe
+starting point for every profile, and the profile's other invariants arrive with
+the deployment settings:
+
+| File | Standalone topology (default) | Cluster topology |
+| --- | --- | --- |
+| `bundle.yaml` | Pins every file below; `connections` from the server | Policy, tools and Connections all from the server, which is their writer in cluster mode (the PostgreSQL control planes) |
+| `deployment.yaml` | `spec.profile`, with a comment marking `development` and `migration` as not for production | The same |
+| `policy.json` | `default_action: deny`, `enforcement_mode: enforce`, no route, and no role unless the answers bind an operator | Not written |
+| `tools.json` | No tools | Not written |
+| `.gitattributes` | `* text eol=lf`, so a Windows checkout cannot change a pinned file's bytes; the reader ignores it | The same |
+
+The permissive starter policy (`docs/examples/policy.starter.json`) is never
+written. No file holds a secret or a credential, and nothing is generated that
+would need one.
+
+The defaults can be replaced by a `GatewayInitAnswers` document
+([schema](schemas/gateway-init-answers.v1alpha1.schema.json)), given with
+`--answers FILE` and read under the same rules as a bundle document (the YAML
+subset, or strict JSON when the file name ends in `.json`; LF line endings;
+closed objects; at most 64 KiB):
+
+```yaml
+apiVersion: greengateway.dev/v1alpha1
+kind: GatewayInitAnswers
+spec:
+  name: payments            # metadata.name and the policy id; default greengateway
+  topology: standalone      # or cluster
+  operator:                 # standalone only
+    issuer: "provider:corporate"
+    auth_methods: [bearer_token]
+```
+
+Every member is an ordinary value, and none can hold a secret value. The profile
+is not an answer: it is `--profile`. `operator` generates a policy role named
+`operator` bound to exactly that issuer and those authentication methods
+(at least one), granting `admin:config:read` and `admin:status:read` with a
+`GET` route for each under the default admin prefix (`/v1/admin/config`,
+`/v1/admin/status`): enough for the [version handshake](ggctl.md#version-handshake)
+and the status read, and nothing that changes anything. The issuer is an exact
+`https` issuer without a user name, password, query or fragment (trailing slashes
+are dropped, as the gateway compares issuers), or the `provider:<name>`
+boundary of an authentication provider configured without an issuer, with the
+name percent-encoded as the gateway encodes it. `operator` with
+`topology: cluster` is `schema.not_applicable`, because a cluster's policy is the
+server's. With a custom `ADMIN_PREFIX`, edit the two routes and the policy's pin.
 
 ## Digests
 
@@ -439,6 +506,7 @@ can appear in one. A published code never changes meaning.
 | `schema.invalid_value` | A value the document version does not allow. |
 | `schema.invalid_name` | `metadata.name` is not a lowercase DNS label. |
 | `schema.invalid_decimal` | A decimal outside the decimal grammar. |
+| `schema.not_applicable` | A member that does not apply given another member's value, such as an init answers `operator` with `topology: cluster`. |
 | `reference.invalid_path` | A referenced name is not a portable file name of the right type. |
 | `reference.reserved_path` | A reference names `bundle.yaml`. |
 | `reference.duplicate_path` | Two references name the same file. |
