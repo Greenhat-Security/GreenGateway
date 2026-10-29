@@ -1851,3 +1851,135 @@ async fn a_managed_openapi_tool_reaches_the_upstream_as_each_caller_with_their_o
     assert_eq!(harness.deployment.exchange_count(), 2);
     assert_eq!(harness.deployment.upstream_count(), 3);
 }
+
+/// A `google_domain_wide_delegation` Connection (#442) on the same lane: a caller it cannot act as
+/// -- attested by an issuer outside `subject_issuers`, or without a plain email -- is refused as
+/// early as a call that names nobody, before the egress preflight resolves anything. Nothing is
+/// allowlisted here, so a refusal that came only after the preflight would read as a refused
+/// host, which is what a caller it can act as gets.
+#[tokio::test]
+async fn a_caller_a_domain_wide_delegation_cannot_act_as_is_refused_before_the_egress_preflight() {
+    let root = std::env::temp_dir().join(format!(
+        "greengateway-tool-static-auth-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir(&root).expect("temporary Connection root creates");
+    let mut config = Config::test_defaults();
+    config.connections_sqlite_path = Some(root.join("connections.sqlite").display().to_string());
+    config.connection_gcp_provider.profiles = vec![crate::connections::gcp_secret::GcpProfileConfig {
+        id: "gateway-wif".to_owned(),
+        audience: "//iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/gateway-pool/providers/gateway-provider".to_owned(),
+        token_root: root.display().to_string(),
+        token_file: "gcp-token".to_owned(),
+        service_account: None,
+    }];
+    let control_plane = ConnectionControlPlane::from_config(&config).expect("control plane builds");
+    let write = ConnectionWrite {
+        display_name: "Workspace mail".to_owned(),
+        description: None,
+        enabled: true,
+        kind: ConnectionKind::HttpApi,
+        endpoint: ConnectionEndpoint {
+            base_url: "https://gmail.googleapis.com".to_owned(),
+            base_path: "/gmail/v1".to_owned(),
+        },
+        authentication: ConnectionAuthentication::GoogleDomainWideDelegation {
+            service_account_email: "gateway-delegate@example-project.iam.gserviceaccount.com"
+                .to_owned(),
+            workload_identity_profile: "gateway-wif".to_owned(),
+            scopes: vec!["https://www.googleapis.com/auth/gmail.readonly".to_owned()],
+            subject_claim: crate::connections::model::GoogleSubjectClaim::Email,
+            subject_issuers: vec![PROVIDER.to_owned()],
+        },
+        additional_headers: Vec::new(),
+        caller_assertion: None,
+        tls: TlsProfile::default(),
+        timeouts: None,
+        discovery: None,
+        test_profile: None,
+    };
+    let initial = control_plane.runtime_snapshot();
+    let created = control_plane
+        .create_managed(
+            initial.collection_etag(),
+            write,
+            &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+        )
+        .await
+        .expect("the delegating Connection saves");
+    let egress_config = EgressConfig::default();
+    let egress_client =
+        Arc::new(EgressClient::new(egress_config.clone()).expect("egress client builds"));
+    let capture = CaptureSink::new();
+    let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+    let connection = TemporaryStaticAuthRuntime {
+        secret_path: root.join("unused"),
+        root,
+        connection_id: created.id.to_string(),
+        runtime: ConnectionHttpRuntime::new(
+            control_plane.clone(),
+            egress_config,
+            Arc::clone(&egress_client),
+        )
+        .with_audit(audit.clone()),
+        control_plane,
+        egress_client,
+    };
+    let executor = executor_for_connection_tool(
+        read_mail_tool(&connection.connection_id),
+        &connection,
+        ToolRuntime::new(
+            runtime_config([("read_mail", enabled_tool(5_000, 4))], 8, 4, 1_000),
+            audit.clone(),
+        ),
+        audit,
+    );
+    async fn refusal(executor: &ToolExecutor, context: ToolInvocationContext) -> Option<String> {
+        let refused = executor
+            .execute("read_mail", json!({}), context, CancellationToken::new())
+            .await
+            .expect_err("no call reaches the upstream");
+        work_failure_reason(refused)
+    }
+
+    let alice = bearer("alice", &["mail:read"]);
+    let mut mallory = bearer("mallory", &["mail:read"]);
+    mallory.issuer = Some("https://other-idp.example.test/".to_owned());
+    mallory.email = alice.email.clone();
+    let mut carol = bearer("carol", &["mail:read"]);
+    carol.email = None;
+
+    assert_eq!(
+        refusal(&executor, context_for(&alice, "dwd-trusted"))
+            .await
+            .as_deref(),
+        Some("host_not_allowed")
+    );
+    assert_eq!(
+        refusal(&executor, context_for(&mallory, "dwd-untrusted"))
+            .await
+            .as_deref(),
+        Some("google_delegation_issuer_not_trusted")
+    );
+    assert_eq!(
+        refusal(&executor, context_for(&carol, "dwd-no-email"))
+            .await
+            .as_deref(),
+        Some("google_delegation_no_email")
+    );
+    let anonymous = ToolInvocationContext {
+        caller: None,
+        ..context_for(&alice, "dwd-anonymous")
+    };
+    assert_eq!(
+        refusal(&executor, anonymous).await.as_deref(),
+        Some("delegated_token_no_principal")
+    );
+    assert!(
+        capture
+            .events()
+            .iter()
+            .all(|event| event.event_type != audit::event::CONNECTION_GOOGLE_DELEGATION_TOKEN),
+        "no token is minted for anyone"
+    );
+}
