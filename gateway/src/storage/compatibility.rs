@@ -66,11 +66,12 @@
 //! ([`OPENAPI_DISCOVERY_CATALOGS`]), which a gateway built before that
 //! format's import cannot generate from; each waits for its own capability
 //! ([`Capability::OpenApiSwagger2Catalogs`],
-//! [`Capability::OpenApiDiscoveryCatalogs`]) the same way. The
-//! approved-extension list in `migrations.rs` stays empty: no operation
-//! changes the schema, and no schema overlap has been qualified. Every other
-//! operation this binary performs belongs to the schema-24 contract, which
-//! every schema-24 member shares. No shipped operation declares a durable
+//! [`Capability::OpenApiDiscoveryCatalogs`]) the same way. No operation
+//! changes the schema: migration 25, the one step that rolls, adds columns
+//! nothing writes yet, and the approved-extension list in `migrations.rs` is
+//! empty. Every other operation this binary performs belongs to the
+//! schema-25 contract, which every member serving schema 25 shares, its
+//! prepared release included. No shipped operation declares a durable
 //! fence or a backfill, so in this release nothing raises the fence and
 //! the backfill ledger is empty; both are checked everywhere they apply.
 
@@ -301,7 +302,7 @@ mod gate {
     /// schema object and no migration, and the document format stays
     /// major 0. `minimum_schema` is 17 because that is the first schema
     /// whose members advertise capabilities at all; the policy tables it
-    /// writes are older. Every member that shares this binary's schema-24
+    /// writes are older. Every member that shares this binary's schema-25
     /// contract meets it, so among those the capability alone decides.
     pub(crate) const POLICY_ROLE_DESCRIPTIONS: OperationRequirement = OperationRequirement {
         operation: "policy.role_descriptions",

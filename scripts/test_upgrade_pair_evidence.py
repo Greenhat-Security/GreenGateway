@@ -15,6 +15,8 @@ GATE = "0" * 39 + "3"
 SUBSTITUTION = "build.rs replaced"
 SERVE_ROW = "serve_row"
 GATE_ROW = "gate_row"
+OPERATION_ROW = "the_successors_new_operation_waits_for_every_prepared_member_to_leave"
+STEP = {"from": 24, "to": 25, "migration": "an_additive_migration", "checksum": "a" * 64}
 
 
 def published_pair():
@@ -95,6 +97,29 @@ class Fixture:
     def observed(self, row: str):
         return json.loads((self.dir / "evidence" / f"{row}.json").read_text(encoding="utf-8"))["observed"]
 
+    def cross_schema_step(self) -> None:
+        """Re-pin to a pair across one schema step whose successor registers no operation."""
+        self.pin_value = {
+            "schema": 1, "issue": 426, "prepared": {"commit": PREPARED},
+            "successor": {"commit": SUCCESSOR}, "schema_version": 24,
+            "schema_step": dict(STEP), "operation": None, "capability": None,
+        }
+        self.write(self.pin, self.pin_value)
+        self.matrix["qualified_pairs"] = [{
+            "prepared": PREPARED, "successor": SUCCESSOR, "schema": 24,
+            "schema_step": dict(STEP), "operation": None, "capability": None,
+            "procedure": "rolling", "rollback_cutoff": "a contraction",
+            "evidence": {SERVE_ROW: {"schema": {"served": {"min": 25, "max": 25}}}},
+        }]
+        self.matrix["schema_steps"] = [
+            {"from": 23, "to": 24, "migration": "before", "procedure": "coordinated"},
+            {**STEP, "procedure": "rolling",
+             "qualified_pair": {"prepared": PREPARED, "successor": SUCCESSOR}},
+        ]
+        self.write(self.matrix_path, self.matrix)
+        (self.dir / "evidence" / f"{GATE_ROW}.json").unlink()
+        self.record(SERVE_ROW, {"schema": {"served": {"min": 25, "max": 25}, "ledger_versions": 25}})
+
     def verify(self, gate_commit=GATE):
         return evidence.verify(self.dir, self.pin, self.matrix_path, gate_commit)
 
@@ -108,11 +133,32 @@ class RepositoryTests(unittest.TestCase):
     def test_every_published_row_is_a_pair_row_of_the_suite_that_records_it(self):
         suite = (pair.ROOT / "gateway" / "tests" / "ha" / "rolling_upgrade.rs").read_text(encoding="utf-8")
         recorded = set(re.findall(r'write_evidence\(\s*"([a-z0-9_]+)"', suite))
-        entry = evidence.find_pair(evidence.load_json(evidence.MATRIX, "the matrix"),
-                                   pair.load_pin(pair.PIN))
-        self.assertEqual(set(entry["evidence"]), recorded)
+        pin = pair.load_pin(pair.PIN)
+        entry = evidence.find_pair(evidence.load_json(evidence.MATRIX, "the matrix"), pin)
+        # The operation row records nothing for a successor that registers
+        # no operation; every other row records for every pair.
+        expected = set(recorded)
+        if pin.get("operation") is None:
+            expected.discard(OPERATION_ROW)
+        self.assertEqual(set(entry["evidence"]), expected)
+        self.assertIn(OPERATION_ROW, recorded)
         for row in recorded:
             self.assertRegex(suite, rf"async fn {row}\(\)")
+
+    def test_the_repositorys_rolling_steps_name_only_published_pairs(self):
+        matrix = evidence.load_json(evidence.MATRIX, "the matrix")
+        for step in matrix["schema_steps"]:
+            if step.get("procedure") != "rolling" or step.get("qualified_pair") is None:
+                continue
+            with self.subTest(step=step):
+                published = [entry for entry in matrix["qualified_pairs"]
+                             if entry["prepared"] == step["qualified_pair"]["prepared"]
+                             and entry["successor"] == step["qualified_pair"]["successor"]]
+                self.assertEqual(len(published), 1)
+                self.assertEqual(published[0]["schema_step"], {
+                    "from": step["from"], "to": step["to"], "migration": step["migration"],
+                    "checksum": step["checksum"],
+                })
 
 
 class VerifyTests(unittest.TestCase):
@@ -242,6 +288,75 @@ class VerifyTests(unittest.TestCase):
                 change(fixture.matrix)
                 fixture.write(fixture.matrix_path, fixture.matrix)
                 self.assert_refused(fixture, pattern)
+
+    def test_a_pair_across_a_schema_step_is_qualified_as_that_steps_pair(self):
+        fixture = Fixture(self)
+        fixture.cross_schema_step()
+        summary = fixture.verify()
+        self.assertEqual(summary["verdict"], "qualified")
+        self.assertEqual(summary["pair"]["schema_step"], STEP)
+        self.assertIsNone(summary["pair"]["operation"])
+        self.assertEqual(set(summary["rows"]), {SERVE_ROW})
+
+    def test_a_schema_step_the_pin_and_the_matrix_disagree_on_is_refused(self):
+        def published_pair(m):
+            return m["qualified_pairs"][0]
+
+        def rolling_step(m):
+            return m["schema_steps"][1]
+
+        cases = (
+            (lambda m: published_pair(m)["schema_step"].update(checksum="b" * 64),
+             "published pair says schema_step"),
+            (lambda m: published_pair(m).pop("schema_step"),
+             "published pair says schema_step"),
+            (lambda m: rolling_step(m).update(checksum="b" * 64),
+             "published schema step says checksum"),
+            (lambda m: rolling_step(m).update(migration="another"),
+             "published schema step says migration"),
+            (lambda m: rolling_step(m).update(procedure="coordinated"), "not rolling"),
+            (lambda m: rolling_step(m).update(qualified_pair=None), "not the pin"),
+            (lambda m: rolling_step(m).update(
+                qualified_pair={"prepared": SUCCESSOR, "successor": PREPARED}), "not the pin"),
+            (lambda m: m["schema_steps"].pop(), "no single schema step from 24 to 25"),
+            (lambda m: m["schema_steps"].append(copy.deepcopy(rolling_step(m))),
+             "no single schema step from 24 to 25"),
+        )
+        for change, pattern in cases:
+            with self.subTest(pattern=pattern):
+                fixture = Fixture(self)
+                fixture.cross_schema_step()
+                change(fixture.matrix)
+                fixture.write(fixture.matrix_path, fixture.matrix)
+                self.assert_refused(fixture, pattern)
+
+    def test_a_malformed_schema_step_in_the_pin_is_refused(self):
+        cases = (
+            ({"to": 26}, "one migration from the pin's schema_version"),
+            ({"from": 23, "to": 24}, "one migration from the pin's schema_version"),
+            ({"from": True}, "one migration from the pin's schema_version"),
+            ({"checksum": "A" * 64}, "one lowercase SHA-256"),
+            ({"migration": ""}, "names no migration"),
+            ({"extra": 1}, "exactly from, to, migration and checksum"),
+        )
+        for change, pattern in cases:
+            with self.subTest(change=change):
+                fixture = Fixture(self)
+                fixture.cross_schema_step()
+                step = {**STEP, **change}
+                fixture.pin_value["schema_step"] = step
+                fixture.write(fixture.pin, fixture.pin_value)
+                # The published pair agrees with the pin, so only the step's
+                # own shape is judged.
+                fixture.matrix["qualified_pairs"][0]["schema_step"] = step
+                fixture.write(fixture.matrix_path, fixture.matrix)
+                self.assert_refused(fixture, pattern)
+
+    def test_a_pair_at_one_schema_point_must_not_be_published_across_a_step(self):
+        fixture = Fixture(self)
+        fixture.matrix["qualified_pairs"][0]["schema_step"] = dict(STEP)
+        fixture.write(fixture.matrix_path, fixture.matrix)
+        self.assert_refused(fixture, "published pair says schema_step")
 
     def test_the_gate_commit_must_be_a_full_sha_when_given(self):
         self.assert_refused(Fixture(self), "full lowercase commit SHA", gate_commit="abc123")

@@ -16,26 +16,32 @@
 //! no released binary can join a PostgreSQL deployment. Two real binaries
 //! still can, built from pinned commits rather than tags.
 //! `rolling-upgrade-pair.json` names them: the *prepared* release, which
-//! implements the compatibility protocol and serves exactly schema 18, and
-//! its *successor*, which adds one change and no migration — a role may carry a
-//! `description`, and committing such a document is the registered
-//! operation `policy.role_descriptions`. `scripts/build_upgrade_pair.py`
-//! builds each from its own commit and the release gate passes both to
-//! this suite ([`harness::pair`]), which verifies the commits and hashes
-//! before it runs either.
+//! implements the compatibility protocol, and its *successor*, which adds
+//! one change. The pin says which kind of change. The pair pinned today
+//! serves exactly schema 18 and its successor adds no migration — a role may
+//! carry a `description`, and committing such a document is the registered
+//! operation `policy.role_descriptions`. A pin with a `schema_step` instead
+//! names a prepared release that approved the next migration by its exact
+//! checksum and a successor that applies it, as the release that approved
+//! migration 25 and the release that applies it are, once both are commits
+//! of `main` and the pin names them. `scripts/build_upgrade_pair.py` builds
+//! each from its own commit and the release gate passes both to this suite
+//! ([`harness::pair`]), which verifies the commits and hashes before it
+//! runs either.
 //!
 //! [`a_prepared_release_and_its_successor_serve_one_deployment`] and
 //! [`the_successors_new_operation_waits_for_every_prepared_member_to_leave`]
 //! run the two together against one database and write what they observed
-//! to the pair's `evidence/` directory. The release gate then checks that
-//! evidence against the published support matrix
+//! to the pair's `evidence/` directory; across a schema step the first row
+//! takes the expand phase first, and the second has nothing to gate unless
+//! the successor also registers an operation. The release gate then checks
+//! that evidence against the published support matrix
 //! (`docs/deployment/upgrade-support-matrix.json`, with
 //! `scripts/upgrade_pair_evidence.py`), so a change to what a row records
 //! or asserts changes the matrix with it. What they do *not* prove is listed
-//! in `docs/architecture/ha-state-model.md` section 7: this pair shares one
-//! schema point, so no schema overlap, backfill or contraction is
-//! exercised, and the gate they exercise judges live membership, not a
-//! durable fence.
+//! in `docs/architecture/ha-state-model.md` section 7: no backfill or
+//! contraction is exercised, and the gate they exercise judges live
+//! membership, not a durable fence.
 //!
 //! [`the_newest_release_tag_still_predates_cluster_mode`] is the tripwire
 //! that keeps the tag question honest. It reads the newest previous `v*`
@@ -56,18 +62,19 @@
 //! Three gates decide, and each one has a row here.
 //!
 //! 1. **The schema ledger.** `storage::migrations::schema_version_range()`
-//!    returns `(len, len + 1)`: the schema this binary's manifest ends at,
-//!    and the one migration above it that this build approved by its exact
-//!    checksum (migration 25, `catalog_change_evidence_actor_metadata`),
-//!    which only a successor applies. A replica refuses a ledger behind its
-//!    manifest and every other one ahead of it, so a migration nobody
-//!    prepared for, applied mid-rollout, makes every not-yet-upgraded
-//!    replica `schema_incompatible` the moment it lands, while the approved
-//!    one leaves them serving
+//!    returns `(len, len)` for this binary: the schema its manifest ends
+//!    at, and nothing above it, because it approved no further migration. A
+//!    replica refuses a ledger behind its manifest and any ahead of it that
+//!    it did not approve, so a migration nobody prepared for, applied
+//!    mid-rollout, makes every not-yet-upgraded replica
+//!    `schema_incompatible` the moment it lands
 //!    ([`an_unapproved_migration_has_no_overlap_window_so_it_cannot_roll`]).
-//!    That is one prepared side, not a qualified pair: no successor that
-//!    applies migration 25 has been run against this build, and the pinned
-//!    pair's two builds share one schema point rather than an overlap.
+//!    A migration a release approved by its exact checksum leaves that
+//!    release's replicas serving instead: migration 25
+//!    (`catalog_change_evidence_actor_metadata`), which this binary applies
+//!    and its prepared release serves. The pair rows prove that with both
+//!    binaries once the pin names that pair; the pair pinned today shares
+//!    one schema point.
 //! 2. **The static-configuration fingerprint.** PR 13 holds a replica
 //!    unready while any *live* member runs a different fingerprint, and
 //!    agreement is sticky once granted. So an incumbent keeps serving when
@@ -1336,59 +1343,31 @@ async fn restarting_an_incumbent_while_a_new_configuration_is_live_costs_it_its_
 // Row 3 — the migration that stalls
 // =====================================================================
 
-/// Migration 25, the one extension this binary approves (issue #426): the
-/// reviewed SQL its successor carries byte for byte, recognized by the
-/// SHA-256 `storage::migrations` pins for it.
-const APPROVED_EXTENSION_VERSION: i64 = 25;
-const APPROVED_EXTENSION_NAME: &str = "catalog_change_evidence_actor_metadata";
-const APPROVED_EXTENSION_SQL: &str =
-    include_str!("../../src/storage/migrations/0025_catalog_change_evidence_actor_metadata.sql");
-
-/// Apply the approved extension as its successor's `migrate up` applies a
-/// migration: the SQL and its ledger row in one transaction, as the
-/// migration role. This binary's own migrator never carries it.
-async fn apply_the_approved_extension(migrator_dsn: &str) {
-    use sha2::Digest;
-
-    let checksum = hex::encode(sha2::Sha256::digest(APPROVED_EXTENSION_SQL.as_bytes()));
-    run_sql(
-        migrator_dsn,
-        &format!(
-            "BEGIN;\n{APPROVED_EXTENSION_SQL}\n\
-             INSERT INTO {LEDGER_TABLE} (version, name, checksum) \
-             VALUES ({APPROVED_EXTENSION_VERSION}, '{APPROVED_EXTENSION_NAME}', '{checksum}');\n\
-             COMMIT;"
-        ),
-    )
-    .await;
-}
-
-/// **A migration applied mid-rollout has no overlap window unless this
-/// build approved it.**
+/// **A migration applied mid-rollout has no overlap window unless the
+/// running build approved it.**
 ///
-/// `storage::migrations::schema_version_range()` answers `(len, len + 1)`:
-/// the schema the manifest ends at, and above it only the one migration
-/// this build approved by its exact checksum and never applies itself.
-/// The ledger rules admit nothing else: a checksum-matching prefix of the
-/// manifest, extended by nothing or by exactly the approved extension, so a
-/// replica tolerates neither a ledger behind its manifest nor any other one
-/// ahead of it.
+/// `storage::migrations::schema_version_range()` answers `(len, len)` for
+/// this binary: it serves the schema its manifest ends at and approves no
+/// migration above it. The ledger rules admit exactly one shape, a
+/// checksum-matching prefix covering the whole manifest, so a replica
+/// tolerates neither a ledger behind its manifest nor one ahead of it.
 ///
-/// So the approved extension, committed by the migration role while both
-/// replicas serve, leaves every replica ready and serving: that is the
-/// prepared side of an expand step. Any other migration is total, as
-/// before: the instant it commits, every replica of this binary is
-/// `schema_incompatible` and serves nothing, because nothing prepared them
-/// for it. The pinned pair below shares one ledger only because its
-/// successor adds no migration, and no successor that applies migration 25
-/// has been run against this build, so this row is not a qualified pair
-/// across a schema change (`docs/architecture/ha-state-model.md` §7).
-/// The day the approved extensions change, step 1 fails and says so.
+/// The consequence for a rolling upgrade is total: the instant a newer
+/// build's `migrate up` commits a migration this build was not prepared
+/// for, every replica still running this build is `schema_incompatible`
+/// and serves nothing. A step rolls only from a release that approved the
+/// next migration by its exact checksum before any build applied it, as
+/// this binary's prepared release did for migration 25; the pinned pair
+/// below runs that kind of release beside its successor
+/// (`docs/architecture/ha-state-model.md` §7). This binary prepared for
+/// nothing, so this row asserts the code: the range is a point, and the
+/// stall is total. The day this build approves an extension, step 1 fails
+/// and says so.
 ///
-/// The row also pins that the stall is a **readiness** refusal, not a
-/// request refusal. A replica whose ledger it does not accept keeps
-/// serving whatever is still routed to it. See step 4b, which asserts that
-/// and explains why it makes the load balancer's `/readyz` wiring
+/// The row also pins that this is a **readiness** refusal, not a request
+/// refusal. A replica whose ledger it does not accept keeps serving
+/// whatever is still routed to it. See step 3b, which asserts that and
+/// explains why it makes the load balancer's `/readyz` wiring
 /// load-bearing rather than advisory.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unapproved_migration_has_no_overlap_window_so_it_cannot_roll() {
@@ -1399,8 +1378,8 @@ async fn an_unapproved_migration_has_no_overlap_window_so_it_cannot_roll() {
     cluster.balancer.round_robin();
 
     // 1. The structural reason, read from the product rather than assumed:
-    //    the accepted schema range is the ledger this binary migrated to
-    //    plus the one extension it approved.
+    //    the accepted schema range is the ledger this binary migrated to,
+    //    and nothing above it.
     let highest: i64 = cluster
         .database
         .query_one(&format!(
@@ -1417,68 +1396,27 @@ async fn an_unapproved_migration_has_no_overlap_window_so_it_cannot_roll() {
         .unwrap_or_else(|| panic!("the binary maximum should be reported: {status}"));
     assert_eq!(
         (minimum, maximum),
-        (highest, APPROVED_EXTENSION_VERSION),
+        (highest, highest),
         "this binary advertises a schema range of [{minimum}, {maximum}] over a ledger it \
-         migrated to {highest}: its manifest and the one extension it approved. Another \
-         width means the approved extensions changed, and this row is the thing to rewrite"
+         migrated to {highest}. A range above the ledger means this build approved an \
+         extension, and this row, which asserts that it approved none, is the thing to rewrite"
     );
-    assert_eq!(APPROVED_EXTENSION_VERSION, highest + 1);
-
-    // 2. The approved extension: the migration role commits migration 25
-    //    while both replicas serve, as the successor's `migrate up` would.
-    //    Every replica stays ready through it, reports the ledger as
-    //    compatible at 25, and serves.
-    apply_the_approved_extension(&cluster.database.migrator_dsn).await;
-    assert_ready_across(
-        &cluster,
-        Duration::from_millis(PROBE_CACHE_MS * 8),
-        "after the approved extension committed",
-    )
-    .await;
-    for name in ["a", "b"] {
-        let status = cluster_status(&cluster, name, &admin).await;
-        assert_eq!(
-            (
-                status["schema"]["current_version"].as_i64(),
-                status["schema"]["compatible"].as_bool(),
-            ),
-            (Some(APPROVED_EXTENSION_VERSION), Some(true)),
-            "replica {name} serves the approved extension: {status}"
-        );
-    }
-    for _ in 0..4 {
-        let response = harness::http_client()
-            .get(format!("{}{PROXIED_PATH}", cluster.balancer.base_url))
-            .bearer_auth(&admin)
-            .send()
-            .await
-            .expect("the balancer should answer");
-        assert_eq!(
-            response.status().as_u16(),
-            200,
-            "the deployment serves on the approved extension"
-        );
-    }
 
     let dispatched_before = proxied_count(&cluster);
 
-    // 3. The migration after it, with a checksum no build carries: what a
-    //    successor nobody prepared this build for would apply. Nothing
-    //    else about the deployment changes.
-    let mut ledger = LedgerRow::insert_version(
-        &cluster.database.migrator_dsn,
-        APPROVED_EXTENSION_VERSION + 1,
-    )
-    .await;
+    // 2. The next migration, with a checksum no build carries: what a
+    //    successor nobody prepared this build for would apply. Nothing else
+    //    about the deployment changes.
+    let mut ledger = LedgerRow::insert_version(&cluster.database.migrator_dsn, highest + 1).await;
 
-    // 4. Every replica still on this binary refuses readiness — every one
+    // 3. Every replica still on this binary refuses readiness — every one
     //    of them, because they all share the ledger and none was prepared
     //    for it. There is no surviving member for a rollout to lean on.
     for replica in &cluster.replicas {
         wait_for_reason(replica, SCHEMA_INCOMPATIBLE, AUTHORITY_BUDGET).await;
     }
 
-    // 4b. And the part that is worth stating precisely, because it is not
+    // 3b. And the part that is worth stating precisely, because it is not
     //     what a reader of the state model would assume: this is a
     //     *readiness* refusal and not a request refusal. The authority is
     //     perfectly reachable, the security-revision gate is satisfied,
@@ -1527,9 +1465,9 @@ async fn an_unapproved_migration_has_no_overlap_window_so_it_cannot_roll() {
         "the status should report the schema as incompatible: {status}"
     );
 
-    // 5. Recovery is the operator finishing the upgrade — here, removing
+    // 4. Recovery is the operator finishing the upgrade — here, removing
     //    the row the newer binary would have left. The deployment comes
-    //    back on the approved extension without a restart.
+    //    back without a restart.
     ledger.revert().await;
     for replica in &cluster.replicas {
         wait_until_ready(replica, AUTHORITY_BUDGET).await;
@@ -2134,23 +2072,208 @@ fn command_succeeded(output: &std::process::Output, context: &str) -> String {
     stdout
 }
 
+/// `(count, max version)` of the shared ledger.
+async fn ledger_extent(cluster: &Cluster) -> (i64, i64) {
+    let ledger = cluster
+        .database
+        .query_one(&format!(
+            "SELECT count(*)::bigint, coalesce(max(version), 0)::bigint FROM {LEDGER_TABLE}"
+        ))
+        .await;
+    (ledger.get(0), ledger.get(1))
+}
+
+/// `(binary_min, binary_max, current_version, compatible)` as one replica
+/// reports its schema contract and the ledger it reads.
+async fn schema_view(
+    cluster: &Cluster,
+    replica: &str,
+    admin: &str,
+) -> (Option<i64>, Option<i64>, Option<i64>, Option<bool>) {
+    let status = cluster_status(cluster, replica, admin).await;
+    (
+        status["schema"]["binary_min"].as_i64(),
+        status["schema"]["binary_max"].as_i64(),
+        status["schema"]["current_version"].as_i64(),
+        status["schema"]["compatible"].as_bool(),
+    )
+}
+
+/// The pair's deployment at the point a rollout first runs both builds:
+/// replica `a` on the prepared release and replica `b` on its successor.
+///
+/// The prepared release always migrates the database, as the release the
+/// deployment ran before the rollout. A pair at one schema point then
+/// starts mixed. A pair across a schema step starts with both replicas on
+/// the prepared release and takes the expand phase first, asserting it on
+/// the way: the migration role runs the successor's `migrate up`, which
+/// applies exactly the pinned migration under the pinned checksum while
+/// both prepared replicas stay ready and keep serving traffic, at the
+/// expanded schema, which the prepared release reports as compatible but
+/// refuses to manage. Only then is `b` replaced with the successor, which
+/// does not start against the prepared release's schema.
+///
+/// Returns the cluster, the readiness of each step taken, and what the
+/// expand phase observed (`null` for a pair at one schema point).
+async fn start_mixed_pair(
+    pair: &UpgradePair,
+    member_stale_ms: u64,
+) -> (Cluster, Vec<Value>, Value) {
+    let prepared = pair.prepared.path.clone();
+    let successor = pair.successor.path.clone();
+    let Some(step) = pair.schema_step.clone() else {
+        let mut cluster = Cluster::start(pair_options(
+            &[&prepared, &successor],
+            &prepared,
+            member_stale_ms,
+        ))
+        .await
+        .expect("the locator was checked before the pair loaded");
+        cluster.wait_until_all_ready().await;
+        let log = vec![readiness(&cluster, pair, "mixed", &["a", "b"]).await];
+        return (cluster, log, Value::Null);
+    };
+
+    let mut cluster = Cluster::start(pair_options(
+        &[&prepared, &prepared],
+        &prepared,
+        member_stale_ms,
+    ))
+    .await
+    .expect("the locator was checked before the pair loaded");
+    cluster.wait_until_all_ready().await;
+    let admin = admin_token(&cluster.oidc, "admin@ha.test");
+    let mut log = vec![readiness(&cluster, pair, "prepared", &["a", "b"]).await];
+
+    // The prepared release: its own manifest's schema point, and the one
+    // migration it approved above it.
+    assert_eq!(
+        ledger_extent(&cluster).await,
+        (step.from, step.from),
+        "the prepared release migrates the deployment to its own schema point"
+    );
+    for name in ["a", "b"] {
+        assert_eq!(
+            schema_view(&cluster, name, &admin).await,
+            (Some(step.from), Some(step.to), Some(step.from), Some(true)),
+            "replica {name} runs the prepared release, which serves schema {} and the approved \
+             migration {}",
+            step.from,
+            step.to
+        );
+    }
+
+    // Expand: the successor's migrate up, as the migration role, while both
+    // prepared replicas serve.
+    let migrated = command_succeeded(
+        &cluster.run_migrator_command_with(&successor, &["migrate", "up"]),
+        "the successor's migrate up",
+    );
+    assert!(
+        migrated.contains(&format!("applied {} migration(s)", step.to - step.from)),
+        "the successor applies exactly its one migration: {migrated}"
+    );
+    let row = cluster
+        .database
+        .query_one(&format!(
+            "SELECT version, name, checksum FROM {LEDGER_TABLE} \
+             WHERE version = (SELECT max(version) FROM {LEDGER_TABLE})"
+        ))
+        .await;
+    let applied: (i64, String, String) = (row.get(0), row.get(1), row.get(2));
+    assert_eq!(
+        applied,
+        (step.to, step.migration.clone(), step.checksum.clone()),
+        "the successor records the pinned migration under the checksum its prepared release \
+         approved"
+    );
+    assert_ready_across(
+        &cluster,
+        Duration::from_millis(PROBE_CACHE_MS * 8),
+        "after the successor's migration committed under the prepared release",
+    )
+    .await;
+    for name in ["a", "b"] {
+        assert_eq!(
+            schema_view(&cluster, name, &admin).await,
+            (Some(step.from), Some(step.to), Some(step.to), Some(true)),
+            "replica {name} keeps serving on the prepared release at the expanded schema"
+        );
+    }
+    let mut served = 0_usize;
+    for _ in 0..4 {
+        let response = harness::http_client()
+            .get(format!("{}{PROXIED_PATH}", cluster.balancer.base_url))
+            .bearer_auth(&admin)
+            .send()
+            .await
+            .expect("the balancer should answer");
+        if response.status().as_u16() == 200 {
+            served += 1;
+        }
+    }
+    assert_eq!(served, 4, "the prepared fleet serves through the expansion");
+    let output = cluster.run_command_with(&prepared, &["migrate", "check"]);
+    let refusal = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        !output.status.success() && refusal.contains("does not carry"),
+        "the prepared release serves the approved migration but never manages it: {refusal}"
+    );
+    let checked = command_succeeded(
+        &cluster.run_command_with(&successor, &["migrate", "check"]),
+        "the successor's migrate check",
+    );
+    assert!(checked.contains("schema: current"), "successor: {checked}");
+    log.push(readiness(&cluster, pair, "expanded", &["a", "b"]).await);
+
+    // Roll: the second replica becomes the successor.
+    cluster.replace_binary("b", &successor).await;
+    wait_until_ready(cluster.replica("b"), JOIN_BUDGET).await;
+    log.push(readiness(&cluster, pair, "mixed", &["a", "b"]).await);
+
+    let expand = json!({
+        "from": step.from,
+        "to": step.to,
+        "migration": applied.1,
+        "checksum": applied.2,
+        "applied_by": "successor",
+        "migrate_up": migrated.trim(),
+        "migrate_check": [
+            { "binary": "prepared", "exit": output.status.code(), "manages": false },
+            { "binary": "successor", "exit": 0, "manages": true },
+        ],
+        "proxied_during_expand": served,
+    });
+    (cluster, log, expand)
+}
+
 /// **Issue #426's pinned pair serves one deployment.**
 ///
 /// Two real binaries, each built from its own pinned commit
 /// (`gateway/tests/ha/rolling-upgrade-pair.json`): the prepared release,
 /// which implements the compatibility protocol, and its successor, which
-/// adds one change and no migration. Both run against one disposable
-/// database with the migration role and the no-DDL runtime role kept
-/// apart, as the harness always does.
+/// adds one change. Either that change is a gated operation and no
+/// migration, and both builds serve one schema point, or it crosses one
+/// schema step: one additive migration the prepared release approved by its
+/// exact checksum before the successor applied it. Both run against one
+/// disposable database with the migration role and the no-DDL runtime role
+/// kept apart, as the harness always does.
 ///
 /// What the row establishes, in order:
 ///
+/// 0. Across a schema step, the expand phase first ([`start_mixed_pair`]):
+///    the successor's `migrate up` applies exactly the pinned migration
+///    under the approved checksum while both replicas run the prepared
+///    release, which stays ready and serving on the expanded schema and
+///    refuses to manage it; only then does a replica become the successor.
 /// 1. The two processes are two different builds and say so: each
 ///    advertises what it was compiled with, and each reads the other's
-///    advertisement through its own vocabulary. They serve one schema
+///    advertisement through its own vocabulary. They share one schema
 ///    point and agree on the static-configuration fingerprint.
-/// 2. Neither changes the schema: the successor's `migrate up` is a no-op
-///    and both binaries' `migrate check` call the shared ledger current.
+/// 2. Nothing else changes the schema: the successor's `migrate up` is a
+///    no-op, its `migrate check` calls the shared ledger current, and so
+///    does the prepared release's at one schema point (across a step it
+///    refuses to manage the successor's migration, as step 0 showed).
 /// 3. Conditional policy writes alternate between the builds with one
 ///    `If-Match` chain: the ETag one computes is the precondition the
 ///    other accepts, a stale one is refused by both, the history stays
@@ -2159,13 +2282,14 @@ fn command_succeeded(output: &std::process::Output, context: &str) -> String {
 /// 4. A JWT revoked through either build's operator command is refused by
 ///    both replicas.
 /// 5. Rolling the successor back to the prepared binary before anything
-///    was contracted serves the same authority state: the same document,
-///    the same revision counter, revocations still in force, and the
-///    control plane still writes. Rolling forward again does the same.
+///    was contracted serves the same authority state, across a schema step
+///    on the expanded schema, which is not rewound: the same document, the
+///    same revision counter, revocations still in force, and the control
+///    plane still writes. Rolling forward again does the same.
 /// 6. A migration neither binary was prepared for is refused by both: the
 ///    next ledger version, unknown to both, makes both replicas
 ///    `schema_incompatible` and both `migrate check`s fail, until it is
-///    removed. No schema overlap is accepted, because none was approved.
+///    removed. No other schema overlap is accepted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_prepared_release_and_its_successor_serve_one_deployment() {
     if harness::locator().is_none() {
@@ -2174,34 +2298,26 @@ async fn a_prepared_release_and_its_successor_serve_one_deployment() {
     let pair = UpgradePair::load();
     let prepared = pair.prepared.path.clone();
     let successor = pair.successor.path.clone();
-    let mut cluster = Cluster::start(pair_options(
-        &[&prepared, &successor],
-        &prepared,
-        STALE_WINDOW_MS,
-    ))
-    .await
-    .expect("the locator was checked above");
-    cluster.wait_until_all_ready().await;
+    let (mut cluster, mut readiness_log, expand) = start_mixed_pair(&pair, STALE_WINDOW_MS).await;
     let admin = admin_token(&cluster.oidc, "admin@ha.test");
-    let mut readiness_log = vec![readiness(&cluster, &pair, "mixed", &["a", "b"]).await];
+    let shared = pair.shared_schema();
+    // What each build serves: the prepared release its own schema point and,
+    // across a step, the approved migration above it; the successor exactly
+    // the point its manifest ends at.
+    let served_by = |role: &str| match (role, &pair.schema_step) {
+        ("prepared", Some(step)) => (step.from, step.to),
+        _ => (shared, shared),
+    };
 
-    // 1. Two builds, one schema point, one fingerprint.
+    // 1. Two builds, one shared schema point, one fingerprint.
     for name in ["a", "b"] {
-        let status = cluster_status(&cluster, name, &admin).await;
+        let role = pair.role_of(cluster.replica(name).binary());
+        let (minimum, maximum) = served_by(role);
         assert_eq!(
-            (
-                status["schema"]["binary_min"].as_i64(),
-                status["schema"]["binary_max"].as_i64(),
-                status["schema"]["compatible"].as_bool(),
-            ),
-            (
-                Some(pair.schema_version),
-                Some(pair.schema_version),
-                Some(true)
-            ),
-            "replica {name} ({}) should serve exactly schema {}: {status}",
-            pair.role_of(cluster.replica(name).binary()),
-            pair.schema_version
+            schema_view(&cluster, name, &admin).await,
+            (Some(minimum), Some(maximum), Some(shared), Some(true)),
+            "replica {name} ({role}) should serve schemas {minimum} to {maximum} over the \
+             shared schema {shared}"
         );
     }
     let fingerprints = cluster
@@ -2215,58 +2331,70 @@ async fn a_prepared_release_and_its_successor_serve_one_deployment() {
 
     let prepared_instance = instance_of(&cluster, "a", &admin).await;
     let successor_instance = instance_of(&cluster, "b", &admin).await;
-    let protocol = vec!["operation_requirements".to_owned()];
-    let successor_set = vec!["operation_requirements".to_owned(), pair.capability.clone()];
     let seen_by_prepared = advertisements(&cluster, "a", &admin).await;
     let seen_by_successor = advertisements(&cluster, "b", &admin).await;
-    assert_eq!(
-        seen_by_successor.get(&successor_instance),
-        Some(&(successor_set.clone(), 0)),
-        "the successor advertises the protocol and its new capability"
-    );
-    assert_eq!(
-        seen_by_successor.get(&prepared_instance),
-        Some(&(protocol.clone(), 0)),
-        "the prepared release advertises only the protocol"
-    );
-    assert_eq!(
-        seen_by_prepared.get(&successor_instance),
-        Some(&(protocol.clone(), 1)),
-        "the prepared release recognizes the protocol in the successor's advertisement and counts \
-         the capability it was not built with, granting it nothing"
+    let protocol = seen_by_prepared
+        .get(&prepared_instance)
+        .map(|(capabilities, _)| capabilities.clone())
+        .unwrap_or_else(|| panic!("the prepared release lists itself: {seen_by_prepared:?}"));
+    // The successor adds the capability its new operation needs, when it
+    // registers one, and nothing else.
+    let mut successor_set = protocol.clone();
+    successor_set.extend(pair.capability.iter().cloned());
+    successor_set.sort();
+    let unrecognized = u64::from(pair.capability.is_some());
+    assert!(
+        protocol.iter().any(|name| name == "operation_requirements"),
+        "the prepared release implements the protocol: {protocol:?}"
     );
     assert_eq!(
         seen_by_prepared.get(&prepared_instance),
         Some(&(protocol.clone(), 0))
     );
+    assert_eq!(
+        seen_by_successor.get(&successor_instance),
+        Some(&(successor_set.clone(), 0)),
+        "the successor advertises the prepared release's capabilities and the one its new \
+         operation needs, if any"
+    );
+    assert_eq!(
+        seen_by_successor.get(&prepared_instance),
+        Some(&(protocol.clone(), 0)),
+        "the successor reads the prepared release's whole advertisement"
+    );
+    assert_eq!(
+        seen_by_prepared.get(&successor_instance),
+        Some(&(protocol.clone(), unrecognized)),
+        "the prepared release recognizes its own capabilities in the successor's advertisement \
+         and counts any it was not built with, granting it nothing"
+    );
 
-    // 2. Neither binary changes the schema.
+    // 2. Nothing else changes the schema.
     let migrated = command_succeeded(
         &cluster.run_migrator_command_with(&successor, &["migrate", "up"]),
         "the successor's migrate up",
     );
     assert!(
-        migrated.contains(&format!("already current at {}", pair.schema_version)),
-        "the successor carries no migration of its own: {migrated}"
+        migrated.contains(&format!("already current at {shared}")),
+        "the successor carries no migration beyond the shared schema: {migrated}"
     );
-    for (role, binary) in [("prepared", &prepared), ("successor", &successor)] {
+    let mut managers = vec![("successor", successor.as_path())];
+    if pair.schema_step.is_none() {
+        managers.insert(0, ("prepared", prepared.as_path()));
+    }
+    for (role, binary) in managers {
         let checked = command_succeeded(
             &cluster.run_command_with(binary, &["migrate", "check"]),
             &format!("the {role} binary's migrate check"),
         );
         assert!(checked.contains("schema: current"), "{role}: {checked}");
     }
-    let ledger = cluster
-        .database
-        .query_one(&format!(
-            "SELECT count(*)::bigint, coalesce(max(version), 0)::bigint FROM {LEDGER_TABLE}"
-        ))
-        .await;
-    let ledger_versions: (i64, i64) = (ledger.get(0), ledger.get(1));
+    let ledger_versions = ledger_extent(&cluster).await;
     assert_eq!(
         ledger_versions,
-        (pair.schema_version, pair.schema_version),
-        "the shared ledger is the prepared release's, unchanged"
+        (shared, shared),
+        "the shared ledger is the prepared release's, plus the successor's one migration across \
+         a schema step, and nothing else"
     );
 
     // 3. One If-Match chain across both builds.
@@ -2454,14 +2582,27 @@ async fn a_prepared_release_and_its_successor_serve_one_deployment() {
     }
     readiness_log.push(readiness(&cluster, &pair, "migration removed", &["a", "b"]).await);
 
+    // The extension the prepared release served is the ledger row the
+    // successor wrote, which step 0 matched against the pin.
+    let approved_extensions: Vec<Value> = pair
+        .schema_step
+        .iter()
+        .map(|step| json!({ "version": step.to, "checksum": expand["checksum"] }))
+        .collect();
+    let served = |role: &str| {
+        let (minimum, maximum) = served_by(role);
+        json!({ "min": minimum, "max": maximum })
+    };
     pair.write_evidence(
         "a_prepared_release_and_its_successor_serve_one_deployment",
         json!({
             "schema": {
                 "ledger_versions": ledger_versions.0,
                 "ledger_max_version": ledger_versions.1,
-                "served": { "min": pair.schema_version, "max": pair.schema_version },
-                "approved_extensions": [],
+                "served": { "min": shared, "max": shared },
+                "served_by": { "prepared": served("prepared"), "successor": served("successor") },
+                "approved_extensions": approved_extensions,
+                "expand": expand,
                 "unapproved_next_version": {
                     "version": highest + 1,
                     "readiness": SCHEMA_INCOMPATIBLE,
@@ -2471,7 +2612,7 @@ async fn a_prepared_release_and_its_successor_serve_one_deployment() {
             "advertisements": {
                 "prepared": protocol,
                 "successor": successor_set,
-                "prepared_sees_successor_unrecognized": 1,
+                "prepared_sees_successor_unrecognized": unrecognized,
             },
             "fingerprints": fingerprints,
             "conditional_writes": chain,
@@ -2515,26 +2656,36 @@ async fn a_prepared_release_and_its_successor_serve_one_deployment() {
 ///    the authority is not rewound to let it.
 /// 6. Recovery is forward: a document without the field brings the
 ///    prepared member back, and the gate closes again while it is live.
+///
+/// A pinned pair whose successor registers no new operation, because its
+/// one change is a schema step, gives this row nothing to gate: it records
+/// no evidence, and the evidence check requires that the published matrix
+/// name none for that pair.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_successors_new_operation_waits_for_every_prepared_member_to_leave() {
     if harness::locator().is_none() {
         return skipped();
     }
     let pair = UpgradePair::load();
+    let (Some(operation), Some(capability)) = (pair.operation.clone(), pair.capability.clone())
+    else {
+        eprintln!(
+            "the pinned successor registers no new operation, so this row has nothing to gate \
+             and records no evidence; the published pair must name none for it"
+        );
+        return;
+    };
+    assert_eq!(
+        operation, "policy.role_descriptions",
+        "this row drives role descriptions; a pair whose successor registers another operation \
+         needs a row of its own"
+    );
     let prepared = pair.prepared.path.clone();
-    let successor = pair.successor.path.clone();
-    let mut cluster = Cluster::start(pair_options(
-        &[&prepared, &successor],
-        &prepared,
-        PAIR_GATE_STALE_WINDOW_MS,
-    ))
-    .await
-    .expect("the locator was checked above");
-    cluster.wait_until_all_ready().await;
+    let (mut cluster, mut readiness_log, _) =
+        start_mixed_pair(&pair, PAIR_GATE_STALE_WINDOW_MS).await;
     let admin = admin_token(&cluster.oidc, "admin@ha.test");
     let prepared_instance = instance_of(&cluster, "a", &admin).await;
     let mut matrix = Vec::new();
-    let mut readiness_log = vec![readiness(&cluster, &pair, "mixed", &["a", "b"]).await];
     let start = AuthorityState::read(&cluster).await;
     let seed = cluster.seed_policy_etag.clone();
 
@@ -2562,7 +2713,7 @@ async fn the_successors_new_operation_waits_for_every_prepared_member_to_leave()
         "a refused write commits nothing"
     );
     matrix.push(json!({
-        "operation": pair.operation,
+        "operation": operation,
         "writer": "successor",
         "live_members": ["prepared", "successor"],
         "status": status,
@@ -2586,8 +2737,8 @@ async fn the_successors_new_operation_waits_for_every_prepared_member_to_leave()
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
     let payload = &refusal["payload"];
-    assert_eq!(payload["operation"], pair.operation.as_str(), "{refusal}");
-    assert_eq!(payload["capability"], pair.capability.as_str(), "{refusal}");
+    assert_eq!(payload["operation"], operation.as_str(), "{refusal}");
+    assert_eq!(payload["capability"], capability.as_str(), "{refusal}");
     assert_eq!(payload["reason"], "capability_not_advertised", "{refusal}");
     assert_eq!(payload["lacking_members"], 1, "{refusal}");
     assert_eq!(payload["live_members"], 2, "{refusal}");
@@ -2617,7 +2768,7 @@ async fn the_successors_new_operation_waits_for_every_prepared_member_to_leave()
     );
     assert_eq!(AuthorityState::read(&cluster).await, start);
     matrix.push(json!({
-        "operation": pair.operation,
+        "operation": operation,
         "writer": "prepared",
         "live_members": ["prepared", "successor"],
         "status": status,
@@ -2652,7 +2803,7 @@ async fn the_successors_new_operation_waits_for_every_prepared_member_to_leave()
     );
     assert_eq!(AuthorityState::read(&cluster).await, start);
     matrix.push(json!({
-        "operation": pair.operation,
+        "operation": operation,
         "writer": "successor",
         "live_members": ["prepared (draining)", "successor"],
         "status": status,
@@ -2691,7 +2842,7 @@ async fn the_successors_new_operation_waits_for_every_prepared_member_to_leave()
         "the successor serves the description it wrote: {document}"
     );
     matrix.push(json!({
-        "operation": pair.operation,
+        "operation": operation,
         "writer": "successor",
         "live_members": ["successor"],
         "status": status,
@@ -2769,7 +2920,7 @@ async fn the_successors_new_operation_waits_for_every_prepared_member_to_leave()
     );
     assert_eq!(AuthorityState::read(&cluster).await, recovered);
     matrix.push(json!({
-        "operation": pair.operation,
+        "operation": operation,
         "writer": "successor",
         "live_members": ["prepared", "successor"],
         "status": status,
