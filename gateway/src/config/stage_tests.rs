@@ -1014,6 +1014,7 @@ fn the_configuration_modules_name_no_input_or_output_api() {
         ("src/config/plan.rs", 0),
         ("src/config/proxy.rs", 0),
         ("src/config/runtime.rs", 0),
+        ("src/config/semantic_diff.rs", 0),
         ("src/config/stage.rs", 0),
         ("src/config/storage.rs", 0),
     ] {

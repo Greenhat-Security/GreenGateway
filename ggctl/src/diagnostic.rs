@@ -181,6 +181,8 @@ pub(crate) enum Code {
     ProductionValidatorsNotRun,
     WarningsAsErrors,
     RequiredCheckFailed,
+    // The semantic diff.
+    DriftFound,
     // This process.
     WriteFailed,
     RuntimeUnavailable,
@@ -198,6 +200,7 @@ pub(crate) const FAMILIES: &[&str] = &[
     "schema",
     "validate",
     "doctor",
+    "diff",
     "output",
     "internal",
 ];
@@ -257,6 +260,7 @@ impl Code {
         Self::ProductionValidatorsNotRun,
         Self::WarningsAsErrors,
         Self::RequiredCheckFailed,
+        Self::DriftFound,
         Self::WriteFailed,
         Self::RuntimeUnavailable,
         Self::ClientUnavailable,
@@ -294,13 +298,14 @@ impl Code {
             "schema" => "docs/ggctl.md#schema-diagnostics",
             "validate" => "docs/ggctl.md#validate-diagnostics",
             "doctor" => "docs/ggctl.md#doctor-diagnostics",
+            "diff" => "docs/ggctl.md#diff-diagnostics",
             "output" => "docs/ggctl.md#output-diagnostics",
             _ => "docs/ggctl.md#internal-diagnostics",
         }
     }
 
     fn entry(self) -> (&'static str, &'static str, Exit) {
-        use Exit::{Denied, Failure, Invalid, Success, Unavailable, Usage};
+        use Exit::{Denied, Drift, Failure, Invalid, Success, Unavailable, Usage};
         match self {
             Self::MissingCommand => ("usage.missing_command", "no command was given", Usage),
             Self::UnknownCommand => ("usage.unknown_command", "the command is not one this ggctl implements", Usage),
@@ -455,6 +460,11 @@ impl Code {
                 "doctor.required_check_failed",
                 "a required doctor check failed",
                 Invalid,
+            ),
+            Self::DriftFound => (
+                "diff.drift_found",
+                "--check was given and the bundles differ",
+                Drift,
             ),
             Self::WriteFailed => ("output.write_failed", "the output could not be written", Failure),
             Self::RuntimeUnavailable => ("internal.runtime_unavailable", "the asynchronous runtime could not be started", Failure),

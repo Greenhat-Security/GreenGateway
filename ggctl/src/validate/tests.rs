@@ -468,7 +468,7 @@ fn sarif_carries_the_diagnostics_alone_and_keeps_the_exit_code() {
 }
 
 #[test]
-fn only_validate_offers_sarif() {
+fn only_validate_and_diff_offer_sarif() {
     for words in [
         &["doctor", "x", "--format", "sarif"][..],
         &["schema", "--format", "sarif"],
