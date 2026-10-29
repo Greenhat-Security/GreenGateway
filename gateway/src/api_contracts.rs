@@ -1159,8 +1159,8 @@ pub(super) struct GatewayAppBuildOverrides {
     #[cfg(feature = "postgres")]
     pub(super) pg_service_tokens: Option<ClusterServiceTokenSeed>,
     /// The cluster-mode record of delegated-token purges and the security
-    /// revision `run()` read before this replica could cache a token (issue
-    /// #441). None in standalone mode, where the one process's cache is the
+    /// revision preflight read before this replica could cache a token
+    /// (issue #441). None in standalone mode, where the one process's cache is the
     /// only one.
     #[cfg(feature = "postgres")]
     pub(super) pg_delegated_token_purges: Option<ClusterDelegatedTokenPurgeSeed>,
@@ -1364,8 +1364,8 @@ pub(super) struct ClusterServiceTokenSeed {
 
 /// The cluster-mode record of delegated-token purges (issue #441): the
 /// store, the deployment ID purge keys are derived under, and the shared
-/// security revision read before the replica served, below which no
-/// recorded purge can name a token it holds.
+/// security revision preflight read before the replica served, below
+/// which no recorded purge can name a token it holds.
 #[cfg(feature = "postgres")]
 pub(super) struct ClusterDelegatedTokenPurgeSeed {
     pub(super) store: Arc<storage::PostgresDelegatedTokenPurgeStore>,

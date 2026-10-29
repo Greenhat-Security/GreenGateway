@@ -69,13 +69,14 @@
 //! [`Capability::OpenApiDiscoveryCatalogs`]) the same way. The fourth (issue
 //! #441) is recording a delegated-token purge for every replica
 //! ([`DELEGATED_TOKEN_PURGES`]), which a gateway built before the record
-//! would not apply; it waits for [`Capability::DelegatedTokenPurges`]. The
-//! approved-extension list in `migrations.rs` holds migration 25 alone, and
-//! it needs no operation requirement: it adds only columns this build never
-//! reads. Every other operation this binary performs belongs to its serving
-//! contract, schemas 24 through 25. No shipped operation declares a durable
-//! fence or a backfill, so in this release nothing raises the fence and
-//! the backfill ledger is empty; both are checked everywhere they apply.
+//! would not apply; it waits for [`Capability::DelegatedTokenPurges`]. No
+//! operation changes the schema: migration 25, the one step that rolls,
+//! adds columns nothing writes yet, and the approved-extension list in
+//! `migrations.rs` is empty. Every other operation this binary performs
+//! belongs to the schema-25 contract, which every member serving schema 25
+//! shares, its prepared release included. No shipped operation declares a
+//! durable fence or a backfill, so in this release nothing raises the fence
+//! and the backfill ledger is empty; both are checked everywhere they apply.
 
 use std::collections::BTreeSet;
 
@@ -312,7 +313,7 @@ mod gate {
     /// schema object and no migration, and the document format stays
     /// major 0. `minimum_schema` is 17 because that is the first schema
     /// whose members advertise capabilities at all; the policy tables it
-    /// writes are older. Every member that shares this binary's schema-24
+    /// writes are older. Every member that shares this binary's schema-25
     /// contract meets it, so among those the capability alone decides.
     pub(crate) const POLICY_ROLE_DESCRIPTIONS: OperationRequirement = OperationRequirement {
         operation: "policy.role_descriptions",

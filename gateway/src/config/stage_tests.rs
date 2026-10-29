@@ -20,6 +20,7 @@ use super::{
     },
     inventory,
     listeners::ListenerInputs,
+    parity_tests::BLANK_CLEARS_THE_DEFAULT,
     plan::{self, ConfigPlan},
     proxy::{RoutingInputs, TrustedProxyInputs},
     runtime::{
@@ -30,7 +31,7 @@ use super::{
     storage::{
         AuditStoreInputs, ClusterInputs, DiscoveryStoreInputs, DocumentInputs, StateBackendInputs,
     },
-    Config, StateBackend,
+    Config, ConfigError, StateBackend,
 };
 use crate::{
     auth::admin_session::AdminSessionStorage, connections::secret::OperatorSecretAliasSource,
@@ -594,62 +595,67 @@ fn a_blank_input_is_attributed_by_what_the_parser_does_with_it() {
     }
 }
 
+/// A standalone configuration whose every secret value and secret locator
+/// carries the canary `zqcanary`.
+const CANARY_STANDALONE: &[(&str, &str)] = &[
+    ("TLS_CERT_FILE", "/run/tls/data.crt"),
+    ("TLS_KEY_FILE", "/run/secrets/zqcanary-data.key"),
+    ("ADMIN_LISTEN_ADDR", "127.0.0.1:9091"),
+    ("ADMIN_TLS_CERT_FILE", "/run/tls/admin.crt"),
+    ("ADMIN_TLS_KEY_FILE", "/run/secrets/zqcanary-admin.key"),
+    (
+        "AUTH_PROVIDERS",
+        r#"[{"name":"primary","type":"jwt","issuer":"https://issuer.example.test","client_id":"admin-ui","client_secret":"zqcanary","redirect_uri":"https://management.example.test/v1/admin/auth/callback"}]"#,
+    ),
+    (
+        "UPSTREAM_ROUTES",
+        r#"[{"id":"billing","path_prefix":"/billing","upstreams":[{"id":"primary","url":"https://billing.example.test","client_identity_pem_path":"/run/secrets/zqcanary-client.pem"}],"add_request_headers":{"x-route-label":"zqcanary"}}]"#,
+    ),
+    (
+        "MCP_UPSTREAM_SERVERS",
+        r#"[{"name":"docs","url":"https://mcp.example.test/mcp?label=zqcanary"}]"#,
+    ),
+    (
+        "CONNECTIONS_SQLITE_PATH",
+        "/var/lib/greengateway/connections.sqlite",
+    ),
+    ("CONNECTION_SECRETS_ROOT", "/run/secrets/zqcanary"),
+    (
+        "CONNECTION_SECRET_ALIASES",
+        r#"[{"id":"billing","label":"Billing","source":{"type":"environment","key":"ZQCANARY_TOKEN"}},{"id":"ledger","label":"Ledger","source":{"type":"file","key":"zqcanary-ledger"}}]"#,
+    ),
+    (
+        "CONNECTION_LOCAL_SECRET_KEYRING",
+        r#"[{"id":"zqcanary-local","file":"zqcanary-local-key","role":"primary"}]"#,
+    ),
+    (
+        "CONNECTION_GCP_PROVIDER",
+        r#"{"profiles":[{"id":"primary","audience":"//iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/gateway-pool/providers/gateway-provider","token_root":"/run/secrets/zqcanary-tokens","token_file":"zqcanary-token"}],"aliases":[{"id":"gcp-ledger","label":"Ledger","profile":"primary","project":"zqcanary-project","secret":"zqcanary-secret"}]}"#,
+    ),
+];
+
+/// The same for cluster mode: the database URL file, the secrets root and
+/// the keyrings.
+const CANARY_CLUSTER: &[(&str, &str)] = &[
+    ("STATE_BACKEND", "postgres"),
+    ("DEPLOYMENT_ID", "deploy-prod-eu"),
+    ("DATABASE_URL_FILE", "/run/secrets/zqcanary-database-url"),
+    ("CONNECTION_SECRETS_ROOT", "/run/secrets/zqcanary"),
+    (
+        "RATE_LIMIT_KEYRING",
+        r#"[{"id":"zqcanary-rate","file":"zqcanary-rate-key","role":"primary"}]"#,
+    ),
+    (
+        "ADMIN_LOGIN_KEYRING",
+        r#"[{"id":"zqcanary-login","file":"zqcanary-login-key","role":"primary"}]"#,
+    ),
+];
+
 #[test]
 fn no_plan_prints_a_secret_or_a_secret_locator() {
-    let standalone = [
-        ("TLS_CERT_FILE", "/run/tls/data.crt"),
-        ("TLS_KEY_FILE", "/run/secrets/zqcanary-data.key"),
-        ("ADMIN_LISTEN_ADDR", "127.0.0.1:9091"),
-        ("ADMIN_TLS_CERT_FILE", "/run/tls/admin.crt"),
-        ("ADMIN_TLS_KEY_FILE", "/run/secrets/zqcanary-admin.key"),
-        (
-            "AUTH_PROVIDERS",
-            r#"[{"name":"primary","type":"jwt","issuer":"https://issuer.example.test","client_id":"admin-ui","client_secret":"zqcanary","redirect_uri":"https://management.example.test/v1/admin/auth/callback"}]"#,
-        ),
-        (
-            "UPSTREAM_ROUTES",
-            r#"[{"id":"billing","path_prefix":"/billing","upstreams":[{"id":"primary","url":"https://billing.example.test","client_identity_pem_path":"/run/secrets/zqcanary-client.pem"}],"add_request_headers":{"x-route-label":"zqcanary"}}]"#,
-        ),
-        (
-            "MCP_UPSTREAM_SERVERS",
-            r#"[{"name":"docs","url":"https://mcp.example.test/mcp?label=zqcanary"}]"#,
-        ),
-        (
-            "CONNECTIONS_SQLITE_PATH",
-            "/var/lib/greengateway/connections.sqlite",
-        ),
-        ("CONNECTION_SECRETS_ROOT", "/run/secrets/zqcanary"),
-        (
-            "CONNECTION_SECRET_ALIASES",
-            r#"[{"id":"billing","label":"Billing","source":{"type":"environment","key":"ZQCANARY_TOKEN"}},{"id":"ledger","label":"Ledger","source":{"type":"file","key":"zqcanary-ledger"}}]"#,
-        ),
-        (
-            "CONNECTION_LOCAL_SECRET_KEYRING",
-            r#"[{"id":"zqcanary-local","file":"zqcanary-local-key","role":"primary"}]"#,
-        ),
-        (
-            "CONNECTION_GCP_PROVIDER",
-            r#"{"profiles":[{"id":"primary","audience":"//iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/gateway-pool/providers/gateway-provider","token_root":"/run/secrets/zqcanary-tokens","token_file":"zqcanary-token"}],"aliases":[{"id":"gcp-ledger","label":"Ledger","profile":"primary","project":"zqcanary-project","secret":"zqcanary-secret"}]}"#,
-        ),
-    ];
-    let cluster = [
-        ("STATE_BACKEND", "postgres"),
-        ("DEPLOYMENT_ID", "deploy-prod-eu"),
-        ("DATABASE_URL_FILE", "/run/secrets/zqcanary-database-url"),
-        ("CONNECTION_SECRETS_ROOT", "/run/secrets/zqcanary"),
-        (
-            "RATE_LIMIT_KEYRING",
-            r#"[{"id":"zqcanary-rate","file":"zqcanary-rate-key","role":"primary"}]"#,
-        ),
-        (
-            "ADMIN_LOGIN_KEYRING",
-            r#"[{"id":"zqcanary-login","file":"zqcanary-login-key","role":"primary"}]"#,
-        ),
-    ];
-
-    let (standalone, report) = compiled(&standalone);
+    let (standalone, report) = compiled(CANARY_STANDALONE);
     assert!(report.is_empty(), "{:?}", report.problems());
-    let (cluster, report) = compiled(&cluster);
+    let (cluster, report) = compiled(CANARY_CLUSTER);
     assert!(report.is_empty(), "{:?}", report.problems());
 
     // The values reached the plans ...
@@ -711,12 +717,151 @@ fn no_plan_prints_a_secret_or_a_secret_locator() {
             format!("{:?}", plan.connections),
             format!("{:?}", plan.egress),
             format!("{:?}", plan.runtime),
+            format!("{:?}", plan.provenance()),
             format!("{plan:?}"),
         ] {
             let rendered = rendered.to_ascii_lowercase();
             assert!(!rendered.contains("zqcanary"), "{rendered}");
         }
     }
+}
+
+/// A refusal reports no secret and no locator it was not about, and its
+/// diagnostics report none at all.
+///
+/// `Display` -- the report startup prints, and so `problems` -- is the
+/// operator-facing form and quotes the value a problem is about: the gateway
+/// is reporting its own environment back to the operator who set it. So the
+/// first half refuses an unrelated setting and holds every rendering of the
+/// refusal free of the secrets and locators the same configuration carries.
+/// The second half refuses the secret inputs themselves and holds the
+/// value-free diagnostics to their word.
+#[test]
+fn a_refusal_reports_no_secret_or_locator() {
+    let render = |error: &ConfigError| {
+        [
+            error.to_string(),
+            format!("{error:?}"),
+            format!("{:?}", error.diagnostics()),
+        ]
+        .map(|rendered| rendered.to_ascii_lowercase())
+    };
+    for canaries in [CANARY_STANDALONE, CANARY_CLUSTER] {
+        let fixture = [canaries, &[("LISTEN_ADDR", "not an address")][..]].concat();
+        let error = Config::from_env_vars(|name| fixture_value(&fixture, name))
+            .expect_err("the listen address is refused");
+        assert_eq!(error.problems().len(), 1, "{error}");
+        for rendered in render(&error) {
+            assert!(!rendered.contains("zqcanary"), "{rendered}");
+        }
+    }
+
+    for refused in [
+        // A private key without its certificate.
+        &[("TLS_KEY_FILE", "/run/secrets/zqcanary-data.key")][..],
+        // Cluster material in standalone mode.
+        &[("DATABASE_URL_FILE", "/run/secrets/zqcanary-database-url")][..],
+        // A keyring with no store for it to encrypt, and no secrets root.
+        &[(
+            "CONNECTION_LOCAL_SECRET_KEYRING",
+            r#"[{"id":"primary","file":"zqcanary-local-key","role":"primary"}]"#,
+        )][..],
+        // A provider with a client secret and no issuer to discover.
+        &[(
+            "AUTH_PROVIDERS",
+            r#"[{"name":"primary","type":"jwt","client_secret":"zqcanary"}]"#,
+        )][..],
+        // A file alias with no secrets root to read it beneath.
+        &[
+            (
+                "CONNECTIONS_SQLITE_PATH",
+                "/var/lib/greengateway/connections.sqlite",
+            ),
+            (
+                "CONNECTION_SECRET_ALIASES",
+                r#"[{"id":"billing","label":"Billing","source":{"type":"file","key":"zqcanary-ledger"}}]"#,
+            ),
+        ][..],
+    ] {
+        let error = Config::from_env_vars(|name| fixture_value(refused, name))
+            .expect_err("the secret input is refused");
+        assert!(!error.diagnostics().is_empty());
+        let diagnostics = format!("{:?}", error.diagnostics()).to_ascii_lowercase();
+        assert!(!diagnostics.contains("zqcanary"), "{diagnostics}");
+    }
+}
+
+/// The static-configuration fingerprint -- the one digest of the
+/// configuration, written to the membership roster and served by the
+/// cluster status API -- is the same whatever the secrets are and wherever
+/// they are kept, while the plans it is computed from do differ in them.
+///
+/// A route's upstream TLS material locators are deliberately part of it
+/// (`ha::insert_route`: they decide which trust the route carries), so they
+/// are held fixed here.
+#[test]
+fn the_fingerprint_is_the_same_whatever_the_secrets_and_their_locators_are() {
+    let configuration = |tag: &str| -> Vec<(&'static str, String)> {
+        vec![
+            ("STATE_BACKEND", "postgres".to_owned()),
+            ("DEPLOYMENT_ID", "deploy-prod-eu".to_owned()),
+            ("DATABASE_URL_FILE", format!("/run/{tag}/database-url")),
+            ("CONNECTION_SECRETS_ROOT", format!("/run/{tag}")),
+            (
+                "RATE_LIMIT_KEYRING",
+                format!(r#"[{{"id":"rate","file":"{tag}-rate-key","role":"primary"}}]"#),
+            ),
+            (
+                "ADMIN_LOGIN_KEYRING",
+                format!(r#"[{{"id":"login","file":"{tag}-login-key","role":"primary"}}]"#),
+            ),
+            ("TLS_CERT_FILE", "/run/tls/data.crt".to_owned()),
+            ("TLS_KEY_FILE", format!("/run/{tag}/data.key")),
+            (
+                "AUTH_PROVIDERS",
+                format!(
+                    r#"[{{"name":"primary","type":"jwt","issuer":"https://issuer.example.test","client_id":"admin-ui","client_secret":"{tag}-client-secret"}}]"#
+                ),
+            ),
+            (
+                "UPSTREAM_ROUTES",
+                format!(
+                    r#"[{{"id":"billing","path_prefix":"/billing","upstream_url":"https://billing.example.test","add_request_headers":{{"x-route-key":"{tag}-header-value"}}}}]"#
+                ),
+            ),
+            (
+                "CONNECTION_SECRET_ALIASES",
+                format!(
+                    r#"[{{"id":"billing","label":"Billing","source":{{"type":"environment","key":"{}_TOKEN"}}}}]"#,
+                    tag.to_ascii_uppercase()
+                ),
+            ),
+            (
+                "CONNECTION_GCP_PROVIDER",
+                format!(
+                    r#"{{"profiles":[{{"id":"primary","audience":"//iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/gateway-pool/providers/gateway-provider","token_root":"/run/{tag}-tokens","token_file":"{tag}-token"}}],"aliases":[{{"id":"gcp-ledger","label":"Ledger","profile":"primary","project":"{tag}-project","secret":"{tag}-secret"}}]}}"#
+                ),
+            ),
+        ]
+    };
+    let compile = |tag: &str| {
+        let fixture = configuration(tag);
+        let fixture: Vec<(&str, &str)> = fixture
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect();
+        let (plan, report) = compiled(&fixture);
+        assert!(report.is_empty(), "{tag}: {:?}", report.problems());
+        plan
+    };
+    let (first, second) = (compile("zqcanary"), compile("relocated"));
+    assert_ne!(first, second, "the plans differ in their secrets");
+
+    let (first, second) = (first.into_config(), second.into_config());
+    let fingerprint = crate::ha::static_config_fingerprint(&first);
+    assert_eq!(fingerprint, crate::ha::static_config_fingerprint(&second));
+    let rendered = format!("{fingerprint} {fingerprint:?}").to_ascii_lowercase();
+    assert!(!rendered.contains("zqcanary"), "{rendered}");
 }
 
 /// The stages carry locators and destinations without touching them: files
@@ -1134,5 +1279,61 @@ fn every_rule_is_reported_by_name_in_the_diagnostics() {
             ConfigDiagnosticCode::Unset
         };
         assert_eq!(diagnostic.code, code, "{rule:?}: {error}");
+    }
+}
+
+fn repository_text(path: &str) -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(path);
+    fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
+}
+
+const COMPILER_CONTRACT: &str = "docs/architecture/configuration-compiler.md";
+
+/// The backticked names in the first column of the Markdown table whose
+/// header row is `header`, in order.
+fn documented_names(document: &str, header: &str) -> Vec<String> {
+    document
+        .lines()
+        .skip_while(|line| line.trim_end() != header)
+        .skip(1)
+        .take_while(|line| line.starts_with('|'))
+        .filter_map(|row| {
+            let cell = row.split('|').nth(1)?.trim();
+            cell.strip_prefix('`')?.strip_suffix('`').map(str::to_owned)
+        })
+        .collect()
+}
+
+/// The compiler contract's table of rules is the rules there are, in the
+/// order they are declared, so a report format built from it misses none.
+#[test]
+fn the_compiler_contract_lists_every_rule() {
+    let documented = documented_names(&repository_text(COMPILER_CONTRACT), "| Rule | Refuses |");
+    let rules: Vec<String> = EVERY_RULE.iter().map(|rule| format!("{rule:?}")).collect();
+    assert_eq!(
+        documented, rules,
+        "{COMPILER_CONTRACT}#rules lists every ConfigRule, in declaration order"
+    );
+}
+
+/// The lists a blank value clears are the ones the compiler contract names,
+/// and the Cloudflare guide, whose wrapper drops blank values, names each.
+#[test]
+fn the_compiler_contract_lists_every_list_a_blank_value_clears() {
+    let documented = documented_names(
+        &repository_text(COMPILER_CONTRACT),
+        "| Setting | Default it replaces |",
+    );
+    assert_eq!(
+        documented, BLANK_CLEARS_THE_DEFAULT,
+        "{COMPILER_CONTRACT}#blank-values lists the parity golden's lists"
+    );
+    let cloudflare = repository_text("docs/deployment/cloudflare.md");
+    for name in BLANK_CLEARS_THE_DEFAULT {
+        assert!(
+            cloudflare.contains(&format!("`{name}`")),
+            "docs/deployment/cloudflare.md says how {name} is cleared through the wrapper"
+        );
     }
 }

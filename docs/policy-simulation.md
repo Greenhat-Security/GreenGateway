@@ -116,9 +116,20 @@ origin syntax, identity bounds, unique case ids and byte lengths.
 
 An edited or inline candidate is validated exactly as a policy write
 validates one -- the 0.x or v1 rules its `schema_version` selects, and the
-proxy-dispatch checks -- and is never stored. A candidate that does not
-validate is `422 policy_candidate_invalid`. Server-side drafts and historical
-revisions are not candidate sources yet.
+proxy-dispatch checks -- and is never stored. An inline candidate is read
+from the exact bytes of `candidate.policy`, by the same parser
+`PUT /v1{ADMIN_PREFIX}/policy` reads its body with, so a v1 document is held
+to the rules only its bytes can show: the 1 MiB bound, and no number spelled
+through serde_json's private number tag (`{"$serde_json::private::Number":
+"..."}`), which a JSON value would silently read as a number. (A repeated
+member anywhere in the request is already `400
+policy_simulation_request_invalid`.) An edited candidate has no bytes of its
+own and is validated as the document its edits produce. A candidate whose
+document format this deployment could not commit -- policy v1 in cluster
+mode -- is refused as `POST /v1{ADMIN_PREFIX}/policy/validate` and a policy
+test run refuse it. A candidate that does not validate is `422
+policy_candidate_invalid`. Server-side drafts and historical revisions are
+not candidate sources yet.
 
 ### Position-aware edits
 
