@@ -2071,6 +2071,63 @@ async fn file_watch_invalid_update_keeps_old_policy_and_accepts_later_valid_upda
     wait_for_status(router, "/unmatched", StatusCode::FORBIDDEN).await;
 }
 
+/// Required authority evidence refuses a standalone file reload (issue
+/// #425, PR 4): the gate audits the refusal and the active policy stays;
+/// best effort, and a reload with no gate, reload as before.
+#[tokio::test]
+async fn required_authority_evidence_refuses_a_policy_file_reload_and_keeps_the_policy() {
+    use crate::authority_events::required::{AuthorityEvidenceGate, BackgroundEvidenceGate};
+    use crate::config::{AuthorityEvidenceDurability, StateBackend};
+
+    let file = TempPolicyFile::new(&default_policy_document("deny"));
+    let initial_policy =
+        Policy::from_file(file.path()).expect("initial policy should parse before test");
+    let (state, _state_capture) = test_state(initial_policy, &[]);
+    let capture = CaptureSink::new();
+    let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+    let required = BackgroundEvidenceGate::new(
+        AuthorityEvidenceGate::new(AuthorityEvidenceDurability::Required, StateBackend::Sqlite),
+        audit.clone(),
+    );
+    file.write(&default_policy_document("allow"));
+
+    for trigger in ["file_watch", "signal"] {
+        assert!(
+            !reload_policy_file_if_admitted(&state, file.path(), Some(&required), trigger).await
+        );
+        assert_eq!(state.current_policy().default_action, DefaultAction::Deny);
+    }
+    let refusals = || {
+        capture
+            .events()
+            .into_iter()
+            .filter(|event| {
+                event.event_type == crate::audit::event::AUTHORITY_EVIDENCE_OPERATION_REFUSED
+            })
+            .map(|event| event.payload)
+            .collect::<Vec<_>>()
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while refusals().len() < 2 {
+        assert!(Instant::now() < deadline, "both refusals are audited");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    for (payload, trigger) in refusals().iter().zip(["file_watch", "signal"]) {
+        assert_eq!(payload["operation"], json!("policy.file_reload"));
+        assert_eq!(payload["trigger"], json!(trigger));
+        assert_eq!(payload["deployment_mode"], json!("standalone"));
+    }
+
+    let best_effort = BackgroundEvidenceGate::new(AuthorityEvidenceGate::best_effort(), audit);
+    assert!(
+        reload_policy_file_if_admitted(&state, file.path(), Some(&best_effort), "signal").await
+    );
+    assert_eq!(state.current_policy().default_action, DefaultAction::Allow);
+    file.write(&default_policy_document("deny"));
+    assert!(reload_policy_file_if_admitted(&state, file.path(), None, "file_watch").await);
+    assert_eq!(state.current_policy().default_action, DefaultAction::Deny);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_requests_complete_during_policy_swaps() {
     let old_policy = swap_policy_document("old:read");

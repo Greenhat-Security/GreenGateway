@@ -488,6 +488,9 @@ pub(super) struct PolicyAdminState {
     pub(super) membership: Option<Arc<cluster_membership::ClusterMembership>>,
     pub(super) event_store: Option<Arc<dyn storage::AuditEventStore>>,
     pub(super) query_store: Option<Arc<storage::SqliteAuditEventStore>>,
+    /// Asked before every policy mutation (issue #425, PR 4): standalone
+    /// mode records no evidence of one, so required mode refuses it.
+    pub(super) authority_evidence: authority_events::required::AuthorityEvidenceGate,
     pub(super) audit: audit::AuditLog,
     pub(super) client_ip_policy: client_ip::ClientIpPolicy,
     pub(super) max_body_size: usize,
@@ -511,6 +514,9 @@ pub(super) struct ConnectionAdminState {
     pub(super) openapi_catalogs: connections::openapi::OpenApiConnectionCatalogService,
     pub(super) tests: connections::test::ConnectionTestService,
     pub(super) rbac_state: Option<middleware::rbac::RbacState>,
+    /// Asked before every Connection, catalog and local-secret change
+    /// (issue #425, PR 4).
+    pub(super) authority_evidence: authority_events::required::AuthorityEvidenceGate,
     pub(super) audit: audit::AuditLog,
     pub(super) client_ip_policy: client_ip::ClientIpPolicy,
     pub(super) max_body_size: usize,
@@ -532,6 +538,8 @@ pub(super) struct ToolAdminState {
     pub(super) inventory: tools::inventory::CapabilityInventory,
     pub(super) executor: tools::executor::ToolExecutor,
     pub(super) rbac_state: Option<middleware::rbac::RbacState>,
+    /// Asked before an OpenAPI tools registration (issue #425, PR 4).
+    pub(super) authority_evidence: authority_events::required::AuthorityEvidenceGate,
     pub(super) audit: audit::AuditLog,
     pub(super) client_ip_policy: client_ip::ClientIpPolicy,
     pub(super) max_body_size: usize,

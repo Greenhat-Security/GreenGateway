@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     audit::{self, AuditEvent, AuditLog},
+    authority_events::required::{AuthorityOperation, BackgroundEvidenceGate},
     config::Config,
     tools::{
         codecs::Codec,
@@ -1610,6 +1611,36 @@ fn reload_tool_registry_from_file_with_optional_mcp_proxy_definitions(
     }
 }
 
+/// A watched or signalled reload of `tools_file`, once the
+/// authority-evidence gate admits it (issue #425, PR 4). Standalone mode
+/// records no evidence of what a reload publishes, so
+/// `AUTHORITY_EVIDENCE_DURABILITY=required` refuses each one -- the gate
+/// audits it -- and the registry, MCP proxy tools included, stays as it is
+/// until a restart activates the file. Without a gate every reload runs.
+async fn reload_tools_file_if_admitted(
+    registry: &ToolRegistry,
+    tools_file: &Path,
+    mcp_proxy_definitions_provider: Option<&McpProxyDefinitionsProvider>,
+    evidence: Option<&BackgroundEvidenceGate>,
+    trigger: &'static str,
+) -> bool {
+    if evidence.is_some_and(|gate| !gate.admits(AuthorityOperation::ToolsPublish, trigger)) {
+        tracing::warn!(
+            tools_file = %tools_file.display(),
+            trigger,
+            "tool registry reload refused by AUTHORITY_EVIDENCE_DURABILITY=required; existing registry remains active until a restart activates the file"
+        );
+        return false;
+    }
+    reload_tool_registry_from_file_with_mcp_proxy_definitions_provider(
+        registry,
+        tools_file,
+        mcp_proxy_definitions_provider,
+    )
+    .await
+    .is_ok()
+}
+
 #[allow(dead_code)] // Retained for callers that do not refresh MCP proxy definitions.
 pub fn spawn_tool_registry_reload_tasks(
     tools_file: impl Into<PathBuf>,
@@ -1627,6 +1658,7 @@ pub fn spawn_tool_registry_reload_tasks_with_mcp_proxy_definitions_provider(
         tools_file.into(),
         registry,
         mcp_proxy_definitions_provider,
+        None,
         CancellationToken::new(),
         None,
     )
@@ -1636,12 +1668,14 @@ pub fn spawn_tool_registry_reload_tasks_with_lifecycle(
     tools_file: impl Into<PathBuf>,
     registry: ToolRegistry,
     mcp_proxy_definitions_provider: Option<McpProxyDefinitionsProvider>,
+    evidence: BackgroundEvidenceGate,
     lifecycle: &crate::lifecycle::GatewayLifecycle,
 ) -> notify::Result<()> {
     spawn_tool_registry_reload_tasks_inner(
         tools_file.into(),
         registry,
         mcp_proxy_definitions_provider,
+        Some(evidence),
         lifecycle.background_cancellation(),
         Some(lifecycle),
     )
@@ -1651,6 +1685,7 @@ fn spawn_tool_registry_reload_tasks_inner(
     tools_file: PathBuf,
     registry: ToolRegistry,
     mcp_proxy_definitions_provider: Option<McpProxyDefinitionsProvider>,
+    evidence: Option<BackgroundEvidenceGate>,
     cancellation: CancellationToken,
     lifecycle: Option<&crate::lifecycle::GatewayLifecycle>,
 ) -> notify::Result<()> {
@@ -1658,12 +1693,14 @@ fn spawn_tool_registry_reload_tasks_inner(
         tools_file.clone(),
         registry.clone(),
         mcp_proxy_definitions_provider.clone(),
+        evidence.clone(),
         cancellation.clone(),
     )?;
     let sighup = spawn_sighup_reload_task(
         tools_file,
         registry,
         mcp_proxy_definitions_provider,
+        evidence,
         cancellation,
     );
     if let Some(lifecycle) = lifecycle {
@@ -1679,6 +1716,7 @@ fn spawn_tool_registry_file_watcher(
     tools_file: PathBuf,
     registry: ToolRegistry,
     mcp_proxy_definitions_provider: Option<McpProxyDefinitionsProvider>,
+    evidence: Option<BackgroundEvidenceGate>,
     cancellation: CancellationToken,
 ) -> notify::Result<tokio::task::JoinHandle<()>> {
     let (sender, receiver) = mpsc::unbounded_channel();
@@ -1691,6 +1729,7 @@ fn spawn_tool_registry_file_watcher(
         tools_file,
         registry,
         mcp_proxy_definitions_provider,
+        evidence,
         receiver,
         watcher,
         cancellation,
@@ -1701,6 +1740,7 @@ async fn tool_registry_file_watch_loop(
     tools_file: PathBuf,
     registry: ToolRegistry,
     mcp_proxy_definitions_provider: Option<McpProxyDefinitionsProvider>,
+    evidence: Option<BackgroundEvidenceGate>,
     mut events: mpsc::UnboundedReceiver<notify::Result<notify::Event>>,
     _watcher: notify::RecommendedWatcher,
     cancellation: CancellationToken,
@@ -1725,10 +1765,12 @@ async fn tool_registry_file_watch_loop(
             let _ = handle_tool_registry_watch_event(&tools_file, event);
         }
 
-        let _ = reload_tool_registry_from_file_with_mcp_proxy_definitions_provider(
+        reload_tools_file_if_admitted(
             &registry,
             &tools_file,
             mcp_proxy_definitions_provider.as_ref(),
+            evidence.as_ref(),
+            "file_watch",
         )
         .await;
     }
@@ -1775,6 +1817,7 @@ fn spawn_sighup_reload_task(
     tools_file: PathBuf,
     registry: ToolRegistry,
     mcp_proxy_definitions_provider: Option<McpProxyDefinitionsProvider>,
+    evidence: Option<BackgroundEvidenceGate>,
     cancellation: CancellationToken,
 ) -> Option<tokio::task::JoinHandle<()>> {
     Some(tokio::spawn(async move {
@@ -1798,10 +1841,12 @@ fn spawn_sighup_reload_task(
             if signal.is_none() {
                 return;
             }
-            let _ = reload_tool_registry_from_file_with_mcp_proxy_definitions_provider(
+            reload_tools_file_if_admitted(
                 &registry,
                 &tools_file,
                 mcp_proxy_definitions_provider.as_ref(),
+                evidence.as_ref(),
+                "signal",
             )
             .await;
         }
@@ -1813,6 +1858,7 @@ fn spawn_sighup_reload_task(
     _tools_file: PathBuf,
     _registry: ToolRegistry,
     _mcp_proxy_definitions_provider: Option<McpProxyDefinitionsProvider>,
+    _evidence: Option<BackgroundEvidenceGate>,
     _cancellation: CancellationToken,
 ) -> Option<tokio::task::JoinHandle<()>> {
     None
@@ -3800,6 +3846,63 @@ mod tests {
             "tools": [tool]
         }))
         .expect("optional query mappings with scalar schemas should load");
+    }
+
+    /// Required authority evidence refuses a standalone tools file reload
+    /// (issue #425, PR 4) and keeps the registry; best effort reloads it.
+    #[tokio::test]
+    async fn required_authority_evidence_refuses_a_tools_file_reload_and_keeps_the_registry() {
+        use crate::{
+            authority_events::required::{AuthorityEvidenceGate, BackgroundEvidenceGate},
+            config::{AuthorityEvidenceDurability, StateBackend},
+        };
+
+        let file = TempToolsFile::new(&tools_document(&[echo_tool("echo", "POST", "/v1/echo")]));
+        let registry = ToolRegistry::from_file(file.path()).expect("initial registry should load");
+        file.write(&tools_document(&[
+            echo_tool("echo", "POST", "/v1/echo"),
+            echo_tool("get_widget", "GET", "/v1/widgets/{widget_id}"),
+        ]));
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(std::sync::Arc::new(capture.clone()));
+        let required = BackgroundEvidenceGate::new(
+            AuthorityEvidenceGate::new(AuthorityEvidenceDurability::Required, StateBackend::Sqlite),
+            audit.clone(),
+        );
+
+        assert!(
+            !reload_tools_file_if_admitted(&registry, file.path(), None, Some(&required), "signal")
+                .await
+        );
+        assert!(registry.get("get_widget").is_none());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let refusal = loop {
+            if let Some(event) = capture.events().into_iter().find(|event| {
+                event.event_type == audit::event::AUTHORITY_EVIDENCE_OPERATION_REFUSED
+            }) {
+                break event;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the refusal is audited"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        assert_eq!(refusal.payload["operation"], json!("tools.publish"));
+        assert_eq!(refusal.payload["trigger"], json!("signal"));
+
+        let best_effort = BackgroundEvidenceGate::new(AuthorityEvidenceGate::best_effort(), audit);
+        assert!(
+            reload_tools_file_if_admitted(
+                &registry,
+                file.path(),
+                None,
+                Some(&best_effort),
+                "file_watch"
+            )
+            .await
+        );
+        assert!(registry.get("get_widget").is_some());
     }
 
     #[tokio::test]

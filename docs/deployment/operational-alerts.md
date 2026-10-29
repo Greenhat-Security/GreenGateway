@@ -184,7 +184,8 @@ missing reading pass as healthy. Its ten-minute hold covers a maintenance
 handover and a restarted fleet's first pass.
 
 A deployment without `AUTHORITY_EVENT_SINK` journals and retains events but
-delivers none, so every retained event is undelivered by design. The lag rule
+delivers none, so every retained event is undelivered by design
+(`AUTHORITY_EVIDENCE_DURABILITY=required` refuses to start such a replica). The lag rule
 judges delivery only where some scraped replica exports the dispatcher's lease age
 or its failure counter: a configured dispatcher creates one of them on its first
 term or its first failed attempt. A dispatcher that once claimed the cursor and

@@ -162,11 +162,21 @@ export function validateEvent(event) {
   return event;
 }
 
+// What AUTHORITY_EVIDENCE_DURABILITY=required does with a row (issue #425,
+// PR 4). `admitted` runs it with the atomic record the row describes;
+// `refused` and `refused_at_startup` refuse it when asked or when the
+// configuration enables it; `unavailable` rows cannot run in the mode at
+// all; `outside_gateway` is a provider's write the gateway cannot refuse;
+// `not_refused` is the activation that starts the gateway.
+const REQUIRED_MODES = new Set(["admitted", "refused", "refused_at_startup", "unavailable", "outside_gateway", "not_refused"]);
+
 export function validateInventory(inventory, readSource = (path) => readFileSync(resolve(ROOT, path), "utf8")) {
   check(inventory.version === 1 && inventory.issue === 425, "unknown inventory contract");
   check(/^[0-9a-f]{40}$/.test(inventory.reviewed_revision), "missing reviewed revision");
   assert.deepEqual(inventory.storage_modes, MODES, "storage modes changed without contract review");
-  check(inventory.required_durability_mode === "not_implemented", "inventory cannot enable runtime durability");
+  // The mode refuses what is unsupported; it qualifies nothing, so every row
+  // keeps required_durability_supported false below.
+  check(inventory.required_durability_mode === "refuses_unsupported", "inventory cannot enable runtime durability");
   const seen = new Set();
   const ids = new Set();
   const coveredEntries = new Set();
@@ -192,6 +202,11 @@ export function validateInventory(inventory, readSource = (path) => readFileSync
       check(typeof group[field] === "string" && group[field].trim().length >= 4, `${group.id}: missing ${field}`);
     }
     check(group.required_durability_supported === false, `${group.id}: unproven durability claim`);
+    check(REQUIRED_MODES.has(group.required_mode), `${group.id}: unknown required mode`);
+    // An unsupported operation is never run as if it had evidence, and a
+    // row with an entry point a request reaches cannot be waved through.
+    check(!(group.required_mode === "admitted" && group.disposition.includes("unsupported_future_operation")), `${group.id}: required mode admits an unsupported operation`);
+    check(!["outside_gateway", "not_refused"].includes(group.required_mode) || group.entrypoints.length === 0, `${group.id}: a reachable entry point must be admitted or refused`);
     check(group.disposition.length > 0 && new Set(group.disposition).size === group.disposition.length, `${group.id}: missing/duplicate disposition`);
     for (const disposition of group.disposition) check(DISPOSITIONS.has(disposition), `${group.id}: unknown disposition`);
     check(!group.disposition.includes("already_sufficient") || group.disposition.length === 1, "sufficient contradicts a gap");
@@ -229,7 +244,7 @@ export function validateInventory(inventory, readSource = (path) => readFileSync
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
     const result = validateInventory(readJson("docs/authority-evidence-inventory.json"));
-    console.log(`Authority evidence inventory valid: ${result.groups} groups, ${result.operationModePairs} operation/mode pairs, ${result.sourceReferences} source references. Runtime durability remains unqualified.`);
+    console.log(`Authority evidence inventory valid: ${result.groups} groups, ${result.operationModePairs} operation/mode pairs, ${result.sourceReferences} source references. Required mode refuses unsupported rows; no row is qualified.`);
   } catch (error) {
     console.error(error.message);
     process.exitCode = 1;
