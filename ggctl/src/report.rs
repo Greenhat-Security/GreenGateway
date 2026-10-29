@@ -64,41 +64,54 @@ impl Format {
 pub(crate) enum ReportDiagnostic {
     Ggctl(Diagnostic),
     Bundle(BundleDiagnostic),
+    /// One the reader found in a document that is not part of a bundle (the
+    /// `ggctl init --answers` document), located by the argument that names
+    /// it, because its path is never echoed.
+    Document {
+        argument: usize,
+        diagnostic: BundleDiagnostic,
+    },
 }
 
 impl ReportDiagnostic {
     pub(crate) fn code(&self) -> &'static str {
         match self {
             Self::Ggctl(diagnostic) => diagnostic.code.as_str(),
-            Self::Bundle(diagnostic) => diagnostic.code.as_str(),
+            Self::Bundle(diagnostic) | Self::Document { diagnostic, .. } => {
+                diagnostic.code.as_str()
+            }
         }
     }
 
     pub(crate) fn severity(&self) -> &'static str {
         match self {
             Self::Ggctl(diagnostic) => diagnostic.severity(),
-            Self::Bundle(diagnostic) => diagnostic.severity.as_str(),
+            Self::Bundle(diagnostic) | Self::Document { diagnostic, .. } => {
+                diagnostic.severity.as_str()
+            }
         }
     }
 
     pub(crate) fn message(&self) -> &'static str {
         match self {
             Self::Ggctl(diagnostic) => diagnostic.code.message(),
-            Self::Bundle(diagnostic) => diagnostic.code.message(),
+            Self::Bundle(diagnostic) | Self::Document { diagnostic, .. } => {
+                diagnostic.code.message()
+            }
         }
     }
 
     pub(crate) fn hint(&self) -> Option<&'static str> {
         match self {
             Self::Ggctl(diagnostic) => diagnostic.hint,
-            Self::Bundle(_) => None,
+            Self::Bundle(_) | Self::Document { .. } => None,
         }
     }
 
     pub(crate) fn remediation(&self) -> &'static str {
         match self {
             Self::Ggctl(diagnostic) => diagnostic.code.remediation(),
-            Self::Bundle(_) => BUNDLE_REMEDIATION,
+            Self::Bundle(_) | Self::Document { .. } => BUNDLE_REMEDIATION,
         }
     }
 
@@ -106,7 +119,7 @@ impl ReportDiagnostic {
     pub(crate) fn exit(&self) -> Exit {
         match self {
             Self::Ggctl(diagnostic) => diagnostic.code.exit(),
-            Self::Bundle(diagnostic) => bundle_exit(diagnostic),
+            Self::Bundle(diagnostic) | Self::Document { diagnostic, .. } => bundle_exit(diagnostic),
         }
     }
 
@@ -117,6 +130,15 @@ impl ReportDiagnostic {
                 .map(|argument| LocationRecord::Argument { argument }),
             Self::Bundle(diagnostic) => diagnostic.file.as_ref().map(|file| LocationRecord::File {
                 file: file.as_str().to_owned(),
+                pointer: diagnostic.pointer.to_string(),
+                line: diagnostic.position.map(|position| position.line),
+                column: diagnostic.position.map(|position| position.column),
+            }),
+            Self::Document {
+                argument,
+                diagnostic,
+            } => Some(LocationRecord::Document {
+                argument: *argument,
                 pointer: diagnostic.pointer.to_string(),
                 line: diagnostic.position.map(|position| position.line),
                 column: diagnostic.position.map(|position| position.column),
@@ -155,9 +177,13 @@ impl From<BundleDiagnostic> for ReportDiagnostic {
 /// The human form written to standard error.
 impl fmt::Display for ReportDiagnostic {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let diagnostic = match self {
+        let (diagnostic, argument) = match self {
             Self::Ggctl(diagnostic) => return diagnostic.fmt(formatter),
-            Self::Bundle(diagnostic) => diagnostic,
+            Self::Bundle(diagnostic) => (diagnostic, None),
+            Self::Document {
+                argument,
+                diagnostic,
+            } => (diagnostic, Some(*argument)),
         };
         write!(
             formatter,
@@ -166,8 +192,13 @@ impl fmt::Display for ReportDiagnostic {
             self.code(),
             self.message()
         )?;
-        if let Some(file) = &diagnostic.file {
-            write!(formatter, "\n  at: {}", file.as_str())?;
+        let at = match (&diagnostic.file, argument) {
+            (Some(file), _) => Some(file.as_str().to_owned()),
+            (None, Some(argument)) => Some(format!("argument {argument}")),
+            (None, None) => None,
+        };
+        if let Some(at) = at {
+            write!(formatter, "\n  at: {at}")?;
             if let Some(position) = diagnostic.position {
                 write!(formatter, ":{}:{}", position.line, position.column)?;
             }
@@ -216,6 +247,17 @@ pub(crate) enum LocationRecord {
     /// column where the reader has them.
     File {
         file: String,
+        pointer: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        line: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        column: Option<u32>,
+    },
+    /// A place in the document that the argument at that position names and
+    /// that is not a bundle file: a JSON Pointer and the 1-based line and
+    /// column where the reader has them.
+    Document {
+        argument: usize,
         pointer: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         line: Option<u32>,

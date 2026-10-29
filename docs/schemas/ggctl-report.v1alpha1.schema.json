@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://greengateway.dev/schemas/ggctl-report.v1alpha1.schema.json",
   "title": "ggctl Report",
-  "description": "The one document ggctl writes to standard output with --format json, for every command that does not write an artifact. exitCode and outcome are the process exit status and its stable name. Diagnostics are value-free: a stable family.reason code, fixed message text, an optional fixed hint, a documentation anchor, and at most one location: the 1-based position of the command-line argument concerned, or a bundle-relative file name with a JSON Pointer built from member names the bundle reader defines and a 1-based line and column; never an argument, token, URL, path, document value, server response, or library error. A published diagnostic code never changes meaning; renaming or removing one requires a new report version. An argument error found before a command runs writes no report (exit 2, standard error only).",
+  "description": "The one document ggctl writes to standard output with --format json, for every command that does not write an artifact. exitCode and outcome are the process exit status and its stable name. Diagnostics are value-free: a stable family.reason code, fixed message text, an optional fixed hint, a documentation anchor, and at most one location: the 1-based position of the command-line argument concerned, or a bundle-relative file name with a JSON Pointer built from member names the bundle reader defines and a 1-based line and column, or the position of the argument naming a document that is not a bundle file (the init answers) with a JSON Pointer and a line and column; never an argument, token, URL, path, document value, server response, or library error. A published diagnostic code never changes meaning; renaming or removing one requires a new report version. An argument error found before a command runs writes no report (exit 2, standard error only).",
   "type": "object",
   "additionalProperties": false,
   "required": ["apiVersion", "kind", "command", "exitCode", "outcome", "diagnostics", "result"],
@@ -15,7 +15,7 @@
       "const": "GgctlReport"
     },
     "command": {
-      "enum": ["version", "schema", "validate", "doctor", "diff"]
+      "enum": ["version", "schema", "init", "validate", "convert", "doctor", "diff"]
     },
     "exitCode": {
       "type": "integer",
@@ -54,10 +54,26 @@
     },
     {
       "if": {
+        "properties": {"command": {"const": "init"}}
+      },
+      "then": {
+        "properties": {"result": {"$ref": "#/$defs/initResult"}}
+      }
+    },
+    {
+      "if": {
         "properties": {"command": {"const": "validate"}}
       },
       "then": {
         "properties": {"result": {"$ref": "#/$defs/validateResult"}}
+      }
+    },
+    {
+      "if": {
+        "properties": {"command": {"const": "convert"}}
+      },
+      "then": {
+        "properties": {"result": {"$ref": "#/$defs/convertResult"}}
       }
     },
     {
@@ -86,7 +102,7 @@
         "code": {
           "description": "The stable family.reason code. docs/ggctl.md lists every ggctl code by family, and docs/configuration-bundles.md every bundle reader code.",
           "type": "string",
-          "pattern": "^(usage|credential|trust|remote|compat|schema|validate|doctor|diff|output|internal|bundle|syntax|json|yaml|reference|secret|resource|profile)\\.[a-z][a-z0-9_]*$"
+          "pattern": "^(usage|credential|trust|remote|compat|schema|validate|doctor|diff|init|convert|output|internal|bundle|syntax|json|yaml|reference|secret|resource|profile)\\.[a-z][a-z0-9_]*$"
         },
         "severity": {
           "enum": ["error", "warning", "info"]
@@ -131,6 +147,30 @@
                 },
                 "pointer": {
                   "description": "An RFC 6901 JSON Pointer into the file's document, built from member names the reader defines and array indices; empty for the document as a whole.",
+                  "type": "string",
+                  "pattern": "^(/([^/~]|~[01])*)*$"
+                },
+                "line": {"type": "integer", "minimum": 1},
+                "column": {
+                  "description": "1-based, counted in Unicode scalar values.",
+                  "type": "integer",
+                  "minimum": 1
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["argument", "pointer"],
+              "dependentRequired": {"line": ["column"], "column": ["line"]},
+              "properties": {
+                "argument": {
+                  "description": "The 1-based position of the command-line argument naming the document, which is not a bundle file: the init answers. Its path is never echoed.",
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "pointer": {
+                  "description": "An RFC 6901 JSON Pointer into the document, built from member names the reader defines and array indices; empty for the document as a whole.",
                   "type": "string",
                   "pattern": "^(/([^/~]|~[01])*)*$"
                 },
@@ -303,6 +343,67 @@
         "schemas": {
           "type": "array",
           "items": {"$ref": "#/$defs/documentVersion"}
+        }
+      }
+    },
+    "initResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["created", "profile"],
+      "properties": {
+        "created": {
+          "description": "The bundle is at the --output directory. It was read back with the bundle reader before it was moved there; the gateway's production policy and tools validators are not part of ggctl and did not run.",
+          "type": "boolean"
+        },
+        "profile": {
+          "enum": ["production", "migration", "development"]
+        },
+        "topology": {
+          "description": "Present once the answers were read. standalone: the bundle supplies its policy and tools; cluster: the server's control planes do.",
+          "enum": ["standalone", "cluster"]
+        },
+        "operator": {
+          "description": "Present once the answers were read: whether the policy holds the generated operator role.",
+          "type": "boolean"
+        },
+        "bundle": {
+          "description": "The bundle as the reader read it back, once it was written.",
+          "$ref": "#/$defs/bundle"
+        }
+      }
+    },
+    "convertResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["valid", "changed", "written"],
+      "properties": {
+        "valid": {
+          "description": "The bundle reader accepted BUNDLE, so it could be converted. The gateway's production policy and tools validators are not part of ggctl and did not run.",
+          "type": "boolean"
+        },
+        "bundle": {
+          "description": "BUNDLE, once its manifest was read.",
+          "$ref": "#/$defs/bundle"
+        },
+        "from": {
+          "description": "BUNDLE's document version, once it was read.",
+          "const": "greengateway.dev/v1alpha1"
+        },
+        "to": {
+          "description": "The document version converted to, present only when --to named one this ggctl implements and the conversion was planned.",
+          "const": "greengateway.dev/v1alpha1"
+        },
+        "changed": {
+          "description": "A conversion step ran, so the converted files differ from BUNDLE's. Always false while greengateway.dev/v1alpha1 is the only version.",
+          "type": "boolean"
+        },
+        "written": {
+          "description": "The converted bundle is at the --output directory. Always false with --in-place, which writes nothing.",
+          "type": "boolean"
+        },
+        "converted": {
+          "description": "The bundle written to --output as the reader read it back.",
+          "$ref": "#/$defs/bundle"
         }
       }
     },

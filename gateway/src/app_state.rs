@@ -45,6 +45,9 @@ pub(super) const POLICY_REPLAY_ADMIN_ROUTE: &str = "/v1/admin/policy/replays/{id
 /// Assemble a canonical evidence package for one policy publication
 /// (issue #243, slice 20).
 pub(super) const POLICY_EVIDENCE_ADMIN_ROUTE: &str = "/v1/admin/policy/evidence";
+/// Analyze the structure of the active policy or a candidate (issue #243,
+/// slice 15).
+pub(super) const POLICY_ANALYSES_ADMIN_ROUTE: &str = "/v1/admin/policy/analyses";
 pub(super) const POLICY_RULES_ADMIN_ROUTE: &str = "/v1/admin/policy/rules";
 pub(super) const POLICY_RULE_ADMIN_ROUTE: &str = "/v1/admin/policy/rules/{id}";
 pub(super) const POLICY_RULES_ORDER_ADMIN_ROUTE: &str = "/v1/admin/policy/rules/order";
@@ -131,6 +134,10 @@ pub(super) const ADMIN_POLICY_SIMULATE_PERMISSION: &str = "admin:policy:simulate
 /// implies; a package section that runs synthetic cases or binds a replay
 /// job also needs the permissions of that section's own endpoint.
 pub(super) const ADMIN_POLICY_EVIDENCE_READ_PERMISSION: &str = "admin:policy:evidence:read";
+/// Run the structural policy analyzer. Always held together with
+/// `admin:policy:read`, which it never implies; it grants no write, and an
+/// analysis applies none of the patches it suggests.
+pub(super) const ADMIN_POLICY_ANALYZE_PERMISSION: &str = "admin:policy:analyze";
 pub(super) const ADMIN_TOKENS_READ_PERMISSION: &str = "admin:tokens:read";
 pub(super) const ADMIN_TOKENS_WRITE_PERMISSION: &str = "admin:tokens:write";
 pub(super) const ADMIN_CONNECTIONS_READ_PERMISSION: &str =
@@ -255,6 +262,7 @@ pub(super) struct AdminRoutes {
     pub(super) policy_test_runs_route: String,
     pub(super) policy_simulations_route: String,
     pub(super) policy_replays_route: String,
+    pub(super) policy_analyses_route: String,
     pub(super) policy_replay_route: String,
     pub(super) policy_evidence_route: String,
     pub(super) policy_rules_route: String,
@@ -369,6 +377,7 @@ impl AdminRoutes {
             policy_test_runs_route: format!("{api_prefix}/policy/tests/runs"),
             policy_simulations_route: format!("{api_prefix}/policy/simulations"),
             policy_replays_route: format!("{api_prefix}/policy/replays"),
+            policy_analyses_route: format!("{api_prefix}/policy/analyses"),
             policy_replay_route: format!("{api_prefix}/policy/replays/{{id}}"),
             policy_evidence_route: format!("{api_prefix}/policy/evidence"),
             policy_rules_route: format!("{api_prefix}/policy/rules"),

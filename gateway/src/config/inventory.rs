@@ -355,10 +355,22 @@ const ENVIRONMENT_READS: &[EnvironmentRead] = &[
         reads: 1,
     },
     EnvironmentRead {
-        file: "src/app_tests.rs",
+        file: "src/admin_observability_app_tests.rs",
         names: ReadNames::Fixed(&["GATEWAY_TEST_POSTGRES_URL_FILE"]),
         purpose: ReadPurpose::TestHarness,
-        reads: 4,
+        reads: 2,
+    },
+    EnvironmentRead {
+        file: "src/admin_policy_app_tests.rs",
+        names: ReadNames::Fixed(&["GATEWAY_TEST_POSTGRES_URL_FILE"]),
+        purpose: ReadPurpose::TestHarness,
+        reads: 1,
+    },
+    EnvironmentRead {
+        file: "src/admin_tools_app_tests.rs",
+        names: ReadNames::Fixed(&["GATEWAY_TEST_POSTGRES_URL_FILE"]),
+        purpose: ReadPurpose::TestHarness,
+        reads: 1,
     },
     EnvironmentRead {
         file: "src/connections/pg_store_tests.rs",

@@ -16,6 +16,7 @@ an exit code. Implementation is grouped by responsibility:
 | `admin_responses`, `admin_ui` | Shared error mapping and embedded UI serving |
 | `admin_policy_test_runs`, `policy_testing` | Policy test suites: the run endpoint, and the state-free suite parser, evaluator-backed runner and JSON/SARIF/JUnit reports |
 | `admin_policy_simulations`, `policy_simulation` | Synthetic policy simulation: the simulation endpoint and its concurrency bound, and the state-free request parser, position-aware edits, shadow projections and evaluator-backed runner |
+| `admin_policy_analyses`, `policy_analysis` | Structural policy analysis: the analysis endpoint and its concurrency bound, and the state-free request parser, sound inclusion checks, evaluator-confirmed findings, advisory patches and JSON/SARIF reports |
 | `admin_policy_replays`, `policy_replay` | Historical policy replay: the replay job endpoints, their process-local job registry and quotas, and the state-free `replay-context.v1` record and parser, the legacy adapters that read one out of a stored audit event, their evaluator-backed replay, the `policy-replay.v1` request parser, the bounded job engine and the base-to-candidate and recorded-to-base impact comparison |
 | `admin_policy_evidence`, `policy_evidence` | Policy evidence packages: the evidence endpoint, its history reads, revalidation, replay-job binding and export audit record, and the state-free `policy-evidence-request.v1` parser and deterministic `policy-evidence.v1` package assembler |
 
@@ -26,14 +27,24 @@ belong in their domain module and must be registered through `routing`.
 
 Large inline unit suites in configuration, connection stores and tool execution
 are in adjacent `*_tests.rs` files. The application suite, which drives the
-composed router, is `app_tests.rs` and the subsystem modules it declares next
+composed router, is the set of subsystem modules `app_tests.rs` declares next
 to the code they exercise: `auth_app_tests.rs` (authentication and the
 validator chain), `admin_identity_app_tests.rs` (admin login, capabilities and
-the admin-endpoint denial audit) and `admin_tokens_app_tests.rs` (the token
-admin API), with acceptance modules still under `tests/`. `app_tests.rs` owns
-the fixtures more than one of them uses. Issue #434 is moving the remaining
-families out of it; [the application test inventory](../testing/application-test-inventory.md)
-counts them. A moved test keeps its function name, so a name filter still
+the admin-endpoint denial audit), `admin_tokens_app_tests.rs` (the token admin
+API), `admin_policy_app_tests.rs` (policy administration),
+`admin_connections_app_tests.rs` (Connections and local secrets),
+`admin_tools_app_tests.rs` (the capability inventory, the tool playground and
+OpenAPI tool registration), `mcp_app_tests.rs` (the MCP endpoint),
+`admin_observability_app_tests.rs` (audit, status, traffic, signals,
+suggestions, principals and schema coverage), `cluster_app_tests.rs` (cluster
+status, readiness and the HA metric registry) and `routing_app_tests.rs`
+(listeners, routing, proxying and the middleware order), beside the
+per-feature `*_app_tests.rs`, `admin_policy_*_tests.rs` and
+`admin_suggestion_drafts_tests.rs` modules it already declared and the
+acceptance modules under `tests/`. `app_tests.rs` itself
+defines no tests; it owns the fixtures more than one of these modules uses.
+[The application test inventory](../testing/application-test-inventory.md)
+counts the moves. A moved test keeps its function name, so a name filter still
 selects it; only its module path gains the subsystem module.
 
 The React connection editor delegates validation, binding intent and request

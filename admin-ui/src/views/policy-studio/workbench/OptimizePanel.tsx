@@ -113,10 +113,11 @@ export function OptimizePanel({
       <div className="error-panel alert info" role="note">
         <h3>The validator’s checks, not a policy analysis</h3>
         <p>
-          The conservative analyzer, which finds duplicate, redundant, shadowed, unreachable
-          and overbroad entries with a proof basis, an access effect and an advisory change
-          for each, is not available on this gateway yet. This view lists what the
-          validator’s structural, cross-resource and risk checks report about the candidate.
+          The conservative analyzer, which finds shadowed, unreachable and overbroad entries
+          with a proof basis, an access effect and an advisory change for each, answers on
+          the gateway’s policy analyses endpoint, but this view does not run it yet. This
+          view lists what the validator’s structural, cross-resource and risk checks report
+          about the candidate.
           An empty list means those checks found nothing; it does not mean the policy has
           none of those problems.
         </p>
