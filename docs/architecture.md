@@ -307,8 +307,9 @@ aggregate state and perform no synchronous network or durable-store work.
 
 ## Module ownership
 
-The Cargo workspace currently contains the `gateway` binary crate. Its focused
-modules include:
+The Cargo workspace contains the `gateway` binary crate, the `ggctl` operator CLI
+and `gateway-config`, the configuration contracts the two share. The gateway's
+focused modules include:
 
 - `middleware/`, `auth/`, and `rbac/` for ingress limits, identity, policy,
   authorization, decision propagation, and terminal observation;
@@ -326,9 +327,10 @@ modules include:
 - `lifecycle.rs` for probes, signal coordination, task/request tracking, and
   bounded shutdown.
 
-`main.rs` composes those modules and owns the HTTP route surfaces. New outbound
-HTTP must not be added outside `egress.rs`; CI enforces the primitive boundary
-with `scripts/check-egress-only.sh`.
+`main.rs` declares those modules; the application modules in
+[the module map](architecture/application-modules.md) compose them and own the
+HTTP route surfaces. New outbound HTTP must not be added outside `egress.rs`; CI
+enforces the primitive boundary with `scripts/check-egress-only.sh`.
 
 The MCP protocol adapter names the concrete HTTP types exposed by egress, while
 its legacy checked-destination factory now lives in `egress::mcp_http_client`.

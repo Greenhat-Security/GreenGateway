@@ -11,6 +11,7 @@ an exit code. Implementation is grouped by responsibility:
 | `api_contracts` | Request/response types and application error contracts |
 | `probes` | Health/readiness, metrics and proxy fallback |
 | `admin_identity`, `admin_authorization` | Admin login, capabilities and final permission checks |
+| `admin_config` | The configuration admin API: the `config/capabilities` version handshake `ggctl` reads |
 | `admin_connections`, `admin_tools`, `admin_tokens`, `admin_policy`, `admin_policy_drafts` | Domain-specific handlers and mutations; policy drafts, including a discovery suggestion opened in one, publish only through `admin_policy`'s mutation path |
 | `admin_observability`, `admin_events` | Audit, traffic, signals, suggestions and change telemetry |
 | `admin_responses`, `admin_ui` | Shared error mapping and embedded UI serving |
@@ -44,7 +45,16 @@ acceptance modules under `tests/`. `app_tests.rs` itself
 defines no tests; it owns the fixtures more than one of these modules uses.
 [The application test inventory](../testing/application-test-inventory.md)
 counts the moves. A moved test keeps its function name, so a name filter still
-selects it; only its module path gains the subsystem module.
+selects it; only its module path gains the subsystem module, so an `--exact`
+filter names the full path, `tests::<module>::<name>`.
+
+`main.rs` declares `app_tests.rs` as `#[cfg(test)] mod tests`, so none of these
+modules is compiled into the shipped binary, and moving a test between them
+moves no production code. The security coverage floors in
+`.github/security-coverage.json` name production files only, and CI measures
+them with `cargo llvm-cov -p gateway --bin gateway`, the one test binary all of
+these modules are compiled into: where a test lives decides neither what a floor
+measures nor whether the test counts toward it.
 
 The React connection editor delegates validation, binding intent and request
 serialization to `connection-editor/model.ts`; reusable form sections and local
