@@ -6,16 +6,20 @@
 //! in one [`Report`], in the order the legacy parser has always reported
 //! them. It returns a [`ConfigPlan`] only when no stage found anything. The
 //! plan holds every domain's validated settings and the provenance of every
-//! input, and carries secret material only as locators: TLS private keys and
-//! the database URL file as `SecretLocator`s, and the Connections aliases,
-//! keyrings and providers in types that print them redacted. Nothing here or
-//! in the stages opens a file, resolves a name or reaches a store, a provider
-//! or the network; preflight and activation stay with startup, which runs
-//! them as stages of their own after this compiler has returned
+//! input, and carries secret material as locators wherever the input format
+//! allows: TLS private keys and the database URL file as `SecretLocator`s,
+//! and the Connections aliases, keyrings and providers in types that print
+//! them redacted. The one secret value is the OIDC client secret the legacy
+//! `AUTH_PROVIDERS` document holds inline, which its `Debug` redacts. Nothing
+//! here or in the stages opens a file, resolves a name or reaches a store, a
+//! provider or the network; preflight and activation stay with startup, which
+//! runs them as stages of their own after this compiler has returned
 //! (`bootstrap::start_serving`, #433 PR 3).
 //!
 //! `Config::from_env_vars` is this compiler followed by
 //! [`ConfigPlan::into_config`], which is why its behaviour has not changed.
+//! The contract this module keeps is documented in
+//! `docs/architecture/configuration-compiler.md`.
 
 use std::env::VarError;
 
