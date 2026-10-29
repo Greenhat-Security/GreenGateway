@@ -1130,21 +1130,40 @@ async fn sqlite_failed_evidence_insert_rolls_back_rotate_and_revoke() {
 }
 
 /// A rotate and a revoke race on two connections to one standalone token
-/// database. Each runs as one immediate transaction, so the loser sees the
-/// winner's committed state: revoke-first refuses the rotate and records
-/// only the revoke; rotate-first records the rotate and then the revoke.
-/// The evidence is exactly the changes that committed, and no plaintext is
-/// live afterwards.
+/// database. Each runs as one immediate transaction, so the loser waits for
+/// the winner and then sees its committed state: revoke-first refuses the
+/// rotate and records only the revoke; rotate-first records the rotate and
+/// then the revoke. A change that cannot take the write lock inside the
+/// store's contention budget is refused cleanly instead -- `Busy`, which the
+/// admin API answers with its stable `503` -- and writes nothing; it never
+/// fails with a raw SQLite lock error. Whatever happened, the evidence is
+/// exactly the changes that committed, in order, and a plaintext is live
+/// exactly when no revoke committed and no later rotate replaced it.
 #[test]
 fn sqlite_rotate_and_revoke_race_records_exactly_the_committed_changes() {
     use crate::auth::tokens::{TokenStore, TokenStoreError};
 
+    fn assert_refused_cleanly(operation: &'static str, error: TokenStoreError) {
+        assert!(
+            matches!(error, TokenStoreError::Busy { .. }),
+            "the {operation} must commit or be refused cleanly: {error}"
+        );
+        assert_eq!(
+            super::service_token::map_token_store_error(operation, error).kind(),
+            RepositoryErrorKind::Timeout,
+            "a refused {operation} is the store-unavailable answer"
+        );
+    }
+
+    const ITERATIONS: usize = 8;
     let db = TempDb::new("token-evidence-race");
     let revoker = SqliteTokenStore::open(&db.path).expect("token store should open");
     let rotator = SqliteTokenStore::open(&db.path).expect("second connection should open");
     let mut saw_revoke_first = false;
     let mut saw_rotate_first = false;
-    for _ in 0..8 {
+    let mut refused_as_busy = 0;
+    let mut decided = 0;
+    for _ in 0..ITERATIONS {
         let created = TokenStore::create(
             &revoker,
             CreateTokenRequest {
@@ -1174,30 +1193,47 @@ fn sqlite_rotate_and_revoke_race_records_exactly_the_committed_changes() {
                 TokenStore::rotate(&store, &id, &ChangeActor::for_test("rotating-admin"))
             })
         };
-        let revoked = revoke
-            .join()
-            .expect("revoke thread")
-            .expect("revoke should commit")
-            .expect("token should exist");
-        assert!(revoked.revoked_at.is_some());
-
-        let mut plaintexts = vec![created.plaintext_token.clone()];
-        let expected: &[(&str, &str)] = match rotate.join().expect("rotate thread") {
-            Err(TokenStoreError::RevokedToken { .. }) => {
-                saw_revoke_first = true;
-                &[("service_token.revoke", "revoking-admin")]
-            }
-            Ok(Some(rotated)) => {
-                saw_rotate_first = true;
-                plaintexts.push(rotated.plaintext_token);
-                &[
-                    ("service_token.rotate", "rotating-admin"),
-                    ("service_token.revoke", "revoking-admin"),
-                ]
+        let revoked = match revoke.join().expect("revoke thread") {
+            Ok(Some(record)) => {
+                assert!(record.revoked_at.is_some());
+                true
             }
             Ok(None) => panic!("the token exists"),
-            Err(error) => panic!("the rotate must either commit or be refused: {error}"),
+            Err(error) => {
+                assert_refused_cleanly("service_token_revoke", error);
+                refused_as_busy += 1;
+                false
+            }
         };
+        let (rotated, refused_as_revoked) = match rotate.join().expect("rotate thread") {
+            Ok(Some(rotated)) => (Some(rotated.plaintext_token), false),
+            Ok(None) => panic!("the token exists"),
+            Err(TokenStoreError::RevokedToken { .. }) => (None, true),
+            Err(error) => {
+                assert_refused_cleanly("service_token_rotate", error);
+                refused_as_busy += 1;
+                (None, false)
+            }
+        };
+        assert!(
+            revoked || !refused_as_revoked,
+            "only a committed revoke refuses the rotate as revoked"
+        );
+        if revoked && (rotated.is_some() || refused_as_revoked) {
+            decided += 1;
+        }
+
+        let mut expected = Vec::new();
+        if rotated.is_some() {
+            // A rotate after the revoke is refused, so a committed rotate
+            // always committed first.
+            saw_rotate_first |= revoked;
+            expected.push(("service_token.rotate", "rotating-admin"));
+        }
+        if revoked {
+            saw_revoke_first |= refused_as_revoked;
+            expected.push(("service_token.revoke", "revoking-admin"));
+        }
         let recorded = sqlite_token_evidence(&db.path)
             .into_iter()
             .filter(|row| row.token_id == id)
@@ -1211,17 +1247,292 @@ fn sqlite_rotate_and_revoke_race_records_exactly_the_committed_changes() {
                 .collect::<Vec<_>>(),
             "the evidence is exactly the committed changes, in order"
         );
-        for plaintext in &plaintexts {
-            assert!(
-                matches!(
-                    TokenStore::verify(&revoker, plaintext).expect("verification should query"),
-                    TokenVerification::Invalid(_)
-                ),
-                "no plaintext may be live after a revoke, whichever order won"
-            );
+
+        let live = (!revoked).then(|| {
+            rotated
+                .clone()
+                .unwrap_or_else(|| created.plaintext_token.clone())
+        });
+        for plaintext in std::iter::once(&created.plaintext_token).chain(rotated.as_ref()) {
+            let verification =
+                TokenStore::verify(&revoker, plaintext).expect("verification should query");
+            if Some(plaintext) == live.as_ref() {
+                assert!(
+                    matches!(verification, TokenVerification::Valid(_)),
+                    "a change refused for contention leaves the last committed plaintext live"
+                );
+            } else {
+                assert!(
+                    matches!(verification, TokenVerification::Invalid(_)),
+                    "no plaintext may be live after a revoke or a later rotate, whichever order won"
+                );
+            }
         }
     }
-    eprintln!("orders observed: revoke-first={saw_revoke_first} rotate-first={saw_rotate_first}");
+    eprintln!(
+        "orders observed: revoke-first={saw_revoke_first} rotate-first={saw_rotate_first} \
+         refused-as-busy={refused_as_busy}"
+    );
+    assert!(
+        decided > 0,
+        "in {ITERATIONS} races neither change ever decided the other: {refused_as_busy} \
+         refusals for contention means the store cannot make progress with two writers"
+    );
+}
+
+/// The standalone token store runs in write-ahead-log mode, so a reader
+/// never holds up a change. A rotate and a revoke commit while another
+/// connection sits inside a read transaction on the same file, and that
+/// reader keeps the snapshot it began with. In the rollback-journal mode the
+/// store used to run in, each commit needed an EXCLUSIVE lock the open read
+/// held off, so both changes ran out of their budget and were refused: the
+/// lock wait that, on loaded Windows runners, made concurrent admin changes
+/// fail.
+#[test]
+fn sqlite_token_changes_commit_while_another_connection_reads() {
+    use crate::auth::tokens::TokenStore;
+
+    let db = TempDb::new("token-reader-does-not-block");
+    // A short budget, so a commit the reader could hold off is refused in a
+    // quarter second rather than after the default five.
+    let store = SqliteTokenStore::open_with_busy_timeout(&db.path, Duration::from_millis(250))
+        .expect("token store should open");
+    let journal_mode: String = rusqlite::Connection::open(&db.path)
+        .expect("token database should open")
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .expect("journal mode should read");
+    assert_eq!(journal_mode, "wal");
+    let request = || CreateTokenRequest {
+        scopes: vec!["admin:tokens:read".to_owned()],
+        created_by: "creating-admin".to_owned(),
+        expires_at: None,
+    };
+    let to_rotate = TokenStore::create(&store, request()).expect("token should create");
+    let to_revoke = TokenStore::create(&store, request()).expect("token should create");
+
+    let reader = rusqlite::Connection::open(&db.path).expect("reader should open");
+    reader.execute_batch("BEGIN").expect("read should begin");
+    let read_revoked_at = |id: &str| -> Option<String> {
+        reader
+            .query_row(
+                "SELECT revoked_at FROM service_tokens WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .expect("reader should read the token")
+    };
+    assert_eq!(read_revoked_at(&to_revoke.record.id), None);
+
+    let rotated = TokenStore::rotate(
+        &store,
+        &to_rotate.record.id,
+        &ChangeActor::for_test("rotating-admin"),
+    )
+    .expect("a rotate commits while another connection reads")
+    .expect("token should exist");
+    let revoked = TokenStore::revoke(
+        &store,
+        &to_revoke.record.id,
+        &ChangeActor::for_test("revoking-admin"),
+    )
+    .expect("a revoke commits while another connection reads")
+    .expect("token should exist");
+    assert!(revoked.revoked_at.is_some());
+    assert_eq!(
+        read_revoked_at(&to_revoke.record.id),
+        None,
+        "the open read keeps the snapshot it began with"
+    );
+    reader.execute_batch("COMMIT").expect("read should end");
+
+    for (plaintext, live) in [
+        (&to_rotate.plaintext_token, false),
+        (&rotated.plaintext_token, true),
+        (&to_revoke.plaintext_token, false),
+    ] {
+        let verification =
+            TokenStore::verify(&store, plaintext).expect("verification should query");
+        assert_eq!(
+            matches!(verification, TokenVerification::Valid(_)),
+            live,
+            "after the read ends every reader sees both commits"
+        );
+    }
+    let recorded = sqlite_token_evidence(&db.path)
+        .into_iter()
+        .map(|row| (row.action, row.token_id))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        recorded,
+        vec![
+            (
+                "service_token.rotate".to_owned(),
+                to_rotate.record.id.clone()
+            ),
+            (
+                "service_token.revoke".to_owned(),
+                to_revoke.record.id.clone()
+            ),
+        ]
+    );
+}
+
+/// A change waits for a writer on another connection, then judges the
+/// state that writer committed. Here the other writer revokes the token and
+/// commits while the rotate is waiting, so the rotate is refused as revoked:
+/// not failed at once for the lock, and not committed against the state it
+/// would have read before the revoke. The outcome does not depend on how
+/// the two threads are scheduled -- a rotate that only starts after the
+/// commit is refused the same way -- so the test cannot flake.
+#[test]
+fn sqlite_token_rotate_waits_for_a_concurrent_writer_and_judges_its_commit() {
+    use crate::auth::tokens::{TokenStore, TokenStoreError};
+
+    let db = TempDb::new("token-waits-for-writer");
+    let store = SqliteTokenStore::open(&db.path).expect("token store should open");
+    let created = TokenStore::create(
+        &store,
+        CreateTokenRequest {
+            scopes: vec!["admin:tokens:read".to_owned()],
+            created_by: "creating-admin".to_owned(),
+            expires_at: None,
+        },
+    )
+    .expect("token should create");
+    let id = created.record.id.clone();
+
+    let writer = rusqlite::Connection::open(&db.path).expect("writer should open");
+    writer
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("writer should take the write lock");
+    writer
+        .execute(
+            "UPDATE service_tokens SET revoked_at = '2026-01-01T00:00:00Z' WHERE id = ?1",
+            [&id],
+        )
+        .expect("writer should revoke");
+    let (started_tx, started_rx) = mpsc::channel();
+    let rotate = {
+        let store = store.clone();
+        let id = id.clone();
+        std::thread::spawn(move || {
+            started_tx.send(()).expect("test should be waiting");
+            TokenStore::rotate(&store, &id, &ChangeActor::for_test("rotating-admin"))
+        })
+    };
+    started_rx.recv().expect("rotate thread should start");
+    // Hold the lock a moment longer so the rotate is almost surely queued
+    // behind it; a slower thread reaches the same answer.
+    std::thread::sleep(Duration::from_millis(100));
+    writer
+        .execute_batch("COMMIT")
+        .expect("writer should commit");
+
+    match rotate.join().expect("rotate thread") {
+        Err(TokenStoreError::RevokedToken { .. }) => {}
+        Ok(_) => panic!("a rotate after a committed revoke must be refused"),
+        Err(error) => panic!("the rotate must wait for the writer, not fail: {error}"),
+    }
+    assert!(
+        sqlite_token_evidence(&db.path).is_empty(),
+        "a refused rotate records nothing"
+    );
+    assert_eq!(
+        TokenStore::verify(&store, &created.plaintext_token).expect("verification should query"),
+        TokenVerification::Invalid(TokenVerificationFailure::Revoked)
+    );
+}
+
+/// A change that cannot take the write lock inside the store's contention
+/// budget is refused cleanly. It waits the budget out rather than failing at
+/// once, reports `Busy` -- not the raw SQLite lock error -- which the
+/// repository answers as `Timeout` and the admin API as its stable
+/// `503 service-token store is unavailable`, and it writes nothing. Once the
+/// other writer is done, the same change commits.
+#[tokio::test]
+async fn sqlite_token_change_blocked_past_its_budget_is_refused_and_writes_nothing() {
+    use crate::auth::tokens::{TokenStore, TokenStoreError};
+
+    let budget = Duration::from_millis(200);
+    let db = TempDb::new("token-busy-refusal");
+    let store = SqliteTokenStore::open_with_busy_timeout(&db.path, budget)
+        .expect("token store should open");
+    let created = TokenStore::create(
+        &store,
+        CreateTokenRequest {
+            scopes: vec!["admin:tokens:read".to_owned()],
+            created_by: "creating-admin".to_owned(),
+            expires_at: None,
+        },
+    )
+    .expect("token should create");
+    let id = created.record.id.clone();
+    let token_row = || -> (String, String, Option<String>) {
+        rusqlite::Connection::open(&db.path)
+            .expect("token database should open")
+            .query_row(
+                "SELECT token_hash, token_prefix, revoked_at FROM service_tokens WHERE id = ?1",
+                [&id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("token row should read")
+    };
+    let before = token_row();
+
+    let writer = rusqlite::Connection::open(&db.path).expect("writer should open");
+    writer
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("writer should take the write lock");
+
+    let started = std::time::Instant::now();
+    let rotate_error =
+        match TokenStore::rotate(&store, &id, &ChangeActor::for_test("rotating-admin")) {
+            Ok(_) => panic!("a rotate behind a held write lock must not commit"),
+            Err(error) => error,
+        };
+    assert!(
+        started.elapsed() >= budget / 2,
+        "the rotate waited for the writer rather than failing at once: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        matches!(rotate_error, TokenStoreError::Busy { .. }),
+        "a lock the budget could not outwait is `Busy`: {rotate_error}"
+    );
+    assert!(
+        !rotate_error.to_string().contains("database is locked"),
+        "the refusal is the store's, not the raw SQLite error: {rotate_error}"
+    );
+
+    let started = std::time::Instant::now();
+    let revoke_error =
+        ServiceTokenStore::revoke(&store, &id, &ChangeActor::for_test("revoking-admin"))
+            .await
+            .expect_err("a revoke behind a held write lock must not commit");
+    assert!(
+        started.elapsed() >= budget / 2,
+        "the revoke waited for the writer rather than failing at once: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        revoke_error.kind(),
+        RepositoryErrorKind::Timeout,
+        "the repository answers a refused change as the store being unavailable: {revoke_error}"
+    );
+    writer.execute_batch("ROLLBACK").expect("writer should end");
+
+    assert_eq!(token_row(), before, "neither refused change wrote anything");
+    assert!(sqlite_token_evidence(&db.path).is_empty());
+    assert!(matches!(
+        TokenStore::verify(&store, &created.plaintext_token).expect("verification should query"),
+        TokenVerification::Valid(_)
+    ));
+    TokenStore::revoke(&store, &id, &ChangeActor::for_test("revoking-admin"))
+        .expect("the revoke commits once the writer is done")
+        .expect("token should exist");
+    let rows = sqlite_token_evidence(&db.path);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].action, "service_token.revoke");
 }
 
 /// The standalone store versions its schema by creating what is missing on
