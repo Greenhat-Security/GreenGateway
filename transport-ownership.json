@@ -1110,6 +1110,7 @@
           "hex@0.4.3|registry+https://github.com/rust-lang/crates.io-index",
           "jsonschema@0.58.6|registry+https://github.com/rust-lang/crates.io-index",
           "proptest@1.11.0|registry+https://github.com/rust-lang/crates.io-index",
+          "rusqlite@0.40.2|registry+https://github.com/rust-lang/crates.io-index",
           "serde@1.0.229|registry+https://github.com/rust-lang/crates.io-index",
           "serde_json@1.0.154|registry+https://github.com/rust-lang/crates.io-index",
           "sha2@0.11.0|registry+https://github.com/rust-lang/crates.io-index",
@@ -6205,6 +6206,19 @@
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           {
+            "name": "rusqlite",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "^0.40.2",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [
+              "bundled"
+            ],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
             "name": "serde",
             "rename": null,
             "kind": null,
@@ -8940,6 +8954,66 @@
       "sha256": "531f313a0883db82809b4028d4db3566138936321fa328cc9879c8cbe105dd20",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway-config/src/ledger/location.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway_config::ledger::location::create_temporary#1",
+      "sha256": "51293a979166bb96d5dbf52dd024d1dae69123488747a23d3d244e7692b1f342",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 PR 10 (standalone revision ledger): creates the seed's temporary database file beneath the state directory with create_new and, on Unix, mode 0600 through std::os::unix::fs::OpenOptionsExt. Local file creation only; it adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/ledger/location.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway_config::ledger::location::owner_alone_can_write#1",
+      "sha256": "a487c6b6631e24091b1d3bfd421e698411fd856b0b08aa474fcd693ce08f04e5",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 PR 10 (standalone revision ledger): reads the Unix mode bits of state-directory and ledger-file metadata through std::os::unix::fs::MetadataExt to refuse an entry group or other can write. Read-only metadata; it adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/ledger/location.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway_config::ledger::location::is_reparse_point#1",
+      "sha256": "b38daad4bb5a2611dccf7b648e45aa79aa9af9944222f0319f6ec5b8b24f642b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 PR 10 (standalone revision ledger): reads the Windows reparse-point attribute of state-directory and ledger-file metadata through std::os::windows::fs::MetadataExt to refuse links and junctions. Read-only metadata; it adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/ledger/store.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway_config::ledger::store::use rusqlite :: { config :: DbConfig , params , Connection , ErrorCode , OpenFlags , OptionalExtension }#1",
+      "sha256": "d4004d0f1282acf7e2d92344d1832af166401970c8b75a10d1e2014f97bdc7c8",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 PR 10 (standalone revision ledger): the bundled SQLite of the existing standalone stores, opened only on the ledger file beneath the state directory (read-write, no create, defensive mode, untrusted schema). Connection is rusqlite's database connection, not a network connection; it adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/ledger/store.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway_config::ledger::store::failure#1",
+      "sha256": "39878e7957cc51d2159f4988a9c5b5b71edca3e138fa30d141120072ba0d8ed8",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 PR 10 (standalone revision ledger): classifies a failure of the ledger's local SQLite database by rusqlite's error type and SQLite error code. It names no transport; the guard flags it through its conservative global union of same-spelled imported names. It adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/ledger/store.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway_config::ledger::store::summary_of_row#1",
+      "sha256": "0a7475b75811083bc93e00a9edc25b3eb62fc2ffea5a8966a48c44ebb108973a",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 PR 10 (standalone revision ledger): decodes one row of the ledger's local SQLite database through rusqlite's Row, whose name the PostgreSQL client also exports, which is why the guard's conservative global alias union flags it. It adds no network or process capability."
     },
     {
       "file": "gateway/src/connections/secret.rs",
