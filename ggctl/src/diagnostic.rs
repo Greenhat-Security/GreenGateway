@@ -77,7 +77,9 @@ impl Exit {
                 "invalid, incompatible or unsupported configuration, server or document version; a failed required doctor check; any warning under --warnings-as-errors"
             }
             Self::Drift => "drift found by diff --check",
-            Self::Conflict => "precondition conflict: missing or stale ETag, plan, acknowledgment or lock",
+            Self::Conflict => {
+                "precondition conflict: missing or stale ETag, plan, acknowledgment or lock, or an output destination that is not empty"
+            }
             Self::Unavailable => "a dependency was unavailable and nothing was sent or committed; safe to retry",
             Self::Integrity => "backup or archive integrity or restore verification failure",
             Self::Denied => "authentication or authorization refused",
@@ -183,8 +185,21 @@ pub(crate) enum Code {
     RequiredCheckFailed,
     // The semantic diff.
     DriftFound,
+    // Initialization.
+    AnswersUnreadable,
+    AnswersNotRegularFile,
+    AnswersUnsafePermissions,
+    AnswersTooLarge,
+    // Conversion between document versions.
+    UnsupportedTargetVersion,
+    DowngradeRefused,
+    InPlaceUnavailable,
     // This process.
     WriteFailed,
+    DestinationExists,
+    DestinationUnusable,
+    PermissionsUnavailable,
+    WrittenBundleInvalid,
     RuntimeUnavailable,
     ClientUnavailable,
 }
@@ -201,6 +216,8 @@ pub(crate) const FAMILIES: &[&str] = &[
     "validate",
     "doctor",
     "diff",
+    "init",
+    "convert",
     "output",
     "internal",
 ];
@@ -261,7 +278,18 @@ impl Code {
         Self::WarningsAsErrors,
         Self::RequiredCheckFailed,
         Self::DriftFound,
+        Self::AnswersUnreadable,
+        Self::AnswersNotRegularFile,
+        Self::AnswersUnsafePermissions,
+        Self::AnswersTooLarge,
+        Self::UnsupportedTargetVersion,
+        Self::DowngradeRefused,
+        Self::InPlaceUnavailable,
         Self::WriteFailed,
+        Self::DestinationExists,
+        Self::DestinationUnusable,
+        Self::PermissionsUnavailable,
+        Self::WrittenBundleInvalid,
         Self::RuntimeUnavailable,
         Self::ClientUnavailable,
     ];
@@ -299,13 +327,15 @@ impl Code {
             "validate" => "docs/ggctl.md#validate-diagnostics",
             "doctor" => "docs/ggctl.md#doctor-diagnostics",
             "diff" => "docs/ggctl.md#diff-diagnostics",
+            "init" => "docs/ggctl.md#init-diagnostics",
+            "convert" => "docs/ggctl.md#convert-diagnostics",
             "output" => "docs/ggctl.md#output-diagnostics",
             _ => "docs/ggctl.md#internal-diagnostics",
         }
     }
 
     fn entry(self) -> (&'static str, &'static str, Exit) {
-        use Exit::{Denied, Drift, Failure, Invalid, Success, Unavailable, Usage};
+        use Exit::{Conflict, Denied, Drift, Failure, Invalid, Success, Unavailable, Usage};
         match self {
             Self::MissingCommand => ("usage.missing_command", "no command was given", Usage),
             Self::UnknownCommand => ("usage.unknown_command", "the command is not one this ggctl implements", Usage),
@@ -466,7 +496,50 @@ impl Code {
                 "--check was given and the bundles differ",
                 Drift,
             ),
+            Self::AnswersUnreadable => ("init.answers_unreadable", "the answers file could not be opened or read", Failure),
+            Self::AnswersNotRegularFile => ("init.answers_not_regular_file", "the answers file is not a regular file", Usage),
+            Self::AnswersUnsafePermissions => (
+                "init.answers_unsafe_permissions",
+                "the answers file, or a directory holding it, is writable by group or other",
+                Usage,
+            ),
+            Self::AnswersTooLarge => ("init.answers_too_large", "the answers file is larger than 64 KiB", Invalid),
+            Self::UnsupportedTargetVersion => (
+                "convert.unsupported_version",
+                "--to is not a document version this ggctl can convert the bundle to",
+                Invalid,
+            ),
+            Self::DowngradeRefused => (
+                "convert.downgrade_refused",
+                "--to is older than the bundle's document version, and ggctl never converts down",
+                Invalid,
+            ),
+            Self::InPlaceUnavailable => (
+                "convert.in_place_unavailable",
+                "this ggctl cannot replace a bundle in place with a conversion that changes it; write it with --output",
+                Invalid,
+            ),
             Self::WriteFailed => ("output.write_failed", "the output could not be written", Failure),
+            Self::DestinationExists => (
+                "output.destination_exists",
+                "the output directory exists and is not empty, or is a link or a file; nothing was written",
+                Conflict,
+            ),
+            Self::DestinationUnusable => (
+                "output.destination_unusable",
+                "the output directory could not be written; nothing was left at it",
+                Failure,
+            ),
+            Self::PermissionsUnavailable => (
+                "output.permissions_unavailable",
+                "the filesystem did not keep owner-only permissions on the files written; nothing was left at the output directory",
+                Failure,
+            ),
+            Self::WrittenBundleInvalid => (
+                "output.written_bundle_invalid",
+                "the files written did not read back as the same valid bundle; nothing was left at the output directory",
+                Failure,
+            ),
             Self::RuntimeUnavailable => ("internal.runtime_unavailable", "the asynchronous runtime could not be started", Failure),
             Self::ClientUnavailable => ("internal.client_unavailable", "the HTTP client could not be built", Failure),
         }
