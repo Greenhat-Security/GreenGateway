@@ -2018,10 +2018,14 @@ mod tests {
             Ok(SchemaStatus::Current)
         );
 
+        // The schema this binary migrates to: where its manifest ends.
+        let current = i32::try_from(MANIFEST.len()).expect("a small manifest");
         let authority = PostgresReadinessAuthority::new(foundation.pool().clone());
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::Writable { schema_version: 24 }
+            AuthorityObservation::Writable {
+                schema_version: current
+            }
         );
         let client = foundation.pool().get().await.expect("fixture client");
         client
@@ -2033,7 +2037,9 @@ mod tests {
             .expect("change fixture checksum without changing extent");
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::IncompatibleSchema { schema_version: 24 }
+            AuthorityObservation::IncompatibleSchema {
+                schema_version: current
+            }
         );
         client
             .execute(
@@ -2044,7 +2050,9 @@ mod tests {
             .expect("restore fixture checksum");
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::Writable { schema_version: 24 }
+            AuthorityObservation::Writable {
+                schema_version: current
+            }
         );
         client
             .execute(
@@ -2055,7 +2063,9 @@ mod tests {
             .expect("remove a fixture history row");
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::IncompatibleSchema { schema_version: 24 }
+            AuthorityObservation::IncompatibleSchema {
+                schema_version: current
+            }
         );
         drop(client);
         clean_database(foundation.pool()).await;
