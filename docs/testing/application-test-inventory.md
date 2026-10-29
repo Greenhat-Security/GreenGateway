@@ -50,9 +50,9 @@ membership and updates this table when it moves it.
 
 | Family | Code it exercises | Proposed module | Tests | Status |
 | --- | --- | --- | --- | --- |
-| Identity and authentication: auth modes, the validator chain (OIDC discovery, JWKS, service tokens, cookie sessions, client certificates) and authentication ahead of RBAC | `auth/`, `middleware/auth.rs`, `bootstrap::auth_validator_from_config` | `auth_app_tests.rs` | 16 | in `app_tests.rs` |
-| Admin login and capabilities: the admin OIDC login flow, the capabilities endpoint and the admin-endpoint denial audit | `admin_identity.rs` | `admin_identity_app_tests.rs` | 19 | in `app_tests.rs` |
-| Admin API tokens: create, list, get, rotate and revoke, actor recording and scope delegation | `admin_tokens.rs`, `admin_authorization::authorize_requested_scopes` | `admin_tokens_app_tests.rs` | 19, 2 of them PostgreSQL-only | in `app_tests.rs` |
+| Identity and authentication: auth modes, the validator chain (OIDC discovery, JWKS, service tokens, cookie sessions, client certificates) and authentication ahead of RBAC | `auth/`, `middleware/auth.rs`, `bootstrap::auth_validator_from_config` | `auth_app_tests.rs` | 16 | moved (#434 PR 1) |
+| Admin login and capabilities: the admin OIDC login flow, the capabilities endpoint and the admin-endpoint denial audit | `admin_identity.rs` | `admin_identity_app_tests.rs` | 19 | moved (#434 PR 1) |
+| Admin API tokens: create, list, get, rotate and revoke, actor recording and scope delegation | `admin_tokens.rs`, `admin_authorization::authorize_requested_scopes` | `admin_tokens_app_tests.rs` | 19, 2 of them PostgreSQL-only | moved (#434 PR 1) |
 | Policy administration: policy and rule CRUD, history, rollback, validate and convert, rule preview, hits and shadow review | `admin_policy.rs` | `admin_policy_app_tests.rs` | 65, plus 13 in `cluster_policy_tests` | in `app_tests.rs` |
 | Connections: Connection and local-secret CRUD, test and refresh, managed OpenAPI, overlays and caller assertions | `admin_connections.rs` | `admin_connections_app_tests.rs` | 33 | in `app_tests.rs` |
 | Tools: the capability inventory, the tool playground and OpenAPI tool registration | `admin_tools.rs` | `admin_tools_app_tests.rs` | 20, plus 9 in `cluster_tools_tests` | in `app_tests.rs` |
@@ -62,6 +62,23 @@ membership and updates this table when it moves it.
 | Listeners, routing and proxy: listener split, admin prefix, admin UI serving, probes, the routing table, proxying and the middleware order | `routing.rs`, `probes.rs`, `proxy/`, `middleware/` | `routing_app_tests.rs` | 81 | in `app_tests.rs` |
 
 The rows add up to the 441 tests defined in `app_tests.rs`.
+
+## After the first move
+
+The identity, admin login and capabilities, and token admin families now live
+in `auth_app_tests.rs`, `admin_identity_app_tests.rs` and
+`admin_tokens_app_tests.rs`, declared from `app_tests.rs`. The listing still
+has 3951 tests with the same test names. Exactly 54 paths changed, each from
+`tests::<name>` to `tests::<module>::<name>`, so a filter on the test name
+still selects the test. `app_tests.rs` now defines 387 tests (350 top-level and
+the same 37 inline), and the separate files 182.
+
+The 28 fixtures that only these tests used moved with them. The rest of what
+they use stays in `app_tests.rs`, because another family or an already
+separate module names it too: for example `test_config`, `TempDb`,
+`TempPolicyFile`, the JWT signing fixtures, the mock OIDC endpoints
+(`admin_session_app_tests.rs` uses them) and the token admin router (the
+capabilities and denial tests drive it as well as the token tests).
 
 ## Shared fixtures
 

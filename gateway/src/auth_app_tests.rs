@@ -1,3 +1,7 @@
+//! Authentication through the composed application: the auth modes, the
+//! validator chain `auth_validator_from_config` builds (OIDC discovery, JWKS,
+//! service tokens, cookie sessions, client certificates) and authentication
+//! running ahead of RBAC. Shared fixtures stay in `app_tests.rs`.
 use super::*;
 
 #[tokio::test]

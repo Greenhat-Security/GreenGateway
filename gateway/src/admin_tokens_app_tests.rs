@@ -1,3 +1,7 @@
+//! The service-token admin API in `admin_tokens.rs`: create, list, get, rotate
+//! and revoke, the actor each change records, and the requested-scope
+//! delegation check (`authorize_requested_scopes`) a create or rotate passes
+//! before anything is minted. Shared fixtures stay in `app_tests.rs`.
 use super::*;
 
 #[tokio::test]

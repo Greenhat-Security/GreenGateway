@@ -1,3 +1,7 @@
+//! The admin identity routes in `admin_identity.rs`: the OIDC login flow, the
+//! capabilities endpoint and the admin-endpoint denial audit. Shared fixtures,
+//! including the mock OIDC endpoints and the token admin router, stay in
+//! `app_tests.rs`.
 use super::*;
 
 fn admin_oidc_login_router(issuer: &str) -> Router {
