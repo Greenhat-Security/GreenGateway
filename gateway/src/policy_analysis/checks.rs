@@ -134,7 +134,9 @@ impl Run<'_> {
             self.stopped = Some(AnalysisLimitation::ComparisonBudgetExhausted);
             return false;
         }
-        if self.comparisons % DEADLINE_CHECK_INTERVAL == 0 && Instant::now() >= self.deadline {
+        if self.comparisons.is_multiple_of(DEADLINE_CHECK_INTERVAL)
+            && Instant::now() >= self.deadline
+        {
             self.stopped = Some(AnalysisLimitation::DeadlineExceeded);
             return false;
         }
@@ -595,11 +597,7 @@ impl Run<'_> {
     /// path before matching any prefix, so a broader earlier route does not
     /// stop a route at an alias path from deciding. An identical prefix does.
     fn alias_cannot_select(&self, earlier: &RouteRule, route: &RouteRule) -> bool {
-        earlier.path_prefix == route.path_prefix
-            || !self
-                .alias_paths
-                .iter()
-                .any(|alias| *alias == route.path_prefix)
+        earlier.path_prefix == route.path_prefix || !self.alias_paths.contains(&route.path_prefix)
     }
 
     fn route_mode(&self, route: &RouteRule) -> EnforcementMode {

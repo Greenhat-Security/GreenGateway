@@ -1511,14 +1511,9 @@ impl RateLaneSelection {
         self.outcome
     }
 
-    /// The override index, for a selection that found one.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "offline analysis reads a selection this way; the live rate adapter matches on its outcome"
-        )
-    )]
+    /// The override index, for a selection that found one. The policy
+    /// analyzer reads a selection this way; the live rate adapter matches on
+    /// its outcome.
     pub(crate) fn matched(&self) -> Option<usize> {
         match self.outcome {
             RateLaneOutcome::Override { index, .. } => Some(index),

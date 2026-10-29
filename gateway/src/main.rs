@@ -123,11 +123,11 @@ mod mcp;
 mod metrics;
 mod middleware;
 mod path_match;
+mod policy_analysis;
 #[cfg(test)]
 #[path = "../tests/support/policy_benchmark.rs"]
 mod policy_benchmark;
 mod policy_eval;
-mod policy_analysis;
 mod policy_replay;
 mod policy_simulation;
 mod policy_testing;

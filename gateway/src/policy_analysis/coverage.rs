@@ -45,11 +45,7 @@ pub(crate) fn pattern_covers(covering: &Segments<'_>, covered: &Segments<'_>) ->
     let (Some(covering), Some(covered)) = (covering.as_deref(), covered.as_deref()) else {
         return false;
     };
-    let never = |segments: &[PatternSegment<'_>]| {
-        segments
-            .iter()
-            .any(|segment| *segment == PatternSegment::Never)
-    };
+    let never = |segments: &[PatternSegment<'_>]| segments.contains(&PatternSegment::Never);
     if never(covering) || never(covered) {
         return false;
     }
