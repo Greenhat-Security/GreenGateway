@@ -36,7 +36,7 @@ use super::{
     json,
     source::{FileName, MANIFEST_FILE_NAME},
     syntax::{decode_text, Node, SyntaxError, TextRules, Value, DOCUMENT_LIMITS},
-    yaml, BundleFile, POLICY_SCHEMA_VERSIONS, TOOLS_SCHEMA_VERSIONS,
+    yaml, FileRole, SourceFile, POLICY_SCHEMA_VERSIONS, TOOLS_SCHEMA_VERSIONS,
 };
 use crate::documents::{API_VERSION_V1ALPHA1, BUNDLE_KIND, DEPLOYMENT_KIND, INIT_ANSWERS_KIND};
 
@@ -383,10 +383,11 @@ fn is_encoded_provider_name(name: &str) -> bool {
 /// The files of the bundle for `profile` and `answers`, the manifest first
 /// and then each file in the order the manifest references it. The
 /// `.gitattributes` beside them is [`GITATTRIBUTES`].
-pub fn scaffold(profile: Profile, answers: &Answers) -> Vec<BundleFile> {
+pub fn scaffold(profile: Profile, answers: &Answers) -> Vec<SourceFile> {
     let deployment = deployment_document(profile).into_bytes();
     let deployment_pin = super::sha256_pin(&deployment);
-    let mut files = vec![BundleFile {
+    let mut files = vec![SourceFile {
+        role: FileRole::Deployment,
         name: FileName::fixed(DEPLOYMENT_FILE),
         bytes: deployment,
     }];
@@ -414,11 +415,13 @@ pub fn scaffold(profile: Profile, answers: &Answers) -> Vec<BundleFile> {
                 tools_version = tools_schema_version(),
                 tools_pin = super::sha256_pin(&tools),
             );
-            files.push(BundleFile {
+            files.push(SourceFile {
+                role: FileRole::Policy,
                 name: FileName::fixed(POLICY_FILE),
                 bytes: policy,
             });
-            files.push(BundleFile {
+            files.push(SourceFile {
+                role: FileRole::Tools,
                 name: FileName::fixed(TOOLS_FILE),
                 bytes: tools,
             });
@@ -458,7 +461,8 @@ pub fn scaffold(profile: Profile, answers: &Answers) -> Vec<BundleFile> {
     );
     files.insert(
         0,
-        BundleFile {
+        SourceFile {
+            role: FileRole::Manifest,
             name: FileName::fixed(MANIFEST_FILE_NAME),
             bytes: manifest.into_bytes(),
         },

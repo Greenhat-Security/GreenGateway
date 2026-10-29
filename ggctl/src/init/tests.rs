@@ -166,10 +166,10 @@ fn a_cluster_bundle_leaves_policy_tools_and_connections_to_the_server() {
         &PublishedSchemasOnly,
     );
     let read = read.bundle.expect("a valid bundle");
-    assert_eq!(read.files.len(), 2);
+    assert_eq!(read.source_files().len(), 2);
     let answers = read_answers(&fs::read(&answers).expect("answers"), AnswersSyntax::Json)
         .expect("the answers read");
-    assert_eq!(read.files, scaffold(Profile::Production, &answers));
+    assert_eq!(read.source_files(), scaffold(Profile::Production, &answers));
 }
 
 #[test]

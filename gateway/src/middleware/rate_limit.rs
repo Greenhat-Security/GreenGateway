@@ -2091,6 +2091,7 @@ mod tests {
             egress: EgressPolicy::default(),
             rate_limits,
             tools: HashMap::new(),
+            identity_mappings: None,
         }
     }
 

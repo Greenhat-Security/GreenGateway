@@ -25,7 +25,7 @@ impl Drop for Written {
 }
 
 impl Written {
-    fn new(files: &[BundleFile]) -> Self {
+    fn new(files: &[SourceFile]) -> Self {
         let root =
             std::env::temp_dir().join(format!("greengateway-bundle-init-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).expect("temporary bundle directory should create");
@@ -117,7 +117,7 @@ fn every_profile_and_answer_set_scaffolds_a_bundle_the_reader_accepts_strictly()
             assert_eq!(bundle.deployment.profile, profile);
             assert!(bundle.connections_from_server);
             // The reader saw exactly the files the scaffold wrote, in order.
-            assert_eq!(bundle.files, files);
+            assert_eq!(bundle.source_files(), files);
             match answers.topology() {
                 Topology::Standalone => {
                     let Some(BundledResource::Bundle { document, .. }) = &bundle.policy else {

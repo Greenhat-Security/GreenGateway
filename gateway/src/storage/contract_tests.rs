@@ -13513,6 +13513,7 @@ pub(crate) mod postgres_audit_tests {
                 principal_ids: Vec::new(),
             },
             action: RuleAction::Allow,
+            conditions: None,
         };
         let client = pool.get().await.expect("client");
         client

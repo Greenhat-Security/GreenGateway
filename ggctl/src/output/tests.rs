@@ -48,11 +48,11 @@ impl Parent {
     }
 }
 
-fn files() -> Vec<BundleFile> {
+fn files() -> Vec<SourceFile> {
     scaffold(Profile::Production, &Answers::default())
 }
 
-fn assert_written(destination: &Path, files: &[BundleFile]) {
+fn assert_written(destination: &Path, files: &[SourceFile]) {
     for file in files {
         assert_eq!(
             fs::read(destination.join(file.name.as_str())).expect("the file is written"),
@@ -85,7 +85,7 @@ fn a_new_bundle_is_written_whole_and_read_back_and_no_staging_remains() {
     let files = files();
     let read = write_new_bundle(&destination, &files).expect("the bundle is written");
     let bundle = read.bundle.expect("it read back as a bundle");
-    assert_eq!(bundle.files, files);
+    assert_eq!(bundle.source_files(), files);
     assert!(read.diagnostics.is_empty(), "{:?}", read.diagnostics);
     assert_written(&destination, &files);
     assert_eq!(parent.entries(), ["bundle"]);

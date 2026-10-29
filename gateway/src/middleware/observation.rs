@@ -3362,6 +3362,7 @@ paths:
             egress: EgressPolicy::default(),
             rate_limits: Vec::new(),
             tools: HashMap::new(),
+            identity_mappings: None,
         }
     }
 
@@ -3386,6 +3387,7 @@ paths:
             dispatch: None,
             principal: PrincipalMatcher::default(),
             action,
+            conditions: None,
         }
     }
 

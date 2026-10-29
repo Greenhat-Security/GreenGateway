@@ -332,7 +332,7 @@ mod tests {
                     report.diagnostics
                 );
                 let read = report.bundle.expect("the bundle should be read");
-                assert_eq!(read.files, files);
+                assert_eq!(read.source_files(), files);
                 match (&read.policy, answers.operator()) {
                     (Some(BundledResource::Bundle { document, .. }), operator) => {
                         assert_eq!(document.default_action, DefaultAction::Deny);

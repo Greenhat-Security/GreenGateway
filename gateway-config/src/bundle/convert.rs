@@ -20,7 +20,7 @@
 //! refused. A release that adds a version adds its rung and its step here,
 //! and keeps reading the previous version for at least one minor release.
 
-use super::{ApiVersion, Bundle, BundleFile};
+use super::{ApiVersion, Bundle, SourceFile};
 
 /// Why a conversion was refused.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -38,7 +38,7 @@ pub struct Conversion {
     pub from: ApiVersion,
     pub to: ApiVersion,
     /// The converted bundle's files, the manifest first.
-    pub files: Vec<BundleFile>,
+    pub files: Vec<SourceFile>,
     /// How many steps ran; none when the bundle was already at the target.
     pub steps: usize,
 }
@@ -56,7 +56,7 @@ impl Conversion {
 struct Step {
     from: &'static str,
     to: &'static str,
-    apply: fn(Vec<BundleFile>) -> Vec<BundleFile>,
+    apply: fn(Vec<SourceFile>) -> Vec<SourceFile>,
 }
 
 /// The steps between neighbouring rungs of [`ApiVersion::ALL`].
@@ -72,7 +72,9 @@ pub fn convert<P, T>(bundle: &Bundle<P, T>, target: &str) -> Result<Conversion, 
     let to = ApiVersion::parse(target).ok_or(Refusal::UnsupportedVersion)?;
     let files = steps
         .iter()
-        .fold(bundle.files.clone(), |files, step| (step.apply)(files));
+        .fold(bundle.source_files().to_vec(), |files, step| {
+            (step.apply)(files)
+        });
     Ok(Conversion {
         from: bundle.api_version,
         to,
@@ -108,15 +110,19 @@ fn plan<'s>(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
     use crate::bundle::{
-        init::{scaffold, Answers},
+        init::{scaffold, Answers, GITATTRIBUTES},
+        read_bundle,
         source::FileName,
-        Profile,
+        FileRole, Profile, PublishedSchemasOnly, ReadOptions,
     };
 
-    fn marked(mut files: Vec<BundleFile>, marker: &'static str) -> Vec<BundleFile> {
-        files.push(BundleFile {
+    fn marked(mut files: Vec<SourceFile>, marker: &'static str) -> Vec<SourceFile> {
+        files.push(SourceFile {
+            role: FileRole::Tools,
             name: FileName::fixed(marker),
             bytes: marker.as_bytes().to_vec(),
         });
@@ -205,21 +211,30 @@ mod tests {
             "a new step needs its own conversion tests"
         );
         let files = scaffold(Profile::Production, &Answers::default());
-        let bundle: Bundle<(), ()> = Bundle {
-            api_version: ApiVersion::V1Alpha1,
-            name: "greengateway".to_owned(),
-            source_digest: String::new(),
-            deployment: crate::bundle::DeploymentDocument {
-                file: FileName::fixed("deployment.yaml"),
-                sha256: String::new(),
-                profile: Profile::Production,
-                canonical_json: Vec::new(),
-            },
-            policy: None,
-            tools: None,
-            connections_from_server: true,
-            files: files.clone(),
-        };
+        let root = std::env::temp_dir().join(format!(
+            "greengateway-bundle-convert-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).expect("temporary bundle directory should create");
+        for file in &files {
+            fs::write(root.join(file.name.as_str()), &file.bytes)
+                .expect("bundle file should write");
+        }
+        fs::write(root.join(".gitattributes"), GITATTRIBUTES).expect("attributes should write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for entry in fs::read_dir(&root).expect("the bundle lists") {
+                let path = entry.expect("an entry").path();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                    .expect("permissions should set");
+            }
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+                .expect("permissions should set");
+        }
+        let read = read_bundle(&root, ReadOptions { strict: true }, &PublishedSchemasOnly);
+        let _ = fs::remove_dir_all(&root);
+        let bundle = read.bundle.expect("the scaffold reads as a bundle");
         let conversion = convert(&bundle, "greengateway.dev/v1alpha1").expect("the identity");
         assert_eq!(conversion.from, ApiVersion::V1Alpha1);
         assert_eq!(conversion.to, ApiVersion::V1Alpha1);

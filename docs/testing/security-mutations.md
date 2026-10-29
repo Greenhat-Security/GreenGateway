@@ -30,8 +30,8 @@ that every selected test still exists, before merge; see
 | `path_match::is_unsafe_request_path` | Ambiguous request-path rejection | Permit backslashes; permit empty interior segments |
 | `egress::host_glob_matches` | Egress exact and wildcard host matching | Remove the wildcard label boundary; skip request-host case folding |
 | `policy_eval::route_host_matches` | Shared evaluator host binding | Ignore a required binding; accept an absent request host |
-| `policy_eval::CompiledPolicy::select_rate_lane` | Which `rate_limits` override governs an authenticated request | Ignore the override's principal constraint; ignore its path pattern; select the last matching override instead of the first |
-| `policy_eval::CompiledPolicy::evaluate_tool` | Tool admission, previews and the rendered-HTTP rule | Admit a disabled tool; ignore a matching deny rule; never consult the rendered request's HTTP rule |
+| `policy_eval::CompiledPolicy::select_rate_lane_with_facts` | Which `rate_limits` override governs an authenticated request | Ignore the override's principal constraint; ignore its path pattern; select the last matching override instead of the first |
+| `policy_eval::CompiledPolicy::evaluate_tool_with_facts` | Tool admission, previews and the rendered-HTTP rule | Admit a disabled tool; ignore a matching deny rule; never consult the rendered request's HTTP rule |
 | `policy_eval::tools::tool_principal_matches` | A tool entry's role, issuer and authentication-method constraints | Admit an anonymous caller to a constrained tool; ignore `allowed_roles` |
 | `policy_eval::tools::validate_rendered_http_path` | Rendered tool paths the HTTP rule is evaluated over | Accept a `..` segment |
 | `policy_eval::egress::CompiledEgressPolicy::evaluate` | That a destination the static egress checks refuse is refused before any name is resolved | Ask for resolution facts while a static refusal is pending |
@@ -65,7 +65,14 @@ them. The #422 legacy retirement moved the enum-source precheck and the
 tool-name coverage check of rule suggestions onto the evaluator
 (`CompiledPolicy::evaluate_source_request`, `CompiledPolicy::match_tool_rules`).
 It retired no registered function and added no target, so the registry and its
-measured campaign time are unchanged. When ownership moves again, update the
+measured campaign time are unchanged. Identity mappings and typed rule
+conditions (#243, item 16) moved the bodies of `select_rate_lane` and
+`evaluate_tool` into `select_rate_lane_with_facts` and
+`evaluate_tool_with_facts`, which take the facts those matchers read; the
+original names are now one-line calls of them with no fact captured, which is
+what every serving adapter calls. The targets moved with the bodies, the
+rendered-HTTP mutation now replaces the three-valued rule scan with
+`RuleScan::NoMatch`, and the same tests are selected. When ownership moves again, update the
 target, function hash and exact tests in the same reviewed change, remove the
 retired target, and remeasure.
 
@@ -405,7 +412,7 @@ source = pathlib.Path("gateway/src/path_match.rs").read_bytes()
 start = source.index(b"pub fn path_prefix_matches(")
 print(hashlib.sha256(source[start:source.index(b"\n}\n", start) + 3]).hexdigest())
 source = pathlib.Path("gateway/src/policy_eval/mod.rs").read_bytes()
-start = source.index(b"    pub(crate) fn select_rate_lane(")
+start = source.index(b"    pub(crate) fn select_rate_lane_with_facts(")
 print(hashlib.sha256(source[start:source.index(b"\n    }\n", start) + 7]).hexdigest())
 PY
 ```

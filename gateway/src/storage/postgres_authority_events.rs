@@ -1,7 +1,7 @@
 //! PostgreSQL authority-event journal and delivery cursor (issue #425, PR 3).
 //!
 //! Migration 21 adds three tables beside the evidence tables of migrations 16
-//! and 18:
+//! and 18 (and, since migration 26, migration 19's admin session evidence):
 //!
 //! - `authority_event_journal`: one row per committed evidence row, appended
 //!   by the producer in the evidence row's own transaction, naming the
@@ -22,6 +22,16 @@
 //!    commit order and the committed journal is gapless. A full journal
 //!    reserves nothing and the producer's whole mutation rolls back: no
 //!    accepted event is ever evicted to admit a new one.
+//!
+//!    Admin sessions (migration 26) append in the statement that writes
+//!    their evidence (`storage::postgres_admin_sessions`), with one
+//!    difference: a withdrawal must never be refused for capacity. So a
+//!    grant takes two units, one for its own event and one *held* for its
+//!    withdrawal (`reserved_withdrawals`), and only while
+//!    `retained_events + 2 <= capacity`; a withdrawal spends its grant's
+//!    held unit and checks no capacity. `retained_events` counts the units
+//!    in use, the retained rows plus the held units, so the append above can
+//!    never spend a unit a session holds.
 //! 2. **Claim** ([`PostgresAuthorityEventStore::claim`]). A replica that took
 //!    the dispatcher's execution lease raises the cursor's fence to the
 //!    lease's fence (never lowering it) and learns the committed position.
@@ -81,20 +91,23 @@ const RETENTION_SCAN_FACTOR: i64 = 10;
 pub(crate) const MAX_READ_BATCH: usize = 1_000;
 
 /// Which evidence table a journal row indexes. The values are the table
-/// names, and migration 21's CHECK holds the same closed list.
+/// names, and migration 26's CHECK holds the same closed list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum JournalSource {
     ConnectionChange,
     ServiceTokenChange,
     JwtRevocation,
+    /// Migration 19's admin session grants and withdrawals, journaled since
+    /// migration 26.
+    AdminSession,
 }
 
 impl JournalSource {
-    #[cfg_attr(not(test), allow(dead_code))] // the tests hold the list to the migration's CHECK
-    pub(crate) const ALL: [Self; 3] = [
+    pub(crate) const ALL: [Self; 4] = [
         Self::ConnectionChange,
         Self::ServiceTokenChange,
         Self::JwtRevocation,
+        Self::AdminSession,
     ];
 
     pub(crate) const fn table(self) -> &'static str {
@@ -102,6 +115,7 @@ impl JournalSource {
             Self::ConnectionChange => "connection_change_evidence",
             Self::ServiceTokenChange => "service_token_change_evidence",
             Self::JwtRevocation => "jwt_revocation_evidence",
+            Self::AdminSession => "admin_session_evidence",
         }
     }
 
@@ -163,12 +177,18 @@ pub(crate) async fn append_to_journal(
     if appended == 1 {
         return Ok(());
     }
+    report_capacity_refusal(source);
+    Err(JournalAppendError::CapacityExhausted)
+}
+
+/// Count and log one mutation refused because the journal was full. Every
+/// producer that finds no room calls this once, before it rolls back.
+pub(crate) fn report_capacity_refusal(source: JournalSource) {
     record_capacity_refusal();
     tracing::warn!(
         source = source.table(),
         "authority event journal is at capacity; the change was refused and nothing was committed"
     );
-    Err(JournalAppendError::CapacityExhausted)
 }
 
 /// Count one mutation refused because the journal was full.
@@ -200,17 +220,19 @@ pub(crate) struct JournaledEvidence {
     /// The resource's owner, when it has one: the issuer of a JWT
     /// revocation's `jti` digest.
     pub(crate) resource_owner: Option<String>,
-    /// The Connection ID, the token ID or the `jti` digest.
+    /// The Connection ID, the token ID, the `jti` digest or the admin
+    /// session ID.
     pub(crate) resource_id: Option<String>,
     pub(crate) prior_version: Option<i64>,
     pub(crate) new_version: Option<i64>,
+    /// `None` for an admin session, which takes no shared revision.
     pub(crate) security_revision: Option<i64>,
     /// RFC 3339 UTC with microseconds, from the evidence row.
     pub(crate) committed_at: Option<String>,
     /// The actor's canonical issuer, kind and auth mode (migration 24). All
     /// three are `None` for evidence committed before migration 24, which
-    /// recorded none of them; the issuer is also `None` for an actor that
-    /// has none.
+    /// recorded none of them, and for admin session evidence, which records
+    /// none of them; the issuer is also `None` for an actor that has none.
     pub(crate) actor_issuer: Option<String>,
     pub(crate) actor_kind: Option<String>,
     pub(crate) actor_auth_mode: Option<String>,
@@ -219,7 +241,12 @@ pub(crate) struct JournaledEvidence {
 /// The journal and the cursor, as one read sees them.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct JournalStats {
+    /// The units of capacity in use: retained rows plus the units held for
+    /// admin session withdrawals.
     pub(crate) retained: i64,
+    /// Of those, the units held for the withdrawal of every admin session
+    /// granted and not yet withdrawn (migration 26).
+    pub(crate) reserved: i64,
     pub(crate) capacity: i64,
     /// The last position ever assigned.
     pub(crate) head: i64,
@@ -256,7 +283,8 @@ impl PostgresAuthorityEventStore {
 
     /// Apply the configured capacity. Called by every replica at startup;
     /// replicas agree on the value because it is fingerprinted. A capacity
-    /// below the retained count admits nothing until retention frees room.
+    /// below the units in use admits no new event until retention frees
+    /// room; admin session withdrawals are still recorded.
     pub async fn configure_capacity(&self, capacity: u64) -> Result<(), RepositoryError> {
         let capacity = i64::try_from(capacity)
             .map_err(|_| RepositoryError::invalid_parameter(OPERATION_CONFIGURE, "capacity"))?;
@@ -439,19 +467,23 @@ impl PostgresAuthorityEventStore {
 /// `$1` the cursor position, `$2` the row limit. Every evidence join is
 /// keyed on the journal row's own table, so a row joins at most one
 /// evidence row; the evidence tables' primary keys are their event IDs.
+/// Admin session evidence names the session's own identity as its actor
+/// and records no actor kind, auth mode, version or shared revision, so
+/// those columns stay empty for it.
 const READ_AFTER_SQL: &str = r#"
 SELECT j.position,
        j.event_id::text,
        j.source,
-       coalesce(c.operation_id, t.operation_id, r.operation_id)::text,
-       coalesce(c.actor_user_id, t.actor_user_id, r.actor_user_id),
-       coalesce(c.action, t.action, r.action),
+       coalesce(c.operation_id, t.operation_id, r.operation_id, a.operation_id)::text,
+       coalesce(c.actor_user_id, t.actor_user_id, r.actor_user_id, a.user_id),
+       coalesce(c.action, t.action, r.action, a.action),
        r.issuer,
-       coalesce(c.connection_id::text, t.token_id, r.jti_hash),
+       coalesce(c.connection_id::text, t.token_id, r.jti_hash, a.session_id::text),
        coalesce(c.prior_version, t.prior_version),
        t.new_version,
        coalesce(c.security_revision, t.security_revision, r.security_revision),
-       to_char(coalesce(c.committed_at, t.committed_at, r.committed_at) AT TIME ZONE 'UTC',
+       to_char(coalesce(c.committed_at, t.committed_at, r.committed_at, a.committed_at)
+                   AT TIME ZONE 'UTC',
                'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
        coalesce(c.actor_issuer, t.actor_issuer, r.actor_issuer),
        coalesce(c.actor_kind, t.actor_kind, r.actor_kind),
@@ -463,6 +495,8 @@ LEFT JOIN greengateway.service_token_change_evidence t
     ON j.source = 'service_token_change_evidence' AND t.event_id = j.event_id
 LEFT JOIN greengateway.jwt_revocation_evidence r
     ON j.source = 'jwt_revocation_evidence' AND r.event_id = j.event_id
+LEFT JOIN greengateway.admin_session_evidence a
+    ON j.source = 'admin_session_evidence' AND a.event_id = j.event_id
 WHERE j.position > $1
 ORDER BY j.position
 LIMIT $2
@@ -470,6 +504,7 @@ LIMIT $2
 
 const STATS_SQL: &str = r#"
 SELECT s.retained_events,
+       s.reserved_withdrawals,
        s.capacity,
        s.last_position,
        c.position,
@@ -524,11 +559,12 @@ async fn read_stats(client: &tokio_postgres::Client) -> Result<JournalStats, Rep
         .ok_or_else(|| invalid_data(OPERATION_STATS))?;
     Ok(JournalStats {
         retained: column(&row, 0, OPERATION_STATS)?,
-        capacity: column(&row, 1, OPERATION_STATS)?,
-        head: column(&row, 2, OPERATION_STATS)?,
-        cursor: column(&row, 3, OPERATION_STATS)?,
-        first_retained: column(&row, 4, OPERATION_STATS)?,
-        oldest_undelivered_age_secs: column(&row, 5, OPERATION_STATS)?,
+        reserved: column(&row, 1, OPERATION_STATS)?,
+        capacity: column(&row, 2, OPERATION_STATS)?,
+        head: column(&row, 3, OPERATION_STATS)?,
+        cursor: column(&row, 4, OPERATION_STATS)?,
+        first_retained: column(&row, 5, OPERATION_STATS)?,
+        oldest_undelivered_age_secs: column(&row, 6, OPERATION_STATS)?,
     })
 }
 
@@ -579,21 +615,31 @@ fn invalid_data(operation: &'static str) -> RepositoryError {
 mod tests {
     use super::*;
 
-    /// The source vocabulary is migration 21's CHECK, value for value, and
+    /// The source vocabulary is migration 26's CHECK, value for value, and
     /// every value round-trips.
     #[test]
     fn the_journal_sources_are_the_migrations_closed_vocabulary() {
-        let migration = include_str!("migrations/0021_authority_event_journal.sql");
+        let journal = include_str!("migrations/0021_authority_event_journal.sql");
+        let migration = include_str!("migrations/0026_admin_session_evidence_journal.sql");
+        let (_, check) = migration
+            .split_once("ADD CONSTRAINT authority_event_journal_source_check CHECK (")
+            .expect("migration 26 replaces the source CHECK");
+        let (check, _) = check.split_once(");").expect("the CHECK ends");
+        assert_eq!(
+            check.matches("_evidence'").count(),
+            JournalSource::ALL.len(),
+            "{check}"
+        );
         for source in JournalSource::ALL {
             assert!(
-                migration.contains(&format!("'{}'", source.table())),
-                "migration 21 must allow {}",
+                check.contains(&format!("'{}'", source.table())),
+                "migration 26 must allow {}",
                 source.table()
             );
             assert_eq!(JournalSource::from_table(source.table()), Some(source));
         }
         assert_eq!(JournalSource::from_table("security_outbox"), None);
-        assert!(migration.contains(&format!("consumer IN ('{DISPATCHER_CONSUMER}')")));
+        assert!(journal.contains(&format!("consumer IN ('{DISPATCHER_CONSUMER}')")));
     }
 
     /// Undelivered is the distance from the cursor (or, before the first

@@ -7,13 +7,16 @@
 //! snapshot and translate the result for `tools::runtime` and inventory.
 
 use super::{
-    framed_digest, validate_path, CompiledPolicy, EvaluationError, LogicalDecision, PolicyEffect,
-    PrincipalFact, ResourceSnapshot, RuleReference, MAX_TRACE_BYTES,
+    framed_digest, validate_facts, validate_path, CompiledPolicy, EvaluationError, FactsUse,
+    LogicalDecision, PolicyEffect, PolicyFacts, PrincipalFact, ResourceSnapshot, RuleReference,
+    MAX_TRACE_BYTES, UNCAPTURED_FACTS,
 };
 use crate::{
     auth::Principal,
     rbac::{
-        matcher::RuleDispatchContext, policy::ToolPolicyEntry, rule::principal_identity_matches,
+        matcher::{RuleDispatchContext, RuleScan},
+        policy::ToolPolicyEntry,
+        rule::principal_identity_matches,
         RuleAction,
     },
     request_bounds::{MAX_REQUEST_METHOD_BYTES, MAX_TOOL_NAME_BYTES},
@@ -147,6 +150,7 @@ impl ToolEvaluationContext {
                 TOOL_SEMANTICS_VERSION,
                 &bytes,
             ),
+            facts: FactsUse::Uncaptured,
         })
     }
 }
@@ -196,6 +200,10 @@ pub(crate) fn validate_rendered_http_path(path: &str) -> Result<(), EvaluationEr
 struct ToolBinding {
     snapshot: ResourceSnapshot,
     context_digest: [u8; 32],
+    /// As for the HTTP lane's binding: absent from the trace without facts,
+    /// and an answer given with them is never reusable.
+    #[serde(skip_serializing_if = "FactsUse::is_uncaptured")]
+    facts: FactsUse,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -244,6 +252,10 @@ pub(crate) enum ToolLimitation {
     Method,
     #[serde(rename = "missing_path")]
     Path,
+    /// A fact an identity mapping or a tool or rendered-HTTP rule's
+    /// conditions read was not captured, and the answer turns on it.
+    #[serde(rename = "missing_matcher_fact")]
+    MatcherFact,
 }
 
 const NOT_EVALUATED: &[&str] = &[
@@ -383,9 +395,23 @@ impl CompiledPolicy {
         &self,
         context: &ToolEvaluationContext,
     ) -> Result<ToolEvaluation, EvaluationError> {
+        self.evaluate_tool_with_facts(context, &UNCAPTURED_FACTS)
+    }
+
+    /// [`Self::evaluate_tool`] with the facts typed matchers read: an
+    /// identity mapping's organization, and whatever a tool-name or rendered
+    /// HTTP rule's conditions read.
+    pub(crate) fn evaluate_tool_with_facts(
+        &self,
+        context: &ToolEvaluationContext,
+        facts: &PolicyFacts,
+    ) -> Result<ToolEvaluation, EvaluationError> {
         context.validate(self.snapshot())?;
+        validate_facts(facts)?;
+        let mut binding = context.binding()?;
+        binding.facts = FactsUse::of(facts);
         let mut result = ToolEvaluation {
-            binding: context.binding()?,
+            binding,
             domain: TOOL_DOMAIN,
             semantics_version: TOOL_SEMANTICS_VERSION,
             context_version: TOOL_CONTEXT_VERSION,
@@ -401,13 +427,19 @@ impl CompiledPolicy {
         let Some(name) = &context.tool_name else {
             return Ok(result.incomplete(ToolLimitation::ToolName));
         };
-        let principal = match &context.principal {
+        let effective = match &context.principal {
             PrincipalFact::Missing if context.operation != ToolOperation::CompositeLeaf => {
                 return Ok(result.incomplete(ToolLimitation::Principal))
             }
-            PrincipalFact::Authenticated(identity) => Some(&identity.0),
+            PrincipalFact::Authenticated(identity) => {
+                match self.effective_principal(&identity.0, facts) {
+                    Some(effective) => Some(effective),
+                    None => return Ok(result.incomplete(ToolLimitation::MatcherFact)),
+                }
+            }
             _ => None,
         };
+        let principal = effective.as_deref();
         let preview = matches!(
             context.operation,
             ToolOperation::Visibility | ToolOperation::PolicyEligibility
@@ -422,11 +454,12 @@ impl CompiledPolicy {
             result.reason = ToolReason::NoHttpRule;
             // This is intentionally neither contextless dispatch nor the HTTP
             // route/default evaluator. It mirrors authorize_http_operation.
-            self.matcher.evaluate_with_dispatch(
+            self.matcher.scan_with_dispatch(
                 method.as_str(),
                 path,
                 principal,
                 RuleDispatchContext::unknown(),
+                facts,
             )
         } else {
             let Some(tool) = self.engine.policy().tools.get(name) else {
@@ -456,7 +489,14 @@ impl CompiledPolicy {
             if preview {
                 result.reason = ToolReason::Eligible;
             }
-            self.matcher.evaluate_tool(name, principal)
+            self.matcher.scan_tool(name, principal, facts)
+        };
+        let decision = match decision {
+            RuleScan::Matched(decision) => Some(decision),
+            RuleScan::NoMatch => None,
+            RuleScan::Undetermined { .. } => {
+                return Ok(result.incomplete(ToolLimitation::MatcherFact))
+            }
         };
         if let Some(decision) = decision {
             result.matched = Some(RuleReference::Direct(decision.rule_index));
@@ -525,6 +565,10 @@ pub(crate) enum SourceRequestDecision {
         /// Source ordinal of the rule, including disabled and tool-name rules.
         index: usize,
     },
+    /// A deny rule whose conditions read a fact a source request never has
+    /// was reached before any deny that certainly matched, so whether a deny
+    /// applies cannot be told. The precheck refuses the source.
+    Undetermined,
 }
 
 impl CompiledPolicy {
@@ -576,11 +620,13 @@ impl CompiledPolicy {
                 None,
                 RuleDispatchContext::contextless(),
                 true,
+                &UNCAPTURED_FACTS,
             ) {
-                Some(decision) => SourceRequestDecision::Denied {
+                RuleScan::Matched(decision) => SourceRequestDecision::Denied {
                     index: decision.rule_index,
                 },
-                None => SourceRequestDecision::Allowed,
+                RuleScan::NoMatch => SourceRequestDecision::Allowed,
+                RuleScan::Undetermined { .. } => SourceRequestDecision::Undetermined,
             },
         )
     }

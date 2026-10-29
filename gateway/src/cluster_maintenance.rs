@@ -284,10 +284,12 @@ impl MaintenanceJob for PendingLoginPrune {
     }
 }
 
-/// Withdraw expired admin sessions, each with its evidence row, and delete
-/// expired pending cookie logins
-/// (`PostgresAdminSessionStore::prune_expired_with`). Needs no keyring, so it
-/// runs whether or not this replica has a session mode configured.
+/// Withdraw expired admin sessions, each with its evidence row and its
+/// authority-event journal row, and delete expired pending cookie logins, in
+/// one transaction (`PostgresAdminSessionStore::prune_expired_with`). An
+/// expiry spends the journal capacity its grant held, so a full journal never
+/// stops this job. Needs no keyring, so it runs whether or not this replica
+/// has a session mode configured.
 pub(crate) struct AdminSessionPrune {
     pub(crate) limit: u32,
 }

@@ -35,7 +35,7 @@ use std::{
 };
 
 use gateway_config::bundle::{
-    self, init::GITATTRIBUTES, BundleFile, PublishedSchemasOnly, ReadOptions, MANIFEST_FILE_NAME,
+    self, init::GITATTRIBUTES, PublishedSchemasOnly, ReadOptions, SourceFile, MANIFEST_FILE_NAME,
 };
 
 use crate::{diagnostic::Code, validate::BundleRead};
@@ -83,7 +83,7 @@ enum Destination {
 /// reader read it.
 pub(crate) fn write_new_bundle(
     destination: &Path,
-    files: &[BundleFile],
+    files: &[SourceFile],
 ) -> Result<BundleRead, WriteError> {
     let found = destination_state(destination)?;
     let staging = Staging::create(destination)?;
@@ -110,7 +110,7 @@ pub(crate) fn write_new_bundle(
     if read
         .bundle
         .as_ref()
-        .is_none_or(|bundle| bundle.files != files)
+        .is_none_or(|bundle| bundle.source_files() != files)
     {
         return Err(WriteError::Invalid(Box::new(read)));
     }

@@ -8433,6 +8433,7 @@ fn expected_ha_metric_names() -> Vec<&'static str> {
         metrics::AUDIT_STREAM_REPLAY_BACKLOG_EVENTS,
         metrics::AUDIT_STREAM_DUPLICATE_POSITIONS_TOTAL,
         metrics::AUTHORITY_EVENT_JOURNAL_RETAINED,
+        metrics::AUTHORITY_EVENT_JOURNAL_RESERVED,
         metrics::AUTHORITY_EVENT_JOURNAL_CAPACITY,
         metrics::AUTHORITY_EVENT_UNDELIVERED,
         metrics::AUTHORITY_EVENT_OLDEST_UNDELIVERED_AGE_SECONDS,
@@ -8800,6 +8801,7 @@ async fn synthetic_ha_run() {
         authority_events::dispatcher::record_journal_stats(
             &storage::postgres_authority_events::JournalStats {
                 retained: 7,
+                reserved: 2,
                 capacity: 1_000_000,
                 head: 41,
                 cursor: Some(38),
@@ -21162,6 +21164,7 @@ async fn policy_rule_preview_moderate_scale_completes_under_two_seconds() {
                 principal_ids: Vec::new(),
             },
             action: rbac::RuleAction::Deny,
+            conditions: None,
         },
         from: Some("2026-01-01T00:00:00Z".to_owned()),
         to: Some("2026-01-02T00:00:00Z".to_owned()),
@@ -37591,3 +37594,6 @@ mod admin_policy_simulations_tests;
 
 #[path = "admin_policy_replays_tests.rs"]
 mod admin_policy_replays_tests;
+
+#[path = "admin_policy_evidence_tests.rs"]
+mod admin_policy_evidence_tests;

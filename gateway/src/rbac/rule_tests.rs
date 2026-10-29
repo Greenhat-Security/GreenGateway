@@ -147,6 +147,7 @@ fn rule_matcher_supports_method_wildcards() {
         dispatch: None,
         principal: PrincipalMatcher::default(),
         action: RuleAction::Allow,
+        conditions: None,
     };
 
     assert!(rule.matches("get", "/data", None));
@@ -162,6 +163,7 @@ fn rule_matcher_supports_method_wildcards() {
         dispatch: None,
         principal: PrincipalMatcher::default(),
         action: RuleAction::Allow,
+        conditions: None,
     };
 
     assert!(wildcard_rule.matches("DELETE", "/data", None));
@@ -178,6 +180,7 @@ fn rule_matcher_supports_literals_globs_and_params() {
         dispatch: None,
         principal: PrincipalMatcher::default(),
         action: RuleAction::Allow,
+        conditions: None,
     };
     let one_asset_segment = Rule {
         id: None,
@@ -188,6 +191,7 @@ fn rule_matcher_supports_literals_globs_and_params() {
         dispatch: None,
         principal: PrincipalMatcher::default(),
         action: RuleAction::Allow,
+        conditions: None,
     };
     let any_admin_depth = Rule {
         id: None,
@@ -198,6 +202,7 @@ fn rule_matcher_supports_literals_globs_and_params() {
         dispatch: None,
         principal: PrincipalMatcher::default(),
         action: RuleAction::Allow,
+        conditions: None,
     };
 
     assert!(user_item.matches("GET", "/api/users/123", None));
@@ -219,6 +224,7 @@ fn rule_matcher_is_anchored_to_whole_path() {
         dispatch: None,
         principal: PrincipalMatcher::default(),
         action: RuleAction::Allow,
+        conditions: None,
     };
 
     assert!(!rule.matches("GET", "/prefix/api/users/123", None));
