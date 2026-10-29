@@ -480,7 +480,8 @@ migration 21; `gateway/src/storage/postgres_authority_events.rs` and
   `_undelivered`, `_oldest_undelivered_age_seconds`, `_delivered_total`,
   `_delivery_failures_total{kind}`, `_capacity_refusals_total` and
   `_evidence_failures_total` (a change refused because the database refused its
-  evidence row or journal entry for any other reason), every label from a fixed
+  evidence row or journal entry for any other reason, including the unjournaled
+  policy, tools and catalog evidence below), every label from a fixed
   vocabulary ([metrics](deployment/postgres.md#metrics)). The
   [operational rule pack](deployment/operational-alerts.md#alert-policy) pages on
   either refusal counter and on a full journal, warns on a filling journal,
@@ -522,8 +523,8 @@ Not covered by PR 3, and still open:
   retained and not delivered. Journaling them adds the journal's capacity
   reservation to every policy, tools and catalog commit, and to the first-boot
   tools seed. A change refused because its evidence insert failed is logged with
-  its classified store error but is not counted by `_evidence_failures_total`, so
-  the rule pack does not page on it.
+  its classified store error and counted by `_evidence_failures_total`, so the
+  rule pack pages on it like any other refused authority change.
 - **Every other operation.** PostgreSQL Connection create/replace, credential
   bindings and token issue have no evidence rows to journal yet.
 

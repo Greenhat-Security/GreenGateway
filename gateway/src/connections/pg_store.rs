@@ -5116,7 +5116,8 @@ struct CatalogChangeEvidence<'a> {
 /// Append one catalog evidence row inside the caller's transaction. The
 /// row's `event_id` is minted here, once; `committed_at` is the database
 /// clock's. Any failure is returned for the caller to roll back, so the
-/// publication it describes never commits without it.
+/// publication it describes never commits without it. A failed insert is
+/// counted here, as the journaled producers count theirs.
 async fn record_catalog_change_evidence(
     client: &deadpool_postgres::Object,
     evidence: &CatalogChangeEvidence<'_>,
@@ -5155,7 +5156,10 @@ async fn record_catalog_change_evidence(
             ],
         )
         .await
-        .map_err(|error| pg_error(OPERATION_CATALOG_CHANGE_EVIDENCE, error))?;
+        .map_err(|error| {
+            crate::storage::postgres_authority_events::record_evidence_failure();
+            pg_error(OPERATION_CATALOG_CHANGE_EVIDENCE, error)
+        })?;
     Ok(())
 }
 

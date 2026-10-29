@@ -606,6 +606,12 @@ async fn a_failed_document_evidence_insert_rolls_back_the_whole_commit() {
         .expect("revision reads");
     let outbox_before = outbox(&pool).await;
     let evidence_before = evidence(&pool).await;
+    // The recorder is this thread's, and the test's current-thread runtime
+    // runs both stores on this thread.
+    let recorder = crate::audit::sink::tests::CountingRecorder::default();
+    let _recording = ::metrics::set_default_local_recorder(&recorder);
+    let evidence_failures =
+        || recorder.count(crate::metrics::AUTHORITY_EVENT_EVIDENCE_FAILURES_TOTAL, &[]);
 
     pool.get()
         .await
@@ -654,6 +660,9 @@ async fn a_failed_document_evidence_insert_rolls_back_the_whole_commit() {
         matches!(failed_tools, Err(PolicyCommitError::Store(_))),
         "{failed_tools:?}"
     );
+    // Each refused commit is counted once, on the counter the evidence
+    // write-failure alert pages on.
+    assert_eq!(evidence_failures(), 2);
     pool.get()
         .await
         .expect("failure trigger cleanup checkout")
@@ -706,6 +715,7 @@ async fn a_failed_document_evidence_insert_rolls_back_the_whole_commit() {
     .await
     .expect("the commit succeeds once evidence can be written");
     assert_eq!(evidence(&pool).await.len(), evidence_before.len() + 1);
+    assert_eq!(evidence_failures(), 2, "a recorded commit counts nothing");
 }
 
 /// An unattributable or mislabeled change is refused before anything is
