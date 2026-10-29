@@ -76,17 +76,19 @@ them.
 ### Blank values
 
 Unset and blank (empty or whitespace-only) are different inputs, and each
-inventoried variable treats a blank value by exactly one of three rules:
+inventoried variable treats a blank value by exactly one of three rules. The
+[field catalog](#the-field-catalog) records which, as each field's `blank`:
 
-| Rule | Meaning | Where the classification lives |
+| Rule | Meaning | Catalog value |
 | --- | --- | --- |
-| Blank is unset | The default applies, exactly as if the variable were absent. | `BLANK_IS_UNSET` in `parity_tests.rs` |
-| Blank is refused | The value is parsed as it stands and refused, with diagnostic code `Empty`. | `BLANK_IS_REFUSED` in `parity_tests.rs` |
-| Blank clears the default | The value is an empty list, which replaces a non-empty default. | `BLANK_CLEARS_THE_DEFAULT` in `parity_tests.rs` |
+| Blank is unset | The default applies, exactly as if the variable were absent. | `Blank::Unset` |
+| Blank is refused | The value is parsed as it stands and refused, with diagnostic code `Empty`. | `Blank::Refused` |
+| Blank clears the default | The value is an empty list, which replaces a non-empty default. | `Blank::ClearsDefault` |
 
 `parity_tests::every_input_treats_a_blank_value_by_one_of_three_legacy_rules`
-classifies every inventoried variable, so a new one has to say which rule it
-follows. These four lists are the ones a blank value clears:
+reads the classification from the catalog and proves it against the
+compiler, so a new variable has to say which rule it follows. These four lists
+are the ones a blank value clears:
 
 | Setting | Default it replaces |
 | --- | --- |
@@ -101,7 +103,7 @@ also gives an empty list, without being blank
 matters to an adapter that drops blank values before they reach the gateway,
 as the [Cloudflare wrapper](#platform-adapters) does.
 `stage_tests::the_compiler_contract_lists_every_list_a_blank_value_clears`
-holds this table to `BLANK_CLEARS_THE_DEFAULT`.
+holds this table to the catalog.
 
 Whether a non-blank value is trimmed before parsing is decided per setting
 (`ADMIN_PREFIX` and `STATE_BACKEND` are trimmed; `LISTEN_ADDR` and
@@ -407,10 +409,13 @@ a failure after serving began is returned unchanged.
 An adapter that sets the gateway's environment for a platform is part of the
 contract only through the variables it passes. The Cloudflare wrapper
 (`cloudflare/src/config.ts`) forwards an exact allowlist,
-`GREEN_GATEWAY_ENV_KEYS`. `gateway/tests/env_example.rs`
-(`cloudflare_forwarding_matches_supported_gateway_env_vars`) holds that list
-to the variables the gateway reads, minus the exclusions it names with their
-reasons, so a new setting cannot be silently left out.
+`GREEN_GATEWAY_ENV_KEYS`. The field catalog marks each field forwarded or
+excluded, with the reason for every exclusion, and
+`gateway/tests/env_example.rs`
+(`cloudflare_forwarding_matches_supported_gateway_env_vars`) holds the
+allowlist to the forwarded fields and the [Cloudflare
+guide](../deployment/cloudflare.md) to the excluded ones, so a new setting
+cannot be silently left out.
 
 The wrapper forwards only non-empty, non-whitespace string bindings, so on
 Cloudflare a blank value always arrives as unset. For a blank-is-unset
@@ -463,13 +468,61 @@ field came from; no API exposes it yet.
 
 ### The field catalog
 
-`CONFIG_INPUTS` is a list of names in read order. The ADR's field catalog
-adds per-field type, default, bounds, sensitivity, reload class, and platform
-support. Until it lands, the facts it will hold are spread across the stage
-code, the parity goldens (defaults and the blank-value classification),
-`configuration.md`, `.env.example`, and the Cloudflare exclusions in
-`gateway/tests/env_example.rs`. A catalog must be checked against all of them,
-not written beside them.
+`gateway_config::catalog` (`gateway-config/src/catalog.rs`, issue #242 PR 3)
+describes every inventoried input, in inventory order: a stable identifier
+(the variable in lower case), the domain whose plan holds it, its type with
+integer bounds, decimal range or accepted words, its default (a literal, unset,
+or derived from named fields), its blank-value rule, its sensitivity and what
+a report may show of it, which state backend it is for, what it becomes in a
+bundle (a deployment field, one of ADR-0008's bootstrap inputs with its
+category, a bundle resource, part of the legacy JWT provider a bundle cannot
+express, or a host path the ADR has not placed yet), its reload class, and
+whether the Cloudflare wrapper forwards it and why not. It is rendered as
+[`docs/configuration-catalog.json`](../configuration-catalog.json), which
+`docs/schemas/configuration-catalog.v1.schema.json` describes.
+
+The catalog describes the compiler and is never a second validator: nothing
+reads it at startup. It is checked against the compiler rather than written
+beside it:
+
+| What | Held to | By |
+| --- | --- | --- |
+| The fields and their order | `CONFIG_INPUTS` | `catalog_tests::the_catalog_lists_exactly_the_compilers_inventory_in_its_order` |
+| Domains | The block that reads each input | `stage_tests::the_field_catalog_places_every_input_in_the_domain_that_reads_it` |
+| Literal defaults | Compiling with the default set explicitly gives the unset configuration | `catalog_tests::every_literal_default_compiles_to_what_leaving_the_field_unset_does` |
+| Integer bounds, decimal ranges, accepted words | The values the compiler accepts and refuses on their own | `catalog_tests::every_integer_range_is_the_range_the_compiler_accepts`, `every_decimal_range_is_the_range_the_compiler_accepts`, `every_choice_and_boolean_accepts_exactly_its_words` |
+| Blank-value rules | The compiler's answer to an empty value | `parity_tests::every_input_treats_a_blank_value_by_one_of_three_legacy_rules` |
+| State backends | What each backend refuses | `catalog_tests::each_state_backend_refuses_only_the_other_backends_fields` |
+| The configuration reference | One entry per field, a `Default:` line stating the catalog's default, any stated `Range:` | `catalog_tests::the_configuration_reference_states_every_fields_default` |
+| `.env.example` | Every field assigned once, to its default or left blank where blank means unset, so copying the file configures exactly the defaults | `catalog_tests::the_env_example_assigns_every_field_its_default` |
+| Bootstrap inputs | ADR-0008's bootstrap table | `catalog_tests::the_bootstrap_fields_are_adr_0008s_bootstrap_inputs` |
+| Sensitivity | The [sensitivity wrappers](#sensitivity-wrappers) table | `catalog_tests::the_secret_fields_are_the_compiler_contracts_sensitive_inputs` |
+| Document paths | The deployment schema's settings | `catalog_tests::the_deployment_schema_defines_exactly_the_catalogs_document_paths` |
+| Cloudflare | `GREEN_GATEWAY_ENV_KEYS` and the Cloudflare guide | `env_example::cloudflare_forwarding_matches_supported_gateway_env_vars` |
+| The rendered catalog | `render_json` and its schema | `catalog::tests::the_committed_catalog_is_the_rendered_catalog`, `the_rendered_catalog_matches_its_published_schema` |
+
+A bound or default the compiler gets from another setting is not a field's
+own: `ADMIN_SESSION_IDLE_TIMEOUT_SECS` may not exceed the session's lifetime,
+and `CLUSTER_MEMBER_STALE_MS` must cover the heartbeats a live replica may
+miss. Those stay the compiler's cross-field rules (see [Rules](#rules)); the
+catalog's range is what a value is accepted or refused for on its own.
+
+What the catalog does not hold yet, because nothing decides or checks it
+today:
+
+- **Document paths.** The deployment schema defines no setting beside the
+  profile, so no deployment field has a path and a bundle cannot set any of
+  them.
+- **Two host paths ADR-0008 does not place.** `OPENAPI_SPEC_PATH` and
+  `AUTHORITY_EVENT_FILE` are neither bootstrap inputs nor bundle resources;
+  the catalog marks them `unplaced`, and the bundle front end must refuse
+  them until the ADR decides.
+- **Exportability and template placeholders, membership of the
+  static-configuration fingerprint, and doctor checks.** `ha.rs` stays the
+  authority on the fingerprint.
+- **Renderer coverage.** A native, Compose, or Kubernetes deployment sets
+  the environment directly, so every field is available there; no renderer
+  exists to check yet.
 
 ### Moving the compiler into `gateway-config`
 
@@ -496,11 +549,12 @@ which the zero-I/O scan holds to no I/O.
 
 - **A new variable** gets a constant, an entry in `CONFIG_INPUTS` where its
   block reads it, a field in its block's inputs read in that block's `read`,
-  its parse in the stage, a plan field, the `into_config` mapping, a
-  classification in one of the three blank-value lists, a `### NAME` entry in
-  `configuration.md`, a line in `.env.example`, and either an entry in the
-  Cloudflare allowlist or an exclusion with its reason in
-  `gateway/tests/env_example.rs`.
+  its parse in the stage, a plan field, the `into_config` mapping, an entry
+  in the field catalog at the same position (its blank-value rule included,
+  and the reason if the Cloudflare wrapper does not forward it), the
+  regenerated `docs/configuration-catalog.json`, a `### NAME` entry in
+  `configuration.md`, a line in `.env.example`, and, if it is forwarded, an
+  entry in the Cloudflare allowlist.
 - **Secret material** (a value or a locator) gets a wrapper that does not
   print it, and a canary in the stage tests' secret fixtures.
 - **A new cross-field rule** gets a `ConfigRule` variant, a fixture in

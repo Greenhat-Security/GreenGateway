@@ -5,8 +5,9 @@ export const CONTAINER_PING_ENDPOINT = "localhost/livez";
 // CONNECTION_SECRET_ALIASES does not dynamically forward the environment
 // variable names referenced by those aliases.
 //
-// gateway/tests/env_example.rs holds this list to the variables the gateway
-// reads, and names every excluded variable with the reason it is excluded.
+// gateway/tests/env_example.rs holds this list to the settings the
+// configuration field catalog (gateway-config/src/catalog.rs) marks forwarded.
+// The catalog names every excluded setting with the reason it is excluded.
 //
 // A blank binding is never forwarded, so the container sees it as unset. For
 // most settings that is what blank means to the gateway too; for the four
