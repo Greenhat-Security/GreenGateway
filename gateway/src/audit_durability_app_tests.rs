@@ -200,6 +200,7 @@ async fn required_durability_scenario(
                         label,
                         connections::secret::ResolvedSecret::new(purpose, value)
                             .expect("the secret value is valid"),
+                        &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
                     )
             })
             .await
@@ -234,7 +235,7 @@ async fn required_durability_scenario(
                 "tls": { "ca_bundle_alias": sealed_ca.id }
             }))
             .expect("the Connection should deserialize"),
-            "test-admin",
+            &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
         )
         .await
         .expect("the Connection should create");

@@ -5,10 +5,11 @@
 //! [`Principal`], and an operator command builds a [`ChangeActor::system`]
 //! one. The store that writes the change's evidence takes it as given, in the
 //! change's own transaction: Connection deletes, service-token rotates and
-//! revokes, and JWT revokes. It carries the four facts the proposed
-//! `authority_event.v1` actor is made of -- the subject, the canonical issuer,
-//! the actor kind and the auth mode -- and nothing else: never a credential, a
-//! session identifier, roles or an email address.
+//! revokes, and JWT revokes, and in standalone mode also Connection creates
+//! and replaces and every encrypted local-secret change. It carries the four
+//! facts the proposed `authority_event.v1` actor is made of -- the subject,
+//! the canonical issuer, the actor kind and the auth mode -- and nothing else:
+//! never a credential, a session identifier, roles or an email address.
 
 use super::principal::{
     canonical_issuer, AuthMethod, Principal, MAX_PRINCIPAL_ISSUER_BYTES,
@@ -27,9 +28,9 @@ pub(crate) enum ActorKind {
     ServiceToken,
     /// An operator command acting on the deployment's own authority under a
     /// fixed label, such as `revoke-jwt`. Nobody authenticated it, so it has
-    /// no issuer and never masquerades as a named person. Only the
-    /// cluster-mode `revoke-jwt` command records one.
-    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+    /// no issuer and never masquerades as a named person. The cluster-mode
+    /// `revoke-jwt` command and the standalone `connection-secrets reencrypt`
+    /// command record one.
     System,
 }
 
@@ -106,8 +107,8 @@ impl ChangeActor {
     }
 
     /// An operator command's fixed label, recorded as system provenance.
-    /// Only the cluster-mode `revoke-jwt` command records one.
-    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+    /// The cluster-mode `revoke-jwt` command and the standalone
+    /// `connection-secrets reencrypt` command record one.
     pub(crate) fn system(label: &'static str) -> Self {
         Self {
             subject: label.to_owned(),
