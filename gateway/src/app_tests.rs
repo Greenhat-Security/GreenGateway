@@ -9,6 +9,8 @@ mod admin_session_app_tests;
 mod audit_durability_app_tests;
 #[path = "audit_stream_app_tests.rs"]
 mod audit_stream_app_tests;
+#[path = "authority_evidence_app_tests.rs"]
+mod authority_evidence_app_tests;
 use crate::auth::TokenStore;
 use axum::{body::Body, http::StatusCode};
 use futures_util::StreamExt;
@@ -26295,6 +26297,8 @@ async fn suggestions_admin_without_engine_answers_not_configured() {
                 membership: None,
                 event_store: None,
                 query_store: None,
+                authority_evidence: authority_events::required::AuthorityEvidenceGate::best_effort(
+                ),
                 audit: test_audit_log(),
                 client_ip_policy: client_ip::ClientIpPolicy::default(),
                 max_body_size: 1024 * 1024,
@@ -36035,6 +36039,8 @@ mod cluster_policy_tests {
                 membership,
                 event_store: None,
                 query_store: None,
+                authority_evidence: authority_events::required::AuthorityEvidenceGate::best_effort(
+                ),
                 audit,
                 client_ip_policy: client_ip::ClientIpPolicy::default(),
                 max_body_size: 1024 * 1024,
@@ -39501,6 +39507,8 @@ mod cluster_discovery_tests {
                     membership: None,
                     event_store: None,
                     query_store: None,
+                    authority_evidence:
+                        authority_events::required::AuthorityEvidenceGate::best_effort(),
                     audit: audit_log,
                     client_ip_policy: client_ip::ClientIpPolicy::default(),
                     max_body_size: 1024 * 1024,

@@ -267,6 +267,8 @@ holds this table to `diagnostic::ConfigRule`.
 | `AuthorityEventSinkRequirements` | An authority-event sink without its pseudonym key alias or, for the file sink, its file. |
 | `AuthorityEventMaterialUnused` | Authority-event material the configured sink never reads. |
 | `AuthorityPseudonymKeysDistinct` | The current and previous pseudonym key aliases naming the same alias. |
+| `AuthorityEvidenceDeliveryRequired` | `AUTHORITY_EVIDENCE_DURABILITY=required` in cluster mode with `AUTHORITY_EVENT_SINK=none`, which would journal evidence that is never delivered. |
+| `AuthorityEvidenceUnsupportedConfiguration` | `AUTHORITY_EVIDENCE_DURABILITY=required` with a setting that enables an authority change the evidence inventory marks unsupported in this mode: `ADMIN_SESSION_MODE=standalone_memory`. |
 
 Codes and rules are Rust enums. They have no serialized names yet: the first
 report format that carries them must assign stable codes, and from then on a

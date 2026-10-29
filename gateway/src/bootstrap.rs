@@ -1550,6 +1550,17 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
     let lifecycle = build_overrides.lifecycle.clone().unwrap_or_default();
     let split_admin_listener = config.admin_listen_addr.is_some();
     let csrf_config = middleware::csrf::CsrfConfig::from_config(&config);
+    // Required authority evidence (issue #425, PR 4): every admin change and
+    // file reload this deployment mode records no evidence of asks this gate.
+    // What the configuration enables on its own was refused before this ran.
+    let authority_evidence =
+        authority_events::required::AuthorityEvidenceGate::from_config(&config);
+    if config.authority_events.durability == config::AuthorityEvidenceDurability::Required {
+        tracing::info!(
+            state_backend = ?config.state_backend,
+            "AUTHORITY_EVIDENCE_DURABILITY=required: authority changes this deployment mode records no evidence of are refused, and reported as authority_evidence.operation_refused"
+        );
+    }
     let audit_query_store = config
         .audit_sqlite_path
         .as_deref()
@@ -2199,6 +2210,10 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
         middleware::rbac::spawn_policy_reload_tasks_with_lifecycle(
             policy_file.clone(),
             rbac_state.clone(),
+            authority_events::required::BackgroundEvidenceGate::new(
+                authority_evidence,
+                audit_log.clone(),
+            ),
             &lifecycle,
         )?;
     }
@@ -2511,6 +2526,10 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
             tools_file.clone(),
             tool_registry.clone(),
             mcp_proxy_definitions_provider.clone(),
+            authority_events::required::BackgroundEvidenceGate::new(
+                authority_evidence,
+                audit_log.clone(),
+            ),
             &lifecycle,
         )?;
     }
@@ -2651,6 +2670,7 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
         membership: build_overrides.pg_membership.clone(),
         event_store: audit_event_store.clone(),
         query_store: audit_query_store.clone(),
+        authority_evidence,
         audit: audit_log.clone(),
         client_ip_policy: client_ip_policy.clone(),
         max_body_size: config.max_body_size,
@@ -2675,6 +2695,7 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
         openapi_catalogs: openapi_catalog_service,
         tests: connections::test::ConnectionTestService::new(connection_http_runtime.clone()),
         rbac_state: rbac_state.clone(),
+        authority_evidence,
         audit: audit_log.clone(),
         client_ip_policy: client_ip_policy.clone(),
         max_body_size: config.max_body_size,
@@ -2688,6 +2709,7 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
         inventory: capability_inventory,
         executor: tool_executor,
         rbac_state: rbac_state.clone(),
+        authority_evidence,
         audit: audit_log.clone(),
         client_ip_policy: client_ip_policy.clone(),
         max_body_size: config.max_body_size,
