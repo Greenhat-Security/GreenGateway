@@ -2683,6 +2683,7 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
         query_store: audit_event_store,
         event_sender: audit_event_sender,
         rbac_state: rbac_state.clone(),
+        stream_limits: AuditStreamLimits::SERVED,
         #[cfg(feature = "postgres")]
         pg_audit: build_overrides.pg_audit,
     };

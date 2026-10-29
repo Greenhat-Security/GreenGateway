@@ -538,6 +538,101 @@ async fn valid_bearer_credential_injects_principal_and_emits_success() {
     assert_eq!(event.payload["user_id"], json!("user-123"));
 }
 
+/// Accepts the one bearer value it was built with until it is revoked, and
+/// records every value it is asked about.
+struct RevocableValidator {
+    accepted: String,
+    revoked: std::sync::atomic::AtomicBool,
+    asked: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl SessionValidator for RevocableValidator {
+    async fn validate_session(
+        &self,
+        credential: &SessionCredential,
+    ) -> Result<Principal, AuthError> {
+        let SessionCredential::Bearer(value) = credential else {
+            return Err(AuthError::InvalidSession("not a bearer".to_owned()));
+        };
+        self.asked.lock().expect("asked lock").push(value.clone());
+        if self.revoked.load(std::sync::atomic::Ordering::SeqCst) || *value != self.accepted {
+            return Err(AuthError::InvalidSession("revoked".to_owned()));
+        }
+        Ok(test_principal())
+    }
+}
+
+#[tokio::test]
+async fn an_admitted_request_carries_its_credential_to_be_judged_again() {
+    let token = format!("test-{}", uuid::Uuid::new_v4());
+    let validator = Arc::new(RevocableValidator {
+        accepted: token.clone(),
+        revoked: std::sync::atomic::AtomicBool::new(false),
+        asked: std::sync::Mutex::new(Vec::new()),
+    });
+    let (state, capture) = test_state(Some(Arc::clone(&validator) as Arc<dyn SessionValidator>));
+    let handed_on = Arc::new(std::sync::Mutex::new(None));
+    let slot = Arc::clone(&handed_on);
+    let router = Router::new()
+        .route(
+            "/protected",
+            get(
+                move |Extension(reauthentication): Extension<Reauthentication>| {
+                    let slot = Arc::clone(&slot);
+                    async move {
+                        *slot.lock().expect("slot lock") = Some(reauthentication);
+                        "ok"
+                    }
+                },
+            ),
+        )
+        .layer(from_fn_with_state(state, auth_middleware));
+
+    let response = router
+        .oneshot(protected_request(Some(&token)))
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let reauthentication = handed_on
+        .lock()
+        .expect("slot lock")
+        .take()
+        .expect("the handler should receive the admitted credential");
+
+    // Judged again, later, by the same validator: still accepted, then
+    // refused once revoked.
+    let principal = reauthentication
+        .revalidate()
+        .await
+        .expect("the credential is still accepted");
+    assert_eq!(principal.user_id, "user-123");
+    validator
+        .revoked
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(matches!(
+        reauthentication.revalidate().await,
+        Err(AuthError::InvalidSession(_))
+    ));
+    assert_eq!(
+        *validator.asked.lock().expect("asked lock"),
+        [token.clone(), token.clone(), token.clone()],
+        "admission and both re-checks judged the very credential the request sent"
+    );
+    assert!(!format!("{reauthentication:?}").contains(&token));
+    // Only the admission is an authentication event; a re-check records
+    // nothing of its own.
+    captured_event(&capture, AUTH_SUCCESS).await;
+    assert_eq!(
+        capture
+            .events()
+            .iter()
+            .filter(|event| event.event_type.starts_with("auth."))
+            .count(),
+        1
+    );
+}
+
 #[tokio::test]
 async fn observe_mode_valid_bearer_credential_injects_principal_and_emits_success() {
     let (state, capture) = test_state_with_mode(

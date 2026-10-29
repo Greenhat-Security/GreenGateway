@@ -13,6 +13,12 @@
 //! behind a per-replica and a per-actor bound on concurrent simulations
 //! and a deadline, and nothing about it touches a rate bucket, tool permit,
 //! resolver or upstream.
+//!
+//! The concurrency bound, [`PolicyEvaluationLimiter`], is shared with policy
+//! test runs: both endpoints admit a request only once its body is in hand,
+//! and the blocking work owns its slot, so a slot counts evaluations doing
+//! work -- not uploads in flight, and not work a cancelled request left
+//! running.
 use std::{
     collections::HashSet,
     sync::{
@@ -45,29 +51,35 @@ pub(super) const MAX_POLICY_SIMULATION_RESULT_BYTES: usize = 8 * 1024 * 1024;
 /// The wall-clock bound on one simulation's evaluation.
 pub(super) const POLICY_SIMULATION_DEADLINE: Duration = Duration::from_secs(2);
 
-/// The concurrency bounds of one router, shared by every request it serves:
-/// at most [`MAX_CONCURRENT_POLICY_SIMULATIONS`] at once, and one at a time
-/// per actor, so a single caller cannot hold every slot.
-pub(super) struct PolicySimulationLimiter {
+/// The concurrency bounds of one evaluation endpoint on one router, shared by
+/// every request it serves: at most `limit` evaluations at once, and one at a
+/// time per actor, so a single caller cannot hold every slot. Each route has
+/// its own, so simulations and test runs never take each other's slots.
+pub(super) struct PolicyEvaluationLimiter {
+    limit: usize,
     active: AtomicUsize,
     actors: Mutex<HashSet<String>>,
 }
 
-impl PolicySimulationLimiter {
-    pub(super) fn new() -> Self {
+impl PolicyEvaluationLimiter {
+    pub(super) fn new(limit: usize) -> Self {
         Self {
+            limit,
             active: AtomicUsize::new(0),
             actors: Mutex::new(HashSet::new()),
         }
     }
 
-    /// Admit one simulation for `actor`, or `None` when either bound is
-    /// reached. The slot gives both back when it drops, whatever ends the
-    /// request -- a refusal, a panic on the blocking thread, a cancellation.
-    pub(super) fn try_acquire(self: &Arc<Self>, actor: String) -> Option<PolicySimulationSlot> {
+    /// Admit one evaluation for `actor`, or `None` when either bound is
+    /// reached. The slot gives both back when it drops: at a refusal before
+    /// any work started or, once [`PolicyEvaluationSlot::run_blocking`] has
+    /// handed it to a blocking thread, when that work ends -- including by a
+    /// panic.
+    pub(super) fn try_acquire(self: &Arc<Self>, actor: String) -> Option<PolicyEvaluationSlot> {
+        let limit = self.limit;
         self.active
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < MAX_CONCURRENT_POLICY_SIMULATIONS).then_some(active + 1)
+                (active < limit).then_some(active + 1)
             })
             .ok()?;
         // The set holds owned keys only; a panic while it was held cannot
@@ -81,19 +93,52 @@ impl PolicySimulationLimiter {
             self.active.fetch_sub(1, Ordering::AcqRel);
             return None;
         }
-        Some(PolicySimulationSlot {
+        Some(PolicyEvaluationSlot {
             limiter: Arc::clone(self),
             actor,
         })
     }
 }
 
-pub(super) struct PolicySimulationSlot {
-    limiter: Arc<PolicySimulationLimiter>,
+/// The key one caller's evaluations are bounded under: the canonical identity
+/// authentication established, so two credentials for one subject share one
+/// slot.
+pub(super) fn policy_evaluation_actor(principal: &auth::Principal) -> String {
+    format!(
+        "{}\u{0}{}",
+        principal.issuer.as_deref().unwrap_or_default(),
+        principal.user_id
+    )
+}
+
+pub(super) struct PolicyEvaluationSlot {
+    limiter: Arc<PolicyEvaluationLimiter>,
     actor: String,
 }
 
-impl Drop for PolicySimulationSlot {
+impl PolicyEvaluationSlot {
+    /// Run `work` on a blocking thread that owns this slot.
+    ///
+    /// A request whose client goes away is dropped at its next `.await`, but
+    /// a blocking thread it started runs to the end regardless. A slot the
+    /// request held would come back at that drop, so a caller who cancelled
+    /// each request once its work had started could pile evaluations onto the
+    /// blocking pool far past the bound. Owned by the work, the slot comes
+    /// back only when the work ends, however the request ends.
+    pub(super) async fn run_blocking<T, F>(self, work: F) -> Result<T, tokio::task::JoinError>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        tokio::task::spawn_blocking(move || {
+            let _slot = self;
+            work()
+        })
+        .await
+    }
+}
+
+impl Drop for PolicyEvaluationSlot {
     fn drop(&mut self) {
         self.limiter
             .actors
@@ -317,7 +362,7 @@ fn emit_policy_simulation_run(
 
 pub(super) async fn policy_simulations_endpoint(
     State(state): State<PolicyAdminState>,
-    Extension(limiter): Extension<Arc<PolicySimulationLimiter>>,
+    Extension(limiter): Extension<Arc<PolicyEvaluationLimiter>>,
     request: AxumRequest,
 ) -> Response {
     record_request(POLICY_SIMULATIONS_ADMIN_ROUTE);
@@ -340,15 +385,8 @@ pub(super) async fn policy_simulations_endpoint(
         Err(response) => return *response,
     };
     // Admitted once the body is in hand, so a slot bounds simulations doing
-    // work rather than uploads in flight. The actor is the canonical identity
-    // authentication established, so two credentials for one subject share
-    // one bound.
-    let actor = format!(
-        "{}\u{0}{}",
-        principal.issuer.as_deref().unwrap_or_default(),
-        principal.user_id
-    );
-    let Some(_slot) = limiter.try_acquire(actor) else {
+    // work rather than uploads in flight.
+    let Some(slot) = limiter.try_acquire(policy_evaluation_actor(&principal)) else {
         return simulation_refusal(
             StatusCode::TOO_MANY_REQUESTS,
             "too many policy simulations are in progress; retry later",
@@ -425,16 +463,24 @@ pub(super) async fn policy_simulations_endpoint(
 
     let simulation = Arc::new(simulation);
     let evaluated = Arc::clone(&simulation);
-    let outcome = match tokio::task::spawn_blocking(move || {
-        let deadline = Instant::now() + POLICY_SIMULATION_DEADLINE;
-        let pairs = compile_pairs(&base, authority, candidate.as_ref(), &evaluated.projections)
-            .map_err(|error| {
-                tracing::error!(error = ?error, "policy under simulation could not be compiled");
-                SimulationError::Internal("compile_failed")
-            })?;
-        simulate(&pairs, &evaluated.cases, evaluated.trace, deadline)
-    })
-    .await
+    // The blocking thread owns the slot, so a request dropped mid-evaluation
+    // keeps its slot until the evaluation it started has ended. The deadline
+    // starts before compilation, so compiling counts against it, and no case
+    // is decided once it has passed.
+    let outcome = match slot
+        .run_blocking(move || {
+            let deadline = Instant::now() + POLICY_SIMULATION_DEADLINE;
+            let pairs = compile_pairs(&base, authority, candidate.as_ref(), &evaluated.projections)
+                .map_err(|error| {
+                    tracing::error!(
+                        error = ?error,
+                        "policy under simulation could not be compiled"
+                    );
+                    SimulationError::Internal("compile_failed")
+                })?;
+            simulate(&pairs, &evaluated.cases, evaluated.trace, deadline)
+        })
+        .await
     {
         Ok(Ok(outcome)) => outcome,
         Ok(Err(SimulationError::CaseRefused { pointer, code })) => {

@@ -42,6 +42,8 @@ Each session has an absolute deadline (`ADMIN_SESSION_TTL_SECS`) and an idle dea
 
 A replica reads the session row on the primary for every request and caches nothing. Logout, replacement by a new sign-in in the same browser, a rejected access token and an identity change each delete the row in one transaction. The next request on any replica is refused. After the provider has answered, the request is admitted only if its row still exists and is still live, so a logout or expiry during validation wins. Requests already admitted and bytes already sent are not recalled.
 
+The one admitted request that keeps sending is the admin audit event stream (`events/stream`). It does not rely on its admission: every 15 seconds it asks the session store and the login provider again, with the same checks as a request but without a CSRF token and without moving the idle deadline, and it ends with a `stream.closed` frame once the session is gone (see the audit routes in [configuration](../configuration.md)).
+
 ### Bounded state and cleanup
 
 `ADMIN_SESSION_MAX_ENTRIES` bounds both the live sessions and the pending cookie logins across the deployment. Admissions serialize on one transaction-scoped advisory lock, so two replicas cannot both take the last slot, and capacity answers `503` without evicting anyone. Each admission first prunes a bounded batch of expired rows. The maintenance singleton runs `admin_session_prune`, one bounded step per pass, for deployments whose logins stopped.
