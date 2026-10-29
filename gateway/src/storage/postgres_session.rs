@@ -243,8 +243,11 @@ fn classify_query(error: tokio_postgres::Error, operation: &'static str) -> Repo
     log_classified(operation, &error, RepositoryError::new(kind, operation))
 }
 
+// `pub(crate)` so the migrator's tests (`storage::migrations`) place their
+// cancellation windows with the same reply gate and ask the server the same
+// questions, instead of carrying a second copy of this harness.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::advisory_lock_key;
 
     #[test]
@@ -301,13 +304,13 @@ mod tests {
     /// and these statements are a lock and an unlock: milliseconds. The
     /// budget is generous only so a loaded CI box does not fail on
     /// scheduling.
-    const RELEASE_BUDGET: Duration = Duration::from_secs(15);
+    pub(crate) const RELEASE_BUDGET: Duration = Duration::from_secs(15);
 
     /// How long the server may take to answer the statement whose answer
     /// the gate is withholding. Generous for the same reason; it bounds a
     /// gate that never closes, not the window, which lasts as long as the
     /// test holds it.
-    const ANSWER_BUDGET: Duration = Duration::from_secs(20);
+    pub(crate) const ANSWER_BUDGET: Duration = Duration::from_secs(20);
 
     /// PostgreSQL wire-protocol message types the gate acts on. From the
     /// client: `Parse` (the first half of a prepared statement), `Bind`
@@ -315,19 +318,20 @@ mod tests {
     /// answered), and the two messages each answered by exactly one
     /// `ReadyForQuery`: a simple `Query` and a `Sync`. From the server:
     /// `ReadyForQuery`, sent once everything up to that point is done.
-    const PARSE: u8 = b'P';
-    const BIND: u8 = b'B';
-    const QUERY: u8 = b'Q';
-    const SYNC: u8 = b'S';
-    const READY_FOR_QUERY: u8 = b'Z';
+    pub(crate) const PARSE: u8 = b'P';
+    pub(crate) const BIND: u8 = b'B';
+    pub(crate) const QUERY: u8 = b'Q';
+    pub(crate) const SYNC: u8 = b'S';
+    pub(crate) const READY_FOR_QUERY: u8 = b'Z';
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum GatePhase {
         /// The server's replies pass.
         Open,
         /// The server's replies pass until a client sends a message of
-        /// this type.
-        Armed(u8),
+        /// type `tag` with `skip` such messages already behind it: the
+        /// `skip + 1`-th one from the moment the gate was armed.
+        Armed { tag: u8, skip: usize },
         /// A client has sent it; nothing the server says reaches the
         /// client. `answered` once the server has finished the statement
         /// that message began.
@@ -336,14 +340,14 @@ mod tests {
 
     /// The switch every connection of a gated pool shares.
     #[derive(Clone)]
-    struct ReplyGate {
+    pub(crate) struct ReplyGate {
         phase: Arc<tokio::sync::watch::Sender<GatePhase>>,
         /// Connection tasks waiting for the gate to open.
         parked: Arc<Mutex<Vec<Waker>>>,
     }
 
     impl ReplyGate {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self {
                 phase: Arc::new(tokio::sync::watch::channel(GatePhase::Open).0),
                 parked: Arc::default(),
@@ -352,12 +356,23 @@ mod tests {
 
         /// Withhold the server's replies from the moment a client next
         /// sends a message of type `tag`.
-        fn hold_replies_from(&self, tag: u8) {
-            self.phase.send_replace(GatePhase::Armed(tag));
+        pub(crate) fn hold_replies_from(&self, tag: u8) {
+            self.hold_replies_from_nth(tag, 1);
+        }
+
+        /// Withhold the server's replies from the moment a client sends
+        /// the `nth` message of type `tag` from now (1-based), for a
+        /// statement that follows others of the same kind -- a simple
+        /// `Query` after the session setup that precedes it. The messages
+        /// before it are answered as usual.
+        pub(crate) fn hold_replies_from_nth(&self, tag: u8, nth: usize) {
+            assert!(nth > 0, "the first message is the 1st");
+            self.phase
+                .send_replace(GatePhase::Armed { tag, skip: nth - 1 });
         }
 
         /// Let everything withheld through, and everything after it.
-        fn open(&self) {
+        pub(crate) fn open(&self) {
             self.phase.send_replace(GatePhase::Open);
             let parked = std::mem::take(
                 &mut *self
@@ -372,7 +387,7 @@ mod tests {
 
         /// Resolves once the server has finished the statement whose
         /// answer is being withheld.
-        async fn answered(&self) {
+        pub(crate) async fn answered(&self) {
             self.phase
                 .subscribe()
                 .wait_for(|phase| matches!(phase, GatePhase::Holding { answered: true }))
@@ -388,11 +403,21 @@ mod tests {
         /// the message the gate was armed for, which closes it.
         fn client_sends(&self, tag: u8) -> bool {
             self.phase.send_if_modified(|phase| {
-                let closes = *phase == GatePhase::Armed(tag);
-                if closes {
-                    *phase = GatePhase::Holding { answered: false };
+                let GatePhase::Armed { tag: armed, skip } = phase else {
+                    return false;
+                };
+                if *armed != tag {
+                    return false;
                 }
-                closes
+                if *skip > 0 {
+                    // An earlier message of the same type: it and its
+                    // answer pass. Nobody waits on the count, so nobody
+                    // is told.
+                    *skip -= 1;
+                    return false;
+                }
+                *phase = GatePhase::Holding { answered: false };
+                true
             })
         }
 
@@ -678,7 +703,7 @@ mod tests {
     /// connection handed back to the pool while it holds a session advisory
     /// lock keeps holding it for as long as the pool keeps the connection
     /// -- which is for ever.
-    fn gated_pool(dsn: &str, gate: &ReplyGate) -> deadpool_postgres::Pool {
+    pub(crate) fn gated_pool(dsn: &str, gate: &ReplyGate) -> deadpool_postgres::Pool {
         let config: tokio_postgres::Config = dsn.parse().expect("the test DSN parses");
         let manager = deadpool_postgres::Manager::from_connect(
             config,
@@ -696,7 +721,7 @@ mod tests {
 
     /// A connection outside the pool, so the observation is never made by
     /// the thing being observed.
-    async fn observer(dsn: &str) -> tokio_postgres::Client {
+    pub(crate) async fn observer(dsn: &str) -> tokio_postgres::Client {
         let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
             .await
             .expect("the observer connects");
@@ -707,14 +732,31 @@ mod tests {
     }
 
     /// What the server says about every backend granted `key` as a
-    /// session advisory lock: pid, backend state, wait event, and the
-    /// query it last ran. A holder that is `active` on a statement is a
-    /// pass still running; a holder that is `idle` on `ClientRead` is a
-    /// connection sitting in the pool with the lock on it.
-    async fn holders(observer: &tokio_postgres::Client, key: i64) -> Vec<String> {
+    /// session advisory lock in the observer's database: pid, backend
+    /// state, wait event, and the query it last ran. A holder that is
+    /// `active` on a statement is a pass still running; a holder that is
+    /// `idle` on `ClientRead` is a connection sitting in the pool with the
+    /// lock on it.
+    pub(crate) async fn holders(observer: &tokio_postgres::Client, key: i64) -> Vec<String> {
+        advisory_backends(observer, key, true).await
+    }
+
+    /// The same for every backend queued for `key` and not yet granted it:
+    /// a blocking `pg_advisory_lock` waiting behind a holder.
+    pub(crate) async fn waiters(observer: &tokio_postgres::Client, key: i64) -> Vec<String> {
+        advisory_backends(observer, key, false).await
+    }
+
+    async fn advisory_backends(
+        observer: &tokio_postgres::Client,
+        key: i64,
+        granted: bool,
+    ) -> Vec<String> {
         // The bigint form of an advisory lock is stored split across
         // `classid` (high half) and `objid` (low half), with
-        // `objsubid = 1`.
+        // `objsubid = 1`. An advisory lock belongs to a database, and the
+        // observer's is the one under test: a fixed key such as the
+        // migrator's is taken in every other test database as well.
         let rows = observer
             .query(
                 "SELECT l.pid, \
@@ -722,9 +764,11 @@ mod tests {
                         coalesce(a.wait_event_type || ':' || a.wait_event, '<none>'), \
                         coalesce(a.query, '<none>') \
                  FROM pg_locks l LEFT JOIN pg_stat_activity a ON a.pid = l.pid \
-                 WHERE l.locktype = 'advisory' AND l.granted AND l.objsubid = 1 \
+                 WHERE l.locktype = 'advisory' AND l.granted = $2 AND l.objsubid = 1 \
+                   AND l.database = (SELECT oid FROM pg_database \
+                                     WHERE datname = current_database()) \
                    AND ((l.classid::bigint << 32) | l.objid::bigint) = $1",
-                &[&key],
+                &[&key, &granted],
             )
             .await
             .expect("pg_locks is readable");
@@ -747,7 +791,11 @@ mod tests {
     /// instant a detached connection's session ends -- and refuses it
     /// once `RELEASE_BUDGET` has gone by, at which point the server is
     /// asked what is holding the key.
-    async fn assert_released(observer: &tokio_postgres::Client, key: i64, what: &str) -> Duration {
+    pub(crate) async fn assert_released(
+        observer: &tokio_postgres::Client,
+        key: i64,
+        what: &str,
+    ) -> Duration {
         let started = Instant::now();
         observer
             .batch_execute(&format!(
@@ -792,7 +840,11 @@ mod tests {
     /// that would mean it heard an answer the gate is holding -- so when
     /// this returns it is parked in the window: its statement has run on
     /// the server, and it does not know.
-    async fn drive_into_window<F: Future>(gate: &ReplyGate, future: Pin<&mut F>, what: &str) {
+    pub(crate) async fn drive_into_window<F: Future>(
+        gate: &ReplyGate,
+        future: Pin<&mut F>,
+        what: &str,
+    ) {
         let parked = tokio::time::timeout(ANSWER_BUDGET, async {
             tokio::select! {
                 biased;
