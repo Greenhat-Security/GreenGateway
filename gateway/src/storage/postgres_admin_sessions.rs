@@ -31,13 +31,31 @@
 //!   conditional on the row still being live: a withdrawal during
 //!   validation wins.
 //! - **Admissions are transactional and bounded.** Beginning a login and
-//!   granting a session take one transaction-scoped advisory lock, prune a
-//!   bounded batch of expired rows, count, and write, so two replicas cannot
-//!   both admit the row that fills the last slot.
+//!   granting a session first prune a bounded batch of expired rows, in a
+//!   transaction of their own, then take one transaction-scoped advisory
+//!   lock, count, and write, so two replicas cannot both admit the row that
+//!   fills the last slot.
 //! - **Each grant and each withdrawal writes one `admin_session_evidence`
-//!   row in the same statement or transaction as the change** (migration
-//!   19). A change whose evidence cannot be written does not happen. An
-//!   expiry is recorded when the prune removes the row.
+//!   row, and journals it, in the same statement as the change** (migrations
+//!   19 and 26). A change whose evidence or journal row cannot be written
+//!   does not happen. An expiry is recorded when the prune removes the row.
+//! - **A withdrawal is never refused for journal capacity.** A grant takes
+//!   two units of the authority-event journal's capacity, one for its own
+//!   event and one held for its withdrawal, and is refused (`503`, nothing
+//!   committed) when the journal cannot spare both. A logout, replacement,
+//!   rejection or expiry spends the unit its grant held and checks no
+//!   capacity, so a full journal still lets every session end, with its
+//!   evidence delivered like any other event
+//!   (`storage::postgres_authority_events`).
+//! - **The journal's state row adds no lock cycle.** A statement that
+//!   journals takes it after the session rows it withdraws, and before
+//!   COMMIT locks nothing else but the pending logins that tracked those
+//!   sessions, which no transaction waiting for the state row can hold
+//!   without first waiting on those sessions. That is why the admission
+//!   prune, which journals expiries, runs before the admission transaction:
+//!   inside it, the state row would be taken before the pending login the
+//!   grant then locks, and a logout holding that login while it waits for
+//!   the state row would deadlock with it.
 //!
 //! A store that cannot be consulted, or a row this replica cannot open, is a
 //! dependency failure: the front answers `503`, never "signed out".
@@ -63,7 +81,14 @@ use crate::{
     connections::local_secret::LocalSecretKeyring,
 };
 
-use super::{log_classified, postgres::classify_pool_error, RepositoryError, RepositoryErrorKind};
+use super::{
+    log_classified,
+    postgres::classify_pool_error,
+    postgres_authority_events::{
+        record_evidence_failure, report_capacity_refusal, JournalSource, OPERATION_JOURNAL_APPEND,
+    },
+    RepositoryError, RepositoryErrorKind,
+};
 
 const OPERATION_BEGIN: &str = "admin_session_begin_login";
 const OPERATION_GRANT: &str = "admin_session_grant";
@@ -115,10 +140,46 @@ const ADMIT_SQL: &str = r#"
     SELECT count(*) FROM admitted
     "#;
 
-/// Withdraw sessions by key with one evidence row each, and release the
-/// pending logins that tracked them. One statement, so the evidence exists
-/// exactly when the withdrawal does.
-const WITHDRAW_SQL: &str = r#"
+/// The tail every withdrawal statement shares, after its `withdrawn` CTE
+/// (the session rows it deleted) and its `evidence` CTE (one withdrawal row
+/// each, returning their event IDs). It journals every evidence row at the
+/// next positions and spends the units their grants held, never checking
+/// capacity: a withdrawal is always recorded. Should fewer units be held
+/// than sessions withdrawn, which no writer leaves behind, the difference
+/// is taken as fresh units rather than refusing the withdrawal. The
+/// statement answers how many evidence rows it wrote and how many it
+/// journaled; the caller refuses, and rolls back, any withdrawal where the
+/// two differ.
+macro_rules! journal_withdrawals {
+    () => {
+        r#"
+    , spent AS (
+        UPDATE greengateway.authority_event_state
+        SET last_position = last_position + (SELECT count(*) FROM evidence),
+            retained_events = retained_events + (SELECT count(*) FROM evidence)
+                - LEAST(reserved_withdrawals, (SELECT count(*) FROM evidence)),
+            reserved_withdrawals = reserved_withdrawals
+                - LEAST(reserved_withdrawals, (SELECT count(*) FROM evidence))
+        WHERE singleton AND EXISTS (SELECT 1 FROM evidence)
+        RETURNING last_position
+    ), journaled AS (
+        INSERT INTO greengateway.authority_event_journal (position, event_id, source)
+        SELECT spent.last_position - (SELECT count(*) FROM evidence)
+                   + row_number() OVER (ORDER BY evidence.event_id),
+               evidence.event_id, 'admin_session_evidence'
+        FROM evidence CROSS JOIN spent
+        RETURNING position
+    )
+    SELECT (SELECT count(*) FROM evidence), (SELECT count(*) FROM journaled)
+    "#
+    };
+}
+
+/// Withdraw sessions by key with one evidence row each, journaled, and
+/// release the pending logins that tracked them. One statement, so the
+/// evidence and its journal row exist exactly when the withdrawal does.
+const WITHDRAW_SQL: &str = concat!(
+    r#"
     WITH withdrawn AS (
         DELETE FROM greengateway.admin_sessions
         WHERE session_hash = ANY($1::text[])
@@ -126,19 +187,23 @@ const WITHDRAW_SQL: &str = r#"
     ), released AS (
         DELETE FROM greengateway.admin_session_logins
         WHERE issued_session_hash IN (SELECT session_hash FROM withdrawn)
-    )
-    INSERT INTO greengateway.admin_session_evidence (
-        event_id, operation_id, session_id, action, reason, user_id, issuer, expires_at
-    )
-    SELECT gen_random_uuid(), $2::text::uuid, id, 'admin_session.withdraw', $3,
-           user_id, issuer, expires_at
-    FROM withdrawn
-    "#;
+    ), evidence AS (
+        INSERT INTO greengateway.admin_session_evidence (
+            event_id, operation_id, session_id, action, reason, user_id, issuer, expires_at
+        )
+        SELECT gen_random_uuid(), $2::text::uuid, id, 'admin_session.withdraw', $3,
+               user_id, issuer, expires_at
+        FROM withdrawn
+        RETURNING event_id
+    )"#,
+    journal_withdrawals!()
+);
 
 /// The same, for one session whose token the provider rejected or which now
 /// names another identity. The ID guards against a row that is not the one
 /// the request read.
-const REJECT_SQL: &str = r#"
+const REJECT_SQL: &str = concat!(
+    r#"
     WITH withdrawn AS (
         DELETE FROM greengateway.admin_sessions
         WHERE session_hash = $1 AND id = $2::text::uuid
@@ -146,19 +211,23 @@ const REJECT_SQL: &str = r#"
     ), released AS (
         DELETE FROM greengateway.admin_session_logins
         WHERE issued_session_hash IN (SELECT session_hash FROM withdrawn)
-    )
-    INSERT INTO greengateway.admin_session_evidence (
-        event_id, operation_id, session_id, action, reason, user_id, issuer, expires_at
-    )
-    SELECT gen_random_uuid(), $3::text::uuid, id, 'admin_session.withdraw', 'rejected',
-           user_id, issuer, expires_at
-    FROM withdrawn
-    "#;
+    ), evidence AS (
+        INSERT INTO greengateway.admin_session_evidence (
+            event_id, operation_id, session_id, action, reason, user_id, issuer, expires_at
+        )
+        SELECT gen_random_uuid(), $3::text::uuid, id, 'admin_session.withdraw', 'rejected',
+               user_id, issuer, expires_at
+        FROM withdrawn
+        RETURNING event_id
+    )"#,
+    journal_withdrawals!()
+);
 
 /// Expired sessions, oldest deadline first, judged on the statement clock.
 /// Rows another transaction holds are skipped rather than waited for: that
 /// transaction is withdrawing or admitting them already.
-const PRUNE_SESSIONS_SQL: &str = r#"
+const PRUNE_SESSIONS_SQL: &str = concat!(
+    r#"
     WITH withdrawn AS (
         DELETE FROM greengateway.admin_sessions
         WHERE session_hash IN (
@@ -172,14 +241,17 @@ const PRUNE_SESSIONS_SQL: &str = r#"
     ), released AS (
         DELETE FROM greengateway.admin_session_logins
         WHERE issued_session_hash IN (SELECT session_hash FROM withdrawn)
-    )
-    INSERT INTO greengateway.admin_session_evidence (
-        event_id, operation_id, session_id, action, reason, user_id, issuer, expires_at
-    )
-    SELECT gen_random_uuid(), $2::text::uuid, id, 'admin_session.withdraw', 'expired',
-           user_id, issuer, expires_at
-    FROM withdrawn
-    "#;
+    ), evidence AS (
+        INSERT INTO greengateway.admin_session_evidence (
+            event_id, operation_id, session_id, action, reason, user_id, issuer, expires_at
+        )
+        SELECT gen_random_uuid(), $2::text::uuid, id, 'admin_session.withdraw', 'expired',
+               user_id, issuer, expires_at
+        FROM withdrawn
+        RETURNING event_id
+    )"#,
+    journal_withdrawals!()
+);
 
 const PRUNE_LOGINS_SQL: &str = r#"
     DELETE FROM greengateway.admin_session_logins
@@ -192,7 +264,11 @@ const PRUNE_LOGINS_SQL: &str = r#"
     "#;
 
 /// One clock reading for every timestamp of the new row, so the idle
-/// deadline can never land after the absolute one.
+/// deadline can never land after the absolute one. The grant's evidence is
+/// journaled in the same statement, taking two units of capacity -- its own
+/// event's and the one held for its withdrawal -- only while both fit. When
+/// they do not, the statement still writes the session and evidence rows
+/// but journals nothing, and the caller rolls the whole grant back.
 const GRANT_SQL: &str = r#"
     WITH clock AS (SELECT clock_timestamp() AS at),
     granted AS (
@@ -205,13 +281,29 @@ const GRANT_SQL: &str = r#"
                LEAST(at + make_interval(secs => $9), at + make_interval(secs => $10))
         FROM clock
         RETURNING id, user_id, issuer, expires_at
+    ), evidence AS (
+        INSERT INTO greengateway.admin_session_evidence (
+            event_id, operation_id, session_id, action, reason, user_id, issuer, expires_at
+        )
+        SELECT gen_random_uuid(), $11::text::uuid, id, 'admin_session.grant', 'issued',
+               user_id, issuer, expires_at
+        FROM granted
+        RETURNING event_id
+    ), held AS (
+        UPDATE greengateway.authority_event_state
+        SET last_position = last_position + 1,
+            retained_events = retained_events + 2,
+            reserved_withdrawals = reserved_withdrawals + 1
+        WHERE singleton AND retained_events + 2 <= capacity
+          AND EXISTS (SELECT 1 FROM evidence)
+        RETURNING last_position
+    ), journaled AS (
+        INSERT INTO greengateway.authority_event_journal (position, event_id, source)
+        SELECT held.last_position, evidence.event_id, 'admin_session_evidence'
+        FROM evidence CROSS JOIN held
+        RETURNING position
     )
-    INSERT INTO greengateway.admin_session_evidence (
-        event_id, operation_id, session_id, action, reason, user_id, issuer, expires_at
-    )
-    SELECT gen_random_uuid(), $11::text::uuid, id, 'admin_session.grant', 'issued',
-           user_id, issuer, expires_at
-    FROM granted
+    SELECT (SELECT count(*) FROM evidence), (SELECT count(*) FROM journaled)
     "#;
 
 pub struct PostgresAdminSessionStore {
@@ -236,18 +328,18 @@ impl PostgresAdminSessionStore {
         }
     }
 
-    /// Withdraw up to `limit` expired sessions, each with its evidence row,
-    /// and delete up to `limit` expired pending logins: the maintenance
-    /// singleton's bounded step. Every admission also prunes a small batch,
-    /// so this matters only for a deployment whose logins stopped. Needs no
-    /// keyring, and runs on the connection the caller holds: the dedicated
-    /// session that holds the maintenance advisory lock. Returns how many
-    /// rows were removed.
+    /// Withdraw up to `limit` expired sessions, each with its evidence row
+    /// and its journal row, and delete up to `limit` expired pending logins:
+    /// the maintenance singleton's bounded step, in one transaction. Every
+    /// admission also prunes a small batch, so this matters only for a
+    /// deployment whose logins stopped. Needs no keyring, and runs on the
+    /// connection the caller holds: the dedicated session that holds the
+    /// maintenance advisory lock. Returns how many rows were removed.
     pub(crate) async fn prune_expired_with(
         client: &tokio_postgres::Client,
         limit: u32,
     ) -> Result<u64, RepositoryError> {
-        prune_expired_statements(
+        prune_expired(
             client,
             i64::from(limit.clamp(1, MAX_PRUNE_BATCH)),
             OPERATION_PRUNE,
@@ -368,7 +460,6 @@ impl PostgresAdminSessionStore {
         delivered: Option<String>,
     ) -> Result<bool, RepositoryError> {
         admission_lock(client, OPERATION_BEGIN).await?;
-        prune_expired_statements(client, PRUNE_BATCH, OPERATION_BEGIN).await?;
         if let Some(delivered) = delivered {
             client
                 .execute(
@@ -433,7 +524,6 @@ impl PostgresAdminSessionStore {
         let operation_id = uuid::Uuid::new_v4().to_string();
 
         admission_lock(client, OPERATION_GRANT).await?;
-        prune_expired_statements(client, PRUNE_BATCH, OPERATION_GRANT).await?;
         let pending = client
             .query_opt(
                 "SELECT issued_session_hash IS NULL FROM greengateway.admin_session_logins \
@@ -479,38 +569,50 @@ impl PostgresAdminSessionStore {
             return Ok(GrantOutcome::AtCapacity);
         }
         // Only a live session is replaced. One already past a deadline is
-        // left to the prune, whose evidence says it expired.
+        // left to the prune, whose evidence says it expired. The replaced
+        // session's withdrawal spends its own held unit, so it never stands
+        // in the way of the grant below; a grant refused there rolls the
+        // withdrawal back with it.
         if let Some(previous) = previous.filter(|_| replaces) {
-            client
-                .execute(
-                    WITHDRAW_SQL,
-                    &[&vec![previous], &operation_id, &REASON_REPLACED],
-                )
-                .await
-                .map_err(|error| classify_query(error, OPERATION_GRANT))?;
+            withdraw_statement(
+                client,
+                WITHDRAW_SQL,
+                &[&vec![previous], &operation_id, &REASON_REPLACED],
+                OPERATION_GRANT,
+            )
+            .await?;
         }
         let (nonce, ciphertext) = self.seal(&grant.key, &session_id, &session.token)?;
-        let granted = client
-            .execute(
-                GRANT_SQL,
-                &[
-                    &key,
-                    &session.id,
-                    &hex::encode(session.csrf),
-                    &session.user_id,
-                    &session.issuer,
-                    &self.keyring.primary_id(),
-                    &nonce,
-                    &ciphertext,
-                    &self.config.ttl.as_secs_f64(),
-                    &self.config.idle_timeout.as_secs_f64(),
-                    &operation_id,
-                ],
-            )
-            .await
-            .map_err(|error| classify_query(error, OPERATION_GRANT))?;
-        if granted != 1 {
+        let granted = journaled_statement(
+            client,
+            GRANT_SQL,
+            &[
+                &key,
+                &session.id,
+                &hex::encode(session.csrf),
+                &session.user_id,
+                &session.issuer,
+                &self.keyring.primary_id(),
+                &nonce,
+                &ciphertext,
+                &self.config.ttl.as_secs_f64(),
+                &self.config.idle_timeout.as_secs_f64(),
+                &operation_id,
+            ],
+            OPERATION_GRANT,
+        )
+        .await?;
+        if granted.evidence != 1 {
             return Err(internal(OPERATION_GRANT));
+        }
+        if granted.journaled != 1 {
+            // The journal cannot spare the grant's two units. The session
+            // and evidence rows the statement wrote go with the rollback.
+            report_capacity_refusal(JournalSource::AdminSession);
+            return Err(RepositoryError::new(
+                RepositoryErrorKind::Unavailable,
+                OPERATION_JOURNAL_APPEND,
+            ));
         }
         client
             .execute(
@@ -550,10 +652,13 @@ impl PostgresAdminSessionStore {
             return Ok(());
         }
         let operation_id = uuid::Uuid::new_v4().to_string();
-        client
-            .execute(WITHDRAW_SQL, &[&targets, &operation_id, &REASON_LOGOUT])
-            .await
-            .map_err(|error| classify_query(error, OPERATION_WITHDRAW))?;
+        withdraw_statement(
+            client,
+            WITHDRAW_SQL,
+            &[&targets, &operation_id, &REASON_LOGOUT],
+            OPERATION_WITHDRAW,
+        )
+        .await?;
         Ok(())
     }
 }
@@ -573,6 +678,9 @@ impl AdminSessionStore for PostgresAdminSessionStore {
         let binding = hex::encode(binding);
         let delivered = delivered.map(hex::encode);
         let client = self.client(OPERATION_BEGIN).await?;
+        prune_expired(&client, PRUNE_BATCH, OPERATION_BEGIN)
+            .await
+            .map_err(|error| unavailable(OPERATION_BEGIN, &error))?;
         transaction(&client, OPERATION_BEGIN, |client| {
             Box::pin(self.begin_login_in(client, &binding, ttl, delivered))
         })
@@ -582,6 +690,9 @@ impl AdminSessionStore for PostgresAdminSessionStore {
 
     async fn grant(&self, grant: SessionGrant) -> Result<GrantOutcome, AuthError> {
         let client = self.client(OPERATION_GRANT).await?;
+        prune_expired(&client, PRUNE_BATCH, OPERATION_GRANT)
+            .await
+            .map_err(|error| unavailable(OPERATION_GRANT, &error))?;
         transaction(&client, OPERATION_GRANT, |client| {
             Box::pin(self.grant_in(client, &grant))
         })
@@ -624,14 +735,23 @@ impl AdminSessionStore for PostgresAdminSessionStore {
     }
 
     async fn reject(&self, key: &SessionDigest, id: &str) -> Result<(), AuthError> {
-        let client = self.client(OPERATION_WITHDRAW).await?;
+        let key = hex::encode(key);
         let operation_id = uuid::Uuid::new_v4().to_string();
-        client
-            .execute(REJECT_SQL, &[&hex::encode(key), &id, &operation_id])
-            .await
-            .map_err(|error| classify_query(error, OPERATION_WITHDRAW))
-            .map_err(|error| unavailable(OPERATION_WITHDRAW, &error))?;
-        Ok(())
+        let client = self.client(OPERATION_WITHDRAW).await?;
+        transaction(&client, OPERATION_WITHDRAW, |client| {
+            Box::pin(async move {
+                withdraw_statement(
+                    client,
+                    REJECT_SQL,
+                    &[&key, &id, &operation_id],
+                    OPERATION_WITHDRAW,
+                )
+                .await
+                .map(|_| ())
+            })
+        })
+        .await
+        .map_err(|error| unavailable(OPERATION_WITHDRAW, &error))
     }
 
     async fn withdraw(
@@ -698,23 +818,86 @@ async fn admission_lock(
     Ok(())
 }
 
-/// Both prune statements over whichever client the caller holds: an
-/// admission transaction, or the singleton's dedicated session.
-async fn prune_expired_statements(
+/// Both prune statements, in one transaction of their own on whichever
+/// client the caller holds: an admission's connection before its admission
+/// transaction begins, or the singleton's dedicated session. The logins go
+/// first, so the journal's state row, which the session prune's expiry
+/// evidence locks, is taken by the transaction's last statement. Returns how
+/// many rows were removed.
+async fn prune_expired(
     client: &tokio_postgres::Client,
     limit: i64,
     operation: &'static str,
 ) -> Result<u64, RepositoryError> {
-    let operation_id = uuid::Uuid::new_v4().to_string();
-    let sessions = client
-        .execute(PRUNE_SESSIONS_SQL, &[&limit, &operation_id])
-        .await
-        .map_err(|error| classify_query(error, operation))?;
-    let logins = client
-        .execute(PRUNE_LOGINS_SQL, &[&limit])
-        .await
-        .map_err(|error| classify_query(error, operation))?;
-    Ok(sessions.saturating_add(logins))
+    transaction(client, operation, |client| {
+        Box::pin(async move {
+            let operation_id = uuid::Uuid::new_v4().to_string();
+            let logins = client
+                .execute(PRUNE_LOGINS_SQL, &[&limit])
+                .await
+                .map_err(|error| classify_query(error, operation))?;
+            let sessions = withdraw_statement(
+                client,
+                PRUNE_SESSIONS_SQL,
+                &[&limit, &operation_id],
+                operation,
+            )
+            .await?;
+            Ok(sessions.saturating_add(logins))
+        })
+    })
+    .await
+}
+
+/// What one evidence-writing statement wrote: its evidence rows, and how
+/// many of them it journaled.
+struct Journaled {
+    evidence: i64,
+    journaled: i64,
+}
+
+/// Run one statement that changes sessions, writes their evidence rows and
+/// journals them, inside the caller's transaction. A statement the database
+/// refuses or does not answer is counted as an evidence failure: the change
+/// and its evidence are one statement, so neither happened.
+async fn journaled_statement(
+    client: &tokio_postgres::Client,
+    sql: &str,
+    params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+    operation: &'static str,
+) -> Result<Journaled, RepositoryError> {
+    let row = client.query_one(sql, params).await.map_err(|error| {
+        record_evidence_failure();
+        classify_query(error, operation)
+    })?;
+    Ok(Journaled {
+        evidence: row.try_get(0).map_err(|_| invalid_data(operation))?,
+        journaled: row.try_get(1).map_err(|_| invalid_data(operation))?,
+    })
+}
+
+/// Run one withdrawal statement (`WITHDRAW_SQL`, `REJECT_SQL` or
+/// `PRUNE_SESSIONS_SQL`) inside the caller's transaction, and refuse it
+/// unless every evidence row it wrote was journaled. Withdrawals check no
+/// capacity, so the counts differ only when the journal's state row is
+/// missing; the caller's rollback then takes the withdrawal back. Returns
+/// how many sessions were withdrawn.
+async fn withdraw_statement(
+    client: &tokio_postgres::Client,
+    sql: &str,
+    params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+    operation: &'static str,
+) -> Result<u64, RepositoryError> {
+    let written = journaled_statement(client, sql, params, operation).await?;
+    if written.journaled != written.evidence {
+        record_evidence_failure();
+        tracing::error!(
+            operation,
+            "admin session withdrawal evidence was not journaled; the withdrawal was rolled back"
+        );
+        return Err(invalid_data(operation));
+    }
+    Ok(u64::try_from(written.evidence).unwrap_or(0))
 }
 
 fn max_entries(config: &AdminSessionConfig) -> i64 {

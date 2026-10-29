@@ -147,6 +147,7 @@ pub(crate) fn record_delivered(events: usize) {
 /// Publish the journal gauges from one consistent read.
 pub(crate) fn record_journal_stats(stats: &JournalStats) {
     ::metrics::gauge!(crate::metrics::AUTHORITY_EVENT_JOURNAL_RETAINED).set(stats.retained as f64);
+    ::metrics::gauge!(crate::metrics::AUTHORITY_EVENT_JOURNAL_RESERVED).set(stats.reserved as f64);
     ::metrics::gauge!(crate::metrics::AUTHORITY_EVENT_JOURNAL_CAPACITY).set(stats.capacity as f64);
     ::metrics::gauge!(crate::metrics::AUTHORITY_EVENT_UNDELIVERED).set(stats.undelivered() as f64);
     ::metrics::gauge!(crate::metrics::AUTHORITY_EVENT_OLDEST_UNDELIVERED_AGE_SECONDS)
