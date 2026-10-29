@@ -296,6 +296,24 @@ pub(crate) fn finish_report<T: Serialize>(
     }
 }
 
+/// Writes a SARIF log a command built from `diagnostics` and its own
+/// findings, and returns the exit code the diagnostics determine.
+pub(crate) fn sarif_log(
+    io: &mut Io<'_>,
+    diagnostics: &[ReportDiagnostic],
+    log: &serde_json::Value,
+) -> Exit {
+    let exit = Exit::worst(diagnostics.iter().map(ReportDiagnostic::exit));
+    match serde_json::to_writer_pretty(&mut *io.stdout, log)
+        .map_err(io::Error::from)
+        .and_then(|()| writeln!(io.stdout))
+        .and_then(|()| io.stdout.flush())
+    {
+        Ok(()) => exit,
+        Err(_) => write_failed(io),
+    }
+}
+
 /// Writes an artifact to standard output.
 pub(crate) fn artifact(io: &mut Io<'_>, text: &str) -> Exit {
     match io
