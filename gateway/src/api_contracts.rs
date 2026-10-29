@@ -1654,6 +1654,74 @@ pub(super) const DURABLE_STREAM_BATCH: usize = 64;
 pub(super) const DURABLE_STREAM_IDLE_POLL: std::time::Duration =
     std::time::Duration::from_millis(500);
 
+/// How often an open audit event stream judges its caller's credential
+/// again, and asks whether the result still holds `admin:audit:stream`.
+/// It bounds how long a stream keeps sending after a logout, an expiry or
+/// a revocation; a policy change is seen sooner, because the permission is
+/// also checked against the live policy before every frame. It is also the
+/// longest one re-check may take before the stream fails closed.
+pub(super) const AUDIT_STREAM_RECHECK_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(15);
+
+/// The longest an audit event stream stays open. A client that still wants
+/// events reconnects, and its new request passes the whole request path
+/// again -- authentication, the RBAC stage and its audit records -- rather
+/// than living on re-checks alone.
+pub(super) const AUDIT_STREAM_MAX_LIFETIME: std::time::Duration =
+    std::time::Duration::from_secs(30 * 60);
+
+/// The two bounds an open audit event stream runs under.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct AuditStreamLimits {
+    pub(super) recheck_interval: std::time::Duration,
+    pub(super) max_lifetime: std::time::Duration,
+}
+
+impl AuditStreamLimits {
+    /// What every gateway serves with. Only tests shorten them, so a
+    /// re-check or a lifetime can be watched happening.
+    pub(super) const SERVED: Self = Self {
+        recheck_interval: AUDIT_STREAM_RECHECK_INTERVAL,
+        max_lifetime: AUDIT_STREAM_MAX_LIFETIME,
+    };
+}
+
+/// The SSE event name of the last frame of an audit event stream the
+/// gateway ends itself. It carries no `id:`, so a durable stream's resume
+/// cursor still names the last audit event delivered, and its data is
+/// `{"reason": ...}` with one of the [`AuditStreamClose`] reasons.
+pub(super) const AUDIT_STREAM_CLOSED_EVENT: &str = "stream.closed";
+
+/// Why the gateway ended an audit event stream.
+#[derive(Debug)]
+pub(super) enum AuditStreamClose {
+    /// The credential was refused when judged again -- logged out,
+    /// expired, revoked, rejected -- or now names a different identity.
+    /// `reason` is the validator's, as `auth.failure` records it.
+    SessionEnded { reason: String },
+    /// The credential's authority could not judge it, or did not answer
+    /// within [`AUDIT_STREAM_RECHECK_INTERVAL`]. Cannot-check fails closed.
+    SessionUnverifiable { reason: String },
+    /// The caller no longer holds `admin:audit:stream` under the live
+    /// policy.
+    PermissionRevoked,
+    /// The stream reached [`AUDIT_STREAM_MAX_LIFETIME`].
+    LifetimeElapsed,
+}
+
+impl AuditStreamClose {
+    /// The `reason` of the closing frame. The validator's own reason stays
+    /// in the audit record and out of the stream.
+    pub(super) fn as_str(&self) -> &'static str {
+        match self {
+            Self::SessionEnded { .. } => "session_ended",
+            Self::SessionUnverifiable { .. } => "session_unverifiable",
+            Self::PermissionRevoked => "permission_revoked",
+            Self::LifetimeElapsed => "lifetime_elapsed",
+        }
+    }
+}
+
 // The `outcome` vocabulary of
 // `greengateway_audit_stream_connections_total` (issue #241, PR 14): how a
 // durable audit-stream connection attempt ended, one compile-time constant
