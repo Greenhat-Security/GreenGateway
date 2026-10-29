@@ -6,13 +6,13 @@ replay can run, each retained record has to be turned into the facts the
 policy evaluator reads, with every fact the record does not carry stated as
 missing rather than guessed. A **replay context** is that record, and this
 page describes its format, `replay-context.v1`, and how the gateway reads one
-out of the audit events it writes today (issue #243, slice 12).
+out of the audit events it writes today (issue #243, slice 12), and the
+bounded [replay jobs](#replay-jobs) that decide a window of them again under
+a candidate policy (slice 13).
 
-There is no replay endpoint yet. The bounded replay job engine (slice 13) and
-the recorded-versus-candidate comparison (slice 14) are the first consumers;
-until they ship, replay contexts exist only inside the gateway and its tests.
-Nothing on the request path writes one: every context comes from the legacy
-adapters described below.
+The recorded-versus-candidate comparison (slice 14) is a later slice. Nothing
+on the request path writes a replay context: every context comes from the
+legacy adapters described below, is built in memory, and is never stored.
 
 ## What a replay context is, and what it is not
 
@@ -248,6 +248,250 @@ destination the static checks refuse is refused; one they admit is
 `indeterminate`, because the addresses it resolved to could still have
 refused it. No replay performs a lookup.
 
+## Replay jobs
+
+`POST /v1{ADMIN_PREFIX}/policy/replays` starts a bounded job that decides one
+window of the standalone audit log again under a candidate policy, through the
+same evaluator the live adapters call, and reports what it decided as counts.
+`GET /v1{ADMIN_PREFIX}/policy/replays/{id}` reads the job, its progress and,
+once it has finished, its result; `DELETE` on the same path cancels a job that
+has not finished and discards one that has.
+
+Every route needs `admin:policy:read`, `admin:policy:simulate` and
+`admin:audit:read`, checked before a body is read or a job is looked up. A job
+is served only to the principal that started it (the same canonical issuer
+and subject): anyone else gets the same `404 policy_replay_job_not_found` as
+for a job that does not exist.
+
+### The request
+
+The request is a `policy-replay.v1` document, published as
+[`docs/schemas/policy-replay.v1.schema.json`](schemas/policy-replay.v1.schema.json).
+The gateway's parser is authoritative: it dispatches the version exactly and
+refuses unknown, repeated and credential-shaped members.
+
+```json
+{
+  "schema_version": "policy-replay.v1",
+  "base_etag": "\"sha256:...\"",
+  "candidate": { "source": "edits", "edits": [
+    { "op": "insert", "section": "rules", "position": 0,
+      "value": { "id": "lockdown", "methods": ["GET"], "path": "/orders/**", "action": "deny" } }
+  ] },
+  "window": { "from": "2026-10-27T00:00:00Z", "to": "2026-10-28T00:00:00Z" },
+  "max_records": 50000,
+  "idempotency_key": "nightly"
+}
+```
+
+| Member | Meaning |
+| --- | --- |
+| `base_etag` | Required. The active policy's ETag the request was written against. A different active policy is `412 policy_replay_base_stale`, never a rebase |
+| `candidate` | Required. `active` (the base itself), `edits` (1 to 64 position-aware edits over the base) or `inline` (a complete policy document), with exactly the members a [simulation](policy-simulation.md) candidate has. An edited or inline candidate is validated like a policy write and never stored |
+| `window` | Required. `from` and optional `to`, RFC 3339 date-times with an offset; the window is `[from, to)` over audit timestamps. `to` defaults to the moment the job is created and may not be later; the window must begin before it ends and may cover at most 31 days |
+| `max_records` | Optional. The most records the job reads, 1 to 100,000; 100,000 when omitted |
+| `idempotency_key` | Optional. 1 to 128 ASCII letters, digits, `.`, `_`, `:` and `-`. A retry by the same principal with the same key and the same request bytes answers `200` with the job it already started, and starts nothing; the same key with a different request is `409 policy_replay_idempotency_conflict`. A key is remembered as long as its job is |
+
+A request that passes is `202 Accepted`, with the job's representation and a
+`Location` header naming it. An invalid one is `422 policy_replay_invalid`
+with structured diagnostics (or `policy_candidate_invalid` for a candidate a
+policy write would refuse), and creates no job.
+
+### The snapshot a job reads
+
+When a job is created, before it is queued, the gateway fixes its **cutoff**:
+the newest audit row id stored at that moment (`high_water`) and how many rows
+of the window are at or below it (`selected_records`). Audit row ids only grow,
+so a record written after the cutoff -- including one the audit writer had not
+flushed yet, whatever its timestamp -- never enters the job. A row whose
+timestamp did not parse when it was stored belongs to no window.
+
+The job reads the window oldest first, in pages, each its own read
+transaction on a read-only connection of its own, so it holds no snapshot
+between pages and cannot write to the log it reads. When it has read the
+window it counts the window's rows again: if retention pruned rows the cutoff
+selected while the job ran, the result says `source_changed` and is
+incomplete, never silently short. A window reaching back past audit retention
+simply holds fewer rows; the cutoff's count says how many.
+
+### Bounds
+
+| Bound | Value | When reached |
+| --- | --- | --- |
+| Records read | `max_records`, at most 100,000 | The scan stops; `scan_truncated` |
+| Run time | 60 seconds | The scan stops; `deadline_exceeded` |
+| One page | 500 rows, and 4 MiB of their JSON past the first row | The next page continues |
+| One row | 256 KiB of actor and payload JSON | Counted as `oversized_record`; its JSON is never read |
+| Running jobs | 1 per replica, on a blocking thread | Further jobs are `queued` |
+| Queued or running jobs | 4 per replica, 1 per principal | `429 policy_replay_busy` |
+| Unexpired jobs held | 32 per replica, 8 per principal | `429 policy_replay_quota_exhausted` |
+| Finished job kept | 15 minutes after it finishes | The job reads `expired`, with no result |
+| Expired job remembered | 1 hour after that | `404` |
+| Request body | 2 MiB, or `MAX_BODY_SIZE` if lower | `413` |
+
+No job is ever evicted to make room for another. A stopped scan is still a
+result, an incomplete one whose counts cover what was read; it is never a
+complete answer.
+
+### Lifecycle
+
+`queued`, then `running`, then one of:
+
+| State | Meaning |
+| --- | --- |
+| `completed` | Every record the cutoff selected was read and classified, the window was unchanged at the end, and at least one record was replayed |
+| `completed_incomplete` | A result whose `limitations` say what it does not cover: `scan_truncated`, `deadline_exceeded`, `source_changed`, or `no_data` when nothing in the window was replayable. It satisfies no gate |
+| `failed` | No result, with a stable `failure.reason`: `source_unavailable`, `compile_failed`, `evaluator_failed` (the evaluator broke its own contract; nothing it counted is an answer), `result_too_large`, `audit_unavailable` or `internal` |
+| `cancelled` | No result. A queued job stops at once; a running one before its next record |
+| `expired` | 15 minutes have passed since the job finished: its result, if it had one, is gone, and it no longer counts against any quota |
+
+`completed` does not mean every record was decided: records the candidate
+answered `indeterminate`, records the adapters could not use and records the
+evaluator refused are all counted, by code.
+
+Every job leaves exactly its own lifecycle records: `policy.replay_started`
+when it is admitted, and one of `policy.replay_completed`,
+`policy.replay_cancelled` or `policy.replay_failed` when it ends. They carry
+the job id, the base and candidate ETags, the request digest, the window and
+cutoff, counts, limitation codes and the result digest -- never a record, a
+principal, a path or policy content -- and the envelope of the request that
+started the job. A job is queued only once the audit log accepts its start
+(otherwise `503 policy_replay_audit_unavailable`, and no job), and its result
+is published only once the audit log accepts its completion: a result whose
+completion is not accepted is `failed` with `audit_unavailable`. "Accepted"
+is what `AUDIT_DURABILITY` makes it: committed to the audit store under
+`required`, queued for the writer under `best_effort`.
+
+### Status codes
+
+| Status | When |
+| --- | --- |
+| `202` | `POST`: the job is queued. `DELETE`: cancellation of a queued or running job was requested |
+| `200` | `GET`: the job. `POST`: an idempotent retry, naming the job it already started |
+| `204` | `DELETE`: a finished job was discarded |
+| `400` | A body that is not JSON, or repeats a member (`policy_replay_request_invalid`) |
+| `401`, `403` | Not authenticated, or missing one of the three permissions; nothing is read or started |
+| `404` | No such job for this principal (`policy_replay_job_not_found`) |
+| `409` | An idempotency key reused for a different request |
+| `412` | `base_etag` is not the active policy's ETag |
+| `413` | The body is over its bound |
+| `422` | An invalid request, window, edit or candidate |
+| `429` | `policy_replay_busy` or `policy_replay_quota_exhausted` |
+| `503` | `audit_evidence_unavailable` (no standalone audit log, or it could not be read), `policy_replay_audit_unavailable` (the start was not recorded), or `policy_replay_unsupported_in_cluster` |
+
+A job's representation is always sent with `Cache-Control: no-store`.
+
+### The result
+
+A job's representation (`policy-replay-job.v1`) states its state, the
+evaluator and gateway versions, the base ETag and whether it is still the
+active one (`base.current`: a result stays the answer for the policies it was
+pinned to, and is stale for the live one once that changes), the candidate's
+source and ETag, the window, the cutoff, the limits applied and its progress.
+A finished job adds `result_digest` and `result`, a
+`policy-replay-results.v1` document:
+
+```json
+{
+  "schema_version": "policy-replay-results.v1",
+  "mode": "historical_replay",
+  "complete": true,
+  "limitations": [],
+  "source": {
+    "kind": "standalone_audit_log",
+    "window": { "from": "2026-10-27T00:00:00Z", "to": "2026-10-28T00:00:00Z" },
+    "high_water": 18734,
+    "max_records": 50000
+  },
+  "records": {
+    "selected": 9, "scanned": 9, "replayable": 8, "duplicate": 1,
+    "not_policy_evaluated": 0, "unsupported": 0, "malformed": 0,
+    "not_request_record": 0, "unreadable": 0, "oversized": 0,
+    "by_code": { "duplicate_http_decision": 1, "replayable": 8 }
+  },
+  "replayed": {
+    "total": 8,
+    "http": {
+      "replayable": 7, "decided": 7, "indeterminate": 0, "refused": 0,
+      "outcomes": [
+        { "logical": "allow", "enforcement": "not_applicable",
+          "effective_action": "would_forward", "reason": "matched_rule", "count": 4 },
+        { "logical": "deny", "enforcement": "enforced",
+          "effective_action": "would_block", "reason": "matched_rule", "count": 3 }
+      ],
+      "limitations": {}, "refusals": {}, "egress_not_replayed": 0
+    },
+    "rate": { "no_override": 3, "override": 4, "indeterminate": 0, "refused": 0,
+              "limitations": {}, "refusals": {} },
+    "tool": { "replayable": 1, "decided": 1, "indeterminate": 0, "refused": 0,
+              "outcomes": [], "limitations": {}, "refusals": {},
+              "egress_not_replayed": 0 }
+  },
+  "not_replayed": ["authentication", "request_admission", "rate_capacity",
+                   "tool_leases", "egress", "transport", "upstream"]
+}
+```
+
+(The tool lane's `outcomes` are abbreviated above; they have the HTTP lane's
+shape.)
+
+- **`records`** classifies every row read: the adapter code of each, as in
+  [Reading the audit records the gateway writes today](#reading-the-audit-records-the-gateway-writes-today),
+  plus `unreadable_record` (actor or payload JSON that does not parse) and
+  `oversized_record`.
+- **`replayed`** is the candidate's answer for every replayable record, per
+  lane: decided outcomes counted by logical decision, enforcement, effective
+  action and reason, in the [simulation](policy-simulation.md)'s vocabulary,
+  so a shadowed deny is never counted as an allow; `indeterminate` answers by
+  limitation code (`missing_principal_fact`, `missing_dispatch_fact`,
+  `missing_mcp_identity` and the rest); and `refused` records, whose facts
+  the evaluator refused because no served request could have left them.
+  `rate` is rate-lane selection for the HTTP records: which override the
+  candidate would select, never whether a bucket had capacity.
+- **`not_replayed`** names the stages a replay does not include. v1 records
+  carry no egress destination, so egress is never replayed.
+
+A result holds counts and stable codes only. It repeats no subject, issuer,
+path, host, request id, source address, user agent, rule id or other value
+from a record. Every count is keyed by a code from a closed set and rendered
+sorted, and `result_digest` is the ADR-0004 semantic digest
+(`application/vnd.greengateway.policy-replay-results+json`,
+`policy-replay-results.v1`) of the result: two complete jobs over the same
+cutoff, candidate and evaluator produce byte-identical results, however the
+log was paged. A job stopped by its deadline is the one exception, and says
+so.
+
+A result reports what the candidate decides for the records. It does not yet
+compare that with what was recorded or with the active policy: that is the
+impact comparison (slice 14), and only it can support the statement "No newly
+allowed decisions were observed among N replayable events". No replay result
+says a policy is safe.
+
+### Standalone only, and process-local
+
+Jobs live in the memory of the replica that admitted them, and run there.
+Shutting the gateway down cancels every job, and a running one stops before
+its next record. A restart forgets every job: its id is `404` afterwards,
+never resumed and never a partial result. Cluster mode answers every replay
+route `503 policy_replay_unsupported_in_cluster`, after the permission checks
+and before a body is read, a cutoff fixed or a job admitted: a replicated job
+needs the durable leases of #241, and the cluster audit authority is
+PostgreSQL, which no replay reader covers yet. Without a
+standalone audit log (`AUDIT_SQLITE_PATH` unset) the start route is
+`503 audit_evidence_unavailable`, never an empty result.
+
+### Side effects
+
+A job reads the audit log, and that is all it does outside its own memory. It
+writes nothing, emits no audit event but its lifecycle records and no metric
+but its requests' own admission metrics, reads or charges no rate bucket,
+acquires no tool permit, resolves no name and contacts no upstream. A test
+replays retained records that, live, would charge a one-request rate bucket,
+record a would-deny, admit a tool and reach an upstream, and checks that the
+job left only its two lifecycle records, moved no metric beyond its requests'
+own, charged no bucket, reached no upstream and wrote no row to the log --
+then sends the same request live to show each of those checks can fail.
+
 ## How this is verified
 
 - Real requests through the live RBAC and observation middleware, across
@@ -264,3 +508,20 @@ refused it. No replay performs a lookup.
   a serialized context or its formatting.
 - Every context round-trips through the parser, matches the published
   schema, and the parser and the schema refuse the same malformed contexts.
+- A replay job's engine is run over in-memory and SQLite audit logs: a window
+  touching every classification and lane is counted by stable code; rows
+  written after the cutoff are never read; the record bound, the deadline,
+  pruning during a run and an empty window each give an incomplete result
+  with their own limitation; cancellation and a failing source give no result;
+  oversized and unreadable rows are counted without their JSON being read; the
+  same cutoff and candidate give byte-identical results however the log is
+  paged; no result repeats a record value; and the run records no metric.
+- Through the application: every route refuses a caller missing any of its
+  three permissions, and serves a job only to its owner; a stale base, an
+  invalid window, edit or candidate creates no job; an idempotent retry starts
+  nothing; queued jobs are cancelled, quotas refuse rather than evict, and
+  results expire; in cluster mode every route answers `503` without reading a
+  body, admitting a job, recording a lifecycle event or consulting the
+  cluster authority; and the side-effect test above holds.
+- The `policy-replay.v1` parser and its published schema accept and refuse
+  the same requests.

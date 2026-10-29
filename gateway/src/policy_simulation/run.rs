@@ -521,14 +521,24 @@ fn refusal(case: &SyntheticCase, error: EvaluationError) -> SimulationError {
 /// The outcome in the result's vocabulary. The logical decision, whether a
 /// denial is enforced or only observed, and what the request would meet are
 /// three separate answers, so a shadowed deny is never read as an allow.
-fn decision_key(logical: LogicalDecision, effect: PolicyEffect, reason: &'static str) -> Key {
-    let (enforcement, effective_action) = match (logical, effect) {
+/// The enforcement and effective action a decision states: kept apart from
+/// the logical outcome, so a shadowed deny is never read as an allow.
+/// Historical replay reports its decisions in the same vocabulary.
+pub(crate) fn enforcement_and_effect(
+    logical: LogicalDecision,
+    effect: PolicyEffect,
+) -> (&'static str, &'static str) {
+    match (logical, effect) {
         // Undecided: no enforcement to describe, and no promise either way.
         (LogicalDecision::Indeterminate, _) => ("not_applicable", "unknown"),
         (_, PolicyEffect::Allow) => ("not_applicable", "would_forward"),
         (_, PolicyEffect::Observe) => ("shadowed", "would_forward"),
         (_, PolicyEffect::Block) => ("enforced", "would_block"),
-    };
+    }
+}
+
+fn decision_key(logical: LogicalDecision, effect: PolicyEffect, reason: &'static str) -> Key {
+    let (enforcement, effective_action) = enforcement_and_effect(logical, effect);
     Key::Decision {
         logical: logical_code(logical),
         enforcement,
