@@ -369,6 +369,36 @@ async fn a_candidate_is_judged_without_being_written() {
     );
 }
 
+/// A candidate is read from the bytes of its `policy` member by the parser
+/// `PUT /policy` reads a body with, so a v1 number spelled as serde_json's
+/// private tag -- a number through a `Value`, an object in the bytes -- is
+/// refused with the error `PUT` gives it, and nothing runs. A `null`
+/// candidate is still a candidate, and is refused as one.
+#[tokio::test]
+async fn a_candidate_is_read_from_its_bytes_like_a_policy_write() {
+    let harness = harness();
+    let request =
+        |candidate: &str| format!(r#"{{"suite":{},"policy":{candidate}}}"#, passing_suite());
+    let tagged = r#"{"schema_version":"1.0.0","rate_limits":[{"id":"l","requests_per_second":{"$serde_json::private::Number":"0.5"},"burst":1}]}"#;
+    let response = run_request(&harness, tester(), request(tagged), None).await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = json_body(response).await;
+    assert_eq!(body["reason"], json!("policy_candidate_invalid"));
+    assert_eq!(
+        body["errors"],
+        json!(["the value is not one this location accepts"])
+    );
+
+    let response = run_request(&harness, tester(), request("null"), None).await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        json_body(response).await["reason"],
+        json!("policy_candidate_invalid")
+    );
+    drain_audit(&harness).await;
+    assert!(test_run_events(&harness).is_empty());
+}
+
 #[tokio::test]
 async fn an_invalid_suite_or_body_is_refused_before_any_run() {
     let harness = harness();

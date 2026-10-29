@@ -35102,6 +35102,12 @@ mod cluster_policy_tests {
                 POLICY_DRAFT_PUBLISH_ADMIN_ROUTE,
                 post(policy_draft_publish_endpoint),
             )
+            .route(
+                POLICY_SIMULATIONS_ADMIN_ROUTE,
+                post(policy_simulations_endpoint).layer(Extension(Arc::new(
+                    PolicyEvaluationLimiter::new(MAX_CONCURRENT_POLICY_SIMULATIONS),
+                ))),
+            )
             .with_state(PolicyAdminState {
                 policy_file: None,
                 rbac_state: Some(rbac_state.clone().with_revision_gate(gate.clone())),
@@ -35471,6 +35477,255 @@ mod cluster_policy_tests {
             .expect("PUT should complete");
         assert_eq!(committed.status(), StatusCode::OK);
         assert_eq!(policy_version_count(&pool).await, before + 1);
+    }
+
+    /// What cluster mode cannot commit it does not save or simulate either
+    /// (issue #243 review). A draft whose candidate is policy v1 is refused
+    /// on create and on patch with the `400` a `PUT` of the same document
+    /// gets, and a simulation of an inline v1 candidate with the `422`
+    /// `POST /policy/validate` and a test run give it, as soon as the
+    /// candidate is read rather than when someone tries to commit it. Nothing
+    /// is committed, and a 0.x candidate on the same paths still is
+    /// accepted.
+    #[tokio::test]
+    async fn cluster_drafts_and_simulations_refuse_a_candidate_the_cluster_cannot_commit() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_policy_foundation(&database.dsn).await;
+        let simulating = r#"{
+            "schema_version": "0.1.0",
+            "id": "simulate-init",
+            "default_action": "deny",
+            "roles": { "admin": { "permissions":
+                ["admin:policy:read", "admin:policy:write", "admin:policy:simulate"] } }
+        }"#;
+        let active = PolicyControlPlane::commit(
+            store.as_ref(),
+            PolicyCommitRequest {
+                precondition: PolicyCommitPrecondition::Initialize,
+                candidate: &parse_policy_body(simulating.as_bytes())
+                    .expect("seed policy should parse"),
+                change: crate::storage::DocumentChange::test_policy("seed"),
+                diff_summary: &DIFF,
+            },
+        )
+        .await
+        .expect("deployment should initialize");
+        let (router, rbac_state) = cluster_policy_router(store.clone());
+        rbac_state
+            .install_revision_snapshot(active.policy.clone(), active.security_revision)
+            .await
+            .expect("the authority's revision should install");
+        let versions_before = policy_version_count(&pool).await;
+        let v1 = r#"{"schema_version":"1.0.0","id":"v1-held","default_action":"deny"}"#;
+        let refuses_format = |body: &Value| {
+            body["errors"][0]
+                .as_str()
+                .is_some_and(|error| error.contains("cannot be committed in cluster mode"))
+        };
+        let request = |method: Method, uri: &str, if_match: &str, body: String| {
+            let mut request = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::IF_MATCH, if_match)
+                .body(Body::from(body))
+                .expect("request should build");
+            request.extensions_mut().insert(admin_principal());
+            request
+        };
+
+        let (status, body) = refusal_of(
+            router
+                .clone()
+                .oneshot(request(
+                    Method::POST,
+                    POLICY_DRAFTS_ADMIN_ROUTE,
+                    &active.etag,
+                    format!(r#"{{"policy":{v1}}}"#),
+                ))
+                .await
+                .expect("create should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(refuses_format(&body), "{body}");
+
+        let created = router
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                POLICY_DRAFTS_ADMIN_ROUTE,
+                &active.etag,
+                "{}".to_owned(),
+            ))
+            .await
+            .expect("create should complete");
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let draft_etag = created
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("draft ETag")
+            .to_owned();
+        let (_, draft) = refusal_of(created).await;
+        let draft_uri = format!(
+            "{POLICY_DRAFTS_ADMIN_ROUTE}/{}",
+            draft["draft_id"].as_str().expect("draft id")
+        );
+        let (status, body) = refusal_of(
+            router
+                .clone()
+                .oneshot(request(
+                    Method::PATCH,
+                    &draft_uri,
+                    &draft_etag,
+                    format!(r#"{{"policy":{v1}}}"#),
+                ))
+                .await
+                .expect("patch should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(refuses_format(&body), "{body}");
+        let (status, kept) = refusal_of(
+            router
+                .clone()
+                .oneshot(request(Method::GET, &draft_uri, "*", String::new()))
+                .await
+                .expect("draft read should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(kept["revision"], 1, "the refused patch saved nothing");
+
+        let simulation = |policy: &str| {
+            format!(
+                r#"{{"schema_version":"policy-simulation.v1","base_etag":{},"candidate":{{"source":"inline","policy":{policy}}},"cases":[{{"id":"anonymous","kind":"http","request":{{"method":"GET","path":"/x"}},"principal":"anonymous"}}]}}"#,
+                json!(active.etag)
+            )
+        };
+        let (status, body) = refusal_of(
+            router
+                .clone()
+                .oneshot(request(
+                    Method::POST,
+                    POLICY_SIMULATIONS_ADMIN_ROUTE,
+                    &active.etag,
+                    simulation(v1),
+                ))
+                .await
+                .expect("simulation should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["reason"], "policy_candidate_invalid");
+        assert!(refuses_format(&body), "{body}");
+        let simulated = router
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                POLICY_SIMULATIONS_ADMIN_ROUTE,
+                &active.etag,
+                simulation(&cluster_policy_json("v0-simulated")),
+            ))
+            .await
+            .expect("simulation should complete");
+        assert_eq!(simulated.status(), StatusCode::OK);
+        assert_eq!(policy_version_count(&pool).await, versions_before);
+    }
+
+    /// A draft publication the commit itself refuses is recorded like one
+    /// refused before it (issue #243 review): here the candidate gives a
+    /// role a `description`, the operation gate has no roster to ask, and
+    /// the publication is the gate's `503` with nothing committed, the draft
+    /// kept open, and a `policy.draft_publish_refused` naming
+    /// `policy_operation_refused`.
+    #[tokio::test]
+    async fn cluster_draft_publications_the_commit_refuses_are_audited() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_policy_foundation(&database.dsn).await;
+        let active = initialize(&store, "refused-init").await;
+        let capture = audit::sink::tests::CaptureSink::new();
+        let (router, rbac_state) = cluster_policy_router_with(
+            store.clone(),
+            None,
+            audit::AuditLog::new(Arc::new(capture.clone())),
+        );
+        rbac_state
+            .install_revision_snapshot(active.policy.clone(), active.security_revision)
+            .await
+            .expect("the authority's revision should install");
+        let versions_before = policy_version_count(&pool).await;
+
+        let mut create = Request::builder()
+            .method(Method::POST)
+            .uri(POLICY_DRAFTS_ADMIN_ROUTE)
+            .header(header::IF_MATCH, &active.etag)
+            .body(Body::from(format!(
+                r#"{{"policy":{}}}"#,
+                described_cluster_policy_json("refused-described")
+            )))
+            .expect("request should build");
+        create.extensions_mut().insert(admin_principal());
+        let created = router
+            .clone()
+            .oneshot(create)
+            .await
+            .expect("create should complete");
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let draft_etag = created
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("draft ETag")
+            .to_owned();
+        let (_, draft) = refusal_of(created).await;
+        let draft_id = draft["draft_id"].as_str().expect("draft id").to_owned();
+
+        let mut publish = Request::builder()
+            .method(Method::POST)
+            .uri(format!("{POLICY_DRAFTS_ADMIN_ROUTE}/{draft_id}/publish"))
+            .header(POLICY_DRAFT_ETAG_HEADER, &draft_etag)
+            .header(header::IF_MATCH, &active.etag)
+            .body(Body::empty())
+            .expect("request should build");
+        publish.extensions_mut().insert(admin_principal());
+        let (status, body) = refusal_of(
+            router
+                .clone()
+                .oneshot(publish)
+                .await
+                .expect("publish should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["reason"], "roster_unavailable");
+        assert_eq!(policy_version_count(&pool).await, versions_before);
+
+        let refused = |capture: &audit::sink::tests::CaptureSink| {
+            capture
+                .events()
+                .into_iter()
+                .filter(|event| event.event_type == audit::event::POLICY_DRAFT_PUBLISH_REFUSED)
+                .map(|event| event.payload)
+                .collect::<Vec<_>>()
+        };
+        assert_eventually(Duration::from_secs(1), || refused(&capture).len() == 1);
+        let refused = refused(&capture);
+        assert_eq!(refused[0]["draft_id"], json!(draft_id));
+        assert_eq!(refused[0]["reason"], "policy_operation_refused");
+        assert_eq!(refused[0]["current_policy_etag"], json!(active.etag));
+        assert!(!capture.events().into_iter().any(|event| {
+            event.event_type == audit::event::POLICY_DRAFT_PUBLISHED
+                || event.event_type == audit::event::POLICY_CHANGED
+        }));
     }
 
     /// Issue #443's registered operation through the managed OpenAPI
