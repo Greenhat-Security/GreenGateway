@@ -428,6 +428,9 @@ fn commit_refusal_reason(refusal: PolicyCommitRefusal) -> &'static str {
         PolicyCommitRefusal::EtagMismatch => PolicyDraftRefusal::PolicyEtagMismatch.reason(),
         #[cfg(feature = "postgres")]
         PolicyCommitRefusal::OperationRefused => "policy_operation_refused",
+        PolicyCommitRefusal::AuthorityEvidenceUnsupported => {
+            authority_events::required::REFUSAL_REASON
+        }
         PolicyCommitRefusal::Failed => "policy_commit_failed",
     }
 }

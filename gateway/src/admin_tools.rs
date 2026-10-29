@@ -324,6 +324,18 @@ pub(super) async fn tools_openapi_register_endpoint(
     {
         return tool_admin_authz_error_response(error);
     }
+    // A standalone registration writes the tools file with no evidence of
+    // who did (issue #425, PR 4).
+    if let Err(response) = admit_authority_change(
+        &state.authority_evidence,
+        authority_events::required::AuthorityOperation::ToolsPublish,
+        &state.audit,
+        &parts,
+        &principal,
+        &state.client_ip_policy,
+    ) {
+        return *response;
+    }
     let authority = match tools_authority(&state) {
         Ok(authority) => authority,
         Err(response) => return *response,
