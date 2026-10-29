@@ -4465,7 +4465,7 @@ async fn catalog_evidence_on_the_expanded_schema_records_no_actor_metadata_yet()
     let (restarted, pool) = migrated_store(&database.dsn, 64).await;
     assert_eq!(
         count(&pool, "SELECT COUNT(*) FROM greengateway.schema_migrations").await,
-        25
+        i64::try_from(crate::storage::migrations::manifest_len()).expect("a short manifest")
     );
     let catalog = restarted
         .mcp_catalog(&created.id)
