@@ -3,9 +3,9 @@
   "issue": 426,
   "describes": "Which GreenGateway builds may share one PostgreSQL deployment, how a deployment moves between them, and what proves each row. The procedure is docs/deployment/postgres.md#upgrading-a-cluster. storage::migrations' tests check this_build and schema_steps against the binary, and scripts/upgrade_pair_evidence.py checks the pinned pair (gateway/tests/ha/rolling-upgrade-pair.json) against the evidence the ha-release-gate (ha_rolling_upgrade) leg records.",
   "this_build": {
-    "manifest_versions": 25,
-    "read": [25, 25],
-    "write": [25, 25],
+    "manifest_versions": 26,
+    "read": [26, 26],
+    "write": [26, 26],
     "approved_extensions": [],
     "document_format": [0, 0],
     "capabilities": ["openapi_discovery_catalogs", "openapi_swagger2_catalogs", "operation_requirements", "policy_role_descriptions"],
@@ -53,7 +53,8 @@
       "procedure": "rolling",
       "checksum": "7d7458311798be0ee0346fff70581300a4d29984ba90d51cd3bccbd00a9ee84f",
       "qualified_pair": null
-    }
+    },
+    { "from": 25, "to": 26, "migration": "admin_session_evidence_journal", "procedure": "coordinated" }
   ],
   "released_cluster_binaries": [],
   "qualified_pairs": [

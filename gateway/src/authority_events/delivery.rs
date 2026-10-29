@@ -20,6 +20,17 @@
 //! reference domain, so a row reads the same before and after migration 24.
 //! The revision fields follow the v1 transition contract.
 //!
+//! Admin session grants and withdrawals (journaled since migration 26) are
+//! delivered as `admin_session.grant` and `admin_session.withdraw`. Their
+//! evidence records the session's own identity and no actor kind, auth mode
+//! or shared revision, so the record names the session's subject as its
+//! recorded actor, says `null` for the kind, auth mode, issuer reference and
+//! security revision, and puts the session on the v1 `session` axis: a
+//! session is granted once and withdrawn once, so its one revision is `1`,
+//! created by the grant and deleted by the withdrawal. Which withdrawal it
+//! was (logout, replacement, rejection, expiry) stays in the evidence row;
+//! the closed record has no field for it.
+//!
 //! A row that cannot be projected faithfully -- its evidence row is gone, its
 //! action is not one this build knows, a stored value is out of shape -- is
 //! refused with a [`ProjectionError`] and the dispatcher stops there rather
@@ -49,6 +60,14 @@ const ACTION_CONNECTION_DELETE: &str = "connection.delete";
 const ACTION_SERVICE_TOKEN_ROTATE: &str = "service_token.rotate";
 const ACTION_SERVICE_TOKEN_REVOKE: &str = "service_token.revoke";
 const ACTION_JWT_REVOKE: &str = "jwt.revoke";
+// Migration 19's admin session vocabulary.
+const ACTION_ADMIN_SESSION_GRANT: &str = "admin_session.grant";
+const ACTION_ADMIN_SESSION_WITHDRAW: &str = "admin_session.withdraw";
+
+/// The one revision of an admin session on the `session` axis. A session is
+/// granted once and withdrawn once (migration 19's `UNIQUE (session_id,
+/// action)`), and nothing in between is an authority change.
+const SESSION_REVISION: i64 = 1;
 
 /// The longest `committed_at` the schema admits.
 const MAX_COMMITTED_AT_CHARS: usize = 30;
@@ -110,7 +129,9 @@ pub(crate) struct DeliveryRevision {
     pub(crate) axis: String,
     pub(crate) before: Option<String>,
     pub(crate) after: Option<String>,
-    pub(crate) security: String,
+    /// The shared security revision the change took; `null` for an admin
+    /// session, which takes none.
+    pub(crate) security: Option<String>,
 }
 
 /// Why a journaled row cannot be delivered. Each names a class, never a
@@ -174,6 +195,20 @@ enum Transition {
     Advance,
     /// No prior version; the shared security revision is the new one.
     PublishOnSecurityAxis,
+    /// An admin session's grant: no prior revision, [`SESSION_REVISION`]
+    /// after, and no shared revision.
+    SessionGrant,
+    /// An admin session's withdrawal: [`SESSION_REVISION`] before, nothing
+    /// after, and no shared revision.
+    SessionWithdraw,
+}
+
+impl Transition {
+    /// Whether the change took the shared security revision. Every
+    /// delivered change does except an admin session's.
+    const fn takes_security_revision(self) -> bool {
+        !matches!(self, Self::SessionGrant | Self::SessionWithdraw)
+    }
 }
 
 fn action_shape(source: JournalSource, action: &str) -> Option<ActionShape> {
@@ -199,6 +234,18 @@ fn action_shape(source: JournalSource, action: &str) -> Option<ActionShape> {
             axis: "jwt_revocation",
             transition: Transition::PublishOnSecurityAxis,
         }),
+        (JournalSource::AdminSession, ACTION_ADMIN_SESSION_GRANT) => Some(ActionShape {
+            resource_kind: "admin_session",
+            domain: ReferenceDomain::AdminSession,
+            axis: "session",
+            transition: Transition::SessionGrant,
+        }),
+        (JournalSource::AdminSession, ACTION_ADMIN_SESSION_WITHDRAW) => Some(ActionShape {
+            resource_kind: "admin_session",
+            domain: ReferenceDomain::AdminSession,
+            axis: "session",
+            transition: Transition::SessionWithdraw,
+        }),
         _ => None,
     }
 }
@@ -212,15 +259,19 @@ pub(crate) fn project(
     let actor = required(evidence.actor_user_id.as_deref())?;
     let action = required(evidence.action.as_deref())?;
     let resource_id = required(evidence.resource_id.as_deref())?;
-    let security_revision = evidence
-        .security_revision
-        .ok_or(ProjectionError::MissingEvidence)?;
     let committed_at = required(evidence.committed_at.as_deref())?;
 
     let shape = action_shape(evidence.source, action).ok_or(ProjectionError::UnknownAction)?;
+    let takes_security_revision = shape.transition.takes_security_revision();
+    let security_revision = match evidence.security_revision {
+        Some(revision) if takes_security_revision && revision >= 1 => Some(revision),
+        Some(_) => return Err(ProjectionError::InvalidEvidence),
+        None if takes_security_revision => return Err(ProjectionError::MissingEvidence),
+        None => None,
+    };
     let event_id = canonical_uuid(&evidence.event_id)?;
     let operation_id = canonical_uuid(operation_id)?;
-    if evidence.position < 1 || security_revision < 1 || !committed_at_in_shape(committed_at) {
+    if evidence.position < 1 || !committed_at_in_shape(committed_at) {
         return Err(ProjectionError::InvalidEvidence);
     }
 
@@ -244,7 +295,19 @@ pub(crate) fn project(
             if evidence.prior_version.is_some() || evidence.new_version.is_some() {
                 return Err(ProjectionError::InvalidEvidence);
             }
-            (None, Some(security_revision))
+            (None, security_revision)
+        }
+        Transition::SessionGrant => {
+            if evidence.prior_version.is_some() || evidence.new_version.is_some() {
+                return Err(ProjectionError::InvalidEvidence);
+            }
+            (None, Some(SESSION_REVISION))
+        }
+        Transition::SessionWithdraw => {
+            if evidence.prior_version.is_some() || evidence.new_version.is_some() {
+                return Err(ProjectionError::InvalidEvidence);
+            }
+            (Some(SESSION_REVISION), None)
         }
     };
 
@@ -280,7 +343,7 @@ pub(crate) fn project(
             axis: shape.axis.to_owned(),
             before: before.map(|value| value.to_string()),
             after: after.map(|value| value.to_string()),
-            security: security_revision.to_string(),
+            security: security_revision.map(|value| value.to_string()),
         },
     })
 }

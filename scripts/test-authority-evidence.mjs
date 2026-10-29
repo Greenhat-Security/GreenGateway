@@ -128,7 +128,7 @@ test("admin session grant and withdrawal project as creation and deletion of a s
   assert.throws(() => validateEvent(withdrawn), /axis mismatch/);
 });
 
-test("the in-memory session authority stays unsupported and the shared one records transactional evidence", () => {
+test("the in-memory session authority stays unsupported and the shared one records and delivers transactional evidence", () => {
   const sessions = inventory().groups.filter((group) => group.operations.includes("admin_session.grant"));
   assert.deepEqual(sessions.flatMap((group) => group.modes).sort(), ["postgres", "standalone"]);
   for (const group of sessions) {
@@ -137,8 +137,11 @@ test("the in-memory session authority stays unsupported and the shared one recor
   }
   const byMode = Object.fromEntries(sessions.map((group) => [group.modes[0], group]));
   assert.deepEqual(byMode.standalone.disposition, ["unsupported_future_operation"]);
-  assert.deepEqual(byMode.postgres.disposition, ["missing_metadata", "missing_delivery"]);
+  assert.deepEqual(byMode.postgres.disposition, ["missing_metadata"]);
+  assert.equal(byMode.postgres.delivery, "journaled_dispatch");
+  assert.equal(byMode.standalone.delivery, "post_commit_telemetry");
   assert.ok(byMode.postgres.sources.some((ref) => ref.anchor.includes("admin_session_evidence")));
+  assert.ok(byMode.postgres.sources.some((ref) => ref.anchor.includes("reserved_withdrawals")));
 });
 
 test("export evidence binds an existing configuration revision without inventing a mutation", () => {

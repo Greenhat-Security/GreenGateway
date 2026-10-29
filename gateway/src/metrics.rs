@@ -402,15 +402,25 @@ pub const AUDIT_STREAM_DUPLICATE_POSITIONS_TOTAL: &str =
 // sink configured still sees its journal fill). No label names an event, an
 // actor, a resource or a position.
 
-/// Journal rows retained: undelivered rows plus delivered rows still inside
-/// `AUTHORITY_EVENT_RETENTION_HOURS`. Every retained row holds one unit of
-/// capacity.
+/// The journal's units of capacity in use: retained rows (undelivered rows
+/// plus delivered rows still inside `AUTHORITY_EVENT_RETENTION_HOURS`), each
+/// holding one unit, plus the units held for admin session withdrawals
+/// ([`AUTHORITY_EVENT_JOURNAL_RESERVED`]).
 #[cfg(feature = "postgres")]
 pub const AUTHORITY_EVENT_JOURNAL_RETAINED: &str = "greengateway_authority_event_journal_retained";
 
-/// The journal's configured capacity. When retained reaches it, every
+/// Of the units in use, those held for the withdrawal of every admin session
+/// granted and not yet withdrawn (migration 26): a withdrawal spends its
+/// grant's unit, so a full journal never refuses a logout, a replacement, a
+/// rejection or an expiry. Retention cannot free these; only withdrawals do.
+#[cfg(feature = "postgres")]
+pub const AUTHORITY_EVENT_JOURNAL_RESERVED: &str = "greengateway_authority_event_journal_reserved";
+
+/// The journal's configured capacity. When the units in use reach it, every
 /// mutation that must journal evidence is refused with `503` until
-/// retention frees room; no accepted event is evicted.
+/// retention frees room (an admin session grant, which needs two units, one
+/// unit earlier); no accepted event is evicted, and admin session
+/// withdrawals are still recorded.
 #[cfg(feature = "postgres")]
 pub const AUTHORITY_EVENT_JOURNAL_CAPACITY: &str = "greengateway_authority_event_journal_capacity";
 

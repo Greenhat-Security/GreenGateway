@@ -8687,6 +8687,7 @@ fn expected_ha_metric_names() -> Vec<&'static str> {
         metrics::AUDIT_STREAM_REPLAY_BACKLOG_EVENTS,
         metrics::AUDIT_STREAM_DUPLICATE_POSITIONS_TOTAL,
         metrics::AUTHORITY_EVENT_JOURNAL_RETAINED,
+        metrics::AUTHORITY_EVENT_JOURNAL_RESERVED,
         metrics::AUTHORITY_EVENT_JOURNAL_CAPACITY,
         metrics::AUTHORITY_EVENT_UNDELIVERED,
         metrics::AUTHORITY_EVENT_OLDEST_UNDELIVERED_AGE_SECONDS,
@@ -9054,6 +9055,7 @@ async fn synthetic_ha_run() {
         authority_events::dispatcher::record_journal_stats(
             &storage::postgres_authority_events::JournalStats {
                 retained: 7,
+                reserved: 2,
                 capacity: 1_000_000,
                 head: 41,
                 cursor: Some(38),

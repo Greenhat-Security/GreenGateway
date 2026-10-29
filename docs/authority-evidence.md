@@ -6,8 +6,10 @@ rotate/revoke and JWT revocation evidence; policy, tools and catalog publication
 evidence), the keyed safe-reference derivation
 ([Keyed safe references](#keyed-safe-references)), PR 3's durable delivery
 ([Durable delivery](#durable-delivery)), the journaled evidence's actor metadata
-([Actor metadata](#actor-metadata)) and the first PR 4 slice (standalone
-Connection and local-secret evidence, [Standalone evidence](#standalone-evidence)).
+([Actor metadata](#actor-metadata)), the cluster admin session evidence in the
+journal ([Admin session withdrawals and journal capacity](#admin-session-withdrawals-and-journal-capacity))
+and the first PR 4 slice (standalone Connection and local-secret evidence,
+[Standalone evidence](#standalone-evidence)).
 Reviewed source: `ebb579e6444d437bf477d0617b8841d1eea34cfc`.
 
 This inventory identifies existing atomic records and the work needed for required
@@ -25,7 +27,10 @@ PostgreSQL policy and tools document commit, and `greengateway.catalog_change_ev
 written by every managed MCP and OpenAPI catalog publication; neither is a journal
 source yet, so the dispatcher does not deliver them. Migration 24 adds the actor's
 kind, auth mode and issuer to the three journaled tables, and the standalone token
-database gains the same columns. The first PR 4 slice adds migration 12 of the
+database gains the same columns. Migration 26 makes migration 19's
+`greengateway.admin_session_evidence` the fourth journal source, with journal
+capacity held for every session's withdrawal so that a full journal never refuses a
+logout. The first PR 4 slice adds migration 12 of the
 standalone Connections database: Connection create/replace/delete and local-secret
 create/rotate/delete/re-encryption write its `connection_change_evidence` and
 `connection_local_secret_change_evidence` rows, with the whole actor, in their own
@@ -80,7 +85,7 @@ or unconfigured individual stores.
 | Service-token issue | Token row with creator, row/shared revisions and outbox | Creation retains only `created_by`; no issue evidence row, operation identity or delivery |
 | Service-token rotate/revoke | Token change, row/shared revisions and outbox, plus a non-cascading `service_token_change_evidence` row (actor, action, event/operation UUIDs, prior/new row revision, the outbox row's shared revision, database-clock time) in the same transaction; repeated revoke and refused rotate write none. Standalone writes the same evidence in the token database's own transaction. In PostgreSQL the change also journals its evidence and is delivered since PR 3. Both stores record the actor's kind, auth mode and canonical issuer (migration 24 and the token database's own columns) | A caller-bound operation identity and an issuer-scoped subject reference; standalone evidence is not delivered |
 | JWT revocation | Scoped JTI digest, actor row, shared revision and outbox, plus one non-cascading `jwt_revocation_evidence` row per effective revoke (actor, JTI digest, resulting expiry, shared revision) that extension, reactivation and expiry cleanup never rewrite, journaled in the same transaction and delivered since PR 3; since migration 24 the CLI's actor is recorded as kind `system`, auth mode `system` and no issuer | The CLI actor stays system provenance, not a named human; a caller-bound operation identity |
-| Admin session grant/withdrawal (#424) | With `ADMIN_SESSION_MODE=cluster_postgres`, the session row and one non-cascading `admin_session_evidence` row (event/operation UUIDs, session ID, action, reason, subject and issuer, absolute deadline, database-clock time) commit together for each grant and each withdrawal; a replacement's withdrawal and grant share one operation ID | Actor kind/auth mode, keyed safe actor reference, a session revision axis, and delivery: these rows are not journaled (see [Durable delivery](#durable-delivery)). Standalone sessions are process-local memory with no durable record and stay `unsupported_future_operation` |
+| Admin session grant/withdrawal (#424) | With `ADMIN_SESSION_MODE=cluster_postgres`, the session row, one non-cascading `admin_session_evidence` row (event/operation UUIDs, session ID, action, reason, subject and issuer, absolute deadline, database-clock time) and, since migration 26, its journal row commit together in one statement for each grant and each withdrawal; a replacement's withdrawal and grant share one operation ID. Delivered since migration 26 on the `session` axis with keyed safe references; a grant holds journal capacity for its withdrawal, so no withdrawal is refused at capacity ([Admin session withdrawals and journal capacity](#admin-session-withdrawals-and-journal-capacity)) | Actor kind and auth mode (the evidence records neither, so a withdrawal by the prune or a provider rejection is named by the session's subject, not as a system actor), an issuer-scoped subject reference, the withdrawal reason in the delivered record, and a caller-bound operation identity. Standalone sessions are process-local memory with no durable record and stay `unsupported_future_operation` |
 
 These foundations are already sufficient for their **existing atomic change-record
 purpose**. The inventory uses `missing_metadata` and `missing_delivery` for
@@ -157,9 +162,12 @@ prune removes the row) deletes the row and inserts its evidence in one
 statement. An evidence failure rolls the change back and answers `503`. The
 rows carry the session's random ID, never the cookie, CSRF token, binding or
 access token, and an expiry's commit time is the prune's, not the deadline's.
-The row is `missing_metadata` and `missing_delivery`: it has no actor kind or
-auth mode, no keyed safe actor reference and no session revision axis, and
-nothing dispatches the rows yet.
+Since migration 26 the same statement journals each row, and the dispatcher
+delivers it ([Admin session withdrawals and journal capacity](#admin-session-withdrawals-and-journal-capacity)).
+The row stays `missing_metadata`: it has no actor kind or auth mode, so the
+delivered record names the session's own subject and says `null` for the kind,
+the auth mode and the issuer reference, even for an expiry or a provider
+rejection, which no person made; and the reason is not delivered.
 
 ## Proposed authority event v1
 
@@ -413,16 +421,24 @@ migration 21; `gateway/src/storage/postgres_authority_events.rs` and
 - **Journal, in the mutation's transaction.** Every PostgreSQL producer of
   `connection_change_evidence`, `service_token_change_evidence` and
   `jwt_revocation_evidence` appends one `authority_event_journal` row in the same
-  transaction as its evidence row, under the evidence row's `event_id`. The row
+  transaction as its evidence row, under the evidence row's `event_id`, and since
+  migration 26 every cluster admin session grant and withdrawal journals its
+  `admin_session_evidence` row in the statement that writes it. The row
   holds identifiers only. Its position is reserved from the
   `authority_event_state` row, whose lock is held to COMMIT, so position order is
   commit order and the committed journal has no gaps. Evidence committed before
-  migration 21 is journaled by the migration in commit order.
+  migration 21 is journaled by the migration in commit order; admin session
+  evidence committed before migration 26 is journaled by that migration, in its
+  own commit order, after everything already journaled.
 - **Bounded capacity, failing closed.** The same reservation succeeds only while
-  fewer than `AUTHORITY_EVENT_JOURNAL_CAPACITY` rows are retained. When the
-  journal is full, the mutation rolls back as a whole and is answered `503` (a CLI
-  `revoke-jwt` exits with a store error); nothing is committed and no accepted
-  event is evicted. This applies whatever `AUTHORITY_EVENT_SINK` says. The capacity
+  fewer than `AUTHORITY_EVENT_JOURNAL_CAPACITY` units are in use: one per retained
+  row, plus one held for the withdrawal of every admin session granted and not yet
+  withdrawn. When the journal is full, the mutation rolls back as a whole and is
+  answered `503` (a CLI `revoke-jwt` exits with a store error); nothing is
+  committed and no accepted event is evicted. The one exception is an admin
+  session withdrawal, which spends the unit its grant held and is never refused for
+  capacity ([below](#admin-session-withdrawals-and-journal-capacity)). This applies
+  whatever `AUTHORITY_EVENT_SINK` says. The capacity
   is one value for the deployment, written by a replica only when the membership
   admits it, so a replica held at the fingerprint door with another value never
   changes the one the serving replicas enforce. The cost is deliberate and has to
@@ -473,10 +489,14 @@ migration 21; `gateway/src/storage/postgres_authority_events.rs` and
   `actor.issuer_ref` (the `actor.issuer` reference) as the evidence recorded them
   since migration 24, each `null` where the row recorded none, the resource kind
   and its keyed reference (a
-  JWT revocation's under its issuer and `jti` digest), and the v1 revision
-  transition as decimal strings. No identifier, token material, `jti`, issuer or
-  secret reaches it.
-- **Signals.** `greengateway_authority_event_journal_retained` and `_capacity`,
+  JWT revocation's under its issuer and `jti` digest, an admin session's under its
+  random session ID), and the v1 revision transition as decimal strings. An admin
+  session record carries `null` for the shared security revision, which a session
+  does not take. No identifier, token material, `jti`, issuer or secret reaches
+  it.
+- **Signals.** `greengateway_authority_event_journal_retained` (the units in
+  use), `_reserved` (the units of those held for admin session withdrawals) and
+  `_capacity`,
   `_undelivered`, `_oldest_undelivered_age_seconds`, `_delivered_total`,
   `_delivery_failures_total{kind}`, `_capacity_refusals_total` and
   `_evidence_failures_total` (a change refused because the database refused its
@@ -491,7 +511,11 @@ migration 21; `gateway/src/storage/postgres_authority_events.rs` and
 Operator actions at capacity, in order of preference: restore delivery (fix the
 sink, or the dispatcher's key, so the cursor advances and retention can free
 room), shorten `AUTHORITY_EVENT_RETENTION_HOURS`, or raise
-`AUTHORITY_EVENT_JOURNAL_CAPACITY` on every replica. A dispatcher that has claimed
+`AUTHORITY_EVENT_JOURNAL_CAPACITY` on every replica. Units held for admin session
+withdrawals (`_reserved`) are not freed by retention: each comes back as its
+session ends, by logout, replacement, rejection or expiry, and there are never
+more of them than session rows (at most `ADMIN_SESSION_MAX_ENTRIES` live sessions,
+plus expired ones the prune has not reached). A dispatcher that has claimed
 the cursor stays a required consumer when the sink is later turned off: its
 cursor keeps holding undelivered rows. To stop delivering deliberately, remove the
 cursor as the migration role (`DELETE FROM greengateway.authority_event_cursors WHERE
@@ -508,9 +532,9 @@ Not covered by PR 3, and still open:
 
 - **Required-durability mode.** Nothing makes a sink mandatory, so a deployment
   with `AUTHORITY_EVENT_SINK=none` journals and retains evidence but delivers none.
-- **Admin sessions.** Migration 19's `admin_session_evidence` is not journaled and
-  not delivered. A withdrawal must stay possible when the journal is full, so
-  journaling it needs its own capacity decision first.
+- **Admin session metadata.** Admin session evidence is journaled and delivered
+  since migration 26, but records no actor kind or auth mode, and the delivered
+  record has no field for the withdrawal's reason.
 - **Standalone mode.** There is no journal and no dispatcher; the SQLite token,
   Connection and local-secret evidence is not delivered.
 - **The v1 contract.** A caller-bound operation identity at the store boundary and
@@ -526,6 +550,78 @@ Not covered by PR 3, and still open:
   the rule pack does not page on it.
 - **Every other operation.** PostgreSQL Connection create/replace, credential
   bindings and token issue have no evidence rows to journal yet.
+
+### Admin session withdrawals and journal capacity
+
+Migration 26 (`admin_session_evidence_journal`) journals every cluster admin session
+grant and withdrawal, and decides what a full journal does to them. **The default,
+reversible decision: a session withdrawal is never blocked by journal capacity.** A
+logout the gateway cannot commit would keep a session the operator asked to end, so
+capacity is held for the withdrawal at the moment the session is created, instead
+of being looked for when it ends:
+
+- **A grant takes two units**, one for its own event and one held for the
+  session's withdrawal (`authority_event_state.reserved_withdrawals`), and only
+  while both fit under `AUTHORITY_EVENT_JOURNAL_CAPACITY`. When they do not, the
+  grant is refused: the OIDC completion answers `503` (`session_authority_unavailable`),
+  nothing is committed, the pending login stays pending, and
+  `greengateway_authority_event_capacity_refusals_total` counts it. A replacement's
+  grant is refused the same way and leaves the session it would have replaced in
+  place.
+- **A withdrawal spends its grant's unit and checks no capacity.** Logout (by cookie
+  or login binding), replacement by a new sign-in, a provider rejection or identity
+  change, and the expiry prune (per admission and in the `admin_session_prune`
+  maintenance job) each delete the session, insert its evidence row and journal it
+  in one statement, whatever the journal holds. A session is withdrawn at most once,
+  so its held unit is always enough; a withdrawal that finds fewer held units than
+  sessions takes fresh ones rather than being refused. A withdrawal is still refused,
+  and changes nothing, when its evidence or journal row cannot be written at all
+  (the database refuses or does not answer the statement): that is an outage, not
+  capacity, and is counted by `_evidence_failures_total`.
+- **Every other producer keeps its rule** (one unit, only while fewer than the
+  capacity are in use), and the held units count as in use, so no Connection
+  delete, token rotate or revoke, or JWT revoke can spend a unit a session holds.
+- **Retention is unchanged.** It deletes delivered rows and gives back exactly their
+  units, never a held one; held units come back only as sessions end.
+- **Migration 26 holds a unit for every session row that exists** when it runs,
+  live or past a deadline the prune has not reached, and journals the admin session
+  evidence already committed, after every event already journaled and in its own
+  commit order, each row at its own commit time. It does not change the capacity: a
+  deployment whose units in use now exceed it refuses grants and every other
+  journaled change until retention frees room, and still records every withdrawal.
+
+The delivered record ([schema](schemas/authority_event_delivery.v1.schema.json)) of a
+session event is `admin_session.grant` or `admin_session.withdraw` on resource kind
+`admin_session`, keyed by the session's random ID under the `resource.admin_session`
+domain. Its actor is the session's own subject, the only identity the evidence
+records, under `actor.recorded`, with `null` kind, auth mode and issuer reference.
+Its revision is the v1 `session` axis: a session is granted once and withdrawn once,
+so its one revision, `1`, is created by the grant (`before: null`, `after: "1"`) and
+deleted by the withdrawal (`before: "1"`, `after: null`), and its shared security
+revision is `null` because session changes take none. The withdrawal's reason stays
+in the evidence row.
+
+Why this is a default and not a contract: the journal rows and the evidence rows do
+not depend on it. A later release could decide otherwise (for example, refuse every
+change at capacity, withdrawals included, or reserve a fixed share of the capacity
+instead of a unit per session) by changing the producer statements in
+`gateway/src/storage/postgres_admin_sessions.rs` and returning the held units with
+one statement (`retained_events - reserved_withdrawals`, `reserved_withdrawals = 0`)
+in its migration. The cost of this default is that, with the journal near capacity,
+signing in is refused one unit before other changes are, and every live session
+keeps one unit of the capacity out of reach of other producers.
+
+Tests: `storage::postgres_admin_sessions`' `a_full_journal_refuses_grants_but_never_a_withdrawal`
+(three sessions and a token rotate fill a journal of seven units; a grant and a token
+revoke are refused and commit nothing; a logout, a provider rejection and the expiry
+prune each commit, journaled; the dispatcher delivers every session event in commit
+order without an identifier; retention frees the delivered rows and the refused grant
+completes), `a_withdrawal_whose_journal_row_cannot_be_written_does_not_happen` and
+`every_grant_and_withdrawal_leaves_one_evidence_row` (every evidence row journaled,
+every held unit spent); `storage::migrations`' `migration_twenty_six_journals_session_evidence_and_holds_withdrawals`;
+and the delivery projection tests in `gateway/src/authority_events/delivery_tests.rs`.
+The PostgreSQL ones run in CI against its disposable loopback database, not verified
+TLS.
 
 ## Actor metadata
 
@@ -742,8 +838,12 @@ What standalone evidence lacks compared with cluster mode:
    undelivered row, capacity exhaustion refusing every producer while committing
    nothing, the running dispatcher's lease and shutdown, and migration 21's
    backfill; the request-audit sink regressions are unchanged. CI runs them against
-   its disposable loopback database, not verified TLS. Still open: the items listed
-   at the end of that section.
+   its disposable loopback database, not verified TLS. Migration 26 adds the
+   cluster admin session evidence as a journal source, with a unit of capacity held
+   for each session's withdrawal ([Admin session withdrawals and journal capacity](#admin-session-withdrawals-and-journal-capacity)),
+   moving the serving contract from exactly schema 25 to exactly schema 26, a
+   coordinated drain/migrate/restart. Still open: the items listed at the end of
+   that section.
 5. **Standalone evidence and #242 ledger integration.** Add evidence only within
    each owning SQLite store transaction; test forced insert failure and restart.
    Connections and local secrets have landed in the Connections database
