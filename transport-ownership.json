@@ -10683,7 +10683,7 @@
         "capability-in-macro-input"
       ],
       "scope": "gateway::middleware::rbac::policy_file_watch_loop#1",
-      "sha256": "effc6f8c8846ff18e4312e5b8125f4ec663616179922aaf20bddd2f7ff155230",
+      "sha256": "e8ceadafc0da642cdbe59291a83a9f7d07a182b87b0a3d9e7c94859488aa3c29",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -11519,7 +11519,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::storage::change_evidence::DocumentAction#1",
-      "sha256": "e82368759f3c4ad40aff3a7b877f7edbaecb74e7cda437d090af3ad2d4618d35",
+      "sha256": "091f0c17aaf2b628bb899f652314f931902f6c6ca7dcff8a83aeafdc9ae9589b",
       "owner": "GreenGateway maintainers",
       "purpose": "Closed action vocabulary of document change evidence; its derive/cfg_attr attributes add no transport capability (issue #425)."
     },
@@ -13711,7 +13711,7 @@
         "capability-in-macro-input"
       ],
       "scope": "gateway::tools::definitions::tool_registry_file_watch_loop#1",
-      "sha256": "db067366d23273a2ecccada9f680357c05107d936957f94696efb2f13193cc73",
+      "sha256": "ddf69fbc251c8a9a7eab34894b273b9d43027b11f1ae1e5ba7df0ffded17666c",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -14592,6 +14592,16 @@
       "purpose": "Opens the operator-configured AUTHORITY_EVENT_FILE for appending with std::fs; a local file only, no network, socket or process capability."
     },
     {
+      "file": "gateway/src/authority_events/required.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::authority_events::required::impl  RequiredMode::as_str#1",
+      "sha256": "ff8d0c39fa232fa007b244c39cefc250cfa571d0e2c86354dd79eea5494720ac",
+      "owner": "GreenGateway maintainers",
+      "purpose": "cfg_attr(not(test), allow(dead_code)) on the inventory spelling of a required mode, which only the required-mode tests compare; a constant string match with no transport, file or process capability (issue #425)."
+    },
+    {
       "file": "gateway/src/cluster_maintenance.rs",
       "reasons": [
         "network-or-process-reference"
@@ -14620,6 +14630,16 @@
       "sha256": "e5f0f85f57447269aa7d76fd7187872f459993214341bfa959539733fc4d0fbc",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway/src/config/authority_events.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::config::authority_events::AuthorityEvidenceDurability#1",
+      "sha256": "4504d9d256f82b5d0e1bccb9bd5a65f603360b6cd1e057d858a651494a1816c8",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Clone/Copy/Debug/Default/PartialEq/Eq derives and #[default] on the two-value AUTHORITY_EVIDENCE_DURABILITY setting; no transport, file or process capability (issue #425)."
     },
     {
       "file": "gateway/src/config/bundle.rs",

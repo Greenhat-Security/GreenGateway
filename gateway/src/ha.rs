@@ -45,7 +45,9 @@ use std::fmt;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::config::{AuthProviderType, Config, StateBackend, UpstreamRouteConfig};
+use crate::config::{
+    AuthProviderType, AuthorityEvidenceDurability, Config, StateBackend, UpstreamRouteConfig,
+};
 
 /// Domain separation for the fingerprint input, with a format version. Bumping
 /// the version is a deliberate act: it changes every deployment's fingerprint
@@ -349,6 +351,15 @@ fn insert_authority_event_settings(input: &mut BTreeMap<String, String>, config:
         ),
     ] {
         input.insert(name.into(), value);
+    }
+    // A replica that refuses changes its peers make is not enforcing the
+    // same contract (issue #425, PR 4). Absent under best effort, the
+    // default, so a deployment that never sets it keeps its fingerprint.
+    if settings.durability == AuthorityEvidenceDurability::Required {
+        input.insert(
+            "authority_evidence_durability".into(),
+            settings.durability.as_str().to_owned(),
+        );
     }
 }
 
@@ -1483,6 +1494,20 @@ mod tests {
                 "{what} must participate"
             );
         }
+        assert_eq!(
+            fingerprint(&|config| {
+                config.authority_events.durability = AuthorityEvidenceDurability::BestEffort
+            }),
+            unchanged,
+            "best effort, the default, adds nothing a deployment's fingerprint did not have"
+        );
+        assert_ne!(
+            fingerprint(&|config| {
+                config.authority_events.durability = AuthorityEvidenceDurability::Required
+            }),
+            unchanged,
+            "required authority evidence must participate"
+        );
         assert_eq!(
             fingerprint(&|config| {
                 config.authority_events.sink =
