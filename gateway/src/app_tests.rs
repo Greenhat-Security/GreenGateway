@@ -6080,45 +6080,37 @@ async fn mcp_real_client_connects_lists_calls_and_records_observability() {
         }))
     );
 
-    // Audit/discovery completion may still be queued on this current-thread
-    // runtime after the SDK receives its response. A blocking polling helper
-    // prevents that work from progressing, especially under instrumentation.
-    let observation_deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let events = harness.capture.events();
-        let has_start = events.iter().any(|event| {
-            event.event_type == audit::event::TOOL_INVOKE_START
-                && event.request_id == request_id
-                && event.payload["tool_name"] == json!("echo")
-        });
-        let has_success = events.iter().any(|event| {
-            event.event_type == audit::event::TOOL_INVOKE_SUCCESS
-                && event.request_id == request_id
-                && event.payload["tool_name"] == json!("echo")
-        });
-        let has_tool_observation = events.iter().any(|event| {
-            event.event_type == "http.request_observed"
-                && event.request_id == request_id
-                && event.payload["method"] == json!("MCP")
-                && event.payload["path"] == json!("/mcp/tools/echo")
-                && event.payload["status"] == json!(200)
-        });
+    // Audit/discovery completion may still be queued after the SDK receives
+    // its response; wait for delivery without blocking this current-thread
+    // runtime, which still has that work to drive.
+    wait_for_delivered_audit_events(
+        &harness.capture,
+        "the MCP start, success and observation events",
+        |events| {
+            let has_start = events.iter().any(|event| {
+                event.event_type == audit::event::TOOL_INVOKE_START
+                    && event.request_id == request_id
+                    && event.payload["tool_name"] == json!("echo")
+            });
+            let has_success = events.iter().any(|event| {
+                event.event_type == audit::event::TOOL_INVOKE_SUCCESS
+                    && event.request_id == request_id
+                    && event.payload["tool_name"] == json!("echo")
+            });
+            let has_tool_observation = events.iter().any(|event| {
+                is_mcp_tool_observation(event, request_id)
+                    && event.payload["path"] == json!("/mcp/tools/echo")
+                    && event.payload["status"] == json!(200)
+            });
+            has_start && has_success && has_tool_observation
+        },
+    )
+    .await;
 
-        if has_start && has_success && has_tool_observation {
-            break;
-        }
-        assert!(
-            Instant::now() < observation_deadline,
-            "MCP start, success and observation events did not all arrive"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-
-    let row =
-        wait_for_mcp_tool_inventory_row(&harness.router, &harness.admin_token, "echo", |row| {
-            row["call_count"] == json!(1) && status_count(row, 200) == Some(1)
-        })
-        .await;
+    let row = wait_for_mcp_tool_inventory_row(&harness, &[request_id], "echo", |row| {
+        row["call_count"] == json!(1) && status_count(row, 200) == Some(1)
+    })
+    .await;
     assert_eq!(row["method"], json!("MCP"));
     assert_eq!(row["endpoint_template"], json!("/mcp/tools/echo"));
     assert_eq!(row["call_count"], json!(1));
@@ -6162,7 +6154,7 @@ async fn successful_mcp_tool_call_appears_as_per_tool_traffic_inventory_row() {
     assert_eq!(body["result"]["isError"], json!(false));
 
     let row =
-        wait_for_mcp_tool_inventory_row(&harness.router, &harness.admin_token, "echo", |row| {
+        wait_for_mcp_tool_inventory_row(&harness, &["mcp-inventory-success"], "echo", |row| {
             row["call_count"] == json!(1) && status_count(row, 200) == Some(1)
         })
         .await;
@@ -6221,8 +6213,8 @@ async fn proxied_mcp_tool_call_appears_as_per_tool_traffic_inventory_row() {
     assert_eq!(body["result"]["isError"], json!(false));
 
     let row = wait_for_mcp_tool_inventory_row(
-        &harness.router,
-        &harness.admin_token,
+        &harness,
+        &["mcp-inventory-proxied"],
         "alpha:remote_echo",
         |row| row["call_count"] == json!(1) && status_count(row, 200) == Some(1),
     )
@@ -6272,7 +6264,7 @@ async fn non_schema_mismatch_mcp_tool_failure_appears_as_error_inventory_row() {
     assert_eq!(body["error"]["code"], json!(-32603));
 
     let row =
-        wait_for_mcp_tool_inventory_row(&harness.router, &harness.admin_token, "echo", |row| {
+        wait_for_mcp_tool_inventory_row(&harness, &["mcp-inventory-failure"], "echo", |row| {
             row["call_count"] == json!(1) && status_count(row, 502) == Some(1)
         })
         .await;
@@ -6311,11 +6303,13 @@ async fn unknown_mcp_tool_call_appears_as_inventory_row() {
 
     // The call is still inventoried, but under the shared unknown-tool
     // template: a caller-supplied name may not mint an inventory key.
-    let row =
-        wait_for_mcp_tool_inventory_row(&harness.router, &harness.admin_token, "{tool}", |row| {
-            row["call_count"] == json!(1) && status_count(row, 404) == Some(1)
-        })
-        .await;
+    let row = wait_for_mcp_tool_inventory_row(
+        &harness,
+        &["mcp-inventory-unknown-tool"],
+        "{tool}",
+        |row| row["call_count"] == json!(1) && status_count(row, 404) == Some(1),
+    )
+    .await;
     assert_eq!(row["method"], json!("MCP"));
     assert_eq!(row["endpoint_template"], json!("/mcp/tools/{tool}"));
     assert_eq!(row["call_count"], json!(1));
@@ -6365,29 +6359,30 @@ async fn task_style_mcp_tool_call_is_rejected_by_gateway_and_records_inventory()
     assert_eq!(body["error"]["data"]["tool_name"], json!("echo"));
     assert_eq!(body["error"]["data"]["reason"], json!("task_unsupported"));
 
-    assert_eventually(Duration::from_secs(1), || {
-        let events = harness.capture.events();
-        let failure_seen = events.iter().any(|event| {
-            event.event_type == audit::event::TOOL_INVOKE_FAILURE
-                && event.request_id == request_id
-                && event.payload["tool_name"] == json!("echo")
-        });
-        let observation_seen = events.iter().any(|event| {
-            event.event_type == "http.request_observed"
-                && event.request_id == request_id
-                && event.payload["method"] == json!("MCP")
-                && event.payload["tool_name"] == json!("echo")
-                && event.payload["status"] == json!(400)
-                && event.payload["reason"] == json!("task_unsupported")
-        });
-        failure_seen && observation_seen
-    });
+    wait_for_delivered_audit_events(
+        &harness.capture,
+        "the task-style failure and its observation",
+        |events| {
+            let failure_seen = events.iter().any(|event| {
+                event.event_type == audit::event::TOOL_INVOKE_FAILURE
+                    && event.request_id == request_id
+                    && event.payload["tool_name"] == json!("echo")
+            });
+            let observation_seen = events.iter().any(|event| {
+                is_mcp_tool_observation(event, request_id)
+                    && event.payload["tool_name"] == json!("echo")
+                    && event.payload["status"] == json!(400)
+                    && event.payload["reason"] == json!("task_unsupported")
+            });
+            failure_seen && observation_seen
+        },
+    )
+    .await;
 
-    let row =
-        wait_for_mcp_tool_inventory_row(&harness.router, &harness.admin_token, "echo", |row| {
-            row["call_count"] == json!(1) && status_count(row, 400) == Some(1)
-        })
-        .await;
+    let row = wait_for_mcp_tool_inventory_row(&harness, &[request_id], "echo", |row| {
+        row["call_count"] == json!(1) && status_count(row, 400) == Some(1)
+    })
+    .await;
     assert_eq!(row["method"], json!("MCP"));
     assert_eq!(row["endpoint_template"], json!("/mcp/tools/echo"));
     assert_eq!(row["call_count"], json!(1));
@@ -6427,22 +6422,20 @@ async fn task_style_unknown_mcp_tool_call_uses_unknown_tool_inventory_path() {
     );
     assert_eq!(body["error"]["data"]["tool_name"], json!("missing_tool"));
 
-    assert_eventually(Duration::from_secs(1), || {
-        harness.capture.events().iter().any(|event| {
-            event.event_type == "http.request_observed"
-                && event.request_id == request_id
-                && event.payload["method"] == json!("MCP")
+    wait_for_delivered_audit_events(&harness.capture, "the unknown-tool observation", |events| {
+        events.iter().any(|event| {
+            is_mcp_tool_observation(event, request_id)
                 && event.payload["tool_name"] == json!("missing_tool")
                 && event.payload["status"] == json!(404)
                 && event.payload["reason"] == json!("unknown_tool")
         })
-    });
+    })
+    .await;
 
-    let row =
-        wait_for_mcp_tool_inventory_row(&harness.router, &harness.admin_token, "{tool}", |row| {
-            row["call_count"] == json!(1) && status_count(row, 404) == Some(1)
-        })
-        .await;
+    let row = wait_for_mcp_tool_inventory_row(&harness, &[request_id], "{tool}", |row| {
+        row["call_count"] == json!(1) && status_count(row, 404) == Some(1)
+    })
+    .await;
     assert_eq!(row["method"], json!("MCP"));
     assert_eq!(row["endpoint_template"], json!("/mcp/tools/{tool}"));
     assert_eq!(row["call_count"], json!(1));
@@ -6461,7 +6454,10 @@ async fn repeated_mcp_tool_calls_accumulate_into_one_inventory_row() {
     })
     .await;
 
-    for index in 0..3 {
+    let request_ids = (0..3)
+        .map(|index| format!("mcp-inventory-repeat-{index}"))
+        .collect::<Vec<_>>();
+    for (index, request_id) in (0..).zip(&request_ids) {
         let (status, body) = mcp_rpc(
             &harness.router,
             Some(&harness.admin_token),
@@ -6473,18 +6469,18 @@ async fn repeated_mcp_tool_calls_accumulate_into_one_inventory_row() {
                     "message": format!("inventory repeat {index}")
                 }
             })),
-            &format!("mcp-inventory-repeat-{index}"),
+            request_id,
         )
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["result"]["isError"], json!(false));
     }
 
-    let row =
-        wait_for_mcp_tool_inventory_row(&harness.router, &harness.admin_token, "echo", |row| {
-            row["call_count"] == json!(3) && status_count(row, 200) == Some(3)
-        })
-        .await;
+    let request_ids = request_ids.iter().map(String::as_str).collect::<Vec<_>>();
+    let row = wait_for_mcp_tool_inventory_row(&harness, &request_ids, "echo", |row| {
+        row["call_count"] == json!(3) && status_count(row, 200) == Some(3)
+    })
+    .await;
     assert_eq!(row["endpoint_template"], json!("/mcp/tools/echo"));
     assert_eq!(row["call_count"], json!(3));
     assert_eq!(status_count(&row, 200), Some(3));
@@ -25046,8 +25042,15 @@ paths:
     // No audit store of record here: this test is not about durability,
     // so it runs the explicit best-effort opt-out (issue #425).
     config.audit_durability = config::AuditDurability::BestEffort;
-    let (audit_log, audit_event_sender) =
-        audit::AuditLog::from_config(&config).expect("audit log should build");
+    // The configured sinks, then a capture sink: an event it holds has
+    // already been handed to the discovery aggregator.
+    let (sink, audit_event_sender) =
+        audit::sink::build_sink_from_config(&config).expect("audit sink should build");
+    let capture = audit::sink::tests::CaptureSink::new();
+    let audit_log = audit::AuditLog::new(Arc::new(audit::sink::CompositeSink::new(vec![
+        sink,
+        Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>,
+    ])) as Arc<dyn audit::AuditSink>);
     let recorder = PrometheusBuilder::new().build_recorder();
     let router =
         app(config, recorder.handle(), audit_log, audit_event_sender).expect("app should build");
@@ -25066,6 +25069,15 @@ paths:
         .expect("request should complete");
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
+    // The 2 s window below is the aggregator's flush, so the observation
+    // must have reached the aggregator before it starts.
+    wait_for_delivered_audit_events(&capture, "the request observation", |events| {
+        events.iter().any(|event| {
+            event.event_type == "http.request_observed"
+                && event.request_id == "request-spec-conformance-missing"
+        })
+    })
+    .await;
     let body = wait_for_traffic_json(&router, "/v1/admin/traffic/endpoints?method=GET", |body| {
         body["endpoints"].as_array().is_some_and(|endpoints| {
             endpoints.iter().any(|endpoint| {
@@ -32638,15 +32650,69 @@ fn mcp_content_text(body: &Value) -> &str {
         .expect("MCP result should include text content")
 }
 
+/// How long the audit writer may take to hand an event to every sink of a
+/// test harness's fan-out. It hands each event to the stdout sink before the
+/// discovery aggregator, so a stalled stdout holds the aggregator up with it:
+/// on the Windows coverage runner the test process's stdout stalled for 15 s
+/// (run 40816060787) while the test's own inventory polls kept running, and
+/// the row it was waiting for had not been observed yet. Delivery therefore
+/// has its own, generous bound; the aggregation that follows keeps its own.
+const AUDIT_DELIVERY_BOUND: Duration = Duration::from_secs(60);
+
+/// Wait, without blocking the runtime, until the audit writer has delivered
+/// every event `condition` needs to `capture`. A harness's capture sink is
+/// the last member of its fan-out, after the configured sinks, so an event
+/// it holds has already been handed to the discovery aggregator.
+async fn wait_for_delivered_audit_events(
+    capture: &audit::sink::tests::CaptureSink,
+    what: &str,
+    condition: impl Fn(&[audit::AuditEvent]) -> bool,
+) {
+    let started = Instant::now();
+    loop {
+        if condition(&capture.events()) {
+            return;
+        }
+        assert!(
+            started.elapsed() < AUDIT_DELIVERY_BOUND,
+            "the audit writer did not deliver {what} within {AUDIT_DELIVERY_BOUND:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// The per-tool observation an MCP `tools/call` emits (method `MCP`), as
+/// opposed to the HTTP observation of the `POST /mcp` that carried it.
+fn is_mcp_tool_observation(event: &audit::AuditEvent, request_id: &str) -> bool {
+    event.event_type == "http.request_observed"
+        && event.request_id == request_id
+        && event.payload["method"] == json!("MCP")
+}
+
+/// The inventory row for `tool_name` once it matches `condition`. Reading it
+/// before the observations it is built from reached the aggregator would
+/// charge the aggregation window for the audit writer's delivery, so the
+/// observation of every request in `request_ids` is awaited first.
 async fn wait_for_mcp_tool_inventory_row(
-    router: &Router,
-    token: &str,
+    harness: &McpInventoryTestHarness,
+    request_ids: &[&str],
     tool_name: &str,
     condition: impl Fn(&Value) -> bool,
 ) -> Value {
-    // This asserts eventual persistence, not a two-second throughput SLO.
-    // Keep a finite bound while allowing instrumented Windows SQLite workers
-    // to drain all observations; the exact row/count assertions stay unchanged.
+    wait_for_delivered_audit_events(&harness.capture, "the MCP tool observations", |events| {
+        request_ids.iter().all(|request_id| {
+            events
+                .iter()
+                .any(|event| is_mcp_tool_observation(event, request_id))
+        })
+    })
+    .await;
+    let (router, token) = (&harness.router, harness.admin_token.as_str());
+
+    // From here the aggregator holds every observation, and the bound is
+    // its flush (every 250 ms) and the query on an instrumented, loaded
+    // Windows runner, not a throughput SLO; the exact row/count assertions
+    // stay unchanged.
     let started = Instant::now();
 
     loop {
