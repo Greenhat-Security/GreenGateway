@@ -12012,7 +12012,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_admin_sessions::impl  PostgresAdminSessionStore::prune_expired_with#1",
-      "sha256": "0be9417b6c6cecc2f34ed4ab0cafe26150fa02cbab062e8c01272830cfbfe65a",
+      "sha256": "9773414d55889dce2fd5823a5468f8ccbb195fdecb39de3ac905c49d2e141754",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -12042,7 +12042,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_admin_sessions::impl  PostgresAdminSessionStore::begin_login_in#1",
-      "sha256": "74ed1817cdffc458eac148a5685e9a78ffb02bb42c8d07d17e7f2b204c152b7a",
+      "sha256": "cb46dd7d30e16f0deb154a9b5ee42aa72c3f984405905b8db8ce787f67e00d8d",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -12052,7 +12052,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_admin_sessions::impl  PostgresAdminSessionStore::grant_in#1",
-      "sha256": "8fe5539da584c9360c31dda4d0d5588cef73c91122cb5008246c0329ec4e531f",
+      "sha256": "162cc45acdf7d35d5772dcfd6546429c3d8d394bcf3b0bb5e1eb07fc6fedbbc0",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -12062,7 +12062,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_admin_sessions::impl  PostgresAdminSessionStore::withdraw_in#1",
-      "sha256": "6f35f9399d77304d63c202ff64d18cb6d3473b65d686e958cad05037fc331f45",
+      "sha256": "ad5a4a7437066d29c274c748654f72d206cf7eb388fc93c22a1fee80843c8b0b",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -12091,8 +12091,28 @@
       "reasons": [
         "network-or-process-reference"
       ],
-      "scope": "gateway::storage::postgres_admin_sessions::prune_expired_statements#1",
-      "sha256": "c6bd1dab84623b4f1420f321ec802656d56a5b43eaf2b280221eb36ef142df00",
+      "scope": "gateway::storage::postgres_admin_sessions::classify_query#1",
+      "sha256": "b9618bf4127da4a3c48146f04769b3bf1026ac7481910dafc4f502dbfdacaf3b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_admin_sessions.rs",
+      "reasons": [
+        "unexpanded-macro"
+      ],
+      "scope": "gateway::storage::postgres_admin_sessions::macro journal_withdrawals#1",
+      "sha256": "3d9f0fc67cc3972578d7d96784934276afd29e850591e9edff2482436a239892",
+      "owner": "GreenGateway maintainers",
+      "purpose": "SQL text assembled at compile time for the admin session withdrawal statements; no network, process or HTTP authority of its own."
+    },
+    {
+      "file": "gateway/src/storage/postgres_admin_sessions.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_admin_sessions::prune_expired#1",
+      "sha256": "6571bbe6880a34fd77c947f97476df99a5a661694fab42b5c4be38277cd0ad12",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -12101,8 +12121,18 @@
       "reasons": [
         "network-or-process-reference"
       ],
-      "scope": "gateway::storage::postgres_admin_sessions::classify_query#1",
-      "sha256": "b9618bf4127da4a3c48146f04769b3bf1026ac7481910dafc4f502dbfdacaf3b",
+      "scope": "gateway::storage::postgres_admin_sessions::journaled_statement#1",
+      "sha256": "d9e9777865a3e9f8a30ae5e4e1bb580880c0499d4227d9dad6209714f7a7039c",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_admin_sessions.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_admin_sessions::withdraw_statement#1",
+      "sha256": "0d9f3db7b079de6c641960482904400559854d7b3799915079fb6c795dbc5150",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -14599,7 +14629,7 @@
         "unexpanded-macro"
       ],
       "scope": "gateway::authority_events::dispatcher::record_journal_stats#1",
-      "sha256": "7d1642231c3f8902db8e57663fec4695d9bd7991ea2c4db5c774e0613ed0b80c",
+      "sha256": "364b5dc167bae0a07a870ded9d35c9ea8d7ef8bf9c8a573a87d01efb63c12bdd",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
@@ -14729,7 +14759,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_authority_events::append_to_journal#1",
-      "sha256": "d9d1eaf857991353453e660e045a9c09b63e4f56f6c3d03b7f85d6f52316e574",
+      "sha256": "0dcc827762d86dd4b19883a1d8868a792dc47b0c73e1d7a627c0bbd1c447c42e",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -14786,16 +14816,6 @@
     {
       "file": "gateway/src/storage/postgres_authority_events.rs",
       "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::storage::postgres_authority_events::impl  JournalSource::ALL#1",
-      "sha256": "a14e519ac249c5759f4e94639370643f6ecab0c78cb46185cab41dc71c2d9b7b",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
-    },
-    {
-      "file": "gateway/src/storage/postgres_authority_events.rs",
-      "reasons": [
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_authority_events::impl  PostgresAuthorityEventStore::new#1",
@@ -14839,7 +14859,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_authority_events::read_stats#1",
-      "sha256": "d2a47bf98201da40e9bebeb22de2d015ad5709052ffb82e93e5391adceafe802",
+      "sha256": "29189f0abcd608dd871143d438391324ad8685bf83afb3fcda5c4adbc2a14443",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
