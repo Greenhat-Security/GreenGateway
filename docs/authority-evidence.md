@@ -577,7 +577,7 @@ the standalone column upgrade in `gateway/src/auth/tokens.rs`, the delivery
 projection tests in `gateway/src/authority_events/delivery_tests.rs`, the
 commit-order dispatcher test, and the app-level
 `admin_token_rotate_and_revoke_record_the_authenticated_subject_and_issuer_sqlite`
-and `_postgres`, which drive the admin endpoints with principals from two identity
+and `_postgres` in `gateway/src/admin_tokens_app_tests.rs`, which drive the admin endpoints with principals from two identity
 providers and a service token and read the evidence rows back. The PostgreSQL ones
 run in CI against its disposable loopback database, not verified TLS.
 

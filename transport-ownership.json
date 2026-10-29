@@ -11640,16 +11640,6 @@
       "reasons": [
         "network-or-process-reference"
       ],
-      "scope": "gateway::storage::migrations::apply_missing#1",
-      "sha256": "c7590b86709c3b34d7200572031c8a85f13452c10adf64277e72d1445f97ae35",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
-    },
-    {
-      "file": "gateway/src/storage/migrations.rs",
-      "reasons": [
-        "network-or-process-reference"
-      ],
       "scope": "gateway::storage::migrations::bootstrap_ledger#1",
       "sha256": "b4adc6b6f32d67d9092a42402d5c9b96adebcece8d404d205ed7b272a99e6304",
       "owner": "GreenGateway maintainers",
@@ -11660,18 +11650,8 @@
       "reasons": [
         "network-or-process-reference"
       ],
-      "scope": "gateway::storage::migrations::apply_one#1",
-      "sha256": "57bfc92e3d1d7f346dd323ecbded2ed662ea8f62d137b783b8748f19a6e41557",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
-    },
-    {
-      "file": "gateway/src/storage/migrations.rs",
-      "reasons": [
-        "network-or-process-reference"
-      ],
       "scope": "gateway::storage::migrations::migration_transaction#1",
-      "sha256": "1ed5a6a310d9b10aa64a2fb6a5ae0bf3a463905fff2d77fe373520c5a7e74dbd",
+      "sha256": "c4f62064dab7399793c69fec9721941a827eb2d7b371ab4256c3a86874dab5a1",
       "owner": "GreenGateway maintainers",
       "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
     },
@@ -11680,10 +11660,30 @@
       "reasons": [
         "network-or-process-reference"
       ],
-      "scope": "gateway::storage::migrations::apply_missing_for_startup#1",
-      "sha256": "82f494822119e52dc7d89aba273f4c5a8475befc4e745c53bb97b7c47f07ba04",
+      "scope": "gateway::storage::migrations::apply_manifest#1",
+      "sha256": "33c5f207bc610f39e80251b5080eb978a4da8803381d1c0d9aa7800ba1229593",
       "owner": "GreenGateway maintainers",
-      "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
+      "purpose": "The migrator checks one connection out of the existing PostgreSQL foundation pool, detaches it under the schema advisory lock and applies the manifest's missing migrations over it; no new connection construction or transport authority."
+    },
+    {
+      "file": "gateway/src/storage/migrations.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::migrations::apply_migration#1",
+      "sha256": "25cdfa166884b64a7894c875ce7be9c99f32e19a8e4ada4c67baca075cf2dd6c",
+      "owner": "GreenGateway maintainers",
+      "purpose": "One migration's explicit transaction on the migrator's detached session, a contracting migration's fence raise included; no new connection construction or transport authority."
+    },
+    {
+      "file": "gateway/src/storage/migrations.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::migrations::auto_migrate#1",
+      "sha256": "ed4a3d433ae71757c3507f85425f020251b8880b721ffb931e0c78dea0490905",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Development auto-migration delegates to the migrator over the existing PostgreSQL foundation pool with the serving configuration; no new transport authority."
     },
     {
       "file": "gateway/src/storage/policy_drafts.rs",
@@ -14872,6 +14872,46 @@
       "sha256": "f7ea42fbe0a39befb09e21a9a49ab5caef8ef939b0a749d731b79a43836992a0",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/storage/contraction.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::contraction::raise_fence_before_contracting#1",
+      "sha256": "8ccde65df9f7bfc1a8dc159f96a26d80ed1ce2060026eeb1cfb938290cfa32a4",
+      "owner": "GreenGateway maintainers",
+      "purpose": "A contracting migration's fence decision inside the migrator's own open transaction on its detached, advisory-locked session: locks and raises the contract fence and reads the backfill and roster rows; no new connection construction or transport authority."
+    },
+    {
+      "file": "gateway/src/storage/contraction.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::contraction::record_contraction_fence#1",
+      "sha256": "c0d962cf3a67ed7505cac97007d2ab036fac4a4f09606727e8ecc09a86fc54b0",
+      "owner": "GreenGateway maintainers",
+      "purpose": "After a contracting migration commits, audits its fence raise through the existing PostgreSQL audit store over the migrator's foundation pool; no new connection construction or transport authority."
+    },
+    {
+      "file": "gateway/src/storage/contraction.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::contraction::fence_from_row#1",
+      "sha256": "ec8cfe812451d852deb6f0d784af5eefc129ec81b6873047d4e8747f7f4dc21c",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Decodes the contract fence row the migrator's transaction read; no connection construction."
+    },
+    {
+      "file": "gateway/src/storage/contraction.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::contraction::live_member_from_row#1",
+      "sha256": "babe36718ab89b5863ad287ea0212855bf3a34a5d4ec4bacc5b0bf44f49804d2",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Decodes a roster row the migrator's transaction read; no connection construction."
     },
     {
       "file": "ggctl/src/completion.rs",

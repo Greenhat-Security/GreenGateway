@@ -5,6 +5,7 @@ use std::{
     fmt,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
+    time::Duration,
 };
 
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
@@ -58,6 +59,30 @@ CREATE TABLE IF NOT EXISTS service_token_change_evidence (
 
 CREATE INDEX IF NOT EXISTS idx_service_token_change_evidence_token
 ON service_token_change_evidence(token_id, sequence);
+"#;
+
+/// How long one statement on a token-store connection waits for a writer on
+/// another connection to the same file before the change is refused with
+/// [`TokenStoreError::Busy`]. It is the Connections store's budget, set
+/// explicitly rather than inherited from the driver's default.
+pub(crate) const SERVICE_TOKEN_SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Per-connection settings, applied on every open before the schema.
+///
+/// Write-ahead logging, like the Connections, discovery and principal
+/// stores. In the rollback-journal mode this store used to run in, a commit
+/// needs an EXCLUSIVE lock that every reader of the file holds off, and it
+/// holds the write lock across creating, syncing and deleting a journal
+/// file and syncing the database: on a loaded Windows runner a rotate racing
+/// a revoke on another connection waited out that I/O and ran out of its
+/// budget. Under WAL a commit appends to the log with one sync, readers never
+/// hold it up, and only writers queue, each for one short IMMEDIATE
+/// transaction. `synchronous = FULL` keeps every committed revoke durable
+/// across a power loss, as rollback mode did. The mode persists in the file;
+/// an older binary opens a WAL database unchanged.
+const CONFIGURE_SERVICE_TOKEN_CONNECTION_SQL: &str = r#"
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = FULL;
 "#;
 
 /// The actor metadata of the change evidence (issue #425, the v1 contract
@@ -270,6 +295,15 @@ pub enum TokenStoreError {
         path: PathBuf,
         source: rusqlite::Error,
     },
+    /// Another connection held the file's write lock for the store's whole
+    /// contention budget ([`SERVICE_TOKEN_SQLITE_BUSY_TIMEOUT`] unless the
+    /// store was opened with another). The change was refused before
+    /// it committed, so nothing it would have written exists; the caller may
+    /// retry it. A store statement that runs out of the budget is reported
+    /// as this, not as the raw `SQLITE_BUSY`/`SQLITE_LOCKED` failure.
+    Busy {
+        path: PathBuf,
+    },
     Json {
         context: &'static str,
         source: serde_json::Error,
@@ -301,15 +335,30 @@ pub enum TokenStoreError {
 
 impl SqliteTokenStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, TokenStoreError> {
+        Self::open_with_busy_timeout(path, SERVICE_TOKEN_SQLITE_BUSY_TIMEOUT)
+    }
+
+    /// [`Self::open`] with a contention budget other than the default, for
+    /// tests that hold the write lock past it.
+    pub(crate) fn open_with_busy_timeout(
+        path: impl AsRef<Path>,
+        busy_timeout: Duration,
+    ) -> Result<Self, TokenStoreError> {
         let path = path.as_ref().to_path_buf();
         let connection = Connection::open(&path).map_err(|source| TokenStoreError::Open {
             path: path.clone(),
             source,
         })?;
-        configure_connection(&connection).map_err(|source| TokenStoreError::Sqlite {
-            path: path.clone(),
-            source,
-        })?;
+        // The budget is set before the first statement, so even the journal
+        // mode switch and the schema statements below wait for a writer on
+        // another connection rather than failing at once.
+        connection
+            .busy_timeout(busy_timeout)
+            .map_err(|source| store_failure(&path, source))?;
+        connection
+            .execute_batch(CONFIGURE_SERVICE_TOKEN_CONNECTION_SQL)
+            .map_err(|source| store_failure(&path, source))?;
+        configure_connection(&connection).map_err(|source| store_failure(&path, source))?;
 
         Ok(Self {
             path,
@@ -339,10 +388,7 @@ impl SqliteTokenStore {
                 ORDER BY id
                 "#,
             )
-            .map_err(|source| TokenStoreError::Sqlite {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(|source| store_failure(&self.path, source))?;
         let tokens = statement
             .query_map([], |row| {
                 Ok(ExportedServiceToken {
@@ -357,23 +403,14 @@ impl SqliteTokenStore {
                     revoked_at: row.get(8)?,
                 })
             })
-            .map_err(|source| TokenStoreError::Sqlite {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(|source| store_failure(&self.path, source))?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|source| TokenStoreError::Sqlite {
-                path: self.path.clone(),
-                source,
-            });
+            .map_err(|source| store_failure(&self.path, source));
         tokens
     }
 
     fn sqlite_error(&self, source: rusqlite::Error) -> TokenStoreError {
-        TokenStoreError::Sqlite {
-            path: self.path.clone(),
-            source,
-        }
+        store_failure(&self.path, source)
     }
 
     fn connection_guard(&self) -> MutexGuard<'_, Connection> {
@@ -437,10 +474,7 @@ impl TokenStore for SqliteTokenStore {
                     request.expires_at.as_deref(),
                 ],
             )
-            .map_err(|source| TokenStoreError::Sqlite {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(|source| store_failure(&self.path, source))?;
 
         Ok(CreatedToken {
             record: TokenRecord {
@@ -468,21 +502,12 @@ impl TokenStore for SqliteTokenStore {
         let connection = self.connection_guard();
         let mut statement = connection
             .prepare(&sql)
-            .map_err(|source| TokenStoreError::Sqlite {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(|source| store_failure(&self.path, source))?;
         let rows = statement
             .query_map(params_from_iter(params.iter()), RawTokenRecord::from_row)
-            .map_err(|source| TokenStoreError::Sqlite {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(|source| store_failure(&self.path, source))?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|source| TokenStoreError::Sqlite {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(|source| store_failure(&self.path, source))?;
 
         let mut rows = rows;
         let has_more = rows.len() > filters.limit;
@@ -665,10 +690,7 @@ impl TokenStore for SqliteTokenStore {
                 "UPDATE service_tokens SET last_used_at = ?1 WHERE id = ?2",
                 params![last_used_at.as_str(), record.id.as_str()],
             )
-            .map_err(|source| TokenStoreError::Sqlite {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(|source| store_failure(&self.path, source))?;
         record.last_used_at = Some(last_used_at);
 
         Ok(TokenVerification::Valid(VerifiedToken {
@@ -698,10 +720,7 @@ impl TokenStore for SqliteTokenStore {
                 "UPDATE service_tokens SET last_used_at = ?1 WHERE id = ?2",
                 params![last_used_at.as_str(), id],
             )
-            .map_err(|source| TokenStoreError::Sqlite {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(|source| store_failure(&self.path, source))?;
 
         load_record_by_id(&connection, &self.path, id)
     }
@@ -721,6 +740,13 @@ impl fmt::Display for TokenStoreError {
                 write!(
                     formatter,
                     "failed to access service-token store at {}: {source}",
+                    path.display()
+                )
+            }
+            Self::Busy { path } => {
+                write!(
+                    formatter,
+                    "service-token store at {} stayed locked by another writer past its contention budget; nothing was changed",
                     path.display()
                 )
             }
@@ -784,9 +810,10 @@ impl Error for TokenStoreError {
             Self::Json { source, .. } => Some(source),
             Self::TimeFormat(source) => Some(source),
             Self::TimeParse { source, .. } => Some(source),
-            Self::InvalidCursor { .. } | Self::RevokedToken { .. } | Self::InvalidChangeActor => {
-                None
-            }
+            Self::Busy { .. }
+            | Self::InvalidCursor { .. }
+            | Self::RevokedToken { .. }
+            | Self::InvalidChangeActor => None,
             Self::Random(source) => Some(source),
         }
     }
@@ -895,6 +922,29 @@ fn record_change_evidence(
     Ok(())
 }
 
+/// A failed store statement as the store reports it: a lock the busy budget
+/// could not outwait is [`TokenStoreError::Busy`] (the statement, and any
+/// transaction it was part of, committed nothing), everything else is
+/// [`TokenStoreError::Sqlite`].
+fn store_failure(path: &Path, source: rusqlite::Error) -> TokenStoreError {
+    let path = path.to_path_buf();
+    // The primary result codes 5 (SQLITE_BUSY) and 6 (SQLITE_LOCKED); the
+    // extended codes share the low byte, as `storage::classify_rusqlite`
+    // reads them.
+    let lock_failure = match &source {
+        rusqlite::Error::SqliteFailure(failure, _) => {
+            let primary = failure.extended_code & 0xff;
+            primary == 5 || primary == 6
+        }
+        _ => false,
+    };
+    if lock_failure {
+        TokenStoreError::Busy { path }
+    } else {
+        TokenStoreError::Sqlite { path, source }
+    }
+}
+
 pub fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
     connection.execute_batch(CREATE_SERVICE_TOKEN_SCHEMA_SQL)?;
     add_change_evidence_actor_columns(connection)
@@ -957,10 +1007,7 @@ fn load_record_by_id(
             RawTokenRecord::from_row,
         )
         .optional()
-        .map_err(|source| TokenStoreError::Sqlite {
-            path: path.to_path_buf(),
-            source,
-        })?
+        .map_err(|source| store_failure(path, source))?
         .map(RawTokenRecord::into_record)
         .transpose()
 }
@@ -989,10 +1036,7 @@ fn load_record_by_hash(
             RawTokenRecord::from_row,
         )
         .optional()
-        .map_err(|source| TokenStoreError::Sqlite {
-            path: path.to_path_buf(),
-            source,
-        })?
+        .map_err(|source| store_failure(path, source))?
         .map(RawTokenRecord::into_record)
         .transpose()
 }
