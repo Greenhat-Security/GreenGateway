@@ -2719,6 +2719,17 @@ mod tests {
             !rendered_allowed,
             "the admitted snapshot's deny rule judges the rendered request"
         );
+        // The deny is handed to the audit writer thread when the rendered
+        // request is judged and delivered asynchronously, so joining the
+        // invocation does not mean it was delivered: wait for the denial
+        // itself before reading what was captured.
+        wait_until(Duration::from_secs(5), || {
+            capture
+                .events()
+                .iter()
+                .any(|event| event.event_type == AUTHZ_DENIED)
+        })
+        .await;
         let events = capture.events();
         let denied = events
             .iter()
