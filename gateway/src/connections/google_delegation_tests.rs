@@ -410,7 +410,11 @@ impl Harness {
         }
         let initial = control_plane.runtime_snapshot();
         let created = control_plane
-            .create_managed(initial.collection_etag(), delegation_write(), "test-admin")
+            .create_managed(
+                initial.collection_etag(),
+                delegation_write(),
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("the delegating Connection saves");
 
@@ -1113,7 +1117,11 @@ async fn an_enabled_save_must_name_a_configured_workload_identity_profile() {
     let snapshot = harness.control_plane.runtime_snapshot();
     let refused = match harness
         .control_plane
-        .create_managed(snapshot.collection_etag(), write.clone(), "test-admin")
+        .create_managed(
+            snapshot.collection_etag(),
+            write.clone(),
+            &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+        )
         .await
     {
         Ok(_) => panic!("an unconfigured profile must refuse an enabled save"),
@@ -1128,7 +1136,11 @@ async fn an_enabled_save_must_name_a_configured_workload_identity_profile() {
     write.enabled = false;
     harness
         .control_plane
-        .create_managed(snapshot.collection_etag(), write, "test-admin")
+        .create_managed(
+            snapshot.collection_etag(),
+            write,
+            &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+        )
         .await
         .expect("a disabled draft saves");
 }

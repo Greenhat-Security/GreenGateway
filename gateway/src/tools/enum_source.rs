@@ -2122,7 +2122,7 @@ mod tests {
                     }
                 }))
                 .expect("fixture Connection should deserialize"),
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("fixture Connection should create");
@@ -2191,7 +2191,7 @@ mod tests {
                     }
                 }))
                 .expect("fixture Connection should deserialize"),
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("fixture Connection should create");
@@ -2369,7 +2369,12 @@ mod tests {
         let mut replacement = created.write.clone();
         replacement.endpoint.base_path = "/v2".to_owned();
         let updated = control_plane
-            .replace_managed(&created.id, &created.etag(), replacement, "test-admin")
+            .replace_managed(
+                &created.id,
+                &created.etag(),
+                replacement,
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("endpoint replacement should advance the connection fence");
         let cold = EnumSourceRuntime::new(

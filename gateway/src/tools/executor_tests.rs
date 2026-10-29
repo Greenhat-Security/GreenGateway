@@ -2479,7 +2479,12 @@ async fn connection_change_during_execution_precondition_fails_before_secret_or_
                         "the validator must first observe the expected old revision"
                     );
                     control_plane
-                        .replace_managed(&connection_id, &expected_etag, edited, "test-admin")
+                        .replace_managed(
+                            &connection_id,
+                            &expected_etag,
+                            edited,
+                            &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+                        )
                         .await
                         .expect("racing Connection edit should publish");
                     fs::remove_file(&secret_path)
@@ -6654,7 +6659,11 @@ impl TemporaryStaticAuthRuntime {
         }
         let initial = control_plane.runtime_snapshot();
         let created = control_plane
-            .create_managed(initial.collection_etag(), write, "test-admin")
+            .create_managed(
+                initial.collection_etag(),
+                write,
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("test Connection should create");
         let mut egress_config = EgressConfig {
@@ -6748,7 +6757,7 @@ impl TemporaryStaticAuthRuntime {
                     discovery: None,
                     test_profile: None,
                 },
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("OAuth test Connection should create");
