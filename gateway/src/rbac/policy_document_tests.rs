@@ -8,6 +8,10 @@ use jsonschema::Validator;
 use serde_json::{json, Value};
 
 use super::*;
+use crate::rbac::conditions::{
+    Condition, HeaderCondition, OrganizationCondition, QueryCondition, SourceNetworkCondition,
+    TimeWindowCondition, ToolArgumentCondition,
+};
 use crate::{
     auth::{AuthMethod, Principal},
     policy_eval::{
@@ -1109,6 +1113,44 @@ fn the_member_vocabularies_match_the_parser() {
         dispatch: Some(RuleDispatchMatcher::legacy("https://a.test".to_owned())),
         principal: full_principal(),
         action: RuleAction::Deny,
+        conditions: Some(Condition::Not(Box::new(Condition::TimeWindow(
+            TimeWindowCondition {
+                from: None,
+                until: Some("2027-01-01T00:00:00Z".to_owned()),
+            },
+        )))),
+    };
+    let mapping = IdentityMapping {
+        id: "m".to_owned(),
+        issuer: "i".to_owned(),
+        auth_methods: vec!["bearer_token".to_owned()],
+        subjects: vec!["s".to_owned()],
+        organizations: vec!["o".to_owned()],
+        claimed_roles: vec!["c".to_owned()],
+        grant_roles: vec!["r".to_owned()],
+    };
+    let organization = OrganizationCondition {
+        issuer: "i".to_owned(),
+        values: vec!["o".to_owned()],
+    };
+    let source_network = SourceNetworkCondition {
+        cidrs: vec!["10.0.0.0/8".to_owned()],
+    };
+    let header = HeaderCondition {
+        name: "x-environment".to_owned(),
+        values: vec!["prod".to_owned()],
+    };
+    let query = QueryCondition {
+        name: "mode".to_owned(),
+        values: vec!["read".to_owned()],
+    };
+    let tool_argument = ToolArgumentCondition {
+        pointer: "/region".to_owned(),
+        values: vec![json!("eu")],
+    };
+    let time_window = TimeWindowCondition {
+        from: Some("2026-01-01T00:00:00Z".to_owned()),
+        until: Some("2027-01-01T00:00:00Z".to_owned()),
     };
     let mut dispatch = RuleDispatchMatcher::legacy("https://a.test".to_owned());
     dispatch.route_id = Some("r".to_owned());
@@ -1156,6 +1198,25 @@ fn the_member_vocabularies_match_the_parser() {
         (serde_json::to_value(&role), &ROLE_MEMBERS),
         (serde_json::to_value(&tool), &TOOL_MEMBERS),
         (serde_json::to_value(&egress), &EGRESS_MEMBERS),
+        (serde_json::to_value(&mapping), &IDENTITY_MAPPING_MEMBERS),
+        (
+            serde_json::to_value(&organization),
+            &ORGANIZATION_CONDITION_MEMBERS,
+        ),
+        (
+            serde_json::to_value(&source_network),
+            &SOURCE_NETWORK_CONDITION_MEMBERS,
+        ),
+        (serde_json::to_value(&header), &HEADER_CONDITION_MEMBERS),
+        (serde_json::to_value(&query), &QUERY_CONDITION_MEMBERS),
+        (
+            serde_json::to_value(&tool_argument),
+            &TOOL_ARGUMENT_CONDITION_MEMBERS,
+        ),
+        (
+            serde_json::to_value(&time_window),
+            &TIME_WINDOW_CONDITION_MEMBERS,
+        ),
     ] {
         let value = value.expect("serialize");
         let written: BTreeSet<&str> = value
@@ -1168,9 +1229,43 @@ fn the_member_vocabularies_match_the_parser() {
         assert_eq!(written, allowed);
     }
 
-    let policy = Policy::validate_json_value(json!({
+    // Every operator a condition node may name is one the typed reading
+    // writes, and no other.
+    let operators: BTreeSet<String> = [
+        Condition::All(Vec::new()),
+        Condition::Any(Vec::new()),
+        Condition::Not(Box::new(Condition::Query(query.clone()))),
+        Condition::Organization(organization),
+        Condition::SourceNetwork(source_network),
+        Condition::Header(header),
+        Condition::Query(query),
+        Condition::ToolArgument(tool_argument),
+        Condition::TimeWindow(time_window),
+    ]
+    .iter()
+    .flat_map(|condition| {
+        serde_json::to_value(condition)
+            .expect("serialize")
+            .as_object()
+            .expect("one-member object")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+    })
+    .collect();
+    assert_eq!(
+        operators,
+        CONDITION_OPERATORS
+            .iter()
+            .map(|operator| (*operator).to_owned())
+            .collect()
+    );
+
+    let policy = parse_v1_with_typed_matchers(&json!({
         "schema_version": "1.0.0",
         "id": "p",
+        "roles": { "r": {} },
+        "identity_mappings": [{ "id": "m", "issuer": "i", "grant_roles": ["r"] }],
         "egress": { "hosts": ["a.test"] },
         "rate_limits": [{ "id": "l", "requests_per_second": 1, "burst": 1 }],
         "tools": { "t": {} }
@@ -1211,6 +1306,41 @@ fn the_published_v1_schema_matches_the_member_vocabularies() {
         ("role_entry", &ROLE_MEMBERS, vec![]),
         ("tool_policy_entry", &TOOL_MEMBERS, vec![]),
         ("egress_policy", &EGRESS_MEMBERS, vec![]),
+        (
+            "identity_mapping",
+            &IDENTITY_MAPPING_MEMBERS,
+            vec!["id", "issuer", "grant_roles"],
+        ),
+        (
+            "organization_condition",
+            &ORGANIZATION_CONDITION_MEMBERS,
+            vec!["issuer", "in"],
+        ),
+        (
+            "source_network_condition",
+            &SOURCE_NETWORK_CONDITION_MEMBERS,
+            vec!["cidrs"],
+        ),
+        (
+            "header_condition",
+            &HEADER_CONDITION_MEMBERS,
+            vec!["name", "in"],
+        ),
+        (
+            "query_condition",
+            &QUERY_CONDITION_MEMBERS,
+            vec!["name", "in"],
+        ),
+        (
+            "tool_argument_condition",
+            &TOOL_ARGUMENT_CONDITION_MEMBERS,
+            vec!["pointer", "in"],
+        ),
+        (
+            "time_window_condition",
+            &TIME_WINDOW_CONDITION_MEMBERS,
+            vec![],
+        ),
     ] {
         let schema_members: BTreeSet<&str> = definitions[definition]["properties"]
             .as_object()
@@ -1249,6 +1379,23 @@ fn the_published_v1_schema_matches_the_member_vocabularies() {
             .collect::<BTreeSet<_>>()
     );
     assert_eq!(schema["additionalProperties"], json!(false));
+    // A condition node names exactly one operator, from the same vocabulary.
+    let condition = &definitions["condition"];
+    let schema_operators: BTreeSet<&str> = condition["properties"]
+        .as_object()
+        .expect("condition operators")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        schema_operators,
+        CONDITION_OPERATORS.iter().copied().collect::<BTreeSet<_>>()
+    );
+    assert_eq!(condition["additionalProperties"], json!(false));
+    assert_eq!(
+        (&condition["minProperties"], &condition["maxProperties"]),
+        (&json!(1), &json!(1))
+    );
     assert_eq!(
         schema["properties"]["schema_version"]["const"],
         json!(POLICY_V1_SCHEMA_VERSION)
@@ -1378,3 +1525,382 @@ const GOLDEN_V1_CANONICAL: &str = concat!(
 /// outside this code.
 const GOLDEN_V1_SEMANTIC_DIGEST: &str =
     "sha256:ea0ee24587a50ccc33a6b42eed021227fd8a3237b00602665af61745d83d78c4";
+
+/// A v1 document using every identity-mapping member and condition leaf.
+fn typed_matcher_v1() -> Value {
+    json!({
+        "schema_version": "1.0.0",
+        "roles": {
+            "admin": { "permissions": ["admin:policy:write"] },
+            "reader": { "permissions": ["data:read"] }
+        },
+        "identity_mappings": [{
+            "id": "idp-admins",
+            "issuer": "https://idp.example.test/",
+            "auth_methods": ["bearer_token"],
+            "subjects": ["alice"],
+            "organizations": ["acme"],
+            "claimed_roles": ["Platform-Admins"],
+            "grant_roles": ["admin", "reader"]
+        }],
+        "rules": [
+            {
+                "id": "staging-reads",
+                "path": "/data/**",
+                "action": "allow",
+                "conditions": { "all": [
+                    { "organization": { "issuer": "https://idp.example.test", "in": ["acme"] } },
+                    { "any": [
+                        { "source_network": { "cidrs": ["10.0.0.0/8", "fd00::/8"] } },
+                        { "not": { "header": { "name": "x-environment", "in": ["prod"] } } }
+                    ] },
+                    { "query": { "name": "mode", "in": ["read", ""] } },
+                    { "time_window": { "from": "2026-01-01T00:00:00Z", "until": "2027-01-01T00:00:00Z" } }
+                ] }
+            },
+            {
+                "id": "eu-exports",
+                "tool_name": "reports.export",
+                "action": "deny",
+                "conditions": { "tool_argument": { "pointer": "/region", "in": ["eu", 1, true] } }
+            }
+        ]
+    })
+}
+
+#[test]
+fn this_release_validates_typed_matchers_and_refuses_to_serve_them() {
+    let document = typed_matcher_v1();
+    let inspection = inspect(&document);
+    // Sound in every other respect: the only diagnostic is the refusal,
+    // located at the identity mappings, and nothing is published.
+    assert_eq!(
+        codes_and_pointers(&inspection),
+        vec![(
+            "typed_matchers_not_enforced",
+            "/identity_mappings".to_owned()
+        )]
+    );
+    assert!(!inspection.is_valid());
+    assert!(inspection.policy().is_none());
+    assert_eq!(inspection.semantic_digest(), None);
+    let refusal = diagnostic(&inspection, IssueCode::TypedMatchersNotEnforced);
+    assert_eq!(
+        refusal.blocks,
+        DiagnosticBlocks {
+            simulation: true,
+            tests: true,
+            publication: true,
+            evidence: true
+        }
+    );
+    // Without the mappings, at the first rule that carries conditions, with
+    // the rule's own id.
+    let mut conditions_only = document.clone();
+    conditions_only
+        .as_object_mut()
+        .expect("object")
+        .remove("identity_mappings");
+    let inspection = inspect(&conditions_only);
+    assert_eq!(
+        codes_and_pointers(&inspection),
+        vec![(
+            "typed_matchers_not_enforced",
+            "/rules/0/conditions".to_owned()
+        )]
+    );
+    assert_eq!(
+        diagnostic(&inspection, IssueCode::TypedMatchersNotEnforced)
+            .element_id
+            .as_deref(),
+        Some("staging-reads")
+    );
+    // An empty mapping list is mapped-role mode too, and refused the same way.
+    let mut empty_mappings = conditions_only.clone();
+    empty_mappings["rules"] = json!([]);
+    empty_mappings["identity_mappings"] = json!([]);
+    assert_eq!(
+        codes_and_pointers(&inspect(&empty_mappings)),
+        vec![(
+            "typed_matchers_not_enforced",
+            "/identity_mappings".to_owned()
+        )]
+    );
+
+    // Every loader that admits a policy refuses it: startup and reload,
+    // replacement, and the in-memory validation drafts and bundles use.
+    let source = serde_json::to_vec(&document).expect("serialize");
+    for error in [
+        Policy::from_source(&source, None).expect_err("startup refuses it"),
+        Policy::validate_json_value(document.clone()).expect_err("validation refuses it"),
+    ] {
+        assert!(
+            error.to_string().contains("/identity_mappings"),
+            "unexpected error: {error}"
+        );
+    }
+
+    // What the gateway refuses to serve it still reads: the typed reading
+    // the kernel tests evaluate is the document itself, issuers canonical.
+    let policy = parse_v1_with_typed_matchers(&document).expect("the document is sound");
+    let mappings = policy.identity_mappings.as_deref().expect("mappings");
+    assert_eq!(mappings[0].issuer, "https://idp.example.test");
+    assert_eq!(mappings[0].grant_roles, vec!["admin", "reader"]);
+    assert!(policy.rules.iter().all(|rule| rule.conditions.is_some()));
+}
+
+#[test]
+fn typed_matcher_structure_is_checked_with_every_problem_located() {
+    let inspection = inspect(&json!({
+        "schema_version": "1.0.0",
+        "roles": { "reader": {} },
+        "identity_mappings": [
+            { "issuer": "i", "grant_roles": ["reader"], "groups": [] },
+            { "id": "shared", "grant_roles": ["reader"] }
+        ],
+        "rules": [
+            {
+                "id": "shared",
+                "path": "/x",
+                "action": "deny",
+                "conditions": { "all": [
+                    { "header": { "name": "x-environment", "in": ["prod"], "case": "any" } },
+                    { "regex": { "pattern": ".*" } },
+                    { "any": [], "all": [] },
+                    "header",
+                    { "any": { "query": {} } },
+                    { "query": { "in": ["read"] } }
+                ] }
+            },
+            {
+                "id": "deep",
+                "path": "/y",
+                "action": "deny",
+                "conditions": { "not": { "not": { "not": { "not": {
+                    "time_window": { "from": "2026-01-01T00:00:00Z" }
+                } } } } }
+            }
+        ]
+    }));
+    assert_eq!(
+        codes_and_pointers(&inspection),
+        vec![
+            ("unknown_member", "/identity_mappings/0/groups".to_owned()),
+            ("element_id_missing", "/identity_mappings/0/id".to_owned()),
+            (
+                "required_member_missing",
+                "/identity_mappings/1/issuer".to_owned()
+            ),
+            ("element_id_duplicate", "/rules/0/id".to_owned()),
+            (
+                "unknown_member",
+                "/rules/0/conditions/all/0/header/case".to_owned()
+            ),
+            (
+                "unknown_member",
+                "/rules/0/conditions/all/1/regex".to_owned()
+            ),
+            (
+                "condition_operator_invalid",
+                "/rules/0/conditions/all/2".to_owned()
+            ),
+            ("invalid_type", "/rules/0/conditions/all/3".to_owned()),
+            ("invalid_type", "/rules/0/conditions/all/4/any".to_owned()),
+            (
+                "required_member_missing",
+                "/rules/0/conditions/all/5/query/name".to_owned()
+            ),
+            (
+                "condition_too_complex",
+                "/rules/1/conditions/not/not/not/not".to_owned()
+            ),
+        ]
+    );
+    let duplicate = diagnostic(&inspection, IssueCode::ElementIdDuplicate);
+    assert_eq!(duplicate.element_id.as_deref(), Some("shared"));
+    let operator = diagnostic(&inspection, IssueCode::ConditionOperatorInvalid);
+    assert_eq!(operator.element_id.as_deref(), Some("shared"));
+}
+
+#[test]
+fn typed_matcher_semantics_are_refused_at_their_pointer() {
+    let mut cases = Vec::new();
+    let mut unknown_role = typed_matcher_v1();
+    unknown_role["identity_mappings"][0]["grant_roles"] = json!(["reader", "owner"]);
+    cases.push((
+        unknown_role,
+        "identity_mapping_role_unknown",
+        "/identity_mappings/0/grant_roles/1",
+        Some("idp-admins"),
+    ));
+    let mut forbidden_header = typed_matcher_v1();
+    forbidden_header["rules"][0]["conditions"]["all"][1]["any"][1]["not"]["header"]["name"] =
+        json!("x-forwarded-for");
+    cases.push((
+        forbidden_header,
+        "condition_name_forbidden",
+        "/rules/0/conditions/all/1/any/1/not/header/name",
+        Some("staging-reads"),
+    ));
+    let mut misplaced = typed_matcher_v1();
+    misplaced["rules"][1]["conditions"] =
+        json!({ "header": { "name": "x-environment", "in": ["prod"] } });
+    cases.push((
+        misplaced,
+        "condition_not_applicable",
+        "/rules/1/conditions/header",
+        Some("eu-exports"),
+    ));
+    let mut unordered = typed_matcher_v1();
+    unordered["rules"][0]["conditions"]["all"][3]["time_window"]["until"] =
+        json!("2025-01-01T00:00:00Z");
+    cases.push((
+        unordered,
+        "condition_time_invalid",
+        "/rules/0/conditions/all/3/time_window/until",
+        Some("staging-reads"),
+    ));
+    let mut host_bits = typed_matcher_v1();
+    host_bits["rules"][0]["conditions"]["all"][1]["any"][0]["source_network"]["cidrs"][0] =
+        json!("10.1.2.3/8");
+    cases.push((
+        host_bits,
+        "condition_cidr_invalid",
+        "/rules/0/conditions/all/1/any/0/source_network/cidrs/0",
+        Some("staging-reads"),
+    ));
+    let mut null_value = typed_matcher_v1();
+    null_value["rules"][1]["conditions"]["tool_argument"]["in"] = json!([null]);
+    cases.push((
+        null_value,
+        "invalid_type",
+        "/rules/1/conditions/tool_argument/in/0",
+        Some("eu-exports"),
+    ));
+    for (document, code, pointer, element_id) in cases {
+        let inspection = inspect(&document);
+        assert_eq!(
+            codes_and_pointers(&inspection),
+            vec![(code, pointer.to_owned())],
+            "{code}"
+        );
+        assert_eq!(
+            inspection.diagnostics()[0].element_id.as_deref(),
+            element_id,
+            "{code}"
+        );
+        assert!(
+            !inspection.diagnostics()[0]
+                .message
+                .contains("x-forwarded-for"),
+            "a diagnostic message never quotes the document"
+        );
+    }
+}
+
+#[test]
+fn a_v0_document_cannot_carry_identity_mappings_or_conditions() {
+    for (document, pointer) in [
+        (
+            json!({
+                "schema_version": "0.1.0",
+                "roles": { "reader": {} },
+                "identity_mappings": [{ "id": "m", "issuer": "i", "grant_roles": ["reader"] }]
+            }),
+            "/identity_mappings",
+        ),
+        (
+            json!({
+                "schema_version": "0.1.0",
+                "rules": [{
+                    "path": "/x",
+                    "action": "allow",
+                    "conditions": { "time_window": { "from": "2026-01-01T00:00:00Z" } }
+                }]
+            }),
+            "/rules/0/conditions",
+        ),
+    ] {
+        let inspection = inspect(&document);
+        assert_eq!(
+            codes_and_pointers(&inspection),
+            vec![("member_requires_v1", pointer.to_owned())]
+        );
+        let error = Policy::validate_json_value(document).expect_err("0.x refuses it");
+        assert!(
+            error
+                .to_string()
+                .contains("requires schema_version \"1.0.0\""),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+#[test]
+fn the_published_v1_schema_describes_the_typed_matchers_the_gateway_reads() {
+    let validator = v1_schema_validator();
+    assert_schema_accepts(&validator, &typed_matcher_v1());
+    let mapping_without_id = json!({
+        "issuer": "https://idp.example.test",
+        "grant_roles": ["reader"]
+    });
+    for (name, pointer, replacement) in [
+        (
+            "two operators in one node",
+            "/rules/0/conditions",
+            json!({ "all": [], "any": [] }),
+        ),
+        (
+            "an unknown operator",
+            "/rules/0/conditions",
+            json!({ "regex": { "pattern": ".*" } }),
+        ),
+        ("an empty all", "/rules/0/conditions", json!({ "all": [] })),
+        (
+            "an uppercase header name",
+            "/rules/0/conditions",
+            json!({ "header": { "name": "X-Environment", "in": ["prod"] } }),
+        ),
+        (
+            "an offset time",
+            "/rules/0/conditions",
+            json!({ "time_window": { "from": "2026-01-01T00:00:00+00:00" } }),
+        ),
+        (
+            "an empty time window",
+            "/rules/0/conditions",
+            json!({ "time_window": {} }),
+        ),
+        (
+            "a relative pointer",
+            "/rules/1/conditions",
+            json!({ "tool_argument": { "pointer": "region", "in": ["eu"] } }),
+        ),
+        (
+            "a mapping without grants",
+            "/identity_mappings/0/grant_roles",
+            json!([]),
+        ),
+        (
+            "a mapping without an id",
+            "/identity_mappings/0",
+            mapping_without_id,
+        ),
+    ] {
+        let mut document = typed_matcher_v1();
+        *document.pointer_mut(pointer).expect("fixture pointer") = replacement;
+        assert!(
+            !validator.is_valid(&document),
+            "the published schema should refuse {name}"
+        );
+        let inspection = inspect(&document);
+        assert!(
+            inspection
+                .diagnostics()
+                .iter()
+                .all(|diagnostic| diagnostic.code != IssueCode::TypedMatchersNotEnforced.as_str()),
+            "the gateway should refuse {name} for itself, before the enforcement refusal: {:?}",
+            inspection.diagnostics()
+        );
+    }
+}

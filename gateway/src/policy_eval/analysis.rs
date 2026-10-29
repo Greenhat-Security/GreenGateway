@@ -30,11 +30,13 @@ use std::collections::HashMap;
 use super::{
     validated_policy_digest, CompiledPolicy, DispatchFacts, EvaluationError, HttpTarget,
     Limitation, PolicyAuthority, PolicyDigest, PolicyEvaluationContext, PrincipalFact,
+    UNCAPTURED_FACTS,
 };
 use crate::{
     rbac::{
-        matcher::RuleDispatchContext, policy::RoleEntry, DefaultAction, EgressPolicy,
-        EnforcementMode, Policy, Rule,
+        matcher::{RuleDispatchContext, RuleScan},
+        policy::RoleEntry,
+        DefaultAction, EgressPolicy, EnforcementMode, Policy, Rule,
     },
     request_bounds::MAX_TOOL_NAME_BYTES,
 };
@@ -67,6 +69,7 @@ impl CompiledPolicy {
             default_action: DefaultAction::default(),
             enforcement_mode: EnforcementMode::default(),
             roles: HashMap::new(),
+            identity_mappings: None,
             routes: Vec::new(),
             rules: vec![rule],
             egress: EgressPolicy::default(),
@@ -153,26 +156,29 @@ impl CompiledPolicy {
         // Past the checks above, a missing principal or dispatch is one no
         // enabled HTTP rule reads, so any stand-in gives the same answer. These
         // are the ones that cannot match a rule that does read it.
-        let principal = match &context.principal {
-            PrincipalFact::Authenticated(identity) => Some(&identity.0),
+        let effective = match &context.principal {
+            PrincipalFact::Authenticated(identity) => {
+                match self.effective_principal(&identity.0, &UNCAPTURED_FACTS) {
+                    Some(effective) => Some(effective),
+                    None => {
+                        return Ok(DirectRuleOutcome::Indeterminate(
+                            Limitation::MissingMatcherFact,
+                        ))
+                    }
+                }
+            }
             PrincipalFact::Anonymous | PrincipalFact::Missing => None,
         };
         let dispatch_context = dispatch_context.unwrap_or_else(RuleDispatchContext::unknown);
-        Ok(
-            match self.match_direct(
-                method.as_str(),
-                path,
-                None,
-                principal,
-                dispatch_context,
-                false,
-            ) {
-                Some(decision) => DirectRuleOutcome::Matched {
-                    index: decision.rule_index,
-                },
-                None => DirectRuleOutcome::NoMatch,
-            },
-        )
+        Ok(direct_rule_outcome(self.match_direct(
+            method.as_str(),
+            path,
+            None,
+            effective.as_deref(),
+            dispatch_context,
+            false,
+            &UNCAPTURED_FACTS,
+        )))
     }
 
     /// Whether any rule that can match an HTTP request reads a fact.
@@ -204,7 +210,7 @@ impl CompiledPolicy {
         if tool_name.len() > MAX_TOOL_NAME_BYTES {
             return Err(EvaluationError::ContextTooLarge);
         }
-        let principal = match principal {
+        let effective = match principal {
             PrincipalFact::Authenticated(identity) => {
                 if let Err(problem) = identity.0.check_shape() {
                     return Err(if problem.is_size() {
@@ -213,7 +219,14 @@ impl CompiledPolicy {
                         EvaluationError::InvalidPrincipal
                     });
                 }
-                Some(&identity.0)
+                match self.effective_principal(&identity.0, &UNCAPTURED_FACTS) {
+                    Some(effective) => Some(effective),
+                    None => {
+                        return Ok(DirectRuleOutcome::Indeterminate(
+                            Limitation::MissingMatcherFact,
+                        ))
+                    }
+                }
             }
             PrincipalFact::Missing
                 if self.direct_rules().iter().any(|rule| {
@@ -228,12 +241,26 @@ impl CompiledPolicy {
             // anonymous stand-in gives the same answer.
             PrincipalFact::Anonymous | PrincipalFact::Missing => None,
         };
-        Ok(match self.matcher.evaluate_tool(tool_name, principal) {
-            Some(decision) => DirectRuleOutcome::Matched {
-                index: decision.rule_index,
-            },
-            None => DirectRuleOutcome::NoMatch,
-        })
+        Ok(direct_rule_outcome(self.matcher.scan_tool(
+            tool_name,
+            effective.as_deref(),
+            &UNCAPTURED_FACTS,
+        )))
+    }
+}
+
+/// A direct-rule scan as an analysis outcome. A rule whose conditions read a
+/// fact no analysis consumer captures is indeterminate, never counted as a
+/// match or a miss.
+fn direct_rule_outcome(scan: RuleScan) -> DirectRuleOutcome {
+    match scan {
+        RuleScan::Matched(decision) => DirectRuleOutcome::Matched {
+            index: decision.rule_index,
+        },
+        RuleScan::NoMatch => DirectRuleOutcome::NoMatch,
+        RuleScan::Undetermined { .. } => {
+            DirectRuleOutcome::Indeterminate(Limitation::MissingMatcherFact)
+        }
     }
 }
 
@@ -322,6 +349,7 @@ impl Limitation {
             Self::MissingPrincipalFact => "missing_principal_fact",
             Self::MissingDispatchFact => "missing_dispatch_fact",
             Self::MissingHostFact => "missing_host_fact",
+            Self::MissingMatcherFact => "missing_matcher_fact",
         }
     }
 }

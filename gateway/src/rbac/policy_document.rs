@@ -8,8 +8,8 @@
 //!
 //! - Exactly `"1.0.0"` is **policy v1**. Every object's members come from a
 //!   closed vocabulary, so an unknown member is an error rather than something
-//!   silently dropped. Every direct rule, route and rate override carries a
-//!   required `id`, unique across all three. Member names are unique in every
+//!   silently dropped. Every direct rule, route, rate override and identity
+//!   mapping carries a required `id`, unique across all four. Member names are unique in every
 //!   object, no value is `null`, and every number lies in the I-JSON safe
 //!   range, so the document has one reading and one RFC 8785 canonical form.
 //!   No other `1.x` string is accepted: a later revision of v1 gets an exact
@@ -23,7 +23,11 @@
 //!
 //! The two schemas share their semantics: a v1 document authorizes exactly as
 //! the 0.x document with the same members would. v1 adds identity and
-//! strictness, not behaviour.
+//! strictness, not behaviour -- and two members a 0.x document cannot carry:
+//! `identity_mappings` and rule `conditions` (`super::identity_mappings`,
+//! `super::conditions`). This build validates both and the kernel evaluates
+//! both, but no serving path enforces them yet, so a document that uses
+//! either is refused with every check but that one reported first.
 //!
 //! ## Diagnostics
 //!
@@ -59,6 +63,8 @@ use serde::{
 use serde_json::{Map, Value};
 
 use super::{
+    conditions::{MAX_CONDITION_BRANCHES, MAX_CONDITION_DEPTH, MAX_CONDITION_NODES},
+    identity_mappings::IdentityMapping,
     policy::{
         DefaultAction, EgressPolicy, EnforcementMode, Policy, PolicyError, RoleEntry,
         ToolPolicyEntry, V0Rejection, KNOWN_TOP_LEVEL_KEYS, MAX_POLICY_FILE_BYTES,
@@ -166,12 +172,25 @@ pub(crate) enum IssueCode {
     DispatchNotConfigured,
     DocumentFormatUnsupportedInCluster,
     ConversionRequiresV0,
+    IdentityMappingsTooMany,
+    IdentityMappingGrantEmpty,
+    IdentityMappingRoleUnknown,
+    IdentityMappingValueInvalid,
+    ConditionOperatorInvalid,
+    ConditionTooComplex,
+    ConditionNotApplicable,
+    ConditionValueInvalid,
+    ConditionNameForbidden,
+    ConditionCidrInvalid,
+    ConditionPointerInvalid,
+    ConditionTimeInvalid,
+    TypedMatchersNotEnforced,
 }
 
 impl IssueCode {
     /// Every code, so tests can check the vocabulary as a whole.
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 41] = [
+    pub(crate) const ALL: [Self; 54] = [
         Self::InvalidJson,
         Self::DocumentTooLarge,
         Self::DuplicateMember,
@@ -213,6 +232,19 @@ impl IssueCode {
         Self::DispatchNotConfigured,
         Self::DocumentFormatUnsupportedInCluster,
         Self::ConversionRequiresV0,
+        Self::IdentityMappingsTooMany,
+        Self::IdentityMappingGrantEmpty,
+        Self::IdentityMappingRoleUnknown,
+        Self::IdentityMappingValueInvalid,
+        Self::ConditionOperatorInvalid,
+        Self::ConditionTooComplex,
+        Self::ConditionNotApplicable,
+        Self::ConditionValueInvalid,
+        Self::ConditionNameForbidden,
+        Self::ConditionCidrInvalid,
+        Self::ConditionPointerInvalid,
+        Self::ConditionTimeInvalid,
+        Self::TypedMatchersNotEnforced,
     ];
 
     pub(crate) const fn as_str(self) -> &'static str {
@@ -258,6 +290,19 @@ impl IssueCode {
             Self::DispatchNotConfigured => "dispatch_not_configured",
             Self::DocumentFormatUnsupportedInCluster => "document_format_unsupported_in_cluster",
             Self::ConversionRequiresV0 => "conversion_requires_v0",
+            Self::IdentityMappingsTooMany => "identity_mappings_too_many",
+            Self::IdentityMappingGrantEmpty => "identity_mapping_grant_empty",
+            Self::IdentityMappingRoleUnknown => "identity_mapping_role_unknown",
+            Self::IdentityMappingValueInvalid => "identity_mapping_value_invalid",
+            Self::ConditionOperatorInvalid => "condition_operator_invalid",
+            Self::ConditionTooComplex => "condition_too_complex",
+            Self::ConditionNotApplicable => "condition_not_applicable",
+            Self::ConditionValueInvalid => "condition_value_invalid",
+            Self::ConditionNameForbidden => "condition_name_forbidden",
+            Self::ConditionCidrInvalid => "condition_cidr_invalid",
+            Self::ConditionPointerInvalid => "condition_pointer_invalid",
+            Self::ConditionTimeInvalid => "condition_time_invalid",
+            Self::TypedMatchersNotEnforced => "typed_matchers_not_enforced",
         }
     }
 
@@ -278,7 +323,8 @@ impl IssueCode {
             Self::ElementIdMissing => "the element has no stable id",
             Self::ElementIdInvalid => "the id is not a valid stable id",
             Self::ElementIdDuplicate => {
-                "the id is already used by an earlier rule, route, or rate override"
+                "the id is already used by an earlier rule, route, rate override, or identity \
+                 mapping"
             }
             Self::MemberRequiresV1 => "the member exists only in policy v1",
             Self::TooManyProblems => "further problems in the document were not reported",
@@ -330,6 +376,43 @@ impl IssueCode {
                 "cluster mode does not yet commit documents of this schema_version"
             }
             Self::ConversionRequiresV0 => "only a 0.x document is converted to policy v1",
+            Self::IdentityMappingsTooMany => {
+                "the policy lists more identity mappings than a policy may"
+            }
+            Self::IdentityMappingGrantEmpty => "the identity mapping grants no role",
+            Self::IdentityMappingRoleUnknown => {
+                "the identity mapping grants a role the policy does not define"
+            }
+            Self::IdentityMappingValueInvalid => {
+                "an identity mapping value is empty, too long, or contains control characters, \
+                 or its list is too long"
+            }
+            Self::ConditionOperatorInvalid => "a condition node must name exactly one operator",
+            Self::ConditionTooComplex => {
+                "the conditions nest too deeply, hold too many nodes, or list too many operands"
+            }
+            Self::ConditionNotApplicable => {
+                "the condition reads a fact this kind of rule does not have"
+            }
+            Self::ConditionValueInvalid => {
+                "a condition value is empty, too long, or malformed, or its list is empty or too \
+                 long"
+            }
+            Self::ConditionNameForbidden => {
+                "the header or query parameter can carry credentials, identity, or hop-by-hop \
+                 routing, so no condition may read it"
+            }
+            Self::ConditionCidrInvalid => "the condition's network is not a CIDR network address",
+            Self::ConditionPointerInvalid => {
+                "the tool argument pointer is not a bounded RFC 6901 JSON Pointer"
+            }
+            Self::ConditionTimeInvalid => {
+                "the time window is empty or unordered, or not written as RFC 3339 UTC instants"
+            }
+            Self::TypedMatchersNotEnforced => {
+                "this gateway validates identity mappings and rule conditions but does not yet \
+                 enforce them, so it accepts no document that uses them"
+            }
         }
     }
 
@@ -360,12 +443,12 @@ impl IssueCode {
                 "Use a finite number whose magnitude is at most 9007199254740991."
             }
             Self::ElementIdMissing | Self::ElementIdInvalid => {
-                "Give every rule, route, and rate override an id of 1 to 64 ASCII letters, \
-                 digits, '.', '_', or '-', starting with a letter or digit."
+                "Give every rule, route, rate override, and identity mapping an id of 1 to 64 \
+                 ASCII letters, digits, '.', '_', or '-', starting with a letter or digit."
             }
             Self::ElementIdDuplicate => {
-                "Give each element its own id; ids are unique across rules, routes, and \
-                 rate_limits."
+                "Give each element its own id; ids are unique across rules, routes, \
+                 rate_limits, and identity_mappings."
             }
             Self::MemberRequiresV1 => {
                 "Remove the member, or set schema_version to \"1.0.0\" and give every rule, \
@@ -435,6 +518,53 @@ impl IssueCode {
             }
             Self::ConversionRequiresV0 => {
                 "The document already is policy v1; validate it instead of converting it."
+            }
+            Self::IdentityMappingsTooMany => "List at most 256 identity mappings.",
+            Self::IdentityMappingGrantEmpty => {
+                "Name at least one role from roles in grant_roles, or remove the mapping."
+            }
+            Self::IdentityMappingRoleUnknown => {
+                "Define the role under roles, or correct the name in grant_roles."
+            }
+            Self::IdentityMappingValueInvalid => {
+                "Keep each value non-empty printable text within its bound, and each list to at \
+                 most 64 values."
+            }
+            Self::ConditionOperatorInvalid => {
+                "Write each node as an object with one member: all, any, not, organization, \
+                 source_network, header, query, tool_argument, or time_window."
+            }
+            Self::ConditionTooComplex => {
+                "Keep a rule's conditions within 4 levels and 32 nodes, with at most 16 operands \
+                 in each all or any."
+            }
+            Self::ConditionNotApplicable => {
+                "Use header and query only in HTTP path rules, and tool_argument only in \
+                 tool_name rules."
+            }
+            Self::ConditionValueInvalid => {
+                "Compare the condition with the published schema for policy v1 under \
+                 docs/schemas."
+            }
+            Self::ConditionNameForbidden => {
+                "Match identity through the verified principal or an identity mapping, and the \
+                 client address through source_network."
+            }
+            Self::ConditionCidrInvalid => {
+                "Write the network as an IPv4 or IPv6 CIDR with no host bits set, such as \
+                 10.0.0.0/8."
+            }
+            Self::ConditionPointerInvalid => {
+                "Write a pointer such as /region, of at most 8 reference tokens and 256 bytes, \
+                 with ~ written ~0 and / written ~1 inside a token."
+            }
+            Self::ConditionTimeInvalid => {
+                "Write from and until as YYYY-MM-DDTHH:MM:SSZ, with from earlier than until; the \
+                 window includes from and excludes until."
+            }
+            Self::TypedMatchersNotEnforced => {
+                "Remove identity_mappings and every rule's conditions before publishing; this \
+                 release only validates them."
             }
         }
     }
@@ -539,8 +669,8 @@ pub(crate) struct PolicyDiagnostic {
     pub(crate) severity: DiagnosticSeverity,
     /// RFC 6901 JSON Pointer into the document; empty for the whole document.
     pub(crate) pointer: String,
-    /// The stable id of the rule, route, or rate override the pointer is in,
-    /// when that element has a valid one.
+    /// The stable id of the rule, route, rate override, or identity mapping
+    /// the pointer is in, when that element has a valid one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) element_id: Option<String>,
     pub(crate) message: &'static str,
@@ -845,7 +975,50 @@ pub(crate) fn parse_v1_source(source: &[u8], document: &Value) -> Result<Policy,
 /// Parses and validates a v1 document that has already been read as JSON.
 /// Structural problems are all reported; semantic validation stops at the
 /// first, as it does for v0.
+///
+/// A document that uses identity mappings or rule conditions is refused last,
+/// after every other check has passed, with
+/// [`IssueCode::TypedMatchersNotEnforced`]: the kernel evaluates them, but no
+/// serving adapter yet captures the facts they read, and the management lane
+/// does not yet resolve roles through them. Refusing them here refuses them
+/// on every path a policy is accepted by -- startup, reload, replacement,
+/// drafts, simulations, test runs and bundles -- since each reads a v1
+/// document through this function.
 pub(crate) fn parse_v1(document: &Value) -> Result<Policy, Vec<PolicyIssue>> {
+    let policy = parse_v1_document(document)?;
+    refuse_unenforced_matchers(&policy).map_err(|issue| vec![issue])?;
+    Ok(policy)
+}
+
+/// [`parse_v1`] without its refusal of the typed matchers this build does not
+/// enforce, for the tests that evaluate them.
+#[cfg(test)]
+pub(crate) fn parse_v1_with_typed_matchers(document: &Value) -> Result<Policy, Vec<PolicyIssue>> {
+    parse_v1_document(document)
+}
+
+/// The refusal [`parse_v1`] applies last: at the identity mappings, or else at
+/// the first rule's conditions.
+fn refuse_unenforced_matchers(policy: &Policy) -> Result<(), PolicyIssue> {
+    let pointer = if policy.identity_mappings.is_some() {
+        Some("/identity_mappings".to_owned())
+    } else {
+        policy
+            .rules
+            .iter()
+            .position(|rule| rule.conditions.is_some())
+            .map(|index| format!("/rules/{index}/conditions"))
+    };
+    match pointer {
+        Some(pointer) => Err(PolicyIssue::located(
+            IssueCode::TypedMatchersNotEnforced,
+            pointer,
+        )),
+        None => Ok(()),
+    }
+}
+
+fn parse_v1_document(document: &Value) -> Result<Policy, Vec<PolicyIssue>> {
     let mut issues = IssueList::default();
     check_v1_structure(document, &mut issues);
     if !issues.is_empty() {
@@ -933,6 +1106,7 @@ pub(super) const RULE_MEMBERS: Members = Members {
         "tool_name",
         "dispatch",
         "principal",
+        "conditions",
         "action",
     ],
     required: &["action"],
@@ -960,6 +1134,69 @@ pub(super) const RATE_LIMIT_MEMBERS: Members = Members {
     ],
     required: &["requests_per_second", "burst"],
 };
+pub(super) const IDENTITY_MAPPING_MEMBERS: Members = Members {
+    allowed: &[
+        "id",
+        "issuer",
+        "auth_methods",
+        "subjects",
+        "organizations",
+        "claimed_roles",
+        "grant_roles",
+    ],
+    required: &["issuer", "grant_roles"],
+};
+/// The operators a condition node may name, one per node.
+#[cfg(test)]
+pub(super) const CONDITION_OPERATORS: [&str; 9] = [
+    "all",
+    "any",
+    "not",
+    "organization",
+    "source_network",
+    "header",
+    "query",
+    "tool_argument",
+    "time_window",
+];
+pub(super) const ORGANIZATION_CONDITION_MEMBERS: Members = Members {
+    allowed: &["issuer", "in"],
+    required: &["issuer", "in"],
+};
+pub(super) const SOURCE_NETWORK_CONDITION_MEMBERS: Members = Members {
+    allowed: &["cidrs"],
+    required: &["cidrs"],
+};
+pub(super) const HEADER_CONDITION_MEMBERS: Members = Members {
+    allowed: &["name", "in"],
+    required: &["name", "in"],
+};
+pub(super) const QUERY_CONDITION_MEMBERS: Members = Members {
+    allowed: &["name", "in"],
+    required: &["name", "in"],
+};
+pub(super) const TOOL_ARGUMENT_CONDITION_MEMBERS: Members = Members {
+    allowed: &["pointer", "in"],
+    required: &["pointer", "in"],
+};
+pub(super) const TIME_WINDOW_CONDITION_MEMBERS: Members = Members {
+    allowed: &["from", "until"],
+    required: &[],
+};
+
+/// The member vocabulary of a condition leaf operator; `None` for a
+/// combinator or a name that is no operator.
+pub(super) fn condition_leaf_members(operator: &str) -> Option<&'static Members> {
+    match operator {
+        "organization" => Some(&ORGANIZATION_CONDITION_MEMBERS),
+        "source_network" => Some(&SOURCE_NETWORK_CONDITION_MEMBERS),
+        "header" => Some(&HEADER_CONDITION_MEMBERS),
+        "query" => Some(&QUERY_CONDITION_MEMBERS),
+        "tool_argument" => Some(&TOOL_ARGUMENT_CONDITION_MEMBERS),
+        "time_window" => Some(&TIME_WINDOW_CONDITION_MEMBERS),
+        _ => None,
+    }
+}
 pub(super) const TOOL_MEMBERS: Members = Members {
     allowed: &[
         "enabled",
@@ -973,7 +1210,7 @@ pub(super) const TOOL_MEMBERS: Members = Members {
 };
 
 /// The sections whose elements carry a stable id, in document order.
-const IDENTIFIED_SECTIONS: [&str; 3] = ["routes", "rules", "rate_limits"];
+const IDENTIFIED_SECTIONS: [&str; 4] = ["identity_mappings", "routes", "rules", "rate_limits"];
 
 fn check_v1_structure(document: &Value, issues: &mut IssueList) {
     let Some(object) = document.as_object() else {
@@ -1008,6 +1245,7 @@ fn check_v1_structure(document: &Value, issues: &mut IssueList) {
                 continue;
             };
             let members = match section {
+                "identity_mappings" => &IDENTITY_MAPPING_MEMBERS,
                 "routes" => &ROUTE_MEMBERS,
                 "rules" => &RULE_MEMBERS,
                 _ => &RATE_LIMIT_MEMBERS,
@@ -1030,6 +1268,9 @@ fn check_v1_structure(document: &Value, issues: &mut IssueList) {
                         &DISPATCH_MEMBERS,
                         issues,
                     );
+                }
+                if let Some(conditions) = element.get("conditions") {
+                    check_conditions(conditions, &format!("{pointer}/conditions"), issues);
                 }
             }
         }
@@ -1104,6 +1345,86 @@ fn check_entries(
                 members,
                 issues,
             );
+        }
+    }
+}
+
+/// A rule's condition tree, read before any typed reading recurses into it:
+/// every node an object naming exactly one known operator, the tree within
+/// its depth and size bounds, and each leaf's members from its closed
+/// vocabulary. A tree past a bound is reported once, where it first exceeds
+/// it, and not examined further.
+fn check_conditions(value: &Value, pointer: &str, issues: &mut IssueList) {
+    let mut nodes = 0;
+    if let Err(pointer) = check_condition_node(value, pointer, 1, &mut nodes, issues) {
+        issues.push(PolicyIssue::located(
+            IssueCode::ConditionTooComplex,
+            pointer,
+        ));
+    }
+}
+
+/// One node; `Err` carries where the tree first exceeded a bound.
+fn check_condition_node(
+    value: &Value,
+    pointer: &str,
+    depth: usize,
+    nodes: &mut usize,
+    issues: &mut IssueList,
+) -> Result<(), String> {
+    *nodes += 1;
+    if depth > MAX_CONDITION_DEPTH || *nodes > MAX_CONDITION_NODES {
+        return Err(pointer.to_owned());
+    }
+    let Some(node) = value.as_object() else {
+        issues.push(PolicyIssue::located(
+            IssueCode::InvalidType,
+            pointer.to_owned(),
+        ));
+        return Ok(());
+    };
+    let mut operators = node.iter();
+    let (Some((operator, operand)), None) = (operators.next(), operators.next()) else {
+        issues.push(PolicyIssue::located(
+            IssueCode::ConditionOperatorInvalid,
+            pointer.to_owned(),
+        ));
+        return Ok(());
+    };
+    let operand_pointer = format!("{pointer}/{}", pointer_token(operator));
+    match operator.as_str() {
+        "all" | "any" => {
+            let Some(operands) = operand.as_array() else {
+                issues.push(PolicyIssue::located(
+                    IssueCode::InvalidType,
+                    operand_pointer,
+                ));
+                return Ok(());
+            };
+            if operands.len() > MAX_CONDITION_BRANCHES {
+                return Err(operand_pointer);
+            }
+            for (index, operand) in operands.iter().enumerate() {
+                check_condition_node(
+                    operand,
+                    &format!("{operand_pointer}/{index}"),
+                    depth + 1,
+                    nodes,
+                    issues,
+                )?;
+            }
+            Ok(())
+        }
+        "not" => check_condition_node(operand, &operand_pointer, depth + 1, nodes, issues),
+        leaf => {
+            match condition_leaf_members(leaf) {
+                Some(members) => check_object(operand, &operand_pointer, members, issues),
+                None => issues.push(PolicyIssue::located(
+                    IssueCode::UnknownMember,
+                    operand_pointer,
+                )),
+            }
+            Ok(())
         }
     }
 }
@@ -1233,7 +1554,8 @@ pub(crate) fn pointer_token(raw: &str) -> String {
     raw.replace('~', "~0").replace('/', "~1")
 }
 
-/// The valid stable id of the rule, route, or rate override `pointer` is in.
+/// The valid stable id of the rule, route, rate override, or identity mapping
+/// `pointer` is in.
 fn element_id_at(document: &Value, pointer: &str) -> Option<String> {
     let mut tokens = pointer.strip_prefix('/')?.split('/');
     let section = tokens.next()?;
@@ -1265,6 +1587,11 @@ fn locate_typed_failure(document: &Value) -> String {
         return "/enforcement_mode".to_owned();
     }
     if let Some(pointer) = failing_entry::<RoleEntry>(object.get("roles"), "/roles") {
+        return pointer;
+    }
+    if let Some(pointer) =
+        failing_element::<IdentityMapping>(object.get("identity_mappings"), "/identity_mappings")
+    {
         return pointer;
     }
     if let Some(pointer) = failing_element::<RouteRule>(object.get("routes"), "/routes") {

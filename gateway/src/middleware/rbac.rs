@@ -837,11 +837,11 @@ impl RbacState {
     }
 
     pub fn principal_has_permission(&self, principal: &auth::Principal, permission: &str) -> bool {
-        self.policy
-            .load()
+        let policy = self.policy.load();
+        policy
             .compiled
             .engine()
-            .principal_has_permission(principal, permission)
+            .principal_has_permission(&policy.compiled.management_principal(principal), permission)
     }
 
     /// [`RbacState::principal_has_permission`] judged by the request's policy
@@ -853,10 +853,11 @@ impl RbacState {
         principal: &auth::Principal,
         permission: &str,
     ) -> bool {
-        self.effective_policy()
+        let policy = self.effective_policy();
+        policy
             .compiled
             .engine()
-            .principal_has_permission(principal, permission)
+            .principal_has_permission(&policy.compiled.management_principal(principal), permission)
     }
 
     /// Returns requested delegated roles that the principal cannot activate.
@@ -870,13 +871,14 @@ impl RbacState {
     ) -> Vec<String> {
         let policy = self.effective_policy();
         let engine = policy.compiled.engine();
-        if engine.principal_has_wildcard(principal) {
+        let principal = policy.compiled.management_principal(principal);
+        if engine.principal_has_wildcard(&principal) {
             return Vec::new();
         }
 
         requested_roles
             .iter()
-            .filter(|role| !engine.principal_has_active_role(principal, role))
+            .filter(|role| !engine.principal_has_active_role(&principal, role))
             .cloned()
             .collect()
     }

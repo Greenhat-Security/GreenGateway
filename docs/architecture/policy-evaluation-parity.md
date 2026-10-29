@@ -39,7 +39,7 @@ Contract evidence for [#421](https://github.com/Greenhat-Security/GreenGateway/i
 
 ## Trace reasons and limitation codes
 
-Both sets are stable wire contracts, not internal names. `Reason` serializes as `matched_rule`, `missing_permission`, `missing_principal`, `default_allow`, `default_deny`, `host_policy_required`, `incomplete`. `Limitation` serializes as `missing_method`, `missing_path`, `missing_principal_fact`, `missing_dispatch_fact`, `missing_host_fact`.
+Both sets are stable wire contracts, not internal names. `Reason` serializes as `matched_rule`, `missing_permission`, `missing_principal`, `default_allow`, `default_deny`, `host_policy_required`, `incomplete`. `Limitation` serializes as `missing_method`, `missing_path`, `missing_principal_fact`, `missing_dispatch_fact`, `missing_host_fact`, `missing_matcher_fact`. The last is a fact an identity mapping or a rule condition reads that was not captured; the serving adapters capture none yet, and policy validation refuses every document that uses either (`typed_matchers_not_enforced`), so no served decision reports it.
 
 Every `Limitation` variant now shares the `Missing` prefix, because every one is a fact that was not supplied — the kernel has no "unsupported" limitation since every target is evaluated. `clippy::enum_variant_names` is allowed there with that reason: dropping the prefix would edit a published contract to satisfy a naming lint.
 

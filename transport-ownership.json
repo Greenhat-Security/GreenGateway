@@ -11434,6 +11434,26 @@
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
     {
+      "file": "gateway/src/rbac/conditions.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::rbac::conditions::use std :: net :: IpAddr#1",
+      "sha256": "abf89a0dd5d2b68df48d2445831118062ac113c2f71cf08f3d392ad95b31637d",
+      "owner": "policy evaluation typed matchers (#243)",
+      "purpose": "The IpAddr value type for the canonical client address a source_network rule condition compares against policy CIDRs (issue #243, item 16). The address is a fact the caller supplies after trusted-proxy processing; the module only compares it with ipnet networks. No socket, resolver, connection or other network or process capability is introduced."
+    },
+    {
+      "file": "gateway/src/rbac/conditions.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::rbac::conditions::Fact#1",
+      "sha256": "8e0ffdb22c8f511ede041f1af313d228e69bf826c43f913254192913933d1ed7",
+      "owner": "policy evaluation typed matchers (#243)",
+      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) on the Captured variant of the typed-matcher fact, which no serving adapter constructs yet: policy validation refuses every document that uses identity mappings or rule conditions until an adapter captures their facts (#243, item 16). Dead-code gating only; no transport or process capability."
+    },
+    {
       "file": "gateway/src/rbac/policy.rs",
       "reasons": [
         "unexpanded-attribute"
