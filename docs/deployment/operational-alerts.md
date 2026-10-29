@@ -78,16 +78,17 @@ below have no application labels; scrape labels identify the replica.
 | `greengateway_cluster_heartbeat_age_seconds`, `greengateway_cluster_config_mismatch` | [Membership](../../gateway/src/cluster_membership.rs), at registration and after heartbeat attempts. Age is seconds since the last successful heartbeat; mismatch is `1` until sticky agreement. | A stopped task can leave a frozen value while metrics scraping succeeds. Drain intentionally stops background work. |
 | `greengateway_security_revision_lag` | [Security reconciler](../../gateway/src/security_cluster.rs), after background passes. Difference between observed and compiled watermarks, bounded below by zero. | Optional runtime; neither zero nor nonzero lag proves readiness. Failed counter reads can leave equal watermarks; frequent legitimate commits can sustain lag while admissions succeed. |
 | `greengateway_authority_event_capacity_refusals_total`, `greengateway_authority_event_evidence_failures_total` | [Journal append](../../gateway/src/storage/postgres_authority_events.rs) and each evidence producer, on the replica that refused the change. A Connection delete, service-token rotate or revoke, JWT revoke, or cluster admin session grant or withdrawal whose evidence row or journal entry cannot commit rolls back whole and is refused: the first counter counts a full journal (which refuses an admin session grant but never a withdrawal), the second any other refused or failed evidence statement, an admin session's expiry prune included. The second also counts a policy or tools document commit, or a managed MCP or OpenAPI catalog publication, refused because its migration 23 evidence row could not be inserted. | Cluster mode only; both exported at `0` from startup. A failure of the transaction's own `COMMIT` is the mutation's failure and is counted by neither. Which producer failed is not a label; the refusing replica's log names the operation. Policy, tools and catalog evidence is not journaled, so a full journal never refuses those changes. |
+| `greengateway_standalone_evidence_failures_total{store}` | The SQLite [token](../../gateway/src/auth/tokens.rs), [Connections](../../gateway/src/connections/store.rs) and [local-secret](../../gateway/src/connections/local_secret.rs) stores, in the standalone process that refused the change. A service-token rotate or revoke, a Connection create, replace or delete, or a local-secret create, rotate, delete or re-encryption batch whose evidence row cannot be inserted rolls back with it and is refused as that store's failure. `store` is `service_tokens` (`SERVICE_TOKEN_SQLITE_PATH`) or `connections` (`CONNECTIONS_SQLITE_PATH`, which holds the local secrets too), spelled as `greengateway_sqlite_storage_checks_total` spells those files. | Standalone mode only; both `store` values exported at `0` from startup. A failure of the transaction's own `COMMIT` is the store's failure and is not counted. The `connection-secrets reencrypt` command exports no metrics: a batch it could not record fails the command instead. |
 | `greengateway_authority_event_journal_retained`, `_capacity`, `_oldest_undelivered_age_seconds` | [Journal statistics](../../gateway/src/authority_events/dispatcher.rs), published by the maintenance leader after every successful retention step and by the dispatcher's leader after every step. | One shared table, so a reading says nothing about the replica exporting it, and a former leader keeps exporting its last reading. Without `AUTHORITY_EVENT_SINK` every retained event counts as undelivered. |
 | `greengateway_cluster_maintenance_leader`, `greengateway_leader_task_last_success_age_seconds{task="authority_event_retention"}` | [Maintenance singleton](../../gateway/src/cluster_maintenance.rs): `1` on the replica holding the maintenance lease and `0` after its term; on that leader, how long ago the retention job last succeeded according to the fenced ledger. | Leader-only, and a job that never succeeded has no age series. They say which journal reading is current, not whether the journal is healthy. |
 | `greengateway_authority_event_delivery_failures_total{kind}`, `greengateway_cluster_lease_age_seconds{scope="authority_event_dispatcher"}` | [Dispatcher](../../gateway/src/authority_events/dispatcher.rs): failed steps by a fixed `kind`, and how long this replica has held the dispatcher lease (`0` after its term). Only a replica with `AUTHORITY_EVENT_SINK` set ever creates either series. | Lazy; their presence is how the rules tell a configured sink from none. `kind="fenced"` is a leadership handover, not a failed delivery. |
 | `up{job="greengateway"}`, `greengateway_monitoring:target_expected` | Scrape success and separately maintained target inventory. | Scrape success is transport evidence. Inventory is operator intent, not application telemetry. |
 
 Every counter a single-event rule reads (audit loss, audit flush failure, audit
-durability refusal, pool timeout and both authority refusals) is exported at `0`
-as soon as the metrics
-recorder is installed, with every label value the rule can match. A counter
-series that first appeared at `1` would have no earlier sample, and
+durability refusal, pool timeout, both authority refusals and the standalone
+evidence failures) is exported at `0` as soon as the metrics recorder is
+installed, in the mode whose rule reads it, with every label value the rule can
+match. A counter series that first appeared at `1` would have no earlier sample, and
 `increase(...[5m])` cannot see a change without one: the first event after a
 process start, often the only one, would never page. Other counters, such as
 the dispatcher's failure series, are still created on their first event, and
@@ -138,6 +139,7 @@ environment variable that changes a Prometheus threshold.
 | `GreenGatewayClusterMetricsMissing` | critical | Successful cluster scrape lacks a pool size, available or waiting gauge, 2 minutes | [Monitoring](#metrics-availability): verify mode labels, build and exporter filtering. |
 | `GreenGatewayAuthorityEventCapacityRefusals` | critical | Observed capacity-refusal increase over 5 minutes, held for 2 minutes | [Authority-event journal](#authority-event-journal): a revocation, rotation or Connection delete did not happen; free journal room, then have it retried. |
 | `GreenGatewayAuthorityEvidenceWriteFailures` | critical | Observed evidence-failure increase over 5 minutes, held for 2 minutes | [Authority evidence failures](#authority-evidence-failures): a revocation, rotation, Connection delete, admin session change, or policy, tools or catalog change did not happen; find why the database refused the evidence, then have the change retried. |
+| `GreenGatewayStandaloneEvidenceWriteFailures` | critical | On a standalone replica, observed standalone evidence-failure increase over 5 minutes, held for 2 minutes | [Standalone evidence failures](#standalone-evidence-failures): a token rotation or revocation, or a Connection or local-secret change, did not happen; find why the SQLite store refused the evidence row, then have the change retried. |
 | `GreenGatewayAuthorityEventJournalFull` | critical | The current maintenance leader reports the journal's units in use (retained events plus units held for admin session withdrawals) at or above capacity for 1 minute | [Authority-event journal](#authority-event-journal): the next authority change will be refused; free room now. |
 | `GreenGatewayAuthorityEventJournalFilling` | warning | The current maintenance leader reports the journal's units in use above 80% of capacity for 5 minutes | [Authority-event journal](#authority-event-journal): restore delivery or retention before the journal is full. |
 | `GreenGatewayAuthorityEventDeliveryLag` | warning | With a dispatcher configured, a current maintenance leader with a recent retention success reports the oldest undelivered event older than 120 seconds, for 5 minutes | [Authority-event delivery](#authority-event-delivery): find the stalled sink or dispatcher. |
@@ -166,8 +168,10 @@ Durability refusals are judged the same way, per replica and in both modes: each
 one is a request the gateway answered `503`, whatever its lifecycle phase.
 
 The authority-event rules also select `deployment_mode="cluster"`: standalone mode
-has no journal. The two refusal counters are judged per replica, like audit loss,
-and are not suppressed during startup or drain, because every increase is an
+has no journal. The one exception is `GreenGatewayStandaloneEvidenceWriteFailures`,
+which selects `deployment_mode="standalone"` and reads the SQLite stores' own
+counter. The refusal counters of both modes are judged per replica, like audit
+loss, and are not suppressed during startup or drain, because every increase is an
 authority change that did not happen. The journal gauges describe one shared
 table and are published only by a leader, while every former leader keeps
 exporting its last reading. The journal rules therefore read the current
@@ -372,19 +376,56 @@ journal entry, so the change it described rolled back whole and was refused. The
 is nothing to reconcile, because nothing committed, but the change did not happen:
 a token or JWT that was to be revoked is still live, a Connection that was to be
 deleted still exists, and a refused policy, tools or catalog change leaves the
-previously active document or catalog enforcing.
+previously active document or catalog enforcing. A refused admin sign-out was
+answered `503` and leaves the session live until it expires or a later sign-out
+commits; a refused sign-in leaves its login pending; a session the identity
+provider rejected keeps being refused (`503`) on every request until its
+withdrawal commits; and an expired session the prune could not withdraw is no
+longer usable, but its withdrawal is not recorded yet.
 
 The refusing replica's log names the failed operation and the classified store
 error: `change_evidence_append` (Connection delete),
 `service_token_change_evidence_append`, `jwt_revocation_evidence_append`,
 `document_change_evidence_append` (policy and tools commits),
-`catalog_change_evidence_append` (catalog and overlay publications) or
-`authority_event_journal_append`. A missing grant or a schema that does not match
+`catalog_change_evidence_append` (catalog and overlay publications),
+`authority_event_journal_append`, or for an admin session, whose evidence and
+journal row are one statement, `admin_session_grant` (a sign-in, the session it
+replaces and the expiry prune its admission runs), `admin_session_begin_login`
+(the prune a login start runs), `admin_session_withdraw` (sign-out and a provider
+rejection) or `admin_session_prune` (the maintenance job). A missing grant or a schema that does not match
 this binary refuses every such change, so compare the ledger with the binary first
 ([schema migrations](postgres.md#schema-migrations)); timeouts and unavailable
 errors point to [Database capacity](#database-capacity). Once the cause is fixed,
 have each refused change retried and confirm it with its evidence row. Never relax evidence
 writing or edit the evidence tables to make a change go through.
+
+### Standalone evidence failures
+
+The security on-call owns the refused changes; the gateway operator finds the
+cause. A standalone gateway records each authority change in the SQLite store that
+owns it, in the change's own transaction ([standalone evidence](../authority-evidence.md#standalone-evidence)).
+The store could not insert that evidence row, so the change rolled back with it and
+was refused: a service token that was to be rotated or revoked is unchanged, and a
+token that was to be revoked still authenticates; a Connection that was to be
+created, replaced or deleted is as it was; a local secret keeps its version and
+envelope. The admin API answered `503` for a Connection or secret change, and an
+internal or unavailable error, by the failure's class, for a token change.
+
+`store` names the file: `service_tokens` is `SERVICE_TOKEN_SQLITE_PATH`, and
+`connections` is `CONNECTIONS_SQLITE_PATH`, which holds the local secrets too.
+Start with that file's `greengateway_sqlite_storage_checks_total{store,outcome="failure"}`
+and `greengateway_sqlite_storage_healthy`: a full disk, a read-only file system,
+changed permissions or a lock another process holds can fail the background
+write check too, and `/readyz` then reports `storage_unavailable`. A refusal while
+the checks pass points at the evidence table rather than the file. The refusing
+process logs a token refusal as
+`failed to record service-token change evidence` and a Connection refusal as the
+`change evidence append` operation, each with the file and the SQLite error; a
+local-secret refusal carries no SQLite detail. Once the cause is fixed, have each
+refused change retried and confirm its evidence row. Never drop or edit the
+evidence tables or their triggers and constraints to make a change go through. The
+`connection-secrets reencrypt` command reports a batch it could not record by
+failing, not on this counter; rerun it once the file accepts writes.
 
 ### Authority-event delivery
 
@@ -443,7 +484,7 @@ The pack does not yet cover every security-signal category in #440:
 | Authentication and authorization denials | No dedicated bounded denial counter for a complete trend. Audit outcomes remain the investigation source; denial volume alone does not establish an availability incident. Metric design and informational thresholds remain deferred. |
 | Authentication/JWKS dependency availability | No dedicated bounded availability counter for the complete dependency path. Define an appropriate signal separately; do not infer identity-provider health from unrelated errors or expose issuer URLs in labels. |
 | Rate-limit denials | `greengateway_rate_limit_shared_decisions_total` exists in cluster mode, with bounded `lane` labels and `outcome` values `allowed`, `denied`, `unavailable`. It covers shared-authority decisions, not every local rejection or standalone traffic. Informational denial-trend thresholds require a workload baseline and are deferred; `unavailable` is an authority failure, distinct from a deliberate denial. |
-| Authority-change evidence outside the cluster journal | The rules cover the cluster-mode journal of [durable delivery](../authority-evidence.md#durable-delivery), admin session evidence included since migration 26, and a policy, tools or catalog change refused because its migration 23 evidence row could not be inserted pages through `greengateway_authority_event_evidence_failures_total`; that evidence is still neither journaled nor delivered. Standalone mode has no journal or dispatcher: its SQLite token, Connection and local-secret evidence commits in its store's own transaction, and a failed evidence insert refuses the change as that store's failure, with no dedicated counter. No authority-evidence durability mode makes an event sink mandatory yet ([issue #425](https://github.com/Greenhat-Security/GreenGateway/issues/425)). None of these gaps has a signal to alert on. The rules prove expression behaviour on synthetic series, not that a downstream system received the events. |
+| Authority-change evidence outside the cluster journal | Every shipped evidence producer that can refuse a change has a refusal signal; see [the producer table](#evidence-producers-and-their-refusal-signals). Policy, tools and catalog evidence (migration 23) is still neither journaled nor delivered, and standalone mode has no journal or dispatcher, so its SQLite token, Connection and local-secret evidence is never delivered: those rows are read from the files. No authority-evidence durability mode makes an event sink mandatory yet ([issue #425](https://github.com/Greenhat-Security/GreenGateway/issues/425)). Delivery of that evidence has no signal because there is no delivery. The rules prove expression behaviour on synthetic series, not that a downstream system received the events. |
 
 The disposable incident rehearsal for #440 is described in
 [the security incident runbook](incident-rehearsal.md#what-the-release-gate-rehearses):
@@ -474,15 +515,31 @@ runbooks do what the item asks; it never means a notification reached a responde
 | Acceptance item | Status and evidence |
 | --- | --- |
 | Rule tests prove firing, recovery, startup/drain handling and missing-target/no-data behavior; quiet failures are not healthy zeros | Met for the shipped rules. `scripts/alert_rules.py` refuses an alert without both a firing and a non-firing assertion, and the [fixtures](alerts/greengateway.test.yml) cover holds, recovery, counter resets, startup and drain allowances, refusals that are not suppressed while draining, failed and missing targets, a missing job or inventory, each missing mandatory gauge and an unobserved journal. Every counter a single-event rule reads is seeded at `0`, so the first event after a start pages. The counter limits in [Signal contract](#signal-contract) still apply: an event before the first scrape, or a process that exits before its last scrape, can escape a counter rule. |
-| No speculative metric names; each rule links to an existing or newly implemented, tested signal | Met. `scripts/test_alert_rules.py` fails when a rule selects a name the runtime registry does not declare, or when a single-event rule reads a counter the recorder does not seed; `single_event_alert_counters_are_exported_at_zero_right_after_install` pins the seeded series, and the producers' own tests count each refusal (the PostgreSQL evidence tests for every evidence table and the journal, the required-durability request test for `reason="timeout"`). |
+| No speculative metric names; each rule links to an existing or newly implemented, tested signal | Met. `scripts/test_alert_rules.py` fails when a rule selects a name the runtime registry does not declare, or when a single-event rule reads a counter the recorder does not seed; `single_event_alert_counters_are_exported_at_zero_right_after_install` pins the seeded series in each mode, and the producers' own tests count each refusal exactly once (the PostgreSQL evidence tests for every evidence table and the journal, the admin session tests for every refused grant, withdrawal and prune step, the SQLite token, Connection and local-secret evidence tests, the required-durability request test for `reason="timeout"`). |
 | Users, hostnames, credentials, provider locators and request IDs never become labels or public drill artifacts | Met for the shipped metrics and the gate's rehearsal. Every HA metric label comes from a fixed vocabulary, which `the_ha_metric_registry_never_labels_by_a_caller_influenced_value` enforces; every rule reduces to `job`, `instance` and `deployment_mode`, and the fixtures assert exactly those labels. The [rehearsal](incident-rehearsal.md#5-collect-the-evidence-sanitized) keeps them out of incident evidence and its gate leg scans the audit evidence for secret material. |
 | The drill states that revocation recalls nothing already admitted, and a hard stop is a controlled drain plus upstream credential or network revocation | Met: [what a withdrawal does not do](incident-rehearsal.md#what-a-withdrawal-does-not-do) and [the security incident runbook](#security-incident). |
 | Rollback preserves current revocations and authority revisions; a stale security database is not a safe rollback | Met: [the rollback boundary](rollback-boundary.md), [Cluster authority](#cluster-authority) and the rehearsal's own statement that a stale security database is not a rollback. |
 | Local fixtures validate rule and runbook mechanics; #389 still requires real delivery and measured RTO/RPO | Met as a boundary. Nothing here claims delivery or recovery times; [issue #389](https://github.com/Greenhat-Security/GreenGateway/issues/389) remains open for them. |
-| Unsupported attestation and durable-event steps stay gated until their implementation issues land | Met. The rehearsal says digest, provenance and SBOM verification are not exercised by the gate and points to the release runbook; [Artifact verification failure](#artifact-verification-failure) is a release-system signal, not a gateway metric; and the evidence producers without a signal are listed in the table above rather than alerted on. |
+| Unsupported attestation and durable-event steps stay gated until their implementation issues land | Met. The rehearsal says digest, provenance and SBOM verification are not exercised by the gate and points to the release runbook; [Artifact verification failure](#artifact-verification-failure) is a release-system signal, not a gateway metric; and every evidence producer either pages on a refused change or is listed below with the reason it has nothing to page on. |
 
 PR 4's durable-event signals are shipped for what #425 has landed: refused
-authority changes (journal capacity and evidence writes, including policy, tools
-and catalog evidence), journal capacity, delivery lag and dispatcher failures, and
-requests refused under `AUDIT_DURABILITY=required`. Signals for the producers in
-the table above follow when those producers export one.
+authority changes (journal capacity and evidence writes, including admin session,
+policy, tools, catalog and standalone SQLite evidence), journal capacity, delivery
+lag and dispatcher failures, and requests refused under `AUDIT_DURABILITY=required`.
+
+#### Evidence producers and their refusal signals
+
+Each change below that writes evidence commits only with its evidence row, so a
+failed evidence write refuses it. Its counter moves once per refused change, on the
+process that refused it, and the alert pages on that replica. The last two rows have
+no counter, for the reason given.
+
+| Producer | Refusal counter | Alert |
+| --- | --- | --- |
+| Cluster Connection delete, service-token rotate and revoke, JWT revoke (journaled) | `greengateway_authority_event_capacity_refusals_total` for a full journal, `greengateway_authority_event_evidence_failures_total` for any other failed evidence or journal write | `GreenGatewayAuthorityEventCapacityRefusals`, `GreenGatewayAuthorityEvidenceWriteFailures` |
+| Cluster admin session grant, replacement, sign-out, provider rejection and expiry prune (journaled since migration 26) | The same two: a full journal refuses a grant (never a withdrawal), any other failed statement refuses whichever change it was, and a withdrawal its journal could not index is refused too | The same two. There is no admin-session-only rule: the producer is not a label, by design, and a second rule over the same series would page twice for one refusal. The [runbook](#authority-evidence-failures) names the admin session operations the log reports. |
+| Cluster policy and tools commits, managed MCP and OpenAPI catalog and overlay publications (migration 23, not journaled) | `greengateway_authority_event_evidence_failures_total` | `GreenGatewayAuthorityEvidenceWriteFailures` |
+| Standalone service-token rotate and revoke | `greengateway_standalone_evidence_failures_total{store="service_tokens"}` | `GreenGatewayStandaloneEvidenceWriteFailures` |
+| Standalone Connection create, replace and delete; local-secret create, rotate, delete and re-encryption batch in the gateway process | `greengateway_standalone_evidence_failures_total{store="connections"}` | `GreenGatewayStandaloneEvidenceWriteFailures` |
+| Local-secret re-encryption by the `connection-secrets reencrypt` command | None: a one-shot command has no metrics endpoint | Gated: the command fails and changes nothing, which its operator sees. |
+| Standalone admin sessions, policy, tools and catalog changes | None: they write no evidence. Sessions are process-local memory, and under `AUTHORITY_EVIDENCE_DURABILITY=required` policy, tools and catalog changes are refused before anything is written ([required-durability mode](../authority-evidence.md#required-durability-mode)) | Gated: there is no evidence write to fail. |

@@ -7,8 +7,13 @@ Some tests in this repository fail intermittently when the suite runs under heav
 **Re-run a suspected flake in isolation before concluding anything.**
 
 ```bash
-cargo test -p gateway --bin gateway <test_name> -- --exact
+cargo test -p gateway --bin gateway <test_path> -- --exact
 ```
+
+`--exact` matches the whole path that `cargo test -- --list` prints, which is
+what the table below gives; the application suite's tests are under
+`tests::<module>::`. Without `--exact`, the bare test name selects the same test
+and any other whose path contains it.
 
 **Membership in this list is not permission to ignore a failure.** A listed test failing *consistently*, or failing in isolation, is a regression. The list exists to stop people re-deriving a known answer, not to provide a reason to skip one. If a listed test starts failing reliably, treat it as a real defect and investigate it as one.
 
@@ -20,16 +25,16 @@ Each of these has been seen to fail under parallel load and pass in isolation. N
 
 | Test | Why it is timing-dependent |
 | --- | --- |
-| `status_commit_refreshes_busy_timeout_from_current_deadline_budget` | Asserts on a deadline budget computed from wall-clock time. |
-| `inferred_conformance_refreshes_cached_schema_after_ttl` | Depends on a cache TTL elapsing. |
-| `retryable_connect_failure_prefers_a_different_endpoint` | Depends on connect failure and retry ordering. |
-| `traffic_endpoint_lifecycle_flags_rule_coverage_and_hot_reload` | Depends on a file-watch reload being observed. |
-| `sse_circuit_permit_stays_pending_until_stream_completion` | Asserts a permit is still held at a point in a stream's lifetime. |
+| `connections::store::tests::status_commit_refreshes_busy_timeout_from_current_deadline_budget` | Asserts on a deadline budget computed from wall-clock time. |
+| `middleware::observation::tests::inferred_conformance_refreshes_cached_schema_after_ttl` | Depends on a cache TTL elapsing. |
+| `proxy::forward::tests::retryable_connect_failure_prefers_a_different_endpoint` | Depends on connect failure and retry ordering. |
+| `tests::admin_observability_app_tests::traffic_endpoint_lifecycle_flags_rule_coverage_and_hot_reload` | Depends on a file-watch reload being observed. |
+| `proxy::forward::tests::sse_circuit_permit_stays_pending_until_stream_completion` | Asserts a permit is still held at a point in a stream's lifetime. |
 | `connections::http::tests::stalled_oauth_denial_is_classified_and_invalidates_the_cached_token` | Drives a deliberately stalled request against a timeout. |
 | `connections::http::tests::timed_out_connection_test_drops_owned_oauth_mint_before_return` | Asserts a drop ordering that a timeout races. |
 | `tools::definitions::tests::reload_rejects_local_tool_colliding_with_preserved_mcp_proxy_tool_name` | Depends on a registry reload being observed. |
-| `repeated_mcp_tool_calls_accumulate_into_one_inventory_row` | Depends on inventory aggregation completing. |
-| `proxied_mcp_tool_call_appears_as_per_tool_traffic_inventory_row` | Depends on inventory aggregation completing. |
+| `tests::mcp_app_tests::repeated_mcp_tool_calls_accumulate_into_one_inventory_row` | Depends on inventory aggregation completing. |
+| `tests::mcp_app_tests::proxied_mcp_tool_call_appears_as_per_tool_traffic_inventory_row` | Depends on inventory aggregation completing. |
 | `egress::tests::rejected_scheme_log_exposes_only_a_bounded_category` | Asserts on log output whose capture competes with parallel test output. |
 
 ## The admin UI live acceptance helper raced the page's own requests (fixed)

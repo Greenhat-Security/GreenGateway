@@ -1190,7 +1190,9 @@ struct SecretChangeEvidence<'a> {
 /// operation IDs minted here, once per store call. Any failure is returned
 /// for the caller to roll back, so the change never commits without it,
 /// and it is reported as an evidence failure rather than as whatever
-/// constraint class SQLite gave it.
+/// constraint class SQLite gave it. A failed insert is counted here, once
+/// per refused change, on the standalone evidence-failure counter the rule
+/// pack pages on; the secrets live in the Connections database.
 fn record_change_evidence(
     connection: &Connection,
     evidence: &SecretChangeEvidence<'_>,
@@ -1234,7 +1236,12 @@ fn record_change_evidence(
                 evidence.committed_at,
             ],
         )
-        .map_err(|_| LocalSecretError::ChangeEvidenceFailure)?;
+        .map_err(|_| {
+            crate::storage::record_standalone_evidence_failure(
+                crate::storage::StandaloneEvidenceStore::Connections,
+            );
+            LocalSecretError::ChangeEvidenceFailure
+        })?;
     Ok(())
 }
 
@@ -3025,8 +3032,10 @@ mod tests {
     /// Evidence is required, not best effort: while its insert fails, a
     /// create, a rotate, a delete and a re-encryption batch each fail with an
     /// evidence failure and leave the envelopes, the versions and the
-    /// provider's metadata exactly as they were. Once evidence can be
-    /// written again, the same batch commits with its row.
+    /// provider's metadata exactly as they were, and each is counted once on
+    /// the standalone evidence-failure counter under the Connections
+    /// database. Once evidence can be written again, the same batch commits
+    /// with its row and counts nothing.
     #[test]
     fn a_failed_secret_evidence_insert_rolls_back_each_change() {
         let environment = TestEnvironment::new("evidence-fault");
@@ -3043,6 +3052,16 @@ mod tests {
             )
             .expect("secret should create");
         let before = envelope(&environment.database, &created.id);
+        // The recorder is this thread's, and the provider runs on this
+        // thread.
+        let recorder = crate::audit::sink::tests::CountingRecorder::default();
+        let _recording = ::metrics::set_default_local_recorder(&recorder);
+        let evidence_failures = || {
+            recorder.count(
+                crate::metrics::STANDALONE_EVIDENCE_FAILURES_TOTAL,
+                &[("store", "connections")],
+            )
+        };
 
         // Test-only fault injection through a second connection; no
         // production hook exists for it.
@@ -3064,6 +3083,7 @@ mod tests {
                 .map(|_| ()),
             Err(LocalSecretError::ChangeEvidenceFailure)
         );
+        assert_eq!(evidence_failures(), 1);
         assert_eq!(
             old_provider
                 .rotate(
@@ -3077,10 +3097,12 @@ mod tests {
                 .map(|_| ()),
             Err(LocalSecretError::ChangeEvidenceFailure)
         );
+        assert_eq!(evidence_failures(), 2);
         assert_eq!(
             old_provider.delete(&created.id, &ChangeActor::for_test("faulted-admin")),
             Err(LocalSecretError::ChangeEvidenceFailure)
         );
+        assert_eq!(evidence_failures(), 3);
         assert_eq!(old_provider.metadata(), vec![created.clone()]);
         drop(old_provider);
         let provider = LocalSecretProvider::open(
@@ -3098,6 +3120,7 @@ mod tests {
             ),
             Err(LocalSecretError::ChangeEvidenceFailure)
         );
+        assert_eq!(evidence_failures(), 4);
         assert_eq!(
             envelope(&environment.database, &created.id),
             before,
@@ -3120,6 +3143,7 @@ mod tests {
                 remaining: 0,
             })
         );
+        assert_eq!(evidence_failures(), 4, "a recorded batch counts nothing");
         let rows = secret_evidence(&environment.database);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].action, "secret.reencrypt");

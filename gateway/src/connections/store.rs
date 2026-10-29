@@ -3922,7 +3922,10 @@ struct ConnectionChangeEvidence<'a> {
 /// so the change it describes never commits without it, and it is reported
 /// as a store failure under its own operation label rather than as the
 /// constraint class SQLite gave it: a change whose evidence failed is never
-/// a validation problem or a conflict.
+/// a validation problem or a conflict. A failed insert is counted here, on
+/// the standalone evidence-failure counter the rule pack pages on; a
+/// replace's credential row is only attempted after its Connection row
+/// succeeded, so each refused change counts once.
 fn record_change_evidence(
     transaction: &Transaction<'_>,
     path: &Path,
@@ -3959,7 +3962,12 @@ fn record_change_evidence(
                 evidence.committed_at,
             ],
         )
-        .map_err(|source| sqlite_error(path, "change evidence append", source))?;
+        .map_err(|source| {
+            crate::storage::record_standalone_evidence_failure(
+                crate::storage::StandaloneEvidenceStore::Connections,
+            );
+            sqlite_error(path, "change evidence append", source)
+        })?;
     Ok(())
 }
 

@@ -131,3 +131,78 @@ the admin routers and request builders more than one module drives, and the
 polling helpers.
 There is no separate helper module; a test's authority setup stays visible
 in the test or in the one fixture it calls.
+
+## Acceptance evidence
+
+The last check of the issue measured both moves once more, after `main` had
+moved on, and checked everything that names a test or a test file.
+
+**Every test still runs once.** On `origin/main` at `952e3677`, which has the
+first move but not the second, and on that same commit with the second move
+merged, the listing, taken as above, has 4173 tests, with the same multiset of
+test names and no path listed twice. Exactly 387 paths differ, and each is the old path
+with the family module inserted after `tests::`: 350 top-level tests and the
+37 in the four inline PostgreSQL modules. Both listings were taken with the
+same toolchain on Windows, where a `#[cfg(unix)]` test compiles to nothing. No
+application test is gated that way: the suite's `#[cfg(unix)]` blocks only set
+file permissions inside a test or fixture body, so a Linux listing changes the
+same 387 paths.
+
+**Nothing changed on the way.** Compared line by line as a multiset,
+`app_tests.rs` and the ten family modules hold every line `app_tests.rs` and
+the modules it declared held before each move. Across the first move's merge
+(`453e8fc1`) no line is missing and 21 are new; against `952e3677`, with the
+second move merged, no line is missing and 60 are new, as in the second move's
+own merge into `main` (`390bb0ec`). The new lines are only the wiring (a
+`#[path]` and `mod` pair per module in `app_tests.rs` and `use super::*;` at
+the top of each module), each module's doc comment and a blank line after
+it. So every test and fixture, with every assertion, moved
+unedited, and `main`'s later edits to tests that had moved landed in their new
+modules.
+
+**Every selector still selects.** A moved test keeps its name, so a filter on
+the name, or on `<inline module>::<name>`, still selects it. What names a test
+or a test file by path was updated with the move or was already
+path-independent:
+
+- No CI workflow selects a test from `app_tests.rs` or the family modules,
+  and no workflow has a path filter. The coverage run excludes one test,
+  `audit::sqlite_sink::tests::moderate_scale_batched_inserts_complete_quickly`,
+  which did not move.
+- `security-mutations.json` names no moved test, and the CI test-list check
+  (`security_mutations.py --check-test-list`) passes on both listings. The
+  microbenchmark kernel (`policy_benchmark::http_policy_evaluation`) and the
+  security corpus worker (`security_corpus::bounded_corpus_worker`) are not
+  application tests.
+- The issue #240 acceptance ledger and `docs/authority-evidence-inventory.json`
+  cite tests as a file and a function; their citations of `app_tests.rs` name
+  the family modules, and `check-issue-240-acceptance.mjs` and
+  `check-authority-evidence.mjs` find every cited function there.
+- `ENVIRONMENT_READS` (`gateway/src/config/inventory.rs`) counts the
+  `GATEWAY_TEST_POSTGRES_URL_FILE` reads in the modules the inline PostgreSQL
+  suites moved to.
+- [The load-sensitive test list](load-sensitive-tests.md) gives each test's
+  full path, which its `--exact` re-run needs, and the three application
+  tests on it are under `tests::admin_observability_app_tests::` and
+  `tests::mcp_app_tests::`.
+- Every other document or comment that cites a moved test names it by its
+  bare name, by `<inline module>::<name>` or by
+  `cluster_app_tests::<name>`, each of which still selects it.
+
+**Coverage floors still apply.** No file that `.github/security-coverage.json`
+floors changed in either move, and no production code moved: `main.rs`
+declares `app_tests.rs` under `#[cfg(test)]`, so every module it declares is
+compiled for tests only. The gateway coverage run,
+`cargo llvm-cov -p gateway --bin gateway`, builds the one test binary all of
+them are compiled into, and the gate reads only the floored files, so neither
+a floor's denominator nor the set of tests that exercise floored code changed.
+
+**Secret scanning needed no new exception.** `.gitleaksignore` pins each
+reviewed finding to a commit, path and line, and none of its entries names
+`app_tests.rs` or a family module. `.gitleaks.toml` allows three exact
+values wherever they appear. The only one in this suite, the test RSA key that
+signs the JWT fixtures (`TEST_JWT_PRIVATE_KEY`), is a shared fixture and stayed
+in `app_tests.rs`; no family module contains an allowlisted value or a private
+key block. The moved lines are byte for byte the lines the full-history scan
+already reads in `app_tests.rs`, so no fingerprint or allowlist entry was moved
+or added.

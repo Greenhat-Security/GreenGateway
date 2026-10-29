@@ -68,6 +68,7 @@ tests:
       - {eval_time: 12m, alertname: GreenGatewayClusterMetricsMissing, exp_alerts: []}
       - {eval_time: 12m, alertname: GreenGatewayAuthorityEventCapacityRefusals, exp_alerts: []}
       - {eval_time: 12m, alertname: GreenGatewayAuthorityEvidenceWriteFailures, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayStandaloneEvidenceWriteFailures, exp_alerts: []}
       - {eval_time: 12m, alertname: GreenGatewayAuthorityEventJournalFull, exp_alerts: []}
       - {eval_time: 12m, alertname: GreenGatewayAuthorityEventJournalFilling, exp_alerts: []}
       - {eval_time: 12m, alertname: GreenGatewayAuthorityEventDeliveryLag, exp_alerts: []}
@@ -1270,6 +1271,11 @@ tests:
         values: '10+0x5 0+0x34'
       - series: 'greengateway_audit_durability_refusals_total{job="greengateway",instance="gateway-1",deployment_mode="cluster",reason="store"}'
         values: '10+0x5 0+0x34'
+      - &series_up_gateway_3_standalone
+        series: 'up{job="greengateway",instance="gateway-3",deployment_mode="standalone"}'
+        values: '1+0x40'
+      - series: 'greengateway_standalone_evidence_failures_total{job="greengateway",instance="gateway-3",deployment_mode="standalone",store="service_tokens"}'
+        values: '10+0x5 0+0x34'
     alert_rule_test:
       - {eval_time: 2m30s, alertname: GreenGatewayAuditLoss, exp_alerts: []}
       - {eval_time: 2m30s, alertname: GreenGatewayAuditFlushFailures, exp_alerts: []}
@@ -1289,6 +1295,9 @@ tests:
       - {eval_time: 2m30s, alertname: GreenGatewayAuditDurabilityRefusals, exp_alerts: []}
       - {eval_time: 6m, alertname: GreenGatewayAuditDurabilityRefusals, exp_alerts: []}
       - {eval_time: 12m, alertname: GreenGatewayAuditDurabilityRefusals, exp_alerts: []}
+      - {eval_time: 2m30s, alertname: GreenGatewayStandaloneEvidenceWriteFailures, exp_alerts: []}
+      - {eval_time: 6m, alertname: GreenGatewayStandaloneEvidenceWriteFailures, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayStandaloneEvidenceWriteFailures, exp_alerts: []}
 
   # Reset at 3m is healthy; first post-reset increase at 3m30s starts the 2m hold.
   - name: 'new failures after a counter reset still fire and later recover'
@@ -1318,6 +1327,9 @@ tests:
       - series: 'greengateway_authority_event_evidence_failures_total{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
         values: '10+0x5 0+1x14 14+0x20'
       - series: 'greengateway_audit_durability_refusals_total{job="greengateway",instance="gateway-1",deployment_mode="cluster",reason="store"}'
+        values: '10+0x5 0+1x14 14+0x20'
+      - *series_up_gateway_3_standalone
+      - series: 'greengateway_standalone_evidence_failures_total{job="greengateway",instance="gateway-3",deployment_mode="standalone",store="connections"}'
         values: '10+0x5 0+1x14 14+0x20'
     alert_rule_test:
       - {eval_time: 5m, alertname: GreenGatewayAuditLoss, exp_alerts: []}
@@ -1363,6 +1375,17 @@ tests:
             exp_annotations: *annotations_audit_durability_refusals
       - {eval_time: 8m, alertname: GreenGatewayAuditDurabilityRefusals, exp_alerts: [*fires_audit_durability_refusals_gateway_1_cluster]}
       - {eval_time: 16m, alertname: GreenGatewayAuditDurabilityRefusals, exp_alerts: []}
+      - {eval_time: 5m, alertname: GreenGatewayStandaloneEvidenceWriteFailures, exp_alerts: []}
+      - eval_time: 5m30s
+        alertname: GreenGatewayStandaloneEvidenceWriteFailures
+        exp_alerts:
+          - &fires_standalone_evidence_write_failures_gateway_3_standalone
+            exp_labels: {job: 'greengateway', instance: 'gateway-3', deployment_mode: 'standalone', severity: 'critical', owner: 'gateway-operations'}
+            exp_annotations: &annotations_standalone_evidence_write_failures
+              summary: 'Standalone authority changes were refused because their evidence could not be written'
+              runbook_url: 'https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#standalone-evidence-failures'
+      - {eval_time: 8m, alertname: GreenGatewayStandaloneEvidenceWriteFailures, exp_alerts: [*fires_standalone_evidence_write_failures_gateway_3_standalone]}
+      - {eval_time: 16m, alertname: GreenGatewayStandaloneEvidenceWriteFailures, exp_alerts: []}
 
   # Authority-event journal rules (issue #440 PR 4). gateway-1 leads maintenance
   # and so publishes the journal gauges; gateway-2 leads the dispatcher.
@@ -1655,12 +1678,60 @@ tests:
       - {eval_time: 12m, alertname: GreenGatewayAuthorityEvidenceWriteFailures, exp_alerts: [*fires_authority_evidence_write_failures_gateway_1_cluster]}
       - {eval_time: 18m, alertname: GreenGatewayAuthorityEvidenceWriteFailures, exp_alerts: []}
 
+  # Standalone SQLite evidence (issue #440). gateway-1 is a standalone replica draining
+  # throughout whose token store refuses a change every 30 seconds until 12m; its
+  # Connections series carries a label the alert must not keep. gateway-2 is a
+  # standalone replica exporting the seeded zeros. gateway-3 is a cluster replica whose
+  # PostgreSQL evidence fails over the same window: each mode pages on its own counter.
+  - name: 'refused standalone authority changes page per replica even while draining, then recover'
+    interval: 30s
+    input_series:
+      - *series_up_gateway_1_standalone
+      - series: 'greengateway_gateway_ready{job="greengateway",instance="gateway-1",deployment_mode="standalone"}'
+        values: '0+0x40'
+      - series: 'greengateway_gateway_draining{job="greengateway",instance="gateway-1",deployment_mode="standalone"}'
+        values: '1+0x40'
+      - series: 'greengateway_standalone_evidence_failures_total{job="greengateway",instance="gateway-1",deployment_mode="standalone",store="service_tokens"}'
+        values: '0+1x24 24+0x15'
+      - series: 'greengateway_standalone_evidence_failures_total{job="greengateway",instance="gateway-1",deployment_mode="standalone",store="connections",detail="fixture-detail"}'
+        values: '0+0x40'
+      - series: 'up{job="greengateway",instance="gateway-2",deployment_mode="standalone"}'
+        values: '1+0x40'
+      - series: 'greengateway_standalone_evidence_failures_total{job="greengateway",instance="gateway-2",deployment_mode="standalone",store="service_tokens"}'
+        values: '0+0x40'
+      - series: 'greengateway_standalone_evidence_failures_total{job="greengateway",instance="gateway-2",deployment_mode="standalone",store="connections"}'
+        values: '0+0x40'
+      - series: 'up{job="greengateway",instance="gateway-3",deployment_mode="cluster"}'
+        values: '1+0x40'
+      - series: 'greengateway_authority_event_evidence_failures_total{job="greengateway",instance="gateway-3",deployment_mode="cluster"}'
+        values: '0+1x24 24+0x15'
+    alert_rule_test:
+      - {eval_time: 2m, alertname: GreenGatewayStandaloneEvidenceWriteFailures, exp_alerts: []}
+      - eval_time: 2m30s
+        alertname: GreenGatewayStandaloneEvidenceWriteFailures
+        exp_alerts:
+          - &fires_standalone_evidence_write_failures_gateway_1_standalone
+            exp_labels: {job: 'greengateway', instance: 'gateway-1', deployment_mode: 'standalone', severity: 'critical', owner: 'gateway-operations'}
+            exp_annotations: *annotations_standalone_evidence_write_failures
+      - {eval_time: 12m, alertname: GreenGatewayStandaloneEvidenceWriteFailures, exp_alerts: [*fires_standalone_evidence_write_failures_gateway_1_standalone]}
+      - {eval_time: 18m, alertname: GreenGatewayStandaloneEvidenceWriteFailures, exp_alerts: []}
+      - eval_time: 12m
+        alertname: GreenGatewayAuthorityEvidenceWriteFailures
+        exp_alerts:
+          - exp_labels: {job: 'greengateway', instance: 'gateway-3', deployment_mode: 'cluster', severity: 'critical', owner: 'gateway-operations'}
+            exp_annotations:
+              summary: 'Authority changes were refused because their required evidence could not be written'
+              runbook_url: 'https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#authority-evidence-failures'
+      - {eval_time: 18m, alertname: GreenGatewayAuthorityEvidenceWriteFailures, exp_alerts: []}
+
   # Startup seeding (issue #440 review). The gateway exports every counter a
   # single-event rule reads at 0 from the moment its recorder is installed, so
   # one event after a restart is a 0 -> 1 increase: gateway-1 counts a single
   # event at 2m30s and pages after the 2m hold, then recovers once the window
   # holds only the 1. gateway-2 counts the same single event on a lazy series
   # that first appears at 1, which increase() cannot see, so it never pages.
+  # gateway-3 and gateway-4 are the same pair in standalone mode, on the SQLite
+  # evidence counter.
   - name: 'one event on a counter seeded at zero pages; the same event on a lazy series cannot'
     interval: 30s
     input_series:
@@ -1691,6 +1762,13 @@ tests:
       - series: 'greengateway_audit_durability_refusals_total{job="greengateway",instance="gateway-1",deployment_mode="cluster",reason="timeout"}'
         values: '0+0x4 1+0x35'
       - series: 'greengateway_audit_durability_refusals_total{job="greengateway",instance="gateway-2",deployment_mode="cluster",reason="timeout"}'
+        values: '_x5 1+0x35'
+      - *series_up_gateway_3_standalone
+      - series: 'greengateway_standalone_evidence_failures_total{job="greengateway",instance="gateway-3",deployment_mode="standalone",store="service_tokens"}'
+        values: '0+0x4 1+0x35'
+      - series: 'up{job="greengateway",instance="gateway-4",deployment_mode="standalone"}'
+        values: '1+0x40'
+      - series: 'greengateway_standalone_evidence_failures_total{job="greengateway",instance="gateway-4",deployment_mode="standalone",store="service_tokens"}'
         values: '_x5 1+0x35'
     alert_rule_test:
       - {eval_time: 2m, alertname: GreenGatewayAuditLoss, exp_alerts: []}
@@ -1723,3 +1801,13 @@ tests:
       - {eval_time: 4m30s, alertname: GreenGatewayAuditDurabilityRefusals, exp_alerts: [*fires_audit_durability_refusals_gateway_1_cluster]}
       - {eval_time: 6m, alertname: GreenGatewayAuditDurabilityRefusals, exp_alerts: [*fires_audit_durability_refusals_gateway_1_cluster]}
       - {eval_time: 9m, alertname: GreenGatewayAuditDurabilityRefusals, exp_alerts: []}
+      - {eval_time: 2m, alertname: GreenGatewayStandaloneEvidenceWriteFailures, exp_alerts: []}
+      - {eval_time: 4m, alertname: GreenGatewayStandaloneEvidenceWriteFailures, exp_alerts: []}
+      - eval_time: 4m30s
+        alertname: GreenGatewayStandaloneEvidenceWriteFailures
+        exp_alerts:
+          - &fires_standalone_evidence_write_failures_gateway_3_seeded
+            exp_labels: {job: 'greengateway', instance: 'gateway-3', deployment_mode: 'standalone', severity: 'critical', owner: 'gateway-operations'}
+            exp_annotations: *annotations_standalone_evidence_write_failures
+      - {eval_time: 6m, alertname: GreenGatewayStandaloneEvidenceWriteFailures, exp_alerts: [*fires_standalone_evidence_write_failures_gateway_3_seeded]}
+      - {eval_time: 9m, alertname: GreenGatewayStandaloneEvidenceWriteFailures, exp_alerts: []}

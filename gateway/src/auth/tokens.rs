@@ -887,7 +887,9 @@ struct ChangeEvidence<'a> {
 /// returned for the caller to roll back, so the change it describes never
 /// commits without it, and it is reported as an evidence failure rather
 /// than as whatever constraint class SQLite gave it: a rotate whose
-/// evidence failed is not a revoked-token conflict.
+/// evidence failed is not a revoked-token conflict. A failed insert is
+/// counted here, once per refused change, on the standalone
+/// evidence-failure counter the rule pack pages on.
 fn record_change_evidence(
     connection: &Connection,
     path: &Path,
@@ -915,9 +917,14 @@ fn record_change_evidence(
                 evidence.committed_at,
             ],
         )
-        .map_err(|source| TokenStoreError::ChangeEvidence {
-            path: path.to_path_buf(),
-            source,
+        .map_err(|source| {
+            crate::storage::record_standalone_evidence_failure(
+                crate::storage::StandaloneEvidenceStore::ServiceTokens,
+            );
+            TokenStoreError::ChangeEvidence {
+                path: path.to_path_buf(),
+                source,
+            }
         })?;
     Ok(())
 }
@@ -1451,6 +1458,69 @@ mod tests {
             );
             assert!(refused.is_err(), "{issuer:?} {kind:?} {mode:?}");
         }
+    }
+
+    /// A rotate or a revoke whose evidence cannot be inserted is refused and
+    /// counted once on the standalone evidence-failure counter under the
+    /// token database; the revoke recorded once evidence can be written
+    /// counts nothing. The rollback itself is pinned by the repository
+    /// contract test `sqlite_failed_evidence_insert_rolls_back_rotate_and_revoke`,
+    /// whose store calls run on blocking threads this thread's recorder does
+    /// not see.
+    #[test]
+    fn a_refused_rotate_or_revoke_counts_one_evidence_failure_each() {
+        let db = TempDb::new("evidence-failure-count");
+        let store = SqliteTokenStore::open(&db.path).expect("token store should open");
+        let created = store
+            .create(create_request(&["admin"], "creator", None))
+            .expect("token should create");
+        let id = created.record.id;
+        // The recorder is this thread's, and the store runs on this thread.
+        let recorder = crate::audit::sink::tests::CountingRecorder::default();
+        let _recording = ::metrics::set_default_local_recorder(&recorder);
+        let evidence_failures = |store: &str| {
+            recorder.count(
+                crate::metrics::STANDALONE_EVIDENCE_FAILURES_TOTAL,
+                &[("store", store)],
+            )
+        };
+
+        // Test-only fault injection through a second connection; no
+        // production hook exists for it.
+        Connection::open(&db.path)
+            .expect("token database should open")
+            .execute_batch(
+                "CREATE TRIGGER fail_token_change_evidence \
+                 BEFORE INSERT ON service_token_change_evidence \
+                 BEGIN SELECT RAISE(ABORT, 'injected evidence failure'); END;",
+            )
+            .expect("failure trigger should install");
+        let faulted = ChangeActor::for_test("faulted-admin");
+        assert!(matches!(
+            store.rotate(&id, &faulted),
+            Err(TokenStoreError::ChangeEvidence { .. })
+        ));
+        assert_eq!(evidence_failures("service_tokens"), 1);
+        assert!(matches!(
+            store.revoke(&id, &faulted),
+            Err(TokenStoreError::ChangeEvidence { .. })
+        ));
+        assert_eq!(evidence_failures("service_tokens"), 2);
+        assert_eq!(evidence_failures("connections"), 0);
+
+        Connection::open(&db.path)
+            .expect("token database should open")
+            .execute_batch("DROP TRIGGER fail_token_change_evidence;")
+            .expect("failure trigger should drop");
+        store
+            .revoke(&id, &ChangeActor::for_test("recovered-admin"))
+            .expect("the revoke commits once evidence can be written")
+            .expect("token should exist");
+        assert_eq!(
+            evidence_failures("service_tokens"),
+            2,
+            "a recorded change counts nothing"
+        );
     }
 
     #[test]
