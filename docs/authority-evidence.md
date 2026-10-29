@@ -687,10 +687,10 @@ row; aligning both with this section's columns is a later #425 slice (the
 inventory's `policy_postgres`, `tools_postgres`, `configuration_import` and
 `catalog_postgres` rows keep `missing_metadata`). For `catalog_change_evidence`
 that slice starts with migration 25, which adds this section's three columns under
-the same CHECK. This release applies it, as a rolling step from the release that
-approved it ([schema 24 to 25](deployment/postgres.md#rolling-upgrade-schema-24-to-25)),
-but still writes no metadata into it: catalog publications record the subject
-alone, and every row says "not recorded" until a later #425 slice fills them.
+the same CHECK. The schema-25 release applied it, as a rolling step from the release
+that approved it ([schema 24 to 25](deployment/postgres.md#rolling-upgrade-schema-24-to-25)),
+and this release carries it, but no build writes metadata into it yet: catalog
+publications record the subject alone, and every row says "not recorded" until a later #425 slice fills them.
 
 ## Standalone evidence
 
