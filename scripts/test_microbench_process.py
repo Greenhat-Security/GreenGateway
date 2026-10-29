@@ -800,6 +800,34 @@ class KernelBuildInputTests(unittest.TestCase):
                 with self.subTest(messages=invalid[:40]), self.assertRaises(ValueError):
                     bench._test_executable(invalid, target)
 
+    def test_every_local_package_built_must_be_a_freshly_compiled_member_of_the_tree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tree = Path(directory) / "tree"
+            executable = Path(directory) / "target" / "gateway-test"
+            messages = build_messages(executable, tree)
+            registry = {"reason": "compiler-artifact", "fresh": True,
+                        "package_id": "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.0",
+                        "manifest_path": str(Path(directory) / "registry" / "serde" / "Cargo.toml")}
+            finished = {"reason": "build-finished", "success": True}
+
+            def lines(*values):
+                return "\n".join(json.dumps(value) for value in values)
+
+            self.assertEqual(bench._local_packages(lines(registry, *messages, finished), tree, MEMBERS),
+                             ["gateway", "gateway-config"])
+            outsider = dict(messages[0], manifest_path=str(Path(directory) / "other" / "gateway-config"
+                                                           / "Cargo.toml"))
+            for invalid, message in (
+                    (lines(messages[0]), "did not compile the revision's gateway"),
+                    (lines(registry, finished), "did not compile the revision's gateway"),
+                    (lines(dict(messages[0], fresh=True), messages[1]), "gateway-config was reused"),
+                    (lines(messages[0], dict(messages[1], fresh=None)), "gateway was reused"),
+                    (lines(outsider, messages[1]), "not a member"),
+                    (lines({"reason": "compiler-artifact", "fresh": False}, *messages), "without its package"),
+                    ("not json", "")):
+                with self.subTest(message=message or invalid), self.assertRaisesRegex(ValueError, message):
+                    bench._local_packages(invalid, tree, MEMBERS)
+
     def test_inherited_build_overrides_are_removed_and_the_profile_is_explicit(self):
         inherited = {"RUSTFLAGS": "-C opt-level=3", "CARGO_ENCODED_RUSTFLAGS": "-Copt-level=3",
                      "CARGO_PROFILE_DEV_OPT_LEVEL": "3", "CARGO_BUILD_RUSTC_WRAPPER": "wrapper",
@@ -870,6 +898,151 @@ class KernelTreeTests(unittest.TestCase):
                                     configured, time.monotonic() + 30)
 
 
+FIXTURE_MANIFEST = """[package]
+name = "{name}"
+version = "0.1.0"
+edition = "2021"
+{dependencies}"""
+CONFIG_DEPENDENCY = '\n[dependencies]\ngateway-config = { path = "../gateway-config" }\n'
+
+
+class KernelWorkspaceBuildTests(unittest.TestCase):
+    """The pinned Cargo builds a fixture workspace through the benchmark's own
+    tree, member, clean and build steps, both revisions sharing one target
+    directory as in CI. The head's gateway imports a gateway-config module the
+    base lacks, as in merge train #667: Cargo judges members fresh by
+    modification time, which extraction sets to the (older) commit time, so
+    cleaning only the gateway let the head link the base's gateway-config."""
+
+    def setUp(self):
+        self.pin = json.loads((ROOT / "build-tools.json").read_text(encoding="utf-8"))["rust_ci"]
+        rustup = shutil.which("rustup")
+        self.assertIsNotNone(rustup, "the repository's pinned Rust toolchain must be installed")
+        self.cargo, self.rustc = (subprocess.run(
+            [rustup, "which", "--toolchain", self.pin, tool], capture_output=True, text=True,
+            timeout=10, check=True).stdout.strip() for tool in ("cargo", "rustc"))
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+        self.root = self.directory / "repository"
+        self.root.mkdir()
+        self.git("init", "-q")
+
+    def git(self, *args):
+        # Fixed, old commit dates: extraction gives every file its commit's time.
+        environment = {**os.environ, "GIT_AUTHOR_DATE": "2026-01-01T00:00:00+0000",
+                       "GIT_COMMITTER_DATE": "2026-01-01T00:00:00+0000"}
+        return subprocess.run(["git", "-C", str(self.root), "-c", "user.name=Benchmark Fixture",
+                               "-c", "user.email=fixture@example.test", "-c", "commit.gpgsign=false",
+                               "-c", "core.autocrlf=false", *args], check=True, capture_output=True,
+                              text=True, env=environment).stdout.strip()
+
+    def commit(self, files, lock="generate"):
+        """Commit `files` (None deletes); `lock` generates, keeps or removes Cargo.lock."""
+        for name, content in files.items():
+            path = self.root / name
+            if content is None and path.is_dir():
+                shutil.rmtree(path)
+            elif content is None:
+                path.unlink()
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+        if lock == "generate":
+            environment = bench._cargo_environment(self.rustc, self.pin, self.directory / "lock-target")
+            subprocess.run([self.cargo, "generate-lockfile", "--offline"], cwd=self.root,
+                           env=environment, check=True, capture_output=True, timeout=60)
+        elif lock == "remove":
+            (self.root / "Cargo.lock").unlink()
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "fixture")
+        return self.git("rev-parse", "HEAD")
+
+    def base_files(self):
+        ui = {name: f"{name}\n" for name in (".node-version", ".npm-version", "build-tools.json",
+                                              "npm-script-policy.json", "scripts/npm-script-policy.mjs",
+                                              "admin-ui/package.json")}
+        return {**ui,
+                "Cargo.toml": '[workspace]\nmembers = ["gateway", "gateway-config"]\nresolver = "2"\n',
+                "gateway-config/Cargo.toml": FIXTURE_MANIFEST.format(name="gateway-config",
+                                                                     dependencies=""),
+                "gateway-config/src/lib.rs": "pub mod bundle;\n",
+                "gateway-config/src/bundle.rs": "pub fn digest() -> u32 {\n    1\n}\n",
+                "gateway/Cargo.toml": FIXTURE_MANIFEST.format(name="gateway",
+                                                              dependencies=CONFIG_DEPENDENCY),
+                "gateway/src/main.rs": "fn main() {\n    println!(\"{}\", gateway_config::bundle::digest());\n}\n"}
+
+    def head_files(self):
+        # A new gateway-config module the gateway imports, and a member the base lacks.
+        uses = "gateway_config::semantic_diff::risk()"
+        return {"Cargo.toml": '[workspace]\nmembers = ["gateway", "gateway-config", "ggctl"]\n'
+                              'resolver = "2"\n',
+                "gateway-config/src/lib.rs": "pub mod bundle;\npub mod semantic_diff;\n",
+                "gateway-config/src/semantic_diff.rs": "pub fn risk() -> u32 {\n    2\n}\n",
+                "gateway/src/main.rs": "use gateway_config::semantic_diff;\n\nfn main() {\n"
+                                       "    println!(\"{}\", semantic_diff::risk());\n}\n",
+                "ggctl/Cargo.toml": FIXTURE_MANIFEST.format(name="ggctl",
+                                                            dependencies=CONFIG_DEPENDENCY),
+                "ggctl/src/main.rs": "fn main() {\n    println!(\"{}\", " + uses + ");\n}\n"}
+
+    def kernel(self, ui_source):
+        return {"cargo": self.cargo, "ui_source": ui_source,
+                "ui_build_inputs": list(bench.UI_BUILD_INPUTS), "context": {"rust_ci": self.pin}}
+
+    def build(self, revision, label, ui_source):
+        output = self.directory / "comparison"
+        output.mkdir(exist_ok=True)
+        return bench._build_kernel(self.root, revision, label, output, self.rustc,
+                                   self.kernel(ui_source), None, None, False,
+                                   self.directory / "work", time.monotonic() + 300)
+
+    def test_a_head_gateway_importing_a_new_gateway_config_module_builds_from_its_own_tree(self):
+        base = self.commit(self.base_files())
+        head = self.commit(self.head_files())
+        # Each revision's members come from its own root manifest.
+        expected = {"base": ["gateway", "gateway-config"],
+                    "head": ["gateway", "gateway-config", "ggctl"]}
+        for label, revision in (("base", base), ("head", head)):
+            binary, _, directory = self.build(revision, label, head)
+            self.assertTrue(binary.is_file())
+            build = json.loads((directory / "build.json").read_text(encoding="utf-8"))
+            self.assertEqual(build["revision"], revision)
+            self.assertEqual(build["workspace_members"],
+                             {name: name + "/Cargo.toml" for name in expected[label]})
+            self.assertEqual(build["clean_command"], [
+                self.cargo, "clean", *(item for name in expected[label] for item in ("-p", name)),
+                "--locked"])
+            # Both local packages were compiled from this tree, none reused.
+            self.assertEqual(build["local_packages"], ["gateway", "gateway-config"])
+        trees = self.directory / "work" / "trees"
+        self.assertTrue((trees / "head" / "gateway-config/src/semantic_diff.rs").is_file())
+        self.assertFalse((trees / "base" / "gateway-config/src/semantic_diff.rs").exists())
+
+    def test_a_missing_workspace_input_fails_closed_before_any_build(self):
+        base = self.commit(self.base_files())
+        cases = {
+            # The root manifest names a member the revision does not carry.
+            "uncommitted member": ({"gateway-config": None}, "keep", RuntimeError, "metadata"),
+            # The revision carries the member, but its archive leaves it out.
+            "member absent from the tree": ({".gitattributes": "gateway-config/** export-ignore\n"},
+                                            "generate", RuntimeError, "metadata"),
+            "no lockfile": ({}, "remove", ValueError, "workspace input Cargo.lock is missing"),
+        }
+        for index, (name, (files, lock, error, message)) in enumerate(cases.items()):
+            with self.subTest(case=name):
+                self.git("checkout", "-q", base)
+                revision = self.commit(files, lock=lock)
+                label = f"broken{index}"
+                with self.assertRaisesRegex(error, message):
+                    self.build(revision, label, revision)
+                logs = self.directory / "comparison" / f"{label}-kernel"
+                self.assertFalse((logs / "clean.stdout.log").exists())
+                self.assertFalse((logs / "build.stdout.log").exists())
+                if error is RuntimeError:
+                    self.assertIn("gateway-config", (logs / "metadata.stderr.log").read_text(
+                        encoding="utf-8", errors="replace"))
+
+
 def pure_envelope(revision):
     return {"schema_version": 1, "context": context(), "revision": revision,
             "regression_fixture": False,
@@ -902,10 +1075,43 @@ def egress_configuration(base_declared, state="pending"):
             "declared": {"base": base_declared, "head": True}}
 
 
-def build_process_code(executable):
-    artifact = {"reason": "compiler-artifact", "executable": str(executable),
-                "target": {"name": "gateway", "kind": ["bin"]}, "profile": {"test": True}}
-    return "print(" + repr(json.dumps(artifact)) + ")"
+# The workspace the simulated Cargo reports for every tree.
+MEMBERS = {"gateway": "gateway/Cargo.toml", "gateway-config": "gateway-config/Cargo.toml"}
+
+
+def member_id(tree, name):
+    return "path+" + (Path(tree) / MEMBERS[name]).parent.resolve().as_uri() + "#0.1.0"
+
+
+def metadata_process_code(tree):
+    packages = [{"id": member_id(tree, name), "name": name, "manifest_path": str(Path(tree) / path)}
+                for name, path in MEMBERS.items()]
+    metadata = {"workspace_root": str(tree), "packages": packages,
+                "workspace_members": [package["id"] for package in packages]}
+    return "print(" + repr(json.dumps(metadata)) + ")"
+
+
+def build_messages(executable, tree, fresh=()):
+    """Cargo's report: gateway-config's library, then the gateway test binary.
+    A member named in `fresh` is reported as reused rather than compiled."""
+    def artifact(name, **fields):
+        return {"reason": "compiler-artifact", "package_id": member_id(tree, name),
+                "manifest_path": str(Path(tree) / MEMBERS[name]), "fresh": name in fresh, **fields}
+    return [artifact("gateway-config", executable=None, profile={"test": False},
+                     target={"name": "gateway_config", "kind": ["lib"]}),
+            artifact("gateway", executable=str(executable), profile={"test": True},
+                     target={"name": "gateway", "kind": ["bin"]})]
+
+
+def build_process_code(executable, tree, fresh=()):
+    lines = [json.dumps(message) for message in build_messages(executable, tree, fresh)]
+    return "print(" + repr("\n".join(lines)) + ")"
+
+
+def prepare_workspace(tree):
+    tree.mkdir(parents=True, exist_ok=True)
+    for name in bench.WORKSPACE_INPUTS:
+        (tree / name).write_text("fixture\n", encoding="utf-8")
 
 
 def report_process_code(report):
@@ -920,13 +1126,14 @@ class KernelStageExecutionTests(unittest.TestCase):
     def run_stage(self, directory, *, state="pending", base_digest=None, base_listing=None,
                   results=None, failures=None, build_executables=1, lane_state="pending",
                   lane_base_digest=None, lane_base_listing=None, lane_results=None,
-                  egress_base_declared=False, egress_base_listing=None, egress_state="pending"):
+                  egress_base_declared=False, egress_base_listing=None, egress_state="pending",
+                  fresh=None):
         """Run `run_comparison` with only the kernel processes simulated.
 
         `results` maps base/head to a kernel report (or None for no file), and
         `lane_results` maps base/head to each lane-harness target's report,
         static egress included; `failures` maps a process label to "crash" or
-        "timeout".
+        "timeout"; `fresh` maps base/head to the members its build reuses.
         """
         directory = Path(directory)
         output, work = directory / "comparison", directory / "work"
@@ -943,26 +1150,30 @@ class KernelStageExecutionTests(unittest.TestCase):
             egress_base_listing = egress_base_declared
         kernel = kernel_configuration(state, base_digest)
         lanes = lane_configuration(lane_state, lane_base_digest)
+        fresh = fresh or {}
         real_bounded = bench._bounded
-        self.kernel_calls = []
+        self.kernel_calls, self.kernel_commands = [], {}
 
-        def bounded(_command, working, label, _seconds, deadline, env=None, cwd=None, max_bytes=None):
+        def bounded(command, working, label, _seconds, deadline, env=None, cwd=None, max_bytes=None):
             side = working.name.removesuffix("-kernel")
             self.kernel_calls.append((side, label))
+            self.kernel_commands[(side, label)] = command
             seconds = 2
             if failures.get(f"{side}:{label}") == "crash":
                 code = "print('deliberate process failure'); raise SystemExit(23)"
             elif failures.get(f"{side}:{label}") == "timeout":
                 code, seconds = "import time; time.sleep(30)", 0.08
+            elif label == "metadata":
+                code = metadata_process_code(cwd)
             elif label == "clean":
                 code = "pass"
             elif label == "build":
-                artifact = {"reason": "compiler-artifact", "executable": str(executable),
-                            "target": {"name": "gateway", "kind": ["bin"]}, "profile": {"test": True}}
-                code = "print(" + repr("\n".join([json.dumps(artifact)] * build_executables)) + ")"
+                code = build_process_code(executable, cwd, fresh.get(side, ()))
                 if build_executables > 1:
-                    other = dict(artifact, executable=str(executable) + "-other")
-                    code = "print(" + repr(json.dumps(artifact) + "\n" + json.dumps(other)) + ")"
+                    messages = build_messages(executable, cwd)
+                    other = dict(messages[-1], executable=str(executable) + "-other")
+                    lines = [json.dumps(message) for message in (*messages, other)]
+                    code = "print(" + repr("\n".join(lines)) + ")"
             elif label == "list":
                 listing = ""
                 if base_listing if side == "base" else True:
@@ -983,7 +1194,7 @@ class KernelStageExecutionTests(unittest.TestCase):
             return real_bounded([sys.executable, "-c", code], working, label, seconds, deadline, env)
 
         def prepare(_root, _revision, tree, _ui_source, _deadline):
-            tree.mkdir(parents=True, exist_ok=True)
+            prepare_workspace(tree)
             executable.parent.mkdir(parents=True, exist_ok=True)
             executable.write_bytes(b"fixture executable")
             (executable.parent / "gateway-test-other").write_bytes(b"fixture executable")
@@ -992,6 +1203,8 @@ class KernelStageExecutionTests(unittest.TestCase):
                          {**context(), "budget": budget(), "proposed_budget": budget()})
         with ExitStack() as stack:
             stack.enter_context(mock.patch.object(bench, "resolve_commit", side_effect=lambda _root, revision: revision))
+            # The revisions are placeholders, so every member counts as committed.
+            stack.enter_context(mock.patch.object(bench, "_has_blob", return_value=True))
             stack.enter_context(mock.patch.object(bench, "_configuration", return_value=configuration))
             stack.enter_context(mock.patch.object(
                 bench, "_measure", side_effect=lambda _root, revision, *_args, **_kwargs: pure_envelope(revision)))
@@ -1007,17 +1220,49 @@ class KernelStageExecutionTests(unittest.TestCase):
         self.assertEqual(stored, report)
         return report, output
 
-    def test_each_revision_cleans_the_gateway_and_measures_its_own_binary_copy(self):
+    def test_each_revision_cleans_its_workspace_members_and_measures_its_own_binary_copy(self):
         # A shared target directory once let the head build reuse the base
         # binary: Cargo judged the second tree fresh and listed zero tests.
+        # Later it reused the base's gateway-config under the head's gateway.
         with tempfile.TemporaryDirectory() as directory:
-            report, _ = self.run_stage(directory, results={"base": None, "head": kernel_result()})
+            report, output = self.run_stage(directory, results={"base": None, "head": kernel_result()})
             self.assertEqual(report["status"], "passed", report["errors"])
             for side in ("base", "head"):
                 labels = [label for owner, label in self.kernel_calls if owner == side]
-                self.assertEqual(labels[:2], ["clean", "build"], labels)
+                self.assertEqual(labels[:3], ["metadata", "clean", "build"], labels)
+                self.assertEqual(self.kernel_commands[(side, "metadata")][1:],
+                                 bench.METADATA_ARGUMENTS)
+                clean = [sys.executable, "clean", "-p", "gateway", "-p", "gateway-config", "--locked"]
+                self.assertEqual(self.kernel_commands[(side, "clean")], clean)
                 copy = Path(directory) / "work" / "binaries" / side / "gateway-test"
                 self.assertEqual(copy.read_bytes(), b"fixture executable")
+                build = json.loads((output / f"{side}-kernel" / "build.json").read_text(encoding="utf-8"))
+                self.assertEqual(build["workspace_members"], MEMBERS)
+                self.assertEqual(build["clean_command"], clean)
+                self.assertEqual(build["local_packages"], ["gateway", "gateway-config"])
+
+    def test_a_member_reused_from_the_other_revisions_build_fails_closed(self):
+        for side in ("base", "head"):
+            for member in MEMBERS:
+                with self.subTest(side=side, member=member), \
+                        tempfile.TemporaryDirectory() as directory:
+                    report, output = self.run_stage(directory, state="enforced",
+                                                    base_digest="f" * 64, fresh={side: (member,)})
+                    self.assertEqual(report["status"], "failed")
+                    self.assertIn(f"workspace member {member} was reused", " ".join(report["errors"]))
+                    self.assertNotIn((side, "list"), self.kernel_calls)
+                    self.assertFalse((output / f"{side}-kernel" / "build.json").exists())
+                    self.assertNotIn("kernel", report)
+
+    def test_a_workspace_cargo_cannot_resolve_fails_before_any_build(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report, _ = self.run_stage(directory, state="enforced", base_digest="f" * 64,
+                                       failures={"head:metadata": "crash"})
+            self.assertEqual(report["status"], "failed")
+            self.assertIn("metadata: process failed", " ".join(report["errors"]))
+            self.assertNotIn(("head", "clean"), self.kernel_calls)
+            self.assertNotIn(("head", "build"), self.kernel_calls)
+            self.assertNotIn("kernel", report)
 
     def test_pending_head_measurement_over_a_base_without_the_harness_passes(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1314,10 +1559,12 @@ class SelfTestExecutionTests(unittest.TestCase):
             return lane_result(target, cases * 1000 + (cases * 100 if fixture else 0), fixture)
 
         def bounded(_command, working, label, _seconds, deadline, env=None, cwd=None, max_bytes=None):
-            if label == "clean":
+            if label == "metadata":
+                code = metadata_process_code(cwd)
+            elif label == "clean":
                 code = "pass"
             elif label == "build":
-                code = build_process_code(executable)
+                code = build_process_code(executable, cwd)
             elif label == "list":
                 tests = (bench.KERNEL_TEST, *bench.LANE_HARNESS_TESTS.values())
                 code = "print(" + repr("".join(f"{test}: test\n" for test in tests)) + ")"
@@ -1332,7 +1579,7 @@ class SelfTestExecutionTests(unittest.TestCase):
             return real_bounded([sys.executable, "-c", code], working, label, 2, deadline, env)
 
         def prepare(_root, _revision, tree, _ui_source, _deadline):
-            tree.mkdir(parents=True, exist_ok=True)
+            prepare_workspace(tree)
             executable.parent.mkdir(parents=True, exist_ok=True)
             executable.write_bytes(b"fixture executable")
 
@@ -1351,6 +1598,7 @@ class SelfTestExecutionTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(bench, "resolve_commit", side_effect=lambda _root, revision: revision))
             stack.enter_context(mock.patch.object(bench, "_configuration", return_value=configuration))
             stack.enter_context(mock.patch.object(bench, "_measure", side_effect=measure))
+            stack.enter_context(mock.patch.object(bench, "_has_blob", return_value=True))
             stack.enter_context(mock.patch.object(
                 bench, "_kernel_configuration", return_value=kernel_configuration("enforced", "f" * 64)))
             stack.enter_context(mock.patch.object(
