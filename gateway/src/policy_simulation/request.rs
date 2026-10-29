@@ -268,7 +268,12 @@ pub(crate) fn parse_candidate(
     }
 }
 
-fn parse_projections(value: &Value, diagnostics: &mut Diagnostics) -> Option<Vec<Projection>> {
+/// The `projections` member: one or both projections, each named once.
+/// Historical replay takes the same member with the same meaning.
+pub(crate) fn parse_projections(
+    value: &Value,
+    diagnostics: &mut Diagnostics,
+) -> Option<Vec<Projection>> {
     let Value::Array(items) = value else {
         diagnostics.push(
             "invalid_type",
