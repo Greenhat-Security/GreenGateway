@@ -7,6 +7,7 @@
 //!   "base_etag": "\"sha256:...\"",
 //!   "candidate": { "source": "edits", "edits": [ ... ] },
 //!   "window": { "from": "2026-10-27T00:00:00Z", "to": "2026-10-28T00:00:00Z" },
+//!   "projections": ["as_authored", "enforce_all_shadow"],
 //!   "max_records": 50000,
 //!   "idempotency_key": "nightly"
 //! }
@@ -14,7 +15,10 @@
 //!
 //! `base_etag` pins the active policy the request was written against, as a
 //! simulation's does, and `candidate` takes the simulation's three sources
-//! with the same members ([`parse_candidate`]). The window is a half-open
+//! with the same members ([`parse_candidate`]); `projections` names the
+//! simulation's projections the impact comparison is reported under
+//! ([`parse_projections`]), `as_authored` alone when omitted. The window is a
+//! half-open
 //! `[from, to)` interval of audit timestamps; `to` defaults to the moment the
 //! job is created. Its bounds against the clock are checked when the job is
 //! created ([`resolve_window`]), since only then is "now" known.
@@ -25,7 +29,10 @@ use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime, Ut
 use super::job::MAX_REPLAY_RECORDS;
 use crate::{
     canonical_json,
-    policy_simulation::request::{parse_candidate, CandidateSource, MAX_BASE_ETAG_BYTES},
+    policy_simulation::{
+        request::{parse_candidate, parse_projections, CandidateSource, MAX_BASE_ETAG_BYTES},
+        Projection,
+    },
     policy_testing::suite::{
         bounded_string, check_members, object, required, Diagnostics, MAX_DESCRIPTION_BYTES,
     },
@@ -54,6 +61,9 @@ pub(crate) struct ReplayRequest {
     pub(crate) from: OffsetDateTime,
     /// `None` when the window ends when the job is created.
     pub(crate) to: Option<OffsetDateTime>,
+    /// The projections the impact comparison is reported under, in the
+    /// order named.
+    pub(crate) projections: Vec<Projection>,
     pub(crate) max_records: usize,
     pub(crate) idempotency_key: Option<String>,
 }
@@ -85,6 +95,7 @@ pub(crate) fn parse_request(bytes: &[u8], value: &Value) -> Result<ReplayRequest
             "base_etag",
             "candidate",
             "window",
+            "projections",
             "max_records",
             "idempotency_key",
         ],
@@ -123,6 +134,10 @@ pub(crate) fn parse_request(bytes: &[u8], value: &Value) -> Result<ReplayRequest
         .and_then(|value| parse_candidate(bytes, value, &mut diagnostics));
     let window = required(root, "window", "", &mut diagnostics)
         .and_then(|value| parse_window(value, &mut diagnostics));
+    let projections = match root.get("projections") {
+        None => Some(vec![Projection::AsAuthored]),
+        Some(value) => parse_projections(value, &mut diagnostics),
+    };
     let max_records = match root.get("max_records") {
         None => Some(MAX_REPLAY_RECORDS),
         Some(value) => {
@@ -147,11 +162,19 @@ pub(crate) fn parse_request(bytes: &[u8], value: &Value) -> Result<ReplayRequest
     if !diagnostics.is_empty() {
         return Err(diagnostics);
     }
-    match (base_etag, candidate, window, max_records, idempotency_key) {
+    match (
+        base_etag,
+        candidate,
+        window,
+        projections,
+        max_records,
+        idempotency_key,
+    ) {
         (
             Some(base_etag),
             Some(candidate),
             Some((from, to)),
+            Some(projections),
             Some(max_records),
             Some(idempotency_key),
         ) => Ok(ReplayRequest {
@@ -160,6 +183,7 @@ pub(crate) fn parse_request(bytes: &[u8], value: &Value) -> Result<ReplayRequest
             candidate,
             from,
             to,
+            projections,
             max_records,
             idempotency_key,
         }),

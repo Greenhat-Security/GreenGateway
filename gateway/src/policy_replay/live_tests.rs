@@ -6,7 +6,9 @@
 //! captures the audit events it writes, adapts them, and replays the result
 //! under the same policy. A replayed decision must be the live decision, or
 //! say why the record cannot decide: never a different answer. The facts the
-//! adapter read must be the facts the request carried, field by field.
+//! adapter read must be the facts the request carried, field by field, and
+//! the impact comparison must find every recorded verdict in agreement with
+//! the policy that recorded it.
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
@@ -25,6 +27,7 @@ use tower::ServiceExt;
 
 use super::{
     evaluate::{evaluate_http, evaluate_tool, HttpReplayLimitation, HttpReplayOutcome},
+    impact::{compare_recorded, http_answer, tool_answer, RecordedComparison, ReplayPolicy},
     legacy::{adapt_audit_event, LegacyRecord},
     HostRecord, McpIdentity, PrincipalRecord, RecordedPolicy, RecordedPrincipal, ReplayFacts,
     RoutingRecord,
@@ -78,7 +81,8 @@ fn http_policy(enforcement_mode: &str) -> Policy {
               "principal": { "principal_ids": ["subject-a"] }, "action": "allow" },
             { "id": "deny-mcp-certificates", "methods": ["*"], "path": "/mcp",
               "principal": { "auth_methods": ["client_certificate"] }, "action": "deny" },
-            { "id": "deny-alias-deletes", "methods": ["DELETE"], "path": ALIAS, "action": "deny" }
+            { "id": "deny-alias-deletes", "methods": ["DELETE"], "path": ALIAS, "action": "deny" },
+            { "methods": ["GET"], "path": "/base/indexed", "action": "allow" }
         ]
     }))
     .expect("the live test policy validates")
@@ -302,12 +306,15 @@ async fn replayed_http_decisions_are_the_live_middleware_decisions() {
     let mut alias_decided = 0_usize;
     let mut alias_indeterminate = 0_usize;
     let mut unclassified = 0_usize;
+    let mut indexed = 0_usize;
     let mut outcomes = HashMap::<&'static str, usize>::new();
     for mode in ["enforce", "shadow"] {
         let policy = http_policy(mode);
         let compiled =
             CompiledPolicy::from_validated_policy(policy.clone(), PolicyAuthority::Standalone)
                 .expect("the live test policy compiles");
+        let replay_policy =
+            ReplayPolicy::compile(policy.clone()).expect("the live test policy compiles");
         let capture = CaptureSink::new();
         let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
         let mut requests = Vec::new();
@@ -317,6 +324,7 @@ async fn replayed_http_decisions_are_the_live_middleware_decisions() {
             "/api/watch/1",
             "/api/me",
             "/base/thing",
+            "/base/indexed",
             ALIAS,
             "/mcp",
             "/other",
@@ -432,10 +440,23 @@ async fn replayed_http_decisions_are_the_live_middleware_decisions() {
             );
             assert_eq!(context.recorded.permission, live.permission, "{label}");
             assert_eq!(context.recorded.path_prefix, live.path_prefix, "{label}");
+            // The impact comparison reads the same record against the same
+            // policy and finds what was recorded.
+            let comparison = compare_recorded(
+                &replay_policy,
+                http_answer(&replay_policy, facts).expect("a recorded request is answered"),
+                &context.recorded,
+                context.source,
+            );
 
             match evaluate_http(&compiled, facts).expect("a recorded request evaluates") {
                 HttpReplayOutcome::Decided(replayed) => {
                     decided += 1;
+                    assert_eq!(comparison, RecordedComparison::Agrees, "{label}");
+                    if request.path == "/base/indexed" && replayed.reason.as_str() == "matched_rule"
+                    {
+                        indexed += 1;
+                    }
                     if request.path == ALIAS {
                         alias_decided += 1;
                     }
@@ -479,12 +500,18 @@ async fn replayed_http_decisions_are_the_live_middleware_decisions() {
                     );
                     assert_eq!(live.outcome, PolicyDecisionOutcome::Denied, "{label}");
                     assert_eq!(live.reason, "policy_evaluation_incomplete", "{label}");
+                    assert_eq!(
+                        comparison,
+                        RecordedComparison::RecordedNotPolicyVerdict,
+                        "{label}"
+                    );
                     unclassified += 1;
                 }
                 // The record does not say the alias was an alias, and the
                 // two readings disagree: no answer, rather than the wrong one.
                 HttpReplayOutcome::Indeterminate(HttpReplayLimitation::MissingMcpIdentity) => {
                     assert_eq!(request.path, ALIAS, "{label}");
+                    assert_eq!(comparison, RecordedComparison::BaseIndeterminate, "{label}");
                     alias_indeterminate += 1;
                 }
                 other => panic!("{label}: unexpected {other:?}"),
@@ -495,6 +522,8 @@ async fn replayed_http_decisions_are_the_live_middleware_decisions() {
     assert!(decided > 400, "{decided}");
     assert!(alias_decided > 0 && alias_indeterminate > 0);
     assert!(unclassified > 0);
+    // A rule without an id is recorded by its position, and found by it.
+    assert!(indexed > 0);
     for reason in [
         "matched_rule",
         "missing_permission",
@@ -545,6 +574,8 @@ async fn replayed_tool_admissions_are_the_live_runtime_decisions() {
     let compiled =
         CompiledPolicy::from_validated_policy(policy.clone(), PolicyAuthority::Standalone)
             .expect("the tool test policy compiles");
+    let replay_policy =
+        ReplayPolicy::compile(policy.clone()).expect("the tool test policy compiles");
     let capture = CaptureSink::new();
     let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
     let runtime = ToolRuntime::new_with_rbac_state(
@@ -629,6 +660,16 @@ async fn replayed_tool_admissions_are_the_live_runtime_decisions() {
             panic!("{label}: a tool record has tool facts");
         };
         assert_eq!(facts.tool_name, *tool, "{label}");
+        assert_eq!(
+            compare_recorded(
+                &replay_policy,
+                tool_answer(&replay_policy, facts).expect("a recorded invocation is answered"),
+                &context.recorded,
+                context.source,
+            ),
+            RecordedComparison::Agrees,
+            "{label}"
+        );
         let replayed = evaluate_tool(&compiled, facts).expect("a recorded invocation evaluates");
         *by_reason.entry(replayed.reason().as_str()).or_default() += 1;
         if *admitted {
