@@ -2,7 +2,7 @@
 
 `ggctl` is GreenGateway's operator command-line tool (issue #242, [ADR-0008](adr/0008-setup-cli-and-configuration-bundles.md)). It is a separate binary: the `gateway` server keeps its name, its no-argument startup, its Docker entrypoint and its one-shot commands (`gateway migrate`, `gateway healthcheck`, `gateway import-standalone`, ...) unchanged.
 
-**Status: foundation, alpha.** This build implements `version`, `schema`, `completion` and `help`, the output contract, the exit codes, secure bearer-token input and the version handshake with a running gateway. It cannot yet validate, initialize, diff, plan, apply, export or back up anything: those commands are later #242 slices (see the ADR's [rollout](adr/0008-setup-cli-and-configuration-bundles.md#rollout)), and a name this build does not implement is refused as an unknown command (exit 2). Nothing here changes how a gateway is configured or started.
+**Status: alpha.** This build implements `version`, `schema`, `validate`, `doctor`, `completion` and `help`, the output contract, the exit codes, secure bearer-token input and the version handshake with a running gateway. `validate` and `doctor` check a [configuration bundle](configuration-bundles.md) offline with the gateway's own bundle reader. `ggctl` cannot yet pin, convert, initialize, diff, plan, apply, export or back up anything, and it cannot yet validate an environment file (`--env`): those are later #242 slices (see the ADR's [rollout](adr/0008-setup-cli-and-configuration-bundles.md#rollout)), and a name this build does not implement is refused as an unknown command (exit 2). Nothing here changes how a gateway is configured or started: no gateway reads a bundle yet.
 
 ## Building
 
@@ -15,13 +15,15 @@ cargo build --locked --release -p ggctl
 
 It is not yet part of the release artifacts or the container image; packaging, checksums, SBOM and signing for Linux, macOS and Windows come with #242 PR 18. CI builds and tests it on all three platforms.
 
-The configuration contracts it shares with the gateway live in the `gateway-config` library crate, which both binaries link: today the published document schemas and the `GatewayCapabilities` handshake document. The bundle reader and the configuration compiler move there when `ggctl validate` arrives (#242 PR 8).
+The configuration contracts it shares with the gateway live in the `gateway-config` library crate, which both binaries link: the published document schemas, the `GatewayCapabilities` handshake document, RFC 8785 canonical JSON and the ADR-0004 digest frame, and the configuration bundle reader. Still in the gateway crate are the environment configuration compiler (`Config::from_env_vars`, being extracted by #433) and the production policy and tools validators, which depend on the rest of the gateway. The bundle reader takes those validators from its caller: the gateway passes its own, and `ggctl`, which cannot link them, reports that they did not run.
 
 ## Commands
 
 ```text
 ggctl version [--server URL] [--ca-file PATH] [--token-stdin | --token-file PATH] [--timeout SECONDS] [--format human|json]
 ggctl schema [KIND] [--api-version VERSION] [--format human|json]
+ggctl validate BUNDLE [--strict] [--warnings-as-errors] [--format human|json|sarif]
+ggctl doctor BUNDLE [--format human|json]
 ggctl completion bash|zsh|fish|powershell
 ggctl help [COMMAND]
 ggctl --help | --version
@@ -37,9 +39,66 @@ Prints the `ggctl` version and the document versions whose schemas it publishes.
 
 Without `KIND`, lists every document kind and version this `ggctl` publishes a JSON Schema (Draft 2020-12) for. With `KIND` (`GatewayBundle`, `GatewayDeployment`, `GatewayCapabilities` or `GgctlReport`), writes that schema to standard output, byte for byte as committed under [`docs/schemas`](schemas/) with LF line endings on every platform. `--api-version` selects a document version (default: the newest published); a version with no published schema exits `3`. Printing a schema writes an artifact, so `--format` is refused there. A schema is necessary but not sufficient: the gateway's reader is authoritative.
 
+### `validate`
+
+Reads the bundle in the directory `BUNDLE` with the bundle reader the gateway uses ([configuration bundles](configuration-bundles.md)) and reports every problem it finds, not just the first: unsafe or oversized files, the YAML subset and strict JSON, exact document versions, closed documents, references and SHA-256 pins, the published policy and tools schemas, and the deployment profile's policy invariants. It reads only beneath `BUNDLE`, writes nothing, makes no network request and reads no environment variable. `BUNDLE` must be valid UTF-8.
+
+- The human result names the bundle and says `valid` or `invalid` with counts; for a valid bundle it adds the source digest, the files and the profile, marking a `development` profile `non-production`. Each diagnostic goes to standard error with its file, line, column and JSON Pointer.
+- `--format json` writes one `GgctlReport` whose `result` holds `valid` and, once the manifest was read, what it declares (`bundle`); digests and the profile appear only when every stage passed. Diagnostics carry `location.file`, `location.pointer` and, where the reader has them, `location.line` and `location.column`.
+- `--format sarif` writes one SARIF 2.1.0 log with one rule per code and one result per diagnostic. File locations are relative to the `BUNDLE_ROOT` base, which the log describes but never resolves, because the bundle's path is an argument and no argument is echoed; map it to the bundle's directory in the tool that ingests the log.
+- `--strict` makes an entry the manifest does not reference an error instead of a warning. `--warnings-as-errors` keeps the diagnostics as they are and exits `3` when any warning was reported (`validate.warnings_as_errors`).
+
+`ggctl` cannot link the gateway's production policy and tools validators, so it does not run them: a bundled policy or tools document is checked against the bundle's own rules and its published schema only, every report about one says so (`validate.production_validators_not_run`, severity `info`, and `productionValidator: not_run` in the result), and the gateway can still refuse a document `validate` accepted. A digest is integrity metadata, not a signature: a valid bundle is not thereby a trusted one.
+
+Exit codes: `0` valid, `3` invalid (or any warning with `--warnings-as-errors`), `1` when the bundle could not be read at all (`bundle.root_unavailable`, `bundle.read_failed`, `bundle.changed_during_read`).
+
+In CI, validate the bundle a change touches and keep the SARIF log for review:
+
+```yaml
+- name: Validate the configuration bundle
+  run: ggctl validate deploy/bundle --strict --warnings-as-errors --format sarif > bundle.sarif
+```
+
+The step fails on exit `3` or `1`; upload `bundle.sarif` with the CI system's SARIF tooling if it annotates reviews.
+
+### `doctor`
+
+Runs the offline checks on the bundle in the directory `BUNDLE`. The doctor runs the same reader as `validate`, once, reports each stage as a check of its own, and then the [checks](#doctor-checks) that need more than the reader. It writes nothing, makes no network request and reads no environment variable; the network checks of ADR-0008 run only inside a gateway, which no `ggctl` command reaches yet.
+
+Every check has a stable `id`, a `severity` (`error` for a required check, whose failure fails the doctor; `warning` for advice), a `status` of `pass`, `warning`, `fail` or `skipped`, a `reason` (the first bundle reader code the stage found, or one of the [reasons](#doctor-reasons) below), a `remediation` anchor and a `durationMs`; the checks drawn from the one reader run all report that run's duration. `skipped` never counts as `pass`: when the reader stopped before it could show a stage clean on every file, the stage is `skipped` with `doctor.incomplete`, not `pass`.
+
+The human result lists each check's status, ID and reason on standard output and ends with whether a required check failed; the reader's diagnostics go to standard error. `--format json` writes one `GgctlReport` whose `result` holds `bundle` (as for `validate`) and `checks`. Exit codes: `0` when no required check failed, `3` when one did (with `doctor.required_check_failed`), `1` when the bundle could not be read.
+
+### Doctor checks
+
+| Check | Severity | What it covers |
+| --- | --- | --- |
+| `bundle.files` | error | The directory and its files: containment, links, special and hard-linked files, permissions, sizes, encoding and line endings. |
+| `bundle.syntax` | error | Strict JSON and the YAML subset, and the structural bounds. |
+| `bundle.compatibility` | error | Exact `apiVersion`, `kind` and resource `schema_version`. |
+| `bundle.structure` | error | Closed documents, required members, values and secret-reference forms. |
+| `bundle.references` | error | References between files, files present, and SHA-256 pins. |
+| `bundle.resources` | error | The bundled policy and tools documents against the bundle's rules and their published schemas. |
+| `bundle.profile` | error | A bundled policy against the deployment profile's invariants; `skipped` when the policy is the server's or there is none. |
+| `bundle.unreferenced_entries` | warning | Directory entries the manifest does not reference. |
+| `resources.production_validators` | error | The gateway's production policy and tools validators: always `skipped`, because they are not part of `ggctl`. |
+| `deployment.profile` | warning | Whether the deployment is a production one: `warning` for `migration` and `development`. |
+
+### Doctor reasons
+
+| Reason | Meaning |
+| --- | --- |
+| `doctor.passed` | The check ran and found nothing. |
+| `doctor.incomplete` | The reader stopped before it could show this check clean; see the other checks' reasons and the diagnostics. |
+| `doctor.server_managed` | The policy is left to the server's store, which an offline check cannot read. |
+| `doctor.not_declared` | The bundle declares nothing this check applies to. |
+| `doctor.validator_unavailable` | The bundle supplies a policy or tools document, but the production validators run only in the gateway. |
+| `doctor.migration_profile` | The deployment uses the `migration` profile, meant for moving an existing deployment over, not as a final state. |
+| `doctor.development_profile` | The deployment uses the `development` profile, which is not for production. |
+
 ### `completion`
 
-Writes a completion script to standard output. It completes commands, options, fixed choices and, for path options, file names.
+Writes a completion script to standard output. It completes commands, options, fixed choices, file names for path options and directory names for a `BUNDLE` argument.
 
 | Shell | Install |
 | --- | --- |
@@ -50,14 +109,16 @@ Writes a completion script to standard output. It completes commands, options, f
 
 ## Output contract
 
-- **Standard output carries only what was asked for**: an artifact (a schema, a completion script, help), the human result, or with `--format json` exactly one `GgctlReport` document ([schema](schemas/ggctl-report.v1alpha1.schema.json)).
-- **Diagnostics go to standard error** in human form. With `--format json` they are in the report instead and standard error stays empty.
+- **Standard output carries only what was asked for**: an artifact (a schema, a completion script, help), the human result, with `--format json` exactly one `GgctlReport` document ([schema](schemas/ggctl-report.v1alpha1.schema.json)), or with `validate --format sarif` exactly one SARIF 2.1.0 log.
+- **Diagnostics go to standard error** in human form. With `--format json` or `--format sarif` they are in the document instead and standard error stays empty.
 - **An argument error found before a command runs** (an unknown option, a refused secret or insecure option, a malformed `--server`) is written to standard error only, exits `2`, and writes no report.
 - **No color, no prompts, no progress output.** `ggctl` reads no configuration file and no environment variable, and makes no network request unless a command is given `--server`.
 
-A report always has `apiVersion: greengateway.dev/v1alpha1`, `kind: GgctlReport`, the `command`, the process `exitCode` and its stable `outcome` name, the `diagnostics`, and a command-specific `result`. Every diagnostic has a stable `code`, a `severity`, fixed `message` text, an optional fixed `hint`, a `remediation` anchor in this document and, when it concerns one argument, that argument's 1-based `location.argument` position. Diagnostics are value-free by construction: they never contain an argument, token, URL, path, address, server response or library error text. An unknown option is reported by its position, never by its spelling, because the spelling may be a mistyped secret. A published code never changes meaning; renaming or removing one needs a new report version.
+A report always has `apiVersion: greengateway.dev/v1alpha1`, `kind: GgctlReport`, the `command`, the process `exitCode` and its stable `outcome` name, the `diagnostics`, and a command-specific `result`. Every diagnostic has a stable `code`, a `severity` (`error`, `warning` or `info`), fixed `message` text, an optional fixed `hint`, a `remediation` anchor and at most one location: when it concerns one argument, that argument's 1-based `location.argument` position; when the bundle reader found it, the bundle-relative `location.file`, a `location.pointer` built from member names the reader defines, and the 1-based `location.line` and `location.column` where the reader has them. Diagnostics are value-free by construction: they never contain an argument, token, URL, path, address, document value, server response or library error text. An unknown option is reported by its position, never by its spelling, because the spelling may be a mistyped secret. A published code never changes meaning; renaming or removing one needs a new report version.
 
-SARIF 2.1.0 output belongs to `validate`, the one command ADR-0008 gives it, and arrives with it; the writer is part of this foundation, and no current command offers `--format sarif`.
+A report about a bundle carries the bundle reader's own codes (the `bundle`, `syntax`, `json`, `yaml`, `compat`, `schema`, `reference`, `secret`, `resource` and `profile` families), each listed in [configuration bundles](configuration-bundles.md#diagnostics), which is its remediation anchor. No code is spelled the same in both lists. A reader warning exits `0` on its own; a reader error exits `3`, or `1` when the bundle could not be read at all.
+
+SARIF 2.1.0 output belongs to `validate`, the one command ADR-0008 gives it.
 
 ## Exit codes
 
@@ -66,7 +127,7 @@ SARIF 2.1.0 output belongs to `validate`, the one command ADR-0008 gives it, and
 | `0` | `success` | Success; for `diff --check`, no drift; for `doctor`, no required check failed. |
 | `1` | `failure` | Unexpected internal, I/O or transport failure, including a mutation whose outcome could not be determined. |
 | `2` | `usage` | Usage error, including a reserved command or a refused insecure option. |
-| `3` | `invalid` | Invalid, incompatible or unsupported configuration, server or document version. |
+| `3` | `invalid` | Invalid, incompatible or unsupported configuration, server or document version; a failed required doctor check; any warning under `--warnings-as-errors`. |
 | `4` | `drift` | Drift found by `diff --check`. |
 | `5` | `conflict` | Precondition conflict: missing or stale ETag, plan, acknowledgment or lock. |
 | `6` | `unavailable` | A dependency was unavailable and nothing was sent or committed; safe to retry. |
@@ -193,6 +254,19 @@ Each code below is stable. The exit column is the exit code the diagnostic produ
 | --- | --- | --- |
 | `schema.unsupported_api_version` | 3 | No schema is published for that kind at that document version. |
 
+### Validate diagnostics
+
+| Code | Exit | Meaning |
+| --- | --- | --- |
+| `validate.production_validators_not_run` | 0 | Information: the bundle supplies a policy or tools document, and the gateway's production validators, which are not part of `ggctl`, did not run on it. The gateway can still refuse it. |
+| `validate.warnings_as_errors` | 3 | `--warnings-as-errors` was given and a warning was reported. |
+
+### Doctor diagnostics
+
+| Code | Exit | Meaning |
+| --- | --- | --- |
+| `doctor.required_check_failed` | 3 | A required [doctor check](#doctor-checks) failed. |
+
 ### Output diagnostics
 
 | Code | Exit | Meaning |
@@ -208,4 +282,4 @@ Each code below is stable. The exit column is the exit code the diagnostic produ
 
 ## Platform notes
 
-`ggctl` is tested on Linux, macOS and Windows. Exit codes, stream separation, terminal detection, token-file type and size checks and the remote client behave the same on all three. The owner-only permission check on token files applies on Unix only. Shell completion is generated for bash, zsh, fish and PowerShell.
+`ggctl` is tested on Linux, macOS and Windows. Exit codes, stream separation, terminal detection, token-file type and size checks and the remote client behave the same on all three. The owner-only permission check on token files applies on Unix only, and so does the bundle reader's refusal of a group- or other-writable bundle directory or file ([files and the directory](configuration-bundles.md#files-and-the-directory)); on Windows the reader enforces the link, reparse-point, regular-file and name rules, and ACLs are left to the operator. Shell completion is generated for bash, zsh, fish and PowerShell.

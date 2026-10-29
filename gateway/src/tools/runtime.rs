@@ -1793,7 +1793,15 @@ fn tool_principal_matches(
 }
 
 fn principal_from_tool_context(context: &ToolInvocationContext) -> Option<Principal> {
-    let actor = context.actor.as_ref()?;
+    principal_from_tool_actor(context.actor.as_ref()?, &context.request_id)
+}
+
+/// The principal the tool lane judges for an invocation's `actor`: one of the
+/// three modes the runtime projects, or none, which the lane judges as
+/// anonymous. Policy replay (#243) projects a recorded tool invocation's actor
+/// through this same function, so a replayed tool decision cannot read the
+/// actor differently from the invocation it replays.
+pub(crate) fn principal_from_tool_actor(actor: &Actor, session_id: &str) -> Option<Principal> {
     let auth_method = auth_method_from_audit_mode(&actor.auth_mode)?;
 
     Some(Principal {
@@ -1802,7 +1810,7 @@ fn principal_from_tool_context(context: &ToolInvocationContext) -> Option<Princi
         email: actor.email.clone(),
         org_id: None,
         roles: actor.roles.clone().unwrap_or_default(),
-        session_id: context.request_id.clone(),
+        session_id: session_id.to_owned(),
         auth_method,
     })
 }

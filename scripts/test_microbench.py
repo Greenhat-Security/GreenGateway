@@ -408,7 +408,7 @@ class BudgetSchemaTests(unittest.TestCase):
             "kernel byte growth": lambda value: value["targets"][-1].update(
                 max_allocated_bytes_growth=True),
             "unknown key": lambda value: value.update(skipped_targets=["http_policy"]),
-            "future schema": lambda value: value.update(schema_version=4),
+            "future schema": lambda value: value.update(schema_version=5),
             "boolean schema": lambda value: value.update(schema_version=True),
         }
         for name, change in changes.items():
@@ -648,6 +648,13 @@ def lane_limit(target):
     return {"id": target, "max_allocation_growth": 0, "max_allocated_bytes_growth": 0}
 
 
+def egress_budget():
+    value = lane_budget()
+    value["schema_version"] = 4
+    value["targets"].append(lane_limit("static_egress"))
+    return value
+
+
 LANES = ("tool_policy", "rate_lane")
 # Every target the lane harness can carry: the budgeted lanes and static egress.
 LANE_HARNESS_TARGETS = tuple(LANE_ROWS)
@@ -709,7 +716,11 @@ class LaneBudgetSchemaTests(unittest.TestCase):
             json.loads((ROOT / bench.BUDGET_PATH).read_text(encoding="utf-8")))
         self.assertTrue(bench.budgets_kernel(repository))
         self.assertTrue(bench.budgets_lanes(repository))
+        self.assertTrue(bench.budgets_egress(repository))
         self.assertEqual(bench.lane_policy(repository, repository), "enforced")
+        self.assertEqual(bench.egress_policy(repository, repository), "enforced")
+        self.assertEqual(bench._budget_entry(repository, "static_egress"),
+                         lane_limit("static_egress"))
         for key, path in (("harness_sha256", bench.HARNESS_PATH),
                           ("kernel_harness_sha256", bench.KERNEL_HARNESS_PATH),
                           ("lane_harness_sha256", bench.LANE_HARNESS_PATH)):
@@ -717,9 +728,9 @@ class LaneBudgetSchemaTests(unittest.TestCase):
                 committed = bench._digest((ROOT / path).read_text(encoding="utf-8"))
                 self.assertIn(committed, repository[key])
 
-    def test_no_budget_schema_lists_static_egress_yet(self):
-        # Budgeting static_egress is a later, reviewed schema change; until
-        # then a budget that names it is invalid rather than silently ignored.
+    def test_only_schema_four_lists_static_egress(self):
+        # A schema-3 budget that names static_egress is invalid rather than
+        # silently enforcing or ignoring it.
         value = lane_budget()
         value["targets"].append(lane_limit("static_egress"))
         with self.assertRaises(ValueError):
@@ -728,8 +739,9 @@ class LaneBudgetSchemaTests(unittest.TestCase):
         value["targets"][-1] = lane_limit("static_egress")
         with self.assertRaises(ValueError):
             bench.validate_budget(value)
-        repository = json.loads((ROOT / bench.BUDGET_PATH).read_text(encoding="utf-8"))
-        self.assertNotIn("static_egress", [entry["id"] for entry in repository["targets"]])
+        self.assertFalse(bench.budgets_egress(bench.validate_budget(lane_budget())))
+        self.assertFalse(bench.budgets_egress(bench.validate_budget(kernel_budget())))
+        self.assertFalse(bench.budgets_egress(bench.validate_budget(budget())))
 
     def test_lane_adoption_follows_the_base_budget_and_keeps_http_policy_enforced(self):
         self.assertEqual(bench.lane_policy(kernel_budget(), kernel_budget()), "pending")
@@ -741,6 +753,74 @@ class LaneBudgetSchemaTests(unittest.TestCase):
         self.assertEqual(bench.kernel_policy(lane_budget(), lane_budget()), "enforced")
         with self.assertRaisesRegex(ValueError, "retire"):
             bench.kernel_policy(lane_budget(), budget())
+
+
+class EgressBudgetSchemaTests(unittest.TestCase):
+    def test_schema_four_budgets_the_kernel_the_lanes_and_static_egress(self):
+        value = bench.validate_budget(egress_budget())
+        self.assertTrue(bench.budgets_kernel(value))
+        self.assertTrue(bench.budgets_lanes(value))
+        self.assertTrue(bench.budgets_egress(value))
+        self.assertEqual([entry["id"] for entry in value["targets"]][-4:],
+                         ["http_policy", "tool_policy", "rate_lane", "static_egress"])
+        self.assertEqual(bench._budget_entry(value, "static_egress"), lane_limit("static_egress"))
+        self.assertEqual(bench._budget_entry(value, "rate_lane"), lane_limit("rate_lane"))
+        with self.assertRaises(ValueError):
+            bench._budget_entry(lane_budget(), "static_egress")
+        report = bench.compare_results(result(), result(), value)
+        self.assertEqual([target["id"] for target in report["targets"]], list(bench.TARGET_IDS))
+
+    def test_egress_budget_must_be_complete_ordered_approved_and_zero(self):
+        changes = {
+            "egress target missing": lambda value: value["targets"].pop(),
+            "egress before rate lane": lambda value: value["targets"].insert(
+                -1, value["targets"].pop()),
+            "egress before the lanes": lambda value: value["targets"].insert(
+                5, value["targets"].pop()),
+            "egress listed twice": lambda value: value["targets"].append(
+                lane_limit("static_egress")),
+            "rate lane missing": lambda value: value["targets"].pop(-2),
+            "egress growth": lambda value: value["targets"][-1].update(max_allocation_growth=1),
+            "egress byte growth": lambda value: value["targets"][-1].update(
+                max_allocated_bytes_growth=True),
+            "negative egress growth": lambda value: value["targets"][-1].update(
+                max_allocation_growth=-1),
+            # The test lives in the lane harness, which lane_harness_sha256
+            # approves; there is no separate digest list to fall back on.
+            "no lane digests": lambda value: value.pop("lane_harness_sha256"),
+            "egress digests": lambda value: value.update(egress_harness_sha256=["e" * 64]),
+            "three lane digests": lambda value: value.update(
+                lane_harness_sha256=["1" * 64, "2" * 64, "3" * 64]),
+            "no kernel digests": lambda value: value.pop("kernel_harness_sha256"),
+            "unknown key": lambda value: value.update(skipped_targets=["static_egress"]),
+            "future schema": lambda value: value.update(schema_version=5),
+        }
+        for name, change in changes.items():
+            with self.subTest(change=name):
+                value = egress_budget()
+                change(value)
+                with self.assertRaises(ValueError):
+                    bench.validate_budget(value)
+        schema_four_without_egress = lane_budget()
+        schema_four_without_egress["schema_version"] = 4
+        with self.assertRaises(ValueError):
+            bench.validate_budget(schema_four_without_egress)
+
+    def test_egress_adoption_follows_the_base_budget_and_keeps_the_lanes_enforced(self):
+        self.assertEqual(bench.egress_policy(lane_budget(), lane_budget()), "pending")
+        self.assertEqual(bench.egress_policy(lane_budget(), egress_budget()), "proposed")
+        self.assertEqual(bench.egress_policy(kernel_budget(), egress_budget()), "proposed")
+        self.assertEqual(bench.egress_policy(egress_budget(), egress_budget()), "enforced")
+        for proposed in (lane_budget(), kernel_budget(), budget()):
+            with self.subTest(proposed=proposed["schema_version"]):
+                with self.assertRaisesRegex(ValueError, "retire"):
+                    bench.egress_policy(egress_budget(), proposed)
+        # Budgeting static egress never relaxes the targets it follows.
+        self.assertEqual(bench.lane_policy(lane_budget(), egress_budget()), "enforced")
+        self.assertEqual(bench.lane_policy(egress_budget(), egress_budget()), "enforced")
+        self.assertEqual(bench.kernel_policy(egress_budget(), egress_budget()), "enforced")
+        with self.assertRaisesRegex(ValueError, "retire"):
+            bench.lane_policy(egress_budget(), kernel_budget())
 
 
 class LaneResultTests(unittest.TestCase):

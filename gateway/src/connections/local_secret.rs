@@ -2189,6 +2189,7 @@ mod tests {
             .create(
                 "Anchored database",
                 secret(SecretPurpose::StaticBearer, CANARY),
+                &ChangeActor::for_test("test-admin"),
             )
             .expect("secret should create in the store's opened database");
         assert_eq!(
