@@ -5,9 +5,11 @@
 //! [`run`] is the whole engine. It reads the pages of the source window a job
 //! was pinned to, oldest first; reads each stored event through
 //! [`legacy::adapt_audit_event`]; decides every replayable context with the
-//! functions in [`evaluate`], which build the kernel's own contexts and call
-//! [`CompiledPolicy`]; and folds every answer into counts keyed by stable
-//! codes. Nothing in it matches a rule, a route or a tool entry itself.
+//! functions in [`super::evaluate`], which build the kernel's own contexts and
+//! call [`crate::policy_eval::CompiledPolicy`], under the candidate and the
+//! base it was written against ([`super::impact`]); and folds every answer
+//! into counts keyed by stable codes. Nothing in it matches a rule, a route or
+//! a tool entry itself.
 //!
 //! ## Bounds
 //!
@@ -30,9 +32,9 @@
 //! The window, the cutoff and the record bound fix which rows a run reads and
 //! in which order; every count is keyed by a stable code and rendered sorted;
 //! and the result digest is the ADR-0004 semantic digest of the rendered
-//! result. Two complete runs over the same cutoff and policy therefore produce
-//! byte-identical results, whatever the machine or its load. A run stopped by
-//! its deadline is the one exception, and says so.
+//! result. Two complete runs over the same cutoff and policies therefore
+//! produce byte-identical results, whatever the machine or its load. A run
+//! stopped by its deadline is the one exception, and says so.
 //!
 //! ## No side effects
 //!
@@ -51,16 +53,13 @@ use std::{
 use serde_json::{json, Map, Value};
 
 use super::{
-    evaluate::{evaluate_http, evaluate_tool, select_rate_lane, HttpReplayOutcome},
+    impact::{Answer, ImpactTally, RateAnswer, ReplayPolicies},
     legacy::{adapt_audit_event, LegacyRecord},
     EgressRecord, ReplayFacts,
 };
 use crate::{
     audit::query::{AuditQueryStore, ReplayCutoff, ReplayPageQuery, ReplayRow},
     canonical_json,
-    policy_eval::{CompiledPolicy, EvaluationError, LogicalDecision, RateLaneOutcome},
-    policy_simulation::run::enforcement_and_effect,
-    policy_testing::runner::{evaluation_error_code, logical_code, tool_limitation_code},
 };
 
 /// The schema of a job's result document.
@@ -192,6 +191,9 @@ pub(crate) struct ReplayOutcome {
     pub(crate) result: Value,
     /// Its ADR-0004 semantic digest.
     pub(crate) digest: String,
+    /// The impact comparison's counts per projection, for the job's
+    /// completion record: codes and counts only.
+    pub(crate) impact: Value,
 }
 
 /// Counts for one lane: how its replayable records were answered.
@@ -210,6 +212,28 @@ struct LaneTally {
 }
 
 impl LaneTally {
+    /// Count the candidate's answer for one replayable record.
+    fn add(&mut self, answer: Answer) {
+        match answer {
+            Answer::Decided(decided) => {
+                let state = decided.state();
+                *self
+                    .decided
+                    .entry((
+                        state.logical,
+                        state.enforcement,
+                        state.effective_action,
+                        state.reason,
+                    ))
+                    .or_default() += 1;
+            }
+            Answer::Indeterminate(limitation) => {
+                *self.indeterminate.entry(limitation).or_default() += 1;
+            }
+            Answer::Refused(code) => *self.refused.entry(code).or_default() += 1,
+        }
+    }
+
     fn decided_count(&self) -> u64 {
         self.decided.values().sum()
     }
@@ -258,6 +282,18 @@ struct RateTally {
 }
 
 impl RateTally {
+    /// Count the candidate's selection for one replayable HTTP record.
+    fn add(&mut self, answer: RateAnswer) {
+        match answer {
+            RateAnswer::NoOverride => self.no_override += 1,
+            RateAnswer::Override { .. } => self.overrides += 1,
+            RateAnswer::Indeterminate(limitation) => {
+                *self.indeterminate.entry(limitation).or_default() += 1;
+            }
+            RateAnswer::Refused(code) => *self.refused.entry(code).or_default() += 1,
+        }
+    }
+
     fn render(&self) -> Value {
         json!({
             "no_override": self.no_override,
@@ -270,9 +306,9 @@ impl RateTally {
     }
 }
 
-/// Every count a run keeps. Keys come from closed sets of stable codes, so
-/// the tally's size is bounded by the codes, not by the window.
-#[derive(Default)]
+/// Every count a run keeps. Keys come from closed sets of stable codes, and
+/// the impact comparison's from element pairs of the policies, so the tally's
+/// size is bounded by the codes and the policies, not by the window.
 struct Tally {
     scanned: u64,
     by_code: BTreeMap<&'static str, u64>,
@@ -287,36 +323,34 @@ struct Tally {
     http: LaneTally,
     rate: RateTally,
     tool: LaneTally,
+    impact: ImpactTally,
 }
-
-/// An evaluator error, sorted into the two answers a run gives one: the
-/// record's facts were refused (a stable code, counted), or the run itself
-/// is broken (`None`: the job fails, and nothing it counted is an answer).
-///
-/// Exhaustive on purpose: a new error is a decision this function must make.
-fn refusal_code(error: EvaluationError) -> Option<&'static str> {
-    match error {
-        EvaluationError::MalformedPath
-        | EvaluationError::ContextTooLarge
-        | EvaluationError::InvalidPrincipal
-        | EvaluationError::InvalidHost
-        | EvaluationError::InconsistentContext => Some(evaluation_error_code(error)),
-        EvaluationError::UnsupportedContextVersion
-        | EvaluationError::SnapshotMismatch
-        | EvaluationError::InternalInvariant
-        | EvaluationError::TraceEncoding
-        | EvaluationError::TraceTooLarge => None,
-    }
-}
-
-const EVALUATOR_FAILED: ReplayStop = ReplayStop::Failed("evaluator_failed");
 
 impl Tally {
+    fn new(policies: &ReplayPolicies) -> Self {
+        Self {
+            scanned: 0,
+            by_code: BTreeMap::new(),
+            replayable: 0,
+            duplicate: 0,
+            not_policy_evaluated: 0,
+            unsupported: 0,
+            malformed: 0,
+            not_request_record: 0,
+            unreadable: 0,
+            oversized: 0,
+            http: LaneTally::default(),
+            rate: RateTally::default(),
+            tool: LaneTally::default(),
+            impact: ImpactTally::new(policies),
+        }
+    }
+
     fn count(&mut self, code: &'static str) {
         *self.by_code.entry(code).or_default() += 1;
     }
 
-    fn observe(&mut self, policy: &CompiledPolicy, row: &ReplayRow) -> Result<(), ReplayStop> {
+    fn observe(&mut self, policies: &ReplayPolicies, row: &ReplayRow) -> Result<(), ReplayStop> {
         self.scanned += 1;
         let event = match row {
             ReplayRow::Event(event) => event,
@@ -342,15 +376,25 @@ impl Tally {
                         if matches!(facts.egress, EgressRecord::Destination(_)) {
                             self.http.egress_not_replayed += 1;
                         }
-                        self.decide_http(policy, facts)?;
-                        self.select_rate(policy, facts)?;
+                        let answer =
+                            self.impact
+                                .observe_http(policies, facts, &context.recorded)?;
+                        self.http.add(answer);
+                        let selection = self.impact.observe_rate(policies, facts)?;
+                        self.rate.add(selection);
                     }
                     ReplayFacts::Tool(facts) => {
                         self.tool.replayable += 1;
                         if matches!(facts.egress, EgressRecord::Destination(_)) {
                             self.tool.egress_not_replayed += 1;
                         }
-                        self.decide_tool(policy, facts)?;
+                        let answer = self.impact.observe_tool(
+                            policies,
+                            facts,
+                            &context.recorded,
+                            context.source,
+                        )?;
+                        self.tool.add(answer);
                     }
                 }
             }
@@ -363,105 +407,6 @@ impl Tally {
         Ok(())
     }
 
-    fn decide_http(
-        &mut self,
-        policy: &CompiledPolicy,
-        facts: &super::HttpFacts,
-    ) -> Result<(), ReplayStop> {
-        match evaluate_http(policy, facts) {
-            Ok(HttpReplayOutcome::Decided(decision)) => {
-                let (enforcement, effective_action) =
-                    enforcement_and_effect(decision.logical, decision.effect);
-                *self
-                    .http
-                    .decided
-                    .entry((
-                        logical_code(decision.logical),
-                        enforcement,
-                        effective_action,
-                        decision.reason.as_str(),
-                    ))
-                    .or_default() += 1;
-            }
-            Ok(HttpReplayOutcome::Indeterminate(limitation)) => {
-                *self
-                    .http
-                    .indeterminate
-                    .entry(limitation.as_str())
-                    .or_default() += 1;
-            }
-            Err(error) => {
-                let code = refusal_code(error).ok_or(EVALUATOR_FAILED)?;
-                *self.http.refused.entry(code).or_default() += 1;
-            }
-        }
-        Ok(())
-    }
-
-    fn select_rate(
-        &mut self,
-        policy: &CompiledPolicy,
-        facts: &super::HttpFacts,
-    ) -> Result<(), ReplayStop> {
-        match select_rate_lane(policy, facts) {
-            Ok(selection) => match selection.outcome() {
-                RateLaneOutcome::NoOverride => self.rate.no_override += 1,
-                RateLaneOutcome::Override { .. } => self.rate.overrides += 1,
-                RateLaneOutcome::Indeterminate(limitation) => {
-                    *self
-                        .rate
-                        .indeterminate
-                        .entry(limitation.as_str())
-                        .or_default() += 1;
-                }
-            },
-            Err(error) => {
-                let code = refusal_code(error).ok_or(EVALUATOR_FAILED)?;
-                *self.rate.refused.entry(code).or_default() += 1;
-            }
-        }
-        Ok(())
-    }
-
-    fn decide_tool(
-        &mut self,
-        policy: &CompiledPolicy,
-        facts: &super::ToolFacts,
-    ) -> Result<(), ReplayStop> {
-        let evaluation = match evaluate_tool(policy, facts) {
-            Ok(evaluation) => evaluation,
-            Err(error) => {
-                let code = refusal_code(error).ok_or(EVALUATOR_FAILED)?;
-                *self.tool.refused.entry(code).or_default() += 1;
-                return Ok(());
-            }
-        };
-        if !evaluation.is_complete() || evaluation.logical() == LogicalDecision::Indeterminate {
-            // An unanswered evaluation always names what it lacked; one that
-            // does not is the kernel breaking its own contract.
-            let limitation = evaluation.limitation().ok_or(EVALUATOR_FAILED)?;
-            *self
-                .tool
-                .indeterminate
-                .entry(tool_limitation_code(limitation))
-                .or_default() += 1;
-            return Ok(());
-        }
-        let (enforcement, effective_action) =
-            enforcement_and_effect(evaluation.logical(), evaluation.effect());
-        *self
-            .tool
-            .decided
-            .entry((
-                logical_code(evaluation.logical()),
-                enforcement,
-                effective_action,
-                evaluation.reason().as_str(),
-            ))
-            .or_default() += 1;
-        Ok(())
-    }
-
     /// Records the candidate answered, decided or indeterminate.
     fn replayed(&self) -> u64 {
         self.http.decided_count()
@@ -470,7 +415,13 @@ impl Tally {
             + self.tool.indeterminate_count()
     }
 
-    fn render(&self, scope: &ReplayScope, complete: bool, limitations: &[&'static str]) -> Value {
+    fn render(
+        &self,
+        policies: &ReplayPolicies,
+        scope: &ReplayScope,
+        complete: bool,
+        limitations: &[&'static str],
+    ) -> Value {
         let mut records = Map::new();
         records.insert("selected".to_owned(), json!(scope.cutoff.selected));
         records.insert("scanned".to_owned(), json!(self.scanned));
@@ -507,13 +458,14 @@ impl Tally {
                 "rate": self.rate.render(),
                 "tool": self.tool.render(),
             },
+            "impact": self.impact.render(policies, complete),
             "not_replayed": NOT_REPLAYED,
         })
     }
 }
 
 /// Run one job: read `scope` from `source`, oldest first, and decide every
-/// replayable record under `policy`.
+/// replayable record under each of `policies`.
 ///
 /// Stops before the next record when `control` is cancelled
 /// ([`ReplayStop::Cancelled`]), and fails on a source read or an evaluator
@@ -524,12 +476,12 @@ impl Tally {
 /// incomplete with `source_changed`, never a silent omission.
 pub(crate) fn run(
     source: &dyn ReplaySource,
-    policy: &CompiledPolicy,
+    policies: &ReplayPolicies,
     scope: &ReplayScope,
     deadline: Instant,
     control: &ReplayControl,
 ) -> Result<ReplayOutcome, ReplayStop> {
-    let mut tally = Tally::default();
+    let mut tally = Tally::new(policies);
     let max_records = scope.max_records.min(MAX_REPLAY_RECORDS);
     let mut deadline_exceeded = false;
     if let (Some(first_id), Some(last_id)) = (scope.cutoff.first_id, scope.cutoff.last_id) {
@@ -571,7 +523,7 @@ pub(crate) fn run(
                 if *id <= query.after_id || *id > query.through_id {
                     return Err(ReplayStop::Failed("source_unavailable"));
                 }
-                tally.observe(policy, row)?;
+                tally.observe(policies, row)?;
                 query.after_id = *id;
                 control.scanned.store(tally.scanned, Ordering::Relaxed);
             }
@@ -606,7 +558,7 @@ pub(crate) fn run(
     }
     limitations.sort_unstable();
     let complete = limitations.is_empty();
-    let result = tally.render(scope, complete, &limitations);
+    let result = tally.render(policies, scope, complete, &limitations);
     let digest = canonical_json::semantic_digest(RESULT_MEDIA_TYPE, RESULT_SCHEMA_VERSION, &result)
         .map_err(|_| ReplayStop::Failed("result_digest_failed"))?;
     Ok(ReplayOutcome {
@@ -616,5 +568,6 @@ pub(crate) fn run(
         replayed,
         result,
         digest,
+        impact: tally.impact.summary(),
     })
 }

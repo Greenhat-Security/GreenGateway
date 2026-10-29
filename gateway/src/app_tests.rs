@@ -1,14 +1,20 @@
 use super::*;
 #[path = "admin_config_app_tests.rs"]
 mod admin_config_app_tests;
+#[path = "admin_identity_app_tests.rs"]
+mod admin_identity_app_tests;
 #[path = "admin_policy_drafts_tests.rs"]
 mod admin_policy_drafts_tests;
 #[path = "admin_session_app_tests.rs"]
 mod admin_session_app_tests;
+#[path = "admin_tokens_app_tests.rs"]
+mod admin_tokens_app_tests;
 #[path = "audit_durability_app_tests.rs"]
 mod audit_durability_app_tests;
 #[path = "audit_stream_app_tests.rs"]
 mod audit_stream_app_tests;
+#[path = "auth_app_tests.rs"]
+mod auth_app_tests;
 #[path = "authority_evidence_app_tests.rs"]
 mod authority_evidence_app_tests;
 use crate::auth::TokenStore;
@@ -654,10 +660,6 @@ async fn mock_oidc_token(
     Json(response).into_response()
 }
 
-fn admin_oidc_login_router(issuer: &str) -> Router {
-    admin_oidc_login_router_from_config(admin_oidc_login_config(issuer))
-}
-
 fn admin_oidc_login_router_from_config(mut config: config::Config) -> Router {
     config.egress_deny_private_ips = false;
     let recorder = PrometheusBuilder::new().build_recorder();
@@ -728,95 +730,6 @@ fn admin_oidc_cookies(response: &Response) -> String {
         .join("; ")
 }
 
-fn admin_oidc_complete_request(cookies: &str, code: &str, state: &str) -> Request<Body> {
-    let csrf = cookies
-        .split(';')
-        .find_map(|pair| pair.trim().strip_prefix("csrf_token="))
-        .unwrap_or("test-csrf");
-    let cookies = if cookies.contains("csrf_token=") {
-        cookies.to_owned()
-    } else {
-        format!("{cookies}; csrf_token={csrf}")
-    };
-    Request::builder()
-        .method(Method::POST)
-        .uri(ADMIN_AUTH_CALLBACK_ROUTE)
-        .header(header::COOKIE, cookies)
-        .header("x-csrf-token", csrf)
-        .header(header::ORIGIN, "http://gateway.example.test")
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(
-            json!({"code": code, "state": state}).to_string(),
-        ))
-        .expect("completion request")
-}
-
-async fn assert_admin_oidc_token(response: Response, expected: &str) {
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
-    assert!(!response.headers().contains_key(header::LOCATION));
-    assert!(response
-        .headers()
-        .get_all(header::SET_COOKIE)
-        .iter()
-        .any(|value| value.to_str().unwrap().contains("Max-Age=0")));
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["access_token"],
-        expected
-    );
-}
-
-async fn admin_oidc_id_token_callback_response(
-    id_token_for_nonce: impl FnOnce(&str, &str) -> String,
-) -> (Response, String) {
-    let jwks_addr = spawn_test_jwks_server().await;
-    let jwks_url = format!("http://127.0.0.1:{}/jwks.json", jwks_addr.port());
-    let token_endpoint = spawn_mock_oidc_token_endpoint(Ipv4Addr::new(127, 0, 0, 2), None).await;
-    let oidc = spawn_mock_oidc_discovery_endpoint(Some(token_endpoint.url.clone()));
-    let access_token = signed_token_with_issuer("admin-operator", &["admin"], &oidc.issuer);
-    token_endpoint.set_access_token(access_token.clone());
-
-    let mut config = admin_oidc_login_config(&oidc.issuer);
-    config.auth_providers[0].jwks_url = Some(jwks_url);
-    let router = admin_oidc_login_router_from_config(config);
-
-    let login_response = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/v1/admin/auth/login")
-                .body(Body::empty())
-                .expect("login request should build"),
-        )
-        .await
-        .expect("login request should complete");
-    let cookies = admin_oidc_cookies(&login_response);
-    let login_location = response_location(&login_response);
-    let authorization_url =
-        Url::parse(&login_location).expect("authorization redirect should be absolute");
-    let authorization_query = url_query_pairs(&authorization_url);
-    let state = authorization_query
-        .get("state")
-        .expect("authorization redirect should include state");
-    let nonce = authorization_query
-        .get("nonce")
-        .expect("authorization redirect should include nonce");
-    token_endpoint.set_id_token(id_token_for_nonce(nonce, &oidc.issuer));
-
-    let callback_response = router
-        .oneshot(admin_oidc_complete_request(&cookies, "admin-code", state))
-        .await
-        .expect("completion request should complete");
-
-    oidc.finish();
-    token_endpoint.abort();
-
-    (callback_response, access_token)
-}
-
 fn response_location(response: &Response) -> String {
     response
         .headers()
@@ -826,51 +739,8 @@ fn response_location(response: &Response) -> String {
         .to_owned()
 }
 
-fn admin_oidc_login_request(peer_ip: Ipv4Addr, forwarded_for: Option<&str>) -> Request<Body> {
-    let mut request = Request::builder()
-        .uri(ADMIN_AUTH_LOGIN_ROUTE)
-        .body(Body::empty())
-        .expect("admin OIDC login request should build");
-    request
-        .extensions_mut()
-        .insert(axum::extract::ConnectInfo(SocketAddr::new(
-            IpAddr::V4(peer_ip),
-            12_345,
-        )));
-    if let Some(forwarded_for) = forwarded_for {
-        request.headers_mut().insert(
-            X_FORWARDED_FOR_HEADER,
-            HeaderValue::from_str(forwarded_for)
-                .expect("forwarded client IP should be a valid header value"),
-        );
-    }
-    request
-}
-
 fn url_query_pairs(url: &Url) -> HashMap<String, String> {
     url.query_pairs().into_owned().collect()
-}
-
-fn form_pairs(body: &str) -> HashMap<String, String> {
-    url::form_urlencoded::parse(body.as_bytes())
-        .into_owned()
-        .collect()
-}
-
-fn fragment_query_pairs(location: &str, expected_path: &str) -> Option<HashMap<String, String>> {
-    let url = Url::parse(&format!("http://gateway.test{location}"))
-        .expect("relative redirect location should parse against test origin");
-    let fragment = url.fragment()?;
-    let (path, query) = fragment.split_once('?')?;
-    if path != expected_path {
-        return None;
-    }
-
-    Some(form_pairs(query))
-}
-
-fn pkce_challenge_for_verifier(verifier: &str) -> String {
-    base64url_no_padding(&Sha256::digest(verifier.as_bytes()))
 }
 
 fn base64url_no_padding(bytes: &[u8]) -> String {
@@ -891,12 +761,6 @@ fn base64url_no_padding(bytes: &[u8]) -> String {
     }
 
     output
-}
-
-fn is_pkce_unreserved(value: &str) -> bool {
-    value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~'))
 }
 
 fn gateway_app_for_test(config: config::Config) -> GatewayApps {
@@ -2517,139 +2381,6 @@ async fn audit_log_extension_is_available_to_middleware() {
     .expect("request should complete");
 
     assert_eq!(response.status(), StatusCode::OK);
-}
-
-#[tokio::test]
-async fn auth_disabled_skips_non_exempt_route_without_principal() {
-    let mut config = test_config(Vec::new());
-    config.auth_enabled = false;
-    let capture = audit::sink::tests::CaptureSink::new();
-    let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
-    let recorder = PrometheusBuilder::new().build_recorder();
-
-    let response = app(
-        config,
-        recorder.handle(),
-        audit_log,
-        test_audit_event_sender(),
-    )
-    .expect("app should build")
-    .oneshot(
-        Request::builder()
-            .uri("/__test/principal")
-            .body(Body::empty())
-            .expect("request should build"),
-    )
-    .await
-    .expect("request should complete");
-
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    assert_eventually(Duration::from_secs(1), || !capture.events().is_empty());
-    let events = capture.events();
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| event.event_type == "http.request_observed")
-            .count(),
-        1
-    );
-    assert!(!events
-        .iter()
-        .any(|event| event.event_type.starts_with("auth.")));
-}
-
-#[tokio::test]
-async fn observe_auth_forwards_anonymous_request_to_rbac_enforcement() {
-    let policy = TempPolicyFile::new(
-        r#"{
-                "schema_version": "0.1.0",
-                "default_action": "deny",
-                "enforcement_mode": "enforce",
-                "roles": {},
-                "routes": [
-                    {
-                        "path_prefix": "/__test",
-                        "permission": "test:read"
-                    }
-                ]
-            }"#,
-    );
-    let mut config = test_config(Vec::new());
-    config.auth_mode = config::AuthMode::Observe;
-    config.policy_file = Some(policy.path.to_string_lossy().into_owned());
-    let capture = audit::sink::tests::CaptureSink::new();
-    let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
-    let recorder = PrometheusBuilder::new().build_recorder();
-    let router = app(
-        config,
-        recorder.handle(),
-        audit_log,
-        test_audit_event_sender(),
-    )
-    .expect("app should build");
-    let request_id = "request-observe-auth-rbac-deny";
-
-    let response = router
-        .oneshot(
-            Request::builder()
-                .uri("/__test/principal")
-                .header(REQUEST_ID_HEADER, request_id)
-                .body(Body::empty())
-                .expect("request should build"),
-        )
-        .await
-        .expect("request should complete");
-
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert_eq!(body_string(response).await, r#"{"error":"forbidden"}"#);
-    assert_eventually(Duration::from_secs(1), || {
-        let events = capture.events();
-        events
-            .iter()
-            .any(|event| event.event_type == "auth.failure")
-            && events
-                .iter()
-                .any(|event| event.event_type == "authz.denied")
-            && events
-                .iter()
-                .any(|event| event.event_type == "http.request_observed")
-    });
-
-    let events = capture.events();
-    let auth_failure = events
-        .iter()
-        .find(|event| event.event_type == "auth.failure")
-        .expect("auth failure should be captured");
-    assert_eq!(auth_failure.request_id, request_id);
-    assert_eq!(auth_failure.payload["path"], json!("/__test/principal"));
-    assert_eq!(auth_failure.payload["reason"], json!("missing_credential"));
-
-    let authz_denied = events
-        .iter()
-        .find(|event| event.event_type == "authz.denied")
-        .expect("authz denied should be captured");
-    assert_eq!(authz_denied.request_id, request_id);
-    assert_eq!(authz_denied.payload["path"], json!("/__test/principal"));
-    assert_eq!(authz_denied.payload["path_prefix"], json!("/__test"));
-    assert_eq!(authz_denied.payload["permission"], json!("test:read"));
-    assert_eq!(authz_denied.payload["reason"], json!("missing_principal"));
-
-    let observed = events
-        .iter()
-        .find(|event| event.event_type == "http.request_observed")
-        .expect("observation event should be captured");
-    assert_eq!(observed.request_id, request_id);
-    assert_eq!(observed.payload["status"], json!(403));
-    assert_eq!(
-        observed.payload["auth_outcome"],
-        json!("anonymous_or_failed")
-    );
-    assert_eq!(observed.payload["auth_reason"], json!("missing_credential"));
-    assert_eq!(observed.payload["policy_decision"], json!("denied"));
-    assert_eq!(
-        observed.payload["policy_reason"],
-        json!("missing_principal")
-    );
 }
 
 #[tokio::test]
@@ -4663,44 +4394,6 @@ async fn custom_admin_prefix_api_requires_and_accepts_real_bearer_auth() {
 }
 
 #[tokio::test]
-async fn real_service_token_authenticates_through_full_stack() {
-    let token_db = TempDb::new("service-token-full-stack");
-    let token_store =
-        auth::tokens::SqliteTokenStore::open(&token_db.path).expect("token store should open");
-    let created = token_store
-        .create(auth::tokens::CreateTokenRequest {
-            scopes: vec!["probe-reader".to_owned()],
-            created_by: "bootstrap-admin".to_owned(),
-            expires_at: None,
-        })
-        .expect("service token should create");
-    let policy = TempPolicyFile::new(&service_token_policy_document());
-    let mut config = test_config(Vec::new());
-    config.policy_file = Some(policy.path.to_string_lossy().into_owned());
-    config.service_token_sqlite_path = Some(token_db.path.to_string_lossy().into_owned());
-    config.service_token_cache_ttl_ms = 20;
-    let recorder = PrometheusBuilder::new().build_recorder();
-    let router = app(
-        config,
-        recorder.handle(),
-        test_audit_log(),
-        test_audit_event_sender(),
-    )
-    .expect("app should build");
-
-    let response = authenticated_principal_probe(&router, &created.plaintext_token).await;
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = json_body(response).await;
-    assert_eq!(
-        body["user_id"],
-        json!(format!("service-token:{}", created.record.id))
-    );
-    assert_eq!(body["auth_method"], json!("service_token"));
-    assert_eq!(body["roles"], json!(["probe-reader"]));
-}
-
-#[tokio::test]
 async fn mcp_initialize_handshake_succeeds() {
     let harness = mcp_test_harness(&["admin"], test_audit_log()).await;
 
@@ -6080,45 +5773,37 @@ async fn mcp_real_client_connects_lists_calls_and_records_observability() {
         }))
     );
 
-    // Audit/discovery completion may still be queued on this current-thread
-    // runtime after the SDK receives its response. A blocking polling helper
-    // prevents that work from progressing, especially under instrumentation.
-    let observation_deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let events = harness.capture.events();
-        let has_start = events.iter().any(|event| {
-            event.event_type == audit::event::TOOL_INVOKE_START
-                && event.request_id == request_id
-                && event.payload["tool_name"] == json!("echo")
-        });
-        let has_success = events.iter().any(|event| {
-            event.event_type == audit::event::TOOL_INVOKE_SUCCESS
-                && event.request_id == request_id
-                && event.payload["tool_name"] == json!("echo")
-        });
-        let has_tool_observation = events.iter().any(|event| {
-            event.event_type == "http.request_observed"
-                && event.request_id == request_id
-                && event.payload["method"] == json!("MCP")
-                && event.payload["path"] == json!("/mcp/tools/echo")
-                && event.payload["status"] == json!(200)
-        });
+    // Audit/discovery completion may still be queued after the SDK receives
+    // its response; wait for delivery without blocking this current-thread
+    // runtime, which still has that work to drive.
+    wait_for_delivered_audit_events(
+        &harness.capture,
+        "the MCP start, success and observation events",
+        |events| {
+            let has_start = events.iter().any(|event| {
+                event.event_type == audit::event::TOOL_INVOKE_START
+                    && event.request_id == request_id
+                    && event.payload["tool_name"] == json!("echo")
+            });
+            let has_success = events.iter().any(|event| {
+                event.event_type == audit::event::TOOL_INVOKE_SUCCESS
+                    && event.request_id == request_id
+                    && event.payload["tool_name"] == json!("echo")
+            });
+            let has_tool_observation = events.iter().any(|event| {
+                is_mcp_tool_observation(event, request_id)
+                    && event.payload["path"] == json!("/mcp/tools/echo")
+                    && event.payload["status"] == json!(200)
+            });
+            has_start && has_success && has_tool_observation
+        },
+    )
+    .await;
 
-        if has_start && has_success && has_tool_observation {
-            break;
-        }
-        assert!(
-            Instant::now() < observation_deadline,
-            "MCP start, success and observation events did not all arrive"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-
-    let row =
-        wait_for_mcp_tool_inventory_row(&harness.router, &harness.admin_token, "echo", |row| {
-            row["call_count"] == json!(1) && status_count(row, 200) == Some(1)
-        })
-        .await;
+    let row = wait_for_mcp_tool_inventory_row(&harness, &[request_id], "echo", |row| {
+        row["call_count"] == json!(1) && status_count(row, 200) == Some(1)
+    })
+    .await;
     assert_eq!(row["method"], json!("MCP"));
     assert_eq!(row["endpoint_template"], json!("/mcp/tools/echo"));
     assert_eq!(row["call_count"], json!(1));
@@ -6162,7 +5847,7 @@ async fn successful_mcp_tool_call_appears_as_per_tool_traffic_inventory_row() {
     assert_eq!(body["result"]["isError"], json!(false));
 
     let row =
-        wait_for_mcp_tool_inventory_row(&harness.router, &harness.admin_token, "echo", |row| {
+        wait_for_mcp_tool_inventory_row(&harness, &["mcp-inventory-success"], "echo", |row| {
             row["call_count"] == json!(1) && status_count(row, 200) == Some(1)
         })
         .await;
@@ -6221,8 +5906,8 @@ async fn proxied_mcp_tool_call_appears_as_per_tool_traffic_inventory_row() {
     assert_eq!(body["result"]["isError"], json!(false));
 
     let row = wait_for_mcp_tool_inventory_row(
-        &harness.router,
-        &harness.admin_token,
+        &harness,
+        &["mcp-inventory-proxied"],
         "alpha:remote_echo",
         |row| row["call_count"] == json!(1) && status_count(row, 200) == Some(1),
     )
@@ -6272,7 +5957,7 @@ async fn non_schema_mismatch_mcp_tool_failure_appears_as_error_inventory_row() {
     assert_eq!(body["error"]["code"], json!(-32603));
 
     let row =
-        wait_for_mcp_tool_inventory_row(&harness.router, &harness.admin_token, "echo", |row| {
+        wait_for_mcp_tool_inventory_row(&harness, &["mcp-inventory-failure"], "echo", |row| {
             row["call_count"] == json!(1) && status_count(row, 502) == Some(1)
         })
         .await;
@@ -6311,11 +5996,13 @@ async fn unknown_mcp_tool_call_appears_as_inventory_row() {
 
     // The call is still inventoried, but under the shared unknown-tool
     // template: a caller-supplied name may not mint an inventory key.
-    let row =
-        wait_for_mcp_tool_inventory_row(&harness.router, &harness.admin_token, "{tool}", |row| {
-            row["call_count"] == json!(1) && status_count(row, 404) == Some(1)
-        })
-        .await;
+    let row = wait_for_mcp_tool_inventory_row(
+        &harness,
+        &["mcp-inventory-unknown-tool"],
+        "{tool}",
+        |row| row["call_count"] == json!(1) && status_count(row, 404) == Some(1),
+    )
+    .await;
     assert_eq!(row["method"], json!("MCP"));
     assert_eq!(row["endpoint_template"], json!("/mcp/tools/{tool}"));
     assert_eq!(row["call_count"], json!(1));
@@ -6365,29 +6052,30 @@ async fn task_style_mcp_tool_call_is_rejected_by_gateway_and_records_inventory()
     assert_eq!(body["error"]["data"]["tool_name"], json!("echo"));
     assert_eq!(body["error"]["data"]["reason"], json!("task_unsupported"));
 
-    assert_eventually(Duration::from_secs(1), || {
-        let events = harness.capture.events();
-        let failure_seen = events.iter().any(|event| {
-            event.event_type == audit::event::TOOL_INVOKE_FAILURE
-                && event.request_id == request_id
-                && event.payload["tool_name"] == json!("echo")
-        });
-        let observation_seen = events.iter().any(|event| {
-            event.event_type == "http.request_observed"
-                && event.request_id == request_id
-                && event.payload["method"] == json!("MCP")
-                && event.payload["tool_name"] == json!("echo")
-                && event.payload["status"] == json!(400)
-                && event.payload["reason"] == json!("task_unsupported")
-        });
-        failure_seen && observation_seen
-    });
+    wait_for_delivered_audit_events(
+        &harness.capture,
+        "the task-style failure and its observation",
+        |events| {
+            let failure_seen = events.iter().any(|event| {
+                event.event_type == audit::event::TOOL_INVOKE_FAILURE
+                    && event.request_id == request_id
+                    && event.payload["tool_name"] == json!("echo")
+            });
+            let observation_seen = events.iter().any(|event| {
+                is_mcp_tool_observation(event, request_id)
+                    && event.payload["tool_name"] == json!("echo")
+                    && event.payload["status"] == json!(400)
+                    && event.payload["reason"] == json!("task_unsupported")
+            });
+            failure_seen && observation_seen
+        },
+    )
+    .await;
 
-    let row =
-        wait_for_mcp_tool_inventory_row(&harness.router, &harness.admin_token, "echo", |row| {
-            row["call_count"] == json!(1) && status_count(row, 400) == Some(1)
-        })
-        .await;
+    let row = wait_for_mcp_tool_inventory_row(&harness, &[request_id], "echo", |row| {
+        row["call_count"] == json!(1) && status_count(row, 400) == Some(1)
+    })
+    .await;
     assert_eq!(row["method"], json!("MCP"));
     assert_eq!(row["endpoint_template"], json!("/mcp/tools/echo"));
     assert_eq!(row["call_count"], json!(1));
@@ -6427,22 +6115,20 @@ async fn task_style_unknown_mcp_tool_call_uses_unknown_tool_inventory_path() {
     );
     assert_eq!(body["error"]["data"]["tool_name"], json!("missing_tool"));
 
-    assert_eventually(Duration::from_secs(1), || {
-        harness.capture.events().iter().any(|event| {
-            event.event_type == "http.request_observed"
-                && event.request_id == request_id
-                && event.payload["method"] == json!("MCP")
+    wait_for_delivered_audit_events(&harness.capture, "the unknown-tool observation", |events| {
+        events.iter().any(|event| {
+            is_mcp_tool_observation(event, request_id)
                 && event.payload["tool_name"] == json!("missing_tool")
                 && event.payload["status"] == json!(404)
                 && event.payload["reason"] == json!("unknown_tool")
         })
-    });
+    })
+    .await;
 
-    let row =
-        wait_for_mcp_tool_inventory_row(&harness.router, &harness.admin_token, "{tool}", |row| {
-            row["call_count"] == json!(1) && status_count(row, 404) == Some(1)
-        })
-        .await;
+    let row = wait_for_mcp_tool_inventory_row(&harness, &[request_id], "{tool}", |row| {
+        row["call_count"] == json!(1) && status_count(row, 404) == Some(1)
+    })
+    .await;
     assert_eq!(row["method"], json!("MCP"));
     assert_eq!(row["endpoint_template"], json!("/mcp/tools/{tool}"));
     assert_eq!(row["call_count"], json!(1));
@@ -6461,7 +6147,10 @@ async fn repeated_mcp_tool_calls_accumulate_into_one_inventory_row() {
     })
     .await;
 
-    for index in 0..3 {
+    let request_ids = (0..3)
+        .map(|index| format!("mcp-inventory-repeat-{index}"))
+        .collect::<Vec<_>>();
+    for (index, request_id) in (0..).zip(&request_ids) {
         let (status, body) = mcp_rpc(
             &harness.router,
             Some(&harness.admin_token),
@@ -6473,18 +6162,18 @@ async fn repeated_mcp_tool_calls_accumulate_into_one_inventory_row() {
                     "message": format!("inventory repeat {index}")
                 }
             })),
-            &format!("mcp-inventory-repeat-{index}"),
+            request_id,
         )
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["result"]["isError"], json!(false));
     }
 
-    let row =
-        wait_for_mcp_tool_inventory_row(&harness.router, &harness.admin_token, "echo", |row| {
-            row["call_count"] == json!(3) && status_count(row, 200) == Some(3)
-        })
-        .await;
+    let request_ids = request_ids.iter().map(String::as_str).collect::<Vec<_>>();
+    let row = wait_for_mcp_tool_inventory_row(&harness, &request_ids, "echo", |row| {
+        row["call_count"] == json!(3) && status_count(row, 200) == Some(3)
+    })
+    .await;
     assert_eq!(row["endpoint_template"], json!("/mcp/tools/echo"));
     assert_eq!(row["call_count"], json!(3));
     assert_eq!(status_count(&row, 200), Some(3));
@@ -7778,73 +7467,6 @@ async fn principal_directory_list_counts_failed_auth_without_creating_principal_
 
     assert_eq!(body["principals"], json!([]));
     assert_eq!(body["anonymous_request_count"], json!(1));
-}
-
-#[tokio::test]
-async fn real_cookie_session_authenticates_through_full_stack() {
-    let (introspection_url, introspection_server) =
-        spawn_blocking_cookie_session_server(Ipv4Addr::LOCALHOST, 1);
-    let mut config = test_config(Vec::new());
-    configure_test_cookie_session_provider(&mut config, introspection_url);
-    config.egress_deny_private_ips = false;
-    let recorder = PrometheusBuilder::new().build_recorder();
-    let router = app(
-        config,
-        recorder.handle(),
-        test_audit_log(),
-        test_audit_event_sender(),
-    )
-    .expect("app should build");
-
-    let response = router
-        .oneshot(
-            Request::builder()
-                .uri("/__test/principal")
-                .header(header::COOKIE, "session=session-secret-123")
-                .body(Body::empty())
-                .expect("request should build"),
-        )
-        .await
-        .expect("request should complete");
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = json_body(response).await;
-    assert_eq!(body["user_id"], json!("cookie-user"));
-    assert_eq!(body["auth_method"], json!("session_cookie"));
-    assert_eq!(body["roles"], json!(["admin", "member"]));
-    assert_eq!(introspection_server.finish(), 1);
-}
-
-#[tokio::test]
-async fn cookie_session_introspection_host_is_auto_seeded_for_cross_host_egress() {
-    let (introspection_url, introspection_server) =
-        spawn_blocking_cookie_session_server(Ipv4Addr::new(127, 0, 0, 2), 1);
-    let mut config = test_config(Vec::new());
-    configure_test_cookie_session_provider(&mut config, introspection_url);
-    config.egress_deny_private_ips = false;
-    let recorder = PrometheusBuilder::new().build_recorder();
-    let router = app(
-        config,
-        recorder.handle(),
-        test_audit_log(),
-        test_audit_event_sender(),
-    )
-    .expect("app should build");
-
-    let response = router
-        .oneshot(
-            Request::builder()
-                .uri("/__test/principal")
-                .header(header::COOKIE, "session=session-secret-123")
-                .body(Body::empty())
-                .expect("request should build"),
-        )
-        .await
-        .expect("request should complete");
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(json_body(response).await["user_id"], json!("cookie-user"));
-    assert_eq!(introspection_server.finish(), 1);
 }
 
 #[test]
@@ -17623,865 +17245,6 @@ async fn all_connection_mutations_report_unconfigured_store_as_unavailable() {
     }
 }
 
-#[tokio::test]
-async fn token_create_rejects_scopes_the_creator_does_not_hold() {
-    let token_db = TempDb::new("token-create-rejects-escalation");
-    let policy = TempPolicyFile::new(&token_policy_document_string());
-    let capture = audit::sink::tests::CaptureSink::new();
-    let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
-    let router = token_admin_router(&token_db, &policy, audit_log);
-
-    let response = router
-        .clone()
-        .oneshot(token_admin_request(
-            Method::POST,
-            TOKENS_ADMIN_ROUTE,
-            Some(test_principal(&["tokens-writer"])),
-            Some(json!({ "scopes": ["token-admin"] }).to_string()),
-        ))
-        .await
-        .expect("token create request should complete");
-
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert_eq!(
-        body_string(response).await,
-        r#"{"error":"requested scopes exceed creator authority: token-admin"}"#
-    );
-
-    let list_response = router
-        .oneshot(token_admin_request(
-            Method::GET,
-            TOKENS_ADMIN_ROUTE,
-            Some(test_principal(&["tokens-reader"])),
-            None,
-        ))
-        .await
-        .expect("token list request should complete");
-    assert_eq!(list_response.status(), StatusCode::OK);
-    assert_eq!(json_body(list_response).await["tokens"], json!([]));
-
-    let event = captured_token_delegation_rejection(&capture);
-    assert_token_change_actor(&event);
-    assert!(!event.request_id.is_empty());
-    assert_eq!(event.source_ip, "unknown");
-    assert_eq!(event.payload["decision"], json!("deny"));
-    assert_eq!(
-        event.payload["reason"],
-        json!("requested_scopes_exceed_creator_authority")
-    );
-    assert_eq!(event.payload["requested_scopes"], json!(["token-admin"]));
-    assert_eq!(event.payload["disallowed_scopes"], json!(["token-admin"]));
-    assert!(!capture
-        .events()
-        .iter()
-        .any(|event| event.event_type == audit::event::SERVICE_TOKEN_CHANGED));
-}
-
-#[tokio::test]
-async fn token_create_rejects_carried_role_inactive_for_creator_identity() {
-    let token_db = TempDb::new("token-create-rejects-inactive-role");
-    let policy = TempPolicyFile::new(&token_policy_document_string());
-    let router = token_admin_router(&token_db, &policy, test_audit_log());
-
-    let response = router
-        .oneshot(token_admin_request(
-            Method::POST,
-            TOKENS_ADMIN_ROUTE,
-            Some(test_principal(&["tokens-writer", "service-admin"])),
-            Some(json!({ "scopes": ["service-admin"] }).to_string()),
-        ))
-        .await
-        .expect("token create request should complete");
-
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert_eq!(
-        body_string(response).await,
-        r#"{"error":"requested scopes exceed creator authority: service-admin"}"#
-    );
-}
-
-#[tokio::test]
-async fn token_create_allows_wildcard_creator_to_delegate_any_scope() {
-    let token_db = TempDb::new("token-create-wildcard-delegation");
-    let policy = TempPolicyFile::new(&token_policy_document_string());
-    let router = token_admin_router(&token_db, &policy, test_audit_log());
-
-    let response = router
-        .oneshot(token_admin_request(
-            Method::POST,
-            TOKENS_ADMIN_ROUTE,
-            Some(test_principal(&["superadmin"])),
-            Some(json!({ "scopes": ["some-narrow-role", "mcp:tools"] }).to_string()),
-        ))
-        .await
-        .expect("wildcard token create request should complete");
-
-    assert_eq!(response.status(), StatusCode::CREATED);
-    assert_eq!(
-        json_body(response).await["token"]["scopes"],
-        json!(["some-narrow-role", "mcp:tools"])
-    );
-}
-
-#[tokio::test]
-async fn token_create_allows_scopes_within_creator_roles() {
-    let token_db = TempDb::new("token-create-bounded-delegation");
-    let policy = TempPolicyFile::new(&token_policy_document_string());
-    let router = token_admin_router(&token_db, &policy, test_audit_log());
-
-    let response = router
-        .oneshot(token_admin_request(
-            Method::POST,
-            TOKENS_ADMIN_ROUTE,
-            Some(test_principal(&["tokens-writer", "probe-reader"])),
-            Some(json!({ "scopes": ["probe-reader"] }).to_string()),
-        ))
-        .await
-        .expect("bounded token create request should complete");
-
-    assert_eq!(response.status(), StatusCode::CREATED);
-    assert_eq!(
-        json_body(response).await["token"]["scopes"],
-        json!(["probe-reader"])
-    );
-}
-
-/// Exercise the same admin handler against both storage implementations.
-/// Rejected rotation must preserve the record and the original credential.
-async fn assert_token_rotation_delegation_contract(store: Arc<dyn storage::ServiceTokenStore>) {
-    let mut policy_json: Value =
-        serde_json::from_str(&token_policy_document_string()).expect("token policy should be JSON");
-    policy_json["roles"]["issuer-admin"] = json!({
-        "permissions": ["*"],
-        "issuers": ["https://issuer.example.test/"]
-    });
-    let policy = parse_policy_body(&Bytes::from(policy_json.to_string()))
-        .expect("token policy should parse");
-    let config = test_config(Vec::new());
-
-    for (roles, scopes, expected) in [
-        (
-            vec!["tokens-writer"],
-            vec!["probe-reader"],
-            StatusCode::FORBIDDEN,
-        ),
-        (
-            vec!["tokens-writer", "unknown-role"],
-            vec!["unknown-role"],
-            StatusCode::FORBIDDEN,
-        ),
-        (
-            vec!["tokens-writer", "service-admin"],
-            vec!["service-admin"],
-            StatusCode::FORBIDDEN,
-        ),
-        (
-            vec!["tokens-writer", "issuer-admin"],
-            vec!["issuer-admin"],
-            StatusCode::FORBIDDEN,
-        ),
-        (
-            vec!["probe-reader"],
-            vec!["probe-reader"],
-            StatusCode::FORBIDDEN,
-        ),
-        (
-            vec!["tokens-writer", "probe-reader"],
-            vec!["probe-reader"],
-            StatusCode::OK,
-        ),
-        (
-            vec!["superadmin"],
-            vec!["unknown-role", "mcp:tools"],
-            StatusCode::OK,
-        ),
-    ] {
-        let created = store
-            .create(auth::tokens::CreateTokenRequest {
-                scopes: scopes.iter().map(|scope| (*scope).to_owned()).collect(),
-                created_by: "bootstrap-admin".to_owned(),
-                expires_at: None,
-            })
-            .await
-            .expect("fixture token should create");
-        let capture = audit::sink::tests::CaptureSink::new();
-        let audit_log =
-            audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
-        let rbac_state =
-            middleware::rbac::RbacState::new(policy.clone(), Vec::new(), false, audit_log.clone());
-        let principal = test_principal(&roles);
-        let can_manage =
-            rbac_state.principal_has_permission(&principal, ADMIN_TOKENS_WRITE_PERMISSION);
-        let state = TokenAdminState {
-            store: Some(Arc::clone(&store)),
-            validator: None,
-            rbac_state: Some(rbac_state),
-            audit: audit_log,
-            client_ip_policy: client_ip::ClientIpPolicy::from_config(&config),
-            max_body_size: config.max_body_size,
-        };
-        let request = token_admin_request(
-            Method::POST,
-            &format!("{TOKENS_ADMIN_ROUTE}/{}/rotate", created.record.id),
-            Some(principal),
-            None,
-        );
-        let response =
-            token_rotate_endpoint(State(state), Path(created.record.id.clone()), request).await;
-        assert_eq!(
-            response.status(),
-            expected,
-            "roles={roles:?}, scopes={scopes:?}"
-        );
-
-        if expected == StatusCode::FORBIDDEN {
-            let body = json_body(response).await;
-            assert!(body.get("plaintext_token").is_none());
-            let unchanged = store
-                .get_by_id(&created.record.id)
-                .await
-                .expect("stored token should read")
-                .expect("denied rotation must retain the token");
-            assert_eq!(unchanged, created.record);
-            assert!(matches!(
-                store
-                    .verify(&created.plaintext_token)
-                    .await
-                    .expect("token should verify"),
-                auth::tokens::TokenVerification::Valid(_)
-            ));
-            if can_manage {
-                let event = captured_token_delegation_rejection(&capture);
-                assert_eq!(event.payload["decision"], json!("deny"));
-                assert_eq!(event.payload["requested_scopes"], json!(scopes));
-                assert_eq!(event.payload["disallowed_scopes"], json!(scopes));
-                let serialized = serde_json::to_string(&event).expect("audit should serialize");
-                assert!(!serialized.contains(&created.plaintext_token));
-                assert!(!serialized.contains("token_hash"));
-            }
-            assert!(!capture
-                .events()
-                .iter()
-                .any(|event| { event.event_type == audit::event::SERVICE_TOKEN_CHANGED }));
-        } else {
-            let body = json_body(response).await;
-            assert_eq!(body["token"]["id"], json!(created.record.id));
-            assert_eq!(body["token"]["scopes"], json!(scopes));
-            let plaintext = body["plaintext_token"]
-                .as_str()
-                .expect("allowed rotation returns the replacement credential");
-            assert!(matches!(
-                store
-                    .verify(&created.plaintext_token)
-                    .await
-                    .expect("old token should check"),
-                auth::tokens::TokenVerification::Invalid(_)
-            ));
-            assert!(matches!(
-                store
-                    .verify(plaintext)
-                    .await
-                    .expect("replacement should verify"),
-                auth::tokens::TokenVerification::Valid(_)
-            ));
-            let event = captured_token_change(&capture, "token_rotated");
-            let serialized = serde_json::to_string(&event).expect("audit should serialize");
-            assert!(!serialized.contains(plaintext));
-            assert!(!serialized.contains(&created.plaintext_token));
-        }
-    }
-}
-
-#[tokio::test]
-async fn token_rotation_delegation_contract_sqlite() {
-    let token_db = TempDb::new("token-rotation-delegation");
-    let store =
-        auth::tokens::SqliteTokenStore::open(&token_db.path).expect("token store should open");
-    assert_token_rotation_delegation_contract(Arc::new(store)).await;
-}
-
-#[cfg(feature = "postgres")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn token_rotation_delegation_contract_postgres() {
-    use storage::contract_tests::postgres_audit_tests::{
-        create_test_database, locator, write_dsn_file, DATABASE,
-    };
-
-    let Some(admin_dsn) = locator() else {
-        eprintln!("skipping PostgreSQL rotation contract: no test database locator");
-        return;
-    };
-    let _serial = DATABASE.lock().await;
-    let database = create_test_database(&admin_dsn).await;
-    let dsn_file = write_dsn_file(&database.dsn);
-    let mut config = config::Config::test_defaults();
-    config.state_backend = config::StateBackend::Postgres;
-    config.deployment_id = Some("deploy-token-rotation-contract".to_owned());
-    config.database.url_file = Some(dsn_file.path.clone());
-    config.database.tls_mode = config::DatabaseTlsMode::LoopbackDev;
-    let foundation = storage::postgres::PostgresFoundation::establish(&config)
-        .await
-        .expect("test database should establish");
-    storage::migrations::apply_missing_for_startup(foundation.pool(), &config.database)
-        .await
-        .expect("test database should migrate");
-    let store =
-        storage::postgres_service_tokens::PostgresServiceTokenStore::new(foundation.pool().clone());
-    assert_token_rotation_delegation_contract(Arc::new(store)).await;
-}
-
-/// One service-token change evidence row as the admin endpoints' test reads
-/// it: action, token, actor subject, actor issuer, actor kind, auth mode.
-type TokenChangeActorRow = (
-    String,
-    String,
-    String,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-);
-
-/// Issue #425: the admin rotate and revoke endpoints pass the authenticated
-/// principal to the store, which records it -- subject, canonical issuer,
-/// actor kind and auth mode -- as the change's evidence. Neither the token's
-/// creator nor a fixed label stands in for it. A person signed in through
-/// one provider rotates, a bearer principal from a second provider revokes
-/// that token, and a service token revokes another; the rows the store
-/// recorded are returned beside the evidence each should be.
-async fn admin_token_changes_record_the_authenticated_actor(
-    store: Arc<dyn storage::ServiceTokenStore>,
-) -> Vec<TokenChangeActorRow> {
-    let policy = parse_policy_body(&Bytes::from(token_policy_document_string()))
-        .expect("token policy should parse");
-    let config = test_config(Vec::new());
-    let audit_log = test_audit_log();
-    let state = TokenAdminState {
-        store: Some(Arc::clone(&store)),
-        validator: None,
-        rbac_state: Some(middleware::rbac::RbacState::new(
-            policy,
-            Vec::new(),
-            false,
-            audit_log.clone(),
-        )),
-        audit: audit_log,
-        client_ip_policy: client_ip::ClientIpPolicy::from_config(&config),
-        max_body_size: config.max_body_size,
-    };
-    let mut ids = Vec::new();
-    for _ in 0..2 {
-        ids.push(
-            store
-                .create(auth::tokens::CreateTokenRequest {
-                    scopes: vec!["probe-reader".to_owned()],
-                    created_by: "bootstrap-admin".to_owned(),
-                    expires_at: None,
-                })
-                .await
-                .expect("fixture token should create")
-                .record
-                .id,
-        );
-    }
-    let principal = |user_id: &str, issuer: Option<&str>, auth_method| auth::Principal {
-        user_id: user_id.to_owned(),
-        issuer: issuer.map(str::to_owned),
-        auth_method,
-        ..test_principal(&["superadmin"])
-    };
-
-    let rotated = token_rotate_endpoint(
-        State(state.clone()),
-        Path(ids[0].clone()),
-        token_admin_request(
-            Method::POST,
-            &format!("{TOKENS_ADMIN_ROUTE}/{}/rotate", ids[0]),
-            Some(principal(
-                "rotating-admin",
-                Some(" https://idp.example.test/ "),
-                auth::AuthMethod::Cookie,
-            )),
-            None,
-        ),
-    )
-    .await;
-    assert_eq!(rotated.status(), StatusCode::OK);
-    for (id, actor) in [
-        (
-            &ids[0],
-            principal(
-                "revoking-admin",
-                Some("https://other-idp.example.test"),
-                auth::AuthMethod::Bearer,
-            ),
-        ),
-        (
-            &ids[1],
-            principal(
-                "service-token:token_admin",
-                None,
-                auth::AuthMethod::ServiceToken,
-            ),
-        ),
-    ] {
-        let revoked = token_revoke_endpoint(
-            State(state.clone()),
-            Path(id.clone()),
-            token_admin_request(
-                Method::DELETE,
-                &format!("{TOKENS_ADMIN_ROUTE}/{id}"),
-                Some(actor),
-                None,
-            ),
-        )
-        .await;
-        assert_eq!(revoked.status(), StatusCode::OK);
-    }
-
-    let owned = |value: &str| value.to_owned();
-    vec![
-        (
-            owned("service_token.rotate"),
-            ids[0].clone(),
-            owned("rotating-admin"),
-            Some(owned("https://idp.example.test")),
-            Some(owned("principal")),
-            Some(owned("session_cookie")),
-        ),
-        (
-            owned("service_token.revoke"),
-            ids[0].clone(),
-            owned("revoking-admin"),
-            Some(owned("https://other-idp.example.test")),
-            Some(owned("principal")),
-            Some(owned("bearer_token")),
-        ),
-        (
-            owned("service_token.revoke"),
-            ids[1].clone(),
-            owned("service-token:token_admin"),
-            None,
-            Some(owned("service_token")),
-            Some(owned("service_token")),
-        ),
-    ]
-}
-
-#[tokio::test]
-async fn admin_token_rotate_and_revoke_record_the_authenticated_subject_and_issuer_sqlite() {
-    let token_db = TempDb::new("token-change-actor-evidence");
-    let store =
-        auth::tokens::SqliteTokenStore::open(&token_db.path).expect("token store should open");
-    let expected = admin_token_changes_record_the_authenticated_actor(Arc::new(store)).await;
-    let connection = Connection::open(&token_db.path).expect("token database should open");
-    let mut statement = connection
-        .prepare(
-            "SELECT action, token_id, actor_user_id, actor_issuer, actor_kind, actor_auth_mode \
-             FROM service_token_change_evidence ORDER BY sequence",
-        )
-        .expect("evidence query should prepare");
-    let recorded = statement
-        .query_map([], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-            ))
-        })
-        .expect("evidence query should run")
-        .collect::<Result<Vec<TokenChangeActorRow>, _>>()
-        .expect("evidence rows should decode");
-    assert_eq!(recorded, expected);
-}
-
-#[cfg(feature = "postgres")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn admin_token_rotate_and_revoke_record_the_authenticated_subject_and_issuer_postgres() {
-    use storage::contract_tests::postgres_audit_tests::{
-        create_test_database, locator, write_dsn_file, DATABASE,
-    };
-
-    let Some(admin_dsn) = locator() else {
-        eprintln!("skipping PostgreSQL change-actor evidence: no test database locator");
-        return;
-    };
-    let _serial = DATABASE.lock().await;
-    let database = create_test_database(&admin_dsn).await;
-    let dsn_file = write_dsn_file(&database.dsn);
-    let mut config = config::Config::test_defaults();
-    config.state_backend = config::StateBackend::Postgres;
-    config.deployment_id = Some("deploy-token-change-actor".to_owned());
-    config.database.url_file = Some(dsn_file.path.clone());
-    config.database.tls_mode = config::DatabaseTlsMode::LoopbackDev;
-    let foundation = storage::postgres::PostgresFoundation::establish(&config)
-        .await
-        .expect("test database should establish");
-    storage::migrations::apply_missing_for_startup(foundation.pool(), &config.database)
-        .await
-        .expect("test database should migrate");
-    let store =
-        storage::postgres_service_tokens::PostgresServiceTokenStore::new(foundation.pool().clone());
-    let expected = admin_token_changes_record_the_authenticated_actor(Arc::new(store)).await;
-    let recorded = foundation
-        .pool()
-        .get()
-        .await
-        .expect("evidence checkout")
-        .query(
-            "SELECT action, token_id, actor_user_id, actor_issuer, actor_kind, actor_auth_mode \
-             FROM greengateway.service_token_change_evidence \
-             ORDER BY security_revision",
-            &[],
-        )
-        .await
-        .expect("evidence rows should read")
-        .iter()
-        .map(|row| {
-            (
-                row.get(0),
-                row.get(1),
-                row.get(2),
-                row.get(3),
-                row.get(4),
-                row.get(5),
-            )
-        })
-        .collect::<Vec<TokenChangeActorRow>>();
-    assert_eq!(recorded, expected);
-}
-
-/// Pins the narrowed create mapping restored from the #340 review: a
-/// malformed `expires_at` is a `400` naming the field, because it is the
-/// one invalid-input case the caller controls on create.
-/// An oversized scope list is refused before the store (and before
-/// delegation is judged): the bound is the client's error, never the
-/// store's check constraint surfacing as a `500`.
-#[tokio::test]
-async fn token_create_with_an_oversized_scope_list_is_a_bad_request() {
-    let token_db = TempDb::new("token-create-oversized-scopes");
-    let policy = TempPolicyFile::new(&token_policy_document_string());
-    let router = token_admin_router(&token_db, &policy, test_audit_log());
-    let scopes = (0..3_000)
-        .map(|index| format!("probe-reader-{index:0>40}"))
-        .collect::<Vec<_>>();
-
-    let response = router
-        .oneshot(token_admin_request(
-            Method::POST,
-            TOKENS_ADMIN_ROUTE,
-            Some(test_principal(&["tokens-writer", "probe-reader"])),
-            Some(json!({ "scopes": scopes }).to_string()),
-        ))
-        .await
-        .expect("oversized-scopes create request should complete");
-
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        body_string(response).await,
-        r#"{"error":"service-token scopes exceed the maximum serialized size"}"#
-    );
-}
-
-/// Scopes become roles at authentication, so a scope list the validator would
-/// refuse is refused when written -- before delegation is judged, which is why
-/// an unheld 257-byte scope is a `400` here and not a `403`.
-#[tokio::test]
-async fn token_create_with_scopes_outside_the_role_bounds_is_a_bad_request() {
-    for (index, (scopes, expected)) in [
-        (
-            json!(["probe-reader", ""]),
-            r#"{"error":"service-token scopes out of bounds: an empty role"}"#,
-        ),
-        (
-            json!(["r".repeat(auth::principal::MAX_PRINCIPAL_ROLE_BYTES + 1)]),
-            r#"{"error":"service-token scopes out of bounds: a role longer than 256 bytes"}"#,
-        ),
-        (
-            json!((0..=auth::principal::MAX_PRINCIPAL_ROLES)
-                .map(|index| format!("probe-reader-{index}"))
-                .collect::<Vec<_>>()),
-            r#"{"error":"service-token scopes out of bounds: more than 256 roles"}"#,
-        ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let token_db = TempDb::new(&format!("token-create-scope-bounds-{index}"));
-        let policy = TempPolicyFile::new(&token_policy_document_string());
-        let router = token_admin_router(&token_db, &policy, test_audit_log());
-
-        let response = router
-            .oneshot(token_admin_request(
-                Method::POST,
-                TOKENS_ADMIN_ROUTE,
-                Some(test_principal(&["tokens-writer", "probe-reader"])),
-                Some(json!({ "scopes": scopes }).to_string()),
-            ))
-            .await
-            .expect("out-of-bounds scopes create request should complete");
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{expected}");
-        assert_eq!(body_string(response).await, expected);
-    }
-}
-
-/// Scopes are immutable through rotation, so a record outside the principal
-/// bounds -- written before the bound existed -- would be re-minted into a
-/// credential authentication refuses on first use. Rotation refuses instead,
-/// leaves the record untouched, and audits nothing as changed.
-#[tokio::test]
-async fn token_rotate_of_a_record_with_scopes_outside_the_role_bounds_is_a_conflict() {
-    let token_db = TempDb::new("token-rotate-scope-bounds");
-    let policy = TempPolicyFile::new(&token_policy_document_string());
-    let capture = audit::sink::tests::CaptureSink::new();
-    let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
-    let router = token_admin_router(&token_db, &policy, audit_log);
-    let store =
-        auth::tokens::SqliteTokenStore::open(&token_db.path).expect("token store should open");
-    // The store does not judge scopes; this is a record from before the bound.
-    let created = store
-        .create(auth::tokens::CreateTokenRequest {
-            scopes: vec!["probe-reader".to_owned(), String::new()],
-            created_by: "bootstrap-admin".to_owned(),
-            expires_at: None,
-        })
-        .expect("fixture token should create");
-
-    let rotated = router
-        .oneshot(token_admin_request(
-            Method::POST,
-            &format!("{TOKENS_ADMIN_ROUTE}/{}/rotate", created.record.id),
-            Some(test_principal(&["superadmin"])),
-            None,
-        ))
-        .await
-        .expect("rotate request should complete");
-
-    assert_eq!(rotated.status(), StatusCode::CONFLICT);
-    assert_eq!(
-        body_string(rotated).await,
-        r#"{"error":"cannot rotate service token whose scopes are out of bounds: an empty role; revoke it and create a new token"}"#
-    );
-    let unchanged = store
-        .get_by_id(&created.record.id)
-        .expect("stored token should read")
-        .expect("refused rotation must retain the token");
-    assert_eq!(unchanged, created.record);
-    assert!(!capture
-        .events()
-        .iter()
-        .any(|event| event.event_type == audit::event::SERVICE_TOKEN_CHANGED));
-}
-
-#[tokio::test]
-async fn token_create_with_malformed_expires_at_is_a_bad_request() {
-    let token_db = TempDb::new("token-create-malformed-expires-at");
-    let policy = TempPolicyFile::new(&token_policy_document_string());
-    let router = token_admin_router(&token_db, &policy, test_audit_log());
-
-    let response = router
-        .oneshot(token_admin_request(
-            Method::POST,
-            TOKENS_ADMIN_ROUTE,
-            Some(test_principal(&["tokens-writer", "probe-reader"])),
-            Some(
-                json!({ "scopes": ["probe-reader"], "expires_at": "not-a-timestamp" }).to_string(),
-            ),
-        ))
-        .await
-        .expect("malformed-expires-at create request should complete");
-
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        body_string(response).await,
-        r#"{"error":"invalid service-token expires_at timestamp"}"#
-    );
-}
-
-/// Pins the one `409` the token store can reach: rotating a revoked
-/// token. Every other conflict must fall through to the shared responder.
-#[tokio::test]
-async fn token_rotate_of_a_revoked_token_is_a_conflict() {
-    let token_db = TempDb::new("token-rotate-revoked-conflict");
-    let policy = TempPolicyFile::new(&token_policy_document_string());
-    let router = token_admin_router(&token_db, &policy, test_audit_log());
-
-    let created = router
-        .clone()
-        .oneshot(token_admin_request(
-            Method::POST,
-            TOKENS_ADMIN_ROUTE,
-            Some(test_principal(&["tokens-writer", "probe-reader"])),
-            Some(json!({ "scopes": ["probe-reader"] }).to_string()),
-        ))
-        .await
-        .expect("token create request should complete");
-    assert_eq!(created.status(), StatusCode::CREATED);
-    let token = json_body(created).await["token"].clone();
-    let token_id = token["id"]
-        .as_str()
-        .expect("created token record carries an id")
-        .to_owned();
-
-    let revoked = router
-        .clone()
-        .oneshot(token_admin_request(
-            Method::DELETE,
-            &format!("{TOKENS_ADMIN_ROUTE}/{token_id}"),
-            Some(test_principal(&["tokens-writer"])),
-            None,
-        ))
-        .await
-        .expect("token revoke request should complete");
-    assert_eq!(revoked.status(), StatusCode::OK);
-
-    let rotated = router
-        .oneshot(token_admin_request(
-            Method::POST,
-            &format!("{TOKENS_ADMIN_ROUTE}/{token_id}/rotate"),
-            Some(test_principal(&["tokens-writer", "probe-reader"])),
-            None,
-        ))
-        .await
-        .expect("rotate-of-revoked request should complete");
-    assert_eq!(rotated.status(), StatusCode::CONFLICT);
-    assert_eq!(
-        body_string(rotated).await,
-        r#"{"error":"cannot rotate revoked service token"}"#
-    );
-}
-
-/// The shared responder must not translate a `Conflict` from a non-rotate
-/// operation into `409`: before #340 only the revoked-token rejection of
-/// rotate answered `409`, and the blanket translation the async-contract
-/// refactor introduced would have answered a store-level uniqueness
-/// violation with "cannot rotate revoked service token" on an endpoint
-/// that never rotated anything.
-#[test]
-fn non_rotate_store_conflicts_are_internal_errors() {
-    let response = token_store_error_response(storage::RepositoryError::new(
-        storage::RepositoryErrorKind::Conflict,
-        "service_token_create",
-    ));
-
-    assert_eq!(
-        response.status(),
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "a create-path conflict is a store failure, not a rotate-revoked 409"
-    );
-}
-
-#[test]
-fn requested_scope_authorization_enforces_subset_and_wildcard_delegation() {
-    let policy = parse_policy_body(&Bytes::from(token_policy_document_string()))
-        .expect("token policy should parse");
-    let rbac_state = middleware::rbac::RbacState::new(policy, Vec::new(), false, test_audit_log());
-
-    assert_eq!(
-        authorize_requested_scopes(
-            &rbac_state,
-            &test_principal(&["tokens-writer", "probe-reader"]),
-            &["probe-reader".to_owned()],
-        ),
-        Ok(())
-    );
-
-    let error = authorize_requested_scopes(
-        &rbac_state,
-        &test_principal(&["tokens-writer"]),
-        &["token-admin".to_owned(), "mcp:tools".to_owned()],
-    )
-    .expect_err("creator must not delegate roles it does not carry");
-    assert_eq!(
-        error,
-        TokenScopeAuthzError {
-            disallowed: vec!["token-admin".to_owned(), "mcp:tools".to_owned()]
-        }
-    );
-
-    let error = authorize_requested_scopes(
-        &rbac_state,
-        &test_principal(&["tokens-writer", "unknown-future-role"]),
-        &["unknown-future-role".to_owned()],
-    )
-    .expect_err("unknown roles must not become delegatable by carrying their name");
-    assert_eq!(
-        error,
-        TokenScopeAuthzError {
-            disallowed: vec!["unknown-future-role".to_owned()]
-        }
-    );
-
-    assert_eq!(
-        authorize_requested_scopes(
-            &rbac_state,
-            &test_principal(&["superadmin"]),
-            &["unknown-future-role".to_owned(), "mcp:tools".to_owned()],
-        ),
-        Ok(())
-    );
-}
-
-#[tokio::test]
-async fn admin_capabilities_use_effective_permissions_without_policy_read() {
-    let token_db = TempDb::new("admin-capabilities");
-    let policy = TempPolicyFile::new(&token_policy_document_string());
-    let router = token_admin_router(&token_db, &policy, test_audit_log());
-    let response = router
-        .clone()
-        .oneshot(token_admin_request(
-            Method::GET,
-            "/v1/admin/capabilities",
-            Some(test_principal(&["tokens-writer"])),
-            None,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
-    let value = json_body(response).await;
-    assert!(value["permissions"]
-        .as_array()
-        .unwrap()
-        .contains(&json!(ADMIN_TOKENS_WRITE_PERMISSION)));
-    assert!(!value["permissions"]
-        .as_array()
-        .unwrap()
-        .contains(&json!(ADMIN_POLICY_READ_PERMISSION)));
-    let response = router
-        .oneshot(token_admin_request(
-            Method::GET,
-            "/v1/admin/capabilities",
-            None,
-            None,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
-async fn admin_endpoint_denial_preserves_decision_and_emits_one_audit_event() {
-    let token_db = TempDb::new("endpoint-denial-audit");
-    let policy = TempPolicyFile::new(&token_policy_document_string());
-    let capture = audit::sink::tests::CaptureSink::new();
-    let log = audit::AuditLog::new(Arc::new(capture.clone()));
-    let router = token_admin_router(&token_db, &policy, log.clone());
-    let response = router
-        .oneshot(token_admin_request(
-            Method::POST,
-            TOKENS_ADMIN_ROUTE,
-            Some(test_principal(&["tokens-reader"])),
-            Some(json!({ "scopes": ["probe-reader"] }).to_string()),
-        ))
-        .await
-        .unwrap();
-    assert_admin_denial(&response, &log, &capture, ADMIN_TOKENS_WRITE_PERMISSION).await;
-}
-
 async fn assert_admin_denial(
     response: &Response,
     log: &audit::AuditLog,
@@ -18507,188 +17270,6 @@ async fn assert_admin_denial(
     assert_eq!(denied.len(), 1);
     assert_eq!(denied[0].payload["permission"], permission);
     assert_eq!(denied[0].payload["authorization_layer"], "admin_endpoint");
-}
-
-#[tokio::test]
-async fn token_admin_create_list_get_require_permissions_and_never_list_secret_material() {
-    let token_db = TempDb::new("token-admin-create-list");
-    let policy = TempPolicyFile::new(&token_policy_document_string());
-    let capture = audit::sink::tests::CaptureSink::new();
-    let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
-    let router = token_admin_router(&token_db, &policy, audit_log);
-
-    let forbidden_create = router
-        .clone()
-        .oneshot(token_admin_request(
-            Method::POST,
-            TOKENS_ADMIN_ROUTE,
-            Some(test_principal(&["tokens-reader"])),
-            Some(json!({ "scopes": ["probe-reader"] }).to_string()),
-        ))
-        .await
-        .expect("read-only token create request should complete");
-    assert_eq!(forbidden_create.status(), StatusCode::FORBIDDEN);
-
-    let create_response = router
-        .clone()
-        .oneshot(token_admin_request(
-            Method::POST,
-            TOKENS_ADMIN_ROUTE,
-            Some(test_principal(&["tokens-writer", "probe-reader"])),
-            Some(
-                json!({
-                    "scopes": ["tokens-writer", "probe-reader"],
-                    "expires_at": "2099-01-01T00:00:00Z"
-                })
-                .to_string(),
-            ),
-        ))
-        .await
-        .expect("token create request should complete");
-    assert_eq!(create_response.status(), StatusCode::CREATED);
-    let create_body = json_body(create_response).await;
-    let plaintext = create_body["plaintext_token"]
-        .as_str()
-        .expect("created response should include one-time plaintext token")
-        .to_owned();
-    assert!(plaintext.starts_with("ggw_"));
-    assert!(create_body["plaintext_token_notice"]
-        .as_str()
-        .unwrap_or_default()
-        .contains("will not be shown again"));
-    let token_id = create_body["token"]["id"]
-        .as_str()
-        .expect("created response should include token id")
-        .to_owned();
-    assert_eq!(
-        create_body["token"]["scopes"],
-        json!(["tokens-writer", "probe-reader"])
-    );
-    let create_serialized = serde_json::to_string(&create_body).unwrap();
-    assert!(!create_serialized.contains("token_hash"));
-
-    let forbidden_list = router
-        .clone()
-        .oneshot(token_admin_request(
-            Method::GET,
-            TOKENS_ADMIN_ROUTE,
-            Some(test_principal(&["tokens-writer"])),
-            None,
-        ))
-        .await
-        .expect("write-only token list request should complete");
-    assert_eq!(forbidden_list.status(), StatusCode::FORBIDDEN);
-
-    let list_response = router
-        .clone()
-        .oneshot(token_admin_request(
-            Method::GET,
-            TOKENS_ADMIN_ROUTE,
-            Some(test_principal(&["tokens-reader"])),
-            None,
-        ))
-        .await
-        .expect("token list request should complete");
-    assert_eq!(list_response.status(), StatusCode::OK);
-    let list_body = json_body(list_response).await;
-    assert_eq!(list_body["tokens"][0]["id"], json!(token_id));
-    let list_serialized = serde_json::to_string(&list_body).unwrap();
-    assert!(!list_serialized.contains(&plaintext));
-    assert!(!list_serialized.contains("plaintext_token"));
-    assert!(!list_serialized.contains("token_hash"));
-
-    let get_missing = router
-        .clone()
-        .oneshot(token_admin_request(
-            Method::GET,
-            &format!("{TOKENS_ADMIN_ROUTE}/missing"),
-            Some(test_principal(&["tokens-reader"])),
-            None,
-        ))
-        .await
-        .expect("missing token get request should complete");
-    assert_eq!(get_missing.status(), StatusCode::NOT_FOUND);
-
-    let get_response = router
-        .clone()
-        .oneshot(token_admin_request(
-            Method::GET,
-            &format!("{TOKENS_ADMIN_ROUTE}/{token_id}"),
-            Some(test_principal(&["tokens-reader"])),
-            None,
-        ))
-        .await
-        .expect("token get request should complete");
-    assert_eq!(get_response.status(), StatusCode::OK);
-    let get_body = json_body(get_response).await;
-    assert_eq!(get_body["id"], json!(token_id));
-    let get_serialized = serde_json::to_string(&get_body).unwrap();
-    assert!(!get_serialized.contains(&plaintext));
-    assert!(!get_serialized.contains("plaintext_token"));
-    assert!(!get_serialized.contains("token_hash"));
-
-    let event = captured_token_change(&capture, "token_created");
-    assert_token_change_actor(&event);
-    assert_eq!(event.payload["action"], json!("token_created"));
-    assert_eq!(event.payload["token_id"], json!(token_id));
-    assert_eq!(
-        event.payload["scopes"],
-        json!(["tokens-writer", "probe-reader"])
-    );
-    let audit_serialized = serde_json::to_string(&event).unwrap();
-    assert!(!audit_serialized.contains(&plaintext));
-    assert!(!audit_serialized.contains("token_hash"));
-}
-
-#[tokio::test]
-async fn token_admin_mutation_with_real_jwt_persists_audit_actor_identity() {
-    let jwks_addr = spawn_test_jwks_server().await;
-    let token_db = TempDb::new("token-admin-real-jwt-audit-token");
-    let audit_db = TempDb::new("token-admin-real-jwt-audit-log");
-    let policy = TempPolicyFile::new(&token_audit_full_stack_policy_document_string());
-    let mut config = test_config(Vec::new());
-    config.policy_file = Some(policy.path.to_string_lossy().into_owned());
-    config.service_token_sqlite_path = Some(token_db.path.to_string_lossy().into_owned());
-    config.audit_sqlite_path = Some(audit_db.path.to_string_lossy().into_owned());
-    config.egress_deny_private_ips = false;
-    configure_test_jwt_provider(&mut config, jwks_addr);
-    let recorder = PrometheusBuilder::new().build_recorder();
-    let (audit_log, audit_event_sender) =
-        audit::AuditLog::from_config(&config).expect("audit log should build");
-    let router =
-        app(config, recorder.handle(), audit_log, audit_event_sender).expect("app should build");
-    let token = signed_token("sso-admin", &["admin"]);
-
-    let create_response = router
-        .clone()
-        .oneshot(bearer_json_request(
-            Method::POST,
-            TOKENS_ADMIN_ROUTE,
-            &token,
-            json!({ "scopes": ["admin"] }).to_string(),
-        ))
-        .await
-        .expect("token create request should complete");
-    assert_eq!(create_response.status(), StatusCode::CREATED);
-
-    let event = wait_for_bearer_audit_event(
-        &router,
-        &format!(
-            "{AUDIT_ADMIN_ROUTE}?event_type={}",
-            audit::event::SERVICE_TOKEN_CHANGED
-        ),
-        &token,
-        |event| event["payload"]["action"] == json!("token_created"),
-    )
-    .await;
-    let actor = event["actor"]
-        .as_object()
-        .expect("service token audit event should include actor");
-
-    assert_eq!(actor["user_id"], json!("sso-admin"));
-    assert_eq!(actor["email"], json!("sso-admin@example.test"));
-    assert_eq!(actor["roles"], json!(["admin"]));
-    assert_eq!(actor["auth_mode"], json!("bearer_token"));
 }
 
 #[tokio::test]
@@ -20199,150 +18780,6 @@ async fn openapi_tools_register_requires_write_permission() {
         .expect("write-forbidden OpenAPI tools register request should complete");
 
     assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
-}
-
-#[tokio::test]
-async fn token_admin_revoke_is_idempotent_requires_write_and_audits() {
-    let token_db = TempDb::new("token-admin-revoke");
-    let policy = TempPolicyFile::new(&token_policy_document_string());
-    let capture = audit::sink::tests::CaptureSink::new();
-    let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
-    let router = token_admin_router(&token_db, &policy, audit_log);
-    let created = create_token_via_endpoint(&router, &["probe-reader"]).await;
-    let token_id = created["token"]["id"]
-        .as_str()
-        .expect("created response should include token id")
-        .to_owned();
-
-    let forbidden_revoke = router
-        .clone()
-        .oneshot(token_admin_request(
-            Method::DELETE,
-            &format!("{TOKENS_ADMIN_ROUTE}/{token_id}"),
-            Some(test_principal(&["tokens-reader"])),
-            None,
-        ))
-        .await
-        .expect("read-only token revoke request should complete");
-    assert_eq!(forbidden_revoke.status(), StatusCode::FORBIDDEN);
-
-    let first = router
-        .clone()
-        .oneshot(token_admin_request(
-            Method::DELETE,
-            &format!("{TOKENS_ADMIN_ROUTE}/{token_id}"),
-            Some(test_principal(&["tokens-writer"])),
-            None,
-        ))
-        .await
-        .expect("token revoke request should complete");
-    assert_eq!(first.status(), StatusCode::OK);
-    let first_body = json_body(first).await;
-    let first_revoked_at = first_body["revoked_at"]
-        .as_str()
-        .expect("revoked token should include revoked_at")
-        .to_owned();
-
-    let second = router
-        .clone()
-        .oneshot(token_admin_request(
-            Method::DELETE,
-            &format!("{TOKENS_ADMIN_ROUTE}/{token_id}"),
-            Some(test_principal(&["tokens-writer"])),
-            None,
-        ))
-        .await
-        .expect("second token revoke request should complete");
-    assert_eq!(second.status(), StatusCode::OK);
-    assert_eq!(
-        json_body(second).await["revoked_at"],
-        json!(first_revoked_at)
-    );
-
-    let event = captured_token_change(&capture, "token_revoked");
-    assert_token_change_actor(&event);
-    assert_eq!(event.payload["action"], json!("token_revoked"));
-    assert_eq!(event.payload["token_id"], json!(token_id));
-}
-
-#[tokio::test]
-async fn token_admin_rotate_returns_new_plaintext_and_invalidates_old_bearer() {
-    let token_db = TempDb::new("token-admin-rotate");
-    let token_store =
-        auth::tokens::SqliteTokenStore::open(&token_db.path).expect("token store should open");
-    let created = token_store
-        .create(auth::tokens::CreateTokenRequest {
-            scopes: vec!["token-admin".to_owned(), "probe-reader".to_owned()],
-            created_by: "bootstrap-admin".to_owned(),
-            expires_at: None,
-        })
-        .expect("service token should create");
-    let policy = TempPolicyFile::new(&service_token_policy_document());
-    let capture = audit::sink::tests::CaptureSink::new();
-    let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
-    let mut config = test_config(Vec::new());
-    config.policy_file = Some(policy.path.to_string_lossy().into_owned());
-    config.service_token_sqlite_path = Some(token_db.path.to_string_lossy().into_owned());
-    config.service_token_cache_ttl_ms = 5_000;
-    config.rbac_exempt_paths.push(TOKENS_ADMIN_ROUTE.to_owned());
-    let recorder = PrometheusBuilder::new().build_recorder();
-    let router = app(
-        config,
-        recorder.handle(),
-        audit_log,
-        test_audit_event_sender(),
-    )
-    .expect("app should build");
-
-    let before_rotate = authenticated_principal_probe(&router, &created.plaintext_token).await;
-    assert_eq!(before_rotate.status(), StatusCode::OK);
-
-    let rotate_response = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri(format!("{TOKENS_ADMIN_ROUTE}/{}/rotate", created.record.id))
-                .header(
-                    header::AUTHORIZATION,
-                    format!("Bearer {}", created.plaintext_token),
-                )
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::empty())
-                .expect("rotate request should build"),
-        )
-        .await
-        .expect("token rotate request should complete");
-    assert_eq!(rotate_response.status(), StatusCode::OK);
-    let rotate_body = json_body(rotate_response).await;
-    let new_plaintext = rotate_body["plaintext_token"]
-        .as_str()
-        .expect("rotate response should include new one-time plaintext")
-        .to_owned();
-    assert_ne!(new_plaintext, created.plaintext_token);
-    assert!(rotate_body["plaintext_token_notice"]
-        .as_str()
-        .unwrap_or_default()
-        .contains("will not be shown again"));
-
-    let old_probe = authenticated_principal_probe(&router, &created.plaintext_token).await;
-    assert_eq!(old_probe.status(), StatusCode::UNAUTHORIZED);
-    let new_probe = authenticated_principal_probe(&router, &new_plaintext).await;
-    assert_eq!(new_probe.status(), StatusCode::OK);
-
-    let event = captured_token_change(&capture, "token_rotated");
-    let actor = event.actor.as_ref().expect("rotate actor should be set");
-    assert_eq!(
-        actor.user_id,
-        format!("service-token:{}", created.record.id)
-    );
-    assert_eq!(actor.auth_mode, "service_token");
-    assert_eq!(event.payload["action"], json!("token_rotated"));
-    assert_eq!(event.payload["token_id"], json!(created.record.id));
-    let audit_serialized = serde_json::to_string(&event).unwrap();
-    assert!(!audit_serialized.contains(&created.plaintext_token));
-    assert!(!audit_serialized.contains(&new_plaintext));
-    assert!(!audit_serialized.contains("token_hash"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -25047,8 +23484,15 @@ paths:
     // No audit store of record here: this test is not about durability,
     // so it runs the explicit best-effort opt-out (issue #425).
     config.audit_durability = config::AuditDurability::BestEffort;
-    let (audit_log, audit_event_sender) =
-        audit::AuditLog::from_config(&config).expect("audit log should build");
+    // The configured sinks, then a capture sink: an event it holds has
+    // already been handed to the discovery aggregator.
+    let (sink, audit_event_sender) =
+        audit::sink::build_sink_from_config(&config).expect("audit sink should build");
+    let capture = audit::sink::tests::CaptureSink::new();
+    let audit_log = audit::AuditLog::new(Arc::new(audit::sink::CompositeSink::new(vec![
+        sink,
+        Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>,
+    ])) as Arc<dyn audit::AuditSink>);
     let recorder = PrometheusBuilder::new().build_recorder();
     let router =
         app(config, recorder.handle(), audit_log, audit_event_sender).expect("app should build");
@@ -25067,6 +23511,15 @@ paths:
         .expect("request should complete");
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
+    // The 2 s window below is the aggregator's flush, so the observation
+    // must have reached the aggregator before it starts.
+    wait_for_delivered_audit_events(&capture, "the request observation", |events| {
+        events.iter().any(|event| {
+            event.event_type == "http.request_observed"
+                && event.request_id == "request-spec-conformance-missing"
+        })
+    })
+    .await;
     let body = wait_for_traffic_json(&router, "/v1/admin/traffic/endpoints?method=GET", |body| {
         body["endpoints"].as_array().is_some_and(|endpoints| {
             endpoints.iter().any(|endpoint| {
@@ -27939,1427 +26392,6 @@ async fn traffic_endpoint_admin_requires_traffic_read_permission() {
 }
 
 #[tokio::test]
-async fn auth_runs_before_rbac_for_non_exempt_routes() {
-    let policy = TempPolicyFile::new(
-        r#"{
-                "schema_version": "0.1.0",
-                "default_action": "deny",
-                "roles": {}
-            }"#,
-    );
-    let mut config = test_config(Vec::new());
-    config.policy_file = Some(policy.path.to_string_lossy().into_owned());
-    let recorder = PrometheusBuilder::new().build_recorder();
-
-    let response = app(
-        config,
-        recorder.handle(),
-        test_audit_log(),
-        test_audit_event_sender(),
-    )
-    .expect("app should build")
-    .oneshot(
-        Request::builder()
-            .uri("/__test/principal")
-            .header(header::AUTHORIZATION, "Bearer token-123")
-            .body(Body::empty())
-            .expect("request should build"),
-    )
-    .await
-    .expect("request should complete");
-
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
-async fn auth_validator_resolves_oidc_discovery_for_issuer_only_provider() {
-    let (issuer, server) = spawn_oidc_jwks_server();
-    let issuer_claim = issuer.clone();
-    let mut config = test_config(Vec::new());
-    config.auth_providers = vec![config::AuthProviderConfig {
-        name: "oidc".to_owned(),
-        provider_type: config::AuthProviderType::Jwt,
-        jwks_url: None,
-        issuer: Some(issuer),
-        audience: None,
-        jwks_timeout_ms: 2000,
-        jwks_max_key_age_secs: 300,
-        require_jti: false,
-        roles_claim: "roles".to_owned(),
-        roles_claim_delimiter: None,
-        org_claim: None,
-        introspection_url: None,
-        introspection_timeout_ms: config::DEFAULT_COOKIE_SESSION_INTROSPECTION_TIMEOUT_MS,
-        cache_ttl_ms: config::DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
-        user_id_claim: None,
-        email_claim: None,
-        client_id: None,
-        client_secret: None,
-        redirect_uri: None,
-    }];
-    config.egress_deny_private_ips = false;
-    let egress_client = Arc::new(
-        egress::EgressClient::new(egress::EgressConfig::from_config(&config))
-            .expect("egress client should build"),
-    );
-    let discovered_oidc_jwks_urls =
-        discover_oidc_jwks_urls_from_config(&config, Arc::clone(&egress_client))
-            .expect("issuer-only provider should discover JWKS URI");
-
-    let validator = auth_validator_from_config(
-        &config,
-        egress_client,
-        None,
-        &discovered_oidc_jwks_urls,
-        None,
-        None,
-        None,
-    )
-    .expect("issuer-only provider should build")
-    .expect("auth validator should be configured");
-    let principal = validator
-        .validate_session(&auth::SessionCredential::Bearer(signed_token_with_issuer(
-            "oidc-user",
-            &["member"],
-            &issuer_claim,
-        )))
-        .await
-        .expect("token should validate through discovered JWKS URI");
-
-    assert_eq!(principal.user_id, "oidc-user");
-    server.finish();
-}
-
-/// Startup hands every JWT validator that has a denylist the observer it
-/// passes in, so a JWT refused as revoked names its principal to the
-/// Connection runtime, which purges that principal's delegated tokens (issue
-/// #441).
-#[tokio::test]
-async fn a_denylisted_jwt_validator_reports_the_principal_of_a_revoked_token() {
-    struct DenyEveryJti;
-
-    #[async_trait::async_trait]
-    impl auth::RevocationStore for DenyEveryJti {
-        async fn is_revoked(&self, _jti: &str) -> Result<bool, auth::AuthError> {
-            Ok(true)
-        }
-    }
-
-    #[derive(Default)]
-    struct RecordingObserver(std::sync::Mutex<Vec<(String, String)>>);
-
-    impl auth::RevokedCredentialObserver for RecordingObserver {
-        fn credential_revoked(&self, issuer: &str, subject: &str, _jti: &str) {
-            self.0
-                .lock()
-                .expect("observer lock")
-                .push((issuer.to_owned(), subject.to_owned()));
-        }
-    }
-
-    let (issuer, server) = spawn_oidc_jwks_server();
-    let issuer_claim = issuer.clone();
-    let mut config = test_config(Vec::new());
-    config.auth_providers = vec![config::AuthProviderConfig {
-        name: "oidc".to_owned(),
-        provider_type: config::AuthProviderType::Jwt,
-        jwks_url: None,
-        issuer: Some(issuer.clone()),
-        audience: None,
-        jwks_timeout_ms: 2000,
-        jwks_max_key_age_secs: 300,
-        require_jti: true,
-        roles_claim: "roles".to_owned(),
-        roles_claim_delimiter: None,
-        org_claim: None,
-        introspection_url: None,
-        introspection_timeout_ms: config::DEFAULT_COOKIE_SESSION_INTROSPECTION_TIMEOUT_MS,
-        cache_ttl_ms: config::DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
-        user_id_claim: None,
-        email_claim: None,
-        client_id: None,
-        client_secret: None,
-        redirect_uri: None,
-    }];
-    config.egress_deny_private_ips = false;
-    let egress_client = Arc::new(
-        egress::EgressClient::new(egress::EgressConfig::from_config(&config))
-            .expect("egress client should build"),
-    );
-    let discovered_oidc_jwks_urls =
-        discover_oidc_jwks_urls_from_config(&config, Arc::clone(&egress_client))
-            .expect("issuer-only provider should discover JWKS URI");
-    let denylist = |_issuer: &str| Arc::new(DenyEveryJti) as Arc<dyn auth::RevocationStore>;
-    let observer = Arc::new(RecordingObserver::default());
-
-    let validator = auth_validator_from_config(
-        &config,
-        egress_client,
-        None,
-        &discovered_oidc_jwks_urls,
-        Some(&denylist as JwtRevocationStoreFactory<'_>),
-        Some(Arc::clone(&observer) as Arc<dyn auth::RevokedCredentialObserver>),
-        None,
-    )
-    .expect("issuer-only provider should build")
-    .expect("auth validator should be configured");
-    let error = validator
-        .validate_session(&auth::SessionCredential::Bearer(signed_token_with_issuer(
-            "oidc-user",
-            &["member"],
-            &issuer_claim,
-        )))
-        .await
-        .expect_err("a denylisted jti is refused");
-
-    // The provider chain reports every provider's refusal alike, so the
-    // observer is what tells this one apart from a bad signature.
-    assert!(
-        matches!(&error, auth::AuthError::InvalidSession(_)),
-        "{error:?}"
-    );
-    assert_eq!(
-        *observer.0.lock().expect("observer lock"),
-        [(issuer, "oidc-user".to_owned())]
-    );
-    server.finish();
-}
-
-/// A deployment whose only credential is a client certificate still gets an
-/// auth chain.
-///
-/// `auth_validator_from_config` returns `None` when nothing is configured,
-/// and `None` means the middleware fails closed on every request. Client
-/// certificates had to be added to that emptiness test or a listener
-/// configured with `CLIENT_CERT_MODE=required` and no token provider at all
-/// would answer 401 to the very callers it was set up for -- a
-/// misconfiguration that looks exactly like a broken certificate.
-#[tokio::test]
-async fn a_client_certificate_only_deployment_still_builds_an_auth_chain() {
-    let mut config = test_config(Vec::new());
-    assert!(
-        config.auth_providers.is_empty(),
-        "the premise is that nothing else is configured"
-    );
-    config.client_cert_auth = Some(config::InboundClientAuthConfig {
-        mode_setting: "CLIENT_CERT_MODE",
-        requirement: crate::inbound_tls::ClientCertRequirement::Required,
-        ca_setting: "CLIENT_CERT_CA_FILE",
-        ca_file: "client-ca.crt".to_owned(),
-        crl_setting: "CLIENT_CERT_CRL_FILE",
-        crl_file: None,
-        identity_source: auth::ClientCertIdentitySource::Spiffe,
-    });
-    config.egress_deny_private_ips = false;
-    let egress_client = Arc::new(
-        egress::EgressClient::new(egress::EgressConfig::from_config(&config))
-            .expect("egress client should build"),
-    );
-
-    let validator = auth_validator_from_config(
-        &config,
-        egress_client,
-        None,
-        &HashMap::new(),
-        None,
-        None,
-        None,
-    )
-    .expect("a certificate-only configuration should build")
-    .expect(
-        "a certificate-only configuration must produce a validator, not None; None \
-                     makes the auth middleware fail closed on every request",
-    );
-
-    assert!(
-        validator.supports_client_certificate(),
-        "the chain built for a certificate-only deployment must accept certificate credentials"
-    );
-}
-
-#[tokio::test]
-async fn auth_validator_accepts_slashless_oidc_issuer_when_config_has_trailing_slash() {
-    let (issuer, document_issuer, server) =
-        spawn_oidc_jwks_server_with_document_issuer(str::to_owned);
-    let mut config = test_config(Vec::new());
-    config.auth_providers = vec![oidc_jwt_provider(format!("{issuer}/"))];
-    config.egress_deny_private_ips = false;
-    let recorder = PrometheusBuilder::new().build_recorder();
-    let router = app(
-        config,
-        recorder.handle(),
-        test_audit_log(),
-        test_audit_event_sender(),
-    )
-    .expect("app should build with slash-normalized OIDC issuer");
-
-    let response = authenticated_principal_probe(
-        &router,
-        &signed_token_with_issuer("slashless-oidc-user", &["member"], &document_issuer),
-    )
-    .await;
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        json_body(response).await["user_id"],
-        json!("slashless-oidc-user")
-    );
-    server.finish();
-}
-
-#[tokio::test]
-async fn auth_validator_accepts_slash_retained_oidc_issuer_and_token() {
-    let (_issuer, document_issuer, server) =
-        spawn_oidc_jwks_server_with_document_issuer(|issuer| format!("{issuer}/"));
-    let mut config = test_config(Vec::new());
-    config.auth_providers = vec![oidc_jwt_provider(document_issuer.clone())];
-    config.egress_deny_private_ips = false;
-    let recorder = PrometheusBuilder::new().build_recorder();
-    let router = app(
-        config,
-        recorder.handle(),
-        test_audit_log(),
-        test_audit_event_sender(),
-    )
-    .expect("app should build with slash-retained OIDC issuer");
-
-    let response = authenticated_principal_probe(
-        &router,
-        &signed_token_with_issuer("slash-retained-oidc-user", &["member"], &document_issuer),
-    )
-    .await;
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        json_body(response).await["user_id"],
-        json!("slash-retained-oidc-user")
-    );
-    server.finish();
-}
-
-#[test]
-fn auth_validator_rejects_oidc_discovery_with_mismatched_issuer() {
-    let (issuer, server) = spawn_oidc_discovery_server(
-        json!({
-            "issuer": "http://attacker.example.test",
-            "jwks_uri": "http://127.0.0.1:1/jwks.json"
-        }),
-        1,
-    );
-    let mut config = test_config(Vec::new());
-    config.auth_providers = vec![config::AuthProviderConfig {
-        name: "oidc".to_owned(),
-        provider_type: config::AuthProviderType::Jwt,
-        jwks_url: None,
-        issuer: Some(issuer),
-        audience: None,
-        jwks_timeout_ms: 2000,
-        jwks_max_key_age_secs: 300,
-        require_jti: false,
-        roles_claim: "roles".to_owned(),
-        roles_claim_delimiter: None,
-        org_claim: None,
-        introspection_url: None,
-        introspection_timeout_ms: config::DEFAULT_COOKIE_SESSION_INTROSPECTION_TIMEOUT_MS,
-        cache_ttl_ms: config::DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
-        user_id_claim: None,
-        email_claim: None,
-        client_id: None,
-        client_secret: None,
-        redirect_uri: None,
-    }];
-    config.egress_deny_private_ips = false;
-    let egress_client = Arc::new(
-        egress::EgressClient::new(egress::EgressConfig::from_config(&config))
-            .expect("egress client should build"),
-    );
-
-    let error = discover_oidc_jwks_urls_from_config(&config, egress_client)
-        .expect_err("mismatched discovery issuer should fail provider construction");
-
-    assert!(matches!(
-        error,
-        auth::AuthError::Upstream(message)
-            if message.contains("OIDC discovery issuer mismatch")
-    ));
-    server.finish();
-}
-
-#[test]
-fn auth_validator_rejects_oidc_discovery_without_issuer() {
-    let (issuer, server) = spawn_oidc_discovery_server(
-        json!({
-            "jwks_uri": "http://127.0.0.1:1/jwks.json"
-        }),
-        1,
-    );
-    let mut config = test_config(Vec::new());
-    config.auth_providers = vec![config::AuthProviderConfig {
-        name: "oidc".to_owned(),
-        provider_type: config::AuthProviderType::Jwt,
-        jwks_url: None,
-        issuer: Some(issuer),
-        audience: None,
-        jwks_timeout_ms: 2000,
-        jwks_max_key_age_secs: 300,
-        require_jti: false,
-        roles_claim: "roles".to_owned(),
-        roles_claim_delimiter: None,
-        org_claim: None,
-        introspection_url: None,
-        introspection_timeout_ms: config::DEFAULT_COOKIE_SESSION_INTROSPECTION_TIMEOUT_MS,
-        cache_ttl_ms: config::DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
-        user_id_claim: None,
-        email_claim: None,
-        client_id: None,
-        client_secret: None,
-        redirect_uri: None,
-    }];
-    config.egress_deny_private_ips = false;
-    let egress_client = Arc::new(
-        egress::EgressClient::new(egress::EgressConfig::from_config(&config))
-            .expect("egress client should build"),
-    );
-
-    let error = discover_oidc_jwks_urls_from_config(&config, egress_client)
-        .expect_err("discovery without issuer should fail provider construction");
-
-    assert!(matches!(
-        error,
-        auth::AuthError::Upstream(message)
-            if message.contains("OIDC discovery response missing issuer")
-    ));
-    server.finish();
-}
-
-#[tokio::test]
-async fn oidc_discovery_allowlists_jwks_uri_host_when_it_differs_from_issuer() {
-    let (jwks_url, jwks_server) = spawn_blocking_jwks_server(Ipv4Addr::new(127, 0, 0, 2), 1);
-    let (issuer, discovery_server) = spawn_blocking_oidc_discovery_server(jwks_url);
-    let issuer_claim = issuer.clone();
-    let mut config = test_config(Vec::new());
-    config.auth_providers = vec![config::AuthProviderConfig {
-        name: "oidc".to_owned(),
-        provider_type: config::AuthProviderType::Jwt,
-        jwks_url: None,
-        issuer: Some(issuer),
-        audience: None,
-        jwks_timeout_ms: 2000,
-        jwks_max_key_age_secs: 300,
-        require_jti: false,
-        roles_claim: "roles".to_owned(),
-        roles_claim_delimiter: None,
-        org_claim: None,
-        introspection_url: None,
-        introspection_timeout_ms: config::DEFAULT_COOKIE_SESSION_INTROSPECTION_TIMEOUT_MS,
-        cache_ttl_ms: config::DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
-        user_id_claim: None,
-        email_claim: None,
-        client_id: None,
-        client_secret: None,
-        redirect_uri: None,
-    }];
-    config.egress_deny_private_ips = false;
-    let recorder = PrometheusBuilder::new().build_recorder();
-    let router = app(
-        config,
-        recorder.handle(),
-        test_audit_log(),
-        test_audit_event_sender(),
-    )
-    .expect("app should build with issuer-only OIDC provider");
-
-    let response = router
-        .oneshot(
-            Request::builder()
-                .uri("/__test/principal")
-                .header(
-                    header::AUTHORIZATION,
-                    format!(
-                        "Bearer {}",
-                        signed_token_with_issuer("split-oidc-user", &["member"], &issuer_claim)
-                    ),
-                )
-                .body(Body::empty())
-                .expect("request should build"),
-        )
-        .await
-        .expect("request should complete");
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        json_body(response).await["user_id"],
-        json!("split-oidc-user")
-    );
-    assert_eq!(discovery_server.finish(), 1);
-    assert_eq!(jwks_server.finish(), 1);
-}
-
-#[tokio::test]
-async fn admin_oidc_login_rejects_new_attempt_when_global_pending_limit_is_full() {
-    let oidc = spawn_mock_oidc_discovery_endpoint(None);
-    let mut config = admin_oidc_login_config(&oidc.issuer);
-    config.admin_login_pending_max_entries = 1;
-    config.admin_login_pending_max_per_ip = 1;
-    let router = admin_oidc_login_router_from_config(config);
-
-    let first_response = router
-        .clone()
-        .oneshot(admin_oidc_login_request(Ipv4Addr::new(192, 0, 2, 10), None))
-        .await
-        .expect("first login request should complete");
-    assert_eq!(first_response.status(), StatusCode::FOUND);
-    let first_location = response_location(&first_response);
-    assert_eq!(
-        Url::parse(&first_location)
-            .expect("authorization redirect should be absolute")
-            .as_str()
-            .split('?')
-            .next(),
-        Some(oidc.authorization_endpoint.as_str())
-    );
-
-    let second_response = router
-        .oneshot(admin_oidc_login_request(Ipv4Addr::new(192, 0, 2, 11), None))
-        .await
-        .expect("second login request should complete");
-    assert_eq!(second_response.status(), StatusCode::FOUND);
-    assert!(
-        fragment_query_pairs(&response_location(&second_response), "/auth/error")
-            .expect("capacity rejection should redirect to auth error fragment")
-            .get("error")
-            .is_some_and(|error| error == "login_start_failed")
-    );
-
-    oidc.finish();
-}
-
-#[tokio::test]
-async fn admin_oidc_login_enforces_peer_ip_limit_despite_untrusted_forwarding_headers() {
-    let oidc = spawn_mock_oidc_discovery_endpoint(None);
-    let mut config = admin_oidc_login_config(&oidc.issuer);
-    config.admin_login_pending_max_entries = 3;
-    config.admin_login_pending_max_per_ip = 1;
-    let router = admin_oidc_login_router_from_config(config);
-    let peer_ip = Ipv4Addr::new(192, 0, 2, 20);
-
-    let first_response = router
-        .clone()
-        .oneshot(admin_oidc_login_request(peer_ip, Some("198.51.100.1")))
-        .await
-        .expect("first login request should complete");
-    assert_eq!(first_response.status(), StatusCode::FOUND);
-    let first_location = response_location(&first_response);
-    assert_eq!(
-        Url::parse(&first_location)
-            .expect("authorization redirect should be absolute")
-            .as_str()
-            .split('?')
-            .next(),
-        Some(oidc.authorization_endpoint.as_str())
-    );
-
-    let same_peer_response = router
-        .clone()
-        .oneshot(admin_oidc_login_request(peer_ip, Some("198.51.100.2")))
-        .await
-        .expect("same-peer login request should complete");
-    assert_eq!(same_peer_response.status(), StatusCode::FOUND);
-    assert!(
-        fragment_query_pairs(&response_location(&same_peer_response), "/auth/error")
-            .expect("per-IP rejection should redirect to auth error fragment")
-            .get("error")
-            .is_some_and(|error| error == "login_start_failed")
-    );
-
-    let different_peer_response = router
-        .oneshot(admin_oidc_login_request(
-            Ipv4Addr::new(192, 0, 2, 21),
-            Some("198.51.100.2"),
-        ))
-        .await
-        .expect("different-peer login request should complete");
-    assert_eq!(different_peer_response.status(), StatusCode::FOUND);
-    let different_peer_location = response_location(&different_peer_response);
-    assert_eq!(
-        Url::parse(&different_peer_location)
-            .expect("authorization redirect should be absolute")
-            .as_str()
-            .split('?')
-            .next(),
-        Some(oidc.authorization_endpoint.as_str())
-    );
-
-    oidc.finish();
-}
-
-struct UnavailablePendingLoginBackend;
-
-fn unavailable_pending_login_store() -> auth::oidc_login::PendingLoginStoreError {
-    auth::oidc_login::PendingLoginStoreError(storage::RepositoryError::new(
-        storage::RepositoryErrorKind::Unavailable,
-        "pending_login_test",
-    ))
-}
-
-#[async_trait::async_trait]
-impl auth::oidc_login::PendingLoginBackend for UnavailablePendingLoginBackend {
-    async fn insert(
-        &self,
-        _state: &str,
-        _pending: auth::oidc_login::PendingLogin,
-    ) -> Result<bool, auth::oidc_login::PendingLoginStoreError> {
-        Err(unavailable_pending_login_store())
-    }
-
-    async fn take(
-        &self,
-        _state: &str,
-    ) -> Result<Option<auth::oidc_login::PendingLogin>, auth::oidc_login::PendingLoginStoreError>
-    {
-        Err(unavailable_pending_login_store())
-    }
-}
-
-async fn json_error_message(response: Response) -> String {
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("response body should be readable");
-    let json: serde_json::Value =
-        serde_json::from_slice(&body).expect("response body should be JSON");
-    json["error"]
-        .as_str()
-        .expect("response should carry an error message")
-        .to_owned()
-}
-
-/// A pending-login store that cannot be consulted is a dependency
-/// failure on both legs: `503`, never "login failed" and never
-/// "unknown state" -- "cannot check" is not "checked and denied" --
-/// and the callback exchanges no code at the provider.
-#[tokio::test]
-async fn admin_oidc_login_answers_503_when_the_pending_login_store_is_unavailable() {
-    let token_endpoint = spawn_mock_oidc_token_endpoint(Ipv4Addr::new(127, 0, 0, 2), None).await;
-    let oidc = spawn_mock_oidc_discovery_endpoint(Some(token_endpoint.url.clone()));
-    let mut config = admin_oidc_login_config(&oidc.issuer);
-    config.egress_deny_private_ips = false;
-    let recorder = PrometheusBuilder::new().build_recorder();
-    let apps = gateway_app_with_process_started_at_and_overrides(
-        config,
-        recorder.handle(),
-        test_audit_log(),
-        test_audit_event_sender(),
-        Instant::now(),
-        GatewayAppBuildOverrides {
-            pending_login_backend: Some(Arc::new(UnavailablePendingLoginBackend)),
-            ..GatewayAppBuildOverrides::default()
-        },
-    )
-    .expect("admin OIDC login app should build");
-    let router = match apps.http {
-        GatewayApp::Unified(router) => router,
-        GatewayApp::Split { .. } => panic!("admin OIDC login app should be unified"),
-    };
-
-    let login_response = router
-        .clone()
-        .oneshot(admin_oidc_login_request(Ipv4Addr::new(192, 0, 2, 7), None))
-        .await
-        .expect("login request should complete");
-    assert_eq!(login_response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(
-        json_error_message(login_response).await,
-        "login state store is unavailable"
-    );
-
-    let binding = "a".repeat(43);
-    let oauth_state = base64url_no_padding(&Sha256::digest(
-        format!("greengateway.admin-login.browser.v1\0{binding}").as_bytes(),
-    ));
-    let cookie_name = format!(
-        "ggw-admin-login-{}",
-        &hex::encode(Sha256::digest(b"/admin"))[..16]
-    );
-    let callback_response = router
-        .oneshot(admin_oidc_complete_request(
-            &format!("{cookie_name}={binding}"),
-            "admin-code",
-            &oauth_state,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(callback_response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(
-        json_error_message(callback_response).await,
-        "login state store is unavailable"
-    );
-    assert!(
-        token_endpoint.requests().is_empty(),
-        "no code is exchanged when the state cannot be checked"
-    );
-    oidc.finish();
-}
-
-#[tokio::test]
-async fn admin_oidc_login_redirects_exchanges_code_and_consumes_state_once() {
-    let jwks_addr = spawn_test_jwks_server().await;
-    let jwks_url = format!("http://127.0.0.1:{}/jwks.json", jwks_addr.port());
-    let token_endpoint = spawn_mock_oidc_token_endpoint(Ipv4Addr::new(127, 0, 0, 2), None).await;
-    let oidc = spawn_mock_oidc_discovery_endpoint(Some(token_endpoint.url.clone()));
-    let access_token = signed_token_with_issuer("admin-operator", &["admin"], &oidc.issuer);
-    token_endpoint.set_access_token(access_token.clone());
-    let mut config = admin_oidc_login_config(&oidc.issuer);
-    config.auth_providers[0].jwks_url = Some(jwks_url);
-    let router = admin_oidc_login_router_from_config(config);
-
-    let login_response = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/v1/admin/auth/login")
-                .body(Body::empty())
-                .expect("login request should build"),
-        )
-        .await
-        .expect("login request should complete");
-
-    assert_eq!(login_response.status(), StatusCode::FOUND);
-    let cookies = admin_oidc_cookies(&login_response);
-    let login_location = response_location(&login_response);
-    let authorization_url =
-        Url::parse(&login_location).expect("authorization redirect should be absolute");
-    assert_eq!(
-        authorization_url.as_str().split('?').next(),
-        Some(oidc.authorization_endpoint.as_str())
-    );
-    let authorization_query = url_query_pairs(&authorization_url);
-    assert_eq!(
-        authorization_query.get("response_type").map(String::as_str),
-        Some("code")
-    );
-    assert_eq!(
-        authorization_query.get("client_id").map(String::as_str),
-        Some("admin-ui")
-    );
-    assert_eq!(
-        authorization_query.get("redirect_uri").map(String::as_str),
-        Some("http://gateway.example.test/v1/admin/auth/callback")
-    );
-    assert_eq!(
-        authorization_query.get("scope").map(String::as_str),
-        Some("openid email profile")
-    );
-    assert_eq!(
-        authorization_query
-            .get("code_challenge_method")
-            .map(String::as_str),
-        Some("S256")
-    );
-    let state = authorization_query
-        .get("state")
-        .expect("authorization redirect should include state");
-    let nonce = authorization_query
-        .get("nonce")
-        .expect("authorization redirect should include nonce");
-    assert!(!state.is_empty());
-    assert!(!nonce.is_empty());
-    token_endpoint.set_id_token(signed_admin_id_token(&oidc.issuer, "admin-ui", nonce));
-    let challenge = authorization_query
-        .get("code_challenge")
-        .expect("authorization redirect should include PKCE challenge");
-    assert_eq!(challenge.len(), 43);
-    assert!(is_pkce_unreserved(challenge));
-
-    let callback_response = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!(
-                    "/v1/admin/auth/callback?code=admin-code&state={}",
-                    query_encode(state)
-                ))
-                .header(header::COOKIE, &cookies)
-                .body(Body::empty())
-                .expect("callback request should build"),
-        )
-        .await
-        .expect("callback request should complete");
-
-    assert_eq!(callback_response.status(), StatusCode::FOUND);
-    let callback_location = response_location(&callback_response);
-    let completion = fragment_query_pairs(&callback_location, "/auth/complete")
-        .expect("callback should redirect to auth completion fragment");
-    assert_eq!(
-        completion.get("code").map(String::as_str),
-        Some("admin-code")
-    );
-    assert_eq!(completion.get("state"), Some(state));
-    assert!(!callback_location.contains(&access_token));
-    assert!(token_endpoint.requests().is_empty());
-    let response = router
-        .clone()
-        .oneshot(admin_oidc_complete_request(&cookies, "admin-code", state))
-        .await
-        .unwrap();
-    assert_admin_oidc_token(response, &access_token).await;
-
-    let token_requests = token_endpoint.requests();
-    assert_eq!(token_requests.len(), 1);
-    assert_eq!(token_requests[0].method, Method::POST);
-    assert_eq!(
-        token_requests[0].headers.get(header::CONTENT_TYPE),
-        Some(&HeaderValue::from_static(
-            "application/x-www-form-urlencoded"
-        ))
-    );
-    let token_form = form_pairs(&token_requests[0].body);
-    assert_eq!(
-        token_form.get("grant_type").map(String::as_str),
-        Some("authorization_code")
-    );
-    assert_eq!(
-        token_form.get("code").map(String::as_str),
-        Some("admin-code")
-    );
-    assert_eq!(
-        token_form.get("redirect_uri").map(String::as_str),
-        Some("http://gateway.example.test/v1/admin/auth/callback")
-    );
-    assert_eq!(
-        token_form.get("client_id").map(String::as_str),
-        Some("admin-ui")
-    );
-    assert_eq!(
-        token_form.get("client_secret").map(String::as_str),
-        Some("secret-value")
-    );
-    let verifier = token_form
-        .get("code_verifier")
-        .expect("token exchange should include the PKCE verifier");
-    assert!((43..=128).contains(&verifier.len()));
-    assert!(is_pkce_unreserved(verifier));
-    assert_eq!(pkce_challenge_for_verifier(verifier), *challenge);
-
-    let replay_response = router
-        .oneshot(admin_oidc_complete_request(&cookies, "admin-code", state))
-        .await
-        .expect("replay completion");
-    assert_eq!(replay_response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(json_error_message(replay_response).await, "invalid_state");
-    assert_eq!(token_endpoint.requests().len(), 1);
-
-    oidc.finish();
-    token_endpoint.abort();
-}
-
-#[tokio::test]
-async fn admin_oidc_completion_requires_initiating_browser_and_same_origin_without_spending_state()
-{
-    let jwks_addr = spawn_test_jwks_server().await;
-    let token_endpoint = spawn_mock_oidc_token_endpoint(Ipv4Addr::new(127, 0, 0, 2), None).await;
-    let oidc = spawn_mock_oidc_discovery_endpoint(Some(token_endpoint.url.clone()));
-    let mut config = admin_oidc_login_config(&oidc.issuer);
-    config.auth_providers[0].jwks_url =
-        Some(format!("http://127.0.0.1:{}/jwks.json", jwks_addr.port()));
-    config.egress_deny_private_ips = false;
-    let capture = audit::sink::tests::CaptureSink::new();
-    let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
-    let recorder = PrometheusBuilder::new().build_recorder();
-    let router = app(
-        config,
-        recorder.handle(),
-        audit_log,
-        test_audit_event_sender(),
-    )
-    .unwrap();
-    let login = router
-        .clone()
-        .oneshot(admin_oidc_login_request(Ipv4Addr::LOCALHOST, None))
-        .await
-        .unwrap();
-    let cookies = admin_oidc_cookies(&login);
-    let query = url_query_pairs(&Url::parse(&response_location(&login)).unwrap());
-    let state = &query["state"];
-    let other_login = router
-        .clone()
-        .oneshot(admin_oidc_login_request(Ipv4Addr::LOCALHOST, None))
-        .await
-        .unwrap();
-    let other_cookies = admin_oidc_cookies(&other_login);
-    let access_token = signed_token_with_issuer("admin-operator", &["admin"], &oidc.issuer);
-    token_endpoint.set_access_token(access_token.clone());
-    token_endpoint.set_id_token(signed_admin_id_token(
-        &oidc.issuer,
-        "admin-ui",
-        &query["nonce"],
-    ));
-
-    // Rejections must leave the original transaction usable. Each test
-    // supplies valid CSRF material so it reaches the browser-binding gate.
-    for cookie in [
-        String::new(),
-        other_cookies,
-        format!("{cookies}; {cookies}"),
-    ] {
-        let callback = router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(format!(
-                        "{ADMIN_AUTH_CALLBACK_ROUTE}?code=admin-code&state={state}"
-                    ))
-                    .header(header::COOKIE, &cookie)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert!(response_location(&callback).contains("error=invalid_state"));
-        assert_eq!(callback.headers()[header::CACHE_CONTROL], "no-store");
-        let completion = router
-            .clone()
-            .oneshot(admin_oidc_complete_request(&cookie, "admin-code", state))
-            .await
-            .unwrap();
-        assert_eq!(completion.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(json_error_message(completion).await, "invalid_state");
-    }
-    for origin in [None, Some("https://other.example.test"), Some("null")] {
-        let mut request = admin_oidc_complete_request(&cookies, "admin-code", state);
-        request.headers_mut().remove(header::ORIGIN);
-        if let Some(origin) = origin {
-            request
-                .headers_mut()
-                .insert(header::ORIGIN, HeaderValue::from_str(origin).unwrap());
-        }
-        let response = router.clone().oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert_eq!(json_error_message(response).await, "invalid_origin");
-    }
-    let mut request = admin_oidc_complete_request(&cookies, "admin-code", state);
-    request.headers_mut().remove("x-csrf-token");
-    assert_eq!(
-        router.clone().oneshot(request).await.unwrap().status(),
-        StatusCode::FORBIDDEN
-    );
-    assert!(token_endpoint.requests().is_empty());
-
-    let (first, second) = tokio::join!(
-        router
-            .clone()
-            .oneshot(admin_oidc_complete_request(&cookies, "admin-code", state)),
-        router.oneshot(admin_oidc_complete_request(&cookies, "admin-code", state)),
-    );
-    let mut successes = 0;
-    for response in [first.unwrap(), second.unwrap()] {
-        if response.status() == StatusCode::OK {
-            assert_admin_oidc_token(response, &access_token).await;
-            successes += 1;
-        } else {
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-            assert_eq!(json_error_message(response).await, "invalid_state");
-        }
-    }
-    assert_eq!(successes, 1);
-    assert_eq!(token_endpoint.requests().len(), 1);
-    assert_eventually(Duration::from_secs(1), || {
-        capture
-            .events()
-            .iter()
-            .filter(|event| event.event_type == "admin_login.transaction")
-            .count()
-            == 13
-    });
-    let events: Vec<_> = capture
-        .events()
-        .into_iter()
-        .filter(|event| event.event_type == "admin_login.transaction")
-        .collect();
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| event.payload["reason"] == "token_exchanged")
-            .count(),
-        1
-    );
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| event.payload["reason"] == "browser_binding_mismatch")
-            .count(),
-        6
-    );
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| event.payload["reason"] == "origin_mismatch")
-            .count(),
-        3
-    );
-    let serialized = serde_json::to_string(&events).unwrap();
-    assert!(!serialized.contains(&access_token));
-    assert!(!serialized.contains(state));
-    assert!(!serialized.contains("admin-code"));
-    for pair in cookies.split(';') {
-        if let Some((name, value)) = pair.trim().split_once('=') {
-            if name.contains("ggw-admin-login-") {
-                assert!(!serialized.contains(value));
-            }
-        }
-    }
-    oidc.finish();
-    token_endpoint.abort();
-}
-
-#[tokio::test]
-async fn admin_oidc_browser_cookie_tracks_custom_prefix_https_and_expiry() {
-    let token_endpoint = spawn_mock_oidc_token_endpoint(Ipv4Addr::new(127, 0, 0, 2), None).await;
-    let oidc = spawn_mock_oidc_discovery_endpoint(Some(token_endpoint.url.clone()));
-    let mut config = admin_oidc_login_config(&oidc.issuer);
-    config.admin_prefix = "/ops".to_owned();
-    config.admin_login_pending_ttl_secs = 1;
-    config.auth_exempt_paths.push("/v1/ops/auth".to_owned());
-    config.rbac_exempt_paths.push("/v1/ops/auth".to_owned());
-    config.auth_providers[0].redirect_uri =
-        Some("https://gateway.example.test/v1/ops/auth/callback".to_owned());
-    let router = admin_oidc_login_router_from_config(config);
-    let login = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/v1/ops/auth/login")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let cookies = admin_oidc_cookies(&login);
-    let binding_cookie = login
-        .headers()
-        .get_all(header::SET_COOKIE)
-        .iter()
-        .map(|value| value.to_str().unwrap())
-        .find(|value| value.starts_with("__Host-ggw-admin-login-"))
-        .unwrap();
-    assert!(binding_cookie.contains("; Path=/; HttpOnly; SameSite=Lax; Max-Age=1; Secure"));
-    assert!(!binding_cookie.contains("Domain="));
-    let query = url_query_pairs(&Url::parse(&response_location(&login)).unwrap());
-    let binding = binding_cookie
-        .split(';')
-        .next()
-        .unwrap()
-        .split_once('=')
-        .unwrap()
-        .1;
-    assert_ne!(binding, query["state"]);
-    assert!(!response_location(&login).contains(binding));
-    let callback = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!(
-                    "/v1/ops/auth/callback?code=admin-code&state={}",
-                    query["state"]
-                ))
-                .header(header::COOKIE, &cookies)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert!(response_location(&callback).starts_with("/ops/#/auth/complete?code="));
-    tokio::time::sleep(Duration::from_millis(1100)).await;
-    let mut request = admin_oidc_complete_request(&cookies, "admin-code", &query["state"]);
-    *request.uri_mut() = "/v1/ops/auth/callback".parse().unwrap();
-    request.headers_mut().insert(
-        header::ORIGIN,
-        HeaderValue::from_static("https://gateway.example.test"),
-    );
-    let response = router.oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(json_error_message(response).await, "invalid_state");
-    assert!(token_endpoint.requests().is_empty());
-    oidc.finish();
-    token_endpoint.abort();
-}
-
-#[tokio::test]
-async fn admin_oidc_login_rejects_token_response_without_id_token() {
-    let token_endpoint = spawn_mock_oidc_token_endpoint(Ipv4Addr::new(127, 0, 0, 2), None).await;
-    let oidc = spawn_mock_oidc_discovery_endpoint(Some(token_endpoint.url.clone()));
-    token_endpoint.set_access_token(signed_token_with_issuer(
-        "admin-operator",
-        &["admin"],
-        &oidc.issuer,
-    ));
-    let router = admin_oidc_login_router(&oidc.issuer);
-
-    let login_response = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/v1/admin/auth/login")
-                .body(Body::empty())
-                .expect("login request should build"),
-        )
-        .await
-        .expect("login request should complete");
-    let cookies = admin_oidc_cookies(&login_response);
-    let login_location = response_location(&login_response);
-    let authorization_url =
-        Url::parse(&login_location).expect("authorization redirect should be absolute");
-    let authorization_query = url_query_pairs(&authorization_url);
-    let state = authorization_query
-        .get("state")
-        .expect("authorization redirect should include state");
-
-    let callback_response = router
-        .oneshot(admin_oidc_complete_request(&cookies, "admin-code", state))
-        .await
-        .expect("completion request should complete");
-
-    assert_eq!(callback_response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        json_error_message(callback_response).await,
-        "token_exchange_failed"
-    );
-    assert_eq!(token_endpoint.requests().len(), 1);
-
-    oidc.finish();
-    token_endpoint.abort();
-}
-
-#[tokio::test]
-async fn admin_oidc_login_accepts_valid_id_token_with_matching_nonce_audience_and_issuer() {
-    let (callback_response, access_token) =
-        admin_oidc_id_token_callback_response(|nonce, issuer| {
-            signed_admin_id_token(issuer, "admin-ui", nonce)
-        })
-        .await;
-
-    assert_admin_oidc_token(callback_response, &access_token).await;
-}
-
-#[tokio::test]
-async fn admin_oidc_login_rejects_id_token_with_mismatched_nonce() {
-    let (callback_response, _) = admin_oidc_id_token_callback_response(|_, issuer| {
-        signed_admin_id_token(issuer, "admin-ui", "other-nonce")
-    })
-    .await;
-
-    assert_eq!(callback_response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        json_error_message(callback_response).await,
-        "token_exchange_failed"
-    );
-}
-
-#[tokio::test]
-async fn admin_oidc_login_rejects_id_token_with_mismatched_audience() {
-    let (callback_response, _) = admin_oidc_id_token_callback_response(|nonce, issuer| {
-        signed_admin_id_token(issuer, "other-client", nonce)
-    })
-    .await;
-
-    assert_eq!(callback_response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        json_error_message(callback_response).await,
-        "token_exchange_failed"
-    );
-}
-
-#[tokio::test]
-async fn admin_oidc_login_rejects_id_token_with_mismatched_issuer() {
-    let (callback_response, _) = admin_oidc_id_token_callback_response(|nonce, _| {
-        signed_admin_id_token("http://other-issuer.example.test", "admin-ui", nonce)
-    })
-    .await;
-
-    assert_eq!(callback_response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        json_error_message(callback_response).await,
-        "token_exchange_failed"
-    );
-}
-
-#[tokio::test]
-async fn admin_oidc_login_rejects_id_token_with_invalid_signature() {
-    let (callback_response, _) = admin_oidc_id_token_callback_response(|nonce, issuer| {
-        corrupt_jwt_signature(&signed_admin_id_token(issuer, "admin-ui", nonce))
-    })
-    .await;
-
-    assert_eq!(callback_response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        json_error_message(callback_response).await,
-        "token_exchange_failed"
-    );
-}
-
-#[tokio::test]
-async fn admin_oidc_callback_with_unknown_state_does_not_exchange_token() {
-    let token_endpoint = spawn_mock_oidc_token_endpoint(Ipv4Addr::LOCALHOST, None).await;
-    let oidc = spawn_mock_oidc_discovery_endpoint(Some(token_endpoint.url.clone()));
-    token_endpoint.set_access_token(signed_token_with_issuer(
-        "admin-operator",
-        &["admin"],
-        &oidc.issuer,
-    ));
-    let router = admin_oidc_login_router(&oidc.issuer);
-
-    let response = router
-        .oneshot(
-            Request::builder()
-                .uri("/v1/admin/auth/callback?code=admin-code&state=unknown-state")
-                .body(Body::empty())
-                .expect("callback request should build"),
-        )
-        .await
-        .expect("callback request should complete");
-
-    assert_eq!(response.status(), StatusCode::FOUND);
-    assert!(
-        fragment_query_pairs(&response_location(&response), "/auth/error")
-            .expect("unknown state should redirect to auth error fragment")
-            .get("error")
-            .is_some_and(|error| error == "invalid_state")
-    );
-    assert!(token_endpoint.requests().is_empty());
-
-    oidc.finish();
-    token_endpoint.abort();
-}
-
-#[test]
-fn admin_oidc_login_provider_rejects_discovery_with_mismatched_issuer() {
-    let (issuer, server) = spawn_oidc_discovery_server(
-        json!({
-            "issuer": "http://attacker.example.test",
-            "jwks_uri": "http://127.0.0.1:1/jwks.json",
-            "authorization_endpoint": "http://127.0.0.1:1/authorize",
-            "token_endpoint": "http://127.0.0.1:1/token"
-        }),
-        1,
-    );
-    let mut config = admin_oidc_login_config(&issuer);
-    config.egress_deny_private_ips = false;
-    let recorder = PrometheusBuilder::new().build_recorder();
-
-    let error = app(
-        config,
-        recorder.handle(),
-        test_audit_log(),
-        test_audit_event_sender(),
-    )
-    .expect_err("admin login discovery with mismatched issuer should fail startup");
-
-    assert!(error.to_string().contains("OIDC discovery issuer mismatch"));
-    server.finish();
-}
-
-#[test]
-fn admin_oidc_login_provider_rejects_discovery_without_issuer() {
-    let (issuer, server) = spawn_oidc_discovery_server(
-        json!({
-            "jwks_uri": "http://127.0.0.1:1/jwks.json",
-            "authorization_endpoint": "http://127.0.0.1:1/authorize",
-            "token_endpoint": "http://127.0.0.1:1/token"
-        }),
-        1,
-    );
-    let mut config = admin_oidc_login_config(&issuer);
-    config.egress_deny_private_ips = false;
-    let recorder = PrometheusBuilder::new().build_recorder();
-
-    let error = app(
-        config,
-        recorder.handle(),
-        test_audit_log(),
-        test_audit_event_sender(),
-    )
-    .expect_err("admin login discovery without issuer should fail startup");
-
-    assert!(error
-        .to_string()
-        .contains("OIDC discovery response missing issuer"));
-    server.finish();
-}
-
-#[test]
-fn admin_oidc_login_provider_requires_discovered_authorize_and_token_endpoints() {
-    let (issuer, server) = spawn_oidc_discovery_server_with(
-        |issuer| {
-            json!({
-                "issuer": issuer,
-                "jwks_uri": "http://127.0.0.1:1/jwks.json",
-                "authorization_endpoint": "http://127.0.0.1:1/authorize"
-            })
-        },
-        1,
-    );
-    let mut config = admin_oidc_login_config(&issuer);
-    config.egress_deny_private_ips = false;
-    let recorder = PrometheusBuilder::new().build_recorder();
-
-    let error = app(
-        config,
-        recorder.handle(),
-        test_audit_log(),
-        test_audit_event_sender(),
-    )
-    .expect_err("admin login discovery without token endpoint should fail startup");
-
-    assert!(error
-        .to_string()
-        .contains("OIDC discovery response missing token_endpoint"));
-    server.finish();
-}
-
-#[tokio::test]
-async fn admin_oidc_login_routes_are_absent_when_provider_unset() {
-    let mut config = test_config(Vec::new());
-    config.auth_enabled = false;
-    let recorder = PrometheusBuilder::new().build_recorder();
-    let router = app(
-        config,
-        recorder.handle(),
-        test_audit_log(),
-        test_audit_event_sender(),
-    )
-    .expect("app should build without admin login provider");
-
-    let response = router
-        .oneshot(
-            Request::builder()
-                .uri("/v1/admin/auth/login")
-                .body(Body::empty())
-                .expect("login request should build"),
-        )
-        .await
-        .expect("login request should complete");
-
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn oidc_discovery_jwks_uri_auto_seed_still_blocks_private_ip() {
-    let (jwks_url, jwks_server) = spawn_blocking_jwks_server(Ipv4Addr::new(127, 0, 0, 2), 1);
-    let (issuer, discovery_server) = spawn_blocking_oidc_discovery_server(jwks_url);
-    let issuer_claim = issuer.clone();
-    let policy = TempPolicyFile::new(
-        r#"{
-                "schema_version": "0.1.0",
-                "default_action": "allow",
-                "roles": {},
-                "routes": [],
-                "egress": {
-                    "cidrs": ["127.0.0.1/32"]
-                }
-            }"#,
-    );
-    let mut config = test_config(Vec::new());
-    config.policy_file = Some(policy.path.to_string_lossy().into_owned());
-    config.auth_providers = vec![config::AuthProviderConfig {
-        name: "oidc".to_owned(),
-        provider_type: config::AuthProviderType::Jwt,
-        jwks_url: None,
-        issuer: Some(issuer),
-        audience: None,
-        jwks_timeout_ms: 2000,
-        jwks_max_key_age_secs: 300,
-        require_jti: false,
-        roles_claim: "roles".to_owned(),
-        roles_claim_delimiter: None,
-        org_claim: None,
-        introspection_url: None,
-        introspection_timeout_ms: config::DEFAULT_COOKIE_SESSION_INTROSPECTION_TIMEOUT_MS,
-        cache_ttl_ms: config::DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
-        user_id_claim: None,
-        email_claim: None,
-        client_id: None,
-        client_secret: None,
-        redirect_uri: None,
-    }];
-    let recorder = PrometheusBuilder::new().build_recorder();
-    let router = app(
-        config,
-        recorder.handle(),
-        test_audit_log(),
-        test_audit_event_sender(),
-    )
-    .expect("app should build after OIDC discovery");
-
-    let response = router
-        .oneshot(
-            Request::builder()
-                .uri("/__test/principal")
-                .header(
-                    header::AUTHORIZATION,
-                    format!(
-                        "Bearer {}",
-                        signed_token_with_issuer("blocked-jwks-user", &["member"], &issuer_claim)
-                    ),
-                )
-                .body(Body::empty())
-                .expect("request should build"),
-        )
-        .await
-        .expect("request should complete");
-
-    // The egress guard makes the key set unfetchable, so the token is never
-    // judged: the answer is "could not verify", not "credential rejected".
-    // The property this test defends is that the blocked JWKS host is never
-    // contacted, asserted below.
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(discovery_server.finish(), 1);
-    assert_eq!(jwks_server.finish(), 0);
-}
-
-#[test]
-fn auth_validator_reports_construction_error_when_oidc_discovery_lacks_jwks_uri() {
-    let (issuer, server) = spawn_oidc_discovery_server_with(|issuer| json!({"issuer": issuer}), 1);
-    let mut config = test_config(Vec::new());
-    config.auth_providers = vec![config::AuthProviderConfig {
-        name: "oidc".to_owned(),
-        provider_type: config::AuthProviderType::Jwt,
-        jwks_url: None,
-        issuer: Some(issuer),
-        audience: None,
-        jwks_timeout_ms: 2000,
-        jwks_max_key_age_secs: 300,
-        require_jti: false,
-        roles_claim: "roles".to_owned(),
-        roles_claim_delimiter: None,
-        org_claim: None,
-        introspection_url: None,
-        introspection_timeout_ms: config::DEFAULT_COOKIE_SESSION_INTROSPECTION_TIMEOUT_MS,
-        cache_ttl_ms: config::DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
-        user_id_claim: None,
-        email_claim: None,
-        client_id: None,
-        client_secret: None,
-        redirect_uri: None,
-    }];
-    config.egress_deny_private_ips = false;
-    let egress_client = Arc::new(
-        egress::EgressClient::new(egress::EgressConfig::from_config(&config))
-            .expect("egress client should build"),
-    );
-
-    let error = match discover_oidc_jwks_urls_from_config(&config, egress_client) {
-        Ok(_) => panic!("missing jwks_uri should fail provider construction"),
-        Err(error) => error,
-    };
-
-    assert!(matches!(
-        error,
-        auth::AuthError::Upstream(message)
-            if message.contains("OIDC discovery response missing jwks_uri")
-    ));
-    server.finish();
-}
-
-#[tokio::test]
 async fn policy_rate_limit_uses_real_authenticated_principal_buckets_in_app_stack() {
     let jwks_addr = spawn_test_jwks_server().await;
     let policy = TempPolicyFile::new(
@@ -30842,24 +27874,6 @@ fn bearer_get_request(uri: &str, token: &str) -> Request<Body> {
         .expect("bearer GET request should build")
 }
 
-async fn create_token_via_endpoint(router: &Router, scopes: &[&str]) -> Value {
-    let creator_roles = std::iter::once("tokens-writer")
-        .chain(scopes.iter().copied())
-        .collect::<Vec<_>>();
-    let response = router
-        .clone()
-        .oneshot(token_admin_request(
-            Method::POST,
-            TOKENS_ADMIN_ROUTE,
-            Some(test_principal(&creator_roles)),
-            Some(json!({ "scopes": scopes }).to_string()),
-        ))
-        .await
-        .expect("token create request should complete");
-    assert_eq!(response.status(), StatusCode::CREATED);
-    json_body(response).await
-}
-
 fn policy_admin_request(
     method: Method,
     uri: &str,
@@ -31213,36 +28227,6 @@ fn connection_policy_document_string() -> String {
             }
         },
         "routes": []
-    })
-    .to_string()
-}
-
-fn token_audit_full_stack_policy_document_string() -> String {
-    json!({
-        "schema_version": "0.1.0",
-        "id": "token-audit-full-stack-policy",
-        "default_action": "deny",
-        "enforcement_mode": "enforce",
-        "roles": {
-            "admin": {
-                "permissions": [
-                    ADMIN_TOKENS_WRITE_PERMISSION,
-                    ADMIN_AUDIT_READ_PERMISSION
-                ]
-            }
-        },
-        "routes": [
-            {
-                "methods": ["POST"],
-                "path_prefix": TOKENS_ADMIN_ROUTE,
-                "permission": ADMIN_TOKENS_WRITE_PERMISSION
-            },
-            {
-                "methods": ["GET"],
-                "path_prefix": AUDIT_ADMIN_ROUTE,
-                "permission": ADMIN_AUDIT_READ_PERMISSION
-            }
-        ]
     })
     .to_string()
 }
@@ -32639,15 +29623,69 @@ fn mcp_content_text(body: &Value) -> &str {
         .expect("MCP result should include text content")
 }
 
+/// How long the audit writer may take to hand an event to every sink of a
+/// test harness's fan-out. It hands each event to the stdout sink before the
+/// discovery aggregator, so a stalled stdout holds the aggregator up with it:
+/// on the Windows coverage runner the test process's stdout stalled for 15 s
+/// (run 40816060787) while the test's own inventory polls kept running, and
+/// the row it was waiting for had not been observed yet. Delivery therefore
+/// has its own, generous bound; the aggregation that follows keeps its own.
+const AUDIT_DELIVERY_BOUND: Duration = Duration::from_secs(60);
+
+/// Wait, without blocking the runtime, until the audit writer has delivered
+/// every event `condition` needs to `capture`. A harness's capture sink is
+/// the last member of its fan-out, after the configured sinks, so an event
+/// it holds has already been handed to the discovery aggregator.
+async fn wait_for_delivered_audit_events(
+    capture: &audit::sink::tests::CaptureSink,
+    what: &str,
+    condition: impl Fn(&[audit::AuditEvent]) -> bool,
+) {
+    let started = Instant::now();
+    loop {
+        if condition(&capture.events()) {
+            return;
+        }
+        assert!(
+            started.elapsed() < AUDIT_DELIVERY_BOUND,
+            "the audit writer did not deliver {what} within {AUDIT_DELIVERY_BOUND:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// The per-tool observation an MCP `tools/call` emits (method `MCP`), as
+/// opposed to the HTTP observation of the `POST /mcp` that carried it.
+fn is_mcp_tool_observation(event: &audit::AuditEvent, request_id: &str) -> bool {
+    event.event_type == "http.request_observed"
+        && event.request_id == request_id
+        && event.payload["method"] == json!("MCP")
+}
+
+/// The inventory row for `tool_name` once it matches `condition`. Reading it
+/// before the observations it is built from reached the aggregator would
+/// charge the aggregation window for the audit writer's delivery, so the
+/// observation of every request in `request_ids` is awaited first.
 async fn wait_for_mcp_tool_inventory_row(
-    router: &Router,
-    token: &str,
+    harness: &McpInventoryTestHarness,
+    request_ids: &[&str],
     tool_name: &str,
     condition: impl Fn(&Value) -> bool,
 ) -> Value {
-    // This asserts eventual persistence, not a two-second throughput SLO.
-    // Keep a finite bound while allowing instrumented Windows SQLite workers
-    // to drain all observations; the exact row/count assertions stay unchanged.
+    wait_for_delivered_audit_events(&harness.capture, "the MCP tool observations", |events| {
+        request_ids.iter().all(|request_id| {
+            events
+                .iter()
+                .any(|event| is_mcp_tool_observation(event, request_id))
+        })
+    })
+    .await;
+    let (router, token) = (&harness.router, harness.admin_token.as_str());
+
+    // From here the aggregator holds every observation, and the bound is
+    // its flush (every 250 ms) and the query on an instrumented, loaded
+    // Windows runner, not a throughput SLO; the exact row/count assertions
+    // stay unchanged.
     let started = Instant::now();
 
     loop {
@@ -33044,44 +30082,6 @@ fn assert_policy_change_actor(event: &audit::AuditEvent) {
     assert_eq!(actor.roles, Some(vec!["admin".to_owned()]));
 }
 
-fn captured_token_change(
-    capture: &audit::sink::tests::CaptureSink,
-    action: &str,
-) -> audit::AuditEvent {
-    assert_eventually(Duration::from_secs(1), || {
-        capture.events().iter().any(|event| {
-            event.event_type == audit::event::SERVICE_TOKEN_CHANGED
-                && event.payload["action"] == json!(action)
-        })
-    });
-
-    capture
-        .events()
-        .into_iter()
-        .find(|event| {
-            event.event_type == audit::event::SERVICE_TOKEN_CHANGED
-                && event.payload["action"] == json!(action)
-        })
-        .expect("service_token.changed event should be captured")
-}
-
-fn captured_token_delegation_rejection(
-    capture: &audit::sink::tests::CaptureSink,
-) -> audit::AuditEvent {
-    assert_eventually(Duration::from_secs(1), || {
-        capture
-            .events()
-            .iter()
-            .any(|event| event.event_type == audit::event::SERVICE_TOKEN_DELEGATION_REJECTED)
-    });
-
-    capture
-        .events()
-        .into_iter()
-        .find(|event| event.event_type == audit::event::SERVICE_TOKEN_DELEGATION_REJECTED)
-        .expect("service_token.delegation_rejected event should be captured")
-}
-
 fn captured_tool_registry_change(
     capture: &audit::sink::tests::CaptureSink,
     action: &str,
@@ -33101,12 +30101,6 @@ fn captured_tool_registry_change(
                 && event.payload["action"] == json!(action)
         })
         .expect("tool_registry.changed event should be captured")
-}
-
-fn assert_token_change_actor(event: &audit::AuditEvent) {
-    let actor = event.actor.as_ref().expect("actor should be set");
-    assert_eq!(actor.user_id, "user-123");
-    assert_eq!(actor.auth_mode, "bearer_token");
 }
 
 async fn status_json(router: Router, principal: Option<auth::Principal>) -> Value {
@@ -33206,45 +30200,6 @@ async fn wait_for_audit_query_event(router: Router, uri: &str, request_id: &str)
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "audit query did not return event with request_id {request_id}"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-}
-
-async fn wait_for_bearer_audit_event(
-    router: &Router,
-    uri: &str,
-    token: &str,
-    predicate: impl Fn(&Value) -> bool,
-) -> Value {
-    let started = Instant::now();
-
-    loop {
-        let response = router
-            .clone()
-            .oneshot(bearer_get_request(uri, token))
-            .await
-            .expect("bearer audit query request should complete");
-        let status = response.status();
-        if status != StatusCode::OK {
-            panic!(
-                "bearer audit query returned {status}: {}",
-                body_string(response).await
-            );
-        }
-        let body = json_body(response).await;
-        if let Some(event) = body["events"]
-            .as_array()
-            .expect("events should be an array")
-            .iter()
-            .find(|event| predicate(event))
-        {
-            return event.clone();
-        }
-
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "bearer audit query did not return matching event: {body}"
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
@@ -33732,65 +30687,6 @@ async fn spawn_test_jwks_server() -> std::net::SocketAddr {
     .await
 }
 
-fn spawn_oidc_jwks_server() -> (String, BlockingJsonServer) {
-    let jwks = json!({
-        "keys": [{
-            "kty": "RSA",
-            "kid": TEST_JWT_KID,
-            "use": "sig",
-            "alg": "RS256",
-            "n": TEST_JWT_PUBLIC_KEY_N,
-            "e": TEST_JWT_PUBLIC_KEY_E
-        }]
-    });
-    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
-        .expect("OIDC discovery test server should bind");
-    let issuer = format!(
-        "http://127.0.0.1:{}",
-        listener
-            .local_addr()
-            .expect("OIDC discovery test server address should be available")
-            .port()
-    );
-    let discovery = json!({
-        "issuer": issuer,
-        "jwks_uri": format!("{issuer}/jwks.json")
-    });
-    spawn_oidc_server(listener, discovery, Some(jwks), 2)
-}
-
-fn spawn_oidc_jwks_server_with_document_issuer(
-    document_issuer: impl FnOnce(&str) -> String,
-) -> (String, String, BlockingJsonServer) {
-    let jwks = json!({
-        "keys": [{
-            "kty": "RSA",
-            "kid": TEST_JWT_KID,
-            "use": "sig",
-            "alg": "RS256",
-            "n": TEST_JWT_PUBLIC_KEY_N,
-            "e": TEST_JWT_PUBLIC_KEY_E
-        }]
-    });
-    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
-        .expect("OIDC discovery test server should bind");
-    let issuer = format!(
-        "http://127.0.0.1:{}",
-        listener
-            .local_addr()
-            .expect("OIDC discovery test server address should be available")
-            .port()
-    );
-    let document_issuer = document_issuer(&issuer);
-    let discovery = json!({
-        "issuer": document_issuer.clone(),
-        "jwks_uri": format!("{issuer}/jwks.json")
-    });
-    let (issuer, server) = spawn_oidc_server(listener, discovery, Some(jwks), 2);
-
-    (issuer, document_issuer, server)
-}
-
 fn spawn_oidc_discovery_server(
     discovery: Value,
     request_count: usize,
@@ -33813,39 +30709,6 @@ fn spawn_oidc_discovery_server_with(
     );
     let discovery = discovery(&issuer);
     spawn_oidc_server(listener, discovery, None, request_count)
-}
-
-fn spawn_blocking_jwks_server(
-    host: Ipv4Addr,
-    request_count: usize,
-) -> (String, BlockingJsonServer) {
-    let listener =
-        std::net::TcpListener::bind((host, 0)).expect("JWKS split-host test server should bind");
-    let jwks_url = format!(
-        "http://{}:{}/jwks.json",
-        host,
-        listener
-            .local_addr()
-            .expect("JWKS split-host test server address should be available")
-            .port()
-    );
-    let jwks = json!({
-        "keys": [{
-            "kty": "RSA",
-            "kid": TEST_JWT_KID,
-            "use": "sig",
-            "alg": "RS256",
-            "n": TEST_JWT_PUBLIC_KEY_N,
-            "e": TEST_JWT_PUBLIC_KEY_E
-        }]
-    });
-    let server = spawn_blocking_json_server(
-        listener,
-        vec![("/jwks.json".to_owned(), jwks.to_string())],
-        request_count,
-    );
-
-    (jwks_url, server)
 }
 
 fn spawn_blocking_cookie_session_server(
@@ -33877,32 +30740,6 @@ fn spawn_blocking_cookie_session_server(
     );
 
     (introspection_url, server)
-}
-
-fn spawn_blocking_oidc_discovery_server(jwks_url: String) -> (String, BlockingJsonServer) {
-    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
-        .expect("OIDC split-host discovery test server should bind");
-    let issuer = format!(
-        "http://127.0.0.1:{}",
-        listener
-            .local_addr()
-            .expect("OIDC split-host discovery test server address should be available")
-            .port()
-    );
-    let discovery = json!({
-        "issuer": issuer,
-        "jwks_uri": jwks_url
-    });
-    let server = spawn_blocking_json_server(
-        listener,
-        vec![(
-            "/.well-known/openid-configuration".to_owned(),
-            discovery.to_string(),
-        )],
-        1,
-    );
-
-    (issuer, server)
 }
 
 /// A blocking HTTP/1.1 test server that answers fixed JSON bodies by path.
@@ -34068,30 +30905,6 @@ fn configure_test_jwt_provider(config: &mut config::Config, jwks_addr: std::net:
     }];
 }
 
-fn oidc_jwt_provider(issuer: String) -> config::AuthProviderConfig {
-    config::AuthProviderConfig {
-        name: "oidc".to_owned(),
-        provider_type: config::AuthProviderType::Jwt,
-        jwks_url: None,
-        issuer: Some(issuer),
-        audience: None,
-        jwks_timeout_ms: 2000,
-        jwks_max_key_age_secs: 300,
-        require_jti: false,
-        roles_claim: "roles".to_owned(),
-        roles_claim_delimiter: None,
-        org_claim: None,
-        introspection_url: None,
-        introspection_timeout_ms: config::DEFAULT_COOKIE_SESSION_INTROSPECTION_TIMEOUT_MS,
-        cache_ttl_ms: config::DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
-        user_id_claim: None,
-        email_claim: None,
-        client_id: None,
-        client_secret: None,
-        redirect_uri: None,
-    }
-}
-
 fn configure_test_cookie_session_provider(config: &mut config::Config, introspection_url: String) {
     config.auth_providers = vec![config::AuthProviderConfig {
         name: "app-session".to_owned(),
@@ -34150,15 +30963,6 @@ fn signed_admin_id_token(issuer: &str, audience: &str, nonce: &str) -> String {
         "aud": audience,
         "nonce": nonce
     }))
-}
-
-fn corrupt_jwt_signature(token: &str) -> String {
-    let mut parts = token.split('.').map(str::to_owned).collect::<Vec<_>>();
-    assert_eq!(parts.len(), 3);
-    let replacement = if parts[2].ends_with('A') { 'B' } else { 'A' };
-    parts[2].pop();
-    parts[2].push(replacement);
-    parts.join(".")
 }
 
 fn signed_token_with_claims(claims: Value) -> String {
