@@ -62,7 +62,7 @@ and the Dockerfile must agree with it. `scripts/build_tools.py check` rejects
 missing declarations, version drift, unpinned installs and implicit npx downloads.
 CI uses the shared `.github/actions/build-tools` action before any build.
 
-The production/default compiler is Rust 1.99.0, matching the reviewed
+The production/default compiler is Rust 1.99.1, matching the reviewed
 Docker image update.
 The required `production-compiler` job checks all targets with that compiler;
 ordinary CI uses the previously passing Rust 1.98.1. As with the 1.98.0 image
@@ -71,7 +71,7 @@ the enforced lint set and the microbenchmark compiler, so it is reviewed
 separately. Coverage remains on nightly-2026-09-01 with cargo-llvm-cov 0.9.0
 and unchanged floors. Its dated compiler is deliberate, not an invitation to
 follow nightly updates.
-Node 26.12.0 and bundled npm 11.20.0 match the current pinned Node image.
+Node 26.12.1 and bundled npm 11.20.0 match the current pinned Node image.
 Gateway builds verify the actual Node/npm executable versions before installing
 UI dependencies, and Docker additionally checks its actual Rust version.
 Cargo builds use the existing lockfile without resolution updates.
@@ -86,16 +86,20 @@ duplicate versions and parent chains are recorded in the Cargo policy with
 maintainer ownership and a 2026-12-01 expiry. Remove the old transport group
 when Axum converges; no license or advisory allowances are added.
 
-jsonschema 0.58.6 is built without default features (so no HTTP or file
+jsonschema 0.60.2 is built without default features (so no HTTP or file
 reference resolution) and with exactly `arbitrary-precision` and `idna`. Keep
 both. `arbitrary-precision` matches the workspace's `serde_json`
-`arbitrary_precision`: without it jsonschema's numeric code assumes every number
-fits a `u64`, `i64` or `f64` and panics on one that does not, which 0.58.6 still
-does for `type: integer`. Without `idna`, `idn-email` and `idn-hostname` silently
-become unknown formats that accept anything. Exact comparison costs grow with
-the square of a number's width, so the tool registry, executor and overlay
-validator bound the numbers in input schemas, tool arguments and overlay
-documents before the validator sees them.
+`arbitrary_precision`: without it jsonschema cannot compare a number that does
+not fit a `u64`, `i64` or `f64` exactly, and releases before 0.60.1 panicked on
+one, for example under `type: integer`. Without `idna`, `idn-email` and
+`idn-hostname` silently become unknown formats that accept anything. Exact
+comparison costs grow with the square of a number's width, so the tool
+registry, executor and overlay validator bound the numbers in input schemas,
+tool arguments and overlay documents before the validator sees them.
+The registry precheck bounds only local `#` reference chains, so a cycle back
+to the root `$id` through a nested `$id` resource reaches the compiler. Beside
+`unevaluatedProperties` or `unevaluatedItems`, 0.58.6 overflowed the stack on
+such a schema, which aborts the process; 0.60.2 compiles it.
 The feature reaches jsonschema-macros only through a weak optional-dependency
 feature, so Cargo.lock and `cargo metadata` resolve jsonschema-macros,
 jsonschema-macros-core, proc-macro-crate, toml_edit, toml_parser,
@@ -236,7 +240,7 @@ output prevents promotion. See [operator verification and offline evidence](../R
 The gateway uses the digest-pinned `gcr.io/distroless/base-nossl-debian13:nonroot`
 runtime. Debian 13 glibc supports the older Rust builder ABI; the actual loader
 and running-image tests enforce compatibility. The base retains CA roots,
-DNS/NSS, fixed tzdata 2026c and Debian package metadata for scanning. Shells,
+DNS/NSS, fixed tzdata 2026e and Debian package metadata for scanning. Shells,
 apt, curl, Perl, mount utilities and OpenSSL are absent. Gateway uses Rustls,
 and Linux linkage requires only glibc and libgcc.
 

@@ -6,6 +6,7 @@ pub mod policy;
 pub mod policy_conversion;
 pub mod policy_document;
 pub mod policy_history;
+pub mod policy_resources;
 pub mod rule;
 
 pub use engine::PolicyEngine;

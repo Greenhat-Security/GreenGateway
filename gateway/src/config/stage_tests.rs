@@ -1014,6 +1014,7 @@ fn the_configuration_modules_name_no_input_or_output_api() {
         ("src/config/plan.rs", 0),
         ("src/config/proxy.rs", 0),
         ("src/config/runtime.rs", 0),
+        ("src/config/semantic_diff.rs", 0),
         ("src/config/stage.rs", 0),
         ("src/config/storage.rs", 0),
     ] {
@@ -1226,10 +1227,33 @@ fn rule_fixture(rule: ConfigRule) -> (&'static [(&'static str, &'static str)], &
             ],
             "AUTHORITY_PSEUDONYM_KEY_ALIAS",
         ),
+        // Every cluster requirement is met; only the sink is missing.
+        ConfigRule::AuthorityEvidenceDeliveryRequired => (
+            &[
+                POSTGRES[0],
+                POSTGRES[1],
+                POSTGRES[2],
+                POSTGRES[3],
+                POSTGRES[4],
+                ("AUTHORITY_EVIDENCE_DURABILITY", "required"),
+            ],
+            "AUTHORITY_EVIDENCE_DURABILITY",
+        ),
+        // The standalone session store best effort accepts.
+        ConfigRule::AuthorityEvidenceUnsupportedConfiguration => (
+            &[
+                ("AUTH_PROVIDERS", ADMIN_LOGIN_PROVIDER_DOCUMENT),
+                ("ADMIN_LOGIN_PROVIDER", "primary"),
+                ("ADMIN_PREFIX", "/operations"),
+                ("ADMIN_SESSION_MODE", "standalone_memory"),
+                ("AUTHORITY_EVIDENCE_DURABILITY", "required"),
+            ],
+            "AUTHORITY_EVIDENCE_DURABILITY",
+        ),
     }
 }
 
-const EVERY_RULE: [ConfigRule; 28] = [
+const EVERY_RULE: [ConfigRule; 30] = [
     ConfigRule::Value,
     ConfigRule::AdminListenerCollision,
     ConfigRule::GrpcListenerCollision,
@@ -1258,6 +1282,8 @@ const EVERY_RULE: [ConfigRule; 28] = [
     ConfigRule::AuthorityEventSinkRequirements,
     ConfigRule::AuthorityEventMaterialUnused,
     ConfigRule::AuthorityPseudonymKeysDistinct,
+    ConfigRule::AuthorityEvidenceDeliveryRequired,
+    ConfigRule::AuthorityEvidenceUnsupportedConfiguration,
 ];
 
 /// Every rule is reachable, and a refusal under it is reported as a

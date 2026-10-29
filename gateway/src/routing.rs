@@ -935,13 +935,18 @@ pub(super) fn register_metrics(cluster: bool) {
 ///
 /// A counter series created by its first event appears at `1` with no
 /// earlier sample, and `increase()` needs two samples of one series to see a
-/// change. Unseeded, the first refused authority change, dropped audit event,
-/// failed audit flush or pool timeout after a process start -- often the only
-/// one, and for a refusal the one that matters -- would never page.
-/// `increment(0)` creates a series without changing it, and every label
-/// value below is one the emitter itself uses, so each family keeps exactly
-/// its bounded vocabulary. `scripts/test_alert_rules.py` fails when a rule
-/// reads a counter that is not seeded here.
+/// change. Unseeded, the first refused authority change, request refused for
+/// its audit record, dropped audit event, failed audit flush or pool timeout
+/// after a process start -- often the only one, and for a refusal the one
+/// that matters -- would never page. `increment(0)` creates a series without
+/// changing it, and every label value below is one the emitter itself uses,
+/// so each family keeps exactly its bounded vocabulary.
+/// `scripts/test_alert_rules.py` fails when a rule reads a counter that is
+/// not seeded here.
+///
+/// The durability refusal reasons are seeded whatever `AUDIT_DURABILITY`
+/// says: under `best_effort` nothing is ever refused, and a series that
+/// stays at `0` says exactly that.
 ///
 /// `greengateway_authority_event_delivery_failures_total` is deliberately
 /// not seeded: its rule waits for failures sustained over ten minutes, and
@@ -952,6 +957,10 @@ fn seed_alerted_counters(cluster: bool) {
         ::metrics::counter!(audit::AUDIT_EVENTS_DROPPED_TOTAL, "reason" => reason).increment(0);
     }
     ::metrics::counter!(metrics::AUDIT_FLUSH_TOTAL, "outcome" => audit::FLUSH_FAILURE).increment(0);
+    for reason in audit::durable::AUDIT_DURABILITY_REFUSAL_REASONS {
+        ::metrics::counter!(metrics::AUDIT_DURABILITY_REFUSALS_TOTAL, "reason" => reason)
+            .increment(0);
+    }
     #[cfg(feature = "postgres")]
     if cluster {
         ::metrics::counter!(

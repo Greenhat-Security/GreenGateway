@@ -15,6 +15,8 @@ const MAX_COMPOSITE_STEP_ID_BYTES = 64;
 const MAX_TOOL_NAME_BYTES = 128;
 const MAX_TRANSFORM_PROBLEMS = 32;
 const MAX_TRANSFORM_PROBLEM_FIELD_BYTES = 1_024;
+const MAX_VALIDATION_ERRORS = 64;
+const MAX_VALIDATION_ERROR_BYTES = 4_096;
 // The fixed reasons the gateway refuses to attest a caller with. A
 // compensation refused for one of them sent nothing, and the write it would
 // have undone is reported as an orphan with that reason.
@@ -81,6 +83,9 @@ export class AdminApiError extends Error {
   readonly code: AdminApiErrorCode;
   readonly problems: readonly AdminValidationProblem[];
   readonly transformProblems: readonly AdminTransformProblem[];
+  // The free-text reasons a document write was refused for, from a
+  // `{"valid":false,"errors":[...]}` body such as the policy API's.
+  readonly validationErrors: readonly string[];
   readonly details: AdminApiErrorDetails;
   readonly etag: string | null;
   readonly collectionEtag: string | null;
@@ -92,6 +97,7 @@ export class AdminApiError extends Error {
       code?: AdminApiErrorCode;
       problems?: readonly AdminValidationProblem[];
       transformProblems?: readonly AdminTransformProblem[];
+      validationErrors?: readonly string[];
       details?: AdminApiErrorDetails;
       etag?: string | null;
       collectionEtag?: string | null;
@@ -103,6 +109,7 @@ export class AdminApiError extends Error {
     this.code = options.code ?? errorCodeForStatus(status);
     this.problems = options.problems ?? [];
     this.transformProblems = options.transformProblems ?? [];
+    this.validationErrors = options.validationErrors ?? [];
     this.details = options.details ?? {};
     this.etag = options.etag ?? null;
     this.collectionEtag = options.collectionEtag ?? null;
@@ -111,6 +118,11 @@ export class AdminApiError extends Error {
 
 export type AdminFetchOptions = Omit<RequestInit, 'headers'> & {
   headers?: HeadersInit;
+  // Error statuses that are this endpoint's answer rather than a failure,
+  // such as the 400 a validation endpoint returns for an invalid document.
+  // Their body is returned like a success's, for the caller to project;
+  // 401 and 403 always fail.
+  answerStatuses?: readonly number[];
 };
 
 export type AdminJsonResponse<T> = {
@@ -152,42 +164,46 @@ export async function adminFetchJsonResponse<T>(
   options: AdminFetchOptions = {},
 ): Promise<AdminJsonResponse<T>> {
   assertAdminRequestOrigin(input);
+  const { answerStatuses = [], ...requestOptions } = options;
   const requestIdentity = getAdminIdentityVersion();
   const headers = new Headers({
     Accept: 'application/json',
     ...authHeaders(),
   });
-  new Headers(options.headers).forEach((value, name) => {
+  new Headers(requestOptions.headers).forEach((value, name) => {
     headers.set(name, value);
   });
-  addCsrfHeader(headers, options.method);
+  addCsrfHeader(headers, requestOptions.method);
 
   const response = await fetch(input, {
-    ...options,
+    ...requestOptions,
     credentials: adminRequestCredentials(),
     redirect: 'error',
     headers,
   });
   const body = await parseJsonBody(response);
-  if (options.signal?.aborted) {
+  if (requestOptions.signal?.aborted) {
     throw new DOMException('Admin request aborted.', 'AbortError');
   }
   if (requestIdentity !== getAdminIdentityVersion()) {
     throw new Error('Admin identity changed while the request was pending.');
   }
-  if (!response.ok) {
+  const answered =
+    response.status !== 401 &&
+    response.status !== 403 &&
+    answerStatuses.includes(response.status);
+  if (!response.ok && !answered) {
     adminAuthorizationFailed(response.status, requestIdentity, input === adminApiUrl('/capabilities'));
     throw adminApiError(body, response);
   }
-  const method = (options.method ?? 'GET').toUpperCase();
-  if (!SAFE_METHODS.has(method)) {
+  const method = (requestOptions.method ?? 'GET').toUpperCase();
+  if (response.ok && !SAFE_METHODS.has(method)) {
     const path = new URL(input, window.location.origin).pathname;
     if (path === adminApiUrl('/auth/logout')) {
       clearMemoryToken();
     } else if (path === adminApiUrl('/auth/callback')) {
       adminIdentityChanged();
-    } else if ((path === adminApiUrl('/policy') || path.startsWith(adminApiUrl('/policy/'))) &&
-               !path.endsWith('/preview') && !path.endsWith('/validate')) {
+    } else if (changesLivePolicy(path)) {
       adminPolicyChanged();
     }
   }
@@ -199,6 +215,36 @@ export async function adminFetchJsonResponse<T>(
     etag: response.headers.get('etag'),
     collectionEtag: collectionEtag(response.headers),
   };
+}
+
+// Whether a successful write to this path can have changed the live policy.
+// Previews, validation, conversion, simulations and test runs read only
+// their request, and a replay job only reads retained records; saving,
+// editing or deleting a draft changes no enforcement, and only a draft's
+// publication does.
+function changesLivePolicy(path: string): boolean {
+  const policyPath = adminApiUrl('/policy');
+  if (path !== policyPath && !path.startsWith(`${policyPath}/`)) {
+    return false;
+  }
+  if (
+    path.endsWith('/preview') ||
+    path.endsWith('/validate') ||
+    path.endsWith('/convert') ||
+    path === adminApiUrl('/policy/simulations') ||
+    path === adminApiUrl('/policy/tests/runs')
+  ) {
+    return false;
+  }
+  const replaysPath = adminApiUrl('/policy/replays');
+  if (path === replaysPath || path.startsWith(`${replaysPath}/`)) {
+    return false;
+  }
+  const draftsPath = adminApiUrl('/policy/drafts');
+  if (path === draftsPath || path.startsWith(`${draftsPath}/`)) {
+    return path.endsWith('/publish');
+  }
+  return true;
 }
 
 async function parseJsonBody(response: Response): Promise<unknown> {
@@ -219,6 +265,7 @@ function adminApiError(body: unknown, response: Response): AdminApiError {
     code: errorCode(body, response.status),
     problems: validationProblems(body),
     transformProblems: transformProblems(body),
+    validationErrors: validationErrors(body),
     details: errorDetails(body),
     etag: response.headers.get('etag'),
     collectionEtag: collectionEtag(response.headers),
@@ -319,6 +366,18 @@ function transformProblems(body: unknown): AdminTransformProblem[] {
       },
     ];
   });
+}
+
+function validationErrors(body: unknown): string[] {
+  if (!isJsonObject(body) || !Array.isArray(body.errors)) {
+    return [];
+  }
+
+  return body.errors
+    .filter((error): error is string =>
+      isBoundedNonEmptyString(error, MAX_VALIDATION_ERROR_BYTES),
+    )
+    .slice(0, MAX_VALIDATION_ERRORS);
 }
 
 function errorDetails(body: unknown): AdminApiErrorDetails {

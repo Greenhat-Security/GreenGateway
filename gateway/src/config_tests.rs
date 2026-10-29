@@ -6483,6 +6483,173 @@ fn delivery_material_without_a_sink_is_refused_rather_than_ignored() {
     }
 }
 
+// --- required authority evidence (issue #425, PR 4) ----------------------
+
+const ADMIN_SESSION_PROVIDER: &str = r#"[{"name":"primary","type":"jwt","issuer":"https://issuer.example.test","client_id":"admin-ui","client_secret":"generated-fixture-placeholder","redirect_uri":"https://management.example.test/v1/operations/auth/callback"}]"#;
+
+fn standalone_vars<'a>(
+    extra: &'a [(&'a str, &'a str)],
+) -> impl Fn(&str) -> Result<String, VarError> + 'a {
+    move |name| {
+        extra
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| (*value).to_owned())
+            .ok_or(VarError::NotPresent)
+    }
+}
+
+#[test]
+fn authority_evidence_durability_defaults_to_best_effort_and_parses_both_values() {
+    for vars in [
+        Config::from_env_vars(standalone_vars(&[])),
+        Config::from_env_vars(postgres_mode_vars(&[])),
+    ] {
+        let config = vars.expect("the defaults validate");
+        assert_eq!(
+            config.authority_events.durability,
+            AuthorityEvidenceDurability::BestEffort
+        );
+    }
+    let standalone = Config::from_env_vars(standalone_vars(&[(
+        "AUTHORITY_EVIDENCE_DURABILITY",
+        "required",
+    )]))
+    .expect("standalone mode has no sink to require");
+    assert_eq!(
+        standalone.authority_events.durability,
+        AuthorityEvidenceDurability::Required
+    );
+    let explicit = Config::from_env_vars(standalone_vars(&[(
+        "AUTHORITY_EVIDENCE_DURABILITY",
+        "best_effort",
+    )]))
+    .expect("best_effort is the explicit default");
+    assert_eq!(
+        explicit.authority_events.durability,
+        AuthorityEvidenceDurability::BestEffort
+    );
+
+    // Neither blank nor a near miss falls back to the weaker default.
+    for value in ["", " ", "Required", "required ", "strict"] {
+        let error =
+            Config::from_env_vars(standalone_vars(&[("AUTHORITY_EVIDENCE_DURABILITY", value)]))
+                .expect_err("the value is refused")
+                .to_string();
+        assert!(
+            error.contains(
+                "AUTHORITY_EVIDENCE_DURABILITY must be a valid authority evidence durability mode"
+            ),
+            "{value:?}: {error}"
+        );
+    }
+}
+
+#[test]
+fn required_authority_evidence_needs_a_sink_in_cluster_mode() {
+    let error = authority_event_error(&[("AUTHORITY_EVIDENCE_DURABILITY", "required")]);
+    assert!(
+        error.contains(
+            "AUTHORITY_EVIDENCE_DURABILITY=required needs AUTHORITY_EVENT_SINK=log or file when STATE_BACKEND=postgres"
+        ),
+        "{error}"
+    );
+    let explicit_none = authority_event_error(&[
+        ("AUTHORITY_EVIDENCE_DURABILITY", "required"),
+        ("AUTHORITY_EVENT_SINK", "none"),
+    ]);
+    assert!(
+        explicit_none.contains("is retained but never delivered"),
+        "{explicit_none}"
+    );
+    let diagnostics = Config::from_env_vars(postgres_mode_vars(&[(
+        "AUTHORITY_EVIDENCE_DURABILITY",
+        "required",
+    )]))
+    .expect_err("no sink is refused")
+    .diagnostics()
+    .to_vec();
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(
+        diagnostics[0].rule,
+        diagnostic::ConfigRule::AuthorityEvidenceDeliveryRequired
+    );
+    assert_eq!(
+        diagnostics[0].variable,
+        Some("AUTHORITY_EVIDENCE_DURABILITY")
+    );
+
+    // A sink that delivers what the journal holds satisfies it; the sink's
+    // own requirements are unchanged.
+    for sink in [
+        vec![
+            ("AUTHORITY_EVIDENCE_DURABILITY", "required"),
+            ("AUTHORITY_EVENT_SINK", "log"),
+            ("AUTHORITY_PSEUDONYM_KEY_ALIAS", "pseudonym-2026-10"),
+        ],
+        vec![
+            ("AUTHORITY_EVIDENCE_DURABILITY", "required"),
+            ("AUTHORITY_EVENT_SINK", "file"),
+            (
+                "AUTHORITY_EVENT_FILE",
+                "/var/lib/greengateway/authority-events.jsonl",
+            ),
+            ("AUTHORITY_PSEUDONYM_KEY_ALIAS", "pseudonym-2026-10"),
+        ],
+    ] {
+        let config = Config::from_env_vars(postgres_mode_vars(&sink))
+            .unwrap_or_else(|error| panic!("{sink:?}: {error}"));
+        assert_eq!(
+            config.authority_events.durability,
+            AuthorityEvidenceDurability::Required
+        );
+    }
+    let keyless = authority_event_error(&[
+        ("AUTHORITY_EVIDENCE_DURABILITY", "required"),
+        ("AUTHORITY_EVENT_SINK", "log"),
+    ]);
+    assert!(
+        keyless
+            .contains("AUTHORITY_PSEUDONYM_KEY_ALIAS is required when AUTHORITY_EVENT_SINK is set"),
+        "{keyless}"
+    );
+    assert!(!keyless.contains("never delivered"), "{keyless}");
+}
+
+#[test]
+fn required_authority_evidence_refuses_process_local_admin_sessions() {
+    let session = [
+        ("AUTH_PROVIDERS", ADMIN_SESSION_PROVIDER),
+        ("ADMIN_LOGIN_PROVIDER", "primary"),
+        ("ADMIN_PREFIX", "/operations"),
+        ("ADMIN_SESSION_MODE", "standalone_memory"),
+    ];
+    Config::from_env_vars(standalone_vars(&session))
+        .expect("best effort keeps the standalone session store");
+
+    let mut required = session.to_vec();
+    required.push(("AUTHORITY_EVIDENCE_DURABILITY", "required"));
+    let error = Config::from_env_vars(standalone_vars(&required))
+        .expect_err("required refuses in-memory sessions");
+    assert_eq!(
+        error.problems,
+        ["AUTHORITY_EVIDENCE_DURABILITY=required refuses ADMIN_SESSION_MODE=standalone_memory; process-local admin sessions leave no durable record of who was granted or withdrawn a session"]
+    );
+    assert_eq!(
+        error.diagnostics()[0].rule,
+        diagnostic::ConfigRule::AuthorityEvidenceUnsupportedConfiguration
+    );
+
+    // Without a session store there is nothing to refuse.
+    Config::from_env_vars(standalone_vars(&[
+        ("AUTH_PROVIDERS", ADMIN_SESSION_PROVIDER),
+        ("ADMIN_LOGIN_PROVIDER", "primary"),
+        ("ADMIN_PREFIX", "/operations"),
+        ("AUTHORITY_EVIDENCE_DURABILITY", "required"),
+    ]))
+    .expect("bearer-only admin login keeps no session to record");
+}
+
 #[test]
 fn every_authority_event_setting_is_refused_in_standalone_mode() {
     for (name, value) in [

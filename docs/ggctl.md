@@ -2,7 +2,7 @@
 
 `ggctl` is GreenGateway's operator command-line tool (issue #242, [ADR-0008](adr/0008-setup-cli-and-configuration-bundles.md)). It is a separate binary: the `gateway` server keeps its name, its no-argument startup, its Docker entrypoint and its one-shot commands (`gateway migrate`, `gateway healthcheck`, `gateway import-standalone`, ...) unchanged.
 
-**Status: alpha.** This build implements `version`, `schema`, `validate`, `doctor`, `completion` and `help`, the output contract, the exit codes, secure bearer-token input and the version handshake with a running gateway. `validate` and `doctor` check a [configuration bundle](configuration-bundles.md) offline with the gateway's own bundle reader. `ggctl` cannot yet pin, convert, initialize, diff, plan, apply, export or back up anything, and it cannot yet validate an environment file (`--env`): those are later #242 slices (see the ADR's [rollout](adr/0008-setup-cli-and-configuration-bundles.md#rollout)), and a name this build does not implement is refused as an unknown command (exit 2). Nothing here changes how a gateway is configured or started: no gateway reads a bundle yet.
+**Status: alpha.** This build implements `version`, `schema`, `validate`, `doctor`, `diff`, `completion` and `help`, the output contract, the exit codes, secure bearer-token input and the version handshake with a running gateway. `validate` and `doctor` check a [configuration bundle](configuration-bundles.md) offline with the gateway's own bundle reader, and `diff` compares two bundles semantically and classifies each change's risk. `ggctl` cannot yet pin, convert, initialize, plan, apply, export or back up anything, and it cannot yet validate or diff an environment file (`--env`, `--against-env`) or diff against a server (`diff --server`): those are later #242 slices (see the ADR's [rollout](adr/0008-setup-cli-and-configuration-bundles.md#rollout)), and a name this build does not implement is refused as an unknown command (exit 2). Nothing here changes how a gateway is configured or started: no gateway reads a bundle yet.
 
 ## Building
 
@@ -24,6 +24,7 @@ ggctl version [--server URL] [--ca-file PATH] [--token-stdin | --token-file PATH
 ggctl schema [KIND] [--api-version VERSION] [--format human|json]
 ggctl validate BUNDLE [--strict] [--warnings-as-errors] [--format human|json|sarif]
 ggctl doctor BUNDLE [--format human|json]
+ggctl diff BUNDLE --against BUNDLE [--check] [--strict] [--format human|json|sarif]
 ggctl completion bash|zsh|fish|powershell
 ggctl help [COMMAND]
 ggctl --help | --version
@@ -96,6 +97,24 @@ The human result lists each check's status, ID and reason on standard output and
 | `doctor.migration_profile` | The deployment uses the `migration` profile, meant for moving an existing deployment over, not as a final state. |
 | `doctor.development_profile` | The deployment uses the `development` profile, which is not for production. |
 
+### `diff`
+
+Compares the bundle in the directory `BUNDLE` with the one `--against` names, semantically: both are read by the same reader as `validate`, and the [semantic diff](semantic-diff.md) compares what they configure, never their text. The change is from the `--against` bundle to `BUNDLE`. The manifest, the deployment document and the policy and tools documents are compared member by member, so formatting, member order, the order of an unordered list and a spelled-out default never register. Each change carries its field (a dotted document path such as `policy.egress.hosts`), its section, whether it was added, removed or modified, its [change class](semantic-diff.md#what-a-change-carries), whether it `loosened`, `tightened` or did something `unknown` or `neutral`, and the stable [risk codes](semantic-diff.md#risk-codes) of what it weakens; a change no detector can classify carries `risk.unknown_impact`, never no code. Only booleans, fixed words and numbers are ever shown: every other value is withheld, with entry counts for a collection, and entry names (roles, tools) never appear. It reads only beneath the two directories, writes nothing, makes no network request and reads no environment variable. `BUNDLE` must be valid UTF-8, and neither path is ever echoed.
+
+- The human result lists one line per change (severity, field, kind, the value or `(value withheld)` with counts, class, effect and codes) and ends with the number of changes, the highest severity and every code; `no changes` when nothing differs.
+- `--format json` writes one `GgctlReport` whose `result` holds `valid`, `bundle` and `against` (each as `validate` reports a bundle) and, when both were read, `diff` ([`diffResult`](schemas/ggctl-report.v1alpha1.schema.json)).
+- `--format sarif` writes one SARIF 2.1.0 log: the readers' diagnostics as `validate` writes them, then one rule per risk code (level `error` for a `high` code, `warning` for `medium`, `note` for `low`) and one result per risk code of each change, located at the change's field as a logical location. A change without a code is not a finding and has no result. This extends ADR-0008, which gave SARIF to `validate` only.
+- `--check` exits `4` when the bundles differ at all (`diff.drift_found`), whatever the risk. `--strict` applies to both bundles as it does for `validate`.
+
+A bundle that is invalid is not compared: the readers' diagnostics are reported, BUNDLE's first, and the result says `valid: false`. Diagnostics name bundle-relative files, so a diagnostic about a file both bundles have does not say which bundle it concerns; read `bundle` and `against` in the result, or validate each bundle on its own. As for `validate`, the production policy and tools validators do not run (`validate.production_validators_not_run`).
+
+Exit codes: `0` when both bundles were compared, `4` with `--check` when they differ, `3` when either is invalid, `1` when either could not be read, `2` without `--against`. To gate a change in CI on the risk it carries, compare the proposed bundle with the deployed one and fail on what the codes say:
+
+```yaml
+- name: Review the configuration change
+  run: ggctl diff deploy/bundle --against deployed/bundle --format sarif > bundle-diff.sarif
+```
+
 ### `completion`
 
 Writes a completion script to standard output. It completes commands, options, fixed choices, file names for path options and directory names for a `BUNDLE` argument.
@@ -109,7 +128,7 @@ Writes a completion script to standard output. It completes commands, options, f
 
 ## Output contract
 
-- **Standard output carries only what was asked for**: an artifact (a schema, a completion script, help), the human result, with `--format json` exactly one `GgctlReport` document ([schema](schemas/ggctl-report.v1alpha1.schema.json)), or with `validate --format sarif` exactly one SARIF 2.1.0 log.
+- **Standard output carries only what was asked for**: an artifact (a schema, a completion script, help), the human result, with `--format json` exactly one `GgctlReport` document ([schema](schemas/ggctl-report.v1alpha1.schema.json)), or with `validate --format sarif` or `diff --format sarif` exactly one SARIF 2.1.0 log.
 - **Diagnostics go to standard error** in human form. With `--format json` or `--format sarif` they are in the document instead and standard error stays empty.
 - **An argument error found before a command runs** (an unknown option, a refused secret or insecure option, a malformed `--server`) is written to standard error only, exits `2`, and writes no report.
 - **No color, no prompts, no progress output.** `ggctl` reads no configuration file and no environment variable, and makes no network request unless a command is given `--server`.
@@ -118,7 +137,7 @@ A report always has `apiVersion: greengateway.dev/v1alpha1`, `kind: GgctlReport`
 
 A report about a bundle carries the bundle reader's own codes (the `bundle`, `syntax`, `json`, `yaml`, `compat`, `schema`, `reference`, `secret`, `resource` and `profile` families), each listed in [configuration bundles](configuration-bundles.md#diagnostics), which is its remediation anchor. No code is spelled the same in both lists. A reader warning exits `0` on its own; a reader error exits `3`, or `1` when the bundle could not be read at all.
 
-SARIF 2.1.0 output belongs to `validate`, the one command ADR-0008 gives it.
+SARIF 2.1.0 output belongs to `validate`, which ADR-0008 gives it, and to `diff`, which reports its risk codes as results.
 
 ## Exit codes
 
@@ -267,6 +286,12 @@ Each code below is stable. The exit column is the exit code the diagnostic produ
 | Code | Exit | Meaning |
 | --- | --- | --- |
 | `doctor.required_check_failed` | 3 | A required [doctor check](#doctor-checks) failed. |
+
+### Diff diagnostics
+
+| Code | Exit | Meaning |
+| --- | --- | --- |
+| `diff.drift_found` | 4 | `--check` was given and the bundles differ. |
 
 ### Output diagnostics
 

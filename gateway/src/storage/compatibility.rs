@@ -53,7 +53,7 @@
 //!
 //! Schema presence alone never enables an operation.
 //!
-//! The registry ([`OPERATION_REQUIREMENTS`]) holds three operations. The
+//! The registry ([`OPERATION_REQUIREMENTS`]) holds four operations. The
 //! first (issue #426, PR 2) is committing a policy document in which a role
 //! carries a `description` ([`POLICY_ROLE_DESCRIPTIONS`]). A gateway built
 //! before the field refuses such a document outright -- the role's fields
@@ -66,14 +66,17 @@
 //! ([`OPENAPI_DISCOVERY_CATALOGS`]), which a gateway built before that
 //! format's import cannot generate from; each waits for its own capability
 //! ([`Capability::OpenApiSwagger2Catalogs`],
-//! [`Capability::OpenApiDiscoveryCatalogs`]) the same way. No operation
-//! changes the schema: migration 25, the one step that rolls, adds columns
-//! nothing writes yet, and the approved-extension list in `migrations.rs` is
-//! empty. Every other operation this binary performs belongs to the
-//! schema-25 contract, which every member serving schema 25 shares, its
-//! prepared release included. No shipped operation declares a durable
-//! fence or a backfill, so in this release nothing raises the fence and
-//! the backfill ledger is empty; both are checked everywhere they apply.
+//! [`Capability::OpenApiDiscoveryCatalogs`]) the same way. The fourth (issue
+//! #441) is recording a delegated-token purge for every replica
+//! ([`DELEGATED_TOKEN_PURGES`]), which a gateway built before the record
+//! would not apply; it waits for [`Capability::DelegatedTokenPurges`]. No
+//! operation changes the schema: migration 25, the one step that rolls,
+//! adds columns nothing writes yet, and the approved-extension list in
+//! `migrations.rs` is empty. Every other operation this binary performs
+//! belongs to the schema-25 contract, which every member serving schema 25
+//! shares, its prepared release included. No shipped operation declares a
+//! durable fence or a backfill, so in this release nothing raises the fence
+//! and the backfill ledger is empty; both are checked everywhere they apply.
 
 use std::collections::BTreeSet;
 
@@ -98,6 +101,11 @@ const SEPARATOR: char = ',';
 /// these, and recognizes only these.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum Capability {
+    /// The member applies every delegated-token purge recorded at the
+    /// authority before it serves another protected request (issue #441). A
+    /// member without it ignores the record and keeps serving the purged
+    /// principal's cached tokens, so [`DELEGATED_TOKEN_PURGES`] waits for it.
+    DelegatedTokenPurges,
     /// The member generates, refreshes and replays a managed OpenAPI
     /// catalog whose specification is a Google Discovery document (issue
     /// #443). A member without it cannot generate from one, so
@@ -122,7 +130,8 @@ pub(crate) enum Capability {
 
 impl Capability {
     /// Every capability, in name order.
-    pub(crate) const KNOWN: [Self; 4] = [
+    pub(crate) const KNOWN: [Self; 5] = [
+        Self::DelegatedTokenPurges,
         Self::OpenApiDiscoveryCatalogs,
         Self::OpenApiSwagger2Catalogs,
         Self::OperationRequirements,
@@ -131,6 +140,7 @@ impl Capability {
 
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
+            Self::DelegatedTokenPurges => "delegated_token_purges",
             Self::OpenApiDiscoveryCatalogs => "openapi_discovery_catalogs",
             Self::OpenApiSwagger2Catalogs => "openapi_swagger2_catalogs",
             Self::OperationRequirements => "operation_requirements",
@@ -147,6 +157,7 @@ impl Capability {
 
 /// What this binary advertises: every capability it implements.
 pub(crate) const BINARY_CAPABILITIES: &[Capability] = &[
+    Capability::DelegatedTokenPurges,
     Capability::OpenApiDiscoveryCatalogs,
     Capability::OpenApiSwagger2Catalogs,
     Capability::OperationRequirements,
@@ -228,8 +239,8 @@ impl RecognizedCapabilities {
 pub(crate) use gate::{
     evaluate, fence_target, Activation, Backfill, BackfillState, BinaryContract, ContractFence,
     FenceExclusion, FenceTarget, MemberAdvertisement, OperationAdmission, OperationRefusal,
-    OperationRequirement, OPENAPI_DISCOVERY_CATALOGS, OPENAPI_SWAGGER2_CATALOGS,
-    OPERATION_REQUIREMENTS, POLICY_ROLE_DESCRIPTIONS,
+    OperationRequirement, DELEGATED_TOKEN_PURGES, OPENAPI_DISCOVERY_CATALOGS,
+    OPENAPI_SWAGGER2_CATALOGS, OPERATION_REQUIREMENTS, POLICY_ROLE_DESCRIPTIONS,
 };
 
 #[cfg(feature = "postgres")]
@@ -359,6 +370,33 @@ mod gate {
         activation: Activation::LiveMembers,
     };
 
+    /// Recording a delegated-token purge at the authority for every replica
+    /// to apply (issue #441): an operator's purge, or one a revoked
+    /// credential started.
+    ///
+    /// The record is a `security_outbox` row every replica of this build
+    /// applies before it serves again. A gateway built before it does not
+    /// read the row: it keeps serving the purged principal's cached tokens,
+    /// for at most the 900 seconds a delegated token is cached, and it
+    /// refuses an operator's purge with `409` itself. So the record waits
+    /// until every live member advertises [`Capability::DelegatedTokenPurges`].
+    /// Live-roster agreement is the activation, not the durable fence: a
+    /// lacking member that starts after the record starts with an empty
+    /// cache, and the one it misses -- one paused past the stale window when
+    /// the purge was admitted, resumed within 900 seconds -- is bounded by
+    /// that cache lifetime, while raising the fence would make one purge
+    /// forbid every earlier binary from rejoining the deployment. The row
+    /// lives in a table schema 6 created, so `minimum_schema` is 17 for the
+    /// same reason as [`POLICY_ROLE_DESCRIPTIONS`]; no document format.
+    pub(crate) const DELEGATED_TOKEN_PURGES: OperationRequirement = OperationRequirement {
+        operation: "connections.delegated_token_purge",
+        minimum_schema: 17,
+        document_format: None,
+        capability: Capability::DelegatedTokenPurges,
+        backfill: Backfill::NotRequired,
+        activation: Activation::LiveMembers,
+    };
+
     /// Every operation this binary gates. An operation added later
     /// registers here, advertises a new capability, and calls the gate
     /// before its write.
@@ -366,6 +404,7 @@ mod gate {
         POLICY_ROLE_DESCRIPTIONS,
         OPENAPI_SWAGGER2_CATALOGS,
         OPENAPI_DISCOVERY_CATALOGS,
+        DELEGATED_TOKEN_PURGES,
     ];
 
     /// What this binary serves and advertises: the left-hand side of every
