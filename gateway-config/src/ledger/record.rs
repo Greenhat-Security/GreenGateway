@@ -15,9 +15,10 @@ use crate::bundle::{
 use crate::canonical_json;
 
 use super::{
-    is_lowercase_hex, ActivationClass, ActorKind, AuthMode, Corruption, LedgerActor, LedgerError,
-    Operation, ParentLink, RecordedBundle, RecordedFile, Refusal, ResourceOrigin, RevisionCodes,
-    RevisionId, RevisionSummary,
+    is_framed_digest, is_lowercase_hex, sorted_codes, ActivationClass, ActorKind, AuthMode,
+    Corruption, LedgerActor, LedgerError, Operation, ParentLink, PlanId, RecordedBundle,
+    RecordedFile, Refusal, ResourceOrigin, RevisionCodes, RevisionId, RevisionRequest,
+    RevisionSummary,
 };
 
 /// The media type a record hash frames the canonical record bytes under.
@@ -37,6 +38,7 @@ pub(super) struct Pending {
     actor: LedgerActor,
     activation: ActivationClass,
     codes: RevisionCodes,
+    request: Option<RevisionRequest>,
     bundle: RecordedBundle,
 }
 
@@ -55,16 +57,42 @@ impl Pending {
             actor,
             activation,
             codes,
+            request: None,
             bundle: recorded_bundle(bundle)?,
         })
+    }
+
+    /// The same revision applied under `request`, whose acknowledged risk
+    /// codes must be exactly the revision's.
+    pub(super) fn with_request(
+        mut self,
+        request: Option<RevisionRequest>,
+    ) -> Result<Self, LedgerError> {
+        if let Some(request) = &request {
+            if request.acknowledged_risks != self.codes.risk_codes {
+                return Err(LedgerError::Refused(Refusal::AcknowledgementMismatch));
+            }
+        }
+        self.request = request;
+        Ok(self)
     }
 
     pub(super) fn operation(&self) -> &Operation {
         &self.operation
     }
 
-    pub(super) fn activation(&self) -> ActivationClass {
-        self.activation
+    pub(super) fn request(&self) -> Option<&RevisionRequest> {
+        self.request.as_ref()
+    }
+
+    /// Whether the active pointer may move with this revision: a live
+    /// revision whose request did not ask to stage only.
+    pub(super) fn activates(&self) -> bool {
+        self.activation == ActivationClass::Live
+            && !self
+                .request
+                .as_ref()
+                .is_some_and(RevisionRequest::stage_only)
     }
 
     pub(super) fn bundle(&self) -> &RecordedBundle {
@@ -109,6 +137,13 @@ pub(super) fn encode(
         changed_sections: pending.codes.changed_sections().to_vec(),
         risk_codes: pending.codes.risk_codes().to_vec(),
         required_permissions: pending.codes.required_permissions().to_vec(),
+        request: pending.request.as_ref().map(|request| RequestV1 {
+            plan: request.plan.as_str().to_owned(),
+            idempotency_key: request.idempotency_key.clone(),
+            binding: request.binding.clone(),
+            acknowledged_risks: request.acknowledged_risks.clone(),
+            stage_only: request.stage_only,
+        }),
         bundle: BundleV1 {
             api_version: pending.bundle.api_version.as_str().to_owned(),
             name: pending.bundle.name.clone(),
@@ -296,12 +331,6 @@ fn is_well_formed(bundle: &RecordedBundle) -> bool {
         })
 }
 
-fn is_framed_digest(digest: &str) -> bool {
-    digest
-        .strip_prefix("sha256:")
-        .is_some_and(|digits| digits.len() == 64 && is_lowercase_hex(digits))
-}
-
 /// The typed record, or why it is not one. A well-formed record that names a
 /// document version this binary does not know is unsupported, not corrupt.
 fn read_record(
@@ -321,6 +350,7 @@ fn read_record(
         changed_sections,
         risk_codes,
         required_permissions,
+        request,
         bundle,
     } = record;
 
@@ -373,6 +403,10 @@ fn read_record(
     {
         return Err(RECORD);
     }
+    let request = match request {
+        None => None,
+        Some(request) => Some(read_request(request, &operation, &codes)?),
+    };
     let bundle = read_bundle_record(bundle)?;
     Ok(RevisionSummary {
         sequence,
@@ -384,7 +418,41 @@ fn read_record(
         actor,
         activation,
         codes,
+        request,
         bundle,
+    })
+}
+
+/// A recorded request: never on a seed, its digests and plan ID in their
+/// grammar, and its acknowledged codes exactly the revision's risk codes.
+fn read_request(
+    request: RequestV1,
+    operation: &Operation,
+    codes: &RevisionCodes,
+) -> Result<RevisionRequest, LedgerError> {
+    const RECORD: LedgerError = LedgerError::Corrupt(Corruption::Record);
+    let RequestV1 {
+        plan,
+        idempotency_key,
+        binding,
+        acknowledged_risks,
+        stage_only,
+    } = request;
+    let plan = PlanId::parse(&plan).ok_or(RECORD)?;
+    if *operation == Operation::Seed
+        || !is_framed_digest(&idempotency_key)
+        || !is_framed_digest(&binding)
+        || sorted_codes(&acknowledged_risks).as_ref() != Some(&acknowledged_risks)
+        || acknowledged_risks != codes.risk_codes
+    {
+        return Err(RECORD);
+    }
+    Ok(RevisionRequest {
+        plan,
+        idempotency_key,
+        binding,
+        acknowledged_risks,
+        stage_only,
     })
 }
 
@@ -468,7 +536,18 @@ struct RecordV1 {
     changed_sections: Vec<String>,
     risk_codes: Vec<String>,
     required_permissions: Vec<String>,
+    request: Option<RequestV1>,
     bundle: BundleV1,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RequestV1 {
+    plan: String,
+    idempotency_key: String,
+    binding: String,
+    acknowledged_risks: Vec<String>,
+    stage_only: bool,
 }
 
 #[derive(Deserialize, Serialize)]

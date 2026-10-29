@@ -29,9 +29,13 @@
 //!   append-only, hash-chained SQLite record of the bundles a standalone
 //!   deployment applied, which refuses to open when anything in it no longer
 //!   verifies;
+//! - [`revisions`]: conditional plan, apply, history and rollback over that
+//!   ledger, which recompiles every candidate, binds risk acknowledgements
+//!   to the exact plan, requires the union of permissions and never
+//!   overwrites a revision it did not plan against;
 //! - [`semantic_diff`]: the semantic diff between two compiled
 //!   configurations and its risk classification, which `ggctl diff` reports
-//!   for two bundles and the gateway's plans will report.
+//!   for two bundles and the ledger's plans gate applies on.
 //!
 //! Still in the gateway crate: the environment configuration compiler
 //! (`config::compile`, extracted by #433 and described in
@@ -44,7 +48,8 @@
 //! reader reads files only beneath the bundle root it is given, and never
 //! writes. The archive guard reads and writes only the readers and writers
 //! it is handed. The ledger is the one store: it reads and writes only its own
-//! database and journal files beneath the state directory it is given.
+//! database and journal files beneath the state directory it is given, and
+//! the revision service reads and writes only through it.
 
 pub mod archive;
 pub mod bundle;
@@ -55,4 +60,5 @@ pub mod documents;
 pub mod ledger;
 pub mod opaque_id;
 pub mod permissions;
+pub mod revisions;
 pub mod semantic_diff;
