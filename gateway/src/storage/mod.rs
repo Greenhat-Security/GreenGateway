@@ -51,6 +51,8 @@ pub mod postgres_audit;
 #[cfg(feature = "postgres")]
 pub mod postgres_authority_events;
 #[cfg(feature = "postgres")]
+pub mod postgres_delegated_token_purges;
+#[cfg(feature = "postgres")]
 pub mod postgres_discovery;
 #[cfg(feature = "postgres")]
 pub mod postgres_discovery_lifecycle;
@@ -99,6 +101,8 @@ pub use policy_history::{
     ActivePolicy, PolicyCommitError, PolicyCommitPrecondition, PolicyCommitRequest,
     PolicyControlPlane,
 };
+#[cfg(feature = "postgres")]
+pub use postgres_delegated_token_purges::PostgresDelegatedTokenPurgeStore;
 #[cfg(feature = "postgres")]
 pub use postgres_execution_leases::PostgresExecutionLeaseStore;
 #[cfg(feature = "postgres")]

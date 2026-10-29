@@ -1230,6 +1230,7 @@ mod tests {
         assert_eq!(
             only.capabilities,
             vec![
+                "delegated_token_purges",
                 "openapi_discovery_catalogs",
                 "openapi_swagger2_catalogs",
                 "operation_requirements",

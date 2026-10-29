@@ -251,11 +251,19 @@ impl GoogleDelegationBinding {
     }
 }
 
+/// Whose Google token a cache entry holds: the issuer and subject the key's principal digest is
+/// taken over, so a purge another replica recorded -- which names only a digest -- is audited with
+/// the principal it dropped (issue #441).
+pub(crate) struct GooglePrincipal {
+    issuer: String,
+    subject: String,
+}
+
 /// A Google token one call holds: injected as `Authorization: Bearer`, and dropped from the cache
 /// by an upstream `401`.
-pub(crate) type GoogleDelegationLease = OAuthTokenLease<GoogleDelegationError>;
+pub(crate) type GoogleDelegationLease = OAuthTokenLease<GoogleDelegationError, GooglePrincipal>;
 
-type GoogleDelegationCache = OAuthTokenCache<GoogleDelegationError>;
+type GoogleDelegationCache = OAuthTokenCache<GoogleDelegationError, GooglePrincipal>;
 
 /// Small on purpose: every clone of the Connection runtime carries one, and it holds nothing a
 /// binding cannot bring.
@@ -348,12 +356,16 @@ impl GoogleDelegationRuntime {
             secret_version: None,
             egress_generation: binding.token_client.configuration_generation(),
         };
+        let principal = || GooglePrincipal {
+            issuer: identity.issuer.to_owned(),
+            subject: identity.subject.to_owned(),
+        };
         let runtime = self.clone();
         let minted_for = binding.clone();
-        let caller = caller.clone();
+        let caller_for_mint = caller.clone();
         self.cache
-            .get_or_mint(key, move || async move {
-                runtime.mint(&minted_for, &caller, &subject).await
+            .get_or_mint_with(key, principal, move || async move {
+                runtime.mint(&minted_for, &caller_for_mint, &subject).await
             })
             .await
     }
@@ -370,6 +382,24 @@ impl GoogleDelegationRuntime {
         self.cache
             .retire_where(|key| key.principal == Some(principal))
             .len()
+    }
+
+    /// Drops every Google token cached for a principal `matches` accepts, by the digest
+    /// [`principal_digest`] takes over its issuer and subject, and names the principal of each
+    /// entry dropped: what applying a purge another replica recorded needs (issue #441). Nothing
+    /// is revoked at Google.
+    pub(crate) fn purge_principals_where(
+        &self,
+        matches: &dyn Fn(&[u8; 32]) -> bool,
+    ) -> Vec<(String, String)> {
+        self.cache
+            .retire_where(|key| key.principal.as_ref().is_some_and(matches))
+            .iter()
+            .map(|slot| {
+                let principal = slot.context();
+                (principal.issuer.clone(), principal.subject.clone())
+            })
+            .collect()
     }
 
     fn transport_for(&self, binding: &GoogleDelegationBinding) -> Arc<dyn GcpTransport> {

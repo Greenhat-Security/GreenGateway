@@ -499,6 +499,167 @@ async fn publishing_a_draft_whose_base_moved_is_refused_until_it_is_rebased() {
 }
 
 #[tokio::test]
+async fn publishing_a_draft_runs_the_cross_resource_checks_of_every_policy_write() {
+    let policy = TempPolicyFile::new(&policy_document_string("base-policy", "test:old"));
+    let (router, capture) = captured_router(&policy);
+    let (base_etag, _) = current_policy(&router).await;
+
+    // Saving a candidate that leaves nobody able to write the policy is
+    // allowed: a draft is a workspace, and only publication is blocked.
+    let mut locked_out = policy_document("locked-out", "test:new");
+    locked_out["roles"]["admin"]["permissions"] = json!([ADMIN_POLICY_READ_PERMISSION]);
+    let (locked_id, locked_etag, locked) =
+        create_draft(&router, &base_etag, Some(locked_out)).await;
+
+    let (status, body) =
+        refusal(publish(&router, &locked_id, &locked_etag, &base_etag).await).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["valid"], json!(false));
+    let codes: Vec<&str> = body["diagnostics"]
+        .as_array()
+        .expect("a refusal carries its diagnostics")
+        .iter()
+        .filter(|diagnostic| diagnostic["blocks"]["publication"] == json!(true))
+        .filter_map(|diagnostic| diagnostic["code"].as_str())
+        .collect();
+    assert_eq!(
+        codes,
+        ["policy_write_unreachable", "publisher_policy_write_lost"],
+        "{body}"
+    );
+    let reviewed = body["resource_snapshot"]["digest"]
+        .as_str()
+        .expect("a refusal names the snapshot it read")
+        .to_owned();
+    assert_eq!(body["resource_snapshot"]["complete"], json!(true));
+
+    // Nothing was written and the draft is kept, still open on its base.
+    let (live_etag, live) = current_policy(&router).await;
+    assert_eq!(live_etag, base_etag);
+    assert_eq!(live["id"], "base-policy");
+    let kept = json_body(
+        send(
+            &router,
+            draft_request(Method::GET, &draft_uri(&locked_id), admin(), None, &[]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(kept["revision"], 1);
+    assert_eq!(kept["state"], "open");
+    assert_eq!(kept["published_etag"], Value::Null);
+    assert_eventually(Duration::from_secs(1), || {
+        !events_of(&capture, audit::event::POLICY_PUBLICATION_REFUSED).is_empty()
+    });
+    assert_eq!(
+        events_of(&capture, audit::event::POLICY_PUBLICATION_REFUSED),
+        [json!({
+            "action": "policy_draft_published",
+            "codes": ["policy_write_unreachable", "publisher_policy_write_lost"],
+            "policy_etag": base_etag,
+            "resource_snapshot_digest": reviewed,
+        })]
+    );
+    // Like every refused publication of a draft, it is also audited as one.
+    let draft_refusal = |draft_id: &str, created: &Value| {
+        json!({
+            "draft_id": draft_id,
+            "draft_revision": 1,
+            "reason": "policy_resources_refused",
+            "base_etag": base_etag,
+            "candidate_etag": created["candidate_etag"],
+            "current_policy_etag": base_etag,
+        })
+    };
+    assert_eventually(Duration::from_secs(1), || {
+        !events_of(&capture, audit::event::POLICY_DRAFT_PUBLISH_REFUSED).is_empty()
+    });
+    assert_eq!(
+        events_of(&capture, audit::event::POLICY_DRAFT_PUBLISH_REFUSED),
+        [draft_refusal(&locked_id, &locked)]
+    );
+    assert!(events_of(&capture, audit::event::POLICY_DRAFT_PUBLISHED).is_empty());
+    assert!(events_of(&capture, audit::event::POLICY_CHANGED).is_empty());
+
+    // A sound draft published against a resource snapshot that is not the
+    // current one is refused as stale, and kept.
+    let (sound_id, sound_etag, sound) = create_draft(
+        &router,
+        &base_etag,
+        Some(policy_document("sound-draft", "test:new")),
+    )
+    .await;
+    let bound_publish = |snapshot: &str| {
+        draft_request(
+            Method::POST,
+            &draft_publish_uri(&sound_id),
+            admin(),
+            None,
+            &[
+                (POLICY_DRAFT_ETAG_HEADER, sound_etag.as_str()),
+                ("if-match", base_etag.as_str()),
+                ("x-greengateway-resource-snapshot", snapshot),
+            ],
+        )
+    };
+    // A repeated binding is the request's fault, answered before the draft
+    // is read, like a malformed precondition, and is no refusal of it.
+    let repeated = send(
+        &router,
+        draft_request(
+            Method::POST,
+            &draft_publish_uri(&sound_id),
+            admin(),
+            None,
+            &[
+                (POLICY_DRAFT_ETAG_HEADER, sound_etag.as_str()),
+                ("if-match", base_etag.as_str()),
+                ("x-greengateway-resource-snapshot", reviewed.as_str()),
+                ("x-greengateway-resource-snapshot", reviewed.as_str()),
+            ],
+        ),
+    )
+    .await;
+    assert_eq!(repeated.status(), StatusCode::BAD_REQUEST);
+    let stale = format!("sha256:{}", "0".repeat(64));
+    let (status, body) = refusal(send(&router, bound_publish(&stale)).await).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["reason"], "resource_snapshot_stale");
+    assert_eq!(body["resource_snapshot"]["digest"], json!(reviewed));
+    assert_eq!(current_policy(&router).await.0, base_etag);
+    assert_eventually(Duration::from_secs(1), || {
+        events_of(&capture, audit::event::POLICY_DRAFT_PUBLISH_REFUSED).len() == 2
+    });
+    assert_eq!(
+        events_of(&capture, audit::event::POLICY_DRAFT_PUBLISH_REFUSED),
+        [
+            draft_refusal(&locked_id, &locked),
+            draft_refusal(&sound_id, &sound)
+        ]
+    );
+    assert_eq!(
+        events_of(&capture, audit::event::POLICY_PUBLICATION_REFUSED)[1],
+        json!({
+            "action": "policy_draft_published",
+            "codes": ["resource_snapshot_stale"],
+            "policy_etag": base_etag,
+            "resource_snapshot_digest": reviewed,
+        })
+    );
+
+    // Bound to the snapshot that is current, it publishes, and the commit's
+    // policy.changed names that snapshot.
+    let published = send(&router, bound_publish(&reviewed)).await;
+    assert_eq!(published.status(), StatusCode::OK);
+    assert_eq!(current_policy(&router).await.1["id"], "sound-draft");
+    assert_eventually(Duration::from_secs(1), || {
+        events_of(&capture, audit::event::POLICY_CHANGED)
+            .iter()
+            .any(|payload| payload["resource_snapshot_digest"] == json!(reviewed))
+    });
+}
+
+#[tokio::test]
 async fn policy_drafts_belong_to_their_owner_alone() {
     let policy = TempPolicyFile::new(&policy_document_string("owned-policy", "test:old"));
     let (router, _capture) = captured_router(&policy);
@@ -1163,6 +1324,7 @@ fn direct_draft_router(
             membership: None,
             event_store: None,
             query_store: None,
+            authority_evidence: authority_events::required::AuthorityEvidenceGate::best_effort(),
             audit: audit_log,
             client_ip_policy: client_ip::ClientIpPolicy::default(),
             max_body_size: 1024 * 1024,

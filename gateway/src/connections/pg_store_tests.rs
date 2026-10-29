@@ -4658,6 +4658,12 @@ async fn a_failed_catalog_evidence_insert_rolls_back_the_publication() {
         .expect("MCP connection should create");
     let revision_before = security_revision(&pool).await;
     let outbox_before = count(&pool, "SELECT COUNT(*) FROM greengateway.security_outbox").await;
+    // The recorder is this thread's, and the test's current-thread runtime
+    // runs the store on this thread.
+    let recorder = crate::audit::sink::tests::CountingRecorder::default();
+    let _recording = ::metrics::set_default_local_recorder(&recorder);
+    let evidence_failures =
+        || recorder.count(crate::metrics::AUTHORITY_EVENT_EVIDENCE_FAILURES_TOTAL, &[]);
 
     pool.get()
         .await
@@ -4693,6 +4699,8 @@ async fn a_failed_catalog_evidence_insert_rolls_back_the_publication() {
         matches!(failed, ConnectionStoreError::Postgres { .. }),
         "{failed}"
     );
+    // Counted once, on the counter the evidence write-failure alert pages on.
+    assert_eq!(evidence_failures(), 1);
     pool.get()
         .await
         .expect("failure trigger cleanup checkout")
@@ -4741,4 +4749,9 @@ async fn a_failed_catalog_evidence_insert_rolls_back_the_publication() {
         .await
         .expect("the publication commits once evidence can be written");
     assert_eq!(catalog_evidence_rows(&pool).await.len(), 1);
+    assert_eq!(
+        evidence_failures(),
+        1,
+        "a recorded publication counts nothing"
+    );
 }
