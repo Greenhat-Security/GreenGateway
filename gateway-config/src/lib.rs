@@ -24,7 +24,10 @@
 //! - [`ledger`]: the standalone configuration revision ledger, an
 //!   append-only, hash-chained SQLite record of the bundles a standalone
 //!   deployment applied, which refuses to open when anything in it no longer
-//!   verifies.
+//!   verifies;
+//! - [`semantic_diff`]: the semantic diff between two compiled
+//!   configurations and its risk classification, which `ggctl diff` reports
+//!   for two bundles and the gateway's plans will report.
 //!
 //! Still in the gateway crate: the environment configuration compiler
 //! (`config::compile`, extracted by #433 and described in
@@ -47,3 +50,4 @@ pub mod documents;
 pub mod ledger;
 pub mod opaque_id;
 pub mod permissions;
+pub mod semantic_diff;

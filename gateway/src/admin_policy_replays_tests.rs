@@ -489,6 +489,8 @@ async fn a_replay_job_runs_to_an_aggregate_deterministic_result_and_audits_its_l
     assert_eq!(accepted["candidate"]["source"], json!("edits"));
     assert_eq!(accepted["candidate"]["edits"], json!(1));
     assert_eq!(accepted["cutoff"]["selected_records"], json!(9));
+    assert_eq!(accepted["projections"], json!(["as_authored"]));
+    assert_eq!(accepted["freshness"], json!({ "state": "current" }));
 
     let job = finished(&harness.router, replayer(), &id).await;
     assert_eq!(job["state"], json!("completed"), "{job}");
@@ -513,6 +515,29 @@ async fn a_replay_job_runs_to_an_aggregate_deterministic_result_and_audits_its_l
         .sum();
     assert_eq!(blocked, 3);
     assert_eq!(result["replayed"]["rate"]["override"], json!(4));
+    // Against the active policy it was written against, the lockdown
+    // blocks the order the route allowed and the one a shadow rule only
+    // observed, re-attributes the anonymous denial, and allows nothing new.
+    let impact = &result["impact"]["projections"]["as_authored"];
+    let transitions = &impact["http"]["transitions"];
+    assert_eq!(transitions["newly_denied"], json!(1));
+    assert_eq!(transitions["enforcement_only_change"], json!(1));
+    assert_eq!(transitions["attribution_only_change"], json!(1));
+    assert_eq!(transitions["unchanged_allow"], json!(4));
+    assert_eq!(transitions["newly_allowed"], json!(0));
+    assert_eq!(
+        impact["http"]["forwarding"],
+        json!({ "newly_forwarded": 0, "newly_blocked": 2 })
+    );
+    assert_eq!(
+        impact["statement"]["text"],
+        json!("No newly allowed decisions were observed among 8 replayable events.")
+    );
+    assert_eq!(
+        result["impact"]["recorded"]["http"]["comparisons"]["agrees"],
+        json!(7)
+    );
+    assert_eq!(job["freshness"], json!({ "state": "current" }));
     assert_eq!(job["progress"]["scanned_records"], json!(9));
     let digest = job["result_digest"].as_str().expect("digest").to_owned();
     let rendered = job.to_string();
@@ -544,6 +569,15 @@ async fn a_replay_job_runs_to_an_aggregate_deterministic_result_and_audits_its_l
     assert_eq!(events[1].payload["state"], json!("completed"));
     assert_eq!(events[1].payload["result_digest"], json!(digest));
     assert_eq!(events[1].payload["replayed_records"], json!(8));
+    assert_eq!(
+        events[1].payload["impact"]["as_authored"]["newly_denied"],
+        json!(1)
+    );
+    assert_eq!(
+        events[1].payload["impact"]["as_authored"]["newly_allowed"],
+        json!(0)
+    );
+    assert_eq!(events[0].payload["projections"], json!(["as_authored"]));
     for event in &events {
         let recorded = event.payload.to_string();
         for absent in [
@@ -594,7 +628,51 @@ async fn a_replay_job_runs_to_an_aggregate_deterministic_result_and_audits_its_l
     assert_eq!(response.status(), StatusCode::OK);
     let stale = json_body(get_job(&harness.router, replayer(), &id).await).await;
     assert_eq!(stale["base"]["current"], json!(false));
+    assert_eq!(
+        stale["freshness"],
+        json!({ "state": "stale", "reason": "base_changed" })
+    );
     assert_eq!(stale["result_digest"], json!(digest));
+}
+
+#[tokio::test]
+async fn a_replay_compares_every_shadow_projected_as_enforced_on_request() {
+    let harness = harness();
+    seed(&harness.audit_db.path, &retained_window());
+    let etag = current_policy(&harness.router).await.0;
+    let mut body = replay_body(&etag, lockdown_edits());
+    body["projections"] = json!(["as_authored", "enforce_all_shadow"]);
+    let response = start(&harness.router, replayer(), body.to_string()).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let id = job_id(&json_body(response).await);
+    let job = finished(&harness.router, replayer(), &id).await;
+    assert_eq!(job["state"], json!("completed"), "{job}");
+    assert_eq!(
+        job["projections"],
+        json!(["as_authored", "enforce_all_shadow"])
+    );
+    let projected = &job["result"]["impact"]["projections"]["enforce_all_shadow"];
+    // With the watched rule enforced in the base too, the lockdown only
+    // changes which rule blocks it.
+    assert_eq!(
+        projected["http"]["transitions"]["enforcement_only_change"],
+        json!(0)
+    );
+    assert_eq!(
+        projected["http"]["transitions"]["attribution_only_change"],
+        json!(2)
+    );
+    assert!(projected.get("statement").is_none());
+
+    // An unknown projection is refused before any job exists.
+    let mut body = replay_body(&etag, lockdown_edits());
+    body["projections"] = json!(["promote_all"]);
+    let response = start(&harness.router, replayer(), body.to_string()).await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        json_body(response).await["reason"],
+        json!("policy_replay_invalid")
+    );
 }
 
 #[tokio::test]

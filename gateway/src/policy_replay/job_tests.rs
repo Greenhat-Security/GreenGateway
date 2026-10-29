@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use super::{
+    impact::ReplayPolicies,
     job::{
         run, ReplayControl, ReplayOutcome, ReplayScope, ReplaySource, ReplaySourceError,
         ReplayStop, MAX_REPLAY_RECORDS, MAX_REPLAY_RECORD_BYTES, REPLAY_PAGE_RECORDS,
@@ -28,7 +29,7 @@ use crate::{
         sqlite_sink, Actor, AuditEvent,
     },
     canonical_json,
-    policy_eval::{CompiledPolicy, PolicyAuthority},
+    policy_simulation::Projection,
     rbac::Policy,
 };
 
@@ -63,9 +64,10 @@ fn policy_document() -> Value {
     })
 }
 
-fn compiled(document: Value) -> CompiledPolicy {
+/// The policies of a job whose candidate is `document` itself.
+fn compiled(document: Value) -> ReplayPolicies {
     let policy = Policy::validate_json_value(document).expect("the test policy validates");
-    CompiledPolicy::from_validated_policy(policy, PolicyAuthority::Standalone)
+    ReplayPolicies::compile(&policy, None, &[Projection::AsAuthored])
         .expect("a standalone policy compiles")
 }
 
@@ -849,6 +851,7 @@ fn a_replay_request_is_strict_and_exactly_versioned() {
     assert_eq!(request.max_records, MAX_REPLAY_RECORDS);
     assert!(request.idempotency_key.is_none());
     assert!(request.digest.starts_with("sha256:"));
+    assert_eq!(request.projections, [Projection::AsAuthored]);
 
     let mut full = request_document();
     full["description"] = json!("nightly");
@@ -857,8 +860,13 @@ fn a_replay_request_is_strict_and_exactly_versioned() {
     full["candidate"] = json!({ "source": "edits", "edits": [
         { "op": "set", "field": "default_action", "value": "allow" }
     ] });
+    full["projections"] = json!(["enforce_all_shadow", "as_authored"]);
     let request = parse(&full).expect("a full request parses");
     assert_eq!(request.max_records, 50);
+    assert_eq!(
+        request.projections,
+        [Projection::EnforceAllShadow, Projection::AsAuthored]
+    );
     assert_eq!(
         request.idempotency_key.as_deref(),
         Some("nightly-2027-01-15")
@@ -911,6 +919,23 @@ fn a_replay_request_is_strict_and_exactly_versioned() {
         let mut document = request_document();
         document["idempotency_key"] = key;
         assert!(parse(&document).is_err());
+    }
+    for (projections, code, pointer) in [
+        (json!([]), "invalid_value", "/projections"),
+        (json!("as_authored"), "invalid_type", "/projections"),
+        (json!(["promote_all"]), "invalid_value", "/projections/0"),
+        (
+            json!(["as_authored", "as_authored"]),
+            "duplicate_projection",
+            "/projections/1",
+        ),
+    ] {
+        let mut document = request_document();
+        document["projections"] = projections;
+        assert_eq!(
+            parse(&document).err().expect("refused"),
+            [(code.to_owned(), pointer.to_owned())]
+        );
     }
 }
 
@@ -974,6 +999,7 @@ fn the_published_schema_agrees_with_the_parser() {
     full["description"] = json!("nightly");
     full["max_records"] = json!(MAX_REPLAY_RECORDS);
     full["idempotency_key"] = json!("nightly.2027-01-15:a_b");
+    full["projections"] = json!(["as_authored", "enforce_all_shadow"]);
     full["window"] = json!({ "from": "2027-01-15T08:00:00+01:00" });
     full["candidate"] = json!({ "source": "edits", "edits": [
         { "op": "insert", "section": "rules", "position": 0, "value": { "id": "n", "path": "/n", "action": "deny" } },
@@ -1017,7 +1043,10 @@ fn the_published_schema_agrees_with_the_parser() {
         |document| document["idempotency_key"] = json!(""),
         |document| document["candidate"] = json!({ "source": "draft" }),
         |document| document["candidate"] = json!({ "source": "edits", "edits": [] }),
-        |document| document["projections"] = json!(["as_authored"]),
+        |document| document["projections"] = json!([]),
+        |document| document["projections"] = json!("as_authored"),
+        |document| document["projections"] = json!(["promote_all"]),
+        |document| document["projections"] = json!(["as_authored", "as_authored"]),
     ] {
         let mut document = request_document();
         mutate(&mut document);

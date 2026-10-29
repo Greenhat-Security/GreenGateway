@@ -208,6 +208,12 @@ A digest is integrity metadata. It does not make an unsigned bundle trusted,
 verified, or authentic; control who can change the delivery channel (branch
 protection, Kubernetes RBAC on the ConfigMaps, admission policy).
 
+Two read bundles can be compared semantically: by their validated manifest,
+deployment, policy and tools documents rather than their text, with each
+change classified by how it takes effect and what it weakens, under stable
+risk codes and with no value shown: `ggctl diff BUNDLE --against BUNDLE`
+([reference](ggctl.md#diff), [semantic diff](semantic-diff.md)).
+
 ## Files and the directory
 
 The reader canonicalizes the bundle root once and opens it as a capability. Each

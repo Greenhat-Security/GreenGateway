@@ -331,3 +331,9 @@ Not part of this slice, and not to be inferred from it:
   rate-override identifiers (policy v1).
 - `ggctl policy test` (#242). The runner holds no application state, so that
   command can link it rather than reimplement it.
+
+The admin UI's Policy Studio has a Test view over this API (#243 slice 18).
+It keeps the suite in page memory only, runs it against the live policy under
+`If-Match` or against the open draft's text as a candidate, and never shows an
+incomplete or refused case as a pass. See **Policy Studio workbench** in
+[the configuration reference](configuration.md#policy_file).
