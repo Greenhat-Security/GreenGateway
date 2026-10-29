@@ -7387,6 +7387,8 @@ async fn principal_delegated_token_revocation_needs_principals_write_and_a_well_
         json!({ "issuer": "https://idp.example.test", "subject": "alice" })
     );
     assert_eq!(purge.payload["purged_entries"], json!(0));
+    // Standalone mode has no other replica to tell.
+    assert_eq!(purge.payload["replication"], json!(null));
 
     for malformed in [
         "not json".to_owned(),
@@ -7410,7 +7412,8 @@ async fn principal_delegated_token_revocation_needs_principals_write_and_a_well_
 }
 
 #[tokio::test]
-async fn principal_delegated_token_revocation_is_refused_where_replicas_cache_their_own() {
+async fn principal_delegated_token_revocation_is_refused_where_the_purge_cannot_reach_every_replica(
+) {
     let policy = parse_policy_body(&Bytes::from(principal_policy_document_string()))
         .expect("principal policy should parse");
     let state = PrincipalAdminState {
@@ -7423,7 +7426,7 @@ async fn principal_delegated_token_revocation_is_refused_where_replicas_cache_th
             false,
             test_audit_log(),
         )),
-        // What cluster mode builds.
+        // What a cluster-mode build with no purge record builds.
         delegated_tokens: None,
         client_ip_policy: client_ip::ClientIpPolicy::from_config(&test_config(Vec::new())),
         max_body_size: 1_024,
@@ -7439,7 +7442,126 @@ async fn principal_delegated_token_revocation_is_refused_where_replicas_cache_th
     )
     .await;
     assert_eq!(response.status(), StatusCode::CONFLICT);
-    assert!(body_string(response).await.contains("cluster mode"));
+    assert!(body_string(response)
+        .await
+        .contains("cannot record the purge for the other replicas"));
+}
+
+/// A purge ledger that answers as `answer` says: what the endpoint sees of
+/// cluster mode's record, without a roster or a database behind it.
+struct ScriptedPurgeLedger {
+    answer: Result<i64, connections::token_exchange::PurgeNotRecorded>,
+}
+
+#[async_trait::async_trait]
+impl connections::token_exchange::DelegatedTokenPurgeLedger for ScriptedPurgeLedger {
+    async fn record(
+        &self,
+        _purge_key: &str,
+        _origin: &connections::token_exchange::DelegatedTokenPurgeTrigger,
+    ) -> Result<i64, connections::token_exchange::PurgeNotRecorded> {
+        self.answer.clone()
+    }
+}
+
+/// Cluster mode's contract (issue #441): `200` names the shared security
+/// revision every replica applies the purge at; a purge that could not be
+/// recorded for the other replicas is `409` while a live replica predates
+/// the record and `503` when the authority did not answer, each saying how
+/// many entries the answering replica purged anyway.
+#[tokio::test]
+async fn principal_delegated_token_revocation_in_cluster_mode_reports_the_record() {
+    use connections::token_exchange::PurgeNotRecorded;
+
+    let policy = parse_policy_body(&Bytes::from(principal_policy_document_string()))
+        .expect("principal policy should parse");
+    let state_with = |answer: Result<i64, PurgeNotRecorded>| {
+        let egress = egress::EgressConfig::default();
+        let client =
+            Arc::new(egress::EgressClient::new(egress.clone()).expect("egress client builds"));
+        PrincipalAdminState {
+            directory: auth::PrincipalDirectory::disabled(),
+            audit_query_store: None,
+            discovery_store: None,
+            rbac_state: Some(middleware::rbac::RbacState::new(
+                policy.clone(),
+                Vec::new(),
+                false,
+                test_audit_log(),
+            )),
+            delegated_tokens: Some(
+                connections::http::ConnectionHttpRuntime::new(
+                    connections::control_plane::ConnectionControlPlane::from_config(&test_config(
+                        Vec::new(),
+                    ))
+                    .expect("control plane builds"),
+                    egress,
+                    client,
+                )
+                .with_delegated_token_purge_ledger(
+                    Arc::new(ScriptedPurgeLedger { answer }),
+                    "deploy-endpoint",
+                ),
+            ),
+            client_ip_policy: client_ip::ClientIpPolicy::from_config(&test_config(Vec::new())),
+            max_body_size: 1_024,
+        }
+    };
+    let purge = |state: PrincipalAdminState| {
+        principal_delegated_tokens_revoke_endpoint(
+            State(state),
+            traffic_admin_json_request(
+                Method::POST,
+                PRINCIPAL_DELEGATED_TOKENS_REVOKE_ADMIN_ROUTE,
+                Some(test_principal(&["principal-writer"])),
+                Some(
+                    json!({ "issuer": "https://idp.example.test", "subject": "alice" }).to_string(),
+                ),
+            ),
+        )
+    };
+
+    let recorded = purge(state_with(Ok(42))).await;
+    assert_eq!(recorded.status(), StatusCode::OK);
+    assert_eq!(recorded.headers()[header::CACHE_CONTROL], "no-store");
+    assert_eq!(
+        json_body(recorded).await,
+        json!({ "purged_entries": 0, "security_revision": 42 })
+    );
+
+    let lacking = purge(state_with(Err(PurgeNotRecorded::Refused {
+        reason: "capability_not_advertised",
+        detail: "a live member does not advertise delegated_token_purges".to_owned(),
+        members_lack_capability: true,
+    })))
+    .await;
+    assert_eq!(lacking.status(), StatusCode::CONFLICT);
+    assert_eq!(lacking.headers()[header::CACHE_CONTROL], "no-store");
+    let body = json_body(lacking).await;
+    assert_eq!(body["reason"], json!("capability_not_advertised"));
+    assert_eq!(body["purged_entries"], json!(0));
+    assert!(body["error"]
+        .as_str()
+        .is_some_and(|error| error.contains("not recorded for the other replicas")));
+
+    let roster = purge(state_with(Err(PurgeNotRecorded::Refused {
+        reason: "roster_unavailable",
+        detail: "cluster membership could not be read".to_owned(),
+        members_lack_capability: false,
+    })))
+    .await;
+    assert_eq!(roster.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        json_body(roster).await["reason"],
+        json!("roster_unavailable")
+    );
+
+    let unavailable = purge(state_with(Err(PurgeNotRecorded::Unavailable))).await;
+    assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        json_body(unavailable).await["reason"],
+        json!("purge_not_recorded")
+    );
 }
 
 #[tokio::test]
@@ -9232,6 +9354,21 @@ fn single_event_alert_counters_are_exported_at_zero_right_after_install() {
         assert_eq!(
             family("greengateway_audit_flush_total"),
             ["greengateway_audit_flush_total{outcome=\"failure\"} 0"],
+            "cluster={cluster}:\n{rendered}"
+        );
+        // Both modes, and whatever AUDIT_DURABILITY says: a refusal needs
+        // only an audit store of record, which standalone mode has too.
+        let mut refusals = family("greengateway_audit_durability_refusals_total");
+        refusals.sort_unstable();
+        let mut expected_refusals: Vec<String> = audit::durable::AUDIT_DURABILITY_REFUSAL_REASONS
+            .iter()
+            .map(|reason| {
+                format!("greengateway_audit_durability_refusals_total{{reason=\"{reason}\"}} 0")
+            })
+            .collect();
+        expected_refusals.sort_unstable();
+        assert_eq!(
+            refusals, expected_refusals,
             "cluster={cluster}:\n{rendered}"
         );
 
@@ -20361,7 +20498,24 @@ async fn policy_validate_accepts_valid_candidate_without_changing_live_policy_or
 
     assert_eq!(response.status(), StatusCode::OK);
     let candidate = policy_document_string("validated-only", "test:new");
-    let body = json_body(response).await;
+    let mut body = json_body(response).await;
+    // The resources the cross-resource checks read: every one of them, so
+    // the snapshot is complete and digested.
+    let snapshot = body
+        .as_object_mut()
+        .and_then(|body| body.remove("resource_snapshot"))
+        .expect("a document that parses is validated against a resource snapshot");
+    assert_eq!(snapshot["complete"], json!(true), "{snapshot}");
+    assert_eq!(snapshot["schema_version"], json!("1.0.0"));
+    assert!(snapshot["digest"]
+        .as_str()
+        .is_some_and(|digest| digest.starts_with("sha256:") && digest.len() == 71));
+    for component in ["configuration", "egress", "tools", "connections"] {
+        assert!(
+            snapshot["components"][component].is_string(),
+            "{component}: {snapshot}"
+        );
+    }
     // A 0.x document: valid, a source digest over the bytes sent, no
     // semantic digest (0.x defines no normalization), and the one stated
     // limitation of a document whose routes carry no stable id.
@@ -20616,6 +20770,466 @@ async fn policy_validate_reports_v1_diagnostics_and_both_digests() {
     assert_eq!(body["errors"].as_array().map(Vec::len), Some(3));
     assert!(body.get("source_digest").is_none(), "{body}");
     assert!(body.get("semantic_digest").is_none(), "{body}");
+}
+
+/// The test policy with `admin` reduced to reading: no role grants
+/// `admin:policy:write` any more.
+fn policy_document_without_policy_write(id: &str) -> Value {
+    let mut policy = policy_document(id, "test:new");
+    policy["roles"]["admin"]["permissions"] = json!([ADMIN_POLICY_READ_PERMISSION]);
+    policy
+}
+
+fn diagnostic_codes(body: &Value) -> Vec<(String, String)> {
+    body["diagnostics"]
+        .as_array()
+        .map(|diagnostics| {
+            diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    (
+                        diagnostic["code"].as_str().unwrap_or_default().to_owned(),
+                        diagnostic["pointer"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn policy_validate_reports_lockout_for_the_caller_and_everyone() {
+    let policy = TempPolicyFile::new(&policy_document_string("initial-policy", "test:old"));
+    let router = policy_admin_router(Some(&policy), test_audit_log());
+    let candidate = policy_document_without_policy_write("locked-out").to_string();
+
+    // The administrator would lose the permission, and so would everyone.
+    let response = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::POST,
+            POLICY_VALIDATE_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            Some(candidate.clone()),
+            None,
+        ))
+        .await
+        .expect("policy validate should complete");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert_eq!(body["valid"], json!(false));
+    let codes = diagnostic_codes(&body);
+    assert!(
+        codes.contains(&("policy_write_unreachable".to_owned(), "/roles".to_owned())),
+        "{body}"
+    );
+    assert!(
+        codes.contains(&(
+            "publisher_policy_write_lost".to_owned(),
+            "/roles".to_owned()
+        )),
+        "{body}"
+    );
+    assert_eq!(body["errors"].as_array().map(Vec::len), Some(2), "{body}");
+    let lockout = body["diagnostics"]
+        .as_array()
+        .and_then(|diagnostics| {
+            diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic["code"] == json!("policy_write_unreachable"))
+        })
+        .expect("lockout diagnostic");
+    assert_eq!(
+        lockout["blocks"],
+        json!({ "simulation": false, "tests": false, "publication": true, "evidence": false })
+    );
+    assert_eq!(body["resource_snapshot"]["complete"], json!(true));
+
+    // A reader has no write to lose; nobody could write afterwards either way.
+    // (The routes that required the permission are also reported, as
+    // warnings: no role grants it any more.)
+    let body = json_body(
+        router
+            .oneshot(policy_admin_request(
+                Method::POST,
+                POLICY_VALIDATE_ADMIN_ROUTE,
+                Some(test_principal(&["policy-reader"])),
+                Some(candidate),
+                None,
+            ))
+            .await
+            .expect("policy validate should complete"),
+    )
+    .await;
+    let errors: Vec<&Value> = body["diagnostics"]
+        .as_array()
+        .expect("diagnostics")
+        .iter()
+        .filter(|diagnostic| diagnostic["severity"] == json!("error"))
+        .collect();
+    assert_eq!(errors.len(), 1, "{body}");
+    assert_eq!(errors[0]["code"], json!("policy_write_unreachable"));
+    assert!(diagnostic_codes(&body).contains(&(
+        "route_permission_ungranted".to_owned(),
+        "/routes/1/permission".to_owned()
+    )));
+}
+
+#[tokio::test]
+async fn policy_put_refuses_an_administrator_lockout_without_writing_and_audits_it() {
+    let initial_policy = policy_document_string("initial-policy", "test:old");
+    let policy = TempPolicyFile::new(&initial_policy);
+    let capture = audit::sink::tests::CaptureSink::new();
+    let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+    let router = policy_admin_router(Some(&policy), audit_log);
+    let before_contents = fs::read_to_string(&policy.path).expect("policy file should read");
+    let (etag, _) = current_policy(&router).await;
+
+    let response = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::PUT,
+            POLICY_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            Some(policy_document_without_policy_write("locked-out").to_string()),
+            Some(&etag),
+        ))
+        .await
+        .expect("policy PUT should complete");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert_eq!(body["valid"], json!(false));
+    assert_eq!(body["errors"].as_array().map(Vec::len), Some(2), "{body}");
+    assert!(diagnostic_codes(&body)
+        .iter()
+        .any(|(code, _)| code == "publisher_policy_write_lost"));
+    let snapshot_digest = body["resource_snapshot"]["digest"].clone();
+    assert!(snapshot_digest.is_string(), "{body}");
+
+    assert_eq!(
+        fs::read_to_string(&policy.path).expect("policy file should read"),
+        before_contents
+    );
+    let (after_etag, after_policy) = current_policy(&router).await;
+    assert_eq!(after_etag, etag);
+    assert_eq!(after_policy["id"], json!("initial-policy"));
+
+    assert_eventually(Duration::from_secs(1), || {
+        capture
+            .events()
+            .iter()
+            .any(|event| event.event_type == audit::event::POLICY_PUBLICATION_REFUSED)
+    });
+    let events = capture.events();
+    assert!(!events
+        .iter()
+        .any(|event| event.event_type == audit::event::POLICY_CHANGED));
+    let refusal = events
+        .iter()
+        .find(|event| event.event_type == audit::event::POLICY_PUBLICATION_REFUSED)
+        .expect("the refusal is audited");
+    assert_eq!(
+        refusal.payload,
+        json!({
+            "action": "policy_replaced",
+            "codes": ["policy_write_unreachable", "publisher_policy_write_lost"],
+            "policy_etag": etag,
+            "resource_snapshot_digest": snapshot_digest,
+        })
+    );
+    assert_eq!(
+        refusal.actor.as_ref().map(|actor| actor.user_id.as_str()),
+        Some("user-123")
+    );
+}
+
+#[tokio::test]
+async fn policy_put_refuses_a_rule_that_would_deny_the_publisher_its_own_put() {
+    let policy = TempPolicyFile::new(&policy_document_string("initial-policy", "test:old"));
+    // The policy route is judged by the RBAC route lane here, not exempt.
+    let mut config = policy_admin_config_with_sqlite(Some(&policy), None);
+    config
+        .rbac_exempt_paths
+        .retain(|path| path != POLICY_ADMIN_ROUTE);
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let router = app(
+        config,
+        recorder.handle(),
+        test_audit_log(),
+        test_audit_event_sender(),
+    )
+    .expect("app should build");
+    let (etag, _) = current_policy(&router).await;
+
+    let locking = policy_document_with_rules_string(
+        "locking-policy",
+        json!([direct_rule_json(
+            Some("lock-admin"),
+            &["PUT"],
+            "/v1/admin/**",
+            "deny"
+        )]),
+    );
+    let response = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::PUT,
+            POLICY_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            Some(locking),
+            Some(&etag),
+        ))
+        .await
+        .expect("policy PUT should complete");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    let lost = body["diagnostics"]
+        .as_array()
+        .and_then(|diagnostics| {
+            diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic["code"] == json!("publisher_policy_write_lost"))
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("expected a publisher lockout: {body}"));
+    assert_eq!(lost["pointer"], json!("/rules/0"));
+    assert_eq!(lost["element_id"], json!("lock-admin"));
+    assert_eq!(current_policy(&router).await.0, etag);
+
+    // The same rule bound to another method takes nothing from the
+    // publisher and is published.
+    let harmless = policy_document_with_rules_string(
+        "harmless-policy",
+        json!([direct_rule_json(
+            Some("lock-admin"),
+            &["DELETE"],
+            "/v1/admin/**",
+            "deny"
+        )]),
+    );
+    let response = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::PUT,
+            POLICY_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            Some(harmless),
+            Some(&etag),
+        ))
+        .await
+        .expect("policy PUT should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_policy_write_bound_to_a_resource_snapshot_is_refused_once_it_is_stale() {
+    let policy = TempPolicyFile::new(&policy_document_string("initial-policy", "test:old"));
+    let capture = audit::sink::tests::CaptureSink::new();
+    let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+    let router = policy_admin_router(Some(&policy), audit_log);
+    let (etag, _) = current_policy(&router).await;
+    let candidate = policy_document_string("bound-policy", "test:new");
+    let validated = json_body(
+        router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::POST,
+                POLICY_VALIDATE_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                Some(candidate.clone()),
+                None,
+            ))
+            .await
+            .expect("policy validate should complete"),
+    )
+    .await;
+    let reviewed = validated["resource_snapshot"]["digest"]
+        .as_str()
+        .expect("a reviewed snapshot digest")
+        .to_owned();
+    let bound_put = |snapshot: &[&str], etag: &str| {
+        let mut request = policy_admin_request(
+            Method::PUT,
+            POLICY_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            Some(candidate.clone()),
+            Some(etag),
+        );
+        for value in snapshot {
+            request.headers_mut().append(
+                "x-greengateway-resource-snapshot",
+                HeaderValue::from_str(value).expect("header value"),
+            );
+        }
+        request
+    };
+
+    // A snapshot that is not the current one: refused, nothing written.
+    let stale = format!("sha256:{}", "0".repeat(64));
+    let response = router
+        .clone()
+        .oneshot(bound_put(&[&stale], &etag))
+        .await
+        .expect("policy PUT should complete");
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = json_body(response).await;
+    assert_eq!(body["reason"], json!("resource_snapshot_stale"));
+    assert_eq!(body["resource_snapshot"]["digest"], json!(reviewed));
+    assert_eq!(current_policy(&router).await.0, etag);
+    assert_eventually(Duration::from_secs(1), || {
+        capture.events().iter().any(|event| {
+            event.event_type == audit::event::POLICY_PUBLICATION_REFUSED
+                && event.payload["codes"] == json!(["resource_snapshot_stale"])
+        })
+    });
+
+    // Naming it twice is ambiguous and refused before anything is judged.
+    let response = router
+        .clone()
+        .oneshot(bound_put(&[&reviewed, &reviewed], &etag))
+        .await
+        .expect("policy PUT should complete");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // The snapshot that was reviewed is still current: published.
+    let response = router
+        .clone()
+        .oneshot(bound_put(&[&reviewed], &etag))
+        .await
+        .expect("policy PUT should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eventually(Duration::from_secs(1), || {
+        capture.events().iter().any(|event| {
+            event.event_type == audit::event::POLICY_CHANGED
+                && event.payload["resource_snapshot_digest"] == json!(reviewed)
+        })
+    });
+}
+
+#[tokio::test]
+async fn policy_writes_record_their_risks_and_resource_snapshot_in_policy_changed() {
+    let policy = TempPolicyFile::new(&policy_document_string("initial-policy", "test:old"));
+    let capture = audit::sink::tests::CaptureSink::new();
+    let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+    let router = policy_admin_router(Some(&policy), audit_log);
+    let (etag, _) = current_policy(&router).await;
+    let mut risky = policy_document("risky-policy", "test:new");
+    risky["default_action"] = json!("allow");
+    risky["roles"]["operator"] = json!({ "permissions": ["*"] });
+    risky["tools"] = json!({ "unregistered-tool": {} });
+
+    let validated = json_body(
+        router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::POST,
+                POLICY_VALIDATE_ADMIN_ROUTE,
+                Some(test_principal(&["admin"])),
+                Some(risky.to_string()),
+                None,
+            ))
+            .await
+            .expect("policy validate should complete"),
+    )
+    .await;
+    assert_eq!(validated["valid"], json!(true), "{validated}");
+    // The live tool registry was asked, and holds no such tool.
+    assert!(diagnostic_codes(&validated).contains(&(
+        "tool_not_registered".to_owned(),
+        "/tools/unregistered-tool".to_owned()
+    )));
+    let risks: Vec<(String, String)> = validated["diagnostics"]
+        .as_array()
+        .expect("diagnostics")
+        .iter()
+        .filter(|diagnostic| diagnostic["severity"] == json!("risk"))
+        .map(|diagnostic| {
+            (
+                diagnostic["code"].as_str().unwrap_or_default().to_owned(),
+                diagnostic["pointer"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        risks,
+        vec![
+            (
+                "default_action_allow".to_owned(),
+                "/default_action".to_owned()
+            ),
+            (
+                "wildcard_permission".to_owned(),
+                "/roles/operator/permissions/0".to_owned()
+            ),
+        ]
+    );
+
+    let response = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::PUT,
+            POLICY_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            Some(risky.to_string()),
+            Some(&etag),
+        ))
+        .await
+        .expect("policy PUT should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let new_etag = policy_etag_header(&response);
+
+    // A rule write is reviewed the same way.
+    let response = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::POST,
+            POLICY_RULES_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            Some(json!({ "id": "reviewed", "path": "/reviewed", "action": "deny" }).to_string()),
+            Some(&new_etag),
+        ))
+        .await
+        .expect("rule POST should complete");
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    assert_eventually(Duration::from_secs(1), || {
+        capture
+            .events()
+            .iter()
+            .filter(|event| event.event_type == audit::event::POLICY_CHANGED)
+            .count()
+            == 2
+    });
+    let changes: Vec<Value> = capture
+        .events()
+        .into_iter()
+        .filter(|event| event.event_type == audit::event::POLICY_CHANGED)
+        .map(|event| event.payload)
+        .collect();
+    assert_eq!(changes.len(), 2);
+    for change in &changes {
+        assert_eq!(
+            change["risks"],
+            json!(["default_action_allow", "wildcard_permission"])
+        );
+        assert_eq!(
+            change["resource_snapshot_digest"],
+            validated["resource_snapshot"]["digest"]
+        );
+    }
+    assert_eq!(
+        changes[0]["diff_summary"]["action"],
+        json!("policy_replaced")
+    );
+    assert_eq!(changes[1]["diff_summary"]["action"], json!("rule_created"));
 }
 
 #[tokio::test]
@@ -27430,7 +28044,7 @@ async fn a_denylisted_jwt_validator_reports_the_principal_of_a_revoked_token() {
     struct RecordingObserver(std::sync::Mutex<Vec<(String, String)>>);
 
     impl auth::RevokedCredentialObserver for RecordingObserver {
-        fn credential_revoked(&self, issuer: &str, subject: &str) {
+        fn credential_revoked(&self, issuer: &str, subject: &str, _jti: &str) {
             self.0
                 .lock()
                 .expect("observer lock")

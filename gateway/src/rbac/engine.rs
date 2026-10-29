@@ -23,8 +23,7 @@ impl PolicyEngine {
             .iter()
             .filter_map(|role| self.policy.roles.get(role))
             .filter(|entry| entry.matches_principal_identity(principal))
-            .flat_map(|entry| entry.permissions.iter())
-            .any(|grant| grant == "*" || grant == permission)
+            .any(|entry| grants_permission(&entry.permissions, permission))
     }
 
     /// True if any identity-matched principal role grants the `"*"` wildcard permission.
@@ -48,6 +47,15 @@ impl PolicyEngine {
                 .get(role)
                 .is_some_and(|entry| entry.matches_principal_identity(principal))
     }
+}
+
+/// Whether a role's `permissions` grant `permission`: listed by name, or by
+/// the `"*"` wildcard. The one grant predicate, shared by principal checks
+/// and by policy checks that ask about a role rather than a principal.
+pub(crate) fn grants_permission(permissions: &[String], permission: &str) -> bool {
+    permissions
+        .iter()
+        .any(|grant| grant == "*" || grant == permission)
 }
 
 #[cfg(test)]

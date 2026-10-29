@@ -129,15 +129,17 @@ pub trait RevocationStore: Send + Sync {
 
 /// Told about each JWT a validator refuses because its `jti` is on the denylist, with the
 /// principal the token names (issue #441): the validator's principal issuer and the token's
-/// `sub`. Gateway startup hands it the Connection runtime, which purges that principal's cached
-/// delegated tokens.
+/// `sub`, and the refused token's `jti`, which tells one of the principal's revoked credentials
+/// from another. Gateway startup hands it the Connection runtime, which purges that principal's
+/// cached delegated tokens. An observer must not keep the `jti` as it is: the authority keeps
+/// only a digest of one.
 ///
 /// The token's signature, issuer, audience, expiry and principal bounds were checked first, so
 /// the principal is one its provider vouched for, never one a caller made up. It runs on the
 /// request that presented the token, which is refused whatever the observer does, so it must not
 /// block.
 pub trait RevokedCredentialObserver: Send + Sync {
-    fn credential_revoked(&self, issuer: &str, subject: &str);
+    fn credential_revoked(&self, issuer: &str, subject: &str, jti: &str);
 }
 
 /// Revocation store that never revokes a token.
@@ -592,7 +594,7 @@ impl JwtValidator {
                     self.revoked_credentials.as_ref(),
                     self.principal_issuer.as_deref(),
                 ) {
-                    observer.credential_revoked(issuer, user_id);
+                    observer.credential_revoked(issuer, user_id, jti);
                 }
                 return Err(AuthError::InvalidSession("revoked_token".to_owned()));
             }

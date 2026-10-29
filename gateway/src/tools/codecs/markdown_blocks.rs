@@ -419,6 +419,20 @@ mod tests {
     }
 
     #[test]
+    fn markdown_that_panicked_the_parser_is_answered_with_a_result() {
+        // pulldown-cmark 0.13.4 panicked in `into_offset_iter` on this input
+        // (pulldown-cmark#1129), with these options or none; 0.13.5 parses it.
+        let result = std::panic::catch_unwind(|| {
+            encode(
+                Value::String("- [o]:u\n    \t".to_owned()),
+                MarkdownDialect::Blocknote,
+                65_536,
+            )
+        });
+        assert!(result.is_ok(), "the Markdown codec must not panic");
+    }
+
+    #[test]
     fn input_and_configuration_limits_are_enforced_before_parsing() {
         assert!(encode(
             Value::String("ok".to_owned()),
