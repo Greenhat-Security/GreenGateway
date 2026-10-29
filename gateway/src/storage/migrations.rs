@@ -303,6 +303,17 @@ static MANIFEST: LazyLock<Vec<Migration>> = LazyLock::new(|| {
         )
         .finalize()
         .with_pinned_checksum("5e85125a700f116dcc4b1b922d00322d40ed2253b77d6e7638198918a1238688"),
+        // The first migration a prepared release approved before any build
+        // applied it (issue #426): these are the bytes, and this the
+        // checksum, its `approved_extensions` carries. See
+        // `ROLLING_MIGRATIONS` below.
+        Migration::new(
+            25,
+            "catalog_change_evidence_actor_metadata",
+            include_str!("migrations/0025_catalog_change_evidence_actor_metadata.sql"),
+        )
+        .finalize()
+        .with_pinned_checksum("7d7458311798be0ee0346fff70581300a4d29984ba90d51cd3bccbd00a9ee84f"),
     ]
 });
 
@@ -335,60 +346,62 @@ impl SchemaCompatibility {
     }
 }
 
-/// Migration 25 (`catalog_change_evidence_actor_metadata`: the actor kind,
-/// auth mode and issuer on catalog change evidence, #425), approved before
-/// any build applies it (issue #426, requirement 1). Its reviewed SQL is
-/// checked in as `migrations/0025_catalog_change_evidence_actor_metadata.sql`
-/// but is not in [`MANIFEST`]: this build recognizes a ledger row carrying
-/// exactly that file's SHA-256 and never executes it. The successor adds the
-/// same bytes to its manifest; `the_approved_extension_is_the_reviewed_sql`
-/// keeps this digest and the file in step until then.
-const CATALOG_EVIDENCE_ACTOR_METADATA: ApprovedExtension = ApprovedExtension {
+// The successor of migration 25's prepared release. This build's manifest
+// ends at 25, and it serves exactly schema 25: it approves no migration above
+// its manifest, and it does not serve schema 24, because it has no reason to
+// run before its own migration has committed. The step from 24 to 25 still
+// rolls, because the release before this one was prepared for it: that build
+// serves schema 24 and, by this migration's exact checksum, schema 25. So the
+// migration role runs this build's `migrate up` while the prepared replicas
+// serve, the replicas are replaced with this build one at a time afterwards,
+// and rolling back to the prepared release is a binary replacement against
+// the expanded schema. This build writes the one table the migration changes
+// as the prepared release does (`connections::pg_store::
+// record_catalog_change_evidence` names every column it sets, and records no
+// actor metadata yet), so the two write the same rows while they overlap. A
+// schema-24 build without the approval refuses the expanded ledger, so the
+// step rolls only from a fleet that runs the prepared release; from any other
+// schema-24 build it is a coordinated drain/migrate/restart.
+// `migration_twenty_five_is_the_extension_its_prepared_release_approved` pins
+// this manifest entry to the checksum that release approved, and the
+// published matrix's rolling step to both.
+//
+// Every earlier move of the schema point was coordinated, without an
+// overlap: from 15 to 16 (#425), from 16 to 17 (member capability
+// advertisements, #426 PR 1), from 17 to 18 (service-token and JWT revocation
+// change evidence, #425 PR 2b), from 18 to 19 (shared admin sessions, #424),
+// from 19 to 20 (the durable contract fence, #426 PR 3), from 20 to 21 (the
+// authority-event journal, #425 PR 3), from 21 to 22 (server-side policy
+// drafts, #243 slice 9), from 22 to 23 (policy, tools and catalog change
+// evidence, #425 PR 2c) and from 23 to 24 (the actor metadata of the
+// journaled authority evidence, #425). A schema-23 binary must not keep
+// writing evidence after migration 24: its Connection, service-token and JWT
+// revocation rows would record no actor kind, auth mode or issuer. A
+// schema-22 binary would also commit policy, tools and catalog changes
+// without their evidence, and a schema-20 one would write evidence that is
+// never journaled. The fence keeps covering every binary that can serve this
+// database: none that predates it accepts this ledger either.
+const BINARY_SCHEMA_COMPATIBILITY: SchemaCompatibility = SchemaCompatibility {
+    read: (25, 25),
+    write: (25, 25),
+    approved_extensions: &[],
+};
+
+/// The migrations of [`MANIFEST`] that a prepared release approved, by exact
+/// version and checksum, before any build applied them (issue #426): the
+/// schema steps to them roll instead of draining the fleet. Each entry is the
+/// descriptor that release carried in its own `approved_extensions`.
+/// Test-only: the migrator needs nothing beyond the manifest, and this record
+/// keeps the manifest entry, the approval and the published matrix from
+/// drifting apart.
+#[cfg(test)]
+const ROLLING_MIGRATIONS: &[ApprovedExtension] = &[ApprovedExtension {
     version: 25,
     checksum: "7d7458311798be0ee0346fff70581300a4d29984ba90d51cd3bccbd00a9ee84f",
-};
-
-// The prepared release for migration 25. This build serves schema 24, where
-// its manifest ends, and schema 25, which only its successor applies. Widening
-// both contracts to 25 is a claim about this build's own readers and writers,
-// not about the SQL: the one table the migration changes is written here only
-// by `connections::pg_store::record_catalog_change_evidence`, which names
-// every column it sets, so the rows it writes record none of the new columns,
-// which the migration's CHECK admits; nothing here reads them or depends on
-// the table's shape. `a_prepared_build_serves_the_approved_extension_only`
-// and the connection store's
-// `a_prepared_store_publishes_catalog_evidence_on_the_approved_extension`
-// prove that against a real database. The migrator and import preflight still
-// require the executable manifest, so a ledger at 25 is the successor's to
-// manage, and every other version or checksum above 24 is still refused. No
-// pair has been qualified across the extension yet: that needs the successor
-// and the two-binary gate, so this overlap is prepared, not a supported
-// rolling upgrade.
-//
-// The schema point itself moved from 23 to 24 (the actor metadata of the
-// journaled authority evidence, #425) without an overlap: a schema-23 binary
-// refuses schema 24 and this binary refuses schema 23, so that upgrade is a
-// coordinated drain/migrate/restart, as the moves from 15 to 16 (#425), from
-// 16 to 17 (member capability advertisements, #426 PR 1), from 17 to 18
-// (service-token and JWT revocation change evidence, #425 PR 2b), from 18 to
-// 19 (shared admin sessions, #424), from 19 to 20 (the durable contract
-// fence, #426 PR 3), from 20 to 21 (the authority-event journal, #425 PR 3),
-// from 21 to 22 (server-side policy drafts, #243 slice 9) and from 22 to 23
-// (policy, tools and catalog change evidence, #425 PR 2c) were. A schema-23
-// binary must not keep writing evidence after migration 24: its Connection,
-// service-token and JWT revocation rows would record no actor kind, auth mode
-// or issuer. A schema-22 binary would also commit policy, tools and catalog
-// changes without their evidence, and a schema-20 one would write evidence
-// that is never journaled. The fence keeps covering every binary that can
-// serve this database: none that predates it accepts this ledger either.
-const BINARY_SCHEMA_COMPATIBILITY: SchemaCompatibility = SchemaCompatibility {
-    read: (24, 25),
-    write: (24, 25),
-    approved_extensions: &[CATALOG_EVIDENCE_ACTOR_METADATA],
-};
+}];
 
 /// The reviewed source of an approved extension: what its successor adds to
-/// its manifest byte for byte. Test-only, so this build's binary never carries
+/// its manifest byte for byte. Test-only, so a prepared binary never carries
 /// SQL its migrator must not run.
 #[cfg(test)]
 struct ExtensionSource {
@@ -398,19 +411,14 @@ struct ExtensionSource {
 }
 
 /// The sources of [`BINARY_SCHEMA_COMPATIBILITY`]'s approved extensions, in
-/// the same order.
+/// the same order. Empty: this build approves nothing above its manifest.
 #[cfg(test)]
-const APPROVED_EXTENSION_SOURCES: &[ExtensionSource] = &[ExtensionSource {
-    version: 25,
-    name: "catalog_change_evidence_actor_metadata",
-    sql: include_str!("migrations/0025_catalog_change_evidence_actor_metadata.sql"),
-}];
+const APPROVED_EXTENSION_SOURCES: &[ExtensionSource] = &[];
 
 /// The intersection of the explicit read/write contracts, advertised to the
 /// roster. This is a summary, not proof of ledger integrity, permission to
 /// write a gated operation (`storage/compatibility.rs`), or permission to
-/// contract the schema. The shipped contract accepts schema 24 and, through
-/// the one approved extension, schema 25.
+/// contract the schema. The shipped contract accepts only schema 25.
 pub(crate) fn schema_version_range() -> (i32, i32) {
     BINARY_SCHEMA_COMPATIBILITY.serving_range()
 }
@@ -1117,23 +1125,6 @@ pub(crate) async fn apply_missing_for_startup(
     apply_missing(pool, settings).await.map(|_| ())
 }
 
-/// Apply every approved extension exactly as the successor's `migrate up`
-/// will: through [`apply_one`], each in one transaction with its ledger row
-/// and the migration timeouts, from the reviewed bytes this build pins by
-/// checksum. Test support only: this build's migrator never carries the SQL.
-#[cfg(test)]
-pub(crate) async fn apply_approved_extensions_as_the_successor(
-    pool: &deadpool_postgres::Pool,
-    settings: &DatabaseSettings,
-) -> Result<(), MigrateError> {
-    let client = acquire(pool).await?;
-    for source in APPROVED_EXTENSION_SOURCES {
-        let extension = Migration::new(source.version, source.name, source.sql).finalize();
-        apply_one(&client, &extension, settings).await?;
-    }
-    Ok(())
-}
-
 /// Translate an auto-migration failure into the foundation's startup error.
 /// Ledger problems keep their specific text; an apply failure is its own
 /// condition (it was a write attempt, not a validation), and anything else
@@ -1213,71 +1204,40 @@ mod tests {
     }
 
     #[test]
-    fn the_shipped_contract_overlaps_only_the_approved_extension() {
+    fn the_shipped_contract_has_no_unproved_overlap() {
         assert_eq!(
             MANIFEST.len(),
-            24,
+            25,
             "review the compatibility contract when adding SQL"
         );
-        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.read, (24, 25));
-        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.write, (24, 25));
-        assert_eq!(schema_version_range(), (24, 25));
-        let approved: Vec<(i64, &str)> = BINARY_SCHEMA_COMPATIBILITY
-            .approved_extensions
-            .iter()
-            .map(|extension| (extension.version, extension.checksum))
-            .collect();
-        assert_eq!(
-            approved,
-            vec![(25, CATALOG_EVIDENCE_ACTOR_METADATA.checksum)],
-            "migration 25 is the one approved extension"
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.read, (25, 25));
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.write, (25, 25));
+        assert_eq!(schema_version_range(), (25, 25));
+        assert!(
+            BINARY_SCHEMA_COMPATIBILITY.approved_extensions.is_empty(),
+            "this build approves no migration above its manifest"
         );
-        // Readiness samples the manifest, the extension and one row more.
+        // Readiness samples the manifest and one row more.
         assert_eq!(runtime_ledger_row_limit(), 26);
-
-        let schema_24 = ledger_for(&MANIFEST, MANIFEST.len(), "");
         assert_eq!(
-            validate_runtime_ledger(&schema_24),
+            validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len(), "")),
             Ok(SchemaStatus::Current)
         );
-        // The reviewed migration 25, by its exact checksum, is served...
-        let mut schema_25 = schema_24.clone();
-        schema_25.push((25, hex_checksum(APPROVED_EXTENSION_SOURCES[0].sql)));
-        assert_eq!(
-            validate_runtime_ledger(&schema_25),
-            Ok(SchemaStatus::Current)
-        );
-        // ...but never managed by this build: `migrate check`, `migrate up`
-        // and import preflight read only the executable manifest.
-        assert_eq!(
-            validate_ledger(&schema_25, &MANIFEST),
-            Err(LedgerProblem::UnknownVersion)
-        );
-        // Any other migration 25 is refused although 25 is inside the range,
-        // and so is anything above it or a ledger that skips 24.
-        let mut unapproved = schema_24.clone();
-        unapproved.push((25, hex_checksum("-- another migration 25")));
-        assert_eq!(
-            validate_runtime_ledger(&unapproved),
-            Err(LedgerProblem::ChecksumMismatch)
-        );
-        let mut beyond = schema_25.clone();
+        // The next migration is refused whatever it is: nothing prepared this
+        // build for one.
+        let mut beyond = ledger_for(&MANIFEST, MANIFEST.len(), "");
         beyond.push((26, hex_checksum("-- migration 26")));
         assert_eq!(
             validate_runtime_ledger(&beyond),
             Err(LedgerProblem::UnknownVersion)
         );
-        let mut gapped = ledger_for(&MANIFEST, MANIFEST.len() - 1, "");
-        gapped.push((25, CATALOG_EVIDENCE_ACTOR_METADATA.checksum.to_owned()));
-        assert_eq!(
-            validate_runtime_ledger(&gapped),
-            Err(LedgerProblem::NotAPrefix)
-        );
 
-        // The previous releases' schemas are not served: moving the point
-        // from one of them was a coordinated upgrade, never an overlap
-        // window.
-        for behind in 1..=8 {
+        // The previous releases' schemas are not served, the prepared
+        // release's schema 24 included: the overlap of the rolling step from
+        // 24 to 25 is that release's, which also serves 25, and this build
+        // starts only once its own migration has committed. Every earlier
+        // point was left by a coordinated upgrade, never an overlap window.
+        for behind in 1..=9 {
             assert_eq!(
                 validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - behind, "")),
                 Ok(SchemaStatus::NeedsUpgrade {
@@ -1289,10 +1249,72 @@ mod tests {
         }
     }
 
+    /// The step from 24 to 25 rolls only because the release before this one
+    /// approved migration 25 by its exact checksum before this build applied
+    /// it. The bytes this manifest executes must be exactly those: the
+    /// checksum the prepared release carries is what this build's migrator
+    /// records in the ledger, and any other checksum at 25 makes every
+    /// prepared replica `schema_incompatible` the moment it commits.
+    #[test]
+    fn migration_twenty_five_is_the_extension_its_prepared_release_approved() {
+        assert_eq!(
+            ROLLING_MIGRATIONS
+                .iter()
+                .map(|approved| approved.version)
+                .collect::<Vec<_>>(),
+            vec![25],
+            "migration 25 is the one migration a prepared release approved"
+        );
+        for approved in ROLLING_MIGRATIONS {
+            let migration = MANIFEST
+                .iter()
+                .find(|migration| migration.version == approved.version)
+                .unwrap_or_else(|| panic!("migration {} is in the manifest", approved.version));
+            assert_eq!(migration.name, "catalog_change_evidence_actor_metadata");
+            assert_eq!(
+                (migration.current_checksum(), migration.pinned_checksum),
+                (approved.checksum, approved.checksum),
+                "migration {} ({}) is not the SQL its prepared release approved; that \
+                 release would refuse the ledger this build writes",
+                migration.version,
+                migration.name
+            );
+            assert!(
+                !migration.sql.contains('\r'),
+                "migration SQL is checked out byte for byte (.gitattributes)"
+            );
+            // Applying it is the step from the schema before it, where the
+            // prepared release's manifest ended. The row this build's migrator
+            // records is the approved one; any other bytes at that version
+            // are a changed checksum, not a new migration.
+            let status = |applied: usize| {
+                if applied == MANIFEST.len() {
+                    SchemaStatus::Current
+                } else {
+                    SchemaStatus::NeedsUpgrade {
+                        applied,
+                        missing: MANIFEST.len() - applied,
+                    }
+                }
+            };
+            let before = usize::try_from(approved.version - 1).expect("a small version");
+            let mut ledger = ledger_for(&MANIFEST, before, "");
+            assert_eq!(validate_ledger(&ledger, &MANIFEST), Ok(status(before)));
+            ledger.push((approved.version, approved.checksum.to_owned()));
+            assert_eq!(validate_ledger(&ledger, &MANIFEST), Ok(status(before + 1)));
+            ledger[before].1 = hex_checksum("-- another migration at this version");
+            assert_eq!(
+                validate_ledger(&ledger, &MANIFEST),
+                Err(LedgerProblem::ChecksumMismatch)
+            );
+        }
+    }
+
     /// Each approved extension pins the exact bytes checked in for it, numbers
     /// the next migration after the manifest without a gap, and is SQL no
     /// manifest entry carries. The successor moves the same file into its
     /// manifest, so the approved checksum is what its ledger row will record.
+    /// This build approves none, so its contract ends where its manifest does.
     #[test]
     fn the_approved_extension_is_the_reviewed_sql() {
         let extensions = BINARY_SCHEMA_COMPATIBILITY.approved_extensions;
@@ -1328,17 +1350,19 @@ mod tests {
         assert_eq!(
             i64::from(BINARY_SCHEMA_COMPATIBILITY.serving_range().1),
             next - 1,
-            "the contract reaches exactly the last approved extension"
+            "the contract reaches exactly the last approved extension, or the end of the \
+             manifest when there is none"
         );
     }
 
     /// The published support matrix (`docs/deployment/upgrade-support-matrix.json`,
     /// issue #426 PR 4) describes this binary: its read/write contracts, its
     /// manifest, its document format, what it advertises and every operation
-    /// it gates, plus one coordinated step per schema point the deployment
-    /// guide documents, ending at this binary's manifest, then one prepared
-    /// step per approved extension, ending at the highest schema it serves.
-    /// A migration, an extension, a capability or
+    /// it gates, plus one step per schema point the deployment guide
+    /// documents, ending at this binary's manifest (coordinated, or rolling
+    /// where a prepared release approved the migration first), then one
+    /// prepared step per approved extension, ending at the highest schema it
+    /// serves. A migration, an extension, a capability or
     /// a gated operation that leaves the published matrix behind fails here,
     /// in the pull request that adds it. The pinned qualified pair is checked
     /// against its evidence by `scripts/upgrade_pair_evidence.py`.
@@ -1420,13 +1444,15 @@ mod tests {
         assert_eq!(published["operations"], Value::Array(operations), "{stale}");
 
         // Every schema step up to this binary's manifest is a coordinated
-        // drain, migrate, restart, and the guide must say how to perform it.
-        // Each approved extension follows as a prepared step: this build
-        // serves that schema without being able to apply it, the step pins
-        // the descriptor's checksum, and the guide says what a prepared
-        // deployment does there. No pair is qualified across one yet, so no
-        // prepared step names a pair; the first that does changes what this
-        // test has to check.
+        // drain, migrate, restart, except a step to a migration a prepared
+        // release approved first (`ROLLING_MIGRATIONS`): that one rolls, and
+        // pins the checksum both builds agree on. Either way the guide must
+        // say how to perform it. A rolling step names its qualified pair once
+        // one is pinned and published, and that pair must be published across
+        // exactly this step. Each approved extension follows as a prepared
+        // step: this build serves that schema without being able to apply
+        // it, the step pins the descriptor's checksum, and the guide says
+        // what a prepared deployment does there.
         let steps = matrix["schema_steps"]
             .as_array()
             .expect("the matrix lists its schema steps");
@@ -1448,13 +1474,53 @@ mod tests {
                 .find(|migration| migration.version == version)
             {
                 assert_eq!(step["migration"], json!(migration.name), "{step}");
-                assert_eq!(step["procedure"], "coordinated", "{step}");
-                let heading =
-                    format!("\n### Coordinated upgrade: schema {expected_from} to {version}\n");
+                let rolling = ROLLING_MIGRATIONS
+                    .iter()
+                    .find(|approved| approved.version == version);
+                let heading = if let Some(approved) = rolling {
+                    assert_eq!(step["procedure"], "rolling", "{step}");
+                    assert_eq!(step["checksum"], json!(approved.checksum), "{step}");
+                    assert_eq!(
+                        step["checksum"],
+                        json!(migration.current_checksum()),
+                        "{step}"
+                    );
+                    let pair = &step["qualified_pair"];
+                    if !pair.is_null() {
+                        let published: Vec<&Value> = matrix["qualified_pairs"]
+                            .as_array()
+                            .expect("the matrix lists its qualified pairs")
+                            .iter()
+                            .filter(|entry| {
+                                entry["prepared"] == pair["prepared"]
+                                    && entry["successor"] == pair["successor"]
+                            })
+                            .collect();
+                        assert_eq!(
+                            published.len(),
+                            1,
+                            "a rolling step names exactly one published qualified pair: {step}"
+                        );
+                        assert_eq!(
+                            published[0]["schema_step"],
+                            json!({
+                                "from": expected_from,
+                                "to": version,
+                                "migration": migration.name,
+                                "checksum": approved.checksum,
+                            }),
+                            "the qualified pair a rolling step names was qualified across it"
+                        );
+                    }
+                    format!("\n### Rolling upgrade: schema {expected_from} to {version}\n")
+                } else {
+                    assert_eq!(step["procedure"], "coordinated", "{step}");
+                    format!("\n### Coordinated upgrade: schema {expected_from} to {version}\n")
+                };
                 assert!(
                     guide.contains(&heading),
-                    "docs/deployment/postgres.md must document the coordinated upgrade the \
-                     matrix publishes: {heading:?}"
+                    "docs/deployment/postgres.md must document the upgrade the matrix \
+                     publishes: {heading:?}"
                 );
             } else {
                 let position = usize::try_from(version - manifest_versions - 1)
@@ -1475,8 +1541,8 @@ mod tests {
                 assert_eq!(
                     step["qualified_pair"],
                     Value::Null,
-                    "no pair is qualified across an extension yet; teach this test what a \
-                     qualified step must say when one is: {step}"
+                    "a pair is qualified across a step only once its successor applies the \
+                     migration, and the step is then rolling: {step}"
                 );
                 let heading =
                     format!("\n### Prepared extension: schema {expected_from} to {version}\n");
@@ -1492,8 +1558,8 @@ mod tests {
             Some(expected_from),
             Some(i64::from(contract.serving_range().1)),
             "the matrix's schema steps must reach this binary's highest served schema: a \
-             coordinated step for every migration, with its section in the deployment guide, \
-             then a prepared step for every approved extension"
+             coordinated or rolling step for every migration, with its section in the \
+             deployment guide, then a prepared step for every approved extension"
         );
         assert!(
             guide.contains("\n## Upgrading a cluster\n"),
@@ -3239,11 +3305,13 @@ mod tests {
         clean_database(foundation.pool()).await;
     }
 
-    /// Migration 25, the approved extension, applied by its successor's
-    /// migrator path to a schema-24 database: catalog evidence committed
-    /// before it keeps every other column and records none of the new three,
-    /// a row written the way this build writes one still commits and records
-    /// none, and from then on the table holds migration 24's rule.
+    /// Migration 25, the approved extension, applied by this build's migrator
+    /// to a schema-24 database, as the rolling step applies it while
+    /// prepared replicas serve: catalog evidence committed before it keeps
+    /// every other column and records none of the new three, a row written
+    /// the way this build and its prepared release write one still commits
+    /// and records none, and from then on the table holds migration 24's
+    /// rule.
     #[tokio::test]
     async fn migration_twenty_five_adds_catalog_actor_metadata_and_guesses_none() {
         let Some(dsn) = real_dsn() else {
@@ -3255,12 +3323,22 @@ mod tests {
         let config = migration_config(&dsn_file);
         let foundation = establish(&config).await;
         clean_database(foundation.pool()).await;
-        apply_missing(foundation.pool(), &test_settings())
-            .await
-            .expect("schema 24 should apply");
         let client = foundation.pool().get().await.expect("checkout");
+        bootstrap_ledger(&client)
+            .await
+            .expect("migration ledger should bootstrap");
+        let through_v24 = MANIFEST
+            .iter()
+            .take_while(|migration| migration.version <= 24)
+            .count();
+        for migration in &MANIFEST[..through_v24] {
+            apply_one(&client, migration, &test_settings())
+                .await
+                .expect("migrations through 24 should apply");
+        }
 
-        // The column list `record_catalog_change_evidence` writes.
+        // The column list `record_catalog_change_evidence` writes, in this
+        // build and in its prepared release alike.
         const PREPARED_INSERT: &str = "INSERT INTO greengateway.catalog_change_evidence \
                  (event_id, operation_id, actor_user_id, action, connection_id, \
                   prior_version, new_version, overlay_revision, security_revision) \
@@ -3297,7 +3375,7 @@ mod tests {
         let before = snapshot(false).await;
         assert_eq!(before.len(), 1);
 
-        apply_approved_extensions_as_the_successor(foundation.pool(), &test_settings())
+        apply_one(&client, &MANIFEST[through_v24], &test_settings())
             .await
             .expect("migration 25 should apply");
         let recorded: (i64, String, String) = client
@@ -3313,9 +3391,9 @@ mod tests {
             (
                 25,
                 "catalog_change_evidence_actor_metadata".to_owned(),
-                CATALOG_EVIDENCE_ACTOR_METADATA.checksum.to_owned()
+                ROLLING_MIGRATIONS[0].checksum.to_owned()
             ),
-            "the successor's ledger row carries exactly the approved checksum"
+            "this build's ledger row carries exactly the checksum its prepared release approved"
         );
         assert_eq!(snapshot(true).await, before, "no other column changed");
 
@@ -3395,13 +3473,19 @@ mod tests {
         clean_database(foundation.pool()).await;
     }
 
-    /// The prepared release serves a ledger that holds its approved
-    /// extension: validate-only and auto-migrating startup both serve it and
-    /// readiness reports it writable at 25. Its own migrator still refuses to
-    /// manage that ledger, and changes nothing. Any other migration 25, and
-    /// anything above 25, refuses startup, auto-migration and readiness alike.
+    /// The expand phase of the rolling step from 24 to 25, as this build sees
+    /// it. Against the schema-24 ledger its prepared release leaves, this
+    /// build serves nothing: validate-only startup refuses naming the one
+    /// missing migration and readiness reports the schema incompatible, so a
+    /// replica of it started before the migration stalls the rollout rather
+    /// than serving. Its `migrate check` reports exactly that migration
+    /// unapplied, and its `migrate up` applies it and nothing else, recording
+    /// exactly the checksum the prepared release approved. From then on it
+    /// serves, with and without development auto-migration, and its
+    /// migrator has nothing left to do. A ledger whose migration 25 carries
+    /// other bytes is refused by the migrator and by startup alike.
     #[tokio::test]
-    async fn a_prepared_build_serves_the_approved_extension_only() {
+    async fn this_build_applies_the_approved_extension_before_it_serves() {
         use super::super::postgres::{PostgresFoundation, PostgresFoundationError};
         use crate::ha_status::{
             AuthorityObservation, PostgresReadinessAuthority, ReadinessAuthority,
@@ -3420,13 +3504,19 @@ mod tests {
         let foundation = establish(&strict).await;
         let pool = foundation.pool();
         clean_database(pool).await;
-        apply_missing(pool, &test_settings())
-            .await
-            .expect("schema 24 should apply");
-        apply_approved_extensions_as_the_successor(pool, &test_settings())
-            .await
-            .expect("the successor applies migration 25");
         let client = pool.get().await.expect("checkout");
+        bootstrap_ledger(&client)
+            .await
+            .expect("migration ledger should bootstrap");
+        let through_v24 = MANIFEST
+            .iter()
+            .take_while(|migration| migration.version <= 24)
+            .count();
+        for migration in &MANIFEST[..through_v24] {
+            apply_one(&client, migration, &test_settings())
+                .await
+                .expect("migrations through 24 should apply");
+        }
         let ledger = || {
             let client = &client;
             async move {
@@ -3442,10 +3532,53 @@ mod tests {
                     .collect::<Vec<_>>()
             }
         };
+
+        // The prepared release's schema: not served here.
+        let authority = PostgresReadinessAuthority::new(pool.clone());
+        assert_eq!(
+            read_and_validate_runtime(pool).await,
+            Ok(SchemaStatus::NeedsUpgrade {
+                applied: 24,
+                missing: 1
+            })
+        );
+        let error = expect_startup_failure(PostgresFoundation::start_if_selected(&strict).await);
+        assert!(
+            matches!(
+                error,
+                PostgresFoundationError::SchemaNotReady {
+                    applied: 24,
+                    missing: 1,
+                    auto_migrate: false
+                }
+            ),
+            "{error}"
+        );
+        assert_eq!(
+            authority.observe().await,
+            AuthorityObservation::IncompatibleSchema { schema_version: 24 }
+        );
+        assert_eq!(
+            execute(&strict, true).await,
+            Ok(MigrateOutput::CheckNeedsUpgrade {
+                applied: 24,
+                missing: 1
+            })
+        );
+
+        // The migration role's `migrate up`: migration 25 and nothing else,
+        // under the approved checksum.
+        assert_eq!(
+            execute(&strict, false).await,
+            Ok(MigrateOutput::Applied { applied: 1 })
+        );
         let expanded = ledger().await;
         assert_eq!(expanded.len(), 25);
-
-        // Served.
+        assert_eq!(
+            expanded.last(),
+            Some(&(25, ROLLING_MIGRATIONS[0].checksum.to_owned())),
+            "the ledger records exactly what the prepared release approved"
+        );
         assert_eq!(
             read_and_validate_runtime(pool).await,
             Ok(SchemaStatus::Current)
@@ -3455,43 +3588,37 @@ mod tests {
                 .await
                 .unwrap_or_else(|error| {
                     panic!(
-                        "auto_migrate={}: a prepared build serves its approved extension: {error}",
+                        "auto_migrate={}: this build serves the schema it applied: {error}",
                         config.database.auto_migrate
                     )
                 });
             assert!(started.is_some(), "cluster mode was selected");
         }
-        let authority = PostgresReadinessAuthority::new(pool.clone());
         assert_eq!(
             authority.observe().await,
             AuthorityObservation::Writable { schema_version: 25 }
         );
-
-        // Not managed: `migrate check` and `migrate up` read the executable
-        // manifest only, refuse, and leave the ledger as they found it.
-        let unmanaged = MigrateError::LedgerInvalid(LedgerProblem::UnknownVersion);
-        assert_eq!(read_and_validate(pool).await, Err(unmanaged.clone()));
-        assert_eq!(execute(&strict, true).await, Err(unmanaged.clone()));
-        assert_eq!(execute(&strict, false).await, Err(unmanaged));
         assert_eq!(
-            ledger().await,
-            expanded,
-            "the prepared migrator changed nothing"
+            execute(&strict, true).await,
+            Ok(MigrateOutput::CheckCurrent)
         );
+        assert_eq!(
+            execute(&strict, false).await,
+            Ok(MigrateOutput::UpToDate { applied: 25 })
+        );
+        assert_eq!(ledger().await, expanded, "a second run changed nothing");
 
         // Any other migration 25: the same version, other bytes.
-        let other = hex_checksum(&format!("{}-- edited\n", APPROVED_EXTENSION_SOURCES[0].sql));
         client
             .execute(
                 &format!("UPDATE {LEDGER_TABLE} SET checksum = $1 WHERE version = 25"),
-                &[&other],
+                &[&hex_checksum("-- another migration 25")],
             )
             .await
             .expect("plant an unapproved migration 25");
-        assert_eq!(
-            read_and_validate_runtime(pool).await,
-            Err(MigrateError::LedgerInvalid(LedgerProblem::ChecksumMismatch))
-        );
+        let refused = MigrateError::LedgerInvalid(LedgerProblem::ChecksumMismatch);
+        assert_eq!(execute(&strict, true).await, Err(refused.clone()));
+        assert_eq!(execute(&strict, false).await, Err(refused));
         for config in [&strict, &dev] {
             let error = expect_startup_failure(PostgresFoundation::start_if_selected(config).await);
             assert!(
@@ -3508,57 +3635,6 @@ mod tests {
         assert_eq!(
             authority.observe().await,
             AuthorityObservation::IncompatibleSchema { schema_version: 25 }
-        );
-        client
-            .execute(
-                &format!("UPDATE {LEDGER_TABLE} SET checksum = $1 WHERE version = 25"),
-                &[&CATALOG_EVIDENCE_ACTOR_METADATA.checksum],
-            )
-            .await
-            .expect("restore the approved checksum");
-
-        // Anything above the approved extension.
-        client
-            .execute(
-                &format!(
-                    "INSERT INTO {LEDGER_TABLE} (version, name, checksum) \
-                     VALUES (26, 'from_the_future', $1)"
-                ),
-                &[&hex_checksum("-- migration 26")],
-            )
-            .await
-            .expect("plant migration 26");
-        assert_eq!(
-            read_and_validate_runtime(pool).await,
-            Err(MigrateError::LedgerInvalid(LedgerProblem::UnknownVersion))
-        );
-        for config in [&strict, &dev] {
-            let error = expect_startup_failure(PostgresFoundation::start_if_selected(config).await);
-            assert!(
-                matches!(
-                    error,
-                    PostgresFoundationError::SchemaInvalid {
-                        problem: LedgerProblem::UnknownVersion
-                    }
-                ),
-                "auto_migrate={}: {error}",
-                config.database.auto_migrate
-            );
-        }
-        assert_eq!(
-            authority.observe().await,
-            AuthorityObservation::IncompatibleSchema { schema_version: 26 }
-        );
-        client
-            .execute(
-                &format!("DELETE FROM {LEDGER_TABLE} WHERE version = 26"),
-                &[],
-            )
-            .await
-            .expect("remove migration 26");
-        assert_eq!(
-            authority.observe().await,
-            AuthorityObservation::Writable { schema_version: 25 }
         );
         drop(client);
         clean_database(pool).await;

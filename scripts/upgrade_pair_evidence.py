@@ -10,7 +10,10 @@ suite, verify the evidence.
 
 * The pin must be a qualified pair that the published matrix
   (`docs/deployment/upgrade-support-matrix.json`) lists, with the same schema
-  point, operation and capability.
+  point, operation and capability, and the same schema step when the pair
+  crosses one. A pair across a schema step must also be the qualified pair of
+  that step: the matrix's `schema_steps` entry for it is `rolling`, carries
+  the same migration and checksum, and names this pair.
 * The manifest must name the pinned commits, and each binary must still hash
   to what the build recorded: two distinct builds.
 * Every evidence row the matrix names must exist, carry both binaries'
@@ -32,12 +35,14 @@ codes) is carried into the summary without being judged.
 import argparse
 import json
 from pathlib import Path
+import re
 import sys
 
 import build_upgrade_pair as pair
 
 MATRIX = pair.ROOT / "docs" / "deployment" / "upgrade-support-matrix.json"
 SUMMARY = "summary.json"
+CHECKSUM = re.compile(r"[0-9a-f]{64}")
 
 
 class EvidenceError(Exception):
@@ -69,15 +74,62 @@ def find_pair(matrix, pin: dict) -> dict:
         )
     entry = found[0]
     for key, pinned in (("schema", pin.get("schema_version")), ("operation", pin.get("operation")),
-                        ("capability", pin.get("capability"))):
+                        ("capability", pin.get("capability")),
+                        ("schema_step", pin.get("schema_step"))):
         if entry.get(key) != pinned:
             raise EvidenceError(
                 f"the published pair says {key} {entry.get(key)!r} but the pin says {pinned!r}"
             )
+    step = pin.get("schema_step")
+    if step is not None:
+        check_schema_step(matrix, step, pin.get("schema_version"),
+                          {"prepared": prepared, "successor": successor})
     evidence = entry.get("evidence")
     if not isinstance(evidence, dict) or not evidence:
         raise EvidenceError("the published pair names no evidence rows")
     return entry
+
+
+def check_schema_step(matrix: dict, step, schema_version, pair_commits: dict) -> None:
+    """A pair across a schema step is that step's published, rolling, qualified pair."""
+    if not isinstance(step, dict) or set(step) != {"from", "to", "migration", "checksum"}:
+        raise EvidenceError("the pin's schema_step must state exactly from, to, migration and checksum")
+    start, end = step["from"], step["to"]
+    if (type(start) is not int or type(end) is not int or start != schema_version
+            or end != start + 1):
+        raise EvidenceError(
+            "the pin's schema_step must be one migration from the pin's schema_version"
+        )
+    if not isinstance(step["migration"], str) or not step["migration"]:
+        raise EvidenceError("the pin's schema_step names no migration")
+    if not isinstance(step["checksum"], str) or not CHECKSUM.fullmatch(step["checksum"]):
+        raise EvidenceError("the pin's schema_step checksum must be one lowercase SHA-256")
+    steps = matrix.get("schema_steps")
+    if not isinstance(steps, list):
+        steps = []
+    published = [entry for entry in steps if isinstance(entry, dict)
+                 and entry.get("from") == start and entry.get("to") == end]
+    if len(published) != 1:
+        raise EvidenceError(
+            f"the support matrix publishes no single schema step from {start} to {end}"
+        )
+    published = published[0]
+    for key in ("migration", "checksum"):
+        if published.get(key) != step[key]:
+            raise EvidenceError(
+                f"the published schema step says {key} {published.get(key)!r} but the pin says "
+                f"{step[key]!r}"
+            )
+    if published.get("procedure") != "rolling":
+        raise EvidenceError(
+            f"the published schema step from {start} to {end} is "
+            f"{published.get('procedure')!r}, not rolling, so no pair is qualified across it"
+        )
+    if published.get("qualified_pair") != pair_commits:
+        raise EvidenceError(
+            f"the published schema step from {start} to {end} names "
+            f"{published.get('qualified_pair')!r} as its qualified pair, not the pin"
+        )
 
 
 def identities(manifest, pin: dict, pair_dir: Path) -> dict:
@@ -202,6 +254,7 @@ def verify(pair_dir: Path, pin_path: Path = pair.PIN, matrix_path: Path = MATRIX
         "gate_commit": gate_commit,
         "pair": {
             "schema": entry["schema"],
+            "schema_step": entry.get("schema_step"),
             "procedure": entry.get("procedure"),
             "operation": entry["operation"],
             "capability": entry["capability"],
