@@ -23,8 +23,14 @@
 //! publishes it: nothing is read from it but `..data` and the generation
 //! directory it names, and that generation must belong to the volume's
 //! owner.
+//!
+//! A bundle can also be read from memory ([`MemoryFiles`]): the files of one
+//! flat bundle directory, by name, as the revision ledger stores them or as a
+//! caller received them. The same names, byte bounds and unreferenced-entry
+//! rules apply; there is no filesystem to check.
 
 use std::{
+    collections::BTreeMap,
     ffi::OsStr,
     fs,
     io::{self, Read as _},
@@ -118,6 +124,72 @@ enum EntryKind {
     Symlink,
     Directory,
     Special,
+}
+
+/// Where the reader takes a bundle's files from.
+pub(crate) trait FileSource {
+    /// Reads one referenced file under `maximum` bytes, charging it against
+    /// [`MAX_BUNDLE_BYTES`].
+    fn read(&mut self, name: &FileName, maximum: usize) -> Result<Vec<u8>, BundleDiagnostic>;
+
+    /// One diagnostic per entry outside `referenced`.
+    fn unreferenced(&self, referenced: &[FileName], strict: bool) -> Vec<BundleDiagnostic>;
+}
+
+/// The diagnostic for an unreferenced regular file: a warning, or an error
+/// when reading strictly.
+fn unreferenced_file(file: &FileName, strict: bool) -> BundleDiagnostic {
+    let diagnostic = BundleDiagnostic::file(Code::UnreferencedEntry, file);
+    if strict {
+        diagnostic
+    } else {
+        diagnostic.warning()
+    }
+}
+
+/// A bundle held in memory: the files of one flat bundle directory, by name.
+///
+/// Names are [`FileName`]s, so every one passed the portable grammar, and a
+/// map holds each name once. The entry bound and the byte bounds are the
+/// directory reader's.
+pub(crate) struct MemoryFiles {
+    files: BTreeMap<FileName, Vec<u8>>,
+    bytes_read: usize,
+}
+
+impl MemoryFiles {
+    pub(crate) fn new(files: BTreeMap<FileName, Vec<u8>>) -> Result<Self, BundleDiagnostic> {
+        if files.len() > MAX_DIRECTORY_ENTRIES {
+            return Err(BundleDiagnostic::bundle(Code::TooManyEntries));
+        }
+        Ok(Self {
+            files,
+            bytes_read: 0,
+        })
+    }
+}
+
+impl FileSource for MemoryFiles {
+    fn read(&mut self, name: &FileName, maximum: usize) -> Result<Vec<u8>, BundleDiagnostic> {
+        let refuse = |code| BundleDiagnostic::file(code, name);
+        let bytes = self.files.get(name).ok_or(refuse(Code::FileMissing))?;
+        if bytes.len() > maximum {
+            return Err(refuse(Code::FileTooLarge));
+        }
+        if self.bytes_read.saturating_add(bytes.len()) > MAX_BUNDLE_BYTES {
+            return Err(refuse(Code::BundleTooLarge));
+        }
+        self.bytes_read += bytes.len();
+        Ok(bytes.clone())
+    }
+
+    fn unreferenced(&self, referenced: &[FileName], strict: bool) -> Vec<BundleDiagnostic> {
+        self.files
+            .keys()
+            .filter(|name| !referenced.contains(name))
+            .map(|name| unreferenced_file(name, strict))
+            .collect()
+    }
 }
 
 /// An opened bundle directory.
@@ -229,11 +301,7 @@ impl BundleDirectory {
     }
 
     /// Reads one referenced file under `maximum` bytes.
-    pub(crate) fn read(
-        &mut self,
-        name: &FileName,
-        maximum: usize,
-    ) -> Result<Vec<u8>, BundleDiagnostic> {
+    fn read_file(&mut self, name: &FileName, maximum: usize) -> Result<Vec<u8>, BundleDiagnostic> {
         let refuse = |code| BundleDiagnostic::file(code, name);
         // Exact-name lookup in the listing: on a case-insensitive filesystem
         // `policy.json` must not open an entry listed as `POLICY.JSON`.
@@ -309,11 +377,7 @@ impl BundleDirectory {
     /// An unreferenced link, subdirectory or special file is always an error:
     /// a flat bundle has none. Only names that pass the file-name grammar are
     /// reported by name.
-    pub(crate) fn unreferenced(
-        &self,
-        referenced: &[FileName],
-        strict: bool,
-    ) -> Vec<BundleDiagnostic> {
+    fn unreferenced_entries(&self, referenced: &[FileName], strict: bool) -> Vec<BundleDiagnostic> {
         self.entries
             .iter()
             .filter(|(name, _)| !referenced.iter().any(|file| file.as_str() == name))
@@ -323,14 +387,15 @@ impl BundleDirectory {
                     EntryKind::Symlink => Code::SymlinkForbidden,
                     EntryKind::Directory | EntryKind::Special => Code::NotRegularFile,
                 };
-                let diagnostic = match FileName::parse(name) {
+                match FileName::parse(name) {
+                    Some(file) if code == Code::UnreferencedEntry => {
+                        unreferenced_file(&file, strict)
+                    }
                     Some(file) => BundleDiagnostic::file(code, &file),
+                    None if code == Code::UnreferencedEntry && !strict => {
+                        BundleDiagnostic::bundle(code).warning()
+                    }
                     None => BundleDiagnostic::bundle(code),
-                };
-                if code == Code::UnreferencedEntry && !strict {
-                    diagnostic.warning()
-                } else {
-                    diagnostic
                 }
             })
             .collect()
@@ -346,6 +411,16 @@ impl BundleDirectory {
 
 /// Lists a directory without following links, refusing a listing larger
 /// than the bundle bound before it is collected.
+impl FileSource for BundleDirectory {
+    fn read(&mut self, name: &FileName, maximum: usize) -> Result<Vec<u8>, BundleDiagnostic> {
+        self.read_file(name, maximum)
+    }
+
+    fn unreferenced(&self, referenced: &[FileName], strict: bool) -> Vec<BundleDiagnostic> {
+        self.unreferenced_entries(referenced, strict)
+    }
+}
+
 fn list_entries(
     directory: &Dir,
     examined: &mut usize,

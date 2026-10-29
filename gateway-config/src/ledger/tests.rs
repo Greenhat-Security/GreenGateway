@@ -162,6 +162,7 @@ fn proposal(
         operation: Operation::Apply,
         activation,
         codes: RevisionCodes::none(),
+        request: None,
         recorded_at: at(60),
     }
 }
@@ -343,7 +344,7 @@ fn the_record_format_is_pinned() {
             "\"name\":\"payments-production\",\"policy\":\"bundle\",\"profile\":\"production\",",
             "\"source_digest\":\"{source_digest}\",\"tools\":\"bundle\"}},",
             "\"changed_sections\":[],\"operation\":\"seed\",\"parent\":null,",
-            "\"recorded_at_ms\":1800000000000,\"required_permissions\":[],\"risk_codes\":[],",
+            "\"recorded_at_ms\":1800000000000,\"request\":null,\"required_permissions\":[],\"risk_codes\":[],",
             "\"rollback_of\":null,\"sequence\":1}}"
         ),
         manifest = pin(FileRole::Manifest),
@@ -1405,5 +1406,252 @@ fn a_record_naming_an_unknown_document_version_is_unsupported() {
     assert_eq!(
         corruption(RevisionLedger::open(state.path())),
         Corruption::Record
+    );
+}
+
+// --- requests ------------------------------------------------------------------------
+
+const BINDING: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+
+fn request(key: &str, acknowledged: &[&str], stage_only: bool) -> RevisionRequest {
+    RevisionRequest::new(
+        PlanId::from_random([7; 16]),
+        key,
+        BINDING,
+        acknowledged,
+        stage_only,
+    )
+    .expect("the request is recordable")
+}
+
+#[test]
+fn a_request_is_recorded_with_its_revision_and_indexed_by_its_key() {
+    let (state, mut ledger, seed) = seeded("request", "first");
+    ledger.activate(&seed.revision).expect("activate");
+    let requested = request("apply-1", &[], false);
+    let second = ledger
+        .append(
+            &seed.revision,
+            Proposal {
+                request: Some(requested.clone()),
+                ..proposal(&bundle("second"), ActivationClass::Live)
+            },
+        )
+        .expect("append");
+    assert_eq!(second.request, Some(requested.clone()));
+    assert!(requested.has_idempotency_key("apply-1"));
+    assert_eq!(
+        ledger.state().expect("state").active,
+        Some(second.revision.clone())
+    );
+
+    // The record holds the key's digest, never the key.
+    let record = String::from_utf8(record_bytes(&outside(&state), 2)).expect("UTF-8");
+    assert!(record.contains(&format!(
+        "\"request\":{{\"acknowledged_risks\":[],\"binding\":\"{BINDING}\",\"idempotency_key\":\"{}\",\"plan\":\"plan-{}\",\"stage_only\":false}}",
+        requested.idempotency_key_digest(),
+        "07".repeat(16)
+    )));
+    assert!(!record.contains("apply-1"));
+
+    // The index finds it by key, and only by that key.
+    assert_eq!(
+        ledger.revision_for_request("apply-1").expect("lookup"),
+        Some(second.clone())
+    );
+    assert_eq!(
+        ledger.revision_for_request("apply-2").expect("lookup"),
+        None
+    );
+    assert_eq!(
+        ledger.revision_for_request("not a key").expect("lookup"),
+        None
+    );
+
+    // A key already recorded is refused inside the append, writing nothing,
+    // and before the head is compared: a retry on the old head learns which
+    // revision its request made.
+    for expected_head in [&second.revision, &seed.revision] {
+        assert_eq!(
+            ledger.append(
+                expected_head,
+                Proposal {
+                    request: Some(request("apply-1", &[], true)),
+                    ..proposal(&bundle("third"), ActivationClass::Live)
+                },
+            ),
+            Err(LedgerError::IdempotencyKeyUsed {
+                revision: second.revision.clone()
+            })
+        );
+    }
+    assert_eq!(ledger.state().expect("state").revisions, 2);
+
+    drop(ledger);
+    let mut reopened = RevisionLedger::open(state.path()).expect("reopen");
+    assert_eq!(reopened.verify().expect("verify").desired, second);
+    assert_eq!(
+        reopened.revision_for_request("apply-1").expect("lookup"),
+        Some(second)
+    );
+}
+
+#[test]
+fn a_live_revision_staged_only_leaves_the_active_pointer() {
+    let (_state, mut ledger, seed) = seeded("stage-only", "first");
+    ledger.activate(&seed.revision).expect("activate");
+    let staged = ledger
+        .append(
+            &seed.revision,
+            Proposal {
+                request: Some(request("stage-1", &[], true)),
+                ..proposal(&bundle("second"), ActivationClass::Live)
+            },
+        )
+        .expect("append");
+    let state = ledger.state().expect("state");
+    assert_eq!(state.desired, staged);
+    assert_eq!(state.active, Some(seed.revision));
+    assert!(state.restart_pending());
+}
+
+#[test]
+fn a_request_acknowledges_exactly_the_revisions_risk_codes() {
+    let (_state, mut ledger, seed) = seeded("acknowledged", "first");
+    let risky = RevisionCodes::new(
+        &["policy"],
+        &["risk.policy_broadened"],
+        &["admin:config:write"],
+    )
+    .expect("codes");
+    for acknowledged in [
+        &[][..],
+        &["risk.unknown_impact"],
+        &["risk.policy_broadened", "risk.shadow_enabled"],
+    ] {
+        assert_eq!(
+            ledger.append(
+                &seed.revision,
+                Proposal {
+                    codes: risky.clone(),
+                    request: Some(request("apply-1", acknowledged, false)),
+                    ..proposal(&bundle("second"), ActivationClass::Live)
+                },
+            ),
+            Err(LedgerError::Refused(Refusal::AcknowledgementMismatch))
+        );
+    }
+    let recorded = ledger
+        .append(
+            &seed.revision,
+            Proposal {
+                codes: risky,
+                request: Some(request("apply-1", &["risk.policy_broadened"], false)),
+                ..proposal(&bundle("second"), ActivationClass::Live)
+            },
+        )
+        .expect("append");
+    assert_eq!(
+        recorded.request.expect("request").acknowledged_risks(),
+        ["risk.policy_broadened"]
+    );
+
+    // Keys, digests and codes outside their grammar are not recordable.
+    let refused = Err(LedgerError::Refused(Refusal::RequestNotRecordable));
+    let plan = || PlanId::from_random([1; 16]);
+    let none: &[&str] = &[];
+    assert_eq!(
+        RevisionRequest::new(plan(), "", BINDING, none, false),
+        refused
+    );
+    assert_eq!(
+        RevisionRequest::new(plan(), "has space", BINDING, none, false),
+        refused
+    );
+    assert_eq!(
+        RevisionRequest::new(
+            plan(),
+            &"k".repeat(MAX_IDEMPOTENCY_KEY_BYTES + 1),
+            BINDING,
+            none,
+            false
+        ),
+        refused
+    );
+    assert_eq!(
+        RevisionRequest::new(plan(), "apply", "sha256:00", none, false),
+        refused
+    );
+    assert_eq!(
+        RevisionRequest::new(plan(), "apply", BINDING, &["Risk.Upper"], false),
+        refused
+    );
+    assert!(RevisionRequest::new(
+        plan(),
+        &"k".repeat(MAX_IDEMPOTENCY_KEY_BYTES),
+        BINDING,
+        none,
+        false
+    )
+    .is_ok());
+    assert_eq!(PlanId::parse("plan-0"), None);
+    assert_eq!(
+        PlanId::parse(&format!("plan-{}", "ab".repeat(16))),
+        Some(PlanId::from_random([0xab; 16]))
+    );
+}
+
+#[test]
+fn an_edited_request_index_is_detected() {
+    let requested = |label: &str| {
+        let (state, mut ledger, seed) = seeded(label, "first");
+        ledger
+            .append(
+                &seed.revision,
+                Proposal {
+                    request: Some(request("apply-1", &[], false)),
+                    ..proposal(&bundle("second"), ActivationClass::Live)
+                },
+            )
+            .expect("append");
+        drop(ledger);
+        state
+    };
+
+    // A removed index row.
+    let state = requested("index-removed");
+    past_trigger(
+        &outside(&state),
+        "config_ledger_requests_no_delete",
+        "DELETE FROM config_ledger_requests",
+    );
+    assert_eq!(
+        corruption(RevisionLedger::open(state.path())),
+        Corruption::Request
+    );
+
+    // An index row naming another revision.
+    let state = requested("index-moved");
+    past_trigger(
+        &outside(&state),
+        "config_ledger_requests_no_update",
+        "UPDATE config_ledger_requests SET sequence = 1",
+    );
+    assert_eq!(
+        corruption(RevisionLedger::open(state.path())),
+        Corruption::Request
+    );
+
+    // An index row for a key no record holds.
+    let state = requested("index-extra");
+    outside(&state)
+        .execute(
+            "INSERT INTO config_ledger_requests (idempotency_key, sequence) VALUES (?1, 1)",
+            params![BINDING],
+        )
+        .expect("the row should insert");
+    assert_eq!(
+        corruption(RevisionLedger::open(state.path())),
+        Corruption::Request
     );
 }

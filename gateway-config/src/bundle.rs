@@ -38,7 +38,11 @@
 //!
 //! An accepted bundle keeps the exact bytes of every file it is made of
 //! ([`Bundle::source_files`]); the standalone revision ledger
-//! ([`crate::ledger`]) records those bytes.
+//! ([`crate::ledger`]) records those bytes. [`read_bundle_files`] reads a
+//! bundle from such bytes in memory by the same pipeline, so a revision's
+//! stored content is held to the current validators before a rollback uses
+//! it, and a bundle a caller submitted is read exactly as a directory would
+//! be.
 //!
 //! Nothing selects a bundle for startup yet: bundle mode and the field
 //! catalog that fills the deployment document are later #242 slices.
@@ -58,7 +62,7 @@ mod property_tests;
 #[cfg(test)]
 mod tests;
 
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -72,7 +76,7 @@ pub use source::{FileName, MANIFEST_FILE_NAME, MAX_BUNDLE_BYTES, MAX_DIRECTORY_E
 
 pub(crate) use document::is_dns_label;
 use document::{Deployment, FileReference, Manifest, ResourceSource};
-use source::BundleDirectory;
+use source::{BundleDirectory, FileSource, MemoryFiles};
 use syntax::{decode_text, Node, SyntaxError, TextRules, DOCUMENT_LIMITS};
 
 /// The manifest's byte bound.
@@ -281,9 +285,43 @@ pub fn read_bundle<V: ResourceValidators>(
     options: ReadOptions,
     validators: &V,
 ) -> BundleReport<V::Policy, V::Tools> {
+    report(BundleDirectory::open(root), options, validators)
+}
+
+/// Reads and validates a bundle held in memory: the files of one flat bundle
+/// directory, by name, exactly as a directory would hold them.
+///
+/// Every stage after the directory checks is the one [`read_bundle`] runs,
+/// with the same byte bounds, and an entry the manifest does not reference
+/// is reported the same way.
+pub fn read_bundle_files<V: ResourceValidators>(
+    files: BTreeMap<FileName, Vec<u8>>,
+    options: ReadOptions,
+    validators: &V,
+) -> BundleReport<V::Policy, V::Tools> {
+    report(MemoryFiles::new(files), options, validators)
+}
+
+fn report<S: FileSource, V: ResourceValidators>(
+    source: Result<S, BundleDiagnostic>,
+    options: ReadOptions,
+    validators: &V,
+) -> BundleReport<V::Policy, V::Tools> {
     let mut diagnostics = Vec::new();
     let mut manifest = None;
-    let bundle = read(root, options, validators, &mut manifest, &mut diagnostics);
+    let bundle = match source {
+        Ok(mut source) => read(
+            &mut source,
+            options,
+            validators,
+            &mut manifest,
+            &mut diagnostics,
+        ),
+        Err(diagnostic) => {
+            diagnostics.push(diagnostic);
+            None
+        }
+    };
     let bundle = bundle.filter(|_| !diagnostics.iter().any(BundleDiagnostic::is_error));
     BundleReport {
         bundle,
@@ -292,20 +330,13 @@ pub fn read_bundle<V: ResourceValidators>(
     }
 }
 
-fn read<V: ResourceValidators>(
-    root: &Path,
+fn read<S: FileSource, V: ResourceValidators>(
+    directory: &mut S,
     options: ReadOptions,
     validators: &V,
     summary: &mut Option<ManifestSummary>,
     diagnostics: &mut Vec<BundleDiagnostic>,
 ) -> Option<Bundle<V::Policy, V::Tools>> {
-    let mut directory = match BundleDirectory::open(root) {
-        Ok(directory) => directory,
-        Err(diagnostic) => {
-            diagnostics.push(diagnostic);
-            return None;
-        }
-    };
     let manifest_file = FileName::manifest();
     let manifest_bytes = match directory.read(&manifest_file, MAX_MANIFEST_BYTES) {
         Ok(bytes) => bytes,
@@ -331,18 +362,13 @@ fn read<V: ResourceValidators>(
         bytes: manifest_bytes,
     }];
 
-    let deployment = read_deployment(
-        &mut directory,
-        &manifest.deployment,
-        &mut files,
-        diagnostics,
-    );
+    let deployment = read_deployment(directory, &manifest.deployment, &mut files, diagnostics);
     // The profile's policy invariants apply once the deployment document says
     // which profile it is; without one the bundle is refused anyway.
     let profile = deployment.as_ref().map(|deployment| deployment.profile);
     let policy = manifest.policy.as_ref().map(|source| {
         read_resource(
-            &mut directory,
+            directory,
             source,
             (FileRole::Policy, &mut files),
             diagnostics,
@@ -354,7 +380,7 @@ fn read<V: ResourceValidators>(
     });
     let tools = manifest.tools.as_ref().map(|source| {
         read_resource(
-            &mut directory,
+            directory,
             source,
             (FileRole::Tools, &mut files),
             diagnostics,
@@ -415,7 +441,7 @@ pub fn sha256_pin(bytes: &[u8]) -> String {
 /// Reads a pinned file: the bound, then the pin over the exact bytes, before
 /// anything parses them.
 fn read_pinned(
-    directory: &mut BundleDirectory,
+    directory: &mut impl FileSource,
     reference: &FileReference,
     maximum: usize,
     diagnostics: &mut Vec<BundleDiagnostic>,
@@ -438,7 +464,7 @@ fn read_pinned(
 }
 
 fn read_deployment(
-    directory: &mut BundleDirectory,
+    directory: &mut impl FileSource,
     reference: &FileReference,
     files: &mut Vec<SourceFile>,
     diagnostics: &mut Vec<BundleDiagnostic>,
@@ -471,7 +497,7 @@ fn read_deployment(
 /// `None` when the resource was refused. A resource the bundle supplies is
 /// added to `files` under its role.
 fn read_resource<T>(
-    directory: &mut BundleDirectory,
+    directory: &mut impl FileSource,
     source: &ResourceSource,
     (role, files): (FileRole, &mut Vec<SourceFile>),
     diagnostics: &mut Vec<BundleDiagnostic>,

@@ -38,6 +38,11 @@
 //!   replica's write, the cluster's operation gate, an authority that could
 //!   not write), emits `policy.draft_publish_refused`. One whose commit was
 //!   written is not a refusal and is not reported as one.
+//!
+//! `POST .../suggestions/{id}/draft` (issue #243, slice 19) is the review
+//! path for a discovery suggestion: it writes the rule the suggestion
+//! proposes into a draft, new or one the caller holds, under these same
+//! rules, and changes neither the live policy nor the suggestion.
 
 use super::*;
 
@@ -300,19 +305,26 @@ fn draft_response(status: StatusCode, record: &PolicyDraftRecord) -> Response {
         Ok(view) => view,
         Err(response) => return *response,
     };
+    private_draft_response(status, &record.summary, view)
+}
+
+/// `body`, which shows the draft `summary`, with that draft's strong ETag
+/// and never cached.
+fn private_draft_response<T: Serialize>(
+    status: StatusCode,
+    summary: &PolicyDraftSummary,
+    body: T,
+) -> Response {
     (
         status,
         [
-            (
-                header::ETAG,
-                etag_header_value(&policy_draft_etag(&record.summary)),
-            ),
+            (header::ETAG, etag_header_value(&policy_draft_etag(summary))),
             (
                 header::CACHE_CONTROL,
                 HeaderValue::from_static("private, no-store"),
             ),
         ],
-        Json(view),
+        Json(body),
     )
         .into_response()
 }
@@ -1071,4 +1083,338 @@ pub(super) async fn policy_draft_publish_endpoint(
         );
     }
     with_policy_history_append_warning(response, commit.history_append_failed)
+}
+
+/// `POST .../suggestions/{id}/draft`. An empty body (or `{}`) opens the
+/// suggestion in a new draft; `draft_id` names an open draft of the caller's
+/// to add its rule to instead.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SuggestionDraftRequest {
+    #[serde(default)]
+    draft_id: Option<String>,
+}
+
+/// A suggestion opened in a draft: the draft as `GET .../drafts/{id}` shows
+/// it, the suggestion as it was read, and the rule the draft now holds for
+/// it at `position` in the candidate's `rules`.
+#[derive(Serialize)]
+struct SuggestionDraftView<'a> {
+    draft: PolicyDraftView<'a>,
+    suggestion: &'a discovery::suggestions::RuleSuggestion,
+    rule: &'a rbac::Rule,
+    position: usize,
+}
+
+/// `409` for a candidate that cannot take a suggestion's rule, with a stable
+/// reason. Nothing was written.
+fn suggestion_draft_conflict(reason: &'static str, error: &'static str) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({ "error": error, "reason": reason })),
+    )
+        .into_response()
+}
+
+/// `base` with `rule` appended, the position a suggestion's rule always
+/// takes, as `POST .../policy/rules` and acceptance append it. A rule the
+/// candidate already holds (the same rule under any identifier) is refused
+/// rather than added twice, and so is a proposed identifier the candidate
+/// already uses; a rule without one gets a fresh identifier, so it keeps its
+/// identity through later edits of the draft.
+fn candidate_with_suggested_rule(
+    base: &rbac::Policy,
+    mut rule: rbac::Rule,
+) -> ResponseResult<(rbac::Policy, usize)> {
+    let already_present = base.rules.iter().any(|existing| {
+        let mut existing = existing.clone();
+        existing.id.clone_from(&rule.id);
+        existing == rule
+    });
+    if already_present {
+        return Err(Box::new(suggestion_draft_conflict(
+            "suggestion_rule_already_present",
+            "the candidate already holds the rule this suggestion proposes",
+        )));
+    }
+    match rule.id.as_deref() {
+        Some(rule_id) if policy_rule_ids(base).iter().any(|id| id == rule_id) => {
+            return Err(Box::new(suggestion_draft_conflict(
+                "suggestion_rule_id_taken",
+                "the candidate already uses the rule id this suggestion proposes",
+            )));
+        }
+        Some(_) => {}
+        None => rule.id = Some(generate_unique_rule_id(base)),
+    }
+    let position = base.rules.len();
+    let mut candidate = base.clone();
+    candidate.rules.push(rule);
+    Ok((candidate, position))
+}
+
+/// `POST .../suggestions/{id}/draft`: write the rule a discovery suggestion
+/// proposes into a policy draft for review, instead of applying it (issue
+/// #243, slice 19).
+///
+/// Needs `admin:suggestions:read`, to read the suggestion, and
+/// `admin:policy:write`, the permission every draft write needs; both are
+/// decided before any store or body is read. The suggestion is checked
+/// exactly as acceptance checks it ([`reviewable_suggestion_rule`]): open,
+/// at the revision [`SUGGESTION_REVISION_HEADER`] names when it names one,
+/// identity-bound, and still describable as a direct rule by current
+/// routing state, which also recomputes an HTTP rule's `dispatch`. A
+/// signal-derived proposal to deny is drafted as `shadow`: a draft never
+/// starts by enforcing a deny that was only inferred from traffic.
+///
+/// `If-Match` names the live policy ETag the suggestion was reviewed
+/// against, exactly one strong tag. Without `draft_id` the rule is appended
+/// to a copy of that live policy, saved as a new draft pinned to it. With
+/// `draft_id`, [`POLICY_DRAFT_ETAG_HEADER`] must name the draft's current
+/// ETag, and the draft must be the caller's, open, and pinned to that same
+/// live ETag -- no silent rebase: a stale draft is
+/// `409 policy_draft_base_stale` and is left alone -- and the rule is
+/// appended to its candidate as a compare-and-set on the draft's revision.
+/// Either way the candidate is validated like a policy write, and bounded
+/// and owner-scoped like every draft.
+///
+/// Nothing live changes: the policy keeps its ETag, and the suggestion keeps
+/// its state and revision. The draft is published, or not, through
+/// `POST .../policy/drafts/{id}/publish` like any other, and that does not
+/// move the suggestion. A written draft emits `policy.draft_changed` and
+/// `policy.suggestion_drafted`; a refusal writes and emits nothing.
+pub(super) async fn rule_suggestion_draft_endpoint(
+    State(state): State<SuggestionsAdminState>,
+    Path(id): Path<String>,
+    request: AxumRequest,
+) -> Response {
+    record_request(SUGGESTION_DRAFT_ADMIN_ROUTE);
+
+    let (parts, body) = request.into_parts();
+    let Some(principal) = parts.extensions.get::<auth::Principal>().cloned() else {
+        return unauthorized();
+    };
+    if let Err(error) =
+        authorized_suggestions_state(&state, &principal, ADMIN_SUGGESTIONS_READ_PERMISSION)
+    {
+        return suggestions_admin_authz_error_response(error);
+    }
+    let (rbac_state, store) =
+        match authorized_draft_store(&state.policy, &principal, ADMIN_POLICY_WRITE_PERMISSION) {
+            Ok(context) => context,
+            Err(response) => return *response,
+        };
+
+    let id = id.trim();
+    if id.is_empty() {
+        return bad_request("invalid suggestion id");
+    }
+    let Some(suggestion_engine) = state.suggestion_engine.as_ref() else {
+        return suggestions_discovery_not_configured();
+    };
+    let presented_policy = match presented_policy_etag(&parts.headers) {
+        Ok(etag) => etag,
+        Err(response) => return *response,
+    };
+    let expected_revision = match expected_suggestion_revision(&parts.headers) {
+        Ok(expected_revision) => expected_revision,
+        Err(response) => return *response,
+    };
+    let draft_etag_header = HeaderName::from_static(POLICY_DRAFT_ETAG_HEADER);
+    let presented_draft = if parts.headers.contains_key(&draft_etag_header) {
+        match presented_draft_etag(&parts.headers, &draft_etag_header) {
+            Ok(etag) => Some(etag),
+            Err(response) => return *response,
+        }
+    } else {
+        None
+    };
+    let body = match read_request_body(body, state.policy.max_body_size).await {
+        Ok(body) => body,
+        Err(response) => return *response,
+    };
+    let request = if body.is_empty() {
+        SuggestionDraftRequest::default()
+    } else {
+        match serde_json::from_slice::<SuggestionDraftRequest>(&body) {
+            Ok(request) => request,
+            Err(error) => {
+                return bad_request(&format!("invalid suggestion draft JSON: {error}"));
+            }
+        }
+    };
+    // The draft ETag is a precondition on an existing draft, so it travels
+    // with `draft_id` or not at all.
+    let target = match (request.draft_id, presented_draft) {
+        (Some(draft_id), Some(draft_etag)) => Some((draft_id, draft_etag)),
+        (Some(_), None) => return PolicyDraftRefusal::EtagRequired.response(),
+        (None, Some(_)) => {
+            return bad_request(
+                "the policy draft ETag precondition applies only to a request that names draft_id",
+            );
+        }
+        (None, None) => None,
+    };
+
+    let (suggestion, mut rule) =
+        match reviewable_suggestion_rule(suggestion_engine, id, expected_revision).await {
+            Ok(reviewed) => reviewed,
+            Err(response) => return *response,
+        };
+    if suggestion.source_signal_id.is_some() && rule.action == rbac::RuleAction::Deny {
+        rule.action = rbac::RuleAction::Shadow;
+    }
+
+    let (live_policy, live_etag) =
+        match authoritative_policy_and_etag(&state.policy, rbac_state).await {
+            Ok(view) => view,
+            Err(response) => return *response,
+        };
+    if presented_policy != live_etag {
+        return PolicyDraftRefusal::PolicyEtagMismatch.response();
+    }
+
+    let owner = policy_draft_owner(&principal);
+    let existing = match target {
+        None => None,
+        Some((draft_id, draft_etag)) => {
+            let draft = match owned_draft(store, &owner, &draft_id).await {
+                Ok(record) => record,
+                Err(response) => return *response,
+            };
+            if let Some(published_etag) = draft.summary.published_etag.as_deref() {
+                return PolicyDraftRefusal::Published
+                    .response_with(json!({ "published_etag": published_etag }));
+            }
+            if policy_draft_etag(&draft.summary) != draft_etag {
+                return PolicyDraftRefusal::EtagMismatch.response();
+            }
+            if draft.summary.base_etag != live_etag {
+                return PolicyDraftRefusal::BaseStale.response_with(json!({
+                    "base_etag": draft.summary.base_etag,
+                    "policy_etag": live_etag,
+                }));
+            }
+            Some(draft)
+        }
+    };
+
+    let base = existing
+        .as_ref()
+        .map_or(&live_policy, |draft| &draft.candidate);
+    let (candidate, position) = match candidate_with_suggested_rule(base, rule) {
+        Ok(prepared) => prepared,
+        Err(response) => return *response,
+    };
+    let candidate = match validate_policy_candidate(&candidate) {
+        Ok(candidate) => candidate,
+        Err(response) => return *response,
+    };
+    if let Err(response) =
+        validate_policy_write_candidate(&state.policy, rbac_state, &live_policy, &candidate)
+    {
+        return *response;
+    }
+    if let Err(response) = within_candidate_bound(&candidate) {
+        return *response;
+    }
+
+    let (status, action, record) = match existing {
+        None => {
+            let Some(draft_id) = new_policy_draft_id() else {
+                tracing::error!("the operating system could not supply a policy draft identifier");
+                return PolicyDraftRefusal::Unavailable.response();
+            };
+            let created = store
+                .create(NewPolicyDraft {
+                    draft_id: &draft_id,
+                    owner: &owner,
+                    base_etag: &live_etag,
+                    candidate: &candidate,
+                })
+                .await;
+            match created {
+                Ok(PolicyDraftCreated::Created(record)) => {
+                    (StatusCode::CREATED, "created", *record)
+                }
+                Ok(PolicyDraftCreated::OwnerQuotaExceeded) => {
+                    return PolicyDraftRefusal::OwnerQuotaExceeded.response_with(
+                        json!({ "max_drafts_per_owner": store.limits().max_per_owner }),
+                    );
+                }
+                Ok(PolicyDraftCreated::DeploymentQuotaExceeded) => {
+                    return PolicyDraftRefusal::DeploymentQuotaExceeded
+                        .response_with(json!({ "max_drafts": store.limits().max_total }));
+                }
+                Err(error) => return policy_draft_store_failed(&error),
+            }
+        }
+        Some(draft) => {
+            let updated = store
+                .update(
+                    &owner,
+                    &draft.summary.draft_id,
+                    draft.summary.revision,
+                    PolicyDraftChange::Candidate {
+                        candidate: &candidate,
+                        base_etag: &draft.summary.base_etag,
+                    },
+                )
+                .await;
+            match updated {
+                Ok(Some(record)) => (StatusCode::OK, "updated", record),
+                Ok(None) => return lost_draft_write(store, &owner, &draft.summary.draft_id).await,
+                Err(error) => return policy_draft_store_failed(&error),
+            }
+        }
+    };
+
+    emit_policy_draft_changed(
+        &state.policy,
+        &parts,
+        &principal,
+        action,
+        &record.summary,
+        false,
+    );
+    let rule = record.candidate.rules.get(position);
+    emit_policy_draft_event(
+        &state.policy,
+        &parts,
+        &principal,
+        audit::event::POLICY_SUGGESTION_DRAFTED,
+        json!({
+            "suggestion_id": suggestion.id,
+            "suggestion_revision": suggestion.revision,
+            "suggestion_type": suggestion.suggestion_type,
+            "draft_id": record.summary.draft_id,
+            "draft_revision": record.summary.revision,
+            "draft_created": action == "created",
+            "base_etag": record.summary.base_etag,
+            "candidate_etag": record.summary.candidate_etag,
+            "rule_id": rule.and_then(|rule| rule.id.as_deref()),
+            "position": position,
+        }),
+    );
+    // The store hands back the candidate it wrote, which is the one built
+    // above; a rule missing from it is a store fault, answered after the
+    // write it cannot undo has been recorded.
+    let Some(rule) = rule else {
+        tracing::error!("a policy draft written for a suggestion does not hold its rule");
+        return internal_server_error("policy draft could not be rendered");
+    };
+    let draft = match draft_view(&record.summary, Some(&record.candidate)) {
+        Ok(view) => view,
+        Err(response) => return *response,
+    };
+    private_draft_response(
+        status,
+        &record.summary,
+        SuggestionDraftView {
+            draft,
+            suggestion: &suggestion,
+            rule,
+            position,
+        },
+    )
 }

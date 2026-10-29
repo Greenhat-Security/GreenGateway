@@ -26,7 +26,7 @@
 //!
 //! Nothing here reads a file, the environment or the network; values are
 //! compared in memory and only the closed-vocabulary ones are shown.
-#![allow(dead_code)] // Server plans (#242 PR 11) are the readers; until then the tests are.
+#![allow(dead_code)] // Ledger plans (`config::revisions`) and the tests are the readers.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -113,7 +113,7 @@ pub(crate) fn bundles(base: &ProductionBundle, candidate: &ProductionBundle) -> 
 /// `unknown` change whenever the pins differ.
 fn policy_value(bundle: &ProductionBundle) -> Option<Value> {
     match &bundle.policy {
-        Some(BundledResource::Bundle { document, .. }) => serde_json::to_value(document).ok(),
+        Some(BundledResource::Bundle { document, .. }) => policy_document_value(document),
         _ => None,
     }
 }
@@ -125,12 +125,25 @@ fn tools_value(bundle: &ProductionBundle) -> Option<Value> {
             schema_version,
             document,
             ..
-        }) => {
-            let tools = serde_json::to_value(document).ok()?;
-            Some(json!({"schema_version": schema_version, "tools": tools}))
-        }
+        }) => tools_document_value(schema_version, document),
         _ => None,
     }
+}
+
+/// A policy the production validator built, as the JSON its loader models:
+/// what a diff and a ledger plan compare.
+pub(super) fn policy_document_value(policy: &Policy) -> Option<Value> {
+    serde_json::to_value(policy).ok()
+}
+
+/// Tool definitions the production validator built, as a tools document of
+/// `schema_version`.
+pub(super) fn tools_document_value(
+    schema_version: &str,
+    tools: &[ToolDefinition],
+) -> Option<Value> {
+    let tools = serde_json::to_value(tools).ok()?;
+    Some(json!({"schema_version": schema_version, "tools": tools}))
 }
 
 // --- Fields -----------------------------------------------------------------

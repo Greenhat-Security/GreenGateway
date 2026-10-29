@@ -14,6 +14,12 @@ pub const POLICY_DRAFT_CHANGED: &str = "policy.draft_changed";
 pub const POLICY_DRAFT_PUBLISHED: &str = "policy.draft_published";
 /// A publication of a draft its owner holds was refused without writing.
 pub const POLICY_DRAFT_PUBLISH_REFUSED: &str = "policy.draft_publish_refused";
+/// A discovery suggestion's rule was written into a policy draft for review
+/// (issue #243, slice 19). Emitted beside the draft's own
+/// `policy.draft_changed`; it binds the suggestion and the revision it was
+/// read at to the draft revision that holds its rule. The suggestion's
+/// lifecycle state does not change.
+pub const POLICY_SUGGESTION_DRAFTED: &str = "policy.suggestion_drafted";
 pub const SIGNAL_OPENED: &str = "signal.opened";
 pub const SIGNAL_LIFECYCLE_CHANGED: &str = "signal.lifecycle_changed";
 pub const SUGGESTION_LIFECYCLE_CHANGED: &str = "suggestion.lifecycle_changed";
