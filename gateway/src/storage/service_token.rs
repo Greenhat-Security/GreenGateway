@@ -151,10 +151,19 @@ impl ServiceTokenStore for SqliteTokenStore {
     }
 }
 
-fn map_token_store_error(operation: &'static str, error: TokenStoreError) -> RepositoryError {
+pub(super) fn map_token_store_error(
+    operation: &'static str,
+    error: TokenStoreError,
+) -> RepositoryError {
     let classified = match &error {
         TokenStoreError::Open { source, .. } | TokenStoreError::Sqlite { source, .. } => {
             classify_rusqlite(operation, source)
+        }
+        // The contention budget ran out and nothing committed: the same
+        // `Timeout` a raw lock failure always classified as, which the admin
+        // API answers `503 service-token store is unavailable`.
+        TokenStoreError::Busy { .. } => {
+            RepositoryError::new(RepositoryErrorKind::Timeout, operation)
         }
         TokenStoreError::Json { .. } | TokenStoreError::TimeFormat(_) => {
             RepositoryError::new(RepositoryErrorKind::InvalidData, operation)
