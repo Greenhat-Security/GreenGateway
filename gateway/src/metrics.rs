@@ -469,12 +469,28 @@ pub const AUTHORITY_EVENT_CAPACITY_REFUSALS_TOTAL: &str =
 ///
 /// It counts every PostgreSQL producer whose change commits only with its
 /// evidence row: the journaled ones (Connection delete, service-token
-/// rotate and revoke, JWT revoke) and migration 23's policy, tools and
-/// catalog commits, which are not journaled yet. The producer is not a
-/// label; the refusing replica's log names the failed operation.
+/// rotate and revoke, JWT revoke, and admin session grants and withdrawals,
+/// the expiry prune included) and migration 23's policy, tools and catalog
+/// commits, which are not journaled yet. The producer is not a label; the
+/// refusing replica's log names the failed operation. Standalone SQLite
+/// evidence is counted by [`STANDALONE_EVIDENCE_FAILURES_TOTAL`] instead.
 #[cfg(feature = "postgres")]
 pub const AUTHORITY_EVENT_EVIDENCE_FAILURES_TOTAL: &str =
     "greengateway_authority_event_evidence_failures_total";
+
+/// Standalone authority changes refused because their evidence row could
+/// not be inserted into the SQLite store that owns them: a service-token
+/// rotate or revoke, a Connection create, replace or delete, or a
+/// local-secret create, rotate, delete or re-encryption batch. The change
+/// rolled back with its evidence, so it did not happen. Counted once per
+/// refused change by the process that refused it.
+///
+/// `store` is the SQLite file, one of `storage::STANDALONE_EVIDENCE_STORES`:
+/// the same spellings `greengateway_sqlite_storage_checks_total` uses for
+/// that file. Nothing about the change, its actor or the SQLite error is a
+/// label.
+pub const STANDALONE_EVIDENCE_FAILURES_TOTAL: &str =
+    "greengateway_standalone_evidence_failures_total";
 
 /// Client-certificate outcomes, per listener.
 ///

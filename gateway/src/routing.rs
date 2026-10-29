@@ -962,6 +962,10 @@ pub(super) fn register_metrics(cluster: bool) {
 /// says: under `best_effort` nothing is ever refused, and a series that
 /// stays at `0` says exactly that.
 ///
+/// A standalone replica seeds its SQLite evidence-failure counter for both
+/// stores, configured or not, and a cluster replica the PostgreSQL one: each
+/// mode exports only the refusal counter its own authority stores can move.
+///
 /// `greengateway_authority_event_delivery_failures_total` is deliberately
 /// not seeded: its rule waits for failures sustained over ten minutes, and
 /// the series' presence is how the delivery-lag rule tells a replica with
@@ -986,8 +990,12 @@ fn seed_alerted_counters(cluster: bool) {
         ::metrics::counter!(metrics::AUTHORITY_EVENT_CAPACITY_REFUSALS_TOTAL).increment(0);
         ::metrics::counter!(metrics::AUTHORITY_EVENT_EVIDENCE_FAILURES_TOTAL).increment(0);
     }
-    #[cfg(not(feature = "postgres"))]
-    let _ = cluster;
+    if !cluster {
+        for store in storage::STANDALONE_EVIDENCE_STORES {
+            ::metrics::counter!(metrics::STANDALONE_EVIDENCE_FAILURES_TOTAL, "store" => store)
+                .increment(0);
+        }
+    }
 }
 
 pub(super) fn cors_layer(config: &config::Config) -> CorsLayer {

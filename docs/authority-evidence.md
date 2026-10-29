@@ -716,7 +716,10 @@ All three follow the same rules:
 - A change whose evidence cannot be inserted rolls back with it and fails as a
   store failure (`503` from the Connection and secret admin API, an internal or
   unavailable error from the token admin API by the failure's class, a failed
-  exit from the maintenance command). A refused change
+  exit from the maintenance command). In the gateway process each such refusal
+  is counted once by `greengateway_standalone_evidence_failures_total{store}`,
+  where `store` is `service_tokens` or `connections`, and the operational rule
+  pack pages on it ([standalone evidence failures](deployment/operational-alerts.md#standalone-evidence-failures)). A refused change
   (stale ETag, dependency conflict, missing record, purpose mismatch) and an
   ineffective one (an identical replace, a batch with nothing to rewrite, a
   repeat revoke) write nothing. A change whose actor evidence cannot record

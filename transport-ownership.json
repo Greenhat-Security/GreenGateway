@@ -6721,7 +6721,7 @@
         "unexpanded-macro"
       ],
       "scope": "gateway::routing::seed_alerted_counters#1",
-      "sha256": "c0354a22e022d899ed445491be182defc8f3b52db387a81bf72d37e46ff36ca5",
+      "sha256": "410e2a2c246e0d24dbd88ae5da8bff376e0dae19ea5e0ccbfea72dd0ece68d5b",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
@@ -13760,6 +13760,16 @@
       "sha256": "39c19bc0eb8e45f17c739310bab575ad397194b9541275a25449d6f3bbbac9aa",
       "owner": "GreenGateway maintainers",
       "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
+    },
+    {
+      "file": "gateway/src/storage/mod.rs",
+      "reasons": [
+        "unexpanded-macro"
+      ],
+      "scope": "gateway::storage::record_standalone_evidence_failure#1",
+      "sha256": "8823e2ebc1ae6fb561cdbc3a020c3a6fb8043ea0b9bff271073f52d00bae89ac",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Counts a standalone authority change refused for its SQLite evidence on a fixed metrics counter with a constant store label; no connection construction or transport authority."
     },
     {
       "file": "gateway/src/storage/mod.rs",
