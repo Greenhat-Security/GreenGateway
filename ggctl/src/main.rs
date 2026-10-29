@@ -2,10 +2,11 @@
 //!
 //! A separate binary: the `gateway` server keeps its name, its no-argument
 //! startup and its one-shot commands. It provides the command table, the
-//! output contract (human, `--format json` reports, SARIF for `validate`),
-//! the stable exit codes, shell completion, secure bearer-token input, the
-//! version handshake with a running gateway, and offline bundle validation
-//! and diagnosis with the gateway's own bundle reader (`gateway-config`).
+//! output contract (human, `--format json` reports, SARIF for `validate` and
+//! `diff`), the stable exit codes, shell completion, secure bearer-token
+//! input, the version handshake with a running gateway, and offline bundle
+//! validation, diagnosis and semantic diff with the gateway's own bundle
+//! reader and diff engine (`gateway-config`).
 //!
 //! `ggctl` reads no configuration file and no environment variable, never
 //! accepts a secret as an argument, and makes no network request unless a
@@ -15,6 +16,7 @@ mod cli;
 mod completion;
 mod credential;
 mod diagnostic;
+mod diff;
 mod doctor;
 mod help;
 mod remote;
