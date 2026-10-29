@@ -94,6 +94,8 @@ mod admin_policy_replays;
 use admin_policy_replays::*;
 mod admin_policy_evidence;
 use admin_policy_evidence::*;
+mod admin_policy_analyses;
+use admin_policy_analyses::*;
 
 mod audit;
 mod auth;
@@ -123,6 +125,7 @@ mod mcp;
 mod metrics;
 mod middleware;
 mod path_match;
+mod policy_analysis;
 #[cfg(test)]
 #[path = "../tests/support/policy_benchmark.rs"]
 mod policy_benchmark;

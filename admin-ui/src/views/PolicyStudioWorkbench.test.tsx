@@ -305,7 +305,7 @@ describe('Policy Studio workbench', () => {
     const optimize = viewPanel('Optimize');
     expect(within(optimize).getByText('Risks to review (1)')).toBeTruthy();
     expect(within(optimize).getByText('Set default_action to deny.')).toBeTruthy();
-    expect(within(optimize).getByText(/is not available on this gateway yet/)).toBeTruthy();
+    expect(within(optimize).getByText(/but this view does not run it yet/)).toBeTruthy();
     expect(within(optimize).getByText(/does not mean the policy has\s+none of those problems/)).toBeTruthy();
     fireEvent.click(
       within(optimize).getByRole('button', {

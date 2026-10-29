@@ -499,3 +499,35 @@ cases, the version before it) compiled with `CompiledPolicy::from_validated_poli
 and binds a finished replay job's result unchanged. `policy_evidence` only
 assembles what those callers returned into a deterministic package; the
 format is in [policy-evidence.md](../policy-evidence.md).
+
+## Structural analysis (#243, slice 15)
+
+`policy_analysis` reasons about which requests a policy element can match
+rather than evaluating one request, so it cannot simply ask `evaluate`; it
+also must not grow a second matcher. Its inclusion checks
+(`policy_analysis::coverage`) read every predicate through the matchers' own
+parsers -- `rbac::matcher::pattern_segments` exposes the segment parser
+`path_pattern_matches` compiles patterns with, `methods_cover` and
+`matches_every_method` the method matcher's reading of a method list, and
+route prefixes are compared with `path_prefix_matches` itself -- and each
+inclusion is a proof or nothing. Which element then wins follows each lane's
+precedence as this document describes it: rule-index-major first match for a
+single identity and rendered tool HTTP, action-major for an alias pair, direct
+denies only for a selected upstream and an enum-source request, exact-prefix
+first for an alias's routes.
+
+Every reachability claim is confirmed by the kernel before it is reported as
+proven. The analyzer builds a witness request the claimed element matches
+alone (a policy holding only that rule, route or override under the analyzed
+policy's roles and identity mappings, compiled with `for_analysis`), then asks
+the analyzed policy which element
+decides it -- `match_direct_rules`, `match_tool_rules`, `evaluate` over the
+policy without its direct rules for a route, `evaluate` over the whole policy
+for a route a rule pre-empts, `select_rate_lane` for an override -- and keeps
+the claim only when an earlier element does. A witness whose facts the kernel
+refuses makes the finding `inconclusive`; any other evaluator error fails the
+analysis. The property tests in `policy_analysis::tests` decide every request
+of small universes through `evaluate`, `evaluate_tool`,
+`evaluate_source_request` and `select_rate_lane` in every lane, before and
+after each suggested patch. The API is in
+[policy-analysis.md](../policy-analysis.md).

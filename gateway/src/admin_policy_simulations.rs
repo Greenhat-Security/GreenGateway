@@ -15,10 +15,10 @@
 //! resolver or upstream.
 //!
 //! The concurrency bound, [`PolicyEvaluationLimiter`], is shared with policy
-//! test runs and historical replay jobs: each endpoint admits a request only
-//! once its body is in hand, and the blocking work owns its slot, so a slot
-//! counts evaluations doing work -- not uploads in flight, and not work a
-//! cancelled request left running.
+//! test runs, historical replay jobs and policy analyses: each endpoint admits
+//! a request only once its body is in hand, and the blocking work owns its
+//! slot, so a slot counts evaluations doing work -- not uploads in flight, and
+//! not work a cancelled request left running.
 use std::{
     collections::HashSet,
     sync::{
@@ -54,8 +54,8 @@ pub(super) const POLICY_SIMULATION_DEADLINE: Duration = Duration::from_secs(2);
 /// The concurrency bounds of one evaluation endpoint on one router, shared by
 /// every request it serves: at most `limit` evaluations at once, and one at a
 /// time per actor, so a single caller cannot hold every slot. Each route has
-/// its own, so simulations, test runs and replay jobs never take each
-/// other's slots.
+/// its own, so simulations, test runs, replay jobs and analyses never take
+/// each other's slots.
 pub(super) struct PolicyEvaluationLimiter {
     limit: usize,
     active: AtomicUsize,
