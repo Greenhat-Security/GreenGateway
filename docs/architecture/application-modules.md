@@ -25,8 +25,16 @@ it does not introduce a second authorization or persistence path. New handlers
 belong in their domain module and must be registered through `routing`.
 
 Large inline unit suites in configuration, connection stores and tool execution
-are in adjacent `*_tests.rs` files. The main application suite is `app_tests.rs`,
-with acceptance modules still under `tests/`. Test module names remain stable.
+are in adjacent `*_tests.rs` files. The application suite, which drives the
+composed router, is `app_tests.rs` and the subsystem modules it declares next
+to the code they exercise: `auth_app_tests.rs` (authentication and the
+validator chain), `admin_identity_app_tests.rs` (admin login, capabilities and
+the admin-endpoint denial audit) and `admin_tokens_app_tests.rs` (the token
+admin API), with acceptance modules still under `tests/`. `app_tests.rs` owns
+the fixtures more than one of them uses. Issue #434 is moving the remaining
+families out of it; [the application test inventory](../testing/application-test-inventory.md)
+counts them. A moved test keeps its function name, so a name filter still
+selects it; only its module path gains the subsystem module.
 
 The React connection editor delegates validation, binding intent and request
 serialization to `connection-editor/model.ts`; reusable form sections and local

@@ -3,6 +3,7 @@ import { NavLink } from 'react-router-dom';
 const RULE_WORKSPACE_LINKS = [
   { label: 'Rulebase', to: '/rules' },
   { label: 'Builder', to: '/policy/rules/editor' },
+  { label: 'Studio', to: '/policy/studio' },
   { label: 'Shadow review', to: '/policy/shadow-review' },
   { label: 'History', to: '/policy/history' },
 ];

@@ -16,6 +16,10 @@
 //!   finalization step, never smuggled into a migration. Additive SQL alone
 //!   does not establish rolling compatibility: issue #426 requires an
 //!   explicitly prepared and qualified adjacent release pair.
+//! - **A migration that removes anything says so** ([`Contraction`], issue
+//!   #426): before its SQL runs, the same transaction raises the durable
+//!   contract fence past every build that still needs what it removes and
+//!   refuses while any such build is live (`storage::contraction`).
 //! - **The ledger must be a prefix of the compiled history, checksums
 //!   matching.** Anything else -- an unknown version (written by a newer
 //!   gateway), a checksum mismatch (edited migration files), a gap or
@@ -48,6 +52,7 @@ use std::{fmt, sync::LazyLock};
 
 use sha2::{Digest, Sha256};
 
+use super::contraction::{Contraction, ContractionRefusal};
 use crate::config::{Config, DatabaseSettings};
 
 /// The one schema every cluster-mode object lives in. Pinned here, pinned in
@@ -84,6 +89,7 @@ pub(crate) fn migration_lock_key() -> i64 {
 /// One embedded migration. Constructed only by [`MANIFEST`] (and by tests);
 /// the checksum is computed from the SQL at construction so a build and its
 /// ledger always agree on what a migration's bytes are.
+#[derive(Clone)]
 pub struct Migration {
     pub version: i64,
     pub name: &'static str,
@@ -95,10 +101,15 @@ pub struct Migration {
     /// runtime compares the computed checksum against every deployment's
     /// ledger, so editing an applied migration fails every `check`.
     pinned_checksum: &'static str,
+    /// What the migration removes, when it removes anything: the migrator
+    /// then raises the durable contract fence in the migration's own
+    /// transaction before its SQL runs (`storage::contraction`). `None` for
+    /// an additive migration, which every shipped one is.
+    contraction: Option<Contraction>,
 }
 
 impl Migration {
-    const fn new(version: i64, name: &'static str, sql: &'static str) -> Self {
+    pub(super) const fn new(version: i64, name: &'static str, sql: &'static str) -> Self {
         Self {
             version,
             name,
@@ -106,24 +117,40 @@ impl Migration {
             // Filled by `finalize` below; a `const fn` cannot hash.
             checksum: String::new(),
             pinned_checksum: "",
+            contraction: None,
         }
     }
 
     /// Compute the checksum the manifest was declared without. A
     /// `LazyLock` construction can hash; a `const` one cannot, so the
     /// manifest is declared with [`Migration::new`] and finalized here.
-    fn finalize(mut self) -> Self {
+    pub(super) fn finalize(mut self) -> Self {
         self.checksum = hex_checksum(self.sql);
         self
     }
 
-    fn current_checksum(&self) -> &str {
+    pub(super) fn current_checksum(&self) -> &str {
         &self.checksum
     }
 
     fn with_pinned_checksum(mut self, pinned: &'static str) -> Self {
         self.pinned_checksum = pinned;
         self
+    }
+
+    /// Declare that this migration removes what `contraction` describes. A
+    /// reviewed change: the descriptor names whom the raised fence keeps
+    /// out, and `contraction::tests` pins every shipped one to a fence this
+    /// build itself meets.
+    #[allow(dead_code)] // Used only by the contraction fixture: no shipped migration contracts.
+    pub(super) fn contracting(mut self, contraction: Contraction) -> Self {
+        self.contraction = Some(contraction);
+        self
+    }
+
+    #[cfg(test)]
+    pub(super) fn contraction(&self) -> Option<&Contraction> {
+        self.contraction.as_ref()
     }
 }
 
@@ -648,6 +675,14 @@ pub(crate) enum MigrateError {
     /// Applying a migration failed. The classified detail is logged at the
     /// failure site; this variant deliberately carries nothing else.
     ApplyFailed,
+    /// A contracting migration was refused before it removed anything: its
+    /// transaction rolled back, so the fence was not raised and the ledger
+    /// stops at the migration before it. Migrations earlier in the same run
+    /// stay committed.
+    ContractionRefused {
+        version: i64,
+        refusal: ContractionRefusal,
+    },
 }
 
 impl fmt::Display for MigrateError {
@@ -678,6 +713,13 @@ impl fmt::Display for MigrateError {
             Self::ApplyFailed => formatter.write_str(
                 "applying a migration failed; every migration runs in one transaction, so \
                  the database is left at its previous schema version",
+            ),
+            Self::ContractionRefused { version, refusal } => write!(
+                formatter,
+                "migration {version} contracts the schema and was refused before it removed \
+                 anything (the contract fence was not raised; the schema stays at version {}): \
+                 {refusal}",
+                version - 1
             ),
         }
     }
@@ -766,7 +808,13 @@ pub(crate) async fn execute(
         };
     }
 
-    let output = apply_missing(foundation.pool(), &config.database).await?;
+    let output = apply_manifest(
+        foundation.pool(),
+        &config.database,
+        &MANIFEST,
+        config.cluster_member_stale_window(),
+    )
+    .await?;
     // The schema now carries the binding table; bind this deployment (a
     // first migration) or refuse another deployment's database.
     refuse_other_deployment(&foundation, config).await?;
@@ -920,7 +968,27 @@ async fn read_ledger(
     }
 }
 
-/// Apply every missing migration under the advisory lock.
+/// [`apply_manifest`] over the shipped manifest, judging a contraction's
+/// roster against the stale window every test configuration carries
+/// (`Config::test_defaults`). The production callers, `migrate up` and
+/// development auto-migration, pass the configured window.
+#[cfg(test)]
+async fn apply_missing(
+    pool: &deadpool_postgres::Pool,
+    settings: &DatabaseSettings,
+) -> Result<MigrateOutput, MigrateError> {
+    apply_manifest(
+        pool,
+        settings,
+        &MANIFEST,
+        std::time::Duration::from_millis(crate::config::DEFAULT_CLUSTER_MEMBER_STALE_MS),
+    )
+    .await
+}
+
+/// Apply every migration of `manifest` the ledger is missing, under the
+/// advisory lock. `manifest` is [`MANIFEST`] everywhere but the contraction
+/// fixture's tests.
 ///
 /// The lock lives on a connection that is then **detached from the pool**
 /// (`Object::take`), so it is released by the session closing the moment
@@ -930,10 +998,18 @@ async fn read_ledger(
 /// and finds nothing left to do. Each migration runs in one transaction
 /// with its ledger row and its own `SET LOCAL` statement/lock timeouts, so
 /// a failure anywhere leaves the database at its previous schema version.
+///
+/// A contracting migration's transaction first raises the durable contract
+/// fence, judging which roster rows are live against `member_stale_window`
+/// on the database clock (`storage::contraction`); a refusal is
+/// [`MigrateError::ContractionRefused`] and leaves the migrations before it
+/// committed. A raise is logged and audited once its migration commits.
 #[cfg(feature = "postgres")]
-async fn apply_missing(
+pub(super) async fn apply_manifest(
     pool: &deadpool_postgres::Pool,
     settings: &DatabaseSettings,
+    manifest: &[Migration],
+    member_stale_window: std::time::Duration,
 ) -> Result<MigrateOutput, MigrateError> {
     let connection = acquire(pool).await?;
 
@@ -948,7 +1024,7 @@ async fn apply_missing(
     connection
         .simple_query(&format!(
             "SET lock_timeout = {}; SET statement_timeout = {};",
-            settings.migration_statement_timeout_ms * (MANIFEST.len() as u64),
+            settings.migration_statement_timeout_ms * (manifest.len() as u64),
             settings.migration_statement_timeout_ms,
         ))
         .await
@@ -982,23 +1058,26 @@ async fn apply_missing(
         LedgerRead::Table(rows) => rows,
         LedgerRead::TableMissing => Vec::new(),
     };
-    let status = validate_ledger(&rows, &MANIFEST).map_err(MigrateError::LedgerInvalid)?;
+    let status = validate_ledger(&rows, manifest).map_err(MigrateError::LedgerInvalid)?;
     let SchemaStatus::NeedsUpgrade { applied, .. } = status else {
         return Ok(MigrateOutput::UpToDate {
             applied: rows.len(),
         });
     };
 
-    for migration in &MANIFEST[applied..] {
-        apply_one(&client, migration, settings).await?;
+    for migration in &manifest[applied..] {
+        let fence = apply_migration(&client, migration, settings, member_stale_window).await?;
         tracing::info!(
             version = migration.version,
             name = migration.name,
             "applied schema migration"
         );
+        if let Some(fence) = fence {
+            super::contraction::record_contraction_fence(pool, migration, &fence).await;
+        }
     }
     Ok(MigrateOutput::Applied {
-        applied: MANIFEST.len() - applied,
+        applied: manifest.len() - applied,
     })
 }
 
@@ -1025,25 +1104,49 @@ async fn bootstrap_ledger(client: &deadpool_postgres::ClientWrapper) -> Result<(
         })
 }
 
-#[cfg(feature = "postgres")]
+/// [`apply_migration`] for the tests that apply the shipped migrations one
+/// at a time to stage an older schema, with the stale window every test
+/// configuration carries (`Config::test_defaults`).
+#[cfg(test)]
 async fn apply_one(
     client: &deadpool_postgres::ClientWrapper,
     migration: &Migration,
     settings: &DatabaseSettings,
 ) -> Result<(), MigrateError> {
+    apply_migration(
+        client,
+        migration,
+        settings,
+        std::time::Duration::from_millis(crate::config::DEFAULT_CLUSTER_MEMBER_STALE_MS),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Apply one migration. For a contracting migration, returns where its
+/// transaction left the durable contract fence, for the record made once it
+/// committed.
+#[cfg(feature = "postgres")]
+async fn apply_migration(
+    client: &deadpool_postgres::ClientWrapper,
+    migration: &Migration,
+    settings: &DatabaseSettings,
+    member_stale_window: std::time::Duration,
+) -> Result<Option<super::contraction::ContractionFence>, MigrateError> {
     // One transaction per migration, driven explicitly over this session:
-    // BEGIN, the bounded timeouts, the migration body, the ledger row, and
-    // COMMIT are one atomic unit, so a failure anywhere rolls the whole
-    // migration back and the database keeps its previous schema version.
+    // BEGIN, the bounded timeouts, a contraction's fence raise, the
+    // migration body, the ledger row, and COMMIT are one atomic unit, so a
+    // failure anywhere rolls the whole migration back -- its fence raise
+    // included -- and the database keeps its previous schema version.
     client.batch_execute("BEGIN").await.map_err(|error| {
         tracing::error!(error = %error, "migration transaction begin failed");
         MigrateError::ApplyFailed
     })?;
-    match migration_transaction(client, migration, settings).await {
-        Ok(()) => match client.batch_execute("COMMIT").await {
+    match migration_transaction(client, migration, settings, member_stale_window).await {
+        Ok(fence) => match client.batch_execute("COMMIT").await {
             // A failed COMMIT has already rolled the transaction back
             // server-side; the ledger was never durably written.
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(fence),
             Err(error) => {
                 tracing::error!(error = %error, "migration commit failed");
                 Err(MigrateError::ApplyFailed)
@@ -1066,7 +1169,8 @@ async fn migration_transaction(
     client: &deadpool_postgres::ClientWrapper,
     migration: &Migration,
     settings: &DatabaseSettings,
-) -> Result<(), MigrateError> {
+    member_stale_window: std::time::Duration,
+) -> Result<Option<super::contraction::ContractionFence>, MigrateError> {
     // `SET LOCAL`: bounded to this transaction, cannot leak into the pooled
     // session, and covers exactly the statements that need the larger
     // budget. The lock timeout matches, so DDL blocked by a stray lock
@@ -1081,6 +1185,21 @@ async fn migration_transaction(
             tracing::error!(error = %error, "migration timeout setup failed");
             MigrateError::ApplyFailed
         })?;
+    // Nothing is removed before the fence keeps out every build that still
+    // needs it: the raise runs first, under the same timeouts, and commits
+    // or rolls back with the SQL below.
+    let fence = match &migration.contraction {
+        Some(contraction) => Some(
+            super::contraction::raise_fence_before_contracting(
+                client,
+                migration.version,
+                contraction,
+                member_stale_window,
+            )
+            .await?,
+        ),
+        None => None,
+    };
     client.batch_execute(migration.sql).await.map_err(|error| {
         tracing::error!(error = %error, version = migration.version, "migration statement failed");
         MigrateError::ApplyFailed
@@ -1095,7 +1214,7 @@ async fn migration_transaction(
             tracing::error!(error = %error, "migration ledger insert failed");
             MigrateError::ApplyFailed
         })?;
-    Ok(())
+    Ok(fence)
 }
 
 /// How many migrations this build carries; startup errors name the count so
@@ -1105,9 +1224,10 @@ pub(crate) fn manifest_len() -> usize {
 }
 
 /// Development auto-migration: run the same `migrate up` the CLI runs, from
-/// the serving process. Production pods validate only; this path exists for
-/// single-process development databases and is opt-in through
-/// `DATABASE_AUTO_MIGRATE`.
+/// the serving process, with the same configuration (a contraction's roster
+/// is judged against this process's `CLUSTER_MEMBER_STALE_MS`). Production
+/// pods validate only; this path exists for single-process development
+/// databases and is opt-in through `DATABASE_AUTO_MIGRATE`.
 ///
 /// A ledger this build already serves is left alone. A prepared build serves
 /// its approved extension without carrying its SQL, so the strict migrator
@@ -1115,6 +1235,28 @@ pub(crate) fn manifest_len() -> usize {
 /// auto-migration must not refuse what validate-only startup serves. Every
 /// other ledger takes the migrator's path, refusals included.
 #[cfg(feature = "postgres")]
+pub(crate) async fn auto_migrate(
+    pool: &deadpool_postgres::Pool,
+    config: &Config,
+) -> Result<(), MigrateError> {
+    if read_and_validate_runtime(pool).await? == SchemaStatus::Current {
+        return Ok(());
+    }
+    apply_manifest(
+        pool,
+        &config.database,
+        &MANIFEST,
+        config.cluster_member_stale_window(),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// [`auto_migrate`] for the suites that set up a database from its
+/// settings alone. They migrate the shipped manifest with the stale window
+/// every test configuration carries (`Config::test_defaults`), so this does
+/// for them exactly what `auto_migrate` would.
+#[cfg(test)]
 pub(crate) async fn apply_missing_for_startup(
     pool: &deadpool_postgres::Pool,
     settings: &DatabaseSettings,
@@ -1127,8 +1269,9 @@ pub(crate) async fn apply_missing_for_startup(
 
 /// Translate an auto-migration failure into the foundation's startup error.
 /// Ledger problems keep their specific text; an apply failure is its own
-/// condition (it was a write attempt, not a validation), and anything else
-/// was a store failure, already logged at its site.
+/// condition (it was a write attempt, not a validation), and so is a refused
+/// contraction, which wrote nothing and was logged with its reason; anything
+/// else was a store failure, already logged at its site.
 #[cfg(feature = "postgres")]
 pub(crate) fn startup_migration_failure(
     error: MigrateError,
@@ -1137,11 +1280,17 @@ pub(crate) fn startup_migration_failure(
         MigrateError::LedgerInvalid(problem) => {
             super::postgres::PostgresFoundationError::SchemaInvalid { problem }
         }
-        MigrateError::ApplyFailed => {
+        MigrateError::ApplyFailed | MigrateError::ContractionRefused { .. } => {
             super::postgres::PostgresFoundationError::SchemaMigrationFailed
         }
         _ => super::postgres::PostgresFoundationError::SchemaCheckFailed,
     }
+}
+
+/// The shipped manifest, for the contraction fixture's tests.
+#[cfg(test)]
+pub(super) fn shipped_manifest() -> &'static [Migration] {
+    &MANIFEST
 }
 
 #[cfg(test)]
