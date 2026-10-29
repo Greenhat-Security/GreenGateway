@@ -67,8 +67,9 @@ The rows add up to the 441 tests defined in `app_tests.rs`.
 
 The identity, admin login and capabilities, and token admin families now live
 in `auth_app_tests.rs`, `admin_identity_app_tests.rs` and
-`admin_tokens_app_tests.rs`, declared from `app_tests.rs`. The listing still
-has 3951 tests with the same test names. Exactly 54 paths changed, each from
+`admin_tokens_app_tests.rs`, declared from `app_tests.rs`. Measured on the
+same `66a4b09` baseline with only this move applied, the listing still has
+3951 tests with the same test names. Exactly 54 paths changed, each from
 `tests::<name>` to `tests::<module>::<name>`, so a filter on the test name
 still selects the test. `app_tests.rs` now defines 387 tests (350 top-level and
 the same 37 inline), and the separate files 182.
