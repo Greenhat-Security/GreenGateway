@@ -339,5 +339,11 @@ Not part of this slice, and not to be inferred from it:
   routing derived server-side from the pinned configuration snapshot.
 - Stage traces for the tool and rate lanes, and egress cases.
 - Isolated rate-bucket sequences on a virtual clock.
-- Historical replay over retained traffic (`/policy/replays`), and the
-  Simulator UI.
+- Historical replay over retained traffic, which is
+  [its own job API](policy-replay.md#replay-jobs).
+
+The admin UI's Policy Studio has a Simulate view over this API (#243 slice
+18): it simulates the open draft's text, unsaved edits included, or the live
+policy, and shows each answer's logical decision, enforcement and effective
+action as separate steps. See **Policy Studio workbench** in
+[the configuration reference](configuration.md#policy_file).

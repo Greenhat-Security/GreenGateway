@@ -71,6 +71,17 @@ import {
   ToolsSection,
   type FieldRegistrar,
 } from './policy-studio/sections';
+import { StudioAlertPanel, type StudioAlert } from './policy-studio/StudioAlert';
+import {
+  AUDIT_READ_PERMISSION,
+  POLICY_SIMULATE_PERMISSION,
+  type WorkbenchCandidate,
+} from './policy-studio/workbench/common';
+import { ImpactPanel } from './policy-studio/workbench/ImpactPanel';
+import { OptimizePanel } from './policy-studio/workbench/OptimizePanel';
+import { SimulatorPanel } from './policy-studio/workbench/SimulatorPanel';
+import { emptySuiteSource, parseSuite } from './policy-studio/workbench/suite';
+import { TestsPanel } from './policy-studio/workbench/TestsPanel';
 import { RuleWorkspaceNav } from './RuleWorkspaceNav';
 
 export const POLICY_VALIDATE_DEBOUNCE_MS = 400;
@@ -79,15 +90,22 @@ const POLICY_READ_PERMISSION = 'admin:policy:read';
 const POLICY_WRITE_PERMISSION = 'admin:policy:write';
 const LEAVE_WARNING =
   'This draft has unsaved edits. Leave the Policy Studio and discard them?';
+const CASES_LEAVE_WARNING =
+  'Your simulation and test cases are kept only in this page. Leave the Policy Studio and discard them?';
+
+// The Studio's views: the editors, and the workbench that simulates, tests,
+// replays and reviews a candidate without changing anything.
+type StudioView = 'edit' | 'simulate' | 'test' | 'impact' | 'optimize';
+
+const STUDIO_VIEWS: ReadonlyArray<{ id: StudioView; label: string }> = [
+  { id: 'edit', label: 'Edit' },
+  { id: 'simulate', label: 'Simulate' },
+  { id: 'test', label: 'Test' },
+  { id: 'impact', label: 'Impact' },
+  { id: 'optimize', label: 'Optimize' },
+];
 
 type LivePolicy = { policy: PolicyDocument; etag: string };
-
-type StudioAlert = {
-  title: string;
-  message: string;
-  tone: 'info' | 'warning' | 'error';
-  details?: readonly string[];
-};
 
 // A refusal the operator has to resolve, with the ways out it offers. The
 // local candidate is kept in every one of them.
@@ -123,6 +141,9 @@ export function PolicyStudioView() {
   const canRead = hasAdminPermission(capabilities, POLICY_READ_PERMISSION);
   const canWrite =
     !writeRejected && hasAdminPermission(capabilities, POLICY_WRITE_PERMISSION);
+  const canSimulate =
+    canRead && hasAdminPermission(capabilities, POLICY_SIMULATE_PERMISSION);
+  const canReplay = canSimulate && hasAdminPermission(capabilities, AUDIT_READ_PERMISSION);
   // Load once after the first grant; a resource 403 must not loop.
   const [readRequested, setReadRequested] = useState(false);
   useEffect(() => {
@@ -159,6 +180,11 @@ export function PolicyStudioView() {
   const tabRefs = useRef(new Map<StudioSection, HTMLButtonElement>());
   const actionRefs = useRef(new Map<Confirmation, HTMLButtonElement>());
   const restoreFocusTo = useRef<Confirmation | null>(null);
+  const [view, setView] = useState<StudioView>('edit');
+  const viewRefs = useRef(new Map<StudioView, HTMLButtonElement>());
+  const [candidateChoice, setCandidateChoice] = useState<'draft' | 'live'>('draft');
+  // The cases the Simulator and the Test view share, in page memory only.
+  const [suiteSource, setSuiteSource] = useState(emptySuiteSource);
 
   const setSource = useCallback((next: string) => {
     sourceRef.current = next;
@@ -189,7 +215,39 @@ export function PolicyStudioView() {
   const changesEgress =
     live !== null && parsed.ok && egressChanged(live.policy, parsed.document);
 
-  useLeaveWarning(dirty, LEAVE_WARNING);
+  const suite = useMemo(() => parseSuite(suiteSource), [suiteSource]);
+  const holdsCases = suite.ok ? suite.cases.length > 0 : suiteSource !== emptySuiteSource();
+  useLeaveWarning(dirty || holdsCases, dirty ? LEAVE_WARNING : CASES_LEAVE_WARNING);
+
+  // What the workbench judges: the open draft's text on screen, unsaved
+  // edits included, or the live policy. Either is pinned to the live
+  // revision read here.
+  const draftChosen = candidateChoice === 'draft' && draft !== null;
+  const workbenchCandidate: WorkbenchCandidate | null =
+    live === null
+      ? null
+      : draftChosen
+        ? parsed.ok && draft !== null
+          ? {
+              kind: 'draft',
+              liveEtag: live.etag,
+              draftId: draft.summary.draft_id,
+              revision: draft.summary.revision,
+              dirty,
+              source,
+            }
+          : null
+        : { kind: 'live', liveEtag: live.etag };
+  const candidateProblem =
+    live === null
+      ? 'The live policy has not been read, so nothing can be pinned to it.'
+      : draftChosen && !parsed.ok
+        ? 'Fix the draft source first: the candidate is not a JSON object.'
+        : null;
+  const liveSource = useMemo(
+    () => (live === null ? null : formatCandidate(live.policy)),
+    [live],
+  );
 
   const register: FieldRegistrar = useCallback((pointer: string) => {
     let callback = fieldCallbacks.current.get(pointer);
@@ -901,8 +959,20 @@ export function PolicyStudioView() {
 
   function showDiagnostic(diagnostic: PolicyDiagnostic) {
     const section = sectionForPointer(diagnostic.pointer);
+    setView('edit');
     setActiveSection(section);
     setPendingFocus(section === 'source' ? '' : diagnostic.pointer);
+  }
+
+  function onViewKeyDown(event: KeyboardEvent<HTMLButtonElement>, index: number) {
+    const next = rovingIndex(event.key, index, STUDIO_VIEWS.length);
+    if (next === null) {
+      return;
+    }
+    event.preventDefault();
+    const target = STUDIO_VIEWS[next].id;
+    setView(target);
+    viewRefs.current.get(target)?.focus();
   }
 
   function onTabKeyDown(event: KeyboardEvent<HTMLButtonElement>, index: number) {
@@ -1033,252 +1103,382 @@ export function PolicyStudioView() {
           />
         ) : null}
 
-        {draft !== null ? (
-          <div className="policy-studio-layout">
-            <div className="policy-studio-main">
-              <RevisionSummary
-                draft={draft}
-                live={live}
-                baseStale={baseStale}
-                dirty={dirty}
-                inspection={currentInspection}
-              />
-
-              <div className="form-actions policy-studio-actions">
+        {canRead ? (
+          <div
+            className="policy-studio-tabs policy-studio-views"
+            role="tablist"
+            aria-label="Policy Studio views"
+          >
+            {STUDIO_VIEWS.map((entry, index) => {
+              const selected = view === entry.id;
+              return (
                 <button
-                  type="button"
-                  className="primary-button"
-                  disabled={!editable || !dirty || !parsed.ok || busy !== null}
-                  onClick={() => void saveDraft()}
-                >
-                  {busy === 'save' ? 'Saving draft' : 'Save draft'}
-                </button>
-                <button
-                  type="button"
-                  className="secondary-button"
-                  disabled={!dirty || busy !== null}
-                  onClick={() => {
-                    setSource(serverSource);
-                    setConversion(null);
+                  key={entry.id}
+                  ref={(element) => {
+                    if (element) viewRefs.current.set(entry.id, element);
+                    else viewRefs.current.delete(entry.id);
                   }}
-                >
-                  Discard edits
-                </button>
-                <button
-                  ref={actionRef('rebase')}
                   type="button"
-                  className="secondary-button"
-                  disabled={!editable || !baseStale || busy !== null}
-                  onClick={() => setConfirming('rebase')}
+                  role="tab"
+                  id={`policy-studio-view-${entry.id}`}
+                  aria-controls={`policy-studio-view-panel-${entry.id}`}
+                  aria-selected={selected}
+                  tabIndex={selected ? 0 : -1}
+                  className={`rule-workspace-tab ${selected ? 'is-active' : ''}`}
+                  onClick={() => setView(entry.id)}
+                  onKeyDown={(event) => onViewKeyDown(event, index)}
                 >
-                  Rebase onto live policy
+                  {entry.label}
                 </button>
-                <button
-                  ref={actionRef('publish')}
-                  type="button"
-                  className="primary-button"
-                  disabled={publishBlockers.length > 0 || busy !== null}
-                  aria-describedby={
-                    publishBlockers.length > 0 ? 'policy-studio-publish-blockers' : undefined
-                  }
-                  onClick={() => setConfirming('publish')}
-                >
-                  {busy === 'publish' ? 'Publishing' : 'Publish draft'}
-                </button>
-                <button
-                  ref={actionRef('delete')}
-                  type="button"
-                  className="rule-danger-button"
-                  disabled={!canWrite || busy !== null}
-                  onClick={() => setConfirming('delete')}
-                >
-                  Delete draft
-                </button>
-              </div>
-              {publishBlockers.length > 0 ? (
-                <div className="policy-studio-blockers" id="policy-studio-publish-blockers">
-                  <p className="rule-hint">Publishing is unavailable:</p>
-                  <ul>
-                    {publishBlockers.map((blocker) => (
-                      <li key={blocker}>{blocker}</li>
-                    ))}
-                  </ul>
-                </div>
-              ) : null}
-
-              {confirming !== null && live !== null ? (
-                <ConfirmationPanel
-                  kind={confirming}
-                  draft={draft}
-                  live={live}
-                  changed={changed}
-                  risks={
-                    currentInspection?.diagnostics.filter(
-                      (diagnostic) => diagnostic.severity === 'risk',
-                    ) ?? []
-                  }
-                  dirty={dirty}
-                  busy={busy !== null}
-                  onConfirm={() => {
-                    if (confirming === 'publish') void publishDraft();
-                    else if (confirming === 'rebase') void rebaseDraft();
-                    else void deleteDraft();
-                  }}
-                  onCancel={() => {
-                    restoreFocusTo.current = confirming;
-                    setConfirming(null);
-                  }}
-                />
-              ) : null}
-
-              <div className="policy-studio-tabs" role="tablist" aria-label="Policy sections">
-                {STUDIO_SECTIONS.map((section, index) => {
-                  const count = parsed.ok
-                    ? diagnosticsInSection(diagnostics, section.id).length
-                    : 0;
-                  const selected = activeSection === section.id;
-                  return (
-                    <button
-                      key={section.id}
-                      ref={(element) => {
-                        if (element) tabRefs.current.set(section.id, element);
-                        else tabRefs.current.delete(section.id);
-                      }}
-                      type="button"
-                      role="tab"
-                      id={`policy-studio-tab-${section.id}`}
-                      aria-controls={selected ? `policy-studio-panel-${section.id}` : undefined}
-                      aria-selected={selected}
-                      aria-label={
-                        count > 0
-                          ? `${section.label}, ${count} ${count === 1 ? 'problem' : 'problems'}`
-                          : undefined
-                      }
-                      tabIndex={selected ? 0 : -1}
-                      className={`rule-workspace-tab ${selected ? 'is-active' : ''}`}
-                      onClick={() => setActiveSection(section.id)}
-                      onKeyDown={(event) => onTabKeyDown(event, index)}
-                    >
-                      {section.label}
-                      {count > 0 ? (
-                        <span className="badge warning policy-studio-tab-count" aria-hidden="true">
-                          {count}
-                        </span>
-                      ) : null}
-                    </button>
-                  );
-                })}
-              </div>
-
-              <div
-                className="policy-studio-section"
-                role="tabpanel"
-                id={`policy-studio-panel-${activeSection}`}
-                aria-labelledby={`policy-studio-tab-${activeSection}`}
-              >
-                {activeSection === 'source' ? (
-                  <SourceSection
-                    source={source}
-                    parseError={parsed.ok ? null : parsed.message}
-                    disabled={!editable}
-                    register={register}
-                    onChange={setSource}
-                  />
-                ) : !parsed.ok ? (
-                  <StudioAlertPanel
-                    alert={{
-                      title: 'Fix the source first',
-                      message: `${parsed.message} The structured editors show the document again once Source holds a JSON object.`,
-                      tone: 'warning',
-                    }}
-                  />
-                ) : activeSection === 'overview' ? (
-                  <OverviewSection
-                    document={parsed.document}
-                    diagnostics={diagnostics}
-                    disabled={!editable}
-                    register={register}
-                    onChange={updateDocument}
-                    conversion={
-                      <ConversionPanel
-                        document={parsed.document}
-                        conversion={conversion}
-                        canConvert={editable && busy === null}
-                        converting={busy === 'convert'}
-                        onConvert={() => void convertDraft()}
-                      />
-                    }
-                  />
-                ) : activeSection === 'roles' ? (
-                  <RolesSection
-                    document={parsed.document}
-                    diagnostics={diagnostics}
-                    disabled={!editable}
-                    register={register}
-                    onChange={updateDocument}
-                  />
-                ) : activeSection === 'routes' ? (
-                  <RoutesSection
-                    document={parsed.document}
-                    diagnostics={diagnostics}
-                    disabled={!editable}
-                    register={register}
-                    onChange={updateDocument}
-                  />
-                ) : activeSection === 'rules' ? (
-                  <RulesSection
-                    document={parsed.document}
-                    diagnostics={diagnostics}
-                    disabled={!editable}
-                    register={register}
-                    onChange={updateDocument}
-                  />
-                ) : activeSection === 'tools' ? (
-                  <ToolsSection
-                    document={parsed.document}
-                    diagnostics={diagnostics}
-                    disabled={!editable}
-                    register={register}
-                    onChange={updateDocument}
-                  />
-                ) : activeSection === 'rate_limits' ? (
-                  <RateLimitsSection
-                    document={parsed.document}
-                    diagnostics={diagnostics}
-                    disabled={!editable}
-                    register={register}
-                    onChange={updateDocument}
-                  />
-                ) : (
-                  <EgressSection
-                    document={parsed.document}
-                    diagnostics={diagnostics}
-                    register={register}
-                    changed={changesEgress}
-                  />
-                )}
-              </div>
-            </div>
-
-            <aside className="policy-studio-aside" aria-label="Validation and changes">
-              <DiagnosticsPanel
-                validation={validation}
-                current={currentInspection !== null}
-                parseError={parsed.ok ? null : parsed.message}
-                onShow={showDiagnostic}
-                onRevalidate={revalidate}
-              />
-              <ChangesPanel live={live} changed={changed} parsed={parsed.ok} />
-            </aside>
+              );
+            })}
           </div>
         ) : null}
 
-        {draft === null && draftList !== null && !isLoading ? (
-          <div className="empty-state">
-            {draftList.drafts.length === 0
-              ? 'You have no policy drafts. Create one from the live policy to start editing.'
-              : 'Open a draft to edit it.'}
-          </div>
+        {canRead && view !== 'edit' ? (
+          <CandidatePicker
+            choice={candidateChoice}
+            draft={draft}
+            dirty={dirty}
+            live={live}
+            onChoose={setCandidateChoice}
+          />
+        ) : null}
+
+        <div
+          className="policy-studio-view"
+          role="tabpanel"
+          id="policy-studio-view-panel-edit"
+          aria-labelledby="policy-studio-view-edit"
+          hidden={view !== 'edit'}
+        >
+          {draft !== null ? (
+            <div className="policy-studio-layout">
+              <div className="policy-studio-main">
+                <RevisionSummary
+                  draft={draft}
+                  live={live}
+                  baseStale={baseStale}
+                  dirty={dirty}
+                  inspection={currentInspection}
+                />
+
+                <div className="form-actions policy-studio-actions">
+                  <button
+                    type="button"
+                    className="primary-button"
+                    disabled={!editable || !dirty || !parsed.ok || busy !== null}
+                    onClick={() => void saveDraft()}
+                  >
+                    {busy === 'save' ? 'Saving draft' : 'Save draft'}
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    disabled={!dirty || busy !== null}
+                    onClick={() => {
+                      setSource(serverSource);
+                      setConversion(null);
+                    }}
+                  >
+                    Discard edits
+                  </button>
+                  <button
+                    ref={actionRef('rebase')}
+                    type="button"
+                    className="secondary-button"
+                    disabled={!editable || !baseStale || busy !== null}
+                    onClick={() => setConfirming('rebase')}
+                  >
+                    Rebase onto live policy
+                  </button>
+                  <button
+                    ref={actionRef('publish')}
+                    type="button"
+                    className="primary-button"
+                    disabled={publishBlockers.length > 0 || busy !== null}
+                    aria-describedby={
+                      publishBlockers.length > 0 ? 'policy-studio-publish-blockers' : undefined
+                    }
+                    onClick={() => setConfirming('publish')}
+                  >
+                    {busy === 'publish' ? 'Publishing' : 'Publish draft'}
+                  </button>
+                  <button
+                    ref={actionRef('delete')}
+                    type="button"
+                    className="rule-danger-button"
+                    disabled={!canWrite || busy !== null}
+                    onClick={() => setConfirming('delete')}
+                  >
+                    Delete draft
+                  </button>
+                </div>
+                {publishBlockers.length > 0 ? (
+                  <div className="policy-studio-blockers" id="policy-studio-publish-blockers">
+                    <p className="rule-hint">Publishing is unavailable:</p>
+                    <ul>
+                      {publishBlockers.map((blocker) => (
+                        <li key={blocker}>{blocker}</li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+
+                {confirming !== null && live !== null ? (
+                  <ConfirmationPanel
+                    kind={confirming}
+                    draft={draft}
+                    live={live}
+                    changed={changed}
+                    risks={
+                      currentInspection?.diagnostics.filter(
+                        (diagnostic) => diagnostic.severity === 'risk',
+                      ) ?? []
+                    }
+                    dirty={dirty}
+                    busy={busy !== null}
+                    onConfirm={() => {
+                      if (confirming === 'publish') void publishDraft();
+                      else if (confirming === 'rebase') void rebaseDraft();
+                      else void deleteDraft();
+                    }}
+                    onCancel={() => {
+                      restoreFocusTo.current = confirming;
+                      setConfirming(null);
+                    }}
+                  />
+                ) : null}
+
+                <div className="policy-studio-tabs" role="tablist" aria-label="Policy sections">
+                  {STUDIO_SECTIONS.map((section, index) => {
+                    const count = parsed.ok
+                      ? diagnosticsInSection(diagnostics, section.id).length
+                      : 0;
+                    const selected = activeSection === section.id;
+                    return (
+                      <button
+                        key={section.id}
+                        ref={(element) => {
+                          if (element) tabRefs.current.set(section.id, element);
+                          else tabRefs.current.delete(section.id);
+                        }}
+                        type="button"
+                        role="tab"
+                        id={`policy-studio-tab-${section.id}`}
+                        aria-controls={selected ? `policy-studio-panel-${section.id}` : undefined}
+                        aria-selected={selected}
+                        aria-label={
+                          count > 0
+                            ? `${section.label}, ${count} ${count === 1 ? 'problem' : 'problems'}`
+                            : undefined
+                        }
+                        tabIndex={selected ? 0 : -1}
+                        className={`rule-workspace-tab ${selected ? 'is-active' : ''}`}
+                        onClick={() => setActiveSection(section.id)}
+                        onKeyDown={(event) => onTabKeyDown(event, index)}
+                      >
+                        {section.label}
+                        {count > 0 ? (
+                          <span className="badge warning policy-studio-tab-count" aria-hidden="true">
+                            {count}
+                          </span>
+                        ) : null}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                <div
+                  className="policy-studio-section"
+                  role="tabpanel"
+                  id={`policy-studio-panel-${activeSection}`}
+                  aria-labelledby={`policy-studio-tab-${activeSection}`}
+                >
+                  {activeSection === 'source' ? (
+                    <SourceSection
+                      source={source}
+                      parseError={parsed.ok ? null : parsed.message}
+                      disabled={!editable}
+                      register={register}
+                      onChange={setSource}
+                    />
+                  ) : !parsed.ok ? (
+                    <StudioAlertPanel
+                      alert={{
+                        title: 'Fix the source first',
+                        message: `${parsed.message} The structured editors show the document again once Source holds a JSON object.`,
+                        tone: 'warning',
+                      }}
+                    />
+                  ) : activeSection === 'overview' ? (
+                    <OverviewSection
+                      document={parsed.document}
+                      diagnostics={diagnostics}
+                      disabled={!editable}
+                      register={register}
+                      onChange={updateDocument}
+                      conversion={
+                        <ConversionPanel
+                          document={parsed.document}
+                          conversion={conversion}
+                          canConvert={editable && busy === null}
+                          converting={busy === 'convert'}
+                          onConvert={() => void convertDraft()}
+                        />
+                      }
+                    />
+                  ) : activeSection === 'roles' ? (
+                    <RolesSection
+                      document={parsed.document}
+                      diagnostics={diagnostics}
+                      disabled={!editable}
+                      register={register}
+                      onChange={updateDocument}
+                    />
+                  ) : activeSection === 'routes' ? (
+                    <RoutesSection
+                      document={parsed.document}
+                      diagnostics={diagnostics}
+                      disabled={!editable}
+                      register={register}
+                      onChange={updateDocument}
+                    />
+                  ) : activeSection === 'rules' ? (
+                    <RulesSection
+                      document={parsed.document}
+                      diagnostics={diagnostics}
+                      disabled={!editable}
+                      register={register}
+                      onChange={updateDocument}
+                    />
+                  ) : activeSection === 'tools' ? (
+                    <ToolsSection
+                      document={parsed.document}
+                      diagnostics={diagnostics}
+                      disabled={!editable}
+                      register={register}
+                      onChange={updateDocument}
+                    />
+                  ) : activeSection === 'rate_limits' ? (
+                    <RateLimitsSection
+                      document={parsed.document}
+                      diagnostics={diagnostics}
+                      disabled={!editable}
+                      register={register}
+                      onChange={updateDocument}
+                    />
+                  ) : (
+                    <EgressSection
+                      document={parsed.document}
+                      diagnostics={diagnostics}
+                      register={register}
+                      changed={changesEgress}
+                    />
+                  )}
+                </div>
+              </div>
+
+              <aside className="policy-studio-aside" aria-label="Validation and changes">
+                <DiagnosticsPanel
+                  validation={validation}
+                  current={currentInspection !== null}
+                  parseError={parsed.ok ? null : parsed.message}
+                  onShow={showDiagnostic}
+                  onRevalidate={revalidate}
+                />
+                <ChangesPanel live={live} changed={changed} parsed={parsed.ok} />
+              </aside>
+            </div>
+          ) : null}
+
+          {draft === null && draftList !== null && !isLoading ? (
+            <div className="empty-state">
+              {draftList.drafts.length === 0
+                ? 'You have no policy drafts. Create one from the live policy to start editing.'
+                : 'Open a draft to edit it.'}
+            </div>
+          ) : null}
+        </div>
+
+        {canRead ? (
+          <>
+            {/* The workbench views stay mounted while hidden, so their cases,
+                results and replay jobs survive a switch between views. */}
+            <div
+              className="policy-studio-view"
+              role="tabpanel"
+              id="policy-studio-view-panel-simulate"
+              aria-labelledby="policy-studio-view-simulate"
+              hidden={view !== 'simulate'}
+            >
+              <SimulatorPanel
+                candidate={workbenchCandidate}
+                candidateProblem={candidateProblem}
+                canSimulate={canSimulate}
+                validationBlocker={runBlocker(workbenchCandidate, currentInspection, 'simulation')}
+                suiteSource={suiteSource}
+                onSuiteChange={setSuiteSource}
+                onReloadLive={() => void refreshLive()}
+              />
+            </div>
+            <div
+              className="policy-studio-view"
+              role="tabpanel"
+              id="policy-studio-view-panel-test"
+              aria-labelledby="policy-studio-view-test"
+              hidden={view !== 'test'}
+            >
+              <TestsPanel
+                candidate={workbenchCandidate}
+                candidateProblem={candidateProblem}
+                canSimulate={canSimulate}
+                validationBlocker={runBlocker(workbenchCandidate, currentInspection, 'tests')}
+                suiteSource={suiteSource}
+                onSuiteChange={setSuiteSource}
+                onReloadLive={() => void refreshLive()}
+              />
+            </div>
+            <div
+              className="policy-studio-view"
+              role="tabpanel"
+              id="policy-studio-view-panel-impact"
+              aria-labelledby="policy-studio-view-impact"
+              hidden={view !== 'impact'}
+            >
+              <ImpactPanel
+                candidate={workbenchCandidate}
+                candidateProblem={candidateProblem}
+                canReplay={canReplay}
+                validationBlocker={runBlocker(workbenchCandidate, currentInspection, 'simulation')}
+                onReloadLive={() => void refreshLive()}
+              />
+            </div>
+            <div
+              className="policy-studio-view"
+              role="tabpanel"
+              id="policy-studio-view-panel-optimize"
+              aria-labelledby="policy-studio-view-optimize"
+              hidden={view !== 'optimize'}
+            >
+              {view === 'optimize' ? (
+                <OptimizePanel
+                  candidate={workbenchCandidate}
+                  candidateProblem={candidateProblem}
+                  liveSource={liveSource}
+                  draftValidation={{
+                    checking:
+                      validation.kind === 'checking' ||
+                      (validation.kind === 'ready' && validation.source !== source),
+                    inspection: currentInspection,
+                    alert: validation.kind === 'failed' ? validation.alert : null,
+                  }}
+                  canEditDraft={editable}
+                  onShowInEditor={showDiagnostic}
+                />
+              ) : null}
+            </div>
+          </>
         ) : null}
       </section>
     </main>
@@ -1901,22 +2101,85 @@ function ProblemPanel({
   );
 }
 
-function StudioAlertPanel({ alert, live = true }: { alert: StudioAlert; live?: boolean }) {
+// The draft's current validation already answers that the gateway would
+// refuse to simulate or test the candidate.
+function runBlocker(
+  candidate: WorkbenchCandidate | null,
+  inspection: PolicyInspection | null,
+  use: 'simulation' | 'tests',
+): string | null {
+  if (candidate === null || candidate.kind !== 'draft' || inspection === null) {
+    return null;
+  }
+  const blocked =
+    inspection.diagnostics.some((diagnostic) => diagnostic.blocks[use]) ||
+    (!inspection.valid && inspection.diagnostics.length === 0);
+  return blocked
+    ? `The candidate’s validation reports problems that rule out ${use === 'tests' ? 'a test run' : 'a simulation or replay'}. Fix them in the editors first.`
+    : null;
+}
+
+// Arrow keys, Home and End move between tabs, wrapping at the ends.
+function rovingIndex(key: string, index: number, count: number): number | null {
+  if (key === 'ArrowRight') return (index + 1) % count;
+  if (key === 'ArrowLeft') return (index + count - 1) % count;
+  if (key === 'Home') return 0;
+  if (key === 'End') return count - 1;
+  return null;
+}
+
+function CandidatePicker({
+  choice,
+  draft,
+  dirty,
+  live,
+  onChoose,
+}: {
+  choice: 'draft' | 'live';
+  draft: PolicyDraft | null;
+  dirty: boolean;
+  live: LivePolicy | null;
+  onChoose: (choice: 'draft' | 'live') => void;
+}) {
+  const effective = choice === 'draft' && draft !== null ? 'draft' : 'live';
   return (
-    <div
-      className={`error-panel alert ${alert.tone}`}
-      role={live ? (alert.tone === 'info' ? 'status' : 'alert') : undefined}
-    >
-      <h3>{alert.title}</h3>
-      <p>{alert.message}</p>
-      {alert.details && alert.details.length > 0 ? (
-        <ul>
-          {alert.details.map((detail, index) => (
-            <li key={index}>{detail}</li>
-          ))}
-        </ul>
-      ) : null}
-    </div>
+    <fieldset className="rule-fieldset workbench-candidate">
+      <legend>Candidate</legend>
+      <div className="studio-choice-grid">
+        <label className={`studio-choice ${effective === 'draft' ? 'is-selected' : ''}`}>
+          <input
+            type="radio"
+            name="policy-studio-candidate"
+            value="draft"
+            checked={effective === 'draft'}
+            disabled={draft === null}
+            onChange={() => onChoose('draft')}
+          />
+          <span className="studio-choice-label">The open draft</span>
+          <span className="rule-hint">
+            {draft === null
+              ? 'Open a draft to use its candidate.'
+              : `Draft ${draft.summary.draft_id}, revision ${draft.summary.revision}${dirty ? ', with the unsaved edits on screen' : ''}.`}
+          </span>
+        </label>
+        <label className={`studio-choice ${effective === 'live' ? 'is-selected' : ''}`}>
+          <input
+            type="radio"
+            name="policy-studio-candidate"
+            value="live"
+            checked={effective === 'live'}
+            onChange={() => onChoose('live')}
+          />
+          <span className="studio-choice-label">The live policy</span>
+          <span className="rule-hint">The policy the gateway enforces now, unchanged.</span>
+        </label>
+      </div>
+      <p className="rule-hint">
+        {live === null
+          ? 'The live policy has not been read.'
+          : `Runs are pinned to live revision ${shortEtag(live.etag)}; a candidate is sent as written and never stored.`}
+      </p>
+    </fieldset>
   );
 }
 
