@@ -1,0 +1,361 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://greengateway.dev/schemas/policy-evidence.v1.schema.json",
+  "title": "GreenGateway policy evidence package",
+  "description": "Draft 2020-12 JSON Schema for a policy-evidence.v1 package: an envelope whose manifest names the ADR-0004 semantic digest and RFC 8785 size of one policy-evidence-report.v1 report. A package is served as its RFC 8785 bytes. The test, simulation and replay results inside a report follow the result formats of their own endpoints (policy-test-results.v1, policy-simulation results and policy-replay-results.v1).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "generated_at", "manifest", "report"],
+  "properties": {
+    "schema_version": { "const": "policy-evidence.v1" },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "manifest": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "media_type", "schema_version", "digest", "size"],
+        "properties": {
+          "name": { "const": "report" },
+          "media_type": { "const": "application/vnd.greengateway.policy-evidence-report+json" },
+          "schema_version": { "const": "policy-evidence-report.v1" },
+          "digest": { "$ref": "#/$defs/digest" },
+          "size": { "type": "integer", "minimum": 1, "maximum": 4194304 }
+        }
+      }
+    },
+    "report": { "$ref": "#/$defs/report" }
+  },
+  "$defs": {
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "etag": { "type": "string", "pattern": "^\"sha256:[0-9a-f]{64}\"$" },
+    "version": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "policy_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "etag", "semantic_digest"],
+      "properties": {
+        "schema_version": { "type": "string", "minLength": 1 },
+        "etag": { "$ref": "#/$defs/etag" },
+        "semantic_digest": {
+          "oneOf": [{ "$ref": "#/$defs/digest" }, { "type": "null" }]
+        }
+      }
+    },
+    "not_included": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["included"],
+      "properties": { "included": { "const": false } }
+    },
+    "report": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "redaction_profile",
+        "gateway_version",
+        "evaluator",
+        "request_digest",
+        "publication",
+        "approval",
+        "validation",
+        "tests",
+        "simulation",
+        "replay",
+        "completeness",
+        "limitations",
+        "trust"
+      ],
+      "properties": {
+        "schema_version": { "const": "policy-evidence-report.v1" },
+        "redaction_profile": { "const": "policy-evidence-aggregate.v1" },
+        "gateway_version": { "type": "string", "minLength": 1 },
+        "evaluator": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "http_semantics_version",
+            "http_context_version",
+            "tool_semantics_version",
+            "tool_context_version",
+            "replay_context_version"
+          ],
+          "properties": {
+            "http_semantics_version": { "type": "string" },
+            "http_context_version": { "type": "integer" },
+            "tool_semantics_version": { "type": "string" },
+            "tool_context_version": { "type": "integer" },
+            "replay_context_version": { "type": "string" }
+          }
+        },
+        "request_digest": { "$ref": "#/$defs/digest" },
+        "publication": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["version", "policy", "predecessor", "predecessor_check"],
+          "properties": {
+            "version": { "$ref": "#/$defs/version" },
+            "policy": { "$ref": "#/$defs/policy_identity" },
+            "predecessor": {
+              "oneOf": [
+                { "type": "null" },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["version", "policy"],
+                  "properties": {
+                    "version": { "$ref": "#/$defs/version" },
+                    "policy": { "$ref": "#/$defs/policy_identity" }
+                  }
+                }
+              ]
+            },
+            "predecessor_check": {
+              "enum": [
+                "matches_recorded_base",
+                "differs_from_recorded_base",
+                "no_recorded_base",
+                "no_predecessor"
+              ]
+            }
+          }
+        },
+        "approval": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["basis", "recorded_at", "actor", "operation"],
+          "properties": {
+            "basis": { "const": "authorized_commit" },
+            "recorded_at": { "type": "string" },
+            "actor": { "const": "withheld" },
+            "operation": {
+              "enum": [
+                "imported_from_standalone",
+                "policy_draft_published",
+                "policy_replaced",
+                "policy_rolled_back",
+                "rule_created",
+                "rule_deleted",
+                "rule_updated",
+                "rules_reordered",
+                "unrecognized",
+                "not_recorded"
+              ]
+            },
+            "draft": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["revision", "base_etag"],
+              "properties": {
+                "revision": { "type": "integer", "minimum": 0 },
+                "base_etag": { "$ref": "#/$defs/etag" }
+              }
+            },
+            "shadow_review": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["transition", "policy_etag", "evidence_digest"],
+              "properties": {
+                "transition": { "enum": ["promote", "disable"] },
+                "policy_etag": { "$ref": "#/$defs/etag" },
+                "evidence_digest": { "$ref": "#/$defs/digest" }
+              }
+            },
+            "rollback_target_version": { "type": "integer", "minimum": 0 },
+            "rule_id": { "type": "string", "minLength": 1, "maxLength": 128 }
+          }
+        },
+        "validation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["basis", "valid", "diagnostics", "diagnostics_truncated", "resource_snapshot"],
+          "properties": {
+            "basis": { "const": "revalidated_by_this_build" },
+            "valid": { "type": "boolean" },
+            "diagnostics": {
+              "type": "array",
+              "maxItems": 100,
+              "items": {
+                "type": "object",
+                "required": ["code", "severity", "pointer", "message", "remediation", "blocks"],
+                "properties": {
+                  "code": { "type": "string" },
+                  "severity": { "enum": ["error", "warning", "risk"] },
+                  "pointer": { "type": "string" },
+                  "element_id": { "type": "string" },
+                  "message": { "type": "string" },
+                  "remediation": { "type": "string" },
+                  "blocks": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["simulation", "tests", "publication", "evidence"],
+                    "properties": {
+                      "simulation": { "type": "boolean" },
+                      "tests": { "type": "boolean" },
+                      "publication": { "type": "boolean" },
+                      "evidence": { "type": "boolean" }
+                    }
+                  }
+                }
+              }
+            },
+            "diagnostics_truncated": { "type": "boolean" },
+            "resource_snapshot": {
+              "description": "The versions and digests of the resources the cross-resource checks read, exactly as POST /policy/validate reports them; null when the document did not parse.",
+              "oneOf": [
+                { "type": "null" },
+                {
+                  "type": "object",
+                  "required": ["schema_version", "complete", "components"],
+                  "properties": {
+                    "schema_version": { "type": "string" },
+                    "digest": { "$ref": "#/$defs/digest" },
+                    "complete": { "type": "boolean" },
+                    "components": { "type": "object" },
+                    "unavailable": { "type": "array", "items": { "type": "string" } }
+                  }
+                }
+              ]
+            }
+          }
+        },
+        "tests": {
+          "oneOf": [
+            { "$ref": "#/$defs/not_included" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["included", "results"],
+              "properties": {
+                "included": { "const": true },
+                "results": {
+                  "type": "object",
+                  "required": ["schema_version", "status", "suite", "policy", "summary", "cases"],
+                  "properties": {
+                    "schema_version": { "const": "policy-test-results.v1" },
+                    "status": { "enum": ["passed", "failed", "incomplete", "error"] }
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "simulation": {
+          "oneOf": [
+            { "$ref": "#/$defs/not_included" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "included",
+                "mode",
+                "trace",
+                "projections",
+                "base",
+                "candidate",
+                "not_evaluated",
+                "summary",
+                "cases"
+              ],
+              "properties": {
+                "included": { "const": true },
+                "mode": { "const": "synthetic" },
+                "trace": { "enum": ["terminal", "matched"] },
+                "projections": {
+                  "type": "array",
+                  "items": { "enum": ["as_authored", "enforce_all_shadow"] }
+                },
+                "base": {
+                  "oneOf": [
+                    { "type": "null" },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["version", "etag"],
+                      "properties": {
+                        "version": { "$ref": "#/$defs/version" },
+                        "etag": { "$ref": "#/$defs/etag" }
+                      }
+                    }
+                  ]
+                },
+                "candidate": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["version", "etag"],
+                  "properties": {
+                    "version": { "$ref": "#/$defs/version" },
+                    "etag": { "$ref": "#/$defs/etag" }
+                  }
+                },
+                "not_evaluated": { "type": "array", "items": { "type": "string" } },
+                "summary": { "type": "object" },
+                "cases": { "type": "array", "maxItems": 256, "items": { "type": "object" } }
+              }
+            }
+          ]
+        },
+        "replay": {
+          "oneOf": [
+            { "$ref": "#/$defs/not_included" },
+            {
+              "type": "object",
+              "required": [
+                "included",
+                "mode",
+                "state",
+                "candidate",
+                "predecessor_check",
+                "result_digest",
+                "result"
+              ],
+              "properties": {
+                "included": { "const": true },
+                "mode": { "const": "historical_replay" },
+                "state": { "enum": ["completed", "completed_incomplete"] },
+                "predecessor_check": {
+                  "enum": ["matches_predecessor", "differs_from_predecessor", "no_predecessor"]
+                },
+                "result_digest": { "$ref": "#/$defs/digest" },
+                "result": { "type": "object" }
+              }
+            }
+          ]
+        },
+        "completeness": { "enum": ["complete", "incomplete"] },
+        "limitations": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "policy_semantic_digest_unavailable",
+              "predecessor_not_in_history",
+              "predecessor_differs_from_recorded_base",
+              "validation_blocks_evidence",
+              "validation_diagnostics_truncated",
+              "tests_not_included",
+              "tests_incomplete",
+              "simulation_not_included",
+              "simulation_base_not_evaluable",
+              "replay_not_included",
+              "replay_incomplete",
+              "replay_base_not_predecessor"
+            ]
+          }
+        },
+        "trust": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["signed", "statement"],
+          "properties": {
+            "signed": { "const": false },
+            "statement": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    }
+  }
+}
