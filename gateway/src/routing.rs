@@ -347,6 +347,10 @@ pub(super) fn add_admin_api_routes(
                     routes.admin.suggestion_dismiss_route.as_str(),
                     post(rule_suggestion_dismiss_endpoint),
                 )
+                .route(
+                    routes.admin.suggestion_draft_route.as_str(),
+                    post(rule_suggestion_draft_endpoint),
+                )
                 .with_state(admin_api_states.suggestions),
         )
         .merge(

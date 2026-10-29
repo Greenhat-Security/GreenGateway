@@ -98,6 +98,9 @@ pub(super) const SUGGESTIONS_ADMIN_ROUTE: &str = "/v1/admin/suggestions";
 pub(super) const SUGGESTIONS_GENERATE_ADMIN_ROUTE: &str = "/v1/admin/suggestions/generate";
 pub(super) const SUGGESTION_ACCEPT_ADMIN_ROUTE: &str = "/v1/admin/suggestions/{id}/accept";
 pub(super) const SUGGESTION_DISMISS_ADMIN_ROUTE: &str = "/v1/admin/suggestions/{id}/dismiss";
+/// Open a suggestion into a server-side policy draft for review (issue
+/// #243, slice 19) instead of applying it.
+pub(super) const SUGGESTION_DRAFT_ADMIN_ROUTE: &str = "/v1/admin/suggestions/{id}/draft";
 pub(super) const SCHEMA_INFERRED_ADMIN_ROUTE: &str = "/v1/admin/schema/inferred";
 pub(super) const TRAFFIC_ENDPOINTS_ADMIN_ROUTE: &str = "/v1/admin/traffic/endpoints";
 pub(super) const TRAFFIC_ENDPOINT_DETAIL_ADMIN_ROUTE: &str = "/v1/admin/traffic/endpoint";
@@ -276,6 +279,7 @@ pub(super) struct AdminRoutes {
     pub(super) suggestions_generate_route: String,
     pub(super) suggestion_accept_route: String,
     pub(super) suggestion_dismiss_route: String,
+    pub(super) suggestion_draft_route: String,
     pub(super) schema_inferred_route: String,
     pub(super) traffic_endpoints_route: String,
     pub(super) traffic_endpoint_detail_route: String,
@@ -392,6 +396,7 @@ impl AdminRoutes {
             suggestions_generate_route: format!("{api_prefix}/suggestions/generate"),
             suggestion_accept_route: format!("{api_prefix}/suggestions/{{id}}/accept"),
             suggestion_dismiss_route: format!("{api_prefix}/suggestions/{{id}}/dismiss"),
+            suggestion_draft_route: format!("{api_prefix}/suggestions/{{id}}/draft"),
             schema_inferred_route: format!("{api_prefix}/schema/inferred"),
             traffic_endpoints_route: format!("{api_prefix}/traffic/endpoints"),
             traffic_endpoint_detail_route: format!("{api_prefix}/traffic/endpoint"),
