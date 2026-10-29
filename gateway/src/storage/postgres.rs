@@ -300,7 +300,7 @@ impl PostgresFoundation {
         let foundation = Self::establish(config).await?;
 
         if config.database.auto_migrate {
-            super::migrations::apply_missing_for_startup(foundation.pool(), &config.database)
+            super::migrations::auto_migrate(foundation.pool(), config)
                 .await
                 .map_err(super::migrations::startup_migration_failure)?;
         }
