@@ -47,14 +47,14 @@ use cap_std::{
 use super::diagnostic::{BundleDiagnostic, Code};
 
 /// The manifest's fixed name.
-pub(crate) const MANIFEST_FILE_NAME: &str = "bundle.yaml";
+pub const MANIFEST_FILE_NAME: &str = "bundle.yaml";
 /// The longest bundle file name.
-pub(crate) const MAX_FILE_NAME_BYTES: usize = 63;
+pub const MAX_FILE_NAME_BYTES: usize = 63;
 /// Directory entries examined in a bundle, counting the root and, for the
 /// atomic-writer layout, the generation directory.
-pub(crate) const MAX_DIRECTORY_ENTRIES: usize = 256;
+pub const MAX_DIRECTORY_ENTRIES: usize = 256;
 /// Bytes of every file read from one bundle, together.
-pub(crate) const MAX_BUNDLE_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_BUNDLE_BYTES: usize = 4 * 1024 * 1024;
 
 const ATOMIC_WRITER_DATA: &str = "..data";
 
@@ -66,10 +66,10 @@ const ATOMIC_WRITER_DATA: &str = "..data";
 /// valid name can neither leave the bundle root nor name an alternate data
 /// stream.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct FileName(String);
+pub struct FileName(String);
 
 impl FileName {
-    pub(crate) fn parse(name: &str) -> Option<Self> {
+    pub fn parse(name: &str) -> Option<Self> {
         is_portable_file_name(name).then(|| Self(name.to_owned()))
     }
 
@@ -77,11 +77,11 @@ impl FileName {
         Self(MANIFEST_FILE_NAME.to_owned())
     }
 
-    pub(crate) fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &str {
         &self.0
     }
 
-    pub(crate) fn has_extension(&self, extension: &str) -> bool {
+    pub fn has_extension(&self, extension: &str) -> bool {
         self.0
             .rsplit_once('.')
             .is_some_and(|(stem, found)| !stem.is_empty() && found == extension)
@@ -392,7 +392,7 @@ fn check_directory(directory: &Dir, not_directory: Code) -> Result<fs::Metadata,
     // The kubelet publishes volume roots as `drwxrwxrwt`; the sticky bit is
     // what stops another account renaming entries, so the same predicate the
     // secret providers use applies here.
-    if !crate::connections::secret::projected_root_permissions_are_safe(&metadata) {
+    if !crate::permissions::projected_root_permissions_are_safe(&metadata) {
         return Err(BundleDiagnostic::bundle(Code::UnsafePermissions));
     }
     Ok(metadata)

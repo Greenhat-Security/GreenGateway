@@ -40,6 +40,15 @@ fn positional_choices(command: &CommandSpec) -> &'static [&'static str] {
     }
 }
 
+/// Whether the command's positional argument is a path, which completes
+/// directory names: every such argument today is a bundle directory.
+fn takes_a_directory(command: &CommandSpec) -> bool {
+    command
+        .arguments
+        .first()
+        .is_some_and(|argument| argument.kind == ValueKind::Path)
+}
+
 /// Single-quotes text for a POSIX shell, zsh or fish.
 fn single_quoted(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
@@ -96,9 +105,14 @@ fn bash() -> String {
             .copied()
             .chain(option_names(command))
             .collect();
+        let directories = if takes_a_directory(command) {
+            "$(compgen -d -- \"$cur\") "
+        } else {
+            ""
+        };
         let _ = writeln!(
             script,
-            "            esac\n            COMPREPLY=($(compgen -W {} -- \"$cur\"))\n            ;;",
+            "            esac\n            COMPREPLY=({directories}$(compgen -W {} -- \"$cur\"))\n            ;;",
             single_quoted(&words.join(" "))
         );
     }
@@ -168,11 +182,15 @@ fn zsh() -> String {
             let _ = writeln!(script, "        {} \\", zsh_option(option));
         }
         if let Some(argument) = command.arguments.first() {
-            let choices = positional_choices(command).join(" ");
+            let action = if takes_a_directory(command) {
+                "_files -/".to_owned()
+            } else {
+                format!("({})", positional_choices(command).join(" "))
+            };
             let _ = writeln!(
                 script,
                 "        {} \\",
-                single_quoted(&format!("1:{}:({choices})", argument.name))
+                single_quoted(&format!("1:{}:{action}", argument.name))
             );
         }
         let _ = writeln!(
@@ -235,6 +253,12 @@ fn fish() -> String {
                 script,
                 "complete -c ggctl -n {condition} -a {}",
                 single_quoted(&choices.join(" "))
+            );
+        }
+        if takes_a_directory(command) {
+            let _ = writeln!(
+                script,
+                "complete -c ggctl -n {condition} -a '(__fish_complete_directories)'"
             );
         }
         let _ = writeln!(
@@ -313,6 +337,11 @@ fn powershell() -> String {
         .collect();
     path_options.sort_unstable();
     path_options.dedup();
+    let directory_commands: Vec<_> = COMMANDS
+        .iter()
+        .filter(|command| takes_a_directory(command))
+        .map(|command| command.name)
+        .collect();
     let _ = write!(
         script,
         "    }}\n    \
@@ -327,6 +356,8 @@ fn powershell() -> String {
                      $candidates = $values[$command][$previous]\n        \
                  }} elseif ($previous -in {}) {{\n            \
                      return\n        \
+                 }} elseif ($wordToComplete -notlike '-*' -and $command -in {}) {{\n            \
+                     return\n        \
                  }} else {{\n            \
                      $candidates = $words[$command]\n        \
                  }}\n    \
@@ -338,7 +369,8 @@ fn powershell() -> String {
              }}\n\
          }}\n",
         powershell_list(&commands),
-        powershell_list(&path_options)
+        powershell_list(&path_options),
+        powershell_list(&directory_commands)
     );
     script
 }
@@ -408,6 +440,14 @@ mod tests {
             powershell.matches(')').count()
         );
         assert!(powershell.contains("$previous -in @('--ca-file', '--token-file')"));
+        // A bundle directory completes directory names.
+        assert!(bash
+            .contains("            COMPREPLY=($(compgen -d -- \"$cur\") $(compgen -W '--strict"));
+        assert!(zsh.contains("'1:BUNDLE:_files -/'"));
+        assert!(fish.contains(
+            "complete -c ggctl -n '__fish_seen_subcommand_from doctor' -a '(__fish_complete_directories)'\n"
+        ));
+        assert!(powershell.contains("$command -in @('validate', 'doctor')"));
         for script in [&bash, &zsh, &fish] {
             // Single quotes pair up once escaped quotes are removed.
             assert_eq!(script.replace(r"'\''", "").matches('\'').count() % 2, 0);

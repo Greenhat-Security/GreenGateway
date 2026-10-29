@@ -74,7 +74,7 @@ impl Exit {
             }
             Self::Usage => "usage error, including a reserved command or a refused insecure option",
             Self::Invalid => {
-                "invalid, incompatible or unsupported configuration, server or document version"
+                "invalid, incompatible or unsupported configuration, server or document version; a failed required doctor check; any warning under --warnings-as-errors"
             }
             Self::Drift => "drift found by diff --check",
             Self::Conflict => "precondition conflict: missing or stale ETag, plan, acknowledgment or lock",
@@ -104,10 +104,16 @@ impl Exit {
     }
 
     /// The exit code for a set of diagnostics: success when there is none.
+    #[cfg(test)]
     pub(crate) fn of(diagnostics: &[Diagnostic]) -> Self {
-        diagnostics
-            .iter()
-            .map(|diagnostic| diagnostic.code.exit())
+        Self::worst(diagnostics.iter().map(|diagnostic| diagnostic.code.exit()))
+    }
+
+    /// The exit code that must not be hidden among `exits`: success when
+    /// there is none.
+    pub(crate) fn worst(exits: impl IntoIterator<Item = Self>) -> Self {
+        exits
+            .into_iter()
             .max_by_key(|exit| exit.precedence())
             .unwrap_or(Self::Success)
     }
@@ -171,6 +177,10 @@ pub(crate) enum Code {
     CapabilitiesInvalid,
     // Published schemas.
     UnsupportedSchemaVersion,
+    // Bundle validation and the offline doctor.
+    ProductionValidatorsNotRun,
+    WarningsAsErrors,
+    RequiredCheckFailed,
     // This process.
     WriteFailed,
     RuntimeUnavailable,
@@ -186,6 +196,8 @@ pub(crate) const FAMILIES: &[&str] = &[
     "remote",
     "compat",
     "schema",
+    "validate",
+    "doctor",
     "output",
     "internal",
 ];
@@ -242,6 +254,9 @@ impl Code {
         Self::UnsupportedCapabilitiesVersion,
         Self::CapabilitiesInvalid,
         Self::UnsupportedSchemaVersion,
+        Self::ProductionValidatorsNotRun,
+        Self::WarningsAsErrors,
+        Self::RequiredCheckFailed,
         Self::WriteFailed,
         Self::RuntimeUnavailable,
         Self::ClientUnavailable,
@@ -277,13 +292,15 @@ impl Code {
             "remote" => "docs/ggctl.md#remote-diagnostics",
             "compat" => "docs/ggctl.md#compat-diagnostics",
             "schema" => "docs/ggctl.md#schema-diagnostics",
+            "validate" => "docs/ggctl.md#validate-diagnostics",
+            "doctor" => "docs/ggctl.md#doctor-diagnostics",
             "output" => "docs/ggctl.md#output-diagnostics",
             _ => "docs/ggctl.md#internal-diagnostics",
         }
     }
 
     fn entry(self) -> (&'static str, &'static str, Exit) {
-        use Exit::{Denied, Failure, Invalid, Unavailable, Usage};
+        use Exit::{Denied, Failure, Invalid, Success, Unavailable, Usage};
         match self {
             Self::MissingCommand => ("usage.missing_command", "no command was given", Usage),
             Self::UnknownCommand => ("usage.unknown_command", "the command is not one this ggctl implements", Usage),
@@ -424,6 +441,21 @@ impl Code {
                 "this ggctl publishes no schema for that kind at that document version",
                 Invalid,
             ),
+            Self::ProductionValidatorsNotRun => (
+                "validate.production_validators_not_run",
+                "the gateway's production policy and tools validators are not part of ggctl and did not run; the gateway can still refuse a document these checks accept",
+                Success,
+            ),
+            Self::WarningsAsErrors => (
+                "validate.warnings_as_errors",
+                "--warnings-as-errors was given and a warning was reported",
+                Invalid,
+            ),
+            Self::RequiredCheckFailed => (
+                "doctor.required_check_failed",
+                "a required doctor check failed",
+                Invalid,
+            ),
             Self::WriteFailed => ("output.write_failed", "the output could not be written", Failure),
             Self::RuntimeUnavailable => ("internal.runtime_unavailable", "the asynchronous runtime could not be started", Failure),
             Self::ClientUnavailable => ("internal.client_unavailable", "the HTTP client could not be built", Failure),
@@ -462,10 +494,14 @@ impl Diagnostic {
         self
     }
 
-    /// Every `ggctl` diagnostic is an error today; warnings arrive with
-    /// `validate` (#242 PR 8).
+    /// A code that leaves the exit status alone is information; every
+    /// other one is an error. Warnings come only from the bundle reader.
     pub(crate) fn severity(&self) -> &'static str {
-        "error"
+        if self.code.exit() == Exit::Success {
+            "info"
+        } else {
+            "error"
+        }
     }
 }
 

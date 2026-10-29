@@ -21,12 +21,15 @@ use super::{
         MAX_DEPTH, MAX_KEY_BYTES, MAX_OBJECT_MEMBERS, MAX_STRING_BYTES, RESOURCE_LIMITS,
     },
     value::{Decimal, SecretReference, Unresolved, UnresolvedReason},
-    yaml, BundledResource, ReadOptions, MANIFEST_MEDIA_TYPE, MAX_DEPLOYMENT_BYTES,
-    MAX_MANIFEST_BYTES,
+    yaml, BundleReport, BundledResource, PublishedSchemasOnly, ReadOptions, ResourceValidators,
+    MANIFEST_MEDIA_TYPE, MAX_DEPLOYMENT_BYTES, MAX_MANIFEST_BYTES,
 };
 use crate::canonical_json;
 
 const CANARY: &str = "zqcanary";
+
+/// What the schema-only reader returns.
+type Report = BundleReport<JsonValue, JsonValue>;
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1164,14 +1167,14 @@ fn tools_file() -> FileName {
 }
 
 #[test]
-fn referenced_policies_pass_their_schema_and_production_validator() {
-    assert!(resource::policy_schema_compiles());
+fn referenced_policies_pass_the_bundle_checks_and_their_published_schema() {
+    assert!(resource::published_schemas_compile());
     let mut diagnostics = Vec::new();
     let starter = repository_text("docs/examples/policy.starter.json");
-    let policy = resource::policy(&starter, "0.1.0", &policy_file(), &mut diagnostics)
+    let policy = resource::policy(&starter, "0.1.0", None, &policy_file(), &mut diagnostics)
         .expect("the starter policy should validate");
     assert!(diagnostics.is_empty(), "{diagnostics:?}");
-    assert_eq!(policy.id.as_deref(), Some("starter"));
+    assert_eq!(policy["id"], "starter");
 
     for (text, code) in [
         (
@@ -1198,20 +1201,20 @@ fn referenced_policies_pass_their_schema_and_production_validator() {
         ("[]".to_owned(), Code::WrongType),
     ] {
         let mut diagnostics = Vec::new();
-        assert!(resource::policy(&text, "0.1.0", &policy_file(), &mut diagnostics).is_none(), "{text}");
+        assert!(resource::policy(&text, "0.1.0", None, &policy_file(), &mut diagnostics).is_none(), "{text}");
         assert_eq!(codes(&diagnostics), [code], "{text}");
         assert_value_free(&diagnostics);
     }
 }
 
 #[test]
-fn referenced_tools_pass_their_production_validator() {
+fn referenced_tools_pass_their_published_schema() {
     let mut diagnostics = Vec::new();
     let starter = repository_text("docs/examples/tools.starter.json");
     let tools = resource::tools(&starter, "0.1.0", &tools_file(), &mut diagnostics)
         .expect("the starter tools should validate");
     assert!(diagnostics.is_empty(), "{diagnostics:?}");
-    assert_eq!(tools.len(), 1);
+    assert_eq!(tools["tools"].as_array().map(Vec::len), Some(1));
 
     for (text, code) in [
         (
@@ -1235,6 +1238,58 @@ fn referenced_tools_pass_their_production_validator() {
         assert_eq!(codes(&diagnostics), [code], "{text}");
         assert_value_free(&diagnostics);
     }
+}
+
+/// Refuses every policy and tools document, as a production validator does
+/// with one it rejects.
+struct Refusing;
+
+impl ResourceValidators for Refusing {
+    type Policy = ();
+    type Tools = ();
+
+    fn policy(&self, _: JsonValue) -> Option<()> {
+        None
+    }
+
+    fn tools(&self, _: JsonValue) -> Option<()> {
+        None
+    }
+}
+
+#[test]
+fn a_callers_validator_refusal_is_reported_by_code_alone_after_the_bundle_checks() {
+    let bundle = TempBundle::complete("refusing-validator");
+    let report = read_bundle(&bundle.root, ReadOptions::default(), &Refusing);
+    assert!(report.bundle.is_none());
+    assert_eq!(
+        report
+            .diagnostics
+            .iter()
+            .map(|diagnostic| (
+                diagnostic.code,
+                diagnostic.file.as_ref().map(FileName::as_str)
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (Code::ResourceInvalid, Some("policy.json")),
+            (Code::ResourceInvalid, Some("tools.json")),
+        ]
+    );
+    // The manifest is still summarized for a caller that reports per file.
+    assert_eq!(
+        report.manifest.map(|manifest| manifest.name),
+        Some("payments-production".to_owned())
+    );
+
+    // A document the bundle checks refuse never reaches the validator.
+    bundle.write(
+        "policy.json",
+        b"{\"schema_version\": \"0.1.0\", \"default_action\": 1}\n",
+    );
+    bundle.write("bundle.yaml", bundle.manifest().as_bytes());
+    let report = read_bundle(&bundle.root, ReadOptions::default(), &PublishedSchemasOnly);
+    assert_eq!(only_codes(&report), [Code::ResourceInvalid]);
 }
 
 // --- reading bundle directories -----------------------------------------------
@@ -1291,12 +1346,16 @@ impl TempBundle {
         )
     }
 
-    fn read(&self) -> super::BundleReport {
-        read_bundle(&self.root, ReadOptions::default())
+    fn read(&self) -> Report {
+        read_bundle(&self.root, ReadOptions::default(), &PublishedSchemasOnly)
     }
 
-    fn read_strict(&self) -> super::BundleReport {
-        read_bundle(&self.root, ReadOptions { strict: true })
+    fn read_strict(&self) -> Report {
+        read_bundle(
+            &self.root,
+            ReadOptions { strict: true },
+            &PublishedSchemasOnly,
+        )
     }
 }
 
@@ -1316,7 +1375,7 @@ const POLICY_JSON: &str =
     "{\n  \"schema_version\": \"0.1.0\",\n  \"default_action\": \"deny\"\n}\n";
 const TOOLS_JSON: &str = "{\n  \"schema_version\": \"0.1.0\",\n  \"tools\": []\n}\n";
 
-fn only_codes(report: &super::BundleReport) -> Vec<Code> {
+fn only_codes<P, T>(report: &BundleReport<P, T>) -> Vec<Code> {
     codes(&report.diagnostics)
 }
 
@@ -1357,11 +1416,100 @@ fn a_complete_bundle_is_read_with_its_digests() {
     assert_eq!(file.as_str(), "policy.json");
     assert_eq!(*schema_version, "0.1.0");
     assert_eq!(*sha256, bundle.digest_of("policy.json"));
-    assert_eq!(document.default_action, crate::rbac::DefaultAction::Deny);
+    assert_eq!(document["default_action"], "deny");
     assert!(
-        matches!(&read.tools, Some(BundledResource::Bundle { document, .. }) if document.is_empty())
+        matches!(&read.tools, Some(BundledResource::Bundle { document, .. }) if document["tools"] == json!([]))
     );
     assert!(read.connections_from_server);
+}
+
+#[test]
+fn a_bundled_policy_is_held_to_its_deployment_profile_invariants() {
+    // The role is named by a value that must never be echoed.
+    let policy = format!(
+        concat!(
+            "{{\n",
+            "  \"schema_version\": \"0.1.0\",\n",
+            "  \"default_action\": \"allow\",\n",
+            "  \"enforcement_mode\": \"shadow\",\n",
+            "  \"roles\": {{\"{canary}\": {{\"permissions\": [\"read\", \"*\"]}}}},\n",
+            "  \"routes\": [\n",
+            "    {{\"path_prefix\": \"/a\", \"permission\": \"read\"}},\n",
+            "    {{\"path_prefix\": \"/b\", \"permission\": \"read\", \"enforcement_mode\": \"shadow\"}}\n",
+            "  ]\n",
+            "}}\n",
+        ),
+        canary = CANARY
+    );
+    for profile in ["production", "migration", "development"] {
+        let bundle = TempBundle::complete(profile);
+        bundle.write(
+            "deployment.yaml",
+            DEPLOYMENT_YAML.replace("production", profile).as_bytes(),
+        );
+        bundle.write("policy.json", policy.as_bytes());
+        bundle.write("bundle.yaml", bundle.manifest().as_bytes());
+        let report = bundle.read();
+        let found: Vec<_> = report
+            .diagnostics
+            .iter()
+            .map(|diagnostic| {
+                assert_eq!(
+                    diagnostic.file.as_ref().map(FileName::as_str),
+                    Some("policy.json")
+                );
+                (
+                    diagnostic.code,
+                    diagnostic.pointer.to_string(),
+                    diagnostic.position,
+                )
+            })
+            .collect();
+        if profile == "development" {
+            assert!(found.is_empty(), "{found:?}");
+            assert!(report.bundle.is_some());
+            continue;
+        }
+        assert_eq!(
+            found,
+            [
+                (
+                    Code::PolicyDefaultAllow,
+                    "/default_action".to_owned(),
+                    Some(at(3, 21))
+                ),
+                (
+                    Code::PolicyShadowMode,
+                    "/enforcement_mode".to_owned(),
+                    Some(at(4, 23))
+                ),
+                (
+                    Code::PolicyWildcardRole,
+                    "/roles".to_owned(),
+                    Some(at(5, 50))
+                ),
+                (
+                    Code::PolicyShadowMode,
+                    "/routes/1/enforcement_mode".to_owned(),
+                    Some(at(8, 69))
+                ),
+            ],
+            "{profile}"
+        );
+        assert!(report.bundle.is_none(), "{profile}");
+        assert_value_free(&report.diagnostics);
+    }
+
+    // Deny by default and enforce are the defaults; a policy that spells
+    // neither, and grants no wildcard, meets the production invariants.
+    let bundle = TempBundle::complete("profile-defaults");
+    bundle.write(
+        "policy.json",
+        b"{\"schema_version\": \"0.1.0\", \"roles\": {\"ops\": {\"permissions\": [\"read\"]}}}\n",
+    );
+    bundle.write("bundle.yaml", bundle.manifest().as_bytes());
+    let report = bundle.read();
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
 }
 
 #[test]
@@ -1406,12 +1554,16 @@ fn the_bundle_root_must_be_an_openable_directory() {
         "greengateway-bundle-missing-{}",
         uuid::Uuid::new_v4()
     ));
-    let report = read_bundle(&missing, ReadOptions::default());
+    let report = read_bundle(&missing, ReadOptions::default(), &PublishedSchemasOnly);
     assert_eq!(only_codes(&report), [Code::RootUnavailable]);
 
     let bundle = TempBundle::empty("root-file");
     bundle.write("not-a-directory", b"x");
-    let report = read_bundle(&bundle.root.join("not-a-directory"), ReadOptions::default());
+    let report = read_bundle(
+        &bundle.root.join("not-a-directory"),
+        ReadOptions::default(),
+        &PublishedSchemasOnly,
+    );
     assert_eq!(only_codes(&report), [Code::RootNotDirectory]);
 
     let empty = TempBundle::empty("no-manifest");
@@ -1962,6 +2114,7 @@ fn every_code_is_stable_unique_and_documented() {
         "reference",
         "secret",
         "resource",
+        "profile",
     ];
     for spelled in reference.split('`').skip(1).step_by(2) {
         let Some((family, reason)) = spelled.split_once('.') else {
