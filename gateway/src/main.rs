@@ -90,6 +90,8 @@ mod admin_policy_test_runs;
 use admin_policy_test_runs::*;
 mod admin_policy_simulations;
 use admin_policy_simulations::*;
+mod admin_policy_replays;
+use admin_policy_replays::*;
 
 mod audit;
 mod auth;

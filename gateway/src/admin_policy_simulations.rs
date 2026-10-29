@@ -15,10 +15,10 @@
 //! resolver or upstream.
 //!
 //! The concurrency bound, [`PolicyEvaluationLimiter`], is shared with policy
-//! test runs: both endpoints admit a request only once its body is in hand,
-//! and the blocking work owns its slot, so a slot counts evaluations doing
-//! work -- not uploads in flight, and not work a cancelled request left
-//! running.
+//! test runs and historical replay jobs: each endpoint admits a request only
+//! once its body is in hand, and the blocking work owns its slot, so a slot
+//! counts evaluations doing work -- not uploads in flight, and not work a
+//! cancelled request left running.
 use std::{
     collections::HashSet,
     sync::{
@@ -54,7 +54,8 @@ pub(super) const POLICY_SIMULATION_DEADLINE: Duration = Duration::from_secs(2);
 /// The concurrency bounds of one evaluation endpoint on one router, shared by
 /// every request it serves: at most `limit` evaluations at once, and one at a
 /// time per actor, so a single caller cannot hold every slot. Each route has
-/// its own, so simulations and test runs never take each other's slots.
+/// its own, so simulations, test runs and replay jobs never take each
+/// other's slots.
 pub(super) struct PolicyEvaluationLimiter {
     limit: usize,
     active: AtomicUsize,
@@ -173,11 +174,9 @@ fn simulation_invalid(diagnostics: &policy_testing::suite::Diagnostics) -> Respo
         .into_response()
 }
 
-fn simulation_candidate_invalid(error: &rbac::policy::PolicyError) -> Response {
-    simulation_candidate_refused(vec![policy_error_message(error)])
-}
-
-fn simulation_candidate_refused(errors: Vec<String>) -> Response {
+/// The `422` a refused candidate answers, with the messages a policy write
+/// refuses the same document with. Shared with historical replay.
+pub(super) fn simulation_candidate_refused(errors: Vec<String>) -> Response {
     (
         StatusCode::UNPROCESSABLE_ENTITY,
         Json(json!({
@@ -192,7 +191,7 @@ fn simulation_candidate_refused(errors: Vec<String>) -> Response {
 /// The active policy, its ETag and the authority it was read under: the
 /// authoritative document in cluster mode, at the revision it was read, and
 /// the installed snapshot in standalone mode.
-async fn simulation_base(
+pub(super) async fn simulation_base(
     state: &PolicyAdminState,
     rbac_state: &middleware::rbac::RbacState,
 ) -> ResponseResult<(rbac::Policy, String, policy_eval::PolicyAuthority)> {
@@ -234,8 +233,20 @@ async fn simulation_base(
     }
 }
 
-/// The candidate the request describes, validated exactly as a policy write
-/// validates one, or `None` when the candidate is the base itself.
+/// Why a request's candidate could not be built.
+pub(super) enum CandidateRefusal {
+    /// An edit did not apply to the base.
+    Edits(policy_testing::suite::Diagnostics),
+    /// The candidate is not a policy a write would accept, or not one this
+    /// deployment could commit: the messages a policy write refuses it with.
+    Invalid(Vec<String>),
+    /// The base could not be serialized for editing.
+    Internal,
+}
+
+/// The candidate a request describes, validated exactly as a policy write
+/// validates one, or `None` when the candidate is the base itself. Shared by
+/// simulation and historical replay, which take the same candidate sources.
 ///
 /// An inline candidate is read from its own bytes by the parser
 /// `PUT .../policy` reads a body with, so a v1 document is held to the same
@@ -244,54 +255,62 @@ async fn simulation_base(
 /// produces. Either is then refused, as `POST .../policy/validate` and a
 /// test run refuse it, when this deployment could not commit its document
 /// format.
+pub(super) fn resolve_candidate(
+    state: &PolicyAdminState,
+    rbac_state: &middleware::rbac::RbacState,
+    base: &rbac::Policy,
+    source: &CandidateSource,
+) -> Result<Option<rbac::Policy>, CandidateRefusal> {
+    let candidate = match source {
+        CandidateSource::Active => return Ok(None),
+        CandidateSource::Inline(source) => {
+            parse_policy_body(source.get().as_bytes()).map_err(CandidateRefusal::Invalid)?
+        }
+        CandidateSource::Edits(edits) => {
+            let base_document = serde_json::to_value(base).map_err(|error| {
+                tracing::error!(error = %error, "failed to serialize the candidate base");
+                CandidateRefusal::Internal
+            })?;
+            let document = apply_edits(&base_document, edits, "/candidate/edits")
+                .map_err(CandidateRefusal::Edits)?;
+            rbac::Policy::validate_json_value(document)
+                .map_err(|error| CandidateRefusal::Invalid(vec![policy_error_message(&error)]))?
+        }
+    };
+    admitted_candidate(state, rbac_state, candidate).map(Some)
+}
+
+/// What a parsed candidate must also satisfy before it is evaluated: proxy
+/// dispatch this deployment can serve, and a document format it can commit.
+fn admitted_candidate(
+    state: &PolicyAdminState,
+    rbac_state: &middleware::rbac::RbacState,
+    candidate: rbac::Policy,
+) -> Result<rbac::Policy, CandidateRefusal> {
+    if let Err(error) = rbac_state.validate_proxy_dispatch_policy(&candidate) {
+        return Err(CandidateRefusal::Invalid(vec![policy_error_message(
+            &error,
+        )]));
+    }
+    if let Some(detail) = deployment_document_format_refusal(state, &candidate) {
+        return Err(CandidateRefusal::Invalid(vec![detail]));
+    }
+    Ok(candidate)
+}
+
 fn simulation_candidate(
     state: &PolicyAdminState,
     rbac_state: &middleware::rbac::RbacState,
     base: &rbac::Policy,
     source: &CandidateSource,
 ) -> ResponseResult<Option<rbac::Policy>> {
-    let document = match source {
-        CandidateSource::Active => return Ok(None),
-        CandidateSource::Inline(source) => {
-            let candidate = parse_policy_body(source.get().as_bytes())
-                .map_err(|errors| Box::new(simulation_candidate_refused(errors)))?;
-            return admitted_simulation_candidate(state, rbac_state, candidate).map(Some);
-        }
-        CandidateSource::Edits(edits) => {
-            let base_document = match serde_json::to_value(base) {
-                Ok(document) => document,
-                Err(error) => {
-                    tracing::error!(error = %error, "failed to serialize the simulation base");
-                    return Err(Box::new(internal_server_error("policy simulation failed")));
-                }
-            };
-            match apply_edits(&base_document, edits, "/candidate/edits") {
-                Ok(document) => document,
-                Err(diagnostics) => return Err(Box::new(simulation_invalid(&diagnostics))),
-            }
-        }
-    };
-    let candidate = match rbac::Policy::validate_json_value(document) {
-        Ok(candidate) => candidate,
-        Err(error) => return Err(Box::new(simulation_candidate_invalid(&error))),
-    };
-    admitted_simulation_candidate(state, rbac_state, candidate).map(Some)
-}
-
-/// What a parsed candidate must also satisfy before it is simulated: proxy
-/// dispatch this deployment can serve, and a document format it can commit.
-fn admitted_simulation_candidate(
-    state: &PolicyAdminState,
-    rbac_state: &middleware::rbac::RbacState,
-    candidate: rbac::Policy,
-) -> ResponseResult<rbac::Policy> {
-    if let Err(error) = rbac_state.validate_proxy_dispatch_policy(&candidate) {
-        return Err(Box::new(simulation_candidate_invalid(&error)));
-    }
-    if let Some(detail) = deployment_document_format_refusal(state, &candidate) {
-        return Err(Box::new(simulation_candidate_refused(vec![detail])));
-    }
-    Ok(candidate)
+    resolve_candidate(state, rbac_state, base, source).map_err(|refusal| {
+        Box::new(match refusal {
+            CandidateRefusal::Edits(diagnostics) => simulation_invalid(&diagnostics),
+            CandidateRefusal::Invalid(errors) => simulation_candidate_refused(errors),
+            CandidateRefusal::Internal => internal_server_error("policy simulation failed"),
+        })
+    })
 }
 
 struct SimulationBinding {
