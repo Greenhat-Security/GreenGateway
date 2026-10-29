@@ -488,3 +488,14 @@ without one, never by position. The recorded result is compared with the
 base's answer the way the live adapters record it, a direct rule by id or by
 position, a route by its permission and path prefix. The format is in
 [policy-replay.md](../policy-replay.md#impact-comparison).
+
+## Evidence packages (#243, slice 20)
+
+`admin_policy_evidence` adds no evaluation of its own. Behind
+`POST /v1{ADMIN_PREFIX}/policy/evidence` it runs a test suite through
+`policy_testing::run_against_policy` and synthetic cases through
+`policy_simulation::run`, both against a policy history version (and, for
+cases, the version before it) compiled with `CompiledPolicy::from_validated_policy`,
+and binds a finished replay job's result unchanged. `policy_evidence` only
+assembles what those callers returned into a deterministic package; the
+format is in [policy-evidence.md](../policy-evidence.md).

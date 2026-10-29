@@ -136,7 +136,7 @@ pub(crate) fn parse_request(bytes: &[u8], value: &Value) -> Result<ReplayRequest
         .and_then(|value| parse_window(value, &mut diagnostics));
     let projections = match root.get("projections") {
         None => Some(vec![Projection::AsAuthored]),
-        Some(value) => parse_projections(value, &mut diagnostics),
+        Some(value) => parse_projections(value, "/projections", &mut diagnostics),
     };
     let max_records = match root.get("max_records") {
         None => Some(MAX_REPLAY_RECORDS),

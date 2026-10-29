@@ -5,6 +5,10 @@
 //! and digest code into one library that both binaries link, so neither can
 //! approximate the other. This crate is that library. Today it holds:
 //!
+//! - [`catalog`]: the configuration field catalog, which describes every
+//!   setting the gateway's configuration compiler reads and is held to that
+//!   compiler, the configuration reference, `.env.example` and the Cloudflare
+//!   wrapper by parity tests;
 //! - [`documents`]: the versioned documents GreenGateway publishes schemas
 //!   for, and those schemas;
 //! - [`capabilities`]: the `GatewayCapabilities` document a gateway serves at
@@ -21,6 +25,10 @@
 //!   duplicate or case-colliding names, and bounded sizes and expansion),
 //!   ahead of the backup archive reader that will apply them, so that reader
 //!   cannot approximate them. Bundles themselves are directories only;
+//! - [`ledger`]: the standalone configuration revision ledger, an
+//!   append-only, hash-chained SQLite record of the bundles a standalone
+//!   deployment applied, which refuses to open when anything in it no longer
+//!   verifies;
 //! - [`semantic_diff`]: the semantic diff between two compiled
 //!   configurations and its risk classification, which `ggctl diff` reports
 //!   for two bundles and the gateway's plans will report.
@@ -32,16 +40,19 @@
 //! [`bundle::ResourceValidators`] argument, so the gateway runs them and
 //! `ggctl`, which cannot link the gateway crate, reports that it did not.
 //!
-//! Nothing here touches the environment, a clock, a store or the network. The
-//! bundle reader is the one part that reads files: only beneath the bundle
-//! root it is given, and it never writes. The archive guard reads and writes
-//! only the readers and writers it is handed.
+//! Nothing here touches the environment, a clock or the network. The bundle
+//! reader reads files only beneath the bundle root it is given, and never
+//! writes. The archive guard reads and writes only the readers and writers
+//! it is handed. The ledger is the one store: it reads and writes only its own
+//! database and journal files beneath the state directory it is given.
 
 pub mod archive;
 pub mod bundle;
 pub mod canonical_json;
 pub mod capabilities;
+pub mod catalog;
 pub mod documents;
+pub mod ledger;
 pub mod opaque_id;
 pub mod permissions;
 pub mod semantic_diff;
