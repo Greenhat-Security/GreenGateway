@@ -4316,6 +4316,24 @@ async fn proxy_returns_504_when_streaming_upstream_body_idles_before_first_chunk
                 .await
                 .expect("test server should accept a connection");
             tokio::spawn(async move {
+                // Answer only after the request, as every other test upstream
+                // does. With hyper 1.12 and tokio 1.54, headers written
+                // straight after the accept can reach hyper's client before it
+                // has sent the request, and it refuses them as an unexpected
+                // message (a 502) instead of waiting on the body this test
+                // leaves idle.
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = stream
+                        .read(&mut chunk)
+                        .await
+                        .expect("test server should read the request");
+                    if read == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                }
                 stream
                         .write_all(
                             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
