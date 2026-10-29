@@ -2,7 +2,7 @@
 
 `ggctl` is GreenGateway's operator command-line tool (issue #242, [ADR-0008](adr/0008-setup-cli-and-configuration-bundles.md)). It is a separate binary: the `gateway` server keeps its name, its no-argument startup, its Docker entrypoint and its one-shot commands (`gateway migrate`, `gateway healthcheck`, `gateway import-standalone`, ...) unchanged.
 
-**Status: alpha.** This build implements `version`, `schema`, `validate`, `doctor`, `diff`, `completion` and `help`, the output contract, the exit codes, secure bearer-token input and the version handshake with a running gateway. `validate` and `doctor` check a [configuration bundle](configuration-bundles.md) offline with the gateway's own bundle reader, and `diff` compares two bundles semantically and classifies each change's risk. `ggctl` cannot yet pin, convert, initialize, plan, apply, export or back up anything, and it cannot yet validate or diff an environment file (`--env`, `--against-env`) or diff against a server (`diff --server`): those are later #242 slices (see the ADR's [rollout](adr/0008-setup-cli-and-configuration-bundles.md#rollout)), and a name this build does not implement is refused as an unknown command (exit 2). Nothing here changes how a gateway is configured or started: no gateway reads a bundle yet.
+**Status: alpha.** This build implements `version`, `schema`, `init`, `validate`, `convert`, `doctor`, `diff`, `completion` and `help`, the output contract, the exit codes, secure bearer-token input and the version handshake with a running gateway. `init` writes a new [configuration bundle](configuration-bundles.md) for a deployment profile, `validate` and `doctor` check one offline with the gateway's own bundle reader, `convert` converts one between document versions, and `diff` compares two bundles semantically and classifies each change's risk. `ggctl` cannot yet pin, plan, apply, export or back up anything, it has no browser wizard (`init --web`), and it cannot yet validate, convert or diff an environment file (`--env`, `--against-env`) or diff against a server (`diff --server`): those are later #242 slices (see the ADR's [rollout](adr/0008-setup-cli-and-configuration-bundles.md#rollout)), and a name this build does not implement is refused as an unknown command (exit 2). Nothing here changes how a gateway is configured or started: no gateway reads a bundle yet.
 
 ## Building
 
@@ -22,7 +22,9 @@ The configuration contracts it shares with the gateway live in the `gateway-conf
 ```text
 ggctl version [--server URL] [--ca-file PATH] [--token-stdin | --token-file PATH] [--timeout SECONDS] [--format human|json]
 ggctl schema [KIND] [--api-version VERSION] [--format human|json]
+ggctl init --profile production|migration|development --output DIR [--answers FILE] [--format human|json]
 ggctl validate BUNDLE [--strict] [--warnings-as-errors] [--format human|json|sarif]
+ggctl convert BUNDLE --to VERSION (--output DIR | --in-place) [--strict] [--format human|json]
 ggctl doctor BUNDLE [--format human|json]
 ggctl diff BUNDLE --against BUNDLE [--check] [--strict] [--format human|json|sarif]
 ggctl completion bash|zsh|fish|powershell
@@ -38,7 +40,25 @@ Prints the `ggctl` version and the document versions whose schemas it publishes.
 
 ### `schema`
 
-Without `KIND`, lists every document kind and version this `ggctl` publishes a JSON Schema (Draft 2020-12) for. With `KIND` (`GatewayBundle`, `GatewayDeployment`, `GatewayCapabilities` or `GgctlReport`), writes that schema to standard output, byte for byte as committed under [`docs/schemas`](schemas/) with LF line endings on every platform. `--api-version` selects a document version (default: the newest published); a version with no published schema exits `3`. Printing a schema writes an artifact, so `--format` is refused there. A schema is necessary but not sufficient: the gateway's reader is authoritative.
+Without `KIND`, lists every document kind and version this `ggctl` publishes a JSON Schema (Draft 2020-12) for. With `KIND` (`GatewayBundle`, `GatewayDeployment`, `GatewayInitAnswers`, `GatewayCapabilities` or `GgctlReport`), writes that schema to standard output, byte for byte as committed under [`docs/schemas`](schemas/) with LF line endings on every platform. `--api-version` selects a document version (default: the newest published); a version with no published schema exits `3`. Printing a schema writes an artifact, so `--format` is refused there. A schema is necessary but not sufficient: the gateway's reader is authoritative.
+
+### `init`
+
+Creates a new bundle in the directory `--output` for the deployment profile `--profile` (`production`, `migration` or `development`; required): `bundle.yaml`, a deployment document declaring the profile and, in the default standalone topology, a policy that denies by default and enforces its decisions with no route and no role, and a tools document with no tools, each pinned by its SHA-256 digest, plus a `.gitattributes` that keeps their line endings LF. What each profile and topology writes is in [generated bundles](configuration-bundles.md#generated-bundles); the permissive starter policy is never written, and no file holds a secret or a credential. The output is deterministic: the same profile and answers always give the same bytes.
+
+- `--answers FILE` replaces the defaults with a `GatewayInitAnswers` document ([schema](schemas/gateway-init-answers.v1alpha1.schema.json); YAML, or strict JSON when `FILE` ends in `.json`): the bundle's `name`, the `cluster` topology, which leaves policy and tools to the server as Connections are, or an `operator` role bound to one issuer and explicit authentication methods that may read status and configuration capabilities and nothing more. No member can hold a secret value. Because the answers decide which issuer the operator role trusts, `FILE` is read like `--ca-file`: a regular file of at most 64 KiB that, on Unix, is not writable by group or other and is not in a directory they can write without the sticky bit. A problem in the document is reported with the bundle reader's code, located by the position of `--answers` with a JSON Pointer, line and column, never by its path.
+- `--output DIR` must not exist, or must be an empty directory that is not a link; anything else is refused with `output.destination_exists` (exit `5`) and left exactly as it was. `ggctl` never overwrites.
+- The files are written into a new hidden directory beside `DIR` (`.NAME.ggctl-staging-PID-N`, created exclusively), each created new and flushed to storage with the manifest last, read back with the gateway's bundle reader strictly, and only then renamed onto `DIR` (an empty `DIR` is removed first) and the parent directory flushed. Any failure removes the staging directory, so nothing that looks like a bundle is ever left at `DIR`; only a process killed mid-write can leave the hidden staging directory, which is safe to delete. On Unix the directory is `0700` and each file `0600`, checked after writing, and a filesystem that does not keep those modes is refused (`output.permissions_unavailable`). Windows has no mode bits: the new entries inherit the ACL of the directory they are created in, which, as for the bundle reader, is left to the operator.
+- `ggctl` prompts for nothing, starts and deploys nothing, and makes no network request. The human result names the bundle, its digests, files and profile (marking `development` non-production) and the next step: review the files and run `ggctl validate --strict` on `DIR`. `--format json` writes one `GgctlReport` whose `result` holds `created`, `profile`, `topology`, `operator` and, once written, `bundle` as `validate` reports it.
+
+As for `validate`, the gateway's production policy and tools validators are not part of `ggctl`; the gateway's own tests hold every bundle `init` can write to them and to the policy enforcement it configures. No gateway reads a bundle yet, so the generated policy and tools documents are, today, also usable as `POLICY_FILE` and `TOOLS_FILE` in environment mode.
+
+Exit codes: `0` written, `3` invalid answers (or an answers file over 64 KiB), `5` when `DIR` holds anything, `2` for an answers file that is not a regular file or is writable by others, `1` when the answers could not be read or the bundle could not be written.
+
+```sh
+ggctl init --profile production --output deploy/bundle --answers deploy/init-answers.yaml
+ggctl validate deploy/bundle --strict
+```
 
 ### `validate`
 
@@ -61,6 +81,18 @@ In CI, validate the bundle a change touches and keep the SARIF log for review:
 ```
 
 The step fails on exit `3` or `1`; upload `bundle.sarif` with the CI system's SARIF tooling if it annotates reviews.
+
+### `convert`
+
+Converts the bundle in the directory `BUNDLE` to the document version `--to` names exactly (required). The bundle is read as `validate` reads it, and an invalid bundle is not converted. Each document version has one place on an ordered ladder and one step to the next, so a bundle is converted step by step from its own version up to `--to`: the result depends only on the bundle and the target, and a bundle already at `--to` is returned byte for byte, so converting twice is converting once. A `--to` older than the bundle is refused (`convert.downgrade_refused`), and so is any version this `ggctl` does not implement (`convert.unsupported_version`); `--to` is never echoed unless it names an implemented version.
+
+- `--output DIR` writes the converted bundle as a new directory exactly as `init` writes one (staging, read back, rename, owner-only on Unix, never over a directory that holds anything).
+- `--in-place` leaves `BUNDLE` where it is. A conversion that would change the bundle is refused in place (`convert.in_place_unavailable`) until an atomic in-place writer exists; write it with `--output` instead.
+- `--strict` reads `BUNDLE` as `validate --strict` does. `--format json` writes one `GgctlReport` whose `result` holds `valid`, `bundle`, `from`, `to`, `changed`, `written` and, once written, `converted`.
+
+`greengateway.dev/v1alpha1` is the only document version, so today every bundle is already at every version `ggctl` can convert to: `--output` writes an unchanged copy (with the same source digest) and `--in-place` changes nothing. A release that adds a version adds its step, and keeps reading the previous version for at least one minor release.
+
+Exit codes: `0` converted, `3` for an invalid bundle, an unknown `--to` or a downgrade, `5` when `--output` holds anything, `2` without `--to` or with both or neither of `--output` and `--in-place`, `1` when a bundle could not be read or written.
 
 ### `doctor`
 
@@ -132,6 +164,7 @@ Writes a completion script to standard output. It completes commands, options, f
 - **Diagnostics go to standard error** in human form. With `--format json` or `--format sarif` they are in the document instead and standard error stays empty.
 - **An argument error found before a command runs** (an unknown option, a refused secret or insecure option, a malformed `--server`) is written to standard error only, exits `2`, and writes no report.
 - **No color, no prompts, no progress output.** `ggctl` reads no configuration file and no environment variable, and makes no network request unless a command is given `--server`.
+- **Files are written only where a command is told to.** `init` and `convert --output` create the one directory `--output` names, and never write anything else, overwrite anything, or echo the path.
 
 A report always has `apiVersion: greengateway.dev/v1alpha1`, `kind: GgctlReport`, the `command`, the process `exitCode` and its stable `outcome` name, the `diagnostics`, and a command-specific `result`. Every diagnostic has a stable `code`, a `severity` (`error`, `warning` or `info`), fixed `message` text, an optional fixed `hint`, a `remediation` anchor and at most one location: when it concerns one argument, that argument's 1-based `location.argument` position; when the bundle reader found it, the bundle-relative `location.file`, a `location.pointer` built from member names the reader defines, and the 1-based `location.line` and `location.column` where the reader has them. Diagnostics are value-free by construction: they never contain an argument, token, URL, path, address, document value, server response or library error text. An unknown option is reported by its position, never by its spelling, because the spelling may be a mistyped secret. A published code never changes meaning; renaming or removing one needs a new report version.
 
@@ -148,12 +181,12 @@ SARIF 2.1.0 output belongs to `validate`, which ADR-0008 gives it, and to `diff`
 | `2` | `usage` | Usage error, including a reserved command or a refused insecure option. |
 | `3` | `invalid` | Invalid, incompatible or unsupported configuration, server or document version; a failed required doctor check; any warning under `--warnings-as-errors`. |
 | `4` | `drift` | Drift found by `diff --check`. |
-| `5` | `conflict` | Precondition conflict: missing or stale ETag, plan, acknowledgment or lock. |
+| `5` | `conflict` | Precondition conflict: missing or stale ETag, plan, acknowledgment or lock, or an output directory that is not empty. |
 | `6` | `unavailable` | A dependency was unavailable and nothing was sent or committed; safe to retry. |
 | `7` | `integrity` | Backup or archive integrity or restore verification failure. |
 | `8` | `denied` | Authentication or authorization refused. |
 
-When several errors apply, the one that must not be hidden wins: `1` over everything, and `6` only when nothing else went wrong, so a pipeline that retries on `6` never resends work another error left in doubt. Codes `4`, `5` and `7` belong to commands later slices add.
+When several errors apply, the one that must not be hidden wins: `1` over everything, and `6` only when nothing else went wrong, so a pipeline that retries on `6` never resends work another error left in doubt. Today `4` comes from `diff --check` and `5` only from an `init` or `convert --output` directory that is not empty; the ETag, plan and lock conflicts of `5`, and `7`, belong to commands later slices add.
 
 ## Credentials
 
@@ -293,11 +326,34 @@ Each code below is stable. The exit column is the exit code the diagnostic produ
 | --- | --- | --- |
 | `diff.drift_found` | 4 | `--check` was given and the bundles differ. |
 
+### Init diagnostics
+
+| Code | Exit | Meaning |
+| --- | --- | --- |
+| `init.answers_unreadable` | 1 | The `--answers` file could not be opened or read. |
+| `init.answers_not_regular_file` | 2 | The `--answers` file is not a regular file. |
+| `init.answers_unsafe_permissions` | 2 | The `--answers` file, or a directory holding it, is writable by group or other (Unix); a directory may be only with the sticky bit. |
+| `init.answers_too_large` | 3 | The `--answers` file is larger than 64 KiB. |
+
+A problem inside the answers document is reported with the [bundle reader's code](configuration-bundles.md#diagnostics), such as `schema.unknown_member` or `schema.not_applicable`.
+
+### Convert diagnostics
+
+| Code | Exit | Meaning |
+| --- | --- | --- |
+| `convert.unsupported_version` | 3 | `--to` is not a document version this `ggctl` can convert the bundle to. |
+| `convert.downgrade_refused` | 3 | `--to` is older than the bundle's document version; `ggctl` never converts down. |
+| `convert.in_place_unavailable` | 3 | The conversion would change the bundle, which `--in-place` cannot do atomically yet; use `--output`. No conversion that changes a bundle exists while `greengateway.dev/v1alpha1` is the only version. |
+
 ### Output diagnostics
 
 | Code | Exit | Meaning |
 | --- | --- | --- |
 | `output.write_failed` | 1 | Standard output could not be written, for example a closed pipe. |
+| `output.destination_exists` | 5 | The `--output` directory exists and is not empty, or is a link or a file. Nothing was written, and it was left as it was. |
+| `output.destination_unusable` | 1 | The `--output` directory could not be created or written, for example because its parent does not exist. Nothing was left at it. |
+| `output.permissions_unavailable` | 1 | The filesystem did not keep owner-only modes on what was written (Unix). Nothing was left at the `--output` directory. |
+| `output.written_bundle_invalid` | 1 | What was written did not read back as the same valid bundle; the reader's diagnostics say why. Nothing was left at the `--output` directory. |
 
 ### Internal diagnostics
 
@@ -308,4 +364,4 @@ Each code below is stable. The exit column is the exit code the diagnostic produ
 
 ## Platform notes
 
-`ggctl` is tested on Linux, macOS and Windows. Exit codes, stream separation, terminal detection, token-file type and size checks and the remote client behave the same on all three. The owner-only permission check on token files applies on Unix only, and so does the bundle reader's refusal of a group- or other-writable bundle directory or file ([files and the directory](configuration-bundles.md#files-and-the-directory)); on Windows the reader enforces the link, reparse-point, regular-file and name rules, and ACLs are left to the operator. Shell completion is generated for bash, zsh, fish and PowerShell.
+`ggctl` is tested on Linux, macOS and Windows. Exit codes, stream separation, terminal detection, token-file type and size checks and the remote client behave the same on all three. The owner-only permission check on token files applies on Unix only, and so does the bundle reader's refusal of a group- or other-writable bundle directory or file ([files and the directory](configuration-bundles.md#files-and-the-directory)); on Windows the reader enforces the link, reparse-point, regular-file and name rules, and ACLs are left to the operator. Likewise `init` and `convert --output` create their directory `0700` and its files `0600` on Unix and check those modes, while on Windows the new entries inherit the ACL of the directory they are created in. Shell completion is generated for bash, zsh, fish and PowerShell.

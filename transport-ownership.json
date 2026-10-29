@@ -6701,7 +6701,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::routing::add_admin_api_routes#1",
-      "sha256": "1c514e5d7bf257c3372dc70823da6f916edb23e8b21ab3948a404378735985c9",
+      "sha256": "0df0079ba808b38d1d322ff5bb94b51b23dc1b9be50ba4d9a4322ce467a3af03",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
@@ -7142,6 +7142,26 @@
       ],
       "scope": "gateway::use admin_policy_evidence :: *#1",
       "sha256": "2cddd23240b381eb60012c19c2f251286a733a37f48c4f422a20844b151c6d7c",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/admin_policy_analyses.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::admin_policy_analyses::use super :: *#1",
+      "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/main.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::use admin_policy_analyses :: *#1",
+      "sha256": "e22b2a94fcb1f5fbbc6dcc3fd0f5e6bd12adbf2945a80b8671fcc2f213a78869",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
@@ -10982,16 +11002,6 @@
       "sha256": "b2c5784b81a8601d8fdf0686f01234eb92f9c3e25955eaa0bb960b3bfdfe363b",
       "owner": "GreenGateway maintainers",
       "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the existing offline analysis or rate-selection contract pending its separate adapter. Replaces the policy evaluator module-wide allowance; no transport or process capability is introduced."
-    },
-    {
-      "file": "gateway/src/policy_eval/mod.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::policy_eval::impl  RateLaneSelection::matched#1",
-      "sha256": "702d6a3838f7f20f294e36f410df95e216bfcda2a58b499729e49a9a01e46f7d",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Per-method cfg_attr(not(test), expect(dead_code)) for a rate-lane selection accessor that offline analysis and the differential tests read; the live rate adapter (#422 PR 3a) matches on the outcome instead. Dead-code gating only; no transport or process capability is introduced."
     },
     {
       "file": "gateway/src/policy_eval/mod.rs",
@@ -15127,6 +15137,46 @@
       "sha256": "ae6db2eb90a4daf2aea533b77a1b4679e616f8a55a6de96b23c20145d7f90905",
       "owner": "GreenGateway maintainers: operator CLI (#242)",
       "purpose": "Reviewed for #242 PR 5: the in-memory string formatting trait for generated help text; no I/O, network or process capability."
+    },
+    {
+      "file": "ggctl/src/output.rs",
+      "reasons": [
+        "capability-in-macro-input"
+      ],
+      "scope": "ggctl::output::impl  Staging::create#1",
+      "sha256": "8446a2b2dcb2c66b7715f1e3a0caf83874aa62c154021d103018b645c20198f6",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 6 (ggctl init and convert): names the hidden staging directory beside the --output directory from the parent path, the destination's name, this process's own ID (std::process::id, read only, inside format!) and an attempt counter, and creates it exclusively through create_private_directory. Local filesystem only; no process is spawned or signalled and no network capability."
+    },
+    {
+      "file": "ggctl/src/output.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "ggctl::output::create_private_directory#1",
+      "sha256": "e1670dcb7e37b51a30944edc8e8a42e3ee0a29631068339838799456590395d0",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 6 (ggctl init and convert): imports DirBuilderExt to create the staging directory with mode 0700 on Unix, exclusively (create fails if it exists). Local filesystem only; no network or process capability."
+    },
+    {
+      "file": "ggctl/src/output.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "ggctl::output::owner_only#1",
+      "sha256": "29e10e1e2d0d1c1007e04707a14336f88c1af4564961dca384bd0c2e05df63a9",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 6 (ggctl init and convert): imports OpenOptionsExt to give each new bundle file mode 0600 on Unix when it is created with create_new. Local filesystem only; no network or process capability."
+    },
+    {
+      "file": "ggctl/src/output.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "ggctl::output::is_owner_only#1",
+      "sha256": "a4872bdbd542b847b24ed2891eeb1a7ffeb0953e934926070bc3bce7898f7546",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 6 (ggctl init and convert): reads the Unix mode bits of the staging directory and its entries through PermissionsExt, without following links, to refuse a filesystem that did not keep owner-only modes. Read-only metadata; no network or process capability."
     },
     {
       "file": "ggctl/src/remote.rs",

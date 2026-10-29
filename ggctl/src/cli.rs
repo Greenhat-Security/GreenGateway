@@ -73,13 +73,18 @@ pub(crate) const SHELLS: &[&str] = &["bash", "zsh", "fish", "powershell"];
 pub(crate) const SCHEMA_KINDS: &[&str] = &[
     gateway_config::documents::BUNDLE_KIND,
     gateway_config::documents::DEPLOYMENT_KIND,
+    gateway_config::documents::INIT_ANSWERS_KIND,
     gateway_config::documents::CAPABILITIES_KIND,
     gateway_config::documents::REPORT_KIND,
 ];
+/// The deployment profiles, as `gateway_config::bundle::Profile` names them.
+pub(crate) const PROFILES: &[&str] = &["production", "migration", "development"];
 const COMMAND_NAMES: &[&str] = &[
     "version",
     "schema",
+    "init",
     "validate",
+    "convert",
     "doctor",
     "diff",
     "completion",
@@ -153,6 +158,31 @@ const TIMEOUT: OptionSpec = OptionSpec {
     value: Some(("SECONDS", ValueKind::Seconds)),
     help: "the time allowed for each request, 1 to 300 seconds (default 30)",
 };
+const PROFILE: OptionSpec = OptionSpec {
+    name: "--profile",
+    value: Some(("PROFILE", ValueKind::Choice(PROFILES))),
+    help: "production, migration or development (required): the deployment profile the bundle declares",
+};
+const OUTPUT: OptionSpec = OptionSpec {
+    name: "--output",
+    value: Some(("DIR", ValueKind::Path)),
+    help: "the bundle directory to create: it must not exist, or must be an empty directory",
+};
+const ANSWERS: OptionSpec = OptionSpec {
+    name: "--answers",
+    value: Some(("FILE", ValueKind::Path)),
+    help: "a GatewayInitAnswers document (YAML, or JSON when FILE ends in .json) to use instead of the defaults",
+};
+const TO: OptionSpec = OptionSpec {
+    name: "--to",
+    value: Some(("VERSION", ValueKind::Text)),
+    help: "the document version to convert to (required), such as greengateway.dev/v1alpha1",
+};
+const IN_PLACE: OptionSpec = OptionSpec {
+    name: "--in-place",
+    value: None,
+    help: "convert BUNDLE where it is instead of writing --output",
+};
 const API_VERSION: OptionSpec = OptionSpec {
     name: "--api-version",
     value: Some(("VERSION", ValueKind::Text)),
@@ -194,6 +224,28 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         run: crate::schema::run,
     },
     CommandSpec {
+        name: "init",
+        summary: "Create a new configuration bundle for a deployment profile",
+        description: &[
+            "Writes a new greengateway.dev/v1alpha1 bundle into --output: bundle.yaml, a \
+             deployment document declaring --profile and, for the standalone topology, a policy \
+             that denies by default with no role and a tools document with no tools. An answers \
+             document (--answers) names the bundle, chooses the cluster topology, whose policy \
+             and tools stay with the server, or binds an operator role to one issuer; nothing \
+             it can hold, and nothing ggctl writes, is a secret.",
+            "The files are written into a new hidden directory beside --output, owner-only on \
+             Unix, read back with the gateway's bundle reader, and only then renamed into \
+             place, so nothing that looks like a bundle is left behind on failure. An existing \
+             --output is refused unless it is an empty directory. ggctl prompts for nothing, \
+             starts nothing and makes no network request. Exits 0 when the bundle was written, \
+             3 for invalid answers, 5 when --output is not empty, and 1 when it could not be \
+             written.",
+        ],
+        arguments: &[],
+        options: &[PROFILE, OUTPUT, ANSWERS, FORMAT],
+        run: crate::init::run,
+    },
+    CommandSpec {
         name: "validate",
         summary: "Validate a configuration bundle offline",
         description: &[
@@ -209,6 +261,25 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         arguments: &[BUNDLE],
         options: &[STRICT, WARNINGS_AS_ERRORS, VALIDATE_FORMAT],
         run: crate::validate::run,
+    },
+    CommandSpec {
+        name: "convert",
+        summary: "Convert a configuration bundle to another document version",
+        description: &[
+            "Reads the bundle in the directory BUNDLE as validate does and converts it to the \
+             document version --to names exactly: step by step from its own version, never \
+             down, so converting the result again changes nothing. --output writes the \
+             converted bundle as a new directory, the way init writes one; --in-place leaves \
+             BUNDLE where it is.",
+            "greengateway.dev/v1alpha1 is the only document version, so a bundle is already at \
+             every version ggctl can convert to: --output copies its files unchanged and \
+             --in-place changes nothing. Exits 0 when converted, 3 for an invalid bundle, an \
+             unknown --to or a downgrade, 5 when --output is not empty, and 1 when the bundle \
+             could not be read or written.",
+        ],
+        arguments: &[BUNDLE],
+        options: &[TO, OUTPUT, IN_PLACE, STRICT, FORMAT],
+        run: crate::convert::run,
     },
     CommandSpec {
         name: "doctor",

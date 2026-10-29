@@ -183,7 +183,7 @@ mod tests {
             captured.stdout(),
             format!(
                 "ggctl {}\nschemas: greengateway.dev/v1alpha1 GatewayBundle, GatewayDeployment, \
-                 GatewayCapabilities, GgctlReport\n",
+                 GatewayInitAnswers, GatewayCapabilities, GgctlReport\n",
                 env!("CARGO_PKG_VERSION")
             )
         );

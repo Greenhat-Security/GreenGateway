@@ -272,6 +272,97 @@ mod tests {
         }
     }
 
+    /// What `ggctl init` writes (issue #242 PR 6) for every profile and
+    /// each kind of answer, read with the production validators: `ggctl`
+    /// cannot run them, so this is where its output is held to them.
+    #[test]
+    fn every_bundle_ggctl_init_writes_passes_the_production_validators() {
+        use gateway_config::bundle::{
+            init::{read_answers, scaffold, Answers, AnswersSyntax, GITATTRIBUTES},
+            Profile,
+        };
+        let answers = |spec: &str| {
+            read_answers(
+                format!(
+                    "apiVersion: greengateway.dev/v1alpha1\nkind: GatewayInitAnswers\nspec:\n{spec}"
+                )
+                .as_bytes(),
+                AnswersSyntax::Yaml,
+            )
+            .expect("the answers should be read")
+        };
+        let answer_sets = [
+            Answers::default(),
+            answers(
+                "  name: payments\n  operator:\n    issuer: \"https://idp.example.test/\"\n    auth_methods: [bearer_token, session_cookie]\n",
+            ),
+            answers("  topology: cluster\n"),
+        ];
+        for profile in Profile::ALL.iter().copied() {
+            for answers in &answer_sets {
+                let root = std::env::temp_dir().join(format!(
+                    "greengateway-gateway-init-{}",
+                    uuid::Uuid::new_v4()
+                ));
+                let bundle = TempBundle(root);
+                fs::create_dir_all(&bundle.0).expect("temporary bundle directory should create");
+                let files = scaffold(profile, answers);
+                for file in &files {
+                    fs::write(bundle.0.join(file.name.as_str()), &file.bytes)
+                        .expect("bundle file should write");
+                }
+                fs::write(bundle.0.join(".gitattributes"), GITATTRIBUTES)
+                    .expect("attributes should write");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    for entry in fs::read_dir(&bundle.0).expect("the bundle lists") {
+                        let path = entry.expect("an entry").path();
+                        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                            .expect("permissions should set");
+                    }
+                    fs::set_permissions(&bundle.0, fs::Permissions::from_mode(0o700))
+                        .expect("permissions should set");
+                }
+
+                let report = read_bundle(&bundle.0, ReadOptions { strict: true });
+                assert!(
+                    report.diagnostics.is_empty(),
+                    "{profile:?} {answers:?}: {:?}",
+                    report.diagnostics
+                );
+                let read = report.bundle.expect("the bundle should be read");
+                assert_eq!(read.source_files(), files);
+                match (&read.policy, answers.operator()) {
+                    (Some(BundledResource::Bundle { document, .. }), operator) => {
+                        assert_eq!(document.default_action, DefaultAction::Deny);
+                        assert_eq!(
+                            document.enforcement_mode,
+                            crate::rbac::EnforcementMode::Enforce
+                        );
+                        assert_eq!(document.roles.len(), usize::from(operator.is_some()));
+                        for role in document.roles.values() {
+                            assert_eq!(role.issuers, ["https://idp.example.test"]);
+                            assert!(!role.auth_methods.is_empty());
+                            assert!(!role.permissions.iter().any(|permission| permission == "*"));
+                        }
+                        let Some(BundledResource::Bundle {
+                            document: tools, ..
+                        }) = &read.tools
+                        else {
+                            panic!("a standalone bundle supplies its tools");
+                        };
+                        assert!(tools.is_empty());
+                    }
+                    (Some(BundledResource::Server), None) => {
+                        assert!(matches!(read.tools, Some(BundledResource::Server)));
+                    }
+                    (policy, operator) => panic!("unexpected {policy:?} with {operator:?}"),
+                }
+            }
+        }
+    }
+
     #[test]
     fn the_shared_reader_holds_the_gateway_limits_and_member_lists() {
         assert_eq!(POLICY_TOP_LEVEL_MEMBERS, KNOWN_TOP_LEVEL_KEYS);

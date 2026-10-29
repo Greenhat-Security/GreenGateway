@@ -44,11 +44,18 @@
 //! it, and a bundle a caller submitted is read exactly as a directory would
 //! be.
 //!
+//! Two modules build on the reader: [`init`] generates the bundle `ggctl
+//! init` writes, and [`convert`] converts a bundle between document versions
+//! for `ggctl convert`. Both hand their output to this reader before anything
+//! treats it as a bundle.
+//!
 //! Nothing selects a bundle for startup yet: bundle mode and the field
 //! catalog that fills the deployment document are later #242 slices.
 
+pub mod convert;
 mod diagnostic;
 mod document;
+pub mod init;
 mod json;
 mod profile;
 mod resource;

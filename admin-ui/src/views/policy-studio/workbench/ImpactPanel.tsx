@@ -334,10 +334,11 @@ export function ImpactPanel({
       <div className="error-panel alert info" role="note">
         <h3>What a replay can and cannot show</h3>
         <p>
-          A replay counts the candidate’s decisions for retained records. It does not yet
-          compare them with what the gateway recorded or with the live policy, so it shows
-          neither newly allowed nor newly denied traffic. Retained records cover only what
-          the audit log kept, and no replay result says a policy is safe.
+          A replay counts the candidate’s decisions for retained records. This view does not
+          yet show the job’s comparison with what the gateway recorded or with the live
+          policy, so it shows neither newly allowed nor newly denied traffic. Retained
+          records cover only what the audit log kept, and no replay result says a policy is
+          safe.
         </p>
       </div>
 
