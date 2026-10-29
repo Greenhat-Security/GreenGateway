@@ -1231,7 +1231,11 @@ mod tests {
         }))
         .expect("attested MCP Connection should deserialize");
         let record = control_plane
-            .create_managed(snapshot.collection_etag(), candidate, "test-admin")
+            .create_managed(
+                snapshot.collection_etag(),
+                candidate,
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("attested MCP Connection should create");
         let egress_client = Arc::new(
@@ -1320,7 +1324,11 @@ mod tests {
         }))
         .expect("managed MCP Connection should deserialize");
         let record = control_plane
-            .create_managed(snapshot.collection_etag(), candidate, "test-admin")
+            .create_managed(
+                snapshot.collection_etag(),
+                candidate,
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("managed MCP Connection should create");
         let egress_client = Arc::new(
@@ -1377,7 +1385,12 @@ mod tests {
         let mut renamed = record.write.clone();
         renamed.display_name = "Managed MCP renamed".to_owned();
         let renamed = control_plane
-            .replace_managed(&record.id, &record.etag(), renamed, "test-admin")
+            .replace_managed(
+                &record.id,
+                &record.etag(),
+                renamed,
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("presentation-only Connection update should succeed");
         let expected_catalog_etag = service
@@ -1580,7 +1593,11 @@ mod tests {
         }))
         .expect("managed MCP Connection should deserialize");
         let record = control_plane
-            .create_managed(snapshot.collection_etag(), candidate, "test-admin")
+            .create_managed(
+                snapshot.collection_etag(),
+                candidate,
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("managed MCP Connection should create");
         let egress_client = Arc::new(
@@ -1610,7 +1627,12 @@ mod tests {
         let mut disabled_write = record.write.clone();
         disabled_write.enabled = false;
         let disabled = control_plane
-            .replace_managed(&record.id, &record.etag(), disabled_write, "test-admin")
+            .replace_managed(
+                &record.id,
+                &record.etag(),
+                disabled_write,
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("published Connection should be disableable");
         service.reconcile_connection(&disabled);
@@ -1750,7 +1772,11 @@ mod tests {
         .expect("managed MCP resource Connection should deserialize");
         let snapshot = control_plane.runtime_snapshot();
         let record = control_plane
-            .create_managed(snapshot.collection_etag(), candidate, "test-admin")
+            .create_managed(
+                snapshot.collection_etag(),
+                candidate,
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("managed MCP resource Connection should create");
         let egress_client = Arc::new(
@@ -1998,7 +2024,7 @@ mod tests {
             .create_managed(
                 control_plane.runtime_snapshot().collection_etag(),
                 candidate,
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("issue 371 Connection should create");

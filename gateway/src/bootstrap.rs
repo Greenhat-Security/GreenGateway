@@ -866,14 +866,35 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => None,
     };
+    // The authority-event journal (issue #425, PR 3) rides the same pool.
+    // Its capacity is one row the whole deployment reserves against, so it
+    // is not written here: a replica applies AUTHORITY_EVENT_JOURNAL_CAPACITY
+    // only when the membership below admits it (an admission write), and a
+    // replica held at the fingerprint door never does, so a stale or
+    // misconfigured replica booting mid-rollout cannot rewrite the capacity
+    // the serving replicas enforce. A capacity that cannot be applied on
+    // admission refuses startup: every authority mutation reserves it.
+    #[cfg(feature = "postgres")]
+    let pg_authority_events_store = _database_foundation.as_ref().map(|foundation| {
+        Arc::new(
+            storage::postgres_authority_events::PostgresAuthorityEventStore::new(
+                foundation.pool().clone(),
+            ),
+        )
+    });
     // Cluster membership (issue #241, PR 13): register this boot in the
     // roster and run the first fingerprint-agreement check before the app
     // is built. A disagreement is logged and leaves the replica unready
     // (`/readyz` answers `config_fingerprint_mismatch`) until the members
-    // agree; only a row that cannot be written aborts startup.
+    // agree; only a row, or an admission write, that cannot be written
+    // aborts startup.
     #[cfg(feature = "postgres")]
-    let pg_membership_seed = match (&_database_foundation, &_ha_foundation) {
-        (Some(foundation), Some(ha_foundation)) => {
+    let pg_membership_seed = match (
+        &_database_foundation,
+        &_ha_foundation,
+        &pg_authority_events_store,
+    ) {
+        (Some(foundation), Some(ha_foundation), Some(journal)) => {
             let deployment_id = config.deployment_id.clone().ok_or_else(|| {
                 Box::<dyn std::error::Error>::from(
                     "STATE_BACKEND=postgres requires DEPLOYMENT_ID for the membership roster",
@@ -891,11 +912,15 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 fingerprint: ha_foundation.fingerprint().hex(),
                 capabilities: storage::compatibility::BINARY_CAPABILITIES.to_vec(),
             };
-            let membership = cluster_membership::ClusterMembership::new(
+            let membership = cluster_membership::ClusterMembership::with_journal_capacity(
                 store,
                 registration,
                 config.cluster_heartbeat_interval(),
                 config.cluster_member_stale_window(),
+                cluster_membership::JournalCapacity {
+                    store: Arc::clone(journal),
+                    capacity: config.authority_events.journal_capacity,
+                },
             );
             membership.register_boot().await.map_err(|error| {
                 Box::new(ClusterMembershipStartupError(error)) as Box<dyn std::error::Error>
@@ -941,33 +966,6 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
             })
         }
         _ => None,
-    };
-    // The authority-event journal (issue #425, PR 3) rides the same pool.
-    // Every replica applies the configured capacity before serving; the
-    // value is fingerprinted, so agreeing replicas write the same number.
-    // A journal that cannot be configured refuses startup: every authority
-    // mutation reserves capacity in it.
-    #[cfg(feature = "postgres")]
-    let pg_authority_events_store = match &_database_foundation {
-        Some(foundation) => {
-            let store = Arc::new(
-                storage::postgres_authority_events::PostgresAuthorityEventStore::new(
-                    foundation.pool().clone(),
-                ),
-            );
-            // Boxed, as is the delivery startup below: `run()`'s future is
-            // held on the main thread's stack, which a debug build on
-            // Windows (1 MiB) has no room left on for inline sub-futures.
-            Box::pin(store.configure_capacity(config.authority_events.journal_capacity))
-                .await
-                .map_err(|error| {
-                    Box::<dyn std::error::Error>::from(format!(
-                        "the authority event journal could not be configured: {error}"
-                    ))
-                })?;
-            Some(store)
-        }
-        None => None,
     };
     // Seeds every counter a single-event alert reads at zero (the
     // cluster-only ones in cluster mode), so the first event moves 0 -> 1.
@@ -1062,7 +1060,11 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Delivery needs the keyring, and the keyring may sit behind a network
     // secret provider the builder only just activated, so it is resolved
     // here, after the build and before any listener binds. Any failure
-    // refuses startup.
+    // refuses startup. This runs on a replica held at the fingerprint door
+    // too, but the dispatcher it spawns contends for the lease only once
+    // the membership gate admits this replica. Boxed: `run()`'s future is
+    // held on the main thread's stack, which a debug build on Windows
+    // (1 MiB) has no room left on for inline sub-futures.
     #[cfg(feature = "postgres")]
     if let Some(startup) = app.authority_events {
         Box::pin(startup.start(&lifecycle, &audit_log))
@@ -2469,6 +2471,8 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
 /// What `run()` needs to start authority-event delivery, when this is a
 /// cluster replica with a sink configured. Kept out of the app builder, whose
 /// unoptimized stack frame already sits close to the main thread's limit.
+/// The membership's readiness gate goes with it: the dispatcher leads only
+/// while the gate admits this replica, and a cluster replica always has one.
 #[cfg(feature = "postgres")]
 #[inline(never)]
 fn authority_event_startup(
@@ -2481,6 +2485,7 @@ fn authority_event_startup(
     }
     let store = build_overrides.pg_authority_events.as_ref()?;
     let seed = build_overrides.pg_limits.as_ref()?;
+    let membership = build_overrides.pg_membership.as_ref()?;
     Some(authority_events::startup::AuthorityEventStartup {
         store: Arc::clone(store),
         resolver: connection_control_plane.secret_resolver_handle(),
@@ -2492,6 +2497,7 @@ fn authority_event_startup(
             authority_events::dispatcher::DISPATCHER_LEASE_TTL,
         )) as Arc<dyn tools::lease::ExecutionLeaseStore>,
         holder: seed.instance_id,
+        readiness: membership.readiness(),
     })
 }
 

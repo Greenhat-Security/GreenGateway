@@ -2835,7 +2835,11 @@ mod tests {
                 })
                 .collect();
             let created = control_plane
-                .create_managed(initial.collection_etag(), write, "test-admin")
+                .create_managed(
+                    initial.collection_etag(),
+                    write,
+                    &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+                )
                 .await
                 .expect("connection should create");
             let egress_config = EgressConfig {
@@ -2999,7 +3003,11 @@ mod tests {
                 ConnectionControlPlane::from_config(&config).expect("control plane should build");
             let initial = control_plane.runtime_snapshot();
             let created = control_plane
-                .create_managed(initial.collection_etag(), write, "test-admin")
+                .create_managed(
+                    initial.collection_etag(),
+                    write,
+                    &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+                )
                 .await
                 .expect("managed connection should create");
             let egress_config = EgressConfig {
@@ -3118,7 +3126,11 @@ mod tests {
                 client_auth_method: OAuthClientAuthMethod::ClientSecretBasic,
             };
             let created = control_plane
-                .create_managed(initial.collection_etag(), write, "test-admin")
+                .create_managed(
+                    initial.collection_etag(),
+                    write,
+                    &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+                )
                 .await
                 .expect("OAuth connection should create");
 
@@ -3569,7 +3581,12 @@ mod tests {
         temporary
             .runtime
             .control_plane
-            .replace_managed(&stored.id, &stored.etag(), without_assertion, "test-admin")
+            .replace_managed(
+                &stored.id,
+                &stored.etag(),
+                without_assertion,
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("the Connection without an assertion should save");
         assert!(temporary.runtime.target(connection_id, "/charges").is_ok());
@@ -3819,7 +3836,12 @@ mod tests {
         temporary
             .runtime
             .control_plane
-            .replace_managed(&stored.id, &stored.etag(), plain, "test-admin")
+            .replace_managed(
+                &stored.id,
+                &stored.etag(),
+                plain,
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("the Connection without an assertion should save");
         let unattested = temporary
@@ -4092,7 +4114,12 @@ mod tests {
         let disabled = temporary
             .runtime
             .control_plane
-            .replace_managed(&stored.id, &stored.etag(), disabled, "test-admin")
+            .replace_managed(
+                &stored.id,
+                &stored.etag(),
+                disabled,
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("the Connection disables");
         let disabled_etag = disabled.etag().to_string();
@@ -4502,7 +4529,12 @@ mod tests {
         let record = temporary
             .runtime
             .control_plane
-            .replace_managed(&original.id, &stale_etag, replacement, "test-admin")
+            .replace_managed(
+                &original.id,
+                &stale_etag,
+                replacement,
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("current connection should gain a valid persisted test profile");
         assert_ne!(record.etag(), stale_etag);
@@ -4665,7 +4697,12 @@ mod tests {
         let record = temporary
             .runtime
             .control_plane
-            .replace_managed(&original.id, &original.etag(), replacement, "test-admin")
+            .replace_managed(
+                &original.id,
+                &original.etag(),
+                replacement,
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("OAuth test profile should replace");
         let expected_etag = record.etag().to_string();
@@ -4812,7 +4849,12 @@ mod tests {
         let record = temporary
             .runtime
             .control_plane
-            .replace_managed(&original.id, &original.etag(), replacement, "test-admin")
+            .replace_managed(
+                &original.id,
+                &original.etag(),
+                replacement,
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("OAuth test profile should replace");
         let expected_etag = record.etag().to_string();
@@ -5304,7 +5346,12 @@ mod tests {
         let replaced = mixed
             .runtime
             .control_plane
-            .replace_managed(&current.id, &current.etag(), replacement, "test-admin")
+            .replace_managed(
+                &current.id,
+                &current.etag(),
+                replacement,
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("mixed OAuth Connection should replace");
         let target = mixed
