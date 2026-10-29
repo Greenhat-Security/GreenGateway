@@ -23,8 +23,8 @@ use crate::{
     auth::{
         actor_from_principal,
         admin_session::{self, SessionRefusal},
-        protected_resource, AuthError, Principal, PrincipalDirectory, SessionCredential,
-        SessionValidator, VerifiedClientIdentity,
+        protected_resource, AuthError, CredentialJudge, Principal, PrincipalDirectory,
+        Reauthentication, SessionCredential, SessionValidator, VerifiedClientIdentity,
     },
     client_ip::{canonical_client_ip, request_id, ClientIpPolicy},
     config::{AuthMode, Config},
@@ -216,10 +216,10 @@ pub async fn auth_middleware(
     };
 
     let is_admin_session = admin_session.is_some();
-    let validation = if let Some((sessions, value)) = admin_session {
+    let (validation, judge) = if let Some((sessions, value)) = admin_session {
         // A gateway-issued session is judged only by its own store and the
         // login provider, never by the global chain.
-        match sessions
+        let validation = match sessions
             .authenticate(&value, req.method(), req.headers())
             .await
         {
@@ -237,7 +237,8 @@ pub async fn auth_middleware(
                     .await
                     .unwrap_or(csrf_refused);
             }
-        }
+        };
+        (validation, CredentialJudge::AdminSession(sessions))
     } else {
         let Some(validator) = state.validator.as_ref().map(Arc::clone) else {
             return auth_failure_response(
@@ -288,9 +289,10 @@ pub async fn auth_middleware(
             _ => {}
         }
 
-        validator
+        let validation = validator
             .validate_session_for_resource(&credential, resource.as_deref())
-            .await
+            .await;
+        (validation, CredentialJudge::Validator(validator))
     };
 
     match validation {
@@ -312,6 +314,11 @@ pub async fn auth_middleware(
                 }
             }
             req.extensions_mut().insert(principal.clone());
+            // A response that outlives this request (the audit event
+            // stream) re-judges the same credential by the same authority
+            // instead of trusting this answer for as long as it stays open.
+            req.extensions_mut()
+                .insert(Reauthentication::new(judge, credential, resource));
             state.principal_directory.observe(&principal);
             let mut response = next.run(req).await;
             response.extensions_mut().insert(AuthOutcome {
