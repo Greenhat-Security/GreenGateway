@@ -11775,9 +11775,9 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::migrations::apply_manifest#1",
-      "sha256": "33c5f207bc610f39e80251b5080eb978a4da8803381d1c0d9aa7800ba1229593",
+      "sha256": "48d4e73cb3e6e8cbd0775ca0561d95e7679f26a33a31d227e992376385bcf36c",
       "owner": "GreenGateway maintainers",
-      "purpose": "The migrator checks one connection out of the existing PostgreSQL foundation pool, detaches it under the schema advisory lock and applies the manifest's missing migrations over it; no new connection construction or transport authority."
+      "purpose": "The migrator checks one connection out of the existing PostgreSQL foundation pool, detaches it before anything runs on it, takes the schema advisory lock on it and applies the manifest's missing migrations over it; no new connection construction or transport authority."
     },
     {
       "file": "gateway/src/storage/migrations.rs",
