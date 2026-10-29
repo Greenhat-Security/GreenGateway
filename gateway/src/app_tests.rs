@@ -7,6 +7,8 @@ mod admin_policy_drafts_tests;
 mod admin_session_app_tests;
 #[path = "audit_durability_app_tests.rs"]
 mod audit_durability_app_tests;
+#[path = "audit_stream_app_tests.rs"]
+mod audit_stream_app_tests;
 use crate::auth::TokenStore;
 use axum::{body::Body, http::StatusCode};
 use futures_util::StreamExt;
@@ -10069,9 +10071,9 @@ async fn audit_events_stream_non_admin_principal_returns_forbidden() {
     let (router, _, _policy) = audit_events_router();
 
     let response = router
-        .oneshot(audit_query_request(
+        .oneshot(audit_stream_request(
             AUDIT_EVENTS_STREAM_ROUTE,
-            Some(test_principal(&["reader"])),
+            test_principal(&["reader"]),
         ))
         .await
         .expect("request should complete");
@@ -22814,9 +22816,9 @@ async fn status_uptime_increases_between_requests() {
 async fn audit_events_stream_admin_principal_receives_emitted_event() {
     let (router, audit_log, _policy) = audit_events_router();
     let response = router
-        .oneshot(audit_query_request(
+        .oneshot(audit_stream_request(
             AUDIT_EVENTS_STREAM_ROUTE,
-            Some(test_principal(&["audit-streamer"])),
+            test_principal(&["audit-streamer"]),
         ))
         .await
         .expect("request should complete");
@@ -22838,9 +22840,9 @@ async fn audit_events_stream_admin_principal_receives_emitted_event() {
 async fn audit_events_stream_filters_by_event_type_and_path() {
     let (router, audit_log, _policy) = audit_events_router();
     let response = router
-        .oneshot(audit_query_request(
+        .oneshot(audit_stream_request(
             &format!("{AUDIT_EVENTS_STREAM_ROUTE}?event_type=audit.sse.match&path=/match"),
-            Some(test_principal(&["audit-streamer"])),
+            test_principal(&["audit-streamer"]),
         ))
         .await
         .expect("request should complete");
@@ -22868,9 +22870,9 @@ async fn audit_events_stream_delivers_request_event_within_latency_budget() {
     let (router, _, _policy) = audit_events_router();
     let response = router
         .clone()
-        .oneshot(audit_query_request(
+        .oneshot(audit_stream_request(
             &format!("{AUDIT_EVENTS_STREAM_ROUTE}?event_type=http.request_observed&path=/health"),
-            Some(test_principal(&["audit-streamer"])),
+            test_principal(&["audit-streamer"]),
         ))
         .await
         .expect("request should complete");
@@ -22939,9 +22941,9 @@ async fn audit_events_stream_delivers_signal_opened_events_from_discovery() {
 
     let stream_response = router
         .clone()
-        .oneshot(audit_query_request(
+        .oneshot(audit_stream_request(
             &format!("{AUDIT_EVENTS_STREAM_ROUTE}?event_type=signal.opened"),
-            Some(test_principal(&["audit-streamer"])),
+            test_principal(&["audit-streamer"]),
         ))
         .await
         .expect("stream request should complete");
@@ -23020,9 +23022,9 @@ async fn audit_events_stream_delivers_signal_lifecycle_transitions() {
 
     let stream_response = router
         .clone()
-        .oneshot(audit_query_request(
+        .oneshot(audit_stream_request(
             &format!("{AUDIT_EVENTS_STREAM_ROUTE}?event_type=signal.lifecycle_changed"),
-            Some(test_principal(&["admin"])),
+            test_principal(&["admin"]),
         ))
         .await
         .expect("stream request should complete");
@@ -23086,11 +23088,11 @@ async fn shadow_would_deny_events_are_queryable_and_streamable() {
     let request_id = "request-shadow-would-deny";
     let stream_response = router
         .clone()
-        .oneshot(audit_query_request(
+        .oneshot(audit_stream_request(
             &format!(
                 "{AUDIT_EVENTS_STREAM_ROUTE}?event_type=authz.would_deny&path=/__test/principal"
             ),
-            Some(test_principal(&["admin"])),
+            test_principal(&["admin"]),
         ))
         .await
         .expect("stream request should complete");
@@ -23366,6 +23368,13 @@ mod durable_sse_tests {
     }
 
     fn durable_stream_router(store: PostgresAuditEventStore) -> (Router, audit::AuditEventSender) {
+        durable_stream_router_with(store, AuditStreamLimits::SERVED)
+    }
+
+    fn durable_stream_router_with(
+        store: PostgresAuditEventStore,
+        stream_limits: AuditStreamLimits,
+    ) -> (Router, audit::AuditEventSender) {
         let policy = middleware::rbac::RbacState::new(
             parse_policy_body(&Bytes::from(
                 r#"{
@@ -23389,6 +23398,7 @@ mod durable_sse_tests {
                 query_store: None,
                 event_sender: event_sender.clone(),
                 rbac_state: Some(policy),
+                stream_limits,
                 pg_audit: Some(std::sync::Arc::new(store)),
             });
         (router, event_sender)
@@ -23418,6 +23428,9 @@ mod durable_sse_tests {
             .body(Body::empty())
             .expect("stream request should build");
         if let Some(principal) = principal {
+            request
+                .extensions_mut()
+                .insert(accepted_reauthentication(principal.clone()));
             request.extensions_mut().insert(principal);
         }
         request
@@ -23659,6 +23672,102 @@ mod durable_sse_tests {
             .await
             .expect("invalid request should complete");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// An authority that accepts the stream's credential until it is told
+    /// the session has ended.
+    struct EndingAuthority {
+        principal: auth::Principal,
+        ended: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl auth::SessionValidator for EndingAuthority {
+        async fn validate_session(
+            &self,
+            _credential: &auth::SessionCredential,
+        ) -> Result<auth::Principal, auth::AuthError> {
+            if self.ended.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(auth::AuthError::InvalidSession("logged out".to_owned()));
+            }
+            Ok(self.principal.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_sse_ends_on_a_lost_session_without_moving_the_resume_cursor() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let store = migrated_store(&database.dsn).await;
+        store
+            .insert_events(&[sse_event("audit.sse.before", "/before")])
+            .await
+            .expect("seed event should commit");
+        let (router, _sender) = durable_stream_router_with(
+            store,
+            AuditStreamLimits {
+                recheck_interval: Duration::from_millis(50),
+                max_lifetime: Duration::from_secs(60),
+            },
+        );
+        let principal = streamer_principal("streamer");
+        let authority = Arc::new(EndingAuthority {
+            principal: principal.clone(),
+            ended: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mut request = stream_request(Some("0"), None);
+        request.extensions_mut().insert(principal);
+        request.extensions_mut().insert(auth::Reauthentication::new(
+            auth::CredentialJudge::Validator(
+                Arc::clone(&authority) as Arc<dyn auth::SessionValidator>
+            ),
+            auth::SessionCredential::Bearer(format!("test-{}", uuid::Uuid::new_v4())),
+            None,
+        ));
+
+        let response = router
+            .oneshot(request)
+            .await
+            .expect("replay request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        let mut received = String::new();
+        while !received.contains("id: 1") {
+            let chunk = tokio::time::timeout(Duration::from_secs(5), body.next())
+                .await
+                .expect("the seeded event should be replayed")
+                .expect("stream should not end before the seeded event")
+                .expect("stream chunk should read");
+            received.push_str(std::str::from_utf8(&chunk).expect("UTF-8"));
+        }
+        authority
+            .ended
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(chunk) = body.next().await {
+                let chunk = chunk.expect("stream chunk should read");
+                received.push_str(std::str::from_utf8(&chunk).expect("UTF-8"));
+            }
+        })
+        .await
+        .expect("the gateway should end the stream");
+
+        let last = received
+            .rsplit("\n\n")
+            .find(|frame| !frame.trim().is_empty())
+            .expect("the stream sent frames");
+        assert!(
+            last.contains("event: stream.closed")
+                && last.contains(r#"data: {"reason":"session_ended"}"#),
+            "the stream must end with its closing frame: {received}"
+        );
+        // A client that reconnects resumes after the last event it was sent,
+        // not after the closing frame.
+        assert!(!last.contains("id:"), "{received}");
+        assert_eq!(received.matches("id: ").count(), 1, "{received}");
     }
 
     #[tokio::test]
@@ -29931,6 +30040,38 @@ fn audit_query_request(uri: &str, principal: Option<auth::Principal>) -> Request
     }
 
     request
+}
+
+/// A stream request as the authentication middleware passes it on: the
+/// principal, and beside it the credential the stream re-checks for as long
+/// as it stays open -- here one whose authority keeps accepting it.
+fn audit_stream_request(uri: &str, principal: auth::Principal) -> Request<Body> {
+    let mut request = audit_query_request(uri, Some(principal.clone()));
+    request
+        .extensions_mut()
+        .insert(accepted_reauthentication(principal));
+    request
+}
+
+/// An authority that accepts every credential as `principal`.
+struct AcceptingAuthority(auth::Principal);
+
+#[async_trait::async_trait]
+impl auth::SessionValidator for AcceptingAuthority {
+    async fn validate_session(
+        &self,
+        _credential: &auth::SessionCredential,
+    ) -> Result<auth::Principal, auth::AuthError> {
+        Ok(self.0.clone())
+    }
+}
+
+fn accepted_reauthentication(principal: auth::Principal) -> auth::Reauthentication {
+    auth::Reauthentication::new(
+        auth::CredentialJudge::Validator(Arc::new(AcceptingAuthority(principal))),
+        auth::SessionCredential::Bearer(format!("test-{}", uuid::Uuid::new_v4())),
+        None,
+    )
 }
 
 fn policy_admin_config_with_sqlite(

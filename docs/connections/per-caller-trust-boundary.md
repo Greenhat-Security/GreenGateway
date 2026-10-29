@@ -538,7 +538,8 @@ and exchanges it at Google's token endpoint with the JWT bearer grant
   is refused with `google_delegation_issuer_not_trusted`, a caller with no
   single plain email address with `google_delegation_no_email`, and a call
   with no principal, a service token included, with
-  `delegated_token_no_principal`, all before anything is read or sent.
+  `delegated_token_no_principal`, all before anything is read or sent, the
+  upstream's egress preflight and DNS lookup included.
 - **No key at rest, fixed endpoints.** The account must be a dedicated
   `{name}@{project}.iam.gserviceaccount.com` account, and the only
   caller-independent value that reaches a URL. `iamcredentials.googleapis.com`
@@ -548,8 +549,12 @@ and exchanges it at Google's token endpoint with the JWT bearer grant
 - **The assertion says only what was asked.** `iss` is the account, `sub` the
   caller's email, `scope` the Connection's sorted scopes, `aud` the token
   endpoint, and `exp` 300 seconds after `iat`. A signed assertion whose claims
-  differ from those sent is refused and never exchanged. A `401` or `403` from
-  `signJwt` earns exactly one retry, with a fresh federated token.
+  differ from those sent is refused and never exchanged. A `401` from
+  `signJwt` earns exactly one retry, with a fresh federated token; a `403`,
+  IAM refusing the profile's identity, is final, so a missing Token Creator
+  grant never makes every call replace the profile's identity and retire its
+  cached Secret Manager values. A profile replaces a refused token at most
+  once every 30 seconds.
 - **Manual HTTP tool calls and stored tests only**, on `http_api` Connections
   without a `caller_assertion`. A stored test runs as the principal who asks
   for it, with a token minted for that one request and cached nowhere, as for

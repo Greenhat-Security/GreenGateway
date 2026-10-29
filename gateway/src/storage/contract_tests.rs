@@ -3350,8 +3350,16 @@ pub(crate) mod postgres_audit_tests {
     }
 
     async fn migrated_limits_pool(database: &TestDatabase) -> deadpool_postgres::Pool {
+        migrated_limits_pool_sized(database, crate::config::DEFAULT_DATABASE_POOL_MAX).await
+    }
+
+    async fn migrated_limits_pool_sized(
+        database: &TestDatabase,
+        pool_max: usize,
+    ) -> deadpool_postgres::Pool {
         let test_dsn_file = write_dsn_file(&database.dsn);
         let mut config = crate::config::Config::test_defaults();
+        config.database.pool_max = pool_max;
         config.state_backend = crate::config::StateBackend::Postgres;
         config.deployment_id = Some("deploy-limits-contract".to_owned());
         config.database.url_file = Some(test_dsn_file.path.clone());
@@ -3547,6 +3555,128 @@ pub(crate) mod postgres_audit_tests {
             decide(&replica_a, SharedLane::Read, caller, limit).await,
             SharedDecision::Denied,
             "and only two: the third is denied"
+        );
+        assert_eq!(replica_a.live_buckets().await.expect("count"), 1);
+    }
+
+    /// A burst for one bucket parks one pooled connection per replica on the
+    /// bucket's row, not the pool.
+    ///
+    /// The row lock serializes a bucket's decisions, so a decision queued
+    /// behind another can do nothing on its connection until that one
+    /// commits. Here a session outside the serving pool holds the row and
+    /// two replicas' stores, sharing a pool of four, each send a burst for
+    /// the same caller. One decision per replica may wait on the row, and
+    /// the rest of the pool must stay free for the work that shares it: the
+    /// revision gate's read, which has 250 ms for its checkout and statement
+    /// together, is the first to be refused when it is not (issue #420's
+    /// `ha_smoke` declines). Without the per-bucket line all four
+    /// connections park on the row and the checkout below waits out the
+    /// pool's acquire timeout.
+    #[tokio::test]
+    async fn a_burst_for_one_bucket_parks_one_connection_per_replica_on_its_row() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool_sized(&database, 4).await;
+        // The row holder and the lock probe, outside the serving pool.
+        let outside = migrated_limits_pool_sized(&database, 2).await;
+        let replica_a =
+            PostgresRateLimitStore::new(pool.clone(), "deploy-limits", limits_keyring(), 1_000);
+        let replica_b =
+            PostgresRateLimitStore::new(pool.clone(), "deploy-limits", limits_keyring(), 1_000);
+        // Lifted, as the smoke suite lifts it: every decision is an allow,
+        // and every one still takes the row.
+        let limit = SharedLimit {
+            requests_per_second: 1.0e6,
+            burst: 1_000_000,
+        };
+        let caller = "ip:203.0.113.7";
+        assert_eq!(
+            decide(&replica_a, SharedLane::Read, caller, limit).await,
+            SharedDecision::Allowed,
+            "the first decision creates the bucket row"
+        );
+
+        let holder = outside.get().await.expect("holder");
+        holder
+            .batch_execute(
+                "BEGIN; SELECT 1 FROM greengateway.rate_limit_buckets \
+                 WHERE deployment_id = 'deploy-limits' FOR UPDATE",
+            )
+            .await
+            .expect("hold the bucket row");
+        let burst: Vec<_> = [&replica_a, &replica_b]
+            .into_iter()
+            .flat_map(|replica| (0..4).map(move |_| replica.clone()))
+            .map(|replica| {
+                tokio::spawn(async move { replica.decide(SharedLane::Read, caller, limit).await })
+            })
+            .collect();
+
+        let probe = outside.get().await.expect("probe");
+        let waiting_on_locks = || async {
+            probe
+                .query_one(
+                    "SELECT count(*) FROM pg_stat_activity \
+                     WHERE datname = current_database() AND wait_event_type = 'Lock'",
+                    &[],
+                )
+                .await
+                .expect("lock probe")
+                .get::<_, i64>(0)
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while waiting_on_locks().await < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "each replica's first decision should reach the held row"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Long enough for the rest of the burst to have reached the row too
+        // if anything were sending it there.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            waiting_on_locks().await,
+            2,
+            "one decision per replica waits on the bucket's row; the others wait in their \
+             replica's line, holding no connection"
+        );
+        let free = tokio::time::timeout(Duration::from_secs(2), pool.get())
+            .await
+            .expect("the serving pool still has a connection for other work")
+            .expect("checkout");
+        free.query_one("SELECT 1", &[])
+            .await
+            .expect("and it is usable");
+        drop(free);
+
+        holder
+            .batch_execute("ROLLBACK")
+            .await
+            .expect("release the bucket row");
+        for decision in burst {
+            assert_eq!(
+                decision
+                    .await
+                    .expect("the decision task completes")
+                    .expect("the shared limiter decides"),
+                SharedDecision::Allowed
+            );
+        }
+        assert_eq!(
+            replica_a.buckets_in_flight(),
+            0,
+            "no line outlives its burst"
+        );
+        assert_eq!(
+            replica_b.buckets_in_flight(),
+            0,
+            "no line outlives its burst"
         );
         assert_eq!(replica_a.live_buckets().await.expect("count"), 1);
     }

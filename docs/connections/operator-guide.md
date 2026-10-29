@@ -1700,8 +1700,14 @@ On a cache miss, for one caller, the gateway:
 2. Builds the claim set below and asks Google to sign it as the service
    account:
    `POST https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/{service_account_email}:signJwt`,
-   with the profile's federated access token as the bearer. A `401` or `403`
-   earns exactly one retry, with a fresh federated token.
+   with the profile's federated access token as the bearer. A `401`, a
+   federated token Google no longer accepts, earns exactly one retry, with a
+   fresh federated token. A `403`, the profile's identity lacking Token
+   Creator on the account, is final: a new token would not change IAM's
+   answer, and replacing the profile's identity on every call would empty
+   the profile's cached Secret Manager values each time. A profile replaces a
+   refused token at most once every 30 seconds; within that interval a `401`
+   is final too.
 3. Refuses a signed assertion whose claims are not exactly those it sent, so a
    signer that answered for another user is never exchanged.
 4. Exchanges it at `https://oauth2.googleapis.com/token` with
@@ -1747,7 +1753,9 @@ leaves the stored catalog stale for the new revision: refresh it, or register
 it again.
 
 Only a caller the Connection can name is served. Before anything is read or
-sent, a call with no principal, a service token included, is refused with
+sent, on a tool call and on a stored test alike -- ahead of the egress
+preflight of the upstream, any DNS lookup and any secret or TLS material --
+a call with no principal, a service token included, is refused with
 `delegated_token_no_principal`; a caller whose attested issuer is not in
 `subject_issuers`, with `google_delegation_issuer_not_trusted`; and a caller
 without a single plain email address, with `google_delegation_no_email`.
