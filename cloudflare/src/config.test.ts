@@ -91,6 +91,16 @@ describe("buildGreenGatewayContainerEnv", () => {
     });
   });
 
+  it("forwards the authority evidence durability mode", () => {
+    const env = buildGreenGatewayContainerEnv({
+      AUTHORITY_EVIDENCE_DURABILITY: "required",
+    });
+
+    expect(env).toMatchObject({
+      AUTHORITY_EVIDENCE_DURABILITY: "required",
+    });
+  });
+
   it("forwards bounded login, session, discovery, and NAT64 settings", () => {
     const env = buildGreenGatewayContainerEnv({
       ADMIN_LOGIN_PENDING_TTL_SECS: "600",

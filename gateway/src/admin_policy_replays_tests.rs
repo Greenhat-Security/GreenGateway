@@ -784,6 +784,7 @@ fn replay_admin_state(
         membership: None,
         event_store: Some(store.clone() as Arc<dyn storage::AuditEventStore>),
         query_store: Some(store),
+        authority_evidence: authority_events::required::AuthorityEvidenceGate::best_effort(),
         audit: audit_log,
         client_ip_policy: client_ip::ClientIpPolicy::default(),
         max_body_size: 1024 * 1024,

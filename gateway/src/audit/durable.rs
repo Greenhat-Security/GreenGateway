@@ -76,8 +76,8 @@ pub enum AuditUnavailable {
 }
 
 /// The whole vocabulary of `greengateway_audit_durability_refusals_total`'s
-/// `reason` label, for the registry label audit.
-#[cfg_attr(not(test), allow(dead_code))]
+/// `reason` label: every value the recorder seeds at `0` on install, and
+/// the registry label audit's allowlist.
 pub const AUDIT_DURABILITY_REFUSAL_REASONS: [&str; 3] = [
     AuditUnavailable::Admission.as_str(),
     AuditUnavailable::Store.as_str(),

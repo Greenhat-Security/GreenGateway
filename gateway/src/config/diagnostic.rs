@@ -178,6 +178,13 @@ pub(crate) enum ConfigRule {
     /// `AUTHORITY_PSEUDONYM_KEY_ALIAS` and
     /// `AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS` name the same alias.
     AuthorityPseudonymKeysDistinct,
+    /// `AUTHORITY_EVIDENCE_DURABILITY=required` in cluster mode without an
+    /// `AUTHORITY_EVENT_SINK` to deliver the journaled evidence.
+    AuthorityEvidenceDeliveryRequired,
+    /// `AUTHORITY_EVIDENCE_DURABILITY=required` with a setting that enables
+    /// an authority change the evidence inventory marks unsupported in this
+    /// deployment mode, such as `ADMIN_SESSION_MODE=standalone_memory`.
+    AuthorityEvidenceUnsupportedConfiguration,
 }
 
 /// The problems the compiler's stages found, each with the rule that refused

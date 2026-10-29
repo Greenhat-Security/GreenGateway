@@ -8,7 +8,7 @@
     "write": [25, 25],
     "approved_extensions": [],
     "document_format": [0, 0],
-    "capabilities": ["openapi_discovery_catalogs", "openapi_swagger2_catalogs", "operation_requirements", "policy_role_descriptions"],
+    "capabilities": ["delegated_token_purges", "openapi_discovery_catalogs", "openapi_swagger2_catalogs", "operation_requirements", "policy_role_descriptions"],
     "operations": [
       {
         "operation": "policy.role_descriptions",
@@ -33,6 +33,14 @@
         "document_format": null,
         "backfill": null,
         "activation": "live_members"
+      },
+      {
+        "operation": "connections.delegated_token_purge",
+        "capability": "delegated_token_purges",
+        "minimum_schema": 17,
+        "document_format": null,
+        "backfill": null,
+        "activation": "live_members"
       }
     ]
   },
@@ -52,7 +60,10 @@
       "migration": "catalog_change_evidence_actor_metadata",
       "procedure": "rolling",
       "checksum": "7d7458311798be0ee0346fff70581300a4d29984ba90d51cd3bccbd00a9ee84f",
-      "qualified_pair": null
+      "qualified_pair": {
+        "prepared": "ffa61edfddbd1f2a31be5affe996bc2f0bde344a",
+        "successor": "48eb65329c1d44f2b3a35484d91c933c45c224e4"
+      }
     }
   ],
   "released_cluster_binaries": [],
@@ -195,6 +206,123 @@
               "replicas": [
                 { "replica": "a", "binary": "prepared", "status": 200 },
                 { "replica": "b", "binary": "successor" }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "prepared": "ffa61edfddbd1f2a31be5affe996bc2f0bde344a",
+      "successor": "48eb65329c1d44f2b3a35484d91c933c45c224e4",
+      "schema": 24,
+      "schema_step": {
+        "from": 24,
+        "to": 25,
+        "migration": "catalog_change_evidence_actor_metadata",
+        "checksum": "7d7458311798be0ee0346fff70581300a4d29984ba90d51cd3bccbd00a9ee84f"
+      },
+      "operation": null,
+      "capability": null,
+      "procedure": "rolling",
+      "rollback_cutoff": "none from the step: the prepared release serves the expanded schema, so rolling back to it replaces binaries; a later contraction or fence raise sets the cutoff",
+      "evidence": {
+        "a_prepared_release_and_its_successor_serve_one_deployment": {
+          "schema": {
+            "ledger_versions": 25,
+            "ledger_max_version": 25,
+            "served": { "min": 25, "max": 25 },
+            "served_by": {
+              "prepared": { "min": 24, "max": 25 },
+              "successor": { "min": 25, "max": 25 }
+            },
+            "approved_extensions": [
+              { "version": 25, "checksum": "7d7458311798be0ee0346fff70581300a4d29984ba90d51cd3bccbd00a9ee84f" }
+            ],
+            "expand": {
+              "from": 24,
+              "to": 25,
+              "migration": "catalog_change_evidence_actor_metadata",
+              "checksum": "7d7458311798be0ee0346fff70581300a4d29984ba90d51cd3bccbd00a9ee84f",
+              "applied_by": "successor",
+              "migrate_check": [
+                { "binary": "prepared", "manages": false },
+                { "binary": "successor", "exit": 0, "manages": true }
+              ],
+              "proxied_during_expand": 4
+            },
+            "unapproved_next_version": {
+              "version": 26,
+              "readiness": "schema_incompatible",
+              "migrate_check": [{ "binary": "prepared" }, { "binary": "successor" }]
+            }
+          },
+          "advertisements": {
+            "prepared": ["openapi_discovery_catalogs", "openapi_swagger2_catalogs", "operation_requirements", "policy_role_descriptions"],
+            "successor": ["openapi_discovery_catalogs", "openapi_swagger2_catalogs", "operation_requirements", "policy_role_descriptions"],
+            "prepared_sees_successor_unrecognized": 0
+          },
+          "fingerprints": 1,
+          "conditional_writes": [
+            { "writer": "prepared", "status": 200 },
+            { "writer": "successor", "status": 200 },
+            { "writer": "prepared", "status": 200 },
+            { "writer": "successor", "status": 200 },
+            { "writer": "prepared", "status": 412, "precondition": "stale" },
+            { "writer": "successor", "status": 412, "precondition": "stale" }
+          ],
+          "revocations": [
+            { "revoked_by": "prepared", "refused_by": ["prepared", "successor"] },
+            { "revoked_by": "successor", "refused_by": ["prepared", "successor"] }
+          ],
+          "readiness": [
+            {
+              "step": "prepared",
+              "replicas": [
+                { "replica": "a", "binary": "prepared", "status": 200 },
+                { "replica": "b", "binary": "prepared", "status": 200 }
+              ]
+            },
+            {
+              "step": "expanded",
+              "replicas": [
+                { "replica": "a", "binary": "prepared", "status": 200 },
+                { "replica": "b", "binary": "prepared", "status": 200 }
+              ]
+            },
+            {
+              "step": "mixed",
+              "replicas": [
+                { "replica": "a", "binary": "prepared" },
+                { "replica": "b", "binary": "successor", "status": 200 }
+              ]
+            },
+            {
+              "step": "rolled back",
+              "replicas": [
+                { "replica": "a", "binary": "prepared" },
+                { "replica": "b", "binary": "prepared", "status": 200 }
+              ]
+            },
+            {
+              "step": "rolled forward",
+              "replicas": [
+                { "replica": "a", "binary": "prepared" },
+                { "replica": "b", "binary": "successor", "status": 200 }
+              ]
+            },
+            {
+              "step": "unapproved migration",
+              "replicas": [
+                { "replica": "a", "binary": "prepared", "status": 503, "reason": "schema_incompatible" },
+                { "replica": "b", "binary": "successor", "status": 503, "reason": "schema_incompatible" }
+              ]
+            },
+            {
+              "step": "migration removed",
+              "replicas": [
+                { "replica": "a", "binary": "prepared", "status": 200 },
+                { "replica": "b", "binary": "successor", "status": 200 }
               ]
             }
           ]

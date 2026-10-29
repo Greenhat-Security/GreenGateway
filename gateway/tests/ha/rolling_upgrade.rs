@@ -17,14 +17,14 @@
 //! still can, built from pinned commits rather than tags.
 //! `rolling-upgrade-pair.json` names them: the *prepared* release, which
 //! implements the compatibility protocol, and its *successor*, which adds
-//! one change. The pin says which kind of change. The pair pinned today
-//! serves exactly schema 18 and its successor adds no migration — a role may
-//! carry a `description`, and committing such a document is the registered
-//! operation `policy.role_descriptions`. A pin with a `schema_step` instead
-//! names a prepared release that approved the next migration by its exact
-//! checksum and a successor that applies it, as the release that approved
-//! migration 25 and the release that applies it are, once both are commits
-//! of `main` and the pin names them. `scripts/build_upgrade_pair.py` builds
+//! one change. The pin says which kind of change. A pin without a
+//! `schema_step` names a pair at one schema point whose successor adds a
+//! registered operation and no migration, as the first qualified pair did:
+//! both served exactly schema 18, and its successor let a role carry a
+//! `description`, which is the operation `policy.role_descriptions`. The
+//! pair pinned today has a `schema_step` instead: a prepared release that
+//! approved migration 25 by its exact checksum, and its successor, the merge
+//! that applies it. `scripts/build_upgrade_pair.py` builds
 //! each from its own commit and the release gate passes both to this suite
 //! ([`harness::pair`]), which verifies the commits and hashes before it
 //! runs either.
@@ -73,8 +73,7 @@
 //!    release's replicas serving instead: migration 25
 //!    (`catalog_change_evidence_actor_metadata`), which this binary applies
 //!    and its prepared release serves. The pair rows prove that with both
-//!    binaries once the pin names that pair; the pair pinned today shares
-//!    one schema point.
+//!    binaries: the pair pinned today is that one.
 //! 2. **The static-configuration fingerprint.** PR 13 holds a replica
 //!    unready while any *live* member runs a different fingerprint, and
 //!    agreement is sticky once granted. So an incumbent keeps serving when
