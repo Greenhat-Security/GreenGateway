@@ -41,6 +41,7 @@ import { LiveTail } from './views/LiveTail';
 import { LogExplorer } from './views/LogExplorer';
 import { OpenApiToolsView } from './views/OpenApiToolsView';
 import { PolicyHistoryView } from './views/PolicyHistoryView';
+import { PolicyStudioView } from './views/PolicyStudioView';
 import { PrincipalDetail } from './views/PrincipalDetail';
 import { RuleEditor } from './views/RuleEditor';
 import { RuleTable } from './views/RuleTable';
@@ -183,6 +184,9 @@ export function AdminShell() {
           <NavLink to="/policy/rules/editor" className={navItemClassName}>
             Rule editor
           </NavLink>
+          <NavLink to="/policy/studio" className={navItemClassName}>
+            Policy Studio
+          </NavLink>
           <NavLink to="/live" className={navItemClassName}>
             Live
           </NavLink>
@@ -247,6 +251,7 @@ export function AdminShell() {
           <Route path="/policy/shadow-review" element={<ShadowReviewView />} />
           <Route path="/signals" element={<SignalsView />} />
           <Route path="/policy/rules/editor" element={<RuleEditor />} />
+          <Route path="/policy/studio" element={<PolicyStudioView />} />
           <Route path="/live" element={<LiveTail />} />
           <Route path="/cluster" element={<ClusterView />} />
           <Route path="/status" element={<StatusPage />} />
@@ -329,6 +334,10 @@ function Dashboard({
           <Link to="/policy/rules/editor">
             <span>Rule editor</span>
             <small>Create or edit one policy rule</small>
+          </Link>
+          <Link to="/policy/studio">
+            <span>Policy Studio</span>
+            <small>Edit the whole policy in a validated draft</small>
           </Link>
           <Link to="/live">
             <span>Live tail</span>
@@ -848,6 +857,9 @@ function pageTitleForPath(pathname: string): string {
   }
   if (pathname === '/policy/rules/editor') {
     return 'Rule editor';
+  }
+  if (pathname === '/policy/studio') {
+    return 'Policy Studio';
   }
   if (pathname === '/live') {
     return 'Live tail';

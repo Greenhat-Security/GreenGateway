@@ -1306,6 +1306,90 @@ describe('AdminShell', () => {
   });
 });
 
+describe('Policy Studio route', () => {
+  it('registers the Policy Studio route, title, navigation entries, and dashboard link', async () => {
+    vi.stubGlobal('fetch', policyStudioFetchMock());
+
+    render(
+      <MemoryRouter initialEntries={['/policy/studio']}>
+        <AdminShell />
+      </MemoryRouter>,
+    );
+
+    expect(
+      within(screen.getByRole('navigation', { name: 'Admin sections' })).getByRole(
+        'link',
+        { name: 'Policy Studio' },
+      ),
+    ).toBeTruthy();
+    expect(
+      within(screen.getByRole('navigation', { name: 'Rules workspace' })).getByRole(
+        'link',
+        { name: 'Studio' },
+      ),
+    ).toBeTruthy();
+    expect(screen.getByRole('heading', { level: 1, name: 'Policy Studio' })).toBeTruthy();
+    expect(
+      await screen.findByText(
+        'You have no policy drafts. Create one from the live policy to start editing.',
+      ),
+    ).toBeTruthy();
+
+    cleanup();
+    vi.stubGlobal('fetch', policyStudioFetchMock());
+
+    render(
+      <MemoryRouter initialEntries={['/']}>
+        <AdminShell />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('Edit the whole policy in a validated draft')).toBeTruthy();
+  });
+});
+
+function policyStudioFetchMock() {
+  return vi.fn((input: RequestInfo | URL) => {
+    const url = new URL(String(input), 'http://localhost');
+    const json = (body: unknown, headers: Record<string, string> = {}) =>
+      Promise.resolve(
+        new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json', ...headers },
+        }),
+      );
+    if (url.pathname === '/v1/admin/capabilities') {
+      return json({ permissions: ['admin:policy:read', 'admin:policy:write'] });
+    }
+    if (url.pathname === '/v1/admin/policy') {
+      return json(
+        {
+          schema_version: '1.0.0',
+          default_action: 'deny',
+          enforcement_mode: 'enforce',
+          roles: {},
+          routes: [],
+          rules: [],
+        },
+        { ETag: '"etag-initial"' },
+      );
+    }
+    if (url.pathname === '/v1/admin/policy/drafts') {
+      return json({
+        drafts: [],
+        limits: {
+          ttl_seconds: 86400,
+          max_drafts_per_owner: 8,
+          max_drafts: 128,
+          max_candidate_bytes: 1048576,
+        },
+      });
+    }
+
+    return Promise.reject(new Error(`unexpected fetch: ${url.pathname}`));
+  });
+}
+
 function policyShadowReviewFetchMock() {
   return vi.fn((input: RequestInfo | URL) => {
     const url = new URL(String(input), 'http://localhost');
