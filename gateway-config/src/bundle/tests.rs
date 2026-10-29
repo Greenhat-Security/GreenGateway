@@ -11,10 +11,10 @@ use super::{
     document::{
         self, ApiVersion, Profile, ResourceSource, POLICY_SCHEMA_VERSIONS, TOOLS_SCHEMA_VERSIONS,
     },
-    json, read_bundle, resource,
+    json, read_bundle, read_bundle_files, resource,
     source::{
-        is_portable_file_name, owner_is_trusted, BundleDirectory, FileName, MAX_BUNDLE_BYTES,
-        MAX_DIRECTORY_ENTRIES,
+        is_portable_file_name, owner_is_trusted, BundleDirectory, FileName, FileSource,
+        MAX_BUNDLE_BYTES, MAX_DIRECTORY_ENTRIES,
     },
     syntax::{
         decode_text, Limits, Node, Numbers, TextRules, Value, DOCUMENT_LIMITS, MAX_ARRAY_ELEMENTS,
@@ -1821,6 +1821,115 @@ fn file_and_bundle_sizes_are_bounded_before_reading() {
     assert_eq!(
         directory
             .read(&name, chunk)
+            .map_err(|diagnostic| diagnostic.code),
+        Err(Code::BundleTooLarge)
+    );
+}
+
+/// The files of `bundle`, by name, as a caller would hold them in memory.
+fn in_memory(bundle: &TempBundle) -> std::collections::BTreeMap<FileName, Vec<u8>> {
+    fs::read_dir(&bundle.root)
+        .expect("bundle directory should list")
+        .map(|entry| {
+            let entry = entry.expect("entry");
+            let name = entry.file_name().into_string().expect("UTF-8 name");
+            (
+                FileName::parse(&name).expect("portable name"),
+                fs::read(entry.path()).expect("file should read"),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_bundle_in_memory_reads_exactly_as_its_directory_does() {
+    let bundle = TempBundle::complete("memory");
+    let from_directory = bundle.read();
+    let from_memory = read_bundle_files(
+        in_memory(&bundle),
+        ReadOptions::default(),
+        &PublishedSchemasOnly,
+    );
+    assert!(
+        from_memory.diagnostics.is_empty(),
+        "{:?}",
+        from_memory.diagnostics
+    );
+    assert_eq!(from_memory.manifest, from_directory.manifest);
+    let (memory, directory) = (
+        from_memory.bundle.expect("read from memory"),
+        from_directory.bundle.expect("read from the directory"),
+    );
+    assert_eq!(memory.source_digest, directory.source_digest);
+    assert_eq!(memory.source_files(), directory.source_files());
+    assert_eq!(
+        memory.deployment.canonical_json,
+        directory.deployment.canonical_json
+    );
+
+    // An unreferenced entry is a warning, and an error when strict.
+    let mut files = in_memory(&bundle);
+    files.insert(FileName::parse("notes.txt").expect("name"), b"x".to_vec());
+    let lenient = read_bundle_files(files.clone(), ReadOptions::default(), &PublishedSchemasOnly);
+    assert!(lenient.bundle.is_some());
+    assert_eq!(only_codes(&lenient), [Code::UnreferencedEntry]);
+    assert_eq!(lenient.diagnostics[0].severity, Severity::Warning);
+    let strict = read_bundle_files(files, ReadOptions { strict: true }, &PublishedSchemasOnly);
+    assert!(strict.bundle.is_none());
+    assert_eq!(only_codes(&strict), [Code::UnreferencedEntry]);
+    assert_eq!(strict.diagnostics[0].severity, Severity::Error);
+
+    // A missing manifest or referenced file, and a changed pin, are refused
+    // by their usual codes.
+    let mut files = in_memory(&bundle);
+    files.remove(&FileName::parse("bundle.yaml").expect("name"));
+    let report = read_bundle_files(files, ReadOptions::default(), &PublishedSchemasOnly);
+    assert_eq!(only_codes(&report), [Code::ManifestMissing]);
+    let mut files = in_memory(&bundle);
+    files.remove(&policy_file());
+    let report = read_bundle_files(files, ReadOptions::default(), &PublishedSchemasOnly);
+    assert!(report.bundle.is_none());
+    assert_eq!(only_codes(&report), [Code::FileMissing]);
+    let mut files = in_memory(&bundle);
+    files.insert(tools_file(), TOOLS_JSON.replace("[]", "[ ]").into_bytes());
+    let report = read_bundle_files(files, ReadOptions::default(), &PublishedSchemasOnly);
+    assert_eq!(only_codes(&report), [Code::DigestMismatch]);
+}
+
+#[test]
+fn a_bundle_in_memory_keeps_the_directory_bounds() {
+    let name = |text: &str| FileName::parse(text).expect("name");
+    // The manifest's own bound.
+    let mut manifest = vec![b'\n'; MAX_MANIFEST_BYTES + 1];
+    manifest[0] = b'a';
+    let files = std::collections::BTreeMap::from([(name("bundle.yaml"), manifest)]);
+    let report = read_bundle_files(files, ReadOptions::default(), &PublishedSchemasOnly);
+    assert_eq!(only_codes(&report), [Code::FileTooLarge]);
+
+    // The entry bound.
+    let files: std::collections::BTreeMap<_, _> = (0..=MAX_DIRECTORY_ENTRIES)
+        .map(|index| (name(&format!("part{index}.bin")), Vec::new()))
+        .collect();
+    let report = read_bundle_files(files, ReadOptions::default(), &PublishedSchemasOnly);
+    assert_eq!(only_codes(&report), [Code::TooManyEntries]);
+
+    // The total bound, across every read of one bundle.
+    let chunk = MAX_BUNDLE_BYTES / 4;
+    let files: std::collections::BTreeMap<_, _> = (0..5)
+        .map(|index| (name(&format!("part{index}.bin")), vec![b'x'; chunk]))
+        .collect();
+    let mut source = super::source::MemoryFiles::new(files).expect("within the entry bound");
+    for index in 0..4 {
+        assert_eq!(
+            source
+                .read(&name(&format!("part{index}.bin")), chunk)
+                .map(|bytes| bytes.len()),
+            Ok(chunk)
+        );
+    }
+    assert_eq!(
+        source
+            .read(&name("part4.bin"), chunk)
             .map_err(|diagnostic| diagnostic.code),
         Err(Code::BundleTooLarge)
     );

@@ -7861,10 +7861,10 @@
       "reasons": [
         "capability-import-or-glob"
       ],
-      "scope": "gateway_config::bundle::source::use std :: { ffi :: OsStr , fs , io :: { self , Read as _ } , path :: { Component , Path } , }#1",
-      "sha256": "2e0ff740827a8be877c4e9e4bf7936c8001bfea168a1f4e2ec43b9910a9293a2",
+      "scope": "gateway_config::bundle::source::use std :: { collections :: BTreeMap , ffi :: OsStr , fs , io :: { self , Read as _ } , path :: { Component , Path } , }#1",
+      "sha256": "9f762b1e7ca2f349a3e47356c96f4b606ca47f8890542b95496adfd6bf435903",
       "owner": "GreenGateway maintainers",
-      "purpose": "Reviewed for #242 PR 4: the configuration bundle reader's contained, read-only filesystem access (canonicalized root opened as a cap-std directory, no-follow opens, link count, reparse attribute and Unix mode read from the opened handle). It adds no network or process capability; constructor bodies require separate scope review."
+      "purpose": "Reviewed for #242 PR 4: the configuration bundle reader's contained, read-only filesystem access (canonicalized root opened as a cap-std directory, no-follow opens, link count, reparse attribute and Unix mode read from the opened handle). #242 PR 11 adds only std's BTreeMap, which keys the in-memory bundle source's files. It adds no network or process capability; constructor bodies require separate scope review."
     },
     {
       "file": "gateway-config/src/bundle/source.rs",
@@ -14836,6 +14836,16 @@
       "sha256": "6651893f61abaf3a3a584a1a4bf787888b6316908097bba4afe06cbd13196060",
       "owner": "GreenGateway maintainers",
       "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the gateway's production validators passed to the shared bundle reader, which bundle mode (a later #242 slice) will call; it only calls the existing policy and tools validators and has no transport or process capability."
+    },
+    {
+      "file": "gateway/src/config/revisions.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::config::revisions::file_attributes#1",
+      "sha256": "fcfb2792059c7e0101f8eeebf037c18bedf13bbf7dc634eced0a54abb31f3244",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the production plan compiler the standalone ledger's plan, apply and rollback service (#242 PR 11) takes, which ledger startup and the admin routes (later #242 slices) will hold; it only hands that service the existing production policy and tools validators and their JSON forms, and has no transport or process capability."
     },
     {
       "file": "gateway/src/connections/control_plane.rs",
