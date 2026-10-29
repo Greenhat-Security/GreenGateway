@@ -1,5 +1,6 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
+use super::conditions::Condition;
 use crate::auth::{AuthMethod, Principal};
 
 pub const AUTH_METHOD_BEARER_TOKEN: &str = "bearer_token";
@@ -215,6 +216,11 @@ pub struct Rule {
     /// authenticated or not.
     #[serde(default)]
     pub principal: PrincipalMatcher,
+    /// Optional typed conditions over request, principal and tool-call facts
+    /// (`super::conditions`). Policy v1 only: a 0.x document that sets them is
+    /// refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditions: Option<Condition>,
     pub action: RuleAction,
 }
 

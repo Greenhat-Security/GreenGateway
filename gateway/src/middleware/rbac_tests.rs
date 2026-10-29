@@ -213,6 +213,7 @@ fn a_tool_eligibility_snapshot_taken_before_an_install_answers_every_tool_from_i
         dispatch: None,
         principal: PrincipalMatcher::default(),
         action: RuleAction::Deny,
+        conditions: None,
     });
     let mut after = test_policy(DefaultAction::Deny, &[], &[]);
     for (name, enabled) in [
@@ -2749,6 +2750,7 @@ fn test_policy_with_enforcement(
         egress: EgressPolicy::default(),
         rate_limits: Vec::new(),
         tools: HashMap::new(),
+        identity_mappings: None,
     }
 }
 
@@ -2772,6 +2774,7 @@ fn direct_rule(id: Option<&str>, methods: &[&str], path: &str, action: RuleActio
         dispatch: None,
         principal: PrincipalMatcher::default(),
         action,
+        conditions: None,
     }
 }
 
@@ -2819,6 +2822,7 @@ fn tool_eligibility_state(
             dispatch: None,
             principal: PrincipalMatcher::default(),
             action,
+            conditions: None,
         });
     }
     test_state(policy, &[])
@@ -3701,6 +3705,7 @@ fn tool_rule(id: &str, tool_name: Option<&str>, path: &str, action: RuleAction) 
         dispatch: None,
         principal: PrincipalMatcher::default(),
         action,
+        conditions: None,
     }
 }
 

@@ -1833,6 +1833,7 @@ fn rule_suggestion_for_endpoint(
             dispatch: None,
             principal,
             action,
+            conditions: None,
         }
     } else {
         Rule {
@@ -1844,6 +1845,7 @@ fn rule_suggestion_for_endpoint(
             dispatch: Some(dispatch),
             principal,
             action,
+            conditions: None,
         }
     }
 }
@@ -2927,6 +2929,7 @@ mod tests {
                 principal_ids: Vec::new(),
             },
             action: RuleAction::Allow,
+            conditions: None,
         });
 
         let engine = suggestion_engine(&discovery_db.path, Some(&audit_db.path));
@@ -3185,6 +3188,7 @@ mod tests {
                 principal_ids: vec!["alice".to_owned()],
             },
             action: RuleAction::Shadow,
+            conditions: None,
         });
 
         let engine = suggestion_engine(&discovery_db.path, None);
@@ -3468,6 +3472,7 @@ mod tests {
             egress: Default::default(),
             rate_limits: Vec::new(),
             tools: Default::default(),
+            identity_mappings: None,
         }
     }
 
