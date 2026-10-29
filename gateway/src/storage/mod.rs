@@ -25,6 +25,11 @@ mod change_evidence;
 /// in cluster mode the gate a write of a registered operation passes first,
 /// with the durable contract fence and backfill states it checks (PR 3).
 pub(crate) mod compatibility;
+/// The migrator's side of the durable contract fence (issue #426): a
+/// migration that removes anything first raises the fence past every build
+/// that still needs it, in the migration's own transaction.
+#[cfg(feature = "postgres")]
+pub(crate) mod contraction;
 /// Versioned migrations and the schema lifecycle (issue #241, PR 4), on the
 /// same `postgres` feature as the pool it runs on. A feature-off build
 /// refuses the `migrate` subcommand in `main` with a clear message rather
