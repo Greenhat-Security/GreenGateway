@@ -21162,6 +21162,7 @@ async fn policy_rule_preview_moderate_scale_completes_under_two_seconds() {
                 principal_ids: Vec::new(),
             },
             action: rbac::RuleAction::Deny,
+            conditions: None,
         },
         from: Some("2026-01-01T00:00:00Z".to_owned()),
         to: Some("2026-01-02T00:00:00Z".to_owned()),
@@ -37594,3 +37595,5 @@ mod admin_policy_replays_tests;
 
 #[path = "admin_policy_analyses_tests.rs"]
 mod admin_policy_analyses_tests;
+#[path = "admin_policy_evidence_tests.rs"]
+mod admin_policy_evidence_tests;

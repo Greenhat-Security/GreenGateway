@@ -411,6 +411,16 @@ pub(super) fn add_admin_api_routes(
                         .layer(Extension(Arc::clone(&replay_jobs))),
                 )
                 .route(
+                    routes.admin.policy_evidence_route.as_str(),
+                    // Its own limiter, and the replay registry a package
+                    // binds a finished job from.
+                    post(policy_evidence_endpoint)
+                        .layer::<_, Infallible>(Extension(Arc::new(PolicyEvaluationLimiter::new(
+                            MAX_CONCURRENT_POLICY_EVIDENCE,
+                        ))))
+                        .layer(Extension(Arc::clone(&replay_jobs))),
+                )
+                .route(
                     routes.admin.policy_analyses_route.as_str(),
                     // Its own limiter, so analyses never take a simulation's,
                     // test run's or replay's slots.

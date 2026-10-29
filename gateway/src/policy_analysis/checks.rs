@@ -184,6 +184,7 @@ impl Run<'_> {
             .enumerate()
             .find(|(_, rule)| {
                 is_http_rule(rule)
+                    && unconditional(rule)
                     && rule.principal.is_unconstrained()
                     && rule.dispatch.is_none()
                     && matches_every_method(&rule.methods)
@@ -298,13 +299,14 @@ impl Run<'_> {
                 RuleAction::Deny => continue,
             };
             if !is_http_rule(rule)
+                || !unconditional(rule)
                 || !rule.principal.is_unconstrained()
                 || rule.dispatch.is_some()
                 || !matches_every_path(&segments(&rule.path))
             {
                 continue;
             }
-            let confirmed = confirm_broad(rule)?;
+            let confirmed = confirm_broad(policy, rule)?;
             let mut finding = finding(
                 code,
                 Severity::High,
@@ -421,7 +423,7 @@ impl Run<'_> {
                 if !self.spend() {
                     return Ok(());
                 }
-                if principal_covers(&earlier.principal, &rule.principal) {
+                if unconditional(earlier) && principal_covers(&earlier.principal, &rule.principal) {
                     covering = Some(earlier_position);
                     break;
                 }
@@ -433,6 +435,7 @@ impl Run<'_> {
             let confirmed = self.confirm_tool_rule(position, rule, tool_name)?;
             let finding = if restrictiveness(&earlier.action) >= restrictiveness(&rule.action) {
                 let duplicate = earlier.action == rule.action
+                    && unconditional(rule)
                     && principal_covers(&rule.principal, &earlier.principal);
                 unreachable_rule(
                     position,
@@ -471,6 +474,7 @@ impl Run<'_> {
             if route_segments.is_some() {
                 for (rule_position, rule) in rules.iter().enumerate() {
                     if !is_http_rule(rule)
+                        || !unconditional(rule)
                         || !rule.principal.is_unconstrained()
                         || rule.dispatch.is_some()
                     {
@@ -730,7 +734,7 @@ impl Run<'_> {
         let Some((request, principal)) = http_rule_witness(rule) else {
             return Ok(false);
         };
-        let alone = CompiledPolicy::for_candidate_rule(rule.clone());
+        let alone = rule_alone(self.policy, rule);
         let own = alone.match_direct_rules(&http_context(alone.snapshot(), &request, &principal));
         let whole = self.compiled.match_direct_rules(&http_context(
             self.compiled.snapshot(),
@@ -756,7 +760,7 @@ impl Run<'_> {
             return Ok(false);
         };
         let principal = principal_fact(principal);
-        let alone = CompiledPolicy::for_candidate_rule(rule.clone());
+        let alone = rule_alone(self.policy, rule);
         let own = alone.match_tool_rules(tool_name, &principal);
         let whole = self.compiled.match_tool_rules(tool_name, &principal);
         Ok(match (answered(own)?, answered(whole)?) {
@@ -861,14 +865,14 @@ impl Run<'_> {
 
 /// A broad rule's witnesses: the root and a deep path, for an anonymous
 /// caller, each matched by the rule alone.
-fn confirm_broad(rule: &Rule) -> Result<bool, AnalysisError> {
+fn confirm_broad(policy: &Policy, rule: &Rule) -> Result<bool, AnalysisError> {
     let (Some(method), Some(principal)) = (
         witness_method(&rule.methods),
         witness_principal(&rule.principal),
     ) else {
         return Ok(false);
     };
-    let alone = CompiledPolicy::for_candidate_rule(rule.clone());
+    let alone = rule_alone(policy, rule);
     for path in ["/", WITNESS_DEEP_PATH] {
         let request = HttpRequest {
             method: method.clone(),
@@ -905,15 +909,27 @@ fn route_alone_selects(
     ))
 }
 
-/// A policy at the analyzed one's schema version with nothing in it, for
-/// compiling one element alone.
+/// `rule` compiled alone, under the analyzed policy's roles and identity
+/// mappings, so it reads a witness's caller as the analyzed policy does.
+fn rule_alone(policy: &Policy, rule: &Rule) -> CompiledPolicy {
+    CompiledPolicy::for_analysis(Policy {
+        rules: vec![rule.clone()],
+        ..empty_policy(policy)
+    })
+}
+
+/// A policy at the analyzed one's schema version, with its roles and identity
+/// mappings and no other element, for compiling one element alone. The
+/// mappings decide which internal roles a caller holds, so an element alone
+/// must be read under the same ones.
 fn empty_policy(policy: &Policy) -> Policy {
     Policy {
         schema_version: policy.schema_version.clone(),
         id: None,
         default_action: DefaultAction::Deny,
         enforcement_mode: EnforcementMode::Enforce,
-        roles: HashMap::new(),
+        roles: policy.roles.clone(),
+        identity_mappings: policy.identity_mappings.clone(),
         routes: Vec::new(),
         rules: Vec::new(),
         egress: EgressPolicy::default(),
@@ -1059,6 +1075,14 @@ fn is_http_rule(rule: &Rule) -> bool {
     rule.enabled && rule.tool_name.is_none()
 }
 
+/// A rule without typed conditions. A conditioned rule matches only the
+/// requests its conditions accept, which no predicate comparison here can
+/// bound, so it never covers another element and is never broad. As the
+/// covered side it needs no such care: its conditions only narrow it.
+fn unconditional(rule: &Rule) -> bool {
+    rule.conditions.is_none()
+}
+
 fn restrictiveness(action: &RuleAction) -> u8 {
     match action {
         RuleAction::Allow => 0,
@@ -1075,15 +1099,17 @@ fn action_str(action: &RuleAction) -> &'static str {
     }
 }
 
-/// Whether `covering` matches every HTTP request `covered` matches: method,
-/// principal, dispatch binding and path, cheapest first.
+/// Whether `covering` matches every HTTP request `covered` matches: no
+/// conditions, then method, principal, dispatch binding and path, cheapest
+/// first.
 fn http_rule_covers(
     covering: &Rule,
     covering_path: &Segments<'_>,
     covered: &Rule,
     covered_path: &Segments<'_>,
 ) -> bool {
-    methods_cover(&covering.methods, &covered.methods)
+    unconditional(covering)
+        && methods_cover(&covering.methods, &covered.methods)
         && principal_covers(&covering.principal, &covered.principal)
         && dispatch_covers(covering.dispatch.as_ref(), covered.dispatch.as_ref())
         && pattern_covers(covering_path, covered_path)

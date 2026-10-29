@@ -893,7 +893,6 @@ impl RbacState {
         self.policy
             .load()
             .compiled
-            .engine()
             .principal_has_permission(principal, permission)
     }
 
@@ -908,7 +907,6 @@ impl RbacState {
     ) -> bool {
         self.effective_policy()
             .compiled
-            .engine()
             .principal_has_permission(principal, permission)
     }
 
@@ -923,13 +921,14 @@ impl RbacState {
     ) -> Vec<String> {
         let policy = self.effective_policy();
         let engine = policy.compiled.engine();
-        if engine.principal_has_wildcard(principal) {
+        let principal = policy.compiled.management_principal(principal);
+        if engine.principal_has_wildcard(&principal) {
             return Vec::new();
         }
 
         requested_roles
             .iter()
-            .filter(|role| !engine.principal_has_active_role(principal, role))
+            .filter(|role| !engine.principal_has_active_role(&principal, role))
             .cloned()
             .collect()
     }

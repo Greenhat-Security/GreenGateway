@@ -28,11 +28,18 @@ use crate::{
     },
     policy_simulation::edits::{apply_edits, parse_edits},
     policy_testing::suite::Diagnostics,
-    rbac::{matcher::path_pattern_matches, Policy},
+    rbac::{matcher::path_pattern_matches, policy_document::parse_v1_with_typed_matchers, Policy},
 };
 
 fn policy(value: Value) -> Policy {
     Policy::validate_json_value(value).expect("test policy validates")
+}
+
+/// A policy v1 document with typed matchers, which this build validates but
+/// does not yet accept for enforcement: parsed as the typed-matcher tests
+/// parse one, so the analyzer's handling of them is pinned before they are.
+fn typed_matcher_policy(value: Value) -> Policy {
+    parse_v1_with_typed_matchers(&value).unwrap_or_else(|issues| panic!("validates: {issues:?}"))
 }
 
 fn far_deadline() -> Instant {
@@ -405,6 +412,68 @@ fn rules_an_earlier_rule_does_not_fully_cover_are_not_reported() {
             codes(&outcome)
         );
     }
+}
+
+#[test]
+fn a_rule_with_conditions_covers_nothing_and_is_never_broad() {
+    let document = json!({
+        "schema_version": "1.0.0",
+        "default_action": "deny",
+        "rules": [
+            {
+                "id": "canary-everything", "path": "/**", "action": "allow",
+                "conditions": { "header": { "name": "x-environment", "in": ["canary"] } }
+            },
+            { "id": "admin-deny", "path": "/admin/**", "action": "deny" },
+            {
+                "id": "admin-deny-canary", "path": "/admin/x", "action": "deny",
+                "conditions": { "query": { "name": "mode", "in": ["export"] } }
+            }
+        ],
+    });
+    let outcome = run(&typed_matcher_policy(document));
+    // The conditioned allow is not broad and covers neither later rule; the
+    // conditioned deny is still covered by the unconditioned one before it.
+    assert_eq!(
+        codes(&outcome),
+        ["rule_unreachable"],
+        "{:?}",
+        codes(&outcome)
+    );
+    let finding = only(&outcome, FindingCode::RuleUnreachable);
+    assert_eq!(finding.element.id.as_deref(), Some("admin-deny-canary"));
+    assert_eq!(finding.details["relation"], json!("covered"));
+}
+
+#[test]
+fn in_mapped_role_mode_a_claim_needing_a_role_holder_is_inconclusive() {
+    // With identity mappings, a caller's claimed roles are not its roles, and
+    // the analyzer does not synthesize a caller the mappings grant one: the
+    // evaluator cannot confirm the claim, so it is not reported as proven.
+    let document = json!({
+        "schema_version": "1.0.0",
+        "default_action": "deny",
+        "roles": { "reader": { "permissions": ["api:read"] } },
+        "identity_mappings": [
+            { "id": "readers", "issuer": "https://idp.example.test", "claimed_roles": ["reader"], "grant_roles": ["reader"] }
+        ],
+        "rules": [
+            { "id": "api-allow", "path": "/api/**", "action": "allow" },
+            { "id": "reader-deny", "path": "/api/admin", "action": "deny", "principal": { "roles": ["reader"] } },
+            { "id": "anyone-deny", "path": "/api/other", "action": "deny" }
+        ],
+    });
+    let outcome = run(&typed_matcher_policy(document));
+    let by_id = |id: &str| {
+        outcome
+            .findings
+            .iter()
+            .find(|finding| finding.element.id.as_deref() == Some(id))
+            .unwrap_or_else(|| panic!("a finding for {id}: {:?}", codes(&outcome)))
+    };
+    assert_eq!(by_id("reader-deny").proof_basis, ProofBasis::Inconclusive);
+    assert!(by_id("reader-deny").patch.is_none());
+    assert_eq!(by_id("anyone-deny").proof_basis, ProofBasis::Proven);
 }
 
 #[test]

@@ -543,7 +543,7 @@ pub(crate) fn deployment(
 }
 
 /// `^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`, the Kubernetes object-name label.
-fn is_dns_label(name: &str) -> bool {
+pub(crate) fn is_dns_label(name: &str) -> bool {
     let bytes = name.as_bytes();
     let alphanumeric = |byte: &u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
     match bytes {

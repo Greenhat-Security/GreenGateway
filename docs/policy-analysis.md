@@ -272,8 +272,20 @@ does not report:
   broad, and an allow narrower than every path as broad at all;
 - a role's coverage through the permissions other roles grant: principal
   constraints are compared field by field;
+- a rule with typed `conditions` as covering another element, as broad, as
+  masking the default or as bypassing a route: its conditions bound what it
+  matches in ways no predicate comparison does (a conditioned rule can still
+  be the covered one). This build validates conditions and identity mappings
+  but accepts no document that uses them yet, so this, and the mapped-role
+  rule below, take effect once they are enforced;
 - anything about traffic: nothing is unused, unobserved or unreachable
   because retained traffic lacks it.
+
+In mapped-role mode (a policy v1 document with `identity_mappings`), a
+caller's claimed roles are not its roles, and the analyzer does not
+synthesize a caller the mappings grant a role. A claim whose witness needs a
+role-holding caller is therefore not confirmed and is reported
+`inconclusive`, without a patch.
 
 So a report with no findings means the analyzer proved none of these
 problems, not that the policy has none.

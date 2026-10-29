@@ -78,6 +78,11 @@
     },
     {
       "methods": ["POST"],
+      "path_prefix": "/v1/admin/policy/evidence",
+      "permission": "admin:policy:evidence:read"
+    },
+    {
+      "methods": ["POST"],
       "path_prefix": "/v1/admin/policy/analyses",
       "permission": "admin:policy:analyze"
     },

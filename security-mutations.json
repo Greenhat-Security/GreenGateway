@@ -105,10 +105,10 @@
     {
       "id": "kernel-rate-lane",
       "path": "gateway/src/policy_eval/mod.rs",
-      "function": "policy_eval::CompiledPolicy::select_rate_lane",
-      "start_marker": "    pub(crate) fn select_rate_lane(",
+      "function": "policy_eval::CompiledPolicy::select_rate_lane_with_facts",
+      "start_marker": "    pub(crate) fn select_rate_lane_with_facts(",
       "end_marker": "\n    }\n",
-      "source_sha256": "dd7cf96a7f31d345ec61973f1b2c4ab665ab126c2570f372f9ec41177135e924",
+      "source_sha256": "540bfd4ceeb21ed5e4a83aabc6e212f95510745731d25f3b02799fc760c10636",
       "tests": [
         "policy_eval::tests::rate_lane_selection_matches_the_frozen_selector"
       ],
@@ -133,10 +133,10 @@
     {
       "id": "kernel-tool",
       "path": "gateway/src/policy_eval/tools.rs",
-      "function": "policy_eval::CompiledPolicy::evaluate_tool",
-      "start_marker": "    pub(crate) fn evaluate_tool(",
+      "function": "policy_eval::CompiledPolicy::evaluate_tool_with_facts",
+      "start_marker": "    pub(crate) fn evaluate_tool_with_facts(",
       "end_marker": "\n    }\n",
-      "source_sha256": "da25c8ec84e8f14d814741a55b1ed0a94339a986275ab1bb09fe8bf375ad86d5",
+      "source_sha256": "9e381337e49583a3ac6fe5216d62ee2ca7c1eae4c353166d85e2c0d779c4b923",
       "tests": [
         "policy_eval::tools::tests::a_disabled_entry_and_a_denying_tool_or_rendered_rule_each_block_on_their_own",
         "policy_eval::tools::tests::rendered_http_accepts_valid_segment_escapes_and_rejects_malformed_escapes"
@@ -154,8 +154,8 @@
         },
         {
           "id": "skip-rendered-http-rule",
-          "old": "self.matcher.evaluate_with_dispatch(\n                method.as_str(),\n                path,\n                principal,\n                RuleDispatchContext::unknown(),\n            )",
-          "new": "None"
+          "old": "self.matcher.scan_with_dispatch(\n                method.as_str(),\n                path,\n                principal,\n                RuleDispatchContext::unknown(),\n                facts,\n            )",
+          "new": "RuleScan::NoMatch"
         }
       ]
     },

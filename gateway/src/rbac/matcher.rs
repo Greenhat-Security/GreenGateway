@@ -1,5 +1,6 @@
 use crate::auth::Principal;
 
+use super::conditions::{CompiledCondition, PolicyFacts, Truth, UNCAPTURED_FACTS};
 use super::rule::{PrincipalMatcher, Rule, RuleAction, RuleDispatchKind, RuleDispatchMatcher};
 use url::Url;
 
@@ -85,6 +86,35 @@ impl<'a> RuleDispatchContext<'a> {
     }
 }
 
+/// What a scan of the direct rules found, under the precedence order the
+/// caller asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RuleScan {
+    /// The first rule the order reaches that certainly matches.
+    Matched(RuleDecision),
+    /// No rule matches.
+    NoMatch,
+    /// The order reached a rule whose conditions read a fact that was not
+    /// captured before any rule that certainly matches, so which rule decides
+    /// -- and whether any does -- cannot be told. Never an answer to act on.
+    Undetermined { rule_index: usize },
+}
+
+impl RuleScan {
+    /// The deciding rule, for a test over a rulebase without conditions,
+    /// whose scans are always determined.
+    #[cfg(test)]
+    fn decided(self) -> Option<RuleDecision> {
+        match self {
+            Self::Matched(decision) => Some(decision),
+            Self::NoMatch => None,
+            Self::Undetermined { rule_index } => {
+                panic!("rule {rule_index} reads a fact this test did not capture")
+            }
+        }
+    }
+}
+
 impl RuleMatcher {
     pub fn new(rules: &[Rule]) -> Self {
         Self {
@@ -106,7 +136,9 @@ impl RuleMatcher {
         self.evaluate_with_dispatch(method, path, principal, RuleDispatchContext::contextless())
     }
 
-    /// Evaluates an HTTP rule against the proxy origin selected before RBAC.
+    /// [`Self::scan_with_dispatch`] with no fact captured, for a test over a
+    /// rulebase without conditions.
+    #[cfg(test)]
     pub fn evaluate_with_dispatch(
         &self,
         method: &str,
@@ -114,13 +146,26 @@ impl RuleMatcher {
         principal: Option<&Principal>,
         dispatch_context: RuleDispatchContext<'_>,
     ) -> Option<RuleDecision> {
-        self.rules
-            .iter()
-            .find(|rule| rule.matches(method, path, principal, dispatch_context))
-            .map(|rule| RuleDecision {
-                rule_index: rule.rule_index,
-                action: rule.action.clone(),
-            })
+        self.scan_with_dispatch(method, path, principal, dispatch_context, &UNCAPTURED_FACTS)
+            .decided()
+    }
+
+    /// The first rule in source order that matches an HTTP request against
+    /// the proxy origin selected before RBAC.
+    pub(crate) fn scan_with_dispatch(
+        &self,
+        method: &str,
+        path: &str,
+        principal: Option<&Principal>,
+        dispatch_context: RuleDispatchContext<'_>,
+        facts: &PolicyFacts,
+    ) -> RuleScan {
+        first_match(self.rules.iter().map(|rule| {
+            (
+                rule,
+                rule.http_truth(method, path, principal, dispatch_context, facts),
+            )
+        }))
     }
 
     /// Returns the first matching deny while ignoring allow and shadow rules,
@@ -140,7 +185,9 @@ impl RuleMatcher {
         )
     }
 
-    /// Returns the first dispatch-compatible deny while ignoring other rules.
+    /// [`Self::scan_denies_with_dispatch`] with no fact captured, for a test
+    /// over a rulebase without conditions.
+    #[cfg(test)]
     pub fn evaluate_denies_with_dispatch(
         &self,
         method: &str,
@@ -148,20 +195,32 @@ impl RuleMatcher {
         principal: Option<&Principal>,
         dispatch_context: RuleDispatchContext<'_>,
     ) -> Option<RuleDecision> {
-        self.evaluate_matching_paths_by_action(
+        self.scan_denies_with_dispatch(method, path, principal, dispatch_context, &UNCAPTURED_FACTS)
+            .decided()
+    }
+
+    /// The first dispatch-compatible deny, ignoring every other rule.
+    pub(crate) fn scan_denies_with_dispatch(
+        &self,
+        method: &str,
+        path: &str,
+        principal: Option<&Principal>,
+        dispatch_context: RuleDispatchContext<'_>,
+        facts: &PolicyFacts,
+    ) -> RuleScan {
+        self.scan_matching_paths_by_action(
             method,
             &[path],
             principal,
             dispatch_context,
             &[RuleAction::Deny],
+            facts,
         )
     }
 
-    /// Evaluates one request against equivalent path identities, preferring the
-    /// most restrictive matching action across the full rulebase. This is used
-    /// for MCP aliases where both the raw public path and canonical `/mcp`
-    /// identity must participate without allowing either path's allow rule to
-    /// suppress a deny or shadow on the other identity.
+    /// [`Self::scan_equivalent_paths_with_dispatch`] with no fact captured,
+    /// for a test over a rulebase without conditions.
+    #[cfg(test)]
     pub fn evaluate_equivalent_paths_with_dispatch(
         &self,
         method: &str,
@@ -170,62 +229,133 @@ impl RuleMatcher {
         dispatch_context: RuleDispatchContext<'_>,
         denies_only: bool,
     ) -> Option<RuleDecision> {
+        self.scan_equivalent_paths_with_dispatch(
+            method,
+            paths,
+            principal,
+            dispatch_context,
+            denies_only,
+            &UNCAPTURED_FACTS,
+        )
+        .decided()
+    }
+
+    /// Evaluates one request against equivalent path identities, preferring the
+    /// most restrictive matching action across the full rulebase. This is used
+    /// for MCP aliases where both the raw public path and canonical `/mcp`
+    /// identity must participate without allowing either path's allow rule to
+    /// suppress a deny or shadow on the other identity.
+    pub(crate) fn scan_equivalent_paths_with_dispatch(
+        &self,
+        method: &str,
+        paths: &[&str],
+        principal: Option<&Principal>,
+        dispatch_context: RuleDispatchContext<'_>,
+        denies_only: bool,
+        facts: &PolicyFacts,
+    ) -> RuleScan {
         if denies_only {
-            self.evaluate_matching_paths_by_action(
+            self.scan_matching_paths_by_action(
                 method,
                 paths,
                 principal,
                 dispatch_context,
                 &[RuleAction::Deny],
+                facts,
             )
         } else {
-            self.evaluate_matching_paths_by_action(
+            self.scan_matching_paths_by_action(
                 method,
                 paths,
                 principal,
                 dispatch_context,
                 &[RuleAction::Deny, RuleAction::Shadow, RuleAction::Allow],
+                facts,
             )
         }
     }
 
-    fn evaluate_matching_paths_by_action(
+    /// Action-major precedence: the first rule of the first action, in
+    /// `actions` order, that matches any of `paths`. An undetermined rule
+    /// stops the scan where it stands: under a more restrictive action it
+    /// could be the decision, and under a less restrictive one it is reached
+    /// only when nothing more restrictive matched.
+    fn scan_matching_paths_by_action(
         &self,
         method: &str,
         paths: &[&str],
         principal: Option<&Principal>,
         dispatch_context: RuleDispatchContext<'_>,
         actions: &[RuleAction],
-    ) -> Option<RuleDecision> {
-        actions.iter().find_map(|action| {
-            self.rules
-                .iter()
-                .find(|rule| {
-                    &rule.action == action
-                        && paths
-                            .iter()
-                            .any(|path| rule.matches(method, path, principal, dispatch_context))
-                })
-                .map(|rule| RuleDecision {
-                    rule_index: rule.rule_index,
-                    action: rule.action.clone(),
-                })
-        })
+        facts: &PolicyFacts,
+    ) -> RuleScan {
+        for action in actions {
+            let scan = first_match(self.rules.iter().map(|rule| {
+                let truth = if &rule.action == action {
+                    paths.iter().fold(Truth::False, |truth, path| {
+                        truth.or_else(|| {
+                            rule.http_truth(method, path, principal, dispatch_context, facts)
+                        })
+                    })
+                } else {
+                    Truth::False
+                };
+                (rule, truth)
+            }));
+            if scan != RuleScan::NoMatch {
+                return scan;
+            }
+        }
+        RuleScan::NoMatch
     }
 
+    /// [`Self::scan_tool`] with no fact captured, for a test over a rulebase
+    /// without conditions.
+    #[cfg(test)]
     pub fn evaluate_tool(
         &self,
         tool_name: &str,
         principal: Option<&Principal>,
     ) -> Option<RuleDecision> {
-        self.rules
-            .iter()
-            .find(|rule| rule.matches_tool(tool_name, principal))
-            .map(|rule| RuleDecision {
-                rule_index: rule.rule_index,
-                action: rule.action.clone(),
-            })
+        self.scan_tool(tool_name, principal, &UNCAPTURED_FACTS)
+            .decided()
     }
+
+    /// The first tool-name rule in source order that matches a tool call.
+    pub(crate) fn scan_tool(
+        &self,
+        tool_name: &str,
+        principal: Option<&Principal>,
+        facts: &PolicyFacts,
+    ) -> RuleScan {
+        first_match(
+            self.rules
+                .iter()
+                .map(|rule| (rule, rule.tool_truth(tool_name, principal, facts))),
+        )
+    }
+}
+
+/// The first certain match in `rules`, unless an undetermined rule comes
+/// first.
+fn first_match<'a>(rules: impl Iterator<Item = (&'a CompiledRule, Truth)>) -> RuleScan {
+    for (rule, truth) in rules {
+        match truth {
+            Truth::True => {
+                return RuleScan::Matched(RuleDecision {
+                    rule_index: rule.rule_index,
+                    action: rule.action.clone(),
+                })
+            }
+            Truth::Unknown => {
+                return RuleScan::Undetermined {
+                    rule_index: rule.rule_index,
+                }
+            }
+            Truth::False => {}
+        }
+    }
+    RuleScan::NoMatch
 }
 
 pub(super) fn rule_matches(
@@ -234,7 +364,13 @@ pub(super) fn rule_matches(
     path: &str,
     principal: Option<&Principal>,
 ) -> bool {
-    CompiledRule::new(0, rule).matches(method, path, principal, RuleDispatchContext::contextless())
+    CompiledRule::new(0, rule).http_truth(
+        method,
+        path,
+        principal,
+        RuleDispatchContext::contextless(),
+        &UNCAPTURED_FACTS,
+    ) == Truth::True
 }
 
 /// Standalone method matcher reusing the hardened, anchored implementation
@@ -336,6 +472,7 @@ struct CompiledRule {
     target: RuleTarget,
     principal: PrincipalMatcher,
     dispatch: Option<CompiledDispatchMatcher>,
+    conditions: Option<CompiledCondition>,
     action: RuleAction,
 }
 
@@ -423,44 +560,71 @@ impl CompiledRule {
             target,
             principal: rule.principal.clone(),
             dispatch: rule.dispatch.as_ref().map(CompiledDispatchMatcher::new),
+            conditions: rule.conditions.as_ref().map(CompiledCondition::new),
             action: rule.action.clone(),
         }
     }
 
-    fn matches(
+    /// Whether this rule matches an HTTP request. Conditions are read only
+    /// once every other predicate holds, so a rule that cannot match for a
+    /// known reason is never undetermined.
+    fn http_truth(
         &self,
         method: &str,
         path: &str,
         principal: Option<&Principal>,
         dispatch_context: RuleDispatchContext<'_>,
-    ) -> bool {
+        facts: &PolicyFacts,
+    ) -> Truth {
         let RuleTarget::Http {
             methods,
             path: rule_path,
         } = &self.target
         else {
-            return false;
+            return Truth::False;
         };
 
-        self.enabled
+        let predicates_hold = self.enabled
             && methods.matches(method)
             && rule_path.matches(path)
             && self
                 .dispatch
                 .as_ref()
                 .is_none_or(|dispatch| dispatch.matches(dispatch_context))
-            && self.principal.matches(principal)
+            && self.principal.matches(principal);
+        self.with_conditions(predicates_hold, principal, facts)
     }
 
-    fn matches_tool(&self, tool_name: &str, principal: Option<&Principal>) -> bool {
+    fn tool_truth(
+        &self,
+        tool_name: &str,
+        principal: Option<&Principal>,
+        facts: &PolicyFacts,
+    ) -> Truth {
         let RuleTarget::Tool {
             tool_name: rule_tool_name,
         } = &self.target
         else {
-            return false;
+            return Truth::False;
         };
 
-        self.enabled && rule_tool_name == tool_name && self.principal.matches(principal)
+        let predicates_hold =
+            self.enabled && rule_tool_name == tool_name && self.principal.matches(principal);
+        self.with_conditions(predicates_hold, principal, facts)
+    }
+
+    fn with_conditions(
+        &self,
+        predicates_hold: bool,
+        principal: Option<&Principal>,
+        facts: &PolicyFacts,
+    ) -> Truth {
+        if !predicates_hold {
+            return Truth::False;
+        }
+        self.conditions.as_ref().map_or(Truth::True, |conditions| {
+            conditions.evaluate(principal, facts)
+        })
     }
 }
 
@@ -643,6 +807,7 @@ mod tests {
                 principal_ids: Vec::new(),
             },
             action: RuleAction::Allow,
+            conditions: None,
         }]);
         let principal = test_principal("user-123", &["support"], AuthMethod::Bearer);
 
@@ -1262,6 +1427,7 @@ mod tests {
                 dispatch: None,
                 principal,
                 action,
+                conditions: None,
             })
     }
 
@@ -1379,6 +1545,7 @@ mod tests {
             dispatch: None,
             principal: PrincipalMatcher::default(),
             action,
+            conditions: None,
         }
     }
 
@@ -1397,6 +1564,7 @@ mod tests {
                 principal_ids: Vec::new(),
             },
             action,
+            conditions: None,
         }
     }
 

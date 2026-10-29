@@ -252,7 +252,8 @@ Diagnostic codes: `invalid_type`, `missing_field`, `unknown_field`,
   `policy-tests.v1`. The version defines no normalization beyond JCS, so member
   order and whitespace do not change it and any other change does.
 - `policy.etag` is the active policy's ETag, or for a candidate the ETag it
-  would have once written. `policy.source` is `active` or `inline_candidate`;
+  would have once written. `policy.source` is `active` or `inline_candidate`
+  (or `publication` inside a [policy evidence package](policy-evidence.md));
   cluster mode adds `security_revision`.
 - Each case reports its `status` (`passed`, `failed`, `incomplete`, `error`),
   what was `expected`, what the evaluator answered in stable codes (`actual`,
