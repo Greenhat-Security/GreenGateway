@@ -411,16 +411,202 @@ async fn an_invalid_suite_or_body_is_refused_before_any_run() {
     assert!(test_run_events(&harness).is_empty());
 }
 
-#[test]
-fn concurrent_runs_are_bounded_and_a_slot_is_returned_on_drop() {
-    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let first = PolicyTestRunSlot::try_acquire(&COUNTER, 2).expect("first slot");
-    let second = PolicyTestRunSlot::try_acquire(&COUNTER, 2).expect("second slot");
-    assert!(PolicyTestRunSlot::try_acquire(&COUNTER, 2).is_none());
-    drop(first);
-    let third = PolicyTestRunSlot::try_acquire(&COUNTER, 2).expect("a released slot is reusable");
-    drop((second, third));
-    assert_eq!(COUNTER.load(std::sync::atomic::Ordering::Acquire), 0);
+/// The test-run route alone, over `limiter`, so a test can see and hold the
+/// slots the route admits runs into. The application builds the same route
+/// with a limiter of its own.
+fn limited_router(
+    harness: &Harness,
+    limiter: Arc<PolicyEvaluationLimiter>,
+    max_body_size: usize,
+) -> Router {
+    let policy =
+        rbac::Policy::validate_json_value(runs_policy_document()).expect("policy is valid");
+    let rbac_state =
+        middleware::rbac::RbacState::new(policy, Vec::new(), false, harness.audit.clone());
+    Router::new()
+        .route(
+            RUNS,
+            post(policy_test_runs_endpoint).layer(Extension(limiter)),
+        )
+        .with_state(PolicyAdminState {
+            policy_file: Some(harness.policy.path.clone()),
+            rbac_state: Some(rbac_state),
+            history_store: None,
+            draft_store: None,
+            #[cfg(feature = "postgres")]
+            control_plane: None,
+            #[cfg(feature = "postgres")]
+            membership: None,
+            event_store: None,
+            query_store: None,
+            audit: harness.audit.clone(),
+            client_ip_policy: client_ip::ClientIpPolicy::default(),
+            max_body_size,
+        })
+}
+
+fn tester_named(user_id: &str) -> auth::Principal {
+    let mut principal = test_principal(&["tester"]);
+    principal.user_id = user_id.to_owned();
+    principal
+}
+
+async fn refusal_reason(response: Response) -> Value {
+    json_body(response).await["reason"].clone()
+}
+
+/// A body that never finishes arriving, and a signal for when the handler
+/// first asks for it: the moment a run that admitted before reading its body
+/// would already hold a slot.
+fn stalled_body() -> (Body, tokio::sync::oneshot::Receiver<()>) {
+    let (polled, polled_signal) = tokio::sync::oneshot::channel();
+    let chunks = stream::once(async move {
+        let _ = polled.send(());
+        std::future::pending::<Result<Bytes, Infallible>>().await
+    });
+    (Body::from_stream(chunks), polled_signal)
+}
+
+/// A run is admitted only once its body is in hand. Uploads trickled by one
+/// caller -- as many as the replica has slots -- hold none of them, so the
+/// same caller's next complete run is admitted while they are still open,
+/// and each stalled upload is refused once its body deadline passes.
+#[tokio::test]
+async fn a_stalled_body_is_refused_within_its_deadline_and_holds_no_slot() {
+    let harness = harness();
+    let limiter = Arc::new(PolicyEvaluationLimiter::new(
+        MAX_CONCURRENT_POLICY_TEST_RUNS,
+    ));
+    let router = limited_router(&harness, Arc::clone(&limiter), 1024 * 1024);
+    let started = tokio::time::Instant::now();
+    let mut stalled = Vec::new();
+    for _ in 0..MAX_CONCURRENT_POLICY_TEST_RUNS {
+        let (body, polled) = stalled_body();
+        let request = policy_admin_request_with_body(Method::POST, RUNS, tester(), body, None);
+        stalled.push(tokio::spawn(router.clone().oneshot(request)));
+        polled.await.expect("the handler reads the stalled body");
+    }
+
+    // Every stalled upload is being read, and none holds a slot: not the
+    // caller's own, and not one of the replica's.
+    let probe = limiter.try_acquire(policy_evaluation_actor(&test_principal(&["tester"])));
+    assert!(probe.is_some(), "a stalled upload holds the caller's slot");
+    drop(probe);
+    let response = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::POST,
+            RUNS,
+            tester(),
+            Some(json!({ "suite": passing_suite() }).to_string()),
+            None,
+        ))
+        .await
+        .expect("policy test run should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    for request in stalled {
+        let response = request
+            .await
+            .expect("the stalled request task completes")
+            .expect("the stalled request completes");
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(
+            refusal_reason(response).await,
+            json!("policy_tests_request_timeout")
+        );
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= POLICY_TEST_RUN_BODY_DEADLINE,
+        "refused after {elapsed:?}, before the body deadline"
+    );
+    assert!(
+        elapsed < POLICY_TEST_RUN_BODY_DEADLINE + Duration::from_secs(5),
+        "refused after {elapsed:?}, long past the body deadline"
+    );
+    // The completed run is the only one recorded.
+    drain_audit(&harness).await;
+    assert_eq!(test_run_events(&harness).len(), 1);
+}
+
+/// One caller holds at most one run slot, so a second concurrent run from the
+/// same actor is refused while another actor is still admitted, and the
+/// replica-wide bound holds across actors.
+#[tokio::test]
+async fn one_actor_holds_one_run_slot_while_others_are_admitted() {
+    let harness = harness();
+    let limiter = Arc::new(PolicyEvaluationLimiter::new(
+        MAX_CONCURRENT_POLICY_TEST_RUNS,
+    ));
+    let router = limited_router(&harness, Arc::clone(&limiter), 1024 * 1024);
+    let body = json!({ "suite": passing_suite() }).to_string();
+    let run = |principal: auth::Principal| {
+        router.clone().oneshot(policy_admin_request(
+            Method::POST,
+            RUNS,
+            Some(principal),
+            Some(body.clone()),
+            None,
+        ))
+    };
+
+    // A run of this caller's in flight holds exactly this slot.
+    let in_flight = limiter
+        .try_acquire(policy_evaluation_actor(&tester_named("alice")))
+        .expect("the first run is admitted");
+    let response = run(tester_named("alice")).await.expect("run completes");
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(refusal_reason(response).await, json!("policy_tests_busy"));
+    let response = run(tester_named("bob")).await.expect("run completes");
+    assert_eq!(response.status(), StatusCode::OK);
+    // The same subject under another issuer is another actor.
+    let mut federated = tester_named("alice");
+    federated.issuer = Some("https://idp.example.test".to_owned());
+    let response = run(federated).await.expect("run completes");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // With every replica slot held, any actor is refused.
+    let others: Vec<_> = (1..MAX_CONCURRENT_POLICY_TEST_RUNS)
+        .map(|index| {
+            limiter
+                .try_acquire(format!("\u{0}other-{index}"))
+                .expect("a slot is free")
+        })
+        .collect();
+    let response = run(tester_named("carol")).await.expect("run completes");
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(refusal_reason(response).await, json!("policy_tests_busy"));
+
+    drop((in_flight, others));
+    let response = run(tester_named("alice")).await.expect("run completes");
+    assert_eq!(response.status(), StatusCode::OK);
+    drain_audit(&harness).await;
+    assert_eq!(test_run_events(&harness).len(), 3);
+}
+
+/// A run's body is bounded by its own limit even where the deployment's
+/// `MAX_BODY_SIZE` is higher.
+#[tokio::test]
+async fn a_body_over_the_run_bound_is_refused_whatever_the_deployment_limit() {
+    let harness = harness();
+    let limiter = Arc::new(PolicyEvaluationLimiter::new(
+        MAX_CONCURRENT_POLICY_TEST_RUNS,
+    ));
+    let router = limited_router(&harness, limiter, 4 * MAX_POLICY_TEST_RUN_BODY_BYTES);
+    let response = router
+        .oneshot(policy_admin_request(
+            Method::POST,
+            RUNS,
+            tester(),
+            Some(" ".repeat(MAX_POLICY_TEST_RUN_BODY_BYTES + 1)),
+            None,
+        ))
+        .await
+        .expect("policy test run should complete");
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    drain_audit(&harness).await;
+    assert!(test_run_events(&harness).is_empty());
 }
 
 #[tokio::test]

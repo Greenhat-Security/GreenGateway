@@ -32,6 +32,8 @@ pub(crate) mod suite;
 #[cfg(test)]
 mod tests;
 
+use std::time::Instant;
+
 use crate::{
     policy_eval::{CompileError, CompiledPolicy, PolicyAuthority},
     rbac::Policy,
@@ -59,7 +61,18 @@ pub(crate) const NOT_EVALUATED: &[&str] = &[
     "gateway_build_identity",
 ];
 
-/// Compile `policy` and run `suite` against it.
+/// Why a run produced no report. Neither is a partial answer.
+#[derive(Debug)]
+pub(crate) enum RunError {
+    /// The policy under test did not compile.
+    Compile(CompileError),
+    /// The run passed its deadline before every case was decided.
+    DeadlineExceeded,
+}
+
+/// Compile `policy` and run `suite` against it, deciding no case once
+/// `deadline` has passed. Compiling counts against the deadline, since the
+/// caller sets it before this starts.
 ///
 /// Compilation goes through [`CompiledPolicy::from_validated_policy`], the
 /// constructor the live install paths use, so the policy is judged exactly as
@@ -68,11 +81,14 @@ pub(crate) fn run_against_policy(
     policy: Policy,
     authority: PolicyAuthority,
     suite: &suite::Suite,
-) -> Result<runner::RunOutcome, CompileError> {
+    deadline: Instant,
+) -> Result<runner::RunOutcome, RunError> {
     let under_test = {
         let rule_ids_source = policy.clone();
-        let compiled = CompiledPolicy::from_validated_policy(policy, authority)?;
+        let compiled =
+            CompiledPolicy::from_validated_policy(policy, authority).map_err(RunError::Compile)?;
         runner::PolicyUnderTest::new(compiled, &rule_ids_source)
     };
-    Ok(runner::run_suite(&under_test, suite))
+    runner::run_suite(&under_test, suite, deadline)
+        .map_err(|runner::DeadlineExceeded| RunError::DeadlineExceeded)
 }
