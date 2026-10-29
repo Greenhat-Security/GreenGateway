@@ -377,6 +377,21 @@ pub(super) struct PolicyInspectionResponse<'a> {
     pub(super) source_digest: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) semantic_digest: Option<&'a str>,
+    /// The resources the cross-resource checks read, for a document that
+    /// parsed (issue #243, slice 8).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) resource_snapshot: Option<&'a rbac::policy_resources::PolicyResourceSnapshot>,
+}
+
+/// A policy write the cross-resource checks refused (issue #243, slice 8):
+/// the `valid`/`errors` pair of every refused policy write, every finding,
+/// and the resources the findings were read from.
+#[derive(Serialize)]
+pub(super) struct PolicyPublicationRefusedResponse<'a> {
+    pub(super) valid: bool,
+    pub(super) errors: Vec<String>,
+    pub(super) diagnostics: Vec<&'a rbac::policy_document::PolicyDiagnostic>,
+    pub(super) resource_snapshot: &'a rbac::policy_resources::PolicyResourceSnapshot,
 }
 
 /// `POST /policy/convert`: a 0.x document converted to policy v1, with what

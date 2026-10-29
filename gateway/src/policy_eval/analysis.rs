@@ -32,6 +32,7 @@ use super::{
     Limitation, PolicyAuthority, PolicyDigest, PolicyEvaluationContext, PrincipalFact,
 };
 use crate::{
+    auth::Principal,
     rbac::{
         matcher::RuleDispatchContext, policy::RoleEntry, DefaultAction, EgressPolicy,
         EnforcementMode, Policy, Rule,
@@ -88,6 +89,14 @@ impl CompiledPolicy {
     /// that asks about a representative caller of each.
     pub(crate) fn roles(&self) -> &HashMap<String, RoleEntry> {
         &self.engine.policy().roles
+    }
+
+    /// Whether this instance grants `principal` the admin `permission`: the
+    /// question the admin API asks of the live policy before every admin
+    /// operation, asked of this one. The policy resource checks use it to
+    /// tell whether a publisher would keep the permission to publish again.
+    pub(crate) fn principal_has_permission(&self, principal: &Principal, permission: &str) -> bool {
+        self.engine.principal_has_permission(principal, permission)
     }
 
     /// The first enabled direct HTTP rule whose own predicates -- method, path

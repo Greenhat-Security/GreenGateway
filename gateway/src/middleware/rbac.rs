@@ -284,6 +284,10 @@ pub struct RbacState {
     pub audit: AuditLog,
     mcp_route_paths: Vec<String>,
     proxy_dispatch_inventory: Arc<ProxyDispatchInventory>,
+    /// The resources a policy is validated against before it is published
+    /// (issue #243, slice 8), attached once at startup. A state built without
+    /// them validates with every one reported unavailable.
+    policy_resources: Option<Arc<crate::rbac::policy_resources::PolicyResourceSources>>,
 }
 
 /// Proof that a caller owns this [`RbacState`]'s policy-write lane.
@@ -623,7 +627,55 @@ impl RbacState {
             audit,
             mcp_route_paths,
             proxy_dispatch_inventory: Arc::new(ProxyDispatchInventory::default()),
+            policy_resources: None,
         }
+    }
+
+    /// Attach the resources a candidate policy is validated against before
+    /// publication. Every clone made afterwards shares them.
+    pub(crate) fn with_policy_resources(
+        mut self,
+        sources: crate::rbac::policy_resources::PolicyResourceSources,
+    ) -> Self {
+        self.policy_resources = Some(Arc::new(sources));
+        self
+    }
+
+    /// What the policy resources say now, read once, for one validation.
+    pub(crate) fn policy_resource_view(&self) -> crate::rbac::policy_resources::PolicyResourceView {
+        let security_revision = self.cluster_security_revision();
+        match self.policy_resources.as_deref() {
+            Some(sources) => sources.read(
+                self.rbac_exempts_path(&sources.policy_route),
+                security_revision,
+            ),
+            None => crate::rbac::policy_resources::PolicyResourceView {
+                security_revision,
+                ..crate::rbac::policy_resources::PolicyResourceView::default()
+            },
+        }
+    }
+
+    /// Whether the RBAC stage lets a gateway-owned request for `path` through
+    /// without evaluating policy: the exemption [`rbac_middleware`] applies to
+    /// a request that was not classified as a proxy dispatch. An exact MCP
+    /// route is never exempt, whatever prefix encloses it.
+    pub(crate) fn rbac_exempts_path(&self, path: &str) -> bool {
+        !self.is_mcp_route_path(path)
+            && self
+                .exempt_paths
+                .iter()
+                .any(|exempt_path| exempt_path_matches(path, exempt_path))
+    }
+
+    /// The security revision of the installed snapshot in cluster mode;
+    /// standalone snapshots have none.
+    fn cluster_security_revision(&self) -> Option<i64> {
+        #[cfg(feature = "postgres")]
+        if self.revision_gate.is_some() {
+            return Some(self.policy.load().security_revision);
+        }
+        None
     }
 
     /// Attach the rate stage, which from now on selects policy rate lanes with
