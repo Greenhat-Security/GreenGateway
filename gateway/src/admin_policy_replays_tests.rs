@@ -672,42 +672,54 @@ struct RegistryHarness {
     audit_db: TempDb,
 }
 
+/// The replay routes alone, over `jobs`.
+fn replay_routes(jobs: &Arc<PolicyReplayJobs>) -> Router<PolicyAdminState> {
+    Router::new()
+        .route(
+            POLICY_REPLAYS_ADMIN_ROUTE,
+            post(policy_replay_create_endpoint).layer(Extension(Arc::clone(jobs))),
+        )
+        .route(
+            POLICY_REPLAY_ADMIN_ROUTE,
+            get(policy_replay_get_endpoint)
+                .delete(policy_replay_delete_endpoint)
+                .layer(Extension(Arc::clone(jobs))),
+        )
+}
+
+/// A standalone policy admin state over the replay test policy and `store`.
+fn replay_admin_state(
+    store: Arc<storage::SqliteAuditEventStore>,
+    audit_log: audit::AuditLog,
+) -> PolicyAdminState {
+    let policy = rbac::Policy::validate_json_value(replays_policy_document())
+        .expect("the test policy validates");
+    let rbac_state = middleware::rbac::RbacState::new(policy, Vec::new(), false, test_audit_log());
+    PolicyAdminState {
+        policy_file: None,
+        rbac_state: Some(rbac_state),
+        history_store: None,
+        draft_store: None,
+        #[cfg(feature = "postgres")]
+        control_plane: None,
+        #[cfg(feature = "postgres")]
+        membership: None,
+        event_store: Some(store.clone() as Arc<dyn storage::AuditEventStore>),
+        query_store: Some(store),
+        audit: audit_log,
+        client_ip_policy: client_ip::ClientIpPolicy::default(),
+        max_body_size: 1024 * 1024,
+    }
+}
+
 fn registry_harness() -> RegistryHarness {
     let capture = audit::sink::tests::CaptureSink::new();
     let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
     let audit_db = TempDb::new("policy-replay-registry");
     let store =
         Arc::new(storage::SqliteAuditEventStore::open(&audit_db.path).expect("audit store opens"));
-    let policy = rbac::Policy::validate_json_value(replays_policy_document())
-        .expect("the test policy validates");
-    let rbac_state = middleware::rbac::RbacState::new(policy, Vec::new(), false, test_audit_log());
     let jobs = Arc::new(PolicyReplayJobs::new());
-    let router = Router::new()
-        .route(
-            POLICY_REPLAYS_ADMIN_ROUTE,
-            post(policy_replay_create_endpoint).layer(Extension(Arc::clone(&jobs))),
-        )
-        .route(
-            POLICY_REPLAY_ADMIN_ROUTE,
-            get(policy_replay_get_endpoint)
-                .delete(policy_replay_delete_endpoint)
-                .layer(Extension(Arc::clone(&jobs))),
-        )
-        .with_state(PolicyAdminState {
-            policy_file: None,
-            rbac_state: Some(rbac_state),
-            history_store: None,
-            draft_store: None,
-            #[cfg(feature = "postgres")]
-            control_plane: None,
-            #[cfg(feature = "postgres")]
-            membership: None,
-            event_store: Some(store.clone() as Arc<dyn storage::AuditEventStore>),
-            query_store: Some(store),
-            audit: audit_log,
-            client_ip_policy: client_ip::ClientIpPolicy::default(),
-            max_body_size: 1024 * 1024,
-        });
+    let router = replay_routes(&jobs).with_state(replay_admin_state(store, audit_log));
     seed(&audit_db.path, &retained_window());
     RegistryHarness {
         router,
@@ -838,6 +850,125 @@ async fn finished_results_are_bounded_per_principal_and_expire() {
         .sweep_after(POLICY_REPLAY_RESULT_TTL + POLICY_REPLAY_EXPIRED_RETENTION);
     let response = get_job(&harness.router, operator("op-0"), &ids[0]).await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// A cluster control plane a replay must never consult: every call counts
+/// and fails.
+#[cfg(feature = "postgres")]
+#[derive(Default)]
+struct UnconsultedControlPlane {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(feature = "postgres")]
+impl UnconsultedControlPlane {
+    fn refuse(&self, operation: &'static str) -> storage::RepositoryError {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        storage::RepositoryError::new(storage::RepositoryErrorKind::Unavailable, operation)
+    }
+}
+
+#[cfg(feature = "postgres")]
+#[async_trait::async_trait]
+impl storage::PolicyHistory for UnconsultedControlPlane {
+    async fn append_version(
+        &self,
+        _actor_user_id: &str,
+        _diff_summary: &Value,
+        _policy: &rbac::Policy,
+    ) -> Result<rbac::policy_history::PolicyVersion, storage::RepositoryError> {
+        Err(self.refuse("policy_history_append"))
+    }
+
+    async fn list_versions(
+        &self,
+        _filters: &rbac::PolicyHistoryListFilters,
+    ) -> Result<rbac::PolicyHistoryPage, storage::RepositoryError> {
+        Err(self.refuse("policy_history_list"))
+    }
+
+    async fn get_version(
+        &self,
+        _version: i64,
+    ) -> Result<Option<rbac::policy_history::PolicyVersion>, storage::RepositoryError> {
+        Err(self.refuse("policy_history_get"))
+    }
+}
+
+#[cfg(feature = "postgres")]
+#[async_trait::async_trait]
+impl storage::PolicyControlPlane for UnconsultedControlPlane {
+    async fn active(&self) -> Result<Option<storage::ActivePolicy>, storage::RepositoryError> {
+        Err(self.refuse("policy_control_plane_active"))
+    }
+
+    async fn commit(
+        &self,
+        _request: storage::PolicyCommitRequest<'_>,
+    ) -> Result<storage::ActivePolicy, storage::PolicyCommitError> {
+        Err(storage::PolicyCommitError::Store(
+            self.refuse("policy_control_plane_commit"),
+        ))
+    }
+}
+
+/// Fail closed in cluster mode: a replica-local job would read one
+/// replica's view of a shared audit authority, and replicated jobs need the
+/// durable leases of #241. Every route answers `503` with a stable reason
+/// after the permission checks and before any work -- no body is parsed, no
+/// cutoff read, no job admitted, no lifecycle recorded and no authority
+/// consulted.
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn cluster_mode_refuses_every_replay_route_before_any_work() {
+    let capture = audit::sink::tests::CaptureSink::new();
+    let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+    let audit_db = TempDb::new("policy-replay-cluster");
+    let store =
+        Arc::new(storage::SqliteAuditEventStore::open(&audit_db.path).expect("audit store opens"));
+    seed(&audit_db.path, &retained_window());
+    let control_plane = Arc::new(UnconsultedControlPlane::default());
+    let mut state = replay_admin_state(store, audit_log);
+    state.control_plane = Some(Arc::clone(&control_plane) as Arc<dyn storage::PolicyControlPlane>);
+    let jobs = Arc::new(PolicyReplayJobs::new());
+    let router = replay_routes(&jobs).with_state(state);
+    let body = replay_body(&registry_etag(), json!({ "source": "active" })).to_string();
+    let id = "rpl_00000000000000000000000000000000";
+
+    let mut responses = vec![
+        start(&router, replayer(), body.clone()).await,
+        // Not even a body that would be refused is read.
+        start(&router, replayer(), "not json".to_owned()).await,
+        get_job(&router, replayer(), id).await,
+        delete_job(&router, replayer(), id).await,
+    ];
+    for response in responses.drain(..) {
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            json_body(response).await["reason"],
+            json!("policy_replay_unsupported_in_cluster")
+        );
+    }
+    // The permission checks still come first.
+    let simulator = Some(test_principal(&["simulator"]));
+    let response = start(&router, simulator.clone(), body).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let response = get_job(&router, simulator, id).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    assert_eq!(
+        control_plane
+            .calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a refused replay never consults the cluster authority"
+    );
+    assert_eq!(jobs.job_count(), 0, "no job is admitted");
+    assert!(lifecycle_events(&capture).is_empty());
+    assert_eq!(
+        audit_row_count(&audit_db.path),
+        i64::try_from(retained_window().len()).expect("fits")
+    );
 }
 
 /// The acceptance criterion of #243 slice 13, after the simulation API's: a

@@ -472,9 +472,11 @@ says a policy is safe.
 Jobs live in the memory of the replica that admitted them, and run there.
 Shutting the gateway down cancels every job, and a running one stops before
 its next record. A restart forgets every job: its id is `404` afterwards,
-never resumed and never a partial result. Cluster mode answers every replay route `503 policy_replay_unsupported_in_cluster`: a
-replicated job needs the durable leases of #241, and the cluster audit
-authority is PostgreSQL, which no replay reader covers yet. Without a
+never resumed and never a partial result. Cluster mode answers every replay
+route `503 policy_replay_unsupported_in_cluster`, after the permission checks
+and before a body is read, a cutoff fixed or a job admitted: a replicated job
+needs the durable leases of #241, and the cluster audit authority is
+PostgreSQL, which no replay reader covers yet. Without a
 standalone audit log (`AUDIT_SQLITE_PATH` unset) the start route is
 `503 audit_evidence_unavailable`, never an empty result.
 
@@ -518,6 +520,8 @@ then sends the same request live to show each of those checks can fail.
   three permissions, and serves a job only to its owner; a stale base, an
   invalid window, edit or candidate creates no job; an idempotent retry starts
   nothing; queued jobs are cancelled, quotas refuse rather than evict, and
-  results expire; and the side-effect test above holds.
+  results expire; in cluster mode every route answers `503` without reading a
+  body, admitting a job, recording a lifecycle event or consulting the
+  cluster authority; and the side-effect test above holds.
 - The `policy-replay.v1` parser and its published schema accept and refuse
   the same requests.

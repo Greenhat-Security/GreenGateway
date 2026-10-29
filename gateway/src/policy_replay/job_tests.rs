@@ -111,17 +111,22 @@ fn observed(method: &str, path: &str, decision: &str, actor: Option<Actor>) -> A
     )
 }
 
-/// One stored row of a test source.
+/// One stored row of a test source. The event is boxed, as the reader's
+/// is: it is far larger than the other rows.
 enum Stored {
-    Event(AuditEvent),
+    Event(Box<AuditEvent>),
     Unreadable,
     Oversized,
 }
 
 impl Stored {
+    fn event(event: AuditEvent) -> Self {
+        Self::Event(Box::new(event))
+    }
+
     fn row(&self) -> ReplayRow {
         match self {
-            Self::Event(event) => ReplayRow::Event(Box::new(event.clone())),
+            Self::Event(event) => ReplayRow::Event(event.clone()),
             Self::Unreadable => ReplayRow::Unreadable,
             Self::Oversized => ReplayRow::Oversized,
         }
@@ -161,7 +166,7 @@ impl VecSource {
     }
 
     fn events(events: Vec<AuditEvent>) -> Self {
-        Self::new(events.into_iter().map(Stored::Event).collect())
+        Self::new(events.into_iter().map(Stored::event).collect())
     }
 
     fn push(&self, epoch_us: i64, stored: Stored) {
@@ -260,30 +265,30 @@ fn mixed_window() -> Vec<Stored> {
     let mut unknown_envelope = observed("GET", "/orders/1", "allowed", Some(reader()));
     unknown_envelope.schema_version = "0.9.0".to_owned();
     vec![
-        Stored::Event(observed("GET", "/public/a", "allowed", Some(reader()))),
-        Stored::Event(audit_event(
+        Stored::event(observed("GET", "/public/a", "allowed", Some(reader()))),
+        Stored::event(audit_event(
             "authz.allowed",
             None,
             json!({ "method": "GET", "path": "/public/a", "matched_rule_id": "public-allow" }),
         )),
-        Stored::Event(observed("GET", PATH_CANARY, "allowed", Some(reader()))),
-        Stored::Event(observed("GET", "/orders/2", "denied", None)),
-        Stored::Event(observed(
+        Stored::event(observed("GET", PATH_CANARY, "allowed", Some(reader()))),
+        Stored::event(observed("GET", "/orders/2", "denied", None)),
+        Stored::event(observed(
             "GET",
             "/orders/watched",
             "would_deny",
             Some(reader()),
         )),
-        Stored::Event(old_envelope),
-        Stored::Event(unknown_envelope),
-        Stored::Event(observed("GET", "/health", "not_evaluated", None)),
-        Stored::Event(observed("GE T", "/orders/3", "allowed", None)),
-        Stored::Event(audit_event(
+        Stored::event(old_envelope),
+        Stored::event(unknown_envelope),
+        Stored::event(observed("GET", "/health", "not_evaluated", None)),
+        Stored::event(observed("GE T", "/orders/3", "allowed", None)),
+        Stored::event(audit_event(
             event::TOOL_INVOKE_START,
             Some(reader()),
             json!({ "tool_name": "search", "outcome": "started" }),
         )),
-        Stored::Event(audit_event(
+        Stored::event(audit_event(
             event::POLICY_CHANGED,
             Some(reader()),
             json!({ "action": "updated" }),
@@ -453,7 +458,7 @@ fn records_written_after_the_cutoff_never_enter_a_job() {
     // Written after the job was created, inside its window.
     source.push(
         WINDOW_START_US + 10,
-        Stored::Event(observed("GET", "/orders/9", "denied", None)),
+        Stored::event(observed("GET", "/orders/9", "denied", None)),
     );
     let outcome = run_to_end(&source, &scope);
     assert!(outcome.complete);

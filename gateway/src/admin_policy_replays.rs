@@ -339,6 +339,13 @@ impl PolicyReplayJobs {
     pub(super) fn sweep_after(&self, elapsed: Duration) {
         drop(self.swept(Instant::now() + elapsed));
     }
+
+    /// Jobs the registry holds, pending, finished or expired. Only the
+    /// cluster-mode refusal test, which needs a control plane, asks.
+    #[cfg(feature = "postgres")]
+    pub(super) fn job_count(&self) -> usize {
+        self.swept(Instant::now()).len()
+    }
 }
 
 fn replay_refusal(status: StatusCode, error: &str, reason: &'static str) -> Response {
