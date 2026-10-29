@@ -6701,7 +6701,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::routing::add_admin_api_routes#1",
-      "sha256": "bedbc6c9d2bd97d381a4b0e489af80a6b16e9c1938cd9379387c9d4f294e7f5a",
+      "sha256": "ac369c173ffeb65d6134a72db73da6f20c80a16deb70cc0c5c2fb3a1de3cc003",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
@@ -7106,6 +7106,16 @@
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
     {
+      "file": "gateway/src/admin_policy_evidence.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::admin_policy_evidence::use super :: *#1",
+      "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
       "file": "gateway/src/main.rs",
       "reasons": [
         "capability-import-or-glob"
@@ -7122,6 +7132,16 @@
       ],
       "scope": "gateway::use admin_policy_replays :: *#1",
       "sha256": "55c05778c910e2295d719e51e3f3a80748d9b3cc17482432b1ee6b422ff92a05",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/main.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::use admin_policy_evidence :: *#1",
+      "sha256": "2cddd23240b381eb60012c19c2f251286a733a37f48c4f422a20844b151c6d7c",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
@@ -11009,9 +11029,9 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::policy_replay::file_attributes#1",
-      "sha256": "bd6d6a86d8c6f7b1896edf24fa8e7be727c837da52523d5a58ee6aae218cfd34",
+      "sha256": "54a6a9a8dcff73aefeffeb33ec7c4e3e2a5c5e6cf7351496a4925f485491e960",
       "owner": "policy replay contexts (#243)",
-      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the policy replay context module: the replay job engine (#243 slice 13) now calls the adapters and evaluator, and the serialized form, egress replay and recorded result wait for the impact comparison (#243 slice 14). The module parses and builds replay contexts in memory and asks the pure policy kernel; dead-code gating only, no I/O and no transport or process capability."
+      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the policy replay context module: the replay job engine (#243 slice 13) calls the adapters and evaluator and the impact comparison (#243 slice 14) reads the recorded result, while the serialized form and egress replay wait for a record that states them. The module parses and builds replay contexts in memory and asks the pure policy kernel; dead-code gating only, no I/O and no transport or process capability."
     },
     {
       "file": "gateway/src/proxy/admission.rs",
@@ -11540,6 +11560,26 @@
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
     {
+      "file": "gateway/src/rbac/conditions.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::rbac::conditions::use std :: net :: IpAddr#1",
+      "sha256": "abf89a0dd5d2b68df48d2445831118062ac113c2f71cf08f3d392ad95b31637d",
+      "owner": "policy evaluation typed matchers (#243)",
+      "purpose": "The IpAddr value type for the canonical client address a source_network rule condition compares against policy CIDRs (issue #243, item 16). The address is a fact the caller supplies after trusted-proxy processing; the module only compares it with ipnet networks. No socket, resolver, connection or other network or process capability is introduced."
+    },
+    {
+      "file": "gateway/src/rbac/conditions.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::rbac::conditions::Fact#1",
+      "sha256": "8e0ffdb22c8f511ede041f1af313d228e69bf826c43f913254192913933d1ed7",
+      "owner": "policy evaluation typed matchers (#243)",
+      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) on the Captured variant of the typed-matcher fact, which no serving adapter constructs yet: policy validation refuses every document that uses identity mappings or rule conditions until an adapter captures their facts (#243, item 16). Dead-code gating only; no transport or process capability."
+    },
+    {
       "file": "gateway/src/rbac/policy.rs",
       "reasons": [
         "unexpanded-attribute"
@@ -11714,16 +11754,6 @@
       "reasons": [
         "network-or-process-reference"
       ],
-      "scope": "gateway::storage::migrations::apply_missing#1",
-      "sha256": "c7590b86709c3b34d7200572031c8a85f13452c10adf64277e72d1445f97ae35",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
-    },
-    {
-      "file": "gateway/src/storage/migrations.rs",
-      "reasons": [
-        "network-or-process-reference"
-      ],
       "scope": "gateway::storage::migrations::bootstrap_ledger#1",
       "sha256": "b4adc6b6f32d67d9092a42402d5c9b96adebcece8d404d205ed7b272a99e6304",
       "owner": "GreenGateway maintainers",
@@ -11734,18 +11764,8 @@
       "reasons": [
         "network-or-process-reference"
       ],
-      "scope": "gateway::storage::migrations::apply_one#1",
-      "sha256": "57bfc92e3d1d7f346dd323ecbded2ed662ea8f62d137b783b8748f19a6e41557",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
-    },
-    {
-      "file": "gateway/src/storage/migrations.rs",
-      "reasons": [
-        "network-or-process-reference"
-      ],
       "scope": "gateway::storage::migrations::migration_transaction#1",
-      "sha256": "1ed5a6a310d9b10aa64a2fb6a5ae0bf3a463905fff2d77fe373520c5a7e74dbd",
+      "sha256": "c4f62064dab7399793c69fec9721941a827eb2d7b371ab4256c3a86874dab5a1",
       "owner": "GreenGateway maintainers",
       "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
     },
@@ -11754,10 +11774,30 @@
       "reasons": [
         "network-or-process-reference"
       ],
-      "scope": "gateway::storage::migrations::apply_missing_for_startup#1",
-      "sha256": "82f494822119e52dc7d89aba273f4c5a8475befc4e745c53bb97b7c47f07ba04",
+      "scope": "gateway::storage::migrations::apply_manifest#1",
+      "sha256": "33c5f207bc610f39e80251b5080eb978a4da8803381d1c0d9aa7800ba1229593",
       "owner": "GreenGateway maintainers",
-      "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
+      "purpose": "The migrator checks one connection out of the existing PostgreSQL foundation pool, detaches it under the schema advisory lock and applies the manifest's missing migrations over it; no new connection construction or transport authority."
+    },
+    {
+      "file": "gateway/src/storage/migrations.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::migrations::apply_migration#1",
+      "sha256": "25cdfa166884b64a7894c875ce7be9c99f32e19a8e4ada4c67baca075cf2dd6c",
+      "owner": "GreenGateway maintainers",
+      "purpose": "One migration's explicit transaction on the migrator's detached session, a contracting migration's fence raise included; no new connection construction or transport authority."
+    },
+    {
+      "file": "gateway/src/storage/migrations.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::migrations::auto_migrate#1",
+      "sha256": "ed4a3d433ae71757c3507f85425f020251b8880b721ffb931e0c78dea0490905",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Development auto-migration delegates to the migrator over the existing PostgreSQL foundation pool with the serving configuration; no new transport authority."
     },
     {
       "file": "gateway/src/storage/policy_drafts.rs",
@@ -12086,7 +12126,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_admin_sessions::impl  PostgresAdminSessionStore::prune_expired_with#1",
-      "sha256": "0be9417b6c6cecc2f34ed4ab0cafe26150fa02cbab062e8c01272830cfbfe65a",
+      "sha256": "9773414d55889dce2fd5823a5468f8ccbb195fdecb39de3ac905c49d2e141754",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -12116,7 +12156,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_admin_sessions::impl  PostgresAdminSessionStore::begin_login_in#1",
-      "sha256": "74ed1817cdffc458eac148a5685e9a78ffb02bb42c8d07d17e7f2b204c152b7a",
+      "sha256": "cb46dd7d30e16f0deb154a9b5ee42aa72c3f984405905b8db8ce787f67e00d8d",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -12126,7 +12166,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_admin_sessions::impl  PostgresAdminSessionStore::grant_in#1",
-      "sha256": "8fe5539da584c9360c31dda4d0d5588cef73c91122cb5008246c0329ec4e531f",
+      "sha256": "162cc45acdf7d35d5772dcfd6546429c3d8d394bcf3b0bb5e1eb07fc6fedbbc0",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -12136,7 +12176,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_admin_sessions::impl  PostgresAdminSessionStore::withdraw_in#1",
-      "sha256": "6f35f9399d77304d63c202ff64d18cb6d3473b65d686e958cad05037fc331f45",
+      "sha256": "ad5a4a7437066d29c274c748654f72d206cf7eb388fc93c22a1fee80843c8b0b",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -12165,8 +12205,28 @@
       "reasons": [
         "network-or-process-reference"
       ],
-      "scope": "gateway::storage::postgres_admin_sessions::prune_expired_statements#1",
-      "sha256": "c6bd1dab84623b4f1420f321ec802656d56a5b43eaf2b280221eb36ef142df00",
+      "scope": "gateway::storage::postgres_admin_sessions::classify_query#1",
+      "sha256": "b9618bf4127da4a3c48146f04769b3bf1026ac7481910dafc4f502dbfdacaf3b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_admin_sessions.rs",
+      "reasons": [
+        "unexpanded-macro"
+      ],
+      "scope": "gateway::storage::postgres_admin_sessions::macro journal_withdrawals#1",
+      "sha256": "3d9f0fc67cc3972578d7d96784934276afd29e850591e9edff2482436a239892",
+      "owner": "GreenGateway maintainers",
+      "purpose": "SQL text assembled at compile time for the admin session withdrawal statements; no network, process or HTTP authority of its own."
+    },
+    {
+      "file": "gateway/src/storage/postgres_admin_sessions.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_admin_sessions::prune_expired#1",
+      "sha256": "6571bbe6880a34fd77c947f97476df99a5a661694fab42b5c4be38277cd0ad12",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -12175,8 +12235,18 @@
       "reasons": [
         "network-or-process-reference"
       ],
-      "scope": "gateway::storage::postgres_admin_sessions::classify_query#1",
-      "sha256": "b9618bf4127da4a3c48146f04769b3bf1026ac7481910dafc4f502dbfdacaf3b",
+      "scope": "gateway::storage::postgres_admin_sessions::journaled_statement#1",
+      "sha256": "d9e9777865a3e9f8a30ae5e4e1bb580880c0499d4227d9dad6209714f7a7039c",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_admin_sessions.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_admin_sessions::withdraw_statement#1",
+      "sha256": "0d9f3db7b079de6c641960482904400559854d7b3799915079fb6c795dbc5150",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -14673,7 +14743,7 @@
         "unexpanded-macro"
       ],
       "scope": "gateway::authority_events::dispatcher::record_journal_stats#1",
-      "sha256": "7d1642231c3f8902db8e57663fec4695d9bd7991ea2c4db5c774e0613ed0b80c",
+      "sha256": "364b5dc167bae0a07a870ded9d35c9ea8d7ef8bf9c8a573a87d01efb63c12bdd",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
@@ -14813,7 +14883,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_authority_events::append_to_journal#1",
-      "sha256": "d9d1eaf857991353453e660e045a9c09b63e4f56f6c3d03b7f85d6f52316e574",
+      "sha256": "0dcc827762d86dd4b19883a1d8868a792dc47b0c73e1d7a627c0bbd1c447c42e",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -14870,16 +14940,6 @@
     {
       "file": "gateway/src/storage/postgres_authority_events.rs",
       "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::storage::postgres_authority_events::impl  JournalSource::ALL#1",
-      "sha256": "a14e519ac249c5759f4e94639370643f6ecab0c78cb46185cab41dc71c2d9b7b",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
-    },
-    {
-      "file": "gateway/src/storage/postgres_authority_events.rs",
-      "reasons": [
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_authority_events::impl  PostgresAuthorityEventStore::new#1",
@@ -14923,7 +14983,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_authority_events::read_stats#1",
-      "sha256": "d2a47bf98201da40e9bebeb22de2d015ad5709052ffb82e93e5391adceafe802",
+      "sha256": "29189f0abcd608dd871143d438391324ad8685bf83afb3fcda5c4adbc2a14443",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -14956,6 +15016,46 @@
       "sha256": "f7ea42fbe0a39befb09e21a9a49ab5caef8ef939b0a749d731b79a43836992a0",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/storage/contraction.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::contraction::raise_fence_before_contracting#1",
+      "sha256": "8ccde65df9f7bfc1a8dc159f96a26d80ed1ce2060026eeb1cfb938290cfa32a4",
+      "owner": "GreenGateway maintainers",
+      "purpose": "A contracting migration's fence decision inside the migrator's own open transaction on its detached, advisory-locked session: locks and raises the contract fence and reads the backfill and roster rows; no new connection construction or transport authority."
+    },
+    {
+      "file": "gateway/src/storage/contraction.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::contraction::record_contraction_fence#1",
+      "sha256": "c0d962cf3a67ed7505cac97007d2ab036fac4a4f09606727e8ecc09a86fc54b0",
+      "owner": "GreenGateway maintainers",
+      "purpose": "After a contracting migration commits, audits its fence raise through the existing PostgreSQL audit store over the migrator's foundation pool; no new connection construction or transport authority."
+    },
+    {
+      "file": "gateway/src/storage/contraction.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::contraction::fence_from_row#1",
+      "sha256": "ec8cfe812451d852deb6f0d784af5eefc129ec81b6873047d4e8747f7f4dc21c",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Decodes the contract fence row the migrator's transaction read; no connection construction."
+    },
+    {
+      "file": "gateway/src/storage/contraction.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::contraction::live_member_from_row#1",
+      "sha256": "babe36718ab89b5863ad287ea0212855bf3a34a5d4ec4bacc5b0bf44f49804d2",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Decodes a roster row the migrator's transaction read; no connection construction."
     },
     {
       "file": "ggctl/src/completion.rs",

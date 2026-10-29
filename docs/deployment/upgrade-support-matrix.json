@@ -1,11 +1,11 @@
 {
   "schema": 1,
   "issue": 426,
-  "describes": "Which GreenGateway builds may share one PostgreSQL deployment, how a deployment moves between them, and what proves each row. The procedure is docs/deployment/postgres.md#upgrading-a-cluster. storage::migrations' tests check this_build and schema_steps against the binary, and scripts/upgrade_pair_evidence.py checks the pinned pair (gateway/tests/ha/rolling-upgrade-pair.json) against the evidence the ha-release-gate (ha_rolling_upgrade) leg records.",
+  "describes": "Which GreenGateway builds may share one PostgreSQL deployment, how a deployment moves between them, and what proves each row. The procedure is docs/deployment/postgres.md#upgrading-a-cluster. storage::migrations' and storage::contraction's tests check this_build (its contracting migrations included) and schema_steps against the binary, and scripts/upgrade_pair_evidence.py checks the pinned pair (gateway/tests/ha/rolling-upgrade-pair.json) against the evidence the ha-release-gate (ha_rolling_upgrade) leg records.",
   "this_build": {
-    "manifest_versions": 25,
-    "read": [25, 25],
-    "write": [25, 25],
+    "manifest_versions": 26,
+    "read": [26, 26],
+    "write": [26, 26],
     "approved_extensions": [],
     "document_format": [0, 0],
     "capabilities": ["delegated_token_purges", "openapi_discovery_catalogs", "openapi_swagger2_catalogs", "operation_requirements", "policy_role_descriptions"],
@@ -42,7 +42,8 @@
         "backfill": null,
         "activation": "live_members"
       }
-    ]
+    ],
+    "contractions": []
   },
   "schema_steps": [
     { "from": 15, "to": 16, "migration": "connection_change_evidence", "procedure": "coordinated" },
@@ -64,7 +65,8 @@
         "prepared": "ffa61edfddbd1f2a31be5affe996bc2f0bde344a",
         "successor": "48eb65329c1d44f2b3a35484d91c933c45c224e4"
       }
-    }
+    },
+    { "from": 25, "to": 26, "migration": "admin_session_evidence_journal", "procedure": "coordinated" }
   ],
   "released_cluster_binaries": [],
   "qualified_pairs": [

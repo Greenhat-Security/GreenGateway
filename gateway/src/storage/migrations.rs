@@ -16,6 +16,10 @@
 //!   finalization step, never smuggled into a migration. Additive SQL alone
 //!   does not establish rolling compatibility: issue #426 requires an
 //!   explicitly prepared and qualified adjacent release pair.
+//! - **A migration that removes anything says so** ([`Contraction`], issue
+//!   #426): before its SQL runs, the same transaction raises the durable
+//!   contract fence past every build that still needs what it removes and
+//!   refuses while any such build is live (`storage::contraction`).
 //! - **The ledger must be a prefix of the compiled history, checksums
 //!   matching.** Anything else -- an unknown version (written by a newer
 //!   gateway), a checksum mismatch (edited migration files), a gap or
@@ -48,6 +52,7 @@ use std::{fmt, sync::LazyLock};
 
 use sha2::{Digest, Sha256};
 
+use super::contraction::{Contraction, ContractionRefusal};
 use crate::config::{Config, DatabaseSettings};
 
 /// The one schema every cluster-mode object lives in. Pinned here, pinned in
@@ -84,6 +89,7 @@ pub(crate) fn migration_lock_key() -> i64 {
 /// One embedded migration. Constructed only by [`MANIFEST`] (and by tests);
 /// the checksum is computed from the SQL at construction so a build and its
 /// ledger always agree on what a migration's bytes are.
+#[derive(Clone)]
 pub struct Migration {
     pub version: i64,
     pub name: &'static str,
@@ -95,10 +101,15 @@ pub struct Migration {
     /// runtime compares the computed checksum against every deployment's
     /// ledger, so editing an applied migration fails every `check`.
     pinned_checksum: &'static str,
+    /// What the migration removes, when it removes anything: the migrator
+    /// then raises the durable contract fence in the migration's own
+    /// transaction before its SQL runs (`storage::contraction`). `None` for
+    /// an additive migration, which every shipped one is.
+    contraction: Option<Contraction>,
 }
 
 impl Migration {
-    const fn new(version: i64, name: &'static str, sql: &'static str) -> Self {
+    pub(super) const fn new(version: i64, name: &'static str, sql: &'static str) -> Self {
         Self {
             version,
             name,
@@ -106,24 +117,40 @@ impl Migration {
             // Filled by `finalize` below; a `const fn` cannot hash.
             checksum: String::new(),
             pinned_checksum: "",
+            contraction: None,
         }
     }
 
     /// Compute the checksum the manifest was declared without. A
     /// `LazyLock` construction can hash; a `const` one cannot, so the
     /// manifest is declared with [`Migration::new`] and finalized here.
-    fn finalize(mut self) -> Self {
+    pub(super) fn finalize(mut self) -> Self {
         self.checksum = hex_checksum(self.sql);
         self
     }
 
-    fn current_checksum(&self) -> &str {
+    pub(super) fn current_checksum(&self) -> &str {
         &self.checksum
     }
 
     fn with_pinned_checksum(mut self, pinned: &'static str) -> Self {
         self.pinned_checksum = pinned;
         self
+    }
+
+    /// Declare that this migration removes what `contraction` describes. A
+    /// reviewed change: the descriptor names whom the raised fence keeps
+    /// out, and `contraction::tests` pins every shipped one to a fence this
+    /// build itself meets.
+    #[allow(dead_code)] // Used only by the contraction fixture: no shipped migration contracts.
+    pub(super) fn contracting(mut self, contraction: Contraction) -> Self {
+        self.contraction = Some(contraction);
+        self
+    }
+
+    #[cfg(test)]
+    pub(super) fn contraction(&self) -> Option<&Contraction> {
+        self.contraction.as_ref()
     }
 }
 
@@ -314,6 +341,13 @@ static MANIFEST: LazyLock<Vec<Migration>> = LazyLock::new(|| {
         )
         .finalize()
         .with_pinned_checksum("7d7458311798be0ee0346fff70581300a4d29984ba90d51cd3bccbd00a9ee84f"),
+        Migration::new(
+            26,
+            "admin_session_evidence_journal",
+            include_str!("migrations/0026_admin_session_evidence_journal.sql"),
+        )
+        .finalize()
+        .with_pinned_checksum("40c65674b78059e9b60f0861f96eb9c02dab758e5ded580ba27639e59045f6ae"),
     ]
 });
 
@@ -346,44 +380,47 @@ impl SchemaCompatibility {
     }
 }
 
-// The successor of migration 25's prepared release. This build's manifest
-// ends at 25, and it serves exactly schema 25: it approves no migration above
-// its manifest, and it does not serve schema 24, because it has no reason to
-// run before its own migration has committed. The step from 24 to 25 still
-// rolls, because the release before this one was prepared for it: that build
-// serves schema 24 and, by this migration's exact checksum, schema 25. So the
-// migration role runs this build's `migrate up` while the prepared replicas
-// serve, the replicas are replaced with this build one at a time afterwards,
-// and rolling back to the prepared release is a binary replacement against
-// the expanded schema. This build writes the one table the migration changes
-// as the prepared release does (`connections::pg_store::
-// record_catalog_change_evidence` names every column it sets, and records no
-// actor metadata yet), so the two write the same rows while they overlap. A
-// schema-24 build without the approval refuses the expanded ledger, so the
-// step rolls only from a fleet that runs the prepared release; from any other
-// schema-24 build it is a coordinated drain/migrate/restart.
+// This build's manifest ends at 26, and it serves exactly schema 26: it
+// approves no migration above its manifest, and it does not serve schema 25.
+// The move from 25 to 26 (admin session evidence in the authority-event
+// journal, with capacity held for every session's withdrawal, #425) is
+// coordinated, without an overlap: a schema-25 binary left serving after
+// migration 26 would grant and withdraw admin sessions without journaling
+// their evidence, and its other producers would spend journal capacity a
+// session holds for its withdrawal, so a logout could no longer be promised.
+//
+// The step from 24 to 25 rolled, between migration 25's prepared release and
+// its successor, the last build whose manifest ended at 25: the prepared
+// build serves schema 24 and, by migration 25's exact checksum, schema 25, so
+// the migration role ran the successor's `migrate up` while the prepared
+// replicas served, and both wrote the one table that migration changes with
+// the same explicit column list (`connections::pg_store::
+// record_catalog_change_evidence`). This build is not that successor: it
+// carries migration 25 byte for byte, so its migrator records the approved
+// checksum, but it serves only schema 26, so from a prepared fleet it is a
+// coordinated drain/migrate/restart like every other step.
 // `migration_twenty_five_is_the_extension_its_prepared_release_approved` pins
-// this manifest entry to the checksum that release approved, and the
+// the manifest entry to the checksum that release approved, and the
 // published matrix's rolling step to both.
 //
-// Every earlier move of the schema point was coordinated, without an
+// Every other move of the schema point was coordinated, without an
 // overlap: from 15 to 16 (#425), from 16 to 17 (member capability
 // advertisements, #426 PR 1), from 17 to 18 (service-token and JWT revocation
 // change evidence, #425 PR 2b), from 18 to 19 (shared admin sessions, #424),
 // from 19 to 20 (the durable contract fence, #426 PR 3), from 20 to 21 (the
 // authority-event journal, #425 PR 3), from 21 to 22 (server-side policy
 // drafts, #243 slice 9), from 22 to 23 (policy, tools and catalog change
-// evidence, #425 PR 2c) and from 23 to 24 (the actor metadata of the
-// journaled authority evidence, #425). A schema-23 binary must not keep
-// writing evidence after migration 24: its Connection, service-token and JWT
-// revocation rows would record no actor kind, auth mode or issuer. A
-// schema-22 binary would also commit policy, tools and catalog changes
-// without their evidence, and a schema-20 one would write evidence that is
-// never journaled. The fence keeps covering every binary that can serve this
-// database: none that predates it accepts this ledger either.
+// evidence, #425 PR 2c), from 23 to 24 (the actor metadata of the
+// journaled authority evidence, #425) and from 25 to 26. A schema-23 binary
+// must not keep writing evidence after migration 24: its Connection,
+// service-token and JWT revocation rows would record no actor kind, auth mode
+// or issuer. A schema-22 binary would also commit policy, tools and catalog
+// changes without their evidence, and a schema-20 one would write evidence
+// that is never journaled. The fence keeps covering every binary that can
+// serve this database: none that predates it accepts this ledger either.
 const BINARY_SCHEMA_COMPATIBILITY: SchemaCompatibility = SchemaCompatibility {
-    read: (25, 25),
-    write: (25, 25),
+    read: (26, 26),
+    write: (26, 26),
     approved_extensions: &[],
 };
 
@@ -418,7 +455,7 @@ const APPROVED_EXTENSION_SOURCES: &[ExtensionSource] = &[];
 /// The intersection of the explicit read/write contracts, advertised to the
 /// roster. This is a summary, not proof of ledger integrity, permission to
 /// write a gated operation (`storage/compatibility.rs`), or permission to
-/// contract the schema. The shipped contract accepts only schema 25.
+/// contract the schema. The shipped contract accepts only schema 26.
 pub(crate) fn schema_version_range() -> (i32, i32) {
     BINARY_SCHEMA_COMPATIBILITY.serving_range()
 }
@@ -648,6 +685,14 @@ pub(crate) enum MigrateError {
     /// Applying a migration failed. The classified detail is logged at the
     /// failure site; this variant deliberately carries nothing else.
     ApplyFailed,
+    /// A contracting migration was refused before it removed anything: its
+    /// transaction rolled back, so the fence was not raised and the ledger
+    /// stops at the migration before it. Migrations earlier in the same run
+    /// stay committed.
+    ContractionRefused {
+        version: i64,
+        refusal: ContractionRefusal,
+    },
 }
 
 impl fmt::Display for MigrateError {
@@ -678,6 +723,13 @@ impl fmt::Display for MigrateError {
             Self::ApplyFailed => formatter.write_str(
                 "applying a migration failed; every migration runs in one transaction, so \
                  the database is left at its previous schema version",
+            ),
+            Self::ContractionRefused { version, refusal } => write!(
+                formatter,
+                "migration {version} contracts the schema and was refused before it removed \
+                 anything (the contract fence was not raised; the schema stays at version {}): \
+                 {refusal}",
+                version - 1
             ),
         }
     }
@@ -766,7 +818,13 @@ pub(crate) async fn execute(
         };
     }
 
-    let output = apply_missing(foundation.pool(), &config.database).await?;
+    let output = apply_manifest(
+        foundation.pool(),
+        &config.database,
+        &MANIFEST,
+        config.cluster_member_stale_window(),
+    )
+    .await?;
     // The schema now carries the binding table; bind this deployment (a
     // first migration) or refuse another deployment's database.
     refuse_other_deployment(&foundation, config).await?;
@@ -920,7 +978,27 @@ async fn read_ledger(
     }
 }
 
-/// Apply every missing migration under the advisory lock.
+/// [`apply_manifest`] over the shipped manifest, judging a contraction's
+/// roster against the stale window every test configuration carries
+/// (`Config::test_defaults`). The production callers, `migrate up` and
+/// development auto-migration, pass the configured window.
+#[cfg(test)]
+async fn apply_missing(
+    pool: &deadpool_postgres::Pool,
+    settings: &DatabaseSettings,
+) -> Result<MigrateOutput, MigrateError> {
+    apply_manifest(
+        pool,
+        settings,
+        &MANIFEST,
+        std::time::Duration::from_millis(crate::config::DEFAULT_CLUSTER_MEMBER_STALE_MS),
+    )
+    .await
+}
+
+/// Apply every migration of `manifest` the ledger is missing, under the
+/// advisory lock. `manifest` is [`MANIFEST`] everywhere but the contraction
+/// fixture's tests.
 ///
 /// The lock lives on a connection that is then **detached from the pool**
 /// (`Object::take`), so it is released by the session closing the moment
@@ -930,10 +1008,18 @@ async fn read_ledger(
 /// and finds nothing left to do. Each migration runs in one transaction
 /// with its ledger row and its own `SET LOCAL` statement/lock timeouts, so
 /// a failure anywhere leaves the database at its previous schema version.
+///
+/// A contracting migration's transaction first raises the durable contract
+/// fence, judging which roster rows are live against `member_stale_window`
+/// on the database clock (`storage::contraction`); a refusal is
+/// [`MigrateError::ContractionRefused`] and leaves the migrations before it
+/// committed. A raise is logged and audited once its migration commits.
 #[cfg(feature = "postgres")]
-async fn apply_missing(
+pub(super) async fn apply_manifest(
     pool: &deadpool_postgres::Pool,
     settings: &DatabaseSettings,
+    manifest: &[Migration],
+    member_stale_window: std::time::Duration,
 ) -> Result<MigrateOutput, MigrateError> {
     let connection = acquire(pool).await?;
 
@@ -948,7 +1034,7 @@ async fn apply_missing(
     connection
         .simple_query(&format!(
             "SET lock_timeout = {}; SET statement_timeout = {};",
-            settings.migration_statement_timeout_ms * (MANIFEST.len() as u64),
+            settings.migration_statement_timeout_ms * (manifest.len() as u64),
             settings.migration_statement_timeout_ms,
         ))
         .await
@@ -982,23 +1068,26 @@ async fn apply_missing(
         LedgerRead::Table(rows) => rows,
         LedgerRead::TableMissing => Vec::new(),
     };
-    let status = validate_ledger(&rows, &MANIFEST).map_err(MigrateError::LedgerInvalid)?;
+    let status = validate_ledger(&rows, manifest).map_err(MigrateError::LedgerInvalid)?;
     let SchemaStatus::NeedsUpgrade { applied, .. } = status else {
         return Ok(MigrateOutput::UpToDate {
             applied: rows.len(),
         });
     };
 
-    for migration in &MANIFEST[applied..] {
-        apply_one(&client, migration, settings).await?;
+    for migration in &manifest[applied..] {
+        let fence = apply_migration(&client, migration, settings, member_stale_window).await?;
         tracing::info!(
             version = migration.version,
             name = migration.name,
             "applied schema migration"
         );
+        if let Some(fence) = fence {
+            super::contraction::record_contraction_fence(pool, migration, &fence).await;
+        }
     }
     Ok(MigrateOutput::Applied {
-        applied: MANIFEST.len() - applied,
+        applied: manifest.len() - applied,
     })
 }
 
@@ -1025,25 +1114,49 @@ async fn bootstrap_ledger(client: &deadpool_postgres::ClientWrapper) -> Result<(
         })
 }
 
-#[cfg(feature = "postgres")]
+/// [`apply_migration`] for the tests that apply the shipped migrations one
+/// at a time to stage an older schema, with the stale window every test
+/// configuration carries (`Config::test_defaults`).
+#[cfg(test)]
 async fn apply_one(
     client: &deadpool_postgres::ClientWrapper,
     migration: &Migration,
     settings: &DatabaseSettings,
 ) -> Result<(), MigrateError> {
+    apply_migration(
+        client,
+        migration,
+        settings,
+        std::time::Duration::from_millis(crate::config::DEFAULT_CLUSTER_MEMBER_STALE_MS),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Apply one migration. For a contracting migration, returns where its
+/// transaction left the durable contract fence, for the record made once it
+/// committed.
+#[cfg(feature = "postgres")]
+async fn apply_migration(
+    client: &deadpool_postgres::ClientWrapper,
+    migration: &Migration,
+    settings: &DatabaseSettings,
+    member_stale_window: std::time::Duration,
+) -> Result<Option<super::contraction::ContractionFence>, MigrateError> {
     // One transaction per migration, driven explicitly over this session:
-    // BEGIN, the bounded timeouts, the migration body, the ledger row, and
-    // COMMIT are one atomic unit, so a failure anywhere rolls the whole
-    // migration back and the database keeps its previous schema version.
+    // BEGIN, the bounded timeouts, a contraction's fence raise, the
+    // migration body, the ledger row, and COMMIT are one atomic unit, so a
+    // failure anywhere rolls the whole migration back -- its fence raise
+    // included -- and the database keeps its previous schema version.
     client.batch_execute("BEGIN").await.map_err(|error| {
         tracing::error!(error = %error, "migration transaction begin failed");
         MigrateError::ApplyFailed
     })?;
-    match migration_transaction(client, migration, settings).await {
-        Ok(()) => match client.batch_execute("COMMIT").await {
+    match migration_transaction(client, migration, settings, member_stale_window).await {
+        Ok(fence) => match client.batch_execute("COMMIT").await {
             // A failed COMMIT has already rolled the transaction back
             // server-side; the ledger was never durably written.
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(fence),
             Err(error) => {
                 tracing::error!(error = %error, "migration commit failed");
                 Err(MigrateError::ApplyFailed)
@@ -1066,7 +1179,8 @@ async fn migration_transaction(
     client: &deadpool_postgres::ClientWrapper,
     migration: &Migration,
     settings: &DatabaseSettings,
-) -> Result<(), MigrateError> {
+    member_stale_window: std::time::Duration,
+) -> Result<Option<super::contraction::ContractionFence>, MigrateError> {
     // `SET LOCAL`: bounded to this transaction, cannot leak into the pooled
     // session, and covers exactly the statements that need the larger
     // budget. The lock timeout matches, so DDL blocked by a stray lock
@@ -1081,6 +1195,21 @@ async fn migration_transaction(
             tracing::error!(error = %error, "migration timeout setup failed");
             MigrateError::ApplyFailed
         })?;
+    // Nothing is removed before the fence keeps out every build that still
+    // needs it: the raise runs first, under the same timeouts, and commits
+    // or rolls back with the SQL below.
+    let fence = match &migration.contraction {
+        Some(contraction) => Some(
+            super::contraction::raise_fence_before_contracting(
+                client,
+                migration.version,
+                contraction,
+                member_stale_window,
+            )
+            .await?,
+        ),
+        None => None,
+    };
     client.batch_execute(migration.sql).await.map_err(|error| {
         tracing::error!(error = %error, version = migration.version, "migration statement failed");
         MigrateError::ApplyFailed
@@ -1095,7 +1224,7 @@ async fn migration_transaction(
             tracing::error!(error = %error, "migration ledger insert failed");
             MigrateError::ApplyFailed
         })?;
-    Ok(())
+    Ok(fence)
 }
 
 /// How many migrations this build carries; startup errors name the count so
@@ -1105,9 +1234,10 @@ pub(crate) fn manifest_len() -> usize {
 }
 
 /// Development auto-migration: run the same `migrate up` the CLI runs, from
-/// the serving process. Production pods validate only; this path exists for
-/// single-process development databases and is opt-in through
-/// `DATABASE_AUTO_MIGRATE`.
+/// the serving process, with the same configuration (a contraction's roster
+/// is judged against this process's `CLUSTER_MEMBER_STALE_MS`). Production
+/// pods validate only; this path exists for single-process development
+/// databases and is opt-in through `DATABASE_AUTO_MIGRATE`.
 ///
 /// A ledger this build already serves is left alone. A prepared build serves
 /// its approved extension without carrying its SQL, so the strict migrator
@@ -1115,6 +1245,28 @@ pub(crate) fn manifest_len() -> usize {
 /// auto-migration must not refuse what validate-only startup serves. Every
 /// other ledger takes the migrator's path, refusals included.
 #[cfg(feature = "postgres")]
+pub(crate) async fn auto_migrate(
+    pool: &deadpool_postgres::Pool,
+    config: &Config,
+) -> Result<(), MigrateError> {
+    if read_and_validate_runtime(pool).await? == SchemaStatus::Current {
+        return Ok(());
+    }
+    apply_manifest(
+        pool,
+        &config.database,
+        &MANIFEST,
+        config.cluster_member_stale_window(),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// [`auto_migrate`] for the suites that set up a database from its
+/// settings alone. They migrate the shipped manifest with the stale window
+/// every test configuration carries (`Config::test_defaults`), so this does
+/// for them exactly what `auto_migrate` would.
+#[cfg(test)]
 pub(crate) async fn apply_missing_for_startup(
     pool: &deadpool_postgres::Pool,
     settings: &DatabaseSettings,
@@ -1127,8 +1279,9 @@ pub(crate) async fn apply_missing_for_startup(
 
 /// Translate an auto-migration failure into the foundation's startup error.
 /// Ledger problems keep their specific text; an apply failure is its own
-/// condition (it was a write attempt, not a validation), and anything else
-/// was a store failure, already logged at its site.
+/// condition (it was a write attempt, not a validation), and so is a refused
+/// contraction, which wrote nothing and was logged with its reason; anything
+/// else was a store failure, already logged at its site.
 #[cfg(feature = "postgres")]
 pub(crate) fn startup_migration_failure(
     error: MigrateError,
@@ -1137,11 +1290,17 @@ pub(crate) fn startup_migration_failure(
         MigrateError::LedgerInvalid(problem) => {
             super::postgres::PostgresFoundationError::SchemaInvalid { problem }
         }
-        MigrateError::ApplyFailed => {
+        MigrateError::ApplyFailed | MigrateError::ContractionRefused { .. } => {
             super::postgres::PostgresFoundationError::SchemaMigrationFailed
         }
         _ => super::postgres::PostgresFoundationError::SchemaCheckFailed,
     }
+}
+
+/// The shipped manifest, for the contraction fixture's tests.
+#[cfg(test)]
+pub(super) fn shipped_manifest() -> &'static [Migration] {
+    &MANIFEST
 }
 
 #[cfg(test)]
@@ -1207,18 +1366,18 @@ mod tests {
     fn the_shipped_contract_has_no_unproved_overlap() {
         assert_eq!(
             MANIFEST.len(),
-            25,
+            26,
             "review the compatibility contract when adding SQL"
         );
-        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.read, (25, 25));
-        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.write, (25, 25));
-        assert_eq!(schema_version_range(), (25, 25));
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.read, (26, 26));
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.write, (26, 26));
+        assert_eq!(schema_version_range(), (26, 26));
         assert!(
             BINARY_SCHEMA_COMPATIBILITY.approved_extensions.is_empty(),
             "this build approves no migration above its manifest"
         );
         // Readiness samples the manifest and one row more.
-        assert_eq!(runtime_ledger_row_limit(), 26);
+        assert_eq!(runtime_ledger_row_limit(), 27);
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len(), "")),
             Ok(SchemaStatus::Current)
@@ -1226,18 +1385,18 @@ mod tests {
         // The next migration is refused whatever it is: nothing prepared this
         // build for one.
         let mut beyond = ledger_for(&MANIFEST, MANIFEST.len(), "");
-        beyond.push((26, hex_checksum("-- migration 26")));
+        beyond.push((27, hex_checksum("-- migration 27")));
         assert_eq!(
             validate_runtime_ledger(&beyond),
             Err(LedgerProblem::UnknownVersion)
         );
 
-        // The previous releases' schemas are not served, the prepared
-        // release's schema 24 included: the overlap of the rolling step from
-        // 24 to 25 is that release's, which also serves 25, and this build
-        // starts only once its own migration has committed. Every earlier
-        // point was left by a coordinated upgrade, never an overlap window.
-        for behind in 1..=9 {
+        // The previous releases' schemas are not served: schema 25 is left by
+        // a coordinated upgrade, and so are the prepared release's schema 24
+        // and every earlier point. The overlap of the rolling step from 24 to
+        // 25 belonged to the prepared release and the schema-25 successor,
+        // both of which serve 25; this build serves neither 24 nor 25.
+        for behind in 1..=10 {
             assert_eq!(
                 validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - behind, "")),
                 Ok(SchemaStatus::NeedsUpgrade {
@@ -3483,17 +3642,249 @@ mod tests {
         clean_database(foundation.pool()).await;
     }
 
-    /// The expand phase of the rolling step from 24 to 25, as this build sees
-    /// it. Against the schema-24 ledger its prepared release leaves, this
-    /// build serves nothing: validate-only startup refuses naming the one
-    /// missing migration and readiness reports the schema incompatible, so a
-    /// replica of it started before the migration stalls the rollout rather
-    /// than serving. Its `migrate check` reports exactly that migration
-    /// unapplied, and its `migrate up` applies it and nothing else, recording
-    /// exactly the checksum the prepared release approved. From then on it
-    /// serves, with and without development auto-migration, and its
-    /// migrator has nothing left to do. A ledger whose migration 25 carries
-    /// other bytes is refused by the migrator and by startup alike.
+    /// Migration 26 journals the admin session evidence a schema-25 gateway
+    /// committed, after every event already journaled and in its own commit
+    /// order, each row at its own commit time, and holds one unit of capacity
+    /// for the withdrawal of every session row that exists, live or not yet
+    /// pruned. It changes no evidence row and not the capacity, and from then
+    /// on the journal accepts the new source and the state row keeps the held
+    /// units inside the units in use.
+    #[tokio::test]
+    async fn migration_twenty_six_journals_session_evidence_and_holds_withdrawals() {
+        let Some(dsn) = real_dsn() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = REAL_DATABASE.lock().await;
+        let dsn_file = write_dsn_file(&dsn);
+        let config = migration_config(&dsn_file);
+        let foundation = establish(&config).await;
+        clean_database(foundation.pool()).await;
+        let client = foundation.pool().get().await.expect("checkout");
+        bootstrap_ledger(&client)
+            .await
+            .expect("migration ledger should bootstrap");
+        let through_v25 = MANIFEST
+            .iter()
+            .take_while(|migration| migration.version <= 25)
+            .count();
+        for migration in &MANIFEST[..through_v25] {
+            apply_one(&client, migration, &test_settings())
+                .await
+                .expect("migrations through 25 should apply");
+        }
+
+        // What a schema-25 deployment holds: one journaled JWT revocation,
+        // and the evidence of three admin sessions -- one withdrawn, one live
+        // and one past its idle deadline that no prune has reached --
+        // committed out of table order.
+        let jwt_event = uuid::Uuid::new_v4().to_string();
+        client
+            .execute(
+                "INSERT INTO greengateway.jwt_revocation_evidence \
+                     (event_id, operation_id, actor_user_id, action, issuer, jti_hash, \
+                      security_revision, committed_at, actor_kind, actor_auth_mode) \
+                 VALUES ($1::text::uuid, gen_random_uuid(), 'operator:revoke-jwt', \
+                         'jwt.revoke', 'https://issuer.example', repeat('c', 64), 1, \
+                         '2026-10-01T00:00:09Z', 'system', 'system')",
+                &[&jwt_event],
+            )
+            .await
+            .expect("a schema-25 JWT revocation");
+        client
+            .execute(
+                "WITH reserved AS ( \
+                     UPDATE greengateway.authority_event_state \
+                     SET last_position = last_position + 1, \
+                         retained_events = retained_events + 1 \
+                     WHERE singleton RETURNING last_position) \
+                 INSERT INTO greengateway.authority_event_journal (position, event_id, source) \
+                 SELECT last_position, $1::text::uuid, 'jwt_revocation_evidence' FROM reserved",
+                &[&jwt_event],
+            )
+            .await
+            .expect("its journal row");
+        let session = |hash: char, idle: &str| {
+            format!(
+                "INSERT INTO greengateway.admin_sessions (session_hash, id, csrf_hash, user_id, \
+                     issuer, key_id, token_nonce, token_ct, created_at, last_seen_at, \
+                     expires_at, idle_expires_at) \
+                 SELECT repeat('{hash}', 64), $1::text::uuid, repeat('c', 64), 'operator', \
+                        'https://issuer.example.test', 'login-key-1', \
+                        decode(repeat('00', 24), 'hex'), decode(repeat('00', 17), 'hex'), \
+                        now() - interval '1 hour', now() - interval '1 hour', \
+                        now() + interval '1 hour', {idle}"
+            )
+        };
+        const EVIDENCE: &str = "INSERT INTO greengateway.admin_session_evidence \
+                 (event_id, operation_id, session_id, action, reason, user_id, issuer, \
+                  expires_at, committed_at) \
+             VALUES ($1::text::uuid, gen_random_uuid(), $2::text::uuid, $3, $4, 'operator', \
+                     'https://issuer.example.test', now() + interval '1 hour', \
+                     $5::text::timestamptz)";
+        let withdrawn = uuid::Uuid::new_v4().to_string();
+        let live = uuid::Uuid::new_v4().to_string();
+        let stale = uuid::Uuid::new_v4().to_string();
+        client
+            .execute(&session('a', "now() + interval '10 minutes'"), &[&live])
+            .await
+            .expect("a live session");
+        client
+            .execute(&session('b', "now() - interval '1 second'"), &[&stale])
+            .await
+            .expect("a session past its idle deadline");
+        let mut evidence = Vec::new();
+        for (session_id, action, reason, committed_at) in [
+            (
+                &stale,
+                "admin_session.grant",
+                "issued",
+                "2026-10-01T00:00:04Z",
+            ),
+            (
+                &withdrawn,
+                "admin_session.withdraw",
+                "logout",
+                "2026-10-01T00:00:03Z",
+            ),
+            (
+                &live,
+                "admin_session.grant",
+                "issued",
+                "2026-10-01T00:00:05Z",
+            ),
+            (
+                &withdrawn,
+                "admin_session.grant",
+                "issued",
+                "2026-10-01T00:00:02Z",
+            ),
+        ] {
+            let event_id = uuid::Uuid::new_v4().to_string();
+            client
+                .execute(
+                    EVIDENCE,
+                    &[&event_id, session_id, &action, &reason, &committed_at],
+                )
+                .await
+                .expect("schema-25 session evidence");
+            evidence.push((committed_at, event_id));
+        }
+        let evidence_snapshot = || {
+            let client = &client;
+            async move {
+                client
+                    .query(
+                        "SELECT row_to_json(t)::text FROM greengateway.admin_session_evidence t \
+                         ORDER BY event_id",
+                        &[],
+                    )
+                    .await
+                    .expect("evidence snapshot")
+                    .iter()
+                    .map(|row| row.get::<_, String>(0))
+                    .collect::<Vec<_>>()
+            }
+        };
+        let evidence_before = evidence_snapshot().await;
+
+        apply_one(&client, &MANIFEST[through_v25], &test_settings())
+            .await
+            .expect("migration 26 should apply");
+        assert_eq!(evidence_snapshot().await, evidence_before);
+
+        // After the existing event, in commit order, at each row's own time.
+        evidence.sort();
+        let journal: Vec<(i64, String, String, String)> = client
+            .query(
+                "SELECT position, event_id::text, source, \
+                        to_char(journaled_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') \
+                 FROM greengateway.authority_event_journal ORDER BY position",
+                &[],
+            )
+            .await
+            .expect("the journal reads")
+            .iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+            .collect();
+        assert_eq!(journal.len(), 5);
+        assert_eq!(
+            (journal[0].0, journal[0].1.as_str(), journal[0].2.as_str()),
+            (1, jwt_event.as_str(), "jwt_revocation_evidence")
+        );
+        for (index, (committed_at, event_id)) in evidence.iter().enumerate() {
+            let row = &journal[index + 1];
+            assert_eq!(
+                (row.0, row.1.as_str(), row.2.as_str(), row.3.as_str()),
+                (
+                    i64::try_from(index).expect("small") + 2,
+                    event_id.as_str(),
+                    "admin_session_evidence",
+                    *committed_at
+                )
+            );
+        }
+        // Four journal rows added, and one unit held for each of the two
+        // session rows; the capacity is the one migration 21 seeded.
+        let state = client
+            .query_one(
+                "SELECT last_position, retained_events, reserved_withdrawals, capacity \
+                 FROM greengateway.authority_event_state WHERE singleton",
+                &[],
+            )
+            .await
+            .expect("the state row exists");
+        assert_eq!(
+            (
+                state.get::<_, i64>(0),
+                state.get::<_, i64>(1),
+                state.get::<_, i64>(2),
+                state.get::<_, i64>(3)
+            ),
+            (5, 7, 2, 1_000_000)
+        );
+
+        // The source vocabulary is closed, and the held units stay inside the
+        // units in use.
+        assert!(client
+            .execute(
+                "INSERT INTO greengateway.authority_event_journal (position, event_id, source) \
+                 VALUES (99, gen_random_uuid(), 'audit_events')",
+                &[],
+            )
+            .await
+            .is_err());
+        assert!(client
+            .execute(
+                "UPDATE greengateway.authority_event_state \
+                 SET reserved_withdrawals = retained_events + 1 WHERE singleton",
+                &[],
+            )
+            .await
+            .is_err());
+        assert!(client
+            .execute(
+                "UPDATE greengateway.authority_event_state \
+                 SET reserved_withdrawals = -1 WHERE singleton",
+                &[],
+            )
+            .await
+            .is_err());
+        drop(client);
+        clean_database(foundation.pool()).await;
+    }
+
+    /// The schema-24 ledger migration 25's prepared release leaves, as this
+    /// build sees it. This build serves nothing there: validate-only startup
+    /// refuses naming the missing migrations and readiness reports the schema
+    /// incompatible, so a replica of it started before the migration stalls
+    /// the rollout rather than serving. Its `migrate check` reports exactly
+    /// migrations 25 and 26 unapplied, and its `migrate up` applies them and
+    /// nothing else, recording for migration 25 exactly the checksum the
+    /// prepared release approved. From then on it serves, with and without
+    /// development auto-migration, and its migrator has nothing left to do.
+    /// A ledger whose migration 25 carries other bytes is refused by the
+    /// migrator and by startup alike.
     #[tokio::test]
     async fn this_build_applies_the_approved_extension_before_it_serves() {
         use super::super::postgres::{PostgresFoundation, PostgresFoundationError};
@@ -3544,12 +3935,14 @@ mod tests {
         };
 
         // The prepared release's schema: not served here.
+        let missing = MANIFEST.len() - through_v24;
+        assert_eq!(missing, 2, "migrations 25 and 26");
         let authority = PostgresReadinessAuthority::new(pool.clone());
         assert_eq!(
             read_and_validate_runtime(pool).await,
             Ok(SchemaStatus::NeedsUpgrade {
                 applied: 24,
-                missing: 1
+                missing
             })
         );
         let error = expect_startup_failure(PostgresFoundation::start_if_selected(&strict).await);
@@ -3558,7 +3951,7 @@ mod tests {
                 error,
                 PostgresFoundationError::SchemaNotReady {
                     applied: 24,
-                    missing: 1,
+                    missing: 2,
                     auto_migrate: false
                 }
             ),
@@ -3572,20 +3965,20 @@ mod tests {
             execute(&strict, true).await,
             Ok(MigrateOutput::CheckNeedsUpgrade {
                 applied: 24,
-                missing: 1
+                missing
             })
         );
 
-        // The migration role's `migrate up`: migration 25 and nothing else,
-        // under the approved checksum.
+        // The migration role's `migrate up`: migrations 25 and 26 and nothing
+        // else, migration 25 under the approved checksum.
         assert_eq!(
             execute(&strict, false).await,
-            Ok(MigrateOutput::Applied { applied: 1 })
+            Ok(MigrateOutput::Applied { applied: missing })
         );
         let expanded = ledger().await;
-        assert_eq!(expanded.len(), 25);
+        assert_eq!(expanded.len(), MANIFEST.len());
         assert_eq!(
-            expanded.last(),
+            expanded.get(through_v24),
             Some(&(25, ROLLING_MIGRATIONS[0].checksum.to_owned())),
             "the ledger records exactly what the prepared release approved"
         );
@@ -3606,7 +3999,7 @@ mod tests {
         }
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::Writable { schema_version: 25 }
+            AuthorityObservation::Writable { schema_version: 26 }
         );
         assert_eq!(
             execute(&strict, true).await,
@@ -3614,7 +4007,9 @@ mod tests {
         );
         assert_eq!(
             execute(&strict, false).await,
-            Ok(MigrateOutput::UpToDate { applied: 25 })
+            Ok(MigrateOutput::UpToDate {
+                applied: MANIFEST.len()
+            })
         );
         assert_eq!(ledger().await, expanded, "a second run changed nothing");
 
@@ -3644,7 +4039,7 @@ mod tests {
         }
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::IncompatibleSchema { schema_version: 25 }
+            AuthorityObservation::IncompatibleSchema { schema_version: 26 }
         );
         drop(client);
         clean_database(pool).await;

@@ -92,6 +92,8 @@ mod admin_policy_simulations;
 use admin_policy_simulations::*;
 mod admin_policy_replays;
 use admin_policy_replays::*;
+mod admin_policy_evidence;
+use admin_policy_evidence::*;
 
 mod audit;
 mod auth;
@@ -125,6 +127,7 @@ mod path_match;
 #[path = "../tests/support/policy_benchmark.rs"]
 mod policy_benchmark;
 mod policy_eval;
+mod policy_evidence;
 mod policy_replay;
 mod policy_simulation;
 mod policy_testing;

@@ -12,12 +12,29 @@ const ISSUER_MARKER: &str = "https://issuer-marker.example.test";
 /// The acting principal's issuer, distinct from a revoked token's.
 const ACTOR_ISSUER_MARKER: &str = "https://actor-issuer-marker.example.test";
 const JTI_DIGEST_MARKER: &str = "abababababababababababababababababababababababababababababababab";
+/// An admin session's random ID, as the evidence row stores it.
+const SESSION_MARKER: &str = "5e551011-0000-4000-8000-000000000001";
 
 fn evidence(source: JournalSource, action: &str) -> JournaledEvidence {
     let (resource_owner, resource_id, prior_version, new_version) = match source {
         JournalSource::ConnectionChange => (None, CONNECTION_MARKER, Some(3), None),
         JournalSource::ServiceTokenChange => (None, TOKEN_MARKER, Some(1), Some(2)),
         JournalSource::JwtRevocation => (Some(ISSUER_MARKER), JTI_DIGEST_MARKER, None, None),
+        // The read leaves every column the session table lacks empty.
+        JournalSource::AdminSession => {
+            return JournaledEvidence {
+                source,
+                resource_owner: None,
+                resource_id: Some(SESSION_MARKER.to_owned()),
+                prior_version: None,
+                new_version: None,
+                security_revision: None,
+                actor_issuer: None,
+                actor_kind: None,
+                actor_auth_mode: None,
+                ..evidence(JournalSource::JwtRevocation, action)
+            };
+        }
     };
     JournaledEvidence {
         position: 41,
@@ -64,6 +81,8 @@ fn every_delivered_shape() -> Vec<JournaledEvidence> {
             ACTION_SERVICE_TOKEN_REVOKE,
         ),
         evidence(JournalSource::JwtRevocation, ACTION_JWT_REVOKE),
+        evidence(JournalSource::AdminSession, ACTION_ADMIN_SESSION_GRANT),
+        evidence(JournalSource::AdminSession, ACTION_ADMIN_SESSION_WITHDRAW),
     ]
 }
 
@@ -148,7 +167,7 @@ fn revisions_follow_the_v1_transition_of_each_operation() {
         ),
         ("connection", Some("3"), None)
     );
-    assert_eq!(deleted.security, "17");
+    assert_eq!(deleted.security.as_deref(), Some("17"));
 
     for action in [ACTION_SERVICE_TOKEN_ROTATE, ACTION_SERVICE_TOKEN_REVOKE] {
         let advanced = revision(JournalSource::ServiceTokenChange, action);
@@ -169,9 +188,31 @@ fn revisions_follow_the_v1_transition_of_each_operation() {
             revoked.axis.as_str(),
             revoked.before.as_deref(),
             revoked.after.as_deref(),
-            revoked.security.as_str()
+            revoked.security.as_deref()
         ),
-        ("jwt_revocation", None, Some("17"), "17")
+        ("jwt_revocation", None, Some("17"), Some("17"))
+    );
+
+    // A session is granted once and withdrawn once: its one revision is
+    // created by the grant and deleted by the withdrawal, and it takes no
+    // shared revision.
+    let granted = revision(JournalSource::AdminSession, ACTION_ADMIN_SESSION_GRANT);
+    let withdrawn = revision(JournalSource::AdminSession, ACTION_ADMIN_SESSION_WITHDRAW);
+    let shape = |revision: &DeliveryRevision| {
+        (
+            revision.axis.clone(),
+            revision.before.clone(),
+            revision.after.clone(),
+            revision.security.clone(),
+        )
+    };
+    assert_eq!(
+        shape(&granted),
+        ("session".to_owned(), None, Some("1".to_owned()), None)
+    );
+    assert_eq!(
+        shape(&withdrawn),
+        ("session".to_owned(), Some("1".to_owned()), None, None)
     );
 }
 
@@ -188,6 +229,7 @@ fn references_name_the_recorded_identities_and_carry_none_of_them() {
             TOKEN_MARKER,
             ISSUER_MARKER,
             JTI_DIGEST_MARKER,
+            SESSION_MARKER,
         ] {
             assert!(
                 !serialized.contains(marker),
@@ -203,18 +245,22 @@ fn references_name_the_recorded_identities_and_carry_none_of_them() {
             ),
             Ok(ReferenceCheck::Current)
         );
-        assert_eq!(
-            keyring.verify(
-                ReferenceDomain::ActorIssuer,
-                &[ACTOR_ISSUER_MARKER],
-                record
-                    .actor
-                    .issuer_ref
-                    .as_deref()
-                    .expect("a principal with an issuer has an issuer reference")
-            ),
-            Ok(ReferenceCheck::Current)
-        );
+        if evidence.actor_issuer.is_some() {
+            assert_eq!(
+                keyring.verify(
+                    ReferenceDomain::ActorIssuer,
+                    &[ACTOR_ISSUER_MARKER],
+                    record
+                        .actor
+                        .issuer_ref
+                        .as_deref()
+                        .expect("a principal with an issuer has an issuer reference")
+                ),
+                Ok(ReferenceCheck::Current)
+            );
+        } else {
+            assert_eq!(record.actor.issuer_ref, None);
+        }
         let (domain, components): (ReferenceDomain, Vec<&str>) = match evidence.source {
             JournalSource::ConnectionChange => {
                 (ReferenceDomain::Connection, vec![CONNECTION_MARKER])
@@ -226,6 +272,7 @@ fn references_name_the_recorded_identities_and_carry_none_of_them() {
                 ReferenceDomain::JwtRevocation,
                 vec![ISSUER_MARKER, JTI_DIGEST_MARKER],
             ),
+            JournalSource::AdminSession => (ReferenceDomain::AdminSession, vec![SESSION_MARKER]),
         };
         assert_eq!(
             keyring.verify(domain, &components, &record.resource.reference),
@@ -450,6 +497,80 @@ fn actor_metadata_that_cannot_be_projected_faithfully_is_refused() {
             ))
         ));
     }
+}
+
+/// Admin session evidence (journaled since migration 26) records the
+/// session's own subject and nothing of the actor's kind, auth mode or
+/// issuer, and takes no shared revision: the record says `null` for all of
+/// them rather than a guess. A row that claims a shared revision, a version
+/// or a resource owner is not session evidence and is refused, and every
+/// other operation still requires its shared revision.
+#[test]
+fn admin_session_rows_project_without_actor_metadata_or_a_shared_revision() {
+    let keyring = generated_keyring(Uuid::new_v4());
+    let validator = delivery_schema();
+    for action in [ACTION_ADMIN_SESSION_GRANT, ACTION_ADMIN_SESSION_WITHDRAW] {
+        let base = evidence(JournalSource::AdminSession, action);
+        let record = project(&base, &keyring).expect("session evidence projects");
+        assert_eq!(record.operation, action);
+        assert_eq!(record.resource.kind, "admin_session");
+        assert_eq!(
+            (
+                record.actor.kind.as_deref(),
+                record.actor.auth_mode.as_deref(),
+                record.actor.issuer_ref.as_deref()
+            ),
+            (None, None, None)
+        );
+        assert_eq!(
+            keyring.verify(
+                ReferenceDomain::ActorRecorded,
+                &[ACTOR_MARKER],
+                &record.actor.recorded_ref
+            ),
+            Ok(ReferenceCheck::Current)
+        );
+        assert_eq!(record.revision.security, None);
+        let value = serde_json::to_value(&record).expect("a record serializes");
+        if let Err(error) = validator.validate(&value) {
+            panic!("the published schema must accept {value}: {error}");
+        }
+
+        for mutate in [
+            (|evidence: &mut JournaledEvidence| evidence.security_revision = Some(17))
+                as fn(&mut JournaledEvidence),
+            |evidence| evidence.prior_version = Some(1),
+            |evidence| evidence.new_version = Some(1),
+            |evidence| evidence.resource_owner = Some(ISSUER_MARKER.to_owned()),
+        ] {
+            let mut refused = base.clone();
+            mutate(&mut refused);
+            assert!(project(&refused, &keyring).is_err(), "{refused:?}");
+        }
+    }
+    // Session actions belong to the session table alone, and the session
+    // table holds no other action.
+    assert_eq!(
+        project(
+            &evidence(JournalSource::ConnectionChange, ACTION_ADMIN_SESSION_GRANT),
+            &keyring
+        ),
+        Err(ProjectionError::UnknownAction)
+    );
+    assert_eq!(
+        project(
+            &evidence(JournalSource::AdminSession, ACTION_CONNECTION_DELETE),
+            &keyring
+        ),
+        Err(ProjectionError::UnknownAction)
+    );
+    // The shared revision stays required wherever a change takes one.
+    let mut unrevisioned = evidence(JournalSource::ConnectionChange, ACTION_CONNECTION_DELETE);
+    unrevisioned.security_revision = None;
+    assert_eq!(
+        project(&unrevisioned, &keyring),
+        Err(ProjectionError::MissingEvidence)
+    );
 }
 
 #[test]

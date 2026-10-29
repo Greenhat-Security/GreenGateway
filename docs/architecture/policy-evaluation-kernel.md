@@ -469,5 +469,33 @@ limitations for `indeterminate` answers, and its input refusals. An evaluator
 invariant failure fails the job; it is never counted as an answer. The run is
 bounded in records, time and memory, is cancelled between records, records no
 audit event or metric, and returns a result with an ADR-0004 semantic digest
-that depends only on the cutoff, the candidate and the evaluator. The API,
+that depends only on the cutoff, the policies and the evaluator. The API,
 bounds and lifecycle are in [policy-replay.md](../policy-replay.md#replay-jobs).
+
+## Impact comparison (#243, slice 14)
+
+`policy_replay::impact` decides each replayed record under the job's pinned
+base as well as its candidate -- compiled once each, as authored and, on
+request, with every shadow projected as enforced -- through the same
+`policy_replay::evaluate` functions, and compares the answers. It reads only
+what the kernel returned: the logical outcome, effect, reason, the deciding
+`RuleReference` (or, for the tool lane, the entry the reason implies) and any
+shadow observation, and it fails the job, rather than answering, when an
+answer breaks the kernel's own contract (an observation that is not a direct
+rule, a decision without the element its reason implies). Elements are
+matched across the two policies by stable id, or by content for entries
+without one, never by position. The recorded result is compared with the
+base's answer the way the live adapters record it, a direct rule by id or by
+position, a route by its permission and path prefix. The format is in
+[policy-replay.md](../policy-replay.md#impact-comparison).
+
+## Evidence packages (#243, slice 20)
+
+`admin_policy_evidence` adds no evaluation of its own. Behind
+`POST /v1{ADMIN_PREFIX}/policy/evidence` it runs a test suite through
+`policy_testing::run_against_policy` and synthetic cases through
+`policy_simulation::run`, both against a policy history version (and, for
+cases, the version before it) compiled with `CompiledPolicy::from_validated_policy`,
+and binds a finished replay job's result unchanged. `policy_evidence` only
+assembles what those callers returned into a deterministic package; the
+format is in [policy-evidence.md](../policy-evidence.md).

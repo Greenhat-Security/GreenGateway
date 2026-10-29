@@ -73,6 +73,25 @@
 //! policy actually has host-qualified routes, so a caller is never asked for a
 //! fact that cannot change the result.
 //!
+//! ## Typed matchers read facts the context does not carry
+//!
+//! A policy v1 document may map verified identities to internal roles and give
+//! direct rules typed conditions (issue #243, item 16). Both read
+//! [`PolicyFacts`] -- the principal's verified organization, the canonical
+//! client address, named headers and query parameters, validated tool
+//! arguments, an injected clock -- which every lane takes beside its context.
+//! The entry points the serving adapters call pass [`UNCAPTURED_FACTS`]: no
+//! adapter captures them yet, and policy validation refuses a document that
+//! uses either (`TypedMatchersNotEnforced`), so no served policy reads one.
+//! Should one ever reach a lane, a mapping or condition that reads an
+//! uncaptured fact makes the answer [`Limitation::MissingMatcherFact`], never a
+//! guessed match.
+//!
+//! In mapped-role mode each lane resolves the principal's internal roles once,
+//! on entry, and judges every role constraint -- route permissions, rule
+//! principals, tool and rate-override roles -- against those, so one request is
+//! never judged by two role sets.
+//!
 //! No runtime handle, store, audit sink, provider, resolver, or callback enters
 //! this API. Principal inputs contain only policy facts, never credentials.
 
@@ -85,8 +104,10 @@ pub(crate) mod stages;
 #[cfg(test)]
 mod tests;
 pub(crate) mod tools;
+#[cfg(test)]
+mod typed_matcher_tests;
 
-use std::fmt;
+use std::{borrow::Cow, fmt};
 
 use http::Method;
 use serde::Serialize;
@@ -97,7 +118,8 @@ use crate::{
     auth::{AuthMethod, Principal},
     path_match::{is_unsafe_request_path, path_prefix_matches},
     rbac::{
-        matcher::{method_matches, path_pattern_matches, RuleDecision, RuleDispatchContext},
+        identity_mappings::CompiledIdentityMappings,
+        matcher::{method_matches, path_pattern_matches, RuleDispatchContext, RuleScan},
         policy::{RouteRule, KNOWN_TOP_LEVEL_KEYS},
         DefaultAction, EnforcementMode, Policy, PolicyEngine, RateLimitRule, RuleAction,
         RuleMatcher,
@@ -113,6 +135,17 @@ use stages::{
     DefaultMatch, DirectAction, DirectMatch, HostUse, HttpStage, NoStages, PermissionCheck,
     RouteMatch, StageSink, UpstreamBinding,
 };
+
+#[cfg(test)]
+pub(crate) use crate::rbac::conditions::Fact;
+pub(crate) use crate::rbac::conditions::{PolicyFacts, UNCAPTURED_FACTS};
+
+/// Most header or query entries one evaluation's facts may carry.
+pub(crate) const MAX_FACT_ENTRIES: usize = 128;
+/// Longest header or query name a fact may carry, in bytes.
+pub(crate) const MAX_FACT_NAME_BYTES: usize = 256;
+/// Longest header or query value, or organization, a fact may carry, in bytes.
+pub(crate) const MAX_FACT_VALUE_BYTES: usize = 8192;
 
 /// Each lane that adds a required fact bumps this, so a context built for an
 /// earlier shape is refused rather than silently reinterpreted under a later one.
@@ -200,6 +233,9 @@ pub(crate) struct CompiledPolicy {
     /// Whether any route is host-qualified. Only then does the request host
     /// change a result, and only then is the caller asked to supply it.
     host_qualified_routes: bool,
+    /// The identity mappings of a policy in mapped-role mode; `None` when the
+    /// policy's claimed roles are its internal roles.
+    identity: Option<CompiledIdentityMappings>,
 }
 
 impl fmt::Debug for CompiledPolicy {
@@ -295,6 +331,10 @@ impl CompiledPolicy {
 
     fn assemble(policy: Policy, digest: PolicyDigest, authority: PolicyAuthority) -> Self {
         let host_qualified_routes = policy.routes.iter().any(|route| !route.hosts.is_empty());
+        let identity = policy
+            .identity_mappings
+            .as_deref()
+            .map(CompiledIdentityMappings::new);
         let snapshot = ResourceSnapshot {
             digest,
             authority,
@@ -306,6 +346,61 @@ impl CompiledPolicy {
             engine: PolicyEngine::new(policy),
             snapshot,
             host_qualified_routes,
+            identity,
+        }
+    }
+
+    /// The principal every lane judges: `principal` itself when the policy's
+    /// claimed roles are its internal roles, or, in mapped-role mode, a copy
+    /// holding exactly the internal roles its identity mappings grant.
+    ///
+    /// `None` when a mapping reads a fact that was not captured, so the
+    /// internal roles cannot be told. A lane answers that as
+    /// [`Limitation::MissingMatcherFact`].
+    pub(crate) fn effective_principal<'a>(
+        &self,
+        principal: &'a Principal,
+        facts: &PolicyFacts,
+    ) -> Option<Cow<'a, Principal>> {
+        let Some(mappings) = &self.identity else {
+            return Some(Cow::Borrowed(principal));
+        };
+        let roles = mappings.effective_roles(principal, facts)?;
+        let mut mapped = principal.clone();
+        mapped.roles = roles;
+        Some(Cow::Owned(mapped))
+    }
+
+    /// The principal the management lane asks this policy's permission
+    /// engine about: [`Self::effective_principal`], with no fact captured.
+    ///
+    /// Management permission checks have no indeterminate answer, so a
+    /// principal whose internal roles cannot be told holds none: it is
+    /// refused every permission, never granted one on a guess.
+    pub(crate) fn management_principal<'a>(&self, principal: &'a Principal) -> Cow<'a, Principal> {
+        self.effective_principal(principal, &UNCAPTURED_FACTS)
+            .unwrap_or_else(|| {
+                let mut stripped = principal.clone();
+                stripped.roles = Vec::new();
+                Cow::Owned(stripped)
+            })
+    }
+
+    /// The principal a lane judges for `fact`, already validated: `Ok(None)`
+    /// for an anonymous caller, and the limitation for one whose internal
+    /// roles cannot be told or that was never captured.
+    fn judged_principal<'a>(
+        &self,
+        fact: &'a PrincipalFact,
+        facts: &PolicyFacts,
+    ) -> Result<Option<Cow<'a, Principal>>, Limitation> {
+        match fact {
+            PrincipalFact::Missing => Err(Limitation::MissingPrincipalFact),
+            PrincipalFact::Anonymous => Ok(None),
+            PrincipalFact::Authenticated(identity) => self
+                .effective_principal(&identity.0, facts)
+                .map(Some)
+                .ok_or(Limitation::MissingMatcherFact),
         }
     }
 
@@ -366,6 +461,10 @@ impl CompiledPolicy {
     ///
     /// Narrowing to denies composes with either: the action set shrinks to
     /// `[deny]`, and over a single action the two orders coincide.
+    ///
+    /// A rule whose conditions read an uncaptured fact, reached before any
+    /// rule that certainly matches, makes the scan [`RuleScan::Undetermined`].
+    #[allow(clippy::too_many_arguments)]
     fn match_direct(
         &self,
         method: &str,
@@ -374,24 +473,28 @@ impl CompiledPolicy {
         principal: Option<&Principal>,
         dispatch_context: RuleDispatchContext<'_>,
         denies_only: bool,
-    ) -> Option<RuleDecision> {
+        facts: &PolicyFacts,
+    ) -> RuleScan {
         match canonical_path {
-            Some(canonical) => self.matcher.evaluate_equivalent_paths_with_dispatch(
+            Some(canonical) => self.matcher.scan_equivalent_paths_with_dispatch(
                 method,
                 &[canonical, path],
                 principal,
                 dispatch_context,
                 denies_only,
+                facts,
             ),
-            None if denies_only => self.matcher.evaluate_denies_with_dispatch(
+            None if denies_only => self.matcher.scan_denies_with_dispatch(
                 method,
                 path,
                 principal,
                 dispatch_context,
+                facts,
             ),
-            None => self
-                .matcher
-                .evaluate_with_dispatch(method, path, principal, dispatch_context),
+            None => {
+                self.matcher
+                    .scan_with_dispatch(method, path, principal, dispatch_context, facts)
+            }
         }
     }
 
@@ -426,8 +529,20 @@ impl CompiledPolicy {
         &self,
         context: &PolicyEvaluationContext,
     ) -> Result<RateLaneSelection, EvaluationError> {
+        self.select_rate_lane_with_facts(context, &UNCAPTURED_FACTS)
+    }
+
+    /// [`Self::select_rate_lane`] with the facts an identity mapping may
+    /// read. Rate overrides carry no conditions, so only mapped-role mode
+    /// reads them, to resolve the roles an override's principal constrains.
+    pub(crate) fn select_rate_lane_with_facts(
+        &self,
+        context: &PolicyEvaluationContext,
+        facts: &PolicyFacts,
+    ) -> Result<RateLaneSelection, EvaluationError> {
         context.validate(self.snapshot)?;
-        let binding = context.binding()?;
+        validate_facts(facts)?;
+        let binding = context.binding()?.with_facts(facts);
         // A fact this lane matches on that was not supplied is an incomplete
         // result, not an evaluator error: ordinary replay over retained data is
         // missing facts routinely, and failing the run would turn "we did not
@@ -452,17 +567,24 @@ impl CompiledPolicy {
         let (Some(method), Some(path)) = (&context.method, &context.path) else {
             return Err(EvaluationError::InternalInvariant);
         };
-        let principal = match &context.principal {
-            PrincipalFact::Authenticated(identity) => &identity.0,
+        let effective = match self.judged_principal(&context.principal, facts) {
+            Ok(Some(effective)) => effective,
             // The live bypass, above.
-            PrincipalFact::Anonymous => {
+            Ok(None) => {
                 return Ok(RateLaneSelection {
                     binding,
                     outcome: RateLaneOutcome::NoOverride,
                 })
             }
-            PrincipalFact::Missing => return Err(EvaluationError::InternalInvariant),
+            Err(Limitation::MissingMatcherFact) => {
+                return Ok(RateLaneSelection {
+                    binding,
+                    outcome: RateLaneOutcome::Indeterminate(Limitation::MissingMatcherFact),
+                })
+            }
+            Err(_) => return Err(EvaluationError::InternalInvariant),
         };
+        let principal: &Principal = &effective;
         let selected = self
             .engine
             .policy()
@@ -539,7 +661,7 @@ impl CompiledPolicy {
         &self,
         context: &PolicyEvaluationContext,
     ) -> Result<Evaluation, EvaluationError> {
-        self.evaluate_with_stages(context, &mut NoStages)
+        self.decide(context, &UNCAPTURED_FACTS, &mut NoStages)
     }
 
     /// [`Self::evaluate`], reporting each stage it runs to `stages`.
@@ -552,9 +674,29 @@ impl CompiledPolicy {
         context: &PolicyEvaluationContext,
         stages: &mut S,
     ) -> Result<Evaluation, EvaluationError> {
+        self.decide(context, &UNCAPTURED_FACTS, stages)
+    }
+
+    /// [`Self::evaluate`] with the facts typed matchers read.
+    #[cfg(test)]
+    pub(crate) fn evaluate_with_facts(
+        &self,
+        context: &PolicyEvaluationContext,
+        facts: &PolicyFacts,
+    ) -> Result<Evaluation, EvaluationError> {
+        self.decide(context, facts, &mut NoStages)
+    }
+
+    fn decide<S: StageSink>(
+        &self,
+        context: &PolicyEvaluationContext,
+        facts: &PolicyFacts,
+        stages: &mut S,
+    ) -> Result<Evaluation, EvaluationError> {
         context.validate(self.snapshot)?;
-        let binding = context.binding()?;
-        let missing = if context.method.is_none() {
+        validate_facts(facts)?;
+        let binding = context.binding()?.with_facts(facts);
+        let mut missing = if context.method.is_none() {
             Some(Limitation::MissingMethod)
         } else if context.path.is_none() {
             Some(Limitation::MissingPath)
@@ -570,6 +712,15 @@ impl CompiledPolicy {
                 HttpTarget::ProxyDispatch => None,
             }
         };
+        // The internal roles are a fact too: in mapped-role mode one the
+        // mappings may be unable to tell.
+        let mut effective = None;
+        if missing.is_none() {
+            match self.judged_principal(&context.principal, facts) {
+                Ok(principal) => effective = principal,
+                Err(limitation) => missing = Some(limitation),
+            }
+        }
         stages.record(HttpStage::Facts(missing));
         if let Some(limitation) = missing {
             return Ok(Evaluation::indeterminate(binding, limitation));
@@ -577,11 +728,7 @@ impl CompiledPolicy {
         let (Some(method), Some(path)) = (&context.method, &context.path) else {
             return Err(EvaluationError::InternalInvariant);
         };
-        let principal = match &context.principal {
-            PrincipalFact::Authenticated(identity) => Some(&identity.0),
-            PrincipalFact::Anonymous => None,
-            PrincipalFact::Missing => return Err(EvaluationError::InternalInvariant),
-        };
+        let principal = effective.as_deref();
 
         let dispatch = context.dispatch.as_ref();
         // A selected virtual upstream, which production identifies by the route
@@ -642,14 +789,26 @@ impl CompiledPolicy {
         // denies: an allow or shadow must not authorize a virtual host. The
         // first match is still computed, because a shadow among the rules an
         // upstream-bound request skips is still recorded as a would-deny.
-        let first_direct = self.match_direct(
+        let first_direct = match self.match_direct(
             method.as_str(),
             path,
             canonical_path,
             principal,
             dispatch_context,
             false,
-        );
+            facts,
+        ) {
+            RuleScan::Matched(decision) => Some(decision),
+            RuleScan::NoMatch => None,
+            // Which direct rule decides, or which shadow a bound request
+            // would record, cannot be told.
+            RuleScan::Undetermined { .. } => {
+                return Ok(Evaluation::indeterminate(
+                    binding,
+                    Limitation::MissingMatcherFact,
+                ))
+            }
+        };
         stages.record(HttpStage::DirectRules(first_direct.as_ref().map(
             |decision| DirectMatch {
                 rule: decision.rule_index,
@@ -661,14 +820,24 @@ impl CompiledPolicy {
                 .then_some(RuleReference::Direct(decision.rule_index))
         });
         let deciding_direct = if host_binding_required {
-            let deny = self.match_direct(
+            let deny = match self.match_direct(
                 method.as_str(),
                 path,
                 canonical_path,
                 principal,
                 dispatch_context,
                 true,
-            );
+                facts,
+            ) {
+                RuleScan::Matched(decision) => Some(decision),
+                RuleScan::NoMatch => None,
+                RuleScan::Undetermined { .. } => {
+                    return Ok(Evaluation::indeterminate(
+                        binding,
+                        Limitation::MissingMatcherFact,
+                    ))
+                }
+            };
             stages.record(HttpStage::UpstreamBinding(UpstreamBinding::DenyOnly(
                 deny.as_ref().map(|decision| decision.rule_index),
             )));
@@ -1092,6 +1261,7 @@ impl PolicyEvaluationContext {
                 &CONTEXT_VERSION.to_string(),
                 &bytes,
             ),
+            facts: FactsUse::Uncaptured,
         })
     }
 }
@@ -1100,6 +1270,69 @@ impl PolicyEvaluationContext {
 struct InputBinding {
     snapshot: ResourceSnapshot,
     context_digest: [u8; 32],
+    /// Whether the answer was given with typed-matcher facts. Absent from the
+    /// trace when none was captured, so a trace without them is unchanged.
+    #[serde(skip_serializing_if = "FactsUse::is_uncaptured")]
+    facts: FactsUse,
+}
+
+impl InputBinding {
+    /// This binding, marked as given with `facts`. An answer given with
+    /// captured facts is never reusable: its values are not part of the
+    /// context a later question is compared by, and binding them by digest
+    /// would put a dictionary-searchable hash of each in the trace.
+    fn with_facts(mut self, facts: &PolicyFacts) -> Self {
+        self.facts = FactsUse::of(facts);
+        self
+    }
+}
+
+/// Whether an answer read typed-matcher facts the caller captured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FactsUse {
+    Uncaptured,
+    Captured,
+}
+
+impl FactsUse {
+    pub(crate) fn of(facts: &PolicyFacts) -> Self {
+        if facts.any_captured() {
+            Self::Captured
+        } else {
+            Self::Uncaptured
+        }
+    }
+
+    pub(crate) fn is_uncaptured(&self) -> bool {
+        *self == Self::Uncaptured
+    }
+}
+
+/// Refuses facts past the work bounds every lane states for itself, as it
+/// does for the context. The organization is held to the bound a subject is,
+/// and header and query entries to bounds no request the gateway admits
+/// exceeds.
+pub(crate) fn validate_facts(facts: &PolicyFacts) -> Result<(), EvaluationError> {
+    use crate::rbac::conditions::Fact;
+
+    if let Fact::Captured(Some(organization)) = &facts.organization {
+        if organization.len() > MAX_FACT_VALUE_BYTES {
+            return Err(EvaluationError::ContextTooLarge);
+        }
+    }
+    for entries in [&facts.headers, &facts.query] {
+        if let Fact::Captured(entries) = entries {
+            if entries.len() > MAX_FACT_ENTRIES
+                || entries.iter().any(|(name, value)| {
+                    name.len() > MAX_FACT_NAME_BYTES || value.len() > MAX_FACT_VALUE_BYTES
+                })
+            {
+                return Err(EvaluationError::ContextTooLarge);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -1173,6 +1406,9 @@ pub(crate) enum Limitation {
     MissingPrincipalFact,
     MissingDispatchFact,
     MissingHostFact,
+    /// A fact an identity mapping or a rule condition reads was not
+    /// captured, and the answer turns on it.
+    MissingMatcherFact,
 }
 
 pub(crate) const NOT_EVALUATED: &[&str] = &[

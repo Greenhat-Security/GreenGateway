@@ -226,7 +226,7 @@ mod tests {
                 axis: "token".to_owned(),
                 before: Some("1".to_owned()),
                 after: Some("2".to_owned()),
-                security: "9".to_owned(),
+                security: Some("9".to_owned()),
             },
         }
     }

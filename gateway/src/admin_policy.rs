@@ -268,6 +268,43 @@ pub(super) async fn policy_rollback_endpoint(
     with_policy_history_append_warning(response, commit.history_append_failed)
 }
 
+/// Inspect policy source bytes as `POST .../policy/validate` judges them: the
+/// document's own diagnostics, then what the document cannot show about
+/// itself -- whether this deployment can enforce and commit it, the checks
+/// that also refuse a replace. Policy evidence revalidates a publication with
+/// the same function.
+pub(super) fn inspect_policy_for_deployment(
+    state: &PolicyAdminState,
+    rbac_state: &middleware::rbac::RbacState,
+    source: &[u8],
+) -> rbac::policy_document::PolicyInspection {
+    let mut inspection = rbac::policy_document::inspect_source(source);
+    let dispatch_error = inspection.policy().and_then(|policy| {
+        rbac_state
+            .validate_proxy_dispatch_policy(policy)
+            .err()
+            .map(|error| policy_error_message(&error))
+    });
+    if let Some(detail) = dispatch_error {
+        inspection.refuse(
+            rbac::policy_document::IssueCode::DispatchNotConfigured,
+            "/rules",
+            detail,
+        );
+    }
+    let format_error = inspection
+        .policy()
+        .and_then(|policy| deployment_document_format_refusal(state, policy));
+    if let Some(detail) = format_error {
+        inspection.refuse(
+            rbac::policy_document::IssueCode::DocumentFormatUnsupportedInCluster,
+            "/schema_version",
+            detail,
+        );
+    }
+    inspection
+}
+
 pub(super) async fn policy_validate_endpoint(
     State(state): State<PolicyAdminState>,
     request: AxumRequest,
@@ -289,32 +326,7 @@ pub(super) async fn policy_validate_endpoint(
         Err(response) => return *response,
     };
 
-    let mut inspection = rbac::policy_document::inspect_source(&body);
-    // What the document cannot show about itself: whether this deployment
-    // can enforce and commit it. The same checks refuse a replace.
-    let dispatch_error = inspection.policy().and_then(|policy| {
-        rbac_state
-            .validate_proxy_dispatch_policy(policy)
-            .err()
-            .map(|error| policy_error_message(&error))
-    });
-    if let Some(detail) = dispatch_error {
-        inspection.refuse(
-            rbac::policy_document::IssueCode::DispatchNotConfigured,
-            "/rules",
-            detail,
-        );
-    }
-    let format_error = inspection
-        .policy()
-        .and_then(|policy| deployment_document_format_refusal(&state, policy));
-    if let Some(detail) = format_error {
-        inspection.refuse(
-            rbac::policy_document::IssueCode::DocumentFormatUnsupportedInCluster,
-            "/schema_version",
-            detail,
-        );
-    }
+    let mut inspection = inspect_policy_for_deployment(&state, rbac_state, &body);
     // What only the other resources can show: the same cross-resource,
     // lockout and risk checks a publication runs, as the replacement of
     // the policy the authority holds now, for this caller.

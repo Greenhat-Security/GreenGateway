@@ -35,6 +35,12 @@ pub const POLICY_REPLAY_COMPLETED: &str = "policy.replay_completed";
 pub const POLICY_REPLAY_CANCELLED: &str = "policy.replay_cancelled";
 /// A replay job failed with a stable reason and produced no result.
 pub const POLICY_REPLAY_FAILED: &str = "policy.replay_failed";
+/// A policy evidence package was assembled and released (issue #243, slice
+/// 20). Records the publication version, its ETag and semantic digest, the
+/// request and report digests, completeness and limitation codes; never a
+/// case, fixture value, policy content or package body. A package whose
+/// export is not recorded is never released.
+pub const POLICY_EVIDENCE_EXPORTED: &str = "policy.evidence_exported";
 pub const SERVICE_TOKEN_CHANGED: &str = "service_token.changed";
 pub const SERVICE_TOKEN_DELEGATION_REJECTED: &str = "service_token.delegation_rejected";
 /// A policy write the cross-resource checks refused before any authority saw

@@ -77,6 +77,11 @@
       "permission": "admin:policy:simulate"
     },
     {
+      "methods": ["POST"],
+      "path_prefix": "/v1/admin/policy/evidence",
+      "permission": "admin:policy:evidence:read"
+    },
+    {
       "methods": ["PUT", "POST", "PATCH", "DELETE"],
       "path_prefix": "/v1/admin/policy",
       "permission": "admin:policy:write"
