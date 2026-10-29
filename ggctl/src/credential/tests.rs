@@ -151,3 +151,55 @@ fn a_fifo_is_refused_without_blocking_on_open() {
         Err(Code::CredentialNotRegularFile)
     );
 }
+
+/// A FIFO put in place of a checked path after the path check, with no
+/// writer behind it: a blocking open would wait forever, before the handle
+/// check could refuse it.
+#[cfg(unix)]
+#[test]
+fn a_fifo_swapped_in_after_the_path_check_is_opened_without_blocking_and_refused() {
+    let file = TempFile::new("swapped-fifo", b"");
+    std::fs::remove_file(&file.0).expect("remove placeholder");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&file.0)
+        .status()
+        .expect("mkfifo should run");
+    assert!(status.success());
+
+    let path = file.0.clone();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let opened = open_without_blocking(&path).and_then(|file| file.metadata());
+        let _ = sender.send(opened.map(|metadata| {
+            check_metadata(&metadata, MAX_TOKEN_BYTES, FilePermissions::OwnerOnly)
+        }));
+    });
+    let checked = receiver
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("opening a FIFO without a writer must not block")
+        .expect("the FIFO opens");
+    assert_eq!(checked, Err(FileProblem::NotRegularFile));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_handle_to_another_file_than_the_one_checked_is_refused() {
+    let first = TempFile::new("identity-first", CANARY.as_bytes());
+    let second = TempFile::new("identity-second", CANARY.as_bytes());
+    let metadata = |path: &Path| std::fs::metadata(path).expect("metadata");
+    // Held open, so the inode cannot be freed and reused below.
+    let handle = File::open(&first.0).expect("open");
+    let opened = handle.metadata().expect("handle metadata");
+    assert_eq!(check_same_file(&metadata(&first.0), &opened), Ok(()));
+    assert_eq!(
+        check_same_file(&metadata(&second.0), &opened),
+        Err(FileProblem::Unreadable)
+    );
+    // A replacement at the same path is another file.
+    std::fs::remove_file(&first.0).expect("remove");
+    std::fs::write(&first.0, CANARY).expect("replacement");
+    assert_eq!(
+        check_same_file(&metadata(&first.0), &opened),
+        Err(FileProblem::Unreadable)
+    );
+}

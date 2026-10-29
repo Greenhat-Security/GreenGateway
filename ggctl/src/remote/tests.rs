@@ -604,26 +604,137 @@ async fn https_verifies_the_certificate_and_the_hostname() {
     );
 }
 
+/// A directory of CA files, removed on drop. On Unix it and every file
+/// written into it get explicit modes, so the runner's umask cannot decide
+/// whether the permission rules pass.
+struct CaDirectory(PathBuf);
+
+impl CaDirectory {
+    fn new(name: &str) -> Self {
+        let directory =
+            std::env::temp_dir().join(format!("ggctl-ca-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("directory");
+        let directory = Self(directory);
+        set_mode(&directory.0, 0o700);
+        directory
+    }
+
+    fn write(&self, name: &str, contents: &[u8]) -> PathBuf {
+        let path = self.0.join(name);
+        std::fs::write(&path, contents).expect("write");
+        set_mode(&path, 0o644);
+        path
+    }
+}
+
+impl Drop for CaDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("mode");
+}
+
+#[cfg(not(unix))]
+fn set_mode(_path: &Path, _mode: u32) {}
+
 #[test]
 fn a_ca_file_must_hold_a_pem_certificate() {
-    let directory = std::env::temp_dir().join(format!("ggctl-ca-{}", std::process::id()));
-    std::fs::create_dir_all(&directory).expect("directory");
-    let valid = directory.join("ca.pem");
-    std::fs::write(&valid, pki(IpAddr::V4(Ipv4Addr::LOCALHOST)).ca_pem).expect("write");
+    let directory = CaDirectory::new("contents");
+    let pem = pki(IpAddr::V4(Ipv4Addr::LOCALHOST)).ca_pem;
+    let valid = directory.write("ca.pem", pem.as_bytes());
     assert_eq!(load_roots(&valid).map(|roots| roots.len()), Ok(1));
-    let empty = directory.join("empty.pem");
-    std::fs::write(&empty, "no certificate here\n").expect("write");
+    let empty = directory.write("empty.pem", b"no certificate here\n");
     assert_eq!(load_roots(&empty).map(|_| ()), Err(Code::CaFileInvalid));
-    let large = directory.join("large.pem");
-    std::fs::write(&large, vec![b'a'; MAX_CA_FILE_BYTES + 1]).expect("write");
+    let large = directory.write("large.pem", &vec![b'a'; MAX_CA_FILE_BYTES + 1]);
     assert_eq!(load_roots(&large).map(|_| ()), Err(Code::CaFileTooLarge));
     assert_eq!(
-        load_roots(&directory).map(|_| ()),
+        load_roots(&directory.0).map(|_| ()),
         Err(Code::CaFileNotRegularFile)
     );
     assert_eq!(
-        load_roots(&directory.join("missing.pem")).map(|_| ()),
+        load_roots(&directory.0.join("missing.pem")).map(|_| ()),
         Err(Code::CaFileUnreadable)
     );
-    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// The trust anchors decide where the token goes, so another account must
+/// not be able to add one: world-readable is fine, writable is not.
+#[cfg(unix)]
+#[test]
+fn a_ca_file_writable_by_group_or_other_is_refused() {
+    let directory = CaDirectory::new("modes");
+    let pem = pki(IpAddr::V4(Ipv4Addr::LOCALHOST)).ca_pem;
+    for mode in [0o644, 0o444, 0o640, 0o600] {
+        let path = directory.write(&format!("ca-{mode:o}.pem"), pem.as_bytes());
+        set_mode(&path, mode);
+        assert_eq!(
+            load_roots(&path).map(|roots| roots.len()),
+            Ok(1),
+            "{mode:o}"
+        );
+    }
+    for mode in [0o664, 0o666, 0o646, 0o620, 0o602] {
+        let path = directory.write(&format!("ca-{mode:o}.pem"), pem.as_bytes());
+        set_mode(&path, mode);
+        assert_eq!(
+            load_roots(&path).map(|_| ()),
+            Err(Code::CaFileUnsafePermissions),
+            "{mode:o}"
+        );
+    }
+}
+
+/// Whoever can write a directory can replace a `0644` file in it; the sticky
+/// bit stops an account doing that to a file it does not own.
+#[cfg(unix)]
+#[test]
+fn a_ca_file_in_a_directory_writable_by_group_or_other_is_refused() {
+    use std::os::unix::fs::symlink;
+
+    let pem = pki(IpAddr::V4(Ipv4Addr::LOCALHOST)).ca_pem;
+    for mode in [0o770, 0o775, 0o707, 0o777] {
+        let directory = CaDirectory::new(&format!("directory-{mode:o}"));
+        let path = directory.write("ca.pem", pem.as_bytes());
+        set_mode(&directory.0, mode);
+        assert_eq!(
+            load_roots(&path).map(|_| ()),
+            Err(Code::CaFileUnsafePermissions),
+            "{mode:o}"
+        );
+    }
+    for mode in [0o755, 0o750, 0o1777, 0o1775] {
+        let directory = CaDirectory::new(&format!("directory-{mode:o}"));
+        let path = directory.write("ca.pem", pem.as_bytes());
+        set_mode(&directory.0, mode);
+        assert_eq!(
+            load_roots(&path).map(|roots| roots.len()),
+            Ok(1),
+            "{mode:o}"
+        );
+    }
+
+    // A link is judged by the directory holding the file it points to too.
+    let shared = CaDirectory::new("link-target");
+    shared.write("ca.pem", pem.as_bytes());
+    set_mode(&shared.0, 0o775);
+    let private = CaDirectory::new("link");
+    let link = private.0.join("ca.pem");
+    symlink(shared.0.join("ca.pem"), &link).expect("symlink");
+    assert_eq!(
+        load_roots(&link).map(|_| ()),
+        Err(Code::CaFileUnsafePermissions)
+    );
+    set_mode(&shared.0, 0o755);
+    assert_eq!(load_roots(&link).map(|roots| roots.len()), Ok(1));
+    // And a link in a writable directory can be repointed, wherever it points.
+    set_mode(&private.0, 0o777);
+    assert_eq!(
+        load_roots(&link).map(|_| ()),
+        Err(Code::CaFileUnsafePermissions)
+    );
 }

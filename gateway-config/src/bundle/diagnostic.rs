@@ -111,6 +111,7 @@ pub enum Code {
     RootUnavailable,
     RootNotDirectory,
     UnsafePermissions,
+    UntrustedOwner,
     TooManyEntries,
     ManifestMissing,
     FileMissing,
@@ -197,6 +198,7 @@ impl Code {
         Self::RootUnavailable,
         Self::RootNotDirectory,
         Self::UnsafePermissions,
+        Self::UntrustedOwner,
         Self::TooManyEntries,
         Self::ManifestMissing,
         Self::FileMissing,
@@ -291,6 +293,10 @@ impl Code {
             Self::UnsafePermissions => (
                 "bundle.unsafe_permissions",
                 "a bundle directory or file is writable by group or other",
+            ),
+            Self::UntrustedOwner => (
+                "bundle.untrusted_owner",
+                "a bundle directory or file is owned by an account other than root or the owner of the directory holding it",
             ),
             Self::TooManyEntries => (
                 "bundle.too_many_entries",

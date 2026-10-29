@@ -13,6 +13,16 @@
 //! never followed. Any other symbolic link, junction, reparse point,
 //! subdirectory, special file or hard-linked file is refused. Entries whose
 //! names begin with `.` are ignored, and never opened.
+//!
+//! On Unix only root and the account that owns the directory files are read
+//! from may supply them: that directory must not be writable by group or
+//! other, and each file must be owned by root or by the directory's owner,
+//! since any other owner could change the file whatever its mode says. The
+//! one exception is the atomic-writer volume root, which may be
+//! world-writable with the sticky bit because that is how the kubelet
+//! publishes it: nothing is read from it but `..data` and the generation
+//! directory it names, and that generation must belong to the volume's
+//! owner.
 
 use std::{
     ffi::OsStr,
@@ -115,6 +125,8 @@ pub(crate) struct BundleDirectory {
     /// The directory files are read from: the root, or the resolved
     /// atomic-writer generation.
     files: Dir,
+    /// The account that owns `files`, where the platform records one.
+    owner: Option<u32>,
     /// Every entry of `files` whose name does not begin with `.`. Names that
     /// are not UTF-8 are kept lossily: they can never pass the file-name
     /// grammar, so they are never opened and never reported by name.
@@ -131,7 +143,7 @@ impl BundleDirectory {
         }
         let directory = Dir::open_ambient_dir(&canonical, ambient_authority())
             .map_err(|_| BundleDiagnostic::bundle(Code::RootUnavailable))?;
-        check_directory(&directory, Code::RootNotDirectory)?;
+        let root_metadata = check_directory(&directory, Code::RootNotDirectory)?;
 
         let mut examined = 0;
         let root_entries = list_entries(&directory, &mut examined)?;
@@ -140,12 +152,20 @@ impl BundleDirectory {
             .find(|(name, _)| name == ATOMIC_WRITER_DATA)
             .map(|(_, kind)| *kind)
         else {
+            // A flat bundle is read from its root. The sticky bit stops
+            // another account replacing an entry, not adding one, and a
+            // `bundle.yaml` or referenced file it added before the operator
+            // did would be read; so here the root is its owner's alone.
+            if !owner_alone_can_write(&root_metadata) {
+                return Err(BundleDiagnostic::bundle(Code::UnsafePermissions));
+            }
             let entries = root_entries
                 .into_iter()
                 .filter(|(name, _)| !name.starts_with('.'))
                 .collect();
             return Ok(Self {
                 files: directory,
+                owner: owner(&root_metadata),
                 entries,
                 bytes_read: 0,
             });
@@ -185,13 +205,24 @@ impl BundleDirectory {
         let generation_directory = directory
             .open_dir_nofollow(generation)
             .map_err(|_| invalid())?;
-        check_directory(&generation_directory, Code::AtomicWriterInvalid)?;
+        let generation_metadata =
+            check_directory(&generation_directory, Code::AtomicWriterInvalid)?;
+        // The kubelet creates every generation `0755`, as the volume's owner.
+        // One another account can add to, or owns, is not one it wrote, even
+        // though that account could have created it under a sticky root.
+        if !owner_alone_can_write(&generation_metadata) {
+            return Err(BundleDiagnostic::bundle(Code::UnsafePermissions));
+        }
+        if !owner_is_trusted(owner(&generation_metadata), owner(&root_metadata)) {
+            return Err(BundleDiagnostic::bundle(Code::UntrustedOwner));
+        }
         let entries = list_entries(&generation_directory, &mut examined)?
             .into_iter()
             .filter(|(name, _)| !name.starts_with('.'))
             .collect();
         Ok(Self {
             files: generation_directory,
+            owner: owner(&generation_metadata),
             entries,
             bytes_read: 0,
         })
@@ -244,8 +275,11 @@ impl BundleDirectory {
         if links != 1 {
             return Err(refuse(Code::HardLinkForbidden));
         }
-        if !file_permissions_are_safe(&metadata) {
+        if !owner_alone_can_write(&metadata) {
             return Err(refuse(Code::UnsafePermissions));
+        }
+        if !owner_is_trusted(owner(&metadata), self.owner) {
+            return Err(refuse(Code::UntrustedOwner));
         }
         let declared = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
         if declared > maximum {
@@ -344,7 +378,10 @@ fn lossy_name(name: &OsStr) -> String {
     name.to_string_lossy().into_owned()
 }
 
-fn check_directory(directory: &Dir, not_directory: Code) -> Result<(), BundleDiagnostic> {
+/// Checks an opened directory and returns its metadata. Every directory is
+/// held at least to the projected-volume rule; the caller tightens it for
+/// the directory files are read from.
+fn check_directory(directory: &Dir, not_directory: Code) -> Result<fs::Metadata, BundleDiagnostic> {
     let metadata = directory
         .try_clone()
         .and_then(|directory| directory.into_std_file().metadata())
@@ -358,11 +395,13 @@ fn check_directory(directory: &Dir, not_directory: Code) -> Result<(), BundleDia
     if !crate::permissions::projected_root_permissions_are_safe(&metadata) {
         return Err(BundleDiagnostic::bundle(Code::UnsafePermissions));
     }
-    Ok(())
+    Ok(metadata)
 }
 
+/// Whether group and other are denied write: for a file, the right to change
+/// it; for a directory, the right to add, rename or remove its entries.
 #[cfg(unix)]
-fn file_permissions_are_safe(metadata: &fs::Metadata) -> bool {
+fn owner_alone_can_write(metadata: &fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
     metadata.mode() & 0o022 == 0
 }
@@ -370,8 +409,36 @@ fn file_permissions_are_safe(metadata: &fs::Metadata) -> bool {
 /// Windows ACLs remain an operator and platform responsibility, as they are
 /// for `CONNECTION_SECRETS_ROOT`.
 #[cfg(not(unix))]
-fn file_permissions_are_safe(_: &fs::Metadata) -> bool {
+fn owner_alone_can_write(_: &fs::Metadata) -> bool {
     true
+}
+
+/// The account that owns an entry, where the platform records one in its
+/// metadata.
+#[cfg(unix)]
+fn owner(metadata: &fs::Metadata) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    Some(metadata.uid())
+}
+
+/// Windows records no owner ID in metadata; its ACLs remain an operator and
+/// platform responsibility.
+#[cfg(not(unix))]
+fn owner(_: &fs::Metadata) -> Option<u32> {
+    None
+}
+
+/// Whether an entry's owner may supply what is read from a directory: root,
+/// or the directory's own owner, who could replace the entry anyway. Any
+/// other owner could rewrite the file whatever its mode says, because an
+/// owner may always change the mode of what it owns.
+pub(crate) fn owner_is_trusted(entry: Option<u32>, directory: Option<u32>) -> bool {
+    const ROOT: u32 = 0;
+    match (entry, directory) {
+        (Some(entry), Some(directory)) => entry == ROOT || entry == directory,
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 #[cfg(windows)]
