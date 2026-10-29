@@ -14,8 +14,8 @@ use crate::bundle::{sha256_pin, SourceFile};
 
 use super::{
     record::{self, Pending},
-    ActivationClass, Corruption, LedgerError, LedgerState, Operation, ParentLink, RecordedBundle,
-    RevisionId, RevisionSummary, StoredRevision,
+    Corruption, LedgerError, LedgerState, Operation, ParentLink, RecordedBundle, RevisionId,
+    RevisionSummary, StoredRevision,
 };
 
 /// `PRAGMA application_id`: "GGLG", so the file identifies itself as a
@@ -61,6 +61,15 @@ const SCHEMA: &[(&str, &str, &str, &str)] = &[
     desired_record_hash TEXT NOT NULL,
     active_sequence INTEGER REFERENCES config_revisions (sequence),
     CHECK (active_sequence IS NULL OR active_sequence <= desired_sequence)
+) STRICT",
+    ),
+    (
+        "table",
+        "config_ledger_requests",
+        "config_ledger_requests",
+        "CREATE TABLE config_ledger_requests (
+    idempotency_key TEXT PRIMARY KEY NOT NULL CHECK (length(idempotency_key) = 71),
+    sequence INTEGER NOT NULL UNIQUE REFERENCES config_revisions (sequence)
 ) STRICT",
     ),
     (
@@ -112,6 +121,26 @@ BEFORE INSERT ON config_revisions
 WHEN NEW.sequence IS NOT (SELECT COALESCE(MAX(sequence), 0) + 1 FROM config_revisions)
 BEGIN
     SELECT RAISE(ABORT, 'configuration revisions are appended in sequence');
+END",
+    ),
+    (
+        "trigger",
+        "config_ledger_requests_no_update",
+        "config_ledger_requests",
+        "CREATE TRIGGER config_ledger_requests_no_update
+BEFORE UPDATE ON config_ledger_requests
+BEGIN
+    SELECT RAISE(ABORT, 'configuration ledger requests are immutable');
+END",
+    ),
+    (
+        "trigger",
+        "config_ledger_requests_no_delete",
+        "config_ledger_requests",
+        "CREATE TRIGGER config_ledger_requests_no_delete
+BEFORE DELETE ON config_ledger_requests
+BEGIN
+    SELECT RAISE(ABORT, 'configuration ledger requests are immutable');
 END",
     ),
     (
@@ -211,6 +240,10 @@ pub(super) fn initialize(
     files: &[SourceFile],
 ) -> Result<(), LedgerError> {
     let mut connection = connect(path)?;
+    if pending.request().is_some() {
+        // A seed is an offline operator command and is never requested.
+        return Err(LedgerError::Refused(super::Refusal::SeedNotAppendable));
+    }
     let encoded = record::encode(&pending, 1, None)?;
     let transaction = connection
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -309,7 +342,8 @@ fn check_schema(connection: &Connection) -> Result<(), LedgerError> {
 
 /// The whole ledger, verified: header, page structure, schema, every
 /// document against its pin, every record and its place in the chain, every
-/// rollback against its target, and the pointer against the head.
+/// rollback against its target, the idempotency key index against the
+/// requests the records hold, and the pointer against the head.
 pub(super) fn verify(
     connection: &Connection,
     max_revisions: usize,
@@ -345,6 +379,8 @@ pub(super) fn verify(
     // Each revision's ID and source digest, by sequence and by ID.
     let mut ids = Vec::new();
     let mut digests = HashMap::new();
+    // The idempotency key digest each requested revision records.
+    let mut requests = HashMap::new();
     let mut head: Option<RevisionSummary> = None;
     {
         let mut statement = snapshot
@@ -390,6 +426,9 @@ pub(super) fn verify(
             }
             let manifest = read_documents(&snapshot, &summary.bundle, 1)?;
             check_manifest(&summary.bundle, &manifest)?;
+            if let Some(request) = &summary.request {
+                requests.insert(summary.sequence, request.idempotency_key.clone());
+            }
             ids.push(summary.revision.clone());
             digests.insert(
                 summary.revision.clone(),
@@ -401,6 +440,7 @@ pub(super) fn verify(
     if referenced.len() != documents.len() {
         return Err(DOCUMENT);
     }
+    check_requests(&snapshot, &requests)?;
     let head = head.ok_or(CHAIN)?;
     let pointer = read_pointer(&snapshot)?;
     if pointer.desired_sequence != head.sequence || pointer.desired_record_hash != head.record_hash
@@ -423,6 +463,35 @@ pub(super) fn verify(
         desired: head,
         active,
     })
+}
+
+/// The idempotency key index: exactly one row for each requested revision,
+/// holding the key digest its record holds, and no other row.
+fn check_requests(
+    connection: &Connection,
+    requests: &HashMap<u64, String>,
+) -> Result<(), LedgerError> {
+    const REQUEST: LedgerError = LedgerError::Corrupt(Corruption::Request);
+    let mut statement = connection
+        .prepare("SELECT idempotency_key, sequence FROM config_ledger_requests")
+        .map_err(failure("verification"))?;
+    let mut rows = statement.query([]).map_err(failure("verification"))?;
+    let mut indexed = 0_usize;
+    while let Some(row) = rows.next().map_err(failure("verification"))? {
+        let key: String = row.get(0).map_err(failure("verification"))?;
+        let sequence: i64 = row.get(1).map_err(failure("verification"))?;
+        let recorded = u64::try_from(sequence)
+            .ok()
+            .and_then(|sequence| requests.get(&sequence));
+        if recorded != Some(&key) {
+            return Err(REQUEST);
+        }
+        indexed += 1;
+    }
+    if indexed != requests.len() {
+        return Err(REQUEST);
+    }
+    Ok(())
 }
 
 /// The manifest alone against the source digest; [`record::check_documents`]
@@ -458,7 +527,9 @@ pub(super) fn state(connection: &Connection) -> Result<LedgerState, LedgerError>
 }
 
 /// Appends `pending` on top of `expected_head` (see
-/// [`super::RevisionLedger::append`]).
+/// [`super::RevisionLedger::append`]): the idempotency key and stale-head
+/// checks, the documents, the record, its request's index row and the
+/// pointer, in one immediate transaction.
 pub(super) fn append(
     connection: &mut Connection,
     max_revisions: usize,
@@ -470,6 +541,17 @@ pub(super) fn append(
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(failure("append transaction"))?;
     let (pointer, head) = pointer_and_head(&transaction)?;
+    // A key already recorded wins over a stale head: the request it carries
+    // was applied, whatever the head is now.
+    if let Some(request) = pending.request() {
+        if let Some(earlier) = request_sequence(&transaction, &request.idempotency_key)? {
+            let earlier = revision_at(&transaction, earlier)?
+                .ok_or(LedgerError::Corrupt(Corruption::Request))?;
+            return Err(LedgerError::IdempotencyKeyUsed {
+                revision: earlier.revision,
+            });
+        }
+    }
     if &head.revision != expected_head {
         return Err(LedgerError::Stale {
             head: head.revision,
@@ -499,9 +581,17 @@ pub(super) fn append(
     )?;
     insert_documents(&transaction, files)?;
     insert_revision(&transaction, &encoded)?;
-    let active = match (pending.activation(), pointer.active_sequence) {
-        (ActivationClass::Live, Some(active)) if active == head.sequence => Some(sequence),
-        (_, active) => active,
+    if let Some(request) = pending.request() {
+        transaction
+            .execute(
+                "INSERT INTO config_ledger_requests (idempotency_key, sequence) VALUES (?1, ?2)",
+                params![request.idempotency_key, sql_sequence(sequence)?],
+            )
+            .map_err(failure("request insert"))?;
+    }
+    let active = match pointer.active_sequence {
+        Some(active) if pending.activates() && active == head.sequence => Some(sequence),
+        active => active,
     };
     let updated = transaction
         .execute(
@@ -518,6 +608,49 @@ pub(super) fn append(
     }
     transaction.commit().map_err(failure("append commit"))?;
     Ok(encoded.summary)
+}
+
+/// The sequence of the revision whose request carried the idempotency key
+/// digest `key`.
+fn request_sequence(connection: &Connection, key: &str) -> Result<Option<u64>, LedgerError> {
+    let sequence: Option<i64> = connection
+        .query_row(
+            "SELECT sequence FROM config_ledger_requests WHERE idempotency_key = ?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(failure("request read"))?;
+    sequence
+        .map(|sequence| {
+            u64::try_from(sequence).map_err(|_| LedgerError::Corrupt(Corruption::Request))
+        })
+        .transpose()
+}
+
+/// The revision whose request carried the idempotency key digest `key`,
+/// held to its record: the record must carry that key.
+pub(super) fn revision_for_request(
+    connection: &Connection,
+    key: &str,
+) -> Result<Option<RevisionSummary>, LedgerError> {
+    const REQUEST: LedgerError = LedgerError::Corrupt(Corruption::Request);
+    let snapshot = connection
+        .unchecked_transaction()
+        .map_err(failure("request read"))?;
+    let Some(sequence) = request_sequence(&snapshot, key)? else {
+        return Ok(None);
+    };
+    let summary = revision_at(&snapshot, sequence)?.ok_or(REQUEST)?;
+    if summary
+        .request
+        .as_ref()
+        .map(|request| request.idempotency_key.as_str())
+        != Some(key)
+    {
+        return Err(REQUEST);
+    }
+    Ok(Some(summary))
 }
 
 /// Moves the active pointer to the desired revision, which must be

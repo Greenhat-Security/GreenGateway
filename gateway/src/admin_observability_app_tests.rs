@@ -7269,19 +7269,6 @@ fn insert_discovery_routing_context(
         .expect("routing context should insert");
 }
 
-fn clear_discovery_routing_classification(path: &PathBuf, method: &str, endpoint_template: &str) {
-    let connection = Connection::open(path).expect("test discovery database should open");
-    connection
-        .execute(
-            r#"
-                DELETE FROM discovery_endpoint_routing_classifications
-                WHERE method = ?1 AND endpoint_template = ?2
-                "#,
-            params![method, endpoint_template],
-        )
-        .expect("routing classification should clear");
-}
-
 fn set_schema_mismatch_count(path: &PathBuf, method: &str, endpoint_template: &str, count: i64) {
     let connection = Connection::open(path).expect("test discovery database should open");
     connection

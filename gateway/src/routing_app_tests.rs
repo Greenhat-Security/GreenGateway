@@ -711,6 +711,10 @@ fn admin_routes_keep_default_api_prefix_and_remap_custom_api_under_v1() {
         SUGGESTION_DISMISS_ADMIN_ROUTE
     );
     assert_eq!(
+        default_routes.suggestion_draft_route,
+        SUGGESTION_DRAFT_ADMIN_ROUTE
+    );
+    assert_eq!(
         default_routes.traffic_endpoints_route,
         TRAFFIC_ENDPOINTS_ADMIN_ROUTE
     );
@@ -844,6 +848,10 @@ fn admin_routes_keep_default_api_prefix_and_remap_custom_api_under_v1() {
     assert_eq!(
         custom_routes.suggestion_dismiss_route,
         "/v1/ops/suggestions/{id}/dismiss"
+    );
+    assert_eq!(
+        custom_routes.suggestion_draft_route,
+        "/v1/ops/suggestions/{id}/draft"
     );
     assert_eq!(
         custom_routes.traffic_endpoints_route,

@@ -113,9 +113,12 @@ cache-control path matchers in `routing.rs`, connection-bound proxying and
 the host-qualified fallback policy are routing tests.
 
 A fixture counts once with its impl blocks. Of the 375 fixtures
-`app_tests.rs` held before this move, 222 were used by one family alone and
-moved with it. The other 153 stay, because more than one family or an already
-separate module names them.
+`app_tests.rs` held before this move, 221 were used by one family alone and
+moved with it. The other 154 stay, because more than one family or an already
+separate module names them. One of them,
+`clear_discovery_routing_classification`, was observability's alone at
+`0d483e9`; `admin_suggestion_drafts_tests.rs`, which main added later, names
+it too, so it stays in `app_tests.rs`.
 
 ## Shared fixtures
 

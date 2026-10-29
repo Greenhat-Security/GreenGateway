@@ -269,8 +269,30 @@ mod tests {
     // held, `pg_stat_activity` -- what the server thinks. Gated on the
     // same harness locator as the rest of the storage suite; a checkout
     // without a database skips rather than fails.
+    //
+    // The named point is placed, not raced for. A cancellation window is
+    // the time between the client sending a statement and hearing the
+    // answer, and on a real connection that is however long the network
+    // and two schedulers happen to take: a test that polls for the window
+    // and hopes to stop inside it reaches it on a quiet machine and
+    // overshoots it on a loaded one. So the test pool's connections run
+    // behind a [`ReplyGate`]. The client's messages reach the server
+    // unchanged; once the test arms the gate for a message type, nothing
+    // the server says after the client sends that message reaches the
+    // client. The statement runs on the server for real -- the lock is
+    // granted, or the unlock is never sent -- and the future under test
+    // cannot hear about it, so it stays parked in the window for exactly
+    // as long as the test decides.
 
-    use std::time::{Duration, Instant};
+    use std::{
+        future::Future,
+        pin::Pin,
+        sync::{Arc, Mutex},
+        task::{ready, Context, Poll, Waker},
+        time::{Duration, Instant},
+    };
+
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
     use super::DedicatedSession;
 
@@ -280,6 +302,358 @@ mod tests {
     /// budget is generous only so a loaded CI box does not fail on
     /// scheduling.
     const RELEASE_BUDGET: Duration = Duration::from_secs(15);
+
+    /// How long the server may take to answer the statement whose answer
+    /// the gate is withholding. Generous for the same reason; it bounds a
+    /// gate that never closes, not the window, which lasts as long as the
+    /// test holds it.
+    const ANSWER_BUDGET: Duration = Duration::from_secs(20);
+
+    /// PostgreSQL wire-protocol message types the gate acts on. From the
+    /// client: `Parse` (the first half of a prepared statement), `Bind`
+    /// (the second half, sent with `Execute` only once `Parse` has been
+    /// answered), and the two messages each answered by exactly one
+    /// `ReadyForQuery`: a simple `Query` and a `Sync`. From the server:
+    /// `ReadyForQuery`, sent once everything up to that point is done.
+    const PARSE: u8 = b'P';
+    const BIND: u8 = b'B';
+    const QUERY: u8 = b'Q';
+    const SYNC: u8 = b'S';
+    const READY_FOR_QUERY: u8 = b'Z';
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum GatePhase {
+        /// The server's replies pass.
+        Open,
+        /// The server's replies pass until a client sends a message of
+        /// this type.
+        Armed(u8),
+        /// A client has sent it; nothing the server says reaches the
+        /// client. `answered` once the server has finished the statement
+        /// that message began.
+        Holding { answered: bool },
+    }
+
+    /// The switch every connection of a gated pool shares.
+    #[derive(Clone)]
+    struct ReplyGate {
+        phase: Arc<tokio::sync::watch::Sender<GatePhase>>,
+        /// Connection tasks waiting for the gate to open.
+        parked: Arc<Mutex<Vec<Waker>>>,
+    }
+
+    impl ReplyGate {
+        fn new() -> Self {
+            Self {
+                phase: Arc::new(tokio::sync::watch::channel(GatePhase::Open).0),
+                parked: Arc::default(),
+            }
+        }
+
+        /// Withhold the server's replies from the moment a client next
+        /// sends a message of type `tag`.
+        fn hold_replies_from(&self, tag: u8) {
+            self.phase.send_replace(GatePhase::Armed(tag));
+        }
+
+        /// Let everything withheld through, and everything after it.
+        fn open(&self) {
+            self.phase.send_replace(GatePhase::Open);
+            let parked = std::mem::take(
+                &mut *self
+                    .parked
+                    .lock()
+                    .expect("the gate's waker list is never poisoned"),
+            );
+            for waker in parked {
+                waker.wake();
+            }
+        }
+
+        /// Resolves once the server has finished the statement whose
+        /// answer is being withheld.
+        async fn answered(&self) {
+            self.phase
+                .subscribe()
+                .wait_for(|phase| matches!(phase, GatePhase::Holding { answered: true }))
+                .await
+                .expect("the gate outlives every wait on it");
+        }
+
+        fn holding(&self) -> bool {
+            matches!(*self.phase.borrow(), GatePhase::Holding { .. })
+        }
+
+        /// A client is sending a message of type `tag`; true if that is
+        /// the message the gate was armed for, which closes it.
+        fn client_sends(&self, tag: u8) -> bool {
+            self.phase.send_if_modified(|phase| {
+                let closes = *phase == GatePhase::Armed(tag);
+                if closes {
+                    *phase = GatePhase::Holding { answered: false };
+                }
+                closes
+            })
+        }
+
+        /// The withheld replies now include the server's answer.
+        fn server_answered(&self) {
+            self.phase.send_if_modified(|phase| {
+                let first = matches!(phase, GatePhase::Holding { answered: false });
+                if first {
+                    *phase = GatePhase::Holding { answered: true };
+                }
+                first
+            });
+        }
+
+        /// Wake `waker` when the gate opens. The phase is checked again
+        /// after parking, so an `open` racing the caller is not missed.
+        fn park(&self, waker: &Waker) {
+            {
+                let mut parked = self
+                    .parked
+                    .lock()
+                    .expect("the gate's waker list is never poisoned");
+                if !parked.iter().any(|known| known.will_wake(waker)) {
+                    parked.push(waker.clone());
+                }
+            }
+            if !self.holding() {
+                waker.wake_by_ref();
+            }
+        }
+    }
+
+    /// Message boundaries in one direction of a PostgreSQL connection.
+    /// Every message is a type byte and a big-endian length that counts
+    /// itself but not the type byte -- except the client's first message
+    /// (startup), which has no type byte.
+    struct Framing {
+        untyped_first: bool,
+        header: Vec<u8>,
+        remaining: usize,
+    }
+
+    impl Framing {
+        fn client() -> Self {
+            Self {
+                untyped_first: true,
+                header: Vec::with_capacity(5),
+                remaining: 0,
+            }
+        }
+
+        fn server() -> Self {
+            Self {
+                untyped_first: false,
+                ..Self::client()
+            }
+        }
+
+        /// Walk the next `bytes` of the stream, reporting the type of every
+        /// message that starts in them, in order.
+        fn scan(&mut self, mut bytes: &[u8], mut started: impl FnMut(u8)) {
+            while !bytes.is_empty() {
+                if self.remaining > 0 {
+                    let body = self.remaining.min(bytes.len());
+                    self.remaining -= body;
+                    bytes = &bytes[body..];
+                    continue;
+                }
+                let header_len = if self.untyped_first { 4 } else { 5 };
+                let take = (header_len - self.header.len()).min(bytes.len());
+                self.header.extend_from_slice(&bytes[..take]);
+                bytes = &bytes[take..];
+                if self.header.len() < header_len {
+                    return;
+                }
+                let (tag, length) = self.header.split_at(header_len - 4);
+                let length = u32::from_be_bytes(length.try_into().expect("a length is four bytes"));
+                self.remaining = usize::try_from(length)
+                    .expect("a u32 fits in a usize")
+                    .saturating_sub(4);
+                if let Some(&tag) = tag.first() {
+                    started(tag);
+                }
+                self.untyped_first = false;
+                self.header.clear();
+            }
+        }
+    }
+
+    /// One pooled connection's socket, behind the gate.
+    struct GatedStream {
+        socket: tokio::net::TcpStream,
+        gate: ReplyGate,
+        sent: Framing,
+        received: Framing,
+        /// `ReadyForQuery` messages the client has asked for (one for
+        /// startup, one per `Query` or `Sync`), and those that arrived.
+        ready_owed: u64,
+        ready_arrived: u64,
+        /// The `ReadyForQuery` that completes the answer this connection's
+        /// gate is withholding -- the one owed for the first `Sync` or
+        /// `Query` from the gated message on, so an earlier statement's
+        /// late `ReadyForQuery` is not mistaken for it.
+        answer_at: Option<u64>,
+        /// What the server said while the gate was holding.
+        withheld: Vec<u8>,
+    }
+
+    impl GatedStream {
+        fn new(socket: tokio::net::TcpStream, gate: ReplyGate) -> Self {
+            Self {
+                socket,
+                gate,
+                sent: Framing::client(),
+                received: Framing::server(),
+                ready_owed: 1,
+                ready_arrived: 0,
+                answer_at: None,
+                withheld: Vec::new(),
+            }
+        }
+
+        fn note_received(&mut self, bytes: &[u8]) {
+            let Self {
+                received,
+                gate,
+                ready_arrived,
+                answer_at,
+                ..
+            } = self;
+            received.scan(bytes, |tag| {
+                if tag != READY_FOR_QUERY {
+                    return;
+                }
+                *ready_arrived += 1;
+                if answer_at.is_some_and(|at| *ready_arrived >= at) {
+                    *answer_at = None;
+                    gate.server_answered();
+                }
+            });
+        }
+    }
+
+    impl AsyncRead for GatedStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            loop {
+                if !this.gate.holding() {
+                    if !this.withheld.is_empty() {
+                        let given = this.withheld.len().min(buf.remaining());
+                        buf.put_slice(&this.withheld[..given]);
+                        this.withheld.drain(..given);
+                        return Poll::Ready(Ok(()));
+                    }
+                    let before = buf.filled().len();
+                    ready!(Pin::new(&mut this.socket).poll_read(cx, buf))?;
+                    this.note_received(&buf.filled()[before..]);
+                    return Poll::Ready(Ok(()));
+                }
+                // Holding: keep reading, so the answer is noticed when it
+                // arrives, but give the client none of it.
+                let mut space = [0_u8; 1024];
+                let mut chunk = ReadBuf::new(&mut space);
+                match Pin::new(&mut this.socket).poll_read(cx, &mut chunk) {
+                    Poll::Ready(Ok(())) if !chunk.filled().is_empty() => {
+                        this.withheld.extend_from_slice(chunk.filled());
+                        this.note_received(chunk.filled());
+                    }
+                    // Nothing more for now, or the server hung up: either
+                    // way the client hears of it once the gate opens.
+                    Poll::Ready(Ok(())) | Poll::Pending => {
+                        this.gate.park(cx.waker());
+                        return Poll::Pending;
+                    }
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                }
+            }
+        }
+    }
+
+    impl AsyncWrite for GatedStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            let written = ready!(Pin::new(&mut this.socket).poll_write(cx, buf))?;
+            // The bytes are on their way to the server, and the gate
+            // closes before this task can next read: nothing the server
+            // says to them reaches the client while it holds.
+            let Self {
+                sent,
+                gate,
+                ready_owed,
+                answer_at,
+                ..
+            } = this;
+            sent.scan(&buf[..written], |tag| {
+                if gate.client_sends(tag) {
+                    *answer_at = Some(*ready_owed + 1);
+                }
+                if tag == QUERY || tag == SYNC {
+                    *ready_owed += 1;
+                }
+            });
+            Poll::Ready(Ok(written))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().socket).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().socket).poll_shutdown(cx)
+        }
+    }
+
+    type Connecting<'a> = Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        (tokio_postgres::Client, tokio::task::JoinHandle<()>),
+                        tokio_postgres::Error,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    >;
+
+    /// Opens a pool's connections the way `tokio_postgres` does for a TCP
+    /// host, with each socket behind the gate.
+    struct GatedConnect(ReplyGate);
+
+    impl deadpool_postgres::Connect for GatedConnect {
+        fn connect(&self, config: &tokio_postgres::Config) -> Connecting<'_> {
+            let gate = self.0.clone();
+            let config = config.clone();
+            Box::pin(async move {
+                let Some(tokio_postgres::config::Host::Tcp(host)) = config.get_hosts().first()
+                else {
+                    panic!("the reply gate wraps a TCP socket; the test DSN must name a TCP host");
+                };
+                let port = config.get_ports().first().copied().unwrap_or(5432);
+                let socket = tokio::net::TcpStream::connect((host.as_str(), port))
+                    .await
+                    .expect("the test database accepts a gated connection");
+                let (client, connection) = config
+                    .connect_raw(GatedStream::new(socket, gate), tokio_postgres::NoTls)
+                    .await?;
+                let task = tokio::spawn(async move {
+                    let _ = connection.await;
+                });
+                Ok((client, task))
+            })
+        }
+    }
 
     fn real_dsn() -> Option<String> {
         // Read through a runtime key, exactly as `postgres.rs` and
@@ -298,16 +672,17 @@ mod tests {
     }
 
     /// A pool that recycles the way the production pool does
-    /// (`RecyclingMethod::Custom("ROLLBACK")`, see `postgres::build_pool`).
-    /// That detail is the whole point: `ROLLBACK` ends a transaction and
-    /// releases nothing else, so a connection handed back to the pool
-    /// while it holds a session advisory lock keeps holding it for as
-    /// long as the pool keeps the connection -- which is for ever.
-    fn recycling_pool(dsn: &str) -> deadpool_postgres::Pool {
+    /// (`RecyclingMethod::Custom("ROLLBACK")`, see `postgres::build_pool`),
+    /// over connections behind `gate`. The recycling detail is the whole
+    /// point: `ROLLBACK` ends a transaction and releases nothing else, so a
+    /// connection handed back to the pool while it holds a session advisory
+    /// lock keeps holding it for as long as the pool keeps the connection
+    /// -- which is for ever.
+    fn gated_pool(dsn: &str, gate: &ReplyGate) -> deadpool_postgres::Pool {
         let config: tokio_postgres::Config = dsn.parse().expect("the test DSN parses");
-        let manager = deadpool_postgres::Manager::from_config(
+        let manager = deadpool_postgres::Manager::from_connect(
             config,
-            tokio_postgres::NoTls,
+            GatedConnect(gate.clone()),
             deadpool_postgres::ManagerConfig {
                 recycling_method: deadpool_postgres::RecyclingMethod::Custom("ROLLBACK".to_owned()),
             },
@@ -366,25 +741,75 @@ mod tests {
             .collect()
     }
 
-    /// Wait for `key` to be free, and report what is holding it if it
-    /// never becomes free.
+    /// Wait for `key` to be free the way the next pass would find it, by
+    /// asking for it: the server grants the observer's blocking
+    /// `pg_advisory_lock` the instant the last holder lets go -- here, the
+    /// instant a detached connection's session ends -- and refuses it
+    /// once `RELEASE_BUDGET` has gone by, at which point the server is
+    /// asked what is holding the key.
     async fn assert_released(observer: &tokio_postgres::Client, key: i64, what: &str) -> Duration {
         let started = Instant::now();
-        loop {
-            let held = holders(observer, key).await;
-            if held.is_empty() {
-                return started.elapsed();
+        observer
+            .batch_execute(&format!(
+                "SET lock_timeout = {}",
+                RELEASE_BUDGET.as_millis()
+            ))
+            .await
+            .expect("the observer bounds its wait");
+        match observer
+            .execute("SELECT pg_advisory_lock($1)", &[&key])
+            .await
+        {
+            Ok(_) => {
+                let elapsed = started.elapsed();
+                observer
+                    .execute("SELECT pg_advisory_unlock($1)", &[&key])
+                    .await
+                    .expect("the observer gives the key back");
+                elapsed
             }
-            assert!(
-                started.elapsed() < RELEASE_BUDGET,
-                "the advisory key was still held {:?} after {what}; the server says: {}\n\
-                 A holder that is idle on ClientRead is a pooled connection that went back \
-                 into the pool with the lock on it: every later pass is answered Conflict, \
-                 for ever, and the deployment's housekeeping stops.",
-                started.elapsed(),
-                held.join(" | ")
-            );
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            Err(error) => {
+                let refusal = error.as_db_error().map_or_else(
+                    || error.to_string(),
+                    |db| format!("{}: {}", db.code().code(), db.message()),
+                );
+                let held = holders(observer, key).await;
+                panic!(
+                    "the advisory key was still held {:?} after {what} ({refusal}); the server \
+                     says: {}\n\
+                     A holder that is idle on ClientRead is a pooled connection that went back \
+                     into the pool with the lock on it: every later pass is answered Conflict, \
+                     for ever, and the deployment's housekeeping stops.",
+                    started.elapsed(),
+                    held.join(" | ")
+                );
+            }
+        }
+    }
+
+    /// Drive `future` until the server has finished the statement whose
+    /// answer the gate is withholding. The future cannot complete first --
+    /// that would mean it heard an answer the gate is holding -- so when
+    /// this returns it is parked in the window: its statement has run on
+    /// the server, and it does not know.
+    async fn drive_into_window<F: Future>(gate: &ReplyGate, future: Pin<&mut F>, what: &str) {
+        let parked = tokio::time::timeout(ANSWER_BUDGET, async {
+            tokio::select! {
+                biased;
+                _ = future => false,
+                () = gate.answered() => true,
+            }
+        })
+        .await;
+        match parked {
+            Ok(true) => {}
+            Ok(false) => panic!(
+                "{what} completed without needing an answer the gate was holding: it never sent \
+                 the message the gate was armed for, so this test is not stopping where it says"
+            ),
+            Err(_) => panic!(
+                "the server did not answer {what}'s withheld statement within {ANSWER_BUDGET:?}"
+            ),
         }
     }
 
@@ -396,59 +821,53 @@ mod tests {
     /// opens its dedicated session as its first act, and the `select!`
     /// that races the pass against `lost.cancelled()` drops the pass
     /// future wherever it happens to be parked. The test does not wait
-    /// for luck -- it polls the acquiring future until the *server* says
-    /// the key is taken, and drops it there.
+    /// for luck: the gate withholds the answer to the lock statement, so
+    /// the acquire is parked in the window from the moment the server
+    /// grants the lock until the test drops it there.
     #[tokio::test]
     async fn a_cancelled_acquire_does_not_leave_the_key_held() {
         let Some(dsn) = real_dsn() else {
             eprintln!("skipping: no test database locator; CI runs this test");
             return;
         };
-        let pool = recycling_pool(&dsn);
+        let gate = ReplyGate::new();
+        let pool = gated_pool(&dsn, &gate);
         let observer = observer(&dsn).await;
         let key = advisory_lock_key(&format!(
             "greengateway.test.cancelled-acquire.{}",
             uuid::Uuid::new_v4().simple()
         ));
 
-        // Warm the pool: the window under test is the lock statement, not
-        // the checkout.
+        // Warm the pool, so the acquire recycles a connection the way a
+        // pass does.
         drop(pool.get().await.expect("the pool reaches the database"));
 
+        // The lock statement is prepared first and then bound and run:
+        // holding the replies from its `Bind` lets the statement run and
+        // keeps its answer from the client.
+        gate.hold_replies_from(BIND);
         // `Box::pin`, not `tokio::pin!`: the macro shadows the future with
         // a `Pin<&mut _>`, and dropping *that* drops a reference and
         // cancels nothing. This test's whole subject is the drop.
         let mut acquire = Box::pin(DedicatedSession::acquire(&pool, key));
-        let deadline = Instant::now() + Duration::from_secs(20);
-        let mut granted = false;
-        while Instant::now() < deadline {
-            // Poll first, ask the server second, and stop the instant the
-            // server says the key is taken -- without polling again. The
-            // future is then parked exactly where the lock is the
-            // server's and the client does not know it yet.
-            if let std::task::Poll::Ready(result) = futures_util::poll!(acquire.as_mut()) {
-                if let Ok(session) = result {
-                    let _ = session.release().await;
-                }
-                panic!(
-                    "the acquiring future completed before the server was observed holding \
-                     the key; the test could not reach the window it exists to cover"
-                );
-            }
-            if !holders(&observer, key).await.is_empty() {
-                granted = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
+        drive_into_window(&gate, acquire.as_mut(), "the acquire").await;
         assert!(
-            granted,
-            "the server never granted the key, so there was no cancellation window to test"
+            !holders(&observer, key).await.is_empty(),
+            "the server has answered the lock statement, so it must be holding the key; \
+             the gate stopped the acquire somewhere other than the window this test covers"
         );
 
         drop(acquire);
+        // The answer was delayed, not lost: let it arrive, as the network
+        // would, at whatever is still listening.
+        gate.open();
         let elapsed = assert_released(&observer, key, "the acquiring future was cancelled").await;
         eprintln!("cancelled acquire: key released after {elapsed:?}");
+        assert_eq!(
+            pool.status().size,
+            0,
+            "the cancelled acquire's connection must be closed, not recycled into the pool"
+        );
 
         // The consequence, stated directly: the next pass must be able to
         // take the key rather than be told Conflict for ever.
@@ -462,17 +881,19 @@ mod tests {
     /// connection back to the pool with the lock still on it.
     ///
     /// `run_pass` releases its session as its last act, inside the same
-    /// `select!`, so this window is as reachable as the first. The
-    /// cancellation is placed deterministically: the future is polled
-    /// once (which sends the unlock's `PREPARE`) and then never again, so
-    /// the unlock itself is provably never sent.
+    /// `select!`, so this window is as reachable as the first. The unlock
+    /// is a prepared statement: the client sends its `Parse` and waits for
+    /// the answer before it sends the unlock itself. The gate withholds
+    /// that answer, so the release is parked where the unlock has not been
+    /// sent -- and, the future being dropped there, never will be.
     #[tokio::test]
     async fn a_cancelled_release_does_not_leave_the_key_held() {
         let Some(dsn) = real_dsn() else {
             eprintln!("skipping: no test database locator; CI runs this test");
             return;
         };
-        let pool = recycling_pool(&dsn);
+        let gate = ReplyGate::new();
+        let pool = gated_pool(&dsn, &gate);
         let observer = observer(&dsn).await;
         let key = advisory_lock_key(&format!(
             "greengateway.test.cancelled-release.{}",
@@ -487,20 +908,25 @@ mod tests {
             "the server must show the key held once the session has it"
         );
 
+        gate.hold_replies_from(PARSE);
         // `Box::pin` for the same reason as above: the drop is the test.
         let mut release = Box::pin(session.release());
+        drive_into_window(&gate, release.as_mut(), "the release").await;
         assert!(
-            futures_util::poll!(release.as_mut()).is_pending(),
-            "the unlock is a round trip; it cannot complete in one poll"
+            !holders(&observer, key).await.is_empty(),
+            "the unlock was never sent, so the server must still be holding the key; \
+             the gate stopped the release somewhere other than the window this test covers"
         );
-        // Let the connection task run the round trip the unlock's
-        // statement preparation needs, then cancel without polling
-        // again -- the unlock is never sent.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        drop(release);
 
+        drop(release);
+        gate.open();
         let elapsed = assert_released(&observer, key, "the releasing future was cancelled").await;
         eprintln!("cancelled release: key released after {elapsed:?}");
+        assert_eq!(
+            pool.status().size,
+            0,
+            "the cancelled release's connection must be closed, not recycled into the pool"
+        );
 
         let session = DedicatedSession::acquire(&pool, key)
             .await

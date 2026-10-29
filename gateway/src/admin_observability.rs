@@ -358,6 +358,90 @@ pub(super) fn suggestion_transition_refused_response(
     }
 }
 
+/// The suggestion `id` and the direct rule it proposes, if it may become
+/// one: the row is open, and at `expected_revision` when the caller named
+/// one; a baseline proposal is bound to an issuer or authentication method;
+/// and current trusted routing state still lets a direct rule describe its
+/// traffic. An HTTP rule's `dispatch` is recomputed from that state, never
+/// taken from the copy stored with the advisory suggestion.
+///
+/// Acceptance and opening a suggestion into a policy draft (issue #243,
+/// slice 19) both ask this, so they refuse exactly the same suggestions with
+/// the same answers. It reads only: an acceptance's own transition predicate
+/// is still what decides a race.
+pub(super) async fn reviewable_suggestion_rule(
+    suggestion_engine: &discovery::suggestions::SuggestionEngineHandle,
+    id: &str,
+    expected_revision: Option<i64>,
+) -> ResponseResult<(discovery::suggestions::RuleSuggestion, rbac::Rule)> {
+    let suggestion = match suggestion_engine.get_suggestion(id.to_owned()).await {
+        Ok(Some(suggestion)) => suggestion,
+        Ok(None) => return Err(Box::new(not_found("suggestion was not found"))),
+        Err(err) => {
+            tracing::error!(error = %err, "failed to load rule suggestion");
+            return Err(Box::new(internal_server_error("suggestion query failed")));
+        }
+    };
+    // The row must still be Open, and at the revision the caller read if
+    // it named one (issue #241, PR 12). For an acceptance this is the early
+    // answer; the authoritative check is the transition's own predicate,
+    // which is what two replicas cannot both pass.
+    if suggestion.state != discovery::suggestions::RuleSuggestionLifecycleState::Open
+        || expected_revision.is_some_and(|expected| expected != suggestion.revision)
+    {
+        return Err(Box::new(suggestion_transition_refused_response(
+            &suggestion,
+        )));
+    }
+    if !suggestion.is_identity_bound_for_acceptance() {
+        return Err(Box::new(conflict(
+            "baseline suggestion is missing issuer or authentication-method constraints",
+        )));
+    }
+
+    let dispatch = match suggestion_engine
+        .direct_rule_suggestion_safety(suggestion.clone())
+        .await
+    {
+        Ok(discovery::suggestions::DirectRuleSuggestionSafety::Safe(dispatch)) => dispatch,
+        Ok(discovery::suggestions::DirectRuleSuggestionSafety::HostRouted) => {
+            return Err(Box::new(conflict(
+                "suggestion targets host-routed traffic and cannot be accepted as a direct rule",
+            )));
+        }
+        Ok(discovery::suggestions::DirectRuleSuggestionSafety::PathRouted) => {
+            return Err(Box::new(conflict(
+                "suggestion targets path-routed traffic and cannot be accepted as a direct rule",
+            )));
+        }
+        Ok(discovery::suggestions::DirectRuleSuggestionSafety::AmbiguousRouting) => {
+            return Err(Box::new(conflict(
+                "suggestion spans multiple upstream routing contexts and cannot be accepted as a direct rule",
+            )));
+        }
+        Ok(discovery::suggestions::DirectRuleSuggestionSafety::UnknownRoutingContext) => {
+            return Err(Box::new(conflict(
+                "suggestion predates trusted routing context and cannot be accepted; dismiss it and review newly classified traffic",
+            )));
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "failed to revalidate rule suggestion routing context");
+            return Err(Box::new(internal_server_error(
+                "suggestion routing-context validation failed",
+            )));
+        }
+    };
+
+    let mut proposed_rule = suggestion.proposed_rule.clone();
+    if proposed_rule.tool_name.is_none() {
+        // Recompute this binding from current trusted routing state instead of
+        // trusting the copy persisted with the advisory suggestion.
+        proposed_rule.dispatch = Some(dispatch);
+    }
+
+    Ok((suggestion, proposed_rule))
+}
+
 pub(super) async fn rule_suggestions_list_endpoint(
     State(state): State<SuggestionsAdminState>,
     principal: Option<Extension<auth::Principal>>,
@@ -483,66 +567,11 @@ pub(super) async fn rule_suggestion_accept_endpoint(
     // cannot land between the two halves of an acceptance and leave the
     // rule installed for a suggestion that reads `dismissed`.
     let _lifecycle_guard = state.lifecycle_guard.lock().await;
-    let suggestion = match suggestion_engine.get_suggestion(id.to_owned()).await {
-        Ok(Some(suggestion)) => suggestion,
-        Ok(None) => return not_found("suggestion was not found"),
-        Err(err) => {
-            tracing::error!(error = %err, "failed to load rule suggestion");
-            return internal_server_error("suggestion query failed");
-        }
-    };
-    // The row must still be Open, and at the revision the caller read if
-    // it named one (issue #241, PR 12). This is the early answer; the
-    // authoritative check is the transition's own predicate below, which
-    // is what two replicas cannot both pass.
-    if suggestion.state != discovery::suggestions::RuleSuggestionLifecycleState::Open
-        || expected_revision.is_some_and(|expected| expected != suggestion.revision)
-    {
-        return suggestion_transition_refused_response(&suggestion);
-    }
-    if !suggestion.is_identity_bound_for_acceptance() {
-        return conflict(
-            "baseline suggestion is missing issuer or authentication-method constraints",
-        );
-    }
-
-    let dispatch = match suggestion_engine
-        .direct_rule_suggestion_safety(suggestion.clone())
-        .await
-    {
-        Ok(discovery::suggestions::DirectRuleSuggestionSafety::Safe(dispatch)) => dispatch,
-        Ok(discovery::suggestions::DirectRuleSuggestionSafety::HostRouted) => {
-            return conflict(
-                "suggestion targets host-routed traffic and cannot be accepted as a direct rule",
-            );
-        }
-        Ok(discovery::suggestions::DirectRuleSuggestionSafety::PathRouted) => {
-            return conflict(
-                "suggestion targets path-routed traffic and cannot be accepted as a direct rule",
-            );
-        }
-        Ok(discovery::suggestions::DirectRuleSuggestionSafety::AmbiguousRouting) => {
-            return conflict(
-                "suggestion spans multiple upstream routing contexts and cannot be accepted as a direct rule",
-            );
-        }
-        Ok(discovery::suggestions::DirectRuleSuggestionSafety::UnknownRoutingContext) => {
-            return conflict(
-                "suggestion predates trusted routing context and cannot be accepted; dismiss it and review newly classified traffic",
-            );
-        }
-        Err(err) => {
-            tracing::error!(error = %err, "failed to revalidate rule suggestion routing context");
-            return internal_server_error("suggestion routing-context validation failed");
-        }
-    };
-
-    let mut proposed_rule = suggestion.proposed_rule.clone();
-    if proposed_rule.tool_name.is_none() {
-        // Recompute this binding from current trusted routing state instead of
-        // trusting the copy persisted with the advisory suggestion.
-        proposed_rule.dispatch = Some(dispatch);
-    }
+    let (suggestion, proposed_rule) =
+        match reviewable_suggestion_rule(suggestion_engine, id, expected_revision).await {
+            Ok(reviewed) => reviewed,
+            Err(response) => return *response,
+        };
 
     // Cluster mode commits the rule and the transition in ONE transaction
     // at the authority (issue #241, PR 12): there is no window in which a

@@ -13,6 +13,8 @@ mod admin_policy_app_tests;
 mod admin_policy_drafts_tests;
 #[path = "admin_session_app_tests.rs"]
 mod admin_session_app_tests;
+#[path = "admin_suggestion_drafts_tests.rs"]
+mod admin_suggestion_drafts_tests;
 #[path = "admin_tokens_app_tests.rs"]
 mod admin_tokens_app_tests;
 #[path = "admin_tools_app_tests.rs"]
@@ -3431,6 +3433,19 @@ fn insert_rule_suggestion_with_identity_binding(
             ],
         )
         .expect("rule suggestion should insert");
+}
+
+fn clear_discovery_routing_classification(path: &PathBuf, method: &str, endpoint_template: &str) {
+    let connection = Connection::open(path).expect("test discovery database should open");
+    connection
+        .execute(
+            r#"
+                DELETE FROM discovery_endpoint_routing_classifications
+                WHERE method = ?1 AND endpoint_template = ?2
+                "#,
+            params![method, endpoint_template],
+        )
+        .expect("routing classification should clear");
 }
 
 struct TempDb {
