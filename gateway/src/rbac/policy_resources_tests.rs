@@ -235,6 +235,34 @@ fn a_publisher_who_would_lose_policy_write_is_told_what_refuses_it() {
 }
 
 #[test]
+fn another_administrator_may_withdraw_every_grant_a_principal_holds() {
+    // What the remediation recommends: the change is made by a principal
+    // who keeps its own grant. The HA suite withdraws permissions this way.
+    let roles = |admin: Value| {
+        json!({
+            "roles": {
+                "admin": { "permissions": admin },
+                "operator": { "permissions": ["admin:policy:write"] }
+            }
+        })
+    };
+    let live = policy(administered(roles(json!(["*"]))));
+    let candidate = policy(administered(roles(json!([]))));
+    let view = complete_view();
+
+    let validation = validate_as(&candidate, &live, &view, &principal(&["operator"]), None);
+    assert!(!validation.blocks_publication(), "{:?}", codes(&validation));
+
+    // The same change made by the principal it strips locks that principal
+    // out, and is refused.
+    let validation = validate_as(&candidate, &live, &view, &principal(&["admin"]), None);
+    assert_eq!(
+        validation.blocking_codes(),
+        vec!["publisher_policy_write_lost"]
+    );
+}
+
+#[test]
 fn the_publisher_check_asks_the_http_lane_only_where_rbac_applies() {
     let live = policy(administered(json!({})));
     let candidate = policy(administered(json!({ "routes": [] })));
