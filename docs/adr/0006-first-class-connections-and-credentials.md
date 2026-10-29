@@ -352,10 +352,12 @@ The gateway keeps no user records, so it does not learn by itself that a user
 was disabled. It purges a principal's cached tokens -- every entry for that
 issuer and subject, under every delegated Connection -- when told: by an
 operator through `POST /v1{ADMIN_PREFIX}/principal/delegated-tokens/revoke`
-(`admin:principals:write`, standalone only, because each replica caches its
-own tokens and no channel carries a purge between them), or by a JWT validator
-refusing one of the principal's tokens as revoked, which happens on whichever
-replica the token is presented to. Each purged token is then revoked once,
+(`admin:principals:write`), or by a JWT validator refusing one of the
+principal's tokens as revoked. Each replica caches its own tokens, so in
+cluster mode a purge is recorded as one shared security revision that every
+replica's strict gate applies to its own cache before it serves again; it
+names the principal by a digest only, and waits for every live replica to
+advertise that it applies such records. Each purged token is then revoked once,
 best effort, at the issuer's RFC 7009 endpoint when the Connection names a
 `revocation_url`, and every purge and revocation is audited
 (`connection.delegated_token_purge`, `connection.delegated_token_revocation`).
