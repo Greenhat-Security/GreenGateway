@@ -57,6 +57,10 @@ pub const CLUSTER_CONTRACT_FENCED: &str = "cluster.contract_fenced";
 /// current and previous key IDs and the sink kind, never key material.
 #[cfg(feature = "postgres")]
 pub const AUTHORITY_EVENT_KEYRING_LOADED: &str = "authority_event.keyring_loaded";
+/// `AUTHORITY_EVIDENCE_DURABILITY=required` refused an authority change this
+/// deployment mode records no evidence of (issue #425, PR 4): the operation
+/// code, the mode, what asked for it and the reason, never its content.
+pub const AUTHORITY_EVIDENCE_OPERATION_REFUSED: &str = "authority_evidence.operation_refused";
 pub const CONNECTION_CHANGED: &str = "connection.changed";
 pub const CONNECTION_CREDENTIAL_CHANGED: &str = "connection.credential_changed";
 pub const CONNECTION_SECRET_CHANGED: &str = "connection.secret_changed";

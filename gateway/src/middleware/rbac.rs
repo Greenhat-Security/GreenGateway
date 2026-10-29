@@ -28,6 +28,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     audit::{AuditEvent, AuditLog, AuditReceipt, AuditUnavailable},
     auth::{self, actor_from_principal, protected_resource},
+    authority_events::required::{AuthorityOperation, BackgroundEvidenceGate},
     client_ip::{canonical_client_ip, request_id, ClientIpPolicy},
     config::Config,
     path_match::{exempt_path_matches, is_unsafe_request_path},
@@ -1355,23 +1356,47 @@ pub(crate) fn reload_policy_from_file_locked(
     }
 }
 
+/// A watched or signalled reload of `policy_file`, once the
+/// authority-evidence gate admits it (issue #425, PR 4). Standalone mode
+/// records no evidence of a reload, so `AUTHORITY_EVIDENCE_DURABILITY=required`
+/// refuses each one -- the gate audits it -- and the active policy stays
+/// until a restart activates the file. Without a gate every reload runs.
+async fn reload_policy_file_if_admitted(
+    state: &RbacState,
+    policy_file: &Path,
+    evidence: Option<&BackgroundEvidenceGate>,
+    trigger: &'static str,
+) -> bool {
+    if evidence.is_some_and(|gate| !gate.admits(AuthorityOperation::PolicyFileReload, trigger)) {
+        tracing::warn!(
+            policy_file = %policy_file.display(),
+            trigger,
+            "RBAC policy reload refused by AUTHORITY_EVIDENCE_DURABILITY=required; existing policy remains active until a restart activates the file"
+        );
+        return false;
+    }
+    reload_policy_from_file(state, policy_file).await.is_ok()
+}
+
 #[cfg(test)]
 pub fn spawn_policy_reload_tasks(
     policy_file: impl Into<PathBuf>,
     state: RbacState,
 ) -> notify::Result<()> {
     let cancellation = CancellationToken::new();
-    spawn_policy_reload_tasks_inner(policy_file.into(), state, cancellation, None)
+    spawn_policy_reload_tasks_inner(policy_file.into(), state, None, cancellation, None)
 }
 
 pub fn spawn_policy_reload_tasks_with_lifecycle(
     policy_file: impl Into<PathBuf>,
     state: RbacState,
+    evidence: BackgroundEvidenceGate,
     lifecycle: &crate::lifecycle::GatewayLifecycle,
 ) -> notify::Result<()> {
     spawn_policy_reload_tasks_inner(
         policy_file.into(),
         state,
+        Some(evidence),
         lifecycle.background_cancellation(),
         Some(lifecycle),
     )
@@ -1380,12 +1405,17 @@ pub fn spawn_policy_reload_tasks_with_lifecycle(
 fn spawn_policy_reload_tasks_inner(
     policy_file: PathBuf,
     state: RbacState,
+    evidence: Option<BackgroundEvidenceGate>,
     cancellation: CancellationToken,
     lifecycle: Option<&crate::lifecycle::GatewayLifecycle>,
 ) -> notify::Result<()> {
-    let watcher =
-        spawn_policy_file_watcher(policy_file.clone(), state.clone(), cancellation.clone())?;
-    let sighup = spawn_sighup_reload_task(policy_file, state, cancellation);
+    let watcher = spawn_policy_file_watcher(
+        policy_file.clone(),
+        state.clone(),
+        evidence.clone(),
+        cancellation.clone(),
+    )?;
+    let sighup = spawn_sighup_reload_task(policy_file, state, evidence, cancellation);
     if let Some(lifecycle) = lifecycle {
         lifecycle.register_background_task(watcher);
         if let Some(sighup) = sighup {
@@ -1398,6 +1428,7 @@ fn spawn_policy_reload_tasks_inner(
 fn spawn_policy_file_watcher(
     policy_file: PathBuf,
     state: RbacState,
+    evidence: Option<BackgroundEvidenceGate>,
     cancellation: CancellationToken,
 ) -> notify::Result<tokio::task::JoinHandle<()>> {
     let (sender, receiver) = mpsc::unbounded_channel();
@@ -1409,6 +1440,7 @@ fn spawn_policy_file_watcher(
     Ok(tokio::spawn(policy_file_watch_loop(
         policy_file,
         state,
+        evidence,
         receiver,
         watcher,
         cancellation,
@@ -1418,6 +1450,7 @@ fn spawn_policy_file_watcher(
 async fn policy_file_watch_loop(
     policy_file: PathBuf,
     state: RbacState,
+    evidence: Option<BackgroundEvidenceGate>,
     mut events: mpsc::UnboundedReceiver<notify::Result<notify::Event>>,
     _watcher: notify::RecommendedWatcher,
     cancellation: CancellationToken,
@@ -1442,7 +1475,7 @@ async fn policy_file_watch_loop(
             let _ = handle_policy_watch_event(&policy_file, event);
         }
 
-        let _ = reload_policy_from_file(&state, &policy_file).await;
+        reload_policy_file_if_admitted(&state, &policy_file, evidence.as_ref(), "file_watch").await;
     }
 }
 
@@ -1483,6 +1516,7 @@ fn watch_directory(policy_file: &Path) -> PathBuf {
 fn spawn_sighup_reload_task(
     policy_file: PathBuf,
     state: RbacState,
+    evidence: Option<BackgroundEvidenceGate>,
     cancellation: CancellationToken,
 ) -> Option<tokio::task::JoinHandle<()>> {
     Some(tokio::spawn(async move {
@@ -1503,7 +1537,7 @@ fn spawn_sighup_reload_task(
             if signal.is_none() {
                 return;
             }
-            let _ = reload_policy_from_file(&state, &policy_file).await;
+            reload_policy_file_if_admitted(&state, &policy_file, evidence.as_ref(), "signal").await;
         }
     }))
 }
@@ -1512,6 +1546,7 @@ fn spawn_sighup_reload_task(
 fn spawn_sighup_reload_task(
     _policy_file: PathBuf,
     _state: RbacState,
+    _evidence: Option<BackgroundEvidenceGate>,
     _cancellation: CancellationToken,
 ) -> Option<tokio::task::JoinHandle<()>> {
     None

@@ -68,7 +68,7 @@ pub(crate) fn process_environment(name: &str) -> Result<String, VarError> {
     env::var(name)
 }
 
-pub use authority_events::AuthorityEventSettings;
+pub use authority_events::{AuthorityEventSettings, AuthorityEvidenceDurability};
 // Named only by the cluster wiring and by tests.
 #[cfg(any(feature = "postgres", test))]
 pub use authority_events::AuthorityEventSinkSetting;

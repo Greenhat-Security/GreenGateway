@@ -1163,6 +1163,7 @@ fn direct_draft_router(
             membership: None,
             event_store: None,
             query_store: None,
+            authority_evidence: authority_events::required::AuthorityEvidenceGate::best_effort(),
             audit: audit_log,
             client_ip_policy: client_ip::ClientIpPolicy::default(),
             max_body_size: 1024 * 1024,
