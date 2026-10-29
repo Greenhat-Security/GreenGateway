@@ -17,11 +17,21 @@ use crate::auth::admin_session::{
     },
     AdminSessionStorage, AdminSessions,
 };
+use crate::authority_events::{
+    delivery::DeliveryRecord,
+    dispatcher::{DispatcherConfig, DispatcherTerm},
+    pseudonym::{test_support::generated_keyring, ReferenceDomain},
+    sink::{AuthorityEventSink, SinkError},
+};
 use crate::cluster_maintenance::{AdminSessionPrune, MaintenanceJob};
 use crate::storage::contract_tests::postgres_audit_tests::{
     create_test_database, locator, write_dsn_file, TestDatabase, DATABASE,
 };
-use crate::storage::{migrations, postgres::PostgresFoundation};
+use crate::storage::{
+    migrations, postgres::PostgresFoundation,
+    postgres_authority_events::PostgresAuthorityEventStore,
+    postgres_service_tokens::PostgresServiceTokenStore, ServiceTokenStore,
+};
 
 const DEPLOYMENT: &str = "deploy-session-contract";
 
@@ -634,6 +644,405 @@ async fn every_grant_and_withdrawal_leaves_one_evidence_row() {
         0,
         "the evidence outlives every session it describes"
     );
+
+    // Every evidence row is journaled under its own event ID, at a gapless
+    // position, and every unit a grant held was spent by its withdrawal.
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM greengateway.admin_session_evidence e \
+             JOIN greengateway.authority_event_journal j \
+               ON j.event_id = e.event_id AND j.source = 'admin_session_evidence'"
+        )
+        .await,
+        12
+    );
+    assert_eq!(
+        journal_state(&pool).await,
+        JournalState {
+            head: 12,
+            in_use: 12,
+            held: 0,
+            rows: 12
+        }
+    );
+}
+
+/// The journal's state row as the tests read it: the last position, the
+/// units in use, the units held for withdrawals, and the rows retained.
+#[derive(Debug, PartialEq, Eq)]
+struct JournalState {
+    head: i64,
+    in_use: i64,
+    held: i64,
+    rows: i64,
+}
+
+async fn journal_state(pool: &deadpool_postgres::Pool) -> JournalState {
+    let row = pool
+        .get()
+        .await
+        .expect("checkout")
+        .query_one(
+            "SELECT last_position, retained_events, reserved_withdrawals, \
+                    (SELECT count(*) FROM greengateway.authority_event_journal) \
+             FROM greengateway.authority_event_state WHERE singleton",
+            &[],
+        )
+        .await
+        .expect("the journal state");
+    JournalState {
+        head: row.get(0),
+        in_use: row.get(1),
+        held: row.get(2),
+        rows: row.get(3),
+    }
+}
+
+/// Takes every batch it is offered.
+#[derive(Default)]
+struct CollectingSink {
+    records: std::sync::Mutex<Vec<DeliveryRecord>>,
+}
+
+#[async_trait]
+impl AuthorityEventSink for CollectingSink {
+    fn kind(&self) -> &'static str {
+        "collecting"
+    }
+
+    async fn deliver(&self, batch: &[DeliveryRecord]) -> Result<(), SinkError> {
+        self.records
+            .lock()
+            .expect("sink lock")
+            .extend_from_slice(batch);
+        Ok(())
+    }
+}
+
+/// The capacity decision (migration 26): a grant holds a unit for its own
+/// withdrawal, so a full journal refuses new grants -- and every other
+/// journaled change -- with `503` and commits nothing, but never a
+/// withdrawal. Logout, a provider rejection and the expiry prune all commit
+/// with their evidence journaled while the journal is full, no other
+/// producer can spend a unit a session holds, and room comes back only
+/// through delivery and retention, after which the refused grant completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_full_journal_refuses_grants_but_never_a_withdrawal() {
+    let Some((_guard, _database, pool)) = database().await else {
+        eprintln!("skipping: no test database locator; CI runs this test");
+        return;
+    };
+    let authority = Arc::new(Authority::default());
+    let a = replica(&authority, &pool, cluster_config(8), login_keyring());
+    let b = replica(&authority, &pool, cluster_config(8), login_keyring());
+    let journal = Arc::new(PostgresAuthorityEventStore::new(pool.clone()));
+    journal
+        .configure_capacity(7)
+        .await
+        .expect("capacity applies");
+    let tokens = PostgresServiceTokenStore::new(pool.clone());
+    let token = tokens
+        .create(crate::auth::tokens::CreateTokenRequest {
+            scopes: vec!["admin:tokens:read".to_owned()],
+            created_by: "creating-admin".to_owned(),
+            expires_at: None,
+        })
+        .await
+        .expect("a create journals nothing")
+        .record
+        .id;
+    let actor = crate::auth::change_actor::ChangeActor::for_test("rotating-admin");
+
+    // Three sessions take two units each, and a token rotate the last one.
+    let logged_out = cookie_headers(&issue_across(&a, &b, &HeaderMap::new()).await.unwrap());
+    let rejected = cookie_headers(&issue_across(&a, &a, &HeaderMap::new()).await.unwrap());
+    let expiring = cookie_headers(&issue_across(&b, &b, &HeaderMap::new()).await.unwrap());
+    assert_eq!(
+        journal_state(&pool).await,
+        JournalState {
+            head: 3,
+            in_use: 6,
+            held: 3,
+            rows: 3
+        }
+    );
+    tokens
+        .rotate(&token, &actor)
+        .await
+        .expect("the last unit is not held")
+        .expect("the token exists");
+    let full = JournalState {
+        head: 4,
+        in_use: 7,
+        held: 3,
+        rows: 4,
+    };
+    assert_eq!(journal_state(&pool).await, full);
+
+    // Full: a grant is refused as a dependency failure and leaves nothing --
+    // no session, no evidence, no journal row -- and neither the token's
+    // revoke nor anything else can spend the units the sessions hold.
+    let sessions = || count(&pool, "SELECT count(*) FROM greengateway.admin_sessions");
+    let evidence = || {
+        count(
+            &pool,
+            "SELECT count(*) FROM greengateway.admin_session_evidence",
+        )
+    };
+    a.begin_login("refused", Duration::from_secs(60), &HeaderMap::new())
+        .await
+        .unwrap();
+    assert!(matches!(
+        b.issue(
+            uuid::Uuid::new_v4().to_string(),
+            &HeaderMap::new(),
+            "refused",
+            CSRF
+        )
+        .await,
+        Err(AuthError::Upstream(_))
+    ));
+    assert_eq!((sessions().await, evidence().await), (3, 3));
+    assert_eq!(journal_state(&pool).await, full);
+    let error = tokens
+        .revoke(&token, &actor)
+        .await
+        .expect_err("a full journal refuses the revoke");
+    assert_eq!(error.kind(), RepositoryErrorKind::Unavailable);
+    assert_eq!(journal_state(&pool).await, full);
+
+    // Every kind of withdrawal still commits, journaled, each spending the
+    // unit its grant held: logout, a rejection, and the expiry prune.
+    b.revoke(&logged_out, None).await.unwrap();
+    assert!(is_invalid(&read(&a, &logged_out).await));
+    authority.outcome.store(3, Ordering::SeqCst);
+    assert!(is_invalid(&read(&b, &rejected).await));
+    authority.outcome.store(0, Ordering::SeqCst);
+    execute(
+        &pool,
+        &format!(
+            "UPDATE greengateway.admin_sessions \
+             SET idle_expires_at = clock_timestamp() - interval '1 second' \
+             WHERE session_hash = '{}'",
+            row_key(&b, &expiring)
+        ),
+    )
+    .await;
+    let client = pool.get().await.expect("maintenance session");
+    let job = AdminSessionPrune { limit: 1_000 };
+    assert_eq!(job.run_step(&client).await.expect("prune step"), 1);
+    assert_eq!(sessions().await, 0);
+    let mut reasons = pool
+        .get()
+        .await
+        .expect("checkout")
+        .query(
+            "SELECT e.reason FROM greengateway.admin_session_evidence e \
+             JOIN greengateway.authority_event_journal j ON j.event_id = e.event_id \
+             WHERE e.action = 'admin_session.withdraw'",
+            &[],
+        )
+        .await
+        .expect("journaled withdrawals")
+        .iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<Vec<_>>();
+    reasons.sort();
+    assert_eq!(reasons, ["expired", "logout", "rejected"]);
+    let spent = JournalState {
+        head: 7,
+        in_use: 7,
+        held: 0,
+        rows: 7,
+    };
+    assert_eq!(journal_state(&pool).await, spent);
+    // Still full, so the refused grant is still refused.
+    assert!(matches!(
+        b.issue(
+            uuid::Uuid::new_v4().to_string(),
+            &HeaderMap::new(),
+            "refused",
+            CSRF
+        )
+        .await,
+        Err(AuthError::Upstream(_))
+    ));
+
+    // The dispatcher delivers every session event in commit order, keyed
+    // and without any identifier the evidence holds.
+    let keyring = Arc::new(generated_keyring(
+        journal
+            .authority_id(uuid::Uuid::new_v4())
+            .await
+            .expect("the authority ID persists"),
+    ));
+    let sink = Arc::new(CollectingSink::default());
+    let mut term = DispatcherTerm::begin(
+        Arc::clone(&journal),
+        Arc::clone(&sink) as Arc<dyn AuthorityEventSink>,
+        Arc::clone(&keyring),
+        DispatcherConfig::default(),
+        1,
+        uuid::Uuid::new_v4(),
+    )
+    .await
+    .expect("the cursor claims");
+    assert_eq!(
+        term.deliver_until_caught_up(&tokio_util::sync::CancellationToken::new())
+            .await
+            .expect("delivery succeeds"),
+        Some(7)
+    );
+    let delivered = sink.records.lock().expect("sink lock").clone();
+    let operations: Vec<&str> = delivered
+        .iter()
+        .map(|record| record.operation.as_str())
+        .collect();
+    assert_eq!(
+        operations,
+        [
+            "admin_session.grant",
+            "admin_session.grant",
+            "admin_session.grant",
+            "service_token.rotate",
+            "admin_session.withdraw",
+            "admin_session.withdraw",
+            "admin_session.withdraw",
+        ]
+    );
+    let session_ids = pool
+        .get()
+        .await
+        .expect("checkout")
+        .query(
+            "SELECT session_id::text FROM greengateway.admin_session_evidence",
+            &[],
+        )
+        .await
+        .expect("session IDs")
+        .iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<Vec<_>>();
+    let operator_ref = keyring
+        .derive(ReferenceDomain::ActorRecorded, &["operator"])
+        .expect("a recorded actor reference derives");
+    for record in delivered
+        .iter()
+        .filter(|record| record.resource.kind == "admin_session")
+    {
+        assert_eq!(record.actor.recorded_ref, operator_ref.as_str());
+        assert_eq!(
+            (
+                record.actor.kind.as_deref(),
+                record.actor.auth_mode.as_deref()
+            ),
+            (None, None)
+        );
+        assert_eq!(record.revision.axis, "session");
+        assert_eq!(record.revision.security, None);
+        let serialized = serde_json::to_string(record).expect("serializes");
+        for identifier in session_ids
+            .iter()
+            .map(String::as_str)
+            .chain(["operator", "https://issuer.example.test"])
+        {
+            assert!(!serialized.contains(identifier), "{serialized}");
+        }
+    }
+
+    // Retention frees the delivered rows -- never a held unit -- and the
+    // refused grant completes.
+    assert_eq!(
+        PostgresAuthorityEventStore::prune_with(&client, Duration::ZERO, 1_000)
+            .await
+            .expect("retention runs"),
+        7
+    );
+    b.issue(
+        uuid::Uuid::new_v4().to_string(),
+        &HeaderMap::new(),
+        "refused",
+        CSRF,
+    )
+    .await
+    .expect("room for the grant and its withdrawal");
+    assert_eq!(
+        journal_state(&pool).await,
+        JournalState {
+            head: 8,
+            in_use: 2,
+            held: 1,
+            rows: 1
+        }
+    );
+}
+
+/// A withdrawal is never refused for capacity, but it is still refused when
+/// its journal row cannot be written at all: the session stays, nothing is
+/// half-recorded, and the front answers a dependency failure rather than
+/// "signed out". The same holds for the expiry prune.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_withdrawal_whose_journal_row_cannot_be_written_does_not_happen() {
+    let Some((_guard, _database, pool)) = database().await else {
+        eprintln!("skipping: no test database locator; CI runs this test");
+        return;
+    };
+    let authority = Arc::new(Authority::default());
+    let a = replica(&authority, &pool, cluster_config(8), login_keyring());
+    let held = cookie_headers(&issue_across(&a, &a, &HeaderMap::new()).await.unwrap());
+    let doomed = cookie_headers(&issue_across(&a, &a, &HeaderMap::new()).await.unwrap());
+    execute(
+        &pool,
+        &format!(
+            "UPDATE greengateway.admin_sessions \
+             SET idle_expires_at = clock_timestamp() - interval '1 second' \
+             WHERE session_hash = '{}'",
+            row_key(&a, &doomed)
+        ),
+    )
+    .await;
+    let before = journal_state(&pool).await;
+    execute(
+        &pool,
+        "ALTER TABLE greengateway.authority_event_journal \
+         ADD CONSTRAINT refuse_for_test CHECK (false) NOT VALID",
+    )
+    .await;
+    assert!(matches!(
+        a.revoke(&held, None).await,
+        Err(AuthError::Upstream(_))
+    ));
+    authority.outcome.store(3, Ordering::SeqCst);
+    assert!(is_unavailable(&read(&a, &held).await));
+    authority.outcome.store(0, Ordering::SeqCst);
+    let client = pool.get().await.expect("maintenance session");
+    assert!(AdminSessionPrune { limit: 1_000 }
+        .run_step(&client)
+        .await
+        .is_err());
+    execute(
+        &pool,
+        "ALTER TABLE greengateway.authority_event_journal DROP CONSTRAINT refuse_for_test",
+    )
+    .await;
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM greengateway.admin_sessions").await,
+        2,
+        "neither the logout, the rejection nor the prune changed anything"
+    );
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM greengateway.admin_session_evidence \
+             WHERE action = 'admin_session.withdraw'"
+        )
+        .await,
+        0
+    );
+    assert_eq!(journal_state(&pool).await, before);
+    read(&a, &held).await.unwrap();
+    a.revoke(&held, None).await.unwrap();
 }
 
 /// A change whose evidence cannot be written does not happen, and is a
