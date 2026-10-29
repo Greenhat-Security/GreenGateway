@@ -10,17 +10,17 @@ This is the orientation doc for anyone, human or AI agent, picking up an issue i
 
 GreenGateway is an open-source, self-hosted universal MCP and API gateway written in Rust. It is intended to point at any HTTP backend, enforce authentication and authorization on every call, discover traffic, support a visual rule builder, and provide native MCP support.
 
-## Current Repo State And Intended Structure
+## Current Repo State And Structure
 
-GreenGateway is alpha software, and code is landing incrementally according to the project roadmap. This repository may temporarily look sparse while foundational work lands through separate issues and pull requests.
+GreenGateway is alpha software, and code lands incrementally according to the project roadmap.
 
-The intended structure will look roughly like a Rust Cargo workspace with a gateway binary crate plus focused library crates for concerns such as middleware and hardening, authentication, RBAC and policy enforcement, egress firewalling, and audit. Issues #3 through #9 are the authoritative source for how that structure actually lands, including the initial workspace scaffold, CI, and subsequent porting work.
+The Cargo workspace has three packages: `gateway`, the gateway binary; `ggctl`, the operator CLI binary; and `gateway-config`, the library of configuration contracts the two share (issue #242, ADR-0008). Beside them, `admin-ui/` is the React front end that `gateway` builds and embeds. The gateway's concerns, such as middleware and hardening, authentication, RBAC and policy enforcement, egress firewalling, audit, Connections, tools and MCP, are modules of the one `gateway` crate rather than separate library crates. [docs/architecture.md](docs/architecture.md) describes the request lifecycle and which module owns each concern, and [docs/architecture/application-modules.md](docs/architecture/application-modules.md) maps the application modules `gateway/src/main.rs` declares and where their tests live.
 
 Prefer `git log`, open issues, and open pull requests over this document for structural details. `AGENTS.md` is orientation, not a source of truth, and it may lag reality until it is updated alongside each landing change.
 
 ## Build, Test, And Lint Commands
 
-The workspace exists: a `gateway` binary crate and the `admin-ui` front end. The commands CI runs, and the ones to run before opening a pull request, are:
+The workspace has three packages, `gateway`, `ggctl` and `gateway-config`, plus the `admin-ui` front end. The commands CI runs, and the ones to run before opening a pull request, are:
 
 ```sh
 # Select the CI toolchain first. RUSTUP_TOOLCHAIN overrides rust-toolchain.toml,
@@ -36,13 +36,13 @@ python scripts/cargo_policy.py install   # `check` execs the pinned cargo-deny d
 python scripts/cargo_policy.py check
 ```
 
-Four things about this repository surprise people, human and agent alike, and each costs a red CI run to discover.
+Five things about this repository surprise people, human and agent alike, and each costs a red CI run to discover.
 
 **Build-tool versions are pinned exactly, and they are not the ones in `rust-toolchain.toml`.** `build-tools.json` at the repository root is the source of truth, read by `scripts/build_tools.py` and the `.github/actions/build-tools` composite action. It declares `rust_ci` (what CI lints and tests with), `rust_production` (what the shipped binary is built with), `rust_coverage`, `node`, `npm` and `python`. `rust_ci` and `rust-toolchain.toml` currently differ, so a bare `cargo clippy` lints with the wrong compiler: export `RUSTUP_TOOLCHAIN` as above, or you will chase lints CI does not enforce and miss ones it does. Re-read `build-tools.json` after every pull; the pins move.
 
 **`gateway/build.rs` enforces the Node and npm pins exactly and builds `admin-ui` on every compile.** There is no skip flag. A Node that is even a patch version off fails with `build tool differs from repository version contract` before any Rust compiles, so keep the declared version on `PATH`.
 
-**The `gateway` crate has no lib target.** `cargo test -p gateway` works, and so does `cargo test --workspace`, but anything expecting a library target does not. Unit tests live beside their modules with `#[path = "..._tests.rs"] mod`.
+**The `gateway` crate has no lib target.** `cargo test -p gateway` works, and so does `cargo test --workspace`, but anything expecting a library target does not. Unit tests live beside their modules with `#[path = "..._tests.rs"] mod`. The application suite, which drives the composed router, is `gateway/src/app_tests.rs` (the binary's `tests` module) and the subsystem `*_app_tests.rs` modules it declares: a new application test belongs in the module of the subsystem whose behaviour it asserts, and `app_tests.rs` keeps only the fixtures more than one of those modules uses. Their tests' paths are `tests::<module>::<name>`, so `cargo test -p gateway <name>` selects a test by name, while `-- --exact` needs the full path that `-- --list` prints.
 
 **Two fail-closed policy gates run in CI and are easy to trip.** `scripts/transport_guard.py` reviews production transport authority: every aliased or glob import, and every unexpanded macro or attribute input, needs an entry in `transport-ownership.json` recording its file, scope, hash, owner and purpose. Adding `use foo::Trait as _;` fails CI until it is registered, which is the point — a new capability should appear in review rather than arrive unnoticed. Do not hand-write the entry: run `python scripts/transport_guard.py inventory`, take the computed record from `target/transport-guard/candidate.json`, add `owner` and `purpose`, and insert it at the position the candidate file shows. `scripts/cargo_policy.py` does the equivalent for the dependency graph.
 
@@ -74,4 +74,4 @@ Use the pinned roadmap in issue #44 for the full 7-phase plan. Pull request desc
 
 - [CONTRIBUTING.md](CONTRIBUTING.md) for contribution process and pull request expectations.
 - Issue #44 for the pinned roadmap and full project scope.
-- [docs/architecture.md](docs/architecture.md) for the request lifecycle once that document lands.
+- [docs/architecture.md](docs/architecture.md) for the request lifecycle and module ownership, and [docs/architecture/application-modules.md](docs/architecture/application-modules.md) for the application module map.
