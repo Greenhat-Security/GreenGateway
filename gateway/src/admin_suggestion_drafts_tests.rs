@@ -3,7 +3,7 @@
 //! draft store beside the policy history database, and the file authority.
 //! The draft routes themselves are in `admin_policy_drafts_tests`, and
 //! acceptance, which still applies a suggestion directly, beside the other
-//! suggestion routes in `app_tests`.
+//! suggestion routes in `admin_observability_app_tests`.
 use super::*;
 
 fn suggestion_draft_uri(suggestion_id: &str) -> String {

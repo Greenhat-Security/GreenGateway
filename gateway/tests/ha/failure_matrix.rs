@@ -41,7 +41,7 @@
 //! `config_fingerprint_mismatch`) are named absences with `#[ignore]`d rows
 //! at the foot of this file or, for `starting`, covered in-crate. The ninth,
 //! `contract_fenced` (issue #426, PR 3), is produced only in-crate
-//! (`app_tests::readiness_is_refused_for_good_once_the_contract_fence_excludes_this_build`
+//! (`cluster_app_tests::readiness_is_refused_for_good_once_the_contract_fence_excludes_this_build`
 //! and `storage::contract_tests::a_build_the_contract_fence_excludes_can_neither_boot_nor_rejoin`):
 //! no shipped build raises the durable contract fence, so no row here can
 //! reach it without writing the fence by hand.
