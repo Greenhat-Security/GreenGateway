@@ -31,12 +31,13 @@
 //!   as, so a v1 document's exact-source rules apply; schema; proxy
 //!   dispatch; no egress change; and a document format this deployment can
 //!   commit -- when it is saved, and again against the current authority
-//!   when it is published.
+//!   when it is published, where the cross-resource and lockout checks of
+//!   [`commit_policy_mutation`] also run (issue #243, slice 8).
 //! - **Every refused publication is audited.** A publication refused before
-//!   the commit, or by the commit itself (another replica's write, the
-//!   cluster's operation gate, an authority that could not write), emits
-//!   `policy.draft_publish_refused`. One whose commit was written is not a
-//!   refusal and is not reported as one.
+//!   the commit, or by the commit itself (the cross-resource checks, another
+//!   replica's write, the cluster's operation gate, an authority that could
+//!   not write), emits `policy.draft_publish_refused`. One whose commit was
+//!   written is not a refusal and is not reported as one.
 
 use super::*;
 
@@ -422,6 +423,7 @@ fn parse_draft_candidate(source: &RawValue) -> ResponseResult<rbac::Policy> {
 fn commit_refusal_reason(refusal: PolicyCommitRefusal) -> &'static str {
     match refusal {
         PolicyCommitRefusal::CandidateInvalid => "policy_draft_candidate_invalid",
+        PolicyCommitRefusal::ResourcesRefused => "policy_resources_refused",
         #[cfg(feature = "postgres")]
         PolicyCommitRefusal::EtagMismatch => PolicyDraftRefusal::PolicyEtagMismatch.reason(),
         #[cfg(feature = "postgres")]
@@ -837,10 +839,11 @@ pub(super) async fn policy_draft_delete_endpoint(
 /// refuses a draft whose pinned base is no longer live (checked before an
 /// `If-Match` mismatch, so the usual stale case gets the binding's reason),
 /// re-validates the candidate against the current authority, and commits it
-/// through [`persist_policy_mutation`] -- the same transaction, history,
-/// audit and replica install as `PUT .../policy`, whose `If-Match`
-/// compare-and-swap still decides a race with another replica. Nothing is
-/// written on any refusal, and the draft is kept.
+/// through [`commit_policy_mutation`] -- the same cross-resource and lockout
+/// checks, transaction, history, audit and replica install as
+/// `PUT .../policy`, whose `If-Match` compare-and-swap still decides a race
+/// with another replica. Nothing is written on any refusal, the draft is
+/// kept, and the refusal is audited as `policy.draft_publish_refused`.
 ///
 /// After the commit the draft is marked published, which freezes it. That
 /// second write is not in the policy transaction: if it fails, the response
@@ -876,6 +879,12 @@ pub(super) async fn policy_draft_publish_endpoint(
         Ok(etag) => etag,
         Err(response) => return *response,
     };
+    // The optional resource snapshot binding is read like the two
+    // preconditions, before any work: a malformed one is the request's
+    // fault, not a refusal of the draft. The commit compares it.
+    if let Err(response) = expected_resource_snapshot(&parts.headers) {
+        return *response;
+    }
     // Everything a publication acts on is named by the two preconditions;
     // a body could only be an option this endpoint does not have.
     match read_request_body(body, state.max_body_size).await {

@@ -37,6 +37,11 @@ pub const POLICY_REPLAY_CANCELLED: &str = "policy.replay_cancelled";
 pub const POLICY_REPLAY_FAILED: &str = "policy.replay_failed";
 pub const SERVICE_TOKEN_CHANGED: &str = "service_token.changed";
 pub const SERVICE_TOKEN_DELEGATION_REJECTED: &str = "service_token.delegation_rejected";
+/// A policy write the cross-resource checks refused before any authority saw
+/// it (issue #243, slice 8): an administrator lockout, or a write bound to a
+/// resource snapshot that is no longer current.
+/// Codes, the replaced policy's ETag and the resource snapshot digest only.
+pub const POLICY_PUBLICATION_REFUSED: &str = "policy.publication_refused";
 /// A write of an operation gated on member capabilities was refused because
 /// not every live cluster member advertises what it requires (issue #426).
 /// Cluster mode only: standalone mode has no roster to gate on.

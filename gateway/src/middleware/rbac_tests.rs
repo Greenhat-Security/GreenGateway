@@ -2241,6 +2241,20 @@ async fn gated_state(
     )
 }
 
+/// The policy resource view records the security revision of the snapshot
+/// a gated state installed, and a standalone state, whose snapshots are not
+/// revisioned, records none (issue #243, slice 8).
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn the_policy_resource_view_records_the_installed_security_revision() {
+    let policy = test_policy(DefaultAction::Deny, &[], &[]);
+    let (standalone, _capture) = test_state(policy.clone(), &[]);
+    assert_eq!(standalone.policy_resource_view().security_revision, None);
+
+    let (gated, _capture) = gated_state(policy, 7, Ok(7)).await;
+    assert_eq!(gated.policy_resource_view().security_revision, Some(7));
+}
+
 /// A gate that publishes bundles: admits at the bundle's revision and
 /// hands the bundle out, exactly as the cluster runtime does.
 #[cfg(feature = "postgres")]
