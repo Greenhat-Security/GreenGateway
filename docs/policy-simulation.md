@@ -316,8 +316,11 @@ refused request (`4xx`) is not recorded as a simulation.
 A simulation is synchronous and CPU-only: at most 256 cases, 64 edits and two
 projections, a body within 2 MiB, a two-second deadline, an 8 MiB result, at
 most four simulations evaluating at once per replica and one per caller, each
-on a blocking thread rather than an async worker. Each case is evaluated once
-per projection, and once more when the candidate differs from the base.
+on a blocking thread rather than an async worker. A simulation is admitted
+only once its body is in hand, and its slot is held until the blocking
+evaluation ends, even when the client disconnects first. Each case is
+evaluated once per projection, and once more when the candidate differs from
+the base.
 
 Not part of this slice, and not to be inferred from it:
 

@@ -340,6 +340,49 @@ describe('LiveTail', () => {
     expect(screen.getByText('Connected')).toBeTruthy();
   });
 
+  it('treats the closing frame as the end of the stream, not as an event', async () => {
+    const stream = sseFetchMock();
+    vi.stubGlobal('fetch', stream.fetch);
+
+    renderLiveTail();
+
+    expect(await screen.findByText('Connected')).toBeTruthy();
+
+    act(() => {
+      stream.calls[0].enqueue(
+        sseFrame(
+          auditEvent({
+            event_id: 'before-close',
+            event_type: 'audit.before_close',
+          }),
+        ),
+      );
+    });
+    expect(await screen.findByText('audit.before_close')).toBeTruthy();
+
+    vi.useFakeTimers();
+    act(() => {
+      stream.calls[0].enqueue(
+        'event: stream.closed\ndata: {"reason":"lifetime_elapsed"}\n\n',
+      );
+      stream.calls[0].close();
+    });
+    await flushStreamWork();
+
+    expect(screen.queryByText('stream.closed')).toBeNull();
+    expect(screen.getByText('1 events')).toBeTruthy();
+    expect(screen.getByText('Reconnecting')).toBeTruthy();
+
+    await act(async () => {
+      vi.advanceTimersByTime(LIVE_TAIL_RECONNECT_DELAY_MS);
+    });
+    await flushStreamWork();
+
+    expect(stream.calls).toHaveLength(2);
+    expect(screen.getByText('Connected')).toBeTruthy();
+    expect(screen.getByText('audit.before_close')).toBeTruthy();
+  });
+
   it('keeps only the most recent retained events', async () => {
     const stream = sseFetchMock();
     vi.stubGlobal('fetch', stream.fetch);
