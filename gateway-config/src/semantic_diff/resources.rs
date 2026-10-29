@@ -22,8 +22,9 @@ use serde_json::{Map, Value};
 
 use super::{
     unmatched, ChangeClass, ChangeKind, Comparison, Display, EntryCounts, Field, Impact, Redaction,
-    RiskCode, Rule, Section, SetCounts,
+    RiskCode, Rule, Section, SemanticDiff, SetCounts,
 };
+use crate::bundle::{Bundle, BundledResource, POLICY_TOP_LEVEL_MEMBERS};
 
 /// Where a bundle's policy or tools document comes from.
 #[derive(Clone, Copy, Debug)]
@@ -67,6 +68,67 @@ pub struct BundleView<'a> {
     pub tools: ResourceView<'a>,
     /// `spec.resources.connections.source: server` is declared.
     pub connections_from_server: bool,
+}
+
+impl<'a> BundleView<'a> {
+    /// What a diff compares of a bundle the reader accepted. `policy` and
+    /// `tools` are its documents in the JSON form to compare: the document
+    /// the reader validated, or the caller's validators' normalized form.
+    pub fn of<P, T>(
+        bundle: &'a Bundle<P, T>,
+        policy: Option<&'a Value>,
+        tools: Option<&'a Value>,
+    ) -> Self {
+        Self {
+            api_version: bundle.api_version.as_str(),
+            name: &bundle.name,
+            profile: bundle.deployment.profile.as_str(),
+            deployment_sha256: &bundle.deployment.sha256,
+            deployment_canonical_json: &bundle.deployment.canonical_json,
+            policy: ResourceView::of(bundle.policy.as_ref(), policy),
+            tools: ResourceView::of(bundle.tools.as_ref(), tools),
+            connections_from_server: bundle.connections_from_server,
+        }
+    }
+}
+
+impl<'a> ResourceView<'a> {
+    fn of<T>(resource: Option<&'a BundledResource<T>>, document: Option<&'a Value>) -> Self {
+        match resource {
+            None => Self::Undeclared,
+            Some(BundledResource::Server) => Self::Server,
+            Some(BundledResource::Bundle { sha256, .. }) => Self::Bundle {
+                sha256: sha256.as_str(),
+                document,
+            },
+        }
+    }
+}
+
+/// Compares two bundles read with `PublishedSchemasOnly`, whose policy and
+/// tools documents are the JSON values the reader checked.
+pub fn compare_read_bundles(
+    base: &Bundle<Value, Value>,
+    candidate: &Bundle<Value, Value>,
+) -> SemanticDiff {
+    let mut comparison = Comparison::new();
+    compare_bundles(
+        &mut comparison,
+        &BundleView::of(base, document(&base.policy), document(&base.tools)),
+        &BundleView::of(
+            candidate,
+            document(&candidate.policy),
+            document(&candidate.tools),
+        ),
+    );
+    comparison.finish()
+}
+
+fn document(resource: &Option<BundledResource<Value>>) -> Option<&Value> {
+    match resource {
+        Some(BundledResource::Bundle { document, .. }) => Some(document),
+        _ => None,
+    }
 }
 
 /// The profiles from the most guarantees to the fewest.
@@ -291,22 +353,6 @@ fn compare_resource(
 }
 
 // --- Policy -----------------------------------------------------------------
-
-/// The top-level members of a policy `0.x` document, as the loader reads
-/// them (`KNOWN_TOP_LEVEL_KEYS` in `gateway/src/rbac/policy.rs`, which a
-/// gateway test holds equal to this list).
-pub const POLICY_TOP_LEVEL_MEMBERS: &[&str] = &[
-    "schema_version",
-    "id",
-    "default_action",
-    "enforcement_mode",
-    "roles",
-    "routes",
-    "rules",
-    "egress",
-    "rate_limits",
-    "tools",
-];
 
 const DEFAULT_ACTIONS: &[&str] = &["deny", "allow"];
 const ENFORCEMENT_MODES: &[&str] = &["enforce", "shadow"];

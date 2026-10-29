@@ -1,24 +1,36 @@
 //! The output contract (ADR-0008, "Output contract").
 //!
 //! - Standard output carries only what was asked for: an artifact (a schema,
-//!   a completion script, help), the human result, or with `--format json`
-//!   exactly one `GgctlReport` document.
-//! - Diagnostics go to standard error in human form. With `--format json`
-//!   they are in the report instead, and standard error stays empty.
+//!   a completion script, help), the human result, with `--format json`
+//!   exactly one `GgctlReport` document, or with `validate --format sarif`
+//!   exactly one SARIF 2.1.0 log.
+//! - Diagnostics go to standard error in human form. With `--format json` or
+//!   `--format sarif` they are in the document instead, and standard error
+//!   stays empty.
 //! - An argument error found before a command runs is reported on standard
 //!   error only, with exit code 2, and no report is written: the requested
 //!   format is not known to be trustworthy yet.
 //! - No color, no prompt, no progress output.
 
-use std::io::{self, Read, Write};
+use std::{
+    fmt,
+    io::{self, Read, Write},
+};
 
-use gateway_config::documents::{API_VERSION_V1ALPHA1, REPORT_KIND};
+use gateway_config::{
+    bundle::{self, BundleDiagnostic},
+    documents::{API_VERSION_V1ALPHA1, REPORT_KIND},
+};
 use serde::Serialize;
 
 use crate::{
-    cli::{Invocation, FORMAT_JSON},
+    cli::{Invocation, FORMAT_JSON, FORMAT_SARIF},
     diagnostic::{Code, Diagnostic, Exit},
+    sarif,
 };
+
+/// Where `docs/configuration-bundles.md` explains every bundle reader code.
+pub(crate) const BUNDLE_REMEDIATION: &str = "docs/configuration-bundles.md#diagnostics";
 
 /// The process's standard streams.
 pub(crate) struct Io<'a> {
@@ -32,14 +44,138 @@ pub(crate) struct Io<'a> {
 pub(crate) enum Format {
     Human,
     Json,
+    /// SARIF 2.1.0: `validate` is the only command whose `--format` offers it.
+    Sarif,
 }
 
 impl Format {
     pub(crate) fn of(invocation: &Invocation) -> Self {
         match invocation.text("--format") {
             Some((_, FORMAT_JSON)) => Self::Json,
+            Some((_, FORMAT_SARIF)) => Self::Sarif,
             _ => Self::Human,
         }
+    }
+}
+
+/// One diagnostic of a report: `ggctl`'s own, or one the shared bundle
+/// reader found. Both are value-free by construction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ReportDiagnostic {
+    Ggctl(Diagnostic),
+    Bundle(BundleDiagnostic),
+}
+
+impl ReportDiagnostic {
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            Self::Ggctl(diagnostic) => diagnostic.code.as_str(),
+            Self::Bundle(diagnostic) => diagnostic.code.as_str(),
+        }
+    }
+
+    pub(crate) fn severity(&self) -> &'static str {
+        match self {
+            Self::Ggctl(diagnostic) => diagnostic.severity(),
+            Self::Bundle(diagnostic) => diagnostic.severity.as_str(),
+        }
+    }
+
+    pub(crate) fn message(&self) -> &'static str {
+        match self {
+            Self::Ggctl(diagnostic) => diagnostic.code.message(),
+            Self::Bundle(diagnostic) => diagnostic.code.message(),
+        }
+    }
+
+    pub(crate) fn hint(&self) -> Option<&'static str> {
+        match self {
+            Self::Ggctl(diagnostic) => diagnostic.hint,
+            Self::Bundle(_) => None,
+        }
+    }
+
+    pub(crate) fn remediation(&self) -> &'static str {
+        match self {
+            Self::Ggctl(diagnostic) => diagnostic.code.remediation(),
+            Self::Bundle(_) => BUNDLE_REMEDIATION,
+        }
+    }
+
+    /// The exit code this diagnostic produces on its own.
+    pub(crate) fn exit(&self) -> Exit {
+        match self {
+            Self::Ggctl(diagnostic) => diagnostic.code.exit(),
+            Self::Bundle(diagnostic) => bundle_exit(diagnostic),
+        }
+    }
+
+    pub(crate) fn location(&self) -> Option<LocationRecord> {
+        match self {
+            Self::Ggctl(diagnostic) => diagnostic
+                .argument
+                .map(|argument| LocationRecord::Argument { argument }),
+            Self::Bundle(diagnostic) => diagnostic.file.as_ref().map(|file| LocationRecord::File {
+                file: file.as_str().to_owned(),
+                pointer: diagnostic.pointer.to_string(),
+                line: diagnostic.position.map(|position| position.line),
+                column: diagnostic.position.map(|position| position.column),
+            }),
+        }
+    }
+}
+
+/// The exit code a bundle reader diagnostic produces on its own.
+fn bundle_exit(diagnostic: &BundleDiagnostic) -> Exit {
+    if !diagnostic.is_error() {
+        return Exit::Success;
+    }
+    match diagnostic.code {
+        // The bundle could not be examined: an I/O failure, not a verdict on
+        // its content.
+        bundle::Code::RootUnavailable
+        | bundle::Code::ReadFailed
+        | bundle::Code::ChangedDuringRead => Exit::Failure,
+        _ => Exit::Invalid,
+    }
+}
+
+impl From<Diagnostic> for ReportDiagnostic {
+    fn from(diagnostic: Diagnostic) -> Self {
+        Self::Ggctl(diagnostic)
+    }
+}
+
+impl From<BundleDiagnostic> for ReportDiagnostic {
+    fn from(diagnostic: BundleDiagnostic) -> Self {
+        Self::Bundle(diagnostic)
+    }
+}
+
+/// The human form written to standard error.
+impl fmt::Display for ReportDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let diagnostic = match self {
+            Self::Ggctl(diagnostic) => return diagnostic.fmt(formatter),
+            Self::Bundle(diagnostic) => diagnostic,
+        };
+        write!(
+            formatter,
+            "ggctl: {}: {}: {}",
+            self.severity(),
+            self.code(),
+            self.message()
+        )?;
+        if let Some(file) = &diagnostic.file {
+            write!(formatter, "\n  at: {}", file.as_str())?;
+            if let Some(position) = diagnostic.position {
+                write!(formatter, ":{}:{}", position.line, position.column)?;
+            }
+            if !diagnostic.pointer.is_root() {
+                write!(formatter, " {}", diagnostic.pointer)?;
+            }
+        }
+        write!(formatter, "\n  see: {}", self.remediation())
     }
 }
 
@@ -69,23 +205,34 @@ struct DiagnosticRecord {
     location: Option<LocationRecord>,
 }
 
-#[derive(Serialize)]
-struct LocationRecord {
+/// What a diagnostic is about.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
+pub(crate) enum LocationRecord {
     /// The 1-based position of the command-line argument.
-    argument: usize,
+    Argument { argument: usize },
+    /// A place in one bundle file: its bundle-relative name, a JSON Pointer
+    /// built from member names the reader defines, and the 1-based line and
+    /// column where the reader has them.
+    File {
+        file: String,
+        pointer: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        line: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        column: Option<u32>,
+    },
 }
 
-impl From<&Diagnostic> for DiagnosticRecord {
-    fn from(diagnostic: &Diagnostic) -> Self {
+impl From<&ReportDiagnostic> for DiagnosticRecord {
+    fn from(diagnostic: &ReportDiagnostic) -> Self {
         Self {
-            code: diagnostic.code.as_str(),
+            code: diagnostic.code(),
             severity: diagnostic.severity(),
-            message: diagnostic.code.message(),
-            hint: diagnostic.hint,
-            remediation: diagnostic.code.remediation(),
-            location: diagnostic
-                .argument
-                .map(|argument| LocationRecord { argument }),
+            message: diagnostic.message(),
+            hint: diagnostic.hint(),
+            remediation: diagnostic.remediation(),
+            location: diagnostic.location(),
         }
     }
 }
@@ -100,7 +247,25 @@ pub(crate) fn finish<T: Serialize>(
     diagnostics: &[Diagnostic],
     human: impl FnOnce(&T, &mut dyn Write) -> io::Result<()>,
 ) -> Exit {
-    let exit = Exit::of(diagnostics);
+    let diagnostics: Vec<_> = diagnostics
+        .iter()
+        .copied()
+        .map(ReportDiagnostic::Ggctl)
+        .collect();
+    finish_report(io, format, command, result, &diagnostics, human)
+}
+
+/// [`finish`] for a command whose diagnostics include the bundle reader's.
+/// With `--format sarif` the log carries the diagnostics only.
+pub(crate) fn finish_report<T: Serialize>(
+    io: &mut Io<'_>,
+    format: Format,
+    command: &'static str,
+    result: &T,
+    diagnostics: &[ReportDiagnostic],
+    human: impl FnOnce(&T, &mut dyn Write) -> io::Result<()>,
+) -> Exit {
+    let exit = Exit::worst(diagnostics.iter().map(ReportDiagnostic::exit));
     let written = match format {
         Format::Json => {
             let report = Report {
@@ -117,11 +282,33 @@ pub(crate) fn finish<T: Serialize>(
                 .and_then(|()| writeln!(io.stdout))
                 .and_then(|()| io.stdout.flush())
         }
+        Format::Sarif => serde_json::to_writer_pretty(&mut *io.stdout, &sarif::log(diagnostics))
+            .map_err(io::Error::from)
+            .and_then(|()| writeln!(io.stdout))
+            .and_then(|()| io.stdout.flush()),
         Format::Human => human(result, io.stdout)
             .and_then(|()| io.stdout.flush())
             .and_then(|()| write_diagnostics(io.stderr, diagnostics)),
     };
     match written {
+        Ok(()) => exit,
+        Err(_) => write_failed(io),
+    }
+}
+
+/// Writes a SARIF log a command built from `diagnostics` and its own
+/// findings, and returns the exit code the diagnostics determine.
+pub(crate) fn sarif_log(
+    io: &mut Io<'_>,
+    diagnostics: &[ReportDiagnostic],
+    log: &serde_json::Value,
+) -> Exit {
+    let exit = Exit::worst(diagnostics.iter().map(ReportDiagnostic::exit));
+    match serde_json::to_writer_pretty(&mut *io.stdout, log)
+        .map_err(io::Error::from)
+        .and_then(|()| writeln!(io.stdout))
+        .and_then(|()| io.stdout.flush())
+    {
         Ok(()) => exit,
         Err(_) => write_failed(io),
     }
@@ -147,7 +334,7 @@ pub(crate) fn error(io: &mut Io<'_>, diagnostic: Diagnostic) -> Exit {
     }
 }
 
-fn write_diagnostics(stderr: &mut dyn Write, diagnostics: &[Diagnostic]) -> io::Result<()> {
+fn write_diagnostics(stderr: &mut dyn Write, diagnostics: &[impl fmt::Display]) -> io::Result<()> {
     for diagnostic in diagnostics {
         writeln!(stderr, "{diagnostic}")?;
     }

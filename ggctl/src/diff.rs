@@ -1,46 +1,122 @@
-//! What `ggctl diff` writes for a semantic diff (issue #242, PR 9; ADR-0008,
-//! "Plan, risk acknowledgment, and conditional apply").
+//! `ggctl diff BUNDLE --against BUNDLE [--check] [--strict]
+//! [--format human|json|sarif]` (issue #242, PR 9; ADR-0008, "Plan, risk
+//! acknowledgment, and conditional apply").
 //!
-//! The diff is `gateway_config::semantic_diff`'s, the one the gateway's
-//! plans will report, so the CLI cannot approximate it. This module renders
-//! it three ways, all value-free because the diff is:
+//! Both bundles are read by the shared reader, exactly as `ggctl validate`
+//! reads them, and compared by `gateway_config::semantic_diff`, the engine
+//! the gateway's plans will use, so the CLI cannot approximate either. The
+//! change is from the `--against` bundle to `BUNDLE`. Everything written is
+//! value-free because the diff is:
 //!
 //! - human: one line per change, then the sorted risk codes;
-//! - `--format json`: the `diffResult` a `GgctlReport` carries;
-//! - `--format sarif`: one SARIF result per risk code of each change, with
-//!   the change's field as a logical location, so CI can annotate a review.
-//!   A change that carries no risk code is not a finding and is not a result.
+//! - `--format json`: one `GgctlReport` whose `result` carries the
+//!   `diffResult`;
+//! - `--format sarif`: the reader's diagnostics as `ggctl validate` reports
+//!   them, then one result per risk code of each change, with the change's
+//!   field as a logical location, so CI can annotate a review. A change that
+//!   carries no risk code is not a finding and is not a result.
 //!
-//! `--check` exits `4` when anything differs. Comparing needs the bundle
-//! reader and the configuration compiler, which move into gateway-config
-//! with `ggctl validate` (#242 PR 8); until then no command writes these and
-//! they are exercised by their tests.
-// `ggctl diff` (#242 PR 8) is the caller; until then only the tests are.
-#![cfg_attr(not(test), expect(dead_code))]
+//! `--check` adds `diff.drift_found` (exit `4`) when anything differs. A
+//! bundle that is invalid is not compared: the command reports the reader's
+//! diagnostics and exits as `ggctl validate` would.
 
-use gateway_config::semantic_diff::{Change, Display, SemanticDiff, Severity, Shown};
+use std::path::Path;
+
+use gateway_config::{
+    bundle::{self, PublishedSchemasOnly, ReadOptions},
+    semantic_diff::{compare_read_bundles, Change, Display, SemanticDiff, Severity, Shown},
+};
+use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::{diagnostic::Exit, sarif};
+use crate::{
+    cli::Invocation,
+    diagnostic::{Code, Diagnostic, Exit},
+    report::{self, Format, Io, ReportDiagnostic},
+    sarif,
+    validate::{self, BundleRecord},
+};
 
 /// Where every risk code is described.
 const RISK_CODES_ANCHOR: &str = "docs/semantic-diff.md#risk-codes";
 
-/// The exit status of a diff that ran: `4` (`drift`) under `--check` when
-/// anything differs, otherwise `0`.
+/// The `diff` result.
+#[derive(Debug, Serialize)]
+struct DiffCommandResult<'a> {
+    /// Both bundles were read with no error, so they were compared.
+    valid: bool,
+    /// `BUNDLE`, the candidate. Present once its manifest was read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bundle: Option<BundleRecord>,
+    /// The `--against` bundle, the base. Present once its manifest was read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    against: Option<BundleRecord>,
+    /// The changes from `--against` to `BUNDLE`, when both were read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diff: Option<&'a SemanticDiff>,
+}
+
+pub(crate) fn run(invocation: &Invocation, io: &mut Io<'_>) -> Exit {
+    let strict = invocation.flag("--strict").is_some();
+    let (Some(candidate), Some((_, against))) = (
+        validate::read(invocation, strict),
+        invocation.value("--against"),
+    ) else {
+        return report::error(io, Diagnostic::new(Code::MissingArgument));
+    };
+    let base = bundle::read_bundle(
+        Path::new(against),
+        ReadOptions { strict },
+        &PublishedSchemasOnly,
+    );
+    let mut diagnostics = validate::diagnostics(&candidate);
+    diagnostics.extend(validate::diagnostics(&base));
+    if validate::supplies_a_resource(&candidate) || validate::supplies_a_resource(&base) {
+        diagnostics.push(Diagnostic::new(Code::ProductionValidatorsNotRun).into());
+    }
+    let diff = match (&base.bundle, &candidate.bundle) {
+        (Some(base), Some(candidate)) => Some(compare_read_bundles(base, candidate)),
+        _ => None,
+    };
+    if let (Some(diff), Some(position)) = (&diff, invocation.flag("--check")) {
+        if exit(diff, true) == Exit::Drift {
+            diagnostics.push(Diagnostic::at(Code::DriftFound, position).into());
+        }
+    }
+    let result = DiffCommandResult {
+        valid: diff.is_some(),
+        bundle: BundleRecord::of(&candidate),
+        against: BundleRecord::of(&base),
+        diff: diff.as_ref(),
+    };
+    match Format::of(invocation) {
+        Format::Sarif => {
+            let empty = SemanticDiff::default();
+            report::sarif_log(
+                io,
+                &diagnostics,
+                &sarif_log(diff.as_ref().unwrap_or(&empty), &diagnostics),
+            )
+        }
+        format => {
+            report::finish_report(io, format, "diff", &result, &diagnostics, |result, out| {
+                match result.diff {
+                    Some(diff) => out.write_all(human(diff).as_bytes()),
+                    None => writeln!(out, "not compared: a bundle is invalid"),
+                }
+            })
+        }
+    }
+}
+
+/// The exit status a diff alone determines: `4` (`drift`) under `--check`
+/// when anything differs, otherwise `0`.
 pub(crate) fn exit(diff: &SemanticDiff, check: bool) -> Exit {
     if check && !diff.is_empty() {
         Exit::Drift
     } else {
         Exit::Success
     }
-}
-
-/// The report's `result`. `None` only when the diff cannot be serialized,
-/// which a caller reports as an internal failure rather than a partial
-/// result.
-pub(crate) fn result(diff: &SemanticDiff) -> Option<Value> {
-    serde_json::to_value(diff).ok()
 }
 
 /// The human form: one line per change, ordered by section and field, then
@@ -109,21 +185,30 @@ fn severity_name(severity: Option<Severity>) -> &'static str {
     severity.map_or("none", Severity::as_str)
 }
 
-/// The SARIF log: one rule per risk code the diff carries, in code order,
-/// and one result per risk code of each change.
-pub(crate) fn sarif(diff: &SemanticDiff) -> Value {
+/// The SARIF log: the reader's diagnostics as `ggctl validate` writes them,
+/// then one rule per risk code the diff carries, in code order, and one
+/// result per risk code of each change.
+pub(crate) fn sarif_log(diff: &SemanticDiff, diagnostics: &[ReportDiagnostic]) -> Value {
+    let mut log = sarif::log(diagnostics);
+    let run = &mut log["runs"][0];
+    if let Some(base) = run["originalUriBaseIds"][sarif::BUNDLE_ROOT].as_object_mut() {
+        base.insert(
+            "description".to_owned(),
+            json!({"text": "The bundle directory a diagnostic concerns: BUNDLE or --against."}),
+        );
+    }
+    let offset = run["tool"]["driver"]["rules"]
+        .as_array()
+        .map_or(0, Vec::len);
     let codes: Vec<_> = diff.risks().into_iter().collect();
-    let rules: Vec<Value> = codes
-        .iter()
-        .map(|code| {
-            json!({
-                "id": code.as_str(),
-                "shortDescription": {"text": code.description()},
-                "help": {"text": format!("See {RISK_CODES_ANCHOR}")},
-                "defaultConfiguration": {"level": level(code.severity())},
-            })
+    let rules = codes.iter().map(|code| {
+        json!({
+            "id": code.as_str(),
+            "shortDescription": {"text": code.description()},
+            "help": {"text": format!("See {RISK_CODES_ANCHOR}")},
+            "defaultConfiguration": {"level": level(code.severity())},
         })
-        .collect();
+    });
     let mut results = Vec::new();
     for change in diff.changes() {
         for code in change.risks() {
@@ -133,7 +218,7 @@ pub(crate) fn sarif(diff: &SemanticDiff) -> Value {
                 .unwrap_or_default();
             results.push(json!({
                 "ruleId": code.as_str(),
-                "ruleIndex": index,
+                "ruleIndex": offset + index,
                 "level": level(code.severity()),
                 "message": {
                     "text": format!("{}: {}", change.field(), code.description()),
@@ -153,7 +238,13 @@ pub(crate) fn sarif(diff: &SemanticDiff) -> Value {
             }));
         }
     }
-    sarif::envelope(rules, results)
+    if let Some(listed) = run["tool"]["driver"]["rules"].as_array_mut() {
+        listed.extend(rules);
+    }
+    if let Some(listed) = run["results"].as_array_mut() {
+        listed.extend(results);
+    }
+    log
 }
 
 fn level(severity: Severity) -> &'static str {
@@ -165,130 +256,4 @@ fn level(severity: Severity) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests {
-    use gateway_config::semantic_diff::{ChangeClass, Comparison, Field, RiskCode, Rule, Section};
-    use serde_json::json;
-
-    use super::{exit, human, result, sarif};
-    use crate::diagnostic::Exit;
-
-    static AUTH: Field = Field {
-        id: "AUTH_ENABLED",
-        section: Section::Authentication,
-        class: ChangeClass::Restart,
-        risk: RiskCode::AuthDisabled,
-        rule: Rule::LooserWhen(false),
-    };
-    static HOSTS: Field = Field {
-        id: "EGRESS_ALLOWED_HOSTS",
-        section: Section::Egress,
-        class: ChangeClass::Restart,
-        risk: RiskCode::EgressBroadened,
-        rule: Rule::GrowthIsLooser,
-    };
-    static KEY: Field = Field {
-        id: "TLS_KEY_FILE",
-        section: Section::Tls,
-        class: ChangeClass::Restart,
-        risk: RiskCode::CredentialBindingChanged,
-        rule: Rule::AnyChange,
-    };
-    static BODY: Field = Field {
-        id: "MAX_BODY_SIZE",
-        section: Section::Limits,
-        class: ChangeClass::Restart,
-        risk: RiskCode::LimitsLoosened,
-        rule: Rule::HigherIsLooser,
-    };
-
-    fn weakened() -> gateway_config::semantic_diff::SemanticDiff {
-        let mut comparison = Comparison::new();
-        comparison.flag(&AUTH, true, false);
-        comparison.set(&HOSTS, ["a.test"], ["a.test", "zqcanary.test"]);
-        comparison.secret(
-            &KEY,
-            Some("/run/zqcanary/a.pem"),
-            Some("/run/zqcanary/b.pem"),
-        );
-        comparison.count(&BODY, Some(2), Some(1));
-        comparison.finish()
-    }
-
-    #[test]
-    fn check_exits_drift_only_when_something_differs() {
-        let empty = Comparison::new().finish();
-        assert_eq!(exit(&empty, true), Exit::Success);
-        assert_eq!(exit(&weakened(), false), Exit::Success);
-        assert_eq!(exit(&weakened(), true), Exit::Drift);
-        assert_eq!(Exit::Drift.code(), 4);
-    }
-
-    #[test]
-    fn the_human_form_lists_each_change_and_never_a_value() {
-        let text = human(&weakened());
-        assert_eq!(
-            text,
-            concat!(
-                "high    TLS_KEY_FILE  modified (reference changed), restart, loosened  [risk.credential_binding_changed]\n",
-                "high    AUTH_ENABLED  modified true -> false, restart, loosened  [risk.auth_disabled]\n",
-                "high    EGRESS_ALLOWED_HOSTS  modified (value withheld) (1 added, 0 removed, 0 changed), restart, loosened  [risk.egress_broadened]\n",
-                "none    MAX_BODY_SIZE  modified 2 -> 1, restart, tightened\n",
-                "4 changed, highest risk high: risk.auth_disabled, risk.credential_binding_changed, risk.egress_broadened\n",
-            )
-        );
-        assert!(!text.contains("zqcanary"));
-        assert_eq!(human(&Comparison::new().finish()), "no changes\n");
-    }
-
-    #[test]
-    fn the_report_result_is_the_engines_diff() {
-        let value = result(&weakened()).expect("serializes");
-        assert_eq!(value["changed"], true);
-        assert_eq!(value["severity"], "high");
-        assert_eq!(value["changes"].as_array().map(Vec::len), Some(4));
-        assert!(!value.to_string().contains("zqcanary"));
-    }
-
-    #[test]
-    fn sarif_has_one_rule_per_code_and_one_result_per_code_of_each_change() {
-        let log = sarif(&weakened());
-        assert_eq!(log["version"], "2.1.0");
-        let run = &log["runs"][0];
-        assert_eq!(run["tool"]["driver"]["name"], "ggctl");
-        let rules = run["tool"]["driver"]["rules"].as_array().expect("rules");
-        let ids: Vec<&str> = rules
-            .iter()
-            .filter_map(|rule| rule["id"].as_str())
-            .collect();
-        assert_eq!(
-            ids,
-            [
-                "risk.auth_disabled",
-                "risk.credential_binding_changed",
-                "risk.egress_broadened"
-            ]
-        );
-        assert_eq!(
-            rules[0]["help"]["text"],
-            "See docs/semantic-diff.md#risk-codes"
-        );
-        let results = run["results"].as_array().expect("results");
-        assert_eq!(results.len(), 3);
-        assert_eq!(
-            results[1],
-            json!({
-                "ruleId": "risk.auth_disabled",
-                "ruleIndex": 0,
-                "level": "error",
-                "message": {"text": "AUTH_ENABLED: authentication is turned off"},
-                "locations": [{"logicalLocations": [{"fullyQualifiedName": "AUTH_ENABLED", "kind": "member"}]}],
-                "properties": {"section": "authentication", "kind": "modified", "class": "restart", "effect": "loosened"}
-            })
-        );
-        assert!(!log.to_string().contains("zqcanary"));
-
-        let empty = sarif(&Comparison::new().finish());
-        assert_eq!(empty["runs"][0]["results"], json!([]));
-        assert_eq!(empty["runs"][0]["tool"]["driver"]["rules"], json!([]));
-    }
-}
+mod tests;

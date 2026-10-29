@@ -1,15 +1,16 @@
 # Semantic configuration diff and risk codes
 
-**Status: alpha library, not yet reported anywhere.** This page describes the
-semantic diff of issue #242 (PR 9) and [ADR-0008](adr/0008-setup-cli-and-configuration-bundles.md)
-("Change classes" and "Plan, risk acknowledgment, and conditional apply"):
-what it compares, how it classifies each change, the stable risk codes, and
-what it never shows. No command, route or status reports it yet. `ggctl diff`
-needs the bundle reader and the configuration compiler, which move into the
-shared `gateway-config` crate with `ggctl validate` (#242 PR 8); server plans
-and risk acknowledgments are #242 PR 11. Until then the diff is exercised by
-its tests only, and nothing here changes how a gateway is configured, started
-or reloaded.
+**Status: alpha.** This page describes the semantic diff of issue #242 (PR 9)
+and [ADR-0008](adr/0008-setup-cli-and-configuration-bundles.md) ("Change
+classes" and "Plan, risk acknowledgment, and conditional apply"): what it
+compares, how it classifies each change, the stable risk codes, and what it
+never shows. [`ggctl diff`](ggctl.md#diff) reports it for two bundles. The
+gateway compares two compiled environment configurations and two bundles it
+read with its production validators, but nothing serves or logs those
+comparisons yet: server plans and risk acknowledgments are #242 PR 11, and
+`ggctl diff --env`, `--against-env` and `--server` need the environment
+compiler and plans, which are still in the gateway crate. Nothing here
+changes how a gateway is configured, started or reloaded.
 
 ## What it compares
 
@@ -20,7 +21,7 @@ a default never register:
 | Input | Compared as | Field identifiers |
 | --- | --- | --- |
 | Two environment configurations | the configuration compiler's validated plan (`gateway/src/config/plan.rs`), setting by setting | the environment variable name, for example `EGRESS_ALLOWED_HOSTS` |
-| Two [configuration bundles](configuration-bundles.md) | the bundle reader's validated bundle: the manifest, the deployment document, and the policy and tools documents in the form their production validators produce | a dotted document path, for example `policy.egress.hosts` or `resources.policy.sha256` |
+| Two [configuration bundles](configuration-bundles.md) | what the shared bundle reader accepted: the manifest, the deployment document, and the policy and tools documents, as written and checked against their published schemas (`ggctl diff`) or in the form the gateway's production validators produce (the gateway) | a dotted document path, for example `policy.egress.hosts` or `resources.policy.sha256` |
 
 Every compiler input is compared exactly once: the environment adapter
 destructures every domain plan field by field, so a setting added to a plan
@@ -170,20 +171,24 @@ code or lowers the severity.
 
 ## Output in `ggctl diff`
 
-When `ggctl diff` arrives (ADR-0008:
-`ggctl diff (BUNDLE | --env FILE) (--against BUNDLE | --against-env FILE | --server URL) [--check]`),
-its renderers, which are part of this slice and tested, write:
+[`ggctl diff BUNDLE --against BUNDLE`](ggctl.md#diff) reads both bundles with
+the shared reader, as `ggctl validate` does (so the production policy and
+tools validators do not run and the report says so), and compares the
+documents as they were written. It writes:
 
 - human output: one line per change (severity, field, kind, the value or
   `(value withheld)` / `(reference changed)` with entry counts, class, effect
   and codes), then the number of changes, the highest severity and the codes;
-- `--format json`: one `GgctlReport` whose `result` is the `diffResult` above;
-- `--format sarif`: SARIF 2.1.0 with one rule per risk code (its fixed
-  description, a `high`/`medium`/`low` code at level `error`/`warning`/`note`)
-  and one result per code of each change, located at the change's field as a
-  logical location and carrying its section, kind, class and effect. A change
-  without a code is not a finding and has no result. This extends ADR-0008,
-  which gives SARIF to `validate` only, so CI can annotate a review with the
-  same codes a plan will require acknowledging.
+- `--format json`: one `GgctlReport` whose `result.diff` is the `diffResult`
+  above;
+- `--format sarif`: SARIF 2.1.0 with the readers' diagnostics, then one rule
+  per risk code (its fixed description, a `high`/`medium`/`low` code at level
+  `error`/`warning`/`note`) and one result per code of each change, located
+  at the change's field as a logical location and carrying its section, kind,
+  class and effect. A change without a code is not a finding and has no
+  result. This extends ADR-0008, which gives SARIF to `validate` only, so CI
+  can annotate a review with the same codes a plan will require
+  acknowledging.
 
-`--check` exits `4` (`drift`) when anything differs and `0` otherwise.
+`--check` exits `4` (`diff.drift_found`) when anything differs and `0`
+otherwise; an invalid bundle is not compared and exits `3`.

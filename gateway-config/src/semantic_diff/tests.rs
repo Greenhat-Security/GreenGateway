@@ -941,9 +941,7 @@ fn generated_known_weakenings_are_detected_and_risk_never_falls_as_more_are_appl
             if !step.is_empty() {
                 assert!(
                     risks(&step).contains(&code),
-                    "{code}
-{before}
-{candidate}"
+                    "{code}\n{before}\n{candidate}"
                 );
                 steps.insert(code);
             }
@@ -952,9 +950,7 @@ fn generated_known_weakenings_are_detected_and_risk_never_falls_as_more_are_appl
                 diff.risks().into_iter().map(RiskCode::as_str).collect();
             assert!(
                 codes.is_superset(&previous),
-                "{previous:?} -> {codes:?}
-{base}
-{candidate}"
+                "{previous:?} -> {codes:?}\n{base}\n{candidate}"
             );
             assert!(diff.severity() >= previous_severity);
             previous = codes;

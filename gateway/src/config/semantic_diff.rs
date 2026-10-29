@@ -12,9 +12,10 @@
 //!   compile until it is named here and is an unused binding, which CI's
 //!   warnings-as-errors builds refuse, until it is compared; a test holds the
 //!   compared names to the inventory's `CONFIG_INPUTS`.
-//! - [`bundles`] compares two bundles the bundle reader read and
-//!   validated, with their policy and tools documents in the form their
-//!   production validators produced.
+//! - [`bundles`] compares two bundles the shared bundle reader accepted
+//!   with the gateway's production validators, with their policy and tools
+//!   documents in the form those validators produced. (`ggctl diff` compares
+//!   bundles read with the published schemas only, as they were written.)
 //!
 //! Every environment setting is read at startup, so every change is a
 //! `restart` change, except a change of state backend or deployment, which is
@@ -25,19 +26,21 @@
 //!
 //! Nothing here reads a file, the environment or the network; values are
 //! compared in memory and only the closed-vocabulary ones are shown.
-#![allow(dead_code)] // `ggctl diff` and server plans (later #242 slices) are the readers.
+#![allow(dead_code)] // Server plans (#242 PR 11) are the readers; until then the tests are.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use gateway_config::semantic_diff::{
-    compare_bundles, BundleView, ChangeClass, ChangeKind, Comparison, Display, Field, Impact,
-    Redaction, ResourceView, RiskCode, Rule, Section, SemanticDiff,
+use gateway_config::{
+    bundle::{Bundle, BundledResource},
+    semantic_diff::{
+        compare_bundles, BundleView, ChangeClass, ChangeKind, Comparison, Display, Field, Impact,
+        Redaction, RiskCode, Rule, Section, SemanticDiff,
+    },
 };
 use serde_json::{json, Value};
 
 use super::{
     authority_events::{AuthorityEventSettings, AuthorityEventSinkSetting},
-    bundle::{Bundle, BundledResource},
     connections::ConnectionsPlan,
     egress::EgressPlan,
     identity::IdentityPlan,
@@ -49,7 +52,9 @@ use super::{
     AuditDurability, AuthMode, AuthProviderConfig, DatabaseTlsMode, InboundClientAuthConfig,
     McpUpstreamServerConfig, StateBackend, UpstreamRouteConfig,
 };
-use crate::inbound_tls::ClientCertRequirement;
+use crate::{
+    inbound_tls::ClientCertRequirement, rbac::policy::Policy, tools::definitions::ToolDefinition,
+};
 
 /// Compares two compiled environment configurations.
 pub(crate) fn plans(base: &ConfigPlan, candidate: &ConfigPlan) -> SemanticDiff {
@@ -80,15 +85,19 @@ pub(crate) fn plans(base: &ConfigPlan, candidate: &ConfigPlan) -> SemanticDiff {
     comparison.finish()
 }
 
-/// Compares two bundles the bundle reader accepted.
-pub(crate) fn bundles(base: &Bundle, candidate: &Bundle) -> SemanticDiff {
+/// A bundle the shared reader accepted with the production validators.
+type ProductionBundle = Bundle<Policy, Vec<ToolDefinition>>;
+
+/// Compares two bundles the shared reader accepted with the gateway's
+/// production validators, by the documents those validators built.
+pub(crate) fn bundles(base: &ProductionBundle, candidate: &ProductionBundle) -> SemanticDiff {
     let (base_policy, base_tools) = (policy_value(base), tools_value(base));
     let (candidate_policy, candidate_tools) = (policy_value(candidate), tools_value(candidate));
     let mut comparison = Comparison::new();
     compare_bundles(
         &mut comparison,
-        &bundle_view(base, base_policy.as_ref(), base_tools.as_ref()),
-        &bundle_view(
+        &BundleView::of(base, base_policy.as_ref(), base_tools.as_ref()),
+        &BundleView::of(
             candidate,
             candidate_policy.as_ref(),
             candidate_tools.as_ref(),
@@ -97,41 +106,10 @@ pub(crate) fn bundles(base: &Bundle, candidate: &Bundle) -> SemanticDiff {
     comparison.finish()
 }
 
-fn bundle_view<'a>(
-    bundle: &'a Bundle,
-    policy: Option<&'a Value>,
-    tools: Option<&'a Value>,
-) -> BundleView<'a> {
-    BundleView {
-        api_version: bundle.api_version.as_str(),
-        name: &bundle.name,
-        profile: bundle.deployment.profile.as_str(),
-        deployment_sha256: &bundle.deployment.sha256,
-        deployment_canonical_json: &bundle.deployment.canonical_json,
-        policy: resource_view(bundle.policy.as_ref(), policy),
-        tools: resource_view(bundle.tools.as_ref(), tools),
-        connections_from_server: bundle.connections_from_server,
-    }
-}
-
-fn resource_view<'a, T>(
-    resource: Option<&'a BundledResource<T>>,
-    document: Option<&'a Value>,
-) -> ResourceView<'a> {
-    match resource {
-        None => ResourceView::Undeclared,
-        Some(BundledResource::Server) => ResourceView::Server,
-        Some(BundledResource::Bundle { sha256, .. }) => ResourceView::Bundle {
-            sha256: sha256.as_str(),
-            document,
-        },
-    }
-}
-
 /// The validated policy as its loader models it, with every default filled
 /// in. `None` when it cannot be serialized, which the engine reports as an
 /// `unknown` change whenever the pins differ.
-fn policy_value(bundle: &Bundle) -> Option<Value> {
+fn policy_value(bundle: &ProductionBundle) -> Option<Value> {
     match &bundle.policy {
         Some(BundledResource::Bundle { document, .. }) => serde_json::to_value(document).ok(),
         _ => None,
@@ -139,7 +117,7 @@ fn policy_value(bundle: &Bundle) -> Option<Value> {
 }
 
 /// The validated tool definitions, as a tools document.
-fn tools_value(bundle: &Bundle) -> Option<Value> {
+fn tools_value(bundle: &ProductionBundle) -> Option<Value> {
     match &bundle.tools {
         Some(BundledResource::Bundle {
             schema_version,

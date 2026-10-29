@@ -45,8 +45,8 @@ mod resources;
 mod tests;
 
 pub use resources::{
-    compare_bundles, compare_policy, compare_tools, BundleView, ResourceView,
-    DEFAULT_TOOL_MAX_CONCURRENT, DEFAULT_TOOL_TIMEOUT_MS, POLICY_TOP_LEVEL_MEMBERS,
+    compare_bundles, compare_policy, compare_read_bundles, compare_tools, BundleView, ResourceView,
+    DEFAULT_TOOL_MAX_CONCURRENT, DEFAULT_TOOL_TIMEOUT_MS,
 };
 
 /// How serious a risk is. `Low < Medium < High`.
