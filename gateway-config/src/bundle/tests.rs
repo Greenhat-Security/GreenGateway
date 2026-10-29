@@ -21,8 +21,8 @@ use super::{
         MAX_DEPTH, MAX_KEY_BYTES, MAX_OBJECT_MEMBERS, MAX_STRING_BYTES, RESOURCE_LIMITS,
     },
     value::{Decimal, SecretReference, Unresolved, UnresolvedReason},
-    yaml, BundleReport, BundledResource, PublishedSchemasOnly, ReadOptions, ResourceValidators,
-    MANIFEST_MEDIA_TYPE, MAX_DEPLOYMENT_BYTES, MAX_MANIFEST_BYTES,
+    yaml, BundleReport, BundledResource, FileRole, PublishedSchemasOnly, ReadOptions,
+    ResourceValidators, MANIFEST_MEDIA_TYPE, MAX_DEPLOYMENT_BYTES, MAX_MANIFEST_BYTES,
 };
 use crate::canonical_json;
 
@@ -1421,6 +1421,63 @@ fn a_complete_bundle_is_read_with_its_digests() {
         matches!(&read.tools, Some(BundledResource::Bundle { document, .. }) if document["tools"] == json!([]))
     );
     assert!(read.connections_from_server);
+}
+
+#[test]
+fn an_accepted_bundle_keeps_its_exact_files_in_order() {
+    let bundle = TempBundle::complete("source-files");
+    let read = bundle.read().bundle.expect("bundle should be read");
+    let on_disk = |name: &str| fs::read(bundle.root.join(name)).expect("bundle file should read");
+    let found: Vec<_> = read
+        .source_files()
+        .iter()
+        .map(|file| (file.role, file.name.as_str(), file.bytes.clone()))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            (FileRole::Manifest, "bundle.yaml", on_disk("bundle.yaml")),
+            (
+                FileRole::Deployment,
+                "deployment.yaml",
+                on_disk("deployment.yaml")
+            ),
+            (FileRole::Policy, "policy.json", on_disk("policy.json")),
+            (FileRole::Tools, "tools.json", on_disk("tools.json")),
+        ]
+    );
+
+    // A resource the server supplies has no file.
+    let server = TempBundle::complete("source-files-server");
+    let manifest = server.manifest();
+    let start = manifest
+        .find(
+            "    tools:
+",
+        )
+        .expect("tools declaration");
+    let end = manifest
+        .find(
+            "    connections:
+",
+        )
+        .expect("connections declaration");
+    let manifest = format!(
+        "{}    tools:
+      source: server
+{}",
+        &manifest[..start],
+        &manifest[end..]
+    );
+    server.write("bundle.yaml", manifest.as_bytes());
+    fs::remove_file(server.root.join("tools.json")).expect("tools file should remove");
+    let read = server.read().bundle.expect("bundle should be read");
+    let roles: Vec<_> = read.source_files().iter().map(|file| file.role).collect();
+    assert_eq!(
+        roles,
+        [FileRole::Manifest, FileRole::Deployment, FileRole::Policy]
+    );
+    assert!(matches!(read.tools, Some(BundledResource::Server)));
 }
 
 #[test]

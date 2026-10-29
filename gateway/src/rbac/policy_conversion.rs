@@ -54,7 +54,7 @@ use serde::{
 use serde_json::{Map, Value};
 
 use super::{
-    policy::KNOWN_TOP_LEVEL_KEYS,
+    policy::V1_TOP_LEVEL_KEYS,
     policy_document::{
         self, inspect_source, is_valid_element_id, IssueCode, PolicyInspection, PolicySchema,
         DISPATCH_MEMBERS, EGRESS_MEMBERS, POLICY_V1_SCHEMA_VERSION, PRINCIPAL_MEMBERS,
@@ -463,7 +463,7 @@ impl Location {
     /// by name; none exists in a document the v1 reader accepts.
     fn member_order(self) -> &'static [&'static str] {
         match self {
-            Self::Document => KNOWN_TOP_LEVEL_KEYS,
+            Self::Document => V1_TOP_LEVEL_KEYS,
             Self::RoleEntry => ROLE_MEMBERS.allowed,
             Self::Route => ROUTE_MEMBERS.allowed,
             Self::Rule => RULE_MEMBERS.allowed,

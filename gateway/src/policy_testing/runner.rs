@@ -628,6 +628,7 @@ pub(crate) fn limitation_code(limitation: Limitation) -> &'static str {
         Limitation::MissingPrincipalFact => "missing_principal_fact",
         Limitation::MissingDispatchFact => "missing_dispatch_fact",
         Limitation::MissingHostFact => "missing_host_fact",
+        Limitation::MissingMatcherFact => "missing_matcher_fact",
     }
 }
 
@@ -639,6 +640,7 @@ pub(crate) fn tool_limitation_code(limitation: ToolLimitation) -> &'static str {
         ToolLimitation::Principal => "missing_principal_fact",
         ToolLimitation::Method => "missing_method",
         ToolLimitation::Path => "missing_path",
+        ToolLimitation::MatcherFact => "missing_matcher_fact",
     }
 }
 

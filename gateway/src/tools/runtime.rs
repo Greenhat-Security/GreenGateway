@@ -1701,6 +1701,15 @@ impl ToolRuntime {
             Ok(SourceRequestDecision::ToolDisabled) => {
                 return deny("tool_disabled", None, EnumSourceFailureReason::ToolDisabled);
             }
+            // A deny whose conditions read a fact no source request has: the
+            // source is refused as incomplete, before any I/O, with no rule.
+            Ok(SourceRequestDecision::Undetermined) => {
+                return deny(
+                    "policy_evaluation_incomplete",
+                    None,
+                    EnumSourceFailureReason::HttpRuleDenied,
+                );
+            }
             Ok(SourceRequestDecision::Denied { index }) => match policy.rule_ids().get(index) {
                 Some(matched_rule_id) => {
                     return deny(
@@ -4445,6 +4454,7 @@ mod tests {
                     )
                 })
                 .collect(),
+            identity_mappings: None,
         };
         let capture = CaptureSink::new();
         let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
@@ -4567,6 +4577,7 @@ mod tests {
                 principal_ids: Vec::new(),
             },
             action,
+            conditions: None,
         }
     }
 

@@ -49,6 +49,9 @@ pub(crate) enum PolicySource {
     Active,
     /// A candidate submitted with the run. Never persisted or activated.
     InlineCandidate,
+    /// A policy history version, judged for a policy evidence package
+    /// (issue #243, slice 20). Never reactivated.
+    Publication,
 }
 
 impl PolicySource {
@@ -56,6 +59,7 @@ impl PolicySource {
         match self {
             Self::Active => "active",
             Self::InlineCandidate => "inline_candidate",
+            Self::Publication => "publication",
         }
     }
 }

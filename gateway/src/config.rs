@@ -39,6 +39,8 @@ use crate::{
 
 mod authority_events;
 mod bundle;
+#[cfg(test)]
+mod catalog_tests;
 mod connections;
 mod diagnostic;
 mod egress;
