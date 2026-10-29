@@ -42,6 +42,9 @@ pub(super) const POLICY_SIMULATIONS_ADMIN_ROUTE: &str = "/v1/admin/policy/simula
 pub(super) const POLICY_REPLAYS_ADMIN_ROUTE: &str = "/v1/admin/policy/replays";
 /// Poll or cancel one replay job.
 pub(super) const POLICY_REPLAY_ADMIN_ROUTE: &str = "/v1/admin/policy/replays/{id}";
+/// Analyze the structure of the active policy or a candidate (issue #243,
+/// slice 15).
+pub(super) const POLICY_ANALYSES_ADMIN_ROUTE: &str = "/v1/admin/policy/analyses";
 pub(super) const POLICY_RULES_ADMIN_ROUTE: &str = "/v1/admin/policy/rules";
 pub(super) const POLICY_RULE_ADMIN_ROUTE: &str = "/v1/admin/policy/rules/{id}";
 pub(super) const POLICY_RULES_ORDER_ADMIN_ROUTE: &str = "/v1/admin/policy/rules/order";
@@ -120,6 +123,10 @@ pub(super) const ADMIN_POLICY_WRITE_PERMISSION: &str = "admin:policy:write";
 /// simulation resource ADR-0004 reserves it for. Always held together with
 /// `admin:policy:read`, which it never implies.
 pub(super) const ADMIN_POLICY_SIMULATE_PERMISSION: &str = "admin:policy:simulate";
+/// Run the structural policy analyzer. Always held together with
+/// `admin:policy:read`, which it never implies; it grants no write, and an
+/// analysis applies none of the patches it suggests.
+pub(super) const ADMIN_POLICY_ANALYZE_PERMISSION: &str = "admin:policy:analyze";
 pub(super) const ADMIN_TOKENS_READ_PERMISSION: &str = "admin:tokens:read";
 pub(super) const ADMIN_TOKENS_WRITE_PERMISSION: &str = "admin:tokens:write";
 pub(super) const ADMIN_CONNECTIONS_READ_PERMISSION: &str =
@@ -244,6 +251,7 @@ pub(super) struct AdminRoutes {
     pub(super) policy_test_runs_route: String,
     pub(super) policy_simulations_route: String,
     pub(super) policy_replays_route: String,
+    pub(super) policy_analyses_route: String,
     pub(super) policy_replay_route: String,
     pub(super) policy_rules_route: String,
     pub(super) policy_rule_route: String,
@@ -356,6 +364,7 @@ impl AdminRoutes {
             policy_test_runs_route: format!("{api_prefix}/policy/tests/runs"),
             policy_simulations_route: format!("{api_prefix}/policy/simulations"),
             policy_replays_route: format!("{api_prefix}/policy/replays"),
+            policy_analyses_route: format!("{api_prefix}/policy/analyses"),
             policy_replay_route: format!("{api_prefix}/policy/replays/{{id}}"),
             policy_rules_route: format!("{api_prefix}/policy/rules"),
             policy_rule_route: format!("{api_prefix}/policy/rules/{{id}}"),

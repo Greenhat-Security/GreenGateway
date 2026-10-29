@@ -940,6 +940,18 @@ impl RbacState {
             .any(|route_path| path == route_path)
     }
 
+    /// The request paths that reach an MCP endpoint by an alias: every MCP
+    /// route path but the canonical one, each evaluated as an alias pair. The
+    /// policy analyzer reads them, because an alias request selects the route
+    /// whose prefix equals its path before any broader route.
+    pub(crate) fn mcp_alias_paths(&self) -> Vec<String> {
+        self.mcp_route_paths
+            .iter()
+            .filter(|path| path.as_str() != protected_resource::MCP_RESOURCE_PATH)
+            .cloned()
+            .collect()
+    }
+
     fn policy_path_for_request<'a>(&'a self, path: &'a str) -> &'a str {
         if path != protected_resource::MCP_RESOURCE_PATH && self.is_mcp_route_path(path) {
             protected_resource::MCP_RESOURCE_PATH

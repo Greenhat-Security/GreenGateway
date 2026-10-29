@@ -13,6 +13,7 @@ It is intentionally small. Most routes cover GreenGateway's own control-plane su
 - `/v1/admin/policy/tests/runs`
 - `/v1/admin/policy/simulations`
 - `/v1/admin/policy/replays`
+- `/v1/admin/policy/analyses`
 - `/v1/admin/policy/rules`
 - `/v1/admin/policy/drafts`
 - `/v1/admin/traffic`
@@ -30,3 +31,5 @@ Health, version, metrics, and `/admin` remain exempt through the compose environ
 `POST /v1/admin/policy/simulations` simulates synthetic cases against the active policy and a candidate (see `docs/policy-simulation.md`). Its route grants `admin:policy:simulate` ahead of the same catch-all, for the same reason, and the handler additionally requires `admin:policy:read`.
 
 `POST /v1/admin/policy/replays` starts a historical replay job, and `DELETE /v1/admin/policy/replays/{id}` cancels or discards one (see `docs/policy-replay.md`). Their route grants `admin:policy:simulate` ahead of the same catch-all, because a replay writes nothing either; `GET /v1/admin/policy/replays/{id}` falls under the `admin:policy:read` route. Every replay handler additionally requires `admin:policy:read`, `admin:policy:simulate` and `admin:audit:read`.
+
+`POST /v1/admin/policy/analyses` runs the structural policy analyzer over the active policy or a candidate (see `docs/policy-analysis.md`). Its route grants `admin:policy:analyze` ahead of the same catch-all, because an analysis writes nothing and applies none of the patches it suggests, and the handler additionally requires `admin:policy:read`.

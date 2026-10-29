@@ -35,6 +35,10 @@ pub const POLICY_REPLAY_COMPLETED: &str = "policy.replay_completed";
 pub const POLICY_REPLAY_CANCELLED: &str = "policy.replay_cancelled";
 /// A replay job failed with a stable reason and produced no result.
 pub const POLICY_REPLAY_FAILED: &str = "policy.replay_failed";
+/// A structural policy analysis completed (issue #243, slice 15). Records
+/// the base and candidate ETags, the request digest, completeness and
+/// finding counts, never a finding's element or policy content.
+pub const POLICY_ANALYSIS_RUN: &str = "policy.analysis_run";
 pub const SERVICE_TOKEN_CHANGED: &str = "service_token.changed";
 pub const SERVICE_TOKEN_DELEGATION_REJECTED: &str = "service_token.delegation_rejected";
 /// A policy write the cross-resource checks refused before any authority saw

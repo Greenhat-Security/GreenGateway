@@ -251,6 +251,64 @@ pub(crate) fn path_pattern_matches(pattern: &str, path: &str) -> bool {
     PathPattern::new(pattern).matches(path)
 }
 
+/// One segment of a direct-rule path pattern, as the matcher compiles it.
+///
+/// For an analysis that reasons about which paths a pattern can match rather
+/// than matching one path: [`pattern_segments`] reads a pattern with the
+/// matcher's own segment parser, so an analysis and the matcher can never
+/// disagree about what a segment is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PatternSegment<'a> {
+    /// Matches exactly this path segment, which may be empty.
+    Literal(&'a str),
+    /// `*` or a valid `{name}` capture: exactly one non-empty segment.
+    One,
+    /// `**`: zero or more complete segments.
+    Any,
+    /// A capture-like segment that is not a valid capture: matches nothing.
+    Never,
+}
+
+/// The segments of `pattern` as the matcher compiles them, or `None` for a
+/// pattern that is not absolute and so matches no path.
+pub(crate) fn pattern_segments(pattern: &str) -> Option<Vec<PatternSegment<'_>>> {
+    absolute_path_segments(pattern).map(|segments| {
+        segments
+            .into_iter()
+            .map(|segment| match PathSegment::new(segment) {
+                PathSegment::Literal(_) => PatternSegment::Literal(segment),
+                PathSegment::SingleWildcard | PathSegment::Capture => PatternSegment::One,
+                PathSegment::DeepWildcard => PatternSegment::Any,
+                PathSegment::Never => PatternSegment::Never,
+            })
+            .collect()
+    })
+}
+
+/// Whether a method list matches every request method, as the matcher reads
+/// it: empty, or naming `*`.
+pub(crate) fn matches_every_method(methods: &[String]) -> bool {
+    matches!(MethodMatcher::new(methods), MethodMatcher::Any)
+}
+
+/// Whether every request method `covered` matches is one `covering` matches,
+/// both read as the matcher reads them. Exact: a list that matches every
+/// method is covered only by another such list, and named methods compare
+/// ASCII-case-insensitively, as a request's method does.
+pub(crate) fn methods_cover(covering: &[String], covered: &[String]) -> bool {
+    match (MethodMatcher::new(covering), MethodMatcher::new(covered)) {
+        (MethodMatcher::Any, _) => true,
+        (MethodMatcher::Exact(_), MethodMatcher::Any) => false,
+        (MethodMatcher::Exact(covering), MethodMatcher::Exact(covered)) => {
+            covered.iter().all(|method| {
+                covering
+                    .iter()
+                    .any(|candidate| candidate.eq_ignore_ascii_case(method))
+            })
+        }
+    }
+}
+
 /// Returns the first path segment that looks like a capture (contains `{`
 /// or `}`) but does not parse as a valid one, if any. `PathSegment::new`
 /// silently compiles such a segment to `PathSegment::Never`, which never

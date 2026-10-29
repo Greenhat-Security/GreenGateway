@@ -411,6 +411,14 @@ pub(super) fn add_admin_api_routes(
                         .layer(Extension(Arc::clone(&replay_jobs))),
                 )
                 .route(
+                    routes.admin.policy_analyses_route.as_str(),
+                    // Its own limiter, so analyses never take a simulation's,
+                    // test run's or replay's slots.
+                    post(policy_analyses_endpoint).layer(Extension(Arc::new(
+                        PolicyEvaluationLimiter::new(MAX_CONCURRENT_POLICY_ANALYSES),
+                    ))),
+                )
+                .route(
                     routes.admin.policy_rules_route.as_str(),
                     post(policy_rule_post_endpoint),
                 )
