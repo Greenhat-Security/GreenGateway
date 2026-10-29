@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use crate::audit::{
     query::{
         AuditQueryError, AuditQueryFilters, AuditQueryPage, AuditQueryStore, EndpointAuditActivity,
-        EndpointAuditFilters, RequestObservation, RequestObservationFilters,
+        EndpointAuditFilters, ReplayCutoff, RequestObservation, RequestObservationFilters,
         ShadowRuleWouldDenySummarySet,
     },
     sqlite_sink, AuditEvent,
@@ -162,6 +162,24 @@ impl SqliteAuditEventStore {
             query
                 .rule_hit_counts()
                 .map_err(|error| map_audit_query_error("audit_rule_hit_counts", error))
+        })
+        .await
+    }
+
+    /// Fix the rows a historical replay job reads (issue #243, slice 13):
+    /// the log's high-water mark now, and the rows of the window
+    /// `[from_epoch_us, to_epoch_us)` at or below it. See
+    /// [`AuditQueryStore::replay_cutoff`].
+    pub(crate) async fn replay_cutoff(
+        &self,
+        from_epoch_us: i64,
+        to_epoch_us: i64,
+    ) -> Result<ReplayCutoff, RepositoryError> {
+        let query = Arc::clone(&self.query);
+        run_blocking(move || {
+            query
+                .replay_cutoff(from_epoch_us, to_epoch_us)
+                .map_err(|error| map_audit_query_error("audit_replay_cutoff", error))
         })
         .await
     }
