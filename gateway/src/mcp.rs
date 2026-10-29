@@ -1679,6 +1679,106 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn posted_json_rpc_responses_are_refused_and_notifications_accepted() {
+        let (state, _registry) = mcp_state_from_empty_registry();
+        let post = |payload: Value| {
+            AxumRequest::builder()
+                .method(http::Method::POST)
+                .uri("/mcp")
+                .header(header::HOST, "localhost")
+                .header(header::CONTENT_TYPE, JSON_MIME)
+                .header(header::ACCEPT, "application/json, text/event-stream")
+                .header("MCP-Protocol-Version", "2025-11-25")
+                .body(Body::from(payload.to_string()))
+                .expect("MCP request should build")
+        };
+
+        // `/mcp` is stateless and sends the client no requests, so a JSON-RPC
+        // response or error answers nothing. rmcp 3.6 refuses one with 400 and
+        // an invalid-request error that names no id; rmcp 3.5 accepted it.
+        for payload in [
+            json!({"jsonrpc": "2.0", "id": 7, "result": {}}),
+            json!({"jsonrpc": "2.0", "id": 7, "error": {"code": -32603, "message": "failed"}}),
+        ] {
+            let (status, body) = mcp_json_rpc_status_and_body(&state, post(payload.clone())).await;
+            assert_eq!(status, http::StatusCode::BAD_REQUEST, "{payload}: {body}");
+            assert_eq!(body["error"]["code"], json!(-32600), "{payload}: {body}");
+            assert!(
+                body.get("id").is_none_or(Value::is_null),
+                "{payload}: {body}"
+            );
+            assert!(body.get("result").is_none(), "{payload}: {body}");
+        }
+
+        // A notification is still accepted without a body.
+        let response = state
+            .service
+            .clone()
+            .oneshot(post(
+                json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            ))
+            .await
+            .expect("MCP service should respond");
+        assert_eq!(response.status(), http::StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn json_rpc_messages_are_classified_by_their_members() {
+        let (state, _registry) = mcp_state_from_empty_registry();
+        let post = |payload: Value| {
+            AxumRequest::builder()
+                .method(http::Method::POST)
+                .uri("/mcp")
+                .header(header::HOST, "localhost")
+                .header(header::CONTENT_TYPE, JSON_MIME)
+                .header(header::ACCEPT, "application/json, text/event-stream")
+                .header("MCP-Protocol-Version", "2025-11-25")
+                .body(Body::from(payload.to_string()))
+                .expect("MCP request should build")
+        };
+
+        // rmcp 3.6 classifies a message by its members before parsing it, so
+        // a request that also carries `result` or `error`, or a message with
+        // both, is no JSON-RPC message at all and is refused.
+        for payload in [
+            json!({"jsonrpc": "2.0", "id": 7, "method": "tools/list", "result": {}}),
+            json!({"jsonrpc": "2.0", "id": 7, "method": "tools/list",
+                   "error": {"code": -32603, "message": "failed"}}),
+            json!({"jsonrpc": "2.0", "id": 7, "result": {},
+                   "error": {"code": -32603, "message": "failed"}}),
+        ] {
+            let response = state
+                .service
+                .clone()
+                .oneshot(post(payload.clone()))
+                .await
+                .expect("MCP service should respond")
+                .map(Body::new);
+            assert!(
+                response.status().is_client_error(),
+                "{payload}: {}",
+                response.status()
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("MCP response body should be readable");
+            let body = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+            assert!(body.get("result").is_none(), "{payload}: {body}");
+        }
+
+        // rmcp 3.6 reads an integral request id written in float form as that
+        // integer, and the answer carries the integer.
+        let (status, body) = mcp_json_rpc_status_and_body(
+            &state,
+            post(json!({"jsonrpc": "2.0", "id": 7.0, "method": "tools/list"})),
+        )
+        .await;
+        assert_eq!(status, http::StatusCode::OK, "{body}");
+        assert_eq!(body["id"], json!(7), "{body}");
+        assert_eq!(body["result"]["tools"], json!([]), "{body}");
+    }
+
     #[test]
     fn task_augmented_tool_calls_are_recognized_before_rmcp_parses_them() {
         for body in [

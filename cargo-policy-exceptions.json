@@ -9,7 +9,7 @@
       ],
       "owner": "GreenGateway maintainers",
       "expires": "2026-12-01",
-      "reason": "reqwest 0.13.5, pem 4 (via rcgen 0.14.10), rmcp 3.5.1 and the gateway workspace pin use base64 0.23 while axum, hyper-util, jsonwebtoken, metrics-exporter-prometheus, pem 3 and postgres-protocol still require 0.22.",
+      "reason": "reqwest 0.13.5, pem 4 (via rcgen 0.14.10), rmcp 3.7.0 and the gateway workspace pin use base64 0.23 while axum, hyper-util, jsonwebtoken, metrics-exporter-prometheus, pem 3 and postgres-protocol still require 0.22.",
       "remediation": "Re-evaluate when the listed 0.22 parent dependencies update; remove the exception once their version requirements converge on 0.23.",
       "parents": {
         "0.22.1": [
@@ -24,7 +24,7 @@
           "gateway@1.0.1",
           "pem@4.0.0",
           "reqwest@0.13.5",
-          "rmcp@3.5.1"
+          "rmcp@3.7.0"
         ]
       }
     },
@@ -194,10 +194,10 @@
         ],
         "0.3.4": [
           "ahash@0.8.12",
-          "jsonschema-value@0.58.6",
-          "jsonschema@0.58.6",
+          "jsonschema-value@0.60.2",
+          "jsonschema@0.60.2",
           "rand_core@0.9.5",
-          "referencing@0.58.6"
+          "referencing@0.60.2"
         ],
         "0.4.3": [
           "crypto-common@0.2.2",
@@ -229,7 +229,7 @@
         "0.17.1": [
           "hashlink@0.12.2",
           "indexmap@2.14.2",
-          "referencing@0.58.6"
+          "referencing@0.60.2"
         ]
       }
     },
@@ -312,7 +312,7 @@
         "0.10.2": [
           "postgres-protocol@0.6.12",
           "quinn-proto@0.11.18",
-          "rmcp@3.5.1",
+          "rmcp@3.7.0",
           "tokio-postgres@0.7.18",
           "tungstenite@0.30.0"
         ]
@@ -385,7 +385,7 @@
           "der_derive@0.7.3",
           "jni-macros@0.22.4",
           "jni-sys-macros@0.4.1",
-          "jsonschema-macros-core@0.58.6",
+          "jsonschema-macros-core@0.60.2",
           "rust-embed-impl@8.13.0",
           "strum_macros@0.28.0",
           "synstructure@0.13.2",
@@ -547,7 +547,7 @@
           "schannel@0.1.29",
           "socket2@0.6.5",
           "tempfile@3.27.0",
-          "tokio@1.53.3",
+          "tokio@1.54.1",
           "winapi-util@0.1.11"
         ]
       }

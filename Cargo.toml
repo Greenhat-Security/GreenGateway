@@ -55,10 +55,11 @@ ipnet = "2.11.0"
 # into unknown formats, which the crate accepts. Request `idna` explicitly so
 # those formats keep the checks they had when idna was a mandatory dependency.
 # `arbitrary-precision` matches serde_json's `arbitrary_precision` below. Without
-# it jsonschema assumes every number fits a u64, i64 or f64 and panics on a tool
-# argument such as `1e400`. Exact comparison costs grow with the square of a
-# number's digits; `gateway/src/tools/definitions.rs` bounds that work.
-jsonschema = { version = "0.58.6", default-features = false, features = ["arbitrary-precision", "idna"] }
+# it jsonschema cannot compare a number that does not fit a u64, i64 or f64
+# exactly; releases before 0.60.1 panicked on a tool argument such as `1e400`.
+# Exact comparison costs grow with the square of a number's digits;
+# `gateway/src/tools/definitions.rs` bounds that work.
+jsonschema = { version = "0.60.2", default-features = false, features = ["arbitrary-precision", "idna"] }
 jsonwebtoken = { version = "11.0.0", features = ["aws_lc_rs"] }
 # Already in the graph transitively (tokio, mio and socket2 depend on it on
 # Unix), and the same 0.2.x they resolve. Naming it directly adds a dependency
@@ -76,7 +77,7 @@ notify = "8.2.0"
 # without hand-rolling 256-bit modular arithmetic.
 num-bigint = { version = "0.4.8", default-features = false }
 percent-encoding = "2.3.2"
-pulldown-cmark = { version = "0.13.0", default-features = false }
+pulldown-cmark = { version = "0.13.5", default-features = false }
 proptest = "1.9.0"
 rcgen = "0.14.10"
 reqwest = { version = "0.13.2", default-features = false, features = ["json", "rustls", "stream"] }

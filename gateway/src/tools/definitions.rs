@@ -3363,6 +3363,39 @@ mod tests {
     }
 
     #[test]
+    fn unevaluated_reference_cycle_through_a_nested_resource_compiles_without_overflowing() {
+        // The precheck follows only local `#` references, so a cycle back to
+        // the root's `$id` from a nested resource reaches the compiler.
+        // jsonschema 0.58.6 overflowed the stack, aborting the process, while
+        // it compiled such a schema beside `unevaluated*`; 0.60.2 compiles it.
+        for keyword in ["unevaluatedProperties", "unevaluatedItems"] {
+            let mut tool = echo_tool("cyclic_schema", "POST", "/v1/echo");
+            tool["input_json_schema"] = json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "$id": "https://schemas.example.test/echo",
+                "type": "object",
+                "required": ["message"],
+                "properties": {
+                    "message": { "type": "string" },
+                    "include_details": { "type": "boolean" }
+                },
+                "anyOf": [{
+                    "$id": "https://schemas.example.test/echo-branch",
+                    "$ref": "https://schemas.example.test/echo",
+                    keyword: false
+                }],
+                keyword: { "type": "boolean" }
+            });
+
+            ToolRegistry::from_json_value(json!({
+                "schema_version": "0.1.0",
+                "tools": [tool]
+            }))
+            .unwrap_or_else(|error| panic!("{keyword} cycle should compile: {error}"));
+        }
+    }
+
+    #[test]
     fn duplicate_input_schema_anchor_names_are_rejected_before_jsonschema_compile() {
         let mut tool = echo_tool("duplicate_anchor_schema", "POST", "/v1/echo");
         tool["input_json_schema"] = duplicate_anchor_schema();
