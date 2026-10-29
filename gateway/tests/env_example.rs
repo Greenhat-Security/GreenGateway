@@ -4,6 +4,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use gateway_config::catalog::{self, Cloudflare, CloudflareExclusion};
+
 #[test]
 fn env_example_matches_gateway_env_reads() {
     let gateway_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -171,6 +173,44 @@ fn configuration_doc_matches_gateway_env_reads() {
     );
 }
 
+/// The field catalog (`gateway_config::catalog`) names every setting the
+/// gateway's configuration compiler reads; the source scan below finds every
+/// variable `gateway/src` reads by name. They are the same set, so nothing the
+/// gateway reads escapes the catalog's checks.
+#[test]
+fn field_catalog_matches_gateway_env_reads() {
+    let gateway_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+    let catalog: BTreeSet<String> = catalog::FIELDS
+        .iter()
+        .map(|field| field.environment.to_owned())
+        .collect();
+    let code_reads = code_env_vars(&gateway_root.join("src"));
+
+    let missing_from_catalog: Vec<_> = code_reads.difference(&catalog).cloned().collect();
+    let missing_from_code: Vec<_> = catalog.difference(&code_reads).cloned().collect();
+
+    assert!(
+        missing_from_catalog.is_empty() && missing_from_code.is_empty(),
+        "field catalog drift detected.\n\
+         Read in gateway/src but missing from gateway-config's catalog: {}\n\
+         In the catalog but not read in gateway/src: {}",
+        format_vars(&missing_from_catalog),
+        format_vars(&missing_from_code)
+    );
+}
+
+/// The Cloudflare wrapper forwards exactly the fields the catalog marks
+/// forwarded, and its guide names every field the catalog excludes.
+///
+/// Each exclusion carries its reason in the catalog
+/// (`gateway_config::catalog::CloudflareExclusion`): the edge terminates TLS
+/// and client certificates never arrive, no HTTP/2 preface reaches the
+/// container, the Worker exposes one container port and sets `LISTEN_ADDR`
+/// itself, cluster mode needs a secret file the deployment has nowhere to
+/// mount, and the Worker serves no cluster status. A forwarding entry that
+/// cannot work is worse than an absent one: it invites the configuration it
+/// silently breaks.
 #[test]
 fn cloudflare_forwarding_matches_supported_gateway_env_vars() {
     let gateway_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -178,135 +218,11 @@ fn cloudflare_forwarding_matches_supported_gateway_env_vars() {
         .parent()
         .expect("gateway crate should live directly under the repo root");
 
-    let mut expected = code_env_vars(&gateway_root.join("src"));
-    expected.remove("LISTEN_ADDR");
-    expected.remove("ADMIN_LISTEN_ADDR");
-    // Inbound TLS settings are deliberately not forwardable.
-    //
-    // The Worker terminates TLS at Cloudflare's edge and reaches the container
-    // over plain HTTP/1.1 on `CONTAINER_PORT`. Forwarding these would make the
-    // container demand a TLS ClientHello on a connection the Worker will never
-    // start one on, so every request would fail while the deployment looked
-    // correctly configured. There is also nowhere for an operator to mount a
-    // certificate and key in that deployment shape.
-    //
-    // Excluded here rather than added to the allowlist because a forwarding
-    // entry that cannot work is worse than an absent one: it invites the
-    // configuration it silently breaks.
-    //
-    // The gRPC settings are excluded for a stronger version of the same reason:
-    // Cloudflare Containers can never carry gRPC. The edge terminates the client
-    // connection and the Durable Object opens its own over HTTP/1.1, so no
-    // HTTP/2 connection preface can arrive at the container -- there is no
-    // configuration that makes the listener reachable, only one that makes an
-    // operator believe it is.
-    for excluded in [
-        "TLS_CERT_FILE",
-        "TLS_KEY_FILE",
-        "ADMIN_TLS_CERT_FILE",
-        "ADMIN_TLS_KEY_FILE",
-        "TLS_MIN_VERSION",
-        "TLS_HANDSHAKE_TIMEOUT_MS",
-        "TLS_MAX_CONCURRENT_HANDSHAKES",
-        // Client-certificate authentication is excluded for a sharper version
-        // of the same reason. It is not merely unusable through a Worker: the
-        // edge terminates the client's TLS connection, so the client
-        // certificate -- if the caller even sent one -- never reaches the
-        // container, and the Durable Object's own connection carries none.
-        // Forwarding CLIENT_CERT_MODE=required would therefore refuse every
-        // request in a deployment whose configuration said mutual TLS was
-        // working.
-        "CLIENT_CERT_MODE",
-        "CLIENT_CERT_CA_FILE",
-        "CLIENT_CERT_CRL_FILE",
-        "CLIENT_CERT_IDENTITY_SOURCE",
-        "ADMIN_CLIENT_CERT_MODE",
-        "ADMIN_CLIENT_CERT_CA_FILE",
-        "ADMIN_CLIENT_CERT_CRL_FILE",
-        "GRPC_LISTEN_ADDR",
-        "GRPC_MAX_CONCURRENT_STREAMS",
-        "GRPC_MAX_METADATA_BYTES",
-        // The PostgreSQL cluster-mode foundation is excluded for the
-        // strongest version of the reasons above, and one more that is its
-        // own: the mode's connection string may only enter the container as
-        // a permission-checked secret FILE (DATABASE_URL_FILE), and a
-        // Cloudflare Containers deployment has no volume to mount one on --
-        // the value would have to arrive as a forwarded plain environment
-        // variable, which is exactly the shape the setting exists to refuse.
-        // Forwarding any of these would let an operator write a cluster-mode
-        // configuration the platform cannot honor and the gateway must
-        // reject at startup. Cluster mode is also single-purpose multi-
-        // replica state sharing, which a one-container-per-deployment
-        // Workers + Containers shape has no use for even with a database
-        // elsewhere.
-        "STATE_BACKEND",
-        "DEPLOYMENT_ID",
-        "DATABASE_URL_FILE",
-        "DATABASE_TLS_MODE",
-        "DATABASE_TLS_CA_FILE",
-        "DATABASE_POOL_MAX",
-        "DATABASE_CONNECT_TIMEOUT_MS",
-        "DATABASE_ACQUIRE_TIMEOUT_MS",
-        "DATABASE_STATEMENT_TIMEOUT_MS",
-        "DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS",
-        "DATABASE_LOCK_TIMEOUT_MS",
-        "DATABASE_STARTUP_RETRY_LIMIT",
-        "DATABASE_AUTO_MIGRATE",
-        "DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS",
-        // Cluster-mode-only: the keyring that seals pending admin logins in
-        // PostgreSQL. It is rejected outright when STATE_BACKEND is sqlite,
-        // so with STATE_BACKEND excluded it can never be honoured here.
-        "ADMIN_LOGIN_KEYRING",
-        // Likewise the keyring the shared rate limiter keys its buckets
-        // under: cluster mode only, rejected in standalone mode.
-        "RATE_LIMIT_KEYRING",
-        // And the discovery projector's cadence: the projector runs only in
-        // cluster mode and its settings are rejected in standalone mode, so
-        // with STATE_BACKEND excluded a forwarded value could only ever
-        // fail the container's startup.
-        "DISCOVERY_PROJECTOR_LEASE_TTL_MS",
-        "DISCOVERY_PROJECTOR_POLL_MS",
-        "DISCOVERY_PROJECTOR_BATCH",
-        // Cluster membership (issue #241, PR 13): the heartbeat interval
-        // and stale window of the `cluster_members` roster. Cluster mode
-        // only, rejected in standalone mode, so never honoured here.
-        "CLUSTER_HEARTBEAT_MS",
-        "CLUSTER_MEMBER_STALE_MS",
-        // The maintenance singleton (issue #241, PR 13): pass interval,
-        // leader lease TTL, and PostgreSQL audit retention. Cluster mode
-        // only, rejected in standalone mode, so never honoured here.
-        "CLUSTER_MAINTENANCE_INTERVAL_MS",
-        "CLUSTER_MAINTENANCE_LEASE_TTL_MS",
-        "AUDIT_POSTGRES_RETENTION_DAYS",
-        // Authority-event delivery (issue #425, PR 3): the dispatcher's
-        // sink and its file, the pseudonym key aliases, and the journal's
-        // capacity and retention. Cluster mode only, rejected in standalone
-        // mode, so never honoured here.
-        "AUTHORITY_EVENT_SINK",
-        "AUTHORITY_EVENT_FILE",
-        "AUTHORITY_PSEUDONYM_KEY_ALIAS",
-        "AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS",
-        "AUTHORITY_EVENT_JOURNAL_CAPACITY",
-        "AUTHORITY_EVENT_RETENTION_HOURS",
-        // The readiness probe's cache window (issue #241, PR 14): it
-        // bounds how often `/readyz` consults the shared authority, and
-        // standalone readiness consults none, so the setting is rejected
-        // in sqlite mode and could never be honoured here.
-        "READINESS_PROBE_CACHE_MS",
-        // Whether the cluster status API may name this replica's own host
-        // (issue #241, PR 14). Unlike the settings above, the gateway honours
-        // this in BOTH modes, because standalone serves the same status
-        // shapes for its single instance. It is excluded here for a different
-        // reason: the Cloudflare worker serves no cluster status endpoint at
-        // all, so there is nothing there for the setting to affect.
-        "CLUSTER_STATUS_EXPOSE_HOSTNAMES",
-    ] {
-        assert!(
-            expected.remove(excluded),
-            "{excluded} is excluded from Cloudflare forwarding but is no longer read in \
-             gateway/src; drop the exclusion so it cannot outlive the setting"
-        );
-    }
+    let expected: BTreeSet<String> = catalog::FIELDS
+        .iter()
+        .filter(|field| field.cloudflare == Cloudflare::Forwarded)
+        .map(|field| field.environment.to_owned())
+        .collect();
     let forwarded = cloudflare_forwarded_env_vars(&repo_root.join("cloudflare/src/config.ts"));
 
     let missing_from_cloudflare: Vec<_> = expected.difference(&forwarded).cloned().collect();
@@ -315,11 +231,44 @@ fn cloudflare_forwarding_matches_supported_gateway_env_vars() {
     assert!(
         missing_from_cloudflare.is_empty() && unsupported_in_cloudflare.is_empty(),
         "Cloudflare environment forwarding drift detected.\n\
-         Gateway variables missing from Cloudflare: {}\n\
-         Unsupported variables forwarded by Cloudflare: {}",
+         Fields the catalog forwards but Cloudflare does not: {}\n\
+         Variables Cloudflare forwards that the catalog excludes or does not know: {}",
         format_vars(&missing_from_cloudflare),
         format_vars(&unsupported_in_cloudflare)
     );
+
+    let config = fs::read_to_string(repo_root.join("cloudflare/src/config.ts"))
+        .expect("cloudflare/src/config.ts should be readable");
+    for field in catalog::FIELDS {
+        if field.cloudflare == Cloudflare::Excluded(CloudflareExclusion::ContainerListener) {
+            assert!(
+                config.contains(&format!("containerEnv.{} =", field.environment)),
+                "the wrapper sets {} itself",
+                field.environment
+            );
+        }
+    }
+
+    let guide = fs::read_to_string(repo_root.join("docs/deployment/cloudflare.md"))
+        .expect("docs/deployment/cloudflare.md should be readable");
+    let named: Vec<&str> = guide.split('`').skip(1).step_by(2).collect();
+    for field in catalog::FIELDS {
+        let Cloudflare::Excluded(exclusion) = field.cloudflare else {
+            continue;
+        };
+        // The guide may name a family of settings with a trailing `*`, as it
+        // names "the `DATABASE_*` settings".
+        let documented = named.iter().any(|name| match name.strip_suffix('*') {
+            Some(prefix) => field.environment.starts_with(prefix),
+            None => *name == field.environment,
+        });
+        assert!(
+            documented,
+            "docs/deployment/cloudflare.md does not name {}, which the wrapper excludes ({})",
+            field.environment,
+            exclusion.code()
+        );
+    }
 }
 
 fn documented_env_vars(path: &Path) -> BTreeSet<String> {
