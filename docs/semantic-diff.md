@@ -6,10 +6,13 @@ classes" and "Plan, risk acknowledgment, and conditional apply"): what it
 compares, how it classifies each change, the stable risk codes, and what it
 never shows. [`ggctl diff`](ggctl.md#diff) reports it for two bundles. The
 gateway compares two compiled environment configurations and two bundles it
-read with its production validators, but nothing serves or logs those
-comparisons yet: server plans and risk acknowledgments are #242 PR 11, and
-`ggctl diff --env`, `--against-env` and `--server` need the environment
-compiler and plans, which are still in the gateway crate. Nothing here
+read with its production validators, and the standalone ledger's plans
+([configuration-ledger.md](configuration-ledger.md#plans-and-conditional-apply))
+diff a candidate against the head this way and require every risk code to be
+acknowledged before an apply. Nothing serves or logs those comparisons yet:
+the admin routes are a later #242 slice, and `ggctl diff --env`,
+`--against-env` and `--server` need the environment compiler and those
+routes. Nothing here
 changes how a gateway is configured, started or reloaded.
 
 ## What it compares

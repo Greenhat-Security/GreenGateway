@@ -25,6 +25,12 @@
 //! - **Pointer.** One row names the desired revision, which is always the
 //!   newest, and the active revision, the one a running gateway compiled.
 //!   Both only move forward: a rollback is a new revision with prior content.
+//! - **Requests.** A revision applied online records the request it was
+//!   applied under ([`RevisionRequest`]): the plan it was bound to, digests
+//!   of its idempotency key and of the request, the risk codes its actor
+//!   acknowledged and whether it was staged only. An index holds each
+//!   idempotency key once, so a retried request finds the revision it made
+//!   instead of making another. [`crate::revisions`] is the caller.
 //!
 //! The ledger fails closed. Opening it checks the file's location and
 //! permissions, the SQLite page structure, the exact schema (including the
@@ -45,8 +51,8 @@
 //!
 //! Not here yet: selecting ledger mode at startup, the state-directory lock
 //! that keeps offline `ggctl ledger` commands and a running gateway apart,
-//! evidence and outbox rows, `ggctl ledger seed|verify|rollback`, plans and
-//! online apply, and pruning. Until pruning lands an append beyond
+//! delivery of the revisions' evidence to the audit pipeline, `ggctl ledger
+//! seed|verify|rollback`, and pruning. Until pruning lands an append beyond
 //! [`MAX_RETAINED_REVISIONS`] is refused rather than history dropped.
 //!
 //! Like the rest of this crate the ledger reads no clock and no environment:
@@ -66,6 +72,7 @@ use std::{fmt, path::Path, time::SystemTime};
 use rusqlite::Connection;
 
 use crate::bundle::{ApiVersion, Bundle, FileName, FileRole, Profile, SourceFile};
+use crate::canonical_json;
 use crate::opaque_id::is_valid_opaque_id;
 
 /// The ledger's file name beneath the state directory.
@@ -84,6 +91,10 @@ pub const MAX_ACTOR_SUBJECT_BYTES: usize = 4096;
 pub const MAX_ACTOR_ISSUER_BYTES: usize = 4096;
 /// The longest system actor label.
 pub const MAX_SYSTEM_LABEL_BYTES: usize = 128;
+/// The longest idempotency key a request may carry.
+pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 128;
+/// The media type an idempotency key's digest frames the key under.
+const IDEMPOTENCY_KEY_MEDIA_TYPE: &str = "application/vnd.greengateway.idempotency-key";
 
 /// An opaque revision identifier: `rev-` and 32 lowercase hexadecimal digits
 /// taken from the revision's record hash.
@@ -117,6 +128,62 @@ impl fmt::Display for RevisionId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
     }
+}
+
+/// An opaque plan identifier: `plan-` and 32 lowercase hexadecimal digits.
+/// The caller draws the digits from a cryptographically secure source; this
+/// crate has none.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PlanId(String);
+
+impl PlanId {
+    const PREFIX: &'static str = "plan-";
+    const DIGITS: usize = 32;
+
+    pub fn parse(text: &str) -> Option<Self> {
+        let digits = text.strip_prefix(Self::PREFIX)?;
+        (digits.len() == Self::DIGITS && is_lowercase_hex(digits)).then(|| Self(text.to_owned()))
+    }
+
+    /// The plan ID made of 16 random bytes.
+    pub fn from_random(bytes: [u8; 16]) -> Self {
+        Self(format!("{}{}", Self::PREFIX, hex::encode(bytes)))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for PlanId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// Whether `key` is an idempotency key a request may carry: 1 to
+/// [`MAX_IDEMPOTENCY_KEY_BYTES`] bytes of ASCII letters, digits, `.`, `_`,
+/// `:` and `-`, the grammar the gateway's other idempotent admin requests
+/// accept.
+pub fn is_idempotency_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= MAX_IDEMPOTENCY_KEY_BYTES
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+}
+
+/// What the ledger stores for an idempotency key: the `GGDIGEST` source
+/// frame of its bytes, never the key itself.
+fn idempotency_key_digest(key: &str) -> String {
+    canonical_json::source_digest(IDEMPOTENCY_KEY_MEDIA_TYPE, "v1", key.as_bytes())
+}
+
+/// Whether `digest` is `sha256:` and 64 lowercase hexadecimal digits.
+fn is_framed_digest(digest: &str) -> bool {
+    digest
+        .strip_prefix("sha256:")
+        .is_some_and(|digits| digits.len() == 64 && is_lowercase_hex(digits))
 }
 
 fn is_lowercase_hex(text: &str) -> bool {
@@ -361,13 +428,7 @@ impl RevisionCodes {
         required_permissions: &[S],
     ) -> Result<Self, LedgerError> {
         let list = |codes: &[S]| {
-            let mut list: Vec<String> = codes.iter().map(|code| code.as_ref().to_owned()).collect();
-            list.sort();
-            list.dedup();
-            let valid = list.len() <= MAX_RECORDED_CODES && list.iter().all(|code| is_code(code));
-            valid
-                .then_some(list)
-                .ok_or(LedgerError::Refused(Refusal::CodeNotRecordable))
+            sorted_codes(codes).ok_or(LedgerError::Refused(Refusal::CodeNotRecordable))
         };
         Ok(Self {
             changed_sections: list(changed_sections)?,
@@ -389,6 +450,15 @@ impl RevisionCodes {
     }
 }
 
+/// `codes` sorted and deduplicated, or `None` when a code is outside the
+/// grammar or the list is beyond its bound.
+fn sorted_codes<S: AsRef<str>>(codes: &[S]) -> Option<Vec<String>> {
+    let mut list: Vec<String> = codes.iter().map(|code| code.as_ref().to_owned()).collect();
+    list.sort();
+    list.dedup();
+    (list.len() <= MAX_RECORDED_CODES && list.iter().all(|code| is_code(code))).then_some(list)
+}
+
 fn is_code(code: &str) -> bool {
     let bytes = code.as_bytes();
     bytes.len() <= MAX_CODE_BYTES
@@ -400,6 +470,80 @@ fn is_code(code: &str) -> bool {
         })
 }
 
+/// The online request a revision was applied under.
+///
+/// Recorded in the revision itself, so the record hash and the chain cover
+/// it: the plan the request was bound to, the digest of its idempotency key
+/// (never the key), the digest of the whole request, the risk codes its
+/// actor acknowledged, which are always exactly the revision's risk codes,
+/// and whether it was staged only. A revision an offline operator command
+/// writes records none.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RevisionRequest {
+    plan: PlanId,
+    idempotency_key: String,
+    binding: String,
+    acknowledged_risks: Vec<String>,
+    stage_only: bool,
+}
+
+impl RevisionRequest {
+    /// A request carrying the idempotency key `key`, which must satisfy
+    /// [`is_idempotency_key`], and `binding`, the request's own digest
+    /// (`sha256:` and 64 lowercase hexadecimal digits). The acknowledged risk
+    /// codes are sorted and deduplicated; an append refuses them unless they
+    /// are exactly the revision's risk codes.
+    pub fn new<S: AsRef<str>>(
+        plan: PlanId,
+        key: &str,
+        binding: &str,
+        acknowledged_risks: &[S],
+        stage_only: bool,
+    ) -> Result<Self, LedgerError> {
+        const REFUSED: LedgerError = LedgerError::Refused(Refusal::RequestNotRecordable);
+        if !is_idempotency_key(key) || !is_framed_digest(binding) {
+            return Err(REFUSED);
+        }
+        Ok(Self {
+            plan,
+            idempotency_key: idempotency_key_digest(key),
+            binding: binding.to_owned(),
+            acknowledged_risks: sorted_codes(acknowledged_risks).ok_or(REFUSED)?,
+            stage_only,
+        })
+    }
+
+    pub fn plan(&self) -> &PlanId {
+        &self.plan
+    }
+
+    /// The digest of the request's idempotency key.
+    pub fn idempotency_key_digest(&self) -> &str {
+        &self.idempotency_key
+    }
+
+    /// Whether this request carried the idempotency key `key`.
+    pub fn has_idempotency_key(&self, key: &str) -> bool {
+        self.idempotency_key == idempotency_key_digest(key)
+    }
+
+    /// The digest of the request as its caller bound it.
+    pub fn binding(&self) -> &str {
+        &self.binding
+    }
+
+    /// The risk codes the actor acknowledged, sorted.
+    pub fn acknowledged_risks(&self) -> &[String] {
+        &self.acknowledged_risks
+    }
+
+    /// Whether the request asked for the revision to be staged only: the
+    /// active pointer does not move with it, whatever its activation class.
+    pub fn stage_only(&self) -> bool {
+        self.stage_only
+    }
+}
+
 /// A revision to append: a bundle [`crate::bundle::read_bundle`] accepted,
 /// who is recording it, and what it does.
 pub struct Proposal<'a, P, T> {
@@ -409,6 +553,9 @@ pub struct Proposal<'a, P, T> {
     pub operation: Operation,
     pub activation: ActivationClass,
     pub codes: RevisionCodes,
+    /// The online request it is applied under, or `None` for an offline
+    /// operator command.
+    pub request: Option<RevisionRequest>,
     /// The time to record, at millisecond precision. The ledger reads no
     /// clock and does not require times to increase.
     pub recorded_at: SystemTime,
@@ -490,6 +637,9 @@ pub struct RevisionSummary {
     pub actor: LedgerActor,
     pub activation: ActivationClass,
     pub codes: RevisionCodes,
+    /// The online request it was applied under; `None` for the seed and for
+    /// offline operator commands.
+    pub request: Option<RevisionRequest>,
     pub bundle: RecordedBundle,
 }
 
@@ -541,6 +691,9 @@ pub enum Corruption {
     /// The pointer is missing, is not at the head, or names a revision the
     /// chain does not hold.
     Pointer,
+    /// The idempotency key index does not match the requests the records
+    /// hold.
+    Request,
 }
 
 impl Corruption {
@@ -554,6 +707,7 @@ impl Corruption {
             Self::Chain => "chain",
             Self::Document => "document",
             Self::Pointer => "pointer",
+            Self::Request => "request",
         }
     }
 }
@@ -579,6 +733,12 @@ pub enum Refusal {
     BundleInconsistent,
     /// The record would exceed its byte bound.
     RecordTooLarge,
+    /// A request's idempotency key or digest is outside its grammar, or so is
+    /// an acknowledged code.
+    RequestNotRecordable,
+    /// The acknowledged risk codes are not exactly the revision's risk
+    /// codes.
+    AcknowledgementMismatch,
 }
 
 impl Refusal {
@@ -593,6 +753,8 @@ impl Refusal {
             Self::RollbackContentDiffers => "rollback_content_differs",
             Self::BundleInconsistent => "bundle_inconsistent",
             Self::RecordTooLarge => "record_too_large",
+            Self::RequestNotRecordable => "request_not_recordable",
+            Self::AcknowledgementMismatch => "acknowledgement_mismatch",
         }
     }
 }
@@ -619,6 +781,8 @@ pub enum LedgerError {
     Corrupt(Corruption),
     /// The head is no longer the one the caller expected.
     Stale { head: RevisionId },
+    /// A revision already records this idempotency key: `revision`.
+    IdempotencyKeyUsed { revision: RevisionId },
     /// The ledger refused to record the proposal.
     Refused(Refusal),
     /// The ledger already holds [`MAX_RETAINED_REVISIONS`] revisions.
@@ -638,6 +802,7 @@ impl LedgerError {
             Self::Unsupported => "ledger.unsupported",
             Self::Corrupt(_) => "ledger.corrupt",
             Self::Stale { .. } => "ledger.stale",
+            Self::IdempotencyKeyUsed { .. } => "ledger.idempotency_key_used",
             Self::Refused(_) => "ledger.refused",
             Self::Full => "ledger.full",
             Self::Unavailable { .. } => "ledger.unavailable",
@@ -664,6 +829,10 @@ impl fmt::Display for LedgerError {
                 kind.as_str()
             ),
             Self::Stale { head } => write!(formatter, "the configuration ledger head is now {head}"),
+            Self::IdempotencyKeyUsed { revision } => write!(
+                formatter,
+                "the idempotency key already applied configuration revision {revision}"
+            ),
             Self::Refused(reason) => write!(
                 formatter,
                 "the configuration ledger refused the revision ({})",
@@ -773,8 +942,13 @@ impl RevisionLedger {
     ///
     /// The desired pointer always moves to the new revision. The active
     /// pointer moves with it only for an [`ActivationClass::Live`] revision
-    /// and only when no restart is pending, that is when the head being
-    /// replaced is the active revision.
+    /// whose request did not ask to stage only, and only when no restart is
+    /// pending, that is when the head being replaced is the active revision.
+    ///
+    /// A request's idempotency key is looked up inside the same transaction,
+    /// before the head is compared: a key some revision already records is
+    /// [`LedgerError::IdempotencyKeyUsed`], whatever the head is now, and
+    /// nothing is written.
     pub fn append<P, T>(
         &mut self,
         expected_head: &RevisionId,
@@ -791,7 +965,8 @@ impl RevisionLedger {
             proposal.activation,
             proposal.codes,
             proposal.recorded_at,
-        )?;
+        )?
+        .with_request(proposal.request)?;
         let appended = store::append(
             &mut self.connection,
             self.max_revisions,
@@ -821,6 +996,20 @@ impl RevisionLedger {
         self.usable()?;
         let page = store::revisions(&self.connection, before, limit.min(MAX_REVISION_PAGE));
         self.observe(page)
+    }
+
+    /// The revision applied under the idempotency key `key`, or `None` when
+    /// no revision records it.
+    pub fn revision_for_request(
+        &mut self,
+        key: &str,
+    ) -> Result<Option<RevisionSummary>, LedgerError> {
+        self.usable()?;
+        if !is_idempotency_key(key) {
+            return Ok(None);
+        }
+        let found = store::revision_for_request(&self.connection, &idempotency_key_digest(key));
+        self.observe(found)
     }
 
     /// One revision with its files, or `None` when this ledger has no such
