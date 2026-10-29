@@ -1009,7 +1009,12 @@ async fn a_verifier_holding_both_published_keys_accepts_either_signing_key() {
         .expect("both keys still load");
     connection
         .control_plane
-        .replace_managed(&stored.id, &stored.etag(), rotated, "test-admin")
+        .replace_managed(
+            &stored.id,
+            &stored.etag(),
+            rotated,
+            &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+        )
         .await
         .expect("the rotation saves");
     executor

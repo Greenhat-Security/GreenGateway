@@ -605,7 +605,12 @@ pub(super) enum StartupFailure {
 ///   allows it, schema, contract fence and deployment binding checked), the
 ///   control-plane documents and stores read and checked, the keyrings
 ///   loaded and this boot's row written to the membership roster -- the one
-///   thing it publishes. It builds nothing that serves.
+///   thing it publishes about this boot, and so the one thing withdrawn.
+///   Its other writes are deployment-wide and the same from every replica
+///   that makes them (migrations the operator allows, the empty tool
+///   document a first boot seeds, the journal capacity an admitted replica
+///   applies), so none says this boot might serve. It builds nothing that
+///   serves.
 /// * **Activation** builds the gateway from the configuration and the
 ///   seeds: the metrics recorder, the listeners' TLS material, the audit
 ///   sinks, every store, client and background task, and the routers. It
@@ -921,6 +926,9 @@ impl StartupStages for ProcessStartup {
         // sit behind a network secret provider the builder only just
         // activated, so it starts here, after the build and before any
         // listener binds. Any failure refuses startup like a build failure.
+        // This runs on a replica held at the fingerprint door too, but the
+        // dispatcher it spawns contends for the lease only once the
+        // membership gate admits this replica.
         #[cfg(feature = "postgres")]
         let apps = {
             let mut apps = apps;
@@ -1300,13 +1308,29 @@ async fn preflight_cluster_authority(
         }
         _ => None,
     };
+    // The authority-event journal (issue #425, PR 3) rides the same pool.
+    // Its capacity is one row the whole deployment reserves against, so it
+    // is not written here: a replica applies AUTHORITY_EVENT_JOURNAL_CAPACITY
+    // only when the membership below admits it (an admission write), and a
+    // replica held at the fingerprint door never does, so a stale or
+    // misconfigured replica booting mid-rollout cannot rewrite the capacity
+    // the serving replicas enforce. A capacity that cannot be applied on
+    // admission refuses startup: every authority mutation reserves it.
+    let authority_events = database_foundation.map(|foundation| {
+        Arc::new(
+            storage::postgres_authority_events::PostgresAuthorityEventStore::new(
+                foundation.pool().clone(),
+            ),
+        )
+    });
     // Cluster membership (issue #241, PR 13): register this boot in the
     // roster and run the first fingerprint-agreement check before the app
     // is built. A disagreement is logged and leaves the replica unready
     // (`/readyz` answers `config_fingerprint_mismatch`) until the members
-    // agree; only a row that cannot be written aborts startup.
-    let membership = match (database_foundation, ha_foundation) {
-        (Some(foundation), Some(ha_foundation)) => {
+    // agree; only a row, or an admission write, that cannot be written
+    // aborts startup.
+    let membership = match (database_foundation, ha_foundation, &authority_events) {
+        (Some(foundation), Some(ha_foundation), Some(journal)) => {
             let deployment_id = config.deployment_id.clone().ok_or_else(|| {
                 Box::<dyn std::error::Error>::from(
                     "STATE_BACKEND=postgres requires DEPLOYMENT_ID for the membership roster",
@@ -1324,15 +1348,19 @@ async fn preflight_cluster_authority(
                 fingerprint: ha_foundation.fingerprint().hex(),
                 capabilities: storage::compatibility::BINARY_CAPABILITIES.to_vec(),
             };
-            let membership = cluster_membership::ClusterMembership::new(
+            let membership = cluster_membership::ClusterMembership::with_journal_capacity(
                 store,
                 registration,
                 config.cluster_heartbeat_interval(),
                 config.cluster_member_stale_window(),
+                cluster_membership::JournalCapacity {
+                    store: Arc::clone(journal),
+                    capacity: config.authority_events.journal_capacity,
+                },
             );
             // Published before registration, which may write the boot row
             // and then fail: from here on, a startup that fails before it
-            // serves -- registration, the journal below, activation,
+            // serves -- registration and its admission writes, activation,
             // binding a listener -- has the row withdrawn.
             *published = Some(Arc::clone(&membership));
             membership.register_boot().await.map_err(|error| {
@@ -1377,32 +1405,6 @@ async fn preflight_cluster_authority(
             })
         }
         _ => None,
-    };
-    // The authority-event journal (issue #425, PR 3) rides the same pool.
-    // Every replica applies the configured capacity before serving; the
-    // value is fingerprinted, so agreeing replicas write the same number.
-    // A journal that cannot be configured refuses startup: every authority
-    // mutation reserves capacity in it.
-    let authority_events = match database_foundation {
-        Some(foundation) => {
-            let store = Arc::new(
-                storage::postgres_authority_events::PostgresAuthorityEventStore::new(
-                    foundation.pool().clone(),
-                ),
-            );
-            // Boxed, as is the delivery startup activation runs: an
-            // unoptimized build holds every startup sub-future inline, and
-            // the main thread's stack on Windows is 1 MiB.
-            Box::pin(store.configure_capacity(config.authority_events.journal_capacity))
-                .await
-                .map_err(|error| {
-                    Box::<dyn std::error::Error>::from(format!(
-                        "the authority event journal could not be configured: {error}"
-                    ))
-                })?;
-            Some(store)
-        }
-        None => None,
     };
     Ok(ClusterBootSeeds {
         policy,
@@ -2762,6 +2764,8 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
 /// What `run()` needs to start authority-event delivery, when this is a
 /// cluster replica with a sink configured. Kept out of the app builder, whose
 /// unoptimized stack frame already sits close to the main thread's limit.
+/// The membership's readiness gate goes with it: the dispatcher leads only
+/// while the gate admits this replica, and a cluster replica always has one.
 #[cfg(feature = "postgres")]
 #[inline(never)]
 fn authority_event_startup(
@@ -2774,6 +2778,7 @@ fn authority_event_startup(
     }
     let store = build_overrides.pg_authority_events.as_ref()?;
     let seed = build_overrides.pg_limits.as_ref()?;
+    let membership = build_overrides.pg_membership.as_ref()?;
     Some(authority_events::startup::AuthorityEventStartup {
         store: Arc::clone(store),
         resolver: connection_control_plane.secret_resolver_handle(),
@@ -2785,6 +2790,7 @@ fn authority_event_startup(
             authority_events::dispatcher::DISPATCHER_LEASE_TTL,
         )) as Arc<dyn tools::lease::ExecutionLeaseStore>,
         holder: seed.instance_id,
+        readiness: membership.readiness(),
     })
 }
 

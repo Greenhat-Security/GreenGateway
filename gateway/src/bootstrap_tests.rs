@@ -75,7 +75,7 @@ impl StartupStages for RecordingStages {
         }
         *published = Some(PUBLISHED);
         if self.fail_at == Some(Stage::PreflightAfterPublishing) {
-            return Err("the authority event journal could not be configured".into());
+            return Err("the authority event journal capacity could not be applied".into());
         }
         Ok(SEEDS)
     }
@@ -259,7 +259,8 @@ fn a_preflight_failure_activates_nothing() {
 #[test]
 fn a_preflight_failure_after_publishing_withdraws_what_it_published() {
     // Cluster preflight writes this boot's membership row and then still
-    // has the authority-event journal to configure; a boot refused there
+    // has the first agreement check to run, and with it the admission
+    // writes (the authority-event journal capacity); a boot refused there
     // never serves, so its row must not be left looking like one that
     // might.
     let (result, stages) = start(
@@ -269,7 +270,7 @@ fn a_preflight_failure_after_publishing_withdraws_what_it_published() {
     );
     assert_eq!(
         stage_error(result),
-        "the authority event journal could not be configured"
+        "the authority event journal capacity could not be applied"
     );
     assert_eq!(stage_calls(&stages), [Call::Preflight, Call::Withdraw]);
     assert_eq!(stages.activated, None);

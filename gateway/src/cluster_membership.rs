@@ -33,6 +33,16 @@
 //! misconfigured replica at the moment the newcomer boots, and a stalled
 //! rollout is that decision handed to the operator.
 //!
+//! **Admission writes.** Some fingerprinted settings are not only enforced
+//! by each replica but written once into the shared authority for the whole
+//! deployment: the authority-event journal capacity (issue #425) is one row
+//! every producer reserves against. A replica writes such a setting only as
+//! part of being admitted, immediately before agreement is recorded, and
+//! never while it is held at the door, so a stale or misconfigured replica
+//! that boots mid-rollout cannot rewrite what the serving replicas enforce.
+//! A write that fails withholds agreement: at boot that fails startup, on a
+//! heartbeat readiness stays withheld and the next heartbeat tries again.
+//!
 //! The heartbeat also carries the replica's security-revision
 //! acknowledgement (`compiled` and `observed`, from the cluster security
 //! runtime), so the roster shows each replica's reconciliation lag, and the
@@ -84,6 +94,7 @@ use crate::{
             self, Activation, Backfill, BinaryContract, ContractFence, MemberAdvertisement,
             OperationAdmission, OperationRefusal, OperationRequirement, OPERATION_REQUIREMENTS,
         },
+        postgres_authority_events::PostgresAuthorityEventStore,
         ClusterMember, FenceDecision, FenceRaise, HeartbeatOutcome, MemberRegistration,
         MemberRevisions, PostgresMembershipStore, RepositoryError,
     },
@@ -109,6 +120,15 @@ pub(crate) enum FingerprintAgreement {
     Agreed,
     /// These live members carry another fingerprint.
     Disagreeing(Vec<Uuid>),
+}
+
+/// The authority-event journal and the capacity this replica's
+/// configuration names for it (`AUTHORITY_EVENT_JOURNAL_CAPACITY`): an
+/// admission write, applied to the shared state row only once this replica
+/// has been admitted.
+pub(crate) struct JournalCapacity {
+    pub(crate) store: Arc<PostgresAuthorityEventStore>,
+    pub(crate) capacity: u64,
 }
 
 /// Why this replica could not register its boot row.
@@ -162,6 +182,10 @@ pub(crate) struct ClusterMembership {
     readiness: Arc<ClusterReadiness>,
     heartbeat_interval: Duration,
     stale_window: Duration,
+    /// The journal capacity this replica applies when it is admitted, and
+    /// at no other time. `None` where nothing is configured to apply (the
+    /// membership tests).
+    journal_capacity: Option<JournalCapacity>,
     /// Whether `ready_at` has been stamped; the stamp is idempotent in
     /// the store, this only saves a statement per tick.
     ready_recorded: AtomicBool,
@@ -171,11 +195,42 @@ pub(crate) struct ClusterMembership {
 }
 
 impl ClusterMembership {
+    /// A membership with no admission writes, for the tests that exercise
+    /// the roster and the gates alone.
+    #[cfg(test)]
     pub(crate) fn new(
         store: PostgresMembershipStore,
         registration: MemberRegistration,
         heartbeat_interval: Duration,
         stale_window: Duration,
+    ) -> Arc<Self> {
+        Self::build(store, registration, heartbeat_interval, stale_window, None)
+    }
+
+    /// A membership whose admission also applies the configured
+    /// authority-event journal capacity: what a serving replica runs.
+    pub(crate) fn with_journal_capacity(
+        store: PostgresMembershipStore,
+        registration: MemberRegistration,
+        heartbeat_interval: Duration,
+        stale_window: Duration,
+        journal_capacity: JournalCapacity,
+    ) -> Arc<Self> {
+        Self::build(
+            store,
+            registration,
+            heartbeat_interval,
+            stale_window,
+            Some(journal_capacity),
+        )
+    }
+
+    fn build(
+        store: PostgresMembershipStore,
+        registration: MemberRegistration,
+        heartbeat_interval: Duration,
+        stale_window: Duration,
+        journal_capacity: Option<JournalCapacity>,
     ) -> Arc<Self> {
         Arc::new(Self {
             store: Arc::new(store),
@@ -183,6 +238,7 @@ impl ClusterMembership {
             readiness: ClusterReadiness::new(),
             heartbeat_interval,
             stale_window,
+            journal_capacity,
             ready_recorded: AtomicBool::new(false),
             last_error_code: Mutex::new(None),
         })
@@ -206,7 +262,9 @@ impl ClusterMembership {
     /// this binary: startup checked the fence before it read any authority
     /// state, so this is a raise that landed in between, and the boot row
     /// is where it is caught for good. A disagreement is not a failure --
-    /// it is logged and the replica boots unready.
+    /// it is logged and the replica boots unready, having written nothing
+    /// to the authority beyond its own roster row. An admission write that
+    /// fails is a failure, as the row is.
     pub(crate) async fn register_boot(
         &self,
     ) -> Result<FingerprintAgreement, BootRegistrationError> {
@@ -252,7 +310,10 @@ impl ClusterMembership {
 
     /// Compare the live roster with this replica's fingerprint, granting
     /// (sticky) agreement when nobody live disagrees. Already-agreed
-    /// replicas answer without a read.
+    /// replicas answer without a read. The admission writes are applied
+    /// first, and agreement is recorded only once they landed: a replica is
+    /// never ready with its deployment-wide settings unapplied, and a
+    /// replica held at the door never applies them.
     pub(crate) async fn check_fingerprint_agreement(
         &self,
     ) -> Result<FingerprintAgreement, RepositoryError> {
@@ -266,6 +327,7 @@ impl ClusterMembership {
             &self.registration.fingerprint,
         );
         if disagreeing.is_empty() {
+            self.apply_admission_writes().await?;
             self.readiness.record_fingerprint_agreement();
             tracing::info!(
                 live_members = members.iter().filter(|member| member.live).count(),
@@ -285,6 +347,31 @@ impl ClusterMembership {
             }
         }
         Ok(FingerprintAgreement::Disagreeing(disagreeing))
+    }
+
+    /// Write this replica's deployment-wide settings to the authority, as
+    /// part of being admitted. The journal capacity is fingerprinted, so a
+    /// replica only gets here when every live member names the same value;
+    /// a capacity below the retained count admits nothing until retention
+    /// frees room.
+    async fn apply_admission_writes(&self) -> Result<(), RepositoryError> {
+        let Some(journal) = self.journal_capacity.as_ref() else {
+            return Ok(());
+        };
+        // Boxed: `run()` awaits the boot registration on the main thread's
+        // stack, which a debug build on Windows has little room left on.
+        if let Err(error) = Box::pin(journal.store.configure_capacity(journal.capacity)).await {
+            tracing::warn!(
+                error = %error,
+                "cluster mode: the authority event journal capacity could not be applied; this replica is not admitted until it is"
+            );
+            return Err(error);
+        }
+        tracing::info!(
+            capacity = journal.capacity,
+            "cluster mode: admitted; the authority event journal capacity is applied"
+        );
+        Ok(())
     }
 
     /// The write-path gate for a registered operation (issue #426, PR 1).
@@ -573,7 +660,7 @@ impl ClusterMembership {
         if !self.readiness.fingerprint_agreed() {
             if let Err(error) = self.check_fingerprint_agreement().await {
                 self.note_failure(&error);
-                tracing::warn!(error = %error, "cluster membership could not be read for the fingerprint check; readiness stays withheld");
+                tracing::warn!(error = %error, "the fingerprint check could not read the roster or apply this replica's admission writes; readiness stays withheld");
                 return;
             }
         }
