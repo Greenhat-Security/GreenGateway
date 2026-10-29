@@ -977,6 +977,14 @@ pub(super) async fn principal_list_endpoint(
 /// purge and each revocation are audited by the Connection runtime with the
 /// operator as actor; this answers once the cache entries are gone, before
 /// the issuers answer.
+///
+/// In cluster mode each replica caches its own tokens, so the purge is also
+/// recorded at the authority, through the operation gate, as one shared
+/// security revision that every replica applies before it serves another
+/// protected request; `200` names that revision. When it cannot be recorded
+/// -- a live replica predates the record (`409`), or the gate or the
+/// authority could not answer (`503`) -- the replica that answered has still
+/// purged its own entries, says how many, and the operator asks again.
 pub(super) async fn principal_delegated_tokens_revoke_endpoint(
     State(state): State<PrincipalAdminState>,
     request: AxumRequest,
@@ -992,11 +1000,13 @@ pub(super) async fn principal_delegated_tokens_revoke_endpoint(
     {
         return principal_admin_authz_error_response(error);
     }
-    // Refused rather than run on the one replica that happens to serve the
-    // request: the others would keep serving the tokens it reports purged.
+    // A cluster-mode build that cannot record the purge for the other
+    // replicas refuses rather than purge the one replica that happens to
+    // serve the request: the others would keep serving the tokens it
+    // reports purged.
     let Some(connection_http) = state.delegated_tokens.as_ref() else {
         return conflict(
-            "purging delegated tokens by principal is not available in cluster mode, where each replica caches its own; disable the Connection instead",
+            "purging delegated tokens by principal is not available on this replica, which cannot record the purge for the other replicas; disable the Connection instead",
         );
     };
     let body = match read_request_body(body, state.max_body_size).await {
@@ -1023,28 +1033,79 @@ pub(super) async fn principal_delegated_tokens_revoke_endpoint(
         return bad_request("invalid delegated token revocation request body: subject");
     }
 
-    let purged_entries = connection_http.purge_delegated_tokens(
-        &issuer,
-        &request.subject,
-        connections::token_exchange::DelegatedTokenPurgeTrigger::Operator {
-            actor: auth::actor_from_principal(&principal),
-            request_id: client_ip::request_id(&parts.headers, &parts.extensions),
-            source_ip: client_ip::canonical_client_ip(
-                &parts.headers,
-                &parts.extensions,
-                &state.client_ip_policy,
-            ),
-        },
-    );
-    let mut response = (
-        StatusCode::OK,
-        Json(PrincipalDelegatedTokensRevokeResponse { purged_entries }),
-    )
-        .into_response();
+    let purged = connection_http
+        .purge_delegated_tokens_everywhere(
+            &issuer,
+            &request.subject,
+            connections::token_exchange::DelegatedTokenPurgeTrigger::Operator {
+                actor: auth::actor_from_principal(&principal),
+                request_id: client_ip::request_id(&parts.headers, &parts.extensions),
+                source_ip: client_ip::canonical_client_ip(
+                    &parts.headers,
+                    &parts.extensions,
+                    &state.client_ip_policy,
+                ),
+            },
+        )
+        .await;
+    let mut response = match purged {
+        Ok(outcome) => (
+            StatusCode::OK,
+            Json(PrincipalDelegatedTokensRevokeResponse {
+                purged_entries: outcome.purged_entries,
+                security_revision: outcome.security_revision,
+            }),
+        )
+            .into_response(),
+        Err(failure) => delegated_token_purge_not_recorded(&failure),
+    };
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
+}
+
+/// A purge this replica applied but could not record for the others:
+/// `409` while a live replica does not apply recorded purges, `503` when the
+/// gate or the authority could not answer. Either way the body says how many
+/// entries this replica purged, because those are gone.
+fn delegated_token_purge_not_recorded(
+    failure: &connections::token_exchange::DelegatedTokenPurgeFailure,
+) -> Response {
+    use connections::token_exchange::PurgeNotRecorded;
+
+    let (status, error) = match &failure.not_recorded {
+        PurgeNotRecorded::Refused {
+            detail,
+            members_lack_capability,
+            ..
+        } => (
+            if *members_lack_capability {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            },
+            format!(
+                "the purge was not recorded for the other replicas, which may still serve the \
+                 principal's delegated tokens: {detail}"
+            ),
+        ),
+        PurgeNotRecorded::Unavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the purge could not be recorded at the authority, so the other replicas may still \
+             serve the principal's delegated tokens; retry"
+                .to_owned(),
+        ),
+    };
+    (
+        status,
+        Json(json!({
+            "error": error,
+            "reason": failure.not_recorded.reason(),
+            "purged_entries": failure.purged_entries,
+        })),
+    )
+        .into_response()
 }
 
 pub(super) async fn principal_detail_endpoint(

@@ -8173,6 +8173,26 @@
     {
       "file": "gateway/src/connections/http.rs",
       "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::connections::http::impl  ConnectionHttpRuntime::with_delegated_token_purge_ledger#1",
+      "sha256": "03ba51171c4f409c6429f06460ce84ff57f3cc6ae531dde0f796c3003b114e27",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway/src/connections/http.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::connections::http::impl  ConnectionHttpRuntime::apply_recorded_delegated_token_purges#1",
+      "sha256": "02c4afb84d378e33e7fc6979aef1a5a09654303775df548fbba3339ca7f6d56a",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway/src/connections/http.rs",
+      "reasons": [
         "unexpanded-macro"
       ],
       "scope": "gateway::connections::http::macro tokio :: task_local#1",
@@ -9010,6 +9030,26 @@
       "sha256": "f99c69c024573de1109d01db69028c2b86a304784f59521a77c43e0e6fb39416",
       "owner": "GreenGateway maintainers",
       "purpose": "Connection configuration, shared storage or checked provider/MCP protocol handling in this exact scope."
+    },
+    {
+      "file": "gateway/src/connections/token_exchange.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::connections::token_exchange::PurgeNotRecorded#1",
+      "sha256": "e6c8bc3fcc5c4b4b8b803a9e9032f6305d93de9eddb354b4d5539ee0cfb380a7",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway/src/connections/token_exchange.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::connections::token_exchange::impl  DelegatedTokenRuntime::with_cluster_purges#1",
+      "sha256": "1454915591224730e05516e0c47c640272d250dbfcf085be1fc617c90bf2dea1",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
     {
       "file": "gateway/src/connections/vault_secret.rs",
@@ -14677,6 +14717,36 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_authority_events::classify_query#1",
+      "sha256": "b9618bf4127da4a3c48146f04769b3bf1026ac7481910dafc4f502dbfdacaf3b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_delegated_token_purges.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_delegated_token_purges::PostgresDelegatedTokenPurgeStore#1",
+      "sha256": "0e83baef38d2c610c1bd160bfe0199de156dd8c7fe189aff6d6463405f7c4a07",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_delegated_token_purges.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_delegated_token_purges::impl  PostgresDelegatedTokenPurgeStore::new#1",
+      "sha256": "214a04f9a93d9e59287228b7a100d25c93b74eacaeb69d5aab944d0b9a3f6441",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_delegated_token_purges.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_delegated_token_purges::classify_query#1",
       "sha256": "b9618bf4127da4a3c48146f04769b3bf1026ac7481910dafc4f502dbfdacaf3b",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."

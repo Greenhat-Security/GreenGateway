@@ -8,7 +8,7 @@
     "write": [25, 25],
     "approved_extensions": [],
     "document_format": [0, 0],
-    "capabilities": ["openapi_discovery_catalogs", "openapi_swagger2_catalogs", "operation_requirements", "policy_role_descriptions"],
+    "capabilities": ["delegated_token_purges", "openapi_discovery_catalogs", "openapi_swagger2_catalogs", "operation_requirements", "policy_role_descriptions"],
     "operations": [
       {
         "operation": "policy.role_descriptions",
@@ -29,6 +29,14 @@
       {
         "operation": "connections.openapi_discovery_catalog",
         "capability": "openapi_discovery_catalogs",
+        "minimum_schema": 17,
+        "document_format": null,
+        "backfill": null,
+        "activation": "live_members"
+      },
+      {
+        "operation": "connections.delegated_token_purge",
+        "capability": "delegated_token_purges",
         "minimum_schema": 17,
         "document_format": null,
         "backfill": null,
