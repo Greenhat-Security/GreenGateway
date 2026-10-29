@@ -15,7 +15,7 @@ cargo build --locked --release -p ggctl
 
 It is not yet part of the release artifacts or the container image; packaging, checksums, SBOM and signing for Linux, macOS and Windows come with #242 PR 18. CI builds and tests it on all three platforms.
 
-The configuration contracts it shares with the gateway live in the `gateway-config` library crate, which both binaries link: the published document schemas, the `GatewayCapabilities` handshake document, RFC 8785 canonical JSON and the ADR-0004 digest frame, and the configuration bundle reader. Still in the gateway crate are the environment configuration compiler (`Config::from_env_vars`, being extracted by #433) and the production policy and tools validators, which depend on the rest of the gateway. The bundle reader takes those validators from its caller: the gateway passes its own, and `ggctl`, which cannot link them, reports that they did not run.
+The configuration contracts it shares with the gateway live in the `gateway-config` library crate, which both binaries link: the published document schemas, the `GatewayCapabilities` handshake document, RFC 8785 canonical JSON and the ADR-0004 digest frame, and the configuration bundle reader. Still in the gateway crate are the environment configuration compiler (`config::compile`, extracted by #433; see [its contract](architecture/configuration-compiler.md)) and the production policy and tools validators, which depend on the rest of the gateway. The bundle reader takes those validators from its caller: the gateway passes its own, and `ggctl`, which cannot link them, reports that they did not run.
 
 ## Commands
 

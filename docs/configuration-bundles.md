@@ -117,7 +117,10 @@ In this alpha `spec` has exactly one member, `profile`: `production`,
 enforce each profile's invariants. The deployment settings themselves join
 `spec` from the field catalog before a gateway can start from a bundle, so a
 document that sets anything else today is refused (`schema.unknown_member`)
-rather than having the setting silently dropped.
+rather than having the setting silently dropped. The compiler compiles
+environment configuration only today; [its
+contract](architecture/configuration-compiler.md#extension-points-for-242)
+says what a bundle front end must add.
 
 The value forms those settings will use are fixed now, with the reader and the
 schema's `$defs`:
