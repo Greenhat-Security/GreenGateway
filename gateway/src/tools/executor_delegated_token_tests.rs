@@ -426,7 +426,11 @@ async fn delegated_connection(
         .expect("the client secret resolves and the signing key loads");
     let initial = control_plane.runtime_snapshot();
     let created = control_plane
-        .create_managed(initial.collection_etag(), write, "test-admin")
+        .create_managed(
+            initial.collection_etag(),
+            write,
+            &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+        )
         .await
         .expect("the delegated Connection saves");
     let mut egress_config = EgressConfig {
@@ -1104,7 +1108,12 @@ async fn a_changed_connection_exchanges_again_and_forgets_the_old_tokens() {
     harness
         .connection
         .control_plane
-        .replace_managed(&current.id, &current.etag(), changed, "test-admin")
+        .replace_managed(
+            &current.id,
+            &current.etag(),
+            changed,
+            &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+        )
         .await
         .expect("the change saves");
 
@@ -1684,7 +1693,12 @@ async fn a_disabled_delegated_connection_is_not_tested_because_its_keys_are_not_
     harness
         .connection
         .control_plane
-        .replace_managed(&current.id, &current.etag(), disabled, "test-admin")
+        .replace_managed(
+            &current.id,
+            &current.etag(),
+            disabled,
+            &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+        )
         .await
         .expect("the Connection disables");
     let saved = harness.secrets.resolutions();
