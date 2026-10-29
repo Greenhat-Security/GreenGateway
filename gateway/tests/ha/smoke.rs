@@ -371,51 +371,87 @@ fn lifted_rate_limits() -> Vec<(String, String)> {
     ]
 }
 
+/// One answer a burst got: its status and, for anything but a `200`, what
+/// the body said — so a row that fails on its declines names the refusal
+/// it met (the revision gate's, the limiter's, the audit's) instead of
+/// only counting them.
+#[derive(Clone, Debug)]
+struct Answer {
+    status: u16,
+    /// Empty for a served request, whose body is not read.
+    body: String,
+}
+
 /// Issue `total` requests for `path`, at most [`CONCURRENCY`] at a time,
 /// through the balancer — round robin, or pinned to one replica — and
-/// answer the status of each.
-async fn burst(cluster: &Cluster, path: &str, total: usize, pin: Option<&str>) -> Vec<u16> {
-    let mut statuses = Vec::with_capacity(total);
+/// answer each one's [`Answer`].
+async fn burst(cluster: &Cluster, path: &str, total: usize, pin: Option<&str>) -> Vec<Answer> {
+    let mut answers = Vec::with_capacity(total);
     let mut issued = 0;
     while issued < total {
         let wave = CONCURRENCY.min(total - issued);
         let responses = futures_util::future::join_all((0..wave).map(|_| async {
-            match pin {
+            let response = match pin {
                 Some(name) => cluster.get_pinned(name, path).await,
                 None => cluster.get_through_balancer(path).await,
-            }
+            };
+            let status = response.status().as_u16();
+            let body = match status {
+                200 => String::new(),
+                _ => response.text().await.unwrap_or_default(),
+            };
+            Answer { status, body }
         }))
         .await;
-        statuses.extend(responses.iter().map(|response| response.status().as_u16()));
+        answers.extend(responses);
         issued += wave;
     }
-    statuses
+    answers
 }
 
-/// Split a burst's statuses into served (`200`) and declined (`503`), and
+/// How many of `answers` said each distinct non-`200` body, most frequent
+/// first: the evidence a failed availability floor is read by.
+fn decline_tally(answers: &[Answer]) -> String {
+    let mut tally = std::collections::BTreeMap::<(u16, &str), usize>::new();
+    for answer in answers.iter().filter(|answer| answer.status != 200) {
+        *tally
+            .entry((answer.status, answer.body.as_str()))
+            .or_default() += 1;
+    }
+    let mut tally: Vec<_> = tally.into_iter().collect();
+    tally.sort_by(|left, right| right.1.cmp(&left.1));
+    tally
+        .iter()
+        .map(|((status, body), count)| format!("{count} x {status} {body}"))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Split a burst's answers into served (`200`) and declined (`503`), and
 /// fail on anything else.
 ///
 /// A `503` is the replica declining to consult its authority under load —
 /// a legitimate answer that records nothing, and admitted; any other
 /// status would mean the burst hit a bound these rows are not about.
-fn served_and_declined(statuses: &[u16], context: &str) -> (usize, usize) {
-    let served = statuses.iter().filter(|status| **status == 200).count();
-    let declined = statuses.iter().filter(|status| **status == 503).count();
+fn served_and_declined(answers: &[Answer], context: &str) -> (usize, usize) {
+    let served = answers.iter().filter(|answer| answer.status == 200).count();
+    let declined = answers.iter().filter(|answer| answer.status == 503).count();
     assert_eq!(
         served + declined,
-        statuses.len(),
+        answers.len(),
         "every {context} request must be proxied or declined outright; statuses: {:?}",
-        statuses
+        answers
             .iter()
-            .filter(|status| !matches!(**status, 200 | 503))
+            .filter(|answer| !matches!(answer.status, 200 | 503))
             .take(8)
             .collect::<Vec<_>>()
     );
     assert!(
-        served * 10 >= statuses.len() * 9,
+        served * 10 >= answers.len() * 9,
         "the deployment served only {served} of {} {context} requests; load may degrade it, \
-         not take it out of service",
-        statuses.len()
+         not take it out of service; the declines said: {}",
+        answers.len(),
+        decline_tally(answers)
     );
     (served, declined)
 }
@@ -549,7 +585,9 @@ async fn every_served_request_leaves_exactly_one_durable_audit_row() {
     eprintln!(
         "audit rows: {served} requests served, {stalled_served} of them with the sink \
          stalled for {stall:?} ({blocked_writers} batch insert(s) were blocked behind the \
-         lock when the stalled burst began)"
+         lock when the stalled burst began); declines unstalled [{}], stalled [{}]",
+        decline_tally(&statuses),
+        decline_tally(&stalled)
     );
 
     // The rows land — the last batch a flush interval after the last
@@ -736,7 +774,7 @@ async fn a_stalled_audit_store_refuses_requests_until_it_recovers() {
         )
     });
     assert!(
-        stalled.iter().all(|status| *status == 503),
+        stalled.iter().all(|answer| answer.status == 503),
         "every request during the stall must be refused, got {stalled:?}"
     );
     assert_eq!(
@@ -876,7 +914,9 @@ async fn a_stopped_replicas_last_events_land_within_the_drain_budget() {
     eprintln!(
         "drain: replica a served {served} requests, stopped in {took:?}, and left {observed} \
          observation rows, {startups} startup, {started} shutdown_started, {completed} \
-         shutdown_completed and {forced} shutdown_forced records in the shared store"
+         shutdown_completed and {forced} shutdown_forced records in the shared store; \
+         declines [{}]",
+        decline_tally(&statuses)
     );
     assert_eq!(
         observed, served as i64,

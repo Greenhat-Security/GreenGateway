@@ -191,12 +191,14 @@ pipeline can gate on the header or on `status` without parsing the rendering.
 | `400` | `policy_tests_request_invalid` | The body is not a JSON object, repeats a member name anywhere, has a member other than `suite`, `policy` and `format`, lacks `suite`, names an unknown format, or combines `If-Match` with a candidate. |
 | `401`, `403` | -- | Not authenticated, or missing either permission. |
 | `404` | -- | No policy is configured. |
+| `408` | `policy_tests_request_timeout` | The body did not arrive within five seconds. Nothing ran. |
 | `412` | -- | `If-Match` does not name the active policy. |
-| `413` | -- | The body exceeds `MAX_BODY_SIZE`. |
+| `413` | -- | The body exceeds `MAX_BODY_SIZE` or 2 MiB, whichever is lower. |
 | `422` | `policy_tests_invalid` | The suite is invalid. The body lists at most 64 `diagnostics` (`code`, JSON `pointer`, fixed `message`) and `diagnostics_truncated`. Diagnostics never repeat an input value. |
 | `422` | `policy_candidate_invalid` | The candidate policy is invalid; `errors` are the policy validator's messages. |
-| `429` | `policy_tests_busy` | Four runs are already evaluating on this replica. Nothing was queued. |
-| `503` | -- | Cluster mode could not read the active policy. |
+| `429` | `policy_tests_busy` | Four runs are already evaluating on this replica, or this caller already has one running. Nothing was queued. |
+| `500` | -- | The policy under test did not compile. No partial result. |
+| `503` | -- | Cluster mode could not read the active policy, or (`policy_tests_deadline_exceeded`) the run did not finish within five seconds. No partial result. |
 
 Diagnostic codes: `invalid_type`, `missing_field`, `unknown_field`,
 `forbidden_field`, `invalid_value`, `too_long`, `unsupported_schema_version`,
@@ -292,7 +294,9 @@ grep -qi '^x-greengateway-policy-tests-status: passed' headers.txt
 ```
 
 Use a service token that holds only `admin:policy:read` and
-`admin:policy:simulate`.
+`admin:policy:simulate`. One caller runs one suite at a time: a second run
+under the same identity while the first is still evaluating is `429`
+(`policy_tests_busy`), so run a pipeline's suites one after another.
 
 ## Audit
 
@@ -306,8 +310,12 @@ not recorded as runs.
 ## Limits and what comes later
 
 A run is synchronous and CPU-only: at most 512 cases, a body within
-`MAX_BODY_SIZE`, and at most four runs evaluating at once per replica, each on
-a blocking thread rather than an async worker.
+`MAX_BODY_SIZE` or 2 MiB, whichever is lower, that arrives within five seconds,
+a five-second deadline on the evaluation, and at most four runs evaluating at
+once per replica and one per caller, each on a blocking thread rather than an
+async worker. A run is admitted only once its body is in hand, so an upload in
+progress holds no slot, and its slot is held until the blocking evaluation
+ends, even when the client disconnects first.
 
 Not part of this slice, and not to be inferred from it:
 

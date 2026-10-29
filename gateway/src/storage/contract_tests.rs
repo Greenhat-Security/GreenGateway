@@ -2545,6 +2545,11 @@ pub(crate) mod postgres_audit_tests {
             .expect("the schema should migrate");
         let pool = foundation.pool().clone();
         let (schema_minimum, schema_maximum) = migrations::schema_version_range();
+        // The newest migration this binary's own migrator applies. A prepared
+        // build also serves an approved extension above it (schema_maximum),
+        // which only its successor applies.
+        let newest_migration =
+            i32::try_from(migrations::manifest_len()).expect("the manifest is short");
         let authority = PostgresReadinessAuthority::new(pool.clone());
 
         // A migrated database on a writable session: the ledger covers
@@ -2552,7 +2557,7 @@ pub(crate) mod postgres_audit_tests {
         assert_eq!(
             authority.observe().await,
             AuthorityObservation::Writable {
-                schema_version: schema_maximum
+                schema_version: newest_migration
             }
         );
         let readiness = ClusterReadiness::new();
@@ -2573,18 +2578,17 @@ pub(crate) mod postgres_audit_tests {
         let client = pool.get().await.expect("client checkout");
         // The ledger's `version` column is bigint; the manifest range is
         // the i32 a member row advertises.
-        let newest_migration = i64::from(schema_maximum);
         client
             .execute(
                 "DELETE FROM greengateway.schema_migrations WHERE version = $1",
-                &[&newest_migration],
+                &[&i64::from(newest_migration)],
             )
             .await
             .expect("the ledger row should delete");
         assert_eq!(
             authority.observe().await,
             AuthorityObservation::IncompatibleSchema {
-                schema_version: schema_maximum - 1
+                schema_version: newest_migration - 1
             }
         );
         assert_eq!(probe.blocked_reason().await, Some(SCHEMA_INCOMPATIBLE));
@@ -3346,8 +3350,16 @@ pub(crate) mod postgres_audit_tests {
     }
 
     async fn migrated_limits_pool(database: &TestDatabase) -> deadpool_postgres::Pool {
+        migrated_limits_pool_sized(database, crate::config::DEFAULT_DATABASE_POOL_MAX).await
+    }
+
+    async fn migrated_limits_pool_sized(
+        database: &TestDatabase,
+        pool_max: usize,
+    ) -> deadpool_postgres::Pool {
         let test_dsn_file = write_dsn_file(&database.dsn);
         let mut config = crate::config::Config::test_defaults();
+        config.database.pool_max = pool_max;
         config.state_backend = crate::config::StateBackend::Postgres;
         config.deployment_id = Some("deploy-limits-contract".to_owned());
         config.database.url_file = Some(test_dsn_file.path.clone());
@@ -3543,6 +3555,128 @@ pub(crate) mod postgres_audit_tests {
             decide(&replica_a, SharedLane::Read, caller, limit).await,
             SharedDecision::Denied,
             "and only two: the third is denied"
+        );
+        assert_eq!(replica_a.live_buckets().await.expect("count"), 1);
+    }
+
+    /// A burst for one bucket parks one pooled connection per replica on the
+    /// bucket's row, not the pool.
+    ///
+    /// The row lock serializes a bucket's decisions, so a decision queued
+    /// behind another can do nothing on its connection until that one
+    /// commits. Here a session outside the serving pool holds the row and
+    /// two replicas' stores, sharing a pool of four, each send a burst for
+    /// the same caller. One decision per replica may wait on the row, and
+    /// the rest of the pool must stay free for the work that shares it: the
+    /// revision gate's read, which has 250 ms for its checkout and statement
+    /// together, is the first to be refused when it is not (issue #420's
+    /// `ha_smoke` declines). Without the per-bucket line all four
+    /// connections park on the row and the checkout below waits out the
+    /// pool's acquire timeout.
+    #[tokio::test]
+    async fn a_burst_for_one_bucket_parks_one_connection_per_replica_on_its_row() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool_sized(&database, 4).await;
+        // The row holder and the lock probe, outside the serving pool.
+        let outside = migrated_limits_pool_sized(&database, 2).await;
+        let replica_a =
+            PostgresRateLimitStore::new(pool.clone(), "deploy-limits", limits_keyring(), 1_000);
+        let replica_b =
+            PostgresRateLimitStore::new(pool.clone(), "deploy-limits", limits_keyring(), 1_000);
+        // Lifted, as the smoke suite lifts it: every decision is an allow,
+        // and every one still takes the row.
+        let limit = SharedLimit {
+            requests_per_second: 1.0e6,
+            burst: 1_000_000,
+        };
+        let caller = "ip:203.0.113.7";
+        assert_eq!(
+            decide(&replica_a, SharedLane::Read, caller, limit).await,
+            SharedDecision::Allowed,
+            "the first decision creates the bucket row"
+        );
+
+        let holder = outside.get().await.expect("holder");
+        holder
+            .batch_execute(
+                "BEGIN; SELECT 1 FROM greengateway.rate_limit_buckets \
+                 WHERE deployment_id = 'deploy-limits' FOR UPDATE",
+            )
+            .await
+            .expect("hold the bucket row");
+        let burst: Vec<_> = [&replica_a, &replica_b]
+            .into_iter()
+            .flat_map(|replica| (0..4).map(move |_| replica.clone()))
+            .map(|replica| {
+                tokio::spawn(async move { replica.decide(SharedLane::Read, caller, limit).await })
+            })
+            .collect();
+
+        let probe = outside.get().await.expect("probe");
+        let waiting_on_locks = || async {
+            probe
+                .query_one(
+                    "SELECT count(*) FROM pg_stat_activity \
+                     WHERE datname = current_database() AND wait_event_type = 'Lock'",
+                    &[],
+                )
+                .await
+                .expect("lock probe")
+                .get::<_, i64>(0)
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while waiting_on_locks().await < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "each replica's first decision should reach the held row"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Long enough for the rest of the burst to have reached the row too
+        // if anything were sending it there.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            waiting_on_locks().await,
+            2,
+            "one decision per replica waits on the bucket's row; the others wait in their \
+             replica's line, holding no connection"
+        );
+        let free = tokio::time::timeout(Duration::from_secs(2), pool.get())
+            .await
+            .expect("the serving pool still has a connection for other work")
+            .expect("checkout");
+        free.query_one("SELECT 1", &[])
+            .await
+            .expect("and it is usable");
+        drop(free);
+
+        holder
+            .batch_execute("ROLLBACK")
+            .await
+            .expect("release the bucket row");
+        for decision in burst {
+            assert_eq!(
+                decision
+                    .await
+                    .expect("the decision task completes")
+                    .expect("the shared limiter decides"),
+                SharedDecision::Allowed
+            );
+        }
+        assert_eq!(
+            replica_a.buckets_in_flight(),
+            0,
+            "no line outlives its burst"
+        );
+        assert_eq!(
+            replica_b.buckets_in_flight(),
+            0,
+            "no line outlives its burst"
         );
         assert_eq!(replica_a.live_buckets().await.expect("count"), 1);
     }
@@ -10157,6 +10291,110 @@ pub(crate) mod postgres_audit_tests {
             fourth.register_boot().await.expect("boot"),
             FingerprintAgreement::Agreed,
             "the same fingerprint as every live member is admitted at once"
+        );
+    }
+
+    /// The authority-event journal capacity is one row every producer in
+    /// the deployment reserves against (issue #425), so a replica writes
+    /// its configured value only as part of being admitted. A replica held
+    /// at the fingerprint door with a lower capacity -- an old pod
+    /// restarting mid-rollout after the fleet raised it, or a misconfigured
+    /// one -- leaves the capacity the serving replicas enforce alone, at
+    /// boot and on every heartbeat while it is held, and producers keep
+    /// committing under it. Only once it is admitted (the serving replica
+    /// drained) is its value the deployment's, and applied.
+    #[tokio::test]
+    async fn a_replica_held_at_the_fingerprint_door_never_rewrites_the_journal_capacity() {
+        use crate::audit::{sink::tests::CaptureSink, AuditLog};
+        use crate::cluster_membership::JournalCapacity;
+        use crate::storage::postgres_authority_events::{
+            append_to_journal, JournalSource, PostgresAuthorityEventStore,
+        };
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let heartbeat = Duration::from_secs(1);
+        let window = Duration::from_secs(30);
+        let audit = AuditLog::new(Arc::new(CaptureSink::new()));
+        let lifecycle = crate::lifecycle::GatewayLifecycle::new();
+        let journal = Arc::new(PostgresAuthorityEventStore::new(pool.clone()));
+        let journal_capacity = |capacity: u64| JournalCapacity {
+            store: Arc::clone(&journal),
+            capacity,
+        };
+        let enforced = || async { journal.stats().await.expect("journal stats").capacity };
+
+        let serving_store = member_store(&pool);
+        let serving = ClusterMembership::with_journal_capacity(
+            serving_store.clone(),
+            registration('a'),
+            heartbeat,
+            window,
+            journal_capacity(2),
+        );
+        assert_eq!(
+            serving.register_boot().await.expect("boot"),
+            FingerprintAgreement::Agreed
+        );
+        assert_eq!(
+            enforced().await,
+            2,
+            "an admitted replica applies its capacity before it serves"
+        );
+
+        let held_store = member_store(&pool);
+        let held = ClusterMembership::with_journal_capacity(
+            held_store,
+            registration('b'),
+            heartbeat,
+            window,
+            journal_capacity(1),
+        );
+        assert_eq!(
+            held.register_boot().await.expect("boot"),
+            FingerprintAgreement::Disagreeing(vec![serving_store.instance_id()])
+        );
+        assert_eq!(
+            enforced().await,
+            2,
+            "a held replica's boot leaves the serving capacity alone"
+        );
+        held.tick_once(&lifecycle, None, &audit).await;
+        held.tick_once(&lifecycle, None, &audit).await;
+        assert_eq!(
+            held.readiness().blocked_reason(),
+            Some("config_fingerprint_mismatch")
+        );
+        assert_eq!(
+            enforced().await,
+            2,
+            "so does every heartbeat while it is held"
+        );
+        // Producers reserve against the serving value: a second event still
+        // commits where the held replica's capacity of 1 would refuse it.
+        let client = pool.get().await.expect("client");
+        for _ in 0..2 {
+            append_to_journal(
+                &client,
+                JournalSource::ServiceTokenChange,
+                &uuid::Uuid::new_v4().to_string(),
+            )
+            .await
+            .expect("the serving capacity admits the event");
+        }
+        drop(client);
+
+        serving_store.mark_draining().await.expect("drain");
+        held.tick_once(&lifecycle, None, &audit).await;
+        assert_eq!(held.readiness().blocked_reason(), None);
+        assert_eq!(
+            enforced().await,
+            1,
+            "admission applies the capacity the deployment now agrees on"
         );
     }
 
