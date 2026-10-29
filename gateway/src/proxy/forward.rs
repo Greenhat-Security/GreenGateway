@@ -3394,7 +3394,11 @@ mod tests {
         .expect("TRACE test Connection should deserialize");
         let initial = control_plane.runtime_snapshot();
         let created = control_plane
-            .create_managed(initial.collection_etag(), write, "test-admin")
+            .create_managed(
+                initial.collection_etag(),
+                write,
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("TRACE test Connection should create");
         let connection_id = created.id.to_string();
@@ -3579,7 +3583,11 @@ mod tests {
         .expect("assertion test Connection should deserialize");
         let initial = control_plane.runtime_snapshot();
         let created = control_plane
-            .create_managed(initial.collection_etag(), write, "test-admin")
+            .create_managed(
+                initial.collection_etag(),
+                write,
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("assertion test Connection should create");
         let connection_id = created.id.to_string();
@@ -3946,7 +3954,11 @@ mod tests {
         .expect("attested route Connection should deserialize");
         let initial = control_plane.runtime_snapshot();
         let created = control_plane
-            .create_managed(initial.collection_etag(), write, "test-admin")
+            .create_managed(
+                initial.collection_etag(),
+                write,
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("attested route Connection should create");
         let mut egress_config = egress::EgressConfig {
