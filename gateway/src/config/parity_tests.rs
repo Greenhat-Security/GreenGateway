@@ -11,6 +11,8 @@
 
 use std::collections::BTreeSet;
 
+use gateway_config::catalog::{self, Blank};
+
 use super::diagnostic::{ConfigDiagnostic, ConfigDiagnosticCode, ConfigRule};
 use super::*;
 
@@ -239,166 +241,26 @@ fn an_empty_environment_parses_to_the_legacy_defaults() {
     assert!(config.egress_deny_private_ips);
 }
 
-/// Variables for which an empty or whitespace-only value is exactly the same
-/// as leaving them unset.
-const BLANK_IS_UNSET: &[&str] = &[
-    "ADMIN_LISTEN_ADDR",
-    "GRPC_LISTEN_ADDR",
-    "TLS_CERT_FILE",
-    "TLS_KEY_FILE",
-    "ADMIN_TLS_CERT_FILE",
-    "ADMIN_TLS_KEY_FILE",
-    "CLIENT_CERT_IDENTITY_SOURCE",
-    "CLIENT_CERT_CA_FILE",
-    "CLIENT_CERT_CRL_FILE",
-    "ADMIN_CLIENT_CERT_CA_FILE",
-    "ADMIN_CLIENT_CERT_CRL_FILE",
-    "ADMIN_LOGIN_PROVIDER",
-    "ADMIN_SESSION_MODE",
-    "ADMIN_SESSION_TTL_SECS",
-    "ADMIN_SESSION_IDLE_TIMEOUT_SECS",
-    "ADMIN_SESSION_MAX_ENTRIES",
-    "GATEWAY_PUBLIC_URL",
-    "AUDIT_LOG_FILE",
-    "AUDIT_SQLITE_PATH",
-    "AUDIT_SQLITE_RETENTION_DAYS",
-    "DISCOVERY_SQLITE_PATH",
-    "DISCOVERY_PROJECTOR_LEASE_TTL_MS",
-    "DISCOVERY_PROJECTOR_POLL_MS",
-    "DISCOVERY_PROJECTOR_BATCH",
-    "PRINCIPAL_SQLITE_PATH",
-    "CONNECTIONS_SQLITE_PATH",
-    "CONNECTION_SECRETS_ROOT",
-    "CONNECTION_SECRET_ALIASES",
-    "CONNECTION_LOCAL_SECRET_KEYRING",
-    "ADMIN_LOGIN_KEYRING",
-    "RATE_LIMIT_KEYRING",
-    "CONNECTION_VAULT_PROVIDER",
-    "CONNECTION_GCP_PROVIDER",
-    "CONNECTION_AZURE_PROVIDER",
-    "CONNECTION_AWS_PROVIDER",
-    "CONNECTION_KUBERNETES_PROVIDER",
-    "OPENAPI_SPEC_PATH",
-    "POLICY_FILE",
-    "TOOLS_FILE",
-    "POLICY_HISTORY_SQLITE_PATH",
-    "CORS_ALLOW_ORIGINS",
-    "TRUSTED_PROXY_CIDRS",
-    "JWT_JWKS_URL",
-    "JWT_ISSUER",
-    "JWT_AUDIENCE",
-    "SERVICE_TOKEN_SQLITE_PATH",
-    "CLUSTER_HEARTBEAT_MS",
-    "CLUSTER_MEMBER_STALE_MS",
-    "CLUSTER_MAINTENANCE_INTERVAL_MS",
-    "CLUSTER_MAINTENANCE_LEASE_TTL_MS",
-    "READINESS_PROBE_CACHE_MS",
-    "CLUSTER_STATUS_EXPOSE_HOSTNAMES",
-    "AUDIT_POSTGRES_RETENTION_DAYS",
-    "AUTH_PROVIDERS",
-    "CSRF_COOKIE_DOMAIN",
-    "UPSTREAM_URL",
-    "UPSTREAM_ROUTES",
-    "MCP_UPSTREAM_SERVERS",
-    "UPSTREAM_TIMEOUT_MS",
-    "UPSTREAM_RESPONSE_IDLE_TIMEOUT_MS",
-    "UPSTREAM_CONNECT_TIMEOUT_MS",
-    "EGRESS_ALLOWED_HOSTS",
-    "EGRESS_NAT64_PREFIXES",
-    "DEPLOYMENT_ID",
-    "DATABASE_URL_FILE",
-    "DATABASE_TLS_CA_FILE",
-    "AUTHORITY_EVENT_SINK",
-    "AUTHORITY_EVENT_FILE",
-    "AUTHORITY_PSEUDONYM_KEY_ALIAS",
-    "AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS",
-    "AUTHORITY_EVENT_JOURNAL_CAPACITY",
-    "AUTHORITY_EVENT_RETENTION_HOURS",
-];
-
-/// Variables for which an empty value is a value, and one the parser refuses:
-/// it is parsed as it stands, without falling back to the default.
-const BLANK_IS_REFUSED: &[&str] = &[
-    "LISTEN_ADDR",
-    "GRPC_MAX_CONCURRENT_STREAMS",
-    "GRPC_MAX_METADATA_BYTES",
-    "TLS_MIN_VERSION",
-    "TLS_HANDSHAKE_TIMEOUT_MS",
-    "TLS_MAX_CONCURRENT_HANDSHAKES",
-    "CLIENT_CERT_MODE",
-    "ADMIN_CLIENT_CERT_MODE",
-    "ADMIN_PREFIX",
-    "ADMIN_LOGIN_PENDING_TTL_SECS",
-    "ADMIN_LOGIN_PENDING_MAX_ENTRIES",
-    "ADMIN_LOGIN_PENDING_MAX_PER_IP",
-    "AUDIT_SUCCESSFUL_PROBES_METRICS_ONLY",
-    "SHUTDOWN_DRAIN_DELAY_MS",
-    "SHUTDOWN_TIMEOUT_MS",
-    "AUDIT_DRAIN_TIMEOUT_MS",
-    "AUDIT_DURABILITY",
-    "AUDIT_DURABILITY_TIMEOUT_MS",
-    "AUTHORITY_EVIDENCE_DURABILITY",
-    "DISCOVERY_ENDPOINT_LIMIT",
-    "PAYLOAD_CAPTURE_ENABLED",
-    "PAYLOAD_CAPTURE_SAMPLE_RATE",
-    "SCHEMA_MISMATCH_SIGNAL_THRESHOLD",
-    "ERROR_RATE_SPIKE_SIGNAL_THRESHOLD",
-    "PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD",
-    "VOLUME_OUTLIER_SIGNAL_THRESHOLD",
-    "RULE_SUGGESTION_BASELINE_WINDOW_HOURS",
-    "MAX_BODY_SIZE",
-    "MAX_REQUEST_PATH_BYTES",
-    "RATE_LIMIT_READ_RPS",
-    "RATE_LIMIT_READ_BURST",
-    "RATE_LIMIT_WRITE_RPS",
-    "RATE_LIMIT_WRITE_BURST",
-    "RATE_LIMIT_MAX_BUCKETS",
-    "RATE_LIMIT_BUCKET_TTL_MS",
-    "TRUST_PROXY_HEADERS",
-    "AUTH_ENABLED",
-    "AUTH_MODE",
-    "AUTH_COOKIE_NAME",
-    "JWT_JWKS_TIMEOUT_MS",
-    "JWT_JWKS_MAX_KEY_AGE_SECS",
-    "JWT_REQUIRE_JTI",
-    "ROLES_CLAIM",
-    "SERVICE_TOKEN_CACHE_TTL_MS",
-    "TOOL_RUNTIME_QUEUE_DEPTH",
-    "TOOL_RUNTIME_GLOBAL_CONCURRENCY",
-    "TOOL_RUNTIME_QUEUE_TIMEOUT_MS",
-    "TOOL_LEASE_TTL_MS",
-    "TOOL_RUNTIME_DEFAULT_TIMEOUT_MS",
-    "CSRF_ENABLED",
-    "CSRF_COOKIE_NAME",
-    "CSRF_HEADER_NAME",
-    "EGRESS_TIMEOUT_MS",
-    "EGRESS_RESPONSE_IDLE_TIMEOUT_MS",
-    "EGRESS_CONNECT_TIMEOUT_MS",
-    "EGRESS_MAX_RESPONSE_BYTES",
-    "EGRESS_MAX_REQUEST_BODY_BYTES",
-    "EGRESS_DENY_PRIVATE_IPS",
-    "STATE_BACKEND",
-    "DATABASE_TLS_MODE",
-    "DATABASE_POOL_MAX",
-    "DATABASE_CONNECT_TIMEOUT_MS",
-    "DATABASE_ACQUIRE_TIMEOUT_MS",
-    "DATABASE_STATEMENT_TIMEOUT_MS",
-    "DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS",
-    "DATABASE_LOCK_TIMEOUT_MS",
-    "DATABASE_STARTUP_RETRY_LIMIT",
-    "DATABASE_AUTO_MIGRATE",
-    "DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS",
-];
+/// The inputs whose blank value the field catalog says is treated by `rule`,
+/// in inventory order.
+///
+/// The catalog spells each classification out, field by field, so a change
+/// to how the compiler treats a blank value fails the tests below until the
+/// catalog says so too (issue #242, PR 3).
+fn blank_rule(rule: Blank) -> Vec<&'static str> {
+    catalog::FIELDS
+        .iter()
+        .filter(|field| field.blank == rule)
+        .map(|field| field.environment)
+        .collect()
+}
 
 /// Variables for which an empty value replaces a non-empty default list with
 /// an empty one. The compiler contract lists them too, because an adapter
 /// that drops blank values changes what they mean (see `stage_tests`).
-pub(super) const BLANK_CLEARS_THE_DEFAULT: &[&str] = &[
-    "RBAC_EXEMPT_PATHS",
-    "VALIDATION_ALLOWED_CONTENT_TYPES",
-    "AUTH_EXEMPT_PATHS",
-    "CSRF_EXEMPT_PATHS",
-];
+pub(super) fn blank_clears_the_default() -> Vec<&'static str> {
+    blank_rule(Blank::ClearsDefault)
+}
 
 fn list_with_a_default<'a>(config: &'a Config, name: &str) -> &'a [String] {
     match name {
@@ -415,10 +277,16 @@ fn list_with_a_default<'a>(config: &'a Config, name: &str) -> &'a [String] {
 /// which answer it gives.
 #[test]
 fn every_input_treats_a_blank_value_by_one_of_three_legacy_rules() {
-    let mut classified: Vec<&str> = BLANK_IS_UNSET
+    // Blank is unset: the default applies, exactly as if absent. Blank is
+    // refused: the value is parsed as it stands, without falling back to the
+    // default. Blank clears the default: an empty list replaces it.
+    let blank_is_unset = blank_rule(Blank::Unset);
+    let blank_is_refused = blank_rule(Blank::Refused);
+    let blank_clears_the_default = blank_clears_the_default();
+    let mut classified: Vec<&str> = blank_is_unset
         .iter()
-        .chain(BLANK_IS_REFUSED)
-        .chain(BLANK_CLEARS_THE_DEFAULT)
+        .chain(&blank_is_refused)
+        .chain(&blank_clears_the_default)
         .copied()
         .collect();
     classified.sort_unstable();
@@ -428,10 +296,10 @@ fn every_input_treats_a_blank_value_by_one_of_three_legacy_rules() {
 
     let defaults = accepted(&[]);
     for blank in ["", " \t "] {
-        for &name in BLANK_IS_UNSET {
+        for &name in &blank_is_unset {
             assert_eq!(accepted(&[(name, blank)]), defaults, "{name}={blank:?}");
         }
-        for &name in BLANK_IS_REFUSED {
+        for &name in &blank_is_refused {
             let error = refused(&[(name, blank)]);
             assert_eq!(error.problems.len(), 1, "{name}={blank:?}: {error}");
             assert!(
@@ -449,7 +317,7 @@ fn every_input_treats_a_blank_value_by_one_of_three_legacy_rules() {
                 "{name}={blank:?}"
             );
         }
-        for &name in BLANK_CLEARS_THE_DEFAULT {
+        for &name in &blank_clears_the_default {
             assert!(!list_with_a_default(&defaults, name).is_empty(), "{name}");
             let config = accepted(&[(name, blank)]);
             assert!(
@@ -466,7 +334,7 @@ fn every_input_treats_a_blank_value_by_one_of_three_legacy_rules() {
 /// wrapper does, and its documentation tells operators so.
 #[test]
 fn a_lone_comma_clears_a_list_as_a_blank_value_does() {
-    for &name in BLANK_CLEARS_THE_DEFAULT {
+    for name in blank_clears_the_default() {
         let blank = accepted(&[(name, "")]);
         for commas in [",", " , ", ",,"] {
             assert_eq!(accepted(&[(name, commas)]), blank, "{name}={commas:?}");

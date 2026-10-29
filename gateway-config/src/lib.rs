@@ -5,6 +5,10 @@
 //! and digest code into one library that both binaries link, so neither can
 //! approximate the other. This crate is that library. Today it holds:
 //!
+//! - [`catalog`]: the configuration field catalog, which describes every
+//!   setting the gateway's configuration compiler reads and is held to that
+//!   compiler, the configuration reference, `.env.example` and the Cloudflare
+//!   wrapper by parity tests;
 //! - [`documents`]: the versioned documents GreenGateway publishes schemas
 //!   for, and those schemas;
 //! - [`capabilities`]: the `GatewayCapabilities` document a gateway serves at
@@ -41,6 +45,7 @@ pub mod archive;
 pub mod bundle;
 pub mod canonical_json;
 pub mod capabilities;
+pub mod catalog;
 pub mod documents;
 pub mod opaque_id;
 pub mod permissions;

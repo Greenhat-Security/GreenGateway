@@ -20,7 +20,7 @@ use super::{
     },
     inventory,
     listeners::ListenerInputs,
-    parity_tests::BLANK_CLEARS_THE_DEFAULT,
+    parity_tests::blank_clears_the_default,
     plan::{self, ConfigPlan},
     proxy::{RoutingInputs, TrustedProxyInputs},
     runtime::{
@@ -263,6 +263,20 @@ fn each_block_requests_its_inputs_once_and_the_blocks_read_the_inventory_in_orde
         inventory::CONFIG_INPUTS,
         "the blocks, in the order they are read, read every inventoried input once and in order"
     );
+}
+
+/// The field catalog places each input in the domain whose block reads it
+/// (issue #242, PR 3).
+#[test]
+fn the_field_catalog_places_every_input_in_the_domain_that_reads_it() {
+    for (domain, names) in blocks() {
+        let expected = format!("{domain:?}").to_ascii_lowercase();
+        for name in names {
+            let field = gateway_config::catalog::field(&name)
+                .unwrap_or_else(|| panic!("{name} has no catalog entry"));
+            assert_eq!(field.domain.code(), expected, "{name}");
+        }
+    }
 }
 
 #[test]
@@ -1352,11 +1366,12 @@ fn the_compiler_contract_lists_every_list_a_blank_value_clears() {
         "| Setting | Default it replaces |",
     );
     assert_eq!(
-        documented, BLANK_CLEARS_THE_DEFAULT,
-        "{COMPILER_CONTRACT}#blank-values lists the parity golden's lists"
+        documented,
+        blank_clears_the_default(),
+        "{COMPILER_CONTRACT}#blank-values lists the field catalog's lists"
     );
     let cloudflare = repository_text("docs/deployment/cloudflare.md");
-    for name in BLANK_CLEARS_THE_DEFAULT {
+    for name in blank_clears_the_default() {
         assert!(
             cloudflare.contains(&format!("`{name}`")),
             "docs/deployment/cloudflare.md says how {name} is cleared through the wrapper"

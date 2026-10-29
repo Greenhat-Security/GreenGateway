@@ -139,6 +139,7 @@ fn test_policy(entries: &[(&str, &[&str])]) -> Policy {
         egress: EgressPolicy::default(),
         rate_limits: Vec::new(),
         tools: HashMap::new(),
+        identity_mappings: None,
     }
 }
 

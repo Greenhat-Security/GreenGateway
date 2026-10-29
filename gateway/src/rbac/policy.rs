@@ -13,6 +13,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;
 
+use super::conditions::{canonicalize_condition_issuers, validate_condition, ConditionTarget};
+use super::identity_mappings::{
+    canonicalize_identity_mapping_issuers, validate_identity_mappings, IdentityMapping,
+};
 use super::policy_document::{self, pointer_token, IssueCode, PolicyIssue, PolicySchema};
 use super::rule::{
     principal_identity_matches, valid_auth_method_name, PrincipalMatcher, Rule, RuleDispatchKind,
@@ -23,12 +27,32 @@ use crate::{
     request_bounds::MAX_TOOL_NAME_BYTES,
 };
 
+/// The top-level members a 0.x document may have. A 0.x reader warns about
+/// any other member and drops it, except one of [`V1_ONLY_TOP_LEVEL_KEYS`],
+/// which it refuses.
 pub(crate) const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "schema_version",
     "id",
     "default_action",
     "enforcement_mode",
     "roles",
+    "routes",
+    "rules",
+    "egress",
+    "rate_limits",
+    "tools",
+];
+/// The top-level members only policy v1 defines.
+pub(crate) const V1_ONLY_TOP_LEVEL_KEYS: &[&str] = &["identity_mappings"];
+/// The closed top-level vocabulary of policy v1, in the order the gateway
+/// writes the members.
+pub(crate) const V1_TOP_LEVEL_KEYS: &[&str] = &[
+    "schema_version",
+    "id",
+    "default_action",
+    "enforcement_mode",
+    "roles",
+    "identity_mappings",
     "routes",
     "rules",
     "egress",
@@ -91,6 +115,12 @@ pub struct Policy {
     pub enforcement_mode: EnforcementMode,
     #[serde(default)]
     pub roles: HashMap<String, RoleEntry>,
+    /// Ordered identity mappings (`super::identity_mappings`). Present, even
+    /// empty, puts the policy in mapped-role mode: a principal's internal
+    /// roles are then the ones the mappings grant it, never its claimed roles.
+    /// Policy v1 only: a 0.x document that sets it is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_mappings: Option<Vec<IdentityMapping>>,
     /// Ordered route-to-permission rules. First matching rule wins.
     #[serde(default)]
     pub routes: Vec<RouteRule>,
@@ -384,6 +414,12 @@ impl Policy {
         }
         for rule in &mut self.rules {
             canonicalize_principal_matcher_issuers(&mut rule.principal);
+            if let Some(conditions) = rule.conditions.as_mut() {
+                canonicalize_condition_issuers(conditions);
+            }
+        }
+        if let Some(mappings) = self.identity_mappings.as_mut() {
+            canonicalize_identity_mapping_issuers(mappings);
         }
         for rule in &mut self.rate_limits {
             canonicalize_principal_matcher_issuers(&mut rule.principal);
@@ -418,6 +454,9 @@ impl Policy {
         validate_rules(&self.rules)?;
         validate_rate_limits(&self.rate_limits)?;
         validate_roles(&self.roles)?;
+        if let Some(mappings) = self.identity_mappings.as_deref() {
+            validate_identity_mappings(mappings, &self.roles)?;
+        }
         validate_tools(&self.tools)?;
 
         self.egress.validate()
@@ -434,10 +473,37 @@ pub(super) enum V0Rejection {
 }
 
 /// A 0.x document cannot carry the ids policy v1 adds to routes and rate
-/// overrides. Refusing them keeps a 0.x document's meaning the same in every
-/// gateway that accepts it, a release that predates v1 included: that one
-/// refuses the member outright.
+/// overrides, nor its identity mappings or rule conditions. Refusing them
+/// keeps a 0.x document's meaning the same in every gateway that accepts it,
+/// a release that predates v1 included: that one refuses an id or a condition
+/// outright, and ignores `identity_mappings` -- which this release therefore
+/// refuses rather than also ignore, so that no 0.x document is accepted
+/// while it asks for a mapping nothing applies.
 fn validate_v0_has_no_v1_members(policy: &Policy) -> Result<(), PolicyIssue> {
+    if policy.identity_mappings.is_some() {
+        return Err(PolicyIssue::new(
+            IssueCode::MemberRequiresV1,
+            "/identity_mappings".to_owned(),
+            format!(
+                "identity_mappings requires schema_version \"{}\"",
+                policy_document::POLICY_V1_SCHEMA_VERSION
+            ),
+        ));
+    }
+    if let Some(rule_index) = policy
+        .rules
+        .iter()
+        .position(|rule| rule.conditions.is_some())
+    {
+        return Err(PolicyIssue::new(
+            IssueCode::MemberRequiresV1,
+            format!("/rules/{rule_index}/conditions"),
+            format!(
+                "rules[{rule_index}].conditions requires schema_version \"{}\"",
+                policy_document::POLICY_V1_SCHEMA_VERSION
+            ),
+        ));
+    }
     if let Some(route_index) = policy.routes.iter().position(|route| route.id.is_some()) {
         return Err(PolicyIssue::new(
             IssueCode::MemberRequiresV1,
@@ -707,6 +773,19 @@ fn validate_rules(rules: &[Rule]) -> Result<(), PolicyIssue> {
             &format!("rules[{rule_index}].principal"),
             &format!("{pointer}/principal"),
         )?;
+        if let Some(conditions) = rule.conditions.as_ref() {
+            let target = if has_tool_name {
+                ConditionTarget::ToolName
+            } else {
+                ConditionTarget::HttpPath
+            };
+            validate_condition(
+                conditions,
+                target,
+                &format!("{pointer}/conditions"),
+                &format!("rules[{rule_index}].conditions"),
+            )?;
+        }
     }
 
     Ok(())
@@ -1201,9 +1280,14 @@ pub(super) fn unknown_top_level_keys(value: &Value) -> Vec<String> {
         return Vec::new();
     };
 
+    // A member only v1 defines is not ignored but refused, as
+    // `validate_v0_has_no_v1_members` does, so it is not reported as dropped.
     object
         .keys()
-        .filter(|key| !KNOWN_TOP_LEVEL_KEYS.contains(&key.as_str()))
+        .filter(|key| {
+            !KNOWN_TOP_LEVEL_KEYS.contains(&key.as_str())
+                && !V1_ONLY_TOP_LEVEL_KEYS.contains(&key.as_str())
+        })
         .cloned()
         .collect()
 }
@@ -2462,11 +2546,12 @@ mod tests {
     /// validate policy files against. The result was a name the gateway loaded,
     /// the rule editor offered, and schema validation rejected, with nothing
     /// anywhere failing. Each schema carries the list in three separate places,
-    /// so all three are checked, in the 0.x schema and in the v1 schema.
+    /// and the v1 schema in a fourth, its identity mappings, so every one is
+    /// checked.
     #[test]
     fn the_published_schema_lists_exactly_the_auth_methods_the_parser_accepts() {
         let repo_root = repo_root();
-        for schema_file in ["policy.v0.schema.json", "policy.v1.schema.json"] {
+        for (schema_file, sites) in [("policy.v0.schema.json", 3), ("policy.v1.schema.json", 4)] {
             let schema_path = repo_root.join("docs/schemas").join(schema_file);
             let schema: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(&schema_path).unwrap_or_else(|err| {
@@ -2479,9 +2564,9 @@ mod tests {
 
             assert_eq!(
                 found.len(),
-                3,
-                "{schema_file} is expected to carry the auth-method list at three sites (role \
-                 permissions, route rules, tool rules); found {}",
+                sites,
+                "{schema_file} is expected to carry the auth-method list at {sites} sites (role \
+                 permissions, route rules, tool rules, and in v1 identity mappings); found {}",
                 found.len()
             );
             for names in &found {
@@ -3354,6 +3439,7 @@ mod tests {
                     max_concurrent: DEFAULT_TOOL_POLICY_MAX_CONCURRENT,
                 },
             )]),
+            identity_mappings: None,
         }
     }
 

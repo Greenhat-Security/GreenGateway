@@ -1,4 +1,6 @@
+pub mod conditions;
 pub mod engine;
+pub mod identity_mappings;
 pub mod matcher;
 pub mod policy;
 pub mod policy_conversion;
