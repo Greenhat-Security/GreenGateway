@@ -333,6 +333,106 @@ impl PolicyReplayJobs {
     }
 }
 
+/// A finished replay job as a policy evidence package records it.
+pub(super) struct ReplayJobEvidence {
+    /// The ETag of the candidate the job replayed, which evidence binds to
+    /// the publication it is about.
+    pub(super) candidate_etag: String,
+    /// The ETag of the active policy the job compared the candidate with.
+    pub(super) base_etag: String,
+    /// Whether the result is complete (`completed`, not
+    /// `completed_incomplete`).
+    pub(super) complete: bool,
+    /// The job's section of an evidence report: its bindings, window,
+    /// cutoff, limits and result, counts only.
+    pub(super) view: Value,
+}
+
+/// Why a job cannot be part of an evidence package.
+pub(super) enum ReplayJobEvidenceRefusal {
+    /// No job of this principal's has the id, as for any replay route.
+    NotFound,
+    /// The job holds no result: it is pending, failed, cancelled or expired,
+    /// named by its state.
+    Unfinished(&'static str),
+}
+
+impl PolicyReplayJobs {
+    /// The result of `principal`'s job `id`, for an evidence package. Served
+    /// exactly as `GET .../policy/replays/{id}` serves a job: only to the
+    /// principal that started it, and only while its result is retained.
+    pub(super) fn evidence(
+        &self,
+        principal: &auth::Principal,
+        id: &str,
+    ) -> Result<ReplayJobEvidence, ReplayJobEvidenceRefusal> {
+        if !is_policy_replay_job_id(id) {
+            return Err(ReplayJobEvidenceRefusal::NotFound);
+        }
+        let Some(job) = self.find(&replay_owner(principal), id) else {
+            return Err(ReplayJobEvidenceRefusal::NotFound);
+        };
+        let record = job.record();
+        let complete = match record.state {
+            ReplayJobState::Completed => true,
+            ReplayJobState::CompletedIncomplete => false,
+            state => return Err(ReplayJobEvidenceRefusal::Unfinished(state.as_str())),
+        };
+        let Some(result) = record.result.as_ref() else {
+            return Err(ReplayJobEvidenceRefusal::Unfinished(record.state.as_str()));
+        };
+        let mut candidate = json!({
+            "source": job.binding.candidate_source,
+            "etag": job.binding.candidate_etag,
+        });
+        if job.binding.candidate_source == "edits" {
+            if let Some(candidate) = candidate.as_object_mut() {
+                candidate.insert("edits".to_owned(), json!(job.binding.edit_count));
+            }
+        }
+        // The job id is left out: it names a process-local job its owner
+        // can poll, and the result digest already ties the section to the
+        // job's `policy.replay_completed` record.
+        let view = json!({
+            "included": true,
+            "mode": "historical_replay",
+            "state": record.state.as_str(),
+            "request_digest": job.request_digest,
+            "evaluator": {
+                "http_semantics_version": policy_eval::HTTP_SEMANTICS_VERSION,
+                "http_context_version": policy_eval::CONTEXT_VERSION,
+                "tool_semantics_version": policy_eval::tools::TOOL_SEMANTICS_VERSION,
+                "tool_context_version": policy_eval::tools::TOOL_CONTEXT_VERSION,
+                "replay_context_version": policy_replay::REPLAY_CONTEXT_SCHEMA_VERSION,
+            },
+            "base": { "source": "active", "etag": job.binding.base_etag },
+            "candidate": candidate,
+            "projections": job.binding.projection_names(),
+            "window": { "from": job.scope.from, "to": job.scope.to },
+            "cutoff": {
+                "high_water": job.scope.cutoff.high_water,
+                "selected_records": job.scope.cutoff.selected,
+            },
+            "limits": {
+                "max_records": job.scope.max_records,
+                "deadline_ms": duration_millis(REPLAY_RUN_DEADLINE),
+                "page_records": REPLAY_PAGE_RECORDS,
+                "max_page_bytes": MAX_REPLAY_PAGE_BYTES,
+                "max_record_bytes": MAX_REPLAY_RECORD_BYTES,
+            },
+            "not_replayed": policy_replay::job::NOT_REPLAYED,
+            "result_digest": result.digest,
+            "result": result.document,
+        });
+        Ok(ReplayJobEvidence {
+            candidate_etag: job.binding.candidate_etag.clone(),
+            base_etag: job.binding.base_etag.clone(),
+            complete,
+            view,
+        })
+    }
+}
+
 /// The application is going away: cancel every job, so a running one stops
 /// before its next record instead of holding a blocking thread through
 /// shutdown. Workers hold the run slot's semaphore, never the registry, so

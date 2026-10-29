@@ -153,7 +153,7 @@ pub(crate) fn parse_request(bytes: &[u8], value: &Value) -> Result<SimulationReq
     };
     let projections = match root.get("projections") {
         None => Some(vec![Projection::AsAuthored]),
-        Some(value) => parse_projections(value, &mut diagnostics),
+        Some(value) => parse_projections(value, "/projections", &mut diagnostics),
     };
     let cases = parse_case_list(
         root.get("cases"),
@@ -268,38 +268,32 @@ pub(crate) fn parse_candidate(
     }
 }
 
-/// The `projections` member: one or both projections, each named once.
-/// Historical replay takes the same member with the same meaning.
+/// The `projections` member at `pointer`: one or both projections, each
+/// named once. Historical replay and policy evidence take the same member
+/// with the same meaning.
 pub(crate) fn parse_projections(
     value: &Value,
+    pointer: &str,
     diagnostics: &mut Diagnostics,
 ) -> Option<Vec<Projection>> {
     let Value::Array(items) = value else {
-        diagnostics.push(
-            "invalid_type",
-            "/projections",
-            "projections must be an array",
-        );
+        diagnostics.push("invalid_type", pointer, "projections must be an array");
         return None;
     };
     if items.is_empty() {
-        diagnostics.push(
-            "invalid_value",
-            "/projections",
-            "name at least one projection",
-        );
+        diagnostics.push("invalid_value", pointer, "name at least one projection");
         return None;
     }
     let mut projections = Vec::with_capacity(items.len());
     for (index, item) in items.iter().enumerate() {
-        let pointer = format!("/projections/{index}");
+        let item_pointer = format!("{pointer}/{index}");
         let projection = match item.as_str() {
             Some("as_authored") => Projection::AsAuthored,
             Some("enforce_all_shadow") => Projection::EnforceAllShadow,
             _ => {
                 diagnostics.push(
                     "invalid_value",
-                    &pointer,
+                    &item_pointer,
                     "a projection is \"as_authored\" or \"enforce_all_shadow\"",
                 );
                 return None;
@@ -308,7 +302,7 @@ pub(crate) fn parse_projections(
         if projections.contains(&projection) {
             diagnostics.push(
                 "duplicate_projection",
-                &pointer,
+                &item_pointer,
                 "each projection may be named once",
             );
             return None;
