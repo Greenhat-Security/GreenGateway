@@ -4,6 +4,16 @@ export const CONTAINER_PING_ENDPOINT = "localhost/livez";
 // This is an exact allowlist. In particular, forwarding
 // CONNECTION_SECRET_ALIASES does not dynamically forward the environment
 // variable names referenced by those aliases.
+//
+// gateway/tests/env_example.rs holds this list to the variables the gateway
+// reads, and names every excluded variable with the reason it is excluded.
+//
+// A blank binding is never forwarded, so the container sees it as unset. For
+// most settings that is what blank means to the gateway too; for the four
+// lists whose blank value clears the default (AUTH_EXEMPT_PATHS,
+// RBAC_EXEMPT_PATHS, CSRF_EXEMPT_PATHS, VALIDATION_ALLOWED_CONTENT_TYPES) it
+// is not, and "," is the forwardable way to clear one. See
+// docs/architecture/configuration-compiler.md#blank-values.
 export const GREEN_GATEWAY_ENV_KEYS = [
   "ADMIN_PREFIX",
   "ADMIN_LOGIN_PROVIDER",

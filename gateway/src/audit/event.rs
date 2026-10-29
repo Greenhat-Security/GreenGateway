@@ -23,6 +23,18 @@ pub const POLICY_TESTS_RUN: &str = "policy.tests_run";
 /// A policy simulation completed (issue #243, slice 10). Records the base
 /// and candidate ETags, the request digest and counts, never its cases.
 pub const POLICY_SIMULATION_RUN: &str = "policy.simulation_run";
+/// A historical replay job was admitted (issue #243, slice 13). Records the
+/// job id, the base and candidate ETags, the request digest, the window, its
+/// cutoff and counts; never a record, a principal or policy content. A job
+/// whose start is not recorded is never queued.
+pub const POLICY_REPLAY_STARTED: &str = "policy.replay_started";
+/// A replay job finished reading its window, completely or not: its state,
+/// limitation codes, result digest and counts.
+pub const POLICY_REPLAY_COMPLETED: &str = "policy.replay_completed";
+/// A replay job was cancelled before it produced a result.
+pub const POLICY_REPLAY_CANCELLED: &str = "policy.replay_cancelled";
+/// A replay job failed with a stable reason and produced no result.
+pub const POLICY_REPLAY_FAILED: &str = "policy.replay_failed";
 pub const SERVICE_TOKEN_CHANGED: &str = "service_token.changed";
 pub const SERVICE_TOKEN_DELEGATION_REJECTED: &str = "service_token.delegation_rejected";
 /// A policy write the cross-resource checks refused before any authority saw

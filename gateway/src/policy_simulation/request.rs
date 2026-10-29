@@ -208,7 +208,11 @@ struct InlinePolicyBytes<'a> {
     policy: &'a RawValue,
 }
 
-fn parse_candidate(
+/// Parse the top-level `candidate` member of a request read as `value` from
+/// `bytes`. Historical replay takes the same three sources, with the same
+/// members, so it parses them here, and an inline candidate keeps its exact
+/// bytes for either.
+pub(crate) fn parse_candidate(
     bytes: &[u8],
     value: &Value,
     diagnostics: &mut Diagnostics,

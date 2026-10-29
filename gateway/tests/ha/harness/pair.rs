@@ -47,15 +47,37 @@ impl PairBinary {
     }
 }
 
+/// The one migration a pair crosses: the successor applies it, and the
+/// prepared release approved it, by exactly this checksum, before any build
+/// applied it.
+#[derive(Clone, Debug)]
+pub struct SchemaStep {
+    /// The schema point the prepared release's manifest ends at.
+    pub from: i64,
+    /// The schema point the successor's manifest ends at: `from + 1`.
+    pub to: i64,
+    pub migration: String,
+    /// The SHA-256 of the migration's SQL, as both builds' ledger checks
+    /// compute it.
+    pub checksum: String,
+}
+
 /// The prepared release and its successor, verified.
 pub struct UpgradePair {
     pub prepared: PairBinary,
     pub successor: PairBinary,
-    /// The operation the successor registers and the capability it needs.
-    pub operation: String,
-    pub capability: String,
-    /// The schema version both binaries serve, as the pin states it.
+    /// The operation the successor registers and the capability it needs,
+    /// when it registers one. A pair that crosses a schema step may add no
+    /// operation.
+    pub operation: Option<String>,
+    pub capability: Option<String>,
+    /// The schema point the prepared release migrates the deployment to, as
+    /// the pin states it: where its manifest ends.
     pub schema_version: i64,
+    /// The migration the successor applies, when the pair crosses one. Absent
+    /// when both builds serve one schema point and the successor carries no
+    /// migration.
+    pub schema_step: Option<SchemaStep>,
     substitution: String,
     evidence: PathBuf,
 }
@@ -71,6 +93,49 @@ fn text<'a>(value: &'a Value, pointer: &str, source: &str) -> &'a str {
         .pointer(pointer)
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("{source} carries no {pointer}: {value}"))
+}
+
+/// A pin member that is a string or `null`, and nothing else.
+fn optional_text(value: &Value, pointer: &str) -> Option<String> {
+    match value.pointer(pointer) {
+        None | Some(Value::Null) => None,
+        Some(Value::String(text)) if !text.is_empty() => Some(text.clone()),
+        Some(other) => panic!("the pair pin's {pointer} must be a name or null, not {other}"),
+    }
+}
+
+/// The pin's `schema_step`, checked: one migration, numbered right after the
+/// prepared release's schema point, named, with a full SHA-256.
+fn schema_step(pin: &Value, schema_version: i64) -> Option<SchemaStep> {
+    let step = match pin.get("schema_step") {
+        None | Some(Value::Null) => return None,
+        Some(step) => step,
+    };
+    let number = |key: &str| {
+        step[key]
+            .as_i64()
+            .unwrap_or_else(|| panic!("the pair pin's schema_step carries no {key}: {step}"))
+    };
+    let (from, to) = (number("from"), number("to"));
+    assert_eq!(
+        (from, to),
+        (schema_version, schema_version + 1),
+        "a pair crosses one migration, from the prepared release's schema point: {step}"
+    );
+    let checksum = text(step, "/checksum", "the pair pin's schema_step").to_owned();
+    assert!(
+        checksum.len() == 64
+            && checksum
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "the schema step's checksum must be one lowercase SHA-256: {step}"
+    );
+    Some(SchemaStep {
+        from,
+        to,
+        migration: text(step, "/migration", "the pair pin's schema_step").to_owned(),
+        checksum,
+    })
 }
 
 impl UpgradePair {
@@ -148,17 +213,40 @@ impl UpgradePair {
                 evidence.display()
             )
         });
+        let operation = optional_text(&pin, "/operation");
+        let capability = optional_text(&pin, "/capability");
+        assert_eq!(
+            operation.is_some(),
+            capability.is_some(),
+            "the pair pin names an operation and its capability together, or neither"
+        );
+        let schema_version = pin["schema_version"]
+            .as_i64()
+            .expect("the pair pin states the schema version");
+        let schema_step = schema_step(&pin, schema_version);
+        assert!(
+            operation.is_some() || schema_step.is_some(),
+            "the successor must differ from the prepared release by an operation or a migration"
+        );
         Self {
             prepared,
             successor,
-            operation: text(&pin, "/operation", "the pair pin").to_owned(),
-            capability: text(&pin, "/capability", "the pair pin").to_owned(),
-            schema_version: pin["schema_version"]
-                .as_i64()
-                .expect("the pair pin states the schema version"),
+            operation,
+            capability,
+            schema_version,
+            schema_step,
             substitution: text(&manifest, "/substitution", "the pair manifest").to_owned(),
             evidence,
         }
+    }
+
+    /// The schema point the deployment reaches once the successor has
+    /// migrated it, and which both builds then serve: the step's target, or
+    /// the one schema point of a pair that crosses none.
+    pub fn shared_schema(&self) -> i64 {
+        self.schema_step
+            .as_ref()
+            .map_or(self.schema_version, |step| step.to)
     }
 
     /// Which side a binary path is, for a row that reports per replica.

@@ -3,6 +3,7 @@ import {
   test,
   type APIRequestContext,
   type Page,
+  type Response as PlaywrightResponse,
 } from '@playwright/test';
 
 const ADMIN_ORIGIN = 'http://127.0.0.1:43203';
@@ -75,7 +76,7 @@ test.describe.serial('Issue #240 live admin acceptance', () => {
           if (new URL(request.url()).pathname.startsWith('/v1/admin/policy')) policyRequests++;
         });
         const [capabilities] = await Promise.all([
-          page.waitForResponse((response) => new URL(response.url()).pathname === '/v1/admin/capabilities'),
+          completedResponse(page, '/v1/admin/capabilities'),
           identity === 'cookie' ? page.goto('/admin/cluster') : page.getByRole('link', { name: 'Cluster', exact: true }).click(),
         ]);
         expect(capabilities.status()).toBe(200);
@@ -115,12 +116,11 @@ test.describe.serial('Issue #240 live admin acceptance', () => {
     expect((await page.content()).includes(tokens.reader)).toBe(false);
     await expect(page.getByLabel('Token', { exact: true })).toHaveValue('');
     const [authenticated] = await Promise.all([
-      page.waitForResponse((response) => new URL(response.url()).pathname === '/v1/admin/connections'),
+      completedResponse(page, '/v1/admin/connections'),
       page.getByRole('link', { name: 'Connections', exact: true }).click(),
     ]);
     expect(authenticated.status()).toBe(200);
     expect(Boolean(await authenticated.request().headerValue('authorization'))).toBe(true);
-    await authenticated.finished();
     await expect(page.getByRole('heading', { level: 2, name: 'Connections', exact: true })).toBeVisible();
     const [response] = await Promise.all([
       // Ignore any in-flight request from the old document. The reloaded page
@@ -547,33 +547,69 @@ async function saveBearerToken(page: Page, token: string) {
       );
     }
   });
-  const [initialCapabilities] = await Promise.all([
-    page.waitForResponse((response) =>
-      new URL(response.url()).pathname === '/v1/admin/capabilities'),
-    page.goto('/admin/'),
-  ]);
-  await initialCapabilities.finished();
-  if (initialCapabilities.status() === 401) {
-    // The initial anonymous rejection clears credential inputs. Let the UI
-    // process it before typing; this must not race the credential submission.
-    await expect(page.getByRole('status').filter({
-      hasText: 'Session ended. Sign in again.',
-    })).toBeVisible();
-  }
+  // A fresh tab holds no credential, so its first admin answer is a 401 and
+  // the app ends the anonymous session: it clears the credential field and
+  // says so. Typing before that races the clearing, so wait for the app's
+  // own announcement rather than for one particular request. The app aborts
+  // capabilities requests it no longer needs (a StrictMode remount, or a
+  // session another answer already ended); when that abort lands after the
+  // response headers, Playwright reports the response but never settles its
+  // finished(), which used to hang this helper until the test timeout.
+  await page.goto('/admin/');
+  await expectTokenStatus(
+    page,
+    'Session ended. Sign in again.',
+    'The anonymous session did not end',
+    rejectedAdminRequests,
+  );
   await page.getByLabel('Token', { exact: true }).fill(token);
   await page.getByRole('button', { name: 'Save' }).click();
+  await expectTokenStatus(
+    page,
+    'Token active in this tab until reload or session expiry.',
+    'Bearer activation failed',
+    rejectedAdminRequests,
+  );
+}
+
+async function expectTokenStatus(
+  page: Page,
+  text: string,
+  failure: string,
+  rejectedAdminRequests: readonly string[],
+) {
   try {
     await expect(
-      page.getByRole('status').filter({
-        hasText: 'Token active in this tab until reload or session expiry.',
-      }),
+      page.getByRole('status').filter({ hasText: text }),
     ).toBeVisible();
   } catch (error) {
     throw new Error(
-      `Bearer activation failed. Admin 401 responses: ${rejectedAdminRequests.join('; ') || 'none'}`,
+      `${failure}. Admin 401 responses: ${rejectedAdminRequests.join('; ') || 'none'}`,
       { cause: error },
     );
   }
+}
+
+/**
+ * The response to the first request for `pathname` that the browser loaded
+ * completely. The admin UI aborts reads it no longer needs (StrictMode
+ * remounts, route changes, an ended session). A response whose request was
+ * aborted after its headers arrived has no body, and Playwright never
+ * settles its finished(), so a test must not bind to it.
+ */
+async function completedResponse(
+  page: Page,
+  pathname: string,
+): Promise<PlaywrightResponse> {
+  const request = await page.waitForEvent(
+    'requestfinished',
+    (finished) => new URL(finished.url()).pathname === pathname,
+  );
+  const response = await request.response();
+  if (response === null) {
+    throw new Error(`${pathname} finished without a response`);
+  }
+  return response;
 }
 
 async function assertThemeChanges(page: Page) {

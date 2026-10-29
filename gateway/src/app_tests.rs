@@ -4305,6 +4305,31 @@ async fn proxy_uses_upstream_timeout_override_for_timed_out_upstream() {
     server.abort();
 }
 
+/// Reads one request head from a raw upstream fixture connection and returns
+/// its request line, or `None` when the peer closes or sends no valid head
+/// (the fixture then answers nothing). A raw fixture must not answer before
+/// this returns: hyper's HTTP/1.1 client rejects bytes that arrive on a
+/// connection it has not yet written a request to ("unexpected message"),
+/// which the proxy reports as a 502. Since tokio 1.54 an accepted socket starts
+/// out writable, so a fixture that writes straight after `accept` wins that
+/// race instead of waiting for the reactor's first event.
+async fn read_raw_http_request_line(stream: &mut tokio::net::TcpStream) -> Option<String> {
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while buffer.len() <= 16 * 1024 {
+        let read = stream.read(&mut chunk).await.ok()?;
+        if read == 0 {
+            return None;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if let Some(end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+            let head = std::str::from_utf8(&buffer[..end]).ok()?;
+            return head.split("\r\n").next().map(str::to_owned);
+        }
+    }
+    None
+}
+
 #[tokio::test]
 async fn proxy_returns_504_when_streaming_upstream_body_idles_before_first_chunk() {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -4313,19 +4338,28 @@ async fn proxy_returns_504_when_streaming_upstream_body_idles_before_first_chunk
     let upstream_addr = listener
         .local_addr()
         .expect("listener address should be available");
+    let (request_lines, mut received_request_lines) = tokio::sync::mpsc::unbounded_channel();
     let server = tokio::spawn(async move {
         loop {
             let (mut stream, _) = listener
                 .accept()
                 .await
                 .expect("test server should accept a connection");
+            let request_lines = request_lines.clone();
             tokio::spawn(async move {
+                // Headers go out only once a request head has arrived (the
+                // proxied request, or the app's own `HEAD /` health probe),
+                // then the body idles before its first chunk.
+                let Some(request_line) = read_raw_http_request_line(&mut stream).await else {
+                    return;
+                };
+                let _ = request_lines.send(request_line);
                 stream
-                        .write_all(
-                            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
-                        )
-                        .await
-                        .expect("test server should write response headers");
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .expect("test server should write response headers");
                 tokio::time::sleep(Duration::from_secs(10)).await;
             });
         }
@@ -4354,6 +4388,18 @@ async fn proxy_returns_504_when_streaming_upstream_body_idles_before_first_chunk
     assert_eq!(
         body_string(response).await,
         r#"{"error":"gateway_timeout"}"#
+    );
+    // The fixture sends a request's line before answering it, and the 504
+    // needs those headers, so the proxied request is already recorded here.
+    let mut request_lines = Vec::new();
+    while let Ok(request_line) = received_request_lines.try_recv() {
+        request_lines.push(request_line);
+    }
+    assert!(
+        request_lines
+            .iter()
+            .any(|request_line| request_line == "GET /slow-body HTTP/1.1"),
+        "the idle response should answer the proxied request: {request_lines:?}"
     );
     server.abort();
 }
@@ -40593,3 +40639,6 @@ mod admin_policy_test_runs_tests;
 
 #[path = "admin_policy_simulations_tests.rs"]
 mod admin_policy_simulations_tests;
+
+#[path = "admin_policy_replays_tests.rs"]
+mod admin_policy_replays_tests;

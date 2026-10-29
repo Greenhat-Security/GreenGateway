@@ -330,6 +330,48 @@ pub struct ShadowRuleWouldDenySample {
     pub actor: Option<Actor>,
 }
 
+/// The rows of the audit log a historical replay job reads, fixed when the
+/// job is created ([`AuditQueryStore::replay_cutoff`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReplayCutoff {
+    /// The newest row id stored when the job was created.
+    pub(crate) high_water: i64,
+    /// Rows inside the window at or below `high_water`.
+    pub(crate) selected: u64,
+    /// The smallest and the largest of those row ids; `None` when there is
+    /// none.
+    pub(crate) first_id: Option<i64>,
+    pub(crate) last_id: Option<i64>,
+}
+
+/// One page of a replay window ([`AuditQueryStore::replay_page`]): the rows
+/// with `after_id < id <= through_id` whose timestamps fall inside
+/// `[from_epoch_us, to_epoch_us)`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReplayPageQuery {
+    pub(crate) from_epoch_us: i64,
+    pub(crate) to_epoch_us: i64,
+    pub(crate) after_id: i64,
+    pub(crate) through_id: i64,
+    /// Most rows the page holds.
+    pub(crate) limit: usize,
+    /// Largest actor-plus-payload JSON, in bytes, read for one row.
+    pub(crate) max_record_bytes: usize,
+    /// Most actor and payload JSON bytes the page holds past its first row.
+    pub(crate) max_page_bytes: usize,
+}
+
+/// One row of a replay page ([`AuditQueryStore::replay_page`]).
+pub(crate) enum ReplayRow {
+    /// The stored event, boxed: it is far larger than the other answers.
+    Event(Box<AuditEvent>),
+    /// The row's actor or payload is not the JSON the audit sink writes.
+    Unreadable,
+    /// The row's actor and payload exceed the per-record byte bound; neither
+    /// was read into memory.
+    Oversized,
+}
+
 pub struct AuditQueryPage {
     pub events: Vec<AuditEvent>,
     pub next_cursor: Option<i64>,
@@ -463,8 +505,9 @@ impl AuditQueryStore {
     /// write-ahead log on close, which an ordinary connection does when it
     /// is the last one open. `SQLITE_OPEN_READ_ONLY` also never creates the
     /// file, so a path that does not exist is a refusal rather than a new
-    /// empty log.
-    #[cfg_attr(not(feature = "postgres"), allow(dead_code))] // The import's only caller.
+    /// empty log. A historical replay job (issue #243, slice 13) reads its
+    /// window through one of these too, so a running job neither shares the
+    /// admin API's connection nor can write to the log it reads.
     pub fn open_read_only(path: impl Into<PathBuf>) -> Result<Self, AuditQueryError> {
         use rusqlite::OpenFlags;
 
@@ -606,6 +649,196 @@ impl AuditQueryStore {
                 row.into_event().map(|event| (id, event))
             })
             .collect()
+    }
+
+    /// The database file this store reads, for a caller that opens a
+    /// connection of its own to it -- the replay job engine's dedicated
+    /// read-only connection.
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// Fix the rows a historical replay job (issue #243, slice 13) reads:
+    /// the newest row id stored now, and the rows inside the window
+    /// `[from_epoch_us, to_epoch_us)` at or below it.
+    ///
+    /// One statement, so the high-water mark and the count come from one
+    /// read snapshot. Row ids are `AUTOINCREMENT`: a row written after this
+    /// call has a larger id than `high_water` and can never enter the job,
+    /// whatever its timestamp. A row whose timestamp has no epoch value (it
+    /// did not parse when it was stored) belongs to no window.
+    pub(crate) fn replay_cutoff(
+        &self,
+        from_epoch_us: i64,
+        to_epoch_us: i64,
+    ) -> Result<ReplayCutoff, AuditQueryError> {
+        let connection = self.connection_guard();
+        connection
+            .query_row(
+                r#"
+                SELECT
+                    (SELECT COALESCE(MAX(id), 0) FROM audit_events),
+                    COUNT(*),
+                    MIN(id),
+                    MAX(id)
+                FROM audit_events
+                WHERE timestamp_epoch_us >= ?1
+                  AND timestamp_epoch_us < ?2
+                  AND id <= (SELECT COALESCE(MAX(id), 0) FROM audit_events)
+                "#,
+                params_from_iter([
+                    SqlValue::Integer(from_epoch_us),
+                    SqlValue::Integer(to_epoch_us),
+                ]),
+                |row| {
+                    let selected: i64 = row.get(1)?;
+                    Ok(ReplayCutoff {
+                        high_water: row.get(0)?,
+                        selected: u64::try_from(selected).unwrap_or(0),
+                        first_id: row.get(2)?,
+                        last_id: row.get(3)?,
+                    })
+                },
+            )
+            .map_err(|source| AuditQueryError::Sqlite {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    /// How many rows of a replay cutoff's window are still stored. A job
+    /// compares it with [`ReplayCutoff::selected`] when it finishes: fewer
+    /// means retention pruned rows it was meant to read.
+    pub(crate) fn replay_window_count(
+        &self,
+        from_epoch_us: i64,
+        to_epoch_us: i64,
+        through_id: i64,
+    ) -> Result<u64, AuditQueryError> {
+        let connection = self.connection_guard();
+        let count = connection
+            .query_row(
+                r#"
+                SELECT COUNT(*)
+                FROM audit_events
+                WHERE timestamp_epoch_us >= ?1
+                  AND timestamp_epoch_us < ?2
+                  AND id <= ?3
+                "#,
+                params_from_iter([
+                    SqlValue::Integer(from_epoch_us),
+                    SqlValue::Integer(to_epoch_us),
+                    SqlValue::Integer(through_id),
+                ]),
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|source| AuditQueryError::Sqlite {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(u64::try_from(count).unwrap_or(0))
+    }
+
+    /// One page of a replay window, oldest first: the rows [`ReplayPageQuery`]
+    /// names, at most `limit` of them and, past the first, no more than
+    /// `max_page_bytes` of actor and payload JSON in total.
+    ///
+    /// A row whose actor and payload together exceed `max_record_bytes` is
+    /// [`ReplayRow::Oversized`] and its JSON is never read into memory; one
+    /// whose JSON does not parse is [`ReplayRow::Unreadable`]. Neither stops
+    /// the page: a replay counts the records it cannot use, it does not fail
+    /// on them.
+    ///
+    /// The page walks the primary key: the window's epoch bounds are applied
+    /// with a unary `+`, which keeps SQLite from choosing the timestamp index
+    /// and sorting the whole window for every page. Each page is its own
+    /// statement and read transaction, so no snapshot is held between pages
+    /// and the job never holds back a WAL checkpoint for longer than one page.
+    pub(crate) fn replay_page(
+        &self,
+        page: &ReplayPageQuery,
+    ) -> Result<Vec<(i64, ReplayRow)>, AuditQueryError> {
+        let sqlite_error = |source| AuditQueryError::Sqlite {
+            path: self.path.clone(),
+            source,
+        };
+        let connection = self.connection_guard();
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT
+                    id,
+                    event_id,
+                    event_type,
+                    timestamp,
+                    schema_version,
+                    request_id,
+                    source_ip,
+                    user_agent,
+                    CASE WHEN record_bytes > ?6 THEN NULL ELSE actor_json END,
+                    CASE WHEN record_bytes > ?6 THEN '' ELSE payload_json END,
+                    record_bytes
+                FROM (
+                    SELECT
+                        id,
+                        event_id,
+                        event_type,
+                        timestamp,
+                        schema_version,
+                        request_id,
+                        source_ip,
+                        user_agent,
+                        actor_json,
+                        payload_json,
+                        octet_length(payload_json)
+                            + COALESCE(octet_length(actor_json), 0) AS record_bytes
+                    FROM audit_events
+                    WHERE id > ?1
+                      AND id <= ?2
+                      AND +timestamp_epoch_us >= ?3
+                      AND +timestamp_epoch_us < ?4
+                    ORDER BY id ASC
+                    LIMIT ?5
+                )
+                ORDER BY id ASC
+                "#,
+            )
+            .map_err(sqlite_error)?;
+        let mut rows = statement
+            .query(params_from_iter([
+                SqlValue::Integer(page.after_id),
+                SqlValue::Integer(page.through_id),
+                SqlValue::Integer(page.from_epoch_us),
+                SqlValue::Integer(page.to_epoch_us),
+                SqlValue::Integer(i64::try_from(page.limit).unwrap_or(i64::MAX)),
+                SqlValue::Integer(i64::try_from(page.max_record_bytes).unwrap_or(i64::MAX)),
+            ]))
+            .map_err(sqlite_error)?;
+        let mut read = Vec::new();
+        let mut page_bytes = 0_usize;
+        while let Some(row) = rows.next().map_err(sqlite_error)? {
+            let record_bytes =
+                usize::try_from(row.get::<_, i64>(10).map_err(sqlite_error)?).unwrap_or(usize::MAX);
+            if record_bytes > page.max_record_bytes {
+                read.push((
+                    row.get::<_, i64>(0).map_err(sqlite_error)?,
+                    ReplayRow::Oversized,
+                ));
+                continue;
+            }
+            if !read.is_empty() && page_bytes.saturating_add(record_bytes) > page.max_page_bytes {
+                break;
+            }
+            page_bytes = page_bytes.saturating_add(record_bytes);
+            let raw = raw_event_row(row).map_err(sqlite_error)?;
+            let id = raw.id;
+            let replay_row = match raw.into_event() {
+                Ok(event) => ReplayRow::Event(Box::new(event)),
+                Err(_) => ReplayRow::Unreadable,
+            };
+            read.push((id, replay_row));
+        }
+        Ok(read)
     }
 
     pub fn query_endpoint_activity(

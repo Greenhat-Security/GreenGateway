@@ -20,6 +20,7 @@ use super::{
     },
     inventory,
     listeners::ListenerInputs,
+    parity_tests::BLANK_CLEARS_THE_DEFAULT,
     plan::{self, ConfigPlan},
     proxy::{RoutingInputs, TrustedProxyInputs},
     runtime::{
@@ -1278,5 +1279,61 @@ fn every_rule_is_reported_by_name_in_the_diagnostics() {
             ConfigDiagnosticCode::Unset
         };
         assert_eq!(diagnostic.code, code, "{rule:?}: {error}");
+    }
+}
+
+fn repository_text(path: &str) -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(path);
+    fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
+}
+
+const COMPILER_CONTRACT: &str = "docs/architecture/configuration-compiler.md";
+
+/// The backticked names in the first column of the Markdown table whose
+/// header row is `header`, in order.
+fn documented_names(document: &str, header: &str) -> Vec<String> {
+    document
+        .lines()
+        .skip_while(|line| line.trim_end() != header)
+        .skip(1)
+        .take_while(|line| line.starts_with('|'))
+        .filter_map(|row| {
+            let cell = row.split('|').nth(1)?.trim();
+            cell.strip_prefix('`')?.strip_suffix('`').map(str::to_owned)
+        })
+        .collect()
+}
+
+/// The compiler contract's table of rules is the rules there are, in the
+/// order they are declared, so a report format built from it misses none.
+#[test]
+fn the_compiler_contract_lists_every_rule() {
+    let documented = documented_names(&repository_text(COMPILER_CONTRACT), "| Rule | Refuses |");
+    let rules: Vec<String> = EVERY_RULE.iter().map(|rule| format!("{rule:?}")).collect();
+    assert_eq!(
+        documented, rules,
+        "{COMPILER_CONTRACT}#rules lists every ConfigRule, in declaration order"
+    );
+}
+
+/// The lists a blank value clears are the ones the compiler contract names,
+/// and the Cloudflare guide, whose wrapper drops blank values, names each.
+#[test]
+fn the_compiler_contract_lists_every_list_a_blank_value_clears() {
+    let documented = documented_names(
+        &repository_text(COMPILER_CONTRACT),
+        "| Setting | Default it replaces |",
+    );
+    assert_eq!(
+        documented, BLANK_CLEARS_THE_DEFAULT,
+        "{COMPILER_CONTRACT}#blank-values lists the parity golden's lists"
+    );
+    let cloudflare = repository_text("docs/deployment/cloudflare.md");
+    for name in BLANK_CLEARS_THE_DEFAULT {
+        assert!(
+            cloudflare.contains(&format!("`{name}`")),
+            "docs/deployment/cloudflare.md says how {name} is cleared through the wrapper"
+        );
     }
 }
