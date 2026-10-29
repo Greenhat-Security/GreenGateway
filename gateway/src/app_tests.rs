@@ -37592,3 +37592,6 @@ mod admin_policy_simulations_tests;
 
 #[path = "admin_policy_replays_tests.rs"]
 mod admin_policy_replays_tests;
+
+#[path = "admin_policy_evidence_tests.rs"]
+mod admin_policy_evidence_tests;
