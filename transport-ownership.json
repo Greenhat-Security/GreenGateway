@@ -5333,7 +5333,8 @@
             "optional": false,
             "uses_default_features": true,
             "features": [
-              "arbitrary_precision"
+              "arbitrary_precision",
+              "raw_value"
             ],
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
