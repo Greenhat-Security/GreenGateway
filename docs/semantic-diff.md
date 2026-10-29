@@ -99,7 +99,7 @@ A detector says which direction of change loosens a setting:
 | Rule | Loosens | Tightens |
 | --- | --- | --- |
 | a flag | the looser value (`AUTH_ENABLED=false`, `TRUST_PROXY_HEADERS=true`) | the other |
-| ranked words | a word further down the order (`required` < `observe`; `1.3` < `1.2`; `production` < `migration` < `development`; `deny` < `allow`) | a word further up; a word not in the order is `unknown` |
+| ranked words | a word further down the order (`required` < `observe`; `required` < `best_effort`; `1.3` < `1.2`; `production` < `migration` < `development`; `deny` < `allow`) | a word further up; a word not in the order is `unknown` |
 | a bound | raising it or removing it (unbounded is the highest); for retention, journal capacity, the audit drain timeout and the rate limiter's bucket capacity and idle lifetime, lowering it | the other direction |
 | an allow set | adding any member | only removing members |
 | a restricting set, where empty means unrestricted (policy egress ports, a role's issuers and auth methods, a tool's allowed roles) | emptying it, or adding a member to a non-empty one | restricting an empty one, or only removing members |
@@ -133,12 +133,13 @@ bundles and documents.
 
 A published code never changes meaning; renaming or
 removing one requires a new report version. Authentication, egress and policy
-weakening, and anything no detector can classify, are `high`.
+weakening, letting requests or authority changes proceed without a durable
+record of them, and anything no detector can classify, are `high`.
 
 | Code | Severity | Meaning | Raised by |
 | --- | --- | --- | --- |
 | `risk.admin_access_path_removed` | high | an admin authentication path was removed, which can lock administrators out | reserved: no detector raises it yet (ADR-0008 makes it non-acknowledgeable online) |
-| `risk.audit_durability_reduced` | medium | fewer events are recorded, less durably, or for less time | audit sinks and stores, retention, `AUDIT_DURABILITY`, `AUDIT_DRAIN_TIMEOUT_MS`, `AUDIT_SUCCESSFUL_PROBES_METRICS_ONLY`, `AUTHORITY_EVENT_SINK`, journal capacity and retention |
+| `risk.audit_durability_reduced` | medium | fewer events are recorded, less durably, or for less time | audit sinks and stores, retention, `AUDIT_DRAIN_TIMEOUT_MS`, `AUDIT_SUCCESSFUL_PROBES_METRICS_ONLY`, `AUTHORITY_EVENT_SINK`, journal capacity and retention |
 | `risk.auth_disabled` | high | authentication is turned off | `AUTH_ENABLED` |
 | `risk.auth_observe_only` | high | failed authentication is observed instead of refused | `AUTH_MODE` |
 | `risk.auth_trust_changed` | high | an identity provider, issuer, key source, audience, claim or client-certificate rule was added or changed, or a check on it was relaxed | `AUTH_PROVIDERS`, `JWT_*`, `ROLES_CLAIM`, service tokens, `ADMIN_LOGIN_PROVIDER`, client certificates |
@@ -147,6 +148,7 @@ weakening, and anything no detector can classify, are `high`.
 | `risk.credential_binding_changed` | high | a secret reference, key, secret provider or credential binding was added or changed | TLS keys, `DATABASE_URL_FILE`, Connections settings and keyrings, pseudonym key aliases, route Connections |
 | `risk.data_exposure_increased` | medium | more request data is captured, or more deployment topology is disclosed | payload capture, `CLUSTER_STATUS_EXPOSE_HOSTNAMES`, session-cookie forwarding |
 | `risk.egress_broadened` | high | more outbound destinations or ports are allowed | `EGRESS_ALLOWED_HOSTS`, `policy.egress.hosts`, `policy.egress.ports` |
+| `risk.evidence_not_required` | high | requests or authority changes may proceed without a durable record of them | `AUDIT_DURABILITY` and `AUTHORITY_EVIDENCE_DURABILITY` moving from `required` to `best_effort` (unset `AUTHORITY_EVIDENCE_DURABILITY` is `best_effort`); returning to `required` tightens and carries no code |
 | `risk.exemptions_broadened` | high | more paths are exempt from authentication, authorization or CSRF checks | `AUTH_EXEMPT_PATHS`, `RBAC_EXEMPT_PATHS`, `CSRF_EXEMPT_PATHS` |
 | `risk.limits_loosened` | low | a size, rate, time, concurrency or validation bound was raised, removed or relaxed | request, egress, TLS, tool runtime, rate-limit and database bounds; policy rate overrides and tool timeouts |
 | `risk.listener_exposed` | high | a listener is reachable beyond loopback, or another listener was opened | `LISTEN_ADDR`, `ADMIN_LISTEN_ADDR`, `GRPC_LISTEN_ADDR` |

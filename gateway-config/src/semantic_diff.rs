@@ -85,6 +85,7 @@ pub enum RiskCode {
     CredentialBindingChanged,
     DataExposureIncreased,
     EgressBroadened,
+    EvidenceNotRequired,
     ExemptionsBroadened,
     LimitsLoosened,
     ListenerExposed,
@@ -116,6 +117,7 @@ impl RiskCode {
         Self::CredentialBindingChanged,
         Self::DataExposureIncreased,
         Self::EgressBroadened,
+        Self::EvidenceNotRequired,
         Self::ExemptionsBroadened,
         Self::LimitsLoosened,
         Self::ListenerExposed,
@@ -146,6 +148,7 @@ impl RiskCode {
             Self::CredentialBindingChanged => "risk.credential_binding_changed",
             Self::DataExposureIncreased => "risk.data_exposure_increased",
             Self::EgressBroadened => "risk.egress_broadened",
+            Self::EvidenceNotRequired => "risk.evidence_not_required",
             Self::ExemptionsBroadened => "risk.exemptions_broadened",
             Self::LimitsLoosened => "risk.limits_loosened",
             Self::ListenerExposed => "risk.listener_exposed",
@@ -165,8 +168,9 @@ impl RiskCode {
         }
     }
 
-    /// Authentication, egress and policy weakening, and anything no
-    /// detector can classify, are high.
+    /// Authentication, egress and policy weakening, letting actions proceed
+    /// without a durable record, and anything no detector can classify, are
+    /// high.
     pub fn severity(self) -> Severity {
         match self {
             Self::AdminAccessPathRemoved
@@ -176,6 +180,7 @@ impl RiskCode {
             | Self::CookieOrCsrfWeakened
             | Self::CredentialBindingChanged
             | Self::EgressBroadened
+            | Self::EvidenceNotRequired
             | Self::ExemptionsBroadened
             | Self::ListenerExposed
             | Self::PlaintextTransport
@@ -223,6 +228,9 @@ impl RiskCode {
                 "more request data is captured, or more deployment topology is disclosed"
             }
             Self::EgressBroadened => "more outbound destinations or ports are allowed",
+            Self::EvidenceNotRequired => {
+                "requests or authority changes may proceed without a durable record of them"
+            }
             Self::ExemptionsBroadened => {
                 "more paths are exempt from authentication, authorization or CSRF checks"
             }

@@ -40,7 +40,9 @@ use gateway_config::{
 use serde_json::{json, Value};
 
 use super::{
-    authority_events::{AuthorityEventSettings, AuthorityEventSinkSetting},
+    authority_events::{
+        AuthorityEventSettings, AuthorityEventSinkSetting, AuthorityEvidenceDurability,
+    },
     connections::ConnectionsPlan,
     egress::EgressPlan,
     identity::IdentityPlan,
@@ -540,15 +542,25 @@ static AUDIT_DRAIN_TIMEOUT_MS: Field = setting(
     RiskCode::AuditDurabilityReduced,
     Rule::LowerIsLooser,
 );
+/// The durability modes from the strictest to the loosest. `best_effort`
+/// lets a request, or an authority change, proceed without a durable record
+/// of it, so moving to it is `risk.evidence_not_required`.
+const DURABILITY_MODES: &[&str] = &["required", "best_effort"];
 static AUDIT_DURABILITY: Field = setting(
     "AUDIT_DURABILITY",
     Section::Audit,
-    RiskCode::AuditDurabilityReduced,
-    Rule::Ranked(&["required", "best_effort"]),
+    RiskCode::EvidenceNotRequired,
+    Rule::Ranked(DURABILITY_MODES),
 );
 static AUDIT_DURABILITY_TIMEOUT_MS: Field = limit("AUDIT_DURABILITY_TIMEOUT_MS", Section::Audit);
 static SHUTDOWN_DRAIN_DELAY_MS: Field = neutral("SHUTDOWN_DRAIN_DELAY_MS", Section::Lifecycle);
 static SHUTDOWN_TIMEOUT_MS: Field = neutral("SHUTDOWN_TIMEOUT_MS", Section::Lifecycle);
+static AUTHORITY_EVIDENCE_DURABILITY: Field = setting(
+    "AUTHORITY_EVIDENCE_DURABILITY",
+    Section::Audit,
+    RiskCode::EvidenceNotRequired,
+    Rule::Ranked(DURABILITY_MODES),
+);
 static AUTHORITY_EVENT_SINK: Field = setting(
     "AUTHORITY_EVENT_SINK",
     Section::Audit,
@@ -871,6 +883,7 @@ pub(crate) static SETTINGS: &[&Field] = &[
     &DATABASE_STARTUP_RETRY_LIMIT,
     &DATABASE_AUTO_MIGRATE,
     &DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS,
+    &AUTHORITY_EVIDENCE_DURABILITY,
     &AUTHORITY_EVENT_SINK,
     &AUTHORITY_EVENT_FILE,
     &AUTHORITY_PSEUDONYM_KEY_ALIAS,
@@ -1759,12 +1772,19 @@ fn compare_authority_events(
     candidate: &AuthorityEventSettings,
 ) {
     let AuthorityEventSettings {
+        durability,
         sink,
         pseudonym_key_alias,
         previous_pseudonym_key_alias,
         journal_capacity,
         retention_hours,
     } = base;
+    // Read in both deployment modes, unlike the delivery settings below.
+    c.word(
+        &AUTHORITY_EVIDENCE_DURABILITY,
+        evidence_durability_word(*durability),
+        evidence_durability_word(candidate.durability),
+    );
     c.word(&AUTHORITY_EVENT_SINK, sink.kind(), candidate.sink.kind());
     c.value(
         &AUTHORITY_EVENT_FILE,
@@ -1791,6 +1811,15 @@ fn compare_authority_events(
         Some(*retention_hours),
         Some(candidate.retention_hours),
     );
+}
+
+/// Matched rather than taken from `as_str`, so a mode added to the setting
+/// does not compile until it is ranked in [`DURABILITY_MODES`].
+fn evidence_durability_word(durability: AuthorityEvidenceDurability) -> &'static str {
+    match durability {
+        AuthorityEvidenceDurability::Required => "required",
+        AuthorityEvidenceDurability::BestEffort => "best_effort",
+    }
 }
 
 fn event_file(sink: &AuthorityEventSinkSetting) -> Option<&String> {

@@ -378,6 +378,7 @@
         "risk.credential_binding_changed",
         "risk.data_exposure_increased",
         "risk.egress_broadened",
+        "risk.evidence_not_required",
         "risk.exemptions_broadened",
         "risk.limits_loosened",
         "risk.listener_exposed",

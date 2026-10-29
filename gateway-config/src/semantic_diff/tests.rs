@@ -120,7 +120,7 @@ fn every_risk_code_is_stable_sorted_unique_and_described() {
 }
 
 #[test]
-fn authentication_egress_policy_and_unknown_risks_are_high() {
+fn authentication_egress_policy_evidence_and_unknown_risks_are_high() {
     for code in [
         RiskCode::AuthDisabled,
         RiskCode::AuthObserveOnly,
@@ -132,6 +132,7 @@ fn authentication_egress_policy_and_unknown_risks_are_high() {
         RiskCode::ShadowEnabled,
         RiskCode::PolicyBroadened,
         RiskCode::ExemptionsBroadened,
+        RiskCode::EvidenceNotRequired,
         RiskCode::UnknownImpact,
     ] {
         assert_eq!(code.severity(), Severity::High, "{}", code.as_str());

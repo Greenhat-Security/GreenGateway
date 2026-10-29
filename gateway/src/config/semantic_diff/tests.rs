@@ -4,8 +4,8 @@ use std::{
 };
 
 use gateway_config::semantic_diff::{
-    ChangeClass, Display, Effect, RiskCode, SemanticDiff, Severity, DEFAULT_TOOL_MAX_CONCURRENT,
-    DEFAULT_TOOL_TIMEOUT_MS,
+    ChangeClass, Display, Effect, RiskCode, SemanticDiff, Severity, Shown,
+    DEFAULT_TOOL_MAX_CONCURRENT, DEFAULT_TOOL_TIMEOUT_MS,
 };
 
 use super::{plans, SETTINGS};
@@ -19,10 +19,12 @@ const CANARY: &str = "zqcanary";
 type Fixture = BTreeMap<&'static str, &'static str>;
 
 /// A strict starting point: loopback only, TLS 1.3 floor, one egress host,
-/// a policy, an audit file and a discovery store.
+/// a policy, an audit file, a discovery store, and required authority
+/// evidence (audit durability is `required` by default).
 fn base() -> Fixture {
     BTreeMap::from([
         ("LISTEN_ADDR", "127.0.0.1:8080"),
+        ("AUTHORITY_EVIDENCE_DURABILITY", "required"),
         ("TLS_MIN_VERSION", "1.3"),
         ("EGRESS_ALLOWED_HOSTS", "api.example.test"),
         ("POLICY_FILE", "/etc/greengateway/policy.json"),
@@ -118,6 +120,18 @@ fn a_configuration_has_no_change_against_itself_or_a_respelling() {
         ),
     );
     assert!(explicit.is_empty(), "{:?}", fields(&explicit));
+    // Each durability mode spelled out as its default.
+    let defaults = diff(
+        &with(base(), &[("AUTHORITY_EVIDENCE_DURABILITY", None)]),
+        &with(
+            base(),
+            &[
+                ("AUTHORITY_EVIDENCE_DURABILITY", Some("best_effort")),
+                ("AUDIT_DURABILITY", Some("required")),
+            ],
+        ),
+    );
+    assert!(defaults.is_empty(), "{:?}", fields(&defaults));
 }
 
 /// Settings to set (`Some`) or unset (`None`).
@@ -190,7 +204,12 @@ const WEAKENINGS: &[Weakening] = &[
     ),
     (
         &[("AUDIT_DURABILITY", Some("best_effort"))],
-        &["risk.audit_durability_reduced"],
+        &["risk.evidence_not_required"],
+        true,
+    ),
+    (
+        &[("AUTHORITY_EVIDENCE_DURABILITY", Some("best_effort"))],
+        &["risk.evidence_not_required"],
         true,
     ),
     (
@@ -296,6 +315,69 @@ fn authentication_egress_and_policy_weakenings_are_high() {
     ] {
         let weakened = diff(&base(), &with(base(), &[(name, value)]));
         assert_eq!(weakened.severity(), Some(Severity::High), "{name}");
+    }
+}
+
+/// Leaving `required` lets a request be served, or an authority change be
+/// made, without a durable record of it: that is high, whichever way the
+/// weaker mode is reached. Returning to `required` carries no risk.
+#[test]
+fn weakening_audit_or_authority_evidence_durability_is_high_and_strengthening_carries_no_risk() {
+    let strict = base();
+    for (name, weaker) in [
+        ("AUDIT_DURABILITY", Some("best_effort")),
+        ("AUTHORITY_EVIDENCE_DURABILITY", Some("best_effort")),
+        // Unset is `best_effort` here.
+        ("AUTHORITY_EVIDENCE_DURABILITY", None),
+    ] {
+        let relaxed = with(base(), &[(name, weaker)]);
+        let forward = diff(&strict, &relaxed);
+        assert_eq!(fields(&forward), [name], "{name}={weaker:?}");
+        let change = &forward.changes()[0];
+        assert_eq!(change.effect(), Effect::Loosened, "{name}");
+        assert_eq!(
+            change.risks().iter().copied().collect::<Vec<_>>(),
+            [RiskCode::EvidenceNotRequired],
+            "{name}"
+        );
+        assert_eq!(change.severity(), Some(Severity::High), "{name}");
+        assert_eq!(forward.severity(), Some(Severity::High), "{name}");
+        assert_eq!(
+            change.display(),
+            Display::Shown {
+                before: Shown::Word("required"),
+                after: Shown::Word("best_effort"),
+            },
+            "{name}"
+        );
+
+        let back = diff(&relaxed, &strict);
+        assert_eq!(fields(&back), [name], "{name}={weaker:?}");
+        let change = &back.changes()[0];
+        assert_eq!(change.effect(), Effect::Tightened, "{name}");
+        assert!(change.risks().is_empty(), "{name}: {:?}", codes(&back));
+        assert_eq!(back.severity(), None, "{name}");
+    }
+
+    // Relaxing both is still one code at the same severity, and adding any
+    // other weakening on top never lowers it.
+    let both = with(
+        base(),
+        &[
+            ("AUDIT_DURABILITY", Some("best_effort")),
+            ("AUTHORITY_EVIDENCE_DURABILITY", Some("best_effort")),
+        ],
+    );
+    let relaxed = diff(&strict, &both);
+    assert_eq!(
+        codes(&relaxed),
+        BTreeSet::from(["risk.evidence_not_required"])
+    );
+    assert_eq!(relaxed.severity(), Some(Severity::High));
+    for (overrides, _, _) in WEAKENINGS {
+        let more = diff(&strict, &with(both.clone(), overrides));
+        assert!(more.severity() >= relaxed.severity(), "{overrides:?}");
+        assert!(more.risks().contains(&RiskCode::EvidenceNotRequired));
     }
 }
 
