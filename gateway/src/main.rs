@@ -143,7 +143,8 @@ mod upstream_route;
 #[cfg(test)]
 use lifecycle::serve_router;
 use lifecycle::{
-    serve_gateway, GatewayApp, GatewayApps, GatewayLifecycle, GrpcApp, ShutdownConfig,
+    serve_gateway, GatewayApp, GatewayApps, GatewayLifecycle, GrpcApp, ListenAddresses,
+    ShutdownConfig,
 };
 use proxy::{ProxyClassifier, ProxyState};
 #[cfg(all(test, feature = "postgres"))]

@@ -12,6 +12,8 @@
 //! ([`PolicyEvaluationLimiter`]).
 use super::*;
 
+use serde_json::value::RawValue;
+
 /// Most runs evaluating at once on this replica. A run is CPU-only and
 /// bounded by its body, case and deadline limits; this bounds how many of
 /// those can compete with the data plane at the same moment. A run over the
@@ -41,8 +43,17 @@ enum PolicyTestFormat {
 /// The request members and what they hold, before the suite is parsed.
 struct PolicyTestRunRequest {
     suite: Value,
-    candidate: Option<Value>,
+    /// The exact bytes of the `policy` member, read later by the parser a
+    /// policy write reads its body with.
+    candidate: Option<Box<RawValue>>,
     format: PolicyTestFormat,
+}
+
+/// The request bytes' `policy` member, unread.
+#[derive(Deserialize)]
+struct PolicyTestRunCandidateBytes<'a> {
+    #[serde(borrow)]
+    policy: &'a RawValue,
 }
 
 fn policy_tests_refusal(status: StatusCode, error: &str, reason: &'static str) -> Response {
@@ -104,9 +115,24 @@ fn parse_policy_test_run_request(body: &Bytes) -> ResponseResult<PolicyTestRunRe
             "policy_tests_request_invalid",
         )));
     };
+    // The member is there (the body was just read with it) and named once;
+    // a `null` candidate stays a candidate, and is refused as one.
+    let candidate = match members.remove("policy") {
+        None => None,
+        Some(_) => match serde_json::from_slice::<PolicyTestRunCandidateBytes<'_>>(body) {
+            Ok(member) => Some(member.policy.to_owned()),
+            Err(_) => {
+                return Err(Box::new(policy_tests_refusal(
+                    StatusCode::BAD_REQUEST,
+                    "the candidate policy could not be read from the request",
+                    "policy_tests_request_invalid",
+                )))
+            }
+        },
+    };
     Ok(PolicyTestRunRequest {
         suite,
-        candidate: members.remove("policy"),
+        candidate,
         format,
     })
 }
@@ -117,7 +143,7 @@ async fn policy_under_test(
     state: &PolicyAdminState,
     rbac_state: &middleware::rbac::RbacState,
     headers: &HeaderMap,
-    candidate: Option<Value>,
+    candidate: Option<Box<RawValue>>,
 ) -> ResponseResult<(
     rbac::Policy,
     policy_eval::PolicyAuthority,
@@ -134,11 +160,12 @@ async fn policy_under_test(
                 "policy_tests_request_invalid",
             )));
         }
-        // The validation `POST /policy/validate` and `PUT /policy` apply, so
-        // a candidate is judged as the gateway would accept it.
-        let candidate = match rbac::Policy::validate_json_value(candidate) {
+        // The validation `POST /policy/validate` and `PUT /policy` apply,
+        // read from the member's own bytes as they read a body, so a
+        // candidate is judged as the gateway would accept it.
+        let candidate = match parse_policy_body(candidate.get().as_bytes()) {
             Ok(candidate) => candidate,
-            Err(error) => return Err(Box::new(policy_candidate_invalid(&error))),
+            Err(errors) => return Err(Box::new(policy_candidate_refused(errors))),
         };
         if let Err(error) = rbac_state.validate_proxy_dispatch_policy(&candidate) {
             return Err(Box::new(policy_candidate_invalid(&error)));

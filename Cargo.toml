@@ -60,6 +60,11 @@ ipnet = "2.11.0"
 # number's digits; `gateway/src/tools/definitions.rs` bounds that work.
 jsonschema = { version = "0.58.6", default-features = false, features = ["arbitrary-precision", "idna"] }
 jsonwebtoken = { version = "11.0.0", features = ["aws_lc_rs"] }
+# Already in the graph transitively (tokio, mio and socket2 depend on it on
+# Unix), and the same 0.2.x they resolve. Naming it directly adds a dependency
+# edge, not a crate: `ggctl/src/credential.rs` takes `O_NONBLOCK` from it so a
+# FIFO swapped in for a checked path cannot block the open.
+libc = "0.2.189"
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 mime_guess = "2"

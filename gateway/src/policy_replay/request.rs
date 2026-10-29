@@ -120,7 +120,7 @@ pub(crate) fn parse_request(bytes: &[u8], value: &Value) -> Result<ReplayRequest
         bounded_string(value, "/base_etag", MAX_BASE_ETAG_BYTES, &mut diagnostics)
     });
     let candidate = required(root, "candidate", "", &mut diagnostics)
-        .and_then(|value| parse_candidate(value, &mut diagnostics));
+        .and_then(|value| parse_candidate(bytes, value, &mut diagnostics));
     let window = required(root, "window", "", &mut diagnostics)
         .and_then(|value| parse_window(value, &mut diagnostics));
     let max_records = match root.get("max_records") {

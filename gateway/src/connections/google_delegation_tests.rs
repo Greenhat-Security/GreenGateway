@@ -8,7 +8,7 @@ use std::{
     fs,
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Mutex,
     },
 };
@@ -250,6 +250,9 @@ impl GcpTransport for StubGoogle {
 struct StubIdentity {
     calls: Mutex<Vec<(String, u64)>>,
     generation: AtomicU64,
+    /// When set, the identity has nothing fresher to give, as a profile that replaced a refused
+    /// token moments ago: it hands back its current generation whatever is asked for.
+    exhausted: AtomicBool,
 }
 
 impl StubIdentity {
@@ -257,11 +260,16 @@ impl StubIdentity {
         Arc::new(Self {
             calls: Mutex::new(Vec::new()),
             generation: AtomicU64::new(1),
+            exhausted: AtomicBool::new(false),
         })
     }
 
     fn calls(&self) -> Vec<(String, u64)> {
         self.calls.lock().expect("call lock").clone()
+    }
+
+    fn exhaust(&self) {
+        self.exhausted.store(true, Ordering::Release);
     }
 }
 
@@ -279,10 +287,13 @@ impl GoogleWorkloadIdentity for StubIdentity {
         if profile_id != PROFILE {
             return Err(FederatedIdentityError::UnknownProfile);
         }
-        let generation = self
-            .generation
-            .fetch_max(minimum_generation, Ordering::AcqRel)
-            .max(minimum_generation);
+        let generation = if self.exhausted.load(Ordering::Acquire) {
+            self.generation.load(Ordering::Acquire)
+        } else {
+            self.generation
+                .fetch_max(minimum_generation, Ordering::AcqRel)
+                .max(minimum_generation)
+        };
         Ok(FederatedAccessToken {
             token: Zeroizing::new(format!("{FEDERATED_TOKEN_CANARY}-{generation}").into_bytes()),
             generation,
@@ -645,6 +656,61 @@ async fn a_caller_the_connection_cannot_act_as_is_refused_before_anything_is_ask
 }
 
 #[tokio::test]
+async fn a_tester_the_connection_cannot_act_as_is_refused_before_the_egress_preflight() {
+    let harness = Harness::new().await;
+    let record = harness
+        .control_plane
+        .runtime_snapshot()
+        .managed()
+        .values()
+        .next()
+        .cloned()
+        .expect("the Connection is stored");
+    let etag = record.etag().to_string();
+    let service = crate::connections::test::ConnectionTestService::new(harness.runtime.clone());
+    let untrusted = caller_from(
+        "mallory",
+        "https://other-idp.example.test",
+        Some("alice@example.test"),
+    );
+    let no_email = caller_from("carol", TRUSTED_ISSUER, None);
+
+    // The harness's egress policy refuses the upstream, so a refusal that came only after the
+    // preflight would read as a refused host.
+    for caller in [&untrusted, &no_email] {
+        let result = service
+            .execute_as(&record, &etag, Some(caller))
+            .await
+            .result;
+        assert!(!result.ok);
+        assert_eq!(
+            result.stages,
+            [crate::connections::test::ConnectionTestStage::failure(
+                crate::connections::test::ConnectionTestStageName::SecretAvailable,
+                crate::connections::test::ConnectionTestReason::DelegatedTokenNoPrincipal,
+            )]
+        );
+    }
+    // A tester it can act as does reach the preflight, which refuses the upstream.
+    let trusted = service
+        .execute_as(&record, &etag, Some(&alice()))
+        .await
+        .result;
+    assert_eq!(
+        trusted.stages,
+        [crate::connections::test::ConnectionTestStage::failure(
+            crate::connections::test::ConnectionTestStageName::EgressPolicy,
+            crate::connections::test::ConnectionTestReason::HostNotAllowed,
+        )]
+    );
+    assert!(harness.google.requests().is_empty());
+    assert!(harness.identity.calls().is_empty());
+    assert!(harness
+        .events_of(audit::event::CONNECTION_GOOGLE_DELEGATION_TOKEN)
+        .is_empty());
+}
+
+#[tokio::test]
 async fn google_refusals_fail_closed_with_reasons_of_their_own_and_are_not_cached() {
     let harness = Harness::new().await;
     let refused = |error| Err(ConnectionHttpError::GoogleDelegation(error));
@@ -718,15 +784,28 @@ async fn a_refused_federated_token_is_replaced_once_and_a_wrong_assertion_is_nev
         Some(format!("Bearer {FEDERATED_TOKEN_CANARY}-2").as_str())
     );
 
-    // A federated identity that may not sign as the account: retried once, then refused.
+    // A federated identity that may not sign as the account: IAM's 403 is final. No fresh
+    // identity is asked for, which would orphan every Secret Manager value cached under the
+    // profile, and a caller repeating the call costs Google one request a call.
     harness.google.set_signer(Signer::Refuse(403));
-    assert_eq!(
-        harness.bearer_for(Some(&bob())).await,
-        Err(ConnectionHttpError::GoogleDelegation(
-            GoogleDelegationError::SigningFailed
-        ))
-    );
+    for _ in 0..2 {
+        assert_eq!(
+            harness.bearer_for(Some(&bob())).await,
+            Err(ConnectionHttpError::GoogleDelegation(
+                GoogleDelegationError::SigningFailed
+            ))
+        );
+    }
     assert_eq!(harness.google.signing_requests().len(), 4);
+    assert_eq!(
+        harness.identity.calls(),
+        vec![
+            (PROFILE.to_owned(), 0),
+            (PROFILE.to_owned(), 2),
+            (PROFILE.to_owned(), 0),
+            (PROFILE.to_owned(), 0),
+        ]
+    );
 
     // A signer that answered about somebody else: nothing is exchanged.
     harness.google.set_signer(Signer::SwapSubject);
@@ -741,9 +820,55 @@ async fn a_refused_federated_token_is_replaced_once_and_a_wrong_assertion_is_nev
         1,
         "only alice's assertion was exchanged"
     );
-    let events = harness.mint_events(3).await;
-    assert_eq!(events[1].payload["stage"], json!("sign"));
-    assert_eq!(events[1].payload["google_status"], json!(403));
+    let events = harness.mint_events(4).await;
+    for event in &events[1..3] {
+        assert_eq!(event.payload["stage"], json!("sign"));
+        assert_eq!(event.payload["google_status"], json!(403));
+    }
+    assert_no_token_material(&harness.rendered_audit().await);
+}
+
+#[tokio::test]
+async fn a_token_signjwt_answers_401_for_is_retried_once_and_only_with_a_fresher_one() {
+    let harness = Harness::new().await;
+    let refused = Err(ConnectionHttpError::GoogleDelegation(
+        GoogleDelegationError::SigningFailed,
+    ));
+
+    // Refused again with a fresh token: one retry, and no more.
+    harness.google.set_signer(Signer::Refuse(401));
+    assert_eq!(harness.bearer_for(Some(&alice())).await, refused);
+    assert_eq!(harness.google.signing_requests().len(), 2);
+    assert_eq!(
+        harness.identity.calls(),
+        vec![(PROFILE.to_owned(), 0), (PROFILE.to_owned(), 2)]
+    );
+
+    // A profile with nothing fresher to give is not asked to sign again with the token Google
+    // just refused.
+    harness.identity.exhaust();
+    assert_eq!(harness.bearer_for(Some(&alice())).await, refused);
+    let signing = harness.google.signing_requests();
+    assert_eq!(signing.len(), 3);
+    assert_eq!(
+        signing[2].authorization.as_deref(),
+        Some(format!("Bearer {FEDERATED_TOKEN_CANARY}-2").as_str())
+    );
+    assert_eq!(
+        harness.identity.calls()[2..],
+        [(PROFILE.to_owned(), 0), (PROFILE.to_owned(), 3)]
+    );
+    assert!(harness.google.token_requests().is_empty());
+
+    let events = harness.mint_events(2).await;
+    for event in &events {
+        assert_eq!(
+            event.payload["reason"],
+            json!("google_delegation_signing_failed")
+        );
+        assert_eq!(event.payload["stage"], json!("sign"));
+        assert_eq!(event.payload["google_status"], json!(401));
+    }
     assert_no_token_material(&harness.rendered_audit().await);
 }
 

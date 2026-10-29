@@ -324,6 +324,7 @@ simply holds fewer rows; the cutoff's count says how many.
 | One row | 256 KiB of actor and payload JSON | Counted as `oversized_record`; its JSON is never read |
 | Running jobs | 1 per replica, on a blocking thread | Further jobs are `queued` |
 | Queued or running jobs | 4 per replica, 1 per principal | `429 policy_replay_busy` |
+| Request body arrival | 5 seconds | `408 policy_replay_request_timeout` |
 | Unexpired jobs held | 32 per replica, 8 per principal | `429 policy_replay_quota_exhausted` |
 | Finished job kept | 15 minutes after it finishes | The job reads `expired`, with no result |
 | Expired job remembered | 1 hour after that | `404` |
@@ -332,6 +333,16 @@ simply holds fewer rows; the cutoff's count says how many.
 No job is ever evicted to make room for another. A stopped scan is still a
 result, an incomplete one whose counts cover what was read; it is never a
 complete answer.
+
+A job is admitted the way a [policy test run](policy-tests.md) or a
+[simulation](policy-simulation.md) is, through the same per-replica and
+per-principal bound, which the replay route keeps for itself: only once its
+body is in hand, so an upload still arriving holds no slot, and then for as
+long as its evaluation lasts. The job holds its slot while it is queued and
+hands it to the blocking thread that runs it, so the slot comes back only
+when that work has ended -- neither a dropped request nor a cancellation
+frees it early -- and before the job reads as finished. A retry naming a job
+already admitted is answered before a slot is asked for.
 
 ### Lifecycle
 
@@ -373,6 +384,7 @@ is what `AUDIT_DURABILITY` makes it: committed to the audit store under
 | `401`, `403` | Not authenticated, or missing one of the three permissions; nothing is read or started |
 | `404` | No such job for this principal (`policy_replay_job_not_found`) |
 | `409` | An idempotency key reused for a different request |
+| `408` | The body did not arrive within five seconds (`policy_replay_request_timeout`). Nothing was started |
 | `412` | `base_etag` is not the active policy's ETag |
 | `413` | The body is over its bound |
 | `422` | An invalid request, window, edit or candidate |
@@ -520,7 +532,8 @@ then sends the same request live to show each of those checks can fail.
   three permissions, and serves a job only to its owner; a stale base, an
   invalid window, edit or candidate creates no job; an idempotent retry starts
   nothing; queued jobs are cancelled, quotas refuse rather than evict, and
-  results expire; in cluster mode every route answers `503` without reading a
+  results expire; a stalled upload holds no admission slot and is refused at
+  its deadline, and a job holds its slot until its evaluation ends; in cluster mode every route answers `503` without reading a
   body, admitting a job, recording a lifecycle event or consulting the
   cluster authority; and the side-effect test above holds.
 - The `policy-replay.v1` parser and its published schema accept and refuse

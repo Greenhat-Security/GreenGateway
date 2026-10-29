@@ -26,10 +26,16 @@
 //!
 //! ## Bounds
 //!
-//! One job runs at a time per replica, on a blocking thread over its own
-//! read-only connection to the audit log; at most
-//! [`MAX_PENDING_POLICY_REPLAYS`] are queued or running, one per principal,
-//! and at most [`MAX_RETAINED_POLICY_REPLAYS`] finished results are held
+//! A job is admitted as a policy test run or a simulation is: only once its
+//! body is in hand, read under [`POLICY_REPLAY_BODY_DEADLINE`], and only
+//! with a slot of the shared [`PolicyEvaluationLimiter`] -- at most
+//! [`MAX_PENDING_POLICY_REPLAYS`] per replica and one per actor -- that the
+//! replay route holds for itself. The job owns that slot from admission until
+//! its evaluation ends, queued or running, and hands it to the blocking
+//! thread that evaluates, so neither a dropped request nor a cancelled job
+//! frees it while work continues. One job runs at a time per replica, on a
+//! blocking thread over its own read-only connection to the audit log, and at
+//! most [`MAX_RETAINED_POLICY_REPLAYS`] finished results are held
 //! ([`MAX_RETAINED_POLICY_REPLAYS_PER_ACTOR`] per principal). Over any bound
 //! is `429`; no job is ever evicted to make room for another.
 //!
@@ -57,7 +63,9 @@ use policy_replay::{
 };
 use policy_simulation::request::CandidateSource;
 
-/// Most replay jobs queued or running at once across this replica.
+/// Most replay jobs queued or running at once across this replica: the
+/// bound of the replay route's [`PolicyEvaluationLimiter`], which also holds
+/// each actor to one.
 pub(super) const MAX_PENDING_POLICY_REPLAYS: usize = 4;
 /// Replay jobs running at once across this replica: one, so a job never
 /// competes with another for the audit log or a blocking thread.
@@ -73,6 +81,10 @@ pub(super) const POLICY_REPLAY_EXPIRED_RETENTION: Duration = Duration::from_secs
 /// Largest replay request body, in bytes: room for a complete inline
 /// candidate at the policy compiler's 1 MiB bound.
 pub(super) const MAX_POLICY_REPLAY_BODY_BYTES: usize = 2 * 1024 * 1024;
+/// How long a replay request's body may take to arrive. A job is admitted
+/// only once its body is in hand, so a trickled upload holds no slot; this
+/// also stops it holding the request open indefinitely.
+pub(super) const POLICY_REPLAY_BODY_DEADLINE: Duration = Duration::from_secs(5);
 /// Largest rendered result, in bytes. Results are counts keyed by stable
 /// codes and stay far below it; one over it is a failed job, never a cut one.
 pub(super) const MAX_POLICY_REPLAY_RESULT_BYTES: usize = 256 * 1024;
@@ -171,9 +183,6 @@ enum ReplayAdmission {
     Existing(Arc<ReplayJob>),
     /// The principal's key names a job started by a different request.
     IdempotencyConflict,
-    /// A job of this principal's is still pending, or the replica's queue is
-    /// full.
-    Busy,
     /// The replica, or this principal, holds as many unexpired jobs as it may.
     QuotaExhausted,
 }
@@ -182,6 +191,11 @@ enum ReplayAdmission {
 /// cancel them.
 pub(super) struct PolicyReplayJobs {
     jobs: Mutex<HashMap<String, Arc<ReplayJob>>>,
+    /// Admission: the replay route's own bound on jobs queued or running,
+    /// per replica and per actor, so replays never take a simulation's or a
+    /// test run's slots, nor they a replay's.
+    admission: Arc<PolicyEvaluationLimiter>,
+    /// Which admitted job runs: one at a time, in turn.
     run_permits: Arc<tokio::sync::Semaphore>,
 }
 
@@ -189,6 +203,7 @@ impl PolicyReplayJobs {
     pub(super) fn new() -> Self {
         Self {
             jobs: Mutex::new(HashMap::new()),
+            admission: Arc::new(PolicyEvaluationLimiter::new(MAX_PENDING_POLICY_REPLAYS)),
             run_permits: Arc::new(tokio::sync::Semaphore::new(MAX_RUNNING_POLICY_REPLAYS)),
         }
     }
@@ -266,27 +281,17 @@ impl PolicyReplayJobs {
         ReplayAdmission::Admitted
     }
 
-    /// Whether `owner` may start another job now: [`ReplayAdmission::Busy`]
-    /// or [`ReplayAdmission::QuotaExhausted`] when not.
+    /// Whether `owner` may hold another job now, or
+    /// [`ReplayAdmission::QuotaExhausted`]. How many may be pending is the
+    /// admission slot's bound, taken before this is asked.
     fn over_quota(jobs: &HashMap<String, Arc<ReplayJob>>, owner: &str) -> Option<ReplayAdmission> {
-        let mut pending = 0;
-        let mut owner_pending = 0;
         let mut retained = 0;
         let mut owner_retained = 0;
         for other in jobs.values() {
-            let state = other.record().state;
-            let own = other.owner == owner;
-            if state.is_pending() {
-                pending += 1;
-                owner_pending += usize::from(own);
-            }
-            if state != ReplayJobState::Expired {
+            if other.record().state != ReplayJobState::Expired {
                 retained += 1;
-                owner_retained += usize::from(own);
+                owner_retained += usize::from(other.owner == owner);
             }
-        }
-        if owner_pending > 0 || pending >= MAX_PENDING_POLICY_REPLAYS {
-            return Some(ReplayAdmission::Busy);
         }
         if retained >= MAX_RETAINED_POLICY_REPLAYS
             || owner_retained >= MAX_RETAINED_POLICY_REPLAYS_PER_ACTOR
@@ -327,6 +332,12 @@ impl Drop for PolicyReplayJobs {
 
 #[cfg(test)]
 impl PolicyReplayJobs {
+    /// The replay route's admission limiter, so a test can see which slots
+    /// jobs and requests hold.
+    pub(super) fn admission(&self) -> &Arc<PolicyEvaluationLimiter> {
+        &self.admission
+    }
+
     /// Hold this replica's run slot, so a job admitted meanwhile stays
     /// queued until the permit drops.
     pub(super) fn occupy_run_slot(&self) -> tokio::sync::OwnedSemaphorePermit {
@@ -619,9 +630,15 @@ async fn finish_without_result(
 
 /// The job's worker: wait for the replica's run slot, run the engine on a
 /// blocking thread over a read-only connection, and publish what it found.
+///
+/// `slot` is the job's admission slot. The worker holds it while the job is
+/// queued and hands it, with the run permit, to the blocking thread, so both
+/// come back only once the evaluation has ended -- and before the job reads
+/// as finished, so a caller who sees it finished may start another.
 async fn run_replay_job(
     run_permits: Arc<tokio::sync::Semaphore>,
     job: Arc<ReplayJob>,
+    slot: PolicyEvaluationSlot,
     candidate: rbac::Policy,
     source_path: PathBuf,
     audit: audit::AuditLog,
@@ -633,6 +650,7 @@ async fn run_replay_job(
         permit = run_permits.acquire_owned() => permit.ok(),
     };
     let Some(permit) = permit.filter(|_| !job.control.is_cancelled()) else {
+        drop(slot);
         finish_without_result(&audit, &job, started, ReplayStop::Cancelled).await;
         return;
     };
@@ -643,25 +661,28 @@ async fn run_replay_job(
     }
     let scope = job.scope.clone();
     let control = Arc::clone(&job.control);
-    let run = tokio::task::spawn_blocking(move || {
-        let source =
-            audit::query::AuditQueryStore::open_read_only(source_path).map_err(|error| {
-                tracing::error!(error = %error, "policy replay could not open the audit log");
-                ReplayStop::Failed("source_unavailable")
+    let run = slot
+        .run_blocking(move || {
+            // The evaluation owns the run permit as it owns the admission
+            // slot: the next job starts only once this one has stopped.
+            let _permit = permit;
+            let source =
+                audit::query::AuditQueryStore::open_read_only(source_path).map_err(|error| {
+                    tracing::error!(error = %error, "policy replay could not open the audit log");
+                    ReplayStop::Failed("source_unavailable")
+                })?;
+            let compiled = policy_eval::CompiledPolicy::from_validated_policy(
+                candidate,
+                policy_eval::PolicyAuthority::Standalone,
+            )
+            .map_err(|error| {
+                tracing::error!(error = ?error, "policy replay candidate could not be compiled");
+                ReplayStop::Failed("compile_failed")
             })?;
-        let compiled = policy_eval::CompiledPolicy::from_validated_policy(
-            candidate,
-            policy_eval::PolicyAuthority::Standalone,
-        )
-        .map_err(|error| {
-            tracing::error!(error = ?error, "policy replay candidate could not be compiled");
-            ReplayStop::Failed("compile_failed")
-        })?;
-        let deadline = Instant::now() + REPLAY_RUN_DEADLINE;
-        policy_replay::job::run(&source, &compiled, &scope, deadline, &control)
-    })
-    .await;
-    drop(permit);
+            let deadline = Instant::now() + REPLAY_RUN_DEADLINE;
+            policy_replay::job::run(&source, &compiled, &scope, deadline, &control)
+        })
+        .await;
     let outcome = match run {
         Ok(Ok(outcome)) => outcome,
         Ok(Err(stop)) => {
@@ -748,9 +769,17 @@ pub(super) async fn policy_replay_create_endpoint(
         return policy_evidence_unavailable("policy replay requires an audit query store");
     };
     let body_limit = state.max_body_size.min(MAX_POLICY_REPLAY_BODY_BYTES);
-    let body = match read_request_body(body, body_limit).await {
+    let body_deadline = tokio::time::Instant::now() + POLICY_REPLAY_BODY_DEADLINE;
+    let body = match read_request_body_before(body, body_limit, body_deadline).await {
         Ok(body) => body,
-        Err(response) => return *response,
+        Err(TimedBodyReadError::Rejected(response)) => return *response,
+        Err(TimedBodyReadError::DeadlineExceeded) => {
+            return replay_refusal(
+                StatusCode::REQUEST_TIMEOUT,
+                "the policy replay body did not arrive within its deadline",
+                "policy_replay_request_timeout",
+            );
+        }
     };
     // A repeated member is refused before anything reads the body: a JSON
     // value keeps the last of two and says nothing, so the request digested
@@ -775,7 +804,8 @@ pub(super) async fn policy_replay_create_endpoint(
     };
     let owner = replay_owner(&principal);
     // A retry of a request already admitted is answered before any work: it
-    // starts nothing and reads nothing.
+    // starts nothing, reads nothing, and takes no slot -- the job it names
+    // may still hold this actor's.
     if let Some(key) = replay.idempotency_key.as_deref() {
         if let Some(existing) = jobs.find_idempotent(&owner, key) {
             return if existing.request_digest == replay.digest {
@@ -785,6 +815,15 @@ pub(super) async fn policy_replay_create_endpoint(
             };
         }
     }
+    // Admitted once the body is in hand, so a slot bounds jobs rather than
+    // uploads in flight, and one actor holds at most one. A refusal from
+    // here on, before the job is queued, gives the slot back.
+    let Some(slot) = jobs
+        .admission
+        .try_acquire(policy_evaluation_actor(&principal))
+    else {
+        return replay_busy();
+    };
     let created_at = OffsetDateTime::now_utc();
     let window = match resolve_window(&replay, created_at) {
         Ok(window) => window,
@@ -808,10 +847,10 @@ pub(super) async fn policy_replay_create_endpoint(
         )
             .into_response();
     }
-    let candidate = match resolve_candidate(rbac_state, &base, &replay.candidate) {
+    let candidate = match resolve_candidate(&state, rbac_state, &base, &replay.candidate) {
         Ok(candidate) => candidate,
         Err(CandidateRefusal::Edits(diagnostics)) => return replay_invalid(&diagnostics),
-        Err(CandidateRefusal::Invalid(error)) => return simulation_candidate_invalid(&error),
+        Err(CandidateRefusal::Invalid(errors)) => return simulation_candidate_refused(errors),
         Err(CandidateRefusal::Internal) => return internal_server_error("policy replay failed"),
     };
     let candidate_etag = match candidate.as_ref().map(policy_etag) {
@@ -909,6 +948,7 @@ pub(super) async fn policy_replay_create_endpoint(
     tokio::spawn(run_replay_job(
         Arc::clone(&jobs.run_permits),
         Arc::clone(&job),
+        slot,
         candidate,
         source_path,
         state.audit.clone(),
@@ -926,17 +966,22 @@ fn admission_refusal(admission: ReplayAdmission) -> Option<Response> {
         ReplayAdmission::Admitted => None,
         ReplayAdmission::Existing(existing) => Some(job_response(StatusCode::OK, &existing, None)),
         ReplayAdmission::IdempotencyConflict => Some(replay_idempotency_conflict()),
-        ReplayAdmission::Busy => Some(replay_refusal(
-            StatusCode::TOO_MANY_REQUESTS,
-            "a policy replay of yours is still running, or too many are queued; retry later",
-            "policy_replay_busy",
-        )),
         ReplayAdmission::QuotaExhausted => Some(replay_refusal(
             StatusCode::TOO_MANY_REQUESTS,
             "too many policy replay results are held; delete finished jobs or wait for them to expire",
             "policy_replay_quota_exhausted",
         )),
     }
+}
+
+/// The replay route's admission slot was refused: a job of this actor's is
+/// still pending, or the replica's queue is full.
+fn replay_busy() -> Response {
+    replay_refusal(
+        StatusCode::TOO_MANY_REQUESTS,
+        "a policy replay of yours is still running, or too many are queued; retry later",
+        "policy_replay_busy",
+    )
 }
 
 fn replay_idempotency_conflict() -> Response {

@@ -811,6 +811,113 @@ async fn a_queued_job_is_cancelled_and_quotas_refuse_rather_than_evict() {
     );
 }
 
+/// A body that never finishes arriving, and a signal for when the handler
+/// first asks for it: the moment a request that admitted before reading its
+/// body would already hold a slot.
+fn stalled_replay_body() -> (Body, tokio::sync::oneshot::Receiver<()>) {
+    let (polled, polled_signal) = tokio::sync::oneshot::channel();
+    let chunks = stream::once(async move {
+        let _ = polled.send(());
+        std::future::pending::<Result<Bytes, Infallible>>().await
+    });
+    (Body::from_stream(chunks), polled_signal)
+}
+
+/// A job is admitted only once its body is in hand. Uploads trickled by one
+/// actor -- as many as the replica admits jobs -- hold no admission slot, so
+/// the same actor's complete request is admitted while they are still open,
+/// and each stalled upload is refused once its body deadline passes, having
+/// started nothing.
+#[tokio::test]
+async fn a_stalled_body_is_refused_within_its_deadline_and_holds_no_slot() {
+    let harness = registry_harness();
+    let actor = operator("op-0").expect("a principal");
+    let started = tokio::time::Instant::now();
+    let mut stalled = Vec::new();
+    for _ in 0..MAX_PENDING_POLICY_REPLAYS {
+        let (body, polled) = stalled_replay_body();
+        let request =
+            policy_admin_request_with_body(Method::POST, REPLAYS, Some(actor.clone()), body, None);
+        stalled.push(tokio::spawn(harness.router.clone().oneshot(request)));
+        polled.await.expect("the handler reads the stalled body");
+    }
+
+    let probe = harness
+        .jobs
+        .admission()
+        .try_acquire(policy_evaluation_actor(&actor));
+    assert!(probe.is_some(), "a stalled upload holds the actor's slot");
+    drop(probe);
+    let body = replay_body(&registry_etag(), json!({ "source": "active" })).to_string();
+    let response = start(&harness.router, Some(actor.clone()), body).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let id = job_id(&json_body(response).await);
+
+    for request in stalled {
+        let response = request
+            .await
+            .expect("the stalled request task completes")
+            .expect("the stalled request completes");
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(
+            json_body(response).await["reason"],
+            json!("policy_replay_request_timeout")
+        );
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= POLICY_REPLAY_BODY_DEADLINE,
+        "refused after {elapsed:?}, before the body deadline"
+    );
+    assert!(
+        elapsed < POLICY_REPLAY_BODY_DEADLINE + Duration::from_secs(5),
+        "refused after {elapsed:?}, long past the body deadline"
+    );
+    let job = finished(&harness.router, Some(actor), &id).await;
+    assert_eq!(job["state"], json!("completed"), "{job}");
+    let started_jobs = wait_for_lifecycle(&harness.capture, 2)
+        .into_iter()
+        .filter(|event| event.event_type == audit::event::POLICY_REPLAY_STARTED)
+        .count();
+    assert_eq!(started_jobs, 1, "a stalled upload starts nothing");
+}
+
+/// A job holds its actor's admission slot from the moment it is admitted,
+/// through the wait for the run slot, until its evaluation has ended -- and
+/// gives it back before it reads as finished.
+#[tokio::test]
+async fn a_job_holds_its_admission_slot_until_its_evaluation_ends() {
+    let harness = registry_harness();
+    let actor = operator("op-0").expect("a principal");
+    let body = replay_body(&registry_etag(), json!({ "source": "active" })).to_string();
+    let run_slot = harness.jobs.occupy_run_slot();
+    let response = start(&harness.router, Some(actor.clone()), body).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let id = job_id(&json_body(response).await);
+
+    let queued = json_body(get_job(&harness.router, Some(actor.clone()), &id).await).await;
+    assert_eq!(queued["state"], json!("queued"));
+    assert!(
+        harness
+            .jobs
+            .admission()
+            .try_acquire(policy_evaluation_actor(&actor))
+            .is_none(),
+        "a queued job holds its actor's slot"
+    );
+    drop(run_slot);
+    let job = finished(&harness.router, Some(actor.clone()), &id).await;
+    assert_eq!(job["state"], json!("completed"), "{job}");
+    assert!(
+        harness
+            .jobs
+            .admission()
+            .try_acquire(policy_evaluation_actor(&actor))
+            .is_some(),
+        "a finished job has given its slot back"
+    );
+}
+
 #[tokio::test]
 async fn finished_results_are_bounded_per_principal_and_expire() {
     let harness = registry_harness();

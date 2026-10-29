@@ -19,6 +19,11 @@ tokio.workspace = true
 url.workspace = true
 zeroize.workspace = true
 
+# `O_NONBLOCK` for opening `--token-file` and `--ca-file`
+# (`src/credential.rs`): a constant only, no call into it.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 # Holds every report this binary writes to the published report schema.
 jsonschema.workspace = true
