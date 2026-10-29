@@ -7,6 +7,8 @@ mod admin_policy_drafts_tests;
 mod admin_session_app_tests;
 #[path = "audit_durability_app_tests.rs"]
 mod audit_durability_app_tests;
+#[path = "audit_stream_app_tests.rs"]
+mod audit_stream_app_tests;
 use crate::auth::TokenStore;
 use axum::{body::Body, http::StatusCode};
 use futures_util::StreamExt;
@@ -487,17 +489,12 @@ async fn spawn_router(router: Router) -> std::net::SocketAddr {
 struct MockOidcDiscoveryEndpoint {
     issuer: String,
     authorization_endpoint: String,
-    handle: std::thread::JoinHandle<usize>,
+    server: BlockingJsonServer,
 }
 
 impl MockOidcDiscoveryEndpoint {
     fn finish(self) {
-        assert_eq!(
-            self.handle
-                .join()
-                .expect("mock OIDC discovery endpoint should finish"),
-            1
-        );
+        assert_eq!(self.server.finish(), 1);
     }
 }
 
@@ -563,7 +560,7 @@ fn spawn_mock_oidc_discovery_endpoint(token_endpoint: Option<String>) -> MockOid
         "authorization_endpoint": authorization_endpoint.clone(),
         "token_endpoint": token_endpoint
     });
-    let handle = spawn_blocking_json_server(
+    let server = spawn_blocking_json_server(
         listener,
         vec![(
             "/.well-known/openid-configuration".to_owned(),
@@ -575,7 +572,7 @@ fn spawn_mock_oidc_discovery_endpoint(token_endpoint: Option<String>) -> MockOid
     MockOidcDiscoveryEndpoint {
         issuer,
         authorization_endpoint,
-        handle,
+        server,
     }
 }
 
@@ -671,6 +668,15 @@ fn admin_oidc_login_router_from_config(mut config: config::Config) -> Router {
     .expect("admin OIDC login app should build")
 }
 
+/// Discovery, JWKS and token-exchange deadline of the admin login test provider.
+///
+/// The 2 s production default bounds a real identity provider. Here every
+/// provider endpoint is a local mock that answers at once, so the deadline only
+/// bounds how long a loaded, coverage-instrumented test process takes to make
+/// the request; at 2 s that scheduling delay surfaced as
+/// `Upstream("OIDC discovery fetch failed")`. A wrong answer still fails at once.
+const ADMIN_OIDC_TEST_FETCH_TIMEOUT_MS: u64 = 30_000;
+
 fn admin_oidc_login_config(issuer: &str) -> config::Config {
     let mut config = test_config(Vec::new());
     config.admin_login_provider = Some("oidc".to_owned());
@@ -684,7 +690,7 @@ fn admin_oidc_login_config(issuer: &str) -> config::Config {
         jwks_url: None,
         issuer: Some(issuer.to_owned()),
         audience: None,
-        jwks_timeout_ms: 2000,
+        jwks_timeout_ms: ADMIN_OIDC_TEST_FETCH_TIMEOUT_MS,
         jwks_max_key_age_secs: 300,
         require_jti: false,
         roles_claim: "roles".to_owned(),
@@ -5282,12 +5288,7 @@ async fn mcp_cookie_session_is_rejected_when_public_url_is_configured() {
     let non_mcp_body = json_body(non_mcp_response).await;
     assert_eq!(non_mcp_body["user_id"], json!("cookie-user"));
     assert_eq!(non_mcp_body["auth_method"], json!("session_cookie"));
-    assert_eq!(
-        introspection_server
-            .join()
-            .expect("cookie-session introspection server should finish"),
-        1
-    );
+    assert_eq!(introspection_server.finish(), 1);
 }
 
 #[tokio::test]
@@ -7641,12 +7642,7 @@ async fn real_cookie_session_authenticates_through_full_stack() {
     assert_eq!(body["user_id"], json!("cookie-user"));
     assert_eq!(body["auth_method"], json!("session_cookie"));
     assert_eq!(body["roles"], json!(["admin", "member"]));
-    assert_eq!(
-        introspection_server
-            .join()
-            .expect("cookie-session introspection server should finish"),
-        1
-    );
+    assert_eq!(introspection_server.finish(), 1);
 }
 
 #[tokio::test]
@@ -7678,12 +7674,7 @@ async fn cookie_session_introspection_host_is_auto_seeded_for_cross_host_egress(
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(json_body(response).await["user_id"], json!("cookie-user"));
-    assert_eq!(
-        introspection_server
-            .join()
-            .expect("cookie-session introspection server should finish"),
-        1
-    );
+    assert_eq!(introspection_server.finish(), 1);
 }
 
 #[test]
@@ -9947,9 +9938,9 @@ async fn audit_events_stream_non_admin_principal_returns_forbidden() {
     let (router, _, _policy) = audit_events_router();
 
     let response = router
-        .oneshot(audit_query_request(
+        .oneshot(audit_stream_request(
             AUDIT_EVENTS_STREAM_ROUTE,
-            Some(test_principal(&["reader"])),
+            test_principal(&["reader"]),
         ))
         .await
         .expect("request should complete");
@@ -23169,9 +23160,9 @@ async fn status_uptime_increases_between_requests() {
 async fn audit_events_stream_admin_principal_receives_emitted_event() {
     let (router, audit_log, _policy) = audit_events_router();
     let response = router
-        .oneshot(audit_query_request(
+        .oneshot(audit_stream_request(
             AUDIT_EVENTS_STREAM_ROUTE,
-            Some(test_principal(&["audit-streamer"])),
+            test_principal(&["audit-streamer"]),
         ))
         .await
         .expect("request should complete");
@@ -23193,9 +23184,9 @@ async fn audit_events_stream_admin_principal_receives_emitted_event() {
 async fn audit_events_stream_filters_by_event_type_and_path() {
     let (router, audit_log, _policy) = audit_events_router();
     let response = router
-        .oneshot(audit_query_request(
+        .oneshot(audit_stream_request(
             &format!("{AUDIT_EVENTS_STREAM_ROUTE}?event_type=audit.sse.match&path=/match"),
-            Some(test_principal(&["audit-streamer"])),
+            test_principal(&["audit-streamer"]),
         ))
         .await
         .expect("request should complete");
@@ -23223,9 +23214,9 @@ async fn audit_events_stream_delivers_request_event_within_latency_budget() {
     let (router, _, _policy) = audit_events_router();
     let response = router
         .clone()
-        .oneshot(audit_query_request(
+        .oneshot(audit_stream_request(
             &format!("{AUDIT_EVENTS_STREAM_ROUTE}?event_type=http.request_observed&path=/health"),
-            Some(test_principal(&["audit-streamer"])),
+            test_principal(&["audit-streamer"]),
         ))
         .await
         .expect("request should complete");
@@ -23294,9 +23285,9 @@ async fn audit_events_stream_delivers_signal_opened_events_from_discovery() {
 
     let stream_response = router
         .clone()
-        .oneshot(audit_query_request(
+        .oneshot(audit_stream_request(
             &format!("{AUDIT_EVENTS_STREAM_ROUTE}?event_type=signal.opened"),
-            Some(test_principal(&["audit-streamer"])),
+            test_principal(&["audit-streamer"]),
         ))
         .await
         .expect("stream request should complete");
@@ -23375,9 +23366,9 @@ async fn audit_events_stream_delivers_signal_lifecycle_transitions() {
 
     let stream_response = router
         .clone()
-        .oneshot(audit_query_request(
+        .oneshot(audit_stream_request(
             &format!("{AUDIT_EVENTS_STREAM_ROUTE}?event_type=signal.lifecycle_changed"),
-            Some(test_principal(&["admin"])),
+            test_principal(&["admin"]),
         ))
         .await
         .expect("stream request should complete");
@@ -23441,11 +23432,11 @@ async fn shadow_would_deny_events_are_queryable_and_streamable() {
     let request_id = "request-shadow-would-deny";
     let stream_response = router
         .clone()
-        .oneshot(audit_query_request(
+        .oneshot(audit_stream_request(
             &format!(
                 "{AUDIT_EVENTS_STREAM_ROUTE}?event_type=authz.would_deny&path=/__test/principal"
             ),
-            Some(test_principal(&["admin"])),
+            test_principal(&["admin"]),
         ))
         .await
         .expect("stream request should complete");
@@ -23721,6 +23712,13 @@ mod durable_sse_tests {
     }
 
     fn durable_stream_router(store: PostgresAuditEventStore) -> (Router, audit::AuditEventSender) {
+        durable_stream_router_with(store, AuditStreamLimits::SERVED)
+    }
+
+    fn durable_stream_router_with(
+        store: PostgresAuditEventStore,
+        stream_limits: AuditStreamLimits,
+    ) -> (Router, audit::AuditEventSender) {
         let policy = middleware::rbac::RbacState::new(
             parse_policy_body(&Bytes::from(
                 r#"{
@@ -23744,6 +23742,7 @@ mod durable_sse_tests {
                 query_store: None,
                 event_sender: event_sender.clone(),
                 rbac_state: Some(policy),
+                stream_limits,
                 pg_audit: Some(std::sync::Arc::new(store)),
             });
         (router, event_sender)
@@ -23773,6 +23772,9 @@ mod durable_sse_tests {
             .body(Body::empty())
             .expect("stream request should build");
         if let Some(principal) = principal {
+            request
+                .extensions_mut()
+                .insert(accepted_reauthentication(principal.clone()));
             request.extensions_mut().insert(principal);
         }
         request
@@ -24014,6 +24016,102 @@ mod durable_sse_tests {
             .await
             .expect("invalid request should complete");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// An authority that accepts the stream's credential until it is told
+    /// the session has ended.
+    struct EndingAuthority {
+        principal: auth::Principal,
+        ended: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl auth::SessionValidator for EndingAuthority {
+        async fn validate_session(
+            &self,
+            _credential: &auth::SessionCredential,
+        ) -> Result<auth::Principal, auth::AuthError> {
+            if self.ended.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(auth::AuthError::InvalidSession("logged out".to_owned()));
+            }
+            Ok(self.principal.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_sse_ends_on_a_lost_session_without_moving_the_resume_cursor() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let store = migrated_store(&database.dsn).await;
+        store
+            .insert_events(&[sse_event("audit.sse.before", "/before")])
+            .await
+            .expect("seed event should commit");
+        let (router, _sender) = durable_stream_router_with(
+            store,
+            AuditStreamLimits {
+                recheck_interval: Duration::from_millis(50),
+                max_lifetime: Duration::from_secs(60),
+            },
+        );
+        let principal = streamer_principal("streamer");
+        let authority = Arc::new(EndingAuthority {
+            principal: principal.clone(),
+            ended: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mut request = stream_request(Some("0"), None);
+        request.extensions_mut().insert(principal);
+        request.extensions_mut().insert(auth::Reauthentication::new(
+            auth::CredentialJudge::Validator(
+                Arc::clone(&authority) as Arc<dyn auth::SessionValidator>
+            ),
+            auth::SessionCredential::Bearer(format!("test-{}", uuid::Uuid::new_v4())),
+            None,
+        ));
+
+        let response = router
+            .oneshot(request)
+            .await
+            .expect("replay request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        let mut received = String::new();
+        while !received.contains("id: 1") {
+            let chunk = tokio::time::timeout(Duration::from_secs(5), body.next())
+                .await
+                .expect("the seeded event should be replayed")
+                .expect("stream should not end before the seeded event")
+                .expect("stream chunk should read");
+            received.push_str(std::str::from_utf8(&chunk).expect("UTF-8"));
+        }
+        authority
+            .ended
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(chunk) = body.next().await {
+                let chunk = chunk.expect("stream chunk should read");
+                received.push_str(std::str::from_utf8(&chunk).expect("UTF-8"));
+            }
+        })
+        .await
+        .expect("the gateway should end the stream");
+
+        let last = received
+            .rsplit("\n\n")
+            .find(|frame| !frame.trim().is_empty())
+            .expect("the stream sent frames");
+        assert!(
+            last.contains("event: stream.closed")
+                && last.contains(r#"data: {"reason":"session_ended"}"#),
+            "the stream must end with its closing frame: {received}"
+        );
+        // A client that reconnects resumes after the last event it was sent,
+        // not after the closing frame.
+        assert!(!last.contains("id:"), "{received}");
+        assert_eq!(received.matches("id: ").count(), 1, "{received}");
     }
 
     #[tokio::test]
@@ -27741,9 +27839,7 @@ async fn auth_validator_resolves_oidc_discovery_for_issuer_only_provider() {
         .expect("token should validate through discovered JWKS URI");
 
     assert_eq!(principal.user_id, "oidc-user");
-    server
-        .join()
-        .expect("OIDC discovery test server should finish");
+    server.finish();
 }
 
 /// Startup hands every JWT validator that has a denylist the observer it
@@ -27838,9 +27934,7 @@ async fn a_denylisted_jwt_validator_reports_the_principal_of_a_revoked_token() {
         *observer.0.lock().expect("observer lock"),
         [(issuer, "oidc-user".to_owned())]
     );
-    server
-        .join()
-        .expect("OIDC discovery test server should finish");
+    server.finish();
 }
 
 /// A deployment whose only credential is a client certificate still gets an
@@ -27922,9 +28016,7 @@ async fn auth_validator_accepts_slashless_oidc_issuer_when_config_has_trailing_s
         json_body(response).await["user_id"],
         json!("slashless-oidc-user")
     );
-    server
-        .join()
-        .expect("OIDC discovery and JWKS test server should finish");
+    server.finish();
 }
 
 #[tokio::test]
@@ -27954,9 +28046,7 @@ async fn auth_validator_accepts_slash_retained_oidc_issuer_and_token() {
         json_body(response).await["user_id"],
         json!("slash-retained-oidc-user")
     );
-    server
-        .join()
-        .expect("OIDC discovery and JWKS test server should finish");
+    server.finish();
 }
 
 #[test]
@@ -28004,9 +28094,7 @@ fn auth_validator_rejects_oidc_discovery_with_mismatched_issuer() {
         auth::AuthError::Upstream(message)
             if message.contains("OIDC discovery issuer mismatch")
     ));
-    server
-        .join()
-        .expect("OIDC discovery test server should finish");
+    server.finish();
 }
 
 #[test]
@@ -28053,9 +28141,7 @@ fn auth_validator_rejects_oidc_discovery_without_issuer() {
         auth::AuthError::Upstream(message)
             if message.contains("OIDC discovery response missing issuer")
     ));
-    server
-        .join()
-        .expect("OIDC discovery test server should finish");
+    server.finish();
 }
 
 #[tokio::test]
@@ -28117,13 +28203,8 @@ async fn oidc_discovery_allowlists_jwks_uri_host_when_it_differs_from_issuer() {
         json_body(response).await["user_id"],
         json!("split-oidc-user")
     );
-    assert_eq!(
-        discovery_server
-            .join()
-            .expect("OIDC discovery server should finish"),
-        1
-    );
-    assert_eq!(jwks_server.join().expect("JWKS server should finish"), 1);
+    assert_eq!(discovery_server.finish(), 1);
+    assert_eq!(jwks_server.finish(), 1);
 }
 
 #[tokio::test]
@@ -28885,9 +28966,7 @@ fn admin_oidc_login_provider_rejects_discovery_with_mismatched_issuer() {
     .expect_err("admin login discovery with mismatched issuer should fail startup");
 
     assert!(error.to_string().contains("OIDC discovery issuer mismatch"));
-    server
-        .join()
-        .expect("OIDC discovery test server should finish");
+    server.finish();
 }
 
 #[test]
@@ -28915,9 +28994,7 @@ fn admin_oidc_login_provider_rejects_discovery_without_issuer() {
     assert!(error
         .to_string()
         .contains("OIDC discovery response missing issuer"));
-    server
-        .join()
-        .expect("OIDC discovery test server should finish");
+    server.finish();
 }
 
 #[test]
@@ -28947,9 +29024,7 @@ fn admin_oidc_login_provider_requires_discovered_authorize_and_token_endpoints()
     assert!(error
         .to_string()
         .contains("OIDC discovery response missing token_endpoint"));
-    server
-        .join()
-        .expect("OIDC discovery test server should finish");
+    server.finish();
 }
 
 #[tokio::test]
@@ -29048,13 +29123,8 @@ async fn oidc_discovery_jwks_uri_auto_seed_still_blocks_private_ip() {
     // The property this test defends is that the blocked JWKS host is never
     // contacted, asserted below.
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(
-        discovery_server
-            .join()
-            .expect("OIDC discovery server should finish"),
-        1
-    );
-    assert_eq!(jwks_server.join().expect("JWKS server should finish"), 0);
+    assert_eq!(discovery_server.finish(), 1);
+    assert_eq!(jwks_server.finish(), 0);
 }
 
 #[test]
@@ -29098,9 +29168,7 @@ fn auth_validator_reports_construction_error_when_oidc_discovery_lacks_jwks_uri(
         auth::AuthError::Upstream(message)
             if message.contains("OIDC discovery response missing jwks_uri")
     ));
-    server
-        .join()
-        .expect("OIDC discovery test server should finish");
+    server.finish();
 }
 
 #[tokio::test]
@@ -30286,6 +30354,38 @@ fn audit_query_request(uri: &str, principal: Option<auth::Principal>) -> Request
     }
 
     request
+}
+
+/// A stream request as the authentication middleware passes it on: the
+/// principal, and beside it the credential the stream re-checks for as long
+/// as it stays open -- here one whose authority keeps accepting it.
+fn audit_stream_request(uri: &str, principal: auth::Principal) -> Request<Body> {
+    let mut request = audit_query_request(uri, Some(principal.clone()));
+    request
+        .extensions_mut()
+        .insert(accepted_reauthentication(principal));
+    request
+}
+
+/// An authority that accepts every credential as `principal`.
+struct AcceptingAuthority(auth::Principal);
+
+#[async_trait::async_trait]
+impl auth::SessionValidator for AcceptingAuthority {
+    async fn validate_session(
+        &self,
+        _credential: &auth::SessionCredential,
+    ) -> Result<auth::Principal, auth::AuthError> {
+        Ok(self.0.clone())
+    }
+}
+
+fn accepted_reauthentication(principal: auth::Principal) -> auth::Reauthentication {
+    auth::Reauthentication::new(
+        auth::CredentialJudge::Validator(Arc::new(AcceptingAuthority(principal))),
+        auth::SessionCredential::Bearer(format!("test-{}", uuid::Uuid::new_v4())),
+        None,
+    )
 }
 
 fn policy_admin_config_with_sqlite(
@@ -33444,7 +33544,7 @@ async fn spawn_test_jwks_server() -> std::net::SocketAddr {
     .await
 }
 
-fn spawn_oidc_jwks_server() -> (String, std::thread::JoinHandle<()>) {
+fn spawn_oidc_jwks_server() -> (String, BlockingJsonServer) {
     let jwks = json!({
         "keys": [{
             "kty": "RSA",
@@ -33473,7 +33573,7 @@ fn spawn_oidc_jwks_server() -> (String, std::thread::JoinHandle<()>) {
 
 fn spawn_oidc_jwks_server_with_document_issuer(
     document_issuer: impl FnOnce(&str) -> String,
-) -> (String, String, std::thread::JoinHandle<()>) {
+) -> (String, String, BlockingJsonServer) {
     let jwks = json!({
         "keys": [{
             "kty": "RSA",
@@ -33506,14 +33606,14 @@ fn spawn_oidc_jwks_server_with_document_issuer(
 fn spawn_oidc_discovery_server(
     discovery: Value,
     request_count: usize,
-) -> (String, std::thread::JoinHandle<()>) {
+) -> (String, BlockingJsonServer) {
     spawn_oidc_discovery_server_with(|_| discovery, request_count)
 }
 
 fn spawn_oidc_discovery_server_with(
     discovery: impl FnOnce(&str) -> Value,
     request_count: usize,
-) -> (String, std::thread::JoinHandle<()>) {
+) -> (String, BlockingJsonServer) {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
         .expect("OIDC discovery test server should bind");
     let issuer = format!(
@@ -33530,7 +33630,7 @@ fn spawn_oidc_discovery_server_with(
 fn spawn_blocking_jwks_server(
     host: Ipv4Addr,
     request_count: usize,
-) -> (String, std::thread::JoinHandle<usize>) {
+) -> (String, BlockingJsonServer) {
     let listener =
         std::net::TcpListener::bind((host, 0)).expect("JWKS split-host test server should bind");
     let jwks_url = format!(
@@ -33563,7 +33663,7 @@ fn spawn_blocking_jwks_server(
 fn spawn_blocking_cookie_session_server(
     host: Ipv4Addr,
     request_count: usize,
-) -> (String, std::thread::JoinHandle<usize>) {
+) -> (String, BlockingJsonServer) {
     let listener = std::net::TcpListener::bind((host, 0))
         .expect("cookie-session introspection test server should bind");
     let introspection_url = format!(
@@ -33591,9 +33691,7 @@ fn spawn_blocking_cookie_session_server(
     (introspection_url, server)
 }
 
-fn spawn_blocking_oidc_discovery_server(
-    jwks_url: String,
-) -> (String, std::thread::JoinHandle<usize>) {
+fn spawn_blocking_oidc_discovery_server(jwks_url: String) -> (String, BlockingJsonServer) {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
         .expect("OIDC split-host discovery test server should bind");
     let issuer = format!(
@@ -33619,21 +33717,68 @@ fn spawn_blocking_oidc_discovery_server(
     (issuer, server)
 }
 
+/// A blocking HTTP/1.1 test server that answers fixed JSON bodies by path.
+///
+/// It serves until it has answered `request_count` requests or until the test
+/// calls [`BlockingJsonServer::finish`] (or drops it). It deliberately has no
+/// wall-clock lifetime: the time between spawning it and the first request
+/// (signing a test token, building the app) has no bound on a loaded runner,
+/// and a listener that closed a fixed 2 s after spawn refused the gateway's
+/// OIDC discovery fetch on the instrumented Windows coverage job.
+struct BlockingJsonServer {
+    finishing: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<usize>>,
+}
+
+impl BlockingJsonServer {
+    /// Answers every connection already queued, closes the listener and
+    /// returns how many requests were served.
+    ///
+    /// Call it after the test has seen the outcome of the requests it caused.
+    /// Each of them was sent before this call, so it has been answered or is
+    /// queued and is answered now: the count is exact without waiting.
+    fn finish(mut self) -> usize {
+        self.finishing.store(true, Ordering::SeqCst);
+        let thread = self
+            .thread
+            .take()
+            .expect("blocking JSON test server should finish once");
+        thread
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    }
+}
+
+impl Drop for BlockingJsonServer {
+    fn drop(&mut self) {
+        // A test that fails before `finish` must not leave the thread polling.
+        self.finishing.store(true, Ordering::SeqCst);
+    }
+}
+
 fn spawn_blocking_json_server(
     listener: std::net::TcpListener,
     routes: Vec<(String, String)>,
     request_count: usize,
-) -> std::thread::JoinHandle<usize> {
-    std::thread::spawn(move || {
-        listener
-            .set_nonblocking(true)
-            .expect("blocking JSON test server should set nonblocking mode");
-        let deadline = Instant::now() + Duration::from_secs(2);
+) -> BlockingJsonServer {
+    listener
+        .set_nonblocking(true)
+        .expect("blocking JSON test server should set nonblocking mode");
+    let finishing = Arc::new(AtomicBool::new(false));
+    let finish_flag = Arc::clone(&finishing);
+    let thread = std::thread::spawn(move || {
         let mut handled = 0;
-        while handled < request_count && Instant::now() < deadline {
-            let Ok((mut stream, _)) = listener.accept() else {
-                std::thread::sleep(Duration::from_millis(10));
-                continue;
+        while handled < request_count {
+            // Read the flag before accepting: an empty accept that follows a
+            // `finish` request proves no connection made before it is left.
+            let finish_requested = finish_flag.load(Ordering::SeqCst);
+            let mut stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(_) if finish_requested => break,
+                Err(_) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
             };
             stream
                 .set_nonblocking(false)
@@ -33657,7 +33802,12 @@ fn spawn_blocking_json_server(
             handled += 1;
         }
         handled
-    })
+    });
+
+    BlockingJsonServer {
+        finishing,
+        thread: Some(thread),
+    }
 }
 
 fn spawn_oidc_server(
@@ -33665,7 +33815,7 @@ fn spawn_oidc_server(
     discovery: Value,
     jwks: Option<Value>,
     request_count: usize,
-) -> (String, std::thread::JoinHandle<()>) {
+) -> (String, BlockingJsonServer) {
     let issuer = format!(
         "http://127.0.0.1:{}",
         listener
@@ -33673,40 +33823,21 @@ fn spawn_oidc_server(
             .expect("OIDC discovery test server address should be available")
             .port()
     );
-    let discovery = discovery.to_string();
-    let jwks = jwks.map(|jwks| jwks.to_string());
-    let server = std::thread::spawn(move || {
-        listener
-            .set_nonblocking(true)
-            .expect("OIDC discovery test server should set nonblocking mode");
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let mut handled = 0;
-        while handled < request_count && Instant::now() < deadline {
-            let Ok((mut stream, _)) = listener.accept() else {
-                std::thread::sleep(Duration::from_millis(10));
-                continue;
-            };
-            stream
-                .set_nonblocking(false)
-                .expect("OIDC discovery test stream should use blocking reads");
-            let path = read_blocking_http_path(&mut stream);
-            let (status, body) = match path.as_str() {
-                "/.well-known/openid-configuration" => ("200 OK", discovery.as_str()),
-                "/jwks.json" => ("200 OK", jwks.as_deref().unwrap_or("{}")),
-                _ => ("404 Not Found", "{}"),
-            };
-            let response = format!(
-                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-            stream
-                .write_all(response.as_bytes())
-                .expect("OIDC discovery test response should write");
-            handled += 1;
-        }
-    });
+    let routes = vec![
+        (
+            "/.well-known/openid-configuration".to_owned(),
+            discovery.to_string(),
+        ),
+        (
+            "/jwks.json".to_owned(),
+            jwks.map_or_else(|| "{}".to_owned(), |jwks| jwks.to_string()),
+        ),
+    ];
 
-    (issuer, server)
+    (
+        issuer,
+        spawn_blocking_json_server(listener, routes, request_count),
+    )
 }
 
 fn read_blocking_http_path(stream: &mut std::net::TcpStream) -> String {
@@ -35719,6 +35850,12 @@ mod cluster_policy_tests {
                 POLICY_DRAFT_PUBLISH_ADMIN_ROUTE,
                 post(policy_draft_publish_endpoint),
             )
+            .route(
+                POLICY_SIMULATIONS_ADMIN_ROUTE,
+                post(policy_simulations_endpoint).layer(Extension(Arc::new(
+                    PolicyEvaluationLimiter::new(MAX_CONCURRENT_POLICY_SIMULATIONS),
+                ))),
+            )
             .with_state(PolicyAdminState {
                 policy_file: None,
                 rbac_state: Some(rbac_state.clone().with_revision_gate(gate.clone())),
@@ -36088,6 +36225,255 @@ mod cluster_policy_tests {
             .expect("PUT should complete");
         assert_eq!(committed.status(), StatusCode::OK);
         assert_eq!(policy_version_count(&pool).await, before + 1);
+    }
+
+    /// What cluster mode cannot commit it does not save or simulate either
+    /// (issue #243 review). A draft whose candidate is policy v1 is refused
+    /// on create and on patch with the `400` a `PUT` of the same document
+    /// gets, and a simulation of an inline v1 candidate with the `422`
+    /// `POST /policy/validate` and a test run give it, as soon as the
+    /// candidate is read rather than when someone tries to commit it. Nothing
+    /// is committed, and a 0.x candidate on the same paths still is
+    /// accepted.
+    #[tokio::test]
+    async fn cluster_drafts_and_simulations_refuse_a_candidate_the_cluster_cannot_commit() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_policy_foundation(&database.dsn).await;
+        let simulating = r#"{
+            "schema_version": "0.1.0",
+            "id": "simulate-init",
+            "default_action": "deny",
+            "roles": { "admin": { "permissions":
+                ["admin:policy:read", "admin:policy:write", "admin:policy:simulate"] } }
+        }"#;
+        let active = PolicyControlPlane::commit(
+            store.as_ref(),
+            PolicyCommitRequest {
+                precondition: PolicyCommitPrecondition::Initialize,
+                candidate: &parse_policy_body(simulating.as_bytes())
+                    .expect("seed policy should parse"),
+                change: crate::storage::DocumentChange::test_policy("seed"),
+                diff_summary: &DIFF,
+            },
+        )
+        .await
+        .expect("deployment should initialize");
+        let (router, rbac_state) = cluster_policy_router(store.clone());
+        rbac_state
+            .install_revision_snapshot(active.policy.clone(), active.security_revision)
+            .await
+            .expect("the authority's revision should install");
+        let versions_before = policy_version_count(&pool).await;
+        let v1 = r#"{"schema_version":"1.0.0","id":"v1-held","default_action":"deny"}"#;
+        let refuses_format = |body: &Value| {
+            body["errors"][0]
+                .as_str()
+                .is_some_and(|error| error.contains("cannot be committed in cluster mode"))
+        };
+        let request = |method: Method, uri: &str, if_match: &str, body: String| {
+            let mut request = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::IF_MATCH, if_match)
+                .body(Body::from(body))
+                .expect("request should build");
+            request.extensions_mut().insert(admin_principal());
+            request
+        };
+
+        let (status, body) = refusal_of(
+            router
+                .clone()
+                .oneshot(request(
+                    Method::POST,
+                    POLICY_DRAFTS_ADMIN_ROUTE,
+                    &active.etag,
+                    format!(r#"{{"policy":{v1}}}"#),
+                ))
+                .await
+                .expect("create should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(refuses_format(&body), "{body}");
+
+        let created = router
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                POLICY_DRAFTS_ADMIN_ROUTE,
+                &active.etag,
+                "{}".to_owned(),
+            ))
+            .await
+            .expect("create should complete");
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let draft_etag = created
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("draft ETag")
+            .to_owned();
+        let (_, draft) = refusal_of(created).await;
+        let draft_uri = format!(
+            "{POLICY_DRAFTS_ADMIN_ROUTE}/{}",
+            draft["draft_id"].as_str().expect("draft id")
+        );
+        let (status, body) = refusal_of(
+            router
+                .clone()
+                .oneshot(request(
+                    Method::PATCH,
+                    &draft_uri,
+                    &draft_etag,
+                    format!(r#"{{"policy":{v1}}}"#),
+                ))
+                .await
+                .expect("patch should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(refuses_format(&body), "{body}");
+        let (status, kept) = refusal_of(
+            router
+                .clone()
+                .oneshot(request(Method::GET, &draft_uri, "*", String::new()))
+                .await
+                .expect("draft read should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(kept["revision"], 1, "the refused patch saved nothing");
+
+        let simulation = |policy: &str| {
+            format!(
+                r#"{{"schema_version":"policy-simulation.v1","base_etag":{},"candidate":{{"source":"inline","policy":{policy}}},"cases":[{{"id":"anonymous","kind":"http","request":{{"method":"GET","path":"/x"}},"principal":"anonymous"}}]}}"#,
+                json!(active.etag)
+            )
+        };
+        let (status, body) = refusal_of(
+            router
+                .clone()
+                .oneshot(request(
+                    Method::POST,
+                    POLICY_SIMULATIONS_ADMIN_ROUTE,
+                    &active.etag,
+                    simulation(v1),
+                ))
+                .await
+                .expect("simulation should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["reason"], "policy_candidate_invalid");
+        assert!(refuses_format(&body), "{body}");
+        let simulated = router
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                POLICY_SIMULATIONS_ADMIN_ROUTE,
+                &active.etag,
+                simulation(&cluster_policy_json("v0-simulated")),
+            ))
+            .await
+            .expect("simulation should complete");
+        assert_eq!(simulated.status(), StatusCode::OK);
+        assert_eq!(policy_version_count(&pool).await, versions_before);
+    }
+
+    /// A draft publication the commit itself refuses is recorded like one
+    /// refused before it (issue #243 review): here the candidate gives a
+    /// role a `description`, the operation gate has no roster to ask, and
+    /// the publication is the gate's `503` with nothing committed, the draft
+    /// kept open, and a `policy.draft_publish_refused` naming
+    /// `policy_operation_refused`.
+    #[tokio::test]
+    async fn cluster_draft_publications_the_commit_refuses_are_audited() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_policy_foundation(&database.dsn).await;
+        let active = initialize(&store, "refused-init").await;
+        let capture = audit::sink::tests::CaptureSink::new();
+        let (router, rbac_state) = cluster_policy_router_with(
+            store.clone(),
+            None,
+            audit::AuditLog::new(Arc::new(capture.clone())),
+        );
+        rbac_state
+            .install_revision_snapshot(active.policy.clone(), active.security_revision)
+            .await
+            .expect("the authority's revision should install");
+        let versions_before = policy_version_count(&pool).await;
+
+        let mut create = Request::builder()
+            .method(Method::POST)
+            .uri(POLICY_DRAFTS_ADMIN_ROUTE)
+            .header(header::IF_MATCH, &active.etag)
+            .body(Body::from(format!(
+                r#"{{"policy":{}}}"#,
+                described_cluster_policy_json("refused-described")
+            )))
+            .expect("request should build");
+        create.extensions_mut().insert(admin_principal());
+        let created = router
+            .clone()
+            .oneshot(create)
+            .await
+            .expect("create should complete");
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let draft_etag = created
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("draft ETag")
+            .to_owned();
+        let (_, draft) = refusal_of(created).await;
+        let draft_id = draft["draft_id"].as_str().expect("draft id").to_owned();
+
+        let mut publish = Request::builder()
+            .method(Method::POST)
+            .uri(format!("{POLICY_DRAFTS_ADMIN_ROUTE}/{draft_id}/publish"))
+            .header(POLICY_DRAFT_ETAG_HEADER, &draft_etag)
+            .header(header::IF_MATCH, &active.etag)
+            .body(Body::empty())
+            .expect("request should build");
+        publish.extensions_mut().insert(admin_principal());
+        let (status, body) = refusal_of(
+            router
+                .clone()
+                .oneshot(publish)
+                .await
+                .expect("publish should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["reason"], "roster_unavailable");
+        assert_eq!(policy_version_count(&pool).await, versions_before);
+
+        let refused = |capture: &audit::sink::tests::CaptureSink| {
+            capture
+                .events()
+                .into_iter()
+                .filter(|event| event.event_type == audit::event::POLICY_DRAFT_PUBLISH_REFUSED)
+                .map(|event| event.payload)
+                .collect::<Vec<_>>()
+        };
+        assert_eventually(Duration::from_secs(1), || refused(&capture).len() == 1);
+        let refused = refused(&capture);
+        assert_eq!(refused[0]["draft_id"], json!(draft_id));
+        assert_eq!(refused[0]["reason"], "policy_operation_refused");
+        assert_eq!(refused[0]["current_policy_etag"], json!(active.etag));
+        assert!(!capture.events().into_iter().any(|event| {
+            event.event_type == audit::event::POLICY_DRAFT_PUBLISHED
+                || event.event_type == audit::event::POLICY_CHANGED
+        }));
     }
 
     /// Issue #443's registered operation through the managed OpenAPI

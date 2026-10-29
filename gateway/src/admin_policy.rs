@@ -1375,7 +1375,14 @@ pub(super) fn parse_openapi_tools_register_body(
 /// A whole-policy request body, read from its bytes so a v1 document is
 /// held to its exact-source rules. A 0.x document reports its single error
 /// in the words it always has; a v1 document reports every structural one.
-pub(super) fn parse_policy_body(body: &Bytes) -> Result<rbac::Policy, Vec<String>> {
+///
+/// A candidate that arrives as one member of a larger request (a draft, an
+/// inline simulation or test-run candidate) is read through this too, from
+/// that member's own bytes, so it is judged exactly as `PUT .../policy`
+/// judges the same document: never from a `Value`, which keeps the last of
+/// two repeated members and reads serde_json's private number tag as a
+/// number, both silently.
+pub(super) fn parse_policy_body(body: &[u8]) -> Result<rbac::Policy, Vec<String>> {
     rbac::policy_document::inspect_source(body).into_policy()
 }
 
@@ -2145,9 +2152,10 @@ pub(super) fn review_policy_resources(
 /// authority sees the candidate: `400` with every finding and the resource
 /// snapshot they read, and a `policy.publication_refused` audit event, and
 /// nothing written. Every commit the policy API makes passes through here:
-/// [`persist_policy_mutation`], which every mutation endpoint, rollback and a
-/// standalone suggestion acceptance use, and a cluster-mode suggestion
-/// acceptance, which commits inside the suggestion's transaction.
+/// [`commit_policy_mutation`], which every mutation endpoint, rollback, a
+/// standalone suggestion acceptance and a draft publication use, and a
+/// cluster-mode suggestion acceptance, which commits inside the
+/// suggestion's transaction.
 pub(super) fn admit_policy_resources(
     request: PublicationRequest<'_>,
     live: &rbac::Policy,
@@ -2240,6 +2248,80 @@ pub(super) fn resource_snapshot_stale(
         .into_response()
 }
 
+/// [`validate_policy_mutation_candidate`] and, before any authority is
+/// asked, whether this deployment can commit the candidate's document
+/// format at all: everything a write refuses about a candidate without
+/// trying to commit it, with the same responses. A policy draft is judged
+/// by this when it is saved and again when it is published, so a draft
+/// cluster mode could never commit (policy v1, today) is refused when it is
+/// saved rather than kept until its publication fails.
+pub(super) fn validate_policy_write_candidate(
+    state: &PolicyAdminState,
+    rbac_state: &middleware::rbac::RbacState,
+    before_policy: &rbac::Policy,
+    candidate: &rbac::Policy,
+) -> ResponseResult<()> {
+    validate_policy_mutation_candidate(rbac_state, before_policy, candidate)?;
+    if let Some(detail) = deployment_document_format_refusal(state, candidate) {
+        return Err(Box::new(policy_validation_failed(vec![detail])));
+    }
+    Ok(())
+}
+
+/// Why [`commit_policy_mutation`] wrote nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PolicyCommitRefusal {
+    /// The candidate failed a check the commit repeats: egress, proxy
+    /// dispatch, or the document format cluster mode commits.
+    CandidateInvalid,
+    /// The cross-resource checks refused the candidate (issue #243, slice
+    /// 8): a blocking finding such as an administrator lockout, or a
+    /// resource snapshot the write was bound to that is no longer the
+    /// current one. [`admit_policy_resources`] has already audited it as
+    /// `policy.publication_refused`, with its codes.
+    ResourcesRefused,
+    /// The authority's compare-and-swap found another live policy: a writer
+    /// on this replica or another got there first. Only the cluster
+    /// authority compares and swaps; the file authority is serialized by
+    /// the write lock alone.
+    #[cfg(feature = "postgres")]
+    EtagMismatch,
+    /// The cluster's operation gate did not admit a document feature some
+    /// live member cannot read, or had no roster to ask.
+    #[cfg(feature = "postgres")]
+    OperationRefused,
+    /// No authority is configured, or it could not write the candidate.
+    Failed,
+}
+
+/// A policy mutation that did not complete, and whether it changed
+/// anything. A caller that records refusals needs the difference: a
+/// refusal left the authority, history and enforcement as they were, while
+/// an incomplete mutation wrote something before a later step failed.
+pub(super) enum PolicyMutationFailure {
+    /// Nothing was written.
+    Refused(PolicyCommitRefusal, Box<Response>),
+    /// The commit (in standalone mode, the policy file) was written, and a
+    /// step after it failed: the reload, the replica install or the ETag.
+    Incomplete(Box<Response>),
+}
+
+impl PolicyMutationFailure {
+    fn refused(refusal: PolicyCommitRefusal, response: Response) -> Self {
+        Self::Refused(refusal, Box::new(response))
+    }
+
+    fn incomplete(response: Response) -> Self {
+        Self::Incomplete(Box::new(response))
+    }
+
+    fn into_response(self) -> Box<Response> {
+        match self {
+            Self::Refused(_, response) | Self::Incomplete(response) => response,
+        }
+    }
+}
+
 pub(super) async fn persist_policy_mutation(
     context: PolicyMutationCommitContext<'_, '_>,
     action: storage::DocumentAction,
@@ -2248,11 +2330,36 @@ pub(super) async fn persist_policy_mutation(
     candidate: &rbac::Policy,
     diff_summary: Value,
 ) -> ResponseResult<PolicyMutationCommitResult> {
+    commit_policy_mutation(
+        context,
+        action,
+        before_policy,
+        expected_etag,
+        candidate,
+        diff_summary,
+    )
+    .await
+    .map_err(PolicyMutationFailure::into_response)
+}
+
+/// [`persist_policy_mutation`], saying on failure whether anything was
+/// written, for a caller that audits the refusals itself (draft
+/// publication).
+pub(super) async fn commit_policy_mutation(
+    context: PolicyMutationCommitContext<'_, '_>,
+    action: storage::DocumentAction,
+    before_policy: &rbac::Policy,
+    expected_etag: &str,
+    candidate: &rbac::Policy,
+    diff_summary: Value,
+) -> Result<PolicyMutationCommitResult, PolicyMutationFailure> {
     // Standalone writes record no change evidence (#425 PR 4): the file,
     // the reload and the optional history are separate steps.
     #[cfg(not(feature = "postgres"))]
     let _ = action;
-    validate_policy_mutation_candidate(context.rbac_state, before_policy, candidate)?;
+    validate_policy_mutation_candidate(context.rbac_state, before_policy, candidate).map_err(
+        |response| PolicyMutationFailure::Refused(PolicyCommitRefusal::CandidateInvalid, response),
+    )?;
     let review = admit_policy_resources(
         PublicationRequest {
             state: context.state,
@@ -2264,7 +2371,10 @@ pub(super) async fn persist_policy_mutation(
         expected_etag,
         candidate,
         &diff_summary,
-    )?;
+    )
+    .map_err(|response| {
+        PolicyMutationFailure::Refused(PolicyCommitRefusal::ResourcesRefused, response)
+    })?;
 
     // Cluster mode: one transaction through the authority -- new immutable
     // version, revision advance, history row, and outbox record commit
@@ -2272,7 +2382,19 @@ pub(super) async fn persist_policy_mutation(
     // a racing writer (on this replica or another) makes this a `412`.
     #[cfg(feature = "postgres")]
     if let Some(control_plane) = context.state.control_plane.as_ref() {
-        admit_policy_document(context.state, context.parts, context.principal, candidate).await?;
+        // [`admit_policy_document`] in its two halves, so a refusal says
+        // which one refused.
+        if let Some(detail) = cluster_document_format_refusal(candidate) {
+            return Err(PolicyMutationFailure::refused(
+                PolicyCommitRefusal::CandidateInvalid,
+                policy_validation_failed(vec![detail]),
+            ));
+        }
+        admit_policy_operations(context.state, context.parts, context.principal, candidate)
+            .await
+            .map_err(|response| {
+                PolicyMutationFailure::Refused(PolicyCommitRefusal::OperationRefused, response)
+            })?;
         let commit = control_plane
             .commit(storage::PolicyCommitRequest {
                 precondition: storage::PolicyCommitPrecondition::Expected {
@@ -2304,7 +2426,9 @@ pub(super) async fn persist_policy_mutation(
                     &review,
                 );
                 if installed.is_err() {
-                    return Err(Box::new(policy_snapshot_not_installable()));
+                    return Err(PolicyMutationFailure::incomplete(
+                        policy_snapshot_not_installable(),
+                    ));
                 }
                 Ok(PolicyMutationCommitResult {
                     after_policy: active.policy,
@@ -2314,35 +2438,50 @@ pub(super) async fn persist_policy_mutation(
                     history_append_failed: false,
                 })
             }
-            Err(storage::PolicyCommitError::PreconditionFailed) => Err(Box::new(
-                precondition_failed("If-Match does not match the current policy ETag"),
-            )),
+            Err(storage::PolicyCommitError::PreconditionFailed) => {
+                Err(PolicyMutationFailure::refused(
+                    PolicyCommitRefusal::EtagMismatch,
+                    precondition_failed("If-Match does not match the current policy ETag"),
+                ))
+            }
             // Policies publish no tool names; the variant is unreachable
             // here and answered as the conflict it would be.
             Err(storage::PolicyCommitError::ToolNameTaken { tool_name, .. }) => {
-                Err(Box::new(conflict(&format!(
-                    "policy commit reported a reserved tool name '{tool_name}'"
-                ))))
+                Err(PolicyMutationFailure::refused(
+                    PolicyCommitRefusal::Failed,
+                    conflict(&format!(
+                        "policy commit reported a reserved tool name '{tool_name}'"
+                    )),
+                ))
             }
             Err(storage::PolicyCommitError::Store(error)) => {
                 tracing::error!(
                     error = %error,
                     "policy control-plane commit failed; nothing was written"
                 );
-                Err(Box::new(service_unavailable(
-                    "policy mutation could not be committed",
-                )))
+                Err(PolicyMutationFailure::refused(
+                    PolicyCommitRefusal::Failed,
+                    service_unavailable("policy mutation could not be committed"),
+                ))
             }
         };
     }
 
     let Some(policy_file) = context.state.policy_file.as_deref() else {
-        return Err(Box::new(policy_not_configured()));
+        return Err(PolicyMutationFailure::refused(
+            PolicyCommitRefusal::Failed,
+            policy_not_configured(),
+        ));
     };
 
+    // The file is replaced by an atomic rename, so a failed persist leaves
+    // the previous document in place.
     if let Err(err) = candidate.persist_to_file(policy_file) {
         tracing::error!(policy_file = %policy_file.display(), error = %err, "failed to persist policy");
-        return Err(Box::new(internal_server_error("policy persist failed")));
+        return Err(PolicyMutationFailure::refused(
+            PolicyCommitRefusal::Failed,
+            internal_server_error("policy persist failed"),
+        ));
     }
 
     if let Err(err) = middleware::rbac::reload_policy_from_file_locked(
@@ -2351,7 +2490,9 @@ pub(super) async fn persist_policy_mutation(
         context.policy_write_guard,
     ) {
         tracing::error!(policy_file = %policy_file.display(), error = %err, "failed to reload persisted policy");
-        return Err(Box::new(internal_server_error("policy reload failed")));
+        return Err(PolicyMutationFailure::incomplete(internal_server_error(
+            "policy reload failed",
+        )));
     }
 
     let after_policy = context.rbac_state.current_policy();
@@ -2376,7 +2517,7 @@ pub(super) async fn persist_policy_mutation(
         Ok(etag) => etag,
         Err(err) => {
             tracing::error!(error = %err, "failed to compute updated policy ETag");
-            return Err(Box::new(internal_server_error(
+            return Err(PolicyMutationFailure::incomplete(internal_server_error(
                 "policy ETag computation failed",
             )));
         }
@@ -2401,10 +2542,12 @@ pub(super) async fn persist_policy_mutation(
 /// the roster for every such write, logs and audits each refusal
 /// (`cluster.operation_refused`), and the refused write commits nothing.
 ///
-/// Every cluster-mode policy commit calls this: the policy API's mutations
-/// through [`persist_policy_mutation`] and a discovery suggestion's
-/// acceptance, which commits the whole document with the new rule in it. A
-/// control plane with no roster to read refuses rather than admits.
+/// Every cluster-mode policy commit calls this: a discovery suggestion's
+/// acceptance, which commits the whole document with the new rule in it,
+/// and the policy API's mutations through [`commit_policy_mutation`], which
+/// takes its two halves (the format check and
+/// [`admit_policy_operations`]) one at a time so it can say which refused.
+/// A control plane with no roster to read refuses rather than admits.
 ///
 /// Before any of that, the document's format must be one every replica can
 /// read. This build advertises `cluster_membership::DOCUMENT_VERSION_RANGE`,
@@ -2421,6 +2564,19 @@ pub(super) async fn admit_policy_document(
     if let Some(detail) = cluster_document_format_refusal(candidate) {
         return Err(Box::new(policy_validation_failed(vec![detail])));
     }
+    admit_policy_operations(state, parts, principal, candidate).await
+}
+
+/// The operation-gate half of [`admit_policy_document`]: a document that
+/// uses a feature an older member cannot read is committed only while
+/// every live member advertises it.
+#[cfg(feature = "postgres")]
+async fn admit_policy_operations(
+    state: &PolicyAdminState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    candidate: &rbac::Policy,
+) -> ResponseResult<()> {
     if !candidate.uses_role_descriptions() {
         return Ok(());
     }

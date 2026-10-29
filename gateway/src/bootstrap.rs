@@ -570,36 +570,517 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .with(production_tracing_filter())
         .init();
 
-    let config = match config::Config::from_env() {
-        Ok(config) => config,
-        Err(err) => {
+    // Serving startup runs in stages (`start_serving`): the configuration
+    // compiler, then preflight, activation and serving. A configuration the
+    // compiler refuses is printed as it reports it, before any stage runs;
+    // a stage's failure goes back to `main` like every other startup error.
+    let mut stages = ProcessStartup { process_started_at };
+    match start_serving(&mut stages, config::process_environment).await {
+        Ok(()) => Ok(()),
+        Err(StartupFailure::Configuration(err)) => {
             eprintln!("{err}");
             std::process::exit(1);
         }
-    };
-    // Cluster mode's startup prerequisites, before anything binds: this build
-    // must carry the PostgreSQL client at all, and a selected
-    // STATE_BACKEND=postgres must prove the database answers within its
-    // bounded retry budget. Standalone mode runs none of this.
-    ha::ensure_backend_compiled_in(&config)?;
-    let _ha_foundation = match config.state_backend {
-        config::StateBackend::Postgres => {
-            let foundation = ha::HaFoundation::generate(&config);
-            tracing::info!(
-                deployment_id = config.deployment_id.as_deref().unwrap_or_default(),
-                instance_id = %foundation.identity().instance_id(),
-                boot_id = %foundation.identity().boot_id(),
-                fingerprint = %foundation.fingerprint(),
-                "cluster mode: identity established; every replica of this deployment \
-                 must agree on the static-configuration fingerprint to become ready"
-            );
-            Some(foundation)
+        Err(StartupFailure::Stage(error)) => Err(error),
+    }
+}
+
+/// Why serving startup stopped.
+#[derive(Debug)]
+pub(super) enum StartupFailure {
+    /// The configuration compiler refused the environment. No stage ran.
+    Configuration(config::ConfigError),
+    /// Preflight, activation or serving failed.
+    Stage(Box<dyn std::error::Error>),
+}
+
+/// The stages of serving startup that do I/O (issue #433, PR 3), run in
+/// order by [`start_serving`] once the configuration compiler has accepted
+/// the environment. Each receives the compiled configuration; none reads
+/// the environment again.
+///
+/// * **Preflight** proves that the authority the configuration names can
+///   be served from: that this build carries its backend, and in cluster
+///   mode the database foundation (connected, migrated when the operator
+///   allows it, schema, contract fence and deployment binding checked), the
+///   control-plane documents and stores read and checked, the keyrings
+///   loaded and this boot's row written to the membership roster -- the one
+///   thing it publishes about this boot, and so the one thing withdrawn.
+///   Its other writes are deployment-wide and the same from every replica
+///   that makes them (migrations the operator allows, the empty tool
+///   document a first boot seeds, the journal capacity an admitted replica
+///   applies), so none says this boot might serve. It builds nothing that
+///   serves.
+/// * **Activation** builds the gateway from the configuration and the
+///   seeds: the metrics recorder, the listeners' TLS material, the audit
+///   sinks, every store, client and background task, and the routers. It
+///   binds nothing.
+/// * **Serving** binds the listeners and serves until shutdown. Once a
+///   listener has served, shutdown is serving's own; until then, a failure
+///   to bind or to announce readiness is a startup failure like the stages'
+///   before it.
+///
+/// [`ProcessStartup`] is the gateway's; the bootstrap tests run the same
+/// sequence against a recording double.
+pub(super) trait StartupStages {
+    type Seeds;
+    type Published;
+    type Activated;
+
+    /// Returns the seeds activation builds from. What preflight publishes
+    /// outside this process goes into `published` before the step that
+    /// publishes it, so it is withdrawn whichever later step fails,
+    /// preflight's own included.
+    async fn preflight(
+        &mut self,
+        config: &config::Config,
+        published: &mut Option<Self::Published>,
+    ) -> Result<Self::Seeds, Box<dyn std::error::Error>>;
+
+    async fn activate(
+        &mut self,
+        config: config::Config,
+        seeds: Self::Seeds,
+    ) -> Result<Self::Activated, Box<dyn std::error::Error>>;
+
+    /// Withdraw what preflight published, after preflight, activation or
+    /// serving failed before the gateway served.
+    async fn withdraw(&mut self, published: Self::Published);
+
+    async fn serve(&mut self, activated: Self::Activated) -> Result<(), ServingFailure>;
+}
+
+/// How serving ended when it did not end in an orderly shutdown.
+#[derive(Debug)]
+pub(super) enum ServingFailure {
+    /// No listener served: a listener could not be bound or readiness could
+    /// not be announced. Startup failed, so what preflight published is
+    /// withdrawn.
+    NeverServed(Box<dyn std::error::Error>),
+    /// Serving ended on an error after the gateway became ready. Serving's
+    /// own shutdown has already run.
+    AfterServing(Box<dyn std::error::Error>),
+}
+
+impl ServingFailure {
+    /// Classify an error `serve_gateway` returned by the phase it left the
+    /// lifecycle in: still starting means no listener ever served.
+    fn from_lifecycle(error: Box<dyn std::error::Error>, lifecycle: &GatewayLifecycle) -> Self {
+        if lifecycle.startup_complete() {
+            Self::AfterServing(error)
+        } else {
+            Self::NeverServed(error)
         }
-        config::StateBackend::Sqlite => None,
+    }
+}
+
+/// Serving startup: the configuration compiler, then the stages.
+///
+/// The compiler runs first and alone. It is handed the environment reader
+/// and nothing else -- no file system, resolver, client, store, provider or
+/// database -- so a configuration it refuses stops startup before anything
+/// has been opened, resolved or connected to, and the configuration every
+/// stage receives is that one compiled result. Its effective values and the
+/// order its problems are reported in are `Config::from_env`'s, and the
+/// stages run the startup work in the order it has always run in, so a
+/// startup that fails still fails with the same error.
+///
+/// Serving starts only with a gateway activation built in full. When
+/// preflight or activation fails, or serving fails before any listener
+/// served, what preflight published is withdrawn before the error is
+/// returned, so a gateway that will not serve leaves nothing behind that
+/// says it might.
+pub(super) async fn start_serving<S: StartupStages>(
+    stages: &mut S,
+    get_var: impl FnMut(&str) -> Result<String, std::env::VarError>,
+) -> Result<(), StartupFailure> {
+    let plan = config::compile(get_var).map_err(StartupFailure::Configuration)?;
+    let config = plan.into_config();
+    // Each stage's future is boxed: an unoptimized build would otherwise
+    // hold all of them inline, and the main thread's stack on Windows is
+    // 1 MiB.
+    let mut published = None;
+    let seeds = match Box::pin(stages.preflight(&config, &mut published)).await {
+        Ok(seeds) => seeds,
+        Err(error) => {
+            if let Some(published) = published {
+                Box::pin(stages.withdraw(published)).await;
+            }
+            return Err(StartupFailure::Stage(error));
+        }
     };
+    let activated = match Box::pin(stages.activate(config, seeds)).await {
+        Ok(activated) => activated,
+        Err(error) => {
+            if let Some(published) = published {
+                Box::pin(stages.withdraw(published)).await;
+            }
+            return Err(StartupFailure::Stage(error));
+        }
+    };
+    match Box::pin(stages.serve(activated)).await {
+        Ok(()) => Ok(()),
+        Err(ServingFailure::NeverServed(error)) => {
+            if let Some(published) = published {
+                Box::pin(stages.withdraw(published)).await;
+            }
+            Err(StartupFailure::Stage(error))
+        }
+        Err(ServingFailure::AfterServing(error)) => Err(StartupFailure::Stage(error)),
+    }
+}
+
+/// The gateway process's startup stages.
+pub(super) struct ProcessStartup {
+    process_started_at: Instant,
+}
+
+/// What preflight proved and loaded, for activation to build from.
+pub(super) struct ProcessSeeds {
+    ha_foundation: Option<ha::HaFoundation>,
     #[cfg(feature = "postgres")]
-    let _database_foundation =
-        storage::postgres::PostgresFoundation::start_if_selected(&config).await?;
+    database_foundation: Option<storage::postgres::PostgresFoundation>,
+    #[cfg(feature = "postgres")]
+    cluster: ClusterBootSeeds,
+}
+
+/// What preflight publishes outside the process: in cluster mode, this
+/// boot's membership row. Standalone mode publishes nothing, and a build
+/// without the PostgreSQL client has nothing it could publish.
+#[cfg(feature = "postgres")]
+pub(super) type ProcessPublication = Arc<cluster_membership::ClusterMembership>;
+#[cfg(not(feature = "postgres"))]
+pub(super) type ProcessPublication = std::convert::Infallible;
+
+/// Cluster mode's boot seeds, read from the authority by preflight. Every
+/// one is `None` in standalone mode.
+#[cfg(feature = "postgres")]
+pub(super) struct ClusterBootSeeds {
+    policy: Option<ClusterPolicySeed>,
+    tools: Option<ClusterToolsSeed>,
+    connections: Option<ClusterConnectionsSeed>,
+    service_tokens: Option<ClusterServiceTokenSeed>,
+    pending_logins: Option<ClusterPendingLoginSeed>,
+    limits: Option<ClusterLimitsSeed>,
+    membership: Option<Arc<cluster_membership::ClusterMembership>>,
+    audit: Option<Arc<storage::postgres_audit::PostgresAuditEventStore>>,
+    discovery: Option<ClusterDiscoverySeed>,
+    authority_events: Option<Arc<storage::postgres_authority_events::PostgresAuthorityEventStore>>,
+}
+
+/// A gateway activation built in full: everything serving needs, and the
+/// foundations it serves from, held until serving ends.
+pub(super) struct ActivatedGateway {
+    apps: GatewayApps,
+    listen: ListenAddresses,
+    inbound_tls: inbound_tls::InboundTlsBindings,
+    audit_log: audit::AuditLog,
+    lifecycle: GatewayLifecycle,
+    shutdown_config: ShutdownConfig,
+    shutdown_budget: Duration,
+    ha_foundation: Option<ha::HaFoundation>,
+    #[cfg(feature = "postgres")]
+    database_foundation: Option<storage::postgres::PostgresFoundation>,
+}
+
+impl StartupStages for ProcessStartup {
+    type Seeds = ProcessSeeds;
+    type Published = ProcessPublication;
+    type Activated = ActivatedGateway;
+
+    async fn preflight(
+        &mut self,
+        config: &config::Config,
+        published: &mut Option<ProcessPublication>,
+    ) -> Result<ProcessSeeds, Box<dyn std::error::Error>> {
+        // Cluster mode's startup prerequisites, before anything binds: this
+        // build must carry the PostgreSQL client at all, and a selected
+        // STATE_BACKEND=postgres must prove the database answers within its
+        // bounded retry budget. Standalone mode runs none of this.
+        ha::ensure_backend_compiled_in(config)?;
+        let ha_foundation = match config.state_backend {
+            config::StateBackend::Postgres => {
+                let foundation = ha::HaFoundation::generate(config);
+                tracing::info!(
+                    deployment_id = config.deployment_id.as_deref().unwrap_or_default(),
+                    instance_id = %foundation.identity().instance_id(),
+                    boot_id = %foundation.identity().boot_id(),
+                    fingerprint = %foundation.fingerprint(),
+                    "cluster mode: identity established; every replica of this deployment \
+                     must agree on the static-configuration fingerprint to become ready"
+                );
+                Some(foundation)
+            }
+            config::StateBackend::Sqlite => None,
+        };
+        #[cfg(feature = "postgres")]
+        let database_foundation =
+            storage::postgres::PostgresFoundation::start_if_selected(config).await?;
+        #[cfg(feature = "postgres")]
+        let cluster = preflight_cluster_authority(
+            config,
+            database_foundation.as_ref(),
+            ha_foundation.as_ref(),
+            published,
+        )
+        .await?;
+        #[cfg(not(feature = "postgres"))]
+        let _ = published;
+        Ok(ProcessSeeds {
+            ha_foundation,
+            #[cfg(feature = "postgres")]
+            database_foundation,
+            #[cfg(feature = "postgres")]
+            cluster,
+        })
+    }
+
+    async fn activate(
+        &mut self,
+        config: config::Config,
+        seeds: ProcessSeeds,
+    ) -> Result<ActivatedGateway, Box<dyn std::error::Error>> {
+        let ProcessSeeds {
+            ha_foundation,
+            #[cfg(feature = "postgres")]
+            database_foundation,
+            #[cfg(feature = "postgres")]
+            cluster,
+        } = seeds;
+        // Seeds every counter a single-event alert reads at zero (the
+        // cluster-only ones in cluster mode), so the first event moves 0 -> 1.
+        let metrics_handle =
+            install_metrics_recorder(config.state_backend == config::StateBackend::Postgres)?;
+        let listen = ListenAddresses::from_config(&config);
+        // Loaded before any listener binds. Certificate and key problems must abort
+        // startup rather than leave a listener serving plaintext that an operator
+        // configured for TLS.
+        let inbound_tls = inbound_tls::InboundTlsBindings::load(&config)?;
+        let shutdown_config = ShutdownConfig::from_config(&config);
+        let shutdown_budget = Duration::from_millis(config.shutdown_timeout_ms);
+        let lifecycle = GatewayLifecycle::new();
+        let overrides = GatewayAppBuildOverrides {
+            lifecycle: Some(lifecycle.clone()),
+            ha_identity: ha_foundation
+                .as_ref()
+                .map(|foundation| *foundation.identity()),
+            #[cfg(feature = "postgres")]
+            pg_audit: cluster.audit,
+            #[cfg(feature = "postgres")]
+            pg_policy: cluster.policy,
+            #[cfg(feature = "postgres")]
+            pg_tools: cluster.tools,
+            #[cfg(feature = "postgres")]
+            pg_connections: cluster.connections,
+            #[cfg(feature = "postgres")]
+            pg_service_tokens: cluster.service_tokens,
+            #[cfg(feature = "postgres")]
+            pg_pending_logins: cluster.pending_logins,
+            #[cfg(feature = "postgres")]
+            pg_limits: cluster.limits,
+            #[cfg(feature = "postgres")]
+            pg_discovery: cluster.discovery,
+            #[cfg(feature = "postgres")]
+            pg_membership: cluster.membership,
+            #[cfg(feature = "postgres")]
+            pg_authority_events: cluster.authority_events,
+            #[cfg(test)]
+            cluster_readiness: None,
+            #[cfg(test)]
+            readiness_probe: None,
+            #[cfg(test)]
+            cluster_status_source: None,
+            #[cfg(test)]
+            egress_resolver: None,
+            #[cfg(test)]
+            pending_login_backend: None,
+            #[cfg(test)]
+            request_selection_count: None,
+            #[cfg(test)]
+            disable_proxy_health_checks: false,
+            #[cfg(test)]
+            stream_proxy_request_bodies: false,
+            #[cfg(test)]
+            gate_converted_openapi_catalogs: false,
+        };
+        let built = build_activated_gateway(
+            config,
+            metrics_handle,
+            &inbound_tls,
+            &lifecycle,
+            overrides,
+            self.process_started_at,
+        );
+        let (apps, audit_log) = match built {
+            Ok(built) => built,
+            Err(error) => {
+                // Building may already have started background work on the
+                // lifecycle -- reload watchers, the membership heartbeat,
+                // the projector and maintenance leaders, the reconciler.
+                // None of it may outlive an activation that will not serve.
+                stop_unserved_gateway(&lifecycle, shutdown_budget).await;
+                return Err(error);
+            }
+        };
+        // Authority-event delivery needs the pseudonym keyring, which may
+        // sit behind a network secret provider the builder only just
+        // activated, so it starts here, after the build and before any
+        // listener binds. Any failure refuses startup like a build failure.
+        // This runs on a replica held at the fingerprint door too, but the
+        // dispatcher it spawns contends for the lease only once the
+        // membership gate admits this replica.
+        #[cfg(feature = "postgres")]
+        let apps = {
+            let mut apps = apps;
+            if let Some(startup) = apps.authority_events.take() {
+                if let Err(error) = Box::pin(startup.start(&lifecycle, &audit_log)).await {
+                    stop_unserved_gateway(&lifecycle, shutdown_budget).await;
+                    return Err(Box::new(error));
+                }
+            }
+            apps
+        };
+        Ok(ActivatedGateway {
+            apps,
+            listen,
+            inbound_tls,
+            audit_log,
+            lifecycle,
+            shutdown_config,
+            shutdown_budget,
+            ha_foundation,
+            #[cfg(feature = "postgres")]
+            database_foundation,
+        })
+    }
+
+    async fn withdraw(&mut self, published: ProcessPublication) {
+        #[cfg(feature = "postgres")]
+        published.withdraw_unserved_boot().await;
+        #[cfg(not(feature = "postgres"))]
+        let _ = published;
+    }
+
+    async fn serve(&mut self, activated: ActivatedGateway) -> Result<(), ServingFailure> {
+        let ActivatedGateway {
+            apps,
+            listen,
+            inbound_tls,
+            audit_log,
+            lifecycle,
+            shutdown_config,
+            shutdown_budget,
+            // Held, not used: the foundations live as long as serving does.
+            ha_foundation: _ha_foundation,
+            #[cfg(feature = "postgres")]
+                database_foundation: _database_foundation,
+        } = activated;
+        let background_lifecycle = lifecycle.clone();
+        let phase = lifecycle.clone();
+        let served = serve_gateway(
+            apps.http,
+            apps.grpc,
+            listen.data,
+            listen.admin,
+            inbound_tls,
+            audit_log,
+            lifecycle,
+            shutdown_config,
+            Box::pin(async move {
+                background_lifecycle.shutdown_background_tasks().await;
+            }),
+        )
+        .await;
+        match served {
+            Ok(()) => Ok(()),
+            Err(error) => match ServingFailure::from_lifecycle(Box::new(error), &phase) {
+                // A listener that could not be bound leaves the background
+                // work activation started running, with no shutdown of
+                // serving's to stop it.
+                ServingFailure::NeverServed(error) => {
+                    stop_unserved_gateway(&phase, shutdown_budget).await;
+                    Err(ServingFailure::NeverServed(error))
+                }
+                after_serving => Err(after_serving),
+            },
+        }
+    }
+}
+
+/// Stop the background work activation started for a gateway that will
+/// never serve, within the shutdown budget: a task that will not stop must
+/// not hold the process that is about to report the failure.
+async fn stop_unserved_gateway(lifecycle: &GatewayLifecycle, budget: Duration) {
+    if tokio::time::timeout(budget, lifecycle.shutdown_background_tasks())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            "background tasks started for a gateway that never served did not stop within SHUTDOWN_TIMEOUT_MS"
+        );
+    }
+}
+
+/// Activation's synchronous part: the audit sinks, the TLS reload watchers
+/// and the gateway itself, built from the configuration and preflight's
+/// seeds (in `overrides`). Everything it starts is registered with
+/// `lifecycle`.
+fn build_activated_gateway(
+    config: config::Config,
+    metrics_handle: PrometheusHandle,
+    inbound_tls: &inbound_tls::InboundTlsBindings,
+    lifecycle: &GatewayLifecycle,
+    overrides: GatewayAppBuildOverrides,
+    process_started_at: Instant,
+) -> Result<(GatewayApps, audit::AuditLog), Box<dyn std::error::Error>> {
+    // Cluster mode's audit of record is the shared store (issue #11, PR 3):
+    // the durable sink writes through the same store instance the SSE and
+    // discovery readers were just handed, with this replica's identity on
+    // every row, and its drain gets the audit drain's own budget. Standalone
+    // builds the sinks exactly as before -- `from_config` is this call with
+    // no store.
+    #[cfg(feature = "postgres")]
+    let (audit_log, audit_event_sender) = audit::AuditLog::from_config_with_durable_store(
+        &config,
+        overrides
+            .pg_audit
+            .as_ref()
+            .map(|store| audit::postgres_sink::PostgresSinkConfig {
+                store: Arc::clone(store),
+                flush_deadline: Duration::from_millis(config.audit_drain_timeout_ms),
+            }),
+    )?;
+    #[cfg(not(feature = "postgres"))]
+    let (audit_log, audit_event_sender) = audit::AuditLog::from_config(&config)?;
+    // Started once the audit log exists, so every reload outcome -- accepted
+    // or rejected -- is observable from the first moment a listener serves.
+    // A watcher that cannot be installed aborts startup for the same reason
+    // unreadable material does: a listener whose certificate files cannot be
+    // watched is a listener whose certificates quietly stop being renewable.
+    inbound_tls.spawn_material_reload_tasks_with_lifecycle(audit_log.clone(), lifecycle)?;
+    let apps = gateway_app_with_process_started_at_and_overrides(
+        config,
+        metrics_handle,
+        audit_log.clone(),
+        audit_event_sender,
+        process_started_at,
+        overrides,
+    )?;
+    Ok((apps, audit_log))
+}
+
+/// Cluster mode's preflight against the authority the database foundation
+/// established: the boot seeds, read and checked in the order startup has
+/// always read them, and this boot's membership row, which goes into
+/// `published` before it is written. Standalone mode, with no foundation,
+/// reads and publishes nothing.
+#[cfg(feature = "postgres")]
+async fn preflight_cluster_authority(
+    config: &config::Config,
+    database_foundation: Option<&storage::postgres::PostgresFoundation>,
+    ha_foundation: Option<&ha::HaFoundation>,
+    published: &mut Option<ProcessPublication>,
+) -> Result<ClusterBootSeeds, Box<dyn std::error::Error>> {
     // The foundation bound the database to this DEPLOYMENT_ID (or refused
     // one bound elsewhere) as part of establishing itself: deployments
     // never share a database.
@@ -608,8 +1089,7 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // cross-check needs the config and runs in the app builder. Serving
     // without a validated active document is not an option the mode has:
     // an uninitialized or unreadable deployment fails startup here.
-    #[cfg(feature = "postgres")]
-    let pg_policy_seed = match &_database_foundation {
+    let policy = match database_foundation {
         Some(foundation) => {
             let store = Arc::new(storage::PostgresPolicyStore::new(foundation.pool().clone()));
             match store.active().await {
@@ -631,8 +1111,7 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // serves without TOOLS_FILE), so a first boot seeds one idempotently:
     // racing replicas produce exactly one seeded document, later boots
     // no-op. The seed loads the authoritative local lane for the builder.
-    #[cfg(feature = "postgres")]
-    let pg_tools_seed = match &_database_foundation {
+    let tools = match database_foundation {
         Some(foundation) => {
             let store = Arc::new(storage::PostgresToolStore::new(foundation.pool().clone()));
             if let Err(error) = store.seed_empty_document().await {
@@ -666,15 +1145,14 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // for is a replica serving unbounded state. The records and catalogs
     // are fetched here, in an async context, because the app builder that
     // needs them is synchronous.
-    #[cfg(feature = "postgres")]
-    let pg_connections_seed = match &_database_foundation {
+    let connections = match database_foundation {
         Some(foundation) => {
             // The bound covers managed records AND this replica's legacy
             // projections (static configuration, so the same on every
             // replica); the store gets the remainder, as the SQLite path
             // gives its store the remainder.
             let legacy_projection_count =
-                connections::control_plane::legacy_projection_count(&config)?;
+                connections::control_plane::legacy_projection_count(config)?;
             let store = Arc::new(
                 connections::pg_store::PostgresConnectionStore::new(
                     foundation.pool().clone(),
@@ -739,8 +1217,7 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Service tokens ride the same pool (issue #241, PR 9). Nothing to
     // seed: an empty deployment has no tokens. The revision is the gate's
     // boot watermark for the resource.
-    #[cfg(feature = "postgres")]
-    let pg_service_tokens_seed = match &_database_foundation {
+    let service_tokens = match database_foundation {
         Some(foundation) => {
             let store = Arc::new(storage::PostgresServiceTokenStore::new(
                 foundation.pool().clone(),
@@ -767,9 +1244,7 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Pending admin logins ride the same pool when an admin login provider
     // is configured. The keyring is loaded here, from files beneath the
     // secrets root, with the connections keyring's reader.
-    #[cfg(feature = "postgres")]
-    let pg_pending_logins_seed = match (&_database_foundation, config.admin_login_provider.as_ref())
-    {
+    let pending_logins = match (database_foundation, config.admin_login_provider.as_ref()) {
         (Some(foundation), Some(_)) => {
             let root = config.connection_secrets_root.as_ref().ok_or_else(|| {
                 Box::<dyn std::error::Error>::from(
@@ -803,8 +1278,7 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // mode (config validation), loaded from files beneath the secrets root
     // with the connections keyring's reader; the replica's instance
     // identity is the lease holder.
-    #[cfg(feature = "postgres")]
-    let pg_limits_seed = match (&_database_foundation, &_ha_foundation) {
+    let limits = match (database_foundation, ha_foundation) {
         (Some(foundation), Some(ha_foundation)) => {
             let root = config.connection_secrets_root.as_ref().ok_or_else(|| {
                 Box::<dyn std::error::Error>::from(
@@ -842,8 +1316,7 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // misconfigured replica booting mid-rollout cannot rewrite the capacity
     // the serving replicas enforce. A capacity that cannot be applied on
     // admission refuses startup: every authority mutation reserves it.
-    #[cfg(feature = "postgres")]
-    let pg_authority_events_store = _database_foundation.as_ref().map(|foundation| {
+    let authority_events = database_foundation.map(|foundation| {
         Arc::new(
             storage::postgres_authority_events::PostgresAuthorityEventStore::new(
                 foundation.pool().clone(),
@@ -856,12 +1329,7 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // (`/readyz` answers `config_fingerprint_mismatch`) until the members
     // agree; only a row, or an admission write, that cannot be written
     // aborts startup.
-    #[cfg(feature = "postgres")]
-    let pg_membership_seed = match (
-        &_database_foundation,
-        &_ha_foundation,
-        &pg_authority_events_store,
-    ) {
+    let membership = match (database_foundation, ha_foundation, &authority_events) {
         (Some(foundation), Some(ha_foundation), Some(journal)) => {
             let deployment_id = config.deployment_id.clone().ok_or_else(|| {
                 Box::<dyn std::error::Error>::from(
@@ -890,6 +1358,11 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     capacity: config.authority_events.journal_capacity,
                 },
             );
+            // Published before registration, which may write the boot row
+            // and then fail: from here on, a startup that fails before it
+            // serves -- registration and its admission writes, activation,
+            // binding a listener -- has the row withdrawn.
+            *published = Some(Arc::clone(&membership));
             membership.register_boot().await.map_err(|error| {
                 Box::new(ClusterMembershipStartupError(error)) as Box<dyn std::error::Error>
             })?;
@@ -901,8 +1374,7 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // endpoint reads committed events through it in cluster mode. Built
     // here, where both the pool and the replica identity exist, and handed
     // to the app builder; standalone mode passes None.
-    #[cfg(feature = "postgres")]
-    let pg_audit_store = match (&_database_foundation, &_ha_foundation) {
+    let audit = match (database_foundation, ha_foundation) {
         (Some(foundation), Some(ha_foundation)) => Some(Arc::new(
             storage::postgres_audit::PostgresAuditEventStore::new(
                 foundation.pool().clone(),
@@ -918,8 +1390,7 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // store above (issue #241, PR 11): one replica at a time projects the
     // stream under a fenced lease, and every replica serves the admin
     // discovery surfaces from the projected tables.
-    #[cfg(feature = "postgres")]
-    let pg_discovery_seed = match (&_database_foundation, &_ha_foundation, &pg_audit_store) {
+    let discovery = match (database_foundation, ha_foundation, &audit) {
         (Some(foundation), Some(ha_foundation), Some(audit)) => {
             let deployment_id = config.deployment_id.clone().ok_or_else(|| {
                 Box::<dyn std::error::Error>::from(
@@ -935,125 +1406,18 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => None,
     };
-    // Seeds every counter a single-event alert reads at zero (the
-    // cluster-only ones in cluster mode), so the first event moves 0 -> 1.
-    let metrics_handle =
-        install_metrics_recorder(config.state_backend == config::StateBackend::Postgres)?;
-    let listen_addr = config.listen_addr;
-    let admin_listen_addr = config.admin_listen_addr;
-    // Loaded before any listener binds. Certificate and key problems must abort
-    // startup rather than leave a listener serving plaintext that an operator
-    // configured for TLS.
-    let inbound_tls = inbound_tls::InboundTlsBindings::load(&config)?;
-    let shutdown_config = ShutdownConfig::from_config(&config);
-    let lifecycle = GatewayLifecycle::new();
-    // Cluster mode's audit of record is the shared store (issue #11, PR 3):
-    // the durable sink writes through the same store instance the SSE and
-    // discovery readers were just handed, with this replica's identity on
-    // every row, and its drain gets the audit drain's own budget. Standalone
-    // builds the sinks exactly as before -- `from_config` is this call with
-    // no store.
-    #[cfg(feature = "postgres")]
-    let (audit_log, audit_event_sender) = audit::AuditLog::from_config_with_durable_store(
-        &config,
-        pg_audit_store
-            .as_ref()
-            .map(|store| audit::postgres_sink::PostgresSinkConfig {
-                store: Arc::clone(store),
-                flush_deadline: Duration::from_millis(config.audit_drain_timeout_ms),
-            }),
-    )?;
-    #[cfg(not(feature = "postgres"))]
-    let (audit_log, audit_event_sender) = audit::AuditLog::from_config(&config)?;
-    // Started once the audit log exists, so every reload outcome -- accepted
-    // or rejected -- is observable from the first moment a listener serves.
-    // A watcher that cannot be installed aborts startup for the same reason
-    // unreadable material does: a listener whose certificate files cannot be
-    // watched is a listener whose certificates quietly stop being renewable.
-    inbound_tls.spawn_material_reload_tasks_with_lifecycle(audit_log.clone(), &lifecycle)?;
-    let app = gateway_app_with_process_started_at_and_overrides(
-        config,
-        metrics_handle,
-        audit_log.clone(),
-        audit_event_sender,
-        process_started_at,
-        GatewayAppBuildOverrides {
-            lifecycle: Some(lifecycle.clone()),
-            ha_identity: _ha_foundation
-                .as_ref()
-                .map(|foundation| *foundation.identity()),
-            #[cfg(feature = "postgres")]
-            pg_audit: pg_audit_store,
-            #[cfg(feature = "postgres")]
-            pg_policy: pg_policy_seed,
-            #[cfg(feature = "postgres")]
-            pg_tools: pg_tools_seed,
-            #[cfg(feature = "postgres")]
-            pg_connections: pg_connections_seed,
-            #[cfg(feature = "postgres")]
-            pg_service_tokens: pg_service_tokens_seed,
-            #[cfg(feature = "postgres")]
-            pg_pending_logins: pg_pending_logins_seed,
-            #[cfg(feature = "postgres")]
-            pg_limits: pg_limits_seed,
-            #[cfg(feature = "postgres")]
-            pg_discovery: pg_discovery_seed,
-            #[cfg(feature = "postgres")]
-            pg_membership: pg_membership_seed,
-            #[cfg(feature = "postgres")]
-            pg_authority_events: pg_authority_events_store,
-            #[cfg(test)]
-            cluster_readiness: None,
-            #[cfg(test)]
-            readiness_probe: None,
-            #[cfg(test)]
-            cluster_status_source: None,
-            #[cfg(test)]
-            egress_resolver: None,
-            #[cfg(test)]
-            pending_login_backend: None,
-            #[cfg(test)]
-            request_selection_count: None,
-            #[cfg(test)]
-            disable_proxy_health_checks: false,
-            #[cfg(test)]
-            stream_proxy_request_bodies: false,
-            #[cfg(test)]
-            gate_converted_openapi_catalogs: false,
-        },
-    )?;
-    let background_lifecycle = lifecycle.clone();
-    // Delivery needs the keyring, and the keyring may sit behind a network
-    // secret provider the builder only just activated, so it is resolved
-    // here, after the build and before any listener binds. Any failure
-    // refuses startup. This runs on a replica held at the fingerprint door
-    // too, but the dispatcher it spawns contends for the lease only once
-    // the membership gate admits this replica. Boxed: `run()`'s future is
-    // held on the main thread's stack, which a debug build on Windows
-    // (1 MiB) has no room left on for inline sub-futures.
-    #[cfg(feature = "postgres")]
-    if let Some(startup) = app.authority_events {
-        Box::pin(startup.start(&lifecycle, &audit_log))
-            .await
-            .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
-    }
-
-    serve_gateway(
-        app.http,
-        app.grpc,
-        listen_addr,
-        admin_listen_addr,
-        inbound_tls,
-        audit_log,
-        lifecycle,
-        shutdown_config,
-        Box::pin(async move {
-            background_lifecycle.shutdown_background_tasks().await;
-        }),
-    )
-    .await?;
-
-    Ok(())
+    Ok(ClusterBootSeeds {
+        policy,
+        tools,
+        connections,
+        service_tokens,
+        pending_logins,
+        limits,
+        membership,
+        audit,
+        discovery,
+        authority_events,
+    })
 }
 
 pub(super) fn production_tracing_filter() -> Targets {
@@ -2336,6 +2700,7 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
         query_store: audit_event_store,
         event_sender: audit_event_sender,
         rbac_state: rbac_state.clone(),
+        stream_limits: AuditStreamLimits::SERVED,
         #[cfg(feature = "postgres")]
         pg_audit: build_overrides.pg_audit,
     };
@@ -2929,3 +3294,7 @@ pub(super) fn policy_history_sqlite_path(config: &config::Config) -> Option<Path
 pub(super) fn default_policy_history_sqlite_path(policy_file: &str) -> PathBuf {
     PathBuf::from(format!("{policy_file}.history.sqlite"))
 }
+
+#[cfg(test)]
+#[path = "bootstrap_tests.rs"]
+mod tests;

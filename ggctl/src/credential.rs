@@ -54,13 +54,14 @@ pub(crate) fn from_stdin(stdin_is_terminal: bool, stdin: &mut dyn Read) -> Resul
 /// followed, as mounted secrets use them), at most [`MAX_TOKEN_BYTES`] and,
 /// on Unix, neither readable nor writable by group or other.
 pub(crate) fn from_file(path: &Path) -> Result<Token, Code> {
-    let bytes =
-        read_regular_file(path, MAX_TOKEN_BYTES, true).map_err(|problem| match problem {
+    let bytes = read_regular_file(path, MAX_TOKEN_BYTES, FilePermissions::OwnerOnly).map_err(
+        |problem| match problem {
             FileProblem::Unreadable => Code::CredentialUnreadable,
             FileProblem::NotRegularFile => Code::CredentialNotRegularFile,
             FileProblem::TooLarge => Code::CredentialTooLarge,
             FileProblem::UnsafePermissions => Code::CredentialUnsafePermissions,
-        })?;
+        },
+    )?;
     token(bytes)
 }
 
@@ -111,27 +112,44 @@ pub(crate) enum FileProblem {
     UnsafePermissions,
 }
 
+/// What another account may do to a local file `ggctl` reads, on Unix.
+/// Windows has no mode bits, and the file's ACL is left to the operator.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FilePermissions {
+    /// Group and other have no access at all (mode `0600` or `0400`): a
+    /// credential, which reading discloses.
+    OwnerOnly,
+    /// Group and other may read the file but not write it (mode `0644` is
+    /// fine, `0664` and `0666` are not), and may write a directory holding
+    /// it only when that directory has the sticky bit: a trust anchor, which
+    /// is public but decides where a credential may be sent, so whoever can
+    /// change or replace it can receive the token.
+    NotWritableByOthers,
+}
+
 /// Reads a whole regular file of at most `maximum` bytes into memory that is
 /// zeroed on drop.
 ///
 /// The path is checked before it is opened, so a FIFO or device is refused
-/// rather than blocking on `open`, and the opened handle is checked again, so
-/// what is read is the file the checks passed: a path swapped between the two
-/// for anything but a small regular file (owner-only when required) is
-/// refused rather than read. With
-/// `owner_only`, a Unix file whose mode grants group or other any access is
-/// refused; Windows has no mode bits, and the file's ACL is left to the
-/// operator.
+/// without being opened, and it is opened without blocking, so one swapped
+/// in after that check cannot stall the read either. The opened handle is
+/// then checked again and, on Unix, must be the very file the path check
+/// examined, so what is read is the file the checks passed: a path swapped
+/// between the two is refused rather than read. [`FilePermissions`] says
+/// what the Unix mode bits, and for a trust anchor the directories holding
+/// it, may allow.
 pub(crate) fn read_regular_file(
     path: &Path,
     maximum: usize,
-    owner_only: bool,
+    permissions: FilePermissions,
 ) -> Result<Zeroizing<Vec<u8>>, FileProblem> {
     let before = std::fs::metadata(path).map_err(|_| FileProblem::Unreadable)?;
-    check_metadata(&before, maximum, owner_only)?;
-    let mut file = File::open(path).map_err(|_| FileProblem::Unreadable)?;
+    check_metadata(&before, maximum, permissions)?;
+    check_directories(path, permissions)?;
+    let mut file = open_without_blocking(path).map_err(|_| FileProblem::Unreadable)?;
     let opened = file.metadata().map_err(|_| FileProblem::Unreadable)?;
-    check_metadata(&opened, maximum, owner_only)?;
+    check_metadata(&opened, maximum, permissions)?;
+    check_same_file(&before, &opened)?;
     read_bounded(&mut file, maximum).map_err(|problem| match problem {
         Bounded::TooLarge => FileProblem::TooLarge,
         Bounded::Failed => FileProblem::Unreadable,
@@ -141,7 +159,7 @@ pub(crate) fn read_regular_file(
 fn check_metadata(
     metadata: &std::fs::Metadata,
     maximum: usize,
-    owner_only: bool,
+    permissions: FilePermissions,
 ) -> Result<(), FileProblem> {
     if !metadata.is_file() {
         return Err(FileProblem::NotRegularFile);
@@ -149,21 +167,106 @@ fn check_metadata(
     if !usize::try_from(metadata.len()).is_ok_and(|length| length <= maximum) {
         return Err(FileProblem::TooLarge);
     }
-    if owner_only && !permissions_are_owner_only(metadata) {
+    if !permissions_are_safe(metadata, permissions) {
         return Err(FileProblem::UnsafePermissions);
     }
     Ok(())
 }
 
 #[cfg(unix)]
-fn permissions_are_owner_only(metadata: &std::fs::Metadata) -> bool {
+fn permissions_are_safe(metadata: &std::fs::Metadata, permissions: FilePermissions) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    metadata.permissions().mode() & 0o077 == 0
+    let forbidden = match permissions {
+        FilePermissions::OwnerOnly => 0o077,
+        FilePermissions::NotWritableByOthers => 0o022,
+    };
+    metadata.permissions().mode() & forbidden == 0
 }
 
 #[cfg(not(unix))]
-fn permissions_are_owner_only(_metadata: &std::fs::Metadata) -> bool {
+fn permissions_are_safe(_metadata: &std::fs::Metadata, _permissions: FilePermissions) -> bool {
     true
+}
+
+/// For a trust anchor, refuses a directory holding it that another account
+/// can write: the one the path names it in and, when that entry is a link,
+/// the one holding the file it resolves to. Either lets that account replace
+/// the file, whatever the file's own mode. The sticky bit stops an account
+/// renaming or removing an entry it does not own, so a sticky directory such
+/// as `/tmp` is accepted, as the gateway accepts one for its TLS material.
+#[cfg(unix)]
+fn check_directories(path: &Path, permissions: FilePermissions) -> Result<(), FileProblem> {
+    use std::os::unix::fs::PermissionsExt;
+    const STICKY: u32 = 0o1000;
+    const GROUP_OTHER_WRITE: u32 = 0o022;
+    if permissions != FilePermissions::NotWritableByOthers {
+        return Ok(());
+    }
+    let resolved = std::fs::canonicalize(path).map_err(|_| FileProblem::Unreadable)?;
+    for entry in [path, resolved.as_path()] {
+        // A bare file name has an empty parent: the current directory.
+        let directory = match entry.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        let mode = std::fs::metadata(directory)
+            .map_err(|_| FileProblem::Unreadable)?
+            .permissions()
+            .mode();
+        if mode & GROUP_OTHER_WRITE != 0 && mode & STICKY == 0 {
+            return Err(FileProblem::UnsafePermissions);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_directories(_path: &Path, _permissions: FilePermissions) -> Result<(), FileProblem> {
+    Ok(())
+}
+
+/// Opens for reading with `O_NONBLOCK`, so opening a FIFO that replaced the
+/// checked path returns at once instead of waiting for a writer; the handle
+/// check then refuses it. A regular file reads the same either way.
+#[cfg(unix)]
+fn open_without_blocking(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+}
+
+/// Opening a Windows named pipe or device does not wait for a peer, so a
+/// plain open cannot block on one; the handle check then refuses it.
+#[cfg(not(unix))]
+fn open_without_blocking(path: &Path) -> io::Result<File> {
+    File::open(path)
+}
+
+/// Refuses an opened handle that is not the file the path check examined
+/// (another device or inode): the path was swapped in between.
+#[cfg(unix)]
+fn check_same_file(
+    checked: &std::fs::Metadata,
+    opened: &std::fs::Metadata,
+) -> Result<(), FileProblem> {
+    use std::os::unix::fs::MetadataExt;
+    if checked.dev() == opened.dev() && checked.ino() == opened.ino() {
+        Ok(())
+    } else {
+        Err(FileProblem::Unreadable)
+    }
+}
+
+/// Windows exposes a file's identity only through an unstable API; the
+/// handle is still checked for everything the path was.
+#[cfg(not(unix))]
+fn check_same_file(
+    _checked: &std::fs::Metadata,
+    _opened: &std::fs::Metadata,
+) -> Result<(), FileProblem> {
+    Ok(())
 }
 
 enum Bounded {

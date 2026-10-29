@@ -1,5 +1,6 @@
 //! admin observability boundary extracted from the application composition root.
 use super::*;
+use futures_util::StreamExt;
 
 pub(super) async fn schema_coverage_endpoint(
     State(state): State<SchemaAdminState>,
@@ -1401,19 +1402,42 @@ pub(super) async fn traffic_endpoint_review_endpoint(
 
 pub(super) async fn audit_events_stream_endpoint(
     State(state): State<AuditAdminState>,
-    principal: Option<Extension<auth::Principal>>,
     Query(params): Query<AuditEventStreamParams>,
-    #[cfg(feature = "postgres")] headers: http::HeaderMap,
+    request: AxumRequest,
 ) -> Response {
     record_request(AUDIT_EVENTS_STREAM_ROUTE);
 
-    let Some(Extension(principal)) = principal else {
+    let (parts, _) = request.into_parts();
+    let Some(principal) = parts.extensions.get::<auth::Principal>().cloned() else {
         return unauthorized();
     };
 
-    if let Err(error) = authorized_audit_state(&state, &principal, ADMIN_AUDIT_STREAM_PERMISSION) {
-        return audit_admin_authz_error_response(error);
-    }
+    let rbac_state = match authorized_audit_state(&state, &principal, ADMIN_AUDIT_STREAM_PERMISSION)
+    {
+        Ok(rbac_state) => rbac_state.clone(),
+        Err(error) => return audit_admin_authz_error_response(error),
+    };
+
+    // The check above holds for this request; the stream answering it can
+    // stay open far longer. It is re-checked while it runs, which needs the
+    // credential the request was admitted with. The authentication
+    // middleware, the only producer of a principal, always inserts both, so
+    // a principal without one is a wiring fault: refuse rather than stream
+    // on an answer nothing can revisit.
+    let Some(reauthentication) = parts.extensions.get::<auth::Reauthentication>().cloned() else {
+        tracing::error!(
+            "audit event stream request carried a principal without its credential; \
+             refusing a stream that could not be re-checked"
+        );
+        return internal_server_error("audit event stream cannot re-check the caller");
+    };
+    let authorization = AuditStreamAuthorization::new(
+        &parts,
+        principal,
+        reauthentication,
+        rbac_state,
+        state.stream_limits,
+    );
 
     // Cluster mode: the durable stream. Committed events from every
     // replica, replayable from a reconnecting client's Last-Event-ID (the
@@ -1426,13 +1450,13 @@ pub(super) async fn audit_events_stream_endpoint(
     if let Some(store) = state.pg_audit.clone() {
         return match durable_audit_stream_start(
             store,
-            &headers,
+            &parts.headers,
             params,
             state.event_sender.subscribe(),
         )
         .await
         {
-            Ok(stream) => Sse::new(stream)
+            Ok(stream) => Sse::new(reauthorized_audit_stream(stream, authorization))
                 .keep_alive(KeepAlive::default())
                 .into_response(),
             Err(DurableStreamStartError::BadCursor) => {
@@ -1466,12 +1490,217 @@ pub(super) async fn audit_events_stream_endpoint(
         };
     }
 
-    Sse::new(audit_event_sse_stream(
-        state.event_sender.subscribe(),
-        params,
+    Sse::new(reauthorized_audit_stream(
+        audit_event_sse_stream(state.event_sender.subscribe(), params),
+        authorization,
     ))
     .keep_alive(KeepAlive::default())
     .into_response()
+}
+
+/// What keeps an open audit event stream authorized: the caller, the
+/// credential they were admitted with, and the policy that granted
+/// `admin:audit:stream`.
+///
+/// The endpoint authorizes the request once, but the stream it answers lasts
+/// as long as the client keeps reading. Without this it would keep sending
+/// audit events after a logout, after the session or token expired or was
+/// revoked, and after a policy change took the permission away. So:
+///
+/// - before every frame, the permission is checked again against the live
+///   policy, so a policy change stops delivery at the next event;
+/// - every [`AuditStreamLimits::recheck_interval`], the credential is judged
+///   again by the authority that admitted it, and the principal that
+///   judgement yields must be the same identity and still hold the
+///   permission;
+/// - after [`AuditStreamLimits::max_lifetime`] the stream ends regardless,
+///   and a client that still wants events reconnects through the whole
+///   request path.
+pub(super) struct AuditStreamAuthorization {
+    principal: auth::Principal,
+    reauthentication: auth::Reauthentication,
+    rbac_state: middleware::rbac::RbacState,
+    request_id: String,
+    source_ip: String,
+    path: String,
+    recheck_interval: Duration,
+    next_recheck: tokio::time::Instant,
+    closes_at: tokio::time::Instant,
+}
+
+impl AuditStreamAuthorization {
+    pub(super) fn new(
+        parts: &http::request::Parts,
+        principal: auth::Principal,
+        reauthentication: auth::Reauthentication,
+        rbac_state: middleware::rbac::RbacState,
+        limits: AuditStreamLimits,
+    ) -> Self {
+        let opened = tokio::time::Instant::now();
+        let request_id = client_ip::request_id(&parts.headers, &parts.extensions);
+        let source_ip = client_ip::canonical_client_ip(
+            &parts.headers,
+            &parts.extensions,
+            &rbac_state.client_ip_policy,
+        );
+        // MatchedPath is a bounded route template, never a raw URL/query.
+        let path = parts
+            .extensions
+            .get::<axum::extract::MatchedPath>()
+            .map_or(
+                AUDIT_EVENTS_STREAM_ROUTE,
+                axum::extract::MatchedPath::as_str,
+            )
+            .to_owned();
+        Self {
+            principal,
+            reauthentication,
+            rbac_state,
+            request_id,
+            source_ip,
+            path,
+            recheck_interval: limits.recheck_interval,
+            next_recheck: opened + limits.recheck_interval,
+            closes_at: opened + limits.max_lifetime,
+        }
+    }
+
+    /// Whether the caller holds `admin:audit:stream` under the live policy.
+    fn permits(&self) -> bool {
+        self.rbac_state
+            .principal_has_permission(&self.principal, ADMIN_AUDIT_STREAM_PERMISSION)
+    }
+
+    /// Judge the credential again and check the identity and permission it
+    /// now yields. A re-check that does not answer within the interval is
+    /// one that could not decide.
+    async fn recheck(&mut self) -> Result<(), AuditStreamClose> {
+        let judged =
+            tokio::time::timeout(self.recheck_interval, self.reauthentication.revalidate()).await;
+        let principal = match judged {
+            Ok(Ok(principal)) => principal,
+            Ok(Err(auth::AuthError::InvalidSession(reason))) => {
+                return Err(AuditStreamClose::SessionEnded { reason })
+            }
+            Ok(Err(auth::AuthError::Upstream(reason))) => {
+                return Err(AuditStreamClose::SessionUnverifiable {
+                    reason: format!("upstream_error: {reason}"),
+                })
+            }
+            Err(_) => {
+                return Err(AuditStreamClose::SessionUnverifiable {
+                    reason: "recheck_timed_out".to_owned(),
+                })
+            }
+        };
+        if principal.user_id != self.principal.user_id || principal.issuer != self.principal.issuer
+        {
+            return Err(AuditStreamClose::SessionEnded {
+                reason: "identity_changed".to_owned(),
+            });
+        }
+        // The fresh principal is the one judged from now on: roles the
+        // authority now reports apply to the permission check below and to
+        // every frame after it.
+        self.principal = principal;
+        if !self.permits() {
+            return Err(AuditStreamClose::PermissionRevoked);
+        }
+        self.next_recheck = tokio::time::Instant::now() + self.recheck_interval;
+        Ok(())
+    }
+
+    /// Record why the stream is ending and build its closing frame.
+    fn close(&self, close: &AuditStreamClose) -> Event {
+        let actor = Some(auth::actor_from_principal(&self.principal));
+        match close {
+            AuditStreamClose::SessionEnded { reason }
+            | AuditStreamClose::SessionUnverifiable { reason } => {
+                tracing::info!(
+                    reason = close.as_str(),
+                    "audit event stream ended: its credential no longer authenticates"
+                );
+                self.rbac_state.audit.emit(audit::AuditEvent::new(
+                    "auth.failure",
+                    &self.request_id,
+                    &self.source_ip,
+                    actor,
+                    json!({
+                        "path": &self.path,
+                        "reason": reason,
+                        "authorization_layer": "audit_event_stream",
+                    }),
+                ));
+            }
+            AuditStreamClose::PermissionRevoked => {
+                tracing::info!(
+                    reason = close.as_str(),
+                    "audit event stream ended: its caller no longer holds the stream permission"
+                );
+                self.rbac_state.audit.emit(audit::AuditEvent::new(
+                    "authz.denied",
+                    &self.request_id,
+                    &self.source_ip,
+                    actor,
+                    json!({
+                        "path": &self.path,
+                        "method": "GET",
+                        "reason": "missing_permission",
+                        "permission": ADMIN_AUDIT_STREAM_PERMISSION,
+                        "authorization_layer": "audit_event_stream",
+                        "operation": "stream",
+                    }),
+                ));
+            }
+            AuditStreamClose::LifetimeElapsed => {
+                tracing::debug!("audit event stream reached its maximum lifetime");
+            }
+        }
+        Event::default()
+            .event(AUDIT_STREAM_CLOSED_EVENT)
+            .data(json!({ "reason": close.as_str() }).to_string())
+    }
+}
+
+/// `events`, for only as long as `authorization` holds: each frame is
+/// released only while the caller still holds the permission, and the
+/// stream ends with one [`AUDIT_STREAM_CLOSED_EVENT`] frame as soon as a
+/// re-check fails or the lifetime runs out. The deadline and the re-check
+/// come before the next event, so a busy stream cannot starve them, and
+/// polling `events` again after a re-check loses nothing: an unfold keeps
+/// its pending step between polls.
+pub(super) fn reauthorized_audit_stream(
+    events: impl Stream<Item = Result<Event, Infallible>> + Send + 'static,
+    authorization: AuditStreamAuthorization,
+) -> impl Stream<Item = Result<Event, Infallible>> + Send + 'static {
+    stream::unfold(
+        Some((Box::pin(events), authorization)),
+        |state| async move {
+            let (mut events, mut authorization) = state?;
+            let close = loop {
+                tokio::select! {
+                    biased;
+                    () = tokio::time::sleep_until(authorization.closes_at) => {
+                        break AuditStreamClose::LifetimeElapsed;
+                    }
+                    () = tokio::time::sleep_until(authorization.next_recheck) => {
+                        if let Err(close) = authorization.recheck().await {
+                            break close;
+                        }
+                    }
+                    frame = events.next() => {
+                        // A source that ends on its own ends this stream.
+                        let frame = frame?;
+                        if !authorization.permits() {
+                            break AuditStreamClose::PermissionRevoked;
+                        }
+                        return Some((frame, Some((events, authorization))));
+                    }
+                }
+            };
+            Some((Ok(authorization.close(&close)), None))
+        },
+    )
 }
 
 #[cfg(feature = "postgres")]
