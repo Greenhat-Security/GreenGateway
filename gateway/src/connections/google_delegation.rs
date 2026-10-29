@@ -9,12 +9,16 @@
 //! - The caller is checked first: it must have been attested by one of the Connection's
 //!   `subject_issuers`, and carry an email, which becomes `sub`. Nothing else could name a
 //!   Workspace user, and an email is only as trustworthy as the provider that vouched for it.
+//!   Every lane that serves the Connection asks [`GoogleDelegationBinding::admit_caller`] before
+//!   its own egress preflight, so a caller refused here costs no DNS lookup and no secret read.
 //! - Both Google endpoints pass the egress policy before anything is read or signed.
 //! - The claims (`iss` = the service account, `sub`, `scope`, `aud` = the token endpoint, `iat`,
 //!   `exp` [`ASSERTION_LIFETIME_SECONDS`] later) are signed by Google itself, through the IAM
 //!   Credentials `signJwt` method, authenticated as the federated identity of the Connection's
 //!   workload identity profile (see [`GoogleWorkloadIdentity`]). The service account's key never
-//!   leaves Google. A refused federated token earns exactly one retry, with a fresh one.
+//!   leaves Google. A federated token `signJwt` answers `401` for earns exactly one retry, with a
+//!   fresh one; a `403`, the identity not being allowed to sign as the account, is final, so a
+//!   missing grant never makes every call replace the profile's identity.
 //! - What comes back must carry exactly the claims that were sent, so a signer that answered for
 //!   another user is refused rather than exchanged.
 //! - The assertion is exchanged once, and the access token injected as `Authorization: Bearer`
@@ -178,7 +182,9 @@ impl TokenCacheFailure for GoogleDelegationError {
 pub(crate) trait GoogleWorkloadIdentity: Send + Sync {
     /// The access token of the profile `profile_id` names, from an exchange of at least
     /// `minimum_generation`: `0` for whatever is cached, one more than a token's own generation
-    /// to replace a token Google refused.
+    /// to replace a token Google refused. A profile that replaced a refused token only moments
+    /// ago may hand back its current token instead; a caller that gets back the generation it
+    /// already had has nothing fresher to retry with, and does not.
     async fn access_token(
         &self,
         profile_id: &str,
@@ -230,6 +236,19 @@ pub(crate) struct GoogleDelegationBinding {
     /// `ConnectionControlPlane::google_workload_identity`), or `None` when the GCP provider is not
     /// active, which refuses every mint.
     pub identity: Option<Arc<dyn GoogleWorkloadIdentity>>,
+}
+
+impl GoogleDelegationBinding {
+    /// Refuses a caller this Connection cannot act as: one attested by an issuer outside
+    /// `subject_issuers`, or carrying no single plain email address. Nothing is read or sent to
+    /// answer, so a lane asks before its own egress preflight, before any secret or TLS material
+    /// is resolved, and before a token is looked up or minted.
+    pub(crate) fn admit_caller(
+        &self,
+        caller: &AttestedCaller,
+    ) -> Result<(), GoogleDelegationError> {
+        delegated_subject(self, caller).map(|_| ())
+    }
 }
 
 /// A Google token one call holds: injected as `Authorization: Bearer`, and dropped from the cache
@@ -423,25 +442,28 @@ impl GoogleDelegationRuntime {
             .map_err(|_| GoogleDelegationError::SigningFailed)?;
 
         let profile = binding.workload_identity_profile.as_str();
-        let mut federated = identity
+        let federated = identity
             .access_token(profile, 0)
             .await
             .map_err(|error| attempt.identity_error(error))?;
         attempt.stage = "sign";
         let mut response = send_signing_request(transport, sign_url, &federated, &body).await?;
-        if matches!(
-            response.status,
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
-        ) {
-            // A rotated, revoked or expired federated token is the one condition that earns a
-            // second attempt, and only after a fresh exchange through the same profile.
+        if response.status == StatusCode::UNAUTHORIZED {
+            // A rotated, revoked or expired federated token -- a `401` -- is the one condition
+            // that earns a second attempt, and only with a fresh exchange through the same
+            // profile. A `403` is IAM refusing the identity to sign as the account, which no new
+            // token changes, so it is final: replacing the token would start a new generation of
+            // the profile's identity and orphan every Secret Manager value cached under it, on
+            // every call. So is a `401` while the profile has no fresher token to give.
             attempt.stage = "identity";
-            federated = identity
+            let fresh = identity
                 .access_token(profile, federated.generation.saturating_add(1))
                 .await
                 .map_err(|error| attempt.identity_error(error))?;
             attempt.stage = "sign";
-            response = send_signing_request(transport, sign_url, &federated, &body).await?;
+            if fresh.generation > federated.generation {
+                response = send_signing_request(transport, sign_url, &fresh, &body).await?;
+            }
         }
         drop(federated);
 

@@ -85,6 +85,14 @@ const MAX_GCP_ACCESS_RESPONSE_BYTES: usize = 128 * 1024;
 const MAX_GCP_TOKEN_BYTES: usize = 8 * 1024;
 const MAX_GCP_TOKEN_LIFETIME: Duration = Duration::from_secs(60 * 60);
 const GCP_TOKEN_REFRESH_SKEW: Duration = Duration::from_secs(30);
+/// Least time between two exchanges a caller forces by asking to replace a
+/// cached token Google answered `401` for. Each such exchange starts a new
+/// identity generation, which orphans every value cached under the old one,
+/// for every alias of the profile, so a token refused over and over must not
+/// empty that cache, or queue every resolution behind the login lock, on
+/// every refusal. Within the interval the current token is served again, and
+/// a caller that sees its generation unchanged does not retry.
+const GCP_FORCED_REEXCHANGE_INTERVAL: Duration = Duration::from_secs(30);
 /// Bounded lifetime requested for every impersonated service-account token.
 const GCP_IMPERSONATION_LIFETIME: Duration = Duration::from_secs(600);
 const GCP_IMPERSONATION_LIFETIME_FIELD: &str = "600s";
@@ -684,6 +692,9 @@ struct CachedGcpToken {
 struct GcpIdentityState {
     tokens: BTreeMap<String, CachedGcpToken>,
     generations: BTreeMap<String, u64>,
+    /// When each profile last replaced a cached token a caller asked to
+    /// replace (see [`GCP_FORCED_REEXCHANGE_INTERVAL`]).
+    forced_reexchanges: BTreeMap<String, Instant>,
 }
 
 /// Read-only Secret Manager provider.
@@ -872,6 +883,11 @@ impl GcpSecretManagerProvider {
         self.value_guard().retain(|key, _| key.alias_id != alias_id);
     }
 
+    /// The cached token of `profile_id`, when it is at least
+    /// `minimum_generation`, or when it is older but the profile already
+    /// replaced a token on demand within [`GCP_FORCED_REEXCHANGE_INTERVAL`]:
+    /// then the same token again, whose unchanged generation tells the caller
+    /// that no fresher one is to be had yet.
     fn cached_token(
         &self,
         profile_id: &str,
@@ -879,12 +895,16 @@ impl GcpSecretManagerProvider {
     ) -> Option<(Zeroizing<Vec<u8>>, u64)> {
         let now = self.clock.now();
         let mut identity = self.identity_guard();
+        let recently_forced = identity
+            .forced_reexchanges
+            .get(profile_id)
+            .is_some_and(|at| now.saturating_duration_since(*at) < GCP_FORCED_REEXCHANGE_INTERVAL);
         let token = identity.tokens.get(profile_id)?;
         if token.expires_at <= now {
             identity.tokens.remove(profile_id);
             return None;
         }
-        if token.generation < minimum_generation {
+        if token.generation < minimum_generation && !recently_forced {
             return None;
         }
         Some((token.token.clone(), token.generation))
@@ -918,8 +938,10 @@ impl GcpSecretManagerProvider {
         generation
     }
 
-    fn invalidate_token(&self, profile_id: &str) {
-        self.identity_guard().tokens.remove(profile_id);
+    /// Drops the cached token of `profile_id`, and returns whether there was
+    /// one.
+    fn invalidate_token(&self, profile_id: &str) -> bool {
+        self.identity_guard().tokens.remove(profile_id).is_some()
     }
 
     async fn resolve_inner(
@@ -962,14 +984,22 @@ impl GcpSecretManagerProvider {
     ) -> Result<(Zeroizing<Vec<u8>>, u64), GcpFailure> {
         let (token, generation) = self.token(profile, 0).await?;
         match self.read_once(alias, purpose, &token).await {
-            Err(GcpFailure::ProviderDenied) => {
-                // A rotated, revoked, or expired token is the only condition
-                // that earns a second attempt, and only after a fresh exchange
-                // through the same fixed identity source.
-                let (token, generation) = self.token(profile, generation.saturating_add(1)).await?;
+            Err(GcpFailure::ProviderUnauthenticated) => {
+                // A rotated, revoked, or expired token -- a `401` -- is the
+                // only condition that earns a second attempt, and only with a
+                // fresh exchange through the same fixed identity source. A
+                // `403` is IAM refusing the identity, which no new token
+                // changes, so it is final, as is a `401` while the profile
+                // has no fresher token to give (see
+                // `GCP_FORCED_REEXCHANGE_INTERVAL`).
+                let (token, fresh_generation) =
+                    self.token(profile, generation.saturating_add(1)).await?;
+                if fresh_generation <= generation {
+                    return Err(GcpFailure::ProviderUnauthenticated);
+                }
                 self.read_once(alias, purpose, &token)
                     .await
-                    .map(|value| (value, generation))
+                    .map(|value| (value, fresh_generation))
             }
             other => other.map(|value| (value, generation)),
         }
@@ -987,7 +1017,15 @@ impl GcpSecretManagerProvider {
         if let Some(hit) = self.cached_token(&profile.id, minimum_generation) {
             return Ok(hit);
         }
-        self.invalidate_token(&profile.id);
+        // An unexpired token is still cached only when the caller asked for a
+        // newer one, to replace a token Google refused: that exchange is the
+        // one `GCP_FORCED_REEXCHANGE_INTERVAL` spaces out.
+        if self.invalidate_token(&profile.id) {
+            let now = self.clock.now();
+            self.identity_guard()
+                .forced_reexchanges
+                .insert(profile.id.clone(), now);
+        }
         self.login(profile).await
     }
 
@@ -1056,7 +1094,7 @@ impl GcpSecretManagerProvider {
                     serde_json::from_slice(body).map_err(|_| GcpFailure::IdentityInvalid)?;
                 // The cache lifetime is the requested bounded lifetime rather
                 // than the response `expireTime`; a token the backend shortens
-                // further is recovered by the single 401/403 re-exchange.
+                // further is recovered by the single `401` re-exchange.
                 //
                 // Parsing `expireTime` would be worse, not merely larger. It is
                 // an absolute RFC3339 wall-clock instant, while this cache is
@@ -1379,7 +1417,12 @@ enum GcpFailure {
     IdentityDenied,
     IdentityInvalid,
     ProviderUnavailable,
+    /// Secret Manager answered `403`: IAM refuses the identity this read.
     ProviderDenied,
+    /// Secret Manager answered `401`: it did not accept the token, which a
+    /// rotated, revoked or expired token explains. The one failure that earns
+    /// a fresh token, and otherwise reported exactly as a `403`.
+    ProviderUnauthenticated,
     SecretAbsent,
     SecretUnusable,
     ChecksumMismatch,
@@ -1400,7 +1443,7 @@ impl GcpFailure {
             Self::IdentityDenied => "identity_denied",
             Self::IdentityInvalid => "identity_invalid",
             Self::ProviderUnavailable => "provider_unavailable",
-            Self::ProviderDenied => "provider_denied",
+            Self::ProviderDenied | Self::ProviderUnauthenticated => "provider_denied",
             Self::SecretAbsent => "secret_absent",
             Self::SecretUnusable => "secret_unusable",
             Self::ChecksumMismatch => "checksum_mismatch",
@@ -1419,7 +1462,9 @@ impl GcpFailure {
             | Self::ProviderUnavailable
             | Self::SecretAbsent
             | Self::SecretUnusable => SecretResolveErrorKind::SourceUnavailable,
-            Self::IdentityDenied | Self::ProviderDenied => SecretResolveErrorKind::SourceDenied,
+            Self::IdentityDenied | Self::ProviderDenied | Self::ProviderUnauthenticated => {
+                SecretResolveErrorKind::SourceDenied
+            }
             Self::EgressDenied | Self::RedirectRefused => SecretResolveErrorKind::UnsafeSource,
             Self::IdentityInvalid
             | Self::ChecksumMismatch
@@ -1462,7 +1507,8 @@ fn classify_status(status: StatusCode, identity: bool) -> Option<GcpFailure> {
     }
     Some(match status.as_u16() {
         400 | 401 | 403 if identity => GcpFailure::IdentityDenied,
-        401 | 403 => GcpFailure::ProviderDenied,
+        401 => GcpFailure::ProviderUnauthenticated,
+        403 => GcpFailure::ProviderDenied,
         // Secret Manager reports disabled and destroyed versions as
         // FAILED_PRECONDITION on access; the error body is never parsed, so the
         // two collapse into one reason, and they stay collapsed. They are
@@ -2644,7 +2690,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_denied_read_reauthenticates_exactly_once() {
+    async fn an_unauthenticated_read_reauthenticates_exactly_once() {
         let fixture = provider(vec![alias("billing", None)]);
         fixture.gcp.push_exchange(json_response(
             200,
@@ -2656,7 +2702,7 @@ mod tests {
         ));
         fixture
             .gcp
-            .push_read(json_response(403, r#"{"error":{"code":403}}"#));
+            .push_read(json_response(401, r#"{"error":{"code":401}}"#));
         fixture.gcp.push_read(json_response(
             200,
             &access_body(&version_name(9), VALUE_CANARY.as_bytes()),
@@ -2680,6 +2726,111 @@ mod tests {
             reads[1].authorization.as_deref(),
             Some(format!("Bearer {FEDERATED_TOKEN_CANARY}").as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn a_permission_denied_read_is_final_and_keeps_the_profiles_other_values() {
+        let fixture = provider(vec![alias("billing", None), alias("payroll", None)]);
+        fixture.gcp.push_exchange(json_response(
+            200,
+            &exchange_body(FEDERATED_TOKEN_CANARY, 600),
+        ));
+        fixture.gcp.push_read(json_response(
+            200,
+            &access_body(&version_name(4), VALUE_CANARY.as_bytes()),
+        ));
+        fixture
+            .provider
+            .resolve("payroll", SecretPurpose::StaticBearer)
+            .await
+            .expect("payroll should resolve");
+
+        // IAM refusing the identity is not a stale token: a fresh exchange
+        // would change nothing, so none is made, and nothing else the
+        // profile cached is orphaned by a new identity generation.
+        fixture
+            .gcp
+            .push_read(json_response(403, r#"{"error":{"code":403}}"#));
+        let error = fixture
+            .provider
+            .resolve("billing", SecretPurpose::StaticBearer)
+            .await
+            .expect_err("a denied read must fail closed");
+        assert_eq!(error.kind(), SecretResolveErrorKind::SourceDenied);
+        assert_eq!(fixture.gcp.exchanges().len(), 1);
+        assert_eq!(fixture.gcp.reads().len(), 2);
+        assert_eq!(fixture.provider.identity_generation("primary"), 1);
+
+        // The read channel still answers 403, so only the cache can serve this.
+        let cached = fixture
+            .provider
+            .resolve("payroll", SecretPurpose::StaticBearer)
+            .await
+            .expect("the cached payroll value survives");
+        assert_eq!(cached.expose(), VALUE_CANARY.as_bytes());
+        assert_eq!(fixture.gcp.reads().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn exchanges_forced_by_refused_tokens_are_spaced_out_per_profile() {
+        let fixture = provider(vec![alias("billing", None)]);
+        fixture.gcp.push_exchange(json_response(
+            200,
+            &exchange_body("ya29.first-token-canary", 600),
+        ));
+        fixture.gcp.push_exchange(json_response(
+            200,
+            &exchange_body(FEDERATED_TOKEN_CANARY, 600),
+        ));
+        let first = fixture
+            .provider
+            .access_token("primary", 0)
+            .await
+            .expect("the first exchange");
+        let forced = fixture
+            .provider
+            .access_token("primary", first.generation.saturating_add(1))
+            .await
+            .expect("a refused token is replaced");
+        assert!(forced.generation > first.generation);
+        assert_eq!(fixture.gcp.exchanges().len(), 2);
+
+        // Refused again at once: the same token, whose unchanged generation
+        // says there is nothing fresher to retry with yet.
+        let again = fixture
+            .provider
+            .access_token("primary", forced.generation.saturating_add(1))
+            .await
+            .expect("the current token");
+        assert_eq!(again.generation, forced.generation);
+        assert_eq!(fixture.gcp.exchanges().len(), 2);
+
+        // A read refused for that token is therefore not read again.
+        fixture
+            .gcp
+            .push_read(json_response(401, r#"{"error":{"code":401}}"#));
+        let error = fixture
+            .provider
+            .resolve("billing", SecretPurpose::StaticBearer)
+            .await
+            .expect_err("an unauthenticated read must fail closed");
+        assert_eq!(error.kind(), SecretResolveErrorKind::SourceDenied);
+        assert_eq!(fixture.gcp.reads().len(), 1);
+        assert_eq!(fixture.gcp.exchanges().len(), 2);
+        assert_eq!(
+            fixture.provider.identity_generation("primary"),
+            forced.generation
+        );
+
+        // Once the interval has passed, a refused token is replaced again.
+        fixture.clock.advance(GCP_FORCED_REEXCHANGE_INTERVAL);
+        let later = fixture
+            .provider
+            .access_token("primary", forced.generation.saturating_add(1))
+            .await
+            .expect("a later refusal is replaced");
+        assert!(later.generation > forced.generation);
+        assert_eq!(fixture.gcp.exchanges().len(), 3);
     }
 
     #[tokio::test]
@@ -3336,6 +3487,7 @@ mod tests {
             GcpFailure::IdentityInvalid,
             GcpFailure::ProviderUnavailable,
             GcpFailure::ProviderDenied,
+            GcpFailure::ProviderUnauthenticated,
             GcpFailure::SecretAbsent,
             GcpFailure::SecretUnusable,
             GcpFailure::ChecksumMismatch,
