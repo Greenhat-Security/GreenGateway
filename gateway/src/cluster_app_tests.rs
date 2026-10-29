@@ -1240,7 +1240,8 @@ fn the_ha_metric_registry_never_labels_by_a_caller_influenced_value() {
 /// restart never paged (issue #440 review). The registry is built and
 /// registered exactly as `install_metrics_recorder` does, minus making it
 /// process-global. Each family exports exactly its emitters' vocabulary,
-/// cluster-only series only in cluster mode, and the dispatcher's failure
+/// cluster-only series only in cluster mode, the standalone SQLite evidence
+/// counter only in standalone mode, and the dispatcher's failure
 /// counter stays lazy because its presence marks a configured sink.
 #[test]
 fn single_event_alert_counters_are_exported_at_zero_right_after_install() {
@@ -1307,6 +1308,27 @@ fn single_event_alert_counters_are_exported_at_zero_right_after_install() {
             };
             assert_eq!(family(name), expected, "cluster={cluster}:\n{rendered}");
         }
+        // Standalone only, for both SQLite stores: a cluster replica's
+        // authority evidence is PostgreSQL's, counted above.
+        let mut standalone = family("greengateway_standalone_evidence_failures_total");
+        standalone.sort_unstable();
+        let mut expected_standalone: Vec<String> = if cluster {
+            Vec::new()
+        } else {
+            storage::STANDALONE_EVIDENCE_STORES
+                .iter()
+                .map(|store| {
+                    format!(
+                        "greengateway_standalone_evidence_failures_total{{store=\"{store}\"}} 0"
+                    )
+                })
+                .collect()
+        };
+        expected_standalone.sort_unstable();
+        assert_eq!(
+            standalone, expected_standalone,
+            "cluster={cluster}:\n{rendered}"
+        );
         assert!(
             family("greengateway_authority_event_delivery_failures_total").is_empty(),
             "a seeded dispatcher failure series would mark every replica as having a sink:\n{rendered}"

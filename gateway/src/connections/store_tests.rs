@@ -4830,14 +4830,26 @@ fn refused_changes_write_no_evidence() {
 /// Evidence is required, not best effort: while its insert fails, a create,
 /// a replace and a delete each fail as a store failure -- not as a
 /// validation problem or a conflict, although SQLite reports a constraint
-/// -- and leave the records and bindings exactly as they were. Once
-/// evidence can be written again the same changes commit with their rows.
+/// -- and leave the records and bindings exactly as they were. Each refused
+/// change is counted once on the standalone evidence-failure counter, a
+/// replace that would also have recorded a binding change included. Once
+/// evidence can be written again the same changes commit with their rows,
+/// and count nothing.
 #[test]
 fn a_failed_evidence_insert_rolls_back_create_replace_and_delete() {
     let (_directory, path, store) = temporary_store("evidence-fault");
     let created = store
         .create(candidate(), &ChangeActor::for_test("creating-admin"))
         .expect("create should commit");
+    // The recorder is this thread's, and the store runs on this thread.
+    let recorder = crate::audit::sink::tests::CountingRecorder::default();
+    let _recording = ::metrics::set_default_local_recorder(&recorder);
+    let evidence_failures = |store: &str| {
+        recorder.count(
+            crate::metrics::STANDALONE_EVIDENCE_FAILURES_TOTAL,
+            &[("store", store)],
+        )
+    };
 
     // Test-only fault injection through a second connection; no production
     // hook exists for it.
@@ -4851,13 +4863,18 @@ fn a_failed_evidence_insert_rolls_back_create_replace_and_delete() {
         .expect("failure trigger should install");
     let faulted = ChangeActor::for_test("faulted-admin");
     let replacement = rebound(&created.write, "billing-token-next");
-    let failures = [
-        store.create(mcp_candidate(), &faulted).map(|_| ()),
+    let mut failures = Vec::new();
+    failures.push(store.create(mcp_candidate(), &faulted).map(|_| ()));
+    assert_eq!(evidence_failures("connections"), 1);
+    failures.push(
         store
             .replace(&created.id, &created.etag(), replacement.clone(), &faulted)
             .map(|_| ()),
-        store.delete(&created.id, &created.etag(), &faulted),
-    ];
+    );
+    assert_eq!(evidence_failures("connections"), 2);
+    failures.push(store.delete(&created.id, &created.etag(), &faulted));
+    assert_eq!(evidence_failures("connections"), 3);
+    assert_eq!(evidence_failures("service_tokens"), 0);
     for failure in failures {
         assert!(
             matches!(
@@ -4906,6 +4923,11 @@ fn a_failed_evidence_insert_rolls_back_create_replace_and_delete() {
     store
         .delete(&created.id, &replaced.etag(), &recovered)
         .expect("the delete commits once evidence can be written");
+    assert_eq!(
+        evidence_failures("connections"),
+        3,
+        "a recorded change counts nothing"
+    );
     let actions = change_evidence(&path)
         .into_iter()
         .map(|row| (row.action, row.actor_user_id))

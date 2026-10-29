@@ -10,6 +10,7 @@ use std::sync::{atomic::Ordering, Arc, LazyLock};
 use http::{HeaderMap, Method};
 
 use super::*;
+use crate::audit::sink::tests::CountingRecorder;
 use crate::auth::admin_session::{
     tests::{
         cookie_headers, front, is_invalid, is_unavailable, issue_across, read,
@@ -105,6 +106,17 @@ async fn execute(pool: &deadpool_postgres::Pool, sql: &str) {
         .batch_execute(sql)
         .await
         .expect("fixture statement");
+}
+
+/// What this thread's recorder counted on the two authority refusal
+/// counters: `(capacity refusals, evidence failures)`. A test body runs on
+/// its own thread under `block_on` and awaits every store call itself, so
+/// each refusal it causes is counted here, whatever the runtime's flavor.
+fn refusals(recorder: &CountingRecorder) -> (u64, u64) {
+    (
+        recorder.count(crate::metrics::AUTHORITY_EVENT_CAPACITY_REFUSALS_TOTAL, &[]),
+        recorder.count(crate::metrics::AUTHORITY_EVENT_EVIDENCE_FAILURES_TOTAL, &[]),
+    )
 }
 
 fn cookie_value(sessions: &AdminSessions, headers: &HeaderMap) -> String {
@@ -727,6 +739,8 @@ impl AuthorityEventSink for CollectingSink {
 /// with their evidence journaled while the journal is full, no other
 /// producer can spend a unit a session holds, and room comes back only
 /// through delivery and retention, after which the refused grant completes.
+/// Each refused grant is counted once as a capacity refusal, and nothing in
+/// it as an evidence failure.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_full_journal_refuses_grants_but_never_a_withdrawal() {
     let Some((_guard, _database, pool)) = database().await else {
@@ -793,6 +807,8 @@ async fn a_full_journal_refuses_grants_but_never_a_withdrawal() {
     a.begin_login("refused", Duration::from_secs(60), &HeaderMap::new())
         .await
         .unwrap();
+    let recorder = CountingRecorder::default();
+    let _recording = ::metrics::set_default_local_recorder(&recorder);
     assert!(matches!(
         b.issue(
             uuid::Uuid::new_v4().to_string(),
@@ -803,6 +819,7 @@ async fn a_full_journal_refuses_grants_but_never_a_withdrawal() {
         .await,
         Err(AuthError::Upstream(_))
     ));
+    assert_eq!(refusals(&recorder), (1, 0), "the refused grant");
     assert_eq!((sessions().await, evidence().await), (3, 3));
     assert_eq!(journal_state(&pool).await, full);
     let error = tokens
@@ -811,6 +828,7 @@ async fn a_full_journal_refuses_grants_but_never_a_withdrawal() {
         .expect_err("a full journal refuses the revoke");
     assert_eq!(error.kind(), RepositoryErrorKind::Unavailable);
     assert_eq!(journal_state(&pool).await, full);
+    assert_eq!(refusals(&recorder), (2, 0), "the refused revoke");
 
     // Every kind of withdrawal still commits, journaled, each spending the
     // unit its grant held: logout, a rejection, and the expiry prune.
@@ -857,7 +875,8 @@ async fn a_full_journal_refuses_grants_but_never_a_withdrawal() {
         rows: 7,
     };
     assert_eq!(journal_state(&pool).await, spent);
-    // Still full, so the refused grant is still refused.
+    // Still full, so the refused grant is still refused. The withdrawals
+    // before it were never refused, so they counted nothing.
     assert!(matches!(
         b.issue(
             uuid::Uuid::new_v4().to_string(),
@@ -868,6 +887,7 @@ async fn a_full_journal_refuses_grants_but_never_a_withdrawal() {
         .await,
         Err(AuthError::Upstream(_))
     ));
+    assert_eq!(refusals(&recorder), (3, 0), "the second refused grant");
 
     // The dispatcher delivers every session event in commit order, keyed
     // and without any identifier the evidence holds.
@@ -981,7 +1001,9 @@ async fn a_full_journal_refuses_grants_but_never_a_withdrawal() {
 /// A withdrawal is never refused for capacity, but it is still refused when
 /// its journal row cannot be written at all: the session stays, nothing is
 /// half-recorded, and the front answers a dependency failure rather than
-/// "signed out". The same holds for the expiry prune.
+/// "signed out". The same holds for the expiry prune. Each refused logout,
+/// rejection and prune step is counted once as an evidence failure, never
+/// as a capacity refusal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_withdrawal_whose_journal_row_cannot_be_written_does_not_happen() {
     let Some((_guard, _database, pool)) = database().await else {
@@ -1003,6 +1025,8 @@ async fn a_withdrawal_whose_journal_row_cannot_be_written_does_not_happen() {
     )
     .await;
     let before = journal_state(&pool).await;
+    let recorder = CountingRecorder::default();
+    let _recording = ::metrics::set_default_local_recorder(&recorder);
     execute(
         &pool,
         "ALTER TABLE greengateway.authority_event_journal \
@@ -1013,14 +1037,17 @@ async fn a_withdrawal_whose_journal_row_cannot_be_written_does_not_happen() {
         a.revoke(&held, None).await,
         Err(AuthError::Upstream(_))
     ));
+    assert_eq!(refusals(&recorder), (0, 1), "the refused logout");
     authority.outcome.store(3, Ordering::SeqCst);
     assert!(is_unavailable(&read(&a, &held).await));
     authority.outcome.store(0, Ordering::SeqCst);
+    assert_eq!(refusals(&recorder), (0, 2), "the refused rejection");
     let client = pool.get().await.expect("maintenance session");
     assert!(AdminSessionPrune { limit: 1_000 }
         .run_step(&client)
         .await
         .is_err());
+    assert_eq!(refusals(&recorder), (0, 3), "the refused prune step");
     execute(
         &pool,
         "ALTER TABLE greengateway.authority_event_journal DROP CONSTRAINT refuse_for_test",
@@ -1043,10 +1070,18 @@ async fn a_withdrawal_whose_journal_row_cannot_be_written_does_not_happen() {
     assert_eq!(journal_state(&pool).await, before);
     read(&a, &held).await.unwrap();
     a.revoke(&held, None).await.unwrap();
+    assert_eq!(
+        refusals(&recorder),
+        (0, 3),
+        "a journaled logout counts nothing"
+    );
 }
 
 /// A change whose evidence cannot be written does not happen, and is a
-/// dependency failure rather than a verdict.
+/// dependency failure rather than a verdict. Each refused grant, logout and
+/// rejection is counted once as an evidence failure, so the evidence
+/// write-failure alert pages on a refused logout; the grant that completes
+/// afterwards counts nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_evidence_insert_rolls_the_change_back() {
     let Some((_guard, _database, pool)) = database().await else {
@@ -1059,6 +1094,8 @@ async fn a_failed_evidence_insert_rolls_the_change_back() {
     a.begin_login("blocked", Duration::from_secs(30), &HeaderMap::new())
         .await
         .unwrap();
+    let recorder = CountingRecorder::default();
+    let _recording = ::metrics::set_default_local_recorder(&recorder);
     execute(
         &pool,
         "ALTER TABLE greengateway.admin_session_evidence \
@@ -1075,13 +1112,16 @@ async fn a_failed_evidence_insert_rolls_the_change_back() {
         .await,
         Err(AuthError::Upstream(_))
     ));
+    assert_eq!(refusals(&recorder), (0, 1), "the refused grant");
     assert!(matches!(
         a.revoke(&held, None).await,
         Err(AuthError::Upstream(_))
     ));
+    assert_eq!(refusals(&recorder), (0, 2), "the refused logout");
     authority.outcome.store(1, Ordering::SeqCst);
     assert!(is_unavailable(&read(&a, &held).await));
     authority.outcome.store(0, Ordering::SeqCst);
+    assert_eq!(refusals(&recorder), (0, 3), "the refused rejection");
     execute(
         &pool,
         "ALTER TABLE greengateway.admin_session_evidence DROP CONSTRAINT refuse_for_test",
@@ -1102,6 +1142,66 @@ async fn a_failed_evidence_insert_rolls_the_change_back() {
     )
     .await
     .unwrap();
+    assert_eq!(
+        refusals(&recorder),
+        (0, 3),
+        "a recorded grant counts nothing"
+    );
+}
+
+/// A withdrawal statement that withdrew a session but journaled none of
+/// its evidence -- which only a missing journal state row can cause -- is
+/// refused, rolled back and counted once as an evidence failure, though
+/// the statement itself succeeded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_withdrawal_left_unjournaled_is_refused_and_counted_once() {
+    let Some((_guard, _database, pool)) = database().await else {
+        eprintln!("skipping: no test database locator; CI runs this test");
+        return;
+    };
+    let authority = Arc::new(Authority::default());
+    let a = replica(&authority, &pool, cluster_config(8), login_keyring());
+    let held = cookie_headers(&issue_across(&a, &a, &HeaderMap::new()).await.unwrap());
+    let before = journal_state(&pool).await;
+    let recorder = CountingRecorder::default();
+    let _recording = ::metrics::set_default_local_recorder(&recorder);
+    execute(
+        &pool,
+        "CREATE TABLE greengateway.saved_state_for_test AS \
+             SELECT * FROM greengateway.authority_event_state; \
+         DELETE FROM greengateway.authority_event_state",
+    )
+    .await;
+    assert!(matches!(
+        a.revoke(&held, None).await,
+        Err(AuthError::Upstream(_))
+    ));
+    assert_eq!(refusals(&recorder), (0, 1));
+    execute(
+        &pool,
+        "INSERT INTO greengateway.authority_event_state \
+             SELECT * FROM greengateway.saved_state_for_test; \
+         DROP TABLE greengateway.saved_state_for_test",
+    )
+    .await;
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM greengateway.admin_session_evidence \
+             WHERE action = 'admin_session.withdraw'"
+        )
+        .await,
+        0,
+        "the refused withdrawal left no evidence"
+    );
+    assert_eq!(journal_state(&pool).await, before);
+    read(&a, &held).await.unwrap();
+    a.revoke(&held, None).await.unwrap();
+    assert_eq!(
+        refusals(&recorder),
+        (0, 1),
+        "a journaled logout counts nothing"
+    );
 }
 
 /// The singleton's step and each admission prune only what is already dead,

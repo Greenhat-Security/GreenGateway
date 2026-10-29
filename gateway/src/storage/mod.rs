@@ -309,6 +309,46 @@ fn join_error_operation(join_error: &tokio::task::JoinError) -> &'static str {
     "repository_blocking_task"
 }
 
+/// The standalone SQLite store whose evidence insert refused an authority
+/// change. Each variant is also the fixed `store` label of
+/// `greengateway_standalone_evidence_failures_total`, spelled as
+/// `greengateway_sqlite_storage_checks_total` spells that file.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StandaloneEvidenceStore {
+    /// `SERVICE_TOKEN_SQLITE_PATH`: service-token rotate and revoke.
+    ServiceTokens,
+    /// `CONNECTIONS_SQLITE_PATH`: Connection and local-secret changes.
+    Connections,
+}
+
+/// The whole vocabulary of `greengateway_standalone_evidence_failures_total`'s
+/// `store` label: every value the recorder seeds at `0` on install.
+pub(crate) const STANDALONE_EVIDENCE_STORES: [&str; 2] = [
+    StandaloneEvidenceStore::ServiceTokens.as_str(),
+    StandaloneEvidenceStore::Connections.as_str(),
+];
+
+impl StandaloneEvidenceStore {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::ServiceTokens => "service_tokens",
+            Self::Connections => "connections",
+        }
+    }
+}
+
+/// Count one standalone authority change refused because its evidence row
+/// could not be inserted. Called once per refused change, where the insert
+/// failed, before the caller rolls the change back. The store is the only
+/// label, and it is one of two constants.
+pub(crate) fn record_standalone_evidence_failure(store: StandaloneEvidenceStore) {
+    ::metrics::counter!(
+        crate::metrics::STANDALONE_EVIDENCE_FAILURES_TOTAL,
+        "store" => store.as_str()
+    )
+    .increment(1);
+}
+
 /// Classify a `rusqlite` failure without propagating its message: SQLite
 /// error text can embed database paths, table names, and SQL fragments.
 pub(crate) fn classify_rusqlite(
@@ -418,5 +458,33 @@ mod error_kind_tests {
             };
             assert!(covered);
         }
+    }
+}
+
+#[cfg(test)]
+mod standalone_evidence_tests {
+    use super::{record_standalone_evidence_failure, StandaloneEvidenceStore};
+
+    /// The `store` label vocabulary is the two SQLite files that hold
+    /// standalone authority evidence, spelled as the storage checks spell
+    /// them, and a refusal moves only its own store's series, by exactly one.
+    #[test]
+    fn a_refusal_counts_once_under_its_own_store() {
+        assert_eq!(
+            super::STANDALONE_EVIDENCE_STORES,
+            ["service_tokens", "connections"]
+        );
+        let recorder = crate::audit::sink::tests::CountingRecorder::default();
+        let _recording = ::metrics::set_default_local_recorder(&recorder);
+        let count = |store: &str| {
+            recorder.count(
+                crate::metrics::STANDALONE_EVIDENCE_FAILURES_TOTAL,
+                &[("store", store)],
+            )
+        };
+        record_standalone_evidence_failure(StandaloneEvidenceStore::Connections);
+        assert_eq!((count("service_tokens"), count("connections")), (0, 1));
+        record_standalone_evidence_failure(StandaloneEvidenceStore::ServiceTokens);
+        assert_eq!((count("service_tokens"), count("connections")), (1, 1));
     }
 }
