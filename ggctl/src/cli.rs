@@ -81,6 +81,7 @@ const COMMAND_NAMES: &[&str] = &[
     "schema",
     "validate",
     "doctor",
+    "diff",
     "completion",
     "help",
 ];
@@ -90,7 +91,8 @@ const FORMAT: OptionSpec = OptionSpec {
     value: Some(("FORMAT", ValueKind::Choice(&[FORMAT_HUMAN, FORMAT_JSON]))),
     help: "human (default) or json: one GgctlReport document on standard output",
 };
-/// `validate` alone also offers SARIF (ADR-0008, "Output contract").
+/// `validate` and `diff` also offer SARIF (ADR-0008, "Output contract"; for
+/// `diff`, an addition made with the semantic diff).
 const VALIDATE_FORMAT: OptionSpec = OptionSpec {
     name: "--format",
     value: Some((
@@ -109,6 +111,16 @@ const WARNINGS_AS_ERRORS: OptionSpec = OptionSpec {
     name: "--warnings-as-errors",
     value: None,
     help: "exit 3 when any warning is reported",
+};
+const AGAINST: OptionSpec = OptionSpec {
+    name: "--against",
+    value: Some(("BUNDLE", ValueKind::Path)),
+    help: "the bundle directory to compare BUNDLE with (required): the change is from it to BUNDLE",
+};
+const CHECK: OptionSpec = OptionSpec {
+    name: "--check",
+    value: None,
+    help: "exit 4 when the bundles differ at all",
 };
 const BUNDLE: ArgumentSpec = ArgumentSpec {
     name: "BUNDLE",
@@ -213,6 +225,25 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         arguments: &[BUNDLE],
         options: &[FORMAT],
         run: crate::doctor::run,
+    },
+    CommandSpec {
+        name: "diff",
+        summary: "Compare two configuration bundles semantically and classify each change's risk",
+        description: &[
+            "Reads BUNDLE and the --against bundle with the gateway's own bundle reader, as \
+             validate does, and compares what they configure rather than their text: the \
+             manifest, the deployment document and the policy and tools documents, member by \
+             member. Each change is reported with its change class, whether it loosens or \
+             tightens a control, and stable risk codes (docs/semantic-diff.md); no value is \
+             ever shown, and a secret only as a changed reference. It makes no network request, \
+             reads no environment variable and writes nothing.",
+            "Exits 0 when both bundles were compared, 4 with --check when they differ, 3 when \
+             either bundle is invalid (they are then not compared), and 1 when one could not be \
+             read. --format sarif reports each risk code of each change as a result.",
+        ],
+        arguments: &[BUNDLE],
+        options: &[AGAINST, CHECK, STRICT, VALIDATE_FORMAT],
+        run: crate::diff::run,
     },
     CommandSpec {
         name: "completion",

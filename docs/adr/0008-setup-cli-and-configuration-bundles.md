@@ -496,7 +496,7 @@ The names `ggctl db` and `ggctl cluster` are reserved. `ggctl` never opens a Pos
 
 #### Output contract
 
-- Human output by default. `--format json` emits one `GgctlReport` document (`apiVersion: greengateway.dev/v1alpha1`) for every command that does not write an artifact; `--format sarif` emits SARIF 2.1.0 for `validate`.
+- Human output by default. `--format json` emits one `GgctlReport` document (`apiVersion: greengateway.dev/v1alpha1`) for every command that does not write an artifact; `--format sarif` emits SARIF 2.1.0 for `validate`, and for `diff`, whose risk codes it reports as results (an addition made with the diff engine; see [semantic-diff.md](../semantic-diff.md)).
 - Stdout carries only the requested artifact or report. Progress and diagnostics go to stderr.
 - No prompts unless stdin is a terminal; a command that needs input it cannot prompt for exits `2`. No ANSI color unless stdout is a terminal and `NO_COLOR` is unset.
 - `ggctl` has no configuration file and reads no ambient environment beyond `NO_COLOR`. Every remote target, CA, and credential source is an explicit flag.
