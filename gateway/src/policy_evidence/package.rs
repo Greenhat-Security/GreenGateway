@@ -47,8 +47,7 @@ use super::{
     REDACTION_PROFILE, REPORT_MEDIA_TYPE, REPORT_SCHEMA_VERSION, TRUST_STATEMENT,
 };
 use crate::{
-    canonical_json,
-    policy_analysis::RESULT_SCHEMA_VERSION as ANALYSIS_SCHEMA_VERSION,
+    canonical_json, policy_analysis,
     policy_eval::{
         tools::{TOOL_CONTEXT_VERSION, TOOL_SEMANTICS_VERSION},
         CONTEXT_VERSION, HTTP_SEMANTICS_VERSION,
@@ -302,7 +301,7 @@ pub(crate) fn assemble(
             let artifact = json_artifact(
                 ANALYSIS_ARTIFACT,
                 ANALYSIS_MEDIA_TYPE,
-                ANALYSIS_SCHEMA_VERSION,
+                policy_analysis::RESULT_SCHEMA_VERSION,
                 &analysis.results,
             )?;
             Some((analysis, artifact))
