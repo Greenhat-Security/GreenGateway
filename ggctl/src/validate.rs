@@ -1,4 +1,4 @@
-//! `ggctl validate BUNDLE [--strict] [--warnings-as-errors]
+//! `ggctl validate (BUNDLE | --env FILE) [--strict] [--warnings-as-errors]
 //! [--format human|json|sarif]`.
 //!
 //! The bundle is read by the shared reader in `gateway-config`, the code the
@@ -6,10 +6,13 @@
 //! disagree about anything the reader decides. `ggctl` cannot link the
 //! gateway's production policy and tools validators, so it reads with
 //! [`PublishedSchemasOnly`], and every report about a bundled policy or tools
-//! document says those validators did not run. Nothing is written, no
-//! network request is made and no environment variable is read.
+//! document says those validators did not run. An environment file is read
+//! as data and compiled by the gateway's own configuration compiler
+//! (`crate::env`). Nothing is written, no network request is made and no
+//! environment variable is read.
 
 use std::{
+    ffi::OsStr,
     io::{self, Write},
     path::Path,
 };
@@ -24,6 +27,7 @@ use serde_json::Value;
 use crate::{
     cli::Invocation,
     diagnostic::{Code, Diagnostic, Exit},
+    env::{self, EnvRecord, Source},
     report::{self, Format, Io, ReportDiagnostic},
 };
 
@@ -34,11 +38,21 @@ pub(crate) type BundleRead = BundleReport<Value, Value>;
 /// there is no such argument (the parser requires one).
 pub(crate) fn read(invocation: &Invocation, strict: bool) -> Option<BundleRead> {
     let (_, path) = invocation.positional(0)?;
-    Some(bundle::read_bundle(
-        Path::new(path),
-        ReadOptions { strict },
-        &PublishedSchemasOnly,
-    ))
+    Some(read_path(OsStr::new(path), strict))
+}
+
+/// Reads the bundle in the directory `path`.
+pub(crate) fn read_path(path: &OsStr, strict: bool) -> BundleRead {
+    bundle::read_bundle(Path::new(path), ReadOptions { strict }, &PublishedSchemasOnly)
+}
+
+/// What a command that takes `(BUNDLE | --env FILE)` was given.
+pub(crate) fn source(invocation: &Invocation) -> Result<Source<'_>, Diagnostic> {
+    env::source(
+        invocation,
+        invocation.positional(0).map(|(_, path)| OsStr::new(path)),
+        "--env",
+    )
 }
 
 /// The bundle reader's diagnostics as a report carries them.
@@ -220,17 +234,84 @@ pub(crate) fn declares_a_bundled_resource(manifest: &ManifestSummary) -> bool {
 /// The `validate` result.
 #[derive(Debug, Serialize)]
 struct ValidateResult {
-    /// No stage of the reader found an error.
+    /// No stage of the reader found an error, or, for an environment file,
+    /// the file and the compiler found none.
     valid: bool,
     /// Present once the manifest was read.
     #[serde(skip_serializing_if = "Option::is_none")]
     bundle: Option<BundleRecord>,
+    /// Present once an environment file was parsed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    environment: Option<EnvRecord>,
 }
 
 pub(crate) fn run(invocation: &Invocation, io: &mut Io<'_>) -> Exit {
-    let Some(read) = read(invocation, invocation.flag("--strict").is_some()) else {
-        return report::error(io, Diagnostic::new(Code::MissingArgument));
+    let strict = invocation.flag("--strict").is_some();
+    match source(invocation) {
+        Err(diagnostic) => report::error(io, diagnostic),
+        Ok(Source::Bundle(path)) => run_bundle(invocation, read_path(path, strict), io),
+        Ok(Source::Env { argument, path }) => {
+            run_env(invocation, &env::read(argument, path, strict), io)
+        }
+    }
+}
+
+/// `--warnings-as-errors`: exit 3 when any diagnostic is a warning.
+fn warnings_as_errors(invocation: &Invocation, diagnostics: &mut Vec<ReportDiagnostic>) {
+    if let Some(position) = invocation.flag("--warnings-as-errors") {
+        if diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity() == "warning")
+        {
+            diagnostics.push(Diagnostic::at(Code::WarningsAsErrors, position).into());
+        }
+    }
+}
+
+/// Writes ", N errors, M warnings" for the non-zero counts.
+fn write_counts(out: &mut dyn Write, errors: usize, warnings: usize) -> io::Result<()> {
+    for (count, noun) in [(errors, "error"), (warnings, "warning")] {
+        match count {
+            0 => {}
+            1 => write!(out, ", 1 {noun}")?,
+            _ => write!(out, ", {count} {noun}s")?,
+        }
+    }
+    writeln!(out)
+}
+
+fn run_env(invocation: &Invocation, read: &env::EnvRead, io: &mut Io<'_>) -> Exit {
+    let mut diagnostics = read.diagnostics.clone();
+    let warnings = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity() == "warning")
+        .count();
+    let errors = diagnostics.len() - warnings;
+    warnings_as_errors(invocation, &mut diagnostics);
+    let result = ValidateResult {
+        valid: read.valid(),
+        bundle: None,
+        environment: read.record(),
     };
+    report::finish_report(
+        io,
+        Format::of(invocation),
+        "validate",
+        &result,
+        &diagnostics,
+        |result, out| {
+            let verdict = if result.valid { "valid" } else { "invalid" };
+            write!(out, "environment file: {verdict}")?;
+            write_counts(out, errors, warnings)?;
+            match &result.environment {
+                Some(environment) => environment.write_details(out),
+                None => Ok(()),
+            }
+        },
+    )
+}
+
+fn run_bundle(invocation: &Invocation, read: BundleRead, io: &mut Io<'_>) -> Exit {
     let mut diagnostics = diagnostics(&read);
     if supplies_a_resource(&read) {
         diagnostics.push(Diagnostic::new(Code::ProductionValidatorsNotRun).into());
@@ -241,14 +322,11 @@ pub(crate) fn run(invocation: &Invocation, io: &mut Io<'_>) -> Exit {
         .filter(|diagnostic| diagnostic.is_error())
         .count();
     let warnings = read.diagnostics.len() - errors;
-    if let Some(position) = invocation.flag("--warnings-as-errors") {
-        if warnings > 0 {
-            diagnostics.push(Diagnostic::at(Code::WarningsAsErrors, position).into());
-        }
-    }
+    warnings_as_errors(invocation, &mut diagnostics);
     let result = ValidateResult {
         valid: read.bundle.is_some(),
         bundle: BundleRecord::of(&read),
+        environment: None,
     };
     report::finish_report(
         io,
@@ -263,14 +341,7 @@ pub(crate) fn run(invocation: &Invocation, io: &mut Io<'_>) -> Exit {
                 .map_or_else(|| "bundle".to_owned(), BundleRecord::title);
             let verdict = if result.valid { "valid" } else { "invalid" };
             write!(out, "{title}: {verdict}")?;
-            for (count, noun) in [(errors, "error"), (warnings, "warning")] {
-                match count {
-                    0 => {}
-                    1 => write!(out, ", 1 {noun}")?,
-                    _ => write!(out, ", {count} {noun}s")?,
-                }
-            }
-            writeln!(out)?;
+            write_counts(out, errors, warnings)?;
             match &result.bundle {
                 Some(bundle) => bundle.write_details(out),
                 None => Ok(()),

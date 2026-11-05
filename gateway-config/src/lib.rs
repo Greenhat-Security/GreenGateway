@@ -9,7 +9,10 @@
 //!   here by #242), which reads every setting through the reader its caller
 //!   passes, never the process environment, and returns a validated plan or
 //!   every problem with a value-free diagnostic. The gateway turns the plan
-//!   into the `Config` it starts from; `ggctl` can run the same compiler;
+//!   into the `Config` it starts from; `ggctl` runs the same compiler;
+//! - [`env_file`]: the `KEY=VALUE` environment file grammar that
+//!   `gateway import-standalone --from` and `ggctl --env` both read, and the
+//!   compilation of the variables a file sets;
 //! - [`catalog`]: the configuration field catalog, which describes every
 //!   setting the compiler reads and is held to the compiler, the
 //!   configuration reference, `.env.example` and the Cloudflare wrapper by
@@ -64,7 +67,8 @@
 //!
 //! Nothing here touches the environment, a clock or the network, and the
 //! compiler and its leaves touch nothing at all: the compiler's one side
-//! effect is a log line naming a setting. The bundle reader reads files only
+//! effect is a log line naming a setting. The environment file grammar parses
+//! text its caller has read. The bundle reader reads files only
 //! beneath the bundle root it is given, and never writes. The archive guard reads and writes only the readers and writers
 //! it is handed. The ledger is the one store: it reads and writes only its own
 //! database and journal files beneath the state directory it is given, and
@@ -80,6 +84,7 @@ pub mod compiler;
 pub mod connections;
 pub mod discovery;
 pub mod documents;
+pub mod env_file;
 pub mod inbound_tls;
 pub mod ledger;
 pub mod opaque_id;

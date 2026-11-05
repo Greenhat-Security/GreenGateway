@@ -31,7 +31,7 @@ same goldens (`gateway-config/src/compiler/parity_tests.rs`).
   settings by, and `Config::from_env_vars` is `compile` followed by the
   gateway's conversion (`config::into_config`); it adds no rule of its own.
 - **Shared with `ggctl`.** The compiler is a public module of the library both
-  binaries link, so `ggctl` can run the gateway's own compiler rather than an
+  binaries link, so `ggctl` runs the gateway's own compiler rather than an
   approximation of it (see [The compiler in
   `gateway-config`](#the-compiler-in-gateway-config)). The gateway keeps
   `Config`, the process-environment reader, the conversion and every startup
@@ -43,10 +43,9 @@ same goldens (`gateway-config/src/compiler/parity_tests.rs`).
 | --- | --- | --- |
 | `gateway` with no arguments: `bootstrap::start_serving` | `config::process_environment`, the process environment | Converts the plan with `config::into_config` and runs the startup stages on it (see [Startup](#startup)). A refused configuration is printed and the process exits with status 1 before any stage runs. |
 | The one-shot commands: `migrate`, `connection-secret`, `revoke-jwt`, `jwt-revocations-cleanup`, `rate-limit-buckets-cleanup`, `cluster-members`, `maintenance-run`, and `import-standalone`'s own configuration | `Config::from_env`, the same reader | Uses the converted `Config`. A refusal is returned as the command's error, in the same operator-facing form. |
-| `gateway import-standalone --from FILE`, for the source deployment | The variables parsed from `FILE`, as a map | Refuses the import with `ImportError::StandaloneConfigInvalid`, naming only the settings that failed, never their values. |
-| Tests | Fixture maps and recording doubles | Parity goldens, stage and catalog tests in `gateway-config`; the gateway's `config_tests` and startup-stage tests. |
-
-No `ggctl` command calls the compiler yet.
+| `gateway import-standalone --from FILE`, for the source deployment | The variables `gateway_config::env_file` parses from `FILE`, as a map | Refuses the import with `ImportError::StandaloneConfigInvalid`, naming only the settings that failed, never their values. |
+| `ggctl validate`, `ggctl doctor` and `ggctl diff` with `--env FILE` (and `--against-env FILE`) | `gateway_config::env_file::EnvFile::var`: the variables the file sets, parsed with the same grammar as the import's, every other input unset | Reports each diagnostic as a `config` code with the rule's stable name, located by the line of its setting ([docs/ggctl.md](../ggctl.md#environment-files)); the doctor evaluates an accepted plan against the production profile as advice, and the diff compares two plans with `semantic_diff::plans`. |
+| Tests | Fixture maps and recording doubles | Parity goldens, stage and catalog tests in `gateway-config`; the gateway's `config_tests`, startup-stage tests and `config/env_file_tests.rs`, which holds what the environment file path decides to `Config::from_env_vars`. |
 
 ## Inputs
 
@@ -236,9 +235,9 @@ in the legacy order:
   begins with, a code describing how that variable was set, the rule that
   refused it, and a message built from those and fixed text alone. Nothing in
   a diagnostic is copied from a value or from a problem's wording, so it is
-  value-free by construction rather than by redaction. No production path
-  reports diagnostics yet; `import-standalone` keeps only the leading setting
-  names of the problems instead.
+  value-free by construction rather than by redaction. `ggctl --env` reports
+  them; `import-standalone` keeps only the leading setting names of the
+  problems instead.
 
 Both are public on `gateway_config::compiler::ConfigError`, as `problems()`
 and `diagnostics()`.
@@ -293,9 +292,13 @@ holds this table to `diagnostic::ConfigRule`.
 | `AuthorityEvidenceDeliveryRequired` | `AUTHORITY_EVIDENCE_DURABILITY=required` in cluster mode with `AUTHORITY_EVENT_SINK=none`, which would journal evidence that is never delivered. |
 | `AuthorityEvidenceUnsupportedConfiguration` | `AUTHORITY_EVIDENCE_DURABILITY=required` with a setting that enables an authority change the evidence inventory marks unsupported in this mode: `ADMIN_SESSION_MODE=standalone_memory`. |
 
-Codes and rules are Rust enums. They have no serialized names yet: the first
-report format that carries them must assign stable codes, and from then on a
-rule's meaning is part of that format's contract.
+Codes and rules are Rust enums. `ConfigRule::as_str` gives every rule
+(`ConfigRule::ALL`) a stable name, its variant name in snake case
+(`admin_listener_collision`), and `ggctl`'s report format (`GgctlReport`)
+publishes those names and one `config` code per code (`config.refused`,
+`config.unset`, ...; see [docs/ggctl.md](../ggctl.md#config-diagnostics)).
+From now on a rule's meaning is part of that format's contract: renaming or
+removing one needs a new report version.
 
 ## Sensitivity wrappers
 
@@ -488,10 +491,11 @@ yet.
 
 ### Reports
 
-`ConfigDiagnostic` is the form a validate or doctor report should carry for
+`ConfigDiagnostic` is the form a validate or doctor report carries for
 environment configuration: it is value-free by construction and names the
-setting, how it was set, and the rule. The report format must give codes and
-rules stable string names (see [Rules](#rules)). Provenance is recorded per
+setting, how it was set, and the rule. `ggctl --env` reports it with stable
+codes and rule names (see [Rules](#rules)), located by the line of the
+setting's effective assignment. Provenance is recorded per
 input and is what a status or Setup Center view needs to explain where a
 field came from; `ConfigPlan::provenance` returns it, and no report or admin
 API carries it yet.
@@ -582,9 +586,10 @@ the bundle diff with the production policy and tools validators, and the
 `config_tests` suite, which still holds `Config::from_env_vars` to every
 setting.
 
-`ggctl` can now compile environment configuration with the gateway's own
-compiler. No `ggctl` command does yet; one that does reports diagnostics,
-never problems, because problems may quote values.
+`ggctl validate`, `ggctl doctor` and `ggctl diff` compile an environment file
+(`--env`) with the gateway's own compiler, through the `KEY=VALUE` grammar in
+`gateway_config::env_file` that `gateway import-standalone` reads too, and
+report diagnostics, never problems, because problems may quote values.
 
 ### Local filesystem checks and preflight
 

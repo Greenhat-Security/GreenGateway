@@ -42,6 +42,8 @@ mod bundle;
 #[cfg(test)]
 mod environment_reads;
 #[cfg(test)]
+mod env_file_tests;
+#[cfg(test)]
 mod fingerprint_tests;
 mod revisions;
 mod semantic_diff;

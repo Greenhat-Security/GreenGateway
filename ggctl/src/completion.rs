@@ -440,7 +440,7 @@ mod tests {
             powershell.matches(')').count()
         );
         assert!(powershell.contains(
-            "$previous -in @('--against', '--answers', '--ca-file', '--output', '--token-file')"
+            "$previous -in @('--against', '--against-env', '--answers', '--ca-file', '--env', '--output', '--token-file')"
         ));
         // A bundle directory completes directory names.
         assert!(bash
