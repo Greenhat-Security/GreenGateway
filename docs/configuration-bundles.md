@@ -189,8 +189,9 @@ without repeating the value:
   it takes a secret reference (`secret.inline_value` for a URL written inline).
 - **`state.stores`** names the standalone stores a deployment keeps beneath its
   state directory, each once: `audit`, `discovery`, `principals`, `connections`
-  and `service_tokens` (`schema.invalid_value` for another word or a repeat). In
-  environment mode they are the stores whose `*_SQLITE_PATH` variable is set.
+  and `service_tokens` (`schema.invalid_value` for another word or a repeat),
+  each the store of one fixed file in [the state directory](#the-state-directory).
+  In environment mode they are the stores whose `*_SQLITE_PATH` variable is set.
   The policy publication history is not one of them: ADR-0008 has not decided
   whether bundle mode keeps one beside a bundle-owned policy.
 

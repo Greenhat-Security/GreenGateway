@@ -30,6 +30,7 @@ use crate::{
     catalog::{
         self, BundleMapping, DecimalBound, DefaultValue, Field, FieldType, Sensitivity, FIELDS,
     },
+    state_dir::StateFile,
 };
 
 const CANARY: &str = "zqcanary";
@@ -237,23 +238,31 @@ fn the_document_has_a_path_for_every_scalar_and_list_deployment_field() {
 }
 
 #[test]
-fn the_standalone_stores_are_the_catalogs_store_resources() {
+fn the_standalone_stores_are_the_state_directorys_store_files() {
+    let files: BTreeSet<StateFile> = STANDALONE_STORES.iter().map(|store| store.file).collect();
+    assert_eq!(files.len(), STANDALONE_STORES.len(), "a file is named once");
+    let names: BTreeSet<&str> = STANDALONE_STORES.iter().map(|store| store.name).collect();
+    assert_eq!(names.len(), STANDALONE_STORES.len(), "a word is used once");
+    let stores: BTreeSet<StateFile> = StateFile::ALL
+        .into_iter()
+        .filter(|file| file.catalog_field().is_some() && *file != StateFile::PolicyHistory)
+        .collect();
+    assert_eq!(
+        files, stores,
+        "every state-directory store that replaces a catalog field can be enabled, \
+         except the policy history ADR-0008 has not placed"
+    );
     let listed: BTreeSet<&str> = STANDALONE_STORES
         .iter()
-        .map(|store| store.environment)
+        .map(|store| store.environment().expect("a store replaces a field"))
         .collect();
-    assert_eq!(listed.len(), STANDALONE_STORES.len());
     let resources: BTreeSet<&str> = FIELDS
         .iter()
         .filter(|field| field.bundle == BundleMapping::Resource)
         .map(|field| field.environment)
         .filter(|name| name.ends_with("_SQLITE_PATH") && *name != "POLICY_HISTORY_SQLITE_PATH")
         .collect();
-    assert_eq!(
-        listed, resources,
-        "every standalone store the catalog replaces with a bundle resource can be enabled, \
-         except the policy history ADR-0008 has not placed"
-    );
+    assert_eq!(listed, resources, "each replaces a bundle resource field");
     for store in STANDALONE_STORES {
         assert!(
             store

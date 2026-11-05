@@ -18,7 +18,7 @@ use super::{
         document::Profile,
         value::{Decimal, UnresolvedReason},
     },
-    children, document_maximum, Child, SECTIONS, STANDALONE_STORES, STORES_PATH,
+    children, document_maximum, Child, StandaloneStore, SECTIONS, STANDALONE_STORES, STORES_PATH,
 };
 
 /// The secret reference grammar: an ADR-0006 opaque alias ID.
@@ -418,7 +418,9 @@ pub fn render_deployment_reference() -> String {
                     format!(
                         "which of {} are set",
                         join_words(
-                            STANDALONE_STORES.iter().map(|store| store.environment),
+                            STANDALONE_STORES
+                                .iter()
+                                .filter_map(StandaloneStore::environment),
                             "and"
                         )
                     ),

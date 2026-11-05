@@ -41,9 +41,10 @@ mod render;
 #[cfg(test)]
 mod tests;
 
-use serde_json::Value as JsonValue;
-
-use crate::catalog::{DecimalBound, DecimalRange, Field, FieldType, Sensitivity, FIELDS};
+use crate::{
+    catalog::{DecimalBound, DecimalRange, Field, FieldType, Sensitivity, FIELDS},
+    state_dir::StateFile,
+};
 
 pub use render::{render_deployment_reference, render_deployment_schema};
 
@@ -66,35 +67,47 @@ pub const STORES_PATH: &str = "/spec/state/stores";
 pub struct StandaloneStore {
     /// Its word in `spec.state.stores`.
     pub name: &'static str,
-    /// The environment variable that locates it in environment mode.
-    pub environment: &'static str,
+    /// Its fixed file beneath the state directory.
+    pub file: StateFile,
+}
+
+impl StandaloneStore {
+    /// The environment variable that locates the store in environment mode.
+    pub fn environment(&self) -> Option<&'static str> {
+        let id = self.file.catalog_field()?;
+        FIELDS
+            .iter()
+            .find(|field| field.id == id)
+            .map(|field| field.environment)
+    }
 }
 
 /// The stores `spec.state.stores` can name, in canonical order.
 ///
 /// Policy publication history is not one of them: whether bundle mode keeps
 /// a history beside a bundle-owned policy is still undecided (ADR-0008), so
-/// `v1alpha1` cannot enable it.
+/// `v1alpha1` cannot enable it. Nor is the configuration ledger, which only
+/// ledger mode keeps.
 pub const STANDALONE_STORES: &[StandaloneStore] = &[
     StandaloneStore {
         name: "audit",
-        environment: "AUDIT_SQLITE_PATH",
+        file: StateFile::Audit,
     },
     StandaloneStore {
         name: "discovery",
-        environment: "DISCOVERY_SQLITE_PATH",
+        file: StateFile::Discovery,
     },
     StandaloneStore {
         name: "principals",
-        environment: "PRINCIPAL_SQLITE_PATH",
+        file: StateFile::Principals,
     },
     StandaloneStore {
         name: "connections",
-        environment: "CONNECTIONS_SQLITE_PATH",
+        file: StateFile::Connections,
     },
     StandaloneStore {
         name: "service_tokens",
-        environment: "SERVICE_TOKEN_SQLITE_PATH",
+        file: StateFile::ServiceTokens,
     },
 ];
 
@@ -261,7 +274,7 @@ impl Settings {
     /// decimal as its shortest exact spelling and the store list in
     /// [`STANDALONE_STORES`] order, so neither changes the canonical bytes
     /// or the digests made from them.
-    pub(crate) fn canonicalize(&self, document: &mut JsonValue) {
+    pub(crate) fn canonicalize(&self, document: &mut serde_json::Value) {
         for setting in &self.values {
             let SettingValue::Decimal(decimal) = &setting.value else {
                 continue;
@@ -271,14 +284,14 @@ impl Settings {
                 .document_path()
                 .and_then(|path| document.pointer_mut(path));
             if let Some(slot) = slot {
-                *slot = JsonValue::String(decimal.canonical().to_owned());
+                *slot = serde_json::Value::String(decimal.canonical().to_owned());
             }
         }
         if let (Some(stores), Some(slot)) = (&self.stores, document.pointer_mut(STORES_PATH)) {
-            *slot = JsonValue::Array(
+            *slot = serde_json::Value::Array(
                 stores
                     .iter()
-                    .map(|store| JsonValue::String((*store).to_owned()))
+                    .map(|store| serde_json::Value::String((*store).to_owned()))
                     .collect(),
             );
         }

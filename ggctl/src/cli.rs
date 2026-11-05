@@ -252,8 +252,9 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         description: &[
             "Reads the bundle in the directory BUNDLE with the gateway's own bundle reader and \
              reports every problem it finds: unsafe files and bounds, the YAML subset and strict \
-             JSON, exact document versions, closed documents, references and SHA-256 pins, the \
-             published policy and tools schemas, and the deployment profile's policy invariants. \
+             JSON, exact document versions, closed documents, the deployment settings' types and \
+             their own bounds, references and SHA-256 pins, the published policy and tools \
+             schemas, and the deployment profile's policy invariants. \
              It makes no network request, reads no environment variable and writes nothing.",
             "The gateway's production policy and tools validators are not part of ggctl and do \
              not run, and the report says so. Exits 0 for a valid bundle, 3 for an invalid one \
