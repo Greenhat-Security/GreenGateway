@@ -22,7 +22,7 @@ rechecks permission and current state for every operation.
 | `admin:connections:secrets:write` | List safe secret-alias metadata; create/rotate/delete local secrets; bind, replace, clear, or redirect credential/TLS authority; declare or preview raw overlay source paths |
 | `admin:connections:test` | Run the saved bounded Connection test |
 | `admin:connections:refresh` | Refresh an enabled managed OpenAPI or MCP catalog |
-| `admin:tools:read` | View capability inventory and safe detail |
+| `admin:tools:read` | View capability inventory and safe detail; preview a Connection's OpenAPI catalog |
 | `admin:tools:write` | Register selected managed OpenAPI tools |
 | `admin:tools:execute` | Submit an eligible capability through the constrained playground |
 
@@ -147,6 +147,80 @@ was partially accepted.
 For OpenAPI, Preview requires tool-read authority and registration requires
 tool-write authority plus explicit selection and any required security
 confirmation. Name collisions fail instead of replacing an existing tool.
+
+## Import a catalog
+
+The detail page of a managed HTTP API Connection with managed OpenAPI
+discovery has an **Import a catalog** section. It previews and registers an
+OpenAPI 3.x, Swagger 2.0 or Google Discovery document, in JSON or YAML,
+through the same `POST /v1{ADMIN_PREFIX}/connections/{id}/openapi/preview`
+and `.../openapi/register` endpoints the admin API documents
+([admin-connections.v1](../openapi/admin-connections.v1.openapi.json)). A
+managed HTTP API Connection without that discovery shows how to enable it.
+
+1. **Submit a document.** Paste it, or upload a file. The page checks the
+   2 MiB limit, in UTF-8 bytes, before it reads a file or sends anything; the
+   gateway checks it again and stays authoritative. Preview stores nothing.
+   The page sends only the document, never a candidate overlay: when the
+   Connection has a stored [overlay](operator-guide.md#openapi-overlays), the
+   preview compiles it and says so, and registration publishes it.
+2. **Review the preview.** The page shows the detected format (OpenAPI 3.x,
+   or Swagger 2.0 or Google Discovery converted to OpenAPI 3.0) and each
+   conversion warning by its code, operation and subject. Its tool table
+   lists every generated tool with its method and path and the security
+   alternative it binds to. An operation that cannot be registered is listed
+   with its reason and, for each of its alternatives, why it does not bind
+   and the scopes the Connection does not request. Skipped operations and
+   generated tool names follow. See
+   [Importing Swagger 2.0 Documents](operator-guide.md#importing-swagger-20-documents)
+   and
+   [Importing Google Discovery Documents](operator-guide.md#importing-google-discovery-documents)
+   for what each warning means.
+3. **Select tools.** A preview starts with only the bindable `GET` and
+   `HEAD` tools selected. The page never selects another method for you, and
+   it warns when your selection includes one. Incompatible operations and
+   the stored overlay's composites cannot be selected.
+4. **Confirm.** The page lists the security alternative each selected tool
+   sends the Connection's credential for. **Register** stays disabled until
+   you confirm them, and every change to the selection withdraws the
+   confirmation.
+5. **Register.** The request sends the previewed document again with
+   exactly the reviewed `spec_digest`, `expected_spec_revision` and
+   `expected_catalog_revision`, a security confirmation for each selected
+   tool and nothing else, and the preview's ETag as `If-Match`.
+
+To give agents read access only, narrow the Connection's scopes first and
+the selection second, as
+[Selecting read operations](operator-guide.md#selecting-read-operations)
+describes; [Security binding and read-only selection](operator-guide.md#security-binding-and-read-only-selection)
+explains which credential binds which scheme.
+
+Preview requires `admin:tools:read`, and also
+`admin:connections:secrets:write` when the stored overlay declares raw source
+paths; registration requires `admin:tools:write`. A principal without
+`admin:tools:write` can preview but sees no **Register** control.
+
+A `412` (the Connection changed after the preview) or a `409` with reason
+`stale_preview` (its stored catalog or document changed) discards the
+preview: preview the document again and review the new result. Every other
+refusal is shown by its reason code with a fixed explanation, never with the
+gateway's error text or anything from the document. Among them, all `409`:
+
+- `capability_not_advertised`: in cluster mode a live replica does not yet
+  support catalogs converted from Swagger 2.0 or Google Discovery. Nothing
+  was stored; finish the rolling upgrade and register again.
+- `authentication_not_supported`: no managed OpenAPI tool sends this
+  Connection's credential, as for every
+  [Google domain-wide delegation](operator-guide.md#google-domain-wide-delegation)
+  Connection.
+- `caller_assertion_not_enforced`: the gateway cannot attest the caller on
+  this path. A [delegated issuer token](operator-guide.md#delegated-issuer-tokens)
+  Connection registers an uploaded document only, because a fetch from the
+  upstream has no caller to exchange for.
+- `connection_disabled`: enable the Connection first.
+
+If the page says the registration outcome is unknown, the catalog may have
+been published: reload the Connection before registering again.
 
 ## Capability Inventory
 

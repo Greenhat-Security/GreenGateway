@@ -35,10 +35,26 @@ No async runtime, DNS lookup, provider request or upstream connection starts.
 This covers pure decoding, not the complete authentication flow.
 
 Numeric `exp` and `nbf` in generated claim fragments map to fixed distant
-timestamps. This does not fuzz negative/fractional numeric timestamp semantics
-or the current-clock leeway boundary. Missing and nonnumeric claims remain
-unchanged. The positive fixture expires in 2100; the forced future-not-before
-fixture is in 2200. Review these explicit dates before 2100.
+timestamps, so corpus bytes never reach the current-clock leeway edge or a
+negative, fractional or out-of-range numeric spelling. Missing and nonnumeric
+claims remain unchanged. The positive fixture expires in 2100; the forced
+future-not-before fixture is in 2200. Review these explicit dates before 2100.
+
+Deterministic tests cover what that mapping skips, against the same
+`JwtValidator::decode_with_key` (jsonwebtoken 11.1.0, `JWT_EXP_LEEWAY_SECS` =
+60, `nbf` validated); see
+[JWT time claims](pure-parser-properties.md#jwt-time-claims) for what they
+pin:
+
+| Test | Covers |
+| --- | --- |
+| `auth::jwt::tests::an_exp_inside_the_leeway_is_accepted_and_one_past_it_is_rejected` | `exp` 10 seconds inside and outside `now - leeway` |
+| `auth::jwt::tests::an_nbf_inside_the_leeway_is_accepted_and_one_past_it_is_rejected` | `nbf` 10 seconds inside and outside `now + leeway` |
+| `auth::jwt::tests::malformed_numeric_exp_and_nbf_fail_closed_with_the_generic_error` | negative, fractional, exponent-form, string, `null` and past-`u64::MAX` `exp` and `nbf` |
+| `storage::postgres_jwt_revocations::tests::retention_is_the_validator_exp_leeway_plus_at_least_a_second` | PostgreSQL revocation retention = leeway + a margin of at least one second |
+
+They are fixed examples, not corpus inputs: the corpus seeds, mutation counts
+and their mapping are unchanged.
 
 ## Run and reproduce
 

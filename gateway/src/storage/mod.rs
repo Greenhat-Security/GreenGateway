@@ -40,6 +40,10 @@ pub mod migrations;
 /// expiring candidate workspace and its standalone SQLite adapter.
 pub mod policy_drafts;
 mod policy_history;
+/// The stored policy test suite (issue #243): the versioned
+/// `policy-tests.v1` resource beside the policy, and its standalone SQLite
+/// adapter.
+pub(crate) mod policy_tests;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 #[cfg(feature = "postgres")]
@@ -77,6 +81,8 @@ pub mod postgres_policy;
 #[cfg(feature = "postgres")]
 pub mod postgres_policy_drafts;
 #[cfg(feature = "postgres")]
+pub(crate) mod postgres_policy_tests;
+#[cfg(feature = "postgres")]
 pub mod postgres_rate_limits;
 #[cfg(feature = "postgres")]
 pub mod postgres_service_tokens;
@@ -105,6 +111,7 @@ pub use policy_history::{
     ActivePolicy, PolicyCommitError, PolicyCommitPrecondition, PolicyCommitRequest,
     PolicyControlPlane,
 };
+pub(crate) use policy_tests::{PolicyTestSuiteStore, SqlitePolicyTestSuiteStore};
 #[cfg(feature = "postgres")]
 pub use postgres_delegated_token_purges::PostgresDelegatedTokenPurgeStore;
 #[cfg(feature = "postgres")]

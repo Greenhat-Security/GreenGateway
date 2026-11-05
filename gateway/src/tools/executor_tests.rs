@@ -7120,6 +7120,7 @@ fn invocation_context() -> ToolInvocationContext {
         actor: None,
         source: ToolInvocationSource::Internal,
         organization: None,
+        source_address: None,
         caller: None,
         admitted_deadline: None,
     }
@@ -7138,6 +7139,7 @@ fn invocation_context_with_roles(roles: &[&str]) -> ToolInvocationContext {
         }),
         source: ToolInvocationSource::Internal,
         organization: None,
+        source_address: None,
         caller: None,
         admitted_deadline: None,
     }

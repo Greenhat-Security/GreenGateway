@@ -300,6 +300,8 @@ impl StartupStages for ProcessStartup {
             #[cfg(test)]
             egress_resolver: None,
             #[cfg(test)]
+            egress_tls_ca_bundle_path: None,
+            #[cfg(test)]
             pending_login_backend: None,
             #[cfg(test)]
             request_selection_count: None,
