@@ -106,6 +106,14 @@ RETURNING id
 /// caller read its revision as, who is accepting, and the fully validated
 /// policy commit (candidate, expected ETag, actor, diff summary) that
 /// installs the proposed rule.
+///
+/// The acceptance commits the whole candidate document, so the caller asks
+/// the cluster's operation gate for it first, as for every policy commit
+/// (`admin_policy::admit_policy_document`): over a policy v1 document that
+/// is `policy.document_v1`, and with a role description
+/// `policy.role_descriptions`. A refusal there writes nothing, here
+/// included. [`postgres_policy::commit_policy_in`] still refuses a
+/// document format no replica of this build serves.
 pub struct AcceptSuggestionRequest<'a> {
     pub suggestion_id: &'a str,
     /// The suggestion revision the caller read (`If-Match`-style); `None`

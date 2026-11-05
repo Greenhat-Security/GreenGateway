@@ -332,6 +332,16 @@ pub(crate) enum ImportError {
     TargetDeploymentMismatch {
         bound: String,
     },
+    /// The cluster's operation gate, asked as a one-shot command, refused
+    /// an operation this import performs (issue #243): a live replica of
+    /// the target deployment does not advertise that it can read what the
+    /// import would write, or the gate could not decide. `reason` is the
+    /// gate's stable reason; nothing was written.
+    TargetOperationRefused {
+        operation: &'static str,
+        reason: &'static str,
+        detail: String,
+    },
     /// The target namespace already holds authoritative state. `occupied`
     /// names the tables and counters, never their contents.
     TargetNamespaceNotEmpty {
@@ -376,6 +386,7 @@ impl ImportError {
             Self::TargetUnavailable { .. } => "target_unavailable",
             Self::TargetSchemaNotCurrent { .. } => "target_schema_not_current",
             Self::TargetDeploymentMismatch { .. } => "target_deployment_mismatch",
+            Self::TargetOperationRefused { .. } => "target_operation_refused",
             Self::TargetNamespaceNotEmpty { .. } => "target_namespace_not_empty",
             Self::SectionConflict { .. } => "section_conflict",
             Self::SectionFailed { .. } => "section_failed",
@@ -448,6 +459,14 @@ impl fmt::Display for ImportError {
             Self::TargetDeploymentMismatch { bound } => write!(
                 formatter,
                 "the target database is bound to deployment '{bound}'"
+            ),
+            Self::TargetOperationRefused {
+                operation,
+                reason,
+                detail,
+            } => write!(
+                formatter,
+                "the target deployment's operation gate refused '{operation}' ({reason}): {detail}"
             ),
             Self::TargetNamespaceNotEmpty { occupied } => write!(
                 formatter,
@@ -626,6 +645,17 @@ pub(crate) async fn run(
     };
     let pool = foundation.pool().clone();
     let schema = preflight::verify_target(&pool, &deployment_id, request.mode).await?;
+    // A policy v1 document, active or in history, is a gated write: every
+    // live replica of the target must read format 1 (issue #243).
+    if source.writes_policy_document_v1() {
+        preflight::live_members_admit(
+            &pool,
+            &deployment_id,
+            target.cluster_member_stale_window(),
+            &crate::storage::compatibility::POLICY_DOCUMENT_V1,
+        )
+        .await?;
+    }
 
     let policy = sections::PolicySection::plan(&source)?;
     let tools = sections::ToolsSection::plan(&source)?;

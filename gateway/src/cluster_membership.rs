@@ -101,12 +101,15 @@ use crate::{
 };
 
 /// The policy/tools document schema range this binary enforces, in
-/// major versions. A cluster replica serves only a 0.x policy document
-/// (`rbac/policy_document.rs`; policy v1, format 1, is standalone-only
-/// until a capability lets every replica agree to read it), and the tools
-/// document rides the same major; the range is advertised so a rolling
+/// major versions. A cluster replica serves a 0.x policy document (format
+/// 0) and a policy v1 document (format 1, `rbac/policy_document.rs`), and
+/// the tools document rides major 0; the range is advertised so a rolling
 /// window can tell a document-format change apart from a schema change.
-pub(crate) const DOCUMENT_VERSION_RANGE: (i32, i32) = (0, 0);
+/// A replica of a build that advertised `(0, 0)` refuses a v1 document, so
+/// committing one is the gated operation `policy.document_v1`
+/// (`storage::compatibility::POLICY_DOCUMENT_V1`), admitted only while
+/// every live member reads format 1.
+pub(crate) const DOCUMENT_VERSION_RANGE: (i32, i32) = (0, 1);
 
 /// How long the draining stamp may take once the lifecycle cancels
 /// background work: bounded, so a slow authority cannot hold shutdown.
@@ -379,7 +382,8 @@ impl ClusterMembership {
     /// unless it admits; answer a refusal with its reason. Only an
     /// operation in `OPERATION_REQUIREMENTS` can be admitted, so an ad hoc
     /// requirement cannot bypass the registry's review. The policy commit
-    /// paths call it for a document with role descriptions (PR 2). An
+    /// paths call it for a document with role descriptions (PR 2) and for a
+    /// policy v1 document (issue #243). An
     /// operation declaring a durable fence is admitted only by raising the
     /// contract fence first (PR 3), which outlives a write that then fails:
     /// the fence records that the operation was activated, not that it
@@ -392,6 +396,26 @@ impl ClusterMembership {
     ) -> Result<OperationAdmission, OperationRefusal> {
         self.admit_registered(requirement, OPERATION_REQUIREMENTS, audit, request)
             .await
+    }
+
+    /// Whether [`Self::admit_operation`] would admit a live-member
+    /// operation now, for a read-only surface that reports it in advance
+    /// (`POST .../policy/validate`). The same registry check, reads and pure
+    /// decision, without the effects: nothing is audited or logged as a
+    /// refusal, and the durable fence is never raised, so a durable-fence
+    /// operation is answered `operation_not_supported` rather than predicted.
+    /// Admission is never sticky, so the answer binds nothing: the write
+    /// asks the gate again.
+    pub(crate) async fn check_operation(
+        &self,
+        requirement: &OperationRequirement,
+    ) -> Result<OperationAdmission, OperationRefusal> {
+        if !OPERATION_REQUIREMENTS.contains(requirement)
+            || requirement.activation != Activation::LiveMembers
+        {
+            return Err(OperationRefusal::NotSupportedByThisBinary);
+        }
+        self.evaluate_on_live_members(requirement).await
     }
 
     /// [`Self::admit_operation`] against an explicit registry, so the
