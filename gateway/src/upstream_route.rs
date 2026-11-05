@@ -49,15 +49,11 @@ pub(crate) fn greenpm_research_operation(
     }
 }
 
-pub(crate) const STABLE_ROUTE_ID_MAX_LEN: usize = 64;
-
-pub(crate) fn is_valid_stable_route_id(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= STABLE_ROUTE_ID_MAX_LEN
-        && value.bytes().enumerate().all(|(index, byte)| {
-            byte.is_ascii_alphanumeric() || (index > 0 && matches!(byte, b'.' | b'_' | b'-'))
-        })
-}
+// The stable route ID grammar the configuration compiler shares with `ggctl`
+// (issue #242).
+pub(crate) use gateway_config::upstream_route::{
+    is_valid_stable_route_id, STABLE_ROUTE_ID_MAX_LEN,
+};
 
 pub(crate) trait RouteMatch {
     fn path_prefix(&self) -> Option<&str>;

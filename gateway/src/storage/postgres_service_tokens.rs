@@ -20,17 +20,20 @@
 //!   `WHERE`, so it either finds a live row and touches it, or finds
 //!   nothing and reports why -- there is no window in which it touches a
 //!   row a revoke has closed.
-//! - **Every committed rotate and revoke names who made it.** Beside its
-//!   outbox row, each writes one `service_token_change_evidence` row
-//!   (migration 18): the actor (its subject, and since migration 24 its
-//!   kind, auth mode and canonical issuer), action, generated event and
-//!   operation IDs, the token's row revision before and after, the shared
+//! - **Every committed issue, rotate and revoke names who made it.** Beside
+//!   its outbox row, each writes one `service_token_change_evidence` row
+//!   (migration 18; the issue since migration 27): the actor (its subject,
+//!   and since migration 24 its kind, auth mode and canonical issuer),
+//!   action, generated event and operation IDs, the token's row revision
+//!   before and after (none before an issue, and 1 after it), the shared
 //!   revision the change took and the database clock's commit time. It has
 //!   no foreign key, so it outlives the token row, and it holds no token
-//!   material. The same transaction journals it for delivery (migration 21,
+//!   material: never the plaintext a create or rotate returns, nor its hash.
+//!   The same transaction journals it for delivery (migration 21,
 //!   `postgres_authority_events`), reserving journal capacity. If either
 //!   cannot be written, or the journal is full, the change rolls back; a
-//!   repeat revoke or a refused rotate writes none.
+//!   repeat revoke or a refused rotate writes none. A token created before
+//!   migration 27 has no issue row: its `created_by` is its only record.
 //!
 //! Lock order, identical in every mutating path so no two paths can
 //! deadlock: (1) `service_token_state_revision` `FOR UPDATE`, which
@@ -163,7 +166,11 @@ impl PostgresServiceTokenStore {
 
 #[async_trait]
 impl ServiceTokenStore for PostgresServiceTokenStore {
-    async fn create(&self, request: CreateTokenRequest) -> Result<CreatedToken, RepositoryError> {
+    async fn create(
+        &self,
+        request: CreateTokenRequest,
+        actor: &ChangeActor,
+    ) -> Result<CreatedToken, RepositoryError> {
         // A malformed expiry is the caller's input, answered 400 by the
         // admin API through the parameter-carrying classification; it is
         // rejected before any connection is taken.
@@ -177,6 +184,8 @@ impl ServiceTokenStore for PostgresServiceTokenStore {
                 "created_by",
             ));
         }
+        validate_change_actor(OPERATION_CREATE, actor)?;
+        let operation_id = uuid::Uuid::new_v4();
         let plaintext_token = generate_plaintext_token()
             .map_err(|error| map_helper_error(OPERATION_CREATE, error))?;
         let token_hash = hash_token(&plaintext_token);
@@ -222,6 +231,22 @@ impl ServiceTokenStore for PostgresServiceTokenStore {
                 &id,
                 None,
                 raw.revision,
+            )
+            .await?;
+            // The issue's evidence: no prior revision, the row's first one,
+            // and the outbox row's shared revision. The plaintext and its
+            // hash stay out of it.
+            record_change_evidence(
+                &client,
+                &ChangeEvidence {
+                    operation_id,
+                    action: crate::auth::tokens::TOKEN_CHANGE_ACTION_ISSUE,
+                    token_id: &id,
+                    prior_version: None,
+                    new_version: raw.revision,
+                    security_revision,
+                    actor,
+                },
             )
             .await?;
             Ok(raw.record)
@@ -366,7 +391,7 @@ impl ServiceTokenStore for PostgresServiceTokenStore {
                     operation_id,
                     action: crate::auth::tokens::TOKEN_CHANGE_ACTION_REVOKE,
                     token_id: id,
-                    prior_version: current.revision,
+                    prior_version: Some(current.revision),
                     new_version: revoked.revision,
                     security_revision,
                     actor,
@@ -439,7 +464,7 @@ impl ServiceTokenStore for PostgresServiceTokenStore {
                     operation_id,
                     action: crate::auth::tokens::TOKEN_CHANGE_ACTION_ROTATE,
                     token_id: id,
-                    prior_version: current.revision,
+                    prior_version: Some(current.revision),
                     new_version: rotated.revision,
                     security_revision,
                     actor,
@@ -682,11 +707,13 @@ fn validate_change_actor(
 
 /// One committed change's evidence: identifiers, revisions and the actor,
 /// never the plaintext, hash, prefix or scopes of the token it describes.
+/// `prior_version` is `None` exactly for an issue, whose `new_version` is the
+/// row's first revision; migration 27's CHECK holds the same rule.
 struct ChangeEvidence<'a> {
     operation_id: uuid::Uuid,
     action: &'static str,
     token_id: &'a str,
-    prior_version: i64,
+    prior_version: Option<i64>,
     new_version: i64,
     security_revision: i64,
     actor: &'a ChangeActor,
