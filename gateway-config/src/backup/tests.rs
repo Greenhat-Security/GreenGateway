@@ -1294,3 +1294,5 @@ fn errors_are_value_free_and_name_only_codes_stores_and_positions() {
     assert!(!refused.to_string().contains(CANARY));
     assert!(!format!("{refused:?}").contains(CANARY));
 }
+
+mod restore;

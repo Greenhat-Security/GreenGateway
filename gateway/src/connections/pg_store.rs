@@ -842,11 +842,13 @@ impl PostgresConnectionStore {
     /// per-entry managed-tool dependency replacement, and -- the cluster
     /// addition -- the shared security revision, the connections
     /// high-water mark, the outbox row and the replacement's durable
-    /// evidence (`catalog_change_evidence`, migration 23), all in the one
-    /// transaction. The evidence outlives the catalog row it describes,
-    /// which the next replacement deletes and a Connection delete cascades;
-    /// a refused or failed replacement writes none, and a replacement whose
-    /// evidence cannot be written does not commit.
+    /// evidence (`catalog_change_evidence`, migration 23, with the whole
+    /// actor since migration 25), all in the one transaction. The evidence
+    /// outlives the catalog row it describes, which the next replacement
+    /// deletes and a Connection delete cascades; a refused or failed
+    /// replacement writes none, and a replacement whose evidence cannot be
+    /// written does not commit. The catalog row itself keeps the actor's
+    /// subject, as before.
     #[allow(clippy::too_many_arguments)]
     pub async fn replace_mcp_catalog(
         &self,
@@ -856,9 +858,10 @@ impl PostgresConnectionStore {
         resources: &[StoredMcpResource],
         resource_templates: &[StoredMcpResourceTemplate],
         expected_catalog_revision: u64,
-        actor_user_id: &str,
+        actor: &crate::auth::change_actor::ChangeActor,
     ) -> Result<StoredMcpCatalog, ConnectionStoreError> {
-        validate_catalog_evidence_actor(actor_user_id)?;
+        validate_evidence_actor(actor)?;
+        let actor_user_id = actor.subject();
         let validated = validate_mcp_catalog(id, entries, resources, resource_templates)?;
         let now = utc_timestamp()?;
         let operation_id = uuid::Uuid::new_v4();
@@ -1137,7 +1140,7 @@ impl PostgresConnectionStore {
                     new_version: catalog_revision,
                     overlay_revision: None,
                     security_revision,
-                    actor_user_id,
+                    actor,
                 },
             )
             .await?;
@@ -1591,7 +1594,7 @@ impl PostgresConnectionStore {
         spec: &str,
         spec_digest: &str,
         entries: &[StoredOpenApiCatalogEntry],
-        actor_user_id: &str,
+        actor: &crate::auth::change_actor::ChangeActor,
     ) -> Result<StoredOpenApiCatalog, ConnectionStoreError> {
         self.replace_openapi_catalog_with_overlay(
             id,
@@ -1603,7 +1606,7 @@ impl PostgresConnectionStore {
             entries,
             None,
             0,
-            actor_user_id,
+            actor,
             &[],
         )
         .await
@@ -1621,7 +1624,7 @@ impl PostgresConnectionStore {
         entries: &[StoredOpenApiCatalogEntry],
         overlay: Option<&StoredOverlayWrite>,
         compiled_overlay_revision: u64,
-        actor_user_id: &str,
+        actor: &crate::auth::change_actor::ChangeActor,
         policy_protected_names: &[String],
     ) -> Result<StoredOpenApiCatalog, ConnectionStoreError> {
         self.replace_openapi_catalog_with_overlay_and_enum_values(
@@ -1634,7 +1637,7 @@ impl PostgresConnectionStore {
             entries,
             overlay,
             compiled_overlay_revision,
-            actor_user_id,
+            actor,
             policy_protected_names,
             &[],
         )
@@ -1644,11 +1647,11 @@ impl PostgresConnectionStore {
     /// The OpenAPI catalog replacement every OpenAPI publication goes
     /// through: a registration, a refresh, and an overlay put or delete.
     /// Like the MCP replacement it commits its durable evidence
-    /// (`catalog_change_evidence`, migration 23) in the same transaction,
-    /// named by what the write did to the overlay: an overlay put is
-    /// `catalog.overlay.replace`, an overlay delete `catalog.overlay.delete`,
-    /// and anything else (no overlay change, or only refreshed source
-    /// reports) `catalog.openapi.publish`.
+    /// (`catalog_change_evidence`, migration 23, with the whole actor since
+    /// migration 25) in the same transaction, named by what the write did to
+    /// the overlay: an overlay put is `catalog.overlay.replace`, an overlay
+    /// delete `catalog.overlay.delete`, and anything else (no overlay change,
+    /// or only refreshed source reports) `catalog.openapi.publish`.
     #[allow(clippy::too_many_arguments)]
     pub async fn replace_openapi_catalog_with_overlay_and_enum_values(
         &self,
@@ -1661,11 +1664,12 @@ impl PostgresConnectionStore {
         entries: &[StoredOpenApiCatalogEntry],
         overlay: Option<&StoredOverlayWrite>,
         compiled_overlay_revision: u64,
-        actor_user_id: &str,
+        actor: &crate::auth::change_actor::ChangeActor,
         policy_protected_names: &[String],
         enum_values: &[StoredEnumSourceValueWrite],
     ) -> Result<StoredOpenApiCatalog, ConnectionStoreError> {
-        validate_catalog_evidence_actor(actor_user_id)?;
+        validate_evidence_actor(actor)?;
+        let actor_user_id = actor.subject();
         let evidence_action = match overlay {
             Some(StoredOverlayWrite::Put { .. }) => CATALOG_EVIDENCE_ACTION_OVERLAY_REPLACE,
             Some(StoredOverlayWrite::Delete { .. }) => CATALOG_EVIDENCE_ACTION_OVERLAY_DELETE,
@@ -1999,7 +2003,7 @@ impl PostgresConnectionStore {
                     new_version: catalog_revision,
                     overlay_revision: Some(overlay_revision),
                     security_revision,
-                    actor_user_id,
+                    actor,
                 },
             )
             .await?;
@@ -5077,10 +5081,11 @@ const _: () =
 const OPERATION_CHANGE_EVIDENCE: &str = "change_evidence_append";
 
 /// An unattributable change has no evidence to record, so it is refused
-/// before any transaction opens rather than committed anonymously. An
+/// before any transaction opens rather than committed anonymously: a
+/// Connection delete and every catalog replacement call this first. An
 /// authenticated principal always satisfies this
 /// ([`crate::auth::change_actor::ChangeActor::is_recordable`]); the CHECKs
-/// in migrations 16 and 24 are the backstop.
+/// in migrations 16, 23, 24 and 25 are the backstop.
 fn validate_evidence_actor(
     actor: &crate::auth::change_actor::ChangeActor,
 ) -> Result<(), ConnectionStoreError> {
@@ -5089,20 +5094,6 @@ fn validate_evidence_actor(
             problems: vec![format!(
                 "the change actor must be between 1 and {EVIDENCE_ACTOR_MAX_BYTES} bytes, and only a principal may carry an issuer, of at most {} bytes",
                 crate::auth::principal::MAX_PRINCIPAL_ISSUER_BYTES
-            )],
-        });
-    }
-    Ok(())
-}
-
-/// The same refusal for a catalog change, whose evidence (migration 23)
-/// records the actor's subject alone. An authenticated principal always
-/// satisfies this; the CHECK in migration 23 is the backstop.
-fn validate_catalog_evidence_actor(actor_user_id: &str) -> Result<(), ConnectionStoreError> {
-    if actor_user_id.is_empty() || actor_user_id.len() > EVIDENCE_ACTOR_MAX_BYTES {
-        return Err(ConnectionStoreError::Validation {
-            problems: vec![format!(
-                "the change actor must be between 1 and {EVIDENCE_ACTOR_MAX_BYTES} bytes"
             )],
         });
     }
@@ -5223,14 +5214,17 @@ struct CatalogChangeEvidence<'a> {
     /// from (`0` for none); `None` for MCP catalogs, which have no overlay.
     overlay_revision: Option<u64>,
     security_revision: i64,
-    actor_user_id: &'a str,
+    actor: &'a crate::auth::change_actor::ChangeActor,
 }
 
 /// Append one catalog evidence row inside the caller's transaction. The
 /// row's `event_id` is minted here, once; `committed_at` is the database
-/// clock's. Any failure is returned for the caller to roll back, so the
-/// publication it describes never commits without it. A failed insert is
-/// counted here, as the journaled producers count theirs.
+/// clock's. The actor is recorded whole, as [`record_change_evidence`]
+/// records it: subject, canonical issuer, kind and auth mode, in migration
+/// 25's columns under migration 24's pairing CHECK. Any failure is returned
+/// for the caller to roll back, so the publication it describes never
+/// commits without it. A failed insert is counted here, as the journaled
+/// producers count theirs.
 async fn record_catalog_change_evidence(
     client: &deadpool_postgres::Object,
     evidence: &CatalogChangeEvidence<'_>,
@@ -5250,16 +5244,21 @@ async fn record_catalog_change_evidence(
         .execute(
             r#"
             INSERT INTO greengateway.catalog_change_evidence (
-                event_id, operation_id, actor_user_id, action, connection_id,
-                prior_version, new_version, overlay_revision, security_revision
+                event_id, operation_id, actor_user_id, actor_issuer, actor_kind,
+                actor_auth_mode, action, connection_id, prior_version, new_version,
+                overlay_revision, security_revision
             ) VALUES (
-                $1::text::uuid, $2::text::uuid, $3, $4, $5::text::uuid, $6, $7, $8, $9
+                $1::text::uuid, $2::text::uuid, $3, $4, $5, $6, $7, $8::text::uuid, $9, $10,
+                $11, $12
             )
             "#,
             &[
                 &event_id,
                 &operation_id,
-                &evidence.actor_user_id,
+                &evidence.actor.subject(),
+                &evidence.actor.issuer(),
+                &evidence.actor.kind().as_str(),
+                &evidence.actor.auth_mode(),
                 &evidence.action,
                 &evidence.id.as_str(),
                 &prior_version,

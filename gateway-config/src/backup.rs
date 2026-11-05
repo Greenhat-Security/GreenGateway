@@ -1,6 +1,7 @@
 //! Standalone backups (issue #242; ADR-0008, "Backup and restore"):
 //! [`create`] writes one archive of a standalone state directory's stores,
-//! and [`verify`] reads one back completely.
+//! [`verify`] reads one back completely, and [`restore`] puts one in place
+//! of an empty or prepared state directory, or leaves it as it was.
 //!
 //! A backup is sensitive recovery material, not configuration: it holds the
 //! audit trail, the principal directory, discovery data, service token
@@ -48,6 +49,13 @@
 //! ledger's full verification and hold the revisions the manifest names.
 //! The staging directory is removed whatever the outcome.
 //!
+//! **Restore** (`restore`) extracts and verifies the archive exactly as
+//! verify does, but into a staging directory beside the target state
+//! directory, checks what it staged further, writes the restore marker
+//! (`marker`) the next gateway start records and removes, and only then
+//! switches the staging directory into the target's place by renames, or
+//! leaves the target as it was.
+//!
 //! Every error is value-free: a stable code and, at most, the store it
 //! concerns or an archive entry's position. A digest is integrity evidence,
 //! not authenticity: whoever can write an archive can write a consistent
@@ -55,6 +63,8 @@
 
 mod container;
 mod manifest;
+mod marker;
+mod restore;
 mod store;
 
 #[cfg(test)]
@@ -90,6 +100,8 @@ use manifest::{
     ProducerRecord, StoreRecord,
 };
 pub use manifest::{ARCHIVE_FORMAT, MANIFEST_ENTRY, MAX_MANIFEST_BYTES, SOURCE_STANDALONE};
+pub use marker::{acknowledge_restore_marker, read_restore_marker, MarkerError, RestoreMarker};
+pub use restore::{restore, RestoreError, RestoreRequest, RestoreSummary, RestoreWarning};
 use store::SqliteFailure;
 
 /// The most bytes one entry may hold.
@@ -264,6 +276,9 @@ pub enum BackupError {
     Refused(ArchiveRefusal),
     /// The file is not a backup archive.
     NotABackup,
+    /// The file is a PostgreSQL dump: cluster state is restored with #241's
+    /// runbooks, never through a standalone backup.
+    PostgresDump,
     /// A backup archive of a container version this build does not read.
     UnsupportedArchiveVersion,
     /// The first entry is not the manifest.
@@ -309,6 +324,7 @@ impl BackupError {
             Self::StagingUnavailable => "backup.staging_unavailable",
             Self::Refused(refusal) => refusal.code.as_str(),
             Self::NotABackup => "backup.not_a_backup",
+            Self::PostgresDump => "backup.postgres_unsupported",
             Self::UnsupportedArchiveVersion => "backup.unsupported_archive_version",
             Self::ManifestMissing => "backup.manifest_missing",
             Self::ManifestInvalid => "backup.manifest_invalid",
@@ -779,10 +795,13 @@ enum LedgerCheck {
 
 /// Verifies the ledger copy in `directory`, which this process owns, as a
 /// gateway does at start, and records its state.
+///
+/// The copy is verified through a read-only connection, so its bytes stay
+/// exactly the ones the archive's checksum covers: a restore moves them into
+/// place unchanged.
 fn ledger_record(directory: &Path) -> Result<LedgerRecord, LedgerCheck> {
     let held = StateDirectory::acquire(directory).map_err(|_| LedgerCheck::Unavailable)?;
-    let mut ledger = RevisionLedger::open(&held).map_err(ledger_check)?;
-    let state = ledger.state().map_err(ledger_check)?;
+    let state = RevisionLedger::inspect(&held).map_err(ledger_check)?;
     Ok(LedgerRecord {
         revisions: state.revisions,
         desired: state.desired.revision.as_str().to_owned(),
@@ -881,6 +900,7 @@ fn container_error(error: ContainerError) -> BackupError {
     match error {
         ContainerError::Refused(refusal) => BackupError::Refused(refusal),
         ContainerError::NotABackup => BackupError::NotABackup,
+        ContainerError::PostgresDump => BackupError::PostgresDump,
         ContainerError::UnsupportedVersion => BackupError::UnsupportedArchiveVersion,
         ContainerError::DigestMismatch => BackupError::ArchiveDigestMismatch,
     }
