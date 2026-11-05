@@ -28,8 +28,11 @@ impl AuthMethod {
 // Issuer canonicalization and the issuer bound, which the configuration
 // compiler shares with `ggctl` (issue #242).
 pub(crate) use gateway_config::auth::{
-    canonical_issuer, provider_issuer, MAX_PRINCIPAL_ISSUER_BYTES, PROVIDER_ISSUER_PREFIX,
+    canonical_issuer, provider_issuer, MAX_PRINCIPAL_ISSUER_BYTES,
 };
+// The verified-claim allowlist bounds, which the configuration compiler
+// holds `AUTH_PROVIDERS` to (issue #243).
+pub(crate) use gateway_config::auth::{MAX_VERIFIED_CLAIMS, MAX_VERIFIED_CLAIM_NAME_BYTES};
 
 /// Authenticated caller identity used for authorization and audit attribution.
 ///
@@ -97,11 +100,6 @@ pub(crate) const MAX_PRINCIPAL_SUBJECT_BYTES: usize = 4096;
 pub(crate) const MAX_PRINCIPAL_SCOPES: usize = 256;
 /// Longest OAuth scope, in bytes.
 pub(crate) const MAX_PRINCIPAL_SCOPE_BYTES: usize = 256;
-/// Most claim names one provider's `verified_claims` allowlist may list, and
-/// so the most verified claims a principal carries.
-pub(crate) const MAX_VERIFIED_CLAIMS: usize = 16;
-/// Longest allowlisted claim name or dotted claim path, in bytes.
-pub(crate) const MAX_VERIFIED_CLAIM_NAME_BYTES: usize = 256;
 /// Most values a verified claim may carry: the elements of a list claim.
 pub(crate) const MAX_VERIFIED_CLAIM_VALUES: usize = 32;
 /// Longest verified claim string, in bytes.

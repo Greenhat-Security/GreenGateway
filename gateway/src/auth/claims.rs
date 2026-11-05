@@ -2,47 +2,12 @@ use serde_json::{Map, Value};
 
 use super::principal::{
     VerifiedClaim, MAX_PRINCIPAL_SCOPES, MAX_PRINCIPAL_SCOPE_BYTES, MAX_VERIFIED_CLAIMS,
-    MAX_VERIFIED_CLAIM_NAME_BYTES, MAX_VERIFIED_CLAIM_VALUES, MAX_VERIFIED_CLAIM_VALUE_BYTES,
+    MAX_VERIFIED_CLAIM_VALUES, MAX_VERIFIED_CLAIM_VALUE_BYTES,
 };
 
-/// Claim names no `verified_claims` allowlist may list, compared exactly.
-/// Each is already read some other way, or bounds the token rather than
-/// describing the caller: the issuer, subject and audience are the
-/// principal's identity and its binding; the validity instants and the token,
-/// session and nonce identifiers and hashes are credential metadata; `cnf`
-/// binds a proof-of-possession key; `scope` and `scp` are the scope fact; and
-/// `email` is display metadata, never a policy input.
-const RESERVED_CLAIM_NAMES: &[&str] = &[
-    "iss", "sub", "aud", "exp", "nbf", "iat", "jti", "sid", "nonce", "at_hash", "c_hash", "s_hash",
-    "cnf", "scope", "scp", "email",
-];
-
-/// Fragments, compared ASCII case-insensitively, that mark a claim name as
-/// one that can carry a credential.
-const CREDENTIAL_CLAIM_FRAGMENTS: &[&str] = &["token", "secret", "passw", "credential"];
-
-/// Why `name` cannot be a verified claim -- an allowlist entry, or the claim
-/// a `claim` condition reads -- or `None` when it can be.
-pub(crate) fn verified_claim_name_problem(name: &str) -> Option<&'static str> {
-    if name.is_empty() || name.len() > MAX_VERIFIED_CLAIM_NAME_BYTES {
-        return Some("must be 1 to 256 bytes");
-    }
-    if name.chars().any(char::is_control) || name.trim() != name {
-        return Some("must not contain control characters or leading or trailing whitespace");
-    }
-    let lowercase = name.to_ascii_lowercase();
-    if RESERVED_CLAIM_NAMES.contains(&name)
-        || CREDENTIAL_CLAIM_FRAGMENTS
-            .iter()
-            .any(|fragment| lowercase.contains(fragment))
-    {
-        return Some(
-            "names a claim that carries the principal's identity, scopes, email or credential \
-             metadata, which policy reads some other way or never",
-        );
-    }
-    None
-}
+// The claim-name check the configuration compiler holds a provider's
+// `verified_claims` allowlist to, shared with `ggctl` (issue #242).
+pub(crate) use gateway_config::auth::verified_claim_name_problem;
 
 /// An RFC 6749 `scope-token` of at most [`MAX_PRINCIPAL_SCOPE_BYTES`]:
 /// printable ASCII without space, `"` or `\`.
@@ -198,6 +163,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::auth::principal::MAX_VERIFIED_CLAIM_NAME_BYTES;
 
     #[test]
     fn resolve_claim_prefers_literal_key_before_dotted_path_segments() {

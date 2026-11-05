@@ -1,4 +1,18 @@
+use std::collections::HashMap;
+
+use gateway_config::connections::{
+    local_secret::MAX_LOCAL_SECRET_KEYRING_CONFIG_BYTES,
+    secret::MAX_OPERATOR_SECRET_ALIAS_CONFIG_BYTES,
+};
+
 use super::*;
+use crate::{
+    auth::{
+        principal::{canonical_issuer, MAX_PRINCIPAL_ISSUER_BYTES},
+        ClientCertIdentitySource,
+    },
+    inbound_tls::ClientCertRequirement,
+};
 
 #[test]
 fn valid_listen_addr_parses() {
@@ -169,7 +183,7 @@ fn admin_listen_addr_must_differ_from_listen_addr() {
     assert!(message.contains("ADMIN_LISTEN_ADDR must not be the same address as LISTEN_ADDR"));
     assert!(message.contains("both resolved to 127.0.0.1:9090"));
     assert!(message.contains("choose a different port for the admin listener"));
-    assert_eq!(error.problems.len(), 1);
+    assert_eq!(error.problems().len(), 1);
 
     let split_config = Config::from_env_vars(|name| match name {
         "LISTEN_ADDR" => Ok("127.0.0.1:9090".to_owned()),
@@ -628,7 +642,7 @@ fn invalid_listen_addr_is_rejected() {
     assert!(message.contains("not-a-socket"));
     assert!(message.contains("ADMIN_LISTEN_ADDR must be a valid socket address"));
     assert!(message.contains("also-not-a-socket"));
-    assert_eq!(error.problems.len(), 2);
+    assert_eq!(error.problems().len(), 2);
 }
 
 #[test]
@@ -920,7 +934,7 @@ fn invalid_admin_prefix_values_are_rejected() {
             message.contains("ADMIN_PREFIX must be a non-root URI path prefix"),
             "{message}"
         );
-        assert_eq!(error.problems.len(), 1);
+        assert_eq!(error.problems().len(), 1);
     }
 }
 
@@ -1032,7 +1046,7 @@ fn invalid_audit_sqlite_retention_is_collected_with_other_problems() {
     let message = error.to_string();
     assert!(message.contains("AUDIT_SQLITE_RETENTION_DAYS must be a valid day count"));
     assert!(message.contains("MAX_BODY_SIZE must be a valid byte size"));
-    assert_eq!(error.problems.len(), 2);
+    assert_eq!(error.problems().len(), 2);
 }
 
 #[test]
@@ -1066,7 +1080,7 @@ fn zero_global_upstream_and_egress_timeouts_are_rejected_like_route_timeouts() {
         message.contains("fails as a timeout"),
         "the rejection should explain why zero is refused: {message}"
     );
-    assert_eq!(error.problems.len(), 6);
+    assert_eq!(error.problems().len(), 6);
 }
 
 #[test]
@@ -1178,7 +1192,7 @@ fn zero_discovery_endpoint_limit_is_rejected() {
     assert!(error
         .to_string()
         .contains("DISCOVERY_ENDPOINT_LIMIT must be greater than 0, got '0'"));
-    assert_eq!(error.problems.len(), 1);
+    assert_eq!(error.problems().len(), 1);
 }
 
 #[test]
@@ -1469,7 +1483,7 @@ fn payload_capture_enabled_requires_discovery_sqlite_path() {
     assert!(
         message.contains("PAYLOAD_CAPTURE_ENABLED=true requires DISCOVERY_SQLITE_PATH to be set")
     );
-    assert_eq!(error.problems.len(), 1);
+    assert_eq!(error.problems().len(), 1);
 }
 
 #[test]
@@ -1490,7 +1504,7 @@ fn invalid_payload_capture_sample_rate_is_rejected() {
                 ),
                 "{message}"
             );
-        assert_eq!(error.problems.len(), 1);
+        assert_eq!(error.problems().len(), 1);
     }
 }
 
@@ -1535,7 +1549,7 @@ fn invalid_discovery_signal_thresholds_are_rejected() {
     assert!(message.contains("PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD must be greater than 0"));
     assert!(message
         .contains("VOLUME_OUTLIER_SIGNAL_THRESHOLD must be a finite number greater than 1.0"));
-    assert_eq!(error.problems.len(), 4);
+    assert_eq!(error.problems().len(), 4);
 }
 
 #[test]
@@ -1568,7 +1582,7 @@ fn invalid_rule_suggestion_baseline_window_is_rejected() {
             message.contains("RULE_SUGGESTION_BASELINE_WINDOW_HOURS must be between 1 and 876000"),
             "{message}"
         );
-        assert_eq!(error.problems.len(), 1);
+        assert_eq!(error.problems().len(), 1);
     }
 }
 
@@ -1833,7 +1847,7 @@ fn invalid_audit_durability_config_is_rejected_rather_than_defaulted() {
         message.contains("AUDIT_DURABILITY_TIMEOUT_MS must be between 1 and 60000"),
         "{message}"
     );
-    assert_eq!(error.problems.len(), 2);
+    assert_eq!(error.problems().len(), 2);
 
     let error = Config::from_env_vars(|name| match name {
         "AUDIT_DURABILITY_TIMEOUT_MS" => Ok("60001".to_owned()),
@@ -1859,7 +1873,7 @@ fn invalid_shutdown_config_is_rejected_with_all_problems() {
     assert!(message.contains("SHUTDOWN_DRAIN_DELAY_MS must be at most 30000"));
     assert!(message.contains("SHUTDOWN_TIMEOUT_MS must be between 1 and 300000"));
     assert!(message.contains("AUDIT_DRAIN_TIMEOUT_MS must be a valid millisecond duration"));
-    assert_eq!(error.problems.len(), 3);
+    assert_eq!(error.problems().len(), 3);
 }
 
 #[test]
@@ -1914,7 +1928,7 @@ fn catch_all_trusted_proxy_cidrs_are_rejected() {
 
     assert_eq!(
         error
-            .problems
+            .problems()
             .iter()
             .filter(|problem| problem.contains("catch-all CIDR"))
             .count(),
@@ -1938,7 +1952,7 @@ fn invalid_rate_limit_values_are_rejected() {
     assert!(message.contains("RATE_LIMIT_READ_BURST must be a valid request burst size"));
     assert!(message.contains("RATE_LIMIT_WRITE_RPS must be a finite non-negative"));
     assert!(message.contains("TRUST_PROXY_HEADERS must be a valid boolean"));
-    assert_eq!(error.problems.len(), 4);
+    assert_eq!(error.problems().len(), 4);
 }
 
 #[test]
@@ -1952,7 +1966,7 @@ fn invalid_max_body_size_is_rejected() {
     let message = error.to_string();
     assert!(message.contains("MAX_BODY_SIZE must be a valid byte size"));
     assert!(message.contains("not-a-size"));
-    assert_eq!(error.problems.len(), 1);
+    assert_eq!(error.problems().len(), 1);
 }
 
 #[test]
@@ -2075,7 +2089,7 @@ fn max_request_path_bytes_cannot_exceed_the_kernel_bound_or_be_zero() {
 
         let message = error.to_string();
         assert!(message.contains(expected), "{message}");
-        assert_eq!(error.problems.len(), 1, "{message}");
+        assert_eq!(error.problems().len(), 1, "{message}");
     }
 }
 
@@ -2121,7 +2135,7 @@ fn invalid_validation_allowed_content_type_is_rejected() {
     assert!(message
         .contains("VALIDATION_ALLOWED_CONTENT_TYPES entries must be valid HTTP header values"));
     assert!(message.contains("bad\nvalue"));
-    assert_eq!(error.problems.len(), 1);
+    assert_eq!(error.problems().len(), 1);
 }
 
 #[test]
@@ -2190,7 +2204,7 @@ fn invalid_rbac_exempt_paths_are_rejected() {
 
     let message = error.to_string();
     assert!(message.contains("RBAC_EXEMPT_PATHS entries must be URI paths"));
-    assert_eq!(error.problems.len(), 1);
+    assert_eq!(error.problems().len(), 1);
 }
 
 #[test]
@@ -2210,7 +2224,7 @@ fn invalid_auth_config_values_are_rejected() {
     assert!(message.contains("expected `required` or `observe`"));
     assert!(message.contains("AUTH_COOKIE_NAME must be a non-empty RFC 6265 cookie name"));
     assert!(message.contains("AUTH_EXEMPT_PATHS entries must be URI paths"));
-    assert_eq!(error.problems.len(), 4);
+    assert_eq!(error.problems().len(), 4);
 }
 
 #[test]
@@ -2278,7 +2292,7 @@ fn invalid_gateway_public_url_values_are_rejected() {
 
         let message = error.to_string();
         assert!(message.contains(expected), "{message}");
-        assert_eq!(error.problems.len(), 1);
+        assert_eq!(error.problems().len(), 1);
     }
 }
 
@@ -2296,7 +2310,7 @@ fn gateway_public_url_rejects_fragment() {
         "{message}"
     );
     assert!(!message.contains("https://gateway.example.test/#metadata"));
-    assert_eq!(error.problems.len(), 1);
+    assert_eq!(error.problems().len(), 1);
 }
 
 #[test]
@@ -2342,7 +2356,7 @@ fn gateway_public_url_rejects_http_non_loopback_hosts() {
         "{message}"
     );
     assert!(message.contains("http://gateway.example.test/base"));
-    assert_eq!(error.problems.len(), 1);
+    assert_eq!(error.problems().len(), 1);
 }
 
 #[test]
@@ -2471,7 +2485,7 @@ fn auth_providers_reject_multiple_jwt_providers_with_missing_issuers() {
                     "AUTH_PROVIDERS[{index}].issuer must be explicitly configured when more than one JWT provider is configured"
                 )));
         }
-        assert_eq!(error.problems.len(), missing_issuer_indices.len());
+        assert_eq!(error.problems().len(), missing_issuer_indices.len());
     }
 }
 
@@ -2775,7 +2789,7 @@ fn admin_login_pending_limits_must_be_positive() {
     assert!(message.contains("ADMIN_LOGIN_PENDING_TTL_SECS must be greater than 0"));
     assert!(message.contains("ADMIN_LOGIN_PENDING_MAX_ENTRIES must be greater than 0"));
     assert!(message.contains("ADMIN_LOGIN_PENDING_MAX_PER_IP must be greater than 0"));
-    assert_eq!(error.problems.len(), 3);
+    assert_eq!(error.problems().len(), 3);
 }
 
 #[test]
@@ -2805,45 +2819,6 @@ fn auth_provider_config_debug_redacts_client_secret() {
     assert!(!output.contains(secret));
     assert!(output.contains("<redacted>"));
     assert!(output.contains("client_secret"));
-}
-
-#[test]
-fn raw_auth_provider_config_debug_redacts_client_secret() {
-    let secret = "raw-auth-provider-secret-value";
-    let raw_with_secret: RawAuthProviderConfig = serde_json::from_str(&format!(
-        r#"{{
-                "name": "primary",
-                "type": "jwt",
-                "issuer": "https://issuer.example.test/",
-                "jwks_url": "https://issuer.example.test/.well-known/jwks.json",
-                "client_id": "admin-ui",
-                "client_secret": "{secret}",
-                "redirect_uri": "https://gateway.example.test/v1/admin/auth/callback"
-            }}"#
-    ))
-    .expect("raw auth provider should parse");
-
-    let output = format!("{:?}", raw_with_secret);
-
-    assert!(!output.contains(secret));
-    assert!(output.contains("<redacted>"));
-    assert!(output.contains("client_secret"));
-
-    let raw_without_secret: RawAuthProviderConfig = serde_json::from_str(
-        r#"{
-                "name": "primary",
-                "type": "jwt",
-                "issuer": "https://issuer.example.test/",
-                "jwks_url": "https://issuer.example.test/.well-known/jwks.json",
-                "client_id": "admin-ui",
-                "redirect_uri": "https://gateway.example.test/v1/admin/auth/callback"
-            }"#,
-    )
-    .expect("raw auth provider without secret should parse");
-
-    let output_without_secret = format!("{:?}", raw_without_secret);
-
-    assert!(output_without_secret.contains("client_secret: None"));
 }
 
 #[test]
@@ -2877,7 +2852,7 @@ fn admin_login_provider_collects_static_validation_problems() {
     assert!(message.contains(
         "ADMIN_LOGIN_PROVIDER provider 'session-provider' must set issuer for OIDC discovery"
     ));
-    assert_eq!(error.problems.len(), 5);
+    assert_eq!(error.problems().len(), 5);
 }
 
 #[test]
@@ -3011,7 +2986,7 @@ fn auth_providers_reject_cookie_session_provider_without_required_fields() {
     assert!(message.contains("AUTH_PROVIDERS[0] must set introspection_url"));
     assert!(message.contains("AUTH_PROVIDERS[0].user_id_claim must be a non-empty string"));
     assert!(message.contains("AUTH_PROVIDERS[0].cache_ttl_ms must be greater than 0"));
-    assert_eq!(error.problems.len(), 3);
+    assert_eq!(error.problems().len(), 3);
 }
 
 #[test]
@@ -3338,7 +3313,7 @@ fn auth_providers_reject_explicit_issuer_that_canonicalizes_to_empty() {
     assert!(error.to_string().contains(
         "AUTH_PROVIDERS[0].issuer must be non-empty after trimming whitespace and trailing slashes"
     ));
-    assert_eq!(error.problems.len(), 1);
+    assert_eq!(error.problems().len(), 1);
 }
 
 #[test]
@@ -3355,7 +3330,7 @@ fn auth_providers_reject_jwt_provider_without_jwks_url_or_issuer() {
 
     let message = error.to_string();
     assert!(message.contains("AUTH_PROVIDERS[0] must set jwks_url or issuer"));
-    assert_eq!(error.problems.len(), 1);
+    assert_eq!(error.problems().len(), 1);
 }
 
 #[test]
@@ -3397,7 +3372,7 @@ fn auth_providers_reject_reserved_and_duplicate_effective_issuers() {
     assert!(message.contains(
             "AUTH_PROVIDERS[3] effective issuer 'https://issuer.example.test' duplicates AUTH_PROVIDERS[2]"
         ));
-    assert_eq!(error.problems.len(), 3);
+    assert_eq!(error.problems().len(), 3);
 }
 
 #[test]
@@ -3410,7 +3385,7 @@ fn malformed_auth_providers_json_is_rejected() {
 
     let message = error.to_string();
     assert!(message.contains("AUTH_PROVIDERS must be a JSON array of auth provider objects"));
-    assert_eq!(error.problems.len(), 1);
+    assert_eq!(error.problems().len(), 1);
 }
 
 #[test]
@@ -3437,7 +3412,7 @@ fn duplicate_auth_provider_names_are_rejected() {
 
     let message = error.to_string();
     assert!(message.contains("AUTH_PROVIDERS[1].name duplicates AUTH_PROVIDERS[0].name"));
-    assert_eq!(error.problems.len(), 1);
+    assert_eq!(error.problems().len(), 1);
 }
 
 #[test]
@@ -3457,7 +3432,7 @@ fn unrecognized_auth_provider_type_is_rejected() {
 
     let message = error.to_string();
     assert!(message.contains("AUTH_PROVIDERS[0].type must be 'jwt' or 'cookie_session'"));
-    assert_eq!(error.problems.len(), 1);
+    assert_eq!(error.problems().len(), 1);
 }
 
 #[test]
@@ -3567,7 +3542,7 @@ fn invalid_jwt_config_values_are_rejected() {
     assert!(message.contains("JWT_JWKS_TIMEOUT_MS must be a valid millisecond duration"));
     assert!(message.contains("JWT_REQUIRE_JTI must be a valid boolean"));
     assert!(message.contains("ROLES_CLAIM must be a non-empty string"));
-    assert_eq!(error.problems.len(), 3);
+    assert_eq!(error.problems().len(), 3);
 }
 
 #[test]
@@ -3614,7 +3589,7 @@ fn invalid_csrf_config_values_are_rejected() {
     assert!(message.contains("CSRF_HEADER_NAME must be a valid HTTP header name"));
     assert!(message.contains("CSRF_COOKIE_DOMAIN must be a valid cookie Domain attribute"));
     assert!(message.contains("CSRF_EXEMPT_PATHS entries must be URI paths"));
-    assert_eq!(error.problems.len(), 5);
+    assert_eq!(error.problems().len(), 5);
 }
 
 #[test]
@@ -3671,7 +3646,7 @@ fn tool_runtime_config_parses_and_validates() {
     assert!(message.contains("TOOL_RUNTIME_GLOBAL_CONCURRENCY must be greater than 0"));
     assert!(message.contains("TOOL_RUNTIME_QUEUE_TIMEOUT_MS must be greater than 0"));
     assert!(message.contains("TOOL_RUNTIME_DEFAULT_TIMEOUT_MS must be greater than 0"));
-    assert_eq!(error.problems.len(), 4);
+    assert_eq!(error.problems().len(), 4);
 }
 
 #[test]
@@ -3733,7 +3708,7 @@ fn invalid_nat64_prefixes_are_rejected() {
     assert!(message.contains("RFC 6052 prefix length"));
     assert!(message.contains("valid IPv6 CIDR prefixes"));
     assert!(message.contains("entries must not overlap"));
-    assert_eq!(error.problems.len(), 4);
+    assert_eq!(error.problems().len(), 4);
 }
 
 #[test]
@@ -3747,7 +3722,7 @@ fn malformed_or_well_known_overlapping_nat64_prefixes_are_rejected() {
     let message = error.to_string();
     assert!(message.contains("must use a zero RFC 6052 u octet"));
     assert!(message.contains("must not overlap the built-in well-known NAT64 prefix 64:ff9b::/96"));
-    assert_eq!(error.problems.len(), 2);
+    assert_eq!(error.problems().len(), 2);
 }
 
 #[test]
@@ -5115,7 +5090,7 @@ fn invalid_upstream_route_openapi_spec_path_is_rejected() {
     let message = error.to_string();
     assert!(message
         .contains("UPSTREAM_ROUTES[0].openapi_spec_path must be a non-empty filesystem path"));
-    assert_eq!(error.problems.len(), 1);
+    assert_eq!(error.problems().len(), 1);
 }
 
 #[test]
@@ -5153,7 +5128,7 @@ fn upstream_url_and_non_empty_upstream_routes_are_mutually_exclusive() {
 
     let message = error.to_string();
     assert!(message.contains("UPSTREAM_URL and UPSTREAM_ROUTES are mutually exclusive"));
-    assert_eq!(error.problems.len(), 1);
+    assert_eq!(error.problems().len(), 1);
 }
 
 #[test]
@@ -5182,7 +5157,7 @@ fn invalid_upstream_routes_are_rejected_with_clear_errors() {
     assert!(message.contains(
             "UPSTREAM_ROUTES[5] duplicates UPSTREAM_ROUTES[4] with the same host and path_prefix matcher"
         ));
-    assert_eq!(error.problems.len(), 8);
+    assert_eq!(error.problems().len(), 8);
 }
 
 #[test]
@@ -5286,7 +5261,7 @@ fn invalid_upstream_url_values_are_rejected() {
 
         let message = error.to_string();
         assert!(message.contains(expected), "{message}");
-        assert_eq!(error.problems.len(), 1);
+        assert_eq!(error.problems().len(), 1);
     }
 }
 
@@ -5306,7 +5281,7 @@ fn invalid_upstream_timeout_overrides_are_rejected() {
         message.contains("UPSTREAM_RESPONSE_IDLE_TIMEOUT_MS must be a valid millisecond duration")
     );
     assert!(message.contains("UPSTREAM_CONNECT_TIMEOUT_MS must be a valid millisecond duration"));
-    assert_eq!(error.problems.len(), 3);
+    assert_eq!(error.problems().len(), 3);
 }
 
 #[test]
@@ -5333,7 +5308,7 @@ fn invalid_egress_config_values_are_rejected() {
     assert!(message.contains("EGRESS_MAX_RESPONSE_BYTES must be a valid byte size"));
     assert!(message.contains("EGRESS_MAX_REQUEST_BODY_BYTES must be a valid byte size"));
     assert!(message.contains("EGRESS_DENY_PRIVATE_IPS must be a valid boolean"));
-    assert_eq!(error.problems.len(), 8);
+    assert_eq!(error.problems().len(), 8);
 }
 
 #[test]
@@ -5347,7 +5322,7 @@ fn invalid_cors_allow_origin_is_rejected() {
     let message = error.to_string();
     assert!(message.contains("CORS_ALLOW_ORIGINS entries must be valid HTTP header values"));
     assert!(message.contains("bad\norigin"));
-    assert_eq!(error.problems.len(), 1);
+    assert_eq!(error.problems().len(), 1);
 }
 
 #[test]
@@ -5361,42 +5336,7 @@ fn wildcard_cors_allow_origin_is_rejected() {
     let message = error.to_string();
     assert!(message.contains("CORS_ALLOW_ORIGINS entries must be exact origins"));
     assert!(message.contains("wildcard origin '*' is not allowed with credentialed CORS"));
-    assert_eq!(error.problems.len(), 1);
-}
-
-#[test]
-fn parse_var_records_independent_problems() {
-    let mut problems = Vec::new();
-
-    let listen_addr = parse_var(
-        "PRIMARY_LISTEN_ADDR",
-        Ok("not-a-socket".to_owned()),
-        "127.0.0.1:8080"
-            .parse::<SocketAddr>()
-            .expect("test default address should parse"),
-        "socket address",
-        &mut problems,
-    );
-    let enabled = parse_var(
-        "FEATURE_ENABLED",
-        Ok("maybe".to_owned()),
-        false,
-        "boolean",
-        &mut problems,
-    );
-
-    assert_eq!(
-        listen_addr,
-        "127.0.0.1:8080"
-            .parse::<SocketAddr>()
-            .expect("test default address should parse")
-    );
-    assert!(!enabled);
-    assert_eq!(problems.len(), 2);
-    assert!(problems.iter().any(|problem| problem
-            == "PRIMARY_LISTEN_ADDR must be a valid socket address, got 'not-a-socket': invalid socket address syntax"));
-    assert!(problems.iter().any(|problem| problem
-            == "FEATURE_ENABLED must be a valid boolean, got 'maybe': provided string was not `true` or `false`"));
+    assert_eq!(error.problems().len(), 1);
 }
 
 // --- shared-state backend selection (issue #241, PR 3) -------------------
@@ -5964,7 +5904,7 @@ fn the_discovery_projector_settings_are_bounded() {
             message.contains(expected),
             "expected {expected:?} in: {message}"
         );
-        assert_eq!(error.problems.len(), 1, "{message}");
+        assert_eq!(error.problems().len(), 1, "{message}");
     }
 }
 
@@ -6707,7 +6647,7 @@ fn required_authority_evidence_refuses_process_local_admin_sessions() {
     let error = Config::from_env_vars(standalone_vars(&required))
         .expect_err("required refuses in-memory sessions");
     assert_eq!(
-        error.problems,
+        error.problems(),
         ["AUTHORITY_EVIDENCE_DURABILITY=required refuses ADMIN_SESSION_MODE=standalone_memory; process-local admin sessions leave no durable record of who was granted or withdrawn a session"]
     );
     assert_eq!(

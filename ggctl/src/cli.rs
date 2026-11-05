@@ -33,7 +33,7 @@ pub(crate) enum ValueKind {
     Seconds,
     /// A whole number.
     Number,
-    /// A document version string, an identifier or an ETag.
+    /// A document version string, an identifier, an ETag or a server entry name.
     Text,
     /// One of a fixed set of words.
     Choice(&'static [&'static str]),
@@ -125,9 +125,15 @@ pub(crate) const SCHEMA_KINDS: &[&str] = &[
     gateway_config::documents::CAPABILITIES_KIND,
     gateway_config::documents::REPORT_KIND,
     gateway_config::documents::BACKUP_KIND,
+    gateway_config::documents::MCP_CLIENT_CONFIGS_KIND,
 ];
 /// The deployment profiles, as `gateway_config::bundle::Profile` names them.
 pub(crate) const PROFILES: &[&str] = &["production", "migration", "development"];
+/// The MCP clients, as `gateway_config::mcp_client_configs::ClientKind` names them.
+pub(crate) const MCP_CLIENTS: &[&str] = &["generic", "claude-desktop", "cursor", "vscode"];
+/// How a template's client authenticates, as
+/// `gateway_config::mcp_client_configs::Auth` names it.
+pub(crate) const MCP_AUTHS: &[&str] = &["oauth", "token"];
 /// Every risk code, as `gateway_config::semantic_diff::RiskCode` names them.
 pub(crate) const RISK_CODES: &[&str] = &[
     "risk.admin_access_path_removed",
@@ -180,6 +186,7 @@ const COMMAND_NAMES: &[&str] = &[
     "policy explain",
     "policy replay",
     "evidence verify",
+    "mcp-config",
     "completion",
     "help",
 ];
@@ -198,6 +205,7 @@ pub(crate) const HELP_TOPICS: &[&str] = &[
     "backup",
     "policy",
     "evidence",
+    "mcp-config",
     "completion",
     "help",
 ];
@@ -325,6 +333,25 @@ const IN_PLACE: OptionSpec = OptionSpec {
     value: None,
     repeatable: false,
     help: "convert BUNDLE where it is instead of writing --output",
+};
+const CLIENT: OptionSpec = OptionSpec {
+    name: "--client",
+    value: Some(("CLIENT", ValueKind::Choice(MCP_CLIENTS))),
+    repeatable: false,
+    help:
+        "generic, claude-desktop, cursor or vscode (required): the client whose template to write",
+};
+const AUTH: OptionSpec = OptionSpec {
+    name: "--auth",
+    value: Some(("AUTH", ValueKind::Choice(MCP_AUTHS))),
+    repeatable: false,
+    help: "oauth (default), which names only the URL, or token, which reads GREENGATEWAY_MCP_TOKEN from the client's environment",
+};
+const NAME: OptionSpec = OptionSpec {
+    name: "--name",
+    value: Some(("NAME", ValueKind::Text)),
+    repeatable: false,
+    help: "the server entry name: 1 to 64 ASCII letters, digits, - and _, starting with a letter or digit (default greengateway)",
 };
 const API_VERSION: OptionSpec = OptionSpec {
     name: "--api-version",
@@ -977,6 +1004,36 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         }],
         options: &[FORMAT],
         run: crate::evidence::verify,
+    },
+    CommandSpec {
+        name: "mcp-config",
+        summary: "Write a credential-free MCP client configuration template from a gateway",
+        description: &[
+            "Reads the gateway's MCP client configuration templates (GET \
+             <server>/mcp/client-configs, permission admin:mcp:clients:read) and writes the one \
+             for --client and --auth to standard output exactly as served: a JSON file for \
+             generic, cursor and vscode, the URL line for claude-desktop. The URL is the gateway's \
+             own MCP endpoint, which it computes from its GATEWAY_PUBLIC_URL; ggctl has no option \
+             to supply or change it.",
+            "No template holds a credential: an oauth template names only the URL, and a token \
+             template reads the bearer token from the client's GREENGATEWAY_MCP_TOKEN environment \
+             variable. ggctl never opens, creates or edits a client's configuration file; redirect \
+             the output where it belongs. Exits 0 when written, 3 when the gateway has no usable \
+             GATEWAY_PUBLIC_URL, offers no oauth template or serves a document this ggctl does \
+             not render, 2 for claude-desktop with --auth token, and 8 when the read is refused.",
+        ],
+        arguments: &[],
+        options: &[
+            SERVER,
+            CLIENT,
+            AUTH,
+            NAME,
+            CA_FILE,
+            TOKEN_STDIN,
+            TOKEN_FILE,
+            TIMEOUT,
+        ],
+        run: crate::mcp_config::run,
     },
     CommandSpec {
         name: "completion",

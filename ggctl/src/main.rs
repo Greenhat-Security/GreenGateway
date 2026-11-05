@@ -30,6 +30,7 @@ mod help;
 mod init;
 mod input;
 mod ledger;
+mod mcp_config;
 mod output;
 mod pin;
 mod policy;
@@ -147,7 +148,8 @@ mod tests {
              greengateway.dev/v1alpha1  GatewayInitAnswers\n\
              greengateway.dev/v1alpha1  GatewayCapabilities\n\
              greengateway.dev/v1alpha1  GgctlReport\n\
-             greengateway.dev/v1alpha1  GatewayBackup\n"
+             greengateway.dev/v1alpha1  GatewayBackup\n\
+             greengateway.dev/v1alpha1  McpClientConfigs\n"
         );
 
         let (exit, captured) = run_words(&[

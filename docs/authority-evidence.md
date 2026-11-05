@@ -907,8 +907,9 @@ drives every refused standalone admin endpoint through the real handlers and ass
 the `409`, the audit event and that nothing changed, and that Connection,
 local-secret and token changes are admitted and write their evidence rows; the
 reload helpers in `middleware/rbac_tests.rs` and `tools/definitions.rs` refuse a
-reload and keep the active document; `config_tests.rs`, `config/stage_tests.rs` and
-`ha.rs` cover the startup rules, their diagnostics and the fingerprint.
+reload and keep the active document; `config_tests.rs`,
+`gateway-config/src/compiler/stage_tests.rs` and `ha.rs` cover the startup rules,
+their diagnostics and the fingerprint.
 
 ## Verified-TLS storage tests
 

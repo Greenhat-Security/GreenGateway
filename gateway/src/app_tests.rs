@@ -5,6 +5,8 @@ mod admin_config_app_tests;
 mod admin_connections_app_tests;
 #[path = "admin_identity_app_tests.rs"]
 mod admin_identity_app_tests;
+#[path = "admin_mcp_clients_app_tests.rs"]
+mod admin_mcp_clients_app_tests;
 #[path = "admin_observability_app_tests.rs"]
 mod admin_observability_app_tests;
 #[path = "admin_policy_app_tests.rs"]
