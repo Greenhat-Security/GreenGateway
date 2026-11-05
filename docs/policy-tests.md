@@ -3,7 +3,8 @@
 A policy test suite is a list of synthetic cases: a hypothetical request or
 tool question, the identity facts of a hypothetical caller, and the decision you
 expect the policy to make. `POST /v1{ADMIN_PREFIX}/policy/tests/runs` runs a
-suite against the active policy, or against a candidate you send with it, and
+suite against the active policy, against a candidate you send with it, or
+against one of your server-side drafts or a version of the policy history, and
 answers JSON, SARIF 2.1.0 or JUnit XML (issue #243, slice 11).
 
 Every case is decided by the same compiled policy evaluator the gateway uses
@@ -96,7 +97,7 @@ and byte rather than character lengths.
 | `cases` | 1 to 512 cases. |
 | `cases[].id` | Unique within the suite, at most 128 bytes, an ASCII letter or digit followed by letters, digits, `.`, `_`, `:` or `-`. Results, SARIF and JUnit identify a case by this id and its JSON Pointer. |
 | `cases[].kind` | `http`, `tool`, `tool_http` or `rate`. Each kind accepts only its own members. |
-| `cases[].principal` | `"anonymous"`, or `subject` (required), `issuer`, `roles` and `auth_method` (required: `bearer_token`, `session_cookie`, `service_token` or `client_certificate`). The issuer is canonicalized as authentication canonicalizes it (a trailing `/` is dropped). |
+| `cases[].principal` | `"anonymous"`, or `subject` (required), `issuer`, `roles`, `auth_method` (required: `bearer_token`, `session_cookie`, `service_token` or `client_certificate`) and `organization`. The issuer is canonicalized as authentication canonicalizes it (a trailing `/` is dropped). `organization` (1 to 8192 bytes) is the organization the principal's identity provider verified, which a policy's identity mappings may test; omitted, the principal has none. As on the live lanes it is read only in mapped-role mode, and no result repeats it. |
 | `cases[].expect` | What the case asserts; see below. |
 
 ### Case kinds
@@ -173,9 +174,19 @@ If-Match: "sha256:..."            (optional)
   Without it the run judges the active policy: the policy file's
   current snapshot in standalone mode, or the authoritative active document in
   cluster mode.
+- `candidate` (optional, instead of `policy`) names a stored candidate with
+  the members a [simulation's](policy-simulation.md#drafts-and-history-versions)
+  has: `{"source": "draft", "draft_id": "pd_...", "draft_etag":
+  "\"sha256:...\""}` for one of your drafts at that draft ETag, or
+  `{"source": "revision", "version": 7}` for a policy history version. It is
+  read, owner-scoped and validated again exactly as a simulation reads it,
+  and never written. A run has no `base_etag`, so a draft is judged only while
+  it is pinned to the live policy, the one it would be published over;
+  otherwise it is `409 policy_draft_base_stale`. Any other `source` is `400`:
+  an inline document is the `policy` member, and edits need a base.
 - `If-Match` (optional, active policy only) pins the run to the policy ETag you
   reviewed; a different active ETag is `412` and nothing runs. Combining it
-  with a candidate is `400`.
+  with a candidate, inline or stored, is `400`.
 
 The policy's own routes are evaluated before the handler, as for every admin
 route. A policy whose routes gate the admin API -- `dev/policy.json`, for
@@ -191,17 +202,23 @@ pipeline can gate on the header or on `status` without parsing the rendering.
 
 | Status | `reason` | Meaning |
 | --- | --- | --- |
-| `400` | `policy_tests_request_invalid` | The body is not a JSON object, repeats a member name anywhere, has a member other than `suite`, `policy` and `format`, lacks `suite`, names an unknown format, or combines `If-Match` with a candidate. |
+| `400` | `policy_tests_request_invalid` | The body is not a JSON object, repeats a member name anywhere, has a member other than `suite`, `policy`, `candidate` and `format`, lacks `suite`, names an unknown format, names both `policy` and `candidate`, has a `candidate` that is not a well-formed `draft` or `revision` (with `diagnostics` when its members are wrong), or combines `If-Match` with a candidate. |
 | `401`, `403` | -- | Not authenticated, or missing either permission. |
-| `404` | -- | No policy is configured. |
+| `404` | -- | No policy is configured, or a `revision` candidate names a deployment with no policy history. |
+| `404` | `policy_draft_not_found`, `policy_revision_not_found` | The `candidate` names no draft of yours, or a version the history does not hold. |
 | `408` | `policy_tests_request_timeout` | The body did not arrive within five seconds. Nothing ran. |
+| `409` | `policy_draft_base_stale` | The draft is pinned to another base than the live policy. |
+| `410` | `policy_draft_expired` | The draft has expired. |
 | `412` | -- | `If-Match` does not name the active policy. |
+| `412` | `policy_draft_stale` | `draft_etag` is no longer the draft's ETag. |
 | `413` | -- | The body exceeds `MAX_BODY_SIZE` or 2 MiB, whichever is lower. |
 | `422` | `policy_tests_invalid` | The suite is invalid. The body lists at most 64 `diagnostics` (`code`, JSON `pointer`, fixed `message`) and `diagnostics_truncated`. Diagnostics never repeat an input value. |
 | `422` | `policy_candidate_invalid` | The candidate policy is invalid; `errors` are the policy validator's messages. |
+| `422` | `policy_revision_incompatible` | The history version is not a policy this build and deployment accept now. |
 | `429` | `policy_tests_busy` | Four runs are already evaluating on this replica, or this caller already has one running. Nothing was queued. |
 | `500` | -- | The policy under test did not compile. No partial result. |
 | `503` | -- | Cluster mode could not read the active policy, or (`policy_tests_deadline_exceeded`) the run did not finish within five seconds. No partial result. |
+| `503` | `policy_drafts_unavailable`, `policy_history_unavailable` | The drafts store or the policy history the candidate names could not be read. |
 
 Diagnostic codes: `invalid_type`, `missing_field`, `unknown_field`,
 `forbidden_field`, `invalid_value`, `too_long`, `unsupported_schema_version`,
@@ -252,9 +269,11 @@ Diagnostic codes: `invalid_type`, `missing_field`, `unknown_field`,
   `policy-tests.v1`. The version defines no normalization beyond JCS, so member
   order and whitespace do not change it and any other change does.
 - `policy.etag` is the active policy's ETag, or for a candidate the ETag it
-  would have once written. `policy.source` is `active` or `inline_candidate`
-  (or `publication` inside a [policy evidence package](policy-evidence.md));
-  cluster mode adds `security_revision`.
+  would have once written. `policy.source` is `active`, `inline_candidate`,
+  `draft` or `revision` (or `publication` inside a
+  [policy evidence package](policy-evidence.md)); cluster mode adds
+  `security_revision` for the active policy. A `draft` adds the `draft_id` and
+  the `draft_revision` it was read at, and a `revision` the `version`.
 - Each case reports its `status` (`passed`, `failed`, `incomplete`, `error`),
   what was `expected`, what the evaluator answered in stable codes (`actual`,
   absent for `error`), which expectations did not hold (`mismatches`, in the
@@ -274,8 +293,10 @@ under the rule `policy-test/failed`, `policy-test/incomplete` or
 `policy-test/error`, located by a logical location whose `name` is the case id
 and whose `fullyQualifiedName` is its JSON Pointer. An empty `results` array
 means every case passed; the run's `properties` carry `status`, the suite
-digest, the policy source and ETag, the summary and `not_evaluated`, so an
-all-passing file is distinguishable from an empty one.
+digest, the policy source and ETag (with `policy_draft_id` and
+`policy_draft_revision`, or `policy_version`, for a stored candidate), the
+summary and `not_evaluated`, so an all-passing file is distinguishable from an
+empty one.
 
 ### JUnit
 
@@ -283,7 +304,9 @@ all-passing file is distinguishable from an empty one.
 `policy-tests.v1` with a `testcase` per case (`classname` `policy.<kind>`,
 `name` the case id). A failed or incomplete case carries a `failure`, a refused
 one an `error`; nothing is ever `skipped`. The suite `properties` carry the run
-status, suite digest, policy source and ETag, and the evaluator versions.
+status, suite digest, policy source and ETag, the evaluator versions and, for a
+stored candidate, `policy_draft_id` and `policy_draft_revision` or
+`policy_version`.
 
 ### In a pipeline
 
@@ -306,8 +329,10 @@ under the same identity while the first is still evaluating is `429`
 
 Each completed run emits one `policy.tests_run` audit event with the acting
 principal and the request envelope, `policy_source`, `policy_etag`,
-`security_revision` (cluster mode), `suite_digest`, `status`, the five summary
-counts and the evaluator semantics versions. It never carries a case id, a
+`security_revision` (cluster mode), for a stored candidate its
+`policy_draft_id` and `policy_draft_revision` or its `policy_version`,
+`suite_digest`, `status`, the five summary counts and the evaluator semantics
+versions. It never carries a case id, a
 fixture value, a matched rule or policy content. Refused requests (`4xx`) are
 not recorded as runs.
 

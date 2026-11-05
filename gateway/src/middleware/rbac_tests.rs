@@ -3738,12 +3738,7 @@ fn an_invocation_answer_the_kernel_never_gives_is_refused() {
     for name in ["reports.open", "reports.closed", "reports.absent"] {
         let has_entry = name != "reports.absent";
         let genuine = snapshot
-            .evaluate_tool(
-                ToolOperation::Invocation,
-                name,
-                PrincipalFact::Anonymous,
-                None,
-            )
+            .evaluate_tool(ToolOperation::Invocation, name, None, None)
             .expect("the kernel answers a bounded question");
         for reason in TOOL_REASONS {
             for effect in EFFECTS {
@@ -3845,7 +3840,7 @@ fn a_rendered_http_answer_the_kernel_never_gives_is_refused() {
         .evaluate_tool(
             ToolOperation::RenderedHttp,
             "reports.open",
-            PrincipalFact::Anonymous,
+            None,
             Some((Method::GET, "/elsewhere".to_owned())),
         )
         .expect("the kernel answers a bounded question");
@@ -4024,3 +4019,6 @@ async fn http_attribution_resolves_references_on_the_instance_that_decided() {
         ]
     );
 }
+
+#[path = "rbac_identity_mapping_tests.rs"]
+mod identity_mappings;

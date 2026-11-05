@@ -8,10 +8,10 @@
 //! exactly what must not reach a log, an error body or an audit record.
 //!
 //! What a case can say is deliberately narrow. Identity is a typed set of
-//! policy facts -- subject, issuer, roles, authentication method -- and never a
-//! token, cookie, header or credential: there is no field to put one in, and a
-//! member named like one is refused with its own code rather than as an
-//! ordinary typo.
+//! policy facts -- subject, issuer, roles, authentication method and the
+//! organization authentication verified -- and never a token, cookie, header
+//! or credential: there is no field to put one in, and a member named like
+//! one is refused with its own code rather than as an ordinary typo.
 
 use http::Method;
 use serde::Serialize;
@@ -26,7 +26,7 @@ use crate::{
     canonical_json,
     policy_eval::{
         tools::{validate_rendered_http_path, ToolOperation},
-        validate_path, DispatchFacts, LogicalDecision, PolicyEffect, Reason,
+        validate_path, DispatchFacts, LogicalDecision, PolicyEffect, Reason, MAX_FACT_VALUE_BYTES,
     },
     rbac::rule::{
         AUTH_METHOD_BEARER_TOKEN, AUTH_METHOD_CLIENT_CERTIFICATE, AUTH_METHOD_SERVICE_TOKEN,
@@ -233,6 +233,16 @@ pub(crate) enum SyntheticTarget {
 pub(crate) enum SyntheticPrincipal {
     Anonymous,
     Authenticated(Principal),
+}
+
+impl SyntheticPrincipal {
+    /// The principal a live lane would hold for this case, if any.
+    pub(crate) fn principal(&self) -> Option<&Principal> {
+        match self {
+            Self::Anonymous => None,
+            Self::Authenticated(principal) => Some(principal),
+        }
+    }
 }
 
 /// What an HTTP or tool case expects. `logical` is required; the rest are
@@ -725,7 +735,7 @@ fn parse_principal(
     check_members(
         map,
         pointer,
-        &["subject", "issuer", "roles", "auth_method"],
+        &["subject", "issuer", "roles", "auth_method", "organization"],
         diagnostics,
     );
     let subject = required(map, "subject", pointer, diagnostics).and_then(|value| {
@@ -802,7 +812,21 @@ fn parse_principal(
         }
         method
     });
-    let (subject, issuer, roles, auth_method) = (subject?, issuer?, roles?, auth_method?);
+    // The organization authentication verified, which a live lane reads from
+    // the principal and an identity mapping may test. Absent is a principal
+    // whose authentication verified none, never an unknown one.
+    let organization = match map.get("organization") {
+        None => Some(None),
+        Some(value) => bounded_string(
+            value,
+            &format!("{pointer}/organization"),
+            MAX_FACT_VALUE_BYTES,
+            diagnostics,
+        )
+        .map(Some),
+    };
+    let (subject, issuer, roles, auth_method, organization) =
+        (subject?, issuer?, roles?, auth_method?, organization?);
     // The predicate authentication applies before any principal exists, so a
     // case cannot describe an identity no credential could produce.
     if let Err(problem) = check_principal_shape(&subject, issuer.as_deref(), &roles) {
@@ -819,7 +843,7 @@ fn parse_principal(
         // Display and session metadata are not policy facts. They stay empty
         // so nothing beyond what a case states can influence a result.
         email: None,
-        org_id: None,
+        org_id: organization,
         roles,
         session_id: String::new(),
         auth_method,
