@@ -3,6 +3,9 @@
 //! One static table defines every command, argument and option. Help text
 //! (`help.rs`) and shell completion (`completion.rs`) are generated from it,
 //! and the parser accepts exactly what it lists, so the three cannot drift.
+//! A command family (`ggctl ledger`, `ggctl backup`) is a name whose commands
+//! are listed in the table under their full names (`ledger seed`,
+//! `backup create`).
 //!
 //! Before anything else the parser refuses any argument that looks like a
 //! secret-carrying or verification-disabling option, wherever it appears, so
@@ -36,6 +39,9 @@ pub(crate) struct OptionSpec {
     pub(crate) name: &'static str,
     /// The placeholder and kind of the option's value; `None` for a flag.
     pub(crate) value: Option<(&'static str, ValueKind)>,
+    /// The option may be given more than once, and every value is kept in
+    /// order. Any other option given twice is a usage error.
+    pub(crate) repeatable: bool,
     pub(crate) help: &'static str,
 }
 
@@ -65,6 +71,42 @@ impl std::fmt::Debug for CommandSpec {
     }
 }
 
+impl CommandSpec {
+    /// How many words the command's name is: two for a family's command.
+    pub(crate) fn words(&self) -> usize {
+        self.name.split(' ').count()
+    }
+
+    /// The family the command belongs to, if any.
+    pub(crate) fn family(&self) -> Option<&'static FamilySpec> {
+        let (family, _) = self.name.split_once(' ')?;
+        FAMILIES.iter().find(|spec| spec.name == family)
+    }
+}
+
+/// A family of commands under one name.
+#[derive(Debug)]
+pub(crate) struct FamilySpec {
+    pub(crate) name: &'static str,
+    pub(crate) summary: &'static str,
+    pub(crate) description: &'static [&'static str],
+    /// The second word of each of its commands, in table order.
+    pub(crate) commands: &'static [&'static str],
+    /// Fixed guidance for a command line that names the family alone.
+    pub(crate) hint: &'static str,
+}
+
+impl FamilySpec {
+    /// The family's commands, in table order.
+    pub(crate) fn members(&self) -> impl Iterator<Item = &'static CommandSpec> + '_ {
+        COMMANDS.iter().filter(move |command| {
+            command
+                .family()
+                .is_some_and(|family| family.name == self.name)
+        })
+    }
+}
+
 pub(crate) const FORMAT_HUMAN: &str = "human";
 pub(crate) const FORMAT_JSON: &str = "json";
 pub(crate) const FORMAT_SARIF: &str = "sarif";
@@ -76,9 +118,42 @@ pub(crate) const SCHEMA_KINDS: &[&str] = &[
     gateway_config::documents::INIT_ANSWERS_KIND,
     gateway_config::documents::CAPABILITIES_KIND,
     gateway_config::documents::REPORT_KIND,
+    gateway_config::documents::BACKUP_KIND,
 ];
 /// The deployment profiles, as `gateway_config::bundle::Profile` names them.
 pub(crate) const PROFILES: &[&str] = &["production", "migration", "development"];
+/// Every risk code, as `gateway_config::semantic_diff::RiskCode` names them.
+pub(crate) const RISK_CODES: &[&str] = &[
+    "risk.admin_access_path_removed",
+    "risk.audit_durability_reduced",
+    "risk.auth_disabled",
+    "risk.auth_observe_only",
+    "risk.auth_trust_changed",
+    "risk.cookie_or_csrf_weakened",
+    "risk.cors_broadened",
+    "risk.credential_binding_changed",
+    "risk.data_exposure_increased",
+    "risk.egress_broadened",
+    "risk.evidence_not_required",
+    "risk.exemptions_broadened",
+    "risk.limits_loosened",
+    "risk.listener_exposed",
+    "risk.plaintext_transport",
+    "risk.policy_broadened",
+    "risk.policy_default_allow",
+    "risk.policy_tests_not_required",
+    "risk.private_egress_allowed",
+    "risk.profile_changed",
+    "risk.public_origin_changed",
+    "risk.routing_changed",
+    "risk.shadow_enabled",
+    "risk.storage_changed",
+    "risk.tls_weakened",
+    "risk.tool_surface_broadened",
+    "risk.trusted_proxies_changed",
+    "risk.unknown_impact",
+];
+#[cfg(test)]
 const COMMAND_NAMES: &[&str] = &[
     "version",
     "schema",
@@ -88,13 +163,40 @@ const COMMAND_NAMES: &[&str] = &[
     "convert",
     "doctor",
     "diff",
+    "ledger seed",
+    "ledger verify",
+    "ledger rollback",
+    "backup create",
+    "backup verify",
+    "backup restore",
     "completion",
     "help",
 ];
+/// What `ggctl help` describes: every command outside a family, and every
+/// family.
+pub(crate) const HELP_TOPICS: &[&str] = &[
+    "version",
+    "schema",
+    "init",
+    "validate",
+    "pin",
+    "convert",
+    "doctor",
+    "diff",
+    "ledger",
+    "backup",
+    "completion",
+    "help",
+];
+const LEDGER_COMMANDS: &[&str] = &["seed", "verify", "rollback"];
+const BACKUP_COMMANDS: &[&str] = &["create", "verify", "restore"];
+/// The second word of every family's commands, once each, for `ggctl help`.
+const SUBCOMMANDS: &[&str] = &["seed", "verify", "rollback", "create", "restore"];
 
 const FORMAT: OptionSpec = OptionSpec {
     name: "--format",
     value: Some(("FORMAT", ValueKind::Choice(&[FORMAT_HUMAN, FORMAT_JSON]))),
+    repeatable: false,
     help: "human (default) or json: one GgctlReport document on standard output",
 };
 /// `validate` and `diff` also offer SARIF (ADR-0008, "Output contract"; for
@@ -105,27 +207,32 @@ const VALIDATE_FORMAT: OptionSpec = OptionSpec {
         "FORMAT",
         ValueKind::Choice(&[FORMAT_HUMAN, FORMAT_JSON, FORMAT_SARIF]),
     )),
+    repeatable: false,
     help: "human (default), json (one GgctlReport document) or sarif (one SARIF 2.1.0 log) on standard output",
 };
 const STRICT: OptionSpec = OptionSpec {
     name: "--strict",
     value: None,
+    repeatable: false,
     help:
         "refuse, rather than warn about, a bundle directory entry the manifest does not reference",
 };
 const WARNINGS_AS_ERRORS: OptionSpec = OptionSpec {
     name: "--warnings-as-errors",
     value: None,
+    repeatable: false,
     help: "exit 3 when any warning is reported",
 };
 const AGAINST: OptionSpec = OptionSpec {
     name: "--against",
     value: Some(("BUNDLE", ValueKind::Path)),
+    repeatable: false,
     help: "the bundle directory to compare BUNDLE with (required): the change is from it to BUNDLE",
 };
 const CHECK: OptionSpec = OptionSpec {
     name: "--check",
     value: None,
+    repeatable: false,
     help: "exit 4 when the bundles differ at all",
 };
 const BUNDLE: ArgumentSpec = ArgumentSpec {
@@ -134,61 +241,149 @@ const BUNDLE: ArgumentSpec = ArgumentSpec {
     required: true,
     help: "the bundle directory, which holds bundle.yaml",
 };
+const REVISION: ArgumentSpec = ArgumentSpec {
+    name: "REVISION",
+    kind: ValueKind::Text,
+    required: true,
+    help: "the revision to roll back to: rev- and 32 lowercase hexadecimal digits, as ggctl ledger verify reports one",
+};
 const SERVER: OptionSpec = OptionSpec {
     name: "--server",
     value: Some(("URL", ValueKind::Url)),
+    repeatable: false,
     help: "the admin API base, https://HOST[:PORT]/v1<ADMIN_PREFIX>; plain http only for a loopback IP literal",
 };
 const CA_FILE: OptionSpec = OptionSpec {
     name: "--ca-file",
     value: Some(("PATH", ValueKind::Path)),
+    repeatable: false,
     help: "a PEM file of trust anchors added to the platform's for an https --server",
 };
 const TOKEN_STDIN: OptionSpec = OptionSpec {
     name: "--token-stdin",
     value: None,
+    repeatable: false,
     help: "read the admin bearer token from standard input, which must be a pipe or file",
 };
 const TOKEN_FILE: OptionSpec = OptionSpec {
     name: "--token-file",
     value: Some(("PATH", ValueKind::Path)),
+    repeatable: false,
     help: "read the admin bearer token from a regular file of at most 8 KiB, owner-only on Unix",
 };
 const TIMEOUT: OptionSpec = OptionSpec {
     name: "--timeout",
     value: Some(("SECONDS", ValueKind::Seconds)),
+    repeatable: false,
     help: "the time allowed for each request, 1 to 300 seconds (default 30)",
 };
 const PROFILE: OptionSpec = OptionSpec {
     name: "--profile",
     value: Some(("PROFILE", ValueKind::Choice(PROFILES))),
+    repeatable: false,
     help: "production, migration or development (required): the deployment profile the bundle declares",
 };
 const OUTPUT: OptionSpec = OptionSpec {
     name: "--output",
     value: Some(("DIR", ValueKind::Path)),
+    repeatable: false,
     help: "the bundle directory to create: it must not exist, or must be an empty directory",
 };
 const ANSWERS: OptionSpec = OptionSpec {
     name: "--answers",
     value: Some(("FILE", ValueKind::Path)),
+    repeatable: false,
     help: "a GatewayInitAnswers document (YAML, or JSON when FILE ends in .json) to use instead of the defaults",
 };
 const TO: OptionSpec = OptionSpec {
     name: "--to",
     value: Some(("VERSION", ValueKind::Text)),
+    repeatable: false,
     help: "the document version to convert to (required), such as greengateway.dev/v1alpha1",
 };
 const IN_PLACE: OptionSpec = OptionSpec {
     name: "--in-place",
     value: None,
+    repeatable: false,
     help: "convert BUNDLE where it is instead of writing --output",
 };
 const API_VERSION: OptionSpec = OptionSpec {
     name: "--api-version",
     value: Some(("VERSION", ValueKind::Text)),
+    repeatable: false,
     help: "the document version to print (default: the newest this ggctl publishes)",
 };
+const STATE_DIR: OptionSpec = OptionSpec {
+    name: "--state-dir",
+    value: Some(("DIR", ValueKind::Path)),
+    repeatable: false,
+    help: "the standalone state directory (required), which ggctl holds under its exclusive lock while it runs",
+};
+const ACKNOWLEDGE: OptionSpec = OptionSpec {
+    name: "--acknowledge",
+    value: Some(("RISK_CODE", ValueKind::Choice(RISK_CODES))),
+    repeatable: true,
+    help: "acknowledge one risk code of the rollback; give it once for each code, since every code must be named",
+};
+const BACKUP_OUTPUT: OptionSpec = OptionSpec {
+    name: "--output",
+    value: Some(("FILE", ValueKind::Path)),
+    repeatable: false,
+    help:
+        "the backup archive to create (required): it must not exist, and is never standard output",
+};
+const ARCHIVE: ArgumentSpec = ArgumentSpec {
+    name: "FILE",
+    kind: ValueKind::Path,
+    required: true,
+    help: "the backup archive, as ggctl backup create wrote it",
+};
+const RESTORE_STATE_DIR: OptionSpec = OptionSpec {
+    name: "--state-dir",
+    value: Some(("DIR", ValueKind::Path)),
+    repeatable: false,
+    help: "the state directory to restore into (required): an existing empty directory, or with --replace-existing-state a stopped state directory, held under its exclusive lock",
+};
+const REPLACE_EXISTING_STATE: OptionSpec = OptionSpec {
+    name: "--replace-existing-state",
+    value: None,
+    repeatable: false,
+    help: "replace the stores a stopped state directory holds; it must hold nothing but the state-directory layout's entries",
+};
+
+pub(crate) const FAMILIES: &[FamilySpec] = &[
+    FamilySpec {
+        name: "ledger",
+        summary: "Seed, verify or roll back a standalone configuration revision ledger, offline",
+        description: &[
+            "The offline commands over the configuration revision ledger beneath a standalone \
+             state directory (docs/configuration-ledger.md). Each takes the state directory's \
+             exclusive lock first, so it runs only while no gateway or other ggctl holds it, and \
+             exits 5 when one does. None makes a network request or reads an environment \
+             variable, and none writes gateway audit events: a revision's record is its \
+             evidence.",
+        ],
+        commands: LEDGER_COMMANDS,
+        hint: "run `ggctl help ledger` for the ledger commands",
+    },
+    FamilySpec {
+        name: "backup",
+        summary: "Back up a standalone state directory, verify a backup, or restore one, offline",
+        description: &[
+            "The offline commands over standalone backups (docs/standalone-backup.md): one \
+             archive of the stores beneath a state directory, with a GatewayBackup manifest of \
+             versions, inventory, counts and checksums. A backup is sensitive recovery material, \
+             not configuration. It never holds a plaintext token, a secret value or a key: the \
+             Connections store keeps its secrets as ciphertext, and the key files under \
+             CONNECTION_SECRETS_ROOT are a separate artifact to back up separately. None of \
+             these commands makes a network request or reads an environment variable, and none \
+             writes gateway audit events; a restore leaves a marker for the next gateway start \
+             to record.",
+        ],
+        commands: BACKUP_COMMANDS,
+        hint: "run `ggctl help backup` for the backup commands",
+    },
+];
 
 pub(crate) const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
@@ -341,6 +536,155 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         run: crate::diff::run,
     },
     CommandSpec {
+        name: "ledger seed",
+        summary: "Create a state directory's revision ledger from a bundle",
+        description: &[
+            "Reads the bundle in the directory BUNDLE with the gateway's own bundle reader, \
+             strictly (an entry the manifest does not reference is an error), takes the \
+             exclusive lock of the state directory --state-dir names, and creates its \
+             configuration revision ledger with the bundle as the first revision: desired, and \
+             not active until a gateway starts from it. The ledger is built under a temporary \
+             name and linked into place only once complete, so an interrupted seed leaves no \
+             ledger. A state directory that already holds a ledger, or a ledger's -wal, -shm \
+             or -journal file, is refused and left as it is.",
+            "The gateway's production policy and tools validators are not part of ggctl and do \
+             not run, and the report says so: a gateway starting from the ledger compiles the \
+             revision again with them and refuses to start if it does not compile. Exits 0 when \
+             seeded, 3 for an invalid bundle or an unusable state directory, 5 when the state \
+             directory is locked or already holds a ledger, and 1 when the bundle or the ledger \
+             could not be read or written.",
+        ],
+        arguments: &[BUNDLE],
+        options: &[STATE_DIR, FORMAT],
+        run: crate::ledger::seed,
+    },
+    CommandSpec {
+        name: "ledger verify",
+        summary: "Verify a state directory's revision ledger, read-only",
+        description: &[
+            "Takes the exclusive lock of the state directory --state-dir names, opens its \
+             configuration revision ledger read-only and verifies all of it, as a gateway does \
+             at start: the file's location and permissions, the SQLite page structure, the \
+             exact schema, every record and its hash, the whole chain, every document against \
+             its pin and the pointer. It reports the desired and active revisions and how many \
+             revisions the ledger holds, or the class of corruption it found. Nothing in the \
+             ledger is written.",
+            "Exits 0 when the ledger verifies, 3 when it is corrupt, missing, unsupported or \
+             unsafely placed, 5 when the state directory is locked, and 1 when the ledger could \
+             not be read.",
+        ],
+        arguments: &[],
+        options: &[STATE_DIR, FORMAT],
+        run: crate::ledger::verify,
+    },
+    CommandSpec {
+        name: "ledger rollback",
+        summary: "Roll a state directory's revision ledger back to a prior revision, offline",
+        description: &[
+            "The offline lockout recovery path: with the gateway stopped, takes the exclusive \
+             lock of the state directory --state-dir names, verifies its ledger, and plans a \
+             rollback to REVISION exactly as the gateway's revision service plans one: the \
+             target's stored content is compiled again and diffed against the desired \
+             revision, with its risk codes. Unless every one of those codes is named with \
+             --acknowledge, nothing is written and the plan is reported. There is no option \
+             that acknowledges them all.",
+            "Every risk code can be acknowledged offline, risk.admin_access_path_removed \
+             included, which no online request can acknowledge: filesystem access to the state \
+             directory is already full control of a standalone deployment. The rollback is \
+             appended as a new forward revision recording ggctl-ledger as its system actor, \
+             history is never rewritten, and the revision is desired and not active until a \
+             gateway starts from it. The gateway's production policy and tools validators do \
+             not run in ggctl, and the report says so: the gateway compiles the revision again \
+             with them at start. Exits 0 when rolled back, 2 for a REVISION that is not a \
+             revision ID, 3 when the ledger or the target's content is invalid or a risk code \
+             is not acknowledged, 5 when the state directory is locked, and 1 when the ledger \
+             could not be read or written.",
+        ],
+        arguments: &[REVISION],
+        options: &[STATE_DIR, ACKNOWLEDGE, FORMAT],
+        run: crate::ledger::rollback,
+    },
+    CommandSpec {
+        name: "backup create",
+        summary: "Back up a stopped standalone state directory into a new archive",
+        description: &[
+            "Takes the exclusive lock of the state directory --state-dir names, so it runs only \
+             while no gateway or other ggctl holds it, and writes one archive of every store of \
+             the state-directory layout it holds to the new file --output names. Each store is \
+             snapshotted with SQLite's VACUUM INTO from a read-only connection, never copied \
+             file by file, so whatever its write-ahead log holds is included consistently and \
+             neither the store nor its log is written; two names for one file are snapshotted \
+             once. The \
+             configuration revision ledger must pass its full verification and every snapshot \
+             SQLite's integrity check. Nothing else in the directory is read: not its lock \
+             file, not a store's -wal, -shm or -journal file, not any other file.",
+            "The archive is written to a new hidden file beside --output, owner-only on Unix, \
+             flushed and read back with every check of ggctl backup verify, then linked to \
+             --output, which must not exist and is never replaced; a failure leaves nothing at \
+             --output. A backup is never written to standard output. Exits 0 when the backup \
+             was written, 3 for a store that is a link, not a regular file, writable by others \
+             or corrupt, a ledger that does not verify, or a state directory with no store, 5 \
+             when the state directory is locked or --output exists, 7 when what was written \
+             did not verify, and 1 when a store or the archive could not be read or written.",
+        ],
+        arguments: &[],
+        options: &[STATE_DIR, BACKUP_OUTPUT, FORMAT],
+        run: crate::backup::create,
+    },
+    CommandSpec {
+        name: "backup verify",
+        summary: "Verify a backup archive completely, offline",
+        description: &[
+            "Reads the archive FILE completely through the shared archive admission rules, into \
+             a new hidden staging directory beside it, owner-only on Unix and removed \
+             afterwards: every entry name, kind and size before its data is read, the \
+             GatewayBackup manifest as a closed document of a version this ggctl reads, \
+             exactly the entries the manifest lists in its order with each one's SHA-256, the \
+             archive's own digest, and then each database: rollback-journal mode, SQLite's \
+             integrity check, its header versions, schema and table rows as the manifest \
+             records them, and the ledger's full verification and revisions.",
+            "Exits 0 when the backup verifies, 7 when anything about it does not (truncation, \
+             tampering, traversal, links, duplicate or case-colliding entries, a bomb, an \
+             unsupported version or a database that fails its checks), 3 when FILE is a link or \
+             not a regular file, and 1 when it or the staging directory could not be read or \
+             written. A digest is integrity evidence, not authenticity.",
+        ],
+        arguments: &[ARCHIVE],
+        options: &[FORMAT],
+        run: crate::backup::verify,
+    },
+    CommandSpec {
+        name: "backup restore",
+        summary: "Restore a backup into an empty or stopped state directory, offline",
+        description: &[
+            "Takes the exclusive lock of the state directory --state-dir names, so it runs only \
+             while no gateway or other ggctl holds it. The directory must be empty, or with \
+             --replace-existing-state hold nothing but the state-directory layout's entries (the \
+             stores' files with their -wal, -shm and -journal files, the lock file and a restore \
+             marker), and must not be a mount point. There is no option that overwrites anything \
+             else.",
+            "The archive FILE is extracted into a new hidden staging directory beside the state \
+             directory, named at random and owner-only on Unix, and checked there with every \
+             check of ggctl backup verify, then each store's SQLite application ID, owner-only \
+             modes and a flush of every file. A restore marker, which the next gateway start \
+             records as config.restore_detected and removes, is written beside the stores. Only \
+             then is the state directory renamed aside, the staging directory renamed into its \
+             place and their parent flushed; the replaced directory is then removed. Any failure \
+             removes the staging directory and leaves the state directory as it was.",
+            "Exits 0 when restored, 7 when the archive does not verify (truncation, tampering, \
+             traversal, links, duplicate or case-colliding entries, a bomb, an unsupported \
+             version, a database that fails its checks or claims another store's identity), 3 \
+             for a state directory that is not admissible, holds what the layout does not name \
+             or is a mount point, and for an archive that is a link, not a regular file or a \
+             PostgreSQL dump, 5 when the state directory is locked, holds stores without \
+             --replace-existing-state or changed meanwhile, and 1 when anything could not be \
+             read, written or renamed.",
+        ],
+        arguments: &[ARCHIVE],
+        options: &[RESTORE_STATE_DIR, REPLACE_EXISTING_STATE, FORMAT],
+        run: crate::backup::restore,
+    },
+    CommandSpec {
         name: "completion",
         summary: "Write a shell completion script",
         description: &[
@@ -360,13 +704,24 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "help",
         summary: "Print help for ggctl or one command",
-        description: &["Prints the help for COMMAND, or the overview without one."],
-        arguments: &[ArgumentSpec {
-            name: "COMMAND",
-            kind: ValueKind::Choice(COMMAND_NAMES),
-            required: false,
-            help: "the command to describe",
-        }],
+        description: &[
+            "Prints the help for COMMAND, or the overview without one. For a command family \
+             such as ledger or backup, prints the family's commands, or with SUBCOMMAND that command's help.",
+        ],
+        arguments: &[
+            ArgumentSpec {
+                name: "COMMAND",
+                kind: ValueKind::Choice(HELP_TOPICS),
+                required: false,
+                help: "the command or command family to describe",
+            },
+            ArgumentSpec {
+                name: "SUBCOMMAND",
+                kind: ValueKind::Choice(SUBCOMMANDS),
+                required: false,
+                help: "a command of the COMMAND family",
+            },
+        ],
         options: &[],
         run: crate::help::run,
     },
@@ -428,10 +783,19 @@ const HINT_INSECURE: &str = "add the server's CA with --ca-file instead";
 #[derive(Debug)]
 pub(crate) enum Parsed {
     Run(Invocation),
-    /// `--help`, `-h` or `help`: the overview or one command's help.
-    Help(Option<&'static CommandSpec>),
+    /// `--help`, `-h` or `help`.
+    Help(HelpTopic),
     /// `--version`.
     Version,
+}
+
+/// What a help request asks about.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum HelpTopic {
+    Overview,
+    Family(&'static FamilySpec),
+    /// One command, by its table entry.
+    Spec(&'static CommandSpec),
 }
 
 /// A command and its arguments, each with its 1-based position.
@@ -463,6 +827,21 @@ impl Invocation {
             .and_then(|(position, value)| value.to_str().map(|value| (position, value)))
     }
 
+    /// Every value of a repeatable option, in command-line order. Each is
+    /// UTF-8, as [`Self::text`] is.
+    pub(crate) fn texts(&self, name: &str) -> Vec<(usize, &str)> {
+        self.options
+            .iter()
+            .filter(|(option, _, _)| *option == name)
+            .filter_map(|(_, position, value)| {
+                value
+                    .as_deref()
+                    .and_then(OsStr::to_str)
+                    .map(|value| (*position, value))
+            })
+            .collect()
+    }
+
     pub(crate) fn positional(&self, index: usize) -> Option<(usize, &str)> {
         self.positionals
             .get(index)
@@ -476,8 +855,8 @@ pub(crate) fn parse(arguments: &[OsString]) -> Result<Parsed, Diagnostic> {
     let Some(first) = arguments.first() else {
         return Err(Diagnostic::new(Code::MissingCommand).with_hint(HINT_HELP));
     };
-    match first.to_str() {
-        Some("--help" | "-h") => return Ok(Parsed::Help(None)),
+    let word = match first.to_str() {
+        Some("--help" | "-h") => return Ok(Parsed::Help(HelpTopic::Overview)),
         Some("--version") => return Ok(Parsed::Version),
         Some(word) if word.starts_with('-') => {
             return Err(Diagnostic::at(Code::UnknownOption, 1).with_hint(HINT_HELP))
@@ -486,26 +865,85 @@ pub(crate) fn parse(arguments: &[OsString]) -> Result<Parsed, Diagnostic> {
             if let Some((_, hint)) = RESERVED.iter().find(|(name, _)| *name == word) {
                 return Err(Diagnostic::at(Code::ReservedCommand, 1).with_hint(hint));
             }
+            word
         }
         None => return Err(Diagnostic::at(Code::ArgumentNotUtf8, 1)),
-    }
-    let Some(command) = COMMANDS
-        .iter()
-        .find(|command| Some(command.name) == first.to_str())
-    else {
-        return Err(Diagnostic::at(Code::UnknownCommand, 1).with_hint(HINT_HELP));
+    };
+    let command = match FAMILIES.iter().find(|family| family.name == word) {
+        Some(family) => match family_command(family, arguments)? {
+            Some(command) => command,
+            None => return Ok(Parsed::Help(HelpTopic::Family(family))),
+        },
+        // A family's command is named only by two arguments.
+        None => COMMANDS
+            .iter()
+            .find(|command| command.family().is_none() && command.name == word)
+            .ok_or(Diagnostic::at(Code::UnknownCommand, 1).with_hint(HINT_HELP))?,
     };
     let invocation = parse_command(command, arguments)?;
     if invocation.flag("--help").is_some() {
-        return Ok(Parsed::Help(Some(command)));
+        return Ok(Parsed::Help(HelpTopic::Spec(command)));
     }
     if command.name == "help" {
-        let topic = invocation
-            .positional(0)
-            .and_then(|(_, name)| COMMANDS.iter().find(|command| command.name == name));
-        return Ok(Parsed::Help(topic));
+        return help_topic(&invocation).map(Parsed::Help);
     }
     Ok(Parsed::Run(invocation))
+}
+
+/// The command of `family` the second argument names, or `None` for a help
+/// request about the family itself.
+fn family_command(
+    family: &'static FamilySpec,
+    arguments: &[OsString],
+) -> Result<Option<&'static CommandSpec>, Diagnostic> {
+    let Some(second) = arguments.get(1) else {
+        return Err(Diagnostic::new(Code::MissingCommand).with_hint(family.hint));
+    };
+    match second.to_str() {
+        Some("--help" | "-h") => Ok(None),
+        Some(word) => family
+            .members()
+            .find(|command| member_word(family, command) == Some(word))
+            .map(Some)
+            .ok_or(Diagnostic::at(Code::UnknownCommand, 2).with_hint(family.hint)),
+        None => Err(Diagnostic::at(Code::ArgumentNotUtf8, 2)),
+    }
+}
+
+/// The second word of `command`'s name when it is a command of `family`.
+fn member_word(family: &FamilySpec, command: &CommandSpec) -> Option<&'static str> {
+    command
+        .name
+        .strip_prefix(family.name)
+        .and_then(|rest| rest.strip_prefix(' '))
+}
+
+/// What `ggctl help [COMMAND [SUBCOMMAND]]` asks about. A SUBCOMMAND is
+/// accepted only after a family that has it.
+pub(crate) fn help_topic(invocation: &Invocation) -> Result<HelpTopic, Diagnostic> {
+    let Some((position, topic)) = invocation.positional(0) else {
+        return Ok(HelpTopic::Overview);
+    };
+    let subcommand = invocation.positional(1);
+    if let Some(family) = FAMILIES.iter().find(|family| family.name == topic) {
+        let Some((position, word)) = subcommand else {
+            return Ok(HelpTopic::Family(family));
+        };
+        return family
+            .members()
+            .find(|command| member_word(family, command) == Some(word))
+            .map(HelpTopic::Spec)
+            .ok_or(Diagnostic::at(Code::InvalidValue, position));
+    }
+    if let Some((position, _)) = subcommand {
+        return Err(Diagnostic::at(Code::UnexpectedArgument, position).with_hint(HINT_HELP));
+    }
+    // The parser accepted only a topic `HELP_TOPICS` lists.
+    COMMANDS
+        .iter()
+        .find(|command| command.name == topic)
+        .map(HelpTopic::Spec)
+        .ok_or(Diagnostic::at(Code::InvalidValue, position))
 }
 
 fn parse_command(
@@ -518,7 +956,7 @@ fn parse_command(
         options: Vec::new(),
     };
     let mut only_positionals = false;
-    let mut index = 1;
+    let mut index = command.words();
     while index < arguments.len() {
         let position = index + 1;
         let argument = &arguments[index];
@@ -550,7 +988,7 @@ fn parse_command(
         let Some(option) = command.options.iter().find(|option| option.name == name) else {
             return Err(Diagnostic::at(Code::UnknownOption, position).with_hint(HINT_HELP));
         };
-        if invocation.flag(option.name).is_some() {
+        if !option.repeatable && invocation.flag(option.name).is_some() {
             return Err(Diagnostic::at(Code::DuplicateOption, position));
         }
         let value = match (option.value, inline) {

@@ -108,7 +108,8 @@ and byte rather than character lengths.
 | `cases` | 1 to 512 cases. |
 | `cases[].id` | Unique within the suite, at most 128 bytes, an ASCII letter or digit followed by letters, digits, `.`, `_`, `:` or `-`. Results, SARIF and JUnit identify a case by this id and its JSON Pointer. |
 | `cases[].kind` | `http`, `tool`, `tool_http`, `rate` or `egress`. Each kind accepts only its own members. |
-| `cases[].principal` | Every kind but `egress`: `"anonymous"`, or `subject` (required), `issuer`, `roles`, `auth_method` (required: `bearer_token`, `session_cookie`, `service_token` or `client_certificate`) and `organization`. The issuer is canonicalized as authentication canonicalizes it (a trailing `/` is dropped). `organization` (1 to 8192 bytes) is the organization the principal's identity provider verified, which a policy's identity mappings may test; omitted, the principal has none. As on the live lanes it is read only in mapped-role mode, and no result repeats it. |
+| `cases[].principal` | Every kind but `egress`: `"anonymous"`, or `subject` (required), `issuer`, `roles`, `auth_method` (required: `bearer_token`, `session_cookie`, `service_token` or `client_certificate`) and `organization`. The issuer is canonicalized as authentication canonicalizes it (a trailing `/` is dropped). `organization` (1 to 8192 bytes) is the organization the principal's identity provider verified, which a policy's identity mappings may test; omitted, the principal has none. As on the live lanes it is read only when an identity mapping or an `organization` condition reads it, and no result repeats it. |
+| `cases[].facts` | `http`, `tool` and `tool_http` only: optional request facts a rule condition reads, `source_ip`, `headers`, `query` and `now`; see [Request facts](#request-facts). |
 | `cases[].expect` | What the case asserts; see below. |
 
 ### Case kinds
@@ -158,10 +159,39 @@ and byte rather than character lengths.
   there is no fallback. An egress case has no `principal`. See
   [egress cases](policy-simulation.md#egress-cases).
 
-There is no member for a token, cookie, header, query value, body or any other
-credential or request content. A member named like one (`token`,
-`authorization`, `cookie`, `headers`, `password`, `secret` and similar) is
+There is no member for a token, cookie, body or any other credential or
+request content. A member named like one (`token`, `authorization`,
+`cookie`, `headers`, `password`, `secret` and similar) outside `facts` is
 refused with `forbidden_field` rather than as an ordinary unknown member.
+
+### Request facts
+
+A policy v1 rule may carry conditions over the source network, request
+headers, query parameters and a time window. A case states those facts in an
+optional `facts` member, typed and bounded:
+
+| Member | Meaning |
+| --- | --- |
+| `source_ip` | The canonical client address the gateway would derive after trusted-proxy processing: an IPv4 or IPv6 address without a port. An IPv4-mapped IPv6 address is its IPv4 address. |
+| `headers` | An object from a lowercase header name to the values of its occurrences, in order: `{"x-environment": ["prod", "canary"]}` is two field lines. Each value is a whole field line, compared exactly. |
+| `query` | An object from a decoded parameter name to its decoded values, in order; `""` is a parameter without a value. |
+| `now` | The evaluation instant, `YYYY-MM-DDTHH:MM:SSZ`. |
+
+`http` cases may state all four; `tool` and `tool_http` cases only
+`source_ip` and `now`, because a tool call carries no headers or query of its
+own (`fact_not_applicable`); `rate` and `egress` cases none, because rate
+overrides carry no conditions and an outbound destination involves no caller. A fact a condition reads that the case does not state is
+unknown: the case is `indeterminate` with `missing_matcher_fact` and is
+reported `incomplete`, never passed, whatever it expected. An empty
+`headers` or `query` object states a request that carried none, which is a
+certain no-match. The organization a condition reads is the principal's
+`organization`, as for identity mappings. A header or query name that can
+carry a credential, an identity or hop-by-hop routing -- the names a
+condition may not read, such as `authorization`, `cookie`, `x-forwarded-for`,
+`connection`, `x-api-key` or `access_token` -- is refused with
+`forbidden_field`, in any letter case; more than 128 occurrences is
+`too_many_facts`; a value is at most 8192 bytes without control characters.
+No stated value appears in a report or diagnostic.
 
 ### Expectations
 
@@ -246,7 +276,7 @@ If-Match: "sha256:..."            (replacing the stored one)
   `<POLICY_FILE>.history.sqlite` default): the newest row is the stored suite,
   and a write is one SQLite transaction that re-checks the precondition and
   appends, so a crash leaves the old version or the new one. In cluster mode,
-  in PostgreSQL migration 28's `greengateway.policy_test_suite_versions` and
+  in PostgreSQL migration 29's `greengateway.policy_test_suite_versions` and
   `greengateway.policy_test_suite_active`, committed through the same
   versioned-document transaction as the policy, as a resource of its own (see
   [the policy control plane](deployment/postgres.md#the-policy-control-plane)).
@@ -283,11 +313,12 @@ policy must pass never needs the current policy to pass it first.
 `POLICY_TESTS_REQUIRED=true` ([configuration](configuration.md#policy_tests_required))
 makes the stored suite a precondition of every policy change the admin API
 activates: `PUT /v1{ADMIN_PREFIX}/policy`, rollback, rule create, update (a
-promotion or disable bound to a shadow review included), delete and reorder,
-a draft publication, and a discovery suggestion's acceptance, standalone or
-in cluster mode (where the rule and the suggestion's transition commit in one
-transaction). Each runs the stored suite against its candidate inside the
-commit precondition: under the policy write lock, after the cross-resource
+promotion or disable bound to a shadow review included), delete and reorder, a
+draft publication (one bound to a suggestion included, which commits as that
+suggestion's acceptance), and a discovery suggestion's acceptance, standalone
+or in cluster mode (where the candidate and the suggestion's transition commit
+in one transaction). Each runs the stored suite against its candidate inside
+the commit precondition: under the policy write lock, after the cross-resource
 checks, before any authority is asked to write. The run is the one
 `POST .../policy/tests/runs` makes for a candidate -- the same runner, the
 same egress controls and rate lanes, the same five-second deadline on a
@@ -434,7 +465,8 @@ Diagnostic codes: `invalid_type`, `missing_field`, `unknown_field`,
 `forbidden_field`, `invalid_value`, `too_long`, `unsupported_schema_version`,
 `empty_suite`, `too_many_cases`, `duplicate_case_id`, `invalid_case_id`,
 `invalid_method`, `invalid_path`, `invalid_host`, `invalid_origin`,
-`invalid_principal`, `inconsistent_case`, `unsupported_number`.
+`invalid_principal`, `inconsistent_case`, `unsupported_number`,
+`fact_not_applicable`, `too_many_facts`.
 
 ### JSON report
 

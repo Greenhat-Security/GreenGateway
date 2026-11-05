@@ -1,6 +1,6 @@
 //! What a policy, tools or policy test suite document commit's durable
 //! evidence says about it (issue #425, PR 2c): the closed action vocabulary of
-//! `document_change_evidence` (migration 23, widened by migration 28) and, in
+//! `document_change_evidence` (migration 23, widened by migration 29) and, in
 //! cluster mode, the actor it records.
 //!
 //! The rows are written by the transaction they describe
@@ -12,7 +12,7 @@
 /// The operation a policy or tools document commit performed, in the proposed
 /// authority-event vocabulary (`docs/schemas/authority_event.v1.schema.json`).
 /// Each code is exactly one of the values the `action` CHECK accepts
-/// (migration 23's, replaced by migration 28's).
+/// (migration 23's, replaced by migration 29's).
 ///
 /// Standalone policy writes pass one too. They record no evidence row: their
 /// file and optional SQLite history are separate steps until the #242

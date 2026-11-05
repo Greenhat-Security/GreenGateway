@@ -358,11 +358,18 @@ static MANIFEST: LazyLock<Vec<Migration>> = LazyLock::new(|| {
         .with_pinned_checksum("47cf1be700027c1798c0e03c8f9b25c47b379043f2effe02396dafb174f0c786"),
         Migration::new(
             28,
-            "policy_test_suites",
-            include_str!("migrations/0028_policy_test_suites.sql"),
+            "connection_create_replace_evidence",
+            include_str!("migrations/0028_connection_create_replace_evidence.sql"),
         )
         .finalize()
-        .with_pinned_checksum("8ebbe73ba807f03c3c7179e82b77add5541f6b23937c8d93bb77c5b7331bc03a"),
+        .with_pinned_checksum("5c71255cbf8f40f95a44ef7bc38bce221cbc7117b8fb3b89a6e9fca566ec605e"),
+        Migration::new(
+            29,
+            "policy_test_suites",
+            include_str!("migrations/0029_policy_test_suites.sql"),
+        )
+        .finalize()
+        .with_pinned_checksum("668b382f85e96c9d29de4ed1bfb0f76b9bb7527be0fdabff877ff08d73ee5a8f"),
     ]
 });
 
@@ -395,19 +402,20 @@ impl SchemaCompatibility {
     }
 }
 
-// This build's manifest ends at 28, and it serves exactly schema 28: it
-// approves no migration above its manifest, and it does not serve schema 27.
-// The move from 27 to 28 (the stored policy test suite, #243) is coordinated,
-// without an overlap: a schema-27 binary left serving after migration 28
+// This build's manifest ends at 29, and it serves exactly schema 29: it
+// approves no migration above its manifest, and it does not serve schema 28.
+// The move from 28 to 29 (the stored policy test suite, #243) is coordinated,
+// without an overlap: a schema-28 binary left serving after migration 29
 // would serve no suite routes and run no stored suite, so replicas behind one
 // load balancer would answer the same request differently.
 //
-// The move from 26 to 27 (service-token issue evidence, #425) was
-// coordinated too: a schema-26 binary left serving after migration 27 would
-// issue tokens without their evidence, so the issue-to-revoke chain of a
-// token issued during the overlap would start at a rotate, and a schema-27
-// binary cannot issue against a schema-26 table, whose CHECK refuses the
-// issue's row.
+// The move from 27 to 28 (Connection create, replace and credential binding
+// change evidence, #425) was coordinated too: a schema-27 binary left serving
+// after migration 28 would create and replace Connections, and change their
+// credential authority, without evidence or a journaled event, so a
+// Connection created during the overlap would start its evidence at a later
+// change, and a schema-28 binary cannot record a create or replace against a
+// schema-27 table, whose CHECK refuses the row.
 //
 // The step from 24 to 25 rolled, between migration 25's prepared release and
 // its successor, the last build whose manifest ended at 25: the prepared
@@ -417,8 +425,10 @@ impl SchemaCompatibility {
 // the same explicit column list (`connections::pg_store::
 // record_catalog_change_evidence`). This build is not that successor: it
 // carries migration 25 byte for byte, so its migrator records the approved
-// checksum, but it serves only schema 28, so from a prepared fleet it is a
+// checksum, but it serves only schema 29, so from a prepared fleet it is a
 // coordinated drain/migrate/restart like every other step.
+// That shared column list left out the three columns; this build's catalog
+// writer records all three.
 // `migration_twenty_five_is_the_extension_its_prepared_release_approved` pins
 // the manifest entry to the checksum that release approved, and the
 // published matrix's rolling step to both.
@@ -433,9 +443,11 @@ impl SchemaCompatibility {
 // evidence, #425 PR 2c), from 23 to 24 (the actor metadata of the
 // journaled authority evidence, #425), from 25 to 26 (admin session evidence
 // in the authority-event journal, with capacity held for every session's
-// withdrawal, #425), from 26 to 27 and from 27 to 28. A schema-25 binary left serving after
-// migration 26 would grant and withdraw admin sessions without journaling
-// their evidence. A schema-23 binary
+// withdrawal, #425), from 26 to 27 (service-token issue evidence, #425),
+// from 27 to 28 and from 28 to 29. A schema-26 binary left serving after
+// migration 27 would issue tokens without their evidence, and a schema-25
+// binary left serving after migration 26 would grant and withdraw admin
+// sessions without journaling their evidence. A schema-23 binary
 // must not keep writing evidence after migration 24: its Connection,
 // service-token and JWT revocation rows would record no actor kind, auth mode
 // or issuer. A schema-22 binary would also commit policy, tools and catalog
@@ -443,8 +455,8 @@ impl SchemaCompatibility {
 // that is never journaled. The fence keeps covering every binary that can
 // serve this database: none that predates it accepts this ledger either.
 const BINARY_SCHEMA_COMPATIBILITY: SchemaCompatibility = SchemaCompatibility {
-    read: (28, 28),
-    write: (28, 28),
+    read: (29, 29),
+    write: (29, 29),
     approved_extensions: &[],
 };
 
@@ -479,7 +491,7 @@ const APPROVED_EXTENSION_SOURCES: &[ExtensionSource] = &[];
 /// The intersection of the explicit read/write contracts, advertised to the
 /// roster. This is a summary, not proof of ledger integrity, permission to
 /// write a gated operation (`storage/compatibility.rs`), or permission to
-/// contract the schema. The shipped contract accepts only schema 28.
+/// contract the schema. The shipped contract accepts only schema 29.
 pub(crate) fn schema_version_range() -> (i32, i32) {
     BINARY_SCHEMA_COMPATIBILITY.serving_range()
 }
@@ -1399,18 +1411,18 @@ mod tests {
     fn the_shipped_contract_has_no_unproved_overlap() {
         assert_eq!(
             MANIFEST.len(),
-            28,
+            29,
             "review the compatibility contract when adding SQL"
         );
-        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.read, (28, 28));
-        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.write, (28, 28));
-        assert_eq!(schema_version_range(), (28, 28));
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.read, (29, 29));
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.write, (29, 29));
+        assert_eq!(schema_version_range(), (29, 29));
         assert!(
             BINARY_SCHEMA_COMPATIBILITY.approved_extensions.is_empty(),
             "this build approves no migration above its manifest"
         );
         // Readiness samples the manifest and one row more.
-        assert_eq!(runtime_ledger_row_limit(), 29);
+        assert_eq!(runtime_ledger_row_limit(), 30);
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len(), "")),
             Ok(SchemaStatus::Current)
@@ -1418,19 +1430,19 @@ mod tests {
         // The next migration is refused whatever it is: nothing prepared this
         // build for one.
         let mut beyond = ledger_for(&MANIFEST, MANIFEST.len(), "");
-        beyond.push((29, hex_checksum("-- migration 29")));
+        beyond.push((30, hex_checksum("-- migration 30")));
         assert_eq!(
             validate_runtime_ledger(&beyond),
             Err(LedgerProblem::UnknownVersion)
         );
 
-        // The previous releases' schemas are not served: schemas 27, 26 and 25
-        // are left by coordinated upgrades, and so are the prepared release's
+        // The previous releases' schemas are not served: schemas 28, 27, 26 and
+        // 25 are left by coordinated upgrades, and so are the prepared release's
         // schema 24 and every earlier point. The overlap of the rolling step
         // from 24 to 25 belonged to the prepared release and the schema-25
-        // successor, both of which serve 25; this build serves none of 24 to
-        // 27.
-        for behind in 1..=12 {
+        // successor, both of which serve 25; this build serves none of 24
+        // through 28.
+        for behind in 1..=13 {
             assert_eq!(
                 validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - behind, "")),
                 Ok(SchemaStatus::NeedsUpgrade {
@@ -2524,7 +2536,11 @@ mod tests {
             }))
             .expect("fixture Connection should decode");
         let record = store
-            .create(write, "migration-fixture", None)
+            .create(
+                write,
+                &crate::auth::change_actor::ChangeActor::for_test("migration-fixture"),
+                None,
+            )
             .await
             .expect("fixture Connection should create");
         let spec = r#"{"openapi":"3.1.0"}"#;
@@ -2556,7 +2572,7 @@ mod tests {
                         }
                     }),
                 }],
-                "migration-fixture",
+                &crate::auth::change_actor::ChangeActor::for_test("migration-fixture"),
             )
             .await
             .expect("fixture catalog should publish");
@@ -3619,8 +3635,9 @@ mod tests {
                 .expect("migrations through 24 should apply");
         }
 
-        // The column list `record_catalog_change_evidence` writes, in this
-        // build and in its prepared release alike.
+        // The column list `record_catalog_change_evidence` wrote in the
+        // prepared release and in the schema-25 release alike; this build
+        // also writes the three columns migration 25 adds.
         const PREPARED_INSERT: &str = "INSERT INTO greengateway.catalog_change_evidence \
                  (event_id, operation_id, actor_user_id, action, connection_id, \
                   prior_version, new_version, overlay_revision, security_revision) \
@@ -4194,15 +4211,18 @@ mod tests {
         clean_database(foundation.pool()).await;
     }
 
-    /// Migration 28 adds the stored policy test suite's versions and active
-    /// pointer and widens the document change evidence vocabulary to name it.
-    /// Every evidence row a schema-27 gateway committed is unchanged and still
-    /// accepted. Afterwards the evidence CHECKs accept exactly one new pairing,
-    /// `policy_tests.publish` on `policy_tests`, keep `configuration.import` to
-    /// the policy and tools documents, and the suite tables refuse a document
-    /// that is not a policy-tests.v1 object or an ETag of the wrong shape.
+    /// Migration 28 lets the Connection evidence table record a create, a
+    /// replace and a credential binding change, and backfills nothing: a
+    /// deletion a schema-27 gateway recorded keeps every column it had, sits
+    /// on the connection axis its prior version always counted, and gains no
+    /// successor, and no create or replace row is guessed for any Connection.
+    /// From then on each action has exactly one axis and one transition, a
+    /// writer must name the axis, and no other action is admitted. This
+    /// build's create and credential-changing replace write exactly the rows
+    /// the rule admits, bound to their outbox rows and journaled.
     #[tokio::test]
-    async fn migration_twenty_eight_adds_the_suite_and_widens_document_evidence() {
+    async fn migration_twenty_eight_admits_connection_create_and_replace_evidence_and_backfills_nothing(
+    ) {
         let Some(dsn) = real_dsn() else {
             eprintln!("skipping: no test database locator; CI runs this test");
             return;
@@ -4226,11 +4246,316 @@ mod tests {
                 .expect("migrations through 27 should apply");
         }
 
+        // A deletion a schema-27 gateway recorded.
+        client
+            .batch_execute(
+                "INSERT INTO greengateway.connection_change_evidence \
+                     (event_id, operation_id, actor_user_id, action, connection_id, \
+                      prior_version, security_revision, actor_kind, actor_auth_mode) \
+                 VALUES (gen_random_uuid(), gen_random_uuid(), 'schema-27-admin', \
+                         'connection.delete', gen_random_uuid(), 2, 3, 'principal', \
+                         'bearer_token');",
+            )
+            .await
+            .expect("a schema-27 deletion's evidence");
+        let snapshot = |without_new_columns: bool| {
+            let client = &client;
+            async move {
+                let projection = if without_new_columns {
+                    "row_to_json(e)::jsonb - 'new_version' - 'revision_axis'"
+                } else {
+                    "row_to_json(e)::jsonb"
+                };
+                client
+                    .query(
+                        &format!(
+                            "SELECT ({projection})::text \
+                             FROM greengateway.connection_change_evidence e"
+                        ),
+                        &[],
+                    )
+                    .await
+                    .expect("evidence snapshot")
+                    .iter()
+                    .map(|row| row.get::<_, String>(0))
+                    .collect::<Vec<_>>()
+            }
+        };
+        let before = snapshot(false).await;
+        assert_eq!(before.len(), 1);
+
+        apply_one(&client, &MANIFEST[through_v27], &test_settings())
+            .await
+            .expect("migration 28 should apply");
+        assert_eq!(snapshot(true).await, before, "no other column changed");
+        let existing = client
+            .query_one(
+                "SELECT revision_axis, new_version FROM greengateway.connection_change_evidence",
+                &[],
+            )
+            .await
+            .expect("the existing row reads");
+        assert_eq!(
+            (
+                existing.get::<_, String>(0),
+                existing.get::<_, Option<i64>>(1)
+            ),
+            ("connection".to_owned(), None),
+            "a deletion counts the connection axis and has no successor"
+        );
+        // The default existed only for the migration: a row that names no
+        // axis is refused.
+        assert!(
+            client
+                .execute(
+                    "INSERT INTO greengateway.connection_change_evidence \
+                         (event_id, operation_id, actor_user_id, action, connection_id, \
+                          prior_version, security_revision, actor_kind, actor_auth_mode) \
+                     VALUES (gen_random_uuid(), gen_random_uuid(), 'schema-28-admin', \
+                             'connection.delete', gen_random_uuid(), 2, 9, 'principal', \
+                             'bearer_token')",
+                    &[],
+                )
+                .await
+                .is_err(),
+            "a writer must name the revision axis"
+        );
+
+        const INSERT: &str = "INSERT INTO greengateway.connection_change_evidence \
+                 (event_id, operation_id, actor_user_id, action, connection_id, revision_axis, \
+                  prior_version, new_version, security_revision, actor_kind, actor_auth_mode) \
+             VALUES (gen_random_uuid(), gen_random_uuid(), 'schema-28-admin', $1, \
+                     gen_random_uuid(), $2, $3, $4, 9, 'principal', 'bearer_token')";
+        for (action, axis, prior, new) in [
+            ("connection.create", "connection", None, Some(1_i64)),
+            ("connection.replace", "connection", Some(1_i64), Some(2)),
+            ("credential.binding_change", "credential", Some(0), Some(1)),
+            ("credential.binding_change", "credential", Some(1), Some(3)),
+            ("connection.delete", "connection", Some(2), None),
+        ] {
+            client
+                .execute(INSERT, &[&action, &axis, &prior, &new])
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{action} on {axis} {prior:?} -> {new:?} is admitted: {error}")
+                });
+        }
+        for (action, axis, prior, new) in [
+            // A create is the first version and nothing before it.
+            ("connection.create", "connection", Some(0_i64), Some(1_i64)),
+            ("connection.create", "connection", None, Some(2)),
+            ("connection.create", "connection", None, None),
+            // A replace advances a positive version.
+            ("connection.replace", "connection", None, Some(2)),
+            ("connection.replace", "connection", Some(0), Some(1)),
+            ("connection.replace", "connection", Some(2), Some(2)),
+            ("connection.replace", "connection", Some(2), None),
+            // A binding change advances the credential revision, from 0 up.
+            ("credential.binding_change", "credential", None, Some(1)),
+            ("credential.binding_change", "credential", Some(-1), Some(0)),
+            ("credential.binding_change", "credential", Some(1), Some(1)),
+            ("credential.binding_change", "credential", Some(1), None),
+            // A deletion keeps a positive prior version and no successor.
+            ("connection.delete", "connection", Some(0), None),
+            ("connection.delete", "connection", Some(2), Some(3)),
+            // Each action has exactly one axis, and the axes are closed.
+            ("connection.create", "credential", None, Some(1)),
+            ("connection.replace", "credential", Some(1), Some(2)),
+            ("credential.binding_change", "connection", Some(0), Some(1)),
+            ("connection.delete", "credential", Some(2), None),
+            ("connection.create", "token", None, Some(1)),
+            // The vocabulary stays closed.
+            ("connection.update", "connection", Some(1), Some(2)),
+            ("credential.rotate", "credential", Some(1), Some(2)),
+        ] {
+            assert!(
+                client
+                    .execute(INSERT, &[&action, &axis, &prior, &new])
+                    .await
+                    .is_err(),
+                "{action} on {axis} {prior:?} -> {new:?} is refused"
+            );
+        }
+        client
+            .execute(
+                "DELETE FROM greengateway.connection_change_evidence \
+                 WHERE actor_user_id = 'schema-28-admin'",
+                &[],
+            )
+            .await
+            .expect("the probe rows go");
+        drop(client);
+        // Every later migration applies on top of the evidence it admits.
+        let later = MANIFEST.len() - through_v27 - 1;
+        assert_eq!(
+            apply_missing(foundation.pool(), &test_settings())
+                .await
+                .expect("the later migrations apply"),
+            if later == 0 {
+                MigrateOutput::UpToDate {
+                    applied: MANIFEST.len(),
+                }
+            } else {
+                MigrateOutput::Applied { applied: later }
+            }
+        );
+
+        // This build's create of a Connection without credential authority,
+        // then a replacement that configures some: a create row, then a
+        // replace row and a binding change row under one operation, each
+        // carrying its outbox row's shared revision and journaled.
+        let store = crate::connections::pg_store::PostgresConnectionStore::new(
+            foundation.pool().clone(),
+            crate::connections::model::MAX_CONNECTIONS,
+        )
+        .expect("the store opens");
+        let write = |authentication: serde_json::Value| {
+            serde_json::from_value::<crate::connections::model::ConnectionWrite>(
+                serde_json::json!({
+                    "display_name": "Schema 28 API",
+                    "enabled": false,
+                    "kind": "http_api",
+                    "endpoint": {
+                        "base_url": "https://migration.example.test",
+                        "base_path": "/v1"
+                    },
+                    "authentication": authentication
+                }),
+            )
+            .expect("the fixture Connection decodes")
+        };
+        let actor = crate::auth::change_actor::ChangeActor::for_test("schema-28-admin");
+        let created = store
+            .create(write(serde_json::json!({ "type": "none" })), &actor, None)
+            .await
+            .expect("a Connection creates after the migration");
+        assert_eq!(created.revisions.credential, 0);
+        let replaced = store
+            .replace(
+                &created.id,
+                &created.etag(),
+                write(serde_json::json!({
+                    "type": "static_bearer",
+                    "secret_id": "migration-token"
+                })),
+                &actor,
+            )
+            .await
+            .expect("a credential-changing replace commits");
+        assert_eq!(replaced.revisions.credential, 1);
+        let client = foundation.pool().get().await.expect("checkout");
+        let outbox: Vec<i64> = client
+            .query(
+                "SELECT revision FROM greengateway.security_outbox \
+                 WHERE resource_type = 'connection' AND resource_id = $1 ORDER BY revision",
+                &[&created.id.as_str()],
+            )
+            .await
+            .expect("the outbox reads")
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(outbox.len(), 2, "one create and one replace outbox row");
+        let recorded = client
+            .query(
+                "SELECT e.action, e.revision_axis, e.prior_version, e.new_version, \
+                        e.security_revision, e.operation_id::text, j.source \
+                 FROM greengateway.connection_change_evidence e \
+                 JOIN greengateway.authority_event_journal j ON j.event_id = e.event_id \
+                 WHERE e.connection_id = $1::text::uuid \
+                 ORDER BY j.position",
+                &[&created.id.as_str()],
+            )
+            .await
+            .expect("the evidence reads");
+        assert_eq!(
+            recorded
+                .iter()
+                .map(|row| (
+                    row.get::<_, String>(0),
+                    row.get::<_, String>(1),
+                    row.get::<_, Option<i64>>(2),
+                    row.get::<_, Option<i64>>(3),
+                    row.get::<_, i64>(4),
+                    row.get::<_, String>(6),
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("connection.create", "connection", None, Some(1), outbox[0]),
+                (
+                    "connection.replace",
+                    "connection",
+                    Some(1),
+                    Some(2),
+                    outbox[1]
+                ),
+                (
+                    "credential.binding_change",
+                    "credential",
+                    Some(0),
+                    Some(1),
+                    outbox[1]
+                ),
+            ]
+            .map(|(action, axis, prior, new, revision)| (
+                action.to_owned(),
+                axis.to_owned(),
+                prior,
+                new,
+                revision,
+                "connection_change_evidence".to_owned()
+            ))
+        );
+        let operations: Vec<String> = recorded.iter().map(|row| row.get(5)).collect();
+        assert_ne!(
+            operations[0], operations[1],
+            "the create is its own operation"
+        );
+        assert_eq!(
+            operations[1], operations[2],
+            "the replace and its binding change are one operation"
+        );
+        drop(client);
+        clean_database(foundation.pool()).await;
+    }
+
+    /// Migration 29 adds the stored policy test suite's versions and active
+    /// pointer and widens the document change evidence vocabulary to name it.
+    /// Every evidence row a schema-28 gateway committed is unchanged and still
+    /// accepted. Afterwards the evidence CHECKs accept exactly one new pairing,
+    /// `policy_tests.publish` on `policy_tests`, keep `configuration.import` to
+    /// the policy and tools documents, and the suite tables refuse a document
+    /// that is not a policy-tests.v1 object or an ETag of the wrong shape.
+    #[tokio::test]
+    async fn migration_twenty_nine_adds_the_suite_and_widens_document_evidence() {
+        let Some(dsn) = real_dsn() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = REAL_DATABASE.lock().await;
+        let dsn_file = write_dsn_file(&dsn);
+        let config = migration_config(&dsn_file);
+        let foundation = establish(&config).await;
+        clean_database(foundation.pool()).await;
+        let client = foundation.pool().get().await.expect("checkout");
+        bootstrap_ledger(&client)
+            .await
+            .expect("migration ledger should bootstrap");
+        let through_v28 = MANIFEST
+            .iter()
+            .take_while(|migration| migration.version <= 28)
+            .count();
+        for migration in &MANIFEST[..through_v28] {
+            apply_one(&client, migration, &test_settings())
+                .await
+                .expect("migrations through 28 should apply");
+        }
+
         const EVIDENCE: &str = "INSERT INTO greengateway.document_change_evidence \
                  (event_id, operation_id, actor_kind, actor_user_id, actor_auth_mode, \
                   action, resource_type, prior_version, new_version, security_revision) \
              VALUES (gen_random_uuid(), gen_random_uuid(), $1, $2, $3, $4, $5, NULL, $6, $7)";
-        // What a schema-27 deployment holds: a policy publication, the tools
+        // What a schema-28 deployment holds: a policy publication, the tools
         // seed and an import activation.
         for (kind, actor, mode, action, resource, version, revision) in [
             (
@@ -4269,7 +4594,7 @@ mod tests {
                     ],
                 )
                 .await
-                .expect("schema-27 document evidence");
+                .expect("schema-28 document evidence");
         }
         let snapshot = || {
             let client = &client;
@@ -4288,9 +4613,9 @@ mod tests {
             }
         };
         let before = snapshot().await;
-        apply_one(&client, &MANIFEST[through_v27], &test_settings())
+        apply_one(&client, &MANIFEST[through_v28], &test_settings())
             .await
-            .expect("migration 28 should apply");
+            .expect("migration 29 should apply");
         assert_eq!(snapshot().await, before, "existing evidence is unchanged");
 
         // The one new pairing is accepted.
@@ -4399,7 +4724,7 @@ mod tests {
     /// refuses naming the missing migrations and readiness reports the schema
     /// incompatible, so a replica of it started before the migration stalls
     /// the rollout rather than serving. Its `migrate check` reports exactly
-    /// migrations 25 through 28 unapplied, and its `migrate up` applies them
+    /// migrations 25 through 29 unapplied, and its `migrate up` applies them
     /// and nothing else, recording for migration 25 exactly the checksum the
     /// prepared release approved. From then on it serves, with and without
     /// development auto-migration, and its migrator has nothing left to do.
@@ -4456,7 +4781,7 @@ mod tests {
 
         // The prepared release's schema: not served here.
         let missing = MANIFEST.len() - through_v24;
-        assert_eq!(missing, 4, "migrations 25 through 28");
+        assert_eq!(missing, 5, "migrations 25 through 29");
         let authority = PostgresReadinessAuthority::new(pool.clone());
         assert_eq!(
             read_and_validate_runtime(pool).await,
@@ -4471,7 +4796,7 @@ mod tests {
                 error,
                 PostgresFoundationError::SchemaNotReady {
                     applied: 24,
-                    missing: 4,
+                    missing: 5,
                     auto_migrate: false
                 }
             ),
@@ -4489,7 +4814,7 @@ mod tests {
             })
         );
 
-        // The migration role's `migrate up`: migrations 25 through 28 and
+        // The migration role's `migrate up`: migrations 25 through 29 and
         // nothing else, migration 25 under the approved checksum.
         assert_eq!(
             execute(&strict, false).await,
@@ -4519,7 +4844,7 @@ mod tests {
         }
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::Writable { schema_version: 28 }
+            AuthorityObservation::Writable { schema_version: 29 }
         );
         assert_eq!(
             execute(&strict, true).await,
@@ -4559,7 +4884,7 @@ mod tests {
         }
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::IncompatibleSchema { schema_version: 28 }
+            AuthorityObservation::IncompatibleSchema { schema_version: 29 }
         );
         drop(client);
         clean_database(pool).await;

@@ -1,4 +1,4 @@
--- Migration 28: the stored policy test suite (issue #243).
+-- Migration 29: the stored policy test suite (issue #243).
 --
 -- A deployment keeps one exact-version policy-tests.v1 suite beside its
 -- policy, as a versioned document under the HA state model's section 2

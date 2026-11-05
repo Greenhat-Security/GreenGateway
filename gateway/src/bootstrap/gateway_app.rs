@@ -303,7 +303,7 @@ pub(crate) fn gateway_app_with_process_started_at_and_overrides(
             .transpose()?
             .map(|store| Arc::new(store) as Arc<dyn storage::PolicyDraftStore>);
     // The stored policy test suite (issue #243) lives beside the policy
-    // history the same way: migration 28's tables in cluster mode, and a
+    // history the same way: migration 29's tables in cluster mode, and a
     // `policy_test_suite_versions` table in the history database standalone.
     // A database that cannot be opened fails startup.
     #[cfg(feature = "postgres")]
@@ -381,6 +381,10 @@ pub(crate) fn gateway_app_with_process_started_at_and_overrides(
         }
         None => egress::EgressConfig::from_config(&config),
     };
+    #[cfg(test)]
+    if let Some(path) = build_overrides.egress_tls_ca_bundle_path.as_ref() {
+        egress_config.apply_tls_ca_bundle_path(path.clone())?;
+    }
     let discovery_egress_client = Arc::new(egress_client_for_build(
         egress_config.clone(),
         &build_overrides,
@@ -1302,8 +1306,11 @@ pub(crate) fn gateway_app_with_process_started_at_and_overrides(
     let suggestions_admin_state = SuggestionsAdminState {
         suggestion_engine: rule_suggestion_engine,
         policy: policy_admin_state.clone(),
-        lifecycle_guard: Arc::new(tokio::sync::Mutex::new(())),
+        lifecycle_guard: Arc::default(),
     };
+    // Settles a standalone acceptance a previous process left pending
+    // (issue #243) without waiting for the first suggestion request.
+    spawn_suggestion_acceptance_reconciler(suggestions_admin_state.clone(), &app_state.lifecycle);
     let principal_admin_state = PrincipalAdminState {
         directory: principal_directory,
         audit_query_store: audit_query_store.clone(),

@@ -632,7 +632,49 @@ pub(super) fn emit_suggestion_lifecycle_changed(
         &state.policy.client_ip_policy,
     );
     let actor = Some(auth::actor_from_principal(principal));
-    let payload = json!({
+
+    state.policy.audit.emit(audit::AuditEvent::new(
+        audit::event::SUGGESTION_LIFECYCLE_CHANGED,
+        request_id,
+        source_ip,
+        actor,
+        suggestion_lifecycle_payload(suggestion),
+    ));
+}
+
+/// `suggestion.lifecycle_changed` for a standalone acceptance the
+/// reconciler completed (issue #243): its policy was committed by a request
+/// that ended before it could move the suggestion. No request asks for this
+/// transition, so the event comes from the reconciler, and
+/// `transitioned_by` names the principal whose acceptance it was. The
+/// `reconciled` member says which route the acceptance came from and which
+/// candidate ETag was found committed.
+pub(super) fn emit_suggestion_acceptance_reconciled(
+    state: &SuggestionsAdminState,
+    intent: &discovery::suggestions::SuggestionAcceptanceIntent,
+    suggestion: &discovery::suggestions::RuleSuggestion,
+) {
+    let mut payload = suggestion_lifecycle_payload(suggestion);
+    if let Value::Object(fields) = &mut payload {
+        fields.insert(
+            "reconciled".to_owned(),
+            json!({
+                "origin": intent.origin.as_str(),
+                "candidate_etag": &intent.candidate_etag,
+            }),
+        );
+    }
+    state.policy.audit.emit(audit::AuditEvent::new(
+        audit::event::SUGGESTION_LIFECYCLE_CHANGED,
+        "suggestion-acceptance-reconciler",
+        "internal",
+        None,
+        payload,
+    ));
+}
+
+fn suggestion_lifecycle_payload(suggestion: &discovery::suggestions::RuleSuggestion) -> Value {
+    json!({
         "id": &suggestion.id,
         "suggestion_type": &suggestion.suggestion_type,
         "method": &suggestion.method,
@@ -642,15 +684,7 @@ pub(super) fn emit_suggestion_lifecycle_changed(
         "transitioned_at": &suggestion.transitioned_at,
         "transitioned_by": &suggestion.transitioned_by,
         "source_signal_id": &suggestion.source_signal_id,
-    });
-
-    state.policy.audit.emit(audit::AuditEvent::new(
-        audit::event::SUGGESTION_LIFECYCLE_CHANGED,
-        request_id,
-        source_ip,
-        actor,
-        payload,
-    ));
+    })
 }
 
 pub(super) fn policy_change_payload(before: &rbac::Policy, after: &rbac::Policy) -> Value {

@@ -417,10 +417,11 @@ fn inline_policy_under_test(
     if let Err(error) = rbac_state.validate_proxy_dispatch_policy(&candidate) {
         return Err(Box::new(policy_candidate_invalid(&error)));
     }
-    // `POST /policy/validate` also refuses a document format this
-    // deployment cannot commit (cluster mode and policy v1), so a run
-    // refuses it too rather than judge a candidate the gateway would not
-    // accept.
+    // `POST /policy/validate` also refuses a document format replicas of
+    // this build do not serve in cluster mode, so a run refuses it too
+    // rather than judge a candidate the gateway would not accept. Whether
+    // every live replica reads it now is a question for the commit's
+    // operation gate, not for a run that commits nothing.
     if let Some(detail) = deployment_document_format_refusal(state, &candidate) {
         return Err(Box::new(policy_candidate_refused(vec![detail])));
     }

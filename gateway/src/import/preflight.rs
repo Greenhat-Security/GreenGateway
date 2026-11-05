@@ -22,13 +22,18 @@
 //! `--resume` skips question 3 only. The sections it resumes are the ones
 //! that made the namespace non-empty, and each recognizes its own work by
 //! the resource's natural key before writing anything.
+//!
+//! A fourth question is asked only of a source that needs it: whether every
+//! live replica of the target can read what the import writes
+//! ([`live_members_admit`]; a policy v1 document, issue #243).
 
 use crate::{
     import::{ImportError, ImportMode, SchemaReport},
     storage::{
+        compatibility::{self, OperationRefusal, OperationRequirement},
         migrations,
         postgres::{read_deployment_binding, PostgresFoundationError},
-        RepositoryError,
+        PostgresMembershipStore, RepositoryError,
     },
 };
 
@@ -113,7 +118,7 @@ const AUTHORITATIVE_TABLES: &[&str] = &[
     // by publications, never by the import.
     "document_change_evidence",
     "catalog_change_evidence",
-    // 0028: the stored policy test suite. The import never writes it (a
+    // 0029: the stored policy test suite. The import never writes it (a
     // standalone suite stays behind), so a row means an operator already
     // stored one in this namespace.
     "policy_test_suite_versions",
@@ -216,6 +221,80 @@ async fn contract_fence_admits_this_build(
         )),
         None => Ok(()),
     }
+}
+
+/// Ask the cluster's operation gate whether every live replica of the
+/// target deployment can read what the import writes (issue #243): today
+/// that is a policy v1 document, active or in history, the registered
+/// operation `policy.document_v1`. Called only when the source holds one.
+///
+/// The import is a one-shot command beside `gateway migrate up`, with no
+/// roster row of its own, so the gate is asked without one
+/// (`compatibility::evaluate_without_own_row`): the contract fence must
+/// admit this build, and every live member, draining ones included, must
+/// advertise the capability and a document range reaching format 1. A
+/// target no replica has joined yet -- the cutover's order, which starts
+/// replicas after the import -- has no live member and admits. A replica
+/// of an earlier build that joins later fails closed on the document,
+/// which is what live-member activation accepts. A dry run asks too, so it
+/// predicts the apply's refusal; either refusal writes nothing. The
+/// lacking members' instance IDs are logged, never reported.
+pub(super) async fn live_members_admit(
+    pool: &deadpool_postgres::Pool,
+    deployment_id: &str,
+    stale_window: std::time::Duration,
+    requirement: &OperationRequirement,
+) -> Result<(), ImportError> {
+    let refused = |refusal: OperationRefusal| {
+        if let OperationRefusal::MembersLackRequirement { lacking, live } = &refusal {
+            for member in lacking {
+                tracing::warn!(
+                    operation = requirement.operation,
+                    capability = requirement.capability.as_str(),
+                    member_instance_id = %member,
+                    live_members = live,
+                    "import-standalone: a live member of the target deployment does not advertise what the import's write requires; nothing is written"
+                );
+            }
+        }
+        ImportError::TargetOperationRefused {
+            operation: requirement.operation,
+            reason: refusal.reason(),
+            detail: refusal.to_string(),
+        }
+    };
+    if !compatibility::OPERATION_REQUIREMENTS.contains(requirement)
+        || requirement.activation != compatibility::Activation::LiveMembers
+        || requirement.backfill != compatibility::Backfill::NotRequired
+    {
+        return Err(refused(OperationRefusal::NotSupportedByThisBinary));
+    }
+    let store = PostgresMembershipStore::new(
+        pool.clone(),
+        deployment_id,
+        crate::ha::InstanceIdentity::generate(),
+    );
+    let fence = store
+        .contract_fence()
+        .await
+        .map_err(|_| refused(OperationRefusal::ActivationFenceUnavailable))?;
+    let members = store
+        .members(stale_window)
+        .await
+        .map_err(|_| refused(OperationRefusal::RosterUnavailable))?;
+    let advertisements: Vec<compatibility::MemberAdvertisement> = members
+        .iter()
+        .map(compatibility::MemberAdvertisement::from)
+        .collect();
+    compatibility::evaluate_without_own_row(
+        requirement,
+        &compatibility::BinaryContract::shipped(),
+        &advertisements,
+        &fence,
+        None,
+    )
+    .map(|_| ())
+    .map_err(refused)
 }
 
 /// The authoritative tables that hold rows and the counters that have

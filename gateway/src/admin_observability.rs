@@ -358,6 +358,22 @@ pub(super) fn suggestion_transition_refused_response(
     }
 }
 
+/// Why [`reviewable_suggestion_rule`] refused a suggestion: the answer, and
+/// the stable reason a draft publication records the refusal under.
+pub(super) struct SuggestionReviewRefusal {
+    pub(super) reason: &'static str,
+    pub(super) response: Box<Response>,
+}
+
+impl SuggestionReviewRefusal {
+    fn new(reason: &'static str, response: Response) -> Self {
+        Self {
+            reason,
+            response: Box::new(response),
+        }
+    }
+}
+
 /// The suggestion `id` and the direct rule it proposes, if it may become
 /// one: the row is open, and at `expected_revision` when the caller named
 /// one; a baseline proposal is bound to an issuer or authentication method;
@@ -365,21 +381,32 @@ pub(super) fn suggestion_transition_refused_response(
 /// traffic. An HTTP rule's `dispatch` is recomputed from that state, never
 /// taken from the copy stored with the advisory suggestion.
 ///
-/// Acceptance and opening a suggestion into a policy draft (issue #243,
-/// slice 19) both ask this, so they refuse exactly the same suggestions with
-/// the same answers. It reads only: an acceptance's own transition predicate
-/// is still what decides a race.
+/// Acceptance, opening a suggestion into a policy draft (issue #243, slice
+/// 19) and a draft publication bound to a suggestion all ask this, so they
+/// refuse exactly the same suggestions with the same answers; `stale`
+/// answers a row that is not open or not at the expected revision, the one
+/// answer each route words its own way. It reads only: an acceptance's own
+/// transition predicate is still what decides a race.
 pub(super) async fn reviewable_suggestion_rule(
     suggestion_engine: &discovery::suggestions::SuggestionEngineHandle,
     id: &str,
     expected_revision: Option<i64>,
-) -> ResponseResult<(discovery::suggestions::RuleSuggestion, rbac::Rule)> {
+    stale: fn(&discovery::suggestions::RuleSuggestion) -> Response,
+) -> Result<(discovery::suggestions::RuleSuggestion, rbac::Rule), SuggestionReviewRefusal> {
     let suggestion = match suggestion_engine.get_suggestion(id.to_owned()).await {
         Ok(Some(suggestion)) => suggestion,
-        Ok(None) => return Err(Box::new(not_found("suggestion was not found"))),
+        Ok(None) => {
+            return Err(SuggestionReviewRefusal::new(
+                "suggestion_not_found",
+                not_found("suggestion was not found"),
+            ))
+        }
         Err(err) => {
             tracing::error!(error = %err, "failed to load rule suggestion");
-            return Err(Box::new(internal_server_error("suggestion query failed")));
+            return Err(SuggestionReviewRefusal::new(
+                "suggestion_unavailable",
+                internal_server_error("suggestion query failed"),
+            ));
         }
     };
     // The row must still be Open, and at the revision the caller read if
@@ -389,46 +416,55 @@ pub(super) async fn reviewable_suggestion_rule(
     if suggestion.state != discovery::suggestions::RuleSuggestionLifecycleState::Open
         || expected_revision.is_some_and(|expected| expected != suggestion.revision)
     {
-        return Err(Box::new(suggestion_transition_refused_response(
-            &suggestion,
-        )));
+        return Err(SuggestionReviewRefusal::new(
+            "suggestion_stale",
+            stale(&suggestion),
+        ));
     }
     if !suggestion.is_identity_bound_for_acceptance() {
-        return Err(Box::new(conflict(
-            "baseline suggestion is missing issuer or authentication-method constraints",
-        )));
+        return Err(SuggestionReviewRefusal::new(
+            "suggestion_not_identity_bound",
+            conflict("baseline suggestion is missing issuer or authentication-method constraints"),
+        ));
     }
 
+    let unroutable = |error: &str| {
+        Err(SuggestionReviewRefusal::new(
+            "suggestion_routing_unsafe",
+            conflict(error),
+        ))
+    };
     let dispatch = match suggestion_engine
         .direct_rule_suggestion_safety(suggestion.clone())
         .await
     {
         Ok(discovery::suggestions::DirectRuleSuggestionSafety::Safe(dispatch)) => dispatch,
         Ok(discovery::suggestions::DirectRuleSuggestionSafety::HostRouted) => {
-            return Err(Box::new(conflict(
+            return unroutable(
                 "suggestion targets host-routed traffic and cannot be accepted as a direct rule",
-            )));
+            );
         }
         Ok(discovery::suggestions::DirectRuleSuggestionSafety::PathRouted) => {
-            return Err(Box::new(conflict(
+            return unroutable(
                 "suggestion targets path-routed traffic and cannot be accepted as a direct rule",
-            )));
+            );
         }
         Ok(discovery::suggestions::DirectRuleSuggestionSafety::AmbiguousRouting) => {
-            return Err(Box::new(conflict(
+            return unroutable(
                 "suggestion spans multiple upstream routing contexts and cannot be accepted as a direct rule",
-            )));
+            );
         }
         Ok(discovery::suggestions::DirectRuleSuggestionSafety::UnknownRoutingContext) => {
-            return Err(Box::new(conflict(
+            return unroutable(
                 "suggestion predates trusted routing context and cannot be accepted; dismiss it and review newly classified traffic",
-            )));
+            );
         }
         Err(err) => {
             tracing::error!(error = %err, "failed to revalidate rule suggestion routing context");
-            return Err(Box::new(internal_server_error(
-                "suggestion routing-context validation failed",
-            )));
+            return Err(SuggestionReviewRefusal::new(
+                "suggestion_unavailable",
+                internal_server_error("suggestion routing-context validation failed"),
+            ));
         }
     };
 
@@ -440,6 +476,21 @@ pub(super) async fn reviewable_suggestion_rule(
     }
 
     Ok((suggestion, proposed_rule))
+}
+
+/// The rule a suggestion's review draft takes for `rule`, the proposal
+/// [`reviewable_suggestion_rule`] returned: a signal-derived proposal to
+/// deny is drafted as `shadow`, because a draft never starts by enforcing a
+/// deny that was only inferred from traffic. A draft publication bound to
+/// the suggestion looks for this rule in the candidate.
+pub(super) fn drafted_suggestion_rule(
+    suggestion: &discovery::suggestions::RuleSuggestion,
+    mut rule: rbac::Rule,
+) -> rbac::Rule {
+    if suggestion.source_signal_id.is_some() && rule.action == rbac::RuleAction::Deny {
+        rule.action = rbac::RuleAction::Shadow;
+    }
+    rule
 }
 
 pub(super) async fn rule_suggestions_list_endpoint(
@@ -466,6 +517,13 @@ pub(super) async fn rule_suggestions_list_endpoint(
         Err(parameter) => return bad_request(&format!("invalid query parameter: {parameter}")),
     };
 
+    // A listing waits for an in-flight acceptance and settles any an
+    // earlier request or process left pending (issue #243), so it never
+    // shows a suggestion open whose rule is already live.
+    let _lifecycle = match reconciled_suggestion_lifecycle(&state).await {
+        Ok(lifecycle) => lifecycle,
+        Err(response) => return *response,
+    };
     let suggestions_page = match suggestion_engine.list_suggestion_page(filters).await {
         Ok(page) => page,
         Err(discovery::suggestions::RuleSuggestionError::InvalidCursor { parameter }) => {
@@ -565,144 +623,25 @@ pub(super) async fn rule_suggestion_accept_endpoint(
     // suggestion (issue #241, PR 12). Every other suggestion lifecycle
     // write in this process takes the same lock, so a concurrent dismissal
     // cannot land between the two halves of an acceptance and leave the
-    // rule installed for a suggestion that reads `dismissed`.
-    let _lifecycle_guard = state.lifecycle_guard.lock().await;
-    let (suggestion, proposed_rule) =
-        match reviewable_suggestion_rule(suggestion_engine, id, expected_revision).await {
-            Ok(reviewed) => reviewed,
-            Err(response) => return *response,
-        };
-
-    // Cluster mode commits the rule and the transition in ONE transaction
-    // at the authority (issue #241, PR 12): there is no window in which a
-    // crash or another replica's commit can separate them.
-    #[cfg(feature = "postgres")]
-    if let Some(engine) = suggestion_engine.cluster() {
-        return accept_suggestion_in_cluster(
-            SuggestionAcceptContext {
-                state: &state,
-                parts: &parts,
-                principal: &principal,
-                rbac_state,
-            },
-            engine,
-            id,
-            suggestion.revision,
-            proposed_rule,
-        )
-        .await;
-    }
-
-    // The standalone policy write records no evidence (issue #425, PR 4);
-    // asked as the acceptance it is, before the rule is written.
-    if let Err(response) = admit_authority_change(
-        &state.policy.authority_evidence,
-        authority_events::required::AuthorityOperation::PolicySuggestionAccept,
-        &state.policy.audit,
-        &parts,
-        &principal,
-        &state.policy.client_ip_policy,
-    ) {
-        return *response;
-    }
-    let created = match create_policy_rule(
-        &state.policy,
-        &parts,
-        &principal,
-        rbac_state,
-        proposed_rule,
+    // rule installed for a suggestion that reads `dismissed`. Taking it
+    // settles any acceptance an earlier request or process left pending.
+    let mut lifecycle = match reconciled_suggestion_lifecycle(&state).await {
+        Ok(lifecycle) => lifecycle,
+        Err(response) => return *response,
+    };
+    let (suggestion, proposed_rule) = match reviewable_suggestion_rule(
+        suggestion_engine,
+        id,
+        expected_revision,
+        suggestion_transition_refused_response,
     )
     .await
     {
-        Ok(result) => result,
-        Err(response) => return *response,
+        Ok(reviewed) => reviewed,
+        Err(refusal) => return *refusal.response,
     };
 
-    // Standalone acceptance is policy write, then the conditional
-    // transition against the revision this handler validated (issue #241,
-    // PR 12). Both steps run under `lifecycle_guard`, taken above and by
-    // every other suggestion lifecycle write in this process, so nothing
-    // can move the row in between: the transition below is refused only if
-    // the row moved before this request read it, which the check above
-    // already answered. If it is ever refused anyway the rule stays and
-    // the caller learns the suggestion moved.
-    let expected = discovery::lifecycle::TransitionPrecondition::from_state(
-        discovery::suggestions::RuleSuggestionLifecycleState::Open,
-    )
-    .with_revision(Some(suggestion.revision));
-    let suggestion = match suggestion_engine
-        .transition_suggestion(
-            id.to_owned(),
-            discovery::suggestions::RuleSuggestionLifecycleState::Accepted,
-            Some(principal.user_id.clone()),
-            expected,
-        )
-        .await
-    {
-        Ok(discovery::lifecycle::TransitionOutcome::Applied(suggestion)) => suggestion,
-        Ok(discovery::lifecycle::TransitionOutcome::Refused(refused)) => {
-            return with_etag(
-                lifecycle_transition_refused(
-                    "suggestion was transitioned concurrently; the rule was created",
-                    "suggestion_transitioned_concurrently",
-                    "suggestion",
-                    &refused.current,
-                ),
-                &created.new_etag,
-            );
-        }
-        Ok(discovery::lifecycle::TransitionOutcome::NotFound) => {
-            return not_found("suggestion was not found")
-        }
-        Err(err) => {
-            tracing::error!(error = %err, "failed to accept rule suggestion");
-            return internal_server_error("suggestion transition failed");
-        }
-    };
-    emit_suggestion_lifecycle_changed(&state, &parts, &principal, &suggestion);
-
-    let response = (
-        StatusCode::CREATED,
-        [(header::ETAG, etag_header_value(&created.new_etag))],
-        Json(RuleSuggestionAcceptResponse {
-            suggestion,
-            rule: created.rule,
-        }),
-    )
-        .into_response();
-    with_policy_history_append_warning(response, created.history_append_failed)
-}
-
-/// Cluster mode's acceptance (issue #241, PR 12): the rule the suggestion
-/// proposes and the suggestion's transition to `accepted` commit in ONE
-/// transaction at the authority, so the HA state model's rule 7 holds --
-/// no partial success exists. The candidate is prepared exactly as
-/// [`create_policy_rule`] prepares it (same `If-Match` precondition, same
-/// validation, same diff summary), then committed by
-/// [`storage::postgres_discovery_lifecycle::PostgresDiscoveryLifecycleStore::accept_suggestion`]
-/// alongside the transition instead of on its own.
-///
-/// Everything with an effect outside the transaction happens AFTER it
-/// commits: the local revision snapshot install and both audit events.
-/// Audit is at-least-once by design, so an event describing an acceptance
-/// that rolled back must be impossible, while losing the events of a
-/// committed acceptance to a crash is tolerable.
-#[cfg(feature = "postgres")]
-pub(super) async fn accept_suggestion_in_cluster(
-    context: SuggestionAcceptContext<'_>,
-    engine: &discovery::cluster_suggestions::ClusterRuleSuggestionEngine,
-    suggestion_id: &str,
-    expected_revision: i64,
-    proposed_rule: rbac::Rule,
-) -> Response {
-    let SuggestionAcceptContext {
-        state,
-        parts,
-        principal,
-        rbac_state,
-    } = context;
-    let _policy_write_guard = rbac_state.policy_write_guard().await;
-
+    let policy_write_guard = rbac_state.policy_write_guard().await;
     let prepared =
         match prepare_policy_rule_create(&state.policy, rbac_state, &parts.headers, proposed_rule)
             .await
@@ -710,70 +649,730 @@ pub(super) async fn accept_suggestion_in_cluster(
             Ok(prepared) => prepared,
             Err(response) => return *response,
         };
+    let committed = commit_suggestion_acceptance(
+        SuggestionAcceptContext {
+            state: &state,
+            parts: &parts,
+            principal: &principal,
+            rbac_state,
+            policy_write_guard: &policy_write_guard,
+        },
+        &mut lifecycle,
+        suggestion_engine,
+        SuggestionAcceptanceCandidate {
+            origin: discovery::suggestions::SuggestionAcceptanceOrigin::Accept,
+            suggestion: &suggestion,
+            before_policy: &prepared.before_policy,
+            current_etag: &prepared.current_etag,
+            candidate: &prepared.candidate,
+            diff_summary: prepared.diff_summary.clone(),
+        },
+    )
+    .await;
+    let committed = match committed {
+        Ok(committed) => committed,
+        Err(failure) => return failure.into_response(),
+    };
+
+    let rule = committed
+        .policy
+        .rules
+        .get(prepared.position)
+        .cloned()
+        .unwrap_or(prepared.created_rule);
+    let response = (
+        StatusCode::CREATED,
+        [(header::ETAG, etag_header_value(&committed.etag))],
+        Json(RuleSuggestionAcceptResponse {
+            suggestion: committed.suggestion,
+            rule,
+        }),
+    )
+        .into_response();
+    with_policy_history_append_warning(response, committed.history_append_failed)
+}
+
+/// The whole document a suggestion acceptance commits, and the suggestion
+/// it moves to `accepted`: the rule appended by `POST .../accept`, or a
+/// draft's candidate that holds the rule for a bound publication.
+pub(super) struct SuggestionAcceptanceCandidate<'a> {
+    pub(super) origin: discovery::suggestions::SuggestionAcceptanceOrigin,
+    /// The suggestion as [`reviewable_suggestion_rule`] read it: open, at
+    /// the revision the commit requires.
+    pub(super) suggestion: &'a discovery::suggestions::RuleSuggestion,
+    pub(super) before_policy: &'a rbac::Policy,
+    /// The live policy ETag the candidate replaces, compared and swapped by
+    /// the commit.
+    pub(super) current_etag: &'a str,
+    pub(super) candidate: &'a rbac::Policy,
+    pub(super) diff_summary: Value,
+}
+
+/// A committed acceptance: the policy now live, its ETag, and the
+/// suggestion after its transition.
+pub(super) struct SuggestionAcceptanceCommitted {
+    pub(super) policy: rbac::Policy,
+    pub(super) etag: String,
+    pub(super) suggestion: discovery::suggestions::RuleSuggestion,
+    pub(super) history_append_failed: bool,
+}
+
+/// An acceptance that did not complete, and whether the policy changed.
+pub(super) enum SuggestionAcceptanceFailure {
+    /// Nothing was written: not the policy, not the suggestion. `reason` is
+    /// the stable reason a draft publication records the refusal under.
+    Refused {
+        reason: &'static str,
+        response: Box<Response>,
+    },
+    /// The policy was committed and a later step did not complete. A
+    /// suggestion this request could not move is moved by the reconciler
+    /// before the next suggestion request (standalone), or was moved in the
+    /// same transaction (cluster, where only the replica install can fail).
+    Incomplete(Box<Response>),
+}
+
+impl SuggestionAcceptanceFailure {
+    fn refused(reason: &'static str, response: Response) -> Self {
+        Self::Refused {
+            reason,
+            response: Box::new(response),
+        }
+    }
+
+    pub(super) fn into_response(self) -> Response {
+        match self {
+            Self::Refused { response, .. } | Self::Incomplete(response) => *response,
+        }
+    }
+}
+
+/// Commit an acceptance's candidate and move its suggestion to `accepted`,
+/// as one outcome (issue #243): in cluster mode one PostgreSQL transaction,
+/// in standalone mode the durable intent sequence of
+/// [`commit_suggestion_acceptance_standalone`].
+///
+/// The caller holds the suggestion lifecycle lock (with pending intents
+/// already reconciled) and the policy write lane, and has validated the
+/// suggestion with [`reviewable_suggestion_rule`] and prepared the
+/// candidate against the authority's current policy.
+pub(super) async fn commit_suggestion_acceptance(
+    context: SuggestionAcceptContext<'_, '_>,
+    lifecycle: &mut SuggestionLifecycle,
+    engine: &discovery::suggestions::SuggestionEngineHandle,
+    acceptance: SuggestionAcceptanceCandidate<'_>,
+) -> Result<SuggestionAcceptanceCommitted, SuggestionAcceptanceFailure> {
+    #[cfg(feature = "postgres")]
+    if let Some(engine) = engine.cluster() {
+        return commit_suggestion_acceptance_in_cluster(context, engine, acceptance).await;
+    }
+    commit_suggestion_acceptance_standalone(context, lifecycle, engine, acceptance).await
+}
+
+/// The reason a refused acceptance's standalone bookkeeping records: the
+/// intent could not be written, or the history it is bound to not read.
+const SUGGESTION_ACCEPTANCE_UNRECORDED: &str = "suggestion_acceptance_unrecorded";
+
+/// Standalone acceptance (issue #243): the policy file and the suggestion
+/// row cannot share a transaction, so the acceptance is made recoverable
+/// instead of atomic.
+///
+/// 1. Ask the authority-evidence gate, as every standalone policy write
+///    does, before anything is recorded.
+/// 2. Record a durable intent in the suggestion's database: the
+///    suggestion and the revision validated, the candidate's ETag, the
+///    base it replaces, and the newest policy history version.
+/// 3. Commit the candidate through [`commit_policy_mutation`], the path
+///    every policy write takes (file, reload, history, `policy.changed`).
+/// 4. Move the suggestion to `accepted` and clear the intent in one SQLite
+///    transaction.
+///
+/// A refusal in step 3 wrote nothing, so the intent is dropped. A process
+/// that dies after step 2 leaves the intent behind, and
+/// [`reconcile_suggestion_acceptances`] settles it at startup or before
+/// the next suggestion request: accepted when the candidate was committed,
+/// dropped otherwise. The suggestion is never shown open while its rule is
+/// live, nor accepted while it is not.
+async fn commit_suggestion_acceptance_standalone(
+    context: SuggestionAcceptContext<'_, '_>,
+    lifecycle: &mut SuggestionLifecycle,
+    engine: &discovery::suggestions::SuggestionEngineHandle,
+    acceptance: SuggestionAcceptanceCandidate<'_>,
+) -> Result<SuggestionAcceptanceCommitted, SuggestionAcceptanceFailure> {
+    let SuggestionAcceptContext {
+        state,
+        parts,
+        principal,
+        rbac_state,
+        policy_write_guard,
+    } = context;
+    let suggestion_id = acceptance.suggestion.id.as_str();
+
+    admit_authority_change(
+        &state.policy.authority_evidence,
+        authority_events::required::AuthorityOperation::PolicySuggestionAccept,
+        &state.policy.audit,
+        parts,
+        principal,
+        &state.policy.client_ip_policy,
+    )
+    .map_err(|response| SuggestionAcceptanceFailure::Refused {
+        reason: authority_events::required::REFUSAL_REASON,
+        response,
+    })?;
+    let candidate_etag = policy_etag(acceptance.candidate).map_err(|error| {
+        tracing::error!(error = %error, "failed to compute a suggestion acceptance's candidate ETag");
+        SuggestionAcceptanceFailure::refused(
+            SUGGESTION_ACCEPTANCE_UNRECORDED,
+            internal_server_error("policy ETag computation failed"),
+        )
+    })?;
+    let history_floor = match state.policy.history_store.as_ref() {
+        None => None,
+        Some(history) => {
+            let newest = history
+                .list_versions(&rbac::PolicyHistoryListFilters {
+                    limit: 1,
+                    cursor: None,
+                    include_policy: false,
+                })
+                .await;
+            match newest {
+                Ok(page) => Some(page.versions.first().map_or(0, |version| version.version)),
+                Err(error) => {
+                    tracing::error!(error = %error, "policy history could not be read before a suggestion acceptance; nothing was written");
+                    return Err(SuggestionAcceptanceFailure::refused(
+                        SUGGESTION_ACCEPTANCE_UNRECORDED,
+                        service_unavailable("policy history is unavailable"),
+                    ));
+                }
+            }
+        }
+    };
+    let intent = discovery::suggestions::SuggestionAcceptanceIntent {
+        suggestion_id: suggestion_id.to_owned(),
+        suggestion_revision: acceptance.suggestion.revision,
+        candidate_etag: candidate_etag.clone(),
+        base_etag: acceptance.current_etag.to_owned(),
+        history_floor,
+        actor: principal.user_id.clone(),
+        origin: acceptance.origin,
+        created_at: discovery::query::utc_timestamp_rfc3339(),
+    };
+    if let Err(error) = engine.record_acceptance_intent(intent).await {
+        tracing::error!(error = %error, "a suggestion acceptance intent could not be recorded; nothing was written");
+        return Err(SuggestionAcceptanceFailure::refused(
+            SUGGESTION_ACCEPTANCE_UNRECORDED,
+            service_unavailable("suggestion acceptance could not be recorded"),
+        ));
+    }
+    if crashes_at(suggestion_id, AcceptanceBoundary::IntentRecorded) {
+        return Err(SuggestionAcceptanceFailure::Incomplete(Box::new(
+            crashed_at(AcceptanceBoundary::IntentRecorded),
+        )));
+    }
+
+    let key = (suggestion_id.to_owned(), candidate_etag);
+    let commit = commit_policy_mutation(
+        PolicyMutationCommitContext {
+            state: &state.policy,
+            rbac_state,
+            policy_write_guard,
+            parts,
+            principal,
+        },
+        storage::DocumentAction::PolicySuggestionAccept,
+        acceptance.before_policy,
+        acceptance.current_etag,
+        acceptance.candidate,
+        acceptance.diff_summary,
+    )
+    .await;
+    let commit = match commit {
+        Ok(commit) => commit,
+        Err(PolicyMutationFailure::Refused(refusal, response)) => {
+            // Nothing was written, so there is nothing to accept. A failure
+            // to drop the intent is safe: the reconciler finds the candidate
+            // uncommitted and drops it then.
+            if let Err(error) = engine
+                .discard_acceptance_intent(key.0.clone(), key.1.clone())
+                .await
+            {
+                tracing::error!(error = %error, "a refused suggestion acceptance's intent could not be dropped; the reconciler drops it");
+            }
+            return Err(SuggestionAcceptanceFailure::Refused {
+                reason: commit_refusal_reason(refusal),
+                response,
+            });
+        }
+        // The policy file was written and a later step failed: the
+        // candidate is committed even though this replica may not serve it
+        // yet, so the suggestion is accepted with it.
+        Err(PolicyMutationFailure::Incomplete(response)) => {
+            lifecycle.committed_acceptances.insert(key.clone());
+            if let Some(suggestion) = complete_committed_acceptance(state, lifecycle, &key).await {
+                emit_suggestion_lifecycle_changed(state, parts, principal, &suggestion);
+            }
+            return Err(SuggestionAcceptanceFailure::Incomplete(response));
+        }
+    };
+    if crashes_at(suggestion_id, AcceptanceBoundary::PolicyCommitted) {
+        return Err(SuggestionAcceptanceFailure::Incomplete(Box::new(
+            crashed_at(AcceptanceBoundary::PolicyCommitted),
+        )));
+    }
+    lifecycle.committed_acceptances.insert(key.clone());
+
+    let completion = engine
+        .complete_acceptance_intent(key.0.clone(), key.1.clone())
+        .await;
+    match completion {
+        Ok(discovery::suggestions::AcceptanceIntentCompletion::Accepted(suggestion)) => {
+            lifecycle.committed_acceptances.remove(&key);
+            emit_suggestion_lifecycle_changed(state, parts, principal, &suggestion);
+            Ok(SuggestionAcceptanceCommitted {
+                policy: commit.after_policy,
+                etag: commit.new_etag,
+                suggestion,
+                history_append_failed: commit.history_append_failed,
+            })
+        }
+        // The lifecycle lock was held since the suggestion was validated,
+        // so nothing in this process moved it; if it moved anyway the rule
+        // stays and the caller learns the suggestion moved.
+        Ok(discovery::suggestions::AcceptanceIntentCompletion::Refused(current)) => {
+            lifecycle.committed_acceptances.remove(&key);
+            let response = match current {
+                Some(current) => lifecycle_transition_refused(
+                    "suggestion was transitioned concurrently; the rule was created",
+                    "suggestion_transitioned_concurrently",
+                    "suggestion",
+                    &current,
+                ),
+                None => not_found("suggestion was not found"),
+            };
+            Err(SuggestionAcceptanceFailure::Incomplete(Box::new(
+                with_etag(response, &commit.new_etag),
+            )))
+        }
+        Ok(discovery::suggestions::AcceptanceIntentCompletion::Missing) => {
+            lifecycle.committed_acceptances.remove(&key);
+            tracing::error!(
+                "a suggestion acceptance's intent disappeared before its transition; the policy was committed"
+            );
+            Err(SuggestionAcceptanceFailure::Incomplete(Box::new(
+                with_etag(
+                    internal_server_error("suggestion transition failed"),
+                    &commit.new_etag,
+                ),
+            )))
+        }
+        // The intent stays, and so does this process's record of the
+        // commit: the next suggestion request (or the next start) accepts
+        // the suggestion before it reads anything.
+        Err(error) => {
+            tracing::error!(error = %error, "failed to accept rule suggestion after its policy commit; it is accepted before the next suggestion request");
+            Err(SuggestionAcceptanceFailure::Incomplete(Box::new(
+                with_etag(
+                    internal_server_error("suggestion transition failed"),
+                    &commit.new_etag,
+                ),
+            )))
+        }
+    }
+}
+
+/// Settle an intent whose candidate this process knows it committed. The
+/// suggestion when it was accepted now; `None` otherwise, with the reason
+/// logged and, if the store failed, the intent and the in-process record
+/// kept for the reconciler.
+async fn complete_committed_acceptance(
+    state: &SuggestionsAdminState,
+    lifecycle: &mut SuggestionLifecycle,
+    key: &(String, String),
+) -> Option<discovery::suggestions::RuleSuggestion> {
+    let engine = state.suggestion_engine.as_ref()?;
+    match engine
+        .complete_acceptance_intent(key.0.clone(), key.1.clone())
+        .await
+    {
+        Ok(discovery::suggestions::AcceptanceIntentCompletion::Accepted(suggestion)) => {
+            lifecycle.committed_acceptances.remove(key);
+            Some(suggestion)
+        }
+        Ok(
+            discovery::suggestions::AcceptanceIntentCompletion::Refused(_)
+            | discovery::suggestions::AcceptanceIntentCompletion::Missing,
+        ) => {
+            lifecycle.committed_acceptances.remove(key);
+            tracing::error!(
+                "a committed suggestion acceptance found its suggestion moved or its intent gone; the suggestion was left as it is"
+            );
+            None
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "a committed suggestion acceptance could not move its suggestion; it is accepted before the next suggestion request");
+            None
+        }
+    }
+}
+
+/// Take the suggestion lifecycle lock and settle every pending standalone
+/// acceptance before the caller reads or moves a suggestion (issue #243).
+/// A pass that cannot decide an intent keeps it and answers `503`: no
+/// caller sees a suggestion as open that an unsettled acceptance may
+/// already have committed.
+pub(super) async fn reconciled_suggestion_lifecycle(
+    state: &SuggestionsAdminState,
+) -> ResponseResult<tokio::sync::MutexGuard<'_, SuggestionLifecycle>> {
+    let mut lifecycle = state.lifecycle_guard.lock().await;
+    match reconcile_suggestion_acceptances(state, &mut lifecycle).await {
+        Ok(()) => Ok(lifecycle),
+        Err(error) => {
+            tracing::error!(error = %error, "pending suggestion acceptances could not be reconciled");
+            Err(Box::new(service_unavailable(
+                "suggestion acceptance reconciliation failed",
+            )))
+        }
+    }
+}
+
+/// Settle the pending standalone acceptance intents (issue #243). The
+/// caller holds the suggestion lifecycle lock, so no acceptance is in
+/// flight and every intent read here belongs to one that ended without
+/// clearing it.
+///
+/// An intent's candidate counts as committed when this process recorded
+/// committing it, when it is the active policy, or when it is the first
+/// policy history version after the intent's floor (the acceptance held
+/// the policy write lane from reading that floor through its own history
+/// append, so a history row it wrote is exactly that one). Then the
+/// suggestion moves to `accepted` as the intent's actor and the intent is
+/// cleared, in one transaction, and `suggestion.lifecycle_changed` is
+/// emitted. Otherwise nothing was committed and the intent is dropped; the
+/// suggestion stays open, at the revision it had.
+///
+/// An error leaves the intents it did not reach in place for the next pass.
+pub(super) async fn reconcile_suggestion_acceptances(
+    state: &SuggestionsAdminState,
+    lifecycle: &mut SuggestionLifecycle,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let Some(engine) = state.suggestion_engine.as_ref() else {
+        return Ok(());
+    };
+    let intents = engine.acceptance_intents().await?;
+    if intents.is_empty() {
+        return Ok(());
+    }
+    let Some(rbac_state) = state.policy.rbac_state.as_ref() else {
+        return Err(
+            "pending suggestion acceptances need the policy authority to be decided".into(),
+        );
+    };
+    let active_etag = policy_etag(&rbac_state.current_policy())?;
+
+    for intent in intents {
+        let key = (intent.suggestion_id.clone(), intent.candidate_etag.clone());
+        let committed = lifecycle.committed_acceptances.contains(&key)
+            || active_etag == intent.candidate_etag
+            || committed_in_history(&state.policy, &intent).await?;
+        if !committed {
+            engine
+                .discard_acceptance_intent(key.0.clone(), key.1.clone())
+                .await?;
+            tracing::warn!(
+                origin = intent.origin.as_str(),
+                "dropped a suggestion acceptance whose policy was never committed; the suggestion stays open"
+            );
+            continue;
+        }
+        let completion = engine
+            .complete_acceptance_intent(key.0.clone(), key.1.clone())
+            .await?;
+        lifecycle.committed_acceptances.remove(&key);
+        match completion {
+            discovery::suggestions::AcceptanceIntentCompletion::Accepted(suggestion) => {
+                tracing::warn!(
+                    origin = intent.origin.as_str(),
+                    "accepted a suggestion whose policy commit outlived its acceptance request"
+                );
+                emit_suggestion_acceptance_reconciled(state, &intent, &suggestion);
+            }
+            discovery::suggestions::AcceptanceIntentCompletion::Refused(_) => {
+                tracing::error!(
+                    origin = intent.origin.as_str(),
+                    "a committed suggestion acceptance found its suggestion moved; the intent was dropped and the suggestion left as it is"
+                );
+            }
+            discovery::suggestions::AcceptanceIntentCompletion::Missing => {}
+        }
+    }
+    Ok(())
+}
+
+/// Whether `intent`'s candidate is the first policy history version after
+/// the intent's floor.
+async fn committed_in_history(
+    policy: &PolicyAdminState,
+    intent: &discovery::suggestions::SuggestionAcceptanceIntent,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let (Some(history), Some(floor)) = (policy.history_store.as_ref(), intent.history_floor) else {
+        return Ok(false);
+    };
+    let Some(version) = history.get_version(floor.saturating_add(1)).await? else {
+        return Ok(false);
+    };
+    match version.policy.as_ref() {
+        Some(committed) => Ok(policy_etag(committed)? == intent.candidate_etag),
+        None => Ok(false),
+    }
+}
+
+/// Settle pending standalone acceptances once at startup (issue #243), on a
+/// task the gateway lifecycle tracks, under the suggestion lifecycle lock,
+/// which is taken before this returns: every suggestion request waits for
+/// the pass. Cluster mode keeps no intents.
+pub(super) fn spawn_suggestion_acceptance_reconciler(
+    state: SuggestionsAdminState,
+    gateway_lifecycle: &lifecycle::GatewayLifecycle,
+) {
+    if !matches!(
+        state.suggestion_engine,
+        Some(discovery::suggestions::SuggestionEngineHandle::Standalone(
+            _
+        ))
+    ) {
+        return;
+    }
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        tracing::warn!(
+            "pending suggestion acceptances are reconciled by the first suggestion request: no runtime to reconcile them at startup"
+        );
+        return;
+    };
+    // The lock is taken here, before the router exists, so the first
+    // suggestion request waits for this pass instead of racing it. Nothing
+    // else can hold it yet; if something did, the task waits its turn.
+    let held = Arc::clone(&state.lifecycle_guard).try_lock_owned().ok();
+    let task = runtime.spawn(async move {
+        let mut lifecycle = match held {
+            Some(lifecycle) => lifecycle,
+            None => Arc::clone(&state.lifecycle_guard).lock_owned().await,
+        };
+        if let Err(error) = reconcile_suggestion_acceptances(&state, &mut lifecycle).await {
+            tracing::error!(error = %error, "pending suggestion acceptances could not be reconciled at startup; the next suggestion request tries again");
+        }
+    });
+    gateway_lifecycle.register_background_task(task);
+}
+
+/// Where a standalone acceptance can be stopped, as a process that died
+/// there would stop: after its intent is recorded and before the policy
+/// write, after the policy commit and before the suggestion moves, and,
+/// for a draft publication bound to a suggestion, after the suggestion
+/// moved and before the draft is marked published. Tests arm a boundary
+/// per suggestion; nothing else ever stops at one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum AcceptanceBoundary {
+    IntentRecorded,
+    PolicyCommitted,
+    SuggestionAccepted,
+}
+
+#[cfg(test)]
+pub(super) mod acceptance_crash {
+    use super::AcceptanceBoundary;
+    use std::sync::Mutex;
+
+    static ARMED: Mutex<Vec<(String, AcceptanceBoundary)>> = Mutex::new(Vec::new());
+
+    /// Stop the next acceptance of `suggestion_id` at `boundary`. Tests run
+    /// in parallel, so each arms a suggestion id of its own.
+    pub(crate) fn arm(suggestion_id: &str, boundary: AcceptanceBoundary) {
+        ARMED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((suggestion_id.to_owned(), boundary));
+    }
+
+    pub(super) fn fires(suggestion_id: &str, boundary: AcceptanceBoundary) -> bool {
+        let mut armed = ARMED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match armed
+            .iter()
+            .position(|(id, at)| id == suggestion_id && *at == boundary)
+        {
+            Some(index) => {
+                armed.swap_remove(index);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// Whether a test stopped this acceptance at `boundary`.
+pub(super) fn crashes_at(suggestion_id: &str, boundary: AcceptanceBoundary) -> bool {
+    #[cfg(test)]
+    {
+        acceptance_crash::fires(suggestion_id, boundary)
+    }
+    #[cfg(not(test))]
+    {
+        let _ = (suggestion_id, boundary);
+        false
+    }
+}
+
+/// The answer of an acceptance stopped at a test boundary: nothing after it
+/// ran, exactly as if the process had died there.
+pub(super) fn crashed_at(boundary: AcceptanceBoundary) -> Response {
+    tracing::error!(?boundary, "a test stopped a suggestion acceptance");
+    internal_server_error("suggestion acceptance stopped")
+}
+
+/// Cluster mode's acceptance (issue #241, PR 12; generalized to a whole
+/// candidate in issue #243): the candidate and the suggestion's transition
+/// to `accepted` commit in ONE transaction at the authority, so the HA
+/// state model's rule 7 holds -- no partial success exists. The candidate is
+/// checked as every cluster policy commit checks one (the mutation rules,
+/// the cross-resource checks, the document format and the operation gate),
+/// then committed by
+/// [`storage::postgres_discovery_lifecycle::PostgresDiscoveryLifecycleStore::accept_suggestion`]
+/// alongside the transition, under the `If-Match` compare-and-swap of the
+/// ETag the caller prepared it from.
+///
+/// Everything with an effect outside the transaction happens AFTER it
+/// commits: the local revision snapshot install and both audit events.
+/// Audit is at-least-once by design, so an event describing an acceptance
+/// that rolled back must be impossible, while losing the events of a
+/// committed acceptance to a crash is tolerable.
+#[cfg(feature = "postgres")]
+pub(super) async fn commit_suggestion_acceptance_in_cluster(
+    context: SuggestionAcceptContext<'_, '_>,
+    engine: &discovery::cluster_suggestions::ClusterRuleSuggestionEngine,
+    acceptance: SuggestionAcceptanceCandidate<'_>,
+) -> Result<SuggestionAcceptanceCommitted, SuggestionAcceptanceFailure> {
+    let SuggestionAcceptContext {
+        state,
+        parts,
+        principal,
+        rbac_state,
+        policy_write_guard,
+    } = context;
+    let SuggestionAcceptanceCandidate {
+        origin,
+        suggestion,
+        before_policy,
+        current_etag,
+        candidate,
+        diff_summary,
+    } = acceptance;
+
+    admit_authority_change(
+        &state.policy.authority_evidence,
+        authority_events::required::AuthorityOperation::PolicySuggestionAccept,
+        &state.policy.audit,
+        parts,
+        principal,
+        &state.policy.client_ip_policy,
+    )
+    .map_err(|response| SuggestionAcceptanceFailure::Refused {
+        reason: authority_events::required::REFUSAL_REASON,
+        response,
+    })?;
+    validate_policy_mutation_candidate(rbac_state, before_policy, candidate).map_err(
+        |response| SuggestionAcceptanceFailure::Refused {
+            reason: commit_refusal_reason(PolicyCommitRefusal::CandidateInvalid),
+            response,
+        },
+    )?;
     // The acceptance publishes the whole document, so it is checked against
     // the other resources exactly as every other policy write is, and, when
-    // policy tests are required, must pass the stored suite (issue #243).
+    // policy tests are required, must pass the stored suite (issue #243),
+    // in the order commit_policy_mutation asks them.
     let publication = PublicationRequest {
         state: &state.policy,
         rbac_state,
         parts,
         principal,
     };
-    let mut review = match admit_policy_resources(
+    let mut review = admit_policy_resources(
         publication,
-        &prepared.before_policy,
-        &prepared.current_etag,
-        &prepared.candidate,
-        &prepared.diff_summary,
-    ) {
-        Ok(review) => review,
-        Err(response) => return *response,
-    };
-    review.required_tests = match admit_required_policy_tests(
+        before_policy,
+        current_etag,
+        candidate,
+        &diff_summary,
+    )
+    .map_err(|response| SuggestionAcceptanceFailure::Refused {
+        reason: commit_refusal_reason(PolicyCommitRefusal::ResourcesRefused),
+        response,
+    })?;
+    review.required_tests = admit_required_policy_tests(
         publication,
-        &prepared.current_etag,
-        &prepared.candidate,
-        &prepared.diff_summary,
+        current_etag,
+        candidate,
+        &diff_summary,
         review.resource_snapshot_digest.as_deref(),
     )
     .await
-    {
-        Ok(required_tests) => required_tests,
-        Err(refused) => return *refused.into_response(),
-    };
-    // The acceptance commits the whole document, so a role description
-    // already in it is written again and the gate is asked again.
-    if let Err(response) =
-        admit_policy_document(&state.policy, parts, principal, &prepared.candidate).await
-    {
-        return *response;
+    .map_err(|failure| match failure {
+        PolicyMutationFailure::Refused(refusal, response) => SuggestionAcceptanceFailure::Refused {
+            reason: commit_refusal_reason(refusal),
+            response,
+        },
+        PolicyMutationFailure::Incomplete(response) => {
+            SuggestionAcceptanceFailure::Incomplete(response)
+        }
+    })?;
+    // [`admit_policy_document`] in its two halves, so a refusal says which
+    // one refused: the format, then the operation gate (a role description
+    // already in the document is written again, so the gate is asked
+    // again).
+    if let Some(detail) = cluster_document_format_refusal(candidate) {
+        return Err(SuggestionAcceptanceFailure::refused(
+            commit_refusal_reason(PolicyCommitRefusal::CandidateInvalid),
+            policy_validation_failed(vec![detail]),
+        ));
     }
+    admit_policy_document(&state.policy, parts, principal, candidate)
+        .await
+        .map_err(|response| SuggestionAcceptanceFailure::Refused {
+            reason: commit_refusal_reason(PolicyCommitRefusal::OperationRefused),
+            response,
+        })?;
 
     let accepted = engine
         .suggestion_store()
         .accept_suggestion(
             storage::postgres_discovery_lifecycle::AcceptSuggestionRequest {
-                suggestion_id,
-                expected_revision: Some(expected_revision),
+                suggestion_id: &suggestion.id,
+                expected_revision: Some(suggestion.revision),
                 actor: &principal.user_id,
                 policy_commit: storage::PolicyCommitRequest {
                     precondition: storage::PolicyCommitPrecondition::Expected {
-                        etag: prepared.current_etag.clone(),
+                        etag: current_etag.to_owned(),
                     },
-                    candidate: &prepared.candidate,
+                    candidate,
                     change: storage::DocumentChange::by_principal(
                         storage::DocumentAction::PolicySuggestionAccept,
                         principal,
                     ),
-                    diff_summary: &prepared.diff_summary,
+                    diff_summary: &diff_summary,
                 },
             },
         )
         .await;
     let accepted = match accepted {
         Ok(accepted) => accepted,
-        Err(refused) => return suggestion_acceptance_refused_response(refused),
+        Err(refused) => return Err(suggestion_acceptance_refused(origin, refused)),
     };
+    if crashes_at(&suggestion.id, AcceptanceBoundary::PolicyCommitted) {
+        return Err(SuggestionAcceptanceFailure::Incomplete(Box::new(
+            crashed_at(AcceptanceBoundary::PolicyCommitted),
+        )));
+    }
 
     // Committed. Install the authority's snapshot before answering, as
     // every other cluster-mode policy mutation does, then emit the two
@@ -781,22 +1380,15 @@ pub(super) async fn accept_suggestion_in_cluster(
     let installed = rbac_state.install_revision_snapshot_locked(
         accepted.policy.policy.clone(),
         accepted.policy.security_revision,
-        &_policy_write_guard,
+        policy_write_guard,
     );
-    let rule = accepted
-        .policy
-        .policy
-        .rules
-        .get(prepared.position)
-        .cloned()
-        .unwrap_or(prepared.created_rule);
     emit_policy_published(
         &state.policy,
         parts,
         principal,
-        &prepared.before_policy,
+        before_policy,
         &accepted.policy.policy,
-        prepared.diff_summary,
+        diff_summary,
         &review,
     );
     emit_suggestion_lifecycle_changed(state, parts, principal, &accepted.suggestion);
@@ -805,30 +1397,58 @@ pub(super) async fn accept_suggestion_in_cluster(
     // failure first would leave two security changes that actually happened
     // missing from the audit stream.
     if installed.is_err() {
-        return policy_snapshot_not_installable();
+        return Err(SuggestionAcceptanceFailure::Incomplete(Box::new(
+            policy_snapshot_not_installable(),
+        )));
     }
 
-    // No history warning header: cluster mode writes the history row
-    // inside the same transaction, so an acceptance cannot succeed
-    // without it.
-    (
-        StatusCode::CREATED,
-        [(header::ETAG, etag_header_value(&accepted.policy.etag))],
-        Json(RuleSuggestionAcceptResponse {
-            suggestion: accepted.suggestion,
-            rule,
-        }),
-    )
-        .into_response()
+    // No history warning: cluster mode writes the history row inside the
+    // same transaction, so an acceptance cannot succeed without it.
+    Ok(SuggestionAcceptanceCommitted {
+        policy: accepted.policy.policy,
+        etag: accepted.policy.etag,
+        suggestion: accepted.suggestion,
+        history_append_failed: false,
+    })
 }
 
 /// Every way an atomic acceptance can decline, answered as the standalone
-/// path answers the same condition. Each variant means the rule, the
-/// history row, the outbox row and the transition were all rolled back
-/// together -- with one caveat carried by the store's `AcceptRefused`
-/// documentation: a store failure raised by the `COMMIT` itself leaves the
-/// outcome indeterminate rather than negative (the halves still never
-/// separate), and the audit events are not emitted for it.
+/// path answers the same condition, with the reason a draft publication
+/// records it under. Each variant means the rule, the history row, the
+/// outbox row and the transition were all rolled back together -- with one
+/// caveat carried by the store's `AcceptRefused` documentation: a store
+/// failure raised by the `COMMIT` itself leaves the outcome indeterminate
+/// rather than negative (the halves still never separate), and the audit
+/// events are not emitted for it.
+#[cfg(feature = "postgres")]
+fn suggestion_acceptance_refused(
+    origin: discovery::suggestions::SuggestionAcceptanceOrigin,
+    refused: storage::postgres_discovery_lifecycle::AcceptRefused,
+) -> SuggestionAcceptanceFailure {
+    use storage::postgres_discovery_lifecycle::AcceptRefused;
+
+    let reason = match &refused {
+        AcceptRefused::Suggestion(_) => "suggestion_stale",
+        AcceptRefused::NotFound => "suggestion_not_found",
+        AcceptRefused::UnsafeBaselineSuggestion { .. } => "suggestion_not_identity_bound",
+        AcceptRefused::Policy(storage::PolicyCommitError::PreconditionFailed) => {
+            commit_refusal_reason(PolicyCommitRefusal::EtagMismatch)
+        }
+        AcceptRefused::Policy(_) | AcceptRefused::Store(_) => {
+            commit_refusal_reason(PolicyCommitRefusal::Failed)
+        }
+    };
+    let response = match (origin, refused) {
+        (
+            discovery::suggestions::SuggestionAcceptanceOrigin::DraftPublish,
+            AcceptRefused::Suggestion(refused),
+        ) => suggestion_stale_response(&refused.current),
+        (_, refused) => suggestion_acceptance_refused_response(refused),
+    };
+    SuggestionAcceptanceFailure::refused(reason, response)
+}
+
+/// The accept route's answer to each way the atomic acceptance declines.
 #[cfg(feature = "postgres")]
 pub(super) fn suggestion_acceptance_refused_response(
     refused: storage::postgres_discovery_lifecycle::AcceptRefused,
@@ -868,6 +1488,20 @@ pub(super) fn suggestion_acceptance_refused_response(
             internal_server_error("suggestion acceptance failed")
         }
     }
+}
+
+/// `409 suggestion_stale`: a draft publication is bound to a suggestion that
+/// is no longer open at the bound revision. Carries the row as it is now, so
+/// the caller re-reads it instead of retrying.
+pub(super) fn suggestion_stale_response(
+    current: &discovery::suggestions::RuleSuggestion,
+) -> Response {
+    lifecycle_transition_refused(
+        "the suggestion this publication is bound to is no longer open at the bound revision",
+        "suggestion_stale",
+        "suggestion",
+        current,
+    )
 }
 
 pub(super) async fn rule_suggestion_dismiss_endpoint(
@@ -922,12 +1556,17 @@ pub(super) async fn rule_suggestion_transition_endpoint(
     // own transition, so this dismissal either happens entirely before
     // that acceptance reads the row (which then loses on the state
     // predicate, having written nothing) or entirely after it (and is
-    // refused, the rule already installed).
+    // refused, the rule already installed). Taking it settles any
+    // acceptance an earlier request or process left pending, so a
+    // dismissal never lands on a suggestion whose rule is already live.
     let expected = discovery::lifecycle::TransitionPrecondition::from_state(
         discovery::suggestions::RuleSuggestionLifecycleState::Open,
     )
     .with_revision(expected_revision);
-    let _lifecycle_guard = state.lifecycle_guard.lock().await;
+    let _lifecycle = match reconciled_suggestion_lifecycle(&state).await {
+        Ok(lifecycle) => lifecycle,
+        Err(response) => return *response,
+    };
     let suggestion = match suggestion_engine
         .transition_suggestion(
             id.to_owned(),

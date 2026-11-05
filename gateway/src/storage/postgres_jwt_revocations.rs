@@ -499,3 +499,41 @@ fn journal_failure(error: super::postgres_authority_events::JournalAppendError) 
 fn invalid_data(operation: &'static str) -> RepositoryError {
     RepositoryError::new(RepositoryErrorKind::InvalidData, operation)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{PostgresJwtRevocationStore, REVOCATION_RETENTION_MARGIN_SECS};
+    use crate::auth::jwt::JWT_EXP_LEEWAY_SECS;
+
+    /// A revocation keyed on a token's own `exp` must stay effective for as
+    /// long as any validator may still accept that token: the validator's
+    /// `exp` leeway, plus at least a second for its whole-second clock. The
+    /// store is built the way production builds it, so a leeway changed
+    /// without the retention, or a retention no longer derived from it,
+    /// fails here.
+    #[test]
+    fn retention_is_the_validator_exp_leeway_plus_at_least_a_second() {
+        // Building a pool opens no connection, and this one is never
+        // checked out.
+        let mut config = tokio_postgres::Config::new();
+        config
+            .host("127.0.0.1")
+            .port(1)
+            .user("gateway_retention_test")
+            .dbname("gateway_retention_test");
+        let pool = deadpool_postgres::Pool::builder(deadpool_postgres::Manager::new(
+            config,
+            tokio_postgres::NoTls,
+        ))
+        .build()
+        .expect("an unconnected pool should build");
+        let store =
+            PostgresJwtRevocationStore::new(pool, "deployment-test", "https://issuer.example.test");
+
+        assert_eq!(
+            store.retention_leeway_secs,
+            (JWT_EXP_LEEWAY_SECS + REVOCATION_RETENTION_MARGIN_SECS) as f64
+        );
+        assert!(store.retention_leeway_secs - JWT_EXP_LEEWAY_SECS as f64 >= 1.0);
+    }
+}

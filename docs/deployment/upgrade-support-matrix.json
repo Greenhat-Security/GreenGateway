@@ -3,12 +3,12 @@
   "issue": 426,
   "describes": "Which GreenGateway builds may share one PostgreSQL deployment, how a deployment moves between them, and what proves each row. The procedure is docs/deployment/postgres.md#upgrading-a-cluster. storage::migrations' and storage::contraction's tests check this_build (its contracting migrations included) and schema_steps against the binary, and scripts/upgrade_pair_evidence.py checks the pinned pair (gateway/tests/ha/rolling-upgrade-pair.json) against the evidence the ha-release-gate (ha_rolling_upgrade) leg records.",
   "this_build": {
-    "manifest_versions": 28,
-    "read": [28, 28],
-    "write": [28, 28],
+    "manifest_versions": 29,
+    "read": [29, 29],
+    "write": [29, 29],
     "approved_extensions": [],
-    "document_format": [0, 0],
-    "capabilities": ["delegated_token_purges", "openapi_discovery_catalogs", "openapi_swagger2_catalogs", "operation_requirements", "policy_role_descriptions"],
+    "document_format": [0, 1],
+    "capabilities": ["delegated_token_purges", "openapi_discovery_catalogs", "openapi_swagger2_catalogs", "operation_requirements", "policy_document_v1", "policy_role_descriptions", "policy_rule_conditions"],
     "operations": [
       {
         "operation": "policy.role_descriptions",
@@ -41,6 +41,22 @@
         "document_format": null,
         "backfill": null,
         "activation": "live_members"
+      },
+      {
+        "operation": "policy.document_v1",
+        "capability": "policy_document_v1",
+        "minimum_schema": 17,
+        "document_format": 1,
+        "backfill": null,
+        "activation": "live_members"
+      },
+      {
+        "operation": "policy.rule_conditions",
+        "capability": "policy_rule_conditions",
+        "minimum_schema": 17,
+        "document_format": 1,
+        "backfill": null,
+        "activation": "live_members"
       }
     ],
     "contractions": []
@@ -68,7 +84,8 @@
     },
     { "from": 25, "to": 26, "migration": "admin_session_evidence_journal", "procedure": "coordinated" },
     { "from": 26, "to": 27, "migration": "service_token_issue_evidence", "procedure": "coordinated" },
-    { "from": 27, "to": 28, "migration": "policy_test_suites", "procedure": "coordinated" }
+    { "from": 27, "to": 28, "migration": "connection_create_replace_evidence", "procedure": "coordinated" },
+    { "from": 28, "to": 29, "migration": "policy_test_suites", "procedure": "coordinated" }
   ],
   "released_cluster_binaries": [],
   "qualified_pairs": [

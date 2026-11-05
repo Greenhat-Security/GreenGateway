@@ -170,3 +170,119 @@ pub(crate) fn dispatch_covers(
         (Some(_), None) => false,
     }
 }
+
+/// The segments of one path both patterns match, or `None` when no common
+/// path was found.
+///
+/// It looks for one alignment of the two patterns, segment by segment, the
+/// way [`pattern_covers`] does, and writes the path it found: a literal as
+/// written, `witness` where both sides accept any one non-empty segment, and
+/// nothing where a deep wildcard absorbs nothing. Every path it returns is
+/// matched by both patterns by construction; it is also the witness the
+/// evaluator is asked about, so a path the matcher reads differently is
+/// caught there. A pattern that is not absolute, or holds a segment that
+/// never matches, has no common path with anything.
+pub(crate) fn pattern_intersection<'a>(
+    left: &Segments<'a>,
+    right: &Segments<'a>,
+    witness: &'a str,
+) -> Option<Vec<&'a str>> {
+    let (Some(left), Some(right)) = (left.as_deref(), right.as_deref()) else {
+        return None;
+    };
+    let never = |segments: &[PatternSegment<'_>]| segments.contains(&PatternSegment::Never);
+    if never(left) || never(right) {
+        return None;
+    }
+    // meets[i][j]: some path matches both left[i..] and right[j..]. Filled
+    // from the ends, so each cell reads only cells already computed.
+    let (rows, columns) = (left.len(), right.len());
+    let mut meets = vec![vec![false; columns + 1]; rows + 1];
+    for i in (0..=rows).rev() {
+        for j in (0..=columns).rev() {
+            meets[i][j] = if i == rows && j == columns {
+                true
+            } else {
+                intersection_steps(left, right, i, j)
+                    .into_iter()
+                    .flatten()
+                    .any(|(next_i, next_j, _)| meets[next_i][next_j])
+            };
+        }
+    }
+    if !meets[0][0] {
+        return None;
+    }
+    // Walk one alignment forward, preferring the step listed first.
+    let (mut i, mut j) = (0, 0);
+    let mut path = Vec::new();
+    while i < rows || j < columns {
+        let (next_i, next_j, segment) = intersection_steps(left, right, i, j)
+            .into_iter()
+            .flatten()
+            .find(|(next_i, next_j, _)| meets[*next_i][*next_j])?;
+        if let Some(segment) = segment {
+            path.push(match segment {
+                Step::Literal(literal) => literal,
+                Step::Any => witness,
+            });
+        }
+        (i, j) = (next_i, next_j);
+    }
+    Some(path)
+}
+
+/// What one step of an intersection alignment writes.
+#[derive(Clone, Copy)]
+enum Step<'a> {
+    Literal(&'a str),
+    /// Any one non-empty segment.
+    Any,
+}
+
+/// One step of an alignment: the cell it moves to and what it writes.
+type StepTo<'a> = Option<(usize, usize, Option<Step<'a>>)>;
+
+/// The steps an alignment can take from `(i, j)`, each strictly advancing
+/// one side or both, in preference order: matching a segment on both sides
+/// first, then letting a deep wildcard absorb nothing.
+fn intersection_steps<'a>(
+    left: &[PatternSegment<'a>],
+    right: &[PatternSegment<'a>],
+    i: usize,
+    j: usize,
+) -> [StepTo<'a>; 3] {
+    let consumed = match (left.get(i), right.get(j)) {
+        (Some(left_segment), Some(right_segment)) => {
+            match (*left_segment, *right_segment) {
+                (PatternSegment::Literal(a), PatternSegment::Literal(b)) => {
+                    (a == b).then_some((i + 1, j + 1, Some(Step::Literal(a))))
+                }
+                (PatternSegment::Literal(literal), PatternSegment::One) => {
+                    (!literal.is_empty()).then_some((i + 1, j + 1, Some(Step::Literal(literal))))
+                }
+                (PatternSegment::One, PatternSegment::Literal(literal)) => {
+                    (!literal.is_empty()).then_some((i + 1, j + 1, Some(Step::Literal(literal))))
+                }
+                (PatternSegment::One, PatternSegment::One) => Some((i + 1, j + 1, Some(Step::Any))),
+                // A deep wildcard absorbs the other side's segment and stays.
+                (PatternSegment::Literal(literal), PatternSegment::Any) => {
+                    Some((i + 1, j, Some(Step::Literal(literal))))
+                }
+                (PatternSegment::Any, PatternSegment::Literal(literal)) => {
+                    Some((i, j + 1, Some(Step::Literal(literal))))
+                }
+                (PatternSegment::One, PatternSegment::Any) => Some((i + 1, j, Some(Step::Any))),
+                (PatternSegment::Any, PatternSegment::One) => Some((i, j + 1, Some(Step::Any))),
+                // Two deep wildcards absorbing together go nowhere new.
+                (PatternSegment::Any, PatternSegment::Any)
+                | (PatternSegment::Never, _)
+                | (_, PatternSegment::Never) => None,
+            }
+        }
+        _ => None,
+    };
+    let left_empty = (left.get(i) == Some(&PatternSegment::Any)).then_some((i + 1, j, None));
+    let right_empty = (right.get(j) == Some(&PatternSegment::Any)).then_some((i, j + 1, None));
+    [consumed, left_empty, right_empty]
+}

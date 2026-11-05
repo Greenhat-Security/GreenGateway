@@ -137,8 +137,8 @@ environment variable that changes a Prometheus threshold.
 | `GreenGatewaySecurityRevisionLag` | warning | Published lag remains positive on a serving replica for 5 minutes | [Cluster authority](#cluster-authority): inspect readiness, reconciliation failures and recent changes. |
 | `GreenGatewayClusterConfigMismatch` | warning | Fingerprint mismatch remains set for 5 minutes | [Cluster authority](#cluster-authority): compare intended configuration and rollout strategy. |
 | `GreenGatewayClusterMetricsMissing` | critical | Successful cluster scrape lacks a pool size, available or waiting gauge, 2 minutes | [Monitoring](#metrics-availability): verify mode labels, build and exporter filtering. |
-| `GreenGatewayAuthorityEventCapacityRefusals` | critical | Observed capacity-refusal increase over 5 minutes, held for 2 minutes | [Authority-event journal](#authority-event-journal): a revocation, rotation or Connection delete did not happen; free journal room, then have it retried. |
-| `GreenGatewayAuthorityEvidenceWriteFailures` | critical | Observed evidence-failure increase over 5 minutes, held for 2 minutes | [Authority evidence failures](#authority-evidence-failures): a revocation, rotation, Connection delete, admin session change, or policy, tools or catalog change did not happen; find why the database refused the evidence, then have the change retried. |
+| `GreenGatewayAuthorityEventCapacityRefusals` | critical | Observed capacity-refusal increase over 5 minutes, held for 2 minutes | [Authority-event journal](#authority-event-journal): a revocation, rotation or Connection create, replace or delete did not happen; free journal room, then have it retried. |
+| `GreenGatewayAuthorityEvidenceWriteFailures` | critical | Observed evidence-failure increase over 5 minutes, held for 2 minutes | [Authority evidence failures](#authority-evidence-failures): a revocation, rotation, Connection create, replace or delete, admin session change, or policy, tools or catalog change did not happen; find why the database refused the evidence, then have the change retried. |
 | `GreenGatewayStandaloneEvidenceWriteFailures` | critical | On a standalone replica, observed standalone evidence-failure increase over 5 minutes, held for 2 minutes | [Standalone evidence failures](#standalone-evidence-failures): a token rotation or revocation, or a Connection or local-secret change, did not happen; find why the SQLite store refused the evidence row, then have the change retried. |
 | `GreenGatewayAuthorityEventJournalFull` | critical | The current maintenance leader reports the journal's units in use (retained events plus units held for admin session withdrawals) at or above capacity for 1 minute | [Authority-event journal](#authority-event-journal): the next authority change will be refused; free room now. |
 | `GreenGatewayAuthorityEventJournalFilling` | warning | The current maintenance leader reports the journal's units in use above 80% of capacity for 5 minutes | [Authority-event journal](#authority-event-journal): restore delivery or retention before the journal is full. |
@@ -331,8 +331,8 @@ fingerprint agreement to complete a rollout.
 ### Authority-event journal
 
 The platform on-call frees journal room; the security on-call owns every refused
-change. The journal keeps one row per committed Connection delete, service-token
-issue, rotate or revoke, JWT revoke and cluster admin session grant or withdrawal until a
+change. The journal keeps one row per committed Connection create, replace (two
+when it changes credential authority) or delete, service-token issue, rotate or revoke, JWT revoke and cluster admin session grant or withdrawal until a
 sink has accepted it and `AUTHORITY_EVENT_RETENTION_HOURS` has passed, and holds one
 more unit for the withdrawal of every admin session still signed in. At
 `AUTHORITY_EVENT_JOURNAL_CAPACITY` units in use (`_retained`, which counts both) each
@@ -384,7 +384,7 @@ withdrawal commits; and an expired session the prune could not withdraw is no
 longer usable, but its withdrawal is not recorded yet.
 
 The refusing replica's log names the failed operation and the classified store
-error: `change_evidence_append` (Connection delete),
+error: `change_evidence_append` (Connection create, replace and delete),
 `service_token_change_evidence_append`, `jwt_revocation_evidence_append`,
 `document_change_evidence_append` (policy and tools commits),
 `catalog_change_evidence_append` (catalog and overlay publications),
@@ -536,7 +536,7 @@ no counter, for the reason given.
 
 | Producer | Refusal counter | Alert |
 | --- | --- | --- |
-| Cluster Connection delete, service-token issue (since migration 27), rotate and revoke, JWT revoke (journaled) | `greengateway_authority_event_capacity_refusals_total` for a full journal, `greengateway_authority_event_evidence_failures_total` for any other failed evidence or journal write | `GreenGatewayAuthorityEventCapacityRefusals`, `GreenGatewayAuthorityEvidenceWriteFailures` |
+| Cluster Connection create and replace (since migration 28) and delete, service-token issue (since migration 27), rotate and revoke, JWT revoke (journaled) | `greengateway_authority_event_capacity_refusals_total` for a full journal, `greengateway_authority_event_evidence_failures_total` for any other failed evidence or journal write | `GreenGatewayAuthorityEventCapacityRefusals`, `GreenGatewayAuthorityEvidenceWriteFailures` |
 | Cluster admin session grant, replacement, sign-out, provider rejection and expiry prune (journaled since migration 26) | The same two: a full journal refuses a grant (never a withdrawal), any other failed statement refuses whichever change it was, and a withdrawal its journal could not index is refused too | The same two. There is no admin-session-only rule: the producer is not a label, by design, and a second rule over the same series would page twice for one refusal. The [runbook](#authority-evidence-failures) names the admin session operations the log reports. |
 | Cluster policy and tools commits, managed MCP and OpenAPI catalog and overlay publications (migration 23, not journaled) | `greengateway_authority_event_evidence_failures_total` | `GreenGatewayAuthorityEvidenceWriteFailures` |
 | Standalone service-token issue, rotate and revoke | `greengateway_standalone_evidence_failures_total{store="service_tokens"}` | `GreenGatewayStandaloneEvidenceWriteFailures` |

@@ -233,10 +233,11 @@ impl ManagedConnectionStore {
         }
     }
 
-    /// Create on behalf of `actor`. The SQLite store records the whole actor
-    /// as the create's evidence in the same transaction (migration 12 of the
-    /// Connections database, issue #425); the PostgreSQL store records its
-    /// subject on the version row and writes no create evidence yet.
+    /// Create on behalf of `actor`. Both stores record the whole actor as the
+    /// create's evidence in the creating transaction (issue #425): the SQLite
+    /// store's migration 12 and PostgreSQL migration 28, which also journals
+    /// it for delivery. The PostgreSQL store still records the subject on its
+    /// version row as well.
     ///
     /// `collection` is the cross-replica half of the caller's `If-Match`
     /// (see [`CollectionCheck`]). The SQLite arm does not consult it: a
@@ -261,13 +262,14 @@ impl ManagedConnectionStore {
                 .await
             }
             #[cfg(feature = "postgres")]
-            Self::Postgres { store, .. } => {
-                store.create(candidate, actor.subject(), collection).await
-            }
+            Self::Postgres { store, .. } => store.create(candidate, actor, collection).await,
         }
     }
 
-    /// Replace on behalf of `actor`, recorded as [`Self::create`] records it.
+    /// Replace on behalf of `actor`, recorded as [`Self::create`] records it:
+    /// a `connection.replace` row and, when the credential revision
+    /// advances, a `credential.binding_change` row under the same operation.
+    /// An identical replacement records nothing in either store.
     pub async fn replace(
         &self,
         id: &ConnectionId,
@@ -287,11 +289,7 @@ impl ManagedConnectionStore {
                 .await
             }
             #[cfg(feature = "postgres")]
-            Self::Postgres { store, .. } => {
-                store
-                    .replace(id, expected, candidate, actor.subject())
-                    .await
-            }
+            Self::Postgres { store, .. } => store.replace(id, expected, candidate, actor).await,
         }
     }
 
@@ -619,7 +617,7 @@ impl ManagedConnectionStore {
         resources: &[StoredMcpResource],
         resource_templates: &[StoredMcpResourceTemplate],
         expected_catalog_revision: u64,
-        actor: &str,
+        actor: &ChangeActor,
     ) -> Result<StoredMcpCatalog, ConnectionStoreError> {
         // `expected_catalog_revision` is the catalog's own compare-and-swap
         // (`0` = no catalog yet). The connection ETag does not move on a
@@ -629,6 +627,7 @@ impl ManagedConnectionStore {
         // commit last. Both arms enforce it.
         match self {
             Self::Sqlite(store) => {
+                // Standalone MCP catalogs record no actor yet (#425).
                 let _ = actor;
                 let store = store.clone();
                 let id = id.clone();
@@ -877,7 +876,7 @@ impl ManagedConnectionStore {
         spec: &str,
         spec_digest: &str,
         entries: &[StoredOpenApiCatalogEntry],
-        actor: &str,
+        actor: &ChangeActor,
     ) -> Result<StoredOpenApiCatalog, ConnectionStoreError> {
         self.replace_openapi_catalog_with_overlay(
             id,
@@ -907,7 +906,7 @@ impl ManagedConnectionStore {
         entries: &[StoredOpenApiCatalogEntry],
         overlay: Option<&StoredOverlayWrite>,
         compiled_overlay_revision: u64,
-        actor: &str,
+        actor: &ChangeActor,
         policy_protected_names: &[String],
     ) -> Result<StoredOpenApiCatalog, ConnectionStoreError> {
         self.replace_openapi_catalog_with_overlay_and_enum_values(
@@ -939,13 +938,12 @@ impl ManagedConnectionStore {
         entries: &[StoredOpenApiCatalogEntry],
         overlay: Option<&StoredOverlayWrite>,
         compiled_overlay_revision: u64,
-        actor: &str,
+        actor: &ChangeActor,
         policy_protected_names: &[String],
         enum_values: &[StoredEnumSourceValueWrite],
     ) -> Result<StoredOpenApiCatalog, ConnectionStoreError> {
         match self {
             Self::Sqlite(store) => {
-                let _ = actor;
                 let store = store.clone();
                 let id = id.clone();
                 let expected_connection_etag = expected_connection_etag.clone();
@@ -953,7 +951,7 @@ impl ManagedConnectionStore {
                 let spec_digest = spec_digest.to_owned();
                 let entries = entries.to_vec();
                 let overlay = overlay.cloned();
-                let actor = actor.to_owned();
+                let actor = actor.clone();
                 let policy_protected_names = policy_protected_names.to_vec();
                 let enum_values = enum_values.to_vec();
                 blocking("openapi catalog replace", move || {

@@ -100,6 +100,7 @@ fn every_name_in_the_layout_is_distinct_portable_and_stable() {
         }
     }
     assert!(names.insert(LOCK_FILE_NAME.to_owned()));
+    assert!(names.insert(RESTORE_MARKER_FILE_NAME.to_owned()));
     assert_eq!(StateFile::ConfigLedger.file_name(), LEDGER_FILE_NAME);
 
     // The names are a published contract: changing one strands a store.
@@ -117,6 +118,7 @@ fn every_name_in_the_layout_is_distinct_portable_and_stable() {
         ]
     );
     assert_eq!(LOCK_FILE_NAME, "state.lock");
+    assert_eq!(RESTORE_MARKER_FILE_NAME, "restore-marker.json");
 }
 
 /// Every standalone store the field catalog replaces with a fixed file has
@@ -165,6 +167,7 @@ fn the_layout_and_codes_are_documented() {
         }
     }
     assert!(reference.contains(&format!("`{LOCK_FILE_NAME}`")));
+    assert!(reference.contains(&format!("`{RESTORE_MARKER_FILE_NAME}`")));
     for code in all_errors()
         .iter()
         .map(StateDirError::code)
