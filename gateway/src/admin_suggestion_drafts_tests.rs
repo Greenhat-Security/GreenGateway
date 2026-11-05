@@ -1,9 +1,10 @@
 //! Opening a discovery suggestion into a server-side policy draft (issue
 //! #243, slice 19), in standalone mode: the SQLite discovery store, the
 //! draft store beside the policy history database, and the file authority.
-//! The draft routes themselves are in `admin_policy_drafts_tests`, and
-//! acceptance, which still applies a suggestion directly, beside the other
-//! suggestion routes in `admin_observability_app_tests`.
+//! The draft routes themselves are in `admin_policy_drafts_tests`,
+//! acceptance beside the other suggestion routes in
+//! `admin_observability_app_tests`, and crash-consistent acceptance and a
+//! publication bound to a suggestion in `admin_suggestion_acceptance_tests`.
 use super::*;
 
 fn suggestion_draft_uri(suggestion_id: &str) -> String {
