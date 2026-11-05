@@ -6701,7 +6701,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::routing::add_admin_api_routes#1",
-      "sha256": "0df0079ba808b38d1d322ff5bb94b51b23dc1b9be50ba4d9a4322ce467a3af03",
+      "sha256": "f33d03520c14d5c158f7d13ce400ccc56eb7698efdb82acbfddf475852fc4fa8",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
@@ -7156,12 +7156,32 @@
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
     {
+      "file": "gateway/src/admin_policy_analysis_suppressions.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::admin_policy_analysis_suppressions::use super :: *#1",
+      "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
       "file": "gateway/src/main.rs",
       "reasons": [
         "capability-import-or-glob"
       ],
       "scope": "gateway::use admin_policy_analyses :: *#1",
       "sha256": "e22b2a94fcb1f5fbbc6dcc3fd0f5e6bd12adbf2945a80b8671fcc2f213a78869",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/main.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::use admin_policy_analysis_suppressions :: *#1",
+      "sha256": "464e054f68672e86843462bd6b9a4a42b5173592d86fdc607d22b9f01f30ce02",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
@@ -11830,6 +11850,26 @@
       "purpose": "Decodes one standalone policy draft SQLite row; no network, process or HTTP authority."
     },
     {
+      "file": "gateway/src/storage/analysis_suppressions.rs",
+      "reasons": [
+        "unexpanded-macro"
+      ],
+      "scope": "gateway::storage::analysis_suppressions::impl  SqliteAnalysisSuppressionStore::connection_guard#1",
+      "sha256": "645c25e9e14401ed9f98b947192e8a9f90825d8214475f7bfe15c2df71851655",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Lock-poison recovery counter for the standalone policy analysis suppression SQLite connection; metrics instrumentation only, no network, process or HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/analysis_suppressions.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::analysis_suppressions::record_from_row#1",
+      "sha256": "4ac91a6be28ebd4b4915393cb1f37312fa34404982f71782626b49ef718089d3",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Decodes one standalone policy analysis suppression SQLite row; no network, process or HTTP authority."
+    },
+    {
       "file": "gateway/src/storage/postgres.rs",
       "reasons": [
         "capability-import-or-glob"
@@ -13427,6 +13467,46 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_policy_drafts::classify_query#1",
+      "sha256": "b9618bf4127da4a3c48146f04769b3bf1026ac7481910dafc4f502dbfdacaf3b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_analysis_suppressions.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_analysis_suppressions::PostgresAnalysisSuppressionStore#1",
+      "sha256": "b5d00730121ac7fa2c7924c5a23299a78979c0624e8a64f6786744e26dd61905",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_analysis_suppressions.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_analysis_suppressions::impl  PostgresAnalysisSuppressionStore::new#1",
+      "sha256": "76706a9ebf24dafecc2c91280de5259437049d9ea0442f16e466bfd5183d82d8",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_analysis_suppressions.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_analysis_suppressions::record_from_row#1",
+      "sha256": "c02e12a71c47f1b93318377775d0d8ee2edd8804d67a621cb67c5c25ad7f4dbd",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_analysis_suppressions.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_analysis_suppressions::classify_query#1",
       "sha256": "b9618bf4127da4a3c48146f04769b3bf1026ac7481910dafc4f502dbfdacaf3b",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."

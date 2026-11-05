@@ -48,6 +48,13 @@ pub(super) const POLICY_EVIDENCE_ADMIN_ROUTE: &str = "/v1/admin/policy/evidence"
 /// Analyze the structure of the active policy or a candidate (issue #243,
 /// slice 15).
 pub(super) const POLICY_ANALYSES_ADMIN_ROUTE: &str = "/v1/admin/policy/analyses";
+/// List and create suppressions of analyzer findings (issue #243, slice
+/// 15).
+pub(super) const POLICY_ANALYSIS_SUPPRESSIONS_ADMIN_ROUTE: &str =
+    "/v1/admin/policy/analyses/suppressions";
+/// End one suppression before its expiry.
+pub(super) const POLICY_ANALYSIS_SUPPRESSION_ADMIN_ROUTE: &str =
+    "/v1/admin/policy/analyses/suppressions/{id}";
 pub(super) const POLICY_RULES_ADMIN_ROUTE: &str = "/v1/admin/policy/rules";
 pub(super) const POLICY_RULE_ADMIN_ROUTE: &str = "/v1/admin/policy/rules/{id}";
 pub(super) const POLICY_RULES_ORDER_ADMIN_ROUTE: &str = "/v1/admin/policy/rules/order";
@@ -263,6 +270,8 @@ pub(super) struct AdminRoutes {
     pub(super) policy_simulations_route: String,
     pub(super) policy_replays_route: String,
     pub(super) policy_analyses_route: String,
+    pub(super) policy_analysis_suppressions_route: String,
+    pub(super) policy_analysis_suppression_route: String,
     pub(super) policy_replay_route: String,
     pub(super) policy_evidence_route: String,
     pub(super) policy_rules_route: String,
@@ -378,6 +387,12 @@ impl AdminRoutes {
             policy_simulations_route: format!("{api_prefix}/policy/simulations"),
             policy_replays_route: format!("{api_prefix}/policy/replays"),
             policy_analyses_route: format!("{api_prefix}/policy/analyses"),
+            policy_analysis_suppressions_route: format!(
+                "{api_prefix}/policy/analyses/suppressions"
+            ),
+            policy_analysis_suppression_route: format!(
+                "{api_prefix}/policy/analyses/suppressions/{{id}}"
+            ),
             policy_replay_route: format!("{api_prefix}/policy/replays/{{id}}"),
             policy_evidence_route: format!("{api_prefix}/policy/evidence"),
             policy_rules_route: format!("{api_prefix}/policy/rules"),
@@ -499,6 +514,11 @@ pub(super) struct PolicyAdminState {
     /// the policy history database standalone, migration 22's table in
     /// cluster mode. `None` leaves the draft routes answering `503`.
     pub(super) draft_store: Option<Arc<dyn storage::PolicyDraftStore>>,
+    /// Analyzer finding suppressions (issue #243, slice 15): a table in the
+    /// policy history database standalone, migration 27's table in cluster
+    /// mode. `None` leaves the suppression routes answering `503` and every
+    /// analysis reporting its suppressions unavailable.
+    pub(super) analysis_suppression_store: Option<Arc<dyn storage::AnalysisSuppressionStore>>,
     /// Cluster mode's authoritative control plane. Present exactly when
     /// `policy_file` is absent-but-cluster: mutations commit through its
     /// CAS transaction instead of the file, and history is its documents.

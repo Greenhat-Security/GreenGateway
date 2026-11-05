@@ -96,6 +96,8 @@ mod admin_policy_evidence;
 use admin_policy_evidence::*;
 mod admin_policy_analyses;
 use admin_policy_analyses::*;
+mod admin_policy_analysis_suppressions;
+use admin_policy_analysis_suppressions::*;
 
 mod audit;
 mod auth;

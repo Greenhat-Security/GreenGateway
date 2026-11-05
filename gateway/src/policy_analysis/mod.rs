@@ -45,6 +45,16 @@
 //! saving the edited document as a draft and publishing that draft under the
 //! ordinary preconditions and authorization.
 //!
+//! ## Suppressions
+//!
+//! A reviewer can record that one finding needs no change until a stated
+//! time ([`suppression`]). A suppression is bound to the finding's
+//! fingerprint and code, the analyzed policy and the resource snapshot, and
+//! marks the finding `suppressed` in the report only while all of them
+//! match and it has not ended; an expired or mismatched suppression is
+//! reported beside the finding and hides nothing. The finding is reported
+//! either way, and nothing suppresses a code or every finding at once.
+//!
 //! ## No side effects
 //!
 //! [`checks::analyze`] is pure: it compiles the policy for analysis, asks the
@@ -52,12 +62,14 @@
 //! emits no event or metric, and touches no rate bucket, tool permit,
 //! resolver or upstream. Its work is bounded by a comparison budget, a
 //! deadline and a findings cap; exhausting any of them makes the result
-//! incomplete, never clean.
+//! incomplete, never clean. [`suppression::apply`] is pure too: the endpoint
+//! reads the records and hands them over.
 
 pub(crate) mod checks;
 pub(crate) mod coverage;
 pub(crate) mod report;
 pub(crate) mod request;
+pub(crate) mod suppression;
 #[cfg(test)]
 mod tests;
 

@@ -51,6 +51,17 @@ pub const POLICY_EVIDENCE_EXPORTED: &str = "policy.evidence_exported";
 /// the base and candidate ETags, the request digest, completeness and
 /// finding counts, never a finding's element or policy content.
 pub const POLICY_ANALYSIS_RUN: &str = "policy.analysis_run";
+/// An analyzer finding was suppressed (issue #243, slice 15): the
+/// suppression id and the finding code, never the finding's element,
+/// fingerprint or the reason the reviewer wrote.
+pub const POLICY_ANALYSIS_SUPPRESSION_CREATED: &str = "policy.analysis_suppression_created";
+/// A suppression was ended before its expiry. Ids and codes only.
+pub const POLICY_ANALYSIS_SUPPRESSION_WITHDRAWN: &str = "policy.analysis_suppression_withdrawn";
+/// A suppression create or withdrawal was refused against current state
+/// (stale policy or resources, a duplicate, the deployment bound, the
+/// expiry window, an ended or changed suppression): the operation, a stable
+/// reason, the finding code and the suppression id when there is one.
+pub const POLICY_ANALYSIS_SUPPRESSION_REFUSED: &str = "policy.analysis_suppression_refused";
 pub const SERVICE_TOKEN_CHANGED: &str = "service_token.changed";
 pub const SERVICE_TOKEN_DELEGATION_REJECTED: &str = "service_token.delegation_rejected";
 /// A policy write the cross-resource checks refused before any authority saw

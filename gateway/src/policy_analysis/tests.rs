@@ -13,6 +13,10 @@ use super::{
     coverage::{pattern_covers, segments},
     report::{to_json, to_sarif, AnalysisBinding},
     request::{parse_request, AnalysisFormat},
+    suppression::{
+        apply, AppliedSuppression, BindingPart, Suppression, SuppressionBinding,
+        SuppressionOutcome, SuppressionRead, SuppressionState,
+    },
     AccessEffect, AnalysisLimitation, AnalysisOutcome, Finding, FindingCode, Lane, ProofBasis,
     Severity, MAX_FINDINGS,
 };
@@ -28,7 +32,12 @@ use crate::{
     },
     policy_simulation::edits::{apply_edits, parse_edits},
     policy_testing::suite::Diagnostics,
-    rbac::{matcher::path_pattern_matches, policy_document::parse_v1_with_typed_matchers, Policy},
+    rbac::{
+        matcher::path_pattern_matches,
+        policy_document::parse_v1_with_typed_matchers,
+        policy_resources::{PolicyResourceSnapshot, PolicyResourceView},
+        Policy,
+    },
 };
 
 fn policy(value: Value) -> Policy {
@@ -848,16 +857,32 @@ fn a_fingerprint_follows_stable_ids_across_reorders_and_differs_by_code() {
     assert_ne!(before, other.fingerprint().expect("fingerprint"));
 }
 
-fn binding<'a>(digest: &'a str, etag: &'a str) -> AnalysisBinding<'a> {
+/// A snapshot of no readable resources: incomplete, so no suppression
+/// binds to it.
+fn unread_snapshot() -> PolicyResourceSnapshot {
+    PolicyResourceSnapshot::of(&PolicyResourceView::default())
+}
+
+fn binding<'a>(
+    digest: &'a str,
+    etag: &'a str,
+    snapshot: &'a PolicyResourceSnapshot,
+) -> AnalysisBinding<'a> {
     AnalysisBinding {
         request_digest: digest,
         base_etag: etag,
         security_revision: None,
         source: "active",
         analyzed_etag: etag,
+        analyzed_semantic_digest: None,
         edit_count: 0,
         mcp_alias_paths: 0,
+        resource_snapshot: snapshot,
     }
+}
+
+fn no_suppressions(outcome: &AnalysisOutcome) -> SuppressionOutcome {
+    SuppressionOutcome::unavailable(outcome.findings.len())
 }
 
 #[test]
@@ -871,7 +896,13 @@ fn the_json_report_is_deterministic_and_names_no_policy_value() {
     );
     let render = || {
         let outcome = run(&policy(document.clone()));
-        to_json(&outcome, &binding("sha256:digest", "\"sha256:etag\"")).expect("renders")
+        let snapshot = unread_snapshot();
+        to_json(
+            &outcome,
+            &binding("sha256:digest", "\"sha256:etag\"", &snapshot),
+            &no_suppressions(&outcome),
+        )
+        .expect("renders")
     };
     let first = render();
     assert_eq!(first, render());
@@ -904,7 +935,13 @@ fn sarif_carries_one_rule_per_code_and_one_result_per_finding() {
         ]),
         json!([]),
     )));
-    let sarif = to_sarif(&outcome, &binding("sha256:digest", "\"sha256:etag\"")).expect("renders");
+    let snapshot = unread_snapshot();
+    let sarif = to_sarif(
+        &outcome,
+        &binding("sha256:digest", "\"sha256:etag\"", &snapshot),
+        &no_suppressions(&outcome),
+    )
+    .expect("renders");
     let run = &sarif["runs"][0];
     assert_eq!(sarif["version"], json!("2.1.0"));
     assert_eq!(
@@ -1645,4 +1682,326 @@ proptest! {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Suppressions (issue #243, slice 15)
+// ---------------------------------------------------------------------------
+
+const SUPPRESSION_ETAG: &str = "\"sha256:analyzed\"";
+const SUPPRESSION_SNAPSHOT: &str = "sha256:snapshot";
+
+fn shadowed_outcome() -> AnalysisOutcome {
+    run(&policy(base(
+        json!([
+            { "path": "/api/**", "action": "allow" },
+            { "path": "/api/admin", "action": "deny" }
+        ]),
+        json!([]),
+    )))
+}
+
+fn record_for(finding: &Finding, id: &str, created_at: i64) -> Suppression {
+    Suppression {
+        id: id.to_owned(),
+        fingerprint: finding.fingerprint().expect("fingerprint"),
+        code: finding.code.as_str().to_owned(),
+        policy_etag: SUPPRESSION_ETAG.to_owned(),
+        policy_semantic_digest: None,
+        resource_snapshot_digest: SUPPRESSION_SNAPSHOT.to_owned(),
+        created_at,
+        ended: false,
+    }
+}
+
+fn exact_binding() -> SuppressionBinding<'static> {
+    SuppressionBinding {
+        policy_etag: SUPPRESSION_ETAG,
+        policy_semantic_digest: None,
+        resource_snapshot_digest: Some(SUPPRESSION_SNAPSHOT),
+    }
+}
+
+fn state_of(
+    outcome: &AnalysisOutcome,
+    records: Vec<Suppression>,
+    binding: &SuppressionBinding<'_>,
+) -> Option<AppliedSuppression> {
+    apply(
+        &outcome.findings,
+        &SuppressionRead::Available(records),
+        binding,
+    )
+    .expect("applies")
+    .applied
+    .into_iter()
+    .next()
+    .flatten()
+}
+
+/// A record suppresses its finding only when fingerprint, code, policy ETag,
+/// semantic digest and resource snapshot all match and it has not ended; a
+/// record for another finding or code says nothing, and one that no longer
+/// binds or has ended is reported, never hidden.
+#[test]
+fn a_suppression_applies_only_when_it_binds_the_analysis_exactly() {
+    let outcome = shadowed_outcome();
+    let finding = only(&outcome, FindingCode::RuleShadowed);
+    let exact = record_for(finding, "pas_exact", 10);
+
+    let applied = state_of(&outcome, vec![exact.clone()], &exact_binding()).expect("applies");
+    assert_eq!(applied.state, SuppressionState::Suppressed);
+    assert_eq!(applied.suppression_id, "pas_exact");
+    assert!(applied.mismatched.is_empty());
+
+    let mut ended = exact.clone();
+    ended.ended = true;
+    let applied = state_of(&outcome, vec![ended], &exact_binding()).expect("reported");
+    assert_eq!(applied.state, SuppressionState::Expired);
+
+    for (record, binding, parts) in [
+        (
+            Suppression {
+                policy_etag: "\"sha256:other\"".to_owned(),
+                ..exact.clone()
+            },
+            exact_binding(),
+            vec![BindingPart::Policy],
+        ),
+        (
+            Suppression {
+                policy_semantic_digest: Some("sha256:semantic".to_owned()),
+                ..exact.clone()
+            },
+            exact_binding(),
+            vec![BindingPart::Policy],
+        ),
+        (
+            Suppression {
+                resource_snapshot_digest: "sha256:moved".to_owned(),
+                ..exact.clone()
+            },
+            exact_binding(),
+            vec![BindingPart::ResourceSnapshot],
+        ),
+        // Resources the analysis could not read bind nothing.
+        (
+            exact.clone(),
+            SuppressionBinding {
+                resource_snapshot_digest: None,
+                ..exact_binding()
+            },
+            vec![BindingPart::ResourceSnapshot],
+        ),
+        (
+            Suppression {
+                policy_etag: "\"sha256:other\"".to_owned(),
+                resource_snapshot_digest: "sha256:moved".to_owned(),
+                ..exact.clone()
+            },
+            exact_binding(),
+            vec![BindingPart::Policy, BindingPart::ResourceSnapshot],
+        ),
+    ] {
+        let applied = state_of(&outcome, vec![record], &binding).expect("reported");
+        assert_eq!(applied.state, SuppressionState::Mismatched);
+        assert_eq!(applied.mismatched, parts);
+    }
+
+    // Another finding's fingerprint, or the same fingerprint under another
+    // code, is not about this finding at all.
+    for record in [
+        Suppression {
+            fingerprint: format!("sha256:{}", "0".repeat(64)),
+            ..exact.clone()
+        },
+        Suppression {
+            code: FindingCode::RuleUnreachable.as_str().to_owned(),
+            ..exact.clone()
+        },
+    ] {
+        assert_eq!(state_of(&outcome, vec![record], &exact_binding()), None);
+    }
+}
+
+/// Of several records naming one finding, one that suppresses it wins; else
+/// an unended mismatched one is named before an ended one; and within a
+/// state the latest created is named.
+#[test]
+fn the_record_a_finding_is_reported_with_is_chosen_deterministically() {
+    let outcome = shadowed_outcome();
+    let finding = only(&outcome, FindingCode::RuleShadowed);
+    let exact = record_for(finding, "pas_exact", 10);
+    let mismatched = Suppression {
+        id: "pas_mismatched".to_owned(),
+        policy_etag: "\"sha256:other\"".to_owned(),
+        created_at: 30,
+        ..exact.clone()
+    };
+    let ended = Suppression {
+        id: "pas_ended".to_owned(),
+        created_at: 40,
+        ended: true,
+        ..exact.clone()
+    };
+    let chosen = |records: Vec<Suppression>| {
+        let applied = state_of(&outcome, records, &exact_binding()).expect("reported");
+        (applied.state, applied.suppression_id)
+    };
+    assert_eq!(
+        chosen(vec![ended.clone(), mismatched.clone(), exact.clone()]),
+        (SuppressionState::Suppressed, "pas_exact".to_owned())
+    );
+    assert_eq!(
+        chosen(vec![ended.clone(), mismatched.clone()]),
+        (SuppressionState::Mismatched, "pas_mismatched".to_owned())
+    );
+    let later_ended = Suppression {
+        id: "pas_later".to_owned(),
+        created_at: 50,
+        ..ended.clone()
+    };
+    assert_eq!(
+        chosen(vec![later_ended, ended]),
+        (SuppressionState::Expired, "pas_later".to_owned())
+    );
+}
+
+/// Unread records suppress nothing, and the report says they were not read:
+/// zero suppressed is not the same as none existing.
+#[test]
+fn unavailable_suppressions_hide_nothing_and_are_reported_unavailable() {
+    let outcome = shadowed_outcome();
+    let applied = apply(
+        &outcome.findings,
+        &SuppressionRead::Unavailable,
+        &exact_binding(),
+    )
+    .expect("applies");
+    assert!(!applied.available);
+    assert!(applied.applied.iter().all(Option::is_none));
+    assert_eq!(applied.applied.len(), outcome.findings.len());
+
+    let snapshot = unread_snapshot();
+    let report = to_json(
+        &outcome,
+        &binding("sha256:digest", SUPPRESSION_ETAG, &snapshot),
+        &applied,
+    )
+    .expect("renders");
+    assert_eq!(
+        report["suppressions"],
+        json!({ "available": false, "records": 0 })
+    );
+    assert_eq!(report["findings"][0]["suppression"], Value::Null);
+    let sarif = to_sarif(
+        &outcome,
+        &binding("sha256:digest", SUPPRESSION_ETAG, &snapshot),
+        &applied,
+    )
+    .expect("renders");
+    let result = &sarif["runs"][0]["results"][0];
+    assert!(
+        result.get("suppressions").is_none(),
+        "SARIF says nothing was checked: {result}"
+    );
+}
+
+/// The JSON report marks each finding with its state and record id and
+/// counts the states; SARIF carries an accepted external suppression only
+/// for a suppressed finding and an empty list for every other checked one.
+/// Neither carries a reason.
+#[test]
+fn reports_mark_suppressed_expired_and_mismatched_findings_and_count_them() {
+    let outcome = run(&policy(base(
+        json!([
+            { "path": "/api/**", "action": "allow" },
+            { "path": "/api/admin", "action": "deny" },
+            { "path": "/ops/**", "action": "allow" },
+            { "path": "/ops/admin", "action": "deny" },
+            { "path": "/web/**", "action": "allow" },
+            { "path": "/web/admin", "action": "deny" },
+            { "path": "/docs/**", "action": "allow" },
+            { "path": "/docs/admin", "action": "deny" }
+        ]),
+        json!([]),
+    )));
+    assert_eq!(codes(&outcome), ["rule_shadowed"; 4]);
+    let records = vec![
+        record_for(&outcome.findings[0], "pas_suppressed", 1),
+        Suppression {
+            ended: true,
+            ..record_for(&outcome.findings[1], "pas_expired", 2)
+        },
+        Suppression {
+            resource_snapshot_digest: "sha256:moved".to_owned(),
+            ..record_for(&outcome.findings[2], "pas_mismatched", 3)
+        },
+    ];
+    let applied = apply(
+        &outcome.findings,
+        &SuppressionRead::Available(records),
+        &exact_binding(),
+    )
+    .expect("applies");
+    let snapshot = unread_snapshot();
+    let report = to_json(
+        &outcome,
+        &binding("sha256:digest", SUPPRESSION_ETAG, &snapshot),
+        &applied,
+    )
+    .expect("renders");
+    assert_eq!(
+        report["suppressions"],
+        json!({ "available": true, "records": 3 })
+    );
+    assert_eq!(
+        report["summary"]["by_suppression_state"],
+        json!({ "suppressed": 1, "suppression_expired": 1, "suppression_mismatched": 1 })
+    );
+    assert_eq!(report["summary"]["findings"], json!(4));
+    assert_eq!(
+        report["findings"][0]["suppression"],
+        json!({ "state": "suppressed", "suppression_id": "pas_suppressed" })
+    );
+    assert_eq!(
+        report["findings"][1]["suppression"],
+        json!({ "state": "suppression_expired", "suppression_id": "pas_expired" })
+    );
+    assert_eq!(
+        report["findings"][2]["suppression"],
+        json!({
+            "state": "suppression_mismatched",
+            "suppression_id": "pas_mismatched",
+            "mismatched": ["resource_snapshot"],
+        })
+    );
+    assert_eq!(report["findings"][3]["suppression"], Value::Null);
+
+    let sarif = to_sarif(
+        &outcome,
+        &binding("sha256:digest", SUPPRESSION_ETAG, &snapshot),
+        &applied,
+    )
+    .expect("renders");
+    let results = sarif["runs"][0]["results"].as_array().expect("results");
+    assert_eq!(
+        results[0]["suppressions"],
+        json!([{
+            "kind": "external",
+            "status": "accepted",
+            "properties": { "suppression_id": "pas_suppressed" },
+        }])
+    );
+    for result in &results[1..] {
+        assert_eq!(result["suppressions"], json!([]), "{result}");
+    }
+    assert_eq!(
+        results[1]["properties"]["suppression"]["state"],
+        json!("suppression_expired")
+    );
+    assert_eq!(
+        sarif["runs"][0]["properties"]["summary"]["by_suppression_state"]["suppressed"],
+        json!(1)
+    );
 }

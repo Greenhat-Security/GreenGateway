@@ -23,7 +23,8 @@ An analysis changes nothing. It does not write, activate or rewrite a policy
 never applied -- emits no data-plane authorization event, records no metric
 of its own, and touches no rate bucket, tool permit, resolver or upstream.
 Beyond the access record every admin request gets, the only record it leaves
-is one `policy.analysis_run` audit event.
+is one `policy.analysis_run` audit event. It reads the deployment's
+[suppressions](#suppressions), which only change how a finding is labeled.
 
 ## The request
 
@@ -105,14 +106,17 @@ Content-Type: application/json
   "base": { "source": "active", "etag": "\"sha256:...\"" },
   "analyzed": { "source": "edits", "etag": "\"sha256:...\"", "edits": 2 },
   "resources": { "mcp_alias_paths": 1 },
+  "resource_snapshot": { "schema_version": "1.0.0", "digest": "sha256:...", "complete": true, "components": { "...": "..." } },
   "complete": true,
   "limitations": [],
   "budget": { "comparisons": 12, "max_comparisons": 2000000, "max_findings": 1000 },
+  "suppressions": { "available": true, "records": 3 },
   "summary": {
     "findings": 1, "patches": 1,
     "by_severity": { "high": 1, "low": 0, "medium": 0 },
     "by_proof_basis": { "heuristic": 0, "inconclusive": 0, "proven": 1 },
-    "by_code": { "rule_shadowed": 1 }
+    "by_code": { "rule_shadowed": 1 },
+    "by_suppression_state": { "suppressed": 0, "suppression_expired": 0, "suppression_mismatched": 1 }
   },
   "findings": [
     {
@@ -133,7 +137,12 @@ Content-Type: application/json
         "access_effect": "narrowing",
         "edits": [{ "op": "move", "section": "rules", "from": 3, "to": 1, "expect_id": "deny-admin" }]
       },
-      "limitations": []
+      "limitations": [],
+      "suppression": {
+        "state": "suppression_mismatched",
+        "suppression_id": "pas_...",
+        "mismatched": ["policy"]
+      }
     }
   ]
 }
@@ -141,11 +150,13 @@ Content-Type: application/json
 
 | Member | Meaning |
 | --- | --- |
-| `base`, `analyzed` | The pinned active policy, and the document analyzed: the base itself, or the candidate, with its own ETag. Every position, pointer and patch names the analyzed document. |
+| `base`, `analyzed` | The pinned active policy, and the document analyzed: the base itself, or the candidate, with its own ETag and, for policy v1, its `semantic_digest`. Every position, pointer and patch names the analyzed document. |
 | `resources.mcp_alias_paths` | How many MCP alias paths the analysis read from this gateway's static configuration (their values are not repeated). |
+| `resource_snapshot` | The [resource snapshot](configuration.md#policy_file) the analysis was judged against, as `POST .../policy/validate` reports one: its `digest`, whether it is `complete`, and the versions and digests of the resources it read. A suppression binds its `digest`. |
+| `suppressions` | Whether the deployment's [suppression](#suppressions) records were read (`available`) and how many (`records`, ended and unmatched ones included). |
 | `complete` | Every check ran over every element. `false` means the analysis stopped at a bound named in `limitations`, and says nothing about the elements it did not reach. |
 | `limitations` | `comparison_budget_exhausted`, `deadline_exceeded` or `findings_truncated`. |
-| `summary` | Counts only, the same counts the audit event carries. |
+| `summary` | Counts only, the same counts the audit event carries, `by_suppression_state` among them. |
 | `findings` | Sorted by severity, then section, position and code. |
 
 A finding never repeats a path, permission, caller or any other value from
@@ -156,7 +167,7 @@ a role by its name, as validation diagnostics do. `rationale` and
 | Finding member | Meaning |
 | --- | --- |
 | `code` | The stable finding code; see the table below. The rationale and remediation texts may be reworded; the code is the contract. |
-| `fingerprint` | `sha256:` over the code and the identities of `element` and `related` -- each element's stable id, a role's name, or its position when it has neither. It does not change when unrelated elements change, or when an element with an id moves, so a later suppression or a CI baseline can name it. |
+| `fingerprint` | `sha256:` over the code and the identities of `element` and `related` -- each element's stable id, a role's name, or its position when it has neither. It does not change when unrelated elements change, or when an element with an id moves, so a [suppression](#suppressions) or a CI baseline can name it. |
 | `severity` | `high`, `medium` or `low`: how likely the finding is to be an exposure rather than clutter. |
 | `proof_basis` | How the finding was established; see below. |
 | `element`, `related` | The element the finding is about, and the element that establishes it (the earlier rule that covers it, the route or rule that decides first, the catch-all that masks a default). |
@@ -165,6 +176,7 @@ a role by its name, as validation diagnostics do. `rationale` and
 | `details` | Value-free facts specific to the code, listed below. |
 | `patch` | An advisory candidate patch, when the analyzer has one; see [Advisory patches](#advisory-patches). |
 | `limitations` | `witness_unconfirmed` for an inconclusive finding. |
+| `suppression` | `null`, or the [suppression state](#how-a-finding-reads) and the id of the suppression that decided it. Never its reason. |
 
 ### Evaluation lanes
 
@@ -322,21 +334,179 @@ at the findings cap. Any of these makes `complete` `false` and names the
 bound in `limitations`; the findings already reported stand, each proven on
 its own, and nothing is said about the elements not reached.
 
+## Suppressions
+
+A suppression records that a reviewer read one finding and decided it needs
+no change until a stated time. It changes no policy and no enforcement, and it
+never removes a finding from a report: it only marks the finding, and only
+while it still describes exactly what was reviewed. There is no way to
+suppress a code, a section or every finding at once.
+
+A suppression names:
+
+- the finding, by its `fingerprint` and `code` as a report gave them;
+- the **binding**: the ETag of the policy the finding was reviewed in, that
+  policy's [semantic digest](schemas/policy.v1.schema.json) when it is policy
+  v1 (a 0.x document has none, and its ETag alone binds it), and the
+  `resource_snapshot.digest` the analysis reported;
+- a `reason`, 1 to 512 bytes of text without control characters;
+- the principal that created it (canonical issuer and subject), when, and an
+  `expires_at` at most 90 days later. The bound is compiled in; configuration
+  cannot raise it.
+
+### How a finding reads
+
+Every finding in a report carries `suppression`: `null`, or the state of the
+suppression that decided it and that suppression's id.
+
+| `suppression.state` | When |
+| --- | --- |
+| `suppressed` | A suppression names this finding's fingerprint and code, its binding equals this analysis's analyzed ETag, semantic digest and resource snapshot digest, and it has not ended. |
+| `suppression_mismatched` | A suppression names the finding and has not ended, but binds another policy or other resources: `mismatched` lists `policy`, `resource_snapshot` or both. Any edit to the policy, an analysis of a different candidate, a tool or Connection change, a configuration change or, in cluster mode, any change to the security revision makes a suppression mismatched. So does a resource snapshot that is not `complete`: nothing binds resources the analysis could not read. |
+| `suppression_expired` | Every suppression naming the finding has ended: its `expires_at` passed, or it was withdrawn. |
+
+Only `suppressed` hides anything, and even then the finding is still listed,
+counted in `summary.findings` and its severity, and carries its patch. An
+expired or mismatched suppression hides nothing; the state says why the
+finding is back. When several suppressions name one finding, one that applies
+wins; otherwise an unended mismatched one is reported before an ended one, and
+within a state the most recently created is named. Whether a suppression has
+ended is the store's judgement when the analysis read it, so two analyses of
+the same policy can differ once a suppression expires between them.
+
+`summary.by_suppression_state` counts the findings in each state, every state
+listed. `suppressions.available` says whether the records were read at all:
+when no store is configured or it cannot be read, no finding is suppressed,
+`available` is `false` and the counts are zero, which is never the same as a
+deployment with no suppressions. A suppression's `reason` never appears in a
+report, SARIF or an audit event; read it from the listing below.
+
+In SARIF, a suppressed finding's result carries one suppression,
+`{"kind": "external", "status": "accepted", "properties": {"suppression_id": ...}}`;
+every other result carries an empty `suppressions` array, which SARIF reads as
+checked and not suppressed, so an expired or mismatched suppression is never a
+SARIF suppression. Its state is in the result's `properties.suppression`. When
+the records could not be read, no result carries `suppressions`, SARIF's "not
+checked".
+
+### The suppression API
+
+| Operation | Route | Permissions |
+| --- | --- | --- |
+| List | `GET /v1{ADMIN_PREFIX}/policy/analyses/suppressions` | `admin:policy:read` and `admin:policy:analyze` |
+| Create | `POST /v1{ADMIN_PREFIX}/policy/analyses/suppressions` | `admin:policy:write` |
+| Expire now | `DELETE /v1{ADMIN_PREFIX}/policy/analyses/suppressions/{id}` | `admin:policy:write` |
+
+Permissions are decided before any body, store or policy read. A policy whose
+routes gate the admin API needs routes for these ahead of its catch-alls;
+`dev/policy.json` routes `POST` and `DELETE` under
+`/v1/admin/policy/analyses/suppressions` to `admin:policy:write`, and a `GET`
+falls to its `admin:policy:read` route (the handler then also requires
+`admin:policy:analyze`).
+
+**Create.** The body is the
+[`policy-analysis-suppression.v1`](schemas/policy-analysis-suppression.v1.schema.json)
+request; unknown and repeated members are refused, and the gateway's checks
+are authoritative.
+
+```http
+POST /v1/admin/policy/analyses/suppressions
+If-Match: "sha256:..."
+Content-Type: application/json
+
+{
+  "fingerprint": "sha256:...",
+  "code": "rule_shadowed",
+  "reason": "kept on purpose: the deny decides at the MCP alias first",
+  "expires_at": "2026-12-01T00:00:00Z",
+  "resource_snapshot_digest": "sha256:..."
+}
+```
+
+`If-Match` names the live policy ETag the finding was reviewed in, as exactly
+one strong entity tag, and `resource_snapshot_digest` the snapshot digest the
+analysis reported. The gateway checks both against the current state and
+records the live ETag, its semantic digest and the snapshot digest as the
+binding: a suppression is always created against the live policy, never
+re-bound to a policy or resources nobody reviewed. To suppress a finding of a
+candidate, publish the candidate and analyze the live policy. `expires_at` is
+RFC 3339, kept to the second, and must be after now and at most 90 days after
+it on the store's clock. The answer is `201` with the suppression and its
+strong `ETag`.
+
+**List.** Every retained suppression, ended ones included, oldest first, with
+the store's `limits` (`max_suppressions`, `max_ttl_seconds`,
+`max_reason_bytes`). Each carries `suppression_id`, `etag`, `revision`,
+`state` (`active`, `expired` or `withdrawn`), `fingerprint`, `code`,
+`reason`, `created_by`, `created_at`, `expires_at`, `withdrawn_at` once
+withdrawn, and its `binding`.
+
+**Expire now.** `DELETE` with the suppression's `etag` in `If-Match` ends it
+at once: its `state` becomes `withdrawn`, `revision` moves from 1 to 2, and
+every analysis from then on reports its finding `suppression_expired`. It is
+a compare-and-set on the revision, so of two holding one ETag exactly one
+wins. A suppression is never edited; to change a reason or an expiry, expire
+it and create another.
+
+| Status | `reason` | Meaning |
+| --- | --- | --- |
+| `200`, `201` | -- | Listed, expired now, or created. `Cache-Control: no-store`. |
+| `400` | `policy_analysis_suppression_request_invalid` | The body is not JSON of the request's shape: an unknown, missing or repeated member. |
+| `400` | `policy_analysis_suppression_etag_invalid` | `If-Match` is not exactly one strong entity tag. |
+| `401`, `403` | -- | Not authenticated, or missing a permission. |
+| `404` | -- | No policy is configured. |
+| `404` | `policy_analysis_suppression_not_found` | No suppression has this id. |
+| `409` | `resource_snapshot_stale` | The resources changed since the analysis; `resource_snapshot` is the current snapshot. Analyze again. |
+| `409` | `policy_analysis_suppression_exists` | This finding already has a suppression under this binding that has not ended; `suppression_id` names it. |
+| `410` | `policy_analysis_suppression_ended` | The suppression already expired or was withdrawn. |
+| `412` | `policy_etag_mismatch` | `If-Match` is not the live policy ETag, which `current_etag` carries. Analyze again. |
+| `412` | `policy_analysis_suppression_etag_mismatch` | The suppression changed since its ETag was read. |
+| `422` | `policy_analysis_suppression_invalid` | A member is out of its bounds; value-free `diagnostics` with JSON pointers (`fingerprint_invalid`, `code_unknown`, `reason_invalid`, `expires_at_invalid`, `resource_snapshot_digest_invalid`). |
+| `422` | `policy_analysis_suppression_expiry_out_of_range` | `expires_at` is not after now, or is more than `max_ttl_seconds` ahead. |
+| `428` | -- | `If-Match` is missing. |
+| `429` | `policy_analysis_suppression_quota_exceeded` | The deployment already holds `max_suppressions` (256) suppressions that have not ended. |
+| `503` | `policy_analysis_suppressions_unavailable` | No suppression store is configured, or it could not be read or written. |
+
+### Storage and bounds
+
+Standalone mode keeps suppressions in a `policy_analysis_suppressions` table
+of the policy history database (`POLICY_HISTORY_SQLITE_PATH`, or the
+`<POLICY_FILE>.history.sqlite` default), judged on the process clock. Cluster
+mode keeps them in `greengateway.policy_analysis_suppressions` (PostgreSQL
+migration 27), shared by every replica and judged on database time; a create
+takes a transaction-scoped advisory lock so the bound holds across replicas.
+At most 256 suppressions that have not ended may exist. An ended suppression
+stays listed, and keeps its findings reading `suppression_expired`, until a
+create needs its room: the table never holds more than 256 rows, and the
+earliest-ended row goes first. `gateway import-standalone` leaves standalone
+suppressions behind; their binding names a standalone policy and resources.
+
+Each create emits `policy.analysis_suppression_created` and each expiry
+`policy.analysis_suppression_withdrawn`, with the `suppression_id` and the
+finding `code` only. A create or expiry refused against current state (a
+stale policy or snapshot, a duplicate, the bound, the expiry window, an ended
+or changed suppression) emits `policy.analysis_suppression_refused` with the
+`operation` (`create` or `withdraw`), the stable `reason`, the `code` and the
+`suppression_id` when there is one. None carries the fingerprint, the binding
+or the reason, and no suppression records a metric of its own. A request
+refused before it was understood (authorization, a malformed body, an
+out-of-bounds member) is not recorded as a suppression decision.
+
 ## Audit
 
 Each completed analysis emits one `policy.analysis_run` audit event with the
 acting principal and the request envelope, `request_digest`, `base_etag`,
 `security_revision` (cluster mode), `candidate_source`, `candidate_etag`, the
 number of `edits`, the `format`, `complete`, the `limitations`, the `summary`
-counts (by severity, proof basis and code) and the analyzer and evaluator
-versions. It never carries a finding's element, pointer, id or fingerprint, a
-patch, or policy content. A refused request (`4xx`) is not recorded as an
+counts (by severity, proof basis, code and suppression state),
+`suppressions_available`, `resource_snapshot_digest` and
+`resource_snapshot_complete`, and the analyzer and evaluator versions. It
+never carries a finding's element, pointer, id or fingerprint, a suppression
+id or reason, a patch, or policy content. A refused request (`4xx`) is not recorded as an
 analysis.
 
 ## Not part of this slice
 
-- Suppressions: separate records binding a fingerprint, reason, actor, expiry
-  and policy binding. Until they exist nothing hides a finding.
 - Findings informed by retained traffic (`bounded_replay`), and unused roles
   and permissions.
 - Partial overlaps and first-match conflicts short of full coverage, MCP
@@ -345,5 +515,6 @@ analysis.
   references and administrator lockout (the
   [cross-resource checks](configuration.md#policy_file) run at publication for the last
   two).
-- Drafts and historical revisions as candidate sources, the Policy Studio
-  Optimize view, and `ggctl` integration.
+- Drafts and historical revisions as candidate sources (the Policy Studio's
+  Optimize view sends an open draft's text as an inline candidate), and
+  `ggctl` integration.

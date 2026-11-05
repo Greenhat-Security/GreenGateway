@@ -12,6 +12,7 @@ import { AdminApiError } from '../lib/api';
 import { hasAdminPermission, useAdminCapabilities } from '../lib/adminCapabilities';
 import { AdminCapabilitiesNotice } from '../lib/AdminCapabilitiesNotice';
 import { fetchPolicy, type PolicyDocument } from '../lib/policy';
+import { POLICY_ANALYZE_PERMISSION } from '../lib/policyAnalyses';
 import {
   POLICY_DRAFT_BASE_STALE_REASON,
   POLICY_DRAFT_DEPLOYMENT_QUOTA_REASON,
@@ -144,6 +145,8 @@ export function PolicyStudioView() {
   const canSimulate =
     canRead && hasAdminPermission(capabilities, POLICY_SIMULATE_PERMISSION);
   const canReplay = canSimulate && hasAdminPermission(capabilities, AUDIT_READ_PERMISSION);
+  const canAnalyze =
+    canRead && hasAdminPermission(capabilities, POLICY_ANALYZE_PERMISSION);
   // Load once after the first grant; a resource 403 must not loop.
   const [readRequested, setReadRequested] = useState(false);
   useEffect(() => {
@@ -1474,6 +1477,8 @@ export function PolicyStudioView() {
                     alert: validation.kind === 'failed' ? validation.alert : null,
                   }}
                   canEditDraft={editable}
+                  canAnalyze={canAnalyze}
+                  canWritePolicy={canWrite}
                   onShowInEditor={showDiagnostic}
                 />
               ) : null}

@@ -16,6 +16,10 @@
 //!   is logged where the failure first occurs, never propagated through the
 //!   contract.
 
+/// Policy analysis suppressions (issue #243, slice 15): bound, expiring
+/// review decisions about analyzer findings, and their standalone SQLite
+/// adapter.
+pub mod analysis_suppressions;
 mod audit;
 /// What a policy or tools document commit's durable evidence records about
 /// it (issue #425, PR 2c): the closed action vocabulary and the actor.
@@ -44,6 +48,8 @@ mod policy_history;
 pub mod postgres;
 #[cfg(feature = "postgres")]
 pub mod postgres_admin_sessions;
+#[cfg(feature = "postgres")]
+pub mod postgres_analysis_suppressions;
 #[cfg(feature = "postgres")]
 pub mod postgres_audit;
 /// The authority-event journal and the dispatcher's durable cursor
@@ -90,6 +96,7 @@ mod service_token;
 #[cfg(test)]
 pub(crate) mod contract_tests;
 
+pub use analysis_suppressions::{AnalysisSuppressionStore, SqliteAnalysisSuppressionStore};
 pub use audit::{AuditEventStore, SqliteAuditEventStore};
 pub use change_evidence::DocumentAction;
 #[cfg(feature = "postgres")]

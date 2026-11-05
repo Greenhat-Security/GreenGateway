@@ -288,7 +288,9 @@ struct EvaluatorVersions {
 }
 
 impl PolicyResourceSnapshot {
-    fn of(view: &PolicyResourceView) -> Self {
+    /// The snapshot of what `view` read, without running a check: what a
+    /// policy analysis and its suppressions bind (issue #243, slice 15).
+    pub(crate) fn of(view: &PolicyResourceView) -> Self {
         let components = SnapshotComponents {
             gateway_build: env!("CARGO_PKG_VERSION"),
             evaluator: EvaluatorVersions {

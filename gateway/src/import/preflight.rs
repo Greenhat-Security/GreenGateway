@@ -106,6 +106,8 @@ const AUTHORITATIVE_TABLES: &[&str] = &[
     // state, never authority or history, and a draft needs a live policy to
     // be pinned to, which an empty namespace does not have. The validation
     // proves the import left the table empty (`EXCLUDED_RUNTIME_TABLES`).
+    // 0027's analysis suppressions are absent for the same reason: review
+    // state bound to a policy and resource snapshot, never authority.
     // 0023: policy, tools and catalog change evidence. The import writes
     // document evidence itself (its policy and tools activations are
     // `configuration.import` rows), so on a fresh target a row here means

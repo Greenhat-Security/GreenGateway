@@ -5427,6 +5427,7 @@ mod cluster_policy_tests {
                 draft_store: Some(
                     Arc::new(store.draft_store()) as Arc<dyn storage::PolicyDraftStore>
                 ),
+                analysis_suppression_store: None,
                 control_plane: Some(store as Arc<dyn storage::PolicyControlPlane>),
                 membership,
                 event_store: None,
