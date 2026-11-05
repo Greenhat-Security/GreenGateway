@@ -21,6 +21,7 @@ export const POLICY_REPLAY_NOT_FOUND_REASON = 'policy_replay_job_not_found';
 export const POLICY_REPLAY_IDEMPOTENCY_CONFLICT_REASON = 'policy_replay_idempotency_conflict';
 export const POLICY_REPLAY_UNSUPPORTED_IN_CLUSTER_REASON = 'policy_replay_unsupported_in_cluster';
 export const POLICY_REPLAY_AUDIT_UNAVAILABLE_REASON = 'policy_replay_audit_unavailable';
+export const POLICY_REPLAY_STORE_UNAVAILABLE_REASON = 'policy_replay_store_unavailable';
 export const AUDIT_EVIDENCE_UNAVAILABLE_REASON = 'audit_evidence_unavailable';
 export const POLICY_REPLAY_MAX_RECORDS = 100_000;
 
@@ -35,6 +36,8 @@ export type PolicyReplayState =
   | 'completed_incomplete'
   | 'failed'
   | 'cancelled'
+  // A cluster job a replica took over but could not continue; never a result.
+  | 'interrupted'
   | 'expired';
 
 export type PolicyReplayCodeCount = Readonly<{ code: string; count: number }>;
@@ -275,7 +278,7 @@ export function projectReplayJob(body: unknown): PolicyReplayJob | null {
   const failure = isJsonObject(body.failure) && isCode(body.failure.reason)
     ? body.failure.reason
     : null;
-  if (body.state === 'failed' && failure === null) {
+  if ((body.state === 'failed' || body.state === 'interrupted') && failure === null) {
     return null;
   }
   let result: PolicyReplayResult | null = null;
@@ -483,6 +486,7 @@ function isReplayState(value: unknown): value is PolicyReplayState {
     value === 'completed_incomplete' ||
     value === 'failed' ||
     value === 'cancelled' ||
+    value === 'interrupted' ||
     value === 'expired'
   );
 }

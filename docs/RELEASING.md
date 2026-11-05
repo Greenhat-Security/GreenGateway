@@ -190,3 +190,43 @@ Refresh trusted roots whenever importing newly signed material. Offline checks
 cannot discover revocations or new vulnerability advisories since the last trusted
 update. See [GitHub's offline verification procedure](https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/verify-attestations-offline)
 and [artifact attestation reference](https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/use-artifact-attestations).
+
+## Releasing ggctl
+
+The operator CLI is versioned on its own, by `version` in `ggctl/Cargo.toml`,
+and released with `ggctl-vMAJOR.MINOR.PATCH` tags. Those tags do not match the
+`CI` workflow's `v*.*.*` trigger, so they publish no image, and a gateway `v`
+tag publishes no ggctl. [docs/ggctl.md](ggctl.md#release-artifacts) lists the
+artifacts and how operators verify them.
+
+1. Land the version bump in `ggctl/Cargo.toml` and `Cargo.lock`, with its
+   `CHANGELOG.md` entry, on `main`, and ensure `main` is green in CI.
+2. Tag that commit and push the tag:
+
+   ```sh
+   git tag ggctl-vX.Y.Z <commit-on-main>
+   git push origin ggctl-vX.Y.Z
+   ```
+
+3. `.github/workflows/release-ggctl.yml` (`Release ggctl`) refuses a tag that
+   does not name the `ggctl/Cargo.toml` version or whose commit is not on
+   `main`. It builds every target twice on its own platform and fails unless
+   both builds package to the same bytes, attests each archive's SBOM and the
+   build provenance of every archive, SBOM and `SHA256SUMS`, checks that every
+   artifact has its checksum, SBOM and attestations, and verifies every
+   attestation with the pinned GitHub CLI, constrained to this repository, this
+   workflow at the tagged commit, the tag and a GitHub-hosted runner. Only then
+   does it draft the GitHub release, marked as a prerelease while the major
+   version is 0.
+4. Review the draft: every target's archive and SBOM, `SHA256SUMS`, the bundles
+   and `ggctl-X.Y.Z-release.json`. Publish it without marking it the latest
+   release, so the repository's latest release stays the gateway's.
+
+A failed run publishes nothing; re-run it after a transient runner failure.
+Otherwise fix the cause on `main` and release a new patch version rather than
+moving the tag: an attestation already made names the tagged commit and stays
+valid for it. Pull requests that touch ggctl, the
+shared library, the lockfile, the toolchain or the release scripts run the
+same builds and the release check as a dry run with read-only permissions and
+no secrets; its `ggctl-release-dry-run` artifact holds what a release would
+publish, unsigned.

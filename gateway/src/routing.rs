@@ -453,6 +453,15 @@ pub(super) fn add_admin_api_routes(
                     ))),
                 )
                 .route(
+                    routes.admin.policy_analysis_suppressions_route.as_str(),
+                    get(policy_analysis_suppressions_list_endpoint)
+                        .post(policy_analysis_suppression_create_endpoint),
+                )
+                .route(
+                    routes.admin.policy_analysis_suppression_route.as_str(),
+                    axum::routing::delete(policy_analysis_suppression_delete_endpoint),
+                )
+                .route(
                     routes.admin.policy_rules_route.as_str(),
                     post(policy_rule_post_endpoint),
                 )

@@ -11,6 +11,7 @@ import {
   POLICY_REPLAY_IDEMPOTENCY_CONFLICT_REASON,
   POLICY_REPLAY_NOT_FOUND_REASON,
   POLICY_REPLAY_QUOTA_REASON,
+  POLICY_REPLAY_STORE_UNAVAILABLE_REASON,
   POLICY_REPLAY_UNSUPPORTED_IN_CLUSTER_REASON,
   AUDIT_EVIDENCE_UNAVAILABLE_REASON,
 } from '../../../lib/policyReplays';
@@ -166,7 +167,9 @@ function unavailableMessage(error: AdminApiError): string {
     case POLICY_REPLAY_AUDIT_UNAVAILABLE_REASON:
       return 'The audit log did not accept the record of this replay starting, so no job was started.';
     case POLICY_REPLAY_UNSUPPORTED_IN_CLUSTER_REASON:
-      return 'Historical replay is not available in cluster mode yet.';
+      return 'Historical replay is not available in cluster mode on this gateway version.';
+    case POLICY_REPLAY_STORE_UNAVAILABLE_REASON:
+      return 'The cluster replay job store could not be reached, so there is no result.';
     default:
       return 'The gateway could not read what this run needs. There is no result.';
   }

@@ -1,0 +1,326 @@
+name: Release ggctl
+
+# Builds ggctl for every release target, twice from scratch to prove the
+# archives reproduce, and packages each build with LICENSE, the man pages and
+# the completion scripts the binary itself generates, plus an SPDX SBOM.
+#
+# A pull request that can change a release runs all of that and then the
+# release check as a dry run: read-only, with no secret, no attestation and
+# nothing published. Pushing the tag `ggctl-vMAJOR.MINOR.PATCH` for the
+# version in ggctl/Cargo.toml, on a commit already on main, also attests the
+# SBOMs and the build provenance, verifies every attestation with the pinned
+# GitHub CLI, and only then drafts a GitHub release holding the artifacts, for
+# a maintainer to publish. docs/RELEASING.md describes the release and
+# docs/ggctl.md how to verify one.
+
+"on":
+  push:
+    tags:
+      - 'ggctl-v*.*.*'
+  pull_request:
+    paths:
+      - '.github/workflows/release-ggctl.yml'
+      - '.github/actions/build-tools/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'LICENSE'
+      - 'build-tools.json'
+      - 'rust-toolchain.toml'
+      - 'docs/schemas/**'
+      - 'gateway-config/**'
+      - 'ggctl/**'
+      - 'scripts/build_tools.py'
+      - 'scripts/ggctl_release.py'
+      - 'scripts/image_evidence.py'
+      - 'scripts/scan_candidate_image.py'
+      - 'scripts/test_ggctl_release.py'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-ggctl-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  tag:
+    name: Check the release tag
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout the tagged commit with main's history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up pinned build tools
+        uses: ./.github/actions/build-tools
+        with:
+          rust: none
+          node: 'false'
+      - name: Require the tag to name the version in ggctl/Cargo.toml
+        id: version
+        run: echo "version=$(python scripts/ggctl_release.py version --ref "${GITHUB_REF}")" >> "$GITHUB_OUTPUT"
+      - name: Require the tagged commit to be on main
+        run: git merge-base --is-ancestor "${GITHUB_SHA}" origin/main
+
+  build:
+    name: Build ggctl (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # Native runners only: each binary is built, run and packaged on the
+        # platform it is for. Linux links glibc (not musl) on the oldest
+        # Ubuntu runner, which sets the documented glibc floor.
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2025
+    defaults:
+      run:
+        shell: bash
+    env:
+      TARGET: ${{ matrix.target }}
+      CARGO_INCREMENTAL: '0'
+      # The oldest macOS both macOS targets support, set for the C code too.
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+      # No archive member times in the C libraries Cargo builds.
+      ZERO_AR_DATE: '1'
+      # A static C runtime, so the Windows binary needs no redistributable,
+      # and a link timestamp derived from the content rather than the clock.
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static -C link-arg=/Brepro
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The production compiler, as the image uses. The tool contract sets up
+      # Node before any Cargo build; ggctl has no build script and needs none.
+      - name: Set up pinned build tools
+        uses: ./.github/actions/build-tools
+        with:
+          rust: production
+          node: 'true'
+      - name: Require a native build
+        run: |
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          if [ "${host}" != "${TARGET}" ]; then
+            echo "::error::${TARGET} would be built on a ${host} runner"
+            exit 1
+          fi
+      - name: Build ggctl
+        run: cargo build --locked --release -p ggctl --target "${TARGET}"
+      - name: Package the build
+        run: python scripts/ggctl_release.py package --release-dir "target/${TARGET}/release" --target "${TARGET}" --output dist/first
+      - name: Rebuild from an empty target directory
+        run: |
+          mv target target-first
+          cargo build --locked --release -p ggctl --target "${TARGET}"
+      - name: Package the rebuild
+        run: python scripts/ggctl_release.py package --release-dir "target/${TARGET}/release" --target "${TARGET}" --output dist/second
+      - name: Require both builds to package to the same bytes
+        run: python scripts/ggctl_release.py compare dist/first dist/second
+      - name: Require no glibc newer than Ubuntu 22.04's
+        if: contains(matrix.target, '-linux-gnu')
+        run: python scripts/ggctl_release.py glibc --binary "target/${TARGET}/release/ggctl" --max 2.35
+      - name: Upload the archive and its SBOM
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ggctl-build-${{ matrix.target }}
+          path: dist/first/
+          if-no-files-found: error
+          retention-days: 30
+
+  # Pull requests only: everything the release checks, with nothing signed or
+  # published and no secret or write permission.
+  dry-run:
+    name: Release dry run
+    if: github.event_name == 'pull_request'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up pinned build tools
+        uses: ./.github/actions/build-tools
+        with:
+          rust: none
+          node: 'false'
+      - name: Install workflow test parser
+        run: python -m pip install PyYAML==6.0.3
+      - name: Test the release packaging and its checks
+        run: python -m unittest discover -s scripts -p 'test_ggctl_release.py' -v
+      - name: Download every target's archive and SBOM
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: ggctl-build-*
+          path: dist
+          merge-multiple: true
+      - name: Write the checksums and the release manifest
+        run: |
+          python scripts/ggctl_release.py checksums dist
+          python scripts/ggctl_release.py manifest dist
+      - name: Require a checksum, an SBOM and attestation entries for every artifact
+        run: python scripts/ggctl_release.py check dist --dry-run
+      - name: Upload the dry-run release
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ggctl-release-dry-run
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  attest:
+    name: Attest the SBOM (${{ matrix.target }})
+    if: github.event_name == 'push'
+    needs: [tag, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+          - x86_64-pc-windows-msvc
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - name: Checkout the tagged commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up pinned build tools
+        uses: ./.github/actions/build-tools
+        with:
+          rust: none
+          node: 'false'
+      - name: Download this target's archive and SBOM
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ggctl-build-${{ matrix.target }}
+          path: dist
+      - name: Require the SBOM to describe the archive
+        id: files
+        run: python scripts/ggctl_release.py artifact dist --target "${TARGET}" >> "$GITHUB_OUTPUT"
+      - name: Attest the archive's SBOM
+        id: sbom
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ steps.files.outputs.archive }}
+          sbom-path: ${{ steps.files.outputs.sbom }}
+      - name: Keep the signature bundle
+        env:
+          BUNDLE: ${{ steps.sbom.outputs.bundle-path }}
+          NAME: ${{ steps.files.outputs.bundle }}
+        run: |
+          mkdir -p attestation
+          cp "${BUNDLE}" "attestation/${NAME}"
+      - name: Upload the signature bundle
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ggctl-attestation-${{ matrix.target }}
+          path: attestation/
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Draft the ggctl release
+    if: github.event_name == 'push'
+    needs: [tag, attest]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      VERSION: ${{ needs.tag.outputs.version }}
+    steps:
+      - name: Checkout the tagged commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up pinned build tools
+        uses: ./.github/actions/build-tools
+        with:
+          rust: none
+          node: 'false'
+      - name: Download every target's archive and SBOM
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: ggctl-build-*
+          path: dist
+          merge-multiple: true
+      - name: Download every SBOM attestation
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: ggctl-attestation-*
+          path: dist
+          merge-multiple: true
+      - name: Write the checksums
+        run: python scripts/ggctl_release.py checksums dist
+      - name: Attest the build provenance of every archive, SBOM and the checksums
+        id: provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.spdx.json
+            dist/SHA256SUMS
+      - name: Keep the signature bundle
+        env:
+          BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+        run: cp "${BUNDLE}" "dist/ggctl-${VERSION}.provenance.sigstore.jsonl"
+      - name: Write the release manifest
+        run: python scripts/ggctl_release.py manifest dist
+      - name: Require a checksum, an SBOM and signed attestations for every artifact
+        run: python scripts/ggctl_release.py check dist
+      - name: Verify every attestation with the pinned GitHub CLI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/ggctl_release.py verify dist
+      - name: Draft the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          flags=(--draft --verify-tag --latest=false)
+          case "${VERSION}" in 0.*) flags+=(--prerelease) ;; esac
+          gh release create "${TAG}" dist/* --repo "${GITHUB_REPOSITORY}" "${flags[@]}" \
+            --title "ggctl ${VERSION}" \
+            --notes "ggctl ${VERSION}, the GreenGateway operator CLI, for Linux, macOS and Windows. Verify a download before using it: docs/ggctl.md, Verifying a release. ggctl has no installer and no self-updater."

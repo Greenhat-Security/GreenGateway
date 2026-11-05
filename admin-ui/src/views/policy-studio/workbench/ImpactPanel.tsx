@@ -61,6 +61,7 @@ const STATE_TEXT: Record<PolicyReplayState, { label: string; badge: string }> = 
   completed_incomplete: { label: '◐ Completed, incomplete', badge: 'warning' },
   failed: { label: '✕ Failed', badge: 'danger' },
   cancelled: { label: '■ Cancelled', badge: 'neutral' },
+  interrupted: { label: '✕ Interrupted', badge: 'danger' },
   expired: { label: '⌛ Expired', badge: 'neutral' },
 };
 
@@ -77,6 +78,13 @@ const FAILURE_TEXT: Record<string, string> = {
   compile_failed: 'The candidate policy could not be compiled.',
   evaluator_failed: 'The evaluator broke its own contract; nothing it counted is an answer.',
   result_too_large: 'The result exceeded its size bound.',
+  checkpoint_too_large: 'The checkpoint of the job exceeded its size bound.',
+  pins_unreadable:
+    'The replica that took the job over could not rebuild its pinned policies under this build.',
+  engine_version_changed:
+    'The job was started under another evaluator version, so no replica of this build continues it.',
+  checkpoint_unreadable: 'The replica that took the job over could not read its checkpoint.',
+  takeover_limit: 'The job was taken over too many times.',
   audit_unavailable: 'The audit log did not accept the record of this job completing.',
   internal: 'The gateway failed internally.',
 };
@@ -85,8 +93,8 @@ type JobEntry = { job: PolicyReplayJob; subject: string; gone: boolean };
 
 // The Impact view: bounded historical replay of retained audit records
 // under the live policy or the candidate. Jobs are read-only on the policy
-// and the log; the gateway keeps them in memory, and this page lists only
-// the ones started here.
+// and the log; the gateway keeps them (in memory standalone, in the shared
+// job table in cluster mode), and this page lists only the ones started here.
 export function ImpactPanel({
   candidate,
   candidateProblem,
@@ -611,9 +619,13 @@ function JobView({
       {job.cancel_requested && pending ? (
         <p className="rule-hint">Cancellation requested: the job stops before its next record.</p>
       ) : null}
-      {job.state === 'failed' ? (
+      {job.state === 'failed' || job.state === 'interrupted' ? (
         <div className="error-panel alert error" role="alert">
-          <h3>Replay failed: there is no result</h3>
+          <h3>
+            {job.state === 'failed'
+              ? 'Replay failed: there is no result'
+              : 'Replay interrupted: there is no result'}
+          </h3>
           <p>
             {FAILURE_TEXT[job.failure ?? ''] ?? 'The job stopped without a result.'}{' '}
             <code>{job.failure}</code>

@@ -104,6 +104,15 @@ pub(super) const EXCLUDED_RUNTIME_TABLES: &[&str] = &[
     // writes none; an owner recreates any it still needs against the
     // imported policy.
     "policy_drafts",
+    // 0030: cluster replay jobs are analysis state pinned to cluster
+    // policies and the cluster audit stream; standalone jobs live in their
+    // replica's memory and are never exported, so the import writes none.
+    "policy_replay_jobs",
+    // 0031: analysis suppressions are review state bound to one policy ETag
+    // and resource snapshot. The imported deployment has its own snapshot,
+    // so no standalone suppression could bind there; a reviewer recreates
+    // any still wanted against an analysis of the imported policy.
+    "policy_analysis_suppressions",
 ];
 
 /// One table's row count on each side.

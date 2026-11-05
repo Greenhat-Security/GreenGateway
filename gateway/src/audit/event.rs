@@ -46,6 +46,12 @@ pub const POLICY_REPLAY_COMPLETED: &str = "policy.replay_completed";
 pub const POLICY_REPLAY_CANCELLED: &str = "policy.replay_cancelled";
 /// A replay job failed with a stable reason and produced no result.
 pub const POLICY_REPLAY_FAILED: &str = "policy.replay_failed";
+/// A cluster replay job a replica took over could not be continued: its
+/// pinned policies or its checkpoint could not be rebuilt under this build's
+/// engine, or it was taken over too often. Records the job id, a stable
+/// reason and the records it had read; no result is ever published for it.
+#[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+pub const POLICY_REPLAY_INTERRUPTED: &str = "policy.replay_interrupted";
 /// A policy evidence package was assembled and released (issue #243, slice
 /// 20). Records the publication version, its ETag and semantic digest, the
 /// request and report digests, completeness and limitation codes; never a
@@ -56,6 +62,17 @@ pub const POLICY_EVIDENCE_EXPORTED: &str = "policy.evidence_exported";
 /// the base and candidate ETags, the request digest, completeness and
 /// finding counts, never a finding's element or policy content.
 pub const POLICY_ANALYSIS_RUN: &str = "policy.analysis_run";
+/// An analyzer finding was suppressed (issue #243, slice 15): the
+/// suppression id and the finding code, never the finding's element,
+/// fingerprint or the reason the reviewer wrote.
+pub const POLICY_ANALYSIS_SUPPRESSION_CREATED: &str = "policy.analysis_suppression_created";
+/// A suppression was ended before its expiry. Ids and codes only.
+pub const POLICY_ANALYSIS_SUPPRESSION_WITHDRAWN: &str = "policy.analysis_suppression_withdrawn";
+/// A suppression create or withdrawal was refused against current state
+/// (stale policy or resources, a duplicate, the deployment bound, the
+/// expiry window, an ended or changed suppression): the operation, a stable
+/// reason, the finding code and the suppression id when there is one.
+pub const POLICY_ANALYSIS_SUPPRESSION_REFUSED: &str = "policy.analysis_suppression_refused";
 pub const SERVICE_TOKEN_CHANGED: &str = "service_token.changed";
 pub const SERVICE_TOKEN_DELEGATION_REJECTED: &str = "service_token.delegation_rejected";
 /// A policy write the cross-resource checks refused before any authority saw
