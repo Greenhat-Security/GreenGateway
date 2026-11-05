@@ -1090,7 +1090,7 @@ impl ToolExecutor {
                 cancel,
                 move |work_context| async move {
                     work_started_for_closure.store(true, Ordering::SeqCst);
-                    let args = Arc::try_unwrap(args).unwrap_or_else(|args| (*args).clone());
+                    let args = Arc::unwrap_or_clone(args);
                     executor
                         .execute_inner(
                             &work_tool_name,
