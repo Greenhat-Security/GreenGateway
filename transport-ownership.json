@@ -1111,6 +1111,7 @@
           "jsonschema@0.60.2|registry+https://github.com/rust-lang/crates.io-index",
           "proptest@1.11.0|registry+https://github.com/rust-lang/crates.io-index",
           "rusqlite@0.40.2|registry+https://github.com/rust-lang/crates.io-index",
+          "rustix@1.1.5|registry+https://github.com/rust-lang/crates.io-index",
           "serde@1.0.229|registry+https://github.com/rust-lang/crates.io-index",
           "serde_json@1.0.154|registry+https://github.com/rust-lang/crates.io-index",
           "sha2@0.11.1|registry+https://github.com/rust-lang/crates.io-index",
@@ -1274,6 +1275,7 @@
           "libc@0.2.189|registry+https://github.com/rust-lang/crates.io-index",
           "rcgen@0.14.10|registry+https://github.com/rust-lang/crates.io-index",
           "reqwest@0.13.5|registry+https://github.com/rust-lang/crates.io-index",
+          "rustix@1.1.5|registry+https://github.com/rust-lang/crates.io-index",
           "serde@1.0.229|registry+https://github.com/rust-lang/crates.io-index",
           "serde_json@1.0.154|registry+https://github.com/rust-lang/crates.io-index",
           "tokio-rustls@0.26.6|registry+https://github.com/rust-lang/crates.io-index",
@@ -4112,6 +4114,7 @@
           "signal-hook-registry",
           "socket2",
           "sync",
+          "test-util",
           "time",
           "tokio-macros",
           "windows-sys"
@@ -5472,6 +5475,26 @@
           {
             "name": "tokio",
             "rename": null,
+            "kind": "dev",
+            "target": null,
+            "req": "^1.52.3",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [
+              "io-util",
+              "macros",
+              "net",
+              "rt-multi-thread",
+              "signal",
+              "sync",
+              "time",
+              "test-util"
+            ],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "tokio",
+            "rename": null,
             "kind": null,
             "target": null,
             "req": "^1.52.3",
@@ -6235,6 +6258,19 @@
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           {
+            "name": "rustix",
+            "rename": null,
+            "kind": null,
+            "target": "cfg(any(target_os = \"linux\", target_os = \"macos\"))",
+            "req": "^1.1.4",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [
+              "fs"
+            ],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
             "name": "uuid",
             "rename": null,
             "kind": "dev",
@@ -6365,6 +6401,20 @@
             "uses_default_features": true,
             "features": [
               "derive"
+            ],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "rustix",
+            "rename": null,
+            "kind": null,
+            "target": "cfg(unix)",
+            "req": "^1.1.4",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [
+              "fs",
+              "process"
             ],
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
@@ -6703,7 +6753,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::bootstrap::commands::run_one_shot_command#1",
-      "sha256": "8fa3ea7163610a40a47e804589b47e3df9760cdb214bb34967adbf2e9b0d1cfc",
+      "sha256": "7606b550e6d877fbe23747cb751cfffa0f9653ca0ad12be7f1c87004d4baa079",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -6843,7 +6893,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::routing::add_admin_api_routes#1",
-      "sha256": "0951077cb57dc6a1875bbc141477bdd9bde642d063c13d697b986ba0d8a7d311",
+      "sha256": "4b8dd97b514c4a67403d66db2519e08b2a178b8d3f89c3d9e029446063a182fe",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
@@ -7228,6 +7278,26 @@
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
     {
+      "file": "gateway/src/admin_policy_tests.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::admin_policy_tests::use super :: *#1",
+      "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/main.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::use admin_policy_tests :: *#1",
+      "sha256": "40680c762f47b373d061da66d5de6e9751791e3241b46713dbf172230939d162",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
       "file": "gateway/src/admin_policy_simulations.rs",
       "reasons": [
         "capability-import-or-glob"
@@ -7296,6 +7366,16 @@
       "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/policy_analysis/checks.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::policy_analysis::checks::use std :: { collections :: { BTreeSet , HashMap , HashSet } , net :: { IpAddr , SocketAddr } , time :: Instant , }#1",
+      "sha256": "3bb8c8354043e27995c872b895f451168be2b1a4956c7c314d4cc5f96b475afd",
+      "owner": "policy analysis (#243)",
+      "purpose": "Import the IpAddr and SocketAddr value types so the pure policy analyzer can hand the static egress lane a witness address and resolution facts when it confirms an egress CIDR finding. Value types only: the analyzer resolves no name, opens no socket and builds no client; every DNS lookup and transport stays in crate::egress."
     },
     {
       "file": "gateway/src/main.rs",
@@ -7924,7 +8004,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::cluster_maintenance::MaintenanceRunner#1",
-      "sha256": "e6e8f86a17a71dca347886fb11823d9f68749f17b263ab079f31f0679e0d4653",
+      "sha256": "6dfdbd79584cd40a5ad5f14ba8307fff0355e406fb29c70f0c4c0ca06de4bc78",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -7934,7 +8014,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::cluster_maintenance::impl  MaintenanceRunner::new#1",
-      "sha256": "b767ac044c28d7e27a12514313d53e2c8c00d300f28b7d634fd1c834553a1fb0",
+      "sha256": "051de269a1055492a727e6e280dae3b9a9a713f923bfbbc672a15d6cb38455c8",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -7954,7 +8034,7 @@
         "unexpanded-macro"
       ],
       "scope": "gateway::cluster_maintenance::impl  MaintenanceRunner::run_jobs#1",
-      "sha256": "87444f601a343b0aed37bd3d15e36a97adc3d723a143f0e813ab52beeff2901d",
+      "sha256": "f60dbfa76e2374cbf3371e2ba7026ce6dfd33a45958e0ba0098f0272c3dc51b3",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
@@ -8965,7 +9045,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::record_change_evidence#1",
-      "sha256": "11e3ab16855d4f9ac9e52b88108115452d60cddf89e8549019d52df38cfe02bb",
+      "sha256": "56cf4d967d548ad3311dfe6c7cd55cf48b0e2a35ce80ce883e18f72559c52ace",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -9160,24 +9240,75 @@
       "purpose": "Reviewed for #242 PR 10 (standalone revision ledger): creates the seed's temporary database file beneath the state directory with create_new and, on Unix, mode 0600 through std::os::unix::fs::OpenOptionsExt. Local file creation only; it adds no network or process capability."
     },
     {
-      "file": "gateway-config/src/ledger/location.rs",
+      "file": "gateway-config/src/state_dir.rs",
       "reasons": [
         "capability-import-or-glob"
       ],
-      "scope": "gateway_config::ledger::location::owner_alone_can_write#1",
-      "sha256": "a487c6b6631e24091b1d3bfd421e698411fd856b0b08aa474fcd693ce08f04e5",
+      "scope": "gateway_config::state_dir::is_reparse_point#1",
+      "sha256": "b614645a054675446906c5e5bd9cd95dfc6bdbcdab6ca5c8d79e8f422cbd3882",
       "owner": "GreenGateway maintainers",
-      "purpose": "Reviewed for #242 PR 10 (standalone revision ledger): reads the Unix mode bits of state-directory and ledger-file metadata through std::os::unix::fs::MetadataExt to refuse an entry group or other can write. Read-only metadata; it adds no network or process capability."
+      "purpose": "Reviewed for #242 (standalone state directory; moved here from the revision ledger's location checks): reads the Windows reparse-point attribute of state-directory, lock-file and ledger-file metadata through std::os::windows::fs::MetadataExt to refuse links and junctions. Read-only metadata; it adds no network or process capability."
     },
     {
-      "file": "gateway-config/src/ledger/location.rs",
+      "file": "gateway-config/src/state_dir.rs",
       "reasons": [
         "capability-import-or-glob"
       ],
-      "scope": "gateway_config::ledger::location::is_reparse_point#1",
-      "sha256": "b38daad4bb5a2611dccf7b648e45aa79aa9af9944222f0319f6ec5b8b24f642b",
+      "scope": "gateway_config::state_dir::owner_alone_can_write#1",
+      "sha256": "f6f79cbe6fedfbc2e5d6b350c8cafc01c7654a31162958c6caff88fbe7c03c26",
       "owner": "GreenGateway maintainers",
-      "purpose": "Reviewed for #242 PR 10 (standalone revision ledger): reads the Windows reparse-point attribute of state-directory and ledger-file metadata through std::os::windows::fs::MetadataExt to refuse links and junctions. Read-only metadata; it adds no network or process capability."
+      "purpose": "Reviewed for #242 (standalone state directory; moved here from the revision ledger's location checks): reads the Unix mode bits of state-directory, lock-file and ledger-file metadata through std::os::unix::fs::MetadataExt to refuse an entry group or other can write. Read-only metadata; it adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/state_dir.rs",
+      "reasons": [
+        "capability-import-or-glob",
+        "network-or-process-reference"
+      ],
+      "scope": "gateway_config::state_dir::owner_only#1",
+      "sha256": "8301c68cd1972a550663c8a7545e452e9d0dc763cbf2f69e5333d5781caed181",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 (standalone state directory): sets mode 0600 on a newly created lock file through cap-std's Unix OpenOptionsExt, called by path because its name is a reviewed capability alias, which is also why the guard flags the call. Local file creation mode only; it adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/state_dir.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway_config::state_dir::use cap_fs_ext :: { DirExt as _ , FollowSymlinks , OpenOptionsFollowExt as _ , OpenOptionsSyncExt as _ }#1",
+      "sha256": "08af99e590ccd695cec1fcc5a48a67f625139d56718313dc9db727445cce05a3",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 (standalone state directory): opens the admitted state directory and its lock file without following a link at the last component (open_dir_nofollow, FollowSymlinks::No) and without blocking on a FIFO swapped in for the lock file (nonblock). Local filesystem access beneath one directory only; it adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/state_dir.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway_config::state_dir::use cap_std :: { ambient_authority , fs :: { Dir , OpenOptions as CapabilityOpenOptions } , }#1",
+      "sha256": "195f6c89077f4e307f3177b3c7d3c177e0e7b8004353c1e9b857d2d1b820e3aa",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 (standalone state directory): opens the canonicalized state directory's parent as a cap-std directory and the lock file beneath the directory handle, so the lock is taken on the directory that was admitted. Local filesystem access only; it adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/state_dir/filesystem.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway_config::state_dir::filesystem::platform_kind#1",
+      "sha256": "d7bc41f299db5a5f2d42c247cd4e155c558a034c4252794109f4de9bb9574e27",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 (standalone state directory, Linux): calls rustix::fs::statfs on the state directory path and compares f_type with network-filesystem magic numbers for doctor's best-effort warning. The guard flags rustix as a raw crate; statfs reads filesystem metadata only and adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/state_dir/filesystem.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway_config::state_dir::filesystem::platform_kind#2",
+      "sha256": "ec54e5b48289695a478243eae1cdd78740cebffd8c269a6c323445a25500c7cc",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 (standalone state directory, macOS): calls rustix::fs::statfs on the state directory path and compares f_fstypename with network-filesystem type names for doctor's best-effort warning. The guard flags rustix as a raw crate; statfs reads filesystem metadata only and adds no network or process capability."
     },
     {
       "file": "gateway-config/src/ledger/store.rs",
@@ -10128,6 +10259,16 @@
       "reasons": [
         "network-or-process-reference"
       ],
+      "scope": "gateway::import::preflight::live_members_admit#1",
+      "sha256": "d59eafb65cfd249ac81f7e20ee24fcd615efab9ecc287154cad591629c795cf1",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Read-only cluster roster and contract-fence reads through the import's existing PostgreSQL pool, for the operation gate; no caller-selected HTTP authority and no new connection."
+    },
+    {
+      "file": "gateway/src/import/preflight.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
       "scope": "gateway::import::preflight::verify_target#1",
       "sha256": "443b5865450024d8b74db97d2b66ca50656eeb15b5cea3907a4ad5d5e011636f",
       "owner": "GreenGateway maintainers",
@@ -10790,9 +10931,9 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::mcp::invocation_context_from_request#1",
-      "sha256": "ba4b2c68cb3cba2fc1dcf8990e556d1e394735176b205563aa472e958e3b12f6",
+      "sha256": "a1878e3928e84a484c3e47941f0bb219edfb2aa12e4380cb825b358106b2cdd6",
       "owner": "GreenGateway maintainers",
-      "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review. Reviewed for #463: the item now also projects the authenticated Principal into the caller a signed caller assertion names (AttestedCaller::from_principal), a pure data copy that adds no network, process or transport capability. Reviewed for #243: the item also copies the authenticated Principal's verified organization (org_id) into the invocation context as a policy fact identity mappings read, a pure data copy that adds no network, process or transport capability."
+      "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review. Reviewed for #463: the item now also projects the authenticated Principal into the caller a signed caller assertion names (AttestedCaller::from_principal), a pure data copy that adds no network, process or transport capability. Reviewed for #243: the item also copies the authenticated Principal's verified organization (org_id) into the invocation context as a policy fact identity mappings read, a pure data copy that adds no network, process or transport capability. Reviewed for #243 (request conditions): the item also records the canonical client address (client_ip::canonical_client_addr, the trusted-proxy-aware address it already audits as source_ip) as the typed policy fact a source_network condition reads, a pure data read of the connection peer and admitted headers that adds no network, process or transport capability."
     },
     {
       "file": "gateway/src/mcp.rs",
@@ -10864,6 +11005,26 @@
       "sha256": "2599f19fc482be175583f24236f4ae2df95403e1f7a0bb41510d39e79a58faac",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway/src/middleware/policy_facts.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::middleware::policy_facts::use std :: { borrow :: Cow , net :: IpAddr , time :: { SystemTime , UNIX_EPOCH } , }#1",
+      "sha256": "df1d11f0603edbbe7b7f70ea076951d7e252000a6b5b9bc9f24fc3ef9436bee1",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Issue #243 live fact builder for rule conditions: imports the IpAddr value type for the canonical client address a source_network condition reads, and SystemTime/UNIX_EPOCH for the injected policy clock. Value types only; no socket, resolver, process or transport capability."
+    },
+    {
+      "file": "gateway/src/middleware/policy_facts.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::middleware::policy_facts::PolicyClock#1",
+      "sha256": "baa369a0fd9a9427b084978f8adea76216c39b7b826078e11135881dae91e980",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Issue #243 policy clock: the system clock in production and a test-only fixed clock behind #[cfg(test)]; derive and cfg attributes only, no transport, provider, resolver or process authority."
     },
     {
       "file": "gateway/src/middleware/rate_limit.rs",
@@ -10968,6 +11129,46 @@
     {
       "file": "gateway/src/middleware/rbac.rs",
       "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::middleware::rbac::impl  RbacState::tool_call#1",
+      "sha256": "50875fabc5f3dc1f00655587a5531702adebb41830076e6691e88dfbd4099289",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Issue #243 tool lanes: bundles the canonical client address a call entered with (std::net::IpAddr, a value) and the state's policy clock as the facts a tool-lane condition reads; no network, process or transport capability."
+    },
+    {
+      "file": "gateway/src/middleware/rbac.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::middleware::rbac::impl  RbacState::evaluate_tool_authorization#1",
+      "sha256": "0370b17a9b5d0ac912b875882aa1620bf06ff6dbf790dab3b3f9e98f193de30b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Issue #243 tool lanes: tool admission now takes the canonical client address the call entered with (std::net::IpAddr, a value) as a policy fact for source_network conditions; a pure data parameter that adds no network, process or transport capability."
+    },
+    {
+      "file": "gateway/src/middleware/rbac.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::middleware::rbac::impl  RbacState::tool_visible#1",
+      "sha256": "d156788665d97d243a3d8b0f4a505f76d46737340bbb06f7e1dbe73f60526433",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Issue #243 tool lanes: tool listing now takes the canonical client address the call entered with (std::net::IpAddr, a value) as a policy fact for source_network conditions; a pure data parameter that adds no network, process or transport capability."
+    },
+    {
+      "file": "gateway/src/middleware/rbac.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::middleware::rbac::impl  RbacState::evaluate_tool_http_rule#1",
+      "sha256": "2029b1f26131bd86220fca37c5e613666c8f3452af8267dacfd4615261737956",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Issue #243 tool lanes: the rendered-HTTP rule check now takes the canonical client address the call entered with (std::net::IpAddr, a value) as a policy fact; it still only decides, before the existing egress path, and adds no network, process or transport capability."
+    },
+    {
+      "file": "gateway/src/middleware/rbac.rs",
+      "reasons": [
         "capability-in-macro-input"
       ],
       "scope": "gateway::middleware::rbac::policy_file_watch_loop#1",
@@ -10981,9 +11182,9 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::middleware::rbac::rbac_middleware#1",
-      "sha256": "0b8e6218f00d6b632fc8b31ee7d57b7d87bfd5c31eddb982ed993d7657489b3b",
+      "sha256": "67c5fb7a91f70ca6e31e5898fbc64b9611a43d5f5c1f20405a5c9db1b8231400",
       "owner": "GreenGateway maintainers",
-      "purpose": "Issue #422 HTTP adapter: evaluate the admitted immutable policy snapshot and translate its result into existing audit and response behavior. Existing cfg/cfg_attr inputs only; no new transport, provider, resolver or process authority. Reviewed for #243: the decision is now asked with the facts serving_facts takes from the authenticated principal (its verified organization in mapped-role mode), a pure data read that adds no transport, provider, resolver or process authority."
+      "purpose": "Issue #422 HTTP adapter: evaluate the admitted immutable policy snapshot and translate its result into existing audit and response behavior. Existing cfg/cfg_attr inputs only; no new transport, provider, resolver or process authority. Reviewed for #243: the decision is now asked with the facts serving_facts takes from the authenticated principal (its verified organization in mapped-role mode), a pure data read that adds no transport, provider, resolver or process authority. Reviewed for #243 (request conditions): the facts now come from policy_facts::http_request_facts -- the canonical client address under the state's ClientIpPolicy, the referenced request headers, the strictly decoded query and an injected clock -- and a query that does not decode strictly is refused as policy_query_undecodable; pure reads of the admitted request that add no transport, provider, resolver or process authority."
     },
     {
       "file": "gateway/src/middleware/validate.rs",
@@ -11174,6 +11375,16 @@
       "sha256": "54a6a9a8dcff73aefeffeb33ec7c4e3e2a5c5e6cf7351496a4925f485491e960",
       "owner": "policy replay contexts (#243)",
       "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the policy replay context module: the replay job engine (#243 slice 13) calls the adapters and evaluator and the impact comparison (#243 slice 14) reads the recorded result, while the serialized form and egress replay wait for a record that states them. The module parses and builds replay contexts in memory and asks the pure policy kernel; dead-code gating only, no I/O and no transport or process capability."
+    },
+    {
+      "file": "gateway/src/policy_testing/suite.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::policy_testing::suite::use std :: net :: IpAddr#1",
+      "sha256": "abf89a0dd5d2b68df48d2445831118062ac113c2f71cf08f3d392ad95b31637d",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Issue #243 synthetic case facts: imports the IpAddr value type to parse a case's hypothetical source_ip; parsing only, never connected to, so no network, process or transport capability."
     },
     {
       "file": "gateway/src/proxy/admission.rs",
@@ -11807,7 +12018,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::storage::change_evidence::DocumentAction#1",
-      "sha256": "091f0c17aaf2b628bb899f652314f931902f6c6ca7dcff8a83aeafdc9ae9589b",
+      "sha256": "4edae494041651164ea43a93d09e06b129d3ef3ada50e9292fea8a0b4127b007",
       "owner": "GreenGateway maintainers",
       "purpose": "Closed action vocabulary of document change evidence; its derive/cfg_attr attributes add no transport capability (issue #425)."
     },
@@ -11950,6 +12161,16 @@
       "sha256": "9cd89ca573aa9bae93b82c4efe1852be2090e407d60cf70deafa8359fec5255d",
       "owner": "GreenGateway maintainers",
       "purpose": "Decodes one standalone policy draft SQLite row; no network, process or HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/policy_tests.rs",
+      "reasons": [
+        "unexpanded-macro"
+      ],
+      "scope": "gateway::storage::policy_tests::impl  SqlitePolicyTestSuiteStore::connection_guard#1",
+      "sha256": "fb0dbf1cfc0a7c7a32c4e8c6a1033cbe8274614e46e2649cf326b6b4e3c9b9be",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Lock-poison recovery counter for the standalone stored policy test suite SQLite connection; metrics instrumentation only, no network, process or HTTP authority."
     },
     {
       "file": "gateway/src/storage/postgres.rs",
@@ -12328,7 +12549,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_admin_sessions::transaction#1",
-      "sha256": "c95a8735dc19c08c17ec98d0d06e524679dda3bcd6b6e8e431e749e1f7305022",
+      "sha256": "7a7da4feda6d6b165da0fff0dd2eea7b931ee0274a3050f6c266a492003774d4",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -13675,6 +13896,26 @@
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
     {
+      "file": "gateway/src/storage/postgres_policy_tests.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_policy_tests::PostgresPolicyTestSuiteStore#1",
+      "sha256": "72f070d0576a2f9da1e35fd04736d32bfa3155eaadf84edf02673d38b3b34cf9",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_policy_tests.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_policy_tests::impl  PostgresPolicyTestSuiteStore::new#1",
+      "sha256": "b7f6eb577ecc5caca349286454af5d5731a6b4045ee0e3e1d93a323cf34fe90f",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
       "file": "gateway/src/storage/postgres_rate_limits.rs",
       "reasons": [
         "network-or-process-reference"
@@ -14940,6 +15181,16 @@
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
     {
+      "file": "gateway/src/tools/runtime.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::tools::runtime::ToolInvocationContext#1",
+      "sha256": "3fc8dc1df9da2c65ac9c629d99e86b57132e7defebb09c7c11910a74ad182493",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Issue #243 tool invocation context: carries the canonical client address the call entered with (Option<std::net::IpAddr>, a value set by the MCP and admin playground entry points) as the policy fact a source_network condition reads; a data field that adds no network, process or transport capability."
+    },
+    {
       "file": "gateway/src/upstream_route.rs",
       "reasons": [
         "capability-import-or-glob"
@@ -14969,6 +15220,86 @@
       "sha256": "8fbb785272e3d2a1f734233cb3f1166193aa149aad24c975040fa3ee85efdbe4",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway-config/src/backup/store.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway_config::backup::store::use rusqlite :: { config :: DbConfig , Connection , ErrorCode , OpenFlags }#1",
+      "sha256": "6e5304ea0dbbd27816498e0fc4d673a3edb1d4681607225008fc6224b803f6f3",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 PR 15 (standalone backup create and verify): the bundled SQLite of the existing standalone stores, opened read-only on each store for VACUUM INTO into this process's own snapshot file, read-write only on those snapshots to set rollback-journal mode, and read-only on staged entries for the integrity check and description, always defensive with an untrusted schema. Connection is rusqlite's database connection, not a network connection; it adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/backup/store.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway_config::backup::store::failure#1",
+      "sha256": "b4a959c60d9d10c4d12b66efc18d9673aea2a6342315ae21bd9ca46f6b656564",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 PR 15 (standalone backup create and verify): classifies a failure of a local SQLite store, snapshot or staged entry by rusqlite's error type and SQLite error code, dropping the message. It names no transport; the guard flags it through its conservative global union of same-spelled imported names. It adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/backup.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway_config::backup::use cap_fs_ext :: { FollowSymlinks , MetadataExt as CapabilityMetadataExt , OpenOptionsFollowExt as _ , OpenOptionsSyncExt as _ , }#1",
+      "sha256": "50f67bd31627cab94c104afd8438f95056638a328d581f004ec4f7bec573c2d6",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 PR 15 (standalone backup create and verify): opens each store beneath the held state directory, and the archive beneath its directory, without following a link (FollowSymlinks::No) and without blocking on a FIFO swapped in (nonblock), and reads the device and file number of an open store handle to snapshot two names for one file once. Local filesystem access only; it adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/backup.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway_config::backup::use cap_std :: { ambient_authority , fs :: { Dir , OpenOptions as CapabilityOpenOptions } , }#1",
+      "sha256": "195f6c89077f4e307f3177b3c7d3c177e0e7b8004353c1e9b857d2d1b820e3aa",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 PR 15 (standalone backup create and verify): opens the held state directory and the archive's directory as cap-std directories, so each store and the archive are opened beneath the directory that was named. Local filesystem access only; it adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/backup.rs",
+      "reasons": [
+        "capability-in-macro-input"
+      ],
+      "scope": "gateway_config::backup::impl  Place::hidden#1",
+      "sha256": "7b8e5e7f19b24c22eccf0f45f315420bbc59d71dd103d4f60a1ae0bf02b91c15",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 PR 15 (standalone backup create and verify): names the hidden working, partial and staging entries beside the archive from its name, a purpose word, this process's own ID (std::process::id, read only, inside format!) and an attempt counter; each is then created exclusively. No process is spawned or signalled; it adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/backup.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway_config::backup::create_private_directory#1",
+      "sha256": "e1670dcb7e37b51a30944edc8e8a42e3ee0a29631068339838799456590395d0",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 PR 15 (standalone backup create and verify): imports DirBuilderExt to create the backup's working and staging directories beside the archive with mode 0700 on Unix, exclusively (create fails if the name exists). Local filesystem only; it adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/backup.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway_config::backup::create_private_file#1",
+      "sha256": "b821e1f7f8778a51386a4ab78672c5e64be75a2888fb05fa606736e827e6a127",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 PR 15 (standalone backup create and verify): imports OpenOptionsExt to create the partial archive, each empty snapshot file VACUUM INTO fills and each staged entry with create_new and mode 0600 on Unix. Local filesystem only; it adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/backup.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway_config::backup::is_owner_only#1",
+      "sha256": "67031b72b45f8e2122272ed02ecfb4dbbe3c961229ad8ca55d7d77adc31cd21c",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 PR 15 (standalone backup create): imports PermissionsExt to read the Unix mode bits of the written archive, not followed, and refuse to publish one the filesystem left readable by group or other. Read-only metadata; it adds no network or process capability."
     },
     {
       "file": "gateway/src/authority_events/dispatcher.rs",
@@ -15236,7 +15567,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_authority_events::journaled_evidence_from_row#1",
-      "sha256": "08b5b3590ed6622748f9e8e805dcf0cdac7b2e324f2deee4f3342b949f9b7439",
+      "sha256": "952269e9c6f8027f9c31a4513c809a38eb34fb4d78b087ed97ba3017e8177f1a",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -15336,19 +15667,29 @@
         "capability-import-or-glob"
       ],
       "scope": "ggctl::credential::permissions_are_safe#1",
-      "sha256": "89ed74d874fd8a97b8e53e21a01d241e093c87470cf01791d988caeb63111e7a",
+      "sha256": "cf13be7114107383518f7daa780dffd53a5a9ba9ada3bc822696e54b4796ec47",
       "owner": "GreenGateway maintainers: operator CLI (#242)",
-      "purpose": "Reviewed for #242 (operator file safety): reads the Unix mode bits of --token-file and --ca-file metadata through PermissionsExt to refuse a credential group or other can access, or a trust anchor they can write. Read-only metadata; no network or process capability."
+      "purpose": "Reviewed for #242 (operator file safety): reads the Unix mode bits of --token-file, --ca-file, --answers and the bundle.yaml ggctl pin compares through PermissionsExt to refuse a credential group or other can access, or another file they can write. Read-only metadata; no network or process capability."
     },
     {
       "file": "ggctl/src/credential.rs",
       "reasons": [
         "capability-import-or-glob"
       ],
-      "scope": "ggctl::credential::check_directories#1",
-      "sha256": "ce92a7e3857cf8330034aed6bc5e575d4bc75e5fcf7723da2e216c97b9300f95",
+      "scope": "ggctl::credential::check_resolution#1",
+      "sha256": "ff910859b93d22d54c3f82226eef06d47ab9f3034b73cfa76051fc68da48002a",
       "owner": "GreenGateway maintainers: operator CLI (#242)",
-      "purpose": "Reviewed for #242 (operator file safety): canonicalizes the --ca-file path and reads the Unix mode bits of the directories holding it and its link target through PermissionsExt, refusing one group or other can write without the sticky bit. Read-only metadata; no network or process capability."
+      "purpose": "Reviewed for #242 (operator file safety): resolves the --ca-file and --answers path one entry at a time from / (a relative path from std::env::current_dir), following each link with std::fs::read_link, and reads each entry's Unix owner and mode bits through MetadataExt, refusing a file, directory or link owned by an account other than root and the running one, or a directory group or other can write without the sticky bit. Read-only metadata; no network or process capability."
+    },
+    {
+      "file": "ggctl/src/credential.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "ggctl::credential::running_account#1",
+      "sha256": "095bb06d5a6f52a5670f4888a764b78ae3a399c7e3d36422e0c122d76918ab3f",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 (operator file safety): reads the effective user ID through rustix::process::geteuid, a safe read-only identity call, so the --ca-file and --answers checks can compare owners against the account running ggctl. It starts, signals or inspects no process and opens no network transport."
     },
     {
       "file": "ggctl/src/credential.rs",

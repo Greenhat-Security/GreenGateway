@@ -272,7 +272,9 @@ pub(super) async fn policy_rollback_endpoint(
 /// document's own diagnostics, then what the document cannot show about
 /// itself -- whether this deployment can enforce and commit it, the checks
 /// that also refuse a replace. Policy evidence revalidates a publication with
-/// the same function.
+/// the same function. Whether every live cluster member reads the format now
+/// is the roster's answer, which validation adds on its own and evidence does
+/// not ask for.
 pub(super) fn inspect_policy_for_deployment(
     state: &PolicyAdminState,
     rbac_state: &middleware::rbac::RbacState,
@@ -302,6 +304,14 @@ pub(super) fn inspect_policy_for_deployment(
             detail,
         );
     }
+    let size_error = inspection.policy().and_then(policy_file_size_refusal);
+    if let Some(detail) = size_error {
+        inspection.refuse(
+            rbac::policy_document::IssueCode::PolicyFileTooLarge,
+            "",
+            detail,
+        );
+    }
     inspection
 }
 
@@ -327,6 +337,23 @@ pub(super) async fn policy_validate_endpoint(
     };
 
     let mut inspection = inspect_policy_for_deployment(&state, rbac_state, &body);
+    // What only the roster can show: in cluster mode, whether every live
+    // replica reads a v1 document's format now. It blocks publication
+    // alone, as the commit's operation gate would refuse it.
+    #[cfg(feature = "postgres")]
+    {
+        let roster_refusal = match inspection.policy() {
+            Some(policy) => cluster_roster_document_format_refusal(&state, policy).await,
+            None => None,
+        };
+        if let Some(detail) = roster_refusal {
+            inspection.refuse(
+                rbac::policy_document::IssueCode::DocumentFormatUnsupportedInCluster,
+                "/schema_version",
+                detail,
+            );
+        }
+    }
     // What only the other resources can show: the same cross-resource,
     // lockout and risk checks a publication runs, as the replacement of
     // the policy the authority holds now, for this caller.
@@ -771,6 +798,7 @@ pub(super) async fn policy_rules_order_put_endpoint(
 
 pub(super) async fn policy_rule_preview_endpoint(
     State(state): State<PolicyAdminState>,
+    Extension(limiter): Extension<Arc<PolicyEvaluationLimiter>>,
     request: AxumRequest,
 ) -> Response {
     record_request(POLICY_RULE_PREVIEW_ADMIN_ROUTE);
@@ -799,8 +827,20 @@ pub(super) async fn policy_rule_preview_endpoint(
         Ok(request) => request,
         Err(errors) => return policy_validation_failed(errors),
     };
+    // Admitted once the request is read and valid, so a slot bounds scans
+    // doing work, and one caller holds at most one.
+    let Some(slot) = limiter.try_acquire(policy_evaluation_actor(principal)) else {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "error": "too many policy rule previews are in progress; retry later",
+                "reason": "policy_rule_preview_busy",
+            })),
+        )
+            .into_response();
+    };
 
-    let previewed = match preview_rule(query_store.as_ref(), preview_request).await {
+    let previewed = match preview_rule(query_store.as_ref(), preview_request, slot).await {
         Ok(response) => response,
         Err(err) => {
             tracing::error!(error = %err, "failed to preview policy rule");
@@ -1442,6 +1482,17 @@ pub(super) fn validate_rule_preview_request(
     if has_tool_name {
         errors.push("rule preview currently supports HTTP path rules only".to_owned());
     }
+    // A condition reads facts a retained observation does not capture, so
+    // every scanned row would be unevaluated however the tree is built, and
+    // an unvalidated tree is evaluated once per row. Refused before any row
+    // is read, as no other bound on its size exists here.
+    if request.rule.conditions.is_some() {
+        errors.push(
+            "rule preview does not support conditions: retained observations do not capture \
+             the facts conditions read"
+                .to_owned(),
+        );
+    }
     if has_path && !request.rule.path.starts_with('/') {
         errors.push(format!(
             "rule.path must start with '/', got '{}'",
@@ -1475,8 +1526,16 @@ pub(super) fn validate_rule_preview_request(
 pub(super) async fn preview_rule(
     query_store: &dyn storage::AuditEventStore,
     request: PolicyRulePreviewRequest,
+    slot: PolicyEvaluationSlot,
 ) -> Result<PolicyRulePreviewResponse, RulePreviewError> {
-    preview_rule_with_scan_limit(query_store, request, MAX_RULE_PREVIEW_SCAN_ROWS).await
+    preview_rule_within(
+        query_store,
+        request,
+        slot,
+        MAX_RULE_PREVIEW_SCAN_ROWS,
+        Instant::now() + POLICY_RULE_PREVIEW_DEADLINE,
+    )
+    .await
 }
 
 /// Why a rule preview failed instead of answering.
@@ -1488,6 +1547,8 @@ pub(super) enum RulePreviewError {
     /// observation's facts. Only a preview bug can cause that, and ADR-0004
     /// fails an analysis on it rather than counting around it.
     Evaluation(policy_eval::EvaluationError),
+    /// A page's evaluation did not finish on its blocking thread.
+    Interrupted(tokio::task::JoinError),
 }
 
 impl std::fmt::Display for RulePreviewError {
@@ -1495,6 +1556,7 @@ impl std::fmt::Display for RulePreviewError {
         match self {
             Self::Storage(error) => write!(formatter, "audit store read failed: {error}"),
             Self::Evaluation(error) => write!(formatter, "policy evaluation failed: {error:?}"),
+            Self::Interrupted(error) => write!(formatter, "policy evaluation interrupted: {error}"),
         }
     }
 }
@@ -1520,34 +1582,117 @@ pub(super) enum PreviewObservationOutcome {
     Unevaluated(&'static str),
 }
 
+/// What stopped a rule preview before it judged every pre-filtered
+/// observation in its window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RulePreviewStop {
+    /// An observation was left after the scan ceiling.
+    Ceiling,
+    /// The deadline passed with an observation still to judge.
+    Deadline,
+}
+
+/// A rule preview's running count. Each page of observations is judged on a
+/// blocking thread, which takes the count and hands it back, so a scan never
+/// evaluates on an async worker.
+struct RulePreviewScan {
+    candidate: policy_eval::CompiledPolicy,
+    sample_limit: usize,
+    max_scan_rows: u64,
+    deadline: Instant,
+    match_count: u64,
+    scanned_event_count: u64,
+    unevaluated_event_count: u64,
+    unevaluated_reasons: BTreeMap<&'static str, u64>,
+    samples: Vec<PolicyRulePreviewSample>,
+    /// The id of the oldest observation judged, which the next page reads
+    /// before.
+    oldest_judged_id: Option<i64>,
+    stopped: Option<RulePreviewStop>,
+}
+
+impl RulePreviewScan {
+    /// Judge one page, newest first, until it ends, the ceiling is reached
+    /// or the deadline passes.
+    fn judge_page(
+        mut self,
+        observations: Vec<audit::query::RequestObservation>,
+    ) -> Result<Self, policy_eval::EvaluationError> {
+        for observation in observations {
+            // Reaching one more row after the ceiling is what proves the
+            // window held more than was scanned; a scan that ends exactly at
+            // the ceiling with nothing left is complete. The deadline is
+            // judged the same way: it stops a scan only with a row unjudged.
+            if self.scanned_event_count >= self.max_scan_rows {
+                self.stopped = Some(RulePreviewStop::Ceiling);
+                break;
+            }
+            if Instant::now() >= self.deadline {
+                self.stopped = Some(RulePreviewStop::Deadline);
+                break;
+            }
+            self.oldest_judged_id = Some(observation.id);
+            self.scanned_event_count = self.scanned_event_count.saturating_add(1);
+            match preview_observation_outcome(&self.candidate, &observation)? {
+                PreviewObservationOutcome::Matched => {
+                    self.match_count = self.match_count.saturating_add(1);
+                    if self.samples.len() < self.sample_limit {
+                        self.samples.push(preview_sample(observation));
+                    }
+                }
+                PreviewObservationOutcome::NotMatched => {}
+                PreviewObservationOutcome::Unevaluated(reason) => {
+                    self.unevaluated_event_count = self.unevaluated_event_count.saturating_add(1);
+                    let count = self.unevaluated_reasons.entry(reason).or_insert(0);
+                    *count = count.saturating_add(1);
+                }
+            }
+        }
+        Ok(self)
+    }
+
+    fn into_response(self) -> PolicyRulePreviewResponse {
+        let scan_truncated = self.stopped.is_some();
+        PolicyRulePreviewResponse {
+            match_count: self.match_count,
+            scanned_event_count: self.scanned_event_count,
+            unevaluated_event_count: self.unevaluated_event_count,
+            unevaluated_reasons: self.unevaluated_reasons,
+            scan_truncated,
+            deadline_exceeded: self.stopped == Some(RulePreviewStop::Deadline),
+            complete: !scan_truncated && self.unevaluated_event_count == 0,
+            sample_strategy: "newest_matches",
+            samples: self.samples,
+        }
+    }
+}
+
 /// Scan at most `max_scan_rows` observations, newest first, however wide the
-/// requested window is. A window holding more rows than that answers with
-/// `scan_truncated` and `complete: false`, so a count over the newest rows is
-/// never presented as a count over the whole window.
+/// requested window is, and stop at `deadline`. A window holding more rows
+/// than the scan judged answers with `scan_truncated` and `complete: false`,
+/// and also `deadline_exceeded` when the deadline stopped it, so a count over
+/// the newest rows is never presented as a count over the whole window.
 ///
 /// Each scanned observation is judged by the shared evaluator
 /// ([`policy_eval::CompiledPolicy::match_direct_rules`]) over the candidate
 /// rule alone. An observation it cannot judge is counted, by reason, in
 /// `unevaluated_reasons` rather than as a non-match, and makes the answer
 /// incomplete: a count that skipped it is a lower bound, not the count.
-pub(super) async fn preview_rule_with_scan_limit(
+///
+/// Pages are read here and judged on a blocking thread that owns `slot`, so
+/// no evaluation runs on an async worker, and a request dropped mid-page
+/// keeps its slot until that page's evaluation ends.
+pub(super) async fn preview_rule_within(
     query_store: &dyn storage::AuditEventStore,
     request: PolicyRulePreviewRequest,
+    slot: PolicyEvaluationSlot,
     max_scan_rows: usize,
+    deadline: Instant,
 ) -> Result<PolicyRulePreviewResponse, RulePreviewError> {
-    let candidate = policy_eval::CompiledPolicy::for_candidate_rule(request.rule.clone());
     let sample_limit = request
         .sample_limit
         .unwrap_or(DEFAULT_RULE_PREVIEW_SAMPLE_LIMIT)
         .min(MAX_RULE_PREVIEW_SAMPLE_LIMIT);
-    let max_scan_rows = u64::try_from(max_scan_rows).unwrap_or(u64::MAX);
-    let mut match_count = 0_u64;
-    let mut scanned_event_count = 0_u64;
-    let mut unevaluated_event_count = 0_u64;
-    let mut unevaluated_reasons = BTreeMap::<&'static str, u64>::new();
-    let mut scan_truncated = false;
-    let mut samples = Vec::with_capacity(sample_limit);
-
     let mut filters = audit::query::RequestObservationFilters {
         from: request.from,
         to: request.to,
@@ -1556,50 +1701,39 @@ pub(super) async fn preview_rule_with_scan_limit(
         path_prefix: prefix_preview_path_filter(&request.rule.path),
         before_id: None,
     };
-    'scan: loop {
+    let mut scan = RulePreviewScan {
+        candidate: policy_eval::CompiledPolicy::for_candidate_rule(request.rule),
+        sample_limit,
+        max_scan_rows: u64::try_from(max_scan_rows).unwrap_or(u64::MAX),
+        deadline,
+        match_count: 0,
+        scanned_event_count: 0,
+        unevaluated_event_count: 0,
+        unevaluated_reasons: BTreeMap::new(),
+        samples: Vec::with_capacity(sample_limit),
+        oldest_judged_id: None,
+        stopped: None,
+    };
+    let mut slot = slot;
+    loop {
         let observations = query_store.query_request_observations(&filters).await?;
         if observations.is_empty() {
             break;
         }
-        for observation in observations {
-            // Reaching one more row after the ceiling is what proves the
-            // window held more than was scanned; a scan that ends exactly at
-            // the ceiling with nothing left is complete.
-            if scanned_event_count >= max_scan_rows {
-                scan_truncated = true;
-                break 'scan;
-            }
-            filters.before_id = Some(observation.id);
-            scanned_event_count = scanned_event_count.saturating_add(1);
-            match preview_observation_outcome(&candidate, &observation)
-                .map_err(RulePreviewError::Evaluation)?
-            {
-                PreviewObservationOutcome::Matched => {
-                    match_count = match_count.saturating_add(1);
-                    if samples.len() < sample_limit {
-                        samples.push(preview_sample(observation));
-                    }
-                }
-                PreviewObservationOutcome::NotMatched => {}
-                PreviewObservationOutcome::Unevaluated(reason) => {
-                    unevaluated_event_count = unevaluated_event_count.saturating_add(1);
-                    let count = unevaluated_reasons.entry(reason).or_insert(0);
-                    *count = count.saturating_add(1);
-                }
-            }
+        let (returned, judged) = slot
+            .run_blocking_step(move || scan.judge_page(observations))
+            .await
+            .map_err(RulePreviewError::Interrupted)?;
+        slot = returned;
+        scan = judged.map_err(RulePreviewError::Evaluation)?;
+        if scan.stopped.is_some() {
+            break;
         }
+        filters.before_id = scan.oldest_judged_id;
     }
+    drop(slot);
 
-    Ok(PolicyRulePreviewResponse {
-        match_count,
-        scanned_event_count,
-        unevaluated_event_count,
-        unevaluated_reasons,
-        scan_truncated,
-        complete: !scan_truncated && unevaluated_event_count == 0,
-        sample_strategy: "newest_matches",
-        samples,
-    })
+    Ok(scan.into_response())
 }
 
 /// Ask the shared evaluator whether the candidate rule matches one retained
@@ -2103,10 +2237,12 @@ pub(super) async fn create_policy_rule(
 }
 
 /// What every policy mutation must satisfy before any authority sees its
-/// candidate: egress cannot change through a mutation endpoint, and the
-/// candidate's proxy dispatch must be valid for this deployment. Pure --
-/// shared by [`persist_policy_mutation`] and by suggestion acceptance,
-/// which commits its candidate inside the suggestion's transaction.
+/// candidate: egress cannot change through a mutation endpoint, the
+/// candidate's proxy dispatch must be valid for this deployment, and the
+/// policy file it would be written as must be one the gateway reads back.
+/// Pure -- shared by [`persist_policy_mutation`] and by suggestion
+/// acceptance, which commits its candidate inside the suggestion's
+/// transaction.
 pub(super) fn validate_policy_mutation_candidate(
     rbac_state: &middleware::rbac::RbacState,
     before_policy: &rbac::Policy,
@@ -2122,7 +2258,27 @@ pub(super) fn validate_policy_mutation_candidate(
         ])));
     }
 
+    if let Some(detail) = policy_file_size_refusal(candidate) {
+        return Err(Box::new(policy_validation_failed(vec![detail])));
+    }
+
     Ok(())
+}
+
+/// Why the policy file `candidate` would be written as -- the pretty-printed
+/// document a standalone commit writes, measured by
+/// [`rbac::Policy::persisted_bytes`] -- is one the gateway would refuse to
+/// read back, or `None` when it fits. The pretty form is larger than the
+/// compact one a body or a draft is measured in, so a candidate under every
+/// other bound can still fail here, and a standalone commit that wrote it
+/// would leave a file that neither its own reload nor the next start reads.
+/// Judged in cluster mode too, so a committed policy always fits a policy
+/// file.
+pub(super) fn policy_file_size_refusal(candidate: &rbac::Policy) -> Option<String> {
+    candidate
+        .persisted_bytes()
+        .err()
+        .map(|error| error.to_string())
 }
 
 /// The request a publication is checked for: who is publishing, how they
@@ -2265,8 +2421,11 @@ pub(super) fn resource_snapshot_stale(
 /// format at all: everything a write refuses about a candidate without
 /// trying to commit it, with the same responses. A policy draft is judged
 /// by this when it is saved and again when it is published, so a draft
-/// cluster mode could never commit (policy v1, today) is refused when it is
-/// saved rather than kept until its publication fails.
+/// cluster mode could never commit (a document format replicas of this
+/// build do not serve) is refused when it is saved rather than kept until
+/// its publication fails. A policy v1 draft is not such a draft: whether
+/// every live replica reads format 1 is the roster's answer at publication
+/// (`policy.document_v1`), and a rollout that finishes makes it publishable.
 pub(super) fn validate_policy_write_candidate(
     state: &PolicyAdminState,
     rbac_state: &middleware::rbac::RbacState,
@@ -2503,7 +2662,9 @@ pub(super) async fn commit_policy_mutation(
     };
 
     // The file is replaced by an atomic rename, so a failed persist leaves
-    // the previous document in place.
+    // the previous document in place. A candidate whose file would be too
+    // large to read back was refused above, before anything was written,
+    // and the persist measures the same bytes again before it writes them.
     if let Err(err) = candidate.persist_to_file(policy_file) {
         tracing::error!(policy_file = %policy_file.display(), error = %err, "failed to persist policy");
         return Err(PolicyMutationFailure::refused(
@@ -2558,30 +2719,37 @@ pub(super) async fn commit_policy_mutation(
     })
 }
 
-/// Ask the cluster's operation gate before committing a document that uses
-/// a feature an older member cannot read (issue #426).
+/// Ask the cluster's operation gate before committing a document that an
+/// older member cannot read (issues #426 and #243).
 ///
-/// A document without such a feature needs nothing beyond the schema-25
-/// contract every member shares, and passes without a roster read. One that
-/// gives a role a `description` is the registered operation
-/// `policy.role_descriptions`: it is committed only while every live member,
-/// draining ones included, advertises `policy_role_descriptions`, because a
-/// member built before the field refuses the whole document. The gate reads
-/// the roster for every such write, logs and audits each refusal
-/// (`cluster.operation_refused`), and the refused write commits nothing.
+/// A 0.x document without role descriptions needs nothing beyond the
+/// schema-25 contract every member shares, and passes without a roster
+/// read. A policy v1 document is the registered operation
+/// `policy.document_v1`, and one that gives a role a `description` is
+/// `policy.role_descriptions`: each is committed only while every live
+/// member, draining ones included, advertises its capability
+/// (`policy_document_v1`, which also needs a document range reaching
+/// format 1, and `policy_role_descriptions`), because a member without it
+/// refuses the whole document. A v1 document whose rules carry
+/// `conditions` is also `policy.rule_conditions` (`policy_rule_conditions`),
+/// because a member that serves format 1 but predates enforced rule
+/// conditions refuses it the same way. A document asks for each operation
+/// it performs. The gate reads the roster for every such write, logs and
+/// audits each refusal (`cluster.operation_refused`), and the refused write
+/// commits nothing.
 ///
 /// Every cluster-mode policy commit calls this: a discovery suggestion's
 /// acceptance, which commits the whole document with the new rule in it,
-/// and the policy API's mutations through [`commit_policy_mutation`], which
-/// takes its two halves (the format check and
+/// and the policy API's mutations through [`commit_policy_mutation`] (the
+/// replacement, rollback, the rule routes, bound shadow promotion and draft
+/// publication), which takes its two halves (the format check and
 /// [`admit_policy_operations`]) one at a time so it can say which refused.
 /// A control plane with no roster to read refuses rather than admits.
 ///
-/// Before any of that, the document's format must be one every replica can
-/// read. This build advertises `cluster_membership::DOCUMENT_VERSION_RANGE`,
-/// and a policy v1 document lies outside it: a replica built before v1
-/// refuses the whole document, and no capability gates v1 yet, so the
-/// commit is refused here with a `400` and nothing is written.
+/// Before any of that, the document's format must be one this build serves
+/// in cluster mode, `cluster_membership::DOCUMENT_VERSION_RANGE`. Both
+/// formats it parses are in that range, so the `400` this answers otherwise
+/// guards only against a format added to the parser without the range.
 #[cfg(feature = "postgres")]
 pub(super) async fn admit_policy_document(
     state: &PolicyAdminState,
@@ -2595,9 +2763,10 @@ pub(super) async fn admit_policy_document(
     admit_policy_operations(state, parts, principal, candidate).await
 }
 
-/// The operation-gate half of [`admit_policy_document`]: a document that
-/// uses a feature an older member cannot read is committed only while
-/// every live member advertises it.
+/// The operation-gate half of [`admit_policy_document`]: a document that an
+/// older member cannot read is committed only while every live member
+/// advertises what each of its operations requires. The first refusal
+/// answers the write, and is the only one audited.
 #[cfg(feature = "postgres")]
 async fn admit_policy_operations(
     state: &PolicyAdminState,
@@ -2605,13 +2774,13 @@ async fn admit_policy_operations(
     principal: &auth::Principal,
     candidate: &rbac::Policy,
 ) -> ResponseResult<()> {
-    if !candidate.uses_role_descriptions() {
+    let operations = policy_document_operations(candidate);
+    let Some(first) = operations.first() else {
         return Ok(());
-    }
-    let requirement = &storage::compatibility::POLICY_ROLE_DESCRIPTIONS;
+    };
     let Some(membership) = state.membership.as_ref() else {
         tracing::error!(
-            operation = requirement.operation,
+            operation = first.operation,
             "a cluster-mode policy commit has no roster to ask; the gated write is refused"
         );
         return Err(Box::new(operation_refused(
@@ -2627,11 +2796,73 @@ async fn admit_policy_operations(
         ),
         actor: Some(auth::actor_from_principal(principal)),
     };
-    membership
-        .admit_operation(requirement, &state.audit, &request)
-        .await
-        .map(|_| ())
-        .map_err(|refusal| Box::new(operation_refused(&refusal)))
+    for requirement in operations {
+        membership
+            .admit_operation(requirement, &state.audit, &request)
+            .await
+            .map_err(|refusal| Box::new(operation_refused(&refusal)))?;
+    }
+    Ok(())
+}
+
+/// The registered operations committing `candidate` performs, in the
+/// order the gate is asked: its document format first, then the features
+/// inside it. Empty for a 0.x document without role descriptions.
+#[cfg(feature = "postgres")]
+fn policy_document_operations(
+    candidate: &rbac::Policy,
+) -> Vec<&'static storage::compatibility::OperationRequirement> {
+    let mut operations = Vec::new();
+    if candidate.is_document_format_v1() {
+        operations.push(&storage::compatibility::POLICY_DOCUMENT_V1);
+        // Only a v1 document can carry conditions; the 0.x reader refuses
+        // them (`member_requires_v1`).
+        if candidate.uses_rule_conditions() {
+            operations.push(&storage::compatibility::POLICY_RULE_CONDITIONS);
+        }
+    }
+    if candidate.uses_role_descriptions() {
+        operations.push(&storage::compatibility::POLICY_ROLE_DESCRIPTIONS);
+    }
+    operations
+}
+
+/// Why this cluster cannot commit `policy`'s document format now, as only
+/// its roster can show, if it cannot: the read-only half of the gate a v1
+/// commit asks (`policy.document_v1`), for `POST .../policy/validate`.
+/// `None` outside cluster mode, for a 0.x document, and while every live
+/// replica advertises `policy_document_v1` and a document range reaching
+/// format 1. No roster, or one that cannot be read, is reported as refusing,
+/// because the commit would be refused the same way. Counts and the stable
+/// reason only; never a member identifier.
+#[cfg(feature = "postgres")]
+async fn cluster_roster_document_format_refusal(
+    state: &PolicyAdminState,
+    policy: &rbac::Policy,
+) -> Option<String> {
+    if state.control_plane.is_none() || !policy.is_document_format_v1() {
+        return None;
+    }
+    let requirement = &storage::compatibility::POLICY_DOCUMENT_V1;
+    let refusal = match state.membership.as_ref() {
+        Some(membership) => membership.check_operation(requirement).await.err()?,
+        None => storage::compatibility::OperationRefusal::RosterUnavailable,
+    };
+    let why = match &refusal {
+        storage::compatibility::OperationRefusal::MembersLackRequirement { lacking, live } => {
+            format!(
+                "{} of {live} live cluster member(s) do not read document format 1; finish the \
+                 rollout, or wait for departed members to go stale",
+                lacking.len()
+            )
+        }
+        _ => "the cluster cannot be shown to read document format 1 right now".to_owned(),
+    };
+    Some(format!(
+        "policy schema_version '{}' cannot be committed in cluster mode yet ({}): {why}",
+        policy.schema_version,
+        refusal.reason()
+    ))
 }
 
 /// Why this deployment could not commit `policy`, if it could not. Only
@@ -2652,7 +2883,9 @@ pub(super) fn deployment_document_format_refusal(
 
 /// Why cluster mode cannot commit `policy`, if it cannot: its document
 /// format major is outside the range every replica of this build
-/// advertises and reads.
+/// advertises and reads. Both formats this build parses are inside it;
+/// whether every live member reads the format too is the operation gate's
+/// question ([`admit_policy_operations`]).
 #[cfg(feature = "postgres")]
 pub(super) fn cluster_document_format_refusal(policy: &rbac::Policy) -> Option<String> {
     if policy.cluster_serves_document_format() {
@@ -2661,8 +2894,7 @@ pub(super) fn cluster_document_format_refusal(policy: &rbac::Policy) -> Option<S
     let (minimum, maximum) = cluster_membership::DOCUMENT_VERSION_RANGE;
     Some(format!(
         "policy schema_version '{}' cannot be committed in cluster mode: replicas of this build \
-         read only document formats {minimum} to {maximum}, and no capability yet lets them \
-         agree to read another",
+         read only document formats {minimum} to {maximum}",
         policy.schema_version
     ))
 }
@@ -2997,17 +3229,22 @@ pub(super) fn exact_strong_entity_tag(
         .to_str()
         .map_err(|_| ToolPlaygroundIfMatchError::Invalid)?
         .trim();
-    if value.len() > 1_024
-        || value.len() < 2
-        || !value.starts_with('"')
-        || !value.ends_with('"')
-        || !value.as_bytes()[1..value.len() - 1]
-            .iter()
-            .all(|byte| *byte == b'!' || (b'#'..=b'~').contains(byte))
-    {
+    if !is_strong_entity_tag(value) {
         return Err(ToolPlaygroundIfMatchError::Invalid);
     }
     Ok(value.to_owned())
+}
+
+/// Whether `value` is one strong entity tag (RFC 9110 `entity-tag` without
+/// `W/`), at most 1 KiB: a quoted run of `etagc` octets.
+pub(super) fn is_strong_entity_tag(value: &str) -> bool {
+    value.len() <= 1_024
+        && value.len() >= 2
+        && value.starts_with('"')
+        && value.ends_with('"')
+        && value.as_bytes()[1..value.len() - 1]
+            .iter()
+            .all(|byte| *byte == b'!' || (b'#'..=b'~').contains(byte))
 }
 
 pub(super) fn if_match_error_response(error: IfMatchError) -> Response {

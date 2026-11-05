@@ -3,7 +3,10 @@
 //!
 //! One SQLite database, [`LEDGER_FILE_NAME`], beneath the state directory,
 //! holding the configuration bundles a standalone deployment applied as an
-//! append-only chain of immutable revisions:
+//! append-only chain of immutable revisions. The ledger is opened and seeded
+//! only through a [`StateDirectory`] held under its exclusive lock, and each
+//! open ledger keeps that lock held, so an offline `ggctl ledger` command and
+//! a running gateway can never have the same ledger open:
 //!
 //! - **Records.** Each revision is one canonical JSON record (RFC 8785): its
 //!   sequence number, its parent revision and that parent's record hash, the
@@ -49,11 +52,14 @@
 //! which is why ADR-0008 treats filesystem access to the state directory as
 //! full control of a standalone deployment.
 //!
-//! Not here yet: selecting ledger mode at startup, the state-directory lock
-//! that keeps offline `ggctl ledger` commands and a running gateway apart,
-//! delivery of the revisions' evidence to the audit pipeline, `ggctl ledger
-//! seed|verify|rollback`, and pruning. Until pruning lands an append beyond
-//! [`MAX_RETAINED_REVISIONS`] is refused rather than history dropped.
+//! `ggctl ledger seed`, `verify` and `rollback` are the offline commands
+//! over it: [`RevisionLedger::seed`], [`RevisionLedger::inspect`] and
+//! [`crate::revisions::RevisionService::apply_offline_rollback`].
+//!
+//! Not here yet: selecting ledger mode at startup, delivery of the
+//! revisions' evidence to the audit pipeline, and pruning. Until pruning
+//! lands an append beyond [`MAX_RETAINED_REVISIONS`] is refused rather than
+//! history dropped.
 //!
 //! Like the rest of this crate the ledger reads no clock and no environment:
 //! callers stamp each revision with its time.
@@ -67,16 +73,17 @@ mod store;
 #[cfg(test)]
 mod tests;
 
-use std::{fmt, path::Path, time::SystemTime};
+use std::{fmt, time::SystemTime};
 
 use rusqlite::Connection;
 
 use crate::bundle::{ApiVersion, Bundle, FileName, FileRole, Profile, SourceFile};
 use crate::canonical_json;
 use crate::opaque_id::is_valid_opaque_id;
+use crate::state_dir::{StateDirectory, StateFile};
 
 /// The ledger's file name beneath the state directory.
-pub const LEDGER_FILE_NAME: &str = "config-ledger.sqlite3";
+pub const LEDGER_FILE_NAME: &str = StateFile::ConfigLedger.file_name();
 /// The most revisions a ledger holds (ADR-0008's retention bound).
 pub const MAX_RETAINED_REVISIONS: usize = 1024;
 /// The most revisions one [`RevisionLedger::revisions`] page returns.
@@ -148,6 +155,14 @@ impl PlanId {
     /// The plan ID made of 16 random bytes.
     pub fn from_random(bytes: [u8; 16]) -> Self {
         Self(format!("{}{}", Self::PREFIX, hex::encode(bytes)))
+    }
+
+    /// The ID of the one plan an offline operator command makes, all zero
+    /// digits. It needs no randomness: the plan lives only in that command's
+    /// own short-lived service, is never shown to another actor, and an
+    /// offline revision records no request, so the ID is never recorded.
+    pub fn offline() -> Self {
+        Self::from_random([0; 16])
     }
 
     pub fn as_str(&self) -> &str {
@@ -854,11 +869,16 @@ impl std::error::Error for LedgerError {}
 /// An open, verified revision ledger.
 ///
 /// Every call takes `&mut self`; a caller that shares one wraps it in a
-/// mutex. Two handles on one ledger, in one process or two, serialize their
-/// writes through SQLite's write lock, and compare-and-set on the head means
-/// exactly one of two appends against the same head wins.
+/// mutex. A ledger keeps the state directory it was opened through locked
+/// for as long as it is open, so only one process can have it open. Two
+/// handles in that process, opened through the same [`StateDirectory`],
+/// serialize their writes through SQLite's write lock, and compare-and-set
+/// on the head means exactly one of two appends against the same head wins.
 pub struct RevisionLedger {
     connection: Connection,
+    /// Never read: holding it keeps the state directory's lock held while
+    /// the ledger is open, whatever happens to the caller's handle.
+    _state_dir: StateDirectory,
     /// Set by the first corruption any call reports; every later call
     /// reports it again.
     corruption: Option<Corruption>,
@@ -875,8 +895,8 @@ impl fmt::Debug for RevisionLedger {
 }
 
 impl RevisionLedger {
-    /// Creates the ledger in `state_dir` with `bundle` as its first, desired
-    /// and not yet active revision, and opens it.
+    /// Creates the ledger in the held `state_dir` with `bundle` as its first,
+    /// desired and not yet active revision, and opens it.
     ///
     /// Refuses a state directory that already holds a ledger or a previous
     /// ledger's journal files. The ledger is built and committed under a
@@ -885,7 +905,7 @@ impl RevisionLedger {
     /// the ledger's name; a leftover temporary file is discarded by the next
     /// seed.
     pub fn seed<P, T>(
-        state_dir: &Path,
+        state_dir: &StateDirectory,
         bundle: &Bundle<P, T>,
         actor: LedgerActor,
         recorded_at: SystemTime,
@@ -898,7 +918,7 @@ impl RevisionLedger {
             RevisionCodes::none(),
             recorded_at,
         )?;
-        let paths = location::prepare_seed(state_dir)?;
+        let paths = location::prepare_seed(state_dir.path())?;
         let initialized = location::create_temporary(&paths)
             .and_then(|()| store::initialize(&paths.temporary, pending, bundle.source_files()));
         if let Err(error) = initialized {
@@ -911,16 +931,31 @@ impl RevisionLedger {
         Ok((ledger, state.desired))
     }
 
-    /// Opens and fully verifies the ledger in `state_dir`.
-    pub fn open(state_dir: &Path) -> Result<Self, LedgerError> {
-        let path = location::existing_ledger(state_dir)?;
+    /// Opens and fully verifies the ledger in the held `state_dir`.
+    pub fn open(state_dir: &StateDirectory) -> Result<Self, LedgerError> {
+        let path = location::existing_ledger(state_dir.path())?;
         let connection = store::open(&path)?;
         store::verify(&connection, MAX_RETAINED_REVISIONS)?;
         Ok(Self {
             connection,
+            _state_dir: state_dir.clone(),
             corruption: None,
             max_revisions: MAX_RETAINED_REVISIONS,
         })
+    }
+
+    /// Fully verifies the ledger in the held `state_dir` as [`Self::open`]
+    /// does, through a read-only connection, and closes it again: what
+    /// `ggctl ledger verify` reports.
+    ///
+    /// Nothing is written to the ledger: not its journal mode, not a
+    /// checkpoint of its write-ahead log, not a change of any page. SQLite
+    /// may still create the `-wal` and `-shm` files beside a write-ahead
+    /// ledger to read it, as any reader does.
+    pub fn inspect(state_dir: &StateDirectory) -> Result<LedgerState, LedgerError> {
+        let path = location::existing_ledger(state_dir.path())?;
+        let connection = store::open_read_only(&path)?;
+        store::verify(&connection, MAX_RETAINED_REVISIONS)
     }
 
     /// Verifies the whole ledger again, as [`Self::open`] did.

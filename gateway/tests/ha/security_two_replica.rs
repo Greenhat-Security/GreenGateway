@@ -3183,8 +3183,9 @@ async fn a_security_incident_rehearsal_holds_through_a_replica_replacement() {
     // replica's shutdown and the replacement's boot included), the
     // break-glass command's output, and every row of every table the
     // incident wrote: its change evidence included, and the Connection's
-    // too, which only a delete writes today, so evidence a later slice
-    // records for a rebind is swept from its first row.
+    // too, whose create and rebind write rows since migration 28 (the rebind
+    // a replace and a credential binding change), so no Connection or
+    // binding material may reach them.
     let mut evidence: Vec<(String, String)> = Vec::new();
     for replica in &cluster.replicas {
         evidence.push((

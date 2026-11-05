@@ -1,6 +1,6 @@
 # Standalone configuration revision ledger
 
-Status: alpha, not yet selectable (issue #242, PRs 10 and 11; [ADR-0008](adr/0008-setup-cli-and-configuration-bundles.md#ledger-mode-standalone)).
+Status: alpha, not yet selectable (issue #242, PRs 10 and 11 and the offline `ggctl ledger` commands; [ADR-0008](adr/0008-setup-cli-and-configuration-bundles.md#ledger-mode-standalone)).
 
 The revision ledger is how a standalone deployment will record every
 configuration bundle it applies: an append-only, hash-chained history of
@@ -10,15 +10,19 @@ gateway and `ggctl` use the same code.
 
 What exists today is the ledger, the conditional plan, apply, history and
 rollback service over it ([Plans and conditional apply](#plans-and-conditional-apply),
-`gateway_config::revisions`), and their tests. Nothing creates or reads a
-ledger yet: there is no ledger startup mode, no `GATEWAY_STATE_DIR`, no `ggctl
-ledger` or `ggctl plan`/`apply` command and no admin route. Environment
-configuration and startup are unchanged.
+`gateway_config::revisions`), the state-directory lock it opens under
+([below](#the-state-directory-lock)), and the offline `ggctl ledger seed`,
+`verify` and `rollback` commands that create, check and recover one
+([Offline commands](#offline-commands)). No gateway reads a ledger yet: there
+is no ledger startup mode, no `GATEWAY_STATE_DIR`, no `ggctl plan`/`apply`
+command and no admin route. Environment configuration and startup are
+unchanged.
 
 ## Layout
 
-The ledger is the file `config-ledger.sqlite3` in the state directory, with
-SQLite's `-wal` and `-shm` files beside it while it is open. The database
+The ledger is the file `config-ledger.sqlite3` in the state directory, one of
+the [fixed state-directory names](configuration-bundles.md#the-state-directory),
+with SQLite's `-wal` and `-shm` files beside it while it is open. The database
 identifies itself with `PRAGMA application_id` `0x47474C47` ("GGLG") and
 `PRAGMA user_version` `1`, and uses the discipline of the existing standalone
 stores: WAL journaling, `synchronous = FULL`, immediate write transactions,
@@ -36,6 +40,21 @@ It holds four tables, all `STRICT`:
 Triggers refuse every update and delete of revisions, documents and request
 rows, an insert out of sequence, deleting the pointer, and moving either
 pointer backwards. A rollback is therefore always a new forward revision.
+
+## The state directory lock
+
+A ledger is opened and seeded only through a held state directory
+(`gateway_config::state_dir::StateDirectory`): `RevisionLedger::open` and
+`RevisionLedger::seed` take one, so no caller can reach a ledger without
+first taking the directory's exclusive lock on `state.lock`. Each open ledger
+keeps a share of that lock until it closes, whatever happens to the handle it
+was opened through. So while a gateway has its ledger open, an offline `ggctl
+ledger` command cannot open it, and the other way round: the second process
+gets `state_dir.locked` before anything is read. Two ledger handles in one
+process share one held directory, and their writes still serialize through
+SQLite's write lock and compare-and-set on the head. The directory's admission
+rules, the lock's semantics and its codes are described with the
+[state directory](configuration-bundles.md#the-state-directory).
 
 ## Records
 
@@ -87,7 +106,8 @@ reordering any revision changes every later hash.
   when no restart is pending, that is when the head being replaced was active;
   a `restart` revision, a staged one, or any revision while a restart is
   pending, moves only the desired pointer. Two writers appending on the same
-  head, in one process or two, get exactly one winner. A request whose
+  head get exactly one winner; they are in one process, because the
+  state-directory lock keeps a second process out. A request whose
   acknowledged risk codes are not the revision's is refused
   (`acknowledgement_mismatch`).
 - **Rollback** appends a new revision whose bundle must have the target's
@@ -103,9 +123,11 @@ reordering any revision changes every later hash.
 Opening a ledger verifies all of it before anything else is read or written,
 and fails closed:
 
-1. The state directory must be a directory, not a link or reparse point, and
-   on Unix not writable by group or other; the ledger must be a regular file,
-   not a link or reparse point, and on Unix not writable by group or other.
+1. The state directory, which the caller already holds under its lock, must
+   still be a directory, not a link or reparse point, and on Unix not writable
+   by group or other, so permissions widened since it was locked are refused;
+   the ledger must be a regular file, not a link or reparse point, and on Unix
+   not writable by group or other.
 2. The header must name a version-1 ledger (a newer one is
    `ledger.unsupported`), and `PRAGMA quick_check` must pass.
 3. The schema must be exactly the ledger's tables and triggers, with nothing
@@ -200,7 +222,9 @@ that set of codes: no more, no fewer (`plan.acknowledgement_mismatch`). The
 acknowledgement lasts 10 minutes and never beyond its plan. There is no
 force flag and no blanket acknowledgement. `risk.admin_access_path_removed`
 cannot be acknowledged online (`plan.risk_not_acknowledgeable`): the
-deployment channel is the remedy.
+deployment channel is the remedy, and in ledger mode that is the offline
+`ggctl ledger rollback` ([below](#offline-rollback)), where every code is
+acknowledgeable by name.
 
 ### Apply
 
@@ -277,12 +301,61 @@ gateway's audit pipeline as `config.revision_staged`, `config.activated` and
 `config.rolled_back` events is part of the admin routes and ledger startup
 slices.
 
+## Offline commands
+
+Three `ggctl` commands work on a ledger directly, with no gateway running
+([`ggctl ledger`](ggctl.md#ledger-seed); ADR-0008, "Seeding a ledger" and
+"Recovery and lockout"). Each first takes the state directory's lock without
+waiting, so it refuses with `state_dir.locked` (exit `5`) while a gateway or
+another `ggctl` holds it, and two of them started together get exactly one
+winner. None writes a gateway audit event: what an offline command records is
+the revision itself, under the system actor `ggctl-ledger`, with no request.
+`ggctl` cannot link the gateway's production policy and tools validators, so
+it compiles with the published schemas only (`PublishedSchemasCompiler`) and
+every report about a revision it wrote says so; a gateway starting from the
+ledger compiles the desired revision again with its own validators and
+refuses to start if it does not compile.
+
+- **Seed.** `ggctl ledger seed BUNDLE --state-dir DIR` reads the bundle
+  strictly with the shared reader and calls `RevisionLedger::seed`, which
+  refuses a state directory holding a ledger or a ledger's journal files
+  (`ledger.exists`, exit `5`) and otherwise [writes](#writing) the first
+  revision: desired, not active, `restart`-class.
+- **Verify.** `ggctl ledger verify --state-dir DIR` runs
+  `RevisionLedger::inspect`: every check of [verification](#verification),
+  through a read-only SQLite connection that changes nothing in the ledger
+  (not its journal mode, not a checkpoint, not a page; SQLite may create the
+  `-wal` and `-shm` files beside a write-ahead ledger to read it). It reports
+  the revision count, the desired and active revisions, or the corruption
+  class.
+- <a id="offline-rollback"></a>**Rollback.** `ggctl ledger rollback REVISION
+  --state-dir DIR [--acknowledge RISK_CODE]...` is the offline lockout
+  recovery path. It plans the rollback through `RevisionService` exactly as an
+  online plan is made (`create_plan` with the target as subject, against the
+  head) and applies it with `RevisionService::apply_offline_rollback`, which:
+  - accepts only a system actor (`apply.offline_actor_required` otherwise), so
+    an authenticated caller cannot reach it;
+  - holds the plan to the head and recompiles it exactly as an online apply
+    does (`plan.unknown`, `plan.stale`, `apply.no_change`);
+  - needs the plan's risk codes acknowledged exactly, each by name
+    (`apply.acknowledgement_required`, `plan.acknowledgement_mismatch`,
+    `plan.nothing_to_acknowledge`). Every code is acknowledgeable offline,
+    `risk.admin_access_path_removed` included: filesystem access to the state
+    directory is already full control of a standalone deployment, which is
+    also why no permission is checked. The plan's union of permissions is
+    still recorded;
+  - needs no `If-Match` or idempotency key, which the held lock makes
+    needless, and records no request;
+  - appends a new forward `rollback` revision recorded `restart`-class
+    whatever its changes are, because no gateway is running to activate it:
+    only the desired pointer moves, and the next start activates it. History
+    is never rewritten.
+
 ## Not yet
 
 Selecting ledger mode at startup (and refusing to start on an empty, unreadable
-or unverifiable ledger), publishing a live revision's runtime snapshot, the
-state-directory lock that keeps offline `ggctl ledger` commands and a running
-gateway apart, `ggctl ledger seed`, `verify` and `rollback`, the admin routes
+or unverifiable ledger, and holding the state-directory lock for the life of
+the process), publishing a live revision's runtime snapshot, the admin routes
 and `ggctl plan`, `apply`, `history` and `rollback` that will serve the
 service above, online activation of a staged revision, delivery of the
 revisions' evidence to the audit pipeline, protected status, and pruning are

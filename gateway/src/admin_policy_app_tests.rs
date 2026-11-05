@@ -312,6 +312,115 @@ async fn policy_put_rejects_egress_change_without_persisting_or_swapping() {
     assert!(live_after["egress"].is_null());
 }
 
+/// A policy document of small rules whose compact JSON -- the request body,
+/// and the form a draft is measured in -- is under the 1 MiB policy bound,
+/// and whose policy file, pretty-printed as a standalone commit writes it,
+/// is over it.
+fn policy_document_too_large_for_a_policy_file() -> Value {
+    let bound = usize::try_from(rbac::policy::MAX_POLICY_FILE_BYTES).expect("the bound fits");
+    let mut count = 2_000;
+    loop {
+        let rules = (0..count)
+            .map(|index| {
+                direct_rule_json(
+                    Some(&format!("rule-{index}")),
+                    &["GET"],
+                    &format!("/large/{index}"),
+                    "deny",
+                )
+            })
+            .collect::<Vec<_>>();
+        let document = policy_document_with_rules("large-policy", Value::Array(rules));
+        let policy =
+            rbac::Policy::validate_json_value(document.clone()).expect("the policy is valid");
+        let pretty = serde_json::to_vec_pretty(&policy).expect("the policy serializes");
+        if pretty.len() >= bound {
+            let compact = serde_json::to_vec(&policy).expect("the policy serializes");
+            assert!(
+                compact.len() < bound && document.to_string().len() < bound,
+                "{count} rules are {} bytes compact",
+                compact.len()
+            );
+            return document;
+        }
+        count += 500;
+    }
+}
+
+#[tokio::test]
+async fn policy_put_refuses_a_policy_file_too_large_to_read_back_without_writing_it() {
+    let initial_policy = policy_document_string("initial-policy", "test:old");
+    let policy = TempPolicyFile::new(&initial_policy);
+    let history_db = TempDb::new("policy-file-too-large");
+    let router = policy_admin_router_with_history(Some(&policy), &history_db);
+    let disk_before = fs::read(&policy.path).expect("policy file should read");
+    let (etag_before, live_before) = current_policy(&router).await;
+    let candidate = policy_document_too_large_for_a_policy_file().to_string();
+
+    // Validation reports what a write would refuse, as a refusal of
+    // publication only: the document itself is sound to simulate and test.
+    let validation = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::POST,
+            POLICY_VALIDATE_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            Some(candidate.clone()),
+            None,
+        ))
+        .await
+        .expect("policy validation should complete");
+    assert_eq!(validation.status(), StatusCode::BAD_REQUEST);
+    let validation = json_body(validation).await;
+    assert_eq!(validation["valid"], json!(false));
+    let diagnostics = validation["diagnostics"]
+        .as_array()
+        .expect("validation lists diagnostics");
+    let refusal = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == json!("policy_file_too_large"))
+        .unwrap_or_else(|| panic!("no policy_file_too_large diagnostic in {diagnostics:?}"));
+    assert_eq!(refusal["severity"], json!("error"));
+    assert_eq!(
+        refusal["blocks"],
+        json!({ "simulation": false, "tests": false, "publication": true, "evidence": false })
+    );
+
+    // Before the fix the commit wrote the file and then could not reload it:
+    // `500`, a POLICY_FILE the gateway refuses to read, and the old policy
+    // still enforced. Now nothing is written.
+    let response = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::PUT,
+            POLICY_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            Some(candidate),
+            Some(&etag_before),
+        ))
+        .await
+        .expect("oversized policy PUT should complete");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert_eq!(body["valid"], json!(false));
+    assert!(
+        body["errors"][0]
+            .as_str()
+            .is_some_and(|error| error.contains("more than the maximum size of 1048576 bytes")),
+        "unexpected refusal: {body}"
+    );
+    assert_eq!(
+        fs::read(&policy.path).expect("policy file should still read"),
+        disk_before
+    );
+    let (etag_after, live_after) = current_policy(&router).await;
+    assert_eq!(etag_after, etag_before);
+    assert_eq!(live_after, live_before);
+    assert!(policy_history_entries(&router, None).await.is_empty());
+    rbac::Policy::from_file(&policy.path).expect("the policy file still reads back");
+}
+
 #[tokio::test]
 async fn policy_history_records_every_policy_mutation_path_once() {
     let initial_policy = policy_document_with_rules_string(
@@ -3393,25 +3502,137 @@ async fn policy_rule_preview_scan_ceiling_reports_a_truncated_incomplete_count()
     // Three observations fall inside the window, newest first: match-new,
     // wrong-role, match-old. A two-row ceiling reads only the first two, so
     // the one match it saw is not the window's count.
-    let truncated = preview_rule_with_scan_limit(&store, request(), 2)
+    let truncated = preview_rule_within(&store, request(), preview_slot(), 2, preview_deadline())
         .await
         .expect("truncated preview should complete");
     assert_eq!(truncated.scanned_event_count, 2);
     assert_eq!(truncated.match_count, 1);
     assert!(truncated.scan_truncated);
+    assert!(!truncated.deadline_exceeded);
     assert!(!truncated.complete);
     assert_eq!(truncated.samples.len(), 1);
     assert_eq!(truncated.samples[0].event_id, "match-new");
 
     // A ceiling the window exactly fills is not a truncation: every row was
     // read and nothing was left behind.
-    let exact = preview_rule_with_scan_limit(&store, request(), 3)
+    let exact = preview_rule_within(&store, request(), preview_slot(), 3, preview_deadline())
         .await
         .expect("exact-ceiling preview should complete");
     assert_eq!(exact.scanned_event_count, 3);
     assert_eq!(exact.match_count, 2);
     assert!(!exact.scan_truncated);
     assert!(exact.complete);
+}
+
+/// A slot of a limiter no other preview shares, for a preview called
+/// directly rather than through the route.
+fn preview_slot() -> PolicyEvaluationSlot {
+    Arc::new(PolicyEvaluationLimiter::new(1))
+        .try_acquire("rule-preview-test".to_owned())
+        .expect("a fresh limiter admits one preview")
+}
+
+fn preview_deadline() -> Instant {
+    Instant::now() + POLICY_RULE_PREVIEW_DEADLINE
+}
+
+#[tokio::test]
+async fn policy_rule_preview_refuses_conditions_before_reading_any_observation() {
+    let db = TempDb::new("rule-preview-conditions");
+    create_audit_schema(&db.path);
+    seed_rule_preview_events(&db.path);
+    let policy = TempPolicyFile::new(&policy_document_string("initial-policy", "test:old"));
+    let router = policy_admin_router_with_sqlite(Some(&policy), test_audit_log(), Some(&db.path));
+
+    // A wide tree no policy validation would accept -- every branch is an
+    // empty `any`, which is false, so evaluating it per observation visits
+    // every node -- and a valid leaf. The preview refuses both: a retained
+    // observation captures none of the facts a condition reads.
+    let empty_branches = vec![json!({ "any": [] }); 4_096];
+    for conditions in [
+        json!({ "any": empty_branches }),
+        json!({ "source_network": { "cidrs": ["10.0.0.0/8"] } }),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(policy_admin_request(
+                Method::POST,
+                POLICY_RULE_PREVIEW_ADMIN_ROUTE,
+                Some(test_principal(&["policy-audit-reader"])),
+                Some(
+                    json!({
+                        "rule": {
+                            "methods": ["GET"],
+                            "path": "/**",
+                            "action": "deny",
+                            "conditions": conditions
+                        }
+                    })
+                    .to_string(),
+                ),
+                None,
+            ))
+            .await
+            .expect("policy rule preview should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(
+            body["errors"],
+            json!([
+                "rule preview does not support conditions: retained observations do not \
+                 capture the facts conditions read"
+            ])
+        );
+    }
+}
+
+#[tokio::test]
+async fn policy_rule_preview_stops_at_its_deadline_and_returns_its_slot() {
+    let db = TempDb::new("rule-preview-deadline");
+    create_audit_schema(&db.path);
+    seed_rule_preview_events(&db.path);
+    let store = storage::SqliteAuditEventStore::open(&db.path).expect("query store should open");
+    let request = || {
+        parse_rule_preview_body(&Bytes::from(
+            json!({
+                "rule": { "methods": ["GET"], "path": "/api/items/{id}", "action": "deny" },
+                "from": "2024-06-01T12:00:00Z",
+                "to": "2024-06-01T12:00:05Z"
+            })
+            .to_string(),
+        ))
+        .expect("preview request should parse")
+    };
+    let limiter = Arc::new(PolicyEvaluationLimiter::new(1));
+    let slot = || {
+        limiter
+            .try_acquire("rule-preview-deadline".to_owned())
+            .expect("the preview's slot should be free again")
+    };
+
+    // A deadline already passed stops the scan at its first row: nothing is
+    // counted, and the answer says the window was not read rather than that
+    // nothing in it matched.
+    let stopped = preview_rule_within(&store, request(), slot(), 100, Instant::now())
+        .await
+        .expect("a preview past its deadline still answers");
+    assert_eq!(stopped.scanned_event_count, 0);
+    assert_eq!(stopped.match_count, 0);
+    assert!(stopped.scan_truncated);
+    assert!(stopped.deadline_exceeded);
+    assert!(!stopped.complete);
+
+    // The slot came back with the answer, so the same caller is admitted
+    // again, and a scan within its deadline is complete.
+    let finished = preview_rule_within(&store, request(), slot(), 100, preview_deadline())
+        .await
+        .expect("a preview within its deadline completes");
+    assert_eq!(finished.scanned_event_count, 3);
+    assert!(!finished.scan_truncated);
+    assert!(!finished.deadline_exceeded);
+    assert!(finished.complete);
+    drop(slot());
 }
 
 #[tokio::test]
@@ -4326,7 +4547,7 @@ async fn policy_rule_preview_moderate_scale_completes_under_two_seconds() {
     };
 
     let started = Instant::now();
-    let response = preview_rule(&store, request)
+    let response = preview_rule(&store, request, preview_slot())
         .await
         .expect("preview should complete");
     let elapsed = started.elapsed();
@@ -5398,6 +5619,9 @@ mod cluster_policy_tests {
             rbac_state: Some(rbac_state.clone().with_revision_gate(gate.clone())),
             history_store: Some(store.clone() as Arc<dyn storage::PolicyHistory>),
             draft_store: Some(Arc::new(store.draft_store()) as Arc<dyn storage::PolicyDraftStore>),
+            test_suite_store: Some(
+                Arc::new(store.test_suite_store()) as Arc<dyn storage::PolicyTestSuiteStore>
+            ),
             control_plane: Some(store as Arc<dyn storage::PolicyControlPlane>),
             membership,
             event_store: None,
@@ -5414,6 +5638,8 @@ mod cluster_policy_tests {
             )
             .route(POLICY_HISTORY_ADMIN_ROUTE, get(policy_history_endpoint))
             .route(POLICY_ROLLBACK_ADMIN_ROUTE, post(policy_rollback_endpoint))
+            .route(POLICY_RULES_ADMIN_ROUTE, post(policy_rule_post_endpoint))
+            .route(POLICY_VALIDATE_ADMIN_ROUTE, post(policy_validate_endpoint))
             .route(
                 POLICY_DRAFTS_ADMIN_ROUTE,
                 get(policy_drafts_list_endpoint).post(policy_draft_create_endpoint),
@@ -5428,6 +5654,16 @@ mod cluster_policy_tests {
                 POLICY_SIMULATIONS_ADMIN_ROUTE,
                 post(policy_simulations_endpoint).layer(Extension(Arc::new(
                     PolicyEvaluationLimiter::new(MAX_CONCURRENT_POLICY_SIMULATIONS),
+                ))),
+            )
+            .route(
+                POLICY_TESTS_ADMIN_ROUTE,
+                get(policy_tests_get_endpoint).put(policy_tests_put_endpoint),
+            )
+            .route(
+                POLICY_TEST_RUNS_ADMIN_ROUTE,
+                post(policy_test_runs_endpoint).layer(Extension(Arc::new(
+                    PolicyEvaluationLimiter::new(MAX_CONCURRENT_POLICY_TEST_RUNS),
                 ))),
             )
             .with_state(policy_state.clone())
@@ -5720,32 +5956,194 @@ mod cluster_policy_tests {
         );
     }
 
-    /// Policy v1 is document format 1, and no replica of this build
-    /// advertises it (`cluster_membership::DOCUMENT_VERSION_RANGE`), so the
-    /// policy API refuses to commit one with a `400` and writes nothing. The
-    /// store refuses the same candidate if a caller skips that check, and a
-    /// 0.x document on the same path is committed as before.
+    /// A policy v1 document whose admin role can read and write the policy,
+    /// with an id on its one rule.
+    fn cluster_v1_policy_json(id: &str) -> String {
+        format!(
+            r#"{{
+                    "schema_version": "1.0.0",
+                    "id": "{id}",
+                    "default_action": "deny",
+                    "roles": {{
+                        "admin": {{ "permissions": ["admin:policy:read", "admin:policy:write"] }}
+                    }},
+                    "rules": [{{ "id": "deny-internal", "path": "/internal/**", "action": "deny" }}]
+                }}"#
+        )
+    }
+
+    /// This replica's roster: a membership of this build, its boot row
+    /// written.
+    async fn registered_replica(
+        pool: &deadpool_postgres::Pool,
+        deployment: &str,
+    ) -> Arc<cluster_membership::ClusterMembership> {
+        use crate::storage::{MemberRegistration, PostgresMembershipStore};
+
+        let membership = cluster_membership::ClusterMembership::new(
+            PostgresMembershipStore::new(
+                pool.clone(),
+                deployment,
+                crate::ha::InstanceIdentity::generate(),
+            ),
+            MemberRegistration {
+                binary_version: env!("CARGO_PKG_VERSION").to_owned(),
+                schema_version: migrations::schema_version_range(),
+                document_version: cluster_membership::DOCUMENT_VERSION_RANGE,
+                fingerprint: "b".repeat(64),
+                capabilities: storage::compatibility::BINARY_CAPABILITIES.to_vec(),
+            },
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+        );
+        membership.register_boot().await.expect("boot row");
+        membership
+    }
+
+    /// A live replica of the build before policy v1 in cluster mode: this
+    /// schema and every capability that build had, but not
+    /// `policy_document_v1`, and document formats `0..=0`.
+    async fn insert_pre_v1_member(pool: &deadpool_postgres::Pool, deployment: &str) -> uuid::Uuid {
+        let member = uuid::Uuid::new_v4();
+        let (schema_min, schema_max) = migrations::schema_version_range();
+        pool.get()
+            .await
+            .expect("client")
+            .execute(
+                "INSERT INTO greengateway.cluster_members
+                     (deployment_id, instance_id, boot_id, binary_version,
+                      schema_version_min, schema_version_max,
+                      document_version_min, document_version_max, fingerprint,
+                      capabilities)
+                 VALUES ($1, $2::text::uuid, $3::text::uuid, 'pre-v1', $4, $5, 0, 0,
+                         repeat('b', 64),
+                         'delegated_token_purges,openapi_discovery_catalogs,'
+                         || 'openapi_swagger2_catalogs,operation_requirements,'
+                         || 'policy_role_descriptions')",
+                &[
+                    &deployment,
+                    &member.to_string(),
+                    &uuid::Uuid::new_v4().to_string(),
+                    &schema_min,
+                    &schema_max,
+                ],
+            )
+            .await
+            .expect("a pre-v1 member row inserts");
+        member
+    }
+
+    /// A live replica of the build that serves policy v1 in cluster mode but
+    /// refuses every rule condition: this schema, document formats `0..=1`
+    /// and every capability that build had, but not `policy_rule_conditions`.
+    async fn insert_pre_conditions_member(
+        pool: &deadpool_postgres::Pool,
+        deployment: &str,
+    ) -> uuid::Uuid {
+        let member = uuid::Uuid::new_v4();
+        let (schema_min, schema_max) = migrations::schema_version_range();
+        pool.get()
+            .await
+            .expect("client")
+            .execute(
+                "INSERT INTO greengateway.cluster_members
+                     (deployment_id, instance_id, boot_id, binary_version,
+                      schema_version_min, schema_version_max,
+                      document_version_min, document_version_max, fingerprint,
+                      capabilities)
+                 VALUES ($1, $2::text::uuid, $3::text::uuid, 'pre-conditions', $4, $5, 0, 1,
+                         repeat('b', 64),
+                         'delegated_token_purges,openapi_discovery_catalogs,'
+                         || 'openapi_swagger2_catalogs,operation_requirements,'
+                         || 'policy_document_v1,policy_role_descriptions')",
+                &[
+                    &deployment,
+                    &member.to_string(),
+                    &uuid::Uuid::new_v4().to_string(),
+                    &schema_min,
+                    &schema_max,
+                ],
+            )
+            .await
+            .expect("a pre-conditions member row inserts");
+        member
+    }
+
+    async fn backdate_member(pool: &deadpool_postgres::Pool, member: uuid::Uuid) {
+        pool.get()
+            .await
+            .expect("client")
+            .execute(
+                "UPDATE greengateway.cluster_members
+                 SET last_heartbeat_at = now() - interval '60 seconds'
+                 WHERE instance_id = $1::text::uuid",
+                &[&member.to_string()],
+            )
+            .await
+            .expect("backdate the member");
+    }
+
+    /// Issue #243's registered operation through the policy API. A policy
+    /// v1 document is committed in cluster mode only while every live
+    /// member reads format 1 (`policy_document_v1`): validation says so in
+    /// advance with `document_format_unsupported_in_cluster`, which blocks
+    /// publication alone; `PUT`, a rule route and a rollback to a v1
+    /// revision are refused with `409 capability_not_advertised`, write no
+    /// version and are audited; no roster at all is a `503`. Once the older
+    /// member has left, the same `PUT` commits the document and it is served
+    /// back, read from the authority and from history as v1. A rollback to
+    /// a 0.x revision needs nothing of the roster and restores that revision
+    /// exactly, never with v1's semantics. A v1 document whose conditions
+    /// read a tool argument is refused for what this build does not enforce,
+    /// in cluster mode as in standalone, never for its format.
     #[tokio::test]
-    async fn cluster_policy_refuses_to_commit_a_v1_document() {
+    async fn cluster_policy_v1_documents_wait_for_every_live_member_to_read_them() {
         let Some(admin_dsn) = locator() else {
             eprintln!("skipping: no test database locator; CI runs this test");
             return;
         };
         let database = create_test_database(&admin_dsn).await;
         let (store, pool) = migrated_policy_foundation(&database.dsn).await;
-        let active = initialize(&store, "v1-init").await;
+        let seeded = initialize(&store, "v1-gate-init").await;
+        let validate = |router: Router, document: String| async move {
+            refusal_of(
+                router
+                    .oneshot(admin_request(
+                        Method::POST,
+                        POLICY_VALIDATE_ADMIN_ROUTE,
+                        Some(("*", &document)),
+                    ))
+                    .await
+                    .expect("validate should complete"),
+            )
+            .await
+        };
+        let format_diagnostic = |body: &Value| {
+            body["diagnostics"]
+                .as_array()
+                .and_then(|diagnostics| {
+                    diagnostics
+                        .iter()
+                        .find(|diagnostic| {
+                            diagnostic["code"] == "document_format_unsupported_in_cluster"
+                        })
+                        .cloned()
+                })
+                .unwrap_or(Value::Null)
+        };
+
+        // No roster to ask: validation and the write both refuse.
         let (router, rbac_state) = cluster_policy_router(store.clone());
         rbac_state
-            .install_revision_snapshot(active.policy.clone(), active.security_revision)
+            .install_revision_snapshot(seeded.policy.clone(), seeded.security_revision)
             .await
             .expect("the authority's revision should install");
-        let v1 = r#"{
-            "schema_version": "1.0.0",
-            "id": "v1-held",
-            "default_action": "deny",
-            "roles": { "admin": { "permissions": ["admin:policy:read", "admin:policy:write"] } }
-        }"#;
-
+        let (status, body) = validate(router.clone(), cluster_v1_policy_json("v1-orphan")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["errors"].to_string().contains("roster_unavailable"),
+            "{body}"
+        );
         let before = policy_version_count(&pool).await;
         let (status, body) = refusal_of(
             router
@@ -5753,64 +6151,742 @@ mod cluster_policy_tests {
                 .oneshot(admin_request(
                     Method::PUT,
                     POLICY_ADMIN_ROUTE,
-                    Some((&active.etag, v1)),
+                    Some((&seeded.etag, &cluster_v1_policy_json("v1-orphan"))),
+                ))
+                .await
+                .expect("PUT should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["reason"], "roster_unavailable");
+        assert_eq!(policy_version_count(&pool).await, before);
+
+        // A roster holding this replica and a live replica of the build
+        // before v1.
+        let deployment = "deploy-cluster-policy-v1";
+        let membership = registered_replica(&pool, deployment).await;
+        let older = insert_pre_v1_member(&pool, deployment).await;
+        let capture = audit::sink::tests::CaptureSink::new();
+        let (router, rbac_state) = cluster_policy_router_with(
+            store.clone(),
+            Some(membership),
+            audit::AuditLog::new(Arc::new(capture.clone())),
+        );
+        rbac_state
+            .install_revision_snapshot(seeded.policy.clone(), seeded.security_revision)
+            .await
+            .expect("the authority's revision should install");
+
+        let (status, body) = validate(router.clone(), cluster_v1_policy_json("v1-held")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let diagnostic = format_diagnostic(&body);
+        assert_eq!(diagnostic["pointer"], "/schema_version", "{body}");
+        assert_eq!(
+            diagnostic["blocks"],
+            json!({ "simulation": false, "tests": false, "publication": true, "evidence": false })
+        );
+        assert!(
+            body["errors"]
+                .to_string()
+                .contains("capability_not_advertised"),
+            "{body}"
+        );
+        assert!(
+            !body.to_string().contains(&older.to_string()),
+            "validation names no member: {body}"
+        );
+        let (status, body) = validate(router.clone(), cluster_policy_json("v0-validated")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a 0.x document asks no roster: {body}"
+        );
+
+        let (status, body) = refusal_of(
+            router
+                .clone()
+                .oneshot(admin_request(
+                    Method::PUT,
+                    POLICY_ADMIN_ROUTE,
+                    Some((&seeded.etag, &cluster_v1_policy_json("v1-held"))),
+                ))
+                .await
+                .expect("PUT should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["reason"], "capability_not_advertised");
+        assert!(
+            !body.to_string().contains(&older.to_string()),
+            "a refusal names no member: {body}"
+        );
+        assert_eq!(
+            policy_version_count(&pool).await,
+            before,
+            "a refused write commits nothing"
+        );
+
+        // A tool_argument condition is refused for what this build does
+        // not enforce, before any roster is asked.
+        let typed = json!({
+            "schema_version": "1.0.0",
+            "id": "v1-typed",
+            "default_action": "deny",
+            "roles": { "admin": { "permissions": ["admin:policy:read", "admin:policy:write"] } },
+            "rules": [{
+                "id": "eu-exports",
+                "tool_name": "reports.export",
+                "action": "deny",
+                "conditions": { "tool_argument": { "pointer": "/region", "in": ["eu"] } }
+            }]
+        })
+        .to_string();
+        let (status, body) = refusal_of(
+            router
+                .clone()
+                .oneshot(admin_request(
+                    Method::PUT,
+                    POLICY_ADMIN_ROUTE,
+                    Some((&seeded.etag, &typed)),
                 ))
                 .await
                 .expect("PUT should complete"),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert_eq!(body["valid"], json!(false));
+        let refusal = body["errors"].to_string();
         assert!(
-            body["errors"][0]
-                .as_str()
-                .unwrap_or_default()
-                .contains("cannot be committed in cluster mode"),
+            refusal.contains("does not yet enforce") && !refusal.contains("cluster mode"),
             "{body}"
         );
         assert_eq!(policy_version_count(&pool).await, before);
 
-        let candidate = parse_policy_body(&Bytes::from(v1)).expect("a valid v1 document");
-        let refused = PolicyControlPlane::commit(
-            store.as_ref(),
-            PolicyCommitRequest {
-                precondition: PolicyCommitPrecondition::Expected {
-                    etag: active.etag.clone(),
-                },
-                candidate: &candidate,
-                change: crate::storage::DocumentChange::test_policy("test"),
-                diff_summary: &DIFF,
-            },
-        )
-        .await;
-        assert!(
-            matches!(refused, Err(storage::PolicyCommitError::Store(_))),
-            "the store must refuse a document no replica reads"
-        );
-        assert_eq!(policy_version_count(&pool).await, before);
-
-        let committed = router
+        // The older member's row goes stale: the same write is admitted and
+        // the document is served back, and read back, as v1.
+        backdate_member(&pool, older).await;
+        let (status, _) = validate(router.clone(), cluster_v1_policy_json("v1-admitted")).await;
+        assert_eq!(status, StatusCode::OK);
+        let admitted = router
+            .clone()
             .oneshot(admin_request(
                 Method::PUT,
                 POLICY_ADMIN_ROUTE,
-                Some((&active.etag, &cluster_policy_json("v0-after"))),
+                Some((&seeded.etag, &cluster_v1_policy_json("v1-admitted"))),
             ))
             .await
             .expect("PUT should complete");
-        assert_eq!(committed.status(), StatusCode::OK);
+        assert_eq!(admitted.status(), StatusCode::OK);
+        let v1_etag = admitted
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("ETag header")
+            .to_owned();
+        let (_, served) = refusal_of(admitted).await;
+        assert_eq!(served["schema_version"], "1.0.0");
+        assert_eq!(served["rules"][0]["id"], "deny-internal");
         assert_eq!(policy_version_count(&pool).await, before + 1);
+        let active = store
+            .active()
+            .await
+            .expect("active read")
+            .expect("the deployment is initialized");
+        assert_eq!(active.etag, v1_etag);
+        assert_eq!(active.policy.schema_version, "1.0.0");
+        let v1_version = active.version;
+        let historical = store
+            .get_version(v1_version)
+            .await
+            .expect("history read")
+            .expect("the v1 version is in history");
+        assert_eq!(historical.policy.as_ref(), Some(&active.policy));
+
+        // A replica of the earlier build joins again. A rule route over the
+        // v1 document writes a v1 document, so it is refused.
+        let returned = insert_pre_v1_member(&pool, deployment).await;
+        let (status, body) = refusal_of(
+            router
+                .clone()
+                .oneshot(admin_request(
+                    Method::POST,
+                    POLICY_RULES_ADMIN_ROUTE,
+                    Some((
+                        &v1_etag,
+                        &json!({ "id": "deny-ops", "path": "/ops/**", "action": "deny" })
+                            .to_string(),
+                    )),
+                ))
+                .await
+                .expect("rule POST should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["reason"], "capability_not_advertised");
+        assert_eq!(policy_version_count(&pool).await, before + 1);
+
+        // Rolling back to the 0.x revision needs nothing of the roster, and
+        // restores that document exactly: the same ETag, no v1 member.
+        let rolled_back = router
+            .clone()
+            .oneshot(admin_request(
+                Method::POST,
+                &format!("/v1/admin/policy/rollback/{}", seeded.version),
+                Some((&v1_etag, "")),
+            ))
+            .await
+            .expect("rollback should complete");
+        assert_eq!(rolled_back.status(), StatusCode::OK);
+        let restored_etag = rolled_back
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("ETag header")
+            .to_owned();
+        assert_eq!(restored_etag, seeded.etag, "the 0.x revision, exactly");
+        let (_, restored) = refusal_of(rolled_back).await;
+        assert_eq!(restored["schema_version"], "0.1.0");
+        assert!(
+            restored["rules"]
+                .as_array()
+                .is_none_or(|rules| rules.iter().all(|rule| rule.get("id").is_none())),
+            "{restored}"
+        );
+        assert_eq!(policy_version_count(&pool).await, before + 2);
+
+        // Rolling forward to the v1 revision is a v1 write, and is refused.
+        let (status, body) = refusal_of(
+            router
+                .clone()
+                .oneshot(admin_request(
+                    Method::POST,
+                    &format!("/v1/admin/policy/rollback/{v1_version}"),
+                    Some((&restored_etag, "")),
+                ))
+                .await
+                .expect("rollback should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["reason"], "capability_not_advertised");
+        assert_eq!(policy_version_count(&pool).await, before + 2);
+
+        // Three refused writes, three audit events, none naming a member.
+        let started = std::time::Instant::now();
+        let refusals = || {
+            capture
+                .events()
+                .into_iter()
+                .filter(|event| event.event_type == "cluster.operation_refused")
+                .collect::<Vec<_>>()
+        };
+        while refusals().len() < 3 && started.elapsed() < Duration::from_secs(5) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let refused = refusals();
+        assert_eq!(
+            refused.len(),
+            3,
+            "validation audits nothing; each write once"
+        );
+        for event in &refused {
+            assert_eq!(event.payload["operation"], "policy.document_v1");
+            assert_eq!(event.payload["capability"], "policy_document_v1");
+            assert_eq!(event.payload["document_format"], 1);
+            assert_eq!(event.payload["lacking_members"], 1);
+            let rendered = event.payload.to_string();
+            assert!(!rendered.contains(&older.to_string()));
+            assert!(!rendered.contains(&returned.to_string()));
+        }
     }
 
-    /// What cluster mode cannot commit it does not save or simulate either
-    /// (issue #243 review). A draft whose candidate is policy v1 is refused
-    /// on create and on patch with the `400` a `PUT` of the same document
-    /// gets, and a simulation of an inline v1 candidate with the `422`
-    /// `POST /policy/validate` and a test run give it, as soon as the
-    /// candidate is read rather than when someone tries to commit it. Nothing
-    /// is committed, and a 0.x candidate on the same paths still is
-    /// accepted.
+    /// A policy v1 document like [`cluster_v1_policy_json`] whose one rule
+    /// allows `/internal/**` only from `10.0.0.0/8`.
+    fn cluster_conditioned_policy_json(id: &str) -> String {
+        json!({
+            "schema_version": "1.0.0",
+            "id": id,
+            "default_action": "deny",
+            "roles": { "admin": { "permissions": ["admin:policy:read", "admin:policy:write"] } },
+            "rules": [{
+                "id": "internal-only",
+                "path": "/internal/**",
+                "action": "allow",
+                "conditions": { "source_network": { "cidrs": ["10.0.0.0/8"] } }
+            }]
+        })
+        .to_string()
+    }
+
+    /// Issue #243's rule conditions through the policy API in cluster mode.
+    /// A replica of the build that serves policy v1 but refuses every rule
+    /// condition reads format 1, so a v1 document without conditions is
+    /// committed while it is live; one whose rules carry conditions is the
+    /// registered operation `policy.rule_conditions` as well, refused with
+    /// `409 capability_not_advertised`, writing no version, audited once
+    /// and naming no member. Once that replica has left, the same `PUT`
+    /// commits the document and its conditions are served back.
     #[tokio::test]
-    async fn cluster_drafts_and_simulations_refuse_a_candidate_the_cluster_cannot_commit() {
+    async fn cluster_policy_rule_conditions_wait_for_every_live_member() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_policy_foundation(&database.dsn).await;
+        let seeded = initialize(&store, "conditions-gate-init").await;
+        let deployment = "deploy-cluster-policy-conditions";
+        let membership = registered_replica(&pool, deployment).await;
+        let older = insert_pre_conditions_member(&pool, deployment).await;
+        let capture = audit::sink::tests::CaptureSink::new();
+        let (router, rbac_state) = cluster_policy_router_with(
+            store.clone(),
+            Some(membership),
+            audit::AuditLog::new(Arc::new(capture.clone())),
+        );
+        rbac_state
+            .install_revision_snapshot(seeded.policy.clone(), seeded.security_revision)
+            .await
+            .expect("the authority's revision should install");
+        let before = policy_version_count(&pool).await;
+
+        let (status, body) = refusal_of(
+            router
+                .clone()
+                .oneshot(admin_request(
+                    Method::PUT,
+                    POLICY_ADMIN_ROUTE,
+                    Some((
+                        &seeded.etag,
+                        &cluster_conditioned_policy_json("conditions-held"),
+                    )),
+                ))
+                .await
+                .expect("PUT should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["reason"], "capability_not_advertised");
+        assert!(
+            !body.to_string().contains(&older.to_string()),
+            "a refusal names no member: {body}"
+        );
+        assert_eq!(
+            policy_version_count(&pool).await,
+            before,
+            "a refused write commits nothing"
+        );
+
+        // The same replica reads a v1 document without conditions.
+        let plain = router
+            .clone()
+            .oneshot(admin_request(
+                Method::PUT,
+                POLICY_ADMIN_ROUTE,
+                Some((&seeded.etag, &cluster_v1_policy_json("v1-unconditioned"))),
+            ))
+            .await
+            .expect("PUT should complete");
+        assert_eq!(plain.status(), StatusCode::OK);
+        let plain_etag = plain
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("ETag header")
+            .to_owned();
+        assert_eq!(policy_version_count(&pool).await, before + 1);
+
+        let started = std::time::Instant::now();
+        let refusals = || {
+            capture
+                .events()
+                .into_iter()
+                .filter(|event| event.event_type == "cluster.operation_refused")
+                .collect::<Vec<_>>()
+        };
+        while refusals().is_empty() && started.elapsed() < Duration::from_secs(5) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let refused = refusals();
+        assert_eq!(refused.len(), 1, "one refused write, one audit event");
+        assert_eq!(refused[0].payload["operation"], "policy.rule_conditions");
+        assert_eq!(refused[0].payload["capability"], "policy_rule_conditions");
+        assert_eq!(refused[0].payload["document_format"], 1);
+        assert_eq!(refused[0].payload["lacking_members"], 1);
+        assert!(!refused[0].payload.to_string().contains(&older.to_string()));
+
+        // The older replica's row goes stale: the conditions are committed
+        // and served back exactly.
+        backdate_member(&pool, older).await;
+        let admitted = router
+            .clone()
+            .oneshot(admin_request(
+                Method::PUT,
+                POLICY_ADMIN_ROUTE,
+                Some((
+                    &plain_etag,
+                    &cluster_conditioned_policy_json("conditions-admitted"),
+                )),
+            ))
+            .await
+            .expect("PUT should complete");
+        assert_eq!(admitted.status(), StatusCode::OK);
+        let (_, served) = refusal_of(admitted).await;
+        assert_eq!(
+            served["rules"][0]["conditions"]["source_network"]["cidrs"][0], "10.0.0.0/8",
+            "{served}"
+        );
+        assert_eq!(policy_version_count(&pool).await, before + 2);
+        let active = store
+            .active()
+            .await
+            .expect("active read")
+            .expect("the deployment is initialized");
+        assert!(active.policy.uses_rule_conditions());
+        assert_eq!(refusals().len(), 1, "the admitted write is not refused");
+    }
+
+    const MAPPED_ISSUER: &str = "https://idp.example.test";
+
+    /// A policy v1 document in mapped-role mode: `admin` reads and writes
+    /// the policy, and only the identity mapping grants it, to a principal
+    /// of [`MAPPED_ISSUER`] claiming `idp-admin` in `organization`.
+    fn mapped_v1_policy_json(id: &str, organization: &str) -> String {
+        json!({
+            "schema_version": "1.0.0",
+            "id": id,
+            "default_action": "deny",
+            "roles": {
+                "admin": { "permissions": ["admin:policy:read", "admin:policy:write"] }
+            },
+            "identity_mappings": [{
+                "id": "idp-admins",
+                "issuer": MAPPED_ISSUER,
+                "organizations": [organization],
+                "claimed_roles": ["idp-admin"],
+                "grant_roles": ["admin"]
+            }],
+            "rules": [{ "id": "deny-internal", "path": "/internal/**", "action": "deny" }]
+        })
+        .to_string()
+    }
+
+    fn mapped_principal(
+        issuer: Option<&str>,
+        organization: Option<&str>,
+        roles: &[&str],
+    ) -> auth::Principal {
+        let mut principal = test_principal(roles);
+        principal.issuer = issuer.map(str::to_owned);
+        principal.org_id = organization.map(str::to_owned);
+        principal
+    }
+
+    /// What one mode answers a request: its status, the code and pointer of
+    /// every error diagnostic it reports, and its free-text errors.
+    async fn judged(
+        router: &Router,
+        request: Request<Body>,
+    ) -> (StatusCode, Vec<(String, String)>, String) {
+        let response = router
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("the request should complete");
+        let status = response.status();
+        let body = json_body(response).await;
+        let mut errors: Vec<(String, String)> = body["diagnostics"]
+            .as_array()
+            .map(|diagnostics| {
+                diagnostics
+                    .iter()
+                    .filter(|diagnostic| diagnostic["severity"] == "error")
+                    .map(|diagnostic| {
+                        (
+                            diagnostic["code"].as_str().unwrap_or_default().to_owned(),
+                            diagnostic["pointer"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_owned(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        errors.sort();
+        (status, errors, body["errors"].to_string())
+    }
+
+    /// Identity mappings in cluster mode (issue #243) are judged exactly as
+    /// standalone mode judges them, request for request, from the same
+    /// 0.x policy: validation and `PUT` refuse a move to mapped-role mode
+    /// that leaves the publisher no mapping granting it the policy write
+    /// (`publisher_policy_write_lost` at `/identity_mappings`), refuse a
+    /// `tool_argument` condition (`typed_matchers_not_enforced`), and commit
+    /// a mapped
+    /// document that keeps the publisher's write -- in cluster mode once the
+    /// operation gate admits format 1 -- and serve it with its mappings.
+    /// From then on the management lane judges every principal by the
+    /// internal roles its mappings grant from the organization its issuer
+    /// verified: a claimed `admin`, another issuer, another organization or
+    /// none hold nothing.
+    #[tokio::test]
+    async fn cluster_identity_mappings_are_judged_exactly_as_standalone_judges_them() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_policy_foundation(&database.dsn).await;
+        let seeded = initialize(&store, "mapped-seed").await;
+        let membership = registered_replica(&pool, "deploy-cluster-policy-mapped").await;
+        let (cluster, rbac_state) =
+            cluster_policy_router_with(store.clone(), Some(membership), test_audit_log());
+        rbac_state
+            .install_revision_snapshot(seeded.policy.clone(), seeded.security_revision)
+            .await
+            .expect("the authority's revision should install");
+
+        let policy_file = TempPolicyFile::new(&cluster_policy_json("mapped-seed"));
+        let mut config = policy_admin_config_with_sqlite(Some(&policy_file), None);
+        config
+            .rbac_exempt_paths
+            .push(POLICY_VALIDATE_ADMIN_ROUTE.to_owned());
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let standalone = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("the standalone app should build");
+        let (standalone_etag, _) = current_policy(&standalone).await;
+
+        let publisher = || {
+            mapped_principal(
+                Some(MAPPED_ISSUER),
+                Some("org-456"),
+                &["admin", "idp-admin"],
+            )
+        };
+        let conditioned = json!({
+            "schema_version": "1.0.0",
+            "id": "mapped-conditioned",
+            "default_action": "deny",
+            "roles": { "admin": { "permissions": ["admin:policy:read", "admin:policy:write"] } },
+            "rules": [{
+                "id": "eu-exports",
+                "tool_name": "reports.export",
+                "action": "deny",
+                "conditions": { "tool_argument": { "pointer": "/region", "in": ["eu"] } }
+            }]
+        })
+        .to_string();
+        let lost = vec![(
+            "publisher_policy_write_lost".to_owned(),
+            "/identity_mappings".to_owned(),
+        )];
+        let typed = vec![(
+            "typed_matchers_not_enforced".to_owned(),
+            "/rules/0/conditions".to_owned(),
+        )];
+        let mut answers = Vec::new();
+
+        for (mode, router, etag) in [
+            ("standalone", &standalone, standalone_etag.as_str()),
+            ("cluster", &cluster, seeded.etag.as_str()),
+        ] {
+            let validated = judged(
+                router,
+                policy_admin_request(
+                    Method::POST,
+                    POLICY_VALIDATE_ADMIN_ROUTE,
+                    Some(publisher()),
+                    Some(mapped_v1_policy_json("mapped-elsewhere", "other-org")),
+                    None,
+                ),
+            )
+            .await;
+            assert_eq!(
+                (validated.0, &validated.1),
+                (StatusCode::BAD_REQUEST, &lost),
+                "{mode}: {}",
+                validated.2
+            );
+            let replaced = judged(
+                router,
+                policy_admin_request(
+                    Method::PUT,
+                    POLICY_ADMIN_ROUTE,
+                    Some(publisher()),
+                    Some(mapped_v1_policy_json("mapped-elsewhere", "other-org")),
+                    Some(etag),
+                ),
+            )
+            .await;
+            assert_eq!(
+                (replaced.0, &replaced.1),
+                (StatusCode::BAD_REQUEST, &lost),
+                "{mode}: {}",
+                replaced.2
+            );
+            let typed_validated = judged(
+                router,
+                policy_admin_request(
+                    Method::POST,
+                    POLICY_VALIDATE_ADMIN_ROUTE,
+                    Some(publisher()),
+                    Some(conditioned.clone()),
+                    None,
+                ),
+            )
+            .await;
+            assert_eq!(
+                (typed_validated.0, &typed_validated.1),
+                (StatusCode::BAD_REQUEST, &typed),
+                "{mode}: {}",
+                typed_validated.2
+            );
+            let refused = judged(
+                router,
+                policy_admin_request(
+                    Method::PUT,
+                    POLICY_ADMIN_ROUTE,
+                    Some(publisher()),
+                    Some(conditioned.clone()),
+                    Some(etag),
+                ),
+            )
+            .await;
+            assert_eq!(refused.0, StatusCode::BAD_REQUEST, "{mode}");
+            assert!(
+                refused.2.contains("does not yet enforce") && !refused.2.contains("cluster mode"),
+                "{mode}: {}",
+                refused.2
+            );
+            assert_eq!(
+                current_policy(router).await.0,
+                etag,
+                "{mode}: nothing was written"
+            );
+
+            let validated = judged(
+                router,
+                policy_admin_request(
+                    Method::POST,
+                    POLICY_VALIDATE_ADMIN_ROUTE,
+                    Some(publisher()),
+                    Some(mapped_v1_policy_json("mapped", "org-456")),
+                    None,
+                ),
+            )
+            .await;
+            assert_eq!(
+                (validated.0, validated.1.is_empty()),
+                (StatusCode::OK, true),
+                "{mode}: {:?}",
+                validated.1
+            );
+            let committed = router
+                .clone()
+                .oneshot(policy_admin_request(
+                    Method::PUT,
+                    POLICY_ADMIN_ROUTE,
+                    Some(publisher()),
+                    Some(mapped_v1_policy_json("mapped", "org-456")),
+                    Some(etag),
+                ))
+                .await
+                .expect("PUT should complete");
+            assert_eq!(committed.status(), StatusCode::OK, "{mode}");
+            let served = json_body(committed).await;
+            assert_eq!(served["schema_version"], "1.0.0", "{mode}");
+            assert_eq!(
+                served["identity_mappings"][0]["id"], "idp-admins",
+                "{mode}: {served}"
+            );
+
+            let mut statuses = Vec::new();
+            for (principal, expected) in [
+                (
+                    mapped_principal(Some(MAPPED_ISSUER), Some("org-456"), &["idp-admin"]),
+                    StatusCode::OK,
+                ),
+                (publisher(), StatusCode::OK),
+                (test_principal(&["admin"]), StatusCode::FORBIDDEN),
+                (
+                    mapped_principal(Some(MAPPED_ISSUER), Some("org-456"), &["admin"]),
+                    StatusCode::FORBIDDEN,
+                ),
+                (
+                    mapped_principal(Some(MAPPED_ISSUER), Some("other-org"), &["idp-admin"]),
+                    StatusCode::FORBIDDEN,
+                ),
+                (
+                    mapped_principal(Some(MAPPED_ISSUER), None, &["idp-admin"]),
+                    StatusCode::FORBIDDEN,
+                ),
+                (
+                    mapped_principal(
+                        Some("https://other.example.test"),
+                        Some("org-456"),
+                        &["idp-admin"],
+                    ),
+                    StatusCode::FORBIDDEN,
+                ),
+            ] {
+                let response = router
+                    .clone()
+                    .oneshot(policy_admin_request(
+                        Method::GET,
+                        POLICY_ADMIN_ROUTE,
+                        Some(principal.clone()),
+                        None,
+                        None,
+                    ))
+                    .await
+                    .expect("GET should complete");
+                assert_eq!(
+                    response.status(),
+                    expected,
+                    "{mode}: {:?} {:?} {:?}",
+                    principal.issuer,
+                    principal.org_id,
+                    principal.roles
+                );
+                statuses.push(response.status());
+            }
+            answers.push((
+                (validated.0, replaced.0, replaced.1),
+                (typed_validated.0, typed_validated.1, refused.0),
+                statuses,
+            ));
+        }
+        assert_eq!(
+            answers[0], answers[1],
+            "standalone and cluster answer alike"
+        );
+
+        let active = store
+            .active()
+            .await
+            .expect("active read")
+            .expect("the deployment is initialized");
+        assert_eq!(active.policy.schema_version, "1.0.0");
+        assert!(
+            active.policy.identity_mappings.is_some(),
+            "the authority serves the mappings"
+        );
+    }
+
+    /// A policy v1 candidate is one cluster mode commits once every live
+    /// replica reads format 1 (issue #243), so a draft saves one on create
+    /// and on patch, and a simulation evaluates an inline one, exactly as
+    /// for a 0.x candidate. Whether the roster reads v1 is asked when the
+    /// draft is published: here there is no roster to ask, so the
+    /// publication is the gate's `503`, nothing is committed, and the draft
+    /// stays as it was saved.
+    #[tokio::test]
+    async fn cluster_drafts_and_simulations_take_a_v1_candidate_and_publication_asks_the_gate() {
         let Some(admin_dsn) = locator() else {
             eprintln!("skipping: no test database locator; CI runs this test");
             return;
@@ -5842,11 +6918,10 @@ mod cluster_policy_tests {
             .await
             .expect("the authority's revision should install");
         let versions_before = policy_version_count(&pool).await;
-        let v1 = r#"{"schema_version":"1.0.0","id":"v1-held","default_action":"deny"}"#;
-        let refuses_format = |body: &Value| {
-            body["errors"][0]
-                .as_str()
-                .is_some_and(|error| error.contains("cannot be committed in cluster mode"))
+        let v1 = |id: &str| {
+            format!(
+                r#"{{"schema_version":"1.0.0","id":"{id}","default_action":"deny","roles":{{"admin":{{"permissions":["admin:policy:read","admin:policy:write","admin:policy:simulate"]}}}}}}"#
+            )
         };
         let request = |method: Method, uri: &str, if_match: &str, body: String| {
             let mut request = Request::builder()
@@ -5858,22 +6933,14 @@ mod cluster_policy_tests {
             request.extensions_mut().insert(admin_principal());
             request
         };
-
-        let (status, body) = refusal_of(
-            router
-                .clone()
-                .oneshot(request(
-                    Method::POST,
-                    POLICY_DRAFTS_ADMIN_ROUTE,
-                    &active.etag,
-                    format!(r#"{{"policy":{v1}}}"#),
-                ))
-                .await
-                .expect("create should complete"),
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert!(refuses_format(&body), "{body}");
+        let etag_of_response = |response: &Response| {
+            response
+                .headers()
+                .get(header::ETAG)
+                .and_then(|value| value.to_str().ok())
+                .expect("ETag")
+                .to_owned()
+        };
 
         let created = router
             .clone()
@@ -5881,37 +6948,68 @@ mod cluster_policy_tests {
                 Method::POST,
                 POLICY_DRAFTS_ADMIN_ROUTE,
                 &active.etag,
-                "{}".to_owned(),
+                format!(r#"{{"policy":{}}}"#, v1("v1-drafted")),
             ))
             .await
             .expect("create should complete");
         assert_eq!(created.status(), StatusCode::CREATED);
-        let draft_etag = created
-            .headers()
-            .get(header::ETAG)
-            .and_then(|value| value.to_str().ok())
-            .expect("draft ETag")
-            .to_owned();
+        let draft_etag = etag_of_response(&created);
         let (_, draft) = refusal_of(created).await;
-        let draft_uri = format!(
-            "{POLICY_DRAFTS_ADMIN_ROUTE}/{}",
-            draft["draft_id"].as_str().expect("draft id")
-        );
+        let draft_id = draft["draft_id"].as_str().expect("draft id").to_owned();
+        let draft_uri = format!("{POLICY_DRAFTS_ADMIN_ROUTE}/{draft_id}");
+        let patched = router
+            .clone()
+            .oneshot(request(
+                Method::PATCH,
+                &draft_uri,
+                &draft_etag,
+                format!(r#"{{"policy":{}}}"#, v1("v1-patched")),
+            ))
+            .await
+            .expect("patch should complete");
+        assert_eq!(patched.status(), StatusCode::OK);
+        let draft_etag = etag_of_response(&patched);
+
+        let simulation = |policy: &str| {
+            format!(
+                r#"{{"schema_version":"policy-simulation.v1","base_etag":{},"candidate":{{"source":"inline","policy":{policy}}},"cases":[{{"id":"anonymous","kind":"http","request":{{"method":"GET","path":"/x"}},"principal":"anonymous"}}]}}"#,
+                json!(active.etag)
+            )
+        };
+        for candidate in [v1("v1-simulated"), cluster_policy_json("v0-simulated")] {
+            let simulated = router
+                .clone()
+                .oneshot(request(
+                    Method::POST,
+                    POLICY_SIMULATIONS_ADMIN_ROUTE,
+                    &active.etag,
+                    simulation(&candidate),
+                ))
+                .await
+                .expect("simulation should complete");
+            assert_eq!(simulated.status(), StatusCode::OK, "{candidate}");
+        }
+        assert_eq!(policy_version_count(&pool).await, versions_before);
+
+        let mut publish = Request::builder()
+            .method(Method::POST)
+            .uri(format!("{draft_uri}/publish"))
+            .header(POLICY_DRAFT_ETAG_HEADER, &draft_etag)
+            .header(header::IF_MATCH, &active.etag)
+            .body(Body::empty())
+            .expect("request should build");
+        publish.extensions_mut().insert(admin_principal());
         let (status, body) = refusal_of(
             router
                 .clone()
-                .oneshot(request(
-                    Method::PATCH,
-                    &draft_uri,
-                    &draft_etag,
-                    format!(r#"{{"policy":{v1}}}"#),
-                ))
+                .oneshot(publish)
                 .await
-                .expect("patch should complete"),
+                .expect("publish should complete"),
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert!(refuses_format(&body), "{body}");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["reason"], "roster_unavailable");
+        assert_eq!(policy_version_count(&pool).await, versions_before);
         let (status, kept) = refusal_of(
             router
                 .clone()
@@ -5921,42 +7019,11 @@ mod cluster_policy_tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(kept["revision"], 1, "the refused patch saved nothing");
-
-        let simulation = |policy: &str| {
-            format!(
-                r#"{{"schema_version":"policy-simulation.v1","base_etag":{},"candidate":{{"source":"inline","policy":{policy}}},"cases":[{{"id":"anonymous","kind":"http","request":{{"method":"GET","path":"/x"}},"principal":"anonymous"}}]}}"#,
-                json!(active.etag)
-            )
-        };
-        let (status, body) = refusal_of(
-            router
-                .clone()
-                .oneshot(request(
-                    Method::POST,
-                    POLICY_SIMULATIONS_ADMIN_ROUTE,
-                    &active.etag,
-                    simulation(v1),
-                ))
-                .await
-                .expect("simulation should complete"),
-        )
-        .await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-        assert_eq!(body["reason"], "policy_candidate_invalid");
-        assert!(refuses_format(&body), "{body}");
-        let simulated = router
-            .clone()
-            .oneshot(request(
-                Method::POST,
-                POLICY_SIMULATIONS_ADMIN_ROUTE,
-                &active.etag,
-                simulation(&cluster_policy_json("v0-simulated")),
-            ))
-            .await
-            .expect("simulation should complete");
-        assert_eq!(simulated.status(), StatusCode::OK);
-        assert_eq!(policy_version_count(&pool).await, versions_before);
+        assert_eq!(
+            kept["revision"], 2,
+            "the refused publication changed nothing"
+        );
+        assert_eq!(kept["state"], "open", "{kept}");
     }
 
     /// Cluster mode reads a stored candidate from the cluster's authorities
@@ -6940,6 +8007,223 @@ mod cluster_policy_tests {
                     admin_principal().user_id
                 ),
             ]
+        );
+    }
+
+    /// The stored policy test suite in cluster mode (issue #243): a write is
+    /// one versioned-document commit of its own resource -- a version row,
+    /// the next shared security revision, an outbox row and an evidence row
+    /// naming the writer -- and every replica reads and replaces the same
+    /// suite under the same strong ETag. A stale ETag is `412` and writes
+    /// nothing, the policy itself is untouched, and a run of the stored
+    /// suite reads it from the authority.
+    #[tokio::test]
+    async fn cluster_policy_tests_commit_through_the_document_transaction() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_policy_foundation(&database.dsn).await;
+        let tester_policy = parse_policy_body(&Bytes::from(
+            json!({
+                "schema_version": "0.1.0",
+                "id": "suite-init",
+                "default_action": "deny",
+                "roles": {
+                    "admin": {
+                        "permissions": [
+                            "admin:policy:read",
+                            "admin:policy:write",
+                            "admin:policy:simulate"
+                        ]
+                    }
+                }
+            })
+            .to_string(),
+        ))
+        .expect("the tester policy parses");
+        let active = PolicyControlPlane::commit(
+            store.as_ref(),
+            PolicyCommitRequest {
+                precondition: PolicyCommitPrecondition::Initialize,
+                candidate: &tester_policy,
+                change: crate::storage::DocumentChange::test_policy("seed"),
+                diff_summary: &DIFF,
+            },
+        )
+        .await
+        .expect("deployment should initialize");
+        let mut replicas = Vec::new();
+        for _ in 0..2 {
+            let (router, rbac_state) = cluster_policy_router(store.clone());
+            rbac_state
+                .install_revision_snapshot(active.policy.clone(), active.security_revision)
+                .await
+                .expect("the authority's revision should install");
+            replicas.push(router);
+        }
+        let suite_request = |method: Method, headers: &[(&str, &str)], body: String| {
+            let mut builder = Request::builder()
+                .method(method)
+                .uri(POLICY_TESTS_ADMIN_ROUTE);
+            for (name, value) in headers {
+                builder = builder.header(*name, *value);
+            }
+            let mut request = builder
+                .body(Body::from(body))
+                .expect("suite request should build");
+            request.extensions_mut().insert(admin_principal());
+            request
+        };
+        let suite = |description: &str| {
+            json!({
+                "schema_version": "policy-tests.v1",
+                "description": description,
+                "cases": [{
+                    "id": "unrouted-is-denied",
+                    "kind": "http",
+                    "request": { "method": "GET", "path": "/unrouted" },
+                    "principal": "anonymous",
+                    "expect": { "logical": "deny" }
+                }]
+            })
+        };
+
+        let created = replicas[0]
+            .clone()
+            .oneshot(suite_request(
+                Method::PUT,
+                &[("if-none-match", "*")],
+                suite("first").to_string(),
+            ))
+            .await
+            .expect("create should complete");
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let first_etag = created
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("ETag")
+            .to_owned();
+
+        // The other replica reads the same suite, and replaces it.
+        let read = replicas[1]
+            .clone()
+            .oneshot(suite_request(Method::GET, &[], String::new()))
+            .await
+            .expect("read should complete");
+        assert_eq!(etag_of(read).await, first_etag);
+        let replaced = replicas[1]
+            .clone()
+            .oneshot(suite_request(
+                Method::PUT,
+                &[("if-match", &first_etag)],
+                suite("second").to_string(),
+            ))
+            .await
+            .expect("replace should complete");
+        let second_etag = etag_of(replaced).await;
+        assert_ne!(second_etag, first_etag);
+        let (status, body) = refusal_of(
+            replicas[0]
+                .clone()
+                .oneshot(suite_request(
+                    Method::PUT,
+                    &[("if-match", &first_etag)],
+                    suite("stale").to_string(),
+                ))
+                .await
+                .expect("stale write should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{body}");
+        assert_eq!(body["reason"], "policy_tests_etag_mismatch");
+
+        // A run of the stored suite, through the first replica.
+        let run = replicas[0]
+            .clone()
+            .oneshot({
+                let mut request = Request::builder()
+                    .method(Method::POST)
+                    .uri(POLICY_TEST_RUNS_ADMIN_ROUTE)
+                    .body(Body::from(
+                        json!({ "suite": { "source": "stored", "etag": second_etag } }).to_string(),
+                    ))
+                    .expect("run request should build");
+                request.extensions_mut().insert(admin_principal());
+                request
+            })
+            .await
+            .expect("run should complete");
+        let (status, report) = refusal_of(run).await;
+        assert_eq!(status, StatusCode::OK, "{report}");
+        assert_eq!(report["status"], "passed");
+        assert_eq!(report["suite"]["stored"]["etag"], json!(second_etag));
+        assert_eq!(
+            report["policy"]["security_revision"],
+            json!(active.security_revision)
+        );
+
+        // Two suite commits, each with its revision, outbox row and evidence;
+        // the stale write recorded nothing, and the policy is unchanged.
+        let client = pool.get().await.expect("checkout");
+        let outbox: Vec<(i64, String, Option<i64>, i64)> = client
+            .query(
+                "SELECT revision, resource_type, from_version, to_version \
+                 FROM greengateway.security_outbox WHERE revision > $1 ORDER BY revision",
+                &[&active.security_revision],
+            )
+            .await
+            .expect("outbox rows")
+            .iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+            .collect();
+        assert_eq!(outbox.len(), 2, "{outbox:?}");
+        assert!(outbox
+            .iter()
+            .all(|(_, resource, _, _)| resource == "policy_tests"));
+        assert_eq!(outbox[0].2, None);
+        assert_eq!(outbox[1].2, Some(outbox[0].3));
+        let evidence: Vec<(String, String, String, i64)> = client
+            .query(
+                "SELECT action, resource_type, actor_user_id, security_revision \
+                 FROM greengateway.document_change_evidence \
+                 WHERE resource_type = 'policy_tests' ORDER BY security_revision",
+                &[],
+            )
+            .await
+            .expect("evidence rows")
+            .iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+            .collect();
+        let writer = admin_principal().user_id;
+        assert_eq!(
+            evidence,
+            vec![
+                (
+                    "policy_tests.publish".to_owned(),
+                    "policy_tests".to_owned(),
+                    writer.clone(),
+                    outbox[0].0
+                ),
+                (
+                    "policy_tests.publish".to_owned(),
+                    "policy_tests".to_owned(),
+                    writer,
+                    outbox[1].0
+                ),
+            ]
+        );
+        let still = store
+            .active()
+            .await
+            .expect("active read")
+            .expect("active document");
+        assert_eq!(
+            (still.version, still.etag),
+            (active.version, active.etag),
+            "storing a suite changes no policy"
         );
     }
 

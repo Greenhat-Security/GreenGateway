@@ -60,6 +60,7 @@
         "policy.rule.reorder",
         "policy.rule.update",
         "policy.suggestion.accept",
+        "policy_tests.publish",
         "secret.create",
         "secret.delete",
         "secret.external_rotate",
@@ -169,7 +170,8 @@
             "jwt_revocation",
             "configuration",
             "maintenance",
-            "session"
+            "session",
+            "policy_tests"
           ]
         },
         "before": {
