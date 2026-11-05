@@ -226,6 +226,11 @@ mod tests {
             .find(|command| command.name == "ledger rollback")
             .expect("ledger rollback");
         assert_eq!(usage(rollback), "ggctl ledger rollback REVISION [OPTIONS]");
+        let verify = COMMANDS
+            .iter()
+            .find(|command| command.name == "backup verify")
+            .expect("backup verify");
+        assert_eq!(usage(verify), "ggctl backup verify FILE [OPTIONS]");
     }
 
     #[test]
