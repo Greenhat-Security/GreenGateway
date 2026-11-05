@@ -4445,6 +4445,7 @@ async fn suggestions_admin_without_engine_answers_not_configured() {
                 history_store: None,
                 draft_store: None,
                 test_suite_store: None,
+                policy_tests_required: false,
                 #[cfg(feature = "postgres")]
                 control_plane: None,
                 #[cfg(feature = "postgres")]
@@ -5414,6 +5415,133 @@ async fn suggestions_admin_accept_surfaces_policy_etag_conflict_without_transiti
     .await;
     assert_eq!(suggestion_ids(&open_page), vec!["sug-stale".to_owned()]);
     assert!(open_page["suggestions"][0]["transitioned_at"].is_null());
+}
+
+/// The stored suite a suggestion's acceptance is judged by, with
+/// `POLICY_TESTS_REQUIRED` on: it holds `GET /accepted/{id}` closed to the
+/// role the suggestion would grant it to.
+fn suggestion_gate_suite() -> Value {
+    json!({
+        "schema_version": "policy-tests.v1",
+        "cases": [{
+            "id": "accepted-stays-closed",
+            "kind": "http",
+            "request": { "method": "GET", "path": "/accepted/7" },
+            "principal": {
+                "subject": "synthetic-reader",
+                "issuer": "provider:test",
+                "roles": ["accepted-reader"],
+                "auth_method": "bearer_token"
+            },
+            "expect": { "logical": "deny" }
+        }]
+    })
+}
+
+/// A suggestion's acceptance publishes its rule, so with
+/// `POLICY_TESTS_REQUIRED` on it must pass the stored suite: a refused
+/// acceptance writes neither the rule nor the transition, and the
+/// suggestion stays open. Off, the same acceptance goes ahead.
+#[tokio::test]
+async fn a_suggestion_acceptance_must_pass_the_required_policy_tests() {
+    for required in [true, false] {
+        let discovery_db = TempDb::new("suggestions-accept-required-tests");
+        create_rule_suggestion_schema(&discovery_db.path);
+        insert_rule_suggestion(
+            &discovery_db.path,
+            RuleSuggestionSeed {
+                id: "sug-gated",
+                suggestion_type: "baseline_allow",
+                method: "GET",
+                path_pattern: "/accepted/{id}",
+                role: Some("accepted-reader"),
+                action: "allow",
+                rationale: "Observed accepted-reader calls to GET /accepted/{id}.",
+                evidence: json!({ "observation_count": 4 }),
+                state: "open",
+                created_at: "2024-06-01T00:00:00Z",
+                transitioned_at: None,
+                transitioned_by: None,
+                source_signal_id: None,
+            },
+        );
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log = audit::AuditLog::new(Arc::new(capture.clone()));
+        let policy = TempPolicyFile::new(&suggestions_policy_document_string());
+        let mut config = suggestions_admin_config(Some(&discovery_db.path), None, &policy);
+        config.policy_tests_required = required;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            audit_log,
+            test_audit_event_sender(),
+        )
+        .expect("app should build");
+        let mut store = suggestions_admin_request(
+            Method::PUT,
+            POLICY_TESTS_ADMIN_ROUTE,
+            Some(test_principal(&["policy-writer"])),
+            Some(suggestion_gate_suite().to_string()),
+            None,
+        );
+        store
+            .headers_mut()
+            .insert(header::IF_NONE_MATCH, HeaderValue::from_static("*"));
+        let stored = router
+            .clone()
+            .oneshot(store)
+            .await
+            .expect("suite PUT should complete");
+        assert_eq!(stored.status(), StatusCode::CREATED);
+        let etag = suggestions_policy_etag(&router).await;
+
+        let accepted = router
+            .clone()
+            .oneshot(suggestions_admin_request(
+                Method::POST,
+                "/v1/admin/suggestions/sug-gated/accept",
+                Some(test_principal(&["suggestions-policy-writer"])),
+                None,
+                Some(&etag),
+            ))
+            .await
+            .expect("accept request should complete");
+        if !required {
+            assert_eq!(accepted.status(), StatusCode::CREATED);
+            continue;
+        }
+        assert_eq!(accepted.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let refused = json_body(accepted).await;
+        assert_eq!(refused["reason"], json!("policy_tests_required_failed"));
+        assert_eq!(
+            refused["required_tests"]["summary"],
+            json!({ "total": 1, "passed": 0, "failed": 1, "incomplete": 0, "errors": 0 })
+        );
+        assert_eq!(suggestions_policy_etag(&router).await, etag);
+        let open_page = suggestions_json(
+            &router,
+            "/v1/admin/suggestions?state=open",
+            Some(test_principal(&["suggestions-reader"])),
+        )
+        .await;
+        assert_eq!(suggestion_ids(&open_page), vec!["sug-gated".to_owned()]);
+        let refusals = || -> Vec<Value> {
+            capture
+                .events()
+                .into_iter()
+                .filter(|event| event.event_type == audit::event::POLICY_PUBLICATION_REFUSED)
+                .map(|event| event.payload)
+                .collect()
+        };
+        assert_eventually(Duration::from_secs(5), || !refusals().is_empty());
+        let refusals = refusals();
+        let [refusal] = refusals.as_slice() else {
+            panic!("one refusal is audited, not {refusals:?}");
+        };
+        assert_eq!(refusal["action"], json!("rule_created"));
+        assert_eq!(refusal["codes"], json!(["policy_tests_required_failed"]));
+    }
 }
 
 /// Standalone acceptance and a concurrent dismissal of the same
@@ -8404,6 +8532,16 @@ mod cluster_discovery_tests {
         pool: &deadpool_postgres::Pool,
         audit_store: Arc<PostgresAuditEventStore>,
     ) -> ClusterSuggestionsHarness {
+        cluster_suggestions_harness_with(pool, audit_store, false).await
+    }
+
+    /// [`cluster_suggestions_harness`], with `POLICY_TESTS_REQUIRED` on or
+    /// off; on, the policy routes read the cluster's stored suite.
+    async fn cluster_suggestions_harness_with(
+        pool: &deadpool_postgres::Pool,
+        audit_store: Arc<PostgresAuditEventStore>,
+        policy_tests_required: bool,
+    ) -> ClusterSuggestionsHarness {
         let policy = parse_policy_body(&axum::body::Bytes::from(
             suggestions_policy_document_string(),
         ))
@@ -8466,7 +8604,11 @@ mod cluster_discovery_tests {
                     rbac_state: Some(rbac_state.clone()),
                     history_store: Some(policy_store.clone() as Arc<dyn storage::PolicyHistory>),
                     draft_store: None,
-                    test_suite_store: None,
+                    test_suite_store: policy_tests_required.then(|| {
+                        Arc::new(policy_store.test_suite_store())
+                            as Arc<dyn storage::PolicyTestSuiteStore>
+                    }),
+                    policy_tests_required,
                     control_plane: Some(
                         policy_store.clone() as Arc<dyn storage::PolicyControlPlane>
                     ),
@@ -9486,6 +9628,89 @@ mod cluster_discovery_tests {
             after,
             "a refused acceptance must write nothing"
         );
+    }
+
+    /// With `POLICY_TESTS_REQUIRED` on, a cluster acceptance must pass the
+    /// cluster's stored suite before its one transaction runs (issue #243):
+    /// with no suite, or one the candidate fails, neither the rule nor the
+    /// transition is written and the suggestion stays open.
+    #[tokio::test]
+    async fn a_cluster_acceptance_must_pass_the_required_suite() {
+        use crate::storage::PolicyTestSuiteStore as _;
+
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_pool(&database.dsn).await;
+        let audit_store = cluster_audit_store(&pool).await;
+        seed_baseline_generation_fixture(&pool, &audit_store).await;
+        let harness = cluster_suggestions_harness_with(&pool, audit_store, true).await;
+        let id = generate_one_suggestion(&harness.router).await;
+        let accept = |etag: &str| {
+            harness
+                .router
+                .clone()
+                .oneshot(accept_request(&id, Some(etag), Some("1")))
+        };
+
+        let before = acceptance_footprint(&harness.policy_store, &pool, &id).await;
+        let refused = accept(&before.active_etag)
+            .await
+            .expect("accept request should complete");
+        assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let refused = json_body(refused).await;
+        assert_eq!(refused["reason"], json!("policy_tests_required_failed"));
+        assert_eq!(refused["required_tests"]["status"], json!("suite_missing"));
+        assert_eq!(
+            acceptance_footprint(&harness.policy_store, &pool, &id).await,
+            before,
+            "an acceptance with no suite to pass must write nothing"
+        );
+
+        // The suggestion grants orders-reader GET /orders/{id}; the suite
+        // holds that closed.
+        let suite = json!({
+            "schema_version": "policy-tests.v1",
+            "cases": [{
+                "id": "orders-stay-closed",
+                "kind": "http",
+                "request": { "method": "GET", "path": "/orders/7" },
+                "principal": {
+                    "subject": "synthetic-reader",
+                    "issuer": "provider:test",
+                    "roles": ["orders-reader"],
+                    "auth_method": "bearer_token"
+                },
+                "expect": { "logical": "deny" }
+            }]
+        });
+        harness
+            .policy_store
+            .test_suite_store()
+            .commit(
+                crate::storage::policy_tests::PolicyTestSuitePrecondition::Absent,
+                &suite,
+                &test_principal(&["policy-writer"]),
+            )
+            .await
+            .expect("the suite should store");
+        let stored = acceptance_footprint(&harness.policy_store, &pool, &id).await;
+        let refused = accept(&stored.active_etag)
+            .await
+            .expect("accept request should complete");
+        assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            json_body(refused).await["required_tests"]["summary"],
+            json!({ "total": 1, "passed": 0, "failed": 1, "incomplete": 0, "errors": 0 })
+        );
+        let after = acceptance_footprint(&harness.policy_store, &pool, &id).await;
+        assert_eq!(
+            after, stored,
+            "a refused acceptance must write neither half"
+        );
+        assert_eq!(after.suggestion_state, "open");
     }
 
     /// An acceptance whose policy commit loses its compare-and-swap
