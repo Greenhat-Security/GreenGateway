@@ -112,29 +112,14 @@ fn stored_policy_identity(policy: &rbac::Policy) -> ResponseResult<PolicyIdentit
         tracing::error!(error = %error, "failed to compute a stored policy ETag");
         Box::new(internal_server_error("policy ETag computation failed"))
     })?;
+    // A 0.x document has no normative normalization, so no semantic digest:
+    // the report says so rather than inventing one. The installed snapshot's
+    // decision facts name the same digest for the same policy.
     let semantic_digest =
-        match rbac::policy_document::PolicySchema::of_version(&policy.schema_version) {
-            Some(rbac::policy_document::PolicySchema::V1) => {
-                let normalized = serde_json::to_value(policy).map_err(|error| {
-                    tracing::error!(error = %error, "failed to serialize a stored policy");
-                    Box::new(internal_server_error("policy digest computation failed"))
-                })?;
-                Some(
-                    canonical_json::semantic_digest(
-                        rbac::policy_document::POLICY_MEDIA_TYPE,
-                        rbac::policy_document::POLICY_V1_SCHEMA_VERSION,
-                        &normalized,
-                    )
-                    .map_err(|error| {
-                        tracing::error!(error = %error, "a stored policy has no canonical form");
-                        Box::new(internal_server_error("policy digest computation failed"))
-                    })?,
-                )
-            }
-            // A 0.x document has no normative normalization, so no semantic
-            // digest: the report says so rather than inventing one.
-            _ => None,
-        };
+        rbac::policy_document::accepted_policy_semantic_digest(policy).map_err(|_| {
+            tracing::error!("a stored policy has no canonical form");
+            Box::new(internal_server_error("policy digest computation failed"))
+        })?;
     Ok(PolicyIdentity {
         schema_version: policy.schema_version.clone(),
         etag,

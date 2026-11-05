@@ -881,18 +881,24 @@ fn differential_context(
     }
 }
 
-/// Everything an audit record carries except its own id and time.
+/// Everything an audit record carries except its own id and time, and the
+/// policy decision facts (issue #243), which the frozen consumers predate:
+/// the live admission records add them and nothing else.
 fn audit_records(capture: &CaptureSink) -> Vec<Value> {
     capture
         .events()
         .iter()
         .map(|event| {
+            let mut payload = event.payload.clone();
+            if let Some(payload) = payload.as_object_mut() {
+                payload.remove(crate::middleware::decision::POLICY_DECISION_FACTS_MEMBER);
+            }
             json!({
                 "event_type": event.event_type,
                 "request_id": event.request_id,
                 "source_ip": event.source_ip,
                 "actor": serde_json::to_value(&event.actor).unwrap(),
-                "payload": event.payload,
+                "payload": payload,
             })
         })
         .collect()
@@ -997,6 +1003,20 @@ async fn assert_old_and_new_agree(policy: &Policy) {
         "a source's fixed query is never audited"
     );
     assert_eq!(old, audit_records(&capture_new));
+    let with_facts = |capture: &CaptureSink| {
+        capture
+            .events()
+            .iter()
+            .filter(|event| {
+                event
+                    .payload
+                    .get(crate::middleware::decision::POLICY_DECISION_FACTS_MEMBER)
+                    .is_some()
+            })
+            .count()
+    };
+    assert_eq!(with_facts(&capture_old), 0);
+    assert!(with_facts(&capture_new) > 0, "live admissions record facts");
 }
 
 fn auth_method_set(code: u8) -> Option<Value> {
