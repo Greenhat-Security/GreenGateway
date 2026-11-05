@@ -7298,6 +7298,16 @@
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
     {
+      "file": "gateway/src/main.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::use admin_policy_test_gate :: *#1",
+      "sha256": "88b5000e16712f3c60014eb72556124fe9cbcd69866f24b9868107a0b9bd0e0c",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
       "file": "gateway/src/admin_policy_simulations.rs",
       "reasons": [
         "capability-import-or-glob"
@@ -7323,6 +7333,16 @@
         "capability-import-or-glob"
       ],
       "scope": "gateway::admin_policy_evidence::use super :: *#1",
+      "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/admin_policy_test_gate.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::admin_policy_test_gate::use super :: *#1",
       "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
@@ -11122,9 +11142,9 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::middleware::rbac::RbacPolicyState#1",
-      "sha256": "a30db022f49cba05f303e2135003bcd2a232174669c9d8d7d88468fce6a6b4eb",
+      "sha256": "2410eb116827f9fdee5881d98962cc01594fb3ebfba59b5d86a1e99b72251557",
       "owner": "GreenGateway maintainers",
-      "purpose": "Issue #422 structural attribution: the pre-cutover permission engine (engine) and route vector (routes) join the direct-rule matcher as #[cfg(test)] fields kept only for the frozen differential oracles, so serving snapshots carry only the compiled policy, whose own routes, direct rules and permission engine every HTTP and tool-lane decision, audit attribution and management permission reads. cfg gating and doc comments only; no field, client, socket, TLS, DNS or header authority is added."
+      "purpose": "Issue #422 structural attribution: the pre-cutover permission engine (engine) and route vector (routes) join the direct-rule matcher as #[cfg(test)] fields kept only for the frozen differential oracles, so serving snapshots carry only the compiled policy, whose own routes, direct rules and permission engine every HTTP and tool-lane decision, audit attribution and management permission reads. cfg gating and doc comments only; no field, client, socket, TLS, DNS or header authority is added. Reviewed for #243 (decision facts): each snapshot also holds decision_identity, an Arc of the installed policy's ETag, semantic digest and element ids computed once at install; plain data that adds no client, socket, TLS, DNS or header authority."
     },
     {
       "file": "gateway/src/middleware/rbac.rs",
@@ -11142,9 +11162,9 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::middleware::rbac::impl  RbacState::evaluate_tool_authorization#1",
-      "sha256": "0370b17a9b5d0ac912b875882aa1620bf06ff6dbf790dab3b3f9e98f193de30b",
+      "sha256": "485f2075b7291f8b97da57a2c05c0a3d097abca795782422c859234d5c4c0a3a",
       "owner": "GreenGateway maintainers",
-      "purpose": "Issue #243 tool lanes: tool admission now takes the canonical client address the call entered with (std::net::IpAddr, a value) as a policy fact for source_network conditions; a pure data parameter that adds no network, process or transport capability."
+      "purpose": "Issue #243 tool lanes: tool admission now takes the canonical client address the call entered with (std::net::IpAddr, a value) as a policy fact for source_network conditions; a pure data parameter that adds no network, process or transport capability. Reviewed for #243 (decision facts): the authorization handed to the runtime also carries the verdict's decision facts (codes, versions, digests and policy positions); a pure data value that adds no network, process or transport capability."
     },
     {
       "file": "gateway/src/middleware/rbac.rs",
@@ -11182,9 +11202,9 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::middleware::rbac::rbac_middleware#1",
-      "sha256": "67c5fb7a91f70ca6e31e5898fbc64b9611a43d5f5c1f20405a5c9db1b8231400",
+      "sha256": "4bcdcc906b161c70262d1faadfc5ef2ed17d70c77acbb30be8c3109ecac77cc7",
       "owner": "GreenGateway maintainers",
-      "purpose": "Issue #422 HTTP adapter: evaluate the admitted immutable policy snapshot and translate its result into existing audit and response behavior. Existing cfg/cfg_attr inputs only; no new transport, provider, resolver or process authority. Reviewed for #243: the decision is now asked with the facts serving_facts takes from the authenticated principal (its verified organization in mapped-role mode), a pure data read that adds no transport, provider, resolver or process authority. Reviewed for #243 (request conditions): the facts now come from policy_facts::http_request_facts -- the canonical client address under the state's ClientIpPolicy, the referenced request headers, the strictly decoded query and an injected clock -- and a query that does not decode strictly is refused as policy_query_undecodable; pure reads of the admitted request that add no transport, provider, resolver or process authority."
+      "purpose": "Issue #422 HTTP adapter: evaluate the admitted immutable policy snapshot and translate its result into existing audit and response behavior. Existing cfg/cfg_attr inputs only; no new transport, provider, resolver or process authority. Reviewed for #243: the decision is now asked with the facts serving_facts takes from the authenticated principal (its verified organization in mapped-role mode), a pure data read that adds no transport, provider, resolver or process authority. Reviewed for #243 (request conditions): the facts now come from policy_facts::http_request_facts -- the canonical client address under the state's ClientIpPolicy, the referenced request headers, the strictly decoded query and an injected clock -- and a query that does not decode strictly is refused as policy_query_undecodable; pure reads of the admitted request that add no transport, provider, resolver or process authority. Reviewed for #243 (decision facts): a complete verdict's PolicyDecision now carries PolicyDecisionFacts built from the evaluation context, the captured facts and the evaluation it already holds, for the request's observation; a pure data value that adds no transport, provider, resolver or process authority."
     },
     {
       "file": "gateway/src/middleware/validate.rs",
@@ -11372,9 +11392,9 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::policy_replay::file_attributes#1",
-      "sha256": "54a6a9a8dcff73aefeffeb33ec7c4e3e2a5c5e6cf7351496a4925f485491e960",
+      "sha256": "463a9839a7b1a94a28d2595154ef19b647c7ba5083ab600db2bdd16e92f160ac",
       "owner": "policy replay contexts (#243)",
-      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the policy replay context module: the replay job engine (#243 slice 13) calls the adapters and evaluator and the impact comparison (#243 slice 14) reads the recorded result, while the serialized form and egress replay wait for a record that states them. The module parses and builds replay contexts in memory and asks the pure policy kernel; dead-code gating only, no I/O and no transport or process capability."
+      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the policy replay context module: the replay job engine (#243 slice 13) calls the adapters and evaluator and the impact comparison (#243 slice 14) reads the recorded result, while the serialized form and egress replay wait for a record that states them. The module parses and builds replay contexts in memory and asks the pure policy kernel; dead-code gating only, no I/O and no transport or process capability. Reviewed for #243 (decision facts): the module documentation now describes replay-context.v2 and the recorded decision facts; documentation only, the dead-code gating is unchanged."
     },
     {
       "file": "gateway/src/policy_testing/suite.rs",

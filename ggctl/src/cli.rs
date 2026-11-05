@@ -147,6 +147,7 @@ pub(crate) const RISK_CODES: &[&str] = &[
     "risk.plaintext_transport",
     "risk.policy_broadened",
     "risk.policy_default_allow",
+    "risk.policy_tests_not_required",
     "risk.private_egress_allowed",
     "risk.profile_changed",
     "risk.public_origin_changed",

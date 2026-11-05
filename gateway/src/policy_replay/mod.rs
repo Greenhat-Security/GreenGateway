@@ -2,10 +2,11 @@
 //! carry for the policy kernel to decide it again, and the adapters that read
 //! one out of the audit records this gateway already writes.
 //!
-//! A [`ReplayContext`] is the `replay-context.v1` record: the facts the kernel
-//! reads for one HTTP request or one tool invocation, each stated as recorded,
-//! absent or not recorded, and the policy result the gateway recorded at the
-//! time. [`evaluate`] turns those facts into the kernel's own contexts --
+//! A [`ReplayContext`] is the `replay-context.v2` record (v1, the same record
+//! without decision facts, is still read): the facts the kernel reads for one
+//! HTTP request or one tool invocation, each stated as recorded, absent or not
+//! recorded, and the policy result the gateway recorded at the time, with the
+//! decision facts it was decided with when the record carries them. [`evaluate`] turns those facts into the kernel's own contexts --
 //! [`crate::policy_eval::PolicyEvaluationContext`],
 //! [`crate::policy_eval::tools::ToolEvaluationContext`] and
 //! [`crate::policy_eval::egress::EgressEvaluationContext`] -- and asks the
@@ -14,7 +15,7 @@
 //! gateway writes today, [`job`] is the bounded engine that replays a window
 //! of them, and [`impact`] compares what a candidate decides for them with
 //! what its base decides and what was recorded. The published form is
-//! `docs/schemas/replay-context.v1.schema.json`.
+//! `docs/schemas/replay-context.v2.schema.json`.
 //!
 //! ## Facts, not guesses
 //!
@@ -27,8 +28,9 @@
 //! always has.
 //!
 //! One fact the kernel cannot express as missing is the MCP alias identity:
-//! an HTTP target is either contextless or an alias, and the observation a
-//! request leaves does not say which. A context then names both, and
+//! an HTTP target is either contextless or an alias, and an observation does
+//! not say which unless its decision facts record the routing
+//! classification. A context without it names both, and
 //! [`evaluate::evaluate_http`] answers only when both give the same decision.
 //! Substituting the contextless reading would decide an alias request under
 //! the wrong precedence order; see [`crate::policy_eval`].
@@ -51,13 +53,24 @@
 //! answer. Keeping them out of results, traces, audit and evidence is the
 //! output projection's job, not this record's.
 //!
+//! ## Decision facts
+//!
+//! The live HTTP and tool lanes write, beside each verdict, its versioned
+//! decision facts ([`crate::middleware::decision::PolicyDecisionFacts`],
+//! `policy-decision.v1`): the policy's ETag and semantic digest, the
+//! evaluator's semantics and context versions, which inputs it had, the
+//! routing classification and the verdict's reason and element. They hold no
+//! request value. [`legacy`] reads them into [`RecordedResult::decision`],
+//! and [`impact`] labels a recorded-versus-base difference they explain as
+//! one, never as a candidate change.
+//!
 //! ## What is not here yet
 //!
-//! No live path writes a `replay-context.v1` record. The replay job engine
-//! ([`job`], slice 13) reads contexts the legacy adapters build in memory and
-//! never a serialized one; the impact comparison ([`impact`], slice 14) is
-//! the reader of the recorded result. Every context today comes from
-//! [`legacy`], and none of them states an egress destination.
+//! No live path writes a replay context. The replay job engine ([`job`],
+//! slice 13) reads contexts the legacy adapters build in memory and never a
+//! serialized one; the impact comparison ([`impact`], slice 14) is the reader
+//! of the recorded result. Every context today comes from [`legacy`], and
+//! none of them states an egress destination.
 
 #![cfg_attr(
     not(test),
@@ -90,9 +103,14 @@ use url::Url;
 use crate::{
     auth::{
         principal::{check_principal_shape, MAX_PRINCIPAL_ISSUER_BYTES},
+        protected_resource::MCP_RESOURCE_PATH,
         AuthMethod,
     },
-    policy_eval::{input::has_unique_members, validate_path, DispatchFacts},
+    middleware::decision::{
+        facts_available, DecisionElement, DecisionLane, DecisionRouting,
+        MAX_DECISION_ELEMENT_ID_BYTES, POLICY_DECISION_FACTS_VERSION,
+    },
+    policy_eval::{input::has_unique_members, tools::ToolReason, validate_path, DispatchFacts},
     rbac::rule::{
         AUTH_METHOD_BEARER_TOKEN, AUTH_METHOD_CLIENT_CERTIFICATE, AUTH_METHOD_SERVICE_TOKEN,
         AUTH_METHOD_SESSION_COOKIE,
@@ -104,8 +122,11 @@ use crate::{
     upstream_route::is_bare_host,
 };
 
-/// The exact schema version this module reads and writes.
-pub(crate) const REPLAY_CONTEXT_SCHEMA_VERSION: &str = "replay-context.v1";
+/// The exact schema version this module writes, and reads.
+pub(crate) const REPLAY_CONTEXT_SCHEMA_VERSION: &str = "replay-context.v2";
+/// The previous version, which this module still reads exactly: v2 without
+/// the recorded decision facts, which v1 has no member for.
+pub(crate) const REPLAY_CONTEXT_V1_SCHEMA_VERSION: &str = "replay-context.v1";
 /// Largest serialized context [`ReplayContext::parse`] reads. Every fact is
 /// bounded by the limit live admission applies to it, and the largest context
 /// those limits allow (roles dominate, at 256 of 256 bytes) is well inside it.
@@ -133,6 +154,40 @@ const DISPATCH_MEMBERS: &[&str] = &[
     "upstream_origin",
 ];
 const ALIAS_MEMBERS: &[&str] = &["state", "canonical_path"];
+const V1_RECORDED_MEMBERS: &[&str] = &[
+    "policy",
+    "reason",
+    "matched_rule_id",
+    "permission",
+    "path_prefix",
+    "attribution_omitted",
+];
+const RECORDED_MEMBERS: &[&str] = &[
+    "policy",
+    "reason",
+    "matched_rule_id",
+    "permission",
+    "path_prefix",
+    "attribution_omitted",
+    "decision",
+];
+const DECISION_MEMBERS: &[&str] = &[
+    "schema_version",
+    "lane",
+    "policy_etag",
+    "policy_semantic_digest",
+    "semantics_version",
+    "context_version",
+    "facts_available",
+    "routing",
+    "reason",
+    "element",
+];
+const POSITIONED_ELEMENT_MEMBERS: &[&str] = &["kind", "position", "id", "id_omitted"];
+const KIND_ONLY: &[&str] = &["kind"];
+/// The reasons an invocation's facts can name when the record states only
+/// that policy admitted it: no rule, or an allow or shadow rule.
+const ADMITTING_TOOL_REASONS: [ToolReason; 2] = [ToolReason::Allowed, ToolReason::MatchedRule];
 const DESTINATION_MEMBERS: &[&str] = &[
     "state",
     "scheme",
@@ -347,6 +402,52 @@ pub(crate) struct RecordedResult {
     pub(crate) path_prefix: Option<String>,
     /// The record named a matched element too long to keep.
     pub(crate) attribution_omitted: bool,
+    /// The decision facts the record carries (`policy_decision_facts`);
+    /// `None` for a record from before the gateway wrote them.
+    pub(crate) decision: Option<RecordedDecision>,
+}
+
+/// A record's decision facts (`policy-decision.v1`), as the gateway wrote
+/// them: the policy and evaluator that decided, which of the evaluator's
+/// inputs it had, how it classified the request for routing, and the
+/// verdict's reason and deciding element.
+///
+/// They say *under what* the recorded result was decided, so the impact
+/// comparison can tell a record decided under another policy or evaluator
+/// from one that disagrees with the base for no stated reason. Like the rest
+/// of the recorded result they are never an input to a replayed decision,
+/// with one exception the adapter states: the routing classification settles
+/// the MCP identity an observation leaves unstated, because it is the target
+/// the evaluator was given. They hold no request value, and a result never
+/// repeats them: it counts records by how their facts compare.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct RecordedDecision {
+    pub(crate) lane: DecisionLane,
+    /// The ETag the admin API reports for the policy that decided.
+    pub(crate) policy_etag: String,
+    /// Its ADR-0004 semantic digest; absent for a 0.x policy.
+    pub(crate) policy_semantic_digest: Option<String>,
+    pub(crate) semantics_version: String,
+    pub(crate) context_version: u16,
+    /// Which inputs the evaluator had, as the
+    /// [`facts_available`] bits.
+    pub(crate) facts_available: u16,
+    /// HTTP only.
+    pub(crate) routing: Option<DecisionRouting>,
+    pub(crate) reason: String,
+    pub(crate) element: RecordedElement,
+}
+
+/// The element a record's decision facts name, by position in the policy
+/// that decided.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct RecordedElement {
+    pub(crate) element: DecisionElement,
+    /// A rule's or route's authored id, when it had one the record kept.
+    pub(crate) id: Option<String>,
+    /// The element's id was over [`MAX_DECISION_ELEMENT_ID_BYTES`] and the
+    /// record dropped it.
+    pub(crate) id_omitted: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -597,7 +698,198 @@ fn check_recorded(recorded: &RecordedResult) -> Result<(), FactProblem> {
             return Err(FactProblem::Invalid);
         }
     }
+    if let Some(decision) = &recorded.decision {
+        decision.check()?;
+    }
     Ok(())
+}
+
+/// Whether `value` is 64 lower-case hexadecimal digits: a SHA-256 digest as
+/// every policy ETag and digest spells one.
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+impl RecordedDecision {
+    /// Every bound the `policy-decision.v1` format states, on its own.
+    fn check(&self) -> Result<(), FactProblem> {
+        // An ETag is the quoted `"sha256:<hex>"` the admin API sends.
+        let etag_hex = self
+            .policy_etag
+            .strip_prefix("\"sha256:")
+            .and_then(|rest| rest.strip_suffix('"'));
+        if !etag_hex.is_some_and(is_sha256_hex) {
+            return Err(FactProblem::Invalid);
+        }
+        if let Some(digest) = self.policy_semantic_digest.as_deref() {
+            if !digest.strip_prefix("sha256:").is_some_and(is_sha256_hex) {
+                return Err(FactProblem::Invalid);
+            }
+        }
+        // A semantics version is a stable code, spelled as reasons are.
+        check_reason_code(&self.semantics_version)?;
+        check_reason_code(&self.reason)?;
+        if self.context_version == 0 {
+            return Err(FactProblem::Invalid);
+        }
+        let (inputs, routed) = match self.lane {
+            DecisionLane::Http => (facts_available::HTTP, true),
+            DecisionLane::Tool => (facts_available::TOOL, false),
+        };
+        if self.facts_available & !inputs != 0 || self.routing.is_some() != routed {
+            return Err(FactProblem::Invalid);
+        }
+        let positioned = match (self.lane, self.element.element) {
+            (_, DecisionElement::Rule(_)) | (DecisionLane::Http, DecisionElement::Route(_)) => true,
+            (DecisionLane::Http, DecisionElement::Default | DecisionElement::HostBinding)
+            | (DecisionLane::Tool, DecisionElement::ToolEntry | DecisionElement::NoToolEntry) => {
+                false
+            }
+            _ => return Err(FactProblem::Invalid),
+        };
+        match self.element.id.as_deref() {
+            Some(id) if id.len() > MAX_DECISION_ELEMENT_ID_BYTES => Err(FactProblem::TooLong),
+            Some(id) if id.is_empty() || self.element.id_omitted || !positioned => {
+                Err(FactProblem::Invalid)
+            }
+            None if self.element.id_omitted && !positioned => Err(FactProblem::Invalid),
+            _ => Ok(()),
+        }
+    }
+
+    /// The `policy-decision.v1` JSON form, member for member as the gateway
+    /// writes it on the request path.
+    pub(crate) fn to_json(&self) -> Value {
+        let mut object = Map::new();
+        object.insert(
+            "schema_version".to_owned(),
+            json!(POLICY_DECISION_FACTS_VERSION),
+        );
+        object.insert("lane".to_owned(), json!(self.lane.as_str()));
+        object.insert("policy_etag".to_owned(), json!(self.policy_etag));
+        if let Some(digest) = &self.policy_semantic_digest {
+            object.insert("policy_semantic_digest".to_owned(), json!(digest));
+        }
+        object.insert(
+            "semantics_version".to_owned(),
+            json!(self.semantics_version),
+        );
+        object.insert("context_version".to_owned(), json!(self.context_version));
+        object.insert("facts_available".to_owned(), json!(self.facts_available));
+        if let Some(routing) = self.routing {
+            object.insert("routing".to_owned(), json!(routing.as_str()));
+        }
+        object.insert("reason".to_owned(), json!(self.reason));
+        let mut element = Map::new();
+        element.insert("kind".to_owned(), json!(self.element.element.kind()));
+        if let DecisionElement::Rule(position) | DecisionElement::Route(position) =
+            self.element.element
+        {
+            element.insert("position".to_owned(), json!(position));
+        }
+        if let Some(id) = &self.element.id {
+            element.insert("id".to_owned(), json!(id));
+        }
+        if self.element.id_omitted {
+            element.insert("id_omitted".to_owned(), json!(true));
+        }
+        object.insert("element".to_owned(), Value::Object(element));
+        Value::Object(object)
+    }
+
+    /// Read a `policy-decision.v1` object: exact version dispatch, no
+    /// unknown member, and every bound [`Self::check`] states. A refusal is
+    /// a stable code that repeats no value.
+    pub(crate) fn from_json(value: &Value) -> Result<Self, ReplayContextError> {
+        let object = object(value)?;
+        if object.get("schema_version").and_then(Value::as_str)
+            != Some(POLICY_DECISION_FACTS_VERSION)
+        {
+            return Err(ReplayContextError::UnsupportedSchemaVersion);
+        }
+        members(object, DECISION_MEMBERS)?;
+        let lane = match text(required(object, "lane")?)? {
+            "http" => DecisionLane::Http,
+            "tool" => DecisionLane::Tool,
+            _ => return Err(ReplayContextError::InvalidValue),
+        };
+        let routing = optional_text(object, "routing")?
+            .map(|code| {
+                DecisionRouting::ALL
+                    .into_iter()
+                    .find(|routing| routing.as_str() == code)
+                    .ok_or(ReplayContextError::InvalidValue)
+            })
+            .transpose()?;
+        let decision = Self {
+            lane,
+            policy_etag: text(required(object, "policy_etag")?)?.to_owned(),
+            policy_semantic_digest: optional_text(object, "policy_semantic_digest")?
+                .map(str::to_owned),
+            semantics_version: text(required(object, "semantics_version")?)?.to_owned(),
+            context_version: u16::try_from(unsigned(required(object, "context_version")?)?)
+                .map_err(|_| ReplayContextError::InvalidValue)?,
+            facts_available: u16::try_from(unsigned(required(object, "facts_available")?)?)
+                .map_err(|_| ReplayContextError::InvalidValue)?,
+            routing,
+            reason: text(required(object, "reason")?)?.to_owned(),
+            element: parse_element(required(object, "element")?)?,
+        };
+        decision.check()?;
+        Ok(decision)
+    }
+}
+
+fn parse_element(value: &Value) -> Result<RecordedElement, ReplayContextError> {
+    let object = object(value)?;
+    let kind = text(required(object, "kind")?)?;
+    let element = match kind {
+        "rule" | "route" => {
+            members(object, POSITIONED_ELEMENT_MEMBERS)?;
+            let position = usize::try_from(unsigned(required(object, "position")?)?)
+                .map_err(|_| ReplayContextError::InvalidValue)?;
+            if kind == "rule" {
+                DecisionElement::Rule(position)
+            } else {
+                DecisionElement::Route(position)
+            }
+        }
+        _ => {
+            let element = match kind {
+                "default" => DecisionElement::Default,
+                "host_binding" => DecisionElement::HostBinding,
+                "tool_entry" => DecisionElement::ToolEntry,
+                "no_tool_entry" => DecisionElement::NoToolEntry,
+                _ => return Err(ReplayContextError::InvalidValue),
+            };
+            members(object, KIND_ONLY)?;
+            element
+        }
+    };
+    let id_omitted = match object.get("id_omitted") {
+        None => false,
+        // Written only when true, so that one element has one serialization.
+        Some(Value::Bool(true)) => true,
+        Some(_) => return Err(ReplayContextError::InvalidValue),
+    };
+    Ok(RecordedElement {
+        element,
+        id: optional_text(object, "id")?.map(str::to_owned),
+        id_omitted,
+    })
+}
+
+/// An unsigned integer member: a value of another type is `invalid_type`,
+/// a negative or fractional number `invalid_value`.
+fn unsigned(value: &Value) -> Result<u64, ReplayContextError> {
+    match value.as_u64() {
+        Some(number) => Ok(number),
+        None if value.is_number() => Err(ReplayContextError::InvalidValue),
+        None => Err(ReplayContextError::InvalidType),
+    }
 }
 
 impl ReplayContext {
@@ -631,10 +923,58 @@ impl ReplayContext {
                 check_egress_record(&facts.egress)?;
             }
         }
-        check_recorded(&self.recorded)
+        check_recorded(&self.recorded)?;
+        self.check_decision()
     }
 
-    /// The `replay-context.v1` JSON form. Deterministic: members are emitted in
+    /// Whether the recorded decision facts describe this record: the lane
+    /// its facts are, the verdict its recorded result states, and, for an
+    /// HTTP request, the routing its facts were read with. The gateway
+    /// writes the facts beside that record from the same verdict, so a
+    /// disagreement is a record it did not write.
+    pub(crate) fn check_decision(&self) -> Result<(), FactProblem> {
+        let Some(decision) = &self.recorded.decision else {
+            return Ok(());
+        };
+        let reason_agrees = match self.recorded.reason.as_deref() {
+            Some(reason) => reason == decision.reason,
+            // Only an invocation policy admitted states no reason.
+            None => {
+                self.recorded.policy == RecordedPolicy::Admitted
+                    && ADMITTING_TOOL_REASONS
+                        .iter()
+                        .any(|admitting| admitting.as_str() == decision.reason)
+            }
+        };
+        let lane_agrees = match (&self.facts, decision.lane) {
+            (ReplayFacts::Http(facts), DecisionLane::Http) => {
+                match (decision.routing, &facts.routing) {
+                    (Some(DecisionRouting::Unclassified), RoutingRecord::NotRecorded)
+                    | (
+                        Some(DecisionRouting::Contextless),
+                        RoutingRecord::Local(McpIdentity::Canonical),
+                    )
+                    | (Some(DecisionRouting::ProxyDispatch), RoutingRecord::ProxyDispatch(_)) => {
+                        true
+                    }
+                    (
+                        Some(DecisionRouting::McpAlias),
+                        RoutingRecord::Local(McpIdentity::Alias { canonical_path }),
+                    ) => canonical_path == MCP_RESOURCE_PATH,
+                    _ => false,
+                }
+            }
+            (ReplayFacts::Tool(_), DecisionLane::Tool) => true,
+            _ => false,
+        };
+        if reason_agrees && lane_agrees {
+            Ok(())
+        } else {
+            Err(FactProblem::Invalid)
+        }
+    }
+
+    /// The `replay-context.v2` JSON form. Deterministic: members are emitted in
     /// one fixed set, and a fact is either present or stated as missing.
     pub(crate) fn to_json(&self) -> Value {
         json!({
@@ -686,16 +1026,17 @@ impl ReplayContext {
     pub(crate) fn from_json(value: &Value) -> Result<Self, ReplayContextError> {
         let object = object(value)?;
         // The version decides everything else, so it is read first and alone.
-        if object.get("schema_version").and_then(Value::as_str)
-            != Some(REPLAY_CONTEXT_SCHEMA_VERSION)
-        {
-            return Err(ReplayContextError::UnsupportedSchemaVersion);
-        }
+        // v1 is read exactly as it was: it has no member for decision facts.
+        let recorded_members = match object.get("schema_version").and_then(Value::as_str) {
+            Some(REPLAY_CONTEXT_SCHEMA_VERSION) => RECORDED_MEMBERS,
+            Some(REPLAY_CONTEXT_V1_SCHEMA_VERSION) => V1_RECORDED_MEMBERS,
+            _ => return Err(ReplayContextError::UnsupportedSchemaVersion),
+        };
         members(object, &["schema_version", "source", "facts", "recorded"])?;
         let source = ReplaySource::parse(text(required(object, "source")?)?)
             .ok_or(ReplayContextError::InvalidValue)?;
         let facts = parse_facts(required(object, "facts")?)?;
-        let recorded = parse_recorded(required(object, "recorded")?)?;
+        let recorded = parse_recorded(required(object, "recorded")?, recorded_members)?;
         let context = Self {
             source,
             facts,
@@ -844,6 +1185,9 @@ fn recorded_json(recorded: &RecordedResult) -> Value {
     }
     if recorded.attribution_omitted {
         object.insert("attribution_omitted".to_owned(), json!(true));
+    }
+    if let Some(decision) = &recorded.decision {
+        object.insert("decision".to_owned(), decision.to_json());
     }
     Value::Object(object)
 }
@@ -1063,19 +1407,9 @@ fn parse_egress(value: &Value) -> Result<EgressRecord, ReplayContextError> {
     }
 }
 
-fn parse_recorded(value: &Value) -> Result<RecordedResult, ReplayContextError> {
+fn parse_recorded(value: &Value, allowed: &[&str]) -> Result<RecordedResult, ReplayContextError> {
     let object = object(value)?;
-    members(
-        object,
-        &[
-            "policy",
-            "reason",
-            "matched_rule_id",
-            "permission",
-            "path_prefix",
-            "attribution_omitted",
-        ],
-    )?;
+    members(object, allowed)?;
     let attribution_omitted = match object.get("attribution_omitted") {
         None => false,
         // Written only when true, so that one context has one serialization.
@@ -1090,5 +1424,9 @@ fn parse_recorded(value: &Value) -> Result<RecordedResult, ReplayContextError> {
         permission: optional_text(object, "permission")?.map(str::to_owned),
         path_prefix: optional_text(object, "path_prefix")?.map(str::to_owned),
         attribution_omitted,
+        decision: object
+            .get("decision")
+            .map(RecordedDecision::from_json)
+            .transpose()?,
     })
 }
