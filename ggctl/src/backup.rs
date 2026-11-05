@@ -1,17 +1,23 @@
-//! `ggctl backup create --state-dir DIR --output FILE [--format human|json]`
-//! and `ggctl backup verify FILE [--format human|json]` (issue #242;
-//! ADR-0008, "Backup and restore").
+//! `ggctl backup create --state-dir DIR --output FILE [--format human|json]`,
+//! `ggctl backup verify FILE [--format human|json]` and `ggctl backup restore
+//! FILE --state-dir DIR [--replace-existing-state] [--format human|json]`
+//! (issue #242; ADR-0008, "Backup and restore").
 //!
-//! Both are `gateway_config::backup`, which the restore that follows will
-//! share: `ggctl` takes the state directory's lock, stamps the time and
-//! reports. A backup is written only to the new file `--output` names, never
-//! to standard output, and holds no plaintext token, secret value or key;
-//! the Connections store keeps its secrets as #240 ciphertext, whose key
-//! files are a separate artifact, and a create that includes that store
-//! says so. Neither command makes a network request, reads an environment
-//! variable or writes gateway audit events, and no path is ever echoed.
+//! All three are `gateway_config::backup`: `ggctl` takes the state
+//! directory's lock (restore takes it inside the library, which must know
+//! whether it created the lock file), stamps the time, draws the restore's
+//! random names and reports. A backup is written only to the new file
+//! `--output` names, never to standard output, and holds no plaintext token,
+//! secret value or key; the Connections store keeps its secrets as #240
+//! ciphertext, whose key files are a separate artifact, and a create or
+//! restore that includes that store says so. No command makes a network
+//! request, reads an environment variable or writes gateway audit events
+//! (a restore leaves a marker the next gateway start records), and no path
+//! is ever echoed.
 
 use std::{
+    collections::hash_map::RandomState,
+    hash::BuildHasher,
     io::{self, Write},
     path::Path,
     time::SystemTime,
@@ -19,7 +25,8 @@ use std::{
 
 use gateway_config::{
     backup::{
-        self, BackupError, BackupSummary, CreateRequest, EntryProblem, Producer, StoreProblem,
+        self, BackupError, BackupSummary, CreateRequest, EntryProblem, Producer, RestoreError,
+        RestoreRequest, RestoreWarning, StoreProblem,
     },
     state_dir::{StateDirectory, StateFile},
 };
@@ -60,6 +67,28 @@ struct VerifyResult {
     /// The store a refusal concerns.
     #[serde(skip_serializing_if = "Option::is_none")]
     store: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backup: Option<BackupRecord>,
+}
+
+/// The `backup restore` result.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RestoreResult {
+    /// The state directory holds the backup's stores and its restore marker.
+    restored: bool,
+    /// When nothing was restored: whether the state directory was left as
+    /// it was, which it is unless `restore.rollback_failed` is reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_unchanged: Option<bool>,
+    /// The store a refusal concerns.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    store: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    restore_id: Option<String>,
+    /// The state directory held stores, which the restore replaced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    replaced: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     backup: Option<BackupRecord>,
 }
@@ -312,6 +341,144 @@ pub(crate) fn verify(invocation: &Invocation, io: &mut Io<'_>) -> Exit {
     )
 }
 
+/// `backup restore`.
+pub(crate) fn restore(invocation: &Invocation, io: &mut Io<'_>) -> Exit {
+    let Some((archive_position, archive)) = invocation.positional(0) else {
+        // The parser requires FILE, so it was not UTF-8.
+        return report::error(io, Diagnostic::new(Code::ArgumentNotUtf8));
+    };
+    let Some((state_dir_position, state_dir)) = invocation.value("--state-dir") else {
+        return report::error(io, Diagnostic::new(Code::MissingArgument));
+    };
+    let mut result = RestoreResult {
+        restored: false,
+        target_unchanged: None,
+        store: None,
+        restore_id: None,
+        replaced: None,
+        backup: None,
+    };
+    let mut diagnostics: Vec<ReportDiagnostic> = Vec::new();
+    let request = RestoreRequest {
+        archive: Path::new(archive),
+        target: Path::new(state_dir),
+        replace_existing: invocation.flag("--replace-existing-state").is_some(),
+        producer: PRODUCER,
+        restored_at: SystemTime::now(),
+        nonce: nonce(),
+    };
+    match backup::restore(&request) {
+        Ok(summary) => {
+            let record = BackupRecord::of(&summary.backup);
+            for warning in &summary.warnings {
+                diagnostics.push(Diagnostic::at(warning_code(*warning), state_dir_position).into());
+            }
+            if record.connections_included() {
+                diagnostics.push(Diagnostic::new(Code::RestoreSecretKeysRequired).into());
+            }
+            result.restored = true;
+            result.restore_id = Some(summary.restore_id);
+            result.replaced = Some(summary.replaced);
+            result.backup = Some(record);
+        }
+        Err(error) => {
+            result.target_unchanged = Some(error != RestoreError::RollbackFailed);
+            result.store = error.store().map(StateFile::id);
+            diagnostics.push(restore_diagnostic(
+                &error,
+                archive_position,
+                state_dir_position,
+            ));
+        }
+    }
+    report::finish_report(
+        io,
+        Format::of(invocation),
+        "backup restore",
+        &result,
+        &diagnostics,
+        |result, out| {
+            match &result.backup {
+            Some(backup) if result.restored => {
+                writeln!(
+                    out,
+                    "restored a backup of {} stores, created at Unix time {}.{:03}{}",
+                    count_included(backup),
+                    backup.created_at_ms / 1000,
+                    backup.created_at_ms % 1000,
+                    if result.replaced == Some(true) {
+                        ", in place of the stores the state directory held"
+                    } else {
+                        ""
+                    }
+                )?;
+                if let Some(restore_id) = &result.restore_id {
+                    writeln!(out, "  restore {restore_id}")?;
+                }
+                backup.write_details(out)
+            }
+            _ if result.target_unchanged == Some(false) => writeln!(
+                out,
+                "backup restore: nothing was restored, and the state directory could not be put back"
+            ),
+            _ => writeln!(
+                out,
+                "backup restore: nothing was restored; the state directory was left as it was"
+            ),
+        }
+        },
+    )
+}
+
+/// 16 bytes no other account can predict, for the restore's hidden
+/// directory names and its ID.
+///
+/// `RandomState` keys each hasher it builds from the operating system's
+/// random source (drawn once per thread, then stepped for each new state),
+/// so hashing under two new states gives 128 bits no other process can
+/// predict, without a random-number dependency. They are not a secret: the
+/// directories are created exclusively, so a name guessed in advance could
+/// only make the restore fail, never redirect it.
+fn nonce() -> [u8; 16] {
+    let high = u128::from(RandomState::new().hash_one(0_u8));
+    let low = u128::from(RandomState::new().hash_one(1_u8));
+    ((high << 64) | low).to_be_bytes()
+}
+
+fn warning_code(warning: RestoreWarning) -> Code {
+    match warning {
+        RestoreWarning::DirectoryNotFlushed => Code::RestoreDirectoryNotFlushed,
+        RestoreWarning::PreviousNotRemoved => Code::RestorePreviousNotRemoved,
+    }
+}
+
+/// The report diagnostic for a restore error: an archive problem as `backup
+/// verify` reports it, located at `FILE`; a state directory or target
+/// problem located at `--state-dir`.
+fn restore_diagnostic(
+    error: &RestoreError,
+    archive_position: usize,
+    state_dir_position: usize,
+) -> ReportDiagnostic {
+    let code = match error {
+        RestoreError::Backup(error) => return diagnostic(error, Some(archive_position)),
+        RestoreError::StateDir(error) => state_dir_code(error),
+        RestoreError::TargetNotEmpty => Code::RestoreTargetNotEmpty,
+        RestoreError::TargetNotStateDirectory => Code::RestoreTargetNotStateDir,
+        RestoreError::TargetMountPoint => Code::RestoreTargetMountPoint,
+        RestoreError::TargetUnavailable => Code::RestoreTargetUnavailable,
+        RestoreError::StagingUnavailable => Code::RestoreStagingUnavailable,
+        RestoreError::PermissionsUnavailable => Code::RestorePermissionsUnavailable,
+        RestoreError::StoreIdentity { .. } => {
+            return Diagnostic::at(Code::RestoreStoreIdentityMismatch, archive_position).into()
+        }
+        RestoreError::TargetChanged => Code::RestoreTargetChanged,
+        RestoreError::SwitchFailed => Code::RestoreSwitchFailed,
+        RestoreError::RollbackFailed => Code::RestoreRollbackFailed,
+    };
+    Diagnostic::at(code, state_dir_position).into()
+}
+
 fn count_included(backup: &BackupRecord) -> usize {
     backup.stores.iter().filter(|store| store.included).count()
 }
@@ -342,6 +509,7 @@ fn diagnostic(error: &BackupError, position: Option<usize>) -> ReportDiagnostic 
         BackupError::ArchiveTooLarge => Code::BackupArchiveTooLarge,
         BackupError::StagingUnavailable => Code::BackupStagingUnavailable,
         BackupError::NotABackup => Code::BackupNotABackup,
+        BackupError::PostgresDump => Code::BackupPostgresUnsupported,
         BackupError::UnsupportedArchiveVersion => Code::BackupUnsupportedArchiveVersion,
         BackupError::ManifestMissing => Code::BackupManifestMissing,
         BackupError::ManifestInvalid => Code::BackupManifestInvalid,

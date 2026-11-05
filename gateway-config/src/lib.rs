@@ -27,8 +27,11 @@
 //!   approximate them. Bundles themselves are directories only;
 //! - [`backup`]: standalone backups, one archive of a state directory's
 //!   stores taken as consistent SQLite snapshots under its lock, with a
-//!   `GatewayBackup` manifest of versions, inventory and checksums, and the
-//!   reader that verifies one completely in a staging directory;
+//!   `GatewayBackup` manifest of versions, inventory and checksums, the
+//!   reader that verifies one completely in a staging directory, the restore
+//!   that switches a verified staging directory into an empty or prepared
+//!   state directory's place, and the restore marker the next gateway start
+//!   records;
 //! - [`state_dir`]: the standalone state directory, with the fixed file
 //!   names of the stores beneath it, the rules the directory must meet, the
 //!   exclusive lock a process holds on it and a best-effort check for a
@@ -73,7 +76,12 @@
 //! held state directory through read-only connections, and writes only the
 //! archive it is told to create and the hidden working, partial and staging
 //! entries beside that archive, which it removes; verifying one writes only
-//! the staging directory beside the archive, which it removes.
+//! the staging directory beside the archive, which it removes. A restore
+//! writes only a staging directory beside the target state directory, which
+//! it renames into the target's place or removes, the target's lock file,
+//! and the rename of the target aside, which it removes once the switch is
+//! done; reading a restore marker reads only that file, and acknowledging it
+//! removes only that file.
 
 pub mod archive;
 pub mod auth;

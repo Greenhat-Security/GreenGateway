@@ -38,6 +38,9 @@ use crate::archive::{
 
 /// The first bytes of every backup archive.
 pub(super) const MAGIC: [u8; 8] = *b"GGBACKUP";
+/// The first bytes of a `pg_dump --format=custom` archive, the logical dump
+/// #241's runbooks take of cluster state.
+const POSTGRES_DUMP_MAGIC: &[u8; 5] = b"PGDMP";
 /// The one container version this build writes and reads.
 pub(super) const FORMAT_VERSION: u16 = 1;
 const FLAGS: u16 = 0;
@@ -178,6 +181,9 @@ pub(super) enum ContainerError {
     Refused(ArchiveRefusal),
     /// The file does not start like a backup archive.
     NotABackup,
+    /// The file is a PostgreSQL custom-format dump: cluster state, which
+    /// #241's runbooks restore, never a standalone backup.
+    PostgresDump,
     /// A backup archive of a container version this build does not read.
     UnsupportedVersion,
     /// The end record's digest is not the digest of the archive before it.
@@ -248,6 +254,9 @@ impl<R: Read> ContainerReader<R> {
         let mut magic = [0_u8; MAGIC.len()];
         let read = read_up_to(&mut reader.source, &mut magic)?;
         if magic[..read] != MAGIC[..read] {
+            if magic[..read].starts_with(POSTGRES_DUMP_MAGIC) {
+                return Err(ContainerError::PostgresDump);
+            }
             return Err(ContainerError::NotABackup);
         }
         if read < magic.len() {
