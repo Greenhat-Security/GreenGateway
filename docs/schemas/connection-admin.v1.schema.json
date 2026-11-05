@@ -4297,6 +4297,7 @@
             "consumes_defaulted",
             "produces_defaulted",
             "request_body_not_mapped",
+            "credential_parameter_not_mapped",
             "unsupported_operation_field",
             "invalid_parameter",
             "unsupported_parameter_location",

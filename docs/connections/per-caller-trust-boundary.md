@@ -369,7 +369,15 @@ grants no authority:
 - **No caller supplies a credential through a tool.** A Discovery document's
   document-level system parameters (`key`, `access_token`, `oauth_token`,
   `alt`, `fields` and the others) are never tool arguments; each is named in a
-  `global_parameter_not_mapped` warning.
+  `global_parameter_not_mapped` warning. A Swagger 2.0 operation whose
+  security names a scheme loses the `query` and `formData` parameters that
+  carry it: `access_token` and `token` under an `oauth2` scheme, and the
+  `name` and `in` of an `apiKey` scheme, compared case-insensitively. Each is
+  named in a `credential_parameter_not_mapped` warning and is never
+  required or sent, and header parameters are never sent at all. An uploaded
+  OpenAPI 3.x document is generated as written: a credential it declares as
+  a query parameter stays a tool argument, so fix the document or leave such
+  tools unselected.
 - **A delegated Connection's catalog is registered from an uploaded
   specification.** Fetching one from the upstream has no caller to exchange
   for and is refused with `caller_assertion_not_enforced`, as are a refresh
