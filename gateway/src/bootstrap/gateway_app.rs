@@ -220,42 +220,7 @@ pub(crate) fn gateway_app_with_process_started_at_and_overrides(
     #[cfg(not(feature = "postgres"))]
     let connection_control_plane =
         connections::control_plane::ConnectionControlPlane::from_config(&config)?;
-    let mut configured_suggestion_routes = config
-        .upstream_url
-        .as_deref()
-        .map(|upstream_url| {
-            discovery::suggestions::ConfiguredProxyRoute::new(
-                None,
-                None,
-                proxy::upstream_origin_from_url(upstream_url, "UPSTREAM_URL"),
-            )
-        })
-        .into_iter()
-        .collect::<Vec<_>>();
-    configured_suggestion_routes.extend(config.upstream_routes.iter().enumerate().map(
-        |(index, route)| {
-            let logical_origin = if let Some(connection_id) = route.connection_id.as_deref() {
-                format!("connection:{connection_id}")
-            } else if route.upstreams.is_empty() {
-                proxy::upstream_origin_from_url(
-                    &route.upstream_url,
-                    &format!("UPSTREAM_ROUTES[{index}].upstream_url"),
-                )
-            } else {
-                proxy::logical_pool_origin(
-                    route
-                        .id
-                        .as_deref()
-                        .expect("validated upstream pool route must have an id"),
-                )
-            };
-            discovery::suggestions::ConfiguredProxyRoute::new(
-                route.host.clone(),
-                route.path_prefix.clone(),
-                logical_origin,
-            )
-        },
-    ));
+    let configured_suggestion_routes = suggestion_proxy_routes(&config);
     // The suggestion engine: cluster mode generates from the PostgreSQL
     // read store, audit store, and lifecycle store on the discovery seed's
     // pool (issue #241, PR 12); standalone mode from the SQLite files.
@@ -485,20 +450,7 @@ pub(crate) fn gateway_app_with_process_started_at_and_overrides(
     }
     let routes = GatewayRoutes::from_config(&config);
     warn_on_mcp_exempt_prefix_overlaps(&routes, &config);
-    for (var, paths) in [
-        ("AUTH_EXEMPT_PATHS", config.auth_exempt_paths.as_slice()),
-        ("RBAC_EXEMPT_PATHS", config.rbac_exempt_paths.as_slice()),
-    ] {
-        let unowned = routes.unowned_exempt_paths(paths);
-        if !unowned.is_empty() {
-            tracing::warn!(
-                var,
-                admin_prefix = %config.admin_prefix,
-                paths = ?unowned,
-                "exempt paths are not gateway-owned; these paths bypass auth/RBAC and can be forwarded upstream; confirm this is intended or align them with ADMIN_PREFIX"
-            );
-        }
-    }
+    warn_on_unowned_exempt_paths(&routes, &config);
     let service_token_store: Option<Arc<dyn storage::ServiceTokenStore>> = config
         .service_token_sqlite_path
         .as_deref()
@@ -1397,6 +1349,72 @@ pub(crate) fn gateway_app_with_process_started_at_and_overrides(
         #[cfg(feature = "postgres")]
         authority_events: authority_event_startup,
     })
+}
+
+/// The proxy routes the configuration declares, for the rule suggestion
+/// engine to attribute observed traffic to: `UPSTREAM_URL` first, then each
+/// `UPSTREAM_ROUTES` entry by its Connection, its upstream's origin or its
+/// pool's logical origin.
+fn suggestion_proxy_routes(
+    config: &config::Config,
+) -> Vec<discovery::suggestions::ConfiguredProxyRoute> {
+    let mut configured_suggestion_routes = config
+        .upstream_url
+        .as_deref()
+        .map(|upstream_url| {
+            discovery::suggestions::ConfiguredProxyRoute::new(
+                None,
+                None,
+                proxy::upstream_origin_from_url(upstream_url, "UPSTREAM_URL"),
+            )
+        })
+        .into_iter()
+        .collect::<Vec<_>>();
+    configured_suggestion_routes.extend(config.upstream_routes.iter().enumerate().map(
+        |(index, route)| {
+            let logical_origin = if let Some(connection_id) = route.connection_id.as_deref() {
+                format!("connection:{connection_id}")
+            } else if route.upstreams.is_empty() {
+                proxy::upstream_origin_from_url(
+                    &route.upstream_url,
+                    &format!("UPSTREAM_ROUTES[{index}].upstream_url"),
+                )
+            } else {
+                proxy::logical_pool_origin(
+                    route
+                        .id
+                        .as_deref()
+                        .expect("validated upstream pool route must have an id"),
+                )
+            };
+            discovery::suggestions::ConfiguredProxyRoute::new(
+                route.host.clone(),
+                route.path_prefix.clone(),
+                logical_origin,
+            )
+        },
+    ));
+    configured_suggestion_routes
+}
+
+/// Warn about every `AUTH_EXEMPT_PATHS` and `RBAC_EXEMPT_PATHS` entry the
+/// gateway does not own: such a path bypasses authentication or RBAC and can
+/// be forwarded upstream.
+fn warn_on_unowned_exempt_paths(routes: &GatewayRoutes, config: &config::Config) {
+    for (var, paths) in [
+        ("AUTH_EXEMPT_PATHS", config.auth_exempt_paths.as_slice()),
+        ("RBAC_EXEMPT_PATHS", config.rbac_exempt_paths.as_slice()),
+    ] {
+        let unowned = routes.unowned_exempt_paths(paths);
+        if !unowned.is_empty() {
+            tracing::warn!(
+                var,
+                admin_prefix = %config.admin_prefix,
+                paths = ?unowned,
+                "exempt paths are not gateway-owned; these paths bypass auth/RBAC and can be forwarded upstream; confirm this is intended or align them with ADMIN_PREFIX"
+            );
+        }
+    }
 }
 
 /// What `run()` needs to start authority-event delivery, when this is a
