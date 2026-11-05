@@ -516,7 +516,8 @@ fn connections(checker: &mut Checker<'_>, node: &Node, pointer: &Pointer) -> boo
 /// `spec` carries the profile and the deployment settings: every catalog
 /// field with a document path, in the closed sections those paths imply
 /// ([`settings`]). The reader checks each setting's shape and its own
-/// bounds; the compiler does not consume them yet.
+/// bounds; the compiler does not consume them yet. Only a `migration`
+/// document may acknowledge a compatibility behavior.
 pub(crate) fn deployment(
     node: &Node,
     file: &FileName,
@@ -557,6 +558,18 @@ pub(crate) fn deployment(
     let mut read = Settings::default();
     if let Some(spec) = spec {
         settings::read_members(&mut checker, spec, "/spec", &spec_pointer, &mut read);
+        let acknowledged = member(spec, "compatibility")
+            .and_then(Node::as_object)
+            .and_then(|compatibility| member(compatibility, "acknowledged"));
+        if let (Some(node), Some(profile)) = (acknowledged, profile) {
+            if profile != Profile::Migration && !read.acknowledged().is_empty() {
+                checker.report(
+                    Code::NotApplicable,
+                    spec_pointer.member("compatibility").member("acknowledged"),
+                    node,
+                );
+            }
+        }
     }
     if checker.failed {
         return None;

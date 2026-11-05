@@ -18,7 +18,9 @@ use super::{
         document::Profile,
         value::{Decimal, UnresolvedReason},
     },
-    children, document_maximum, Child, StandaloneStore, SECTIONS, STANDALONE_STORES, STORES_PATH,
+    children, document_maximum,
+    structured::{Document, Form, Kind},
+    Child, OwnMember, OwnValue, StandaloneStore, SECTIONS, STANDALONE_STORES,
 };
 
 /// The secret reference grammar: an ADR-0006 opaque alias ID.
@@ -154,6 +156,7 @@ pub fn render_deployment_schema() -> String {
                 "The deployment document of a greengateway.dev/v1alpha1 configuration bundle, generated from the configuration field catalog. ",
                 "Each setting under spec is one catalog field at its document path, typed and bounded as the catalog says, and every object is closed. ",
                 "Integers lie within the I-JSON safe range, a fractional setting is a decimal string, a setting whose value may carry a secret accepts only a secretReference, and no setting accepts an unresolved placeholder. ",
+                "A setting that holds a JSON document in environment mode is an array of closed objects mirroring the compiler's own types, in which every member that may carry a secret is a secretReference and host paths and literal request headers have no form. ",
                 "A decimal setting's bounds are stated in its description and enforced by the reader. ",
                 "No gateway starts from a deployment document yet. ",
                 "This schema is necessary but not sufficient: the gateway's reader is authoritative, and rules that relate settings are the configuration compiler's."
@@ -197,7 +200,7 @@ pub fn render_deployment_schema() -> String {
 }
 
 fn definitions() -> Json {
-    Json::Object(vec![
+    let mut definitions = vec![
         (
             "secretReference",
             Json::Object(vec![
@@ -281,7 +284,90 @@ fn definitions() -> Json {
                 ),
             ]),
         ),
+    ];
+    definitions.extend(
+        forms()
+            .into_iter()
+            .map(|form| (form.name, form_schema(form))),
+    );
+    Json::Object(definitions)
+}
+
+/// Every structured form, each once, in the order the settings name them.
+pub(crate) fn forms() -> Vec<&'static Form> {
+    let mut forms = Vec::new();
+    for document in Document::ALL {
+        document.entry().with_nested(&mut forms);
+    }
+    forms
+}
+
+/// A structured form's closed object.
+fn form_schema(form: &Form) -> Json {
+    let properties = form
+        .members
+        .iter()
+        .filter(|member| member.kind != Kind::AdminLogin)
+        .map(|member| (member.name, kind_schema(member.kind)))
+        .collect();
+    let mut members = vec![
+        ("description", text(form.description)),
+        ("type", text("object")),
+        ("additionalProperties", Json::Bool(false)),
+    ];
+    let required = form.required();
+    if !required.is_empty() {
+        members.push(("required", words(required)));
+    }
+    members.push(("properties", Json::Object(properties)));
+    Json::Object(members)
+}
+
+fn integer_schema(maximum: u64) -> Json {
+    Json::Object(vec![
+        ("type", text("integer")),
+        ("minimum", Json::Integer(0)),
+        ("maximum", Json::Integer(document_maximum(maximum))),
     ])
+}
+
+fn array_of(items: Json) -> Json {
+    Json::Object(vec![("type", text("array")), ("items", items)])
+}
+
+/// The schema of one structured member.
+fn kind_schema(kind: Kind) -> Json {
+    match kind {
+        Kind::Boolean => Json::Object(vec![("type", text("boolean"))]),
+        Kind::Integer(maximum) => integer_schema(maximum),
+        Kind::Text => Json::Object(vec![reference("text")]),
+        Kind::Exact => Json::Object(vec![
+            ("type", text("string")),
+            ("minLength", Json::Integer(1)),
+        ]),
+        Kind::Word(values) => Json::Object(vec![("enum", words(values.iter().copied()))]),
+        Kind::TextList => array_of(Json::Object(vec![reference("text")])),
+        Kind::IntegerList(maximum) => array_of(integer_schema(maximum)),
+        Kind::Object(form) => Json::Object(vec![reference(form.name)]),
+        Kind::ObjectList(form) => array_of(Json::Object(vec![reference(form.name)])),
+        Kind::Secret => Json::Object(vec![
+            (
+                "description",
+                text("It may carry a credential, so it is a secret reference."),
+            ),
+            reference("secretReference"),
+        ]),
+        Kind::Headers => Json::Object(vec![
+            (
+                "description",
+                text("Static request headers can carry a credential, so this document version cannot hold their values; use a managed Connection. Only an empty object is accepted."),
+            ),
+            ("type", text("object")),
+            ("maxProperties", Json::Integer(0)),
+        ]),
+        // A host path never enters a bundle; `false` admits no value.
+        Kind::HostPath | Kind::AdminLogin => Json::Bool(false),
+    }
 }
 
 /// The schema properties of the object at `path`.
@@ -297,28 +383,32 @@ fn section_properties(path: &str) -> Vec<(&'static str, Json)> {
                     ("additionalProperties", Json::Bool(false)),
                     ("properties", Json::Object(section_properties(section))),
                 ]),
-                Child::Stores => Json::Object(vec![
-                    (
-                        "description",
-                        text(concat!(
-                            "The standalone stores kept beneath the state directory, each named once; ",
-                            "in environment mode, which of their *_SQLITE_PATH variables are set."
-                        )),
-                    ),
-                    ("type", text("array")),
-                    ("uniqueItems", Json::Bool(true)),
-                    (
-                        "items",
-                        Json::Object(vec![(
-                            "enum",
-                            words(STANDALONE_STORES.iter().map(|store| store.name)),
-                        )]),
-                    ),
-                ]),
+                Child::Own(member) => own_schema(member),
             };
             (name, schema)
         })
         .collect()
+}
+
+fn own_schema(member: &OwnMember) -> Json {
+    let mut members = vec![("description", text(member.description))];
+    match member.value {
+        OwnValue::Word(values) => members.push(("enum", words(values.iter().copied()))),
+        OwnValue::Text => members.push(reference("text")),
+        OwnValue::Secret => members.push(reference("secretReference")),
+        OwnValue::Stores | OwnValue::Compatibility => {
+            members.push(("type", text("array")));
+            members.push(("uniqueItems", Json::Bool(true)));
+            members.push((
+                "items",
+                Json::Object(vec![(
+                    "enum",
+                    words(member.value.set_words().unwrap_or_default()),
+                )]),
+            ));
+        }
+    }
+    Json::Object(members)
 }
 
 fn section_description(path: &str) -> &'static str {
@@ -335,7 +425,14 @@ fn setting_schema(field: &Field) -> Json {
         field.documentation()
     );
     let mut members = Vec::new();
-    if field.sensitivity != Sensitivity::Public {
+    if let Some(document) = Document::of(field) {
+        description.push_str(" An array of closed entries mirroring the environment form.");
+        members.push(("type", text("array")));
+        members.push((
+            "items",
+            Json::Object(vec![reference(document.entry().name)]),
+        ));
+    } else if field.sensitivity != Sensitivity::Public {
         description.push_str(" Its value may carry a secret, so it is a secret reference.");
         members.push(reference("secretReference"));
     } else {
@@ -392,7 +489,7 @@ pub fn render_deployment_reference() -> String {
         let (description, rows) = match child {
             Child::Section(section) => (section_description(section), leaves(section)),
             Child::Setting(field) => ("", vec![(field.document_path().unwrap_or_default(), child)]),
-            Child::Stores => ("", vec![(STORES_PATH, child)]),
+            Child::Own(member) => ("", vec![(member.path, child)]),
         };
         out.push_str(&format!("\n#### `spec.{name}`\n\n"));
         if !description.is_empty() {
@@ -409,21 +506,10 @@ pub fn render_deployment_reference() -> String {
                     default_text(field),
                     format!("[`{}`](configuration.md#{})", field.environment, field.id),
                 ),
-                Child::Stores => (
-                    format!(
-                        "array of distinct {}",
-                        join_words(STANDALONE_STORES.iter().map(|store| store.name), "and")
-                    ),
-                    "unset".to_owned(),
-                    format!(
-                        "which of {} are set",
-                        join_words(
-                            STANDALONE_STORES
-                                .iter()
-                                .filter_map(StandaloneStore::environment),
-                            "and"
-                        )
-                    ),
+                Child::Own(own) => (
+                    own_value_text(own.value),
+                    own.default.to_owned(),
+                    own_environment_text(own),
                 ),
                 Child::Section(_) => continue,
             };
@@ -432,7 +518,90 @@ pub fn render_deployment_reference() -> String {
             ));
         }
     }
+    for form in forms() {
+        out.push_str(&format!(
+            "\n#### {}\n\n{}\n\n",
+            form.title, form.description
+        ));
+        out.push_str("| Member | Value |\n| --- | --- |\n");
+        for member in form.members {
+            let mut value = kind_text(member.kind, member.name);
+            if member.required {
+                value.push_str(", required");
+            }
+            out.push_str(&format!("| `{}` | {value} |\n", member.name));
+        }
+    }
     out
+}
+
+fn own_value_text(value: OwnValue) -> String {
+    match value {
+        OwnValue::Word(values) => join_words(values.iter().copied(), "or"),
+        OwnValue::Text => "string".to_owned(),
+        OwnValue::Secret => "secret reference".to_owned(),
+        OwnValue::Stores | OwnValue::Compatibility => format!(
+            "array of distinct {}",
+            join_words(value.set_words().unwrap_or_default().into_iter(), "and")
+        ),
+    }
+}
+
+fn own_environment_text(own: &OwnMember) -> String {
+    match own.value {
+        OwnValue::Stores => format!(
+            "which of {} are set",
+            join_words(
+                STANDALONE_STORES
+                    .iter()
+                    .filter_map(StandaloneStore::environment),
+                "and"
+            )
+        ),
+        OwnValue::Word(_) | OwnValue::Text | OwnValue::Secret | OwnValue::Compatibility => {
+            own.environment.to_owned()
+        }
+    }
+}
+
+/// A link to a form's table, by GitHub's anchor for its heading. The text
+/// is the title in running prose: its first letter lowercased, unless its
+/// first word is an acronym (`MCP`).
+fn form_link(form: &Form) -> String {
+    let first = form.title.split(' ').next().unwrap_or_default();
+    let text = if first.len() > 1 && first.bytes().all(|byte| byte.is_ascii_uppercase()) {
+        form.title.to_owned()
+    } else {
+        let mut characters = form.title.chars();
+        characters.next().map_or_else(String::new, |initial| {
+            initial.to_ascii_lowercase().to_string() + characters.as_str()
+        })
+    };
+    format!(
+        "[{text}](#{})",
+        form.title.to_ascii_lowercase().replace(' ', "-")
+    )
+}
+
+/// How the reference describes one structured member.
+fn kind_text(kind: Kind, name: &str) -> String {
+    match kind {
+        Kind::Boolean => "`true` or `false`".to_owned(),
+        Kind::Integer(maximum) => format!("integer, 0 to {}", document_maximum(maximum)),
+        Kind::Text => "string".to_owned(),
+        Kind::Exact => "string, kept exactly as written".to_owned(),
+        Kind::Word(values) => join_words(values.iter().copied(), "or"),
+        Kind::TextList => "array of strings".to_owned(),
+        Kind::IntegerList(maximum) => {
+            format!("array of integers, 0 to {}", document_maximum(maximum))
+        }
+        Kind::Object(form) => format!("{} object", form_link(form)),
+        Kind::ObjectList(form) => format!("array of {} objects", form_link(form)),
+        Kind::Secret => "secret reference".to_owned(),
+        Kind::Headers => "not representable: only `{}`; use a managed Connection".to_owned(),
+        Kind::HostPath => "not representable: a host path".to_owned(),
+        Kind::AdminLogin => format!("not here: set `admin_login.{name}`"),
+    }
 }
 
 /// Every setting beneath the section at `path`, depth first, in schema order.
@@ -444,7 +613,7 @@ fn leaves(path: &'static str) -> Vec<(&'static str, Child)> {
             Child::Setting(field) => {
                 found.push((field.document_path().unwrap_or_default(), child));
             }
-            Child::Stores => found.push((STORES_PATH, child)),
+            Child::Own(member) => found.push((member.path, child)),
         }
     }
     found
@@ -468,6 +637,9 @@ fn join_words(values: impl Iterator<Item = &'static str>, last: &str) -> String 
 }
 
 fn value_text(field: &Field) -> String {
+    if let Some(document) = Document::of(field) {
+        return format!("array of {} objects", form_link(document.entry()));
+    }
     if field.sensitivity != Sensitivity::Public {
         return "secret reference".to_owned();
     }

@@ -617,8 +617,10 @@ fn schema_leaves(schema: &Value, pointer: &str, leaves: &mut BTreeSet<String>) {
 
 /// A field reaches a bundle only through the deployment schema: each setting
 /// the schema defines beneath `spec`, in its closed sections, is a catalog
-/// field's document path and the reverse. The profile and the standalone
-/// store list are the document's own members, not fields. The schema is
+/// field's document path and the reverse. The profile and the members
+/// `bundle::settings::OWN_MEMBERS` lists (the store list, the listener
+/// intents, the admin login client and the acknowledged compatibility
+/// behaviors) are the document's own, not fields. The schema is
 /// rendered from the catalog (`bundle::settings::tests` holds the committed
 /// file to the rendering), and it defines the typed forms the catalog's
 /// deployment fields use.
@@ -632,10 +634,13 @@ fn the_deployment_schema_defines_exactly_the_catalogs_document_paths() {
         defined.remove("/spec/profile"),
         "the schema defines the profile"
     );
-    assert!(
-        defined.remove(bundle::STORES_PATH),
-        "the schema defines the standalone store list"
-    );
+    for member in bundle::settings::OWN_MEMBERS {
+        assert!(
+            defined.remove(member.path),
+            "the schema defines {}",
+            member.path
+        );
+    }
     let catalog: BTreeSet<String> = FIELDS
         .iter()
         .filter_map(|field| match field.bundle {
