@@ -62,3 +62,35 @@ serialization to `connection-editor/model.ts`; reusable form sections and local
 secret controls live in `connection-editor/sections.tsx`. The view owns loading,
 save orchestration and navigation. Maintain these boundaries when adding fields:
 the server remains authoritative for permissions and secret binding validity.
+
+## Shared configuration contracts
+
+`gateway-config` is the library the gateway and `ggctl` both link (issue #242,
+ADR-0008). Besides the bundle reader, catalog, ledger and digests its own
+documentation lists, it holds the I/O-free leaves of the configuration
+compiler, which is moving into it from `gateway/src/config`: the types and
+validators a setting is parsed into, with no file, socket, clock or provider
+behind them. The gateway re-exports each one from the module it used to live
+in, so call sites did not change:
+
+| `gateway-config` module | Holds | Re-exported by |
+|---|---|---|
+| `connections` | Connections limits (`MAX_CREDENTIALS`, display name, Connection and secret ID bounds) and the Connection ID grammar | `connections::model` |
+| `connections::secret` | The operator alias document, the secrets root, and the alias, environment-key and file-key grammars | `connections::secret` |
+| `connections::{aws,azure,gcp,vault,kubernetes}_secret` | Each secret provider's configuration document and validator | the gateway module of the same name |
+| `connections::local_secret` | The local keyring document and validator | `connections::local_secret` |
+| `inbound_tls` | `TlsMinVersion`, `ClientCertMode`, `ClientCertRequirement` | `inbound_tls` |
+| `auth` | Issuer canonicalization and bound, JWKS key age bounds, the cookie-name grammar, `ClientCertIdentitySource`, admin session settings | `auth::principal`, `auth::jwt`, `middleware::auth`, `auth::client_certificate`, `auth::admin_session` |
+| `path_match` | Exempt-path and prefix matching, unsafe request paths | `path_match` |
+| `request_bounds` | The request shape bounds admission, the policy kernel and configuration share | `request_bounds` |
+| `upstream_route` | The stable route ID grammar | `upstream_route` |
+| `discovery` | Signal detector thresholds and the rule suggestion window, with their defaults | `discovery::signals`, `discovery::suggestions` |
+
+Their unit tests moved with them and run under `cargo test -p gateway-config`,
+except `path_match`'s: the tests `security-mutations.json` selects and the
+property tests stay in the gateway's `path_match` module, because the mutation
+campaign builds and runs only the gateway's test binary. Tests that exercise a
+provider, a listener or a store, rather than the document, stay in the gateway.
+What touches files, the network or a clock (provider construction, key and
+secrets-root reads, listener binding) stays in the gateway, and the compiler's
+zero-I/O scan (`config::stage_tests`) reads these modules too.

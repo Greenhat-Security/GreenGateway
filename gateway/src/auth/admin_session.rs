@@ -36,10 +36,6 @@ use super::{AuthError, AuthMethod, Principal, SessionCredential, SessionValidato
 const INVALID: &str = "admin session is unknown, expired, or revoked";
 const UNAVAILABLE: &str = "admin session authority is unavailable";
 
-/// The longest absolute session lifetime, in seconds.
-pub const MAX_SESSION_TTL_SECS: u64 = 86_400;
-/// The most sessions, and the most pending cookie logins, a store holds.
-pub const MAX_SESSION_ENTRIES: usize = 100_000;
 /// The largest access token a session holds, in bytes.
 pub const MAX_ACCESS_TOKEN_BYTES: usize = 32_768;
 
@@ -47,46 +43,9 @@ const PURPOSE_SESSION: &str = "session";
 const PURPOSE_BINDING: &str = "binding";
 const PURPOSE_CSRF: &str = "csrf";
 
-/// Where issued sessions live. Each store is valid in exactly one state
-/// backend; configuration refuses every other combination.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AdminSessionStorage {
-    /// A bounded map in this process (`STATE_BACKEND=sqlite` only).
-    StandaloneMemory,
-    /// Rows on the PostgreSQL primary (`STATE_BACKEND=postgres` only).
-    ClusterPostgres,
-}
-
-impl AdminSessionStorage {
-    /// The `ADMIN_SESSION_MODE` value, also advertised as `storage`.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::StandaloneMemory => "standalone_memory",
-            Self::ClusterPostgres => "cluster_postgres",
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct AdminSessionConfig {
-    pub storage: AdminSessionStorage,
-    /// The absolute lifetime. Requests never extend it.
-    pub ttl: Duration,
-    /// The inactivity limit, at most `ttl`; equal to `ttl` it never binds.
-    pub idle_timeout: Duration,
-    pub max_entries: usize,
-}
-
-impl AdminSessionConfig {
-    fn is_valid(&self) -> bool {
-        self.ttl.as_secs() > 0
-            && self.ttl <= Duration::from_secs(MAX_SESSION_TTL_SECS)
-            && self.idle_timeout.as_secs() > 0
-            && self.idle_timeout <= self.ttl
-            && self.max_entries > 0
-            && self.max_entries <= MAX_SESSION_ENTRIES
-    }
-}
+// The admin session settings and their bounds, which the configuration
+// compiler shares with `ggctl` (issue #242).
+pub(crate) use gateway_config::auth::{AdminSessionConfig, AdminSessionStorage};
 
 /// A purpose-separated SHA-256 digest of a session secret: the only form in
 /// which a session cookie, a login binding or a CSRF token reaches a store.

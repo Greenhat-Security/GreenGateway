@@ -4290,12 +4290,11 @@ fn normalize_stable_id(name: &str, value: &str, problems: &mut Vec<String>) -> O
 
 fn normalize_connection_id(name: &str, value: &str, problems: &mut Vec<String>) -> Option<String> {
     let value = value.trim();
-    match crate::connections::model::ConnectionId::parse(value.to_owned()) {
-        Ok(id) => Some(id.to_string()),
-        Err(_) => {
-            problems.push(format!("{name} must be a stable URL-safe Connection ID"));
-            None
-        }
+    if crate::connections::model::is_valid_connection_id(value) {
+        Some(value.to_owned())
+    } else {
+        problems.push(format!("{name} must be a stable URL-safe Connection ID"));
+        None
     }
 }
 
