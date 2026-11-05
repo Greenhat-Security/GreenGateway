@@ -1084,3 +1084,101 @@ fn a_held_state_directory_exits_5_and_two_ggctl_processes_have_one_winner() {
     );
     assert_eq!(state.revisions(), 3);
 }
+
+#[test]
+fn backup_create_refuses_a_locked_state_directory_and_verify_exits_7_on_damage() {
+    use gateway_config::{
+        bundle::{read_bundle, PublishedSchemasOnly, ReadOptions},
+        ledger::{LedgerActor, RevisionLedger},
+        state_dir::StateDirectory,
+    };
+
+    let bundle = Bundle::new("{\"schema_version\": \"0.1.0\", \"default_action\": \"deny\"}\n");
+    let state = TempDirectory::new(&format!("backup-state-{CANARY}"));
+    let out = TempDirectory::new(&format!("backup-out-{CANARY}"));
+    let state_dir = state.0.to_str().expect("UTF-8");
+    let archive = out.0.join("state.ggbk");
+    let archive_path = archive.to_str().expect("UTF-8");
+    {
+        let read = read_bundle(&bundle.0, ReadOptions::default(), &PublishedSchemasOnly);
+        let held = StateDirectory::acquire(&state.0).expect("the state directory locks");
+        let actor = LedgerActor::system("ggctl-ledger-seed").expect("recordable");
+        let seeded = RevisionLedger::seed(
+            &held,
+            read.bundle.as_ref().expect("the bundle reads"),
+            actor,
+            std::time::SystemTime::now(),
+        );
+        drop(seeded.expect("seed"));
+
+        // While this process holds the lock, as a running gateway would, a
+        // backup is refused and writes nothing.
+        let output = ggctl(
+            &[
+                "backup",
+                "create",
+                "--state-dir",
+                state_dir,
+                "--output",
+                archive_path,
+                "--format",
+                "json",
+            ],
+            None,
+        );
+        assert_eq!(output.status.code(), Some(5), "{}", text(&output.stdout));
+        let refused = report(&output);
+        assert_eq!(refused["diagnostics"][0]["code"], "state_dir.locked");
+        assert!(!archive.exists());
+        assert_no_canary(&output);
+        drop(held);
+    }
+
+    let output = ggctl(
+        &[
+            "backup",
+            "create",
+            "--state-dir",
+            state_dir,
+            "--output",
+            archive_path,
+        ],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert!(text(&output.stdout).starts_with("created a backup of 1 stores\n"));
+    assert!(output.stderr.is_empty(), "{}", text(&output.stderr));
+    assert_no_canary(&output);
+
+    let output = ggctl(
+        &["backup", "verify", archive_path, "--format", "json"],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stdout));
+    assert_eq!(report(&output)["result"]["verified"], true);
+
+    // Cut short, the archive is an integrity failure; nothing is left beside it.
+    let bytes = std::fs::read(&archive).expect("the archive");
+    std::fs::write(&archive, &bytes[..bytes.len() - 1]).expect("truncated");
+    let output = ggctl(
+        &["backup", "verify", archive_path, "--format", "json"],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(7));
+    assert_eq!(
+        report(&output)["diagnostics"][0]["code"],
+        "archive.truncated"
+    );
+    assert_no_canary(&output);
+    let names: Vec<_> = std::fs::read_dir(&out.0)
+        .expect("lists")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .into_string()
+                .expect("UTF-8")
+        })
+        .collect();
+    assert_eq!(names, ["state.ggbk"]);
+}
