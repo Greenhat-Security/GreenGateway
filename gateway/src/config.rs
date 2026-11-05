@@ -42,6 +42,7 @@ use crate::{
 mod environment_reads;
 #[cfg(test)]
 mod fingerprint_tests;
+mod restore;
 #[cfg(test)]
 mod revisions;
 

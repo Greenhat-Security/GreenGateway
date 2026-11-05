@@ -167,6 +167,7 @@ const COMMAND_NAMES: &[&str] = &[
     "ledger rollback",
     "backup create",
     "backup verify",
+    "backup restore",
     "completion",
     "help",
 ];
@@ -187,9 +188,9 @@ pub(crate) const HELP_TOPICS: &[&str] = &[
     "help",
 ];
 const LEDGER_COMMANDS: &[&str] = &["seed", "verify", "rollback"];
-const BACKUP_COMMANDS: &[&str] = &["create", "verify"];
+const BACKUP_COMMANDS: &[&str] = &["create", "verify", "restore"];
 /// The second word of every family's commands, once each, for `ggctl help`.
-const SUBCOMMANDS: &[&str] = &["seed", "verify", "rollback", "create"];
+const SUBCOMMANDS: &[&str] = &["seed", "verify", "rollback", "create", "restore"];
 
 const FORMAT: OptionSpec = OptionSpec {
     name: "--format",
@@ -336,6 +337,18 @@ const ARCHIVE: ArgumentSpec = ArgumentSpec {
     required: true,
     help: "the backup archive, as ggctl backup create wrote it",
 };
+const RESTORE_STATE_DIR: OptionSpec = OptionSpec {
+    name: "--state-dir",
+    value: Some(("DIR", ValueKind::Path)),
+    repeatable: false,
+    help: "the state directory to restore into (required): an existing empty directory, or with --replace-existing-state a stopped state directory, held under its exclusive lock",
+};
+const REPLACE_EXISTING_STATE: OptionSpec = OptionSpec {
+    name: "--replace-existing-state",
+    value: None,
+    repeatable: false,
+    help: "replace the stores a stopped state directory holds; it must hold nothing but the state-directory layout's entries",
+};
 
 pub(crate) const FAMILIES: &[FamilySpec] = &[
     FamilySpec {
@@ -354,7 +367,7 @@ pub(crate) const FAMILIES: &[FamilySpec] = &[
     },
     FamilySpec {
         name: "backup",
-        summary: "Back up a standalone state directory, or verify a backup, offline",
+        summary: "Back up a standalone state directory, verify a backup, or restore one, offline",
         description: &[
             "The offline commands over standalone backups (docs/standalone-backup.md): one \
              archive of the stores beneath a state directory, with a GatewayBackup manifest of \
@@ -363,7 +376,8 @@ pub(crate) const FAMILIES: &[FamilySpec] = &[
              Connections store keeps its secrets as ciphertext, and the key files under \
              CONNECTION_SECRETS_ROOT are a separate artifact to back up separately. None of \
              these commands makes a network request or reads an environment variable, and none \
-             writes gateway audit events.",
+             writes gateway audit events; a restore leaves a marker for the next gateway start \
+             to record.",
         ],
         commands: BACKUP_COMMANDS,
         hint: "run `ggctl help backup` for the backup commands",
@@ -637,6 +651,37 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         arguments: &[ARCHIVE],
         options: &[FORMAT],
         run: crate::backup::verify,
+    },
+    CommandSpec {
+        name: "backup restore",
+        summary: "Restore a backup into an empty or stopped state directory, offline",
+        description: &[
+            "Takes the exclusive lock of the state directory --state-dir names, so it runs only \
+             while no gateway or other ggctl holds it. The directory must be empty, or with \
+             --replace-existing-state hold nothing but the state-directory layout's entries (the \
+             stores' files with their -wal, -shm and -journal files, the lock file and a restore \
+             marker), and must not be a mount point. There is no option that overwrites anything \
+             else.",
+            "The archive FILE is extracted into a new hidden staging directory beside the state \
+             directory, named at random and owner-only on Unix, and checked there with every \
+             check of ggctl backup verify, then each store's SQLite application ID, owner-only \
+             modes and a flush of every file. A restore marker, which the next gateway start \
+             records as config.restore_detected and removes, is written beside the stores. Only \
+             then is the state directory renamed aside, the staging directory renamed into its \
+             place and their parent flushed; the replaced directory is then removed. Any failure \
+             removes the staging directory and leaves the state directory as it was.",
+            "Exits 0 when restored, 7 when the archive does not verify (truncation, tampering, \
+             traversal, links, duplicate or case-colliding entries, a bomb, an unsupported \
+             version, a database that fails its checks or claims another store's identity), 3 \
+             for a state directory that is not admissible, holds what the layout does not name \
+             or is a mount point, and for an archive that is a link, not a regular file or a \
+             PostgreSQL dump, 5 when the state directory is locked, holds stores without \
+             --replace-existing-state or changed meanwhile, and 1 when anything could not be \
+             read, written or renamed.",
+        ],
+        arguments: &[ARCHIVE],
+        options: &[RESTORE_STATE_DIR, REPLACE_EXISTING_STATE, FORMAT],
+        run: crate::backup::restore,
     },
     CommandSpec {
         name: "completion",
