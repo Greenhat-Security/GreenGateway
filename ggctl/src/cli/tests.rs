@@ -56,6 +56,378 @@ fn the_table_is_consistent() {
     for (reserved, _) in RESERVED {
         assert!(!names.contains(reserved));
     }
+    // Help names every command outside a family and every family, in table
+    // order; a family lists its commands' second words in table order.
+    let mut topics: Vec<&str> = Vec::new();
+    for command in COMMANDS {
+        let topic = command.family().map_or(command.name, |family| family.name);
+        if !topics.contains(&topic) {
+            topics.push(topic);
+        }
+    }
+    assert_eq!(topics, HELP_TOPICS);
+    for family in FAMILIES {
+        let words: Vec<_> = family
+            .members()
+            .map(|command| member_word(family, command).expect("a member"))
+            .collect();
+        assert_eq!(words, family.commands);
+        assert!(COMMANDS.iter().all(|command| command.name != family.name));
+        // `ggctl help FAMILY SUBCOMMAND` accepts every family's words.
+        for word in words {
+            assert!(SUBCOMMANDS.contains(&word), "{word}");
+        }
+    }
+    for word in SUBCOMMANDS {
+        assert!(
+            FAMILIES.iter().any(|family| family.commands.contains(word)),
+            "{word}"
+        );
+    }
+    // Only an acknowledgement can be given more than once.
+    for command in COMMANDS {
+        for option in command.options {
+            assert_eq!(
+                option.repeatable,
+                option.name == "--acknowledge",
+                "{}",
+                option.name
+            );
+        }
+    }
+}
+
+#[test]
+fn the_acknowledgeable_risk_codes_are_the_diff_engines() {
+    let codes: Vec<_> = gateway_config::semantic_diff::RiskCode::ALL
+        .iter()
+        .map(|code| code.as_str())
+        .collect();
+    assert_eq!(codes, RISK_CODES);
+}
+
+#[test]
+fn a_family_command_is_its_family_and_a_second_word() {
+    let invocation = runnable(&[
+        "ledger",
+        "rollback",
+        "rev-00000000000000000000000000000000",
+        "--acknowledge",
+        "risk.policy_broadened",
+        "--state-dir",
+        "/state",
+        "--acknowledge=risk.unknown_impact",
+    ]);
+    assert_eq!(invocation.command.name, "ledger rollback");
+    assert_eq!(
+        invocation.positional(0),
+        Some((3, "rev-00000000000000000000000000000000"))
+    );
+    assert_eq!(
+        invocation.texts("--acknowledge"),
+        [(4, "risk.policy_broadened"), (8, "risk.unknown_impact")]
+    );
+    assert_eq!(invocation.text("--state-dir"), Some((6, "/state")));
+    assert!(invocation.texts("--format").is_empty());
+
+    for (words, code, position) in [
+        (&["ledger"][..], Code::MissingCommand, None),
+        (&["ledger", "frobnicate"], Code::UnknownCommand, Some(2)),
+        (&["ledger", "--state-dir"], Code::UnknownCommand, Some(2)),
+        (&["ledger seed", "/bundle"], Code::UnknownCommand, Some(1)),
+        (
+            &["ledger", "verify", "extra"],
+            Code::UnexpectedArgument,
+            Some(3),
+        ),
+        (
+            &["ledger", "verify", "--state-dir", "/a", "--state-dir", "/b"],
+            Code::DuplicateOption,
+            Some(5),
+        ),
+        (
+            &[
+                "ledger",
+                "rollback",
+                "rev-x",
+                "--acknowledge",
+                "risk.everything",
+            ],
+            Code::InvalidValue,
+            Some(5),
+        ),
+        (
+            &["help", "ledger", "frobnicate"],
+            Code::InvalidValue,
+            Some(3),
+        ),
+        (
+            &["help", "version", "seed"],
+            Code::UnexpectedArgument,
+            Some(3),
+        ),
+    ] {
+        let diagnostic = refused(words);
+        assert_eq!(diagnostic.code, code, "{words:?}");
+        assert_eq!(diagnostic.argument, position, "{words:?}");
+    }
+    let alone = refused(&["ledger"]);
+    assert!(alone
+        .hint
+        .is_some_and(|hint| hint.contains("ggctl help ledger")));
+}
+
+#[test]
+fn the_policy_and_evidence_commands_are_family_commands() {
+    let invocation = runnable(&[
+        "policy",
+        "test",
+        "suite.json",
+        "--server",
+        "https://gateway.example.test/v1/admin",
+        "--draft=pd_1",
+        "--draft-etag",
+        "\"e\"",
+    ]);
+    assert_eq!(invocation.command.name, "policy test");
+    assert_eq!(invocation.positional(0), Some((3, "suite.json")));
+    assert_eq!(invocation.text("--draft"), Some((6, "pd_1")));
+    assert_eq!(invocation.text("--draft-etag"), Some((7, "\"e\"")));
+    let invocation = runnable(&["evidence", "verify", "package.json"]);
+    assert_eq!(invocation.command.name, "evidence verify");
+    assert_eq!(invocation.positional(0), Some((3, "package.json")));
+
+    for (words, code, position) in [
+        (&["policy"][..], Code::MissingCommand, None),
+        (&["policy", "frobnicate"], Code::UnknownCommand, Some(2)),
+        (&["policy", "--server"], Code::UnknownCommand, Some(2)),
+        (
+            &["policy lint", "policy.json"],
+            Code::UnknownCommand,
+            Some(1),
+        ),
+        (&["evidence", "lint"], Code::UnknownCommand, Some(2)),
+        (
+            &["policy", "seed", "/bundle"],
+            Code::UnknownCommand,
+            Some(2),
+        ),
+        (
+            &["evidence", "verify", "a.json", "b.json"],
+            Code::UnexpectedArgument,
+            Some(4),
+        ),
+        (
+            &["policy", "replay", "--wait", "--wait"],
+            Code::DuplicateOption,
+            Some(4),
+        ),
+        (
+            &["policy", "test", "s.json", "--format", "sarif"],
+            Code::InvalidValue,
+            Some(5),
+        ),
+        (
+            &["policy", "replay", "--max-records"],
+            Code::MissingValue,
+            Some(3),
+        ),
+        (&["help", "policy", "verify"], Code::InvalidValue, Some(3)),
+        (&["help", "evidence", "seed"], Code::InvalidValue, Some(3)),
+        (
+            &["help", "version", "lint"],
+            Code::UnexpectedArgument,
+            Some(3),
+        ),
+    ] {
+        let diagnostic = refused(words);
+        assert_eq!(diagnostic.code, code, "{words:?}");
+        assert_eq!(diagnostic.argument, position, "{words:?}");
+    }
+    let alone = refused(&["evidence"]);
+    assert!(alone
+        .hint
+        .is_some_and(|hint| hint.contains("ggctl help evidence")));
+    for words in [
+        &["policy", "--help"][..],
+        &["policy", "-h"],
+        &["help", "policy"],
+    ] {
+        match parsed(words) {
+            Ok(Parsed::Help(HelpTopic::Family(family))) => assert_eq!(family.name, "policy"),
+            other => panic!("{words:?}: {other:?}"),
+        }
+    }
+    for words in [
+        &["evidence", "verify", "--help"][..],
+        &["help", "evidence", "verify"],
+        &["evidence", "verify", "package.json", "-h"],
+    ] {
+        match parsed(words) {
+            Ok(Parsed::Help(HelpTopic::Spec(command))) => {
+                assert_eq!(command.name, "evidence verify")
+            }
+            other => panic!("{words:?}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_family_and_its_commands_have_help() {
+    for words in [
+        &["ledger", "--help"][..],
+        &["ledger", "-h"],
+        &["help", "ledger"],
+    ] {
+        match parsed(words) {
+            Ok(Parsed::Help(HelpTopic::Family(family))) => assert_eq!(family.name, "ledger"),
+            other => panic!("{words:?}: {other:?}"),
+        }
+    }
+    for words in [
+        &["ledger", "seed", "--help"][..],
+        &["help", "ledger", "seed"],
+        &["ledger", "seed", "/bundle", "--state-dir", "/state", "-h"],
+    ] {
+        match parsed(words) {
+            Ok(Parsed::Help(HelpTopic::Spec(command))) => {
+                assert_eq!(command.name, "ledger seed")
+            }
+            other => panic!("{words:?}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_backup_command_is_its_family_and_a_second_word() {
+    let invocation = runnable(&[
+        "backup",
+        "create",
+        "--output",
+        "/backups/state.ggbk",
+        "--state-dir",
+        "/state",
+    ]);
+    assert_eq!(invocation.command.name, "backup create");
+    assert_eq!(invocation.text("--state-dir"), Some((5, "/state")));
+    assert_eq!(
+        invocation.text("--output"),
+        Some((3, "/backups/state.ggbk"))
+    );
+    let invocation = runnable(&["backup", "verify", "/backups/state.ggbk"]);
+    assert_eq!(invocation.command.name, "backup verify");
+    assert_eq!(invocation.positional(0), Some((3, "/backups/state.ggbk")));
+    let invocation = runnable(&[
+        "backup",
+        "restore",
+        "/backups/state.ggbk",
+        "--state-dir",
+        "/state",
+        "--replace-existing-state",
+    ]);
+    assert_eq!(invocation.command.name, "backup restore");
+    assert_eq!(invocation.positional(0), Some((3, "/backups/state.ggbk")));
+    assert_eq!(invocation.text("--state-dir"), Some((4, "/state")));
+    assert_eq!(invocation.flag("--replace-existing-state"), Some(6));
+    let invocation = runnable(&[
+        "backup",
+        "restore",
+        "/backups/state.ggbk",
+        "--state-dir",
+        "/state",
+    ]);
+    assert_eq!(invocation.flag("--replace-existing-state"), None);
+
+    for (words, code, position) in [
+        (&["backup"][..], Code::MissingCommand, None),
+        (&["backup", "frobnicate"], Code::UnknownCommand, Some(2)),
+        (&["backup", "--state-dir"], Code::UnknownCommand, Some(2)),
+        (
+            &["backup create", "--state-dir"],
+            Code::UnknownCommand,
+            Some(1),
+        ),
+        (&["create"], Code::UnknownCommand, Some(1)),
+        (&["backup", "verify"], Code::MissingArgument, None),
+        (
+            &[
+                "backup",
+                "restore",
+                "/a.ggbk",
+                "--state-dir",
+                "/a",
+                "--replace-existing-state=yes",
+            ],
+            Code::UnexpectedValue,
+            Some(6),
+        ),
+        (
+            &[
+                "backup",
+                "restore",
+                "/a.ggbk",
+                "--state-dir",
+                "/a",
+                "--force",
+            ],
+            Code::UnknownOption,
+            Some(6),
+        ),
+        (
+            &["backup", "verify", "/a.ggbk", "extra"],
+            Code::UnexpectedArgument,
+            Some(4),
+        ),
+        (
+            &["backup", "create", "--state-dir", "/a", "--state-dir", "/b"],
+            Code::DuplicateOption,
+            Some(5),
+        ),
+        (
+            &["help", "backup", "frobnicate"],
+            Code::InvalidValue,
+            Some(3),
+        ),
+        (
+            &["help", "version", "create"],
+            Code::UnexpectedArgument,
+            Some(3),
+        ),
+    ] {
+        let diagnostic = refused(words);
+        assert_eq!(diagnostic.code, code, "{words:?}");
+        assert_eq!(diagnostic.argument, position, "{words:?}");
+    }
+    let alone = refused(&["backup"]);
+    assert!(alone
+        .hint
+        .is_some_and(|hint| hint.contains("ggctl help backup")));
+}
+
+#[test]
+fn the_backup_family_and_its_commands_have_help() {
+    for words in [
+        &["backup", "--help"][..],
+        &["backup", "-h"],
+        &["help", "backup"],
+    ] {
+        match parsed(words) {
+            Ok(Parsed::Help(HelpTopic::Family(family))) => assert_eq!(family.name, "backup"),
+            other => panic!("{words:?}: {other:?}"),
+        }
+    }
+    for words in [
+        &["backup", "create", "--help"][..],
+        &["help", "backup", "create"],
+        &["backup", "create", "--state-dir", "/state", "-h"],
+    ] {
+        match parsed(words) {
+            Ok(Parsed::Help(HelpTopic::Spec(command))) => {
+                assert_eq!(command.name, "backup create")
+            }
+            other => panic!("{words:?}: {other:?}"),
+        }
+    }
 }
 
 #[test]
@@ -97,9 +469,12 @@ fn commands_options_and_values_parse_in_every_spelling() {
 
 #[test]
 fn help_and_version_are_recognized_everywhere() {
-    assert!(matches!(parsed(&["--help"]), Ok(Parsed::Help(None))));
-    assert!(matches!(parsed(&["-h"]), Ok(Parsed::Help(None))));
-    assert!(matches!(parsed(&["help"]), Ok(Parsed::Help(None))));
+    for words in [&["--help"][..], &["-h"], &["help"]] {
+        assert!(
+            matches!(parsed(words), Ok(Parsed::Help(HelpTopic::Overview))),
+            "{words:?}"
+        );
+    }
     assert!(matches!(parsed(&["--version"]), Ok(Parsed::Version)));
     for words in [
         &["help", "version"][..],
@@ -112,7 +487,7 @@ fn help_and_version_are_recognized_everywhere() {
         ],
     ] {
         match parsed(words) {
-            Ok(Parsed::Help(Some(command))) => assert_eq!(command.name, "version"),
+            Ok(Parsed::Help(HelpTopic::Spec(command))) => assert_eq!(command.name, "version"),
             other => panic!("{words:?}: {other:?}"),
         }
     }
@@ -277,13 +652,33 @@ fn only_a_path_value_may_be_non_utf8() {
         }
         other => panic!("{other:?}"),
     }
+    // A document named by an option is a path too.
+    let parsed = parse(&[
+        OsString::from("policy"),
+        OsString::from("test"),
+        OsString::from("suite.json"),
+        OsString::from("--candidate"),
+        path.clone(),
+    ]);
+    match parsed {
+        Ok(Parsed::Run(invocation)) => assert_eq!(
+            invocation
+                .value("--candidate")
+                .map(|(_, value)| value.to_owned()),
+            Some(path.clone())
+        ),
+        other => panic!("{other:?}"),
+    }
     let refused = parse(&[OsString::from("version"), OsString::from("--server"), path])
         .expect_err("a URL must be UTF-8");
     assert_eq!(refused.code, Code::ArgumentNotUtf8);
     assert_eq!(refused.argument, Some(3));
-    // Nor may a command, an option name or a positional argument.
+    // Nor may a command, a family's command, an option name or a positional
+    // argument.
     for (arguments, position) in [
         (vec![non_utf8("version")], 1),
+        (vec![OsString::from("ledger"), non_utf8("seed")], 2),
+        (vec![OsString::from("policy"), non_utf8("lint")], 2),
         (vec![OsString::from("version"), non_utf8("--server")], 2),
         (vec![OsString::from("schema"), non_utf8("GatewayBundle")], 2),
     ] {

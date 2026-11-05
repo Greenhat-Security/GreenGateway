@@ -338,6 +338,14 @@ API discovery, payload capture and the discovery signals.
 | `discovery.signals.volume_outlier_threshold` | decimal string, above 1 | `"3"` | [`VOLUME_OUTLIER_SIGNAL_THRESHOLD`](configuration.md#volume_outlier_signal_threshold) |
 | `discovery.rule_suggestion_baseline_window_hours` | integer hours, 1 to 876000 | `24` | [`RULE_SUGGESTION_BASELINE_WINDOW_HOURS`](configuration.md#rule_suggestion_baseline_window_hours) |
 
+#### `spec.policy_tests`
+
+The stored policy test suite as a gate on policy changes.
+
+| Member | Value | Default | Environment mode |
+| --- | --- | --- | --- |
+| `policy_tests.required` | `true` or `false` | `false` | [`POLICY_TESTS_REQUIRED`](configuration.md#policy_tests_required) |
+
 #### `spec.cors`
 
 Cross-origin resource sharing.
@@ -701,9 +709,9 @@ reopened. Specifically:
   and the gateway must not read the same bytes differently.
 
 Bundles are directories only. There is no archive form of a bundle, so no
-archive reader sits in the configuration path; the backup archive (a later #242
-slice) has its own reader, which must apply the
-[archive entry admission rules](archive-admission.md).
+archive reader sits in the configuration path; the
+[standalone backup](standalone-backup.md) archive has its own reader, which
+applies the [archive entry admission rules](archive-admission.md).
 
 ## The YAML subset
 
@@ -795,7 +803,9 @@ will refuse the variable. No gateway reads `GATEWAY_STATE_DIR` yet, and in
 environment mode every store stays where its variable puts it. The layout, the
 admission rules and the lock are the shared `gateway-config` library's
 `state_dir` module, which the gateway and `ggctl` both use. Today the revision
-ledger is the only thing that opens through it.
+ledger, the `ggctl ledger` commands over it, and `ggctl backup create` and
+`ggctl backup restore` ([standalone backups](standalone-backup.md)) are the only
+things that open through it.
 
 | File | Store | Environment-mode variable |
 | --- | --- | --- |
@@ -807,6 +817,7 @@ ledger is the only thing that opens through it.
 | `policy-history.sqlite3` | Policy publication history | `POLICY_HISTORY_SQLITE_PATH` |
 | `config-ledger.sqlite3` | The [configuration revision ledger](configuration-ledger.md) | none |
 | `state.lock` | The directory's lock file | none |
+| `restore-marker.json` | The [restore marker](standalone-backup.md#the-restore-marker) `ggctl backup restore` leaves for the next gateway start, which records it and removes it | none |
 
 SQLite keeps `-wal`, `-shm` and `-journal` files beside each store; they belong
 to it. A test holds this table to the field catalog: every store the catalog
@@ -832,8 +843,8 @@ responsibility, as they are for bundle directories.
 advisory lock on `state.lock` (`flock` on Unix, `LockFileEx` on Windows),
 opened beneath the admitted directory without following a link. It never
 waits: if another process, or another handle in the same process, holds the
-lock, the attempt fails with `state_dir.locked`, which the `ggctl` commands
-that open a state directory will exit with as code 5. The lock is held for as long as the handle and every store opened
+lock, the attempt fails with `state_dir.locked`, which the `ggctl ledger`
+commands, the ones that open a state directory, exit with as code 5. The lock is held for as long as the handle and every store opened
 through it live, and is released when the last of them closes or the process
 exits. An open ledger keeps it held. The lock file is created empty and
 owner-only on Unix. Its content is never read or written, and it is never

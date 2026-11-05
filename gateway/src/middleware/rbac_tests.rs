@@ -3738,7 +3738,7 @@ fn an_invocation_answer_the_kernel_never_gives_is_refused() {
     for name in ["reports.open", "reports.closed", "reports.absent"] {
         let has_entry = name != "reports.absent";
         let genuine = snapshot
-            .evaluate_tool(ToolOperation::Invocation, name, None, None)
+            .evaluate_tool(ToolOperation::Invocation, name, None, no_call_facts(), None)
             .expect("the kernel answers a bounded question");
         for reason in TOOL_REASONS {
             for effect in EFFECTS {
@@ -3753,7 +3753,21 @@ fn an_invocation_answer_the_kernel_never_gives_is_refused() {
                         let attributable_rule = reason == ToolReason::MatchedRule
                             && matched == Some(RuleReference::Direct(0))
                             && rule_action_for(effect, logical).is_some();
-                        let verdict = snapshot.invocation_verdict(name, &answer);
+                        let (verdict, facts) = snapshot.answered_invocation(
+                            name,
+                            &answer,
+                            &crate::policy_eval::PolicyFacts::uncaptured(),
+                        );
+                        // Facts name a verdict, in a shape the kernel gives;
+                        // a refusal has none.
+                        let kernel_shaped = matched.is_none()
+                            || (reason == ToolReason::MatchedRule
+                                && matches!(matched, Some(RuleReference::Direct(_))));
+                        if matches!(verdict, ToolInvocationVerdict::Refused(_)) {
+                            assert!(facts.is_none(), "{shape}");
+                        } else {
+                            assert_eq!(facts.is_some(), kernel_shaped, "{shape}");
+                        }
                         match &verdict {
                             ToolInvocationVerdict::Entry {
                                 rule_decision: None,
@@ -3841,6 +3855,7 @@ fn a_rendered_http_answer_the_kernel_never_gives_is_refused() {
             ToolOperation::RenderedHttp,
             "reports.open",
             None,
+            no_call_facts(),
             Some((Method::GET, "/elsewhere".to_owned())),
         )
         .expect("the kernel answers a bounded question");
@@ -4022,3 +4037,19 @@ async fn http_attribution_resolves_references_on_the_instance_that_decided() {
 
 #[path = "rbac_identity_mapping_tests.rs"]
 mod identity_mappings;
+
+#[path = "rbac_condition_tests.rs"]
+mod conditions;
+
+#[path = "rbac_decision_facts_tests.rs"]
+mod decision_facts;
+
+/// A tool call with no address, judged by the system clock: what a policy
+/// without conditions never reads.
+fn no_call_facts() -> ToolCallFacts<'static> {
+    static CLOCK: PolicyClock = PolicyClock::System;
+    ToolCallFacts {
+        source_address: None,
+        clock: &CLOCK,
+    }
+}

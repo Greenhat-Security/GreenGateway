@@ -302,6 +302,25 @@ pub(crate) fn gateway_app_with_process_started_at_and_overrides(
             .map(storage::SqlitePolicyDraftStore::open)
             .transpose()?
             .map(|store| Arc::new(store) as Arc<dyn storage::PolicyDraftStore>);
+    // The stored policy test suite (issue #243) lives beside the policy
+    // history the same way: migration 29's tables in cluster mode, and a
+    // `policy_test_suite_versions` table in the history database standalone.
+    // A database that cannot be opened fails startup.
+    #[cfg(feature = "postgres")]
+    let policy_test_suite_store: Option<Arc<dyn storage::PolicyTestSuiteStore>> =
+        match build_overrides.pg_policy.as_ref() {
+            Some(seed) => Some(Arc::new(seed.store.test_suite_store())),
+            None => policy_history_sqlite_path(&config)
+                .map(storage::SqlitePolicyTestSuiteStore::open)
+                .transpose()?
+                .map(|store| Arc::new(store) as Arc<dyn storage::PolicyTestSuiteStore>),
+        };
+    #[cfg(not(feature = "postgres"))]
+    let policy_test_suite_store: Option<Arc<dyn storage::PolicyTestSuiteStore>> =
+        policy_history_sqlite_path(&config)
+            .map(storage::SqlitePolicyTestSuiteStore::open)
+            .transpose()?
+            .map(|store| Arc::new(store) as Arc<dyn storage::PolicyTestSuiteStore>);
     let observation_state =
         middleware::observation::ObservationState::from_config(&config, audit_log.clone())
             .with_conformance(schema_conformance_state);
@@ -362,6 +381,10 @@ pub(crate) fn gateway_app_with_process_started_at_and_overrides(
         }
         None => egress::EgressConfig::from_config(&config),
     };
+    #[cfg(test)]
+    if let Some(path) = build_overrides.egress_tls_ca_bundle_path.as_ref() {
+        egress_config.apply_tls_ca_bundle_path(path.clone())?;
+    }
     let discovery_egress_client = Arc::new(egress_client_for_build(
         egress_config.clone(),
         &build_overrides,
@@ -1140,6 +1163,8 @@ pub(crate) fn gateway_app_with_process_started_at_and_overrides(
         rbac_state: rbac_state.clone(),
         history_store: policy_history_store,
         draft_store: policy_draft_store,
+        test_suite_store: policy_test_suite_store,
+        policy_tests_required: config.policy_tests_required,
         #[cfg(feature = "postgres")]
         control_plane: policy_control_plane,
         #[cfg(feature = "postgres")]
@@ -1171,7 +1196,6 @@ pub(crate) fn gateway_app_with_process_started_at_and_overrides(
         openapi_catalogs: openapi_catalog_service,
         tests: connections::test::ConnectionTestService::new(connection_http_runtime.clone()),
         rbac_state: rbac_state.clone(),
-        authority_evidence,
         audit: audit_log.clone(),
         client_ip_policy: client_ip_policy.clone(),
         max_body_size: config.max_body_size,
@@ -1281,8 +1305,11 @@ pub(crate) fn gateway_app_with_process_started_at_and_overrides(
     let suggestions_admin_state = SuggestionsAdminState {
         suggestion_engine: rule_suggestion_engine,
         policy: policy_admin_state.clone(),
-        lifecycle_guard: Arc::new(tokio::sync::Mutex::new(())),
+        lifecycle_guard: Arc::default(),
     };
+    // Settles a standalone acceptance a previous process left pending
+    // (issue #243) without waiting for the first suggestion request.
+    spawn_suggestion_acceptance_reconciler(suggestions_admin_state.clone(), &app_state.lifecycle);
     let principal_admin_state = PrincipalAdminState {
         directory: principal_directory,
         audit_query_store: audit_query_store.clone(),

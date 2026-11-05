@@ -368,11 +368,50 @@ impl Policy {
         self.roles.values().any(|role| role.description.is_some())
     }
 
+    /// Whether any direct rule carries `conditions`, which a gateway that
+    /// serves policy v1 but predates enforced rule conditions refuses.
+    /// Cluster-mode writers ask the operation gate before committing such a
+    /// document (`storage::compatibility::POLICY_RULE_CONDITIONS`), so a
+    /// build without cluster mode has no caller.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn uses_rule_conditions(&self) -> bool {
+        self.rules.iter().any(|rule| rule.conditions.is_some())
+    }
+
+    /// Whether any direct rule's conditions contain a `tool_argument` leaf,
+    /// which a gateway that enforces the other conditions but predates
+    /// tool-argument conditions refuses. Cluster-mode writers ask the
+    /// operation gate before committing such a document
+    /// (`storage::compatibility::POLICY_TOOL_ARGUMENT_CONDITIONS`).
+    #[cfg(feature = "postgres")]
+    pub(crate) fn uses_tool_argument_conditions(&self) -> bool {
+        self.rules.iter().any(|rule| {
+            rule.conditions.as_ref().is_some_and(|conditions| {
+                let mut leaves = Vec::new();
+                conditions.tool_argument_leaves("", &mut leaves);
+                !leaves.is_empty()
+            })
+        })
+    }
+
+    /// Whether this is a policy v1 document (document format 1), which a
+    /// gateway that does not serve format 1 in cluster mode refuses.
+    /// Cluster-mode writers ask the operation gate before committing one
+    /// (`storage::compatibility::POLICY_DOCUMENT_V1`), so a build without
+    /// cluster mode has no caller.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn is_document_format_v1(&self) -> bool {
+        PolicySchema::of_version(&self.schema_version) == Some(PolicySchema::V1)
+    }
+
     /// Whether a cluster replica of this build reads and writes this
     /// policy's document format: `0` for a 0.x document, `1` for policy v1,
     /// which must lie in `cluster_membership::DOCUMENT_VERSION_RANGE`, the
-    /// range every replica advertises on the roster. A `schema_version` that
-    /// names no schema this build implements is never served.
+    /// range every replica of this build advertises on the roster (`0..=1`).
+    /// A `schema_version` that names no schema this build implements is
+    /// never served. That a replica of this build serves a format is not
+    /// that every live member does: committing a v1 document also asks the
+    /// operation gate.
     #[cfg(feature = "postgres")]
     pub(crate) fn cluster_serves_document_format(&self) -> bool {
         let (minimum, maximum) = crate::cluster_membership::DOCUMENT_VERSION_RANGE;
@@ -3662,6 +3701,7 @@ mod tests {
             policy_file,
             tools_file: None,
             policy_history_sqlite_path: None,
+            policy_tests_required: false,
             cors_allow_origins: Vec::new(),
             max_body_size: 1_048_576,
             max_request_path_bytes: crate::config::DEFAULT_MAX_REQUEST_PATH_BYTES,

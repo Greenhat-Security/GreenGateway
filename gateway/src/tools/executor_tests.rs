@@ -7120,6 +7120,7 @@ fn invocation_context() -> ToolInvocationContext {
         actor: None,
         source: ToolInvocationSource::Internal,
         organization: None,
+        source_address: None,
         caller: None,
         admitted_deadline: None,
     }
@@ -7138,6 +7139,7 @@ fn invocation_context_with_roles(roles: &[&str]) -> ToolInvocationContext {
         }),
         source: ToolInvocationSource::Internal,
         organization: None,
+        source_address: None,
         caller: None,
         admitted_deadline: None,
     }
@@ -7445,3 +7447,6 @@ impl ReleaseGate {
 
 #[path = "executor_caller_assertion_tests.rs"]
 mod caller_assertion_tests;
+
+#[path = "executor_argument_condition_tests.rs"]
+mod argument_condition_tests;

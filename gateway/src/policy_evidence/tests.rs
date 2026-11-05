@@ -11,7 +11,7 @@ use super::{
         assemble, EvidenceInputs, PackageError, PolicyIdentity, PredecessorRecord,
         PublicationRecord, ReplayEvidence, SimulationEvidence, ValidationOutcome,
     },
-    request::{parse_request, EvidenceRequest},
+    request::{parse_request, EvidenceRequest, SuiteSelection},
     LIMITATION_CODES, MAX_EVIDENCE_DIAGNOSTICS, PACKAGE_SCHEMA_VERSION, REDACTION_PROFILE,
     REPORT_MEDIA_TYPE, REPORT_SCHEMA_VERSION, REQUEST_SCHEMA_VERSION, TRUST_STATEMENT,
 };
@@ -158,10 +158,10 @@ fn a_full_request_parses_and_its_digest_ignores_representation() {
     let request = parsed(&full_request());
     assert_eq!(request.publication.version, 12);
     assert_eq!(request.publication.etag.as_deref(), Some(PUBLICATION_ETAG));
-    assert_eq!(
-        request.suite.as_ref().map(|suite| suite.cases.len()),
-        Some(2)
-    );
+    assert!(matches!(
+        request.suite.as_ref(),
+        Some(SuiteSelection::Inline(suite)) if suite.cases.len() == 2
+    ));
     let simulation = request.simulation.as_ref().expect("simulation section");
     assert_eq!(simulation.trace, TraceLevel::Matched);
     assert_eq!(
@@ -184,6 +184,58 @@ fn a_full_request_parses_and_its_digest_ignores_representation() {
     let mut changed = full_request();
     changed["publication"]["version"] = json!(13);
     assert_ne!(parsed(&changed).digest, request.digest);
+}
+
+/// A suite may instead be the stored one, pinned to the ETag the caller
+/// reviewed. The pin is required, the reference strict, and the request's
+/// digest covers the pin, so two packages naming one stored version name the
+/// same inputs.
+#[test]
+fn a_suite_may_be_the_stored_suite_pinned_by_its_etag() {
+    let mut request = full_request();
+    request["suite"] = json!({ "source": "stored", "etag": OTHER_ETAG });
+    let accepted = parsed(&request);
+    assert!(matches!(
+        accepted.suite.as_ref(),
+        Some(SuiteSelection::Stored { etag }) if etag == OTHER_ETAG
+    ));
+    assert!(accepted.evaluates_synthetic_cases());
+    let mut repinned = request.clone();
+    repinned["suite"]["etag"] = json!(PREDECESSOR_ETAG);
+    assert_ne!(parsed(&repinned).digest, accepted.digest);
+
+    for (suite, code, pointer) in [
+        (
+            json!({ "source": "stored" }),
+            "missing_field",
+            "/suite/etag",
+        ),
+        (
+            json!({ "source": "inline", "etag": OTHER_ETAG }),
+            "invalid_value",
+            "/suite/source",
+        ),
+        (
+            json!({ "source": "stored", "etag": "" }),
+            "invalid_value",
+            "/suite/etag",
+        ),
+        (
+            json!({ "source": "stored", "etag": OTHER_ETAG, "version": 3 }),
+            "unknown_field",
+            "/suite/version",
+        ),
+        (
+            json!({ "source": "stored", "etag": OTHER_ETAG, "token": "abc" }),
+            "forbidden_field",
+            "/suite/token",
+        ),
+    ] {
+        let mut request = full_request();
+        request["suite"] = suite.clone();
+        let diagnostics = refused(&request);
+        assert!(has(&diagnostics, code, pointer), "{suite}: {diagnostics:?}");
+    }
 }
 
 #[test]
@@ -914,7 +966,9 @@ fn the_published_request_schema_agrees_with_the_parser() {
     });
     let mut cases_only = minimal.clone();
     cases_only["simulation"] = json!({ "cases": simulation_cases() });
-    for request in [full_request(), minimal.clone(), cases_only] {
+    let mut stored_suite = full_request();
+    stored_suite["suite"] = json!({ "source": "stored", "etag": OTHER_ETAG });
+    for request in [full_request(), minimal.clone(), cases_only, stored_suite] {
         parsed(&request);
         if let Err(error) = validator.validate(&request) {
             panic!("the schema refuses an accepted request: {error}\n{request}");
@@ -945,6 +999,12 @@ fn the_published_request_schema_agrees_with_the_parser() {
     variant(&|request| request["simulation"]["cases"] = json!([]));
     variant(&|request| request["simulation"]["base_etag"] = json!(OTHER_ETAG));
     variant(&|request| request["suite"] = Value::Null);
+    variant(&|request| request["suite"] = json!({ "source": "stored" }));
+    variant(&|request| request["suite"] = json!({ "source": "inline", "etag": OTHER_ETAG }));
+    variant(&|request| {
+        request["suite"] = json!({ "source": "stored", "etag": OTHER_ETAG, "version": 2 });
+    });
+    variant(&|request| request["suite"]["source"] = json!("stored"));
     variant(&|request| request["replay_job_id"] = json!(""));
     variant(&|request| request["replay_job_id"] = json!("r".repeat(65)));
     for request in refusals {
@@ -980,4 +1040,109 @@ fn a_package_matches_the_published_package_schema() {
             .collect::<Vec<_>>();
         assert!(errors.is_empty(), "{errors:?}");
     }
+}
+
+/// A suite and synthetic cases that state a tool invocation's arguments are
+/// decided by them, and the package repeats none of the values.
+#[test]
+fn a_report_repeats_no_tool_argument() {
+    const ARGUMENT_CANARY: &str = "evidence-argument-canary-2b7d";
+    let document = json!({
+        "schema_version": "1.0.0",
+        "default_action": "deny",
+        "tools": { "reports.export": {} },
+        "rules": [
+            {
+                "id": "no-eu-exports",
+                "tool_name": "reports.export",
+                "action": "deny",
+                "conditions": { "tool_argument": { "pointer": "/region", "in": ["eu"] } }
+            },
+            { "id": "exports-open", "tool_name": "reports.export", "action": "allow" }
+        ]
+    });
+    let invocation = |id: &str| {
+        json!({
+            "id": id,
+            "kind": "tool",
+            "tool": { "name": "reports.export" },
+            "principal": "anonymous",
+            "facts": { "arguments": { "region": ARGUMENT_CANARY, "memo": ARGUMENT_CANARY } }
+        })
+    };
+    let mut tested = invocation("export-elsewhere");
+    tested["expect"] = json!({ "logical": "allow", "matched": { "rule": "exports-open" } });
+    let request = parsed(&json!({
+        "schema_version": REQUEST_SCHEMA_VERSION,
+        "publication": { "version": 12, "etag": PUBLICATION_ETAG },
+        "suite": { "schema_version": "policy-tests.v1", "cases": [tested] },
+        "simulation": { "trace": "matched", "cases": [invocation("simulated-export")] }
+    }));
+    let Some(SuiteSelection::Inline(suite)) = request.suite.as_ref() else {
+        panic!("the request carries its suite");
+    };
+    let outcome = policy_testing::run_against_policy(
+        policy(document.clone()),
+        PolicyAuthority::Standalone,
+        suite,
+        &SyntheticResources::none(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .expect("suite runs");
+    let tests = RunReport::new(
+        suite.digest.clone(),
+        PolicyBinding {
+            source: PolicySource::Publication,
+            etag: PUBLICATION_ETAG.to_owned(),
+            security_revision: None,
+            stored: None,
+        },
+        outcome,
+    );
+    let selection = request.simulation.as_ref().expect("simulation section");
+    let pairs = compile_pairs(
+        &policy(predecessor_document()),
+        PolicyAuthority::Standalone,
+        Some(&policy(document.clone())),
+        &selection.projections,
+    )
+    .expect("policies compile");
+    let simulated = simulate(
+        &pairs,
+        &selection.cases,
+        selection.trace,
+        &SyntheticResources::none(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap_or_else(|error| panic!("cases simulate: {error:?}"));
+    let package = assemble(
+        EvidenceInputs {
+            request_digest: request.digest.clone(),
+            publication: PublicationRecord {
+                version: 12,
+                recorded_at: "2026-10-28T11:00:00Z".to_owned(),
+                diff_summary: draft_summary(PREDECESSOR_ETAG),
+                policy: identity(PUBLICATION_ETAG, Some(SEMANTIC_DIGEST)),
+            },
+            predecessor: None,
+            validation: validation_of(&document),
+            tests: Some(tests),
+            simulation: Some(SimulationEvidence {
+                trace: selection.trace,
+                projections: selection.projections.clone(),
+                compared_with_predecessor: true,
+                outcome: simulated,
+            }),
+            replay: None,
+        },
+        GENERATED_AT,
+    )
+    .expect("package assembles");
+    let report = package_value(&package.bytes)["report"].clone();
+    assert_eq!(report["tests"]["results"]["status"], "passed");
+    let text = String::from_utf8(package.bytes).expect("UTF-8");
+    assert!(
+        !text.contains(ARGUMENT_CANARY),
+        "the package repeats an argument"
+    );
 }

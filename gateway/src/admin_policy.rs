@@ -272,7 +272,9 @@ pub(super) async fn policy_rollback_endpoint(
 /// document's own diagnostics, then what the document cannot show about
 /// itself -- whether this deployment can enforce and commit it, the checks
 /// that also refuse a replace. Policy evidence revalidates a publication with
-/// the same function.
+/// the same function. Whether every live cluster member reads the format now
+/// is the roster's answer, which validation adds on its own and evidence does
+/// not ask for.
 pub(super) fn inspect_policy_for_deployment(
     state: &PolicyAdminState,
     rbac_state: &middleware::rbac::RbacState,
@@ -335,6 +337,23 @@ pub(super) async fn policy_validate_endpoint(
     };
 
     let mut inspection = inspect_policy_for_deployment(&state, rbac_state, &body);
+    // What only the roster can show: in cluster mode, whether every live
+    // replica reads a v1 document's format now. It blocks publication
+    // alone, as the commit's operation gate would refuse it.
+    #[cfg(feature = "postgres")]
+    {
+        let roster_refusal = match inspection.policy() {
+            Some(policy) => cluster_roster_document_format_refusal(&state, policy).await,
+            None => None,
+        };
+        if let Some(detail) = roster_refusal {
+            inspection.refuse(
+                rbac::policy_document::IssueCode::DocumentFormatUnsupportedInCluster,
+                "/schema_version",
+                detail,
+            );
+        }
+    }
     // What only the other resources can show: the same cross-resource,
     // lockout and risk checks a publication runs, as the replacement of
     // the policy the authority holds now, for this caller.
@@ -2264,6 +2283,7 @@ pub(super) fn policy_file_size_refusal(candidate: &rbac::Policy) -> Option<Strin
 
 /// The request a publication is checked for: who is publishing, how they
 /// reached the gateway, and the state that judges them.
+#[derive(Clone, Copy)]
 pub(super) struct PublicationRequest<'a> {
     pub(super) state: &'a PolicyAdminState,
     pub(super) rbac_state: &'a middleware::rbac::RbacState,
@@ -2273,10 +2293,13 @@ pub(super) struct PublicationRequest<'a> {
 
 /// What the cross-resource checks said about a publication that went
 /// ahead, for its `policy.changed` record: the resource snapshot it was
-/// checked against, and the risks it carried.
+/// checked against, and the risks it carried; and, when
+/// `POLICY_TESTS_REQUIRED` is on, the stored suite that admitted it
+/// ([`admit_required_policy_tests`]).
 pub(super) struct PublicationReview {
     pub(super) resource_snapshot_digest: Option<String>,
     pub(super) risks: Vec<&'static str>,
+    pub(super) required_tests: Option<RequiredTestsPassed>,
 }
 
 /// The cross-resource, lockout and risk checks of `candidate` as the
@@ -2329,6 +2352,7 @@ pub(super) fn admit_policy_resources(
                 codes,
                 policy_etag: live_etag,
                 resource_snapshot_digest: review.snapshot().digest(),
+                required_tests: None,
             },
         );
     };
@@ -2346,6 +2370,7 @@ pub(super) fn admit_policy_resources(
         return Ok(PublicationReview {
             resource_snapshot_digest: review.snapshot().digest().map(str::to_owned),
             risks: review.risk_codes(),
+            required_tests: None,
         });
     }
     refuse(&review.blocking_codes());
@@ -2402,8 +2427,11 @@ pub(super) fn resource_snapshot_stale(
 /// format at all: everything a write refuses about a candidate without
 /// trying to commit it, with the same responses. A policy draft is judged
 /// by this when it is saved and again when it is published, so a draft
-/// cluster mode could never commit (policy v1, today) is refused when it is
-/// saved rather than kept until its publication fails.
+/// cluster mode could never commit (a document format replicas of this
+/// build do not serve) is refused when it is saved rather than kept until
+/// its publication fails. A policy v1 draft is not such a draft: whether
+/// every live replica reads format 1 is the roster's answer at publication
+/// (`policy.document_v1`), and a rollout that finishes makes it publishable.
 pub(super) fn validate_policy_write_candidate(
     state: &PolicyAdminState,
     rbac_state: &middleware::rbac::RbacState,
@@ -2442,6 +2470,13 @@ pub(super) enum PolicyCommitRefusal {
     /// `AUTHORITY_EVIDENCE_DURABILITY=required` refused a change this
     /// deployment mode records no evidence of (issue #425, PR 4).
     AuthorityEvidenceUnsupported,
+    /// `POLICY_TESTS_REQUIRED` is on and the stored suite did not pass
+    /// against the candidate, or there is no suite to run (issue #243).
+    /// [`admit_required_policy_tests`] has already audited it as
+    /// `policy.publication_refused`.
+    RequiredTestsFailed,
+    /// `POLICY_TESTS_REQUIRED` is on and the suite store could not be read.
+    RequiredTestsUnavailable,
     /// No authority is configured, or it could not write the candidate.
     Failed,
 }
@@ -2467,7 +2502,7 @@ impl PolicyMutationFailure {
         Self::Incomplete(Box::new(response))
     }
 
-    fn into_response(self) -> Box<Response> {
+    pub(super) fn into_response(self) -> Box<Response> {
         match self {
             Self::Refused(_, response) | Self::Incomplete(response) => response,
         }
@@ -2525,13 +2560,14 @@ pub(super) async fn commit_policy_mutation(
     validate_policy_mutation_candidate(context.rbac_state, before_policy, candidate).map_err(
         |response| PolicyMutationFailure::Refused(PolicyCommitRefusal::CandidateInvalid, response),
     )?;
-    let review = admit_policy_resources(
-        PublicationRequest {
-            state: context.state,
-            rbac_state: context.rbac_state,
-            parts: context.parts,
-            principal: context.principal,
-        },
+    let publication = PublicationRequest {
+        state: context.state,
+        rbac_state: context.rbac_state,
+        parts: context.parts,
+        principal: context.principal,
+    };
+    let mut review = admit_policy_resources(
+        publication,
         before_policy,
         expected_etag,
         candidate,
@@ -2540,6 +2576,17 @@ pub(super) async fn commit_policy_mutation(
     .map_err(|response| {
         PolicyMutationFailure::Refused(PolicyCommitRefusal::ResourcesRefused, response)
     })?;
+    // With `POLICY_TESTS_REQUIRED` on, the stored suite must pass against
+    // the candidate, still under the write lock and before any authority
+    // sees it (issue #243).
+    review.required_tests = admit_required_policy_tests(
+        publication,
+        expected_etag,
+        candidate,
+        &diff_summary,
+        review.resource_snapshot_digest.as_deref(),
+    )
+    .await?;
 
     // Cluster mode: one transaction through the authority -- new immutable
     // version, revision advance, history row, and outbox record commit
@@ -2697,30 +2744,40 @@ pub(super) async fn commit_policy_mutation(
     })
 }
 
-/// Ask the cluster's operation gate before committing a document that uses
-/// a feature an older member cannot read (issue #426).
+/// Ask the cluster's operation gate before committing a document that an
+/// older member cannot read (issues #426 and #243).
 ///
-/// A document without such a feature needs nothing beyond the schema-25
-/// contract every member shares, and passes without a roster read. One that
-/// gives a role a `description` is the registered operation
-/// `policy.role_descriptions`: it is committed only while every live member,
-/// draining ones included, advertises `policy_role_descriptions`, because a
-/// member built before the field refuses the whole document. The gate reads
-/// the roster for every such write, logs and audits each refusal
-/// (`cluster.operation_refused`), and the refused write commits nothing.
+/// A 0.x document without role descriptions needs nothing beyond the
+/// schema-25 contract every member shares, and passes without a roster
+/// read. A policy v1 document is the registered operation
+/// `policy.document_v1`, and one that gives a role a `description` is
+/// `policy.role_descriptions`: each is committed only while every live
+/// member, draining ones included, advertises its capability
+/// (`policy_document_v1`, which also needs a document range reaching
+/// format 1, and `policy_role_descriptions`), because a member without it
+/// refuses the whole document. A v1 document whose rules carry
+/// `conditions` is also `policy.rule_conditions` (`policy_rule_conditions`),
+/// because a member that serves format 1 but predates enforced rule
+/// conditions refuses it the same way, and one whose conditions contain a
+/// `tool_argument` leaf is also `policy.tool_argument_conditions`
+/// (`policy_tool_argument_conditions`), which a member that enforces only
+/// the other leaves refuses. A document asks for each operation
+/// it performs. The gate reads the roster for every such write, logs and
+/// audits each refusal (`cluster.operation_refused`), and the refused write
+/// commits nothing.
 ///
 /// Every cluster-mode policy commit calls this: a discovery suggestion's
 /// acceptance, which commits the whole document with the new rule in it,
-/// and the policy API's mutations through [`commit_policy_mutation`], which
-/// takes its two halves (the format check and
+/// and the policy API's mutations through [`commit_policy_mutation`] (the
+/// replacement, rollback, the rule routes, bound shadow promotion and draft
+/// publication), which takes its two halves (the format check and
 /// [`admit_policy_operations`]) one at a time so it can say which refused.
 /// A control plane with no roster to read refuses rather than admits.
 ///
-/// Before any of that, the document's format must be one every replica can
-/// read. This build advertises `cluster_membership::DOCUMENT_VERSION_RANGE`,
-/// and a policy v1 document lies outside it: a replica built before v1
-/// refuses the whole document, and no capability gates v1 yet, so the
-/// commit is refused here with a `400` and nothing is written.
+/// Before any of that, the document's format must be one this build serves
+/// in cluster mode, `cluster_membership::DOCUMENT_VERSION_RANGE`. Both
+/// formats it parses are in that range, so the `400` this answers otherwise
+/// guards only against a format added to the parser without the range.
 #[cfg(feature = "postgres")]
 pub(super) async fn admit_policy_document(
     state: &PolicyAdminState,
@@ -2734,9 +2791,10 @@ pub(super) async fn admit_policy_document(
     admit_policy_operations(state, parts, principal, candidate).await
 }
 
-/// The operation-gate half of [`admit_policy_document`]: a document that
-/// uses a feature an older member cannot read is committed only while
-/// every live member advertises it.
+/// The operation-gate half of [`admit_policy_document`]: a document that an
+/// older member cannot read is committed only while every live member
+/// advertises what each of its operations requires. The first refusal
+/// answers the write, and is the only one audited.
 #[cfg(feature = "postgres")]
 async fn admit_policy_operations(
     state: &PolicyAdminState,
@@ -2744,13 +2802,13 @@ async fn admit_policy_operations(
     principal: &auth::Principal,
     candidate: &rbac::Policy,
 ) -> ResponseResult<()> {
-    if !candidate.uses_role_descriptions() {
+    let operations = policy_document_operations(candidate);
+    let Some(first) = operations.first() else {
         return Ok(());
-    }
-    let requirement = &storage::compatibility::POLICY_ROLE_DESCRIPTIONS;
+    };
     let Some(membership) = state.membership.as_ref() else {
         tracing::error!(
-            operation = requirement.operation,
+            operation = first.operation,
             "a cluster-mode policy commit has no roster to ask; the gated write is refused"
         );
         return Err(Box::new(operation_refused(
@@ -2766,11 +2824,76 @@ async fn admit_policy_operations(
         ),
         actor: Some(auth::actor_from_principal(principal)),
     };
-    membership
-        .admit_operation(requirement, &state.audit, &request)
-        .await
-        .map(|_| ())
-        .map_err(|refusal| Box::new(operation_refused(&refusal)))
+    for requirement in operations {
+        membership
+            .admit_operation(requirement, &state.audit, &request)
+            .await
+            .map_err(|refusal| Box::new(operation_refused(&refusal)))?;
+    }
+    Ok(())
+}
+
+/// The registered operations committing `candidate` performs, in the
+/// order the gate is asked: its document format first, then the features
+/// inside it. Empty for a 0.x document without role descriptions.
+#[cfg(feature = "postgres")]
+fn policy_document_operations(
+    candidate: &rbac::Policy,
+) -> Vec<&'static storage::compatibility::OperationRequirement> {
+    let mut operations = Vec::new();
+    if candidate.is_document_format_v1() {
+        operations.push(&storage::compatibility::POLICY_DOCUMENT_V1);
+        // Only a v1 document can carry conditions; the 0.x reader refuses
+        // them (`member_requires_v1`).
+        if candidate.uses_rule_conditions() {
+            operations.push(&storage::compatibility::POLICY_RULE_CONDITIONS);
+        }
+        if candidate.uses_tool_argument_conditions() {
+            operations.push(&storage::compatibility::POLICY_TOOL_ARGUMENT_CONDITIONS);
+        }
+    }
+    if candidate.uses_role_descriptions() {
+        operations.push(&storage::compatibility::POLICY_ROLE_DESCRIPTIONS);
+    }
+    operations
+}
+
+/// Why this cluster cannot commit `policy`'s document format now, as only
+/// its roster can show, if it cannot: the read-only half of the gate a v1
+/// commit asks (`policy.document_v1`), for `POST .../policy/validate`.
+/// `None` outside cluster mode, for a 0.x document, and while every live
+/// replica advertises `policy_document_v1` and a document range reaching
+/// format 1. No roster, or one that cannot be read, is reported as refusing,
+/// because the commit would be refused the same way. Counts and the stable
+/// reason only; never a member identifier.
+#[cfg(feature = "postgres")]
+async fn cluster_roster_document_format_refusal(
+    state: &PolicyAdminState,
+    policy: &rbac::Policy,
+) -> Option<String> {
+    if state.control_plane.is_none() || !policy.is_document_format_v1() {
+        return None;
+    }
+    let requirement = &storage::compatibility::POLICY_DOCUMENT_V1;
+    let refusal = match state.membership.as_ref() {
+        Some(membership) => membership.check_operation(requirement).await.err()?,
+        None => storage::compatibility::OperationRefusal::RosterUnavailable,
+    };
+    let why = match &refusal {
+        storage::compatibility::OperationRefusal::MembersLackRequirement { lacking, live } => {
+            format!(
+                "{} of {live} live cluster member(s) do not read document format 1; finish the \
+                 rollout, or wait for departed members to go stale",
+                lacking.len()
+            )
+        }
+        _ => "the cluster cannot be shown to read document format 1 right now".to_owned(),
+    };
+    Some(format!(
+        "policy schema_version '{}' cannot be committed in cluster mode yet ({}): {why}",
+        policy.schema_version,
+        refusal.reason()
+    ))
 }
 
 /// Why this deployment could not commit `policy`, if it could not. Only
@@ -2791,7 +2914,9 @@ pub(super) fn deployment_document_format_refusal(
 
 /// Why cluster mode cannot commit `policy`, if it cannot: its document
 /// format major is outside the range every replica of this build
-/// advertises and reads.
+/// advertises and reads. Both formats this build parses are inside it;
+/// whether every live member reads the format too is the operation gate's
+/// question ([`admit_policy_operations`]).
 #[cfg(feature = "postgres")]
 pub(super) fn cluster_document_format_refusal(policy: &rbac::Policy) -> Option<String> {
     if policy.cluster_serves_document_format() {
@@ -2800,8 +2925,7 @@ pub(super) fn cluster_document_format_refusal(policy: &rbac::Policy) -> Option<S
     let (minimum, maximum) = cluster_membership::DOCUMENT_VERSION_RANGE;
     Some(format!(
         "policy schema_version '{}' cannot be committed in cluster mode: replicas of this build \
-         read only document formats {minimum} to {maximum}, and no capability yet lets them \
-         agree to read another",
+         read only document formats {minimum} to {maximum}",
         policy.schema_version
     ))
 }
@@ -3136,17 +3260,22 @@ pub(super) fn exact_strong_entity_tag(
         .to_str()
         .map_err(|_| ToolPlaygroundIfMatchError::Invalid)?
         .trim();
-    if value.len() > 1_024
-        || value.len() < 2
-        || !value.starts_with('"')
-        || !value.ends_with('"')
-        || !value.as_bytes()[1..value.len() - 1]
-            .iter()
-            .all(|byte| *byte == b'!' || (b'#'..=b'~').contains(byte))
-    {
+    if !is_strong_entity_tag(value) {
         return Err(ToolPlaygroundIfMatchError::Invalid);
     }
     Ok(value.to_owned())
+}
+
+/// Whether `value` is one strong entity tag (RFC 9110 `entity-tag` without
+/// `W/`), at most 1 KiB: a quoted run of `etagc` octets.
+pub(super) fn is_strong_entity_tag(value: &str) -> bool {
+    value.len() <= 1_024
+        && value.len() >= 2
+        && value.starts_with('"')
+        && value.ends_with('"')
+        && value.as_bytes()[1..value.len() - 1]
+            .iter()
+            .all(|byte| *byte == b'!' || (b'#'..=b'~').contains(byte))
 }
 
 pub(super) fn if_match_error_response(error: IfMatchError) -> Response {

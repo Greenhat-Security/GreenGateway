@@ -40,7 +40,8 @@ fn this_binary_advertises_a_bounded_canonical_set_it_recognizes() {
     assert_eq!(
         rendered,
         "delegated_token_purges,openapi_discovery_catalogs,openapi_swagger2_catalogs,\
-         operation_requirements,policy_role_descriptions"
+         operation_requirements,policy_document_v1,policy_role_descriptions,\
+         policy_rule_conditions,policy_tool_argument_conditions"
     );
     let recognized = RecognizedCapabilities::parse(&rendered);
     assert_eq!(recognized.unrecognized(), 0);
@@ -54,9 +55,57 @@ fn this_binary_advertises_a_bounded_canonical_set_it_recognizes() {
             "openapi_discovery_catalogs",
             "openapi_swagger2_catalogs",
             "operation_requirements",
-            "policy_role_descriptions"
+            "policy_document_v1",
+            "policy_role_descriptions",
+            "policy_rule_conditions",
+            "policy_tool_argument_conditions"
         ]
     );
+}
+
+/// What the build before policy v1 in cluster mode advertises is still
+/// understood, and grants everything it implemented except format 1.
+#[test]
+fn a_pre_v1_members_advertisement_lacks_the_policy_document_v1_capability() {
+    let earlier = RecognizedCapabilities::parse(
+        "delegated_token_purges,openapi_discovery_catalogs,openapi_swagger2_catalogs,\
+         operation_requirements,policy_role_descriptions",
+    );
+    assert_eq!(earlier.unrecognized(), 0);
+    assert!(earlier.contains(Capability::PolicyRoleDescriptions));
+    assert!(!earlier.contains(Capability::PolicyDocumentV1));
+    assert!(!earlier.contains(Capability::PolicyRuleConditions));
+}
+
+/// What the build that served policy v1 in cluster mode before rule
+/// conditions were enforced advertises is still understood, and grants
+/// everything it implemented except enforced conditions.
+#[test]
+fn a_pre_conditions_members_advertisement_lacks_the_policy_rule_conditions_capability() {
+    let earlier = RecognizedCapabilities::parse(
+        "delegated_token_purges,openapi_discovery_catalogs,openapi_swagger2_catalogs,\
+         operation_requirements,policy_document_v1,policy_role_descriptions",
+    );
+    assert_eq!(earlier.unrecognized(), 0);
+    assert!(earlier.contains(Capability::PolicyDocumentV1));
+    assert!(!earlier.contains(Capability::PolicyRuleConditions));
+    assert!(!earlier.contains(Capability::PolicyToolArgumentConditions));
+}
+
+/// What the build that enforced rule conditions before tool-argument
+/// conditions advertises is still understood, and grants everything it
+/// implemented except the tool-argument leaf.
+#[test]
+fn a_pre_tool_argument_members_advertisement_lacks_the_policy_tool_argument_conditions_capability()
+{
+    let earlier = RecognizedCapabilities::parse(
+        "delegated_token_purges,openapi_discovery_catalogs,openapi_swagger2_catalogs,\
+         operation_requirements,policy_document_v1,policy_role_descriptions,\
+         policy_rule_conditions",
+    );
+    assert_eq!(earlier.unrecognized(), 0);
+    assert!(earlier.contains(Capability::PolicyRuleConditions));
+    assert!(!earlier.contains(Capability::PolicyToolArgumentConditions));
 }
 
 /// What a schema-18 gateway built before role descriptions advertises
@@ -70,6 +119,9 @@ fn a_prepared_members_advertisement_lacks_the_successors_capability() {
     assert!(!prepared.contains(Capability::OpenApiSwagger2Catalogs));
     assert!(!prepared.contains(Capability::DelegatedTokenPurges));
     assert!(!prepared.contains(Capability::OpenApiDiscoveryCatalogs));
+    assert!(!prepared.contains(Capability::PolicyDocumentV1));
+    assert!(!prepared.contains(Capability::PolicyRuleConditions));
+    assert!(!prepared.contains(Capability::PolicyToolArgumentConditions));
     assert_eq!(prepared.unrecognized(), 0);
 }
 
@@ -263,10 +315,46 @@ mod gate_tests {
                 POLICY_ROLE_DESCRIPTIONS,
                 OPENAPI_SWAGGER2_CATALOGS,
                 OPENAPI_DISCOVERY_CATALOGS,
-                DELEGATED_TOKEN_PURGES
+                DELEGATED_TOKEN_PURGES,
+                POLICY_DOCUMENT_V1,
+                POLICY_RULE_CONDITIONS,
+                POLICY_TOOL_ARGUMENT_CONDITIONS
             ],
             "registering an operation is a protocol change: review its requirement, its new \
              capability and the docs in ha-state-model.md section 7 before updating this test"
+        );
+        assert_eq!(
+            POLICY_TOOL_ARGUMENT_CONDITIONS,
+            OperationRequirement {
+                operation: "policy.tool_argument_conditions",
+                minimum_schema: 17,
+                document_format: Some(1),
+                capability: Capability::PolicyToolArgumentConditions,
+                backfill: Backfill::NotRequired,
+                activation: Activation::LiveMembers,
+            }
+        );
+        assert_eq!(
+            POLICY_RULE_CONDITIONS,
+            OperationRequirement {
+                operation: "policy.rule_conditions",
+                minimum_schema: 17,
+                document_format: Some(1),
+                capability: Capability::PolicyRuleConditions,
+                backfill: Backfill::NotRequired,
+                activation: Activation::LiveMembers,
+            }
+        );
+        assert_eq!(
+            POLICY_DOCUMENT_V1,
+            OperationRequirement {
+                operation: "policy.document_v1",
+                minimum_schema: 17,
+                document_format: Some(1),
+                capability: Capability::PolicyDocumentV1,
+                backfill: Backfill::NotRequired,
+                activation: Activation::LiveMembers,
+            }
         );
         assert_eq!(
             DELEGATED_TOKEN_PURGES,
@@ -559,6 +647,287 @@ mod gate_tests {
                 &[current, departed]
             ),
             Ok(OperationAdmission { live_members: 1 })
+        );
+    }
+
+    /// Issue #243's operation against a mixed roster. Committing a policy
+    /// v1 document needs both halves of the requirement from every live
+    /// member: the capability, and a document range reaching format 1. The
+    /// build before it has neither and holds the write; a member that
+    /// advertised one without the other would hold it too; and once only
+    /// members that read format 1 remain, the write is admitted. A 0.x
+    /// operation is not held by the same member.
+    #[test]
+    fn policy_document_v1_waits_for_every_live_member_to_read_format_one() {
+        const EARLIER: &str = "delegated_token_purges,openapi_discovery_catalogs,\
+                               openapi_swagger2_catalogs,operation_requirements,\
+                               policy_role_descriptions";
+        const CURRENT: &str = "delegated_token_purges,openapi_discovery_catalogs,\
+                               openapi_swagger2_catalogs,operation_requirements,\
+                               policy_document_v1,policy_role_descriptions";
+        let reads = |instance_id: Uuid, live: bool, capabilities: &str, document: (i32, i32)| {
+            MemberAdvertisement {
+                document_version: document,
+                ..member(instance_id, live, capabilities)
+            }
+        };
+        let shipped = BinaryContract::shipped();
+        assert_eq!(shipped.document, (0, 1), "this build reads formats 0 and 1");
+        let current = reads(OWN, true, CURRENT, shipped.document);
+
+        let earlier = reads(PEER, true, EARLIER, (0, 0));
+        assert_eq!(
+            gate(
+                &POLICY_DOCUMENT_V1,
+                &shipped,
+                OWN,
+                &[current.clone(), earlier.clone()]
+            ),
+            Err(OperationRefusal::MembersLackRequirement {
+                lacking: vec![PEER],
+                live: 2
+            })
+        );
+        assert_eq!(
+            gate(
+                &POLICY_ROLE_DESCRIPTIONS,
+                &shipped,
+                OWN,
+                &[current.clone(), earlier]
+            ),
+            Ok(OperationAdmission { live_members: 2 }),
+            "the earlier member still admits the 0.x operation it advertises"
+        );
+
+        for half in [
+            reads(PEER, true, CURRENT, (0, 0)),
+            reads(PEER, true, EARLIER, (0, 1)),
+        ] {
+            assert!(
+                matches!(
+                    gate(
+                        &POLICY_DOCUMENT_V1,
+                        &shipped,
+                        OWN,
+                        &[current.clone(), half.clone()]
+                    ),
+                    Err(OperationRefusal::MembersLackRequirement { .. })
+                ),
+                "{half:?} meets only half of the requirement"
+            );
+        }
+
+        let departed = reads(PEER, false, EARLIER, (0, 0));
+        assert_eq!(
+            gate(
+                &POLICY_DOCUMENT_V1,
+                &shipped,
+                OWN,
+                &[current.clone(), departed]
+            ),
+            Ok(OperationAdmission { live_members: 1 })
+        );
+        let successor = reads(PEER, true, CURRENT, (0, 1));
+        assert_eq!(
+            gate(&POLICY_DOCUMENT_V1, &shipped, OWN, &[current, successor]),
+            Ok(OperationAdmission { live_members: 2 })
+        );
+
+        // A build that reads only format 0 cannot admit the operation at
+        // all, whatever the roster says.
+        let earlier_build = BinaryContract {
+            document: (0, 0),
+            ..shipped
+        };
+        assert_eq!(
+            gate(
+                &POLICY_DOCUMENT_V1,
+                &earlier_build,
+                OWN,
+                &[reads(OWN, true, CURRENT, (0, 1))]
+            ),
+            Err(OperationRefusal::NotSupportedByThisBinary)
+        );
+    }
+
+    /// Issue #243's rule conditions against a mixed roster. A member of the
+    /// build that serves policy v1 in cluster mode but refuses every rule
+    /// condition reads format 1, so it admits a v1 document without
+    /// conditions, and holds one with them until it has left; a member of
+    /// this build admits both.
+    #[test]
+    fn policy_rule_conditions_wait_for_every_member_built_before_enforced_conditions() {
+        const EARLIER: &str = "delegated_token_purges,openapi_discovery_catalogs,\
+                               openapi_swagger2_catalogs,operation_requirements,\
+                               policy_document_v1,policy_role_descriptions";
+        const CURRENT: &str = "delegated_token_purges,openapi_discovery_catalogs,\
+                               openapi_swagger2_catalogs,operation_requirements,\
+                               policy_document_v1,policy_role_descriptions,\
+                               policy_rule_conditions,policy_tool_argument_conditions";
+        let reads = |instance_id: Uuid, live: bool, capabilities: &str| MemberAdvertisement {
+            document_version: (0, 1),
+            ..member(instance_id, live, capabilities)
+        };
+        let shipped = BinaryContract::shipped();
+        let current = reads(OWN, true, CURRENT);
+
+        let earlier = reads(PEER, true, EARLIER);
+        assert_eq!(
+            gate(
+                &POLICY_RULE_CONDITIONS,
+                &shipped,
+                OWN,
+                &[current.clone(), earlier.clone()]
+            ),
+            Err(OperationRefusal::MembersLackRequirement {
+                lacking: vec![PEER],
+                live: 2
+            })
+        );
+        assert_eq!(
+            gate(
+                &POLICY_DOCUMENT_V1,
+                &shipped,
+                OWN,
+                &[current.clone(), earlier]
+            ),
+            Ok(OperationAdmission { live_members: 2 }),
+            "the earlier member still admits a v1 document without conditions"
+        );
+
+        let departed = reads(PEER, false, EARLIER);
+        assert_eq!(
+            gate(
+                &POLICY_RULE_CONDITIONS,
+                &shipped,
+                OWN,
+                &[current.clone(), departed]
+            ),
+            Ok(OperationAdmission { live_members: 1 })
+        );
+        let successor = reads(PEER, true, CURRENT);
+        assert_eq!(
+            gate(
+                &POLICY_RULE_CONDITIONS,
+                &shipped,
+                OWN,
+                &[current, successor]
+            ),
+            Ok(OperationAdmission { live_members: 2 })
+        );
+    }
+
+    /// Issue #243's tool-argument conditions against a mixed roster. A
+    /// member of the build that enforced the other conditions before this
+    /// leaf admits a document with those conditions, and holds one with a
+    /// `tool_argument` leaf until it has left; a member of this build admits
+    /// both.
+    #[test]
+    fn policy_tool_argument_conditions_wait_for_every_member_built_before_the_leaf() {
+        const EARLIER: &str = "delegated_token_purges,openapi_discovery_catalogs,\
+                               openapi_swagger2_catalogs,operation_requirements,\
+                               policy_document_v1,policy_role_descriptions,\
+                               policy_rule_conditions";
+        let current_set = advertisement(BINARY_CAPABILITIES).expect("the shipped set fits");
+        let reads = |instance_id: Uuid, live: bool, capabilities: &str| MemberAdvertisement {
+            document_version: (0, 1),
+            ..member(instance_id, live, capabilities)
+        };
+        let shipped = BinaryContract::shipped();
+        let current = reads(OWN, true, &current_set);
+
+        let earlier = reads(PEER, true, EARLIER);
+        assert_eq!(
+            gate(
+                &POLICY_TOOL_ARGUMENT_CONDITIONS,
+                &shipped,
+                OWN,
+                &[current.clone(), earlier.clone()]
+            ),
+            Err(OperationRefusal::MembersLackRequirement {
+                lacking: vec![PEER],
+                live: 2
+            })
+        );
+        assert_eq!(
+            gate(
+                &POLICY_RULE_CONDITIONS,
+                &shipped,
+                OWN,
+                &[current.clone(), earlier]
+            ),
+            Ok(OperationAdmission { live_members: 2 }),
+            "the earlier member still admits the other conditions"
+        );
+
+        let departed = reads(PEER, false, EARLIER);
+        assert_eq!(
+            gate(
+                &POLICY_TOOL_ARGUMENT_CONDITIONS,
+                &shipped,
+                OWN,
+                &[current.clone(), departed]
+            ),
+            Ok(OperationAdmission { live_members: 1 })
+        );
+        let successor = reads(PEER, true, &current_set);
+        assert_eq!(
+            gate(
+                &POLICY_TOOL_ARGUMENT_CONDITIONS,
+                &shipped,
+                OWN,
+                &[current, successor]
+            ),
+            Ok(OperationAdmission { live_members: 2 })
+        );
+    }
+
+    /// The one-shot gate (the standalone import) makes every decision the
+    /// replica's gate makes except the one about its own roster row: an
+    /// empty roster admits, a lacking live member refuses, a stale one is
+    /// ignored, and the fence and this build's own support still decide.
+    #[test]
+    fn the_one_shot_gate_judges_the_live_roster_without_a_row_of_its_own() {
+        let without_own_row = |members: &[MemberAdvertisement]| {
+            evaluate_without_own_row(
+                &requirement(),
+                &contract(),
+                members,
+                &ContractFence::open(),
+                None,
+            )
+        };
+        assert_eq!(
+            without_own_row(&[]),
+            Ok(OperationAdmission { live_members: 0 })
+        );
+        assert_eq!(
+            without_own_row(&[advertised(PEER)]),
+            Ok(OperationAdmission { live_members: 1 })
+        );
+        assert_eq!(
+            without_own_row(&[advertised(PEER), member(OWN, true, "")]),
+            Err(OperationRefusal::MembersLackRequirement {
+                lacking: vec![OWN],
+                live: 2
+            })
+        );
+        assert_eq!(
+            without_own_row(&[member(OWN, false, "")]),
+            Ok(OperationAdmission { live_members: 0 })
+        );
+        let beyond = fence(1, contract().schema.1 + 1, "");
+        assert!(matches!(
+            evaluate_without_own_row(&requirement(), &contract(), &[], &beyond, None),
+            Err(OperationRefusal::ContractFenced(_))
+        ));
+        let unsupported = OperationRequirement {
+            document_format: Some(1),
+            ..requirement()
+        };
+        assert_eq!(
+            evaluate_without_own_row(&unsupported, &contract(), &[], &ContractFence::open(), None),
+            Err(OperationRefusal::NotSupportedByThisBinary)
         );
     }
 

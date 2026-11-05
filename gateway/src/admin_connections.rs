@@ -1,6 +1,5 @@
 //! admin connections boundary extracted from the application composition root.
 use super::*;
-use authority_events::required::AuthorityOperation;
 
 pub(super) async fn connection_secret_list_endpoint(
     State(state): State<ConnectionAdminState>,
@@ -79,29 +78,6 @@ pub(super) async fn connection_secret_list_endpoint(
         Json(response_body),
     )
         .into_response()
-}
-
-/// Ask the authority-evidence gate before a managed catalog or overlay
-/// publication (issue #425, PR 4): the standalone Connections database
-/// keeps the current catalog but no evidence of who published it, so
-/// required mode refuses each one there. Asked once the caller is
-/// authorized, before anything is fetched or written. Connection and
-/// local-secret changes never ask: both modes record them in the change's
-/// own transaction.
-fn admit_catalog_change(
-    state: &ConnectionAdminState,
-    parts: &http::request::Parts,
-    principal: &auth::Principal,
-    operation: AuthorityOperation,
-) -> ResponseResult<()> {
-    admit_authority_change(
-        &state.authority_evidence,
-        operation,
-        &state.audit,
-        parts,
-        principal,
-        &state.client_ip_policy,
-    )
 }
 
 pub(super) async fn connection_secret_create_endpoint(
@@ -1117,16 +1093,12 @@ async fn refresh_managed_openapi_catalog(
     connections::openapi::OpenApiCatalogPublishResult,
     Box<(ConnectionRefreshFailure, Response)>,
 > {
+    let actor = auth::change_actor::ChangeActor::from_principal(principal);
     let mut converted_catalog = connections::openapi::ConvertedCatalogAdmission::NotAsked;
     loop {
         let result = state
             .openapi_catalogs
-            .refresh_with_admission(
-                id.as_str(),
-                current_etag,
-                converted_catalog,
-                &principal.user_id,
-            )
+            .refresh_with_admission(id.as_str(), current_etag, converted_catalog, &actor)
             .await;
         match result {
             Err(connections::openapi::OpenApiCatalogError::ConvertedCatalogNeedsAdmission {
@@ -1211,26 +1183,14 @@ pub(super) async fn connection_refresh_endpoint(
         Err(error) => return with_etag(if_match_error_response(error), current_etag.as_str()),
     }
 
-    // A refresh publishes the catalog its discovery names; asked as that
-    // publication, once the record and its ETag say which one it is.
-    let publication = match &record.write.discovery {
-        Some(connections::model::DiscoveryConfig::ManagedMcp { .. }) => {
-            Some(AuthorityOperation::CatalogMcpPublish)
-        }
-        Some(connections::model::DiscoveryConfig::ManagedOpenapi { .. }) => {
-            Some(AuthorityOperation::CatalogOpenapiPublish)
-        }
-        None => None,
-    };
-    if let Some(operation) = publication {
-        if let Err(response) = admit_catalog_change(&state, &parts, &principal, operation) {
-            return with_etag(*response, current_etag.as_str());
-        }
-    }
     let refreshed = match &record.write.discovery {
         Some(connections::model::DiscoveryConfig::ManagedMcp { .. }) => state
             .mcp_catalogs
-            .refresh(id.as_str(), current_etag.as_str(), &principal.user_id)
+            .refresh(
+                id.as_str(),
+                current_etag.as_str(),
+                &auth::change_actor::ChangeActor::from_principal(&principal),
+            )
             .await
             .map(ConnectionCatalogRefreshResponse::Mcp)
             .map_err(|error| {
@@ -1683,14 +1643,6 @@ pub(super) async fn connection_openapi_overlay_put_endpoint(
     if !state.control_plane.is_managed_store_configured() {
         return connection_store_not_configured();
     }
-    if let Err(response) = admit_catalog_change(
-        &state,
-        &parts,
-        &principal,
-        AuthorityOperation::CatalogOverlayReplace,
-    ) {
-        return *response;
-    }
     let expected_etag = match exact_strong_if_match(&parts.headers) {
         Ok(etag) => etag,
         Err(ToolPlaygroundIfMatchError::Missing) => {
@@ -1712,6 +1664,7 @@ pub(super) async fn connection_openapi_overlay_put_endpoint(
         rbac_state.principal_has_permission(&principal, ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION);
     // At most two passes, as for registration: an overlay over a converted
     // catalog asks the operation gate before anything is written.
+    let actor = auth::change_actor::ChangeActor::from_principal(&principal);
     let mut converted_catalog = connections::openapi::ConvertedCatalogAdmission::NotAsked;
     let updated = loop {
         let result = state
@@ -1723,7 +1676,7 @@ pub(super) async fn connection_openapi_overlay_put_endpoint(
                 params.allow_unresolved_enum_sources,
                 secrets_write_authorized,
                 converted_catalog,
-                &principal.user_id,
+                &actor,
             )
             .await;
         if let (
@@ -1774,14 +1727,6 @@ pub(super) async fn connection_openapi_overlay_delete_endpoint(
     if !state.control_plane.is_managed_store_configured() {
         return connection_store_not_configured();
     }
-    if let Err(response) = admit_catalog_change(
-        &state,
-        &parts,
-        &principal,
-        AuthorityOperation::CatalogOverlayDelete,
-    ) {
-        return *response;
-    }
     let expected_etag = match exact_strong_if_match(&parts.headers) {
         Ok(etag) => etag,
         Err(ToolPlaygroundIfMatchError::Missing) => {
@@ -1793,7 +1738,11 @@ pub(super) async fn connection_openapi_overlay_delete_endpoint(
     };
     match state
         .openapi_catalogs
-        .delete_overlay(&raw_id, &expected_etag, &principal.user_id)
+        .delete_overlay(
+            &raw_id,
+            &expected_etag,
+            &auth::change_actor::ChangeActor::from_principal(&principal),
+        )
         .await
     {
         Ok(result) => {
@@ -1914,14 +1863,6 @@ pub(super) async fn connection_openapi_register_endpoint(
     if !state.control_plane.is_managed_store_configured() {
         return connection_store_not_configured();
     }
-    if let Err(response) = admit_catalog_change(
-        &state,
-        &parts,
-        &principal,
-        AuthorityOperation::CatalogOpenapiPublish,
-    ) {
-        return *response;
-    }
     let id = match connections::model::ConnectionId::parse(raw_id.clone()) {
         Ok(id) => id,
         Err(_) => return not_found("connection was not found"),
@@ -1969,6 +1910,7 @@ pub(super) async fn connection_openapi_register_endpoint(
 
     // At most two passes: the second only after the operation gate admitted
     // a converted document the first pass stopped at, before writing.
+    let actor = auth::change_actor::ChangeActor::from_principal(&principal);
     let mut converted_catalog = connections::openapi::ConvertedCatalogAdmission::NotAsked;
     let registered = loop {
         let result = state
@@ -1983,7 +1925,7 @@ pub(super) async fn connection_openapi_register_endpoint(
                 &requested.selected_tool_names,
                 &confirmations,
                 converted_catalog,
-                &principal.user_id,
+                &actor,
             )
             .await;
         if let (

@@ -7,7 +7,13 @@ hypothetical caller where the lane has one, and the decision you expect.
 policy, against a candidate you send with it, or against one of your
 server-side drafts or a version of the policy history, and answers JSON, SARIF
 2.1.0 or JUnit XML (issue #243, slice 11; isolated rate sequences and egress
-cases in slice 12).
+cases in slice 12). A deployment can also keep one suite beside its policy, as
+a versioned resource with a strong ETag (`GET`/`PUT
+/v1{ADMIN_PREFIX}/policy/tests`), and a run or an
+[evidence package](policy-evidence.md) can name that stored suite instead of
+carrying one. With `POLICY_TESTS_REQUIRED=true` no policy change is activated
+unless the stored suite passes against it
+([below](#requiring-the-stored-suite-before-activation)).
 
 Every case is decided by the same compiled policy evaluator the gateway uses
 for live traffic (`gateway/src/policy_eval`): the runner builds the same typed
@@ -102,7 +108,8 @@ and byte rather than character lengths.
 | `cases` | 1 to 512 cases. |
 | `cases[].id` | Unique within the suite, at most 128 bytes, an ASCII letter or digit followed by letters, digits, `.`, `_`, `:` or `-`. Results, SARIF and JUnit identify a case by this id and its JSON Pointer. |
 | `cases[].kind` | `http`, `tool`, `tool_http`, `rate` or `egress`. Each kind accepts only its own members. |
-| `cases[].principal` | Every kind but `egress`: `"anonymous"`, or `subject` (required), `issuer`, `roles`, `auth_method` (required: `bearer_token`, `session_cookie`, `service_token` or `client_certificate`) and `organization`. The issuer is canonicalized as authentication canonicalizes it (a trailing `/` is dropped). `organization` (1 to 8192 bytes) is the organization the principal's identity provider verified, which a policy's identity mappings may test; omitted, the principal has none. As on the live lanes it is read only in mapped-role mode, and no result repeats it. |
+| `cases[].principal` | Every kind but `egress`: `"anonymous"`, or `subject` (required), `issuer`, `roles`, `auth_method` (required: `bearer_token`, `session_cookie`, `service_token` or `client_certificate`) and `organization`. The issuer is canonicalized as authentication canonicalizes it (a trailing `/` is dropped). `organization` (1 to 8192 bytes) is the organization the principal's identity provider verified, which a policy's identity mappings may test; omitted, the principal has none. As on the live lanes it is read only when an identity mapping or an `organization` condition reads it, and no result repeats it. |
+| `cases[].facts` | `http`, `tool` and `tool_http` only: optional request facts a rule condition reads, `source_ip`, `headers`, `query`, `now` and, for a tool invocation, `arguments`; see [Request facts](#request-facts). |
 | `cases[].expect` | What the case asserts; see below. |
 
 ### Case kinds
@@ -152,10 +159,45 @@ and byte rather than character lengths.
   there is no fallback. An egress case has no `principal`. See
   [egress cases](policy-simulation.md#egress-cases).
 
-There is no member for a token, cookie, header, query value, body or any other
-credential or request content. A member named like one (`token`,
-`authorization`, `cookie`, `headers`, `password`, `secret` and similar) is
+There is no member for a token, cookie, body or any other credential or
+request content. A member named like one (`token`, `authorization`,
+`cookie`, `headers`, `password`, `secret` and similar) outside `facts` is
 refused with `forbidden_field` rather than as an ordinary unknown member.
+
+### Request facts
+
+A policy v1 rule may carry conditions over the source network, request
+headers, query parameters, a time window and a tool call's arguments. A case
+states those facts in an optional `facts` member, typed and bounded:
+
+| Member | Meaning |
+| --- | --- |
+| `source_ip` | The canonical client address the gateway would derive after trusted-proxy processing: an IPv4 or IPv6 address without a port. An IPv4-mapped IPv6 address is its IPv4 address. |
+| `headers` | An object from a lowercase header name to the values of its occurrences, in order: `{"x-environment": ["prod", "canary"]}` is two field lines. Each value is a whole field line, compared exactly. |
+| `query` | An object from a decoded parameter name to its decoded values, in order; `""` is a parameter without a value. |
+| `now` | The evaluation instant, `YYYY-MM-DDTHH:MM:SSZ`. |
+| `arguments` | A tool invocation's arguments as they stand once the tool's input schema has accepted them: one JSON object, nested at most 8 levels deep, of at most 128 values with member names of at most 256 bytes and strings of at most 8192 bytes. Only the scalars at the pointers the tool's `tool_argument` conditions read are evaluated, as the live lane reduces a validated call's; the runner has no tool registry, so it neither re-validates them nor judges pointer eligibility, which publication checks. |
+
+`http` cases may state the first four; `tool` cases `source_ip`, `now` and,
+for the `invocation` operation only, `arguments` (a visibility or eligibility
+preview never has a call's arguments, on the live lane or here); `tool_http`
+cases only `source_ip` and `now`, because a tool call carries no headers or
+query of its own and a rendered request no arguments
+(`fact_not_applicable`); `rate` and `egress` cases none, because rate
+overrides carry no conditions and an outbound destination involves no caller. A fact a condition reads that the case does not state is
+unknown: the case is `indeterminate` with `missing_matcher_fact` and is
+reported `incomplete`, never passed, whatever it expected. An empty
+`headers` or `query` object states a request that carried none, which is a
+certain no-match. The organization a condition reads is the principal's
+`organization`, as for identity mappings. A header or query name that can
+carry a credential, an identity or hop-by-hop routing -- the names a
+condition may not read, such as `authorization`, `cookie`, `x-forwarded-for`,
+`connection`, `x-api-key` or `access_token` -- is refused with
+`forbidden_field`, in any letter case; more than 128 occurrences, or more
+than 128 argument values, is `too_many_facts`; a value is at most 8192 bytes
+without control characters; arguments that are not an object are
+`invalid_type` and arguments past their other bounds `invalid_value`. No
+stated value appears in a report or diagnostic.
 
 ### Expectations
 
@@ -189,6 +231,165 @@ limits).
 Routes and rate overrides are named by position because the current policy
 schema gives them no identifiers; a reordered policy changes them.
 
+## Storing a suite beside the policy
+
+`/v1{ADMIN_PREFIX}/policy/tests` holds at most one suite: the stored suite, an
+exact-version `policy-tests.v1` document kept with the policy authority. Every
+write is a new immutable version; nothing is edited in place and nothing is
+deleted. Storing a suite changes no enforcement and activates nothing; with
+`POLICY_TESTS_REQUIRED=true` it is the suite every later policy change must
+pass.
+
+```http
+PUT /v1/admin/policy/tests
+Content-Type: application/json
+If-None-Match: *                  (the first suite)
+If-Match: "sha256:..."            (replacing the stored one)
+
+{ "schema_version": "policy-tests.v1", "cases": [ ... ] }
+```
+
+- **Permissions.** `GET` needs both `admin:policy:read` and
+  `admin:policy:simulate`, what a run of the suite needs; `PUT` needs
+  `admin:policy:write`. Both are decided before any header, body or store is
+  read. The dev policy's routes already cover the path: `GET` under the
+  `admin:policy:read` route for `/v1/admin/policy`, `PUT` under the
+  `admin:policy:write` catch-all.
+- **The ETag is the suite digest.** The strong `ETag` is the suite's
+  [semantic digest](#json-report) in quotes, so `report.suite.digest` names the
+  stored version a run decided, and two versions carry one ETag exactly when
+  they are the same suite (member order and whitespace do not count).
+  `X-GreenGateway-Policy-Tests-Version` gives the stored version number.
+- **The representation.** `GET` and a successful `PUT` answer the stored suite
+  as its RFC 8785 (JCS) bytes, `application/json`, with `Cache-Control:
+  private, no-store`. It is the document you stored, re-serialized; send it
+  back unchanged and you store the same ETag again.
+- **Exactly one precondition.** `PUT` requires `If-None-Match: *` to store the
+  first suite or `If-Match` with exactly one strong entity tag naming the
+  stored one. Neither is `428`; both, a list, a weak tag, `If-Match: *` or any
+  other `If-None-Match` is `400`. A precondition that no longer holds is `412`,
+  decided in the store's own transaction, so of two writers holding one ETag
+  exactly one wins. A replaced suite answers `200`, the first one `201`.
+- **Strict and bounded, like a run.** The body is read within `MAX_BODY_SIZE` or
+  2 MiB, whichever is lower, and within five seconds; repeated member names
+  are refused before parsing; and the suite is parsed by exactly the parser a
+  run uses (at most 512 cases), with the same value-free diagnostics. A suite
+  that holds the character U+0000 in any string is refused as well, because
+  the cluster store cannot hold one, so a stored suite means the same thing in
+  both modes. Nothing refused is stored.
+- **Where it lives.** Standalone, in a `policy_test_suite_versions` table of the
+  policy history database (`POLICY_HISTORY_SQLITE_PATH`, or the
+  `<POLICY_FILE>.history.sqlite` default): the newest row is the stored suite,
+  and a write is one SQLite transaction that re-checks the precondition and
+  appends, so a crash leaves the old version or the new one. In cluster mode,
+  in PostgreSQL migration 29's `greengateway.policy_test_suite_versions` and
+  `greengateway.policy_test_suite_active`, committed through the same
+  versioned-document transaction as the policy, as a resource of its own (see
+  [the policy control plane](deployment/postgres.md#the-policy-control-plane)).
+  Never in browser storage. Every read re-parses the stored suite and requires
+  it to reproduce its ETag; a row edited out of band answers `503` and is never
+  run. `import-standalone` does not carry a standalone suite into a cluster.
+
+| Status | `reason` | Meaning |
+| --- | --- | --- |
+| `200`, `201` | -- | Read, replaced or first stored. |
+| `400` | `policy_tests_precondition_invalid` | The precondition is not exactly one strong tag in `If-Match` or `If-None-Match: *`. |
+| `400` | `policy_tests_request_invalid` | The body is not JSON, or repeats a member name anywhere. |
+| `401`, `403` | -- | Not authenticated, or missing a permission. |
+| `404` | -- | No policy is configured. |
+| `404` | `policy_tests_not_found` | No suite is stored (`GET`). |
+| `408` | `policy_tests_request_timeout` | The body did not arrive within five seconds. |
+| `409` | `authority_evidence_unsupported` | `AUTHORITY_EVIDENCE_DURABILITY=required` in standalone mode, which records no evidence of the write beyond the version row ([authority evidence](authority-evidence.md)). Nothing was written. |
+| `412` | `policy_tests_etag_mismatch` | `If-Match` does not name the stored suite (or none is stored). |
+| `412` | `policy_tests_exist` | `If-None-Match: *`, and a suite is already stored. |
+| `413` | -- | The body exceeds `MAX_BODY_SIZE` or 2 MiB, whichever is lower. |
+| `422` | `policy_tests_invalid` | The suite is invalid; `diagnostics` as for a run. |
+| `428` | `policy_tests_precondition_required` | Neither `If-Match` nor `If-None-Match` was sent. |
+| `503` | `policy_tests_unavailable` | No suite store is configured or it could not be read or written. |
+
+With `POLICY_TESTS_REQUIRED=true` a successful `PUT` also reports what the
+[activation gate](#requiring-the-stored-suite-before-activation) would answer
+for the active policy under the suite just stored, in
+`X-GreenGateway-Policy-Tests-Active-Status`: `passed`, or the refusal's
+`status`. The suite is stored either way, so storing the suite the next
+policy must pass never needs the current policy to pass it first.
+
+## Requiring the stored suite before activation
+
+`POLICY_TESTS_REQUIRED=true` ([configuration](configuration.md#policy_tests_required))
+makes the stored suite a precondition of every policy change the admin API
+activates: `PUT /v1{ADMIN_PREFIX}/policy`, rollback, rule create, update (a
+promotion or disable bound to a shadow review included), delete and reorder, a
+draft publication (one bound to a suggestion included, which commits as that
+suggestion's acceptance), and a discovery suggestion's acceptance, standalone
+or in cluster mode (where the candidate and the suggestion's transition commit
+in one transaction). Each runs the stored suite against its candidate inside
+the commit precondition: under the policy write lock, after the cross-resource
+checks, before any authority is asked to write. The run is the one
+`POST .../policy/tests/runs` makes for a candidate -- the same runner, the
+same egress controls and rate lanes, the same five-second deadline on a
+blocking thread -- and the write lock serializes it with every other
+publication on the replica.
+
+The change is committed only when every case of the suite passed. Anything
+else refuses it and writes nothing:
+
+| `required_tests.status` | Meaning |
+| --- | --- |
+| `suite_missing` | No suite is stored. |
+| `suite_invalid` | The stored suite no longer verifies against its ETag (a row edited out of band) or this build no longer accepts it. |
+| `suite_unavailable` | No suite store is configured, or it could not be read (`503`). |
+| `failed` | At least one case's expectation did not hold. |
+| `incomplete` | At least one case could not be decided, or the run decided fewer cases than the suite holds. |
+| `error` | The evaluator refused at least one case. |
+| `deadline_exceeded` | The run did not finish within five seconds. |
+| `evaluation_failed` | The candidate did not compile or the evaluation did not complete. |
+
+An evaluator error is never a pass, and neither is an undecided or
+incomplete case, whatever the case expected.
+
+```json
+{
+  "error": "the stored policy test suite this deployment requires did not pass against this policy; nothing was written",
+  "reason": "policy_tests_required_failed",
+  "required_tests": {
+    "status": "failed",
+    "suite_version": 3,
+    "suite_etag": "\"sha256:...\"",
+    "summary": { "total": 4, "passed": 3, "failed": 1, "incomplete": 0, "errors": 0 }
+  }
+}
+```
+
+The answer is `422 policy_tests_required_failed`, or `503
+policy_tests_unavailable` for `suite_unavailable`. `suite_version` and
+`suite_etag` are `null` when no suite was read, and `summary` is `null` unless
+the run completed. The answer carries counts only: run the stored suite
+(`{"suite": {"source": "stored"}}`) against the same candidate to see which
+cases did not pass. A draft publication that is refused this way is also
+audited as `policy.draft_publish_refused` with the same reason.
+
+Each refusal is audited as `policy.publication_refused` with the code
+(`policy_tests_required_failed` or `policy_tests_unavailable`), the policy ETag
+the change would have replaced, the resource snapshot digest and
+`required_tests` as in the answer. A change the suite admitted records
+`required_tests` (`suite_version`, `suite_etag`, `total` and `passed`) in its
+`policy.changed` event. Neither ever carries a case id, a fixture value or a
+matched element.
+
+What the gate does not cover:
+
+- It reads the suite once per publication. In cluster mode another replica
+  can store a new suite between that read and the policy commit; the
+  `policy.changed` record names the suite version that admitted the change.
+- A watched or `SIGHUP` reload of `POLICY_FILE`, a restart, and
+  `gateway import-standalone` are not publications through the API and are
+  not gated: whoever can write the policy file or run the import is trusted
+  with the policy.
+- Bundle activation (#242) has no runtime path in this build: nothing opens a
+  revision ledger or selects a bundle at startup, so there is no activation
+  there to gate yet.
+
 ## Running a suite
 
 ```http
@@ -199,6 +400,12 @@ If-Match: "sha256:..."            (optional)
 { "suite": { ... }, "format": "json" }
 ```
 
+- `suite` is a complete suite, or `{"source": "stored"}` to run the stored
+  suite, optionally pinned as `{"source": "stored", "etag": "\"sha256:...\""}`
+  to the strong ETag you reviewed. A reference accepts only those two members,
+  and `etag` must be one strong entity tag. A pinned ETag that is no longer
+  stored is `412` (`policy_tests_etag_mismatch`) and nothing runs; no stored
+  suite is `404` (`policy_tests_not_found`).
 - The caller needs both `admin:policy:read` and `admin:policy:simulate`;
   either one alone is `403`. Both are checked before the body is read. The
   admin capabilities endpoint lists `admin:policy:simulate` when it is held.
@@ -239,15 +446,17 @@ pipeline can gate on the header or on `status` without parsing the rendering.
 
 | Status | `reason` | Meaning |
 | --- | --- | --- |
-| `400` | `policy_tests_request_invalid` | The body is not a JSON object, repeats a member name anywhere, has a member other than `suite`, `policy`, `candidate` and `format`, lacks `suite`, names an unknown format, names both `policy` and `candidate`, has a `candidate` that is not a well-formed `draft` or `revision` (with `diagnostics` when its members are wrong), or combines `If-Match` with a candidate. |
+| `400` | `policy_tests_request_invalid` | The body is not a JSON object, repeats a member name anywhere, has a member other than `suite`, `policy`, `candidate` and `format`, lacks `suite`, names an unknown format, names both `policy` and `candidate`, has a `candidate` that is not a well-formed `draft` or `revision` (with `diagnostics` when its members are wrong), combines `If-Match` with a candidate, or names the stored suite with a malformed reference. |
 | `401`, `403` | -- | Not authenticated, or missing either permission. |
 | `404` | -- | No policy is configured, or a `revision` candidate names a deployment with no policy history. |
 | `404` | `policy_draft_not_found`, `policy_revision_not_found` | The `candidate` names no draft of yours, or a version the history does not hold. |
+| `404` | `policy_tests_not_found` | The run names the stored suite, and none is stored. |
 | `408` | `policy_tests_request_timeout` | The body did not arrive within five seconds. Nothing ran. |
 | `409` | `policy_draft_base_stale` | The draft is pinned to another base than the live policy. |
 | `410` | `policy_draft_expired` | The draft has expired. |
 | `412` | -- | `If-Match` does not name the active policy. |
 | `412` | `policy_draft_stale` | `draft_etag` is no longer the draft's ETag. |
+| `412` | `policy_tests_etag_mismatch` | The stored suite is not the one the reference pinned. |
 | `413` | -- | The body exceeds `MAX_BODY_SIZE` or 2 MiB, whichever is lower. |
 | `422` | `policy_tests_invalid` | The suite is invalid. The body lists at most 64 `diagnostics` (`code`, JSON `pointer`, fixed `message`) and `diagnostics_truncated`. Diagnostics never repeat an input value. |
 | `422` | `policy_candidate_invalid` | The candidate policy is invalid; `errors` are the policy validator's messages. |
@@ -256,12 +465,14 @@ pipeline can gate on the header or on `status` without parsing the rendering.
 | `500` | -- | The policy under test did not compile. No partial result. |
 | `503` | -- | Cluster mode could not read the active policy, or (`policy_tests_deadline_exceeded`) the run did not finish within five seconds. No partial result. |
 | `503` | `policy_drafts_unavailable`, `policy_history_unavailable` | The drafts store or the policy history the candidate names could not be read. |
+| `503` | `policy_tests_unavailable` | The run names the stored suite, and no suite store is configured or it could not be read. |
 
 Diagnostic codes: `invalid_type`, `missing_field`, `unknown_field`,
 `forbidden_field`, `invalid_value`, `too_long`, `unsupported_schema_version`,
 `empty_suite`, `too_many_cases`, `duplicate_case_id`, `invalid_case_id`,
 `invalid_method`, `invalid_path`, `invalid_host`, `invalid_origin`,
-`invalid_principal`, `inconsistent_case`, `unsupported_number`.
+`invalid_principal`, `inconsistent_case`, `unsupported_number`,
+`fact_not_applicable`, `too_many_facts`.
 
 ### JSON report
 
@@ -306,6 +517,9 @@ Diagnostic codes: `invalid_type`, `missing_field`, `unknown_field`,
 
 - `status` is the worst case outcome: `error`, then `incomplete`, then
   `failed`; `passed` only when every case passed.
+- `suite.stored` is present only when the run decided the stored suite:
+  `{"version": <stored version>, "etag": "\"sha256:...\""}`. A suite sent
+  with the run has no `stored` member, so its report is unchanged.
 - `suite.digest` is the ADR-0004 semantic digest of the submitted suite: the
   RFC 8785 (JCS) bytes of the document, framed with the media type
   `application/vnd.greengateway.policy-tests+json` and version
@@ -377,10 +591,23 @@ Each completed run emits one `policy.tests_run` audit event with the acting
 principal and the request envelope, `policy_source`, `policy_etag`,
 `security_revision` (cluster mode), for a stored candidate its
 `policy_draft_id` and `policy_draft_revision` or its `policy_version`,
+`suite_source` (`inline` or `stored`), `suite_version` (stored suites only),
 `suite_digest`, `status`, the five summary counts and the evaluator semantics
-versions. It never carries a case id, a
-fixture value, a matched rule or policy content. Refused requests (`4xx`) are
-not recorded as runs.
+versions. It never carries a case id, a fixture value, a matched rule or
+policy content. Refused requests (`4xx`) are not recorded as runs.
+
+Each stored or replaced suite emits one `policy.tests_changed` event with the
+acting principal and the request envelope, `action` (`created` or
+`replaced`), the new `version`, `suite_digest`, `previous_suite_digest` (`null`
+for the first suite), `case_count`, `case_kinds` (the number of `http`, `tool`,
+`tool_http`, `rate` and `egress` cases) and, in cluster mode, the `security_revision` the
+write committed at. With `POLICY_TESTS_REQUIRED=true` it also carries
+`active_policy`: the activation gate's answer for the active policy under the
+new suite (`status`, `suite_version`, `suite_etag` and `summary`, as in a
+[refusal](#requiring-the-stored-suite-before-activation)). It never carries a
+case, a case id or a fixture value, and a refused write emits none. Cluster mode additionally records the write in
+`greengateway.document_change_evidence` (action `policy_tests.publish`), in the
+same transaction.
 
 ## Limits and what comes later
 
@@ -394,17 +621,17 @@ ends, even when the client disconnects first.
 
 Not part of this slice, and not to be inferred from it:
 
-- Storing a suite beside the policy as a versioned resource with a strong
-  ETag (`GET`/`PUT /policy/tests`), and requiring a passing suite before a
-  policy change is activated. Today a suite is submitted with each run and
-  nothing is gated on it.
+- Gating bundle activation or a policy file reload on the stored suite (see
+  [what the gate does not cover](#requiring-the-stored-suite-before-activation)).
 - Typed claim, header, query, tool-argument and time-window matchers, and
   stable route and rate-override identifiers (policy v1).
-- `ggctl policy test` (#242). The runner holds no application state, so that
-  command can link it rather than reimplement it.
+- Running a suite offline. `ggctl policy test` (docs/ggctl.md) sends a suite
+  to this endpoint and reports the gateway's run, as JSON or the gateway's
+  own JUnit report; it does not run cases itself.
 
 The admin UI's Policy Studio has a Test view over this API (#243 slice 18).
 It keeps the suite in page memory only, runs it against the live policy under
 `If-Match` or against the open draft's text as a candidate, and never shows an
-incomplete or refused case as a pass. See **Policy Studio workbench** in
+incomplete or refused case as a pass. It does not read or write the stored
+suite yet. See **Policy Studio workbench** in
 [the configuration reference](configuration.md#policy_file).

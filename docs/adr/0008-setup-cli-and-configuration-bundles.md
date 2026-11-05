@@ -467,14 +467,21 @@ ggctl rollback REVISION --server URL --if-match ETAG --plan PLAN_ID [--acknowled
 ggctl export --server URL --output DIR [--template]
 ggctl ledger seed BUNDLE --state-dir DIR
 ggctl ledger verify --state-dir DIR
-ggctl ledger rollback REVISION --state-dir DIR
+ggctl ledger rollback REVISION --state-dir DIR [--acknowledge RISK_CODE]...
 ggctl backup create --state-dir DIR --output FILE
 ggctl backup verify FILE
 ggctl backup restore FILE --state-dir DIR
 ggctl deploy render BUNDLE --target compose|kubernetes|cloudflare --output DIR
 ggctl mcp-config --server URL --client generic|claude-desktop|cursor|vscode
+ggctl policy lint FILE --server URL [--warnings-as-errors] [--format human|json|sarif]
+ggctl policy test SUITE --server URL [--candidate FILE | --draft ID --draft-etag ETAG] [--format human|json|junit]
+ggctl policy explain CASES --server URL [--format human|json]
+ggctl policy replay --server URL (--base-etag ETAG --window FROM[/TO] [--candidate FILE | --draft ID --draft-etag ETAG] [--enforce-all-shadow] [--max-records N] [--idempotency-key KEY] | --job ID | --cancel ID) [--wait]
+ggctl evidence verify PACKAGE [--format human|json]
 ggctl completion SHELL
 ```
+
+The `policy` and `evidence` families are #243's contribution to this tree (ADR-0004, "Relationship to other epics"), added with the commands themselves. A policy command sends its document to the gateway's own endpoint (`POST /policy/validate`, `POST /policy/tests/runs`, `POST /policy/simulations`, `/policy/replays`) and reports the answer: `ggctl` links no policy validator or evaluator, so it cannot become the second, approximate policy implementation ADR-0004 forbids, and it judges nothing offline. The commands share the remote client below, the output contract and the exit codes; they read no capability document, because they touch no configuration and a policy pipeline's token need not hold `admin:config:read`. A replay start is the one request that creates anything, a bounded job, and it follows the mutation rules: sent once, never retried, and after an ambiguous outcome reported as such, with the request's own idempotency key as the way to find the job. `evidence verify` is the offline half of ADR-0004's evidence: it makes no network request and checks a package's canonical bytes, manifest, media types, sizes and ADR-0004 digests with the digest code the gateway uses (`gateway-config`). Packages are unsigned until ADR-0004's signing slice, so a package that passes is reported as `integrity_valid` and `unsigned`, never as trusted; trust-root verification of a signed package arrives with that slice.
 
 `--env FILE` reads a `KEY=VALUE` file as data, in the grammar `gateway import-standalone` already accepts for its source file; it never reads the process environment for that purpose and never sources the file. A key assigned twice is a warning (`env.duplicate_key`), and an error under `--strict`, because a reviewer may read the first assignment while every reader applies the last. This lets a deployment that stays in environment mode get the same offline validation, doctor, and diff in CI.
 
@@ -493,10 +500,11 @@ The names `ggctl db` and `ggctl cluster` are reserved. `ggctl` never opens a Pos
 | `GET /setup/status`, "a public form if retained" | Authenticated only | No public setup surface. |
 | Archive import for bundles | Directories only | Archives exist only for backups, which removes a parser surface from the GitOps path. |
 | — | `ggctl pin`, `ggctl status`, `ggctl ledger seed\|verify\|rollback` | Digests must be maintainable by a tool, `--wait` needs a status read, and ledger mode needs an offline seed and an offline lockout recovery. |
+| — | `ggctl policy lint\|test\|explain\|replay`, `ggctl evidence verify` | #243 needs CI surfaces for its validation, tests, simulation, replay and evidence (ADR-0004); they ask the gateway rather than link a second policy implementation, and evidence verification runs offline. |
 
 #### Output contract
 
-- Human output by default. `--format json` emits one `GgctlReport` document (`apiVersion: greengateway.dev/v1alpha1`) for every command that does not write an artifact; `--format sarif` emits SARIF 2.1.0 for `validate`, and for `diff`, whose risk codes it reports as results (an addition made with the diff engine; see [semantic-diff.md](../semantic-diff.md)).
+- Human output by default. `--format json` emits one `GgctlReport` document (`apiVersion: greengateway.dev/v1alpha1`) for every command that does not write an artifact; `--format sarif` emits SARIF 2.1.0 for `validate`, for `diff`, whose risk codes it reports as results (an addition made with the diff engine; see [semantic-diff.md](../semantic-diff.md)), and for `policy lint`, whose validator diagnostics it reports as results; `policy test --format junit` writes the gateway's JUnit report.
 - Stdout carries only the requested artifact or report. Progress and diagnostics go to stderr.
 - No prompts unless stdin is a terminal; a command that needs input it cannot prompt for exits `2`. No ANSI color unless stdout is a terminal and `NO_COLOR` is unset.
 - `ggctl` has no configuration file and reads no ambient environment beyond `NO_COLOR`. Every remote target, CA, and credential source is an explicit flag.
@@ -509,11 +517,11 @@ The names `ggctl db` and `ggctl cluster` are reserved. `ggctl` never opens a Pos
 | `0` | Success; for `diff --check`, no drift; for `doctor`, no required check failed. |
 | `1` | Unexpected internal, I/O, or transport failure, including a mutation whose outcome could not be determined. |
 | `2` | Usage error, including a reserved command or a refused insecure option. |
-| `3` | Invalid, incompatible, or unsupported configuration; a required doctor check failed; a risk needs acknowledgment; any warning under `--warnings-as-errors`. |
+| `3` | Invalid, incompatible, or unsupported configuration; a required doctor check failed; a risk needs acknowledgment; a policy that does not lint clean, a policy test suite that did not pass, or an incomplete replay; any warning under `--warnings-as-errors`. |
 | `4` | Drift found by `diff --check`. |
-| `5` | Precondition conflict: missing or stale ETag (`428`, `412`), stale plan, acknowledgment, or idempotency binding (`409`), or a held lock. |
+| `5` | Precondition conflict: missing or stale ETag (`428`, `412`), stale plan, draft, acknowledgment, or idempotency binding (`409`, `410`), a replay whose base changed, or a held lock. |
 | `6` | A dependency was unavailable and nothing was committed (`503`, or a failure before any request byte was sent). |
-| `7` | Backup or archive integrity failure, or restore verification failure. |
+| `7` | Backup, archive, or evidence package integrity failure, or restore verification failure. |
 | `8` | Authentication or authorization refused (`401`, `403`). |
 
 Exit `6` means "safe to retry". An ambiguous mutation outcome is `1`, never `6`, so a pipeline that retries on `6` cannot resend a mutation that may have committed.

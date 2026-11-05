@@ -33,12 +33,12 @@ use crate::{
     config::Config,
     path_match::{exempt_path_matches, is_unsafe_request_path},
     policy_eval::{
-        stages::NoStages,
+        stages::{NoStages, StageSink, ToolRules, ToolStage},
         tools::{
             ToolEvaluation, ToolEvaluationContext, ToolLimitation, ToolOperation, ToolReason,
             TOOL_CONTEXT_VERSION,
         },
-        EvaluationError, LogicalDecision, PolicyEffect, PrincipalFact, PrincipalIdentity,
+        EvaluationError, Fact, LogicalDecision, PolicyEffect, PrincipalFact, PrincipalIdentity,
         RuleReference,
     },
     rbac::{
@@ -54,14 +54,19 @@ use url::Url;
 
 use super::{
     decision::{
-        audit_unavailable_response, PolicyDecision, PolicyDecisionOutcome, AUDIT_UNAVAILABLE_REASON,
+        audit_unavailable_response, PolicyDecision, PolicyDecisionFacts, PolicyDecisionIdentity,
+        PolicyDecisionOutcome, AUDIT_UNAVAILABLE_REASON,
     },
+    policy_facts::{http_request_facts, tool_call_facts, FactsRefusal, PolicyClock, ToolCallFacts},
     rate_limit::RateLimitState,
 };
 
 const AUTHZ_ALLOWED: &str = "authz.allowed";
 const AUTHZ_DENIED: &str = "authz.denied";
 const AUTHZ_WOULD_DENY: &str = "authz.would_deny";
+/// The refusal of a request whose query does not decode strictly, under a
+/// policy whose conditions read a query parameter.
+const POLICY_QUERY_UNDECODABLE: &str = "policy_query_undecodable";
 const POLICY_RELOAD_DEBOUNCE: Duration = Duration::from_millis(200);
 
 /// Why a strict security-revision check refused to let a request proceed.
@@ -290,6 +295,9 @@ pub struct RbacState {
     /// (issue #243, slice 8), attached once at startup. A state built without
     /// them validates with every one reported unavailable.
     policy_resources: Option<Arc<crate::rbac::policy_resources::PolicyResourceSources>>,
+    /// The clock a `time_window` condition is judged by: the system clock,
+    /// or a fixed one a test injects. Every clone shares it.
+    policy_clock: PolicyClock,
 }
 
 /// Proof that a caller owns this [`RbacState`]'s policy-write lane.
@@ -421,6 +429,11 @@ pub(crate) struct RbacPolicyState {
     /// regress it.
     #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
     security_revision: i64,
+    /// The identity this snapshot's decision facts name -- its ETag, semantic
+    /// digest and element ids -- computed once per install from `compiled`'s
+    /// own policy and shared by every verdict. `None` when it could not be
+    /// computed: verdicts are then recorded without decision facts.
+    decision_identity: Option<Arc<PolicyDecisionIdentity>>,
     /// The same policy compiled for the pure kernel, built once per install.
     ///
     /// It lives here rather than on [`RbacState`] deliberately. A request is
@@ -450,6 +463,9 @@ pub(crate) struct ToolInvocationAuthorization<'a> {
     /// limiters of tools the policy no longer carries.
     pub tools: &'a HashMap<String, ToolPolicyEntry>,
     pub verdict: ToolInvocationVerdict<'a>,
+    /// The facts of the verdict, for the invocation's admission records;
+    /// `None` for a refusal, which the policy stage did not answer.
+    pub decision_facts: Option<PolicyDecisionFacts>,
 }
 
 /// The evaluator's invocation answer, translated for the runtime. Each variant
@@ -526,22 +542,32 @@ pub(crate) struct ToolPolicyEligibility {
 }
 
 /// One policy snapshot's inventory eligibility answers, for a caller that
-/// previews many tools and must not straddle a policy install between them.
-pub(crate) struct ToolEligibilitySnapshot(Arc<RbacPolicyState>);
+/// previews many tools and must not straddle a policy install between them,
+/// with the clock a time window is judged by.
+pub(crate) struct ToolEligibilitySnapshot(Arc<RbacPolicyState>, PolicyClock);
 
 impl ToolEligibilitySnapshot {
     /// Whether `principal` may invoke `tool_name` under this snapshot, without
     /// emitting audit events or beginning execution. A shadow rule leaves a tool
     /// eligible; a refusal is ineligible with the refusal's reason.
+    ///
+    /// A preview has no call, so it has no client address: a tool rule
+    /// whose conditions read one leaves the tool ineligible with
+    /// `policy_evaluation_incomplete`, never eligible on a guess.
     pub(crate) fn eligibility(
         &self,
         tool_name: &str,
         principal: &auth::Principal,
     ) -> ToolPolicyEligibility {
+        let call = ToolCallFacts {
+            source_address: None,
+            clock: &self.1,
+        };
         match self.0.evaluate_tool(
             ToolOperation::PolicyEligibility,
             tool_name,
             Some(principal),
+            call,
             None,
         ) {
             Ok(evaluation) => ToolPolicyEligibility {
@@ -630,6 +656,22 @@ impl RbacState {
             mcp_route_paths,
             proxy_dispatch_inventory: Arc::new(ProxyDispatchInventory::default()),
             policy_resources: None,
+            policy_clock: PolicyClock::System,
+        }
+    }
+
+    /// Judge `time_window` conditions by `clock` instead of the system clock.
+    #[cfg(test)]
+    pub(crate) fn with_policy_clock(mut self, clock: PolicyClock) -> Self {
+        self.policy_clock = clock;
+        self
+    }
+
+    /// What a tool lane knows of a call entering from `source_address`.
+    fn tool_call(&self, source_address: Option<std::net::IpAddr>) -> ToolCallFacts<'_> {
+        ToolCallFacts {
+            source_address,
+            clock: &self.policy_clock,
         }
     }
 
@@ -984,18 +1026,66 @@ impl RbacState {
     ///
     /// `principal` is the identity the caller projects, which for the tool
     /// runtime is its Actor projection, not necessarily the inbound principal.
-    pub(crate) fn evaluate_tool_authorization<R>(
+    /// `source_address` is the canonical client address the call entered
+    /// with, when its entry point had one; a `source_network` condition is
+    /// undetermined, and refuses, without it.
+    ///
+    /// `arguments` is asked for the call's arguments only when the snapshot's
+    /// tool-name rules for `tool_name` read one (`FactNeeds::
+    /// tool_argument_pointers`) and those rules leave the call undetermined
+    /// without them: the entry exists, is enabled and admits the caller, so
+    /// the rules are the only stage left. It is handed the pointers the rules
+    /// read and answers with the argument fact
+    /// (`policy_facts::tool_argument_facts`) once the call's arguments have
+    /// passed the tool's input schema, or with its own refusal of the call,
+    /// which is returned as it is and decides nothing. The call is then
+    /// decided again, by the same snapshot, with that fact. A call any other
+    /// answer decides never has its arguments asked for -- a caller the
+    /// entry refuses is not told how its arguments fare -- and a policy whose
+    /// rules read no argument decides exactly as before.
+    pub(crate) fn evaluate_tool_authorization<R, E>(
         &self,
         tool_name: &str,
         principal: Option<&auth::Principal>,
+        source_address: Option<std::net::IpAddr>,
+        arguments: impl FnOnce(&[String]) -> Result<Fact<Value>, E>,
         evaluate: impl FnOnce(ToolInvocationAuthorization<'_>) -> R,
-    ) -> R {
+    ) -> Result<R, E> {
         let policy = self.effective_policy();
-        let verdict = policy.tool_invocation_verdict(tool_name, principal);
-        evaluate(ToolInvocationAuthorization {
+        let (verdict, decision_facts) = policy.tool_invocation_verdict(
+            tool_name,
+            principal,
+            self.tool_call(source_address),
+            arguments,
+        )?;
+        Ok(evaluate(ToolInvocationAuthorization {
             tools: policy.compiled.tool_entries(),
             verdict,
-        })
+            decision_facts,
+        }))
+    }
+
+    /// [`Self::evaluate_tool_authorization`] for a call that brings no
+    /// arguments, as a task call does: a rule that reads one leaves it
+    /// undetermined.
+    #[cfg(test)]
+    pub(crate) fn evaluate_tool_authorization_without_arguments<R>(
+        &self,
+        tool_name: &str,
+        principal: Option<&auth::Principal>,
+        source_address: Option<std::net::IpAddr>,
+        evaluate: impl FnOnce(ToolInvocationAuthorization<'_>) -> R,
+    ) -> R {
+        match self.evaluate_tool_authorization(
+            tool_name,
+            principal,
+            source_address,
+            |_| Ok::<_, std::convert::Infallible>(Fact::Uncaptured),
+            evaluate,
+        ) {
+            Ok(result) => result,
+            Err(never) => match never {},
+        }
     }
 
     /// Whether a tool is listed to `principal`, decided by the shared evaluator.
@@ -1004,9 +1094,16 @@ impl RbacState {
         &self,
         tool_name: &str,
         principal: Option<&auth::Principal>,
+        source_address: Option<std::net::IpAddr>,
     ) -> bool {
         self.effective_policy()
-            .evaluate_tool(ToolOperation::Visibility, tool_name, principal, None)
+            .evaluate_tool(
+                ToolOperation::Visibility,
+                tool_name,
+                principal,
+                self.tool_call(source_address),
+                None,
+            )
             .is_ok_and(|evaluation| evaluation.effect() == PolicyEffect::Allow)
     }
 
@@ -1044,6 +1141,7 @@ impl RbacState {
         method: &str,
         path: &str,
         principal: Option<&auth::Principal>,
+        source_address: Option<std::net::IpAddr>,
     ) -> Result<Option<MatchedRuleDecision>, ToolPolicyRefusal> {
         // Rendering passes an `http::Method`'s own text, so this cannot fail
         // for a served call; an unparsable method is refused, not guessed.
@@ -1054,6 +1152,7 @@ impl RbacState {
             ToolOperation::RenderedHttp,
             tool_name,
             principal,
+            self.tool_call(source_address),
             Some((method, path.to_owned())),
         )?;
         policy.rendered_http_rule(&evaluation)
@@ -1077,7 +1176,7 @@ impl RbacState {
     /// The request's policy snapshot, read once, for previewing the
     /// eligibility of many tools from the same snapshot.
     pub(crate) fn tool_eligibility_snapshot(&self) -> ToolEligibilitySnapshot {
-        ToolEligibilitySnapshot(self.effective_policy())
+        ToolEligibilitySnapshot(self.effective_policy(), self.policy_clock.clone())
     }
 }
 
@@ -1088,6 +1187,19 @@ fn principal_fact(principal: Option<&auth::Principal>) -> PrincipalFact {
     principal.map_or(PrincipalFact::Anonymous, |principal| {
         PrincipalFact::Authenticated(PrincipalIdentity::from_principal(principal))
     })
+}
+
+/// Notes whether the tool-name rules left an invocation undetermined: the
+/// one stage a call's arguments can still settle, since every stage before
+/// it -- the entry and the caller's identity -- has then admitted the call.
+struct RulesUndetermined(bool);
+
+impl StageSink<ToolStage> for RulesUndetermined {
+    fn record(&mut self, stage: ToolStage) {
+        if stage == ToolStage::Rules(ToolRules::Undetermined) {
+            self.0 = true;
+        }
+    }
 }
 
 /// Whether a tool answer is the evaluator's own allow with no rule behind it,
@@ -1176,6 +1288,7 @@ impl RbacPolicyState {
             .enumerate()
             .map(|(rule_index, rule)| rule.id.clone().unwrap_or_else(|| rule_index.to_string()))
             .collect();
+        let decision_identity = PolicyDecisionIdentity::of_compiled(&compiled).map(Arc::new);
 
         Ok(Self {
             #[cfg(test)]
@@ -1190,6 +1303,7 @@ impl RbacPolicyState {
             #[cfg(test)]
             routes,
             security_revision,
+            decision_identity,
             compiled,
         })
     }
@@ -1211,18 +1325,19 @@ impl RbacPolicyState {
     }
 
     /// Ask the shared evaluator one tool-lane question of this snapshot about
-    /// `principal`, with the facts this snapshot's serving lanes capture for
-    /// it ([`crate::policy_eval::CompiledPolicy::serving_facts`]): in
-    /// mapped-role mode, the organization authentication verified for it, so
-    /// its internal roles are the ones every other lane resolves.
+    /// `principal`, with the facts a tool lane captures for it and the call
+    /// ([`tool_call_facts`]): the organization authentication verified for
+    /// it, so its internal roles are the ones every other lane resolves, and
+    /// the source address and instant when the policy's conditions read them.
     fn evaluate_tool(
         &self,
         operation: ToolOperation,
         tool_name: &str,
         principal: Option<&auth::Principal>,
+        call: ToolCallFacts<'_>,
         rendered: Option<(Method, String)>,
     ) -> Result<ToolEvaluation, ToolPolicyRefusal> {
-        let facts = self.compiled.serving_facts(principal);
+        let facts = tool_call_facts(&self.compiled, principal, call);
         self.evaluate_tool_with_facts(
             operation,
             tool_name,
@@ -1246,8 +1361,31 @@ impl RbacPolicyState {
         facts: &crate::policy_eval::PolicyFacts,
         rendered: Option<(Method, String)>,
     ) -> Result<ToolEvaluation, ToolPolicyRefusal> {
+        self.answer_tool(
+            operation,
+            tool_name,
+            principal,
+            facts,
+            rendered,
+            &mut NoStages,
+        )
+        .map_err(|refusal| refused(operation, refusal))
+    }
+
+    /// [`Self::evaluate_tool_with_facts`] without the log, reporting each
+    /// stage the evaluator runs to `stages`: for an answer that may yet be
+    /// asked again with more facts, and is logged only if it stands.
+    fn answer_tool(
+        &self,
+        operation: ToolOperation,
+        tool_name: &str,
+        principal: PrincipalFact,
+        facts: &crate::policy_eval::PolicyFacts,
+        rendered: Option<(Method, String)>,
+        stages: &mut impl StageSink<ToolStage>,
+    ) -> Result<ToolEvaluation, ToolPolicyRefusal> {
         if tool_name.len() > MAX_TOOL_NAME_BYTES {
-            return Err(refused(operation, ToolPolicyRefusal::NameOutOfBounds));
+            return Err(ToolPolicyRefusal::NameOutOfBounds);
         }
         let (method, path) = rendered.unzip();
         let context = ToolEvaluationContext {
@@ -1261,7 +1399,7 @@ impl RbacPolicyState {
         };
         match self
             .compiled
-            .evaluate_tool_with_facts(&context, facts, &mut NoStages)
+            .evaluate_tool_with_facts(&context, facts, stages)
         {
             Ok(evaluation)
                 if evaluation.is_complete()
@@ -1269,11 +1407,8 @@ impl RbacPolicyState {
             {
                 Ok(evaluation)
             }
-            Ok(evaluation) => Err(refused(
-                operation,
-                ToolPolicyRefusal::Incomplete(evaluation.limitation()),
-            )),
-            Err(error) => Err(refused(operation, ToolPolicyRefusal::Error(error))),
+            Ok(evaluation) => Err(ToolPolicyRefusal::Incomplete(evaluation.limitation())),
+            Err(error) => Err(ToolPolicyRefusal::Error(error)),
         }
     }
 
@@ -1332,15 +1467,84 @@ impl RbacPolicyState {
             .map_err(|refusal| refused(ToolOperation::RenderedHttp, refusal))
     }
 
-    fn tool_invocation_verdict(
+    /// One invocation's verdict, with the facts it was decided with when the
+    /// lane answered: a refusal has none. See
+    /// [`RbacState::evaluate_tool_authorization`] for when `arguments` is
+    /// asked.
+    fn tool_invocation_verdict<E>(
         &self,
         tool_name: &str,
         principal: Option<&auth::Principal>,
-    ) -> ToolInvocationVerdict<'_> {
-        match self.evaluate_tool(ToolOperation::Invocation, tool_name, principal, None) {
-            Ok(evaluation) => self.invocation_verdict(tool_name, &evaluation),
-            Err(refusal) => ToolInvocationVerdict::Refused(refusal),
-        }
+        call: ToolCallFacts<'_>,
+        arguments: impl FnOnce(&[String]) -> Result<Fact<Value>, E>,
+    ) -> Result<(ToolInvocationVerdict<'_>, Option<PolicyDecisionFacts>), E> {
+        // The facts the evaluator is given, held here so the verdict's
+        // decision facts state exactly what it was decided with, the call's
+        // arguments included once they were asked for and captured.
+        let mut facts = tool_call_facts(&self.compiled, principal, call);
+        let pointers = self.compiled.fact_needs().tool_argument_pointers(tool_name);
+        let answer = if pointers.is_empty() {
+            self.evaluate_tool_with_facts(
+                ToolOperation::Invocation,
+                tool_name,
+                principal_fact(principal),
+                &facts,
+                None,
+            )
+        } else {
+            let mut rules = RulesUndetermined(false);
+            let first = self.answer_tool(
+                ToolOperation::Invocation,
+                tool_name,
+                principal_fact(principal),
+                &facts,
+                None,
+                &mut rules,
+            );
+            let answer = if rules.0 {
+                match arguments(pointers)? {
+                    Fact::Captured(values) => {
+                        facts.tool_arguments = Fact::Captured(values);
+                        self.answer_tool(
+                            ToolOperation::Invocation,
+                            tool_name,
+                            principal_fact(principal),
+                            &facts,
+                            None,
+                            &mut NoStages,
+                        )
+                    }
+                    Fact::Uncaptured => first,
+                }
+            } else {
+                first
+            };
+            answer.map_err(|refusal| refused(ToolOperation::Invocation, refusal))
+        };
+        Ok(match answer {
+            Ok(evaluation) => self.answered_invocation(tool_name, &evaluation, &facts),
+            Err(refusal) => (ToolInvocationVerdict::Refused(refusal), None),
+        })
+    }
+
+    /// [`Self::invocation_verdict`] for one accepted answer, with the facts it
+    /// was decided with when the translation is a verdict: a refusal has none.
+    fn answered_invocation(
+        &self,
+        tool_name: &str,
+        evaluation: &ToolEvaluation,
+        facts: &crate::policy_eval::PolicyFacts,
+    ) -> (ToolInvocationVerdict<'_>, Option<PolicyDecisionFacts>) {
+        let verdict = self.invocation_verdict(tool_name, evaluation);
+        let decision_facts = match verdict {
+            ToolInvocationVerdict::Refused(_) => None,
+            _ => PolicyDecisionFacts::tool_invocation(
+                self.decision_identity.as_ref(),
+                facts,
+                evaluation,
+            ),
+        };
+        (verdict, decision_facts)
     }
 
     /// Translate one accepted invocation answer for the runtime, asking the
@@ -1845,9 +2049,35 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
         ),
         dispatch,
     };
-    // The facts identity mappings read, from the authenticated principal
-    // alone: in mapped-role mode its verified organization, never a header.
-    let matcher_facts = compiled.serving_facts(principal.as_ref());
+    // The facts the policy's typed matchers read, and no others: the
+    // principal's verified organization, never a header, and the request
+    // facts its conditions name (`policy_facts`). A query that does not
+    // decode strictly, or facts past the evaluator's bounds, are refused
+    // here rather than decided on.
+    let matcher_facts = match http_request_facts(
+        compiled,
+        principal.as_ref(),
+        req.headers(),
+        req.uri(),
+        req.extensions(),
+        &state.client_ip_policy,
+        &state.policy_clock,
+    ) {
+        Ok(facts) => facts,
+        Err(refusal) => {
+            let (reason, error) = match refusal {
+                FactsRefusal::QueryUndecodable => (POLICY_QUERY_UNDECODABLE, None),
+                FactsRefusal::TooLarge => (
+                    "policy_evaluation_error",
+                    Some(crate::policy_eval::EvaluationError::ContextTooLarge),
+                ),
+            };
+            let refusal =
+                evaluation_failed(&state, &context, principal.as_ref(), reason, None, error);
+            drop(policy);
+            return refusal.answer().await;
+        }
+    };
     // The classifier derives these two contexts together. Never accept a
     // missing or different host-binding authority as a contextless allow.
     let evaluation = if observation.and_then(|facts| facts.authorization_context()) != proxy_context
@@ -1888,7 +2118,7 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
             return refusal.answer().await;
         }
     };
-    let (decision, records) = match apply_http_evaluation(
+    let (mut decision, records) = match apply_http_evaluation(
         &state,
         &policy,
         &context,
@@ -1910,6 +2140,14 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
             return refusal.answer().await;
         }
     };
+    // The facts this verdict was decided with, named against the snapshot
+    // that decided it, for the request's observation.
+    decision.facts = PolicyDecisionFacts::http(
+        policy.decision_identity.as_ref(),
+        &input,
+        &matcher_facts,
+        &evaluation,
+    );
     drop(policy);
     // Required audit durability (issue #425): the decision is acted on --
     // forwarded, or answered with its 403 -- only once its records are in
@@ -1982,6 +2220,7 @@ fn denied_decision(reason: &'static str) -> PolicyDecision {
         permission: None,
         path_prefix: None,
         matched_rule_id: None,
+        facts: None,
     }
 }
 
@@ -2079,6 +2318,7 @@ fn apply_http_evaluation(
             permission: None,
             path_prefix: None,
             matched_rule_id: None,
+            facts: None,
         },
     };
     Ok((decision, DecisionRecords { observed, verdict }))
@@ -2408,6 +2648,7 @@ fn decision_for_rule(
         permission: Some(rule.permission.clone()),
         path_prefix: Some(rule.path_prefix.clone()),
         matched_rule_id: None,
+        facts: None,
     }
 }
 
@@ -2422,6 +2663,7 @@ fn decision_for_direct_rule(
         permission: None,
         path_prefix: None,
         matched_rule_id: Some(matched_rule_id),
+        facts: None,
     }
 }
 

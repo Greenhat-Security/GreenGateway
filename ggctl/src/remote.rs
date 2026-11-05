@@ -27,7 +27,10 @@ use std::{
     time::Duration,
 };
 
-use gateway_config::capabilities::{self, GatewayCapabilities, ReadError, MAX_CAPABILITIES_BYTES};
+use gateway_config::{
+    capabilities::{self, GatewayCapabilities, ReadError, MAX_CAPABILITIES_BYTES},
+    mcp_client_configs::{self, McpClientConfigs, ServerName, MAX_MCP_CLIENT_CONFIGS_BYTES},
+};
 use url::{Host, Url};
 
 use crate::{
@@ -50,6 +53,8 @@ const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CA_FILE_BYTES: usize = 1024 * 1024;
 /// The capability document, relative to the admin API base.
 const CAPABILITIES_PATH: &str = "/config/capabilities";
+/// The MCP client configuration templates, relative to the admin API base.
+const MCP_CLIENT_CONFIGS_PATH: &str = "/mcp/client-configs";
 const USER_AGENT: &str = concat!("ggctl/", env!("CARGO_PKG_VERSION"));
 
 /// A validated admin API base: `https://HOST[:PORT]/v1<ADMIN_PREFIX>`, or
@@ -213,42 +218,174 @@ impl AdminClient {
         })
     }
 
-    /// An idempotent `GET` of a JSON document below the admin API base.
+    /// An idempotent `GET` of a JSON document below the admin API base, with
+    /// `query` form-encoded. `refusals` names the code for each status the
+    /// route defines beyond those every admin route shares.
     async fn get_json(
         &self,
         suffix: &str,
+        query: &[(&str, &str)],
         maximum: usize,
-        not_found: Code,
+        refusals: &[(u16, Code)],
     ) -> Result<Vec<u8>, Code> {
-        let url = self.server.endpoint(suffix);
-        let mut retries = 0;
+        let mut url = self.server.endpoint(suffix);
+        if !query.is_empty() {
+            url.query_pairs_mut().extend_pairs(query);
+        }
+        let reply = self.send(url, &Exchange::get(suffix, maximum)).await?;
+        match reply.status {
+            200 => reply.body.ok_or(Code::UnexpectedContentType),
+            503 => Err(Code::ServerUnavailable),
+            status => Err(refusals
+                .iter()
+                .find(|(refused, _)| *refused == status)
+                .map_or(Code::UnexpectedStatus, |(_, code)| *code)),
+        }
+    }
+
+    /// Sends one request below the admin API base and reads its answer.
+    ///
+    /// A redirect, `401` and `403` are refused here, for every command alike;
+    /// every other status is the caller's to interpret. A success's body is
+    /// read only when it has the media type the request accepts, and any
+    /// other status's only when it is JSON, so an error page is never read
+    /// as a document. Only a `GET` is ever sent twice, and only when its
+    /// connection was never established.
+    pub(crate) async fn exchange(&self, exchange: &Exchange<'_>) -> Result<Reply, Code> {
+        self.send(self.server.endpoint(exchange.path), exchange)
+            .await
+    }
+
+    /// [`AdminClient::exchange`] to `url`: `exchange.path` below the admin
+    /// API base, with the query [`AdminClient::get_json`] adds when it has
+    /// one.
+    async fn send(&self, url: Url, exchange: &Exchange<'_>) -> Result<Reply, Code> {
+        let retries = if exchange.method == Method::Get {
+            READ_RETRIES
+        } else {
+            0
+        };
+        let mut attempt = 0;
         let response = loop {
+            let method = match exchange.method {
+                Method::Get => reqwest::Method::GET,
+                Method::Post => reqwest::Method::POST,
+                Method::Delete => reqwest::Method::DELETE,
+            };
             let mut request = self
                 .http
-                .get(url.clone())
-                .header(reqwest::header::ACCEPT, "application/json");
+                .request(method, url.clone())
+                .header(reqwest::header::ACCEPT, exchange.accept);
             if let Some(token) = &self.token {
                 request = request.bearer_auth(token.expose());
             }
+            if let Some(body) = &exchange.body {
+                request = request
+                    .header(reqwest::header::CONTENT_TYPE, JSON_MEDIA_TYPE)
+                    .body(body.clone());
+            }
             match request.send().await {
                 Ok(response) => break response,
-                Err(error) if error.is_connect() && retries < READ_RETRIES => retries += 1,
+                Err(error) if error.is_connect() && attempt < retries => attempt += 1,
                 Err(error) => return Err(transport_code(&error)),
             }
         };
-        match response.status().as_u16() {
-            200 => {}
+        let status = response.status().as_u16();
+        match status {
             300..=399 => return Err(Code::RedirectRefused),
             401 => return Err(Code::Unauthenticated),
             403 => return Err(Code::Forbidden),
-            404 => return Err(not_found),
-            503 => return Err(Code::ServerUnavailable),
-            _ => return Err(Code::UnexpectedStatus),
+            _ => {}
         }
-        if !is_json(response.headers()) {
+        let success = (200..300).contains(&status);
+        let headers = exchange
+            .headers
+            .iter()
+            .filter_map(|name| {
+                let value = response.headers().get(*name)?.to_str().ok()?;
+                value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_graphic())
+                    .then(|| (*name, value.to_owned()))
+            })
+            .collect();
+        let wanted = if success {
+            exchange.accept
+        } else {
+            JSON_MEDIA_TYPE
+        };
+        let body = if has_media_type(response.headers(), wanted) {
+            Some(read_body(response, exchange.maximum.min(MAX_RESPONSE_BYTES)).await?)
+        } else if success && status != 204 {
             return Err(Code::UnexpectedContentType);
+        } else {
+            None
+        };
+        Ok(Reply {
+            status,
+            headers,
+            body,
+        })
+    }
+}
+
+/// The JSON media type every request body has and most answers have.
+pub(crate) const JSON_MEDIA_TYPE: &str = "application/json";
+
+/// The methods the admin API client sends.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Method {
+    /// An idempotent read: the only request ever sent twice.
+    Get,
+    Post,
+    Delete,
+}
+
+/// One request a command makes.
+pub(crate) struct Exchange<'a> {
+    pub(crate) method: Method,
+    /// The path below the admin API base, such as `/policy/validate`.
+    pub(crate) path: &'a str,
+    /// A JSON body, sent as these exact bytes.
+    pub(crate) body: Option<Vec<u8>>,
+    /// The one media type a successful answer may have.
+    pub(crate) accept: &'static str,
+    /// The response headers the command reads.
+    pub(crate) headers: &'static [&'static str],
+    /// The most response body bytes read, at most 8 MiB.
+    pub(crate) maximum: usize,
+}
+
+impl<'a> Exchange<'a> {
+    /// A `GET` of a JSON document.
+    pub(crate) fn get(path: &'a str, maximum: usize) -> Self {
+        Self {
+            method: Method::Get,
+            path,
+            body: None,
+            accept: JSON_MEDIA_TYPE,
+            headers: &[],
+            maximum,
         }
-        read_body(response, maximum.min(MAX_RESPONSE_BYTES)).await
+    }
+}
+
+/// What the server answered.
+#[derive(Debug)]
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    /// The requested headers the answer had, with visible-ASCII values.
+    pub(crate) headers: Vec<(&'static str, String)>,
+    /// The body, when it had the media type [`AdminClient::exchange`] reads.
+    pub(crate) body: Option<Vec<u8>>,
+}
+
+impl Reply {
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(header, _)| header.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
     }
 }
 
@@ -264,12 +401,12 @@ fn transport_code(error: &reqwest::Error) -> Code {
     }
 }
 
-fn is_json(headers: &reqwest::header::HeaderMap) -> bool {
+fn has_media_type(headers: &reqwest::header::HeaderMap, wanted: &str) -> bool {
     headers
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(';').next())
-        .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("application/json"))
+        .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case(wanted))
 }
 
 async fn read_body(mut response: reqwest::Response, maximum: usize) -> Result<Vec<u8>, Code> {
@@ -314,8 +451,9 @@ pub(crate) async fn handshake(client: &AdminClient) -> Result<Handshake, Code> {
     let body = client
         .get_json(
             CAPABILITIES_PATH,
+            &[],
             MAX_CAPABILITIES_BYTES,
-            Code::CapabilitiesUnavailable,
+            &[(404, Code::CapabilitiesUnavailable)],
         )
         .await?;
     Ok(match capabilities::read(&body) {
@@ -332,6 +470,40 @@ pub(crate) async fn handshake(client: &AdminClient) -> Result<Handshake, Code> {
             gateway_version: None,
             reason: Code::CapabilitiesInvalid,
         },
+    })
+}
+
+/// Reads the server's MCP client configuration templates for `ggctl
+/// mcp-config`, naming the server entry `name` when one is given. The shared
+/// reader accepts the document only when every template in it is exactly
+/// what this `ggctl` renders for the URL, name and OAuth flag it states, so a
+/// server can never hand a template through `ggctl` that it would not have
+/// written itself. Neither the version handshake nor `admin:config:read` is
+/// needed: the route has its own permission, `admin:mcp:clients:read`.
+pub(crate) async fn mcp_client_configs(
+    client: &AdminClient,
+    name: Option<&ServerName>,
+) -> Result<McpClientConfigs, Code> {
+    let query: Vec<(&str, &str)> = name
+        .map(|name| ("name", name.as_str()))
+        .into_iter()
+        .collect();
+    let body = client
+        .get_json(
+            MCP_CLIENT_CONFIGS_PATH,
+            &query,
+            MAX_MCP_CLIENT_CONFIGS_BYTES,
+            &[
+                (404, Code::McpConfigsUnavailable),
+                (409, Code::McpPublicUrlUnusable),
+            ],
+        )
+        .await?;
+    mcp_client_configs::read(&body).map_err(|error| match error {
+        mcp_client_configs::ReadError::UnsupportedVersion => Code::McpUnsupportedVersion,
+        mcp_client_configs::ReadError::TooLarge
+        | mcp_client_configs::ReadError::NotADocument
+        | mcp_client_configs::ReadError::Invalid => Code::McpConfigsInvalid,
     })
 }
 
@@ -403,6 +575,12 @@ impl RemoteArguments {
             token,
             timeout,
         }))
+    }
+
+    /// The remote options of a command that has no offline form: one
+    /// without `--server` is refused.
+    pub(crate) fn required(invocation: &Invocation) -> Result<Self, Diagnostic> {
+        Self::from_invocation(invocation)?.ok_or(Diagnostic::new(Code::ServerRequired))
     }
 
     /// Reads the credential and trust anchors the arguments name.

@@ -195,6 +195,50 @@ pub(crate) struct StandaloneDiscovery {
 }
 
 impl StandaloneSource {
+    /// Whether the import writes a policy v1 document to the cluster: the
+    /// policy it activates, or any history version it carries. Committing
+    /// one is the gated operation `policy.document_v1`, so preflight asks
+    /// the target's live roster before anything is written.
+    pub(crate) fn writes_policy_document_v1(&self) -> bool {
+        self.policy.is_document_format_v1()
+            || self
+                .history
+                .iter()
+                .filter_map(|version| version.policy.as_ref())
+                .any(Policy::is_document_format_v1)
+    }
+
+    /// Whether the import writes a policy v1 document whose rules carry
+    /// `conditions` to the cluster, active or in history: the gated
+    /// operation `policy.rule_conditions`, which preflight asks the target's
+    /// live roster for as well.
+    pub(crate) fn writes_policy_rule_conditions(&self) -> bool {
+        let conditioned =
+            |policy: &Policy| policy.is_document_format_v1() && policy.uses_rule_conditions();
+        conditioned(&self.policy)
+            || self
+                .history
+                .iter()
+                .filter_map(|version| version.policy.as_ref())
+                .any(conditioned)
+    }
+
+    /// Whether the import writes a policy v1 document whose conditions
+    /// contain a `tool_argument` leaf to the cluster, active or in history:
+    /// the gated operation `policy.tool_argument_conditions`, which preflight
+    /// asks the target's live roster for as well.
+    pub(crate) fn writes_policy_tool_argument_conditions(&self) -> bool {
+        let conditioned = |policy: &Policy| {
+            policy.is_document_format_v1() && policy.uses_tool_argument_conditions()
+        };
+        conditioned(&self.policy)
+            || self
+                .history
+                .iter()
+                .filter_map(|version| version.policy.as_ref())
+                .any(conditioned)
+    }
+
     /// Read and validate the whole source. Blocking: the caller runs it on
     /// Tokio's blocking pool.
     pub(crate) fn load(env_file: &Path) -> Result<Self, ImportError> {
@@ -473,11 +517,13 @@ fn open_read_only(setting: &'static str, path: &Path) -> Result<(), ImportError>
         })
 }
 
-/// Standalone mode reads policy v1, but a cluster replica serves only the
-/// document formats it advertises (`cluster_membership::DOCUMENT_VERSION_RANGE`),
-/// so an import that wrote a v1 document -- active or historical -- would
-/// leave every replica refusing it. Refused here instead, before anything is
-/// written.
+/// A cluster replica serves only the document formats it advertises
+/// (`cluster_membership::DOCUMENT_VERSION_RANGE`), so an import that wrote a
+/// document in any other format -- active or historical -- would leave every
+/// replica refusing it. Refused here instead, before anything is written.
+/// Both formats this build parses, 0.x and policy v1, are in the range;
+/// whether the target's live replicas read v1 as well is the operation
+/// gate's question, which preflight asks ([`StandaloneSource::writes_policy_document_v1`]).
 fn ensure_cluster_document_format(policy: &Policy, kind: &'static str) -> Result<(), ImportError> {
     if policy.cluster_serves_document_format() {
         return Ok(());
@@ -487,8 +533,7 @@ fn ensure_cluster_document_format(policy: &Policy, kind: &'static str) -> Result
         kind,
         detail: format!(
             "schema_version '{}' is a document format cluster replicas of this build do not \
-             serve (they read {minimum} to {maximum}); keep the standalone policy on a 0.x \
-             document to import it",
+             serve (they read {minimum} to {maximum})",
             policy.schema_version
         ),
     })

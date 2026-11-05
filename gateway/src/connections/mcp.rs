@@ -10,12 +10,15 @@ use arc_swap::ArcSwap;
 use serde::Serialize;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-use crate::tools::{
-    definitions::{
-        McpCatalogPublishError, ToolDefinition, ToolRegistry, ToolRegistryError, ToolSource,
-        ToolTarget,
+use crate::{
+    auth::change_actor::ChangeActor,
+    tools::{
+        definitions::{
+            McpCatalogPublishError, ToolDefinition, ToolRegistry, ToolRegistryError, ToolSource,
+            ToolTarget,
+        },
+        mcp_upstream::{self, McpUpstreamCallError},
     },
-    mcp_upstream::{self, McpUpstreamCallError},
 };
 
 use super::{
@@ -477,7 +480,7 @@ impl McpConnectionCatalogService {
         &self,
         raw_connection_id: &str,
         expected_etag: &str,
-        actor: &str,
+        actor: &ChangeActor,
     ) -> Result<McpCatalogRefreshResult, McpCatalogRefreshError> {
         if !self.control_plane.is_managed_store_configured() {
             return Err(McpCatalogRefreshError::StoreUnavailable);
@@ -1048,12 +1051,15 @@ fn refresh_store_error(error: &ConnectionStoreError) -> McpCatalogRefreshError {
         }
         // A rejected constraint is a verdict on the catalog we tried to store,
         // not a storage outage: retrying the same discovery result reproduces
-        // it exactly, so it must not be reported as retryable.
+        // it exactly, so it must not be reported as retryable. A failed
+        // evidence insert is the exception: it is the store failing to record
+        // the publication, whatever class SQLite gave it.
         ConnectionStoreError::Sqlite { source, .. }
-            if matches!(
-                source.sqlite_error_code(),
-                Some(rusqlite::ErrorCode::ConstraintViolation)
-            ) =>
+            if !error.is_evidence_append_failure()
+                && matches!(
+                    source.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::ConstraintViolation)
+                ) =>
         {
             McpCatalogRefreshError::InvalidResponse
         }
@@ -1252,7 +1258,11 @@ mod tests {
             .expect("managed MCP catalog service should load");
 
         let refused = service
-            .refresh(record.id.as_str(), record.etag().as_str(), "test-admin")
+            .refresh(
+                record.id.as_str(),
+                record.etag().as_str(),
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .err();
 
@@ -1346,7 +1356,11 @@ mod tests {
                 .expect("managed MCP catalog service should load");
 
         let first = service
-            .refresh(record.id.as_str(), record.etag().as_str(), "test-admin")
+            .refresh(
+                record.id.as_str(),
+                record.etag().as_str(),
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("first complete MCP catalog should publish");
         assert_eq!(first.catalog_revision, 1);
@@ -1356,7 +1370,11 @@ mod tests {
         assert!(registry.get(&public_name).is_some());
 
         let failure = service
-            .refresh(record.id.as_str(), record.etag().as_str(), "test-admin")
+            .refresh(
+                record.id.as_str(),
+                record.etag().as_str(),
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect_err("duplicate remote names should reject the whole refresh");
         assert_eq!(failure, McpCatalogRefreshError::InvalidResponse);
@@ -1460,7 +1478,7 @@ mod tests {
                 .refresh(
                     harness.record.id.as_str(),
                     harness.record.etag().as_str(),
-                    "test-admin",
+                    &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
                 )
                 .await
                 .expect("an absent optional discovery method should be treated as empty");
@@ -1516,7 +1534,7 @@ mod tests {
             .refresh(
                 harness.record.id.as_str(),
                 harness.record.etag().as_str(),
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect_err("tools/list remains required when tools are advertised");
@@ -1618,7 +1636,11 @@ mod tests {
         .expect("managed MCP catalog service should load");
 
         service
-            .refresh(record.id.as_str(), record.etag().as_str(), "test-admin")
+            .refresh(
+                record.id.as_str(),
+                record.etag().as_str(),
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("managed MCP catalog should publish");
         let public_name = format!("{}:alpha", record.id);
@@ -1721,6 +1743,21 @@ mod tests {
             refresh_store_error(&outage),
             McpCatalogRefreshError::StorageUnavailable,
             "a genuine storage failure must stay retryable"
+        );
+
+        let evidence = ConnectionStoreError::Sqlite {
+            path: PathBuf::from("connections.sqlite"),
+            operation: "catalog change evidence append",
+            source: rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER),
+                Some("evidence refused".to_owned()),
+            ),
+        };
+        assert!(evidence.is_evidence_append_failure());
+        assert_eq!(
+            refresh_store_error(&evidence),
+            McpCatalogRefreshError::StorageUnavailable,
+            "a publication whose evidence could not be recorded is a store failure, not a verdict on the catalog"
         );
     }
 

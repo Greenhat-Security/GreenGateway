@@ -203,6 +203,11 @@ pub(super) async fn tool_playground_execute_endpoint(
         ),
         actor: Some(auth::actor_from_principal(&principal)),
         organization: principal.org_id.clone(),
+        source_address: client_ip::canonical_client_addr(
+            &parts.headers,
+            &parts.extensions,
+            &state.client_ip_policy,
+        ),
         caller: connections::caller_assertion::AttestedCaller::from_principal(&principal)
             .map(std::sync::Arc::new),
         source: tools::runtime::ToolInvocationSource::AdminPlayground,

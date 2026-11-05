@@ -9,11 +9,19 @@
 //!
 //! What a case can say is deliberately narrow. Identity is a typed set of
 //! policy facts -- subject, issuer, roles, authentication method and the
-//! organization authentication verified -- and never a token, cookie, header
-//! or credential: there is no field to put one in, and a member named like
-//! one is refused with its own code rather than as an ordinary typo.
+//! organization authentication verified -- and never a token, cookie or
+//! credential: there is no field to put one in, and a member named like one
+//! is refused with its own code rather than as an ordinary typo. The request
+//! facts a rule condition reads -- source address, headers, query parameters,
+//! the evaluation instant and a tool invocation's arguments -- are an
+//! optional typed `facts` member, whose header and query names are held to
+//! the same rule conditions are: a name that can carry a credential, an
+//! identity or hop-by-hop routing is refused with `forbidden_field`. No fact
+//! value, an argument least of all, is ever quoted back.
 
-use http::Method;
+use std::net::IpAddr;
+
+use http::{HeaderName, Method};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use url::Url;
@@ -26,7 +34,12 @@ use crate::{
     canonical_json,
     policy_eval::{
         tools::{validate_rendered_http_path, ToolOperation},
-        validate_path, DispatchFacts, LogicalDecision, PolicyEffect, Reason, MAX_FACT_VALUE_BYTES,
+        validate_path, DispatchFacts, LogicalDecision, PolicyEffect, Reason, MAX_FACT_ENTRIES,
+        MAX_FACT_NAME_BYTES, MAX_FACT_VALUE_BYTES,
+    },
+    rbac::conditions::{
+        header_name_is_readable, parse_utc_instant, query_name_is_readable,
+        MAX_TOOL_ARGUMENT_POINTER_TOKENS,
     },
     rbac::rule::{
         AUTH_METHOD_BEARER_TOKEN, AUTH_METHOD_CLIENT_CERTIFICATE, AUTH_METHOD_SERVICE_TOKEN,
@@ -166,6 +179,37 @@ pub(crate) struct Case {
     /// The JSON Pointer of the case in the submitted suite, for reports.
     pub(crate) pointer: String,
     pub(crate) input: CaseInput,
+    pub(crate) facts: CaseFacts,
+}
+
+/// The request facts a case states for the rule conditions a policy may
+/// carry (issue #243): the optional `facts` member.
+///
+/// A member the case omits is a fact it does not state, and a condition that
+/// reads it cannot be decided: the answer is indeterminate, never a guessed
+/// match or no-match. An empty `headers` or `query` object states a request
+/// that carried none. Only an `http` case may state headers or a query; a
+/// tool call has neither, on the live lane or here. Only a `tool` case of the
+/// `invocation` operation may state `arguments`: no other lane, and no
+/// listing or eligibility preview, ever has a call's arguments.
+#[derive(Default)]
+pub(crate) struct CaseFacts {
+    /// The canonical client address, as the gateway derives it after
+    /// trusted-proxy processing.
+    pub(crate) source_ip: Option<IpAddr>,
+    /// Header field lines, one entry per occurrence, names lowercase.
+    pub(crate) headers: Option<Vec<(String, String)>>,
+    /// Decoded query parameters, one entry per occurrence.
+    pub(crate) query: Option<Vec<(String, String)>>,
+    /// The evaluation instant, in whole seconds since the Unix epoch.
+    pub(crate) now: Option<i64>,
+    /// The invocation's arguments, as they stand once they have passed the
+    /// tool's input schema: the evaluator reads only the scalars at the
+    /// pointers the tool's rules read, as the live lane captures them. The
+    /// tool's schema is not consulted here, so which pointers it makes
+    /// eligible is not either; publication checks that against the
+    /// registry.
+    pub(crate) arguments: Option<Value>,
 }
 
 /// What a case asks, per lane. Each variant carries the expectation that lane
@@ -414,6 +458,7 @@ pub(crate) struct SyntheticCase {
     /// The JSON Pointer of the case in the submitted document, for results.
     pub(crate) pointer: String,
     pub(crate) context: CaseContext,
+    pub(crate) facts: CaseFacts,
 }
 
 /// What a case asks, per lane, without what it expects.
@@ -522,6 +567,8 @@ pub(crate) fn parse_synthetic_case(
     let before = diagnostics.diagnostics.len();
     let (map, id, kind) = parse_case_header(value, pointer, false, diagnostics)?;
     let context = parse_case_context(map, pointer, kind, diagnostics);
+    let facts = parse_case_facts(map, pointer, kind, diagnostics);
+    check_arguments_apply(context.as_ref(), facts.as_ref(), pointer, diagnostics);
     if diagnostics.diagnostics.len() != before || diagnostics.truncated {
         return None;
     }
@@ -529,6 +576,7 @@ pub(crate) fn parse_synthetic_case(
         id: id?,
         pointer: pointer.to_owned(),
         context: context?,
+        facts: facts?,
     })
 }
 
@@ -536,6 +584,8 @@ fn parse_case(value: &Value, pointer: &str, diagnostics: &mut Diagnostics) -> Op
     let before = diagnostics.diagnostics.len();
     let (map, id, kind) = parse_case_header(value, pointer, true, diagnostics)?;
     let context = parse_case_context(map, pointer, kind, diagnostics);
+    let facts = parse_case_facts(map, pointer, kind, diagnostics);
+    check_arguments_apply(context.as_ref(), facts.as_ref(), pointer, diagnostics);
     let expect_pointer = format!("{pointer}/expect");
     let expect = required(map, "expect", pointer, diagnostics).and_then(|value| match kind {
         CaseKind::Http => {
@@ -660,6 +710,7 @@ fn parse_case(value: &Value, pointer: &str, diagnostics: &mut Diagnostics) -> Op
         id: id?,
         pointer: pointer.to_owned(),
         input,
+        facts: facts?,
     })
 }
 
@@ -725,8 +776,11 @@ fn parse_case_header<'a>(
             "sequence",
             "destination",
             "resolution",
+            "facts",
         ],
-        Some(CaseKind::Http) => vec!["id", "description", "kind", "principal", "request"],
+        Some(CaseKind::Http) => {
+            vec!["id", "description", "kind", "principal", "request", "facts"]
+        }
         Some(CaseKind::Rate) => {
             vec![
                 "id",
@@ -737,9 +791,17 @@ fn parse_case_header<'a>(
                 "sequence",
             ]
         }
-        Some(CaseKind::Tool) => vec!["id", "description", "kind", "principal", "tool"],
+        Some(CaseKind::Tool) => vec!["id", "description", "kind", "principal", "tool", "facts"],
         Some(CaseKind::ToolHttp) => {
-            vec!["id", "description", "kind", "principal", "tool", "request"]
+            vec![
+                "id",
+                "description",
+                "kind",
+                "principal",
+                "tool",
+                "request",
+                "facts",
+            ]
         }
         // An outbound destination is decided by the egress controls alone:
         // no caller identity takes part, so a case states none.
@@ -1062,6 +1124,344 @@ fn parse_resolution(
         }
     }
     Some(addresses)
+}
+
+/// A case's optional `facts` member; see [`CaseFacts`].
+fn parse_case_facts(
+    map: &Map<String, Value>,
+    pointer: &str,
+    kind: CaseKind,
+    diagnostics: &mut Diagnostics,
+) -> Option<CaseFacts> {
+    // Only the lanes a rule condition can decide state facts: rate overrides
+    // carry no conditions and an egress destination involves no caller, so
+    // their cases have no `facts` member and the member check refuses one.
+    let Some(value) = map
+        .get("facts")
+        .filter(|_| matches!(kind, CaseKind::Http | CaseKind::Tool | CaseKind::ToolHttp))
+    else {
+        return Some(CaseFacts::default());
+    };
+    let pointer = format!("{pointer}/facts");
+    let facts = object(value, &pointer, diagnostics)?;
+    let request_facts = kind == CaseKind::Http;
+    let invocation_facts = kind == CaseKind::Tool;
+    // `headers`, `query` and `arguments` pass the member check for every
+    // kind, so a case naming one its lane does not have is told the fact does
+    // not apply rather than that it tried to supply a credential.
+    check_members(
+        facts,
+        &pointer,
+        &["source_ip", "headers", "query", "now", "arguments"],
+        diagnostics,
+    );
+    if !request_facts {
+        for member in ["headers", "query"] {
+            if facts.contains_key(member) {
+                diagnostics.push(
+                    "fact_not_applicable",
+                    &format!("{pointer}/{member}"),
+                    "headers and query are facts of an inbound HTTP request; only an http case states them",
+                );
+            }
+        }
+    }
+    if !invocation_facts && facts.contains_key("arguments") {
+        diagnostics.push(
+            "fact_not_applicable",
+            &format!("{pointer}/arguments"),
+            "arguments are facts of a tool invocation; only a tool case states them",
+        );
+    }
+    let source_ip = match facts.get("source_ip") {
+        None => Some(None),
+        Some(value) => {
+            let member = format!("{pointer}/source_ip");
+            match value.as_str().map(str::parse::<IpAddr>) {
+                Some(Ok(address)) => Some(Some(address.to_canonical())),
+                _ => {
+                    diagnostics.push(
+                        "invalid_value",
+                        &member,
+                        "source_ip must be an IPv4 or IPv6 address without a port",
+                    );
+                    None
+                }
+            }
+        }
+    };
+    let now = match facts.get("now") {
+        None => Some(None),
+        Some(value) => match value.as_str().and_then(parse_utc_instant) {
+            Some(now) => Some(Some(now)),
+            None => {
+                diagnostics.push(
+                    "invalid_value",
+                    &format!("{pointer}/now"),
+                    "now must be an RFC 3339 UTC instant written YYYY-MM-DDTHH:MM:SSZ",
+                );
+                None
+            }
+        },
+    };
+    let headers = match facts.get("headers") {
+        Some(value) if request_facts => parse_fact_entries(
+            value,
+            &format!("{pointer}/headers"),
+            FactKind::Header,
+            diagnostics,
+        )
+        .map(Some),
+        _ => Some(None),
+    };
+    let query = match facts.get("query") {
+        Some(value) if request_facts => parse_fact_entries(
+            value,
+            &format!("{pointer}/query"),
+            FactKind::Query,
+            diagnostics,
+        )
+        .map(Some),
+        _ => Some(None),
+    };
+    let arguments = match facts.get("arguments") {
+        Some(value) if invocation_facts => {
+            parse_tool_arguments(value, &format!("{pointer}/arguments"), diagnostics).map(Some)
+        }
+        _ => Some(None),
+    };
+    Some(CaseFacts {
+        source_ip: source_ip?,
+        headers: headers?,
+        query: query?,
+        now: now?,
+        arguments: arguments?,
+    })
+}
+
+/// A tool case's `arguments`: one JSON object, nested no deeper than a
+/// condition's pointer reaches, of at most [`MAX_FACT_ENTRIES`] values with
+/// member names of at most [`MAX_FACT_NAME_BYTES`] bytes and strings of at
+/// most [`MAX_FACT_VALUE_BYTES`]. A refusal names where, never what.
+fn parse_tool_arguments(
+    value: &Value,
+    pointer: &str,
+    diagnostics: &mut Diagnostics,
+) -> Option<Value> {
+    if !value.is_object() {
+        diagnostics.push(
+            "invalid_type",
+            pointer,
+            "arguments must be an object, as a tool call's arguments are",
+        );
+        return None;
+    }
+    let mut values = 0;
+    match bounded_arguments(value, 0, &mut values) {
+        ArgumentsBound::Within => Some(value.clone()),
+        ArgumentsBound::TooMany => {
+            diagnostics.push(
+                "too_many_facts",
+                pointer,
+                format!("arguments may hold at most {MAX_FACT_ENTRIES} values"),
+            );
+            None
+        }
+        ArgumentsBound::TooLarge => {
+            diagnostics.push(
+                "invalid_value",
+                pointer,
+                format!(
+                    "arguments nest at most {MAX_TOOL_ARGUMENT_POINTER_TOKENS} levels deep, with \
+                     member names of at most {MAX_FACT_NAME_BYTES} bytes and strings of at most \
+                     {MAX_FACT_VALUE_BYTES} bytes"
+                ),
+            );
+            None
+        }
+    }
+}
+
+enum ArgumentsBound {
+    Within,
+    TooMany,
+    TooLarge,
+}
+
+/// Whether `value`, `depth` levels below the arguments object, keeps within
+/// the bounds of [`parse_tool_arguments`], counting every value below the
+/// object into `values`.
+fn bounded_arguments(value: &Value, depth: usize, values: &mut usize) -> ArgumentsBound {
+    if depth > 0 {
+        *values += 1;
+        if *values > MAX_FACT_ENTRIES {
+            return ArgumentsBound::TooMany;
+        }
+    }
+    if depth > MAX_TOOL_ARGUMENT_POINTER_TOKENS {
+        return ArgumentsBound::TooLarge;
+    }
+    match value {
+        Value::Object(members) => {
+            if members.keys().any(|name| name.len() > MAX_FACT_NAME_BYTES) {
+                return ArgumentsBound::TooLarge;
+            }
+            bounded_children(members.values(), depth, values)
+        }
+        Value::Array(items) => bounded_children(items.iter(), depth, values),
+        Value::String(text) if text.len() > MAX_FACT_VALUE_BYTES => ArgumentsBound::TooLarge,
+        Value::String(_) | Value::Null | Value::Bool(_) | Value::Number(_) => {
+            ArgumentsBound::Within
+        }
+    }
+}
+
+fn bounded_children<'a>(
+    children: impl Iterator<Item = &'a Value>,
+    depth: usize,
+    values: &mut usize,
+) -> ArgumentsBound {
+    for child in children {
+        match bounded_arguments(child, depth + 1, values) {
+            ArgumentsBound::Within => {}
+            refused => return refused,
+        }
+    }
+    ArgumentsBound::Within
+}
+
+/// Refuses `arguments` stated for a tool case that is not an invocation: a
+/// listing or an eligibility preview is decided without any call, live and
+/// here, so the arguments could only be ignored.
+fn check_arguments_apply(
+    context: Option<&CaseContext>,
+    facts: Option<&CaseFacts>,
+    pointer: &str,
+    diagnostics: &mut Diagnostics,
+) {
+    if let (
+        Some(CaseContext::Tool { operation, .. }),
+        Some(CaseFacts {
+            arguments: Some(_), ..
+        }),
+    ) = (context, facts)
+    {
+        if *operation != ToolOperation::Invocation {
+            diagnostics.push(
+                "fact_not_applicable",
+                &format!("{pointer}/facts/arguments"),
+                "arguments are facts of a tool invocation; a visibility or eligibility preview has none",
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FactKind {
+    Header,
+    Query,
+}
+
+/// `headers` or `query`: an object from each name to the values of its
+/// occurrences, in order, flattened to one entry per occurrence. Names are
+/// checked as a condition's are; values are never quoted in a diagnostic.
+fn parse_fact_entries(
+    value: &Value,
+    pointer: &str,
+    kind: FactKind,
+    diagnostics: &mut Diagnostics,
+) -> Option<Vec<(String, String)>> {
+    let map = object(value, pointer, diagnostics)?;
+    let mut entries = Vec::new();
+    let mut valid = true;
+    for (name, values) in map {
+        let member = member_pointer(pointer, name);
+        // Readability first, and in any letter case, so `Authorization` is
+        // refused as what it is rather than for its spelling.
+        let readable = match kind {
+            FactKind::Header => header_name_is_readable(&name.to_ascii_lowercase()),
+            FactKind::Query => query_name_is_readable(name),
+        };
+        if !readable {
+            diagnostics.push(
+                "forbidden_field",
+                &member,
+                "a name that can carry credentials, identity or hop-by-hop routing is never a case fact; no condition may read it",
+            );
+            valid = false;
+            continue;
+        }
+        let well_formed = match kind {
+            FactKind::Header => {
+                name.len() <= MAX_FACT_NAME_BYTES
+                    && HeaderName::from_bytes(name.as_bytes()).is_ok()
+                    && !name.bytes().any(|byte| byte.is_ascii_uppercase())
+            }
+            FactKind::Query => {
+                !name.is_empty()
+                    && name.len() <= MAX_FACT_NAME_BYTES
+                    && !name.chars().any(char::is_control)
+            }
+        };
+        if !well_formed {
+            diagnostics.push(
+                "invalid_value",
+                &member,
+                match kind {
+                    FactKind::Header => "a header name is a lowercase HTTP field name of at most 256 bytes",
+                    FactKind::Query => "a query parameter name is 1 to 256 bytes of text without control characters",
+                },
+            );
+            valid = false;
+            continue;
+        }
+        let Value::Array(occurrences) = values else {
+            diagnostics.push("invalid_type", &member, "expected an array of strings");
+            valid = false;
+            continue;
+        };
+        if occurrences.is_empty() {
+            diagnostics.push(
+                "invalid_value",
+                &member,
+                "list at least one occurrence, or omit the name",
+            );
+            valid = false;
+            continue;
+        }
+        for (index, occurrence) in occurrences.iter().enumerate() {
+            let occurrence_pointer = format!("{member}/{index}");
+            match occurrence {
+                Value::String(text)
+                    if text.len() <= MAX_FACT_VALUE_BYTES
+                        && !text.chars().any(char::is_control) =>
+                {
+                    entries.push((name.clone(), text.clone()));
+                }
+                Value::String(_) => {
+                    diagnostics.push(
+                        "invalid_value",
+                        &occurrence_pointer,
+                        "a value is at most 8192 bytes of text without control characters",
+                    );
+                    valid = false;
+                }
+                _ => {
+                    diagnostics.push("invalid_type", &occurrence_pointer, "expected a string");
+                    valid = false;
+                }
+            }
+        }
+    }
+    if entries.len() > MAX_FACT_ENTRIES {
+        diagnostics.push(
+            "too_many_facts",
+            pointer,
+            format!("at most {MAX_FACT_ENTRIES} occurrences may be stated"),
+        );
+        return None;
+    }
+    valid.then_some(entries)
 }
 
 fn valid_case_id(id: &str) -> bool {

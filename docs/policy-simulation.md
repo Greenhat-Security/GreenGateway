@@ -64,8 +64,13 @@ the audit, resolver, bucket and upstream against the live path afterwards
 
 A request is a `policy-simulation.v1` document. The version is dispatched
 exactly, every object refuses unknown members, and a member named like a
-credential (`token`, `authorization`, `cookie`, `headers` and similar) is
-refused with `forbidden_field`. The published schema is
+credential (`token`, `authorization`, `cookie` and similar) is refused with
+`forbidden_field`. A case may state the request facts a rule condition
+reads in an optional `facts` member, exactly as a
+[policy test case](policy-tests.md#request-facts) does, a tool invocation's
+`arguments` included; a fact a condition reads that the case omits is
+`indeterminate`, the simulator never reads the clock, and no stated value,
+an argument least of all, appears in a result or trace. The published schema is
 [`docs/schemas/policy-simulation.v1.schema.json`](schemas/policy-simulation.v1.schema.json);
 the gateway's parser is authoritative and additionally checks path, host and
 origin syntax, identity bounds, unique case ids and byte lengths.
@@ -138,9 +143,11 @@ through serde_json's private number tag (`{"$serde_json::private::Number":
 member anywhere in the request is already `400
 policy_simulation_request_invalid`.) An edited candidate has no bytes of its
 own and is validated as the document its edits produce. A candidate whose
-document format this deployment could not commit -- policy v1 in cluster
-mode -- is refused as `POST /v1{ADMIN_PREFIX}/policy/validate` and a policy
-test run refuse it. A candidate that does not validate is `422
+document format this deployment's replicas do not serve is refused as
+`POST /v1{ADMIN_PREFIX}/policy/validate` and a policy test run refuse it;
+cluster mode serves 0.x and policy v1 alike, so a v1 candidate is simulated
+there too, and whether every live replica reads it is asked only when a
+document is committed. A candidate that does not validate is `422
 policy_candidate_invalid`.
 
 ### Drafts and history versions

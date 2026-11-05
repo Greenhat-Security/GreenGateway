@@ -8,7 +8,7 @@ use serde_json::Value;
 use super::*;
 use crate::audit::sink::tests::CaptureSink;
 
-const EVERY_OPERATION: [AuthorityOperation; 14] = [
+const EVERY_OPERATION: [AuthorityOperation; 11] = [
     AuthorityOperation::PolicyPublish,
     AuthorityOperation::PolicyRollback,
     AuthorityOperation::PolicyRuleCreate,
@@ -18,11 +18,8 @@ const EVERY_OPERATION: [AuthorityOperation; 14] = [
     AuthorityOperation::PolicySuggestionAccept,
     AuthorityOperation::PolicyFileReload,
     AuthorityOperation::ToolsPublish,
-    AuthorityOperation::CatalogMcpPublish,
-    AuthorityOperation::CatalogOpenapiPublish,
-    AuthorityOperation::CatalogOverlayReplace,
-    AuthorityOperation::CatalogOverlayDelete,
     AuthorityOperation::ConfigurationImport,
+    AuthorityOperation::PolicyTestsPublish,
 ];
 
 /// The operation whose gate covers an inventory operation code, or `None`
@@ -163,7 +160,7 @@ fn a_refusal_is_audited_with_its_operation_mode_and_origin_and_nothing_else() {
         AuthorityEvidenceGate::new(AuthorityEvidenceDurability::Required, StateBackend::Sqlite);
     let refusal = gate
         .admit(
-            AuthorityOperation::CatalogOverlayDelete,
+            AuthorityOperation::ToolsPublish,
             &audit,
             RefusalOrigin::Request {
                 request_id: "request-1".to_owned(),
@@ -177,11 +174,8 @@ fn a_refusal_is_audited_with_its_operation_mode_and_origin_and_nothing_else() {
                 }),
             },
         )
-        .expect_err("standalone mode records no overlay evidence");
-    assert_eq!(
-        refusal.operation(),
-        AuthorityOperation::CatalogOverlayDelete
-    );
+        .expect_err("standalone mode records no tools evidence");
+    assert_eq!(refusal.operation(), AuthorityOperation::ToolsPublish);
     assert!(!BackgroundEvidenceGate::new(gate, audit.clone())
         .admits(AuthorityOperation::PolicyFileReload, "signal"));
 
@@ -201,7 +195,7 @@ fn a_refusal_is_audited_with_its_operation_mode_and_origin_and_nothing_else() {
     assert_eq!(
         request.payload,
         json!({
-            "operation": "catalog.overlay.delete",
+            "operation": "tools.publish",
             "deployment_mode": "standalone",
             "trigger": "admin_api",
             "reason": "authority_evidence_unsupported",
@@ -316,7 +310,9 @@ fn the_gate_enforces_exactly_what_the_evidence_inventory_says() {
         "config_tests covers each refusal at startup"
     );
     // The standalone Connections database records these in the change's own
-    // transaction, so required mode admits them and no gate asks.
+    // transaction, so required mode admits them and no gate asks: Connection
+    // and local-secret changes since its migration 12, and managed catalog
+    // and overlay publication since its migration 13.
     for code in [
         "connection.create",
         "connection.replace",
@@ -326,6 +322,10 @@ fn the_gate_enforces_exactly_what_the_evidence_inventory_says() {
         "secret.rotate",
         "secret.delete",
         "secret.reencrypt",
+        "catalog.mcp.publish",
+        "catalog.openapi.publish",
+        "catalog.overlay.replace",
+        "catalog.overlay.delete",
     ] {
         assert_eq!(
             by_mode.get(&(code, "standalone")),

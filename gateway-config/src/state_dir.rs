@@ -9,8 +9,10 @@
 //!
 //! - **Layout.** [`StateFile`] names the file of every standalone store the
 //!   field catalog maps to a fixed file (`BundleMapping::Resource`), plus the
-//!   configuration revision ledger, and [`LOCK_FILE_NAME`] names the lock
-//!   file. The names never change meaning; a store that moves gets a new one.
+//!   configuration revision ledger, [`LOCK_FILE_NAME`] names the lock file
+//!   and [`RESTORE_MARKER_FILE_NAME`] the marker `ggctl backup restore`
+//!   leaves for the next gateway start ([`crate::backup`]). The names never
+//!   change meaning; a store that moves gets a new one.
 //! - **Admission.** The directory must be a real directory: not a symbolic
 //!   link, junction or other reparse point, and on Unix not writable by
 //!   group or other, who could otherwise replace a store. It is checked by
@@ -66,6 +68,11 @@ pub use filesystem::{filesystem_kind, FilesystemKind, NETWORK_FILESYSTEM_CODE};
 
 /// The lock file's name beneath the state directory.
 pub const LOCK_FILE_NAME: &str = "state.lock";
+/// The restore marker's name beneath the state directory: present from a
+/// completed `ggctl backup restore` until the next gateway start records it.
+pub const RESTORE_MARKER_FILE_NAME: &str = "restore-marker.json";
+/// The `PRAGMA application_id` of the configuration revision ledger, "GGLG".
+const LEDGER_APPLICATION_ID: i32 = 0x4747_4C47;
 
 /// A standalone store's fixed file beneath the state directory.
 ///
@@ -112,6 +119,20 @@ impl StateFile {
         Self::ConfigLedger,
     ];
 
+    /// The store's stable identifier, as a backup manifest names it
+    /// ([`crate::backup`]). Like the file name, it never changes meaning.
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Audit => "audit",
+            Self::Discovery => "discovery",
+            Self::Principals => "principals",
+            Self::Connections => "connections",
+            Self::ServiceTokens => "service_tokens",
+            Self::PolicyHistory => "policy_history",
+            Self::ConfigLedger => "config_ledger",
+        }
+    }
+
     /// The file's name beneath the state directory.
     pub const fn file_name(self) -> &'static str {
         match self {
@@ -122,6 +143,16 @@ impl StateFile {
             Self::ServiceTokens => "service-tokens.sqlite3",
             Self::PolicyHistory => "policy-history.sqlite3",
             Self::ConfigLedger => "config-ledger.sqlite3",
+        }
+    }
+
+    /// The `PRAGMA application_id` a database under this name carries: the
+    /// ledger's "GGLG", and `0` for the gateway's stores, which set none. A
+    /// restore refuses an entry that claims another store's identity.
+    pub const fn application_id(self) -> i32 {
+        match self {
+            Self::ConfigLedger => LEDGER_APPLICATION_ID,
+            _ => 0,
         }
     }
 

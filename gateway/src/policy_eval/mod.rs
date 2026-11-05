@@ -81,17 +81,24 @@
 //! client address, named headers and query parameters, validated tool
 //! arguments, an injected clock -- which every lane takes beside its context.
 //!
-//! Identity mappings are served. Every serving adapter asks
-//! [`CompiledPolicy::serving_facts`] for the facts it evaluates with, which in
-//! mapped-role mode carry the organization authentication verified for the
-//! principal (`Principal::org_id`, never a request header), and passes them to
-//! the `_with_facts` entry points: the HTTP lane, the tool lanes, rate-lane
-//! selection and the management lane all resolve roles from the same fact.
-//! Rule conditions are not served yet: policy validation still refuses a
-//! document that uses them (`TypedMatchersNotEnforced`), and no adapter
-//! captures the request facts they read. A mapping or condition that reads an
-//! uncaptured fact makes the answer [`Limitation::MissingMatcherFact`], never a
-//! guessed match, and every live lane refuses an indeterminate answer.
+//! Identity mappings and every condition leaf are served. Every serving
+//! adapter evaluates with the facts the compiled policy reads
+//! ([`CompiledPolicy::fact_needs`]) and no others: the organization
+//! authentication verified for the principal ([`CompiledPolicy::serving_facts`],
+//! `Principal::org_id`, never a request header), and on the lanes that have
+//! them the canonical client address, the referenced headers, the strictly
+//! decoded query parameters and an injected clock (`middleware::policy_facts`).
+//! The HTTP lane, the tool lanes, rate-lane selection and the management lane
+//! all resolve roles from the same organization. A policy that reads no fact
+//! is evaluated with none captured, exactly as before facts were served.
+//! Tool invocation admission is the one lane that asks twice: a call whose
+//! tool-name rules reach a `tool_argument` leaf is decided again, after its
+//! arguments have passed the tool's input schema and before any capacity is
+//! taken, with only the eligible scalars those leaves read
+//! (`middleware::policy_facts::tool_argument_facts`); no other lane ever
+//! captures arguments. A mapping or condition that reads an uncaptured fact
+//! makes the answer [`Limitation::MissingMatcherFact`], never a guessed match,
+//! and every live lane refuses an indeterminate answer.
 //!
 //! In mapped-role mode each lane resolves the principal's internal roles once,
 //! on entry, and judges every role constraint -- route permissions, rule
@@ -142,13 +149,15 @@ use stages::{
     RateStage, RouteMatch, StageSink, UpstreamBinding,
 };
 
-pub(crate) use crate::rbac::conditions::{Fact, PolicyFacts, UNCAPTURED_FACTS};
+pub(crate) use crate::rbac::conditions::{Fact, FactNeeds, PolicyFacts, UNCAPTURED_FACTS};
 
-/// Most header or query entries one evaluation's facts may carry.
+/// Most header or query entries, or tool-argument scalars, one evaluation's
+/// facts may carry.
 pub(crate) const MAX_FACT_ENTRIES: usize = 128;
 /// Longest header or query name a fact may carry, in bytes.
 pub(crate) const MAX_FACT_NAME_BYTES: usize = 256;
-/// Longest header or query value, or organization, a fact may carry, in bytes.
+/// Longest header or query value, organization, or tool-argument string a
+/// fact may carry, in bytes.
 pub(crate) const MAX_FACT_VALUE_BYTES: usize = 8192;
 
 /// Each lane that adds a required fact bumps this, so a context built for an
@@ -240,6 +249,9 @@ pub(crate) struct CompiledPolicy {
     /// The identity mappings of a policy in mapped-role mode; `None` when the
     /// policy's claimed roles are its internal roles.
     identity: Option<CompiledIdentityMappings>,
+    /// The facts this policy's identity mappings and rule conditions read,
+    /// so a serving lane captures those and no others.
+    fact_needs: FactNeeds,
 }
 
 impl fmt::Debug for CompiledPolicy {
@@ -339,6 +351,7 @@ impl CompiledPolicy {
             .identity_mappings
             .as_deref()
             .map(CompiledIdentityMappings::new);
+        let fact_needs = FactNeeds::of(&policy.rules, identity.is_some());
         let snapshot = ResourceSnapshot {
             digest,
             authority,
@@ -351,7 +364,15 @@ impl CompiledPolicy {
             snapshot,
             host_qualified_routes,
             identity,
+            fact_needs,
         }
+    }
+
+    /// The facts this policy's typed matchers read. A serving lane captures
+    /// exactly these (`middleware::policy_facts`), and nothing when the
+    /// policy has neither identity mappings nor rule conditions.
+    pub(crate) fn fact_needs(&self) -> &FactNeeds {
+        &self.fact_needs
     }
 
     /// The principal every lane judges: `principal` itself when the policy's
@@ -375,24 +396,25 @@ impl CompiledPolicy {
         Some(Cow::Owned(mapped))
     }
 
-    /// The facts a serving lane captures for `principal` under this policy.
+    /// The facts a serving lane captures for `principal` alone under this
+    /// policy, before any request fact.
     ///
-    /// In mapped-role mode that is the organization authentication verified
-    /// for the principal: its `org_id`, and `Captured(None)` when
-    /// authentication verified none or the caller is anonymous. It is read
-    /// from the authenticated principal only, never from a request header,
-    /// so a caller cannot name its own organization. Otherwise nothing is
-    /// captured, because nothing a served policy without identity mappings
-    /// can contain reads a fact (rule conditions are refused at validation):
-    /// claimed-role mode stays exactly as it was, as the host fact is asked
-    /// for only when a route can turn on it.
+    /// When an identity mapping or an `organization` condition reads it, that
+    /// is the organization authentication verified for the principal: its
+    /// `org_id`, and `Captured(None)` when authentication verified none or
+    /// the caller is anonymous. It is read from the authenticated principal
+    /// only, never from a request header, so a caller cannot name its own
+    /// organization. Otherwise nothing is captured: a policy that reads no
+    /// fact decides exactly as it did before facts were served, as the host
+    /// fact is asked for only when a route can turn on it.
     ///
-    /// The other facts -- client address, headers, query, tool arguments,
-    /// clock -- stay uncaptured on every serving lane until rule conditions
-    /// are served.
+    /// The request facts -- client address, headers, query, clock -- are
+    /// added by the lane that has them (`middleware::policy_facts`), and only
+    /// those [`Self::fact_needs`] names. Tool arguments are added only by tool
+    /// invocation admission, once the call's arguments are validated.
     pub(crate) fn serving_facts(&self, principal: Option<&Principal>) -> PolicyFacts {
         let mut facts = PolicyFacts::uncaptured();
-        if self.identity.is_some() {
+        if self.fact_needs.organization {
             facts.organization =
                 Fact::Captured(principal.and_then(|principal| principal.org_id.clone()));
         }
@@ -408,6 +430,11 @@ impl CompiledPolicy {
     /// the bounds every lane refuses ([`validate_facts`]), holds none: it is
     /// refused every permission, never granted one on a guess.
     pub(crate) fn management_principal<'a>(&self, principal: &'a Principal) -> Cow<'a, Principal> {
+        // Only identity mappings change management roles; an organization
+        // condition on a direct rule has no say here.
+        if self.identity.is_none() {
+            return Cow::Borrowed(principal);
+        }
         let facts = self.serving_facts(Some(principal));
         validate_facts(&facts)
             .ok()
@@ -738,11 +765,11 @@ impl CompiledPolicy {
         self.decide(context, facts, &mut NoStages)
     }
 
-    fn decide<S: StageSink>(
+    fn decide(
         &self,
         context: &PolicyEvaluationContext,
         facts: &PolicyFacts,
-        stages: &mut S,
+        stages: &mut impl StageSink,
     ) -> Result<Evaluation, EvaluationError> {
         context.validate(self.snapshot)?;
         validate_facts(facts)?;
@@ -1362,8 +1389,10 @@ impl FactsUse {
 
 /// Refuses facts past the work bounds every lane states for itself, as it
 /// does for the context. The organization is held to the bound a subject is,
-/// and header and query entries to bounds no request the gateway admits
-/// exceeds.
+/// header and query entries to bounds no request the gateway admits exceeds,
+/// and tool arguments -- already reduced to the scalars conditions read -- to
+/// the same entry and value bounds, nested no deeper than a condition's
+/// pointer reaches.
 pub(crate) fn validate_facts(facts: &PolicyFacts) -> Result<(), EvaluationError> {
     use crate::rbac::conditions::Fact;
 
@@ -1383,7 +1412,36 @@ pub(crate) fn validate_facts(facts: &PolicyFacts) -> Result<(), EvaluationError>
             }
         }
     }
+    if let Fact::Captured(arguments) = &facts.tool_arguments {
+        let mut scalars = 0;
+        if !arguments_within_bounds(arguments, 0, &mut scalars) {
+            return Err(EvaluationError::ContextTooLarge);
+        }
+    }
     Ok(())
+}
+
+/// Whether `value`, `depth` objects below the argument root, stays within
+/// the tool-argument fact bounds, counting its scalars into `scalars`.
+fn arguments_within_bounds(value: &Value, depth: usize, scalars: &mut usize) -> bool {
+    match value {
+        Value::Object(members) => {
+            depth < crate::rbac::conditions::MAX_TOOL_ARGUMENT_POINTER_TOKENS
+                && members.iter().all(|(name, member)| {
+                    name.len() <= MAX_FACT_NAME_BYTES
+                        && arguments_within_bounds(member, depth + 1, scalars)
+                })
+        }
+        Value::Array(_) => false,
+        Value::String(text) => {
+            *scalars += 1;
+            text.len() <= MAX_FACT_VALUE_BYTES && *scalars <= MAX_FACT_ENTRIES
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {
+            *scalars += 1;
+            *scalars <= MAX_FACT_ENTRIES
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]

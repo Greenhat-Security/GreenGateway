@@ -174,6 +174,10 @@ pub const SECTIONS: &[Section] = &[
         description: "The thresholds of the discovery signals.",
     },
     Section {
+        path: "/spec/policy_tests",
+        description: "The stored policy test suite as a gate on policy changes.",
+    },
+    Section {
         path: "/spec/cors",
         description: "Cross-origin resource sharing.",
     },
