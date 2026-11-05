@@ -13800,7 +13800,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_policy_replays::record_from_row#1",
-      "sha256": "2adf70890b92b2cd3a43dd7161c8d13348eeb22abad73a53656a2dcdd77864e4",
+      "sha256": "a103ac321f72f345db773ab9e696a8f46201d013d93a27029a76d520aaf8f971",
       "owner": "policy replay contexts (#243)",
       "purpose": "PostgreSQL repository operations for cluster policy replay jobs through the shared infrastructure pool, under the policy_replay checkout class; no caller-selected HTTP authority and no new network or process capability."
     },

@@ -2596,6 +2596,8 @@ mod tests {
                  DROP TABLE greengateway.policy_drafts; \
                  DROP TABLE greengateway.document_change_evidence; \
                  DROP TABLE greengateway.catalog_change_evidence; \
+                 DROP TABLE greengateway.policy_replay_jobs; \
+                 DROP SEQUENCE greengateway.policy_replay_job_fence; \
                  DELETE FROM {LEDGER_TABLE} WHERE version >= 13;"
             ))
             .await
@@ -4124,12 +4126,13 @@ mod tests {
             .await
             .expect("the probe rows go");
         drop(client);
+        // Only the migrations after 27 are left to apply.
         assert_eq!(
             apply_missing(foundation.pool(), &test_settings())
                 .await
-                .expect("nothing is left to apply"),
-            MigrateOutput::UpToDate {
-                applied: MANIFEST.len()
+                .expect("the migrations after 27 apply"),
+            MigrateOutput::Applied {
+                applied: MANIFEST.len() - through_v26 - 1
             }
         );
 

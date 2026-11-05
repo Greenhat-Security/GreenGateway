@@ -364,8 +364,8 @@ async fn a_lapsed_lease_is_taken_over_and_the_old_holder_is_fenced_out() {
         second
             .checkpoint
             .as_deref()
-            .map(serde_json::from_str::<serde_json::Value>),
-        Some(Ok(serde_json::json!({ "after_id": 3 }))),
+            .and_then(|document| serde_json::from_str::<serde_json::Value>(document).ok()),
+        Some(serde_json::json!({ "after_id": 3 })),
         "the takeover resumes from the last checkpoint"
     );
     assert_eq!(second.record.status.scanned_records, 2);

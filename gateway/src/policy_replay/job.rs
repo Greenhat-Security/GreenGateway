@@ -212,7 +212,9 @@ impl ReplayControl {
     /// Ask the run to give its job up without an answer: its replica is
     /// shutting down, or no longer holds the job's lease. It stops before its
     /// next record with [`ReplayStop::Released`], and the job's last
-    /// checkpoint stands for whoever resumes it.
+    /// checkpoint stands for whoever resumes it. Only cluster jobs are
+    /// released.
+    #[cfg(feature = "postgres")]
     pub(crate) fn release(&self) {
         self.released.store(true, Ordering::Release);
     }

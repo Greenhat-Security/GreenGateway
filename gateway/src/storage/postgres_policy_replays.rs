@@ -290,10 +290,6 @@ impl PostgresPolicyReplayStore {
         }
     }
 
-    pub(crate) fn lease_ttl(&self) -> Duration {
-        self.lease_ttl
-    }
-
     /// The same store as another replica, for the takeover tests.
     #[cfg(test)]
     pub(crate) fn as_holder(&self, holder: uuid::Uuid) -> Self {
