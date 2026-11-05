@@ -224,6 +224,7 @@ an allow.
 | routing `local`, identity `not_recorded` | both readings; see below |
 | routing `proxy_dispatch` | the classified dispatch with the recorded facts |
 | egress `destination` | the destination with no resolution facts |
+| organization (never recorded) | not recorded: an identity mapping that tests `organizations` is `missing_matcher_fact` |
 
 **MCP identity.** A record that does not say whether its path was an MCP
 alias is decided under both readings, contextless and alias, and answers
@@ -232,6 +233,14 @@ reason, the deciding element and any shadow observation. When they disagree
 the answer is `indeterminate` with `missing_mcp_identity`. Choosing the
 contextless reading would decide an alias request under the wrong
 precedence order.
+
+**Identity mappings.** A record carries no organization, so replay leaves
+the organization not recorded rather than read it as none: a principal whose
+internal roles turn on a mapping that tests `organizations` is
+`indeterminate` with `missing_matcher_fact` in every lane, where live it was
+decided by the organization its provider verified. Mappings that test only
+the issuer, authentication method, subject and claimed roles replay as they
+are served.
 
 **Rate lane.** Rate-lane selection reads the recorded method, path and
 principal, exactly as the live rate stage does, and an anonymous caller

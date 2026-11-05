@@ -314,6 +314,135 @@ fn every_case_kind_decides_through_the_evaluator_and_passes() {
     );
 }
 
+/// A case's `organization` is the organization authentication verified for
+/// its principal, and decides an identity mapping in every lane exactly as
+/// it would on a live one (#243): stated, it is captured; omitted, the
+/// principal has none; another issuer's never applies. No rendering repeats
+/// it.
+#[test]
+fn a_case_organization_decides_identity_mappings_as_a_live_lane_does() {
+    const ORGANIZATION_CANARY: &str = "organization-canary-5d1e";
+    let mapped = Policy::validate_json_value(json!({
+        "schema_version": "1.0.0",
+        "default_action": "deny",
+        "roles": { "reader": { "permissions": ["orders:read"] } },
+        "identity_mappings": [{
+            "id": "canary-readers",
+            "issuer": "https://idp.example.test",
+            "organizations": [ORGANIZATION_CANARY],
+            "grant_roles": ["reader"]
+        }],
+        "routes": [{ "id": "orders", "methods": ["GET"], "path_prefix": "/orders", "permission": "orders:read" }],
+        "rate_limits": [{
+            "id": "readers",
+            "principal": { "roles": ["reader"] },
+            "requests_per_second": 5,
+            "burst": 10
+        }],
+        "tools": { "reports.export": { "allowed_roles": ["reader"] } }
+    }))
+    .expect("the mapped policy is valid");
+    let member = json!({
+        "subject": SUBJECT_CANARY,
+        "issuer": "https://idp.example.test/",
+        "organization": ORGANIZATION_CANARY,
+        "auth_method": "bearer_token"
+    });
+    let mut outsider = member.clone();
+    outsider["organization"] = json!("another-organization");
+    let mut unverified = member.clone();
+    unverified
+        .as_object_mut()
+        .expect("object")
+        .remove("organization");
+    let mut elsewhere = member.clone();
+    elsewhere["issuer"] = json!("https://other.example.test");
+    let mut cases = Vec::new();
+    for (name, principal, admitted) in [
+        ("member", member, true),
+        ("outsider", outsider, false),
+        ("unverified", unverified, false),
+        ("elsewhere", elsewhere, false),
+    ] {
+        let (logical, reason, tool_reason, rate_override) = if admitted {
+            ("allow", "matched_rule", "allowed", json!(0))
+        } else {
+            (
+                "deny",
+                "missing_permission",
+                "role_not_allowed",
+                Value::Null,
+            )
+        };
+        cases.push(json!({
+            "id": format!("{name}-reads-orders"),
+            "kind": "http",
+            "request": { "method": "GET", "path": "/orders/1" },
+            "principal": principal,
+            "expect": { "logical": logical, "reason": reason }
+        }));
+        cases.push(json!({
+            "id": format!("{name}-invokes-export"),
+            "kind": "tool",
+            "tool": { "name": "reports.export" },
+            "principal": principal,
+            "expect": { "logical": logical, "reason": tool_reason }
+        }));
+        cases.push(json!({
+            "id": format!("{name}-rate-override"),
+            "kind": "rate",
+            "request": { "method": "GET", "path": "/orders/1" },
+            "principal": principal,
+            "expect": { "rate_override": rate_override }
+        }));
+    }
+    let document = suite(cases);
+    let parsed = parse_suite(&document).expect("the suite is valid");
+    let outcome = run_against_policy(mapped, PolicyAuthority::Standalone, &parsed, far_deadline())
+        .expect("policy compiles and the run finishes");
+    let report = RunReport::new(parsed.digest.clone(), binding(), outcome);
+    let failures: Vec<_> = report
+        .cases
+        .iter()
+        .filter(|case| case.status != CaseStatus::Passed)
+        .map(|case| (case.id.clone(), case.status, case.actual.clone()))
+        .collect();
+    assert!(failures.is_empty(), "unexpected outcomes: {failures:?}");
+    let rendered = serde_json::to_string(&report::to_json(&report).expect("json")).expect("text");
+    assert!(!rendered.contains(ORGANIZATION_CANARY));
+
+    // Under a policy without mappings the organization reads nothing.
+    let mut claimed = suite(vec![json!({
+        "id": "organization-is-not-a-role",
+        "kind": "http",
+        "request": { "method": "GET", "path": "/orders/1" },
+        "principal": {
+            "subject": "subject-1",
+            "organization": ORGANIZATION_CANARY,
+            "roles": ["reader"],
+            "auth_method": "bearer_token"
+        },
+        "expect": { "logical": "allow", "matched": { "route": 0 } }
+    })]);
+    assert_eq!(run(&claimed).status, RunStatus::Passed);
+    // An organization is a bounded, non-empty string, refused at its pointer.
+    for value in [
+        json!(""),
+        json!(7),
+        json!("o".repeat(crate::policy_eval::MAX_FACT_VALUE_BYTES + 1)),
+    ] {
+        claimed["cases"][0]["principal"]["organization"] = value;
+        let diagnostics = refused(&claimed);
+        assert_eq!(
+            codes(&diagnostics)
+                .into_iter()
+                .map(|(_, pointer)| pointer)
+                .collect::<Vec<_>>(),
+            vec!["/cases/0/principal/organization".to_owned()]
+        );
+    }
+}
+
 #[test]
 fn a_wrong_expectation_fails_and_names_every_mismatch_in_order() {
     let report = run(&suite(vec![json!({
@@ -736,7 +865,8 @@ fn suite_schema() -> Value {
 fn the_published_schema_agrees_with_the_parser() {
     let schema = suite_schema();
     let validator = jsonschema::validator_for(&schema).expect("the schema compiles");
-    let accepted = suite(passing_cases());
+    let mut accepted = suite(passing_cases());
+    accepted["cases"][1]["principal"]["organization"] = json!("acme");
     assert!(parse_suite(&accepted).is_ok());
     if let Err(error) = validator.validate(&accepted) {
         panic!("the schema refuses a suite the parser accepts: {error}");
@@ -763,6 +893,11 @@ fn the_published_schema_agrees_with_the_parser() {
     let mut cases = passing_cases();
     cases[16]["expect"] = json!({});
     refusals.push(suite(cases));
+    for organization in [json!(""), json!(["acme"])] {
+        let mut cases = passing_cases();
+        cases[1]["principal"]["organization"] = organization;
+        refusals.push(suite(cases));
+    }
     for document in refusals {
         assert!(parse_suite(&document).is_err(), "parser: {document}");
         assert!(!validator.is_valid(&document), "schema: {document}");

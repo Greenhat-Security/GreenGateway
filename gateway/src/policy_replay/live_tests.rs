@@ -612,6 +612,7 @@ async fn replayed_tool_admissions_are_the_live_runtime_decisions() {
                         request_id: request_id.clone(),
                         source_ip: "203.0.113.9".to_owned(),
                         actor: actor.clone(),
+                        organization: None,
                         caller: None,
                         source: ToolInvocationSource::Mcp,
                         admitted_deadline: None,

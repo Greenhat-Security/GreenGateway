@@ -3,11 +3,12 @@
 //! Two stages. The global lanes key by canonical client IP and run before
 //! authentication. The policy stage runs after it, for authenticated requests
 //! only: it asks the shared policy evaluator which `rate_limits` override governs
-//! the request ([`CompiledPolicy::select_rate_lane`]), and then charges that
-//! override's token bucket. Selection is policy and pure; the buckets, their
-//! capacity and the shared store's decision are mutable state and stay here.
+//! the request ([`CompiledPolicy::select_rate_lane_with_facts`]), and then
+//! charges that override's token bucket. Selection is policy and pure; the
+//! buckets, their capacity and the shared store's decision are mutable state and
+//! stay here.
 //!
-//! [`CompiledPolicy::select_rate_lane`]: crate::policy_eval::CompiledPolicy::select_rate_lane
+//! [`CompiledPolicy::select_rate_lane_with_facts`]: crate::policy_eval::CompiledPolicy::select_rate_lane_with_facts
 
 use std::{
     collections::{hash_map::RandomState, HashMap, VecDeque},
@@ -587,7 +588,10 @@ impl RateLimitPolicyState {
     /// Selection reads the method, the exact request path and the principal.
     /// Routing and host facts are not captured here, and the context says so
     /// (`HttpTarget::Missing`, `HostFact::Missing`) rather than claim the
-    /// request had none.
+    /// request had none. In mapped-role mode an override's roles are judged
+    /// by the internal roles the identity mappings grant, resolved from the
+    /// same facts the authorization stage reads
+    /// ([`crate::policy_eval::CompiledPolicy::serving_facts`]).
     fn select(
         &self,
         method: &Method,
@@ -622,8 +626,9 @@ impl RateLimitPolicyState {
             request_host: HostFact::Missing,
             dispatch: None,
         };
+        let facts = compiled.serving_facts(Some(principal));
         let selection = compiled
-            .select_rate_lane(&context)
+            .select_rate_lane_with_facts(&context, &facts)
             .map_err(|error| refused(RateLaneRefusal::Error(error)))?;
         match selection.outcome() {
             RateLaneOutcome::NoOverride => Ok(None),
