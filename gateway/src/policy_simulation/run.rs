@@ -7,13 +7,15 @@
 //! case's principal (`case_facts`): `evaluate_with_stages` (which *is*
 //! `evaluate_with_facts`, with a collecting sink) for HTTP,
 //! `evaluate_tool_with_facts` for the tool lanes and
-//! `select_rate_lane_with_facts` for rate overrides. Nothing here matches a
-//! rule.
+//! `select_rate_lane_with_facts` for rate overrides, each with a collecting
+//! sink. An isolated rate sequence runs on a fresh bucket for the selected
+//! lane, and an egress case is asked of the static egress lane, both through
+//! [`crate::policy_testing::synthetic`]. Nothing here matches a rule.
 //!
 //! Results carry case ids, stable codes, element positions and, for an admin
 //! who already holds `admin:policy:read`, the matched element's stable `id`
 //! and a route's permission -- bounded in length -- and never a value a case
-//! supplied: no path, host, subject, role, origin or tool name.
+//! supplied: no path, host, address, subject, role, origin or tool name.
 
 use std::time::Instant;
 
@@ -23,25 +25,33 @@ use super::{Projection, TraceLevel};
 use crate::{
     policy_eval::{
         stages::{
-            DirectAction, HostUse, HttpStage, PermissionCheck, UpstreamBinding, MAX_HTTP_STAGES,
+            DirectAction, HostUse, HttpStage, IdentityCheck, PermissionCheck, RateStage, ToolEntry,
+            ToolRules, ToolStage, UpstreamBinding, MAX_HTTP_STAGES, MAX_RATE_STAGES,
+            MAX_TOOL_STAGES,
         },
-        tools::{ToolOperation, ToolReason},
+        tools::{ToolEvaluationContext, ToolOperation, ToolReason},
         CompileError, CompiledPolicy, EvaluationError, LogicalDecision, PolicyAuthority,
-        PolicyEffect, RateLaneOutcome, Reason, RuleReference,
+        PolicyEffect, PolicyFacts, RateLaneOutcome, Reason, RuleReference,
     },
     policy_testing::{
         runner::{
             case_facts, evaluation_error_code, http_context, limitation_code, logical_code,
-            rate_context, tool_context, tool_limitation_code,
+            rate_context, step_codes, tool_context, tool_limitation_code,
         },
-        suite::{CaseContext, SyntheticCase},
+        suite::{CaseContext, EgressCase, StepOutcome, SyntheticCase},
+        synthetic::{
+            egress_limitation, egress_reason, evaluate_egress, run_sequence, EgressAnswer,
+            SequenceRun, SyntheticResources, MISSING_EGRESS_CONTROLS,
+            MISSING_RATE_LANE_CONFIGURATION,
+        },
     },
     rbac::{EnforcementMode, Policy, RuleAction},
 };
 
 /// Most stage steps one simulation returns across all its evaluations. Each
-/// HTTP evaluation returns one step per stage; past this budget the steps of
-/// further evaluations are omitted and the result says so.
+/// HTTP, tool or rate evaluation returns one step per stage of its lane; past
+/// this budget the steps of further evaluations are omitted and the result
+/// says so.
 pub(crate) const MAX_TRACE_STAGES: usize = 4096;
 /// Longest authored element id or route permission a result repeats, in
 /// bytes.
@@ -57,6 +67,13 @@ const HTTP_STAGE_NAMES: &[&str] = &[
     "routes",
     "default",
 ];
+/// The order a tool operation runs its stages in.
+const TOOL_STAGE_NAMES: &[&str] = &["facts", "tool_entry", "tool_identity", "tool_rules"];
+/// The order a rendered tool request runs its stages in: it is decided by
+/// the direct HTTP rules alone.
+const RENDERED_TOOL_STAGE_NAMES: &[&str] = &["facts", "rendered_http_rules"];
+/// The order the rate lane runs its stages in.
+const RATE_STAGE_NAMES: &[&str] = &["facts", "anonymous_bypass", "rate_overrides"];
 
 /// A policy compiled for a simulation, with the authored strings a matched
 /// element is reported by. Built from one `Policy` value, so the strings and
@@ -166,16 +183,26 @@ pub(crate) struct SimulationOutcome {
     pub(crate) stages_truncated: bool,
 }
 
+/// A decision in the result's vocabulary.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Outcome {
+    logical: &'static str,
+    enforcement: &'static str,
+    effective_action: &'static str,
+    reason: &'static str,
+}
+
 /// What a decision is compared by: the outcome, not the element positions,
 /// which an insert before them shifts without changing anything.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Key {
-    Decision {
-        logical: &'static str,
-        enforcement: &'static str,
-        effective_action: &'static str,
-        reason: &'static str,
-    },
+    /// An HTTP or tool decision.
+    Decision(Outcome),
+    /// An egress verdict, counted apart: admitting a destination is not
+    /// forwarding a request.
+    Egress(Outcome),
+    /// A rate selection. The limits decide every step of a sequence on the
+    /// lane, so comparing them compares the sequence too.
     Rate {
         selected: &'static str,
         requests_per_second: Option<f64>,
@@ -188,6 +215,33 @@ struct Evaluated {
     key: Key,
 }
 
+/// The stage steps a simulation may still return, and whether it has run
+/// out. Shared by every lane, so one budget bounds a whole result.
+struct StageBudget {
+    remaining: usize,
+    truncated: bool,
+}
+
+impl StageBudget {
+    /// Insert the `count` stage steps `render` builds into `view`, or mark
+    /// them omitted when the budget cannot hold them all: an evaluation's
+    /// stages are listed whole or not at all.
+    fn insert(
+        &mut self,
+        view: &mut Map<String, Value>,
+        count: usize,
+        render: impl FnOnce() -> Vec<Value>,
+    ) {
+        if count <= self.remaining {
+            self.remaining -= count;
+            view.insert("stages".to_owned(), Value::Array(render()));
+        } else {
+            self.truncated = true;
+            view.insert("stages_truncated".to_owned(), json!(true));
+        }
+    }
+}
+
 /// Running counts for one projection's summary.
 #[derive(Default)]
 struct Counts {
@@ -198,26 +252,30 @@ struct Counts {
     rate_override: usize,
     no_rate_override: usize,
     rate_unknown: usize,
+    egress_allow: usize,
+    egress_deny: usize,
+    egress_unknown: usize,
     changed_from_base: usize,
 }
 
 impl Counts {
     fn add(&mut self, key: &Key) {
         match key {
-            Key::Decision {
-                effective_action,
-                enforcement,
-                ..
-            } => {
-                match *effective_action {
+            Key::Decision(outcome) => {
+                match outcome.effective_action {
                     "would_forward" => self.would_forward += 1,
                     "would_block" => self.would_block += 1,
                     _ => self.unknown += 1,
                 }
-                if *enforcement == "shadowed" {
+                if outcome.enforcement == "shadowed" {
                     self.shadowed += 1;
                 }
             }
+            Key::Egress(outcome) => match outcome.logical {
+                "allow" => self.egress_allow += 1,
+                "deny" => self.egress_deny += 1,
+                _ => self.egress_unknown += 1,
+            },
             Key::Rate { selected, .. } => match *selected {
                 "override" => self.rate_override += 1,
                 "no_override" => self.no_rate_override += 1,
@@ -229,15 +287,19 @@ impl Counts {
 
 /// Decide every case under every projection.
 ///
-/// Pure: reads the compiled policies and the cases, and returns values.
+/// Pure: reads the compiled policies, the cases and the synthetic
+/// resources, and returns values.
 pub(crate) fn simulate(
     pairs: &[ProjectedPair],
     cases: &[SyntheticCase],
     trace: TraceLevel,
+    resources: &SyntheticResources,
     deadline: Instant,
 ) -> Result<SimulationOutcome, SimulationError> {
-    let mut budget = MAX_TRACE_STAGES;
-    let mut stages_truncated = false;
+    let mut budget = StageBudget {
+        remaining: MAX_TRACE_STAGES,
+        truncated: false,
+    };
     let mut counts: Vec<Counts> = pairs.iter().map(|_| Counts::default()).collect();
     let mut projection_changed = 0usize;
     let mut rendered = Vec::with_capacity(cases.len());
@@ -250,19 +312,13 @@ pub(crate) fn simulate(
         let mut results = Vec::with_capacity(pairs.len());
         let mut candidate_keys = Vec::with_capacity(pairs.len());
         for (pair, counts) in pairs.iter().zip(counts.iter_mut()) {
-            let candidate = evaluate_case(
-                &pair.candidate,
-                case,
-                trace,
-                &mut budget,
-                &mut stages_truncated,
-            )?;
+            let candidate = evaluate_case(&pair.candidate, case, trace, resources, &mut budget)?;
             counts.add(&candidate.key);
             candidate_keys.push(candidate.key);
             let mut result = Map::new();
             result.insert("projection".to_owned(), json!(pair.projection.as_str()));
             if let Some(base) = &pair.base {
-                let base = evaluate_case(base, case, trace, &mut budget, &mut stages_truncated)?;
+                let base = evaluate_case(base, case, trace, resources, &mut budget)?;
                 let changed = base.key != candidate.key;
                 if changed {
                     counts.changed_from_base += 1;
@@ -298,6 +354,9 @@ pub(crate) fn simulate(
             "rate_override": counts.rate_override,
             "no_rate_override": counts.no_rate_override,
             "rate_unknown": counts.rate_unknown,
+            "egress_allow": counts.egress_allow,
+            "egress_deny": counts.egress_deny,
+            "egress_unknown": counts.egress_unknown,
         });
         if pair.base.is_some() {
             if let Some(view) = view.as_object_mut() {
@@ -318,7 +377,7 @@ pub(crate) fn simulate(
     Ok(SimulationOutcome {
         cases: rendered,
         summary: Value::Object(summary),
-        stages_truncated,
+        stages_truncated: budget.truncated,
     })
 }
 
@@ -326,8 +385,8 @@ fn evaluate_case(
     policy: &SimulatedPolicy,
     case: &SyntheticCase,
     trace: TraceLevel,
-    budget: &mut usize,
-    truncated: &mut bool,
+    resources: &SyntheticResources,
+    budget: &mut StageBudget,
 ) -> Result<Evaluated, SimulationError> {
     let compiled = &policy.compiled;
     let refused = |error: EvaluationError| refusal(case, error);
@@ -342,7 +401,7 @@ fn evaluate_case(
                     &mut stages,
                 )
                 .map_err(refused)?;
-            let key = decision_key(
+            let outcome = decision_outcome(
                 evaluation.logical(),
                 evaluation.effect(),
                 evaluation.reason().as_str(),
@@ -350,7 +409,7 @@ fn evaluate_case(
             let mut view = decision_view(
                 "http",
                 None,
-                &key,
+                &outcome,
                 evaluation.is_complete(),
                 evaluation.limitation().map(limitation_code),
             );
@@ -367,24 +426,20 @@ fn evaluate_case(
             if trace == TraceLevel::Full {
                 // Every stage is listed, reached or not, so each evaluation
                 // returns exactly one step per stage name.
-                if HTTP_STAGE_NAMES.len() <= *budget {
-                    *budget -= HTTP_STAGE_NAMES.len();
-                    view.insert(
-                        "stages".to_owned(),
-                        Value::Array(stage_views(
-                            policy,
-                            &stages,
-                            evaluation.logical() == LogicalDecision::Indeterminate,
-                        )),
-                    );
-                } else {
-                    *truncated = true;
-                    view.insert("stages_truncated".to_owned(), json!(true));
-                }
+                let indeterminate = evaluation.logical() == LogicalDecision::Indeterminate;
+                budget.insert(&mut view, HTTP_STAGE_NAMES.len(), || {
+                    ordered_stages(
+                        HTTP_STAGE_NAMES,
+                        &stages,
+                        indeterminate,
+                        stage_name,
+                        |stage| stage_view(policy, stage),
+                    )
+                });
             }
             Ok(Evaluated {
                 view: Value::Object(view),
-                key,
+                key: Key::Decision(outcome),
             })
         }
         CaseContext::Tool {
@@ -394,7 +449,7 @@ fn evaluate_case(
         } => {
             let context = tool_context(compiled.snapshot(), *operation, tool_name, principal, None);
             let facts = case_facts(compiled, principal, &case.facts);
-            tool_evaluated(policy, *operation, &context, &facts, trace).map_err(refused)
+            tool_evaluated(policy, *operation, &context, &facts, trace, budget).map_err(refused)
         }
         CaseContext::ToolHttp {
             tool_name,
@@ -410,31 +465,44 @@ fn evaluate_case(
                 Some((method, path)),
             );
             let facts = case_facts(compiled, principal, &case.facts);
-            tool_evaluated(policy, ToolOperation::RenderedHttp, &context, &facts, trace)
-                .map_err(refused)
+            tool_evaluated(
+                policy,
+                ToolOperation::RenderedHttp,
+                &context,
+                &facts,
+                trace,
+                budget,
+            )
+            .map_err(refused)
         }
         CaseContext::Rate {
             method,
             path,
             principal,
+            sequence,
         } => {
             let context = rate_context(compiled.snapshot(), method, path, principal);
+            let mut stages = Vec::with_capacity(MAX_RATE_STAGES);
             let selection = compiled
                 .select_rate_lane_with_facts(
                     &context,
                     &case_facts(compiled, principal, &case.facts),
+                    &mut stages,
                 )
                 .map_err(refused)?;
             let mut view = Map::new();
             view.insert("lane".to_owned(), json!("rate_selection"));
-            let key = match selection.outcome() {
+            let (key, selected) = match selection.outcome() {
                 RateLaneOutcome::NoOverride => {
                     view.insert("rate_override".to_owned(), Value::Null);
-                    Key::Rate {
-                        selected: "no_override",
-                        requests_per_second: None,
-                        burst: None,
-                    }
+                    (
+                        Key::Rate {
+                            selected: "no_override",
+                            requests_per_second: None,
+                            burst: None,
+                        },
+                        "no_override",
+                    )
                 }
                 RateLaneOutcome::Override { index, limit } => {
                     let mut selected = Map::new();
@@ -454,29 +522,62 @@ fn evaluate_case(
                         selected.insert("burst".to_owned(), json!(limit.burst()));
                     }
                     view.insert("rate_override".to_owned(), Value::Object(selected));
-                    Key::Rate {
-                        selected: "override",
-                        requests_per_second: Some(limit.requests_per_second()),
-                        burst: Some(limit.burst()),
-                    }
+                    (
+                        Key::Rate {
+                            selected: "override",
+                            requests_per_second: Some(limit.requests_per_second()),
+                            burst: Some(limit.burst()),
+                        },
+                        "override",
+                    )
                 }
                 RateLaneOutcome::Indeterminate(limitation) => {
                     view.insert("limitation".to_owned(), json!(limitation_code(limitation)));
-                    Key::Rate {
-                        selected: "indeterminate",
-                        requests_per_second: None,
-                        burst: None,
-                    }
+                    (
+                        Key::Rate {
+                            selected: "indeterminate",
+                            requests_per_second: None,
+                            burst: None,
+                        },
+                        "indeterminate",
+                    )
                 }
             };
-            if let Key::Rate { selected, .. } = key {
-                view.insert("selected".to_owned(), json!(selected));
-                view.insert("complete".to_owned(), json!(selected != "indeterminate"));
+            view.insert("selected".to_owned(), json!(selected));
+            let mut complete = selected != "indeterminate";
+            if let Some(sequence) = sequence {
+                let run = run_sequence(selection.outcome(), method, sequence, resources);
+                if matches!(run, SequenceRun::LaneConfigurationUnavailable) {
+                    // The selection decided, so this is the only limitation.
+                    complete = false;
+                    view.insert(
+                        "limitation".to_owned(),
+                        json!(MISSING_RATE_LANE_CONFIGURATION),
+                    );
+                }
+                view.insert("sequence".to_owned(), sequence_view(run, trace));
+            }
+            view.insert("complete".to_owned(), json!(complete));
+            if trace == TraceLevel::Full {
+                let indeterminate = selected == "indeterminate";
+                budget.insert(&mut view, RATE_STAGE_NAMES.len(), || {
+                    ordered_stages(
+                        RATE_STAGE_NAMES,
+                        &stages,
+                        indeterminate,
+                        rate_stage_name,
+                        |stage| rate_stage_view(policy, stage),
+                    )
+                });
             }
             Ok(Evaluated {
                 view: Value::Object(view),
                 key,
             })
+        }
+        CaseContext::Egress { egress } => {
+            let answer = evaluate_egress(egress, resources).map_err(refused)?;
+            Ok(egress_evaluated(answer, egress, trace))
         }
     }
 }
@@ -484,12 +585,16 @@ fn evaluate_case(
 fn tool_evaluated(
     policy: &SimulatedPolicy,
     operation: ToolOperation,
-    context: &crate::policy_eval::tools::ToolEvaluationContext,
-    facts: &crate::policy_eval::PolicyFacts,
+    context: &ToolEvaluationContext,
+    facts: &PolicyFacts,
     trace: TraceLevel,
+    budget: &mut StageBudget,
 ) -> Result<Evaluated, EvaluationError> {
-    let evaluation = policy.compiled.evaluate_tool_with_facts(context, facts)?;
-    let key = decision_key(
+    let mut stages = Vec::with_capacity(MAX_TOOL_STAGES);
+    let evaluation = policy
+        .compiled
+        .evaluate_tool_with_facts(context, facts, &mut stages)?;
+    let outcome = decision_outcome(
         evaluation.logical(),
         evaluation.effect(),
         ToolReason::as_str(evaluation.reason()),
@@ -497,7 +602,7 @@ fn tool_evaluated(
     let mut view = decision_view(
         "tool",
         Some(operation_code(operation)),
-        &key,
+        &outcome,
         evaluation.is_complete(),
         evaluation.limitation().map(tool_limitation_code),
     );
@@ -507,10 +612,128 @@ fn tool_evaluated(
             .map(|element| element_view(policy, element, None));
         view.insert("matched".to_owned(), matched.unwrap_or(Value::Null));
     }
+    if trace == TraceLevel::Full {
+        let rendered = operation == ToolOperation::RenderedHttp;
+        let names = if rendered {
+            RENDERED_TOOL_STAGE_NAMES
+        } else {
+            TOOL_STAGE_NAMES
+        };
+        let indeterminate = evaluation.logical() == LogicalDecision::Indeterminate;
+        budget.insert(&mut view, names.len(), || {
+            ordered_stages(
+                names,
+                &stages,
+                indeterminate,
+                |stage| tool_stage_name(stage, rendered),
+                |stage| tool_stage_view(policy, stage, rendered),
+            )
+        });
+    }
     Ok(Evaluated {
         view: Value::Object(view),
-        key,
+        key: Key::Decision(outcome),
     })
+}
+
+/// An egress case's result. The lane names no policy element, so a
+/// `matched` trace adds only the ordinal of the hypothetical address that
+/// decided -- never the address.
+fn egress_evaluated(answer: EgressAnswer, egress: &EgressCase, trace: TraceLevel) -> Evaluated {
+    let (outcome, mut view) = match answer {
+        EgressAnswer::ControlsUnavailable => {
+            let outcome = decision_outcome(
+                LogicalDecision::Indeterminate,
+                PolicyEffect::Block,
+                "incomplete",
+            );
+            let view = decision_view(
+                "egress",
+                None,
+                &outcome,
+                false,
+                Some(MISSING_EGRESS_CONTROLS),
+            );
+            (outcome, view)
+        }
+        EgressAnswer::Decided(evaluation) => {
+            let outcome = decision_outcome(
+                evaluation.logical(),
+                evaluation.effect(),
+                egress_reason(evaluation.outcome()),
+            );
+            let mut view = decision_view(
+                "egress",
+                None,
+                &outcome,
+                evaluation.is_complete(),
+                egress_limitation(&evaluation),
+            );
+            if trace != TraceLevel::Terminal {
+                match evaluation.outcome() {
+                    crate::policy_eval::egress::EgressOutcome::Allow { pinned } => {
+                        view.insert("pinned_address".to_owned(), json!(pinned));
+                    }
+                    crate::policy_eval::egress::EgressOutcome::Deny(
+                        crate::policy_eval::egress::EgressDenial::NonGlobalAddress { index },
+                    ) => {
+                        view.insert("refused_address".to_owned(), json!(index));
+                    }
+                    _ => {}
+                }
+            }
+            (outcome, view)
+        }
+    };
+    view.insert(
+        "resolution".to_owned(),
+        json!(if egress.hypothetical_addresses.is_some() {
+            "hypothetical"
+        } else {
+            "none"
+        }),
+    );
+    Evaluated {
+        view: Value::Object(view),
+        key: Key::Egress(outcome),
+    }
+}
+
+/// An isolated sequence's result: the lane and key class it modelled, that
+/// its bucket started empty on a virtual clock, and each step's outcome. A
+/// `matched` trace adds the limits the bucket was built from.
+fn sequence_view(run: SequenceRun, trace: TraceLevel) -> Value {
+    match run {
+        SequenceRun::Ran { lane, limit, steps } => {
+            let allowed = steps
+                .iter()
+                .filter(|step| **step == StepOutcome::Allowed)
+                .count();
+            let mut view = Map::new();
+            view.insert("lane".to_owned(), json!(lane.as_str()));
+            view.insert("key_class".to_owned(), json!(lane.key_class()));
+            view.insert("bucket".to_owned(), json!("isolated_empty"));
+            view.insert("clock".to_owned(), json!("virtual"));
+            if trace != TraceLevel::Terminal {
+                view.insert(
+                    "requests_per_second".to_owned(),
+                    json!(limit.requests_per_second),
+                );
+                view.insert("burst".to_owned(), json!(limit.burst));
+            }
+            view.insert("steps".to_owned(), json!(step_codes(&steps)));
+            view.insert("allowed".to_owned(), json!(allowed));
+            view.insert("limited".to_owned(), json!(steps.len() - allowed));
+            view.insert("complete".to_owned(), json!(true));
+            Value::Object(view)
+        }
+        // The selection's own limitation says why there was no lane.
+        SequenceRun::Undecided => json!({ "complete": false }),
+        SequenceRun::LaneConfigurationUnavailable => json!({
+            "complete": false,
+            "limitation": MISSING_RATE_LANE_CONFIGURATION,
+        }),
+    }
 }
 
 fn refusal(case: &SyntheticCase, error: EvaluationError) -> SimulationError {
@@ -553,9 +776,13 @@ pub(crate) fn enforcement_and_effect(
     }
 }
 
-fn decision_key(logical: LogicalDecision, effect: PolicyEffect, reason: &'static str) -> Key {
+fn decision_outcome(
+    logical: LogicalDecision,
+    effect: PolicyEffect,
+    reason: &'static str,
+) -> Outcome {
     let (enforcement, effective_action) = enforcement_and_effect(logical, effect);
-    Key::Decision {
+    Outcome {
         logical: logical_code(logical),
         enforcement,
         effective_action,
@@ -566,7 +793,7 @@ fn decision_key(logical: LogicalDecision, effect: PolicyEffect, reason: &'static
 fn decision_view(
     lane: &'static str,
     operation: Option<&'static str>,
-    key: &Key,
+    outcome: &Outcome,
     complete: bool,
     limitation: Option<&'static str>,
 ) -> Map<String, Value> {
@@ -575,18 +802,13 @@ fn decision_view(
     if let Some(operation) = operation {
         view.insert("operation".to_owned(), json!(operation));
     }
-    if let Key::Decision {
-        logical,
-        enforcement,
-        effective_action,
-        reason,
-    } = key
-    {
-        view.insert("logical".to_owned(), json!(logical));
-        view.insert("enforcement".to_owned(), json!(enforcement));
-        view.insert("effective_action".to_owned(), json!(effective_action));
-        view.insert("reason".to_owned(), json!(reason));
-    }
+    view.insert("logical".to_owned(), json!(outcome.logical));
+    view.insert("enforcement".to_owned(), json!(outcome.enforcement));
+    view.insert(
+        "effective_action".to_owned(),
+        json!(outcome.effective_action),
+    );
+    view.insert("reason".to_owned(), json!(outcome.reason));
     view.insert("complete".to_owned(), json!(complete));
     if let Some(limitation) = limitation {
         view.insert("limitation".to_owned(), json!(limitation));
@@ -673,6 +895,20 @@ fn route_view(policy: &SimulatedPolicy, position: usize) -> Value {
     Value::Object(view)
 }
 
+fn rate_override_view(policy: &SimulatedPolicy, position: usize) -> Value {
+    let mut view = Map::new();
+    view.insert("kind".to_owned(), json!("rate_override"));
+    view.insert("position".to_owned(), json!(position));
+    insert_id(
+        &mut view,
+        policy
+            .rate_override_ids
+            .get(position)
+            .and_then(Option::as_deref),
+    );
+    Value::Object(view)
+}
+
 fn action_code(action: &DirectAction) -> &'static str {
     match action {
         DirectAction::Allow => "allow",
@@ -688,15 +924,21 @@ fn mode_code(mode: EnforcementMode) -> &'static str {
     }
 }
 
-/// Every HTTP stage in evaluation order: the ones the evaluator recorded, as
-/// it recorded them, and the ones it did not reach -- `skipped` after a
-/// decision, `unknown` after an indeterminate answer.
-fn stage_views(policy: &SimulatedPolicy, stages: &[HttpStage], indeterminate: bool) -> Vec<Value> {
-    HTTP_STAGE_NAMES
+/// Every stage of a lane in evaluation order: the ones the evaluator
+/// recorded, as it recorded them, and the ones it did not reach -- `skipped`
+/// after a decision, `unknown` after an indeterminate answer.
+fn ordered_stages<S>(
+    names: &[&'static str],
+    stages: &[S],
+    indeterminate: bool,
+    name_of: impl Fn(&S) -> &'static str,
+    view_of: impl Fn(&S) -> Value,
+) -> Vec<Value> {
+    names
         .iter()
         .map(
-            |name| match stages.iter().find(|stage| stage_name(stage) == *name) {
-                Some(stage) => stage_view(policy, stage),
+            |name| match stages.iter().find(|stage| name_of(stage) == *name) {
+                Some(stage) => view_of(stage),
                 None => json!({
                     "stage": name,
                     "status": if indeterminate { "unknown" } else { "skipped" },
@@ -781,6 +1023,83 @@ fn stage_view(policy: &SimulatedPolicy, stage: &HttpStage) -> Value {
             "status": "matched",
             "default_action": if default.allow { "allow" } else { "deny" },
             "enforcement_mode": mode_code(default.mode),
+        }),
+    }
+}
+
+fn tool_stage_name(stage: &ToolStage, rendered: bool) -> &'static str {
+    match stage {
+        ToolStage::Facts(_) => "facts",
+        ToolStage::Entry(_) => "tool_entry",
+        ToolStage::Identity(_) => "tool_identity",
+        ToolStage::Rules(_) if rendered => "rendered_http_rules",
+        ToolStage::Rules(_) => "tool_rules",
+    }
+}
+
+fn tool_stage_view(policy: &SimulatedPolicy, stage: &ToolStage, rendered: bool) -> Value {
+    let name = tool_stage_name(stage, rendered);
+    match stage {
+        ToolStage::Facts(None) => json!({ "stage": name, "status": "matched" }),
+        ToolStage::Facts(Some(limitation)) => json!({
+            "stage": name,
+            "status": "unknown",
+            "limitation": tool_limitation_code(*limitation),
+        }),
+        ToolStage::Entry(ToolEntry::Absent) => json!({ "stage": name, "status": "no_match" }),
+        ToolStage::Entry(ToolEntry::Disabled) => {
+            json!({ "stage": name, "status": "matched", "enabled": false })
+        }
+        ToolStage::Entry(ToolEntry::Enabled) => {
+            json!({ "stage": name, "status": "matched", "enabled": true })
+        }
+        ToolStage::Identity(IdentityCheck::Admitted) => {
+            json!({ "stage": name, "status": "matched" })
+        }
+        ToolStage::Identity(IdentityCheck::Refused) => {
+            json!({ "stage": name, "status": "no_match" })
+        }
+        ToolStage::Rules(ToolRules::NoMatch) => json!({ "stage": name, "status": "no_match" }),
+        ToolStage::Rules(ToolRules::Matched(direct)) => json!({
+            "stage": name,
+            "status": "matched",
+            "element": rule_view(policy, direct.rule),
+            "action": action_code(&direct.action),
+        }),
+        ToolStage::Rules(ToolRules::Undetermined) => json!({
+            "stage": name,
+            "status": "unknown",
+            "limitation": "missing_matcher_fact",
+        }),
+    }
+}
+
+fn rate_stage_name(stage: &RateStage) -> &'static str {
+    match stage {
+        RateStage::Facts(_) => "facts",
+        RateStage::AnonymousBypass(_) => "anonymous_bypass",
+        RateStage::Overrides(_) => "rate_overrides",
+    }
+}
+
+fn rate_stage_view(policy: &SimulatedPolicy, stage: &RateStage) -> Value {
+    let name = rate_stage_name(stage);
+    match stage {
+        RateStage::Facts(None) => json!({ "stage": name, "status": "matched" }),
+        RateStage::Facts(Some(limitation)) => json!({
+            "stage": name,
+            "status": "unknown",
+            "limitation": limitation_code(*limitation),
+        }),
+        RateStage::AnonymousBypass(true) => json!({ "stage": name, "status": "matched" }),
+        RateStage::AnonymousBypass(false) => {
+            json!({ "stage": name, "status": "not_applicable" })
+        }
+        RateStage::Overrides(None) => json!({ "stage": name, "status": "no_match" }),
+        RateStage::Overrides(Some(position)) => json!({
+            "stage": name,
+            "status": "matched",
+            "element": rate_override_view(policy, *position),
         }),
     }
 }

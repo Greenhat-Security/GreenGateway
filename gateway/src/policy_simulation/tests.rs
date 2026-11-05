@@ -17,9 +17,17 @@ use super::{
 };
 use crate::{
     policy_eval::PolicyAuthority,
-    policy_testing::suite::Diagnostics,
+    policy_testing::{
+        suite::Diagnostics,
+        synthetic::{test_resources, SyntheticResources},
+    },
     rbac::{EnforcementMode, Policy, RuleAction},
 };
+
+/// What every run here decides egress cases and sequences by.
+fn resources() -> SyntheticResources {
+    test_resources()
+}
 
 /// Fixture values a result must never repeat.
 const SUBJECT_CANARY: &str = "simulated-subject-canary-7e1";
@@ -160,6 +168,10 @@ fn candidate_of(request: &SimulationRequest, base: &Policy) -> Option<Policy> {
 }
 
 fn run(document: &Value) -> SimulationOutcome {
+    run_with(document, &resources())
+}
+
+fn run_with(document: &Value, resources: &SyntheticResources) -> SimulationOutcome {
     let request = parse(document).unwrap_or_else(|diagnostics| {
         panic!("request parses: {:?}", codes(&diagnostics));
     });
@@ -176,6 +188,7 @@ fn run(document: &Value) -> SimulationOutcome {
         &pairs,
         &request.cases,
         request.trace,
+        resources,
         Instant::now() + Duration::from_secs(30),
     )
     .expect("simulation completes")
@@ -711,6 +724,7 @@ fn a_v1_result_names_the_route_and_rate_override_by_id() {
         &pairs,
         &request.cases,
         request.trace,
+        &resources(),
         Instant::now() + Duration::from_secs(30),
     )
     .expect("simulation completes");
@@ -1018,6 +1032,84 @@ fn a_case_organization_decides_an_inline_candidates_identity_mappings() {
         .contains(ORGANIZATION_CANARY));
 }
 
+/// The tool and rate stage traces and an isolated sequence follow the roles
+/// a candidate's identity mappings grant for the case's organization: the
+/// traced lanes are asked with the facts a live lane captures, so a full
+/// trace explains the decision a served request would get.
+#[test]
+fn stage_traces_and_sequences_follow_the_case_organization() {
+    let candidate = json!({
+        "schema_version": "1.0.0",
+        "default_action": "deny",
+        "roles": { "reader": { "permissions": ["orders:read"] } },
+        "identity_mappings": [{
+            "id": "acme-readers",
+            "issuer": "https://idp.example.test",
+            "organizations": ["acme"],
+            "grant_roles": ["reader"]
+        }],
+        "routes": [{ "id": "orders", "path_prefix": "/orders", "permission": "orders:read" }],
+        "rate_limits": [{
+            "id": "readers",
+            "principal": { "roles": ["reader"] },
+            "requests_per_second": 1,
+            "burst": 1
+        }],
+        "tools": { "search": { "allowed_roles": ["reader"] } }
+    });
+    let mut cases = Vec::new();
+    for (id, organization) in [("member", "acme"), ("outsider", "globex")] {
+        let principal = json!({
+            "subject": SUBJECT_CANARY,
+            "issuer": "https://idp.example.test",
+            "auth_method": "bearer_token",
+            "organization": organization
+        });
+        cases.push(json!({
+            "id": format!("{id}-tool"),
+            "kind": "tool",
+            "tool": { "name": "search" },
+            "principal": principal.clone()
+        }));
+        cases.push(json!({
+            "id": format!("{id}-rate"),
+            "kind": "rate",
+            "request": { "method": "GET", "path": "/orders/7" },
+            "principal": principal,
+            "sequence": { "at_ms": [0, 0] }
+        }));
+    }
+    let outcome = run(&with_cases(
+        json!({ "source": "inline", "policy": candidate }),
+        "full",
+        json!(["as_authored"]),
+        Value::Array(cases),
+    ));
+    for (id, admitted) in [("member", true), ("outsider", false)] {
+        let tool = &result(case(&outcome, &format!("{id}-tool")), "as_authored")["candidate"];
+        assert_eq!(
+            tool["stages"][2],
+            json!({
+                "stage": "tool_identity",
+                "status": if admitted { "matched" } else { "no_match" }
+            }),
+            "{id}"
+        );
+        let rate = &result(case(&outcome, &format!("{id}-rate")), "as_authored")["candidate"];
+        assert_eq!(
+            rate["stages"][2]["status"],
+            json!(if admitted { "matched" } else { "no_match" }),
+            "{id}"
+        );
+        // The override allows a burst of one; the global read lane two.
+        assert_eq!(
+            rate["sequence"]["allowed"],
+            json!(if admitted { 1 } else { 2 }),
+            "{id}"
+        );
+    }
+}
+
 #[test]
 fn tool_and_rate_cases_answer_from_their_own_lanes() {
     let outcome = run(&document(
@@ -1149,7 +1241,7 @@ fn a_simulation_past_its_deadline_returns_nothing() {
         .checked_sub(Duration::from_millis(1))
         .unwrap_or_else(Instant::now);
     assert!(matches!(
-        simulate(&pairs, &request.cases, request.trace, past),
+        simulate(&pairs, &request.cases, request.trace, &resources(), past),
         Err(SimulationError::DeadlineExceeded)
     ));
 }
@@ -1396,5 +1488,476 @@ fn case_facts_decide_an_inline_candidates_conditions_and_are_never_echoed() {
     let rendered = serde_json::to_string(&outcome.cases).expect("serializes");
     for value in [HEADER_CANARY, QUERY_CANARY, "10.1.2.3", "203.0.113.9"] {
         assert!(!rendered.contains(value), "{value} in {rendered}");
+    }
+}
+
+fn with_cases(candidate: Value, trace: &str, projections: Value, cases: Value) -> Value {
+    let mut request = document(candidate, trace, projections);
+    request["cases"] = cases;
+    request
+}
+
+/// The tool and rate lanes report their own stages at the full trace level,
+/// one step per stage of the lane, from the evaluator's own record.
+#[test]
+fn tool_and_rate_lanes_report_their_own_stages_at_the_full_level() {
+    let outcome = run(&with_cases(
+        json!({ "source": "active" }),
+        "full",
+        json!(["as_authored"]),
+        json!([
+            { "id": "search", "kind": "tool", "tool": { "name": "search" }, "principal": reader() },
+            { "id": "missing-tool", "kind": "tool", "tool": { "name": "absent" }, "principal": reader() },
+            {
+                "id": "rendered",
+                "kind": "tool_http",
+                "tool": { "name": "search" },
+                "request": { "method": "GET", "path": "/public/a" },
+                "principal": reader()
+            },
+            {
+                "id": "reader-rate",
+                "kind": "rate",
+                "request": { "method": "GET", "path": "/orders/7" },
+                "principal": reader()
+            },
+            {
+                "id": "anonymous-rate",
+                "kind": "rate",
+                "request": { "method": "GET", "path": "/orders/7" },
+                "principal": "anonymous"
+            }
+        ]),
+    ));
+    let stages =
+        |id: &str| result(case(&outcome, id), "as_authored")["candidate"]["stages"].clone();
+    assert_eq!(
+        stages("search"),
+        json!([
+            { "stage": "facts", "status": "matched" },
+            { "stage": "tool_entry", "status": "matched", "enabled": true },
+            { "stage": "tool_identity", "status": "matched" },
+            {
+                "stage": "tool_rules",
+                "status": "matched",
+                "element": { "kind": "rule", "position": 2, "id": "search-tool", "action": "allow" },
+                "action": "allow"
+            }
+        ])
+    );
+    assert_eq!(
+        stages("missing-tool"),
+        json!([
+            { "stage": "facts", "status": "matched" },
+            { "stage": "tool_entry", "status": "no_match" },
+            { "stage": "tool_identity", "status": "skipped" },
+            { "stage": "tool_rules", "status": "skipped" }
+        ])
+    );
+    assert_eq!(
+        stages("rendered"),
+        json!([
+            { "stage": "facts", "status": "matched" },
+            {
+                "stage": "rendered_http_rules",
+                "status": "matched",
+                "element": { "kind": "rule", "position": 0, "id": "public", "action": "allow" },
+                "action": "allow"
+            }
+        ])
+    );
+    assert_eq!(
+        stages("reader-rate"),
+        json!([
+            { "stage": "facts", "status": "matched" },
+            { "stage": "anonymous_bypass", "status": "not_applicable" },
+            {
+                "stage": "rate_overrides",
+                "status": "matched",
+                "element": { "kind": "rate_override", "position": 0 }
+            }
+        ])
+    );
+    assert_eq!(
+        stages("anonymous-rate"),
+        json!([
+            { "stage": "facts", "status": "matched" },
+            { "stage": "anonymous_bypass", "status": "matched" },
+            { "stage": "rate_overrides", "status": "skipped" }
+        ])
+    );
+    assert!(!outcome.stages_truncated);
+
+    // Below the full level no lane lists stages.
+    let matched = run(&document(
+        json!({ "source": "active" }),
+        "matched",
+        json!(["as_authored"]),
+    ));
+    for id in ["search-tool", "order-rate"] {
+        assert!(result(case(&matched, id), "as_authored")["candidate"]
+            .get("stages")
+            .is_none());
+    }
+}
+
+/// Every lane's steps are counted against the one budget: tool stages that
+/// fill it leave the last HTTP case's steps omitted, and said to be.
+#[test]
+fn the_stage_budget_counts_every_lane() {
+    let mut cases: Vec<Value> = (0..MAX_SIMULATION_CASES - 1)
+        .map(|index| {
+            json!({
+                "id": format!("tool-{index}"),
+                "kind": "tool",
+                "tool": { "name": "search" },
+                "principal": reader()
+            })
+        })
+        .collect();
+    cases.push(json!({
+        "id": "last-http",
+        "kind": "http",
+        "request": { "method": "GET", "path": "/orders/7" },
+        "principal": reader()
+    }));
+    let outcome = run(&with_cases(
+        json!({ "source": "edits", "edits": [{ "op": "set", "field": "default_action", "value": "allow" }] }),
+        "full",
+        json!(["as_authored", "enforce_all_shadow"]),
+        Value::Array(cases),
+    ));
+    assert!(outcome.stages_truncated);
+    let returned: usize = outcome
+        .cases
+        .iter()
+        .flat_map(|case| case["results"].as_array().cloned().unwrap_or_default())
+        .flat_map(|result| [result["candidate"].clone(), result["base"].clone()])
+        .filter_map(|view| view["stages"].as_array().map(Vec::len))
+        .sum();
+    assert!(returned <= MAX_TRACE_STAGES);
+    let last = &case(&outcome, "last-http")["results"][1]["base"];
+    assert_eq!(last["stages_truncated"], json!(true));
+    assert_eq!(last["effective_action"], json!("would_forward"));
+}
+
+fn egress_cases() -> Value {
+    json!([
+        {
+            "id": "public-answer",
+            "kind": "egress",
+            "destination": { "scheme": "https", "host": "api.example.test", "port": 443 },
+            "resolution": { "hypothetical_addresses": ["93.184.216.34:443"] }
+        },
+        {
+            "id": "no-evidence",
+            "kind": "egress",
+            "destination": { "scheme": "https", "host": "billing.svc.example.test", "port": 443 }
+        },
+        {
+            "id": "private-answer",
+            "kind": "egress",
+            "destination": { "scheme": "https", "host": "api.example.test", "port": 443 },
+            "resolution": { "hypothetical_addresses": ["93.184.216.34:443", "10.1.2.3:443"] }
+        },
+        {
+            "id": "unlisted-host",
+            "kind": "egress",
+            "destination": { "scheme": "https", "host": "elsewhere.example.test", "port": 443 }
+        }
+    ])
+}
+
+/// An egress case is decided by the static egress lane over the case's own
+/// hypothetical addresses, and is indeterminate without any. No candidate or
+/// projection changes it, and no host or address is repeated.
+#[test]
+fn egress_cases_are_decided_over_hypothetical_addresses_only() {
+    let outcome = run(&with_cases(
+        json!({ "source": "edits", "edits": [{ "op": "set", "field": "default_action", "value": "allow" }] }),
+        "matched",
+        json!(["as_authored", "enforce_all_shadow"]),
+        egress_cases(),
+    ));
+    let view = |id: &str| result(case(&outcome, id), "as_authored")["candidate"].clone();
+    assert_eq!(
+        view("public-answer"),
+        json!({
+            "lane": "egress",
+            "logical": "allow",
+            "enforcement": "not_applicable",
+            "effective_action": "would_forward",
+            "reason": "allowed",
+            "complete": true,
+            "pinned_address": 0,
+            "resolution": "hypothetical"
+        })
+    );
+    assert_eq!(
+        view("no-evidence"),
+        json!({
+            "lane": "egress",
+            "logical": "indeterminate",
+            "enforcement": "not_applicable",
+            "effective_action": "unknown",
+            "reason": "incomplete",
+            "complete": false,
+            "limitation": "missing_resolution_evidence",
+            "resolution": "none"
+        })
+    );
+    assert_eq!(
+        view("private-answer")["reason"],
+        json!("non_global_address")
+    );
+    assert_eq!(view("private-answer")["refused_address"], json!(1));
+    assert_eq!(view("unlisted-host")["reason"], json!("host_not_allowed"));
+    assert_eq!(view("unlisted-host")["complete"], json!(true));
+    for entry in &outcome.cases {
+        assert_eq!(entry["projection_changed"], json!(false));
+        for result in entry["results"].as_array().expect("results") {
+            assert_eq!(result["changed"], json!(false));
+            assert_eq!(result["base"], result["candidate"]);
+        }
+    }
+    let summary = &outcome.summary["projections"]["as_authored"];
+    assert_eq!(summary["egress_allow"], json!(1));
+    assert_eq!(summary["egress_deny"], json!(2));
+    assert_eq!(summary["egress_unknown"], json!(1));
+    assert_eq!(summary["would_forward"], json!(0));
+    let rendered = serde_json::to_string(&outcome.cases).expect("serializes");
+    for absent in [
+        "api.example.test",
+        "svc.example.test",
+        "93.184.216.34",
+        "10.1.2.3",
+    ] {
+        assert!(!rendered.contains(absent), "a result repeats {absent}");
+    }
+
+    // Without egress controls every egress case is incomplete, never decided.
+    let unavailable = run_with(
+        &with_cases(
+            json!({ "source": "active" }),
+            "terminal",
+            json!(["as_authored"]),
+            egress_cases(),
+        ),
+        &SyntheticResources::none(),
+    );
+    for entry in &unavailable.cases {
+        let candidate = &entry["results"][0]["candidate"];
+        assert_eq!(candidate["logical"], json!("indeterminate"));
+        assert_eq!(candidate["limitation"], json!("missing_egress_controls"));
+    }
+}
+
+/// An isolated sequence runs on a fresh bucket for the selected lane and
+/// reports each step. A candidate that changes the selected override's
+/// limits changes the comparison.
+#[test]
+fn an_isolated_sequence_reports_each_step_against_a_fresh_bucket() {
+    let sequences = json!([
+        {
+            "id": "override-sequence",
+            "kind": "rate",
+            "request": { "method": "GET", "path": "/orders/7" },
+            "principal": reader(),
+            "sequence": { "at_ms": [0, 0, 0, 0, 0, 0, 400] }
+        },
+        {
+            "id": "global-sequence",
+            "kind": "rate",
+            "request": { "method": "GET", "path": "/orders/7" },
+            "principal": "anonymous",
+            "sequence": { "at_ms": [0, 0, 0, 1000] }
+        }
+    ]);
+    let narrower = json!({ "source": "edits", "edits": [{
+        "op": "replace", "section": "rate_limits", "position": 0,
+        "value": { "path": "/orders/**", "requests_per_second": 2.5, "burst": 1 }
+    }] });
+    let outcome = run(&with_cases(
+        narrower.clone(),
+        "matched",
+        json!(["as_authored"]),
+        sequences.clone(),
+    ));
+    let authored = result(case(&outcome, "override-sequence"), "as_authored");
+    assert_eq!(
+        authored["base"]["sequence"],
+        json!({
+            "lane": "policy_override",
+            "key_class": "principal",
+            "bucket": "isolated_empty",
+            "clock": "virtual",
+            "requests_per_second": 2.5,
+            "burst": 5,
+            "steps": ["allowed", "allowed", "allowed", "allowed", "allowed", "limited", "allowed"],
+            "allowed": 6,
+            "limited": 1,
+            "complete": true
+        })
+    );
+    assert_eq!(
+        authored["candidate"]["sequence"]["steps"],
+        json!(["allowed", "limited", "limited", "limited", "limited", "limited", "allowed"])
+    );
+    assert_eq!(authored["changed"], json!(true));
+    let global = result(case(&outcome, "global-sequence"), "as_authored");
+    assert_eq!(
+        global["candidate"]["sequence"]["lane"],
+        json!("global_read")
+    );
+    assert_eq!(
+        global["candidate"]["sequence"]["key_class"],
+        json!("client_ip")
+    );
+    assert_eq!(
+        global["candidate"]["sequence"]["steps"],
+        json!(["allowed", "allowed", "limited", "allowed"])
+    );
+    assert_eq!(global["changed"], json!(false));
+
+    // The terminal level keeps the steps and leaves out the limits.
+    let terminal = run(&with_cases(
+        json!({ "source": "active" }),
+        "terminal",
+        json!(["as_authored"]),
+        sequences.clone(),
+    ));
+    let sequence =
+        &result(case(&terminal, "override-sequence"), "as_authored")["candidate"]["sequence"];
+    assert!(sequence.get("requests_per_second").is_none());
+    assert!(sequence.get("burst").is_none());
+    assert_eq!(sequence["allowed"], json!(6));
+
+    // Without the global lanes' configuration only the override runs.
+    let unavailable = run_with(
+        &with_cases(
+            json!({ "source": "active" }),
+            "terminal",
+            json!(["as_authored"]),
+            sequences,
+        ),
+        &SyntheticResources::none(),
+    );
+    let global = &result(case(&unavailable, "global-sequence"), "as_authored")["candidate"];
+    assert_eq!(global["complete"], json!(false));
+    assert_eq!(
+        global["limitation"],
+        json!("missing_rate_lane_configuration")
+    );
+    assert_eq!(
+        global["sequence"],
+        json!({ "complete": false, "limitation": "missing_rate_lane_configuration" })
+    );
+    let override_sequence =
+        &result(case(&unavailable, "override-sequence"), "as_authored")["candidate"];
+    assert_eq!(override_sequence["complete"], json!(true));
+    assert_eq!(override_sequence["sequence"]["complete"], json!(true));
+}
+
+/// The simulation schema is one document: every candidate source the parser
+/// accepts -- the active policy, edits, an inline document, a server-side
+/// draft and a history revision -- carries every case kind, an isolated
+/// sequence on a principal with a verified organization and egress cases
+/// alike, and the schema and the parser agree on each request.
+#[test]
+fn one_schema_describes_every_candidate_source_with_every_case_kind() {
+    let schema = request_schema();
+    let validator = jsonschema::validator_for(&schema).expect("the schema compiles");
+    let mut organized = reader();
+    organized["organization"] = json!("acme");
+    let mut cases = cases().as_array().cloned().unwrap_or_default();
+    let first_egress = cases.len();
+    cases.extend(egress_cases().as_array().cloned().unwrap_or_default());
+    cases.push(json!({
+        "id": "organized-sequence",
+        "kind": "rate",
+        "request": { "method": "GET", "path": "/orders/7" },
+        "principal": organized.clone(),
+        "sequence": { "at_ms": [0, 5, 5] }
+    }));
+    let sequence = cases.len() - 1;
+    let cases = Value::Array(cases);
+    for candidate in [
+        json!({ "source": "active" }),
+        json!({ "source": "edits", "edits": [
+            { "op": "set", "field": "default_action", "value": "allow" }
+        ] }),
+        json!({ "source": "inline", "policy": base_document() }),
+        json!({ "source": "draft", "draft_id": "pd_0123456789abcdef0123456789abcdef", "draft_etag": "\"sha256:d\"" }),
+        json!({ "source": "revision", "version": 3 }),
+    ] {
+        let request = with_cases(
+            candidate,
+            "full",
+            json!(["as_authored", "enforce_all_shadow"]),
+            cases.clone(),
+        );
+        assert!(parse(&request).is_ok(), "parser: {request}");
+        if let Err(error) = validator.validate(&request) {
+            panic!("the schema refuses a request the parser accepts: {error}");
+        }
+        let mut refusals = Vec::new();
+        let mut organized_egress = request.clone();
+        organized_egress["cases"][first_egress]["principal"] = organized.clone();
+        refusals.push(organized_egress);
+        let mut empty_organization = request.clone();
+        empty_organization["cases"][sequence]["principal"]["organization"] = json!("");
+        refusals.push(empty_organization);
+        let mut empty_sequence = request;
+        empty_sequence["cases"][sequence]["sequence"]["at_ms"] = json!([]);
+        refusals.push(empty_sequence);
+        for refused in refusals {
+            assert!(parse(&refused).is_err(), "parser: {refused}");
+            assert!(!validator.is_valid(&refused), "schema: {refused}");
+        }
+    }
+}
+
+/// The published schema accepts the new case kinds the parser accepts, and
+/// both refuse a principal on an egress case.
+#[test]
+fn the_published_schema_accepts_sequences_and_egress_cases() {
+    let schema = request_schema();
+    let validator = jsonschema::validator_for(&schema).expect("the schema compiles");
+    let mut cases = egress_cases().as_array().cloned().unwrap_or_default();
+    cases.push(json!({
+        "id": "sequence",
+        "kind": "rate",
+        "request": { "method": "GET", "path": "/orders/7" },
+        "principal": "anonymous",
+        "sequence": { "at_ms": [0, 5, 5] }
+    }));
+    let accepted = with_cases(
+        json!({ "source": "active" }),
+        "full",
+        json!(["as_authored"]),
+        Value::Array(cases),
+    );
+    assert!(parse(&accepted).is_ok());
+    if let Err(error) = validator.validate(&accepted) {
+        panic!("the schema refuses a request the parser accepts: {error}");
+    }
+    let mut refused_requests = Vec::new();
+    let mut with_principal = accepted.clone();
+    with_principal["cases"][0]["principal"] = json!("anonymous");
+    refused_requests.push(with_principal);
+    let mut without_destination = accepted.clone();
+    if let Some(case) = without_destination["cases"][1].as_object_mut() {
+        case.remove("destination");
+    }
+    refused_requests.push(without_destination);
+    let mut negative_instant = accepted.clone();
+    negative_instant["cases"][4]["sequence"]["at_ms"] = json!([-1]);
+    refused_requests.push(negative_instant);
+    let mut empty_sequence = accepted;
+    empty_sequence["cases"][4]["sequence"]["at_ms"] = json!([]);
+    refused_requests.push(empty_sequence);
+    for request in refused_requests {
+        assert!(parse(&request).is_err(), "parser: {request}");
+        assert!(!validator.is_valid(&request), "schema: {request}");
     }
 }

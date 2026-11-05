@@ -7,6 +7,7 @@ use super::{
     run_against_policy,
     runner::{CaseStatus, RunStatus, Summary},
     suite::{parse_suite, Diagnostics, MAX_CASES, SUITE_SCHEMA_VERSION},
+    synthetic::{test_resources, SyntheticResources},
     RunError,
 };
 use crate::{
@@ -244,7 +245,56 @@ fn passing_cases() -> Vec<Value> {
             "principal": "anonymous",
             "expect": { "rate_override": null }
         }),
+        json!({
+            "id": "reader-burst-then-refill",
+            "description": "burst 10 at 5/s: the eleventh request waits for a token",
+            "kind": "rate",
+            "request": { "method": "GET", "path": "/orders/1" },
+            "principal": reader(),
+            "sequence": { "at_ms": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 200] },
+            "expect": {
+                "rate_override": 0,
+                "steps": [
+                    "allowed", "allowed", "allowed", "allowed", "allowed",
+                    "allowed", "allowed", "allowed", "allowed", "allowed",
+                    "limited", "allowed"
+                ]
+            }
+        }),
+        json!({
+            "id": "anonymous-sequence-meets-the-read-lane",
+            "kind": "rate",
+            "request": { "method": "GET", "path": "/orders/1" },
+            "principal": "anonymous",
+            "sequence": { "at_ms": [0, 0, 0, 1000] },
+            "expect": { "rate_override": null, "steps": ["allowed", "allowed", "limited", "allowed"] }
+        }),
+        json!({
+            "id": "egress-public-hypothetical-address",
+            "kind": "egress",
+            "destination": { "scheme": "https", "host": "api.example.test", "port": 443 },
+            "resolution": { "hypothetical_addresses": ["93.184.216.34:443"] },
+            "expect": { "logical": "allow", "reason": "allowed" }
+        }),
+        json!({
+            "id": "egress-unlisted-host-needs-no-evidence",
+            "kind": "egress",
+            "destination": { "scheme": "https", "host": "other.example.test", "port": 443 },
+            "expect": { "logical": "deny", "reason": "host_not_allowed" }
+        }),
+        json!({
+            "id": "egress-private-address-refused",
+            "kind": "egress",
+            "destination": { "scheme": "https", "host": "billing.svc.example.test", "port": 443 },
+            "resolution": { "hypothetical_addresses": ["93.184.216.34:443", "10.0.0.5:443"] },
+            "expect": { "logical": "deny", "reason": "non_global_address" }
+        }),
     ]
+}
+
+/// What every run here decides egress cases and sequences by.
+fn resources() -> SyntheticResources {
+    test_resources()
 }
 
 fn binding() -> PolicyBinding {
@@ -263,12 +313,17 @@ fn far_deadline() -> Instant {
 }
 
 fn run(document: &Value) -> RunReport {
+    run_with(document, &resources())
+}
+
+fn run_with(document: &Value, resources: &SyntheticResources) -> RunReport {
     let suite = parse_suite(document).expect("the suite is valid");
     let digest = suite.digest.clone();
     let outcome = run_against_policy(
         policy(),
         PolicyAuthority::Standalone,
         &suite,
+        resources,
         far_deadline(),
     )
     .expect("policy compiles and the run finishes");
@@ -401,8 +456,14 @@ fn a_case_organization_decides_identity_mappings_as_a_live_lane_does() {
     }
     let document = suite(cases);
     let parsed = parse_suite(&document).expect("the suite is valid");
-    let outcome = run_against_policy(mapped, PolicyAuthority::Standalone, &parsed, far_deadline())
-        .expect("policy compiles and the run finishes");
+    let outcome = run_against_policy(
+        mapped,
+        PolicyAuthority::Standalone,
+        &parsed,
+        &resources(),
+        far_deadline(),
+    )
+    .expect("policy compiles and the run finishes");
     let report = RunReport::new(parsed.digest.clone(), binding(), outcome);
     let failures: Vec<_> = report
         .cases
@@ -523,7 +584,13 @@ fn a_run_past_its_deadline_returns_nothing() {
         .checked_sub(Duration::from_millis(1))
         .unwrap_or_else(Instant::now);
     assert!(matches!(
-        run_against_policy(policy(), PolicyAuthority::Standalone, &suite, past),
+        run_against_policy(
+            policy(),
+            PolicyAuthority::Standalone,
+            &suite,
+            &resources(),
+            past
+        ),
         Err(RunError::DeadlineExceeded)
     ));
     // The same suite inside its deadline decides every case.
@@ -531,6 +598,7 @@ fn a_run_past_its_deadline_returns_nothing() {
         policy(),
         PolicyAuthority::Standalone,
         &suite,
+        &resources(),
         far_deadline(),
     )
     .expect("the run finishes");
@@ -925,13 +993,40 @@ fn suite_schema() -> Value {
 fn the_published_schema_agrees_with_the_parser() {
     let schema = suite_schema();
     let validator = jsonschema::validator_for(&schema).expect("the schema compiles");
-    let mut accepted = suite(passing_cases());
-    accepted["cases"][1]["principal"]["organization"] = json!("acme");
+    // One document for every kind: an isolated sequence on a principal with
+    // a verified organization and an egress case sit beside the others.
+    let mut cases = passing_cases();
+    cases[1]["principal"]["organization"] = json!("acme");
+    let organized = cases[1]["principal"].clone();
+    cases.push(json!({
+        "id": "organized-sequence",
+        "kind": "rate",
+        "request": { "method": "GET", "path": "/orders/1" },
+        "principal": organized.clone(),
+        "sequence": { "at_ms": [0, 5, 5] },
+        "expect": { "rate_override": null, "steps": ["allowed", "allowed", "limited"] }
+    }));
+    let mut egress = egress_case(
+        json!({ "scheme": "https", "host": "api.example.test", "port": 443 }),
+        Some(json!({ "hypothetical_addresses": ["203.0.113.7:443"] })),
+        json!({ "logical": "allow" }),
+    );
+    egress["id"] = json!("organized-egress");
+    cases.push(egress);
+    let accepted = suite(cases);
     assert!(parse_suite(&accepted).is_ok());
     if let Err(error) = validator.validate(&accepted) {
         panic!("the schema refuses a suite the parser accepts: {error}");
     }
+    let last = accepted["cases"].as_array().map_or(0, Vec::len) - 1;
     let mut refusals = Vec::new();
+    // An egress case has no principal, so none with an organization either.
+    let mut document = accepted.clone();
+    document["cases"][last]["principal"] = organized;
+    refusals.push(document);
+    let mut document = accepted.clone();
+    document["cases"][last - 1]["principal"]["organization"] = json!("");
+    refusals.push(document);
     let mut document = suite(passing_cases());
     document["schema_version"] = json!("policy-tests.v2");
     refusals.push(document);
@@ -1185,6 +1280,7 @@ fn run_conditioned(document: &Value) -> RunReport {
         conditioned_policy(),
         PolicyAuthority::Standalone,
         &suite,
+        &resources(),
         far_deadline(),
     )
     .expect("policy compiles and the run finishes");
@@ -1501,4 +1597,389 @@ fn case_facts_refuse_credential_names_and_malformed_values_without_echoing_them(
         assert!(parse_suite(&document).is_err(), "parser: {facts}");
         assert!(!validator.is_valid(&document), "schema: {facts}");
     }
+}
+
+fn egress_case(destination: Value, resolution: Option<Value>, expect: Value) -> Value {
+    let mut case = json!({
+        "id": "egress",
+        "kind": "egress",
+        "destination": destination,
+        "expect": expect
+    });
+    if let Some(resolution) = resolution {
+        case["resolution"] = resolution;
+    }
+    case
+}
+
+/// A destination the static checks admit, with no resolution evidence, is
+/// undecided: never a pass, and nothing is resolved to decide it. The same
+/// destination with hypothetical evidence is decided over exactly that
+/// evidence, and the report never repeats a host or an address.
+#[test]
+fn an_admitted_destination_without_resolution_evidence_is_incomplete() {
+    let destination = json!({ "scheme": "https", "host": "api.example.test", "port": 443 });
+    let report = run(&suite(vec![egress_case(
+        destination.clone(),
+        None,
+        json!({ "logical": "allow" }),
+    )]));
+    let case = &report.cases[0];
+    assert_eq!(case.status, CaseStatus::Incomplete);
+    assert_eq!(report.status, RunStatus::Incomplete);
+    let actual = case.actual.as_ref().expect("an undecided case reports why");
+    assert_eq!(actual.logical, Some("indeterminate"));
+    assert_eq!(actual.effect, Some("block"));
+    assert_eq!(actual.reason, Some("incomplete"));
+    assert_eq!(actual.limitation, Some("missing_resolution_evidence"));
+    assert!(!actual.complete);
+
+    // An answer on another port is refused, an empty answer set is refused,
+    // and a non-global answer is refused by its position only.
+    for (addresses, logical, reason) in [
+        (json!(["93.184.216.34:443"]), "allow", "allowed"),
+        (
+            json!(["93.184.216.34:8443"]),
+            "deny",
+            "unexpected_resolved_port",
+        ),
+        (json!([]), "deny", "empty_resolution"),
+        (json!(["[2001:db8::10]:443"]), "deny", "non_global_address"),
+    ] {
+        let report = run(&suite(vec![egress_case(
+            destination.clone(),
+            Some(json!({ "hypothetical_addresses": addresses })),
+            json!({ "logical": logical, "reason": reason }),
+        )]));
+        assert_eq!(report.cases[0].status, CaseStatus::Passed, "{reason}");
+        let rendered =
+            serde_json::to_string(&report::to_json(&report).expect("json")).expect("serializes");
+        for absent in ["api.example.test", "93.184.216.34", "2001:db8"] {
+            assert!(!rendered.contains(absent), "the report repeats {absent}");
+        }
+    }
+}
+
+/// Static refusals decide without evidence, in the lane's own order.
+#[test]
+fn a_statically_refused_destination_is_decided_without_evidence() {
+    let cases = [
+        (
+            json!({ "scheme": "ftp", "host": "api.example.test", "port": 21 }),
+            "scheme_not_allowed",
+        ),
+        (
+            json!({ "scheme": "https", "host": "api.example.test", "port": 8443 }),
+            "port_not_allowed",
+        ),
+        (json!({ "scheme": "https", "port": 443 }), "missing_host"),
+        (
+            json!({ "scheme": "https", "host": "api.example.test", "port": 443, "userinfo": true }),
+            "userinfo",
+        ),
+        (
+            json!({ "scheme": "https", "host": "API.Example.Test", "port": 443, "fragment": true }),
+            "fragment",
+        ),
+        (
+            json!({ "scheme": "https", "host": "svc.example.test", "port": 443 }),
+            "host_not_allowed",
+        ),
+        (
+            json!({ "scheme": "https", "host": "api.example.test" }),
+            "missing_port",
+        ),
+    ];
+    for (destination, reason) in cases {
+        let report = run(&suite(vec![egress_case(
+            destination,
+            None,
+            json!({ "logical": "deny", "reason": reason }),
+        )]));
+        assert_eq!(report.cases[0].status, CaseStatus::Passed, "{reason}");
+    }
+}
+
+/// Without the configuration they are decided by, egress cases and
+/// sequences on a global lane are incomplete with a stable code. A sequence
+/// on an override still runs: its limits are the policy's own.
+#[test]
+fn synthetic_cases_without_their_configuration_are_incomplete() {
+    let cases = passing_cases();
+    let pick = |id: &str| {
+        cases
+            .iter()
+            .find(|case| case["id"] == json!(id))
+            .cloned()
+            .unwrap_or_else(|| panic!("no case {id}"))
+    };
+    let report = run_with(
+        &suite(vec![
+            pick("reader-burst-then-refill"),
+            pick("anonymous-sequence-meets-the-read-lane"),
+            pick("egress-public-hypothetical-address"),
+        ]),
+        &SyntheticResources::none(),
+    );
+    assert_eq!(report.cases[0].status, CaseStatus::Passed);
+    for (case, limitation) in report.cases[1..]
+        .iter()
+        .zip(["missing_rate_lane_configuration", "missing_egress_controls"])
+    {
+        assert_eq!(case.status, CaseStatus::Incomplete, "{}", case.id);
+        let actual = case.actual.as_ref().expect("reports why");
+        assert_eq!(actual.limitation, Some(limitation), "{}", case.id);
+        assert!(actual.steps.is_none(), "{}", case.id);
+    }
+    assert_eq!(report.status, RunStatus::Incomplete);
+    let value = report::to_json(&report).expect("json");
+    assert_eq!(
+        value["synthetic_resources"],
+        json!({ "egress_controls_digest": null, "global_rate_lanes": "unavailable" })
+    );
+    let configured = report::to_json(&run(&suite(passing_cases()))).expect("json");
+    assert_eq!(
+        configured["synthetic_resources"]["global_rate_lanes"],
+        json!("configured")
+    );
+    assert!(configured["synthetic_resources"]["egress_controls_digest"]
+        .as_str()
+        .is_some_and(|digest| digest.starts_with("sha256:") && digest.len() == 71));
+}
+
+/// A step outcome that does not hold fails the case, and the report names
+/// the steps expected and found -- outcomes only.
+#[test]
+fn a_wrong_step_outcome_fails_and_names_the_steps() {
+    let report = run(&suite(vec![json!({
+        "id": "steps",
+        "kind": "rate",
+        "request": { "method": "GET", "path": "/orders/1" },
+        "principal": "anonymous",
+        "sequence": { "at_ms": [0, 0, 0] },
+        "expect": { "rate_override": null, "steps": ["allowed", "allowed", "allowed"] }
+    })]));
+    let case = &report.cases[0];
+    assert_eq!(case.status, CaseStatus::Failed);
+    assert_eq!(case.mismatches, ["steps"]);
+    assert_eq!(
+        case.actual.as_ref().and_then(|actual| actual.steps.clone()),
+        Some(vec!["allowed", "allowed", "limited"])
+    );
+    let junit = report::to_junit(&report);
+    assert!(junit.contains(
+        "Case steps failed: steps expected [allowed, allowed, allowed], got [allowed, allowed, limited]."
+    ));
+    // Without a steps expectation the same sequence asserts its lane only.
+    let report = run(&suite(vec![json!({
+        "id": "lane-only",
+        "kind": "rate",
+        "request": { "method": "GET", "path": "/orders/1" },
+        "principal": "anonymous",
+        "sequence": { "at_ms": [0, 0, 0] },
+        "expect": { "rate_override": null }
+    })]));
+    assert_eq!(report.cases[0].status, CaseStatus::Passed);
+}
+
+fn rate_suite(sequence: Option<Value>, expect: Value) -> Value {
+    let mut case = json!({
+        "id": "rate",
+        "kind": "rate",
+        "request": { "method": "GET", "path": "/orders/1" },
+        "principal": "anonymous",
+        "expect": expect
+    });
+    if let Some(sequence) = sequence {
+        case["sequence"] = sequence;
+    }
+    suite(vec![case])
+}
+
+fn egress_suite(destination: Value, resolution: Option<Value>, expect: Value) -> Value {
+    suite(vec![egress_case(destination, resolution, expect)])
+}
+
+#[test]
+fn sequences_and_egress_cases_are_parsed_strictly() {
+    let no_override = || json!({ "rate_override": null });
+    let deny = || json!({ "logical": "deny" });
+    let https = || json!({ "scheme": "https", "host": "api.example.test" });
+    let mut with_principal = egress_case(https(), None, deny());
+    with_principal["principal"] = json!("anonymous");
+    let refusals: Vec<(Value, &str, &str)> = vec![
+        (
+            rate_suite(None, json!({ "rate_override": null, "steps": ["allowed"] })),
+            "inconsistent_case",
+            "/cases/0/expect/steps",
+        ),
+        (
+            rate_suite(
+                Some(json!({ "at_ms": [0, 1] })),
+                json!({ "rate_override": null, "steps": ["allowed"] }),
+            ),
+            "inconsistent_case",
+            "/cases/0/expect/steps",
+        ),
+        (
+            rate_suite(
+                Some(json!({ "at_ms": [0] })),
+                json!({ "rate_override": null, "steps": ["throttled"] }),
+            ),
+            "invalid_value",
+            "/cases/0/expect/steps/0",
+        ),
+        (
+            rate_suite(Some(json!({ "at_ms": [5, 4] })), no_override()),
+            "sequence_not_monotonic",
+            "/cases/0/sequence/at_ms/1",
+        ),
+        (
+            rate_suite(Some(json!({ "at_ms": [] })), no_override()),
+            "empty_sequence",
+            "/cases/0/sequence/at_ms",
+        ),
+        (
+            rate_suite(Some(json!({ "at_ms": vec![0; 65] })), no_override()),
+            "too_many_steps",
+            "/cases/0/sequence/at_ms",
+        ),
+        (
+            rate_suite(Some(json!({ "at_ms": [86_400_001u64] })), no_override()),
+            "invalid_value",
+            "/cases/0/sequence/at_ms/0",
+        ),
+        (
+            rate_suite(Some(json!({ "at_ms": [-1] })), no_override()),
+            "invalid_value",
+            "/cases/0/sequence/at_ms/0",
+        ),
+        (
+            rate_suite(
+                Some(json!({ "at_ms": [0], "clock": "wall" })),
+                no_override(),
+            ),
+            "unknown_field",
+            "/cases/0/sequence/clock",
+        ),
+        (
+            suite(vec![with_principal]),
+            "unknown_field",
+            "/cases/0/principal",
+        ),
+        (
+            suite(vec![
+                json!({ "id": "e", "kind": "egress", "expect": { "logical": "deny" } }),
+            ]),
+            "missing_field",
+            "/cases/0/destination",
+        ),
+        (
+            egress_suite(
+                json!({ "scheme": "HTTPS", "host": "api.example.test" }),
+                None,
+                deny(),
+            ),
+            "invalid_value",
+            "/cases/0/destination/scheme",
+        ),
+        (
+            egress_suite(
+                json!({ "scheme": "https", "host": "user@api.example.test" }),
+                None,
+                deny(),
+            ),
+            "invalid_host",
+            "/cases/0/destination/host",
+        ),
+        (
+            egress_suite(
+                json!({ "scheme": "https", "host": "api.example.test", "port": 70000 }),
+                None,
+                deny(),
+            ),
+            "invalid_value",
+            "/cases/0/destination/port",
+        ),
+        (
+            egress_suite(
+                json!({ "scheme": "https", "url": "https://api.example.test/" }),
+                None,
+                deny(),
+            ),
+            "unknown_field",
+            "/cases/0/destination/url",
+        ),
+        (
+            egress_suite(
+                https(),
+                Some(json!({ "hypothetical_addresses": ["api.example.test:443"] })),
+                deny(),
+            ),
+            "invalid_address",
+            "/cases/0/resolution/hypothetical_addresses/0",
+        ),
+        (
+            egress_suite(
+                https(),
+                Some(json!({ "hypothetical_addresses": vec!["192.0.2.1:443"; 17] })),
+                deny(),
+            ),
+            "too_many_addresses",
+            "/cases/0/resolution/hypothetical_addresses",
+        ),
+        (
+            egress_suite(
+                https(),
+                Some(json!({ "addresses": ["192.0.2.1:443"] })),
+                deny(),
+            ),
+            "unknown_field",
+            "/cases/0/resolution/addresses",
+        ),
+        (
+            egress_suite(https(), None, json!({ "logical": "indeterminate" })),
+            "invalid_value",
+            "/cases/0/expect/logical",
+        ),
+        (
+            egress_suite(
+                https(),
+                None,
+                json!({ "logical": "deny", "reason": "incomplete" }),
+            ),
+            "invalid_value",
+            "/cases/0/expect/reason",
+        ),
+        (
+            egress_suite(
+                https(),
+                None,
+                json!({ "logical": "deny", "matched": "none" }),
+            ),
+            "unknown_field",
+            "/cases/0/expect/matched",
+        ),
+    ];
+    for (document, code, pointer) in refusals {
+        let found = codes(&refused(&document));
+        assert!(
+            found.contains(&(code, pointer.to_owned())),
+            "expected {code} at {pointer}, found {found:?} for {document}"
+        );
+    }
+}
+
+/// The egress reason codes the schema lists are exactly the ones an
+/// expectation may name.
+#[test]
+fn the_published_schema_lists_exactly_the_egress_reason_codes() {
+    let schema = suite_schema();
+    let listed: Vec<&str> = schema["$defs"]["egress_expect"]["properties"]["reason"]["enum"]
+        .as_array()
+        .expect("an egress reason enum")
+        .iter()
+        .map(|code| code.as_str().expect("a code"))
+        .collect();
+    assert_eq!(listed, super::suite::EGRESS_REASONS);
 }
