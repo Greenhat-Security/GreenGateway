@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://greengateway.dev/schemas/policy-analysis-suppression.v1.schema.json",
+  "title": "GreenGateway policy analysis suppression request",
+  "description": "Draft 2020-12 JSON Schema for the body of POST /v1{ADMIN_PREFIX}/policy/analyses/suppressions: one analyzer finding, named by the fingerprint and code a policy-analysis-results.v1 report gave it, the resource snapshot digest that report carried, an expiry and a reason. The request names the live policy ETag in If-Match. The gateway's checks are authoritative and also enforce what JSON Schema cannot state here: the reason's bound in bytes (not characters) and that it is not only whitespace, unique member names, and that expires_at is after now and at most 90 days after it on the store's clock. Unknown members are refused: there is no member that suppresses more than one finding.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["fingerprint", "code", "reason", "expires_at", "resource_snapshot_digest"],
+  "properties": {
+    "fingerprint": {"$ref": "#/$defs/digest"},
+    "code": {
+      "enum": [
+        "default_allow",
+        "global_shadow_enforcement",
+        "broad_unconstrained_allow",
+        "broad_unconstrained_shadow",
+        "wildcard_grant_without_issuer",
+        "rule_unreachable",
+        "rule_shadowed",
+        "route_unreachable",
+        "route_shadowed",
+        "route_bypassed",
+        "rate_override_unreachable",
+        "rate_override_shadowed",
+        "rule_partially_shadowed",
+        "mcp_alias_rule_overridden",
+        "mcp_alias_route_precedence",
+        "selected_upstream_allow_ignored",
+        "tool_rule_never_decides",
+        "tool_rule_grant_narrowed",
+        "issuerless_role_grant",
+        "wildcard_permission",
+        "broad_path_grant",
+        "all_methods_grant",
+        "rate_override_looser_than_global",
+        "egress_broad_wildcard_host",
+        "egress_non_public_cidr",
+        "egress_unusual_port",
+        "egress_change_requires_restart",
+        "role_not_defined",
+        "route_permission_ungranted",
+        "tool_not_registered",
+        "connection_endpoint_egress_denied",
+        "name_case_collision",
+        "policy_write_unreachable"
+      ]
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]*$"
+    },
+    "expires_at": {"type": "string", "format": "date-time"},
+    "resource_snapshot_digest": {"$ref": "#/$defs/digest"}
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+  }
+}

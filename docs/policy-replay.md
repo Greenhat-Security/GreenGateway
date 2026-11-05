@@ -425,7 +425,8 @@ refused it. No replay performs a lookup.
 ## Replay jobs
 
 `POST /v1{ADMIN_PREFIX}/policy/replays` starts a bounded job that decides one
-window of the standalone audit log again under a candidate policy and under
+window of retained audit records -- the standalone audit log, or in cluster
+mode the cluster audit stream -- again under a candidate policy and under
 the active policy it was written against, through the same evaluator the live
 adapters call, and reports what each decided and how they differ as counts.
 `GET /v1{ADMIN_PREFIX}/policy/replays/{id}` reads the job, its progress and,
@@ -496,9 +497,7 @@ simply holds fewer rows; the cutoff's count says how many.
 In cluster mode the audit authority is PostgreSQL's `audit_events` and its
 commit-ordered `audit_stream`, and the reader over them
 (`storage::postgres_audit_replay`) answers the job engine exactly as the
-standalone reader does. Cluster mode still answers every replay route `503`
-(see [below](#standalone-only-and-process-local)); the reader is what a cluster
-job will read.
+standalone reader does. [Cluster jobs](#cluster-jobs) read through it.
 
 - **Cutoff.** `high_water` is the highest stream position assigned when the
   job is created, read in the same statement as the window's rows at or below
@@ -553,9 +552,12 @@ job will read.
 | One page | 500 rows, and 4 MiB of their JSON past the first row | The next page continues |
 | One row | 256 KiB of actor and payload JSON | Counted as `oversized_record`; its JSON is never read |
 | Running jobs | 1 per replica, on a blocking thread | Further jobs are `queued` |
-| Queued or running jobs | 4 per replica, 1 per principal | `429 policy_replay_busy` |
+| Queued or running jobs | 4 per replica, 1 per principal; in cluster mode 4 per deployment, 1 per principal | `429 policy_replay_busy` |
 | Request body arrival | 5 seconds | `408 policy_replay_request_timeout` |
-| Unexpired jobs held | 32 per replica, 8 per principal | `429 policy_replay_quota_exhausted` |
+| Unexpired jobs held | 32 per replica, 8 per principal; in cluster mode 32 per deployment, 8 per principal | `429 policy_replay_quota_exhausted` |
+| Cluster lease | 30 seconds, renewed every 10 seconds and by every checkpoint | Another replica takes the job over and resumes it |
+| Cluster claims | 3 per job, not counting one given back at shutdown | `interrupted` with `takeover_limit` |
+| Cluster checkpoint | 4 MiB rendered | `failed` with `checkpoint_too_large` |
 | Finished job kept | 15 minutes after it finishes | The job reads `expired`, with no result |
 | Expired job remembered | 1 hour after that | `404` |
 | Request body | 2 MiB, or `MAX_BODY_SIZE` if lower | `413` |
@@ -574,7 +576,10 @@ long as its evaluation lasts. The job holds its slot while it is queued and
 hands it to the blocking thread that runs it, so the slot comes back only
 when that work has ended -- neither a dropped request nor a cancellation
 frees it early -- and before the job reads as finished. A retry naming a job
-already admitted is answered before a slot is asked for.
+already admitted is answered before a slot is asked for. A cluster job may
+run on any replica, so there the slot bounds the replica's admissions in
+flight and comes back when the request ends; the deployment's pending jobs
+are counted by the job store ([cluster jobs](#cluster-jobs)).
 
 ### Lifecycle
 
@@ -584,8 +589,9 @@ already admitted is answered before a slot is asked for.
 | --- | --- |
 | `completed` | Every record the cutoff selected was read and classified, the window was unchanged at the end, and at least one record was replayed |
 | `completed_incomplete` | A result whose `limitations` say what it does not cover: `scan_truncated`, `deadline_exceeded`, `source_changed`, `source_pruned` (cluster audit stream only: rows the window may have held are gone), or `no_data` when nothing in the window was replayable. It satisfies no gate |
-| `failed` | No result, with a stable `failure.reason`: `source_unavailable`, `compile_failed`, `evaluator_failed` (the evaluator broke its own contract; nothing it counted is an answer), `result_too_large`, `audit_unavailable` or `internal` |
+| `failed` | No result, with a stable `failure.reason`: `source_unavailable`, `compile_failed`, `evaluator_failed` (the evaluator broke its own contract; nothing it counted is an answer), `result_too_large`, `checkpoint_too_large` (cluster only), `audit_unavailable` or `internal` |
 | `cancelled` | No result. A queued job stops at once; a running one before its next record |
+| `interrupted` | Cluster only. No result: a replica took the job over and could not continue it, with `failure.reason` `pins_unreadable` (a pinned policy no longer validates or reproduces its ETag), `engine_version_changed` (the job was admitted under another evaluator, replay-context, checkpoint or result version), `checkpoint_unreadable` or `takeover_limit` ([cluster jobs](#cluster-jobs)) |
 | `expired` | 15 minutes have passed since the job finished: its result, if it had one, is gone, and it no longer counts against any quota |
 
 `completed` does not mean every record was decided: records the candidate
@@ -594,7 +600,8 @@ evaluator refused are all counted, by code.
 
 Every job leaves exactly its own lifecycle records: `policy.replay_started`
 when it is admitted, and one of `policy.replay_completed`,
-`policy.replay_cancelled` or `policy.replay_failed` when it ends. They carry
+`policy.replay_cancelled`, `policy.replay_failed` or (cluster only)
+`policy.replay_interrupted` when it ends. They carry
 the job id, the base and candidate ETags, the request digest, the projections,
 the window and cutoff (the start also names a stored candidate by its
 `candidate_draft_id` and `candidate_draft_revision`, or its
@@ -627,7 +634,7 @@ is what `AUDIT_DURABILITY` makes it: committed to the audit store under
 | `413` | The body is over its bound |
 | `422` | An invalid request, window, edit or candidate, or a history version this build does not accept now (`policy_revision_incompatible`) |
 | `429` | `policy_replay_busy` or `policy_replay_quota_exhausted` |
-| `503` | `audit_evidence_unavailable` (no standalone audit log, or it could not be read), `policy_replay_audit_unavailable` (the start was not recorded), `policy_replay_unsupported_in_cluster`, or a drafts store or policy history that could not be read (`policy_drafts_unavailable`, `policy_history_unavailable`) |
+| `503` | `audit_evidence_unavailable` (no standalone audit log or cluster job store, or the audit records could not be read), `policy_replay_audit_unavailable` (the start was not recorded), `policy_replay_store_unavailable` (cluster mode: the job store could not be read or written), or a drafts store or policy history that could not be read (`policy_drafts_unavailable`, `policy_history_unavailable`) |
 
 A job's representation is always sent with `Cache-Control: no-store`.
 
@@ -732,18 +739,96 @@ cutoff, base, candidate, projections and evaluator produce byte-identical
 results, however the log was paged. A job stopped by its deadline is the one
 exception, and says so. No replay result says a policy is safe.
 
-### Standalone only, and process-local
+### Standalone jobs are process-local
 
-Jobs live in the memory of the replica that admitted them, and run there.
-Shutting the gateway down cancels every job, and a running one stops before
-its next record. A restart forgets every job: its id is `404` afterwards,
-never resumed and never a partial result. Cluster mode answers every replay
-route `503 policy_replay_unsupported_in_cluster`, after the permission checks
-and before a body is read, a cutoff fixed or a job admitted: a replicated job
-needs the durable leases of #241. The [cluster reader](#the-cluster-reader)
-over PostgreSQL's audit stream exists, but no route uses it yet. Without a
-standalone audit log (`AUDIT_SQLITE_PATH` unset) the start route is
+A standalone job lives in the memory of the replica that admitted it, and
+runs there. Shutting the gateway down cancels every job, and a running one
+stops before its next record. A restart forgets every job: its id is `404`
+afterwards, never resumed and never a partial result. Without a standalone
+audit log (`AUDIT_SQLITE_PATH` unset) the start route is
 `503 audit_evidence_unavailable`, never an empty result.
+
+### Cluster jobs
+
+In cluster mode a job is a row of `greengateway.policy_replay_jobs`
+(migration 30), so every replica answers `GET` and `DELETE` for every job and
+any replica may run it. It reads the cluster audit stream through
+[the cluster reader](#the-cluster-reader), under the bounds above, and its
+result is the same `policy-replay-results.v1` document, with `source.kind`
+`cluster_audit_stream`. The routes, permissions, request, representation and
+status codes are the standalone ones.
+
+- **Admission.** The request is validated and pinned exactly as a standalone
+  one. The job store then looks up the idempotency key and counts the pending
+  jobs (4 per deployment, 1 per principal) and the unexpired ones (32 per
+  deployment, 8 per principal) in the transaction that inserts the job, under
+  a transaction-scoped advisory lock, so two replicas can neither both take
+  the last slot nor both admit one key. No job is ever evicted or ended to
+  make room. The row pins both policy documents as the gateway serialized
+  them (and, for a draft or history candidate, the draft revision or history
+  version it was read as), the cutoff, and the versions of the evaluator,
+  replay context, checkpoint and result the job was admitted under. The job becomes `queued`
+  only once its `policy.replay_started` event is accepted; until then no
+  replica runs it.
+- **Workers and leases.** Every cluster replica runs one replay worker, so
+  each runs at most one job at a time, on a blocking thread. While the
+  cluster membership gate admits the replica, the worker claims the oldest
+  job that is queued or whose holder's lease has expired by the database
+  clock. A lease lasts 30 seconds and is renewed every 10 seconds and by every
+  checkpoint. Every claim draws a fence from one sequence, so a takeover always
+  holds a larger fence than the lease it replaced, and every write a holder
+  makes names its holder and fence, so it matches nothing once another replica
+  holds the job.
+- **Checkpoints and takeover.** After every page the worker stores, in one
+  statement under its fence, the stream position it has read through and its
+  whole partial aggregate: a lossless `policy-replay-checkpoint.v1` document
+  of every count the run keeps, without a result's row caps. A replica that
+  takes a job over -- its holder crashed, stalled past its lease or lost the
+  database -- resumes from that checkpoint and reads the page after it. A page
+  whose checkpoint was not stored is read again whole, and one whose
+  checkpoint was is never read again, so every record is counted exactly once
+  and a resumed job's result is the one an uninterrupted job would have
+  produced. The 60-second run deadline is fixed by the job's first claim and
+  kept across takeovers: a resumed run gets what is left of it.
+- **Interrupted.** A replica that claims a job re-validates both pinned
+  documents and requires each to reproduce its ETag, and requires the job's
+  engine versions to be its own. A job that fails either, whose checkpoint
+  cannot be read back, or that has been claimed more than three times (a claim
+  given back at shutdown does not count) ends `interrupted`, with
+  `policy.replay_interrupted` carrying the job id, the reason and the records
+  it had read. It is never resumed under another evaluator and never
+  publishes a partial result.
+- **Cancellation.** `DELETE` ends a queued job at once (recording
+  `policy.replay_cancelled` with the admitting request's envelope) and asks a
+  running one to stop: its holder learns of it at its next checkpoint or lease
+  renewal and stops before its next record, and a replica that takes the job
+  over ends it without reading anything.
+- **Completion.** The worker records `policy.replay_completed` and only then
+  stores the result under its fence. If the lease is lost between the two, the
+  replica that takes the job over runs it from the last checkpoint and records
+  its own completion, so the audit trail can then hold two completion records
+  for one job -- with the same result digest, unless a deadline cut one of the
+  runs short. Only one result is ever stored.
+- **Draining and shutdown.** A draining replica's worker stops claiming. A run
+  in progress stops before its next record and gives its job back: its lease
+  expires at once, so another replica resumes it from its last checkpoint
+  without counting a takeover. Readiness never depends on the worker.
+- **Retention.** Every admission and every idle turn of a worker run one
+  bounded retention pass of at most 64 rows: finished jobs past their
+  retention are deleted, expired results cleared, and an admission whose start
+  was never recorded is removed 60 seconds after it began. A pending job is
+  never pruned. Every time is database time.
+
+The job table is analysis state, not authority: nothing about a job advances
+the security revision, writes the outbox or changes what any replica
+enforces. A row holds the admitting request's audit envelope (the actor,
+request id and client address its `policy.replay_started` event already
+holds) and both pinned policy documents for as long as the job is retained,
+at most 75 minutes after it finishes. Store failures are classified and
+logged where they happen, and a route that cannot read or write the store
+answers `503 policy_replay_store_unavailable`. [Policy evidence](policy-evidence.md)
+binds a cluster job through the same store, so a package can include a job
+that ran on any replica.
 
 ### In the admin UI
 
@@ -1027,9 +1112,28 @@ evaluator version or element id.
   invalid window, edit or candidate creates no job; an idempotent retry starts
   nothing; queued jobs are cancelled, quotas refuse rather than evict, and
   results expire; a stalled upload holds no admission slot and is refused at
-  its deadline, and a job holds its slot until its evaluation ends; in cluster mode every route answers `503` without reading a
-  body, admitting a job, recording a lifecycle event or consulting the
-  cluster authority; and the side-effect test above holds.
+  its deadline, and a job holds its slot until its evaluation ends; in cluster
+  mode without a job store every route answers `503` without reading a body,
+  admitting a job, recording a lifecycle event or consulting the cluster
+  authority; and the side-effect test above holds.
+- Cluster jobs are run against a real PostgreSQL. The job store keeps one job
+  per owner and idempotency key across replicas, refuses at its per-owner and
+  per-deployment pending and unexpired bounds without evicting a job, never
+  lets a worker claim a job whose start is not recorded, hands a lapsed lease
+  to the next claim with a larger fence and the last checkpoint while the old
+  holder's checkpoint, renewal, ending and release match nothing, does not
+  count a claim given back at shutdown, ends a queued job's cancellation at
+  once and reports a running one's at its next checkpoint and renewal, serves
+  a result until its TTL and then `expired` with none, and prunes only
+  finished jobs and abandoned admissions. A job that loses its lease after one
+  checkpointed page is taken over by another replica, which resumes from the
+  checkpoint and publishes a result byte-identical to an uninterrupted run's,
+  every record counted once. A job admitted under another engine, one whose
+  pinned base no longer reproduces its ETag and one past its takeover limit
+  are interrupted with their reasons; a cancellation requested while a job's
+  holder was gone ends it at the takeover; and a takeover keeps the job's
+  deadline. The engine's checkpoint is read back strictly, and a run resumed
+  from any page's checkpoint produces the uninterrupted run's result.
 - The `policy-replay.v1` parser and its published schema accept and refuse
   the same requests, projections included.
 - The impact comparison is run over a window that touches every transition,

@@ -27,6 +27,19 @@
 //! A stopped run is still a result -- an incomplete one, whose counts cover the
 //! records it read -- never a failure and never a complete answer.
 //!
+//! ## Checkpoints
+//!
+//! A cluster job ([`run_resumable`]) is handed a [`ReplayCheckpoints`] sink.
+//! After every whole page the run gives it the stream position it has read
+//! through and its partial aggregate, the lossless
+//! [`super::checkpoint`] dump of every count it keeps; the sink stores both
+//! in one fenced statement or stops the run. A run started from a checkpoint
+//! restores that aggregate and reads on from the position after it, so a job
+//! taken over by another replica counts every record exactly once: the page
+//! a lost lease interrupted was never checkpointed, and is read again whole.
+//! The deadline is the job's, not the run's: a resumed run gets what is left
+//! of it.
+//!
 //! ## Determinism
 //!
 //! The window, the cutoff and the record bound fix which rows a run reads and
@@ -53,6 +66,7 @@ use std::{
 use serde_json::{json, Map, Value};
 
 use super::{
+    checkpoint::{self, CheckpointError, Restored, CHECKPOINT_SCHEMA_VERSION},
     impact::{Answer, ImpactTally, RateAnswer, ReplayPolicies},
     legacy::{adapt_audit_event, LegacyRecord},
     EgressRecord, ReplayFacts,
@@ -81,6 +95,11 @@ pub(crate) const MAX_REPLAY_PAGE_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const MAX_REPLAY_RECORD_BYTES: usize = 256 * 1024;
 /// The wall-clock bound on one run.
 pub(crate) const REPLAY_RUN_DEADLINE: Duration = Duration::from_secs(60);
+/// Largest serialized checkpoint a run hands its sink. A checkpoint holds
+/// every count the run keeps, without a result's row caps, so it can be
+/// larger than any result; one past this bound fails the job
+/// (`checkpoint_too_large`) rather than storing an unbounded document.
+pub(crate) const MAX_REPLAY_CHECKPOINT_BYTES: usize = 4 * 1024 * 1024;
 /// Stages a replayed decision does not include: the ones outside the policy
 /// verdict, which retained records cannot reconstruct.
 pub(crate) const NOT_REPLAYED: &[&str] = &[
@@ -170,12 +189,13 @@ impl ReplaySource for AuditQueryStore {
     }
 }
 
-/// What a run and its job share: the cancellation request and the progress
-/// counter. Both are plain atomics, so reading progress never waits on the
-/// run and cancelling never blocks.
+/// What a run and its job share: the cancellation request, the release
+/// request and the progress counter. All are plain atomics, so reading
+/// progress never waits on the run and stopping it never blocks.
 #[derive(Debug, Default)]
 pub(crate) struct ReplayControl {
     cancelled: AtomicBool,
+    released: AtomicBool,
     scanned: AtomicU64,
 }
 
@@ -187,6 +207,29 @@ impl ReplayControl {
 
     pub(crate) fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Ask the run to give its job up without an answer: its replica is
+    /// shutting down, or no longer holds the job's lease. It stops before its
+    /// next record with [`ReplayStop::Released`], and the job's last
+    /// checkpoint stands for whoever resumes it. Only cluster jobs are
+    /// released.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn release(&self) {
+        self.released.store(true, Ordering::Release);
+    }
+
+    /// Why the run must stop before its next record, if it must. A release
+    /// wins over a cancellation: a run that no longer holds its job does not
+    /// decide how the job ends.
+    fn stop_requested(&self) -> Option<ReplayStop> {
+        if self.released.load(Ordering::Acquire) {
+            Some(ReplayStop::Released)
+        } else if self.is_cancelled() {
+            Some(ReplayStop::Cancelled)
+        } else {
+            None
+        }
     }
 
     /// Records read so far.
@@ -203,6 +246,22 @@ pub(crate) enum ReplayStop {
     /// The run could not be completed honestly, with a stable code. No part
     /// of it is an answer.
     Failed(&'static str),
+    /// The run gave its job up without ending it: its lease was lost or its
+    /// replica is shutting down ([`ReplayControl::release`]). It records
+    /// nothing; the job's last checkpoint stands, and the replica that holds
+    /// the job next resumes from it. Only cluster jobs are released.
+    Released,
+}
+
+/// Where a cluster job stores its progress, page by page.
+pub(crate) trait ReplayCheckpoints {
+    /// Every row through stream position `after_id` is folded into
+    /// `checkpoint`, the run's whole partial aggregate (`scanned` rows so
+    /// far). Store both atomically, or stop the run: [`ReplayStop::Cancelled`]
+    /// when the job's cancellation was requested, [`ReplayStop::Released`]
+    /// when this run no longer holds the job, [`ReplayStop::Failed`] when the
+    /// checkpoint cannot be stored.
+    fn page_done(&self, after_id: i64, scanned: u64, checkpoint: &Value) -> Result<(), ReplayStop>;
 }
 
 /// A run that read its window, or as much of it as its bounds allowed.
@@ -223,22 +282,24 @@ pub(crate) struct ReplayOutcome {
     pub(crate) impact: Value,
 }
 
+/// `(logical, enforcement, effective_action, reason)`.
+type DecidedKey<'a> = (&'a str, &'a str, &'a str, &'a str);
+
 /// Counts for one lane: how its replayable records were answered.
 #[derive(Default)]
-struct LaneTally {
+struct LaneTally<'a> {
     replayable: u64,
-    /// `(logical, enforcement, effective_action, reason)`.
-    decided: BTreeMap<(&'static str, &'static str, &'static str, &'static str), u64>,
-    indeterminate: BTreeMap<&'static str, u64>,
+    decided: BTreeMap<DecidedKey<'a>, u64>,
+    indeterminate: BTreeMap<&'a str, u64>,
     /// Records whose facts the kernel refused: not records a served request
     /// could have left.
-    refused: BTreeMap<&'static str, u64>,
+    refused: BTreeMap<&'a str, u64>,
     /// Contexts that state an egress destination, which a job does not
     /// replay. The legacy adapters never record one.
     egress_not_replayed: u64,
 }
 
-impl LaneTally {
+impl<'a> LaneTally<'a> {
     /// Count the candidate's answer for one replayable record.
     fn add(&mut self, answer: Answer) {
         match answer {
@@ -296,19 +357,75 @@ impl LaneTally {
             "egress_not_replayed": self.egress_not_replayed,
         })
     }
+
+    fn dump(&self) -> Value {
+        let decided = self
+            .decided
+            .iter()
+            .map(
+                |((logical, enforcement, effective_action, reason), count)| {
+                    json!([logical, enforcement, effective_action, reason, count])
+                },
+            )
+            .collect::<Vec<_>>();
+        json!({
+            "replayable": self.replayable,
+            "decided": decided,
+            "indeterminate": self.indeterminate,
+            "refused": self.refused,
+            "egress_not_replayed": self.egress_not_replayed,
+        })
+    }
+
+    fn restore(value: &'a Value) -> Restored<Self> {
+        let object = checkpoint::exact_object(
+            value,
+            &[
+                "replayable",
+                "decided",
+                "indeterminate",
+                "refused",
+                "egress_not_replayed",
+            ],
+        )?;
+        let mut decided = BTreeMap::new();
+        for row in checkpoint::array(checkpoint::member(object, "decided")?)? {
+            let [logical, enforcement, effective_action, reason, count] = checkpoint::tuple(row)?;
+            checkpoint::insert(
+                &mut decided,
+                (
+                    checkpoint::code(logical)?,
+                    checkpoint::code(enforcement)?,
+                    checkpoint::code(effective_action)?,
+                    checkpoint::code(reason)?,
+                ),
+                count,
+            )?;
+        }
+        Ok(Self {
+            replayable: checkpoint::total(checkpoint::member(object, "replayable")?)?,
+            decided,
+            indeterminate: checkpoint::restore_codes(checkpoint::member(object, "indeterminate")?)?,
+            refused: checkpoint::restore_codes(checkpoint::member(object, "refused")?)?,
+            egress_not_replayed: checkpoint::total(checkpoint::member(
+                object,
+                "egress_not_replayed",
+            )?)?,
+        })
+    }
 }
 
 /// Rate-lane selection for the HTTP records: which override the candidate
 /// would select. Selection only; capacity is never reconstructed.
 #[derive(Default)]
-struct RateTally {
+struct RateTally<'a> {
     no_override: u64,
     overrides: u64,
-    indeterminate: BTreeMap<&'static str, u64>,
-    refused: BTreeMap<&'static str, u64>,
+    indeterminate: BTreeMap<&'a str, u64>,
+    refused: BTreeMap<&'a str, u64>,
 }
 
-impl RateTally {
+impl<'a> RateTally<'a> {
     /// Count the candidate's selection for one replayable HTTP record.
     fn add(&mut self, answer: RateAnswer) {
         match answer {
@@ -331,14 +448,36 @@ impl RateTally {
             "refusals": self.refused,
         })
     }
+
+    fn dump(&self) -> Value {
+        json!({
+            "no_override": self.no_override,
+            "override": self.overrides,
+            "indeterminate": self.indeterminate,
+            "refused": self.refused,
+        })
+    }
+
+    fn restore(value: &'a Value) -> Restored<Self> {
+        let object = checkpoint::exact_object(
+            value,
+            &["no_override", "override", "indeterminate", "refused"],
+        )?;
+        Ok(Self {
+            no_override: checkpoint::total(checkpoint::member(object, "no_override")?)?,
+            overrides: checkpoint::total(checkpoint::member(object, "override")?)?,
+            indeterminate: checkpoint::restore_codes(checkpoint::member(object, "indeterminate")?)?,
+            refused: checkpoint::restore_codes(checkpoint::member(object, "refused")?)?,
+        })
+    }
 }
 
 /// Every count a run keeps. Keys come from closed sets of stable codes, and
 /// the impact comparison's from element pairs of the policies, so the tally's
 /// size is bounded by the codes and the policies, not by the window.
-struct Tally {
+struct Tally<'a> {
     scanned: u64,
-    by_code: BTreeMap<&'static str, u64>,
+    by_code: BTreeMap<&'a str, u64>,
     replayable: u64,
     duplicate: u64,
     not_policy_evaluated: u64,
@@ -347,13 +486,26 @@ struct Tally {
     not_request_record: u64,
     unreadable: u64,
     oversized: u64,
-    http: LaneTally,
-    rate: RateTally,
-    tool: LaneTally,
-    impact: ImpactTally,
+    http: LaneTally<'a>,
+    rate: RateTally<'a>,
+    tool: LaneTally<'a>,
+    impact: ImpactTally<'a>,
 }
 
-impl Tally {
+/// The record counters of a [`Tally`], as a checkpoint names them.
+const RECORD_COUNTERS: [&str; 9] = [
+    "scanned",
+    "replayable",
+    "duplicate",
+    "not_policy_evaluated",
+    "unsupported",
+    "malformed",
+    "not_request_record",
+    "unreadable",
+    "oversized",
+];
+
+impl<'a> Tally<'a> {
     fn new(policies: &ReplayPolicies) -> Self {
         Self {
             scanned: 0,
@@ -375,6 +527,95 @@ impl Tally {
 
     fn count(&mut self, code: &'static str) {
         *self.by_code.entry(code).or_default() += 1;
+    }
+
+    fn record_counters(&self) -> [u64; 9] {
+        [
+            self.scanned,
+            self.replayable,
+            self.duplicate,
+            self.not_policy_evaluated,
+            self.unsupported,
+            self.malformed,
+            self.not_request_record,
+            self.unreadable,
+            self.oversized,
+        ]
+    }
+
+    /// The `policy-replay-checkpoint.v1` document for this tally, read
+    /// through stream position `after_id`.
+    fn checkpoint(&self, after_id: i64) -> Value {
+        let mut records = Map::new();
+        for (name, value) in RECORD_COUNTERS.iter().zip(self.record_counters()) {
+            records.insert((*name).to_owned(), json!(value));
+        }
+        records.insert("by_code".to_owned(), json!(self.by_code));
+        json!({
+            "schema_version": CHECKPOINT_SCHEMA_VERSION,
+            "after_id": after_id,
+            "records": Value::Object(records),
+            "http": self.http.dump(),
+            "rate": self.rate.dump(),
+            "tool": self.tool.dump(),
+            "impact": self.impact.dump(),
+        })
+    }
+
+    /// The tally a checkpoint of a run over `policies` describes, and the
+    /// stream position it was read through. Refused whole when it is not
+    /// exactly such a checkpoint ([`super::checkpoint`]).
+    fn restore(policies: &ReplayPolicies, value: &'a Value) -> Restored<(Self, i64)> {
+        let object = checkpoint::exact_object(
+            value,
+            &[
+                "schema_version",
+                "after_id",
+                "records",
+                "http",
+                "rate",
+                "tool",
+                "impact",
+            ],
+        )?;
+        if checkpoint::member(object, "schema_version")?.as_str() != Some(CHECKPOINT_SCHEMA_VERSION)
+        {
+            return Err(CheckpointError);
+        }
+        let after_id = checkpoint::member(object, "after_id")?
+            .as_i64()
+            .ok_or(CheckpointError)?;
+        let mut record_members = RECORD_COUNTERS.to_vec();
+        record_members.push("by_code");
+        let records =
+            checkpoint::exact_object(checkpoint::member(object, "records")?, &record_members)?;
+        let mut counters = [0_u64; 9];
+        for (slot, name) in counters.iter_mut().zip(RECORD_COUNTERS) {
+            *slot = checkpoint::total(checkpoint::member(records, name)?)?;
+        }
+        let [scanned, replayable, duplicate, not_policy_evaluated, unsupported, malformed, not_request_record, unreadable, oversized] =
+            counters;
+        let tally = Self {
+            scanned,
+            by_code: checkpoint::restore_codes(checkpoint::member(records, "by_code")?)?,
+            replayable,
+            duplicate,
+            not_policy_evaluated,
+            unsupported,
+            malformed,
+            not_request_record,
+            unreadable,
+            oversized,
+            http: LaneTally::restore(checkpoint::member(object, "http")?)?,
+            rate: RateTally::restore(checkpoint::member(object, "rate")?)?,
+            tool: LaneTally::restore(checkpoint::member(object, "tool")?)?,
+            impact: ImpactTally::restore(policies, checkpoint::member(object, "impact")?)?,
+        };
+        // Every record read is counted under exactly one adapter code.
+        if tally.by_code.values().sum::<u64>() != tally.scanned {
+            return Err(CheckpointError);
+        }
+        Ok((tally, after_id))
     }
 
     fn observe(&mut self, policies: &ReplayPolicies, row: &ReplayRow) -> Result<(), ReplayStop> {
@@ -511,15 +752,57 @@ pub(crate) fn run(
     deadline: Instant,
     control: &ReplayControl,
 ) -> Result<ReplayOutcome, ReplayStop> {
-    let mut tally = Tally::new(policies);
+    run_resumable(source, policies, scope, deadline, control, None, None)
+}
+
+/// [`run`], for a job that keeps checkpoints: start from `resume`, the last
+/// checkpoint the job stored (`None` for a fresh start), and hand
+/// `checkpoints` the aggregate after every whole page.
+///
+/// A checkpoint that is not one this build wrote for these policies and this
+/// scope fails the run with `checkpoint_unreadable`, and one past
+/// [`MAX_REPLAY_CHECKPOINT_BYTES`] with `checkpoint_too_large`; whatever the
+/// sink answers stops the run as it says.
+pub(crate) fn run_resumable(
+    source: &dyn ReplaySource,
+    policies: &ReplayPolicies,
+    scope: &ReplayScope,
+    deadline: Instant,
+    control: &ReplayControl,
+    resume: Option<&Value>,
+    checkpoints: Option<&dyn ReplayCheckpoints>,
+) -> Result<ReplayOutcome, ReplayStop> {
     let max_records = scope.max_records.min(MAX_REPLAY_RECORDS);
+    let (mut tally, resumed_after) = match resume {
+        None => (Tally::new(policies), None),
+        Some(document) => {
+            let (tally, after_id) = Tally::restore(policies, document)
+                .map_err(|_| ReplayStop::Failed("checkpoint_unreadable"))?;
+            (tally, Some(after_id))
+        }
+    };
+    control.scanned.store(tally.scanned, Ordering::Relaxed);
     let mut deadline_exceeded = false;
     if let (Some(first_id), Some(last_id)) = (scope.cutoff.first_id, scope.cutoff.last_id) {
+        let start = first_id.saturating_sub(1);
+        let through_id = last_id.min(scope.cutoff.high_water);
+        let after_id = match resumed_after {
+            None => start,
+            // A checkpoint names a position inside the window it read, and
+            // never more rows than the job may read.
+            Some(after_id)
+                if (start..=through_id).contains(&after_id)
+                    && usize::try_from(tally.scanned).unwrap_or(usize::MAX) <= max_records =>
+            {
+                after_id
+            }
+            Some(_) => return Err(ReplayStop::Failed("checkpoint_unreadable")),
+        };
         let mut query = ReplayPageQuery {
             from_epoch_us: scope.from_epoch_us,
             to_epoch_us: scope.to_epoch_us,
-            after_id: first_id.saturating_sub(1),
-            through_id: last_id.min(scope.cutoff.high_water),
+            after_id,
+            through_id,
             limit: REPLAY_PAGE_RECORDS,
             max_record_bytes: MAX_REPLAY_RECORD_BYTES,
             max_page_bytes: MAX_REPLAY_PAGE_BYTES,
@@ -530,8 +813,8 @@ pub(crate) fn run(
             if remaining == 0 {
                 break;
             }
-            if control.is_cancelled() {
-                return Err(ReplayStop::Cancelled);
+            if let Some(stop) = control.stop_requested() {
+                return Err(stop);
             }
             query.limit = remaining.min(REPLAY_PAGE_RECORDS);
             let page = source
@@ -541,8 +824,8 @@ pub(crate) fn run(
                 break;
             }
             for (id, row) in &page {
-                if control.is_cancelled() {
-                    return Err(ReplayStop::Cancelled);
+                if let Some(stop) = control.stop_requested() {
+                    return Err(stop);
                 }
                 if Instant::now() >= deadline {
                     deadline_exceeded = true;
@@ -557,10 +840,18 @@ pub(crate) fn run(
                 query.after_id = *id;
                 control.scanned.store(tally.scanned, Ordering::Relaxed);
             }
+            if let Some(sink) = checkpoints {
+                let document = tally.checkpoint(query.after_id);
+                let size = serde_json::to_vec(&document).map_or(usize::MAX, |bytes| bytes.len());
+                if size > MAX_REPLAY_CHECKPOINT_BYTES {
+                    return Err(ReplayStop::Failed("checkpoint_too_large"));
+                }
+                sink.page_done(query.after_id, tally.scanned, &document)?;
+            }
         }
     }
-    if control.is_cancelled() {
-        return Err(ReplayStop::Cancelled);
+    if let Some(stop) = control.stop_requested() {
+        return Err(stop);
     }
     let mut limitations = Vec::new();
     if deadline_exceeded {

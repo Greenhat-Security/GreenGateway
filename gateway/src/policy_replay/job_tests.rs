@@ -17,9 +17,9 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use super::{
     impact::ReplayPolicies,
     job::{
-        run, ReplayControl, ReplayOutcome, ReplayScope, ReplaySource, ReplaySourceCheck,
-        ReplaySourceError, ReplayStop, MAX_REPLAY_RECORDS, MAX_REPLAY_RECORD_BYTES,
-        REPLAY_PAGE_RECORDS,
+        run, run_resumable, ReplayCheckpoints, ReplayControl, ReplayOutcome, ReplayScope,
+        ReplaySource, ReplaySourceCheck, ReplaySourceError, ReplayStop, MAX_REPLAY_RECORDS,
+        MAX_REPLAY_RECORD_BYTES, REPLAY_PAGE_RECORDS,
     },
     request::{parse_request, resolve_window, ReplayRequest, MAX_REPLAY_WINDOW},
 };
@@ -610,6 +610,159 @@ fn a_cancelled_run_returns_no_result() {
     assert_eq!(stopped.err(), Some(ReplayStop::Cancelled));
     assert_eq!(control.scanned(), 0);
     assert_eq!(source.pages.get(), 1);
+}
+
+/// A checkpoint sink that keeps every checkpoint a run hands it, as text,
+/// the way the cluster job store keeps it.
+#[derive(Default)]
+struct KeptCheckpoints(RefCell<Vec<(i64, u64, String)>>);
+
+impl ReplayCheckpoints for KeptCheckpoints {
+    fn page_done(&self, after_id: i64, scanned: u64, checkpoint: &Value) -> Result<(), ReplayStop> {
+        self.0
+            .borrow_mut()
+            .push((after_id, scanned, checkpoint.to_string()));
+        Ok(())
+    }
+}
+
+/// The exactly-once half of a cluster takeover, without a database: a run
+/// that keeps checkpoints produces the result one that keeps none does, and a
+/// run resumed from the checkpoint of any page -- reading only the pages after
+/// it -- produces that result byte for byte, under a candidate and both
+/// projections, so every count of every lane, transition and recorded
+/// comparison crosses the checkpoint intact. A checkpoint that is not exactly
+/// one this run wrote is refused, never resumed.
+#[test]
+fn a_run_resumed_from_any_checkpoint_produces_the_uninterrupted_result() {
+    let mut rows = Vec::new();
+    for _ in 0..3 {
+        rows.extend(mixed_window());
+    }
+    let mut source = VecSource::new(rows);
+    source.page_cap = 4;
+    let scope = source.scope(MAX_REPLAY_RECORDS);
+    let base = Policy::validate_json_value(policy_document()).expect("the base validates");
+    let mut candidate = policy_document();
+    candidate["default_action"] = json!("allow");
+    candidate["rules"].as_array_mut().expect("rules").insert(
+        0,
+        json!({ "id": "lockdown", "methods": ["GET"], "path": "/orders/**", "action": "deny" }),
+    );
+    let candidate = Policy::validate_json_value(candidate).expect("the candidate validates");
+    let projections = [Projection::AsAuthored, Projection::EnforceAllShadow];
+    let policies = ReplayPolicies::compile(&base, Some(&candidate), &projections)
+        .expect("the policies compile");
+    let deadline = || Instant::now() + Duration::from_secs(60);
+
+    let uninterrupted = run(
+        &source,
+        &policies,
+        &scope,
+        deadline(),
+        &ReplayControl::default(),
+    )
+    .expect("the run completes");
+    assert!(uninterrupted.complete);
+    let kept = KeptCheckpoints::default();
+    let checkpointed = run_resumable(
+        &source,
+        &policies,
+        &scope,
+        deadline(),
+        &ReplayControl::default(),
+        None,
+        Some(&kept),
+    )
+    .expect("the run completes");
+    assert_eq!(
+        checkpointed.digest, uninterrupted.digest,
+        "keeping checkpoints changes nothing"
+    );
+    let checkpoints = kept.0.borrow();
+    assert!(checkpoints.len() > 3, "one checkpoint per page");
+    assert_eq!(
+        checkpoints.last().map(|(_, scanned, _)| *scanned),
+        Some(uninterrupted.scanned)
+    );
+
+    for (after_id, scanned, document) in checkpoints.iter() {
+        let stored: Value = serde_json::from_str(document).expect("a checkpoint is JSON");
+        assert_eq!(stored["after_id"], json!(after_id));
+        let pages_before = source.pages.get();
+        let control = ReplayControl::default();
+        let resumed = run_resumable(
+            &source,
+            &policies,
+            &scope,
+            deadline(),
+            &control,
+            Some(&stored),
+            None,
+        )
+        .expect("the resumed run completes");
+        assert_eq!(
+            resumed.digest, uninterrupted.digest,
+            "after {scanned} records"
+        );
+        assert_eq!(resumed.result, uninterrupted.result);
+        assert_eq!(
+            resumed.scanned, uninterrupted.scanned,
+            "no record read twice"
+        );
+        assert_eq!(control.scanned(), uninterrupted.scanned);
+        let rest = usize::try_from(uninterrupted.scanned - scanned).expect("fits");
+        assert!(
+            source.pages.get() - pages_before <= rest.div_ceil(source.page_cap) + 1,
+            "a resumed run reads only the pages after its checkpoint"
+        );
+    }
+
+    let first: Value = serde_json::from_str(&checkpoints[0].2).expect("a checkpoint is JSON");
+    let refused = |policies: &ReplayPolicies, checkpoint: &Value| {
+        run_resumable(
+            &source,
+            policies,
+            &scope,
+            deadline(),
+            &ReplayControl::default(),
+            Some(checkpoint),
+            None,
+        )
+        .err()
+    };
+    let unreadable = Some(ReplayStop::Failed("checkpoint_unreadable"));
+    let mut miscounted = first.clone();
+    miscounted["records"]["scanned"] = json!(1);
+    assert_eq!(refused(&policies, &miscounted), unreadable);
+    let mut zero = first.clone();
+    zero["records"]["by_code"]["replayable"] = json!(0);
+    assert_eq!(
+        refused(&policies, &zero),
+        unreadable,
+        "a tally holds no zero"
+    );
+    let mut unknown = first.clone();
+    unknown["impact"]["extra"] = json!({});
+    assert_eq!(refused(&policies, &unknown), unreadable);
+    let mut outside = first.clone();
+    outside["after_id"] = json!(scope.cutoff.high_water + 1);
+    assert_eq!(
+        refused(&policies, &outside),
+        unreadable,
+        "a position outside the window"
+    );
+    let mut version = first.clone();
+    version["schema_version"] = json!("policy-replay-checkpoint.v0");
+    assert_eq!(refused(&policies, &version), unreadable);
+    let as_authored_only =
+        ReplayPolicies::compile(&base, Some(&candidate), &[Projection::AsAuthored])
+            .expect("the policies compile");
+    assert_eq!(
+        refused(&as_authored_only, &first),
+        unreadable,
+        "a checkpoint of other projections"
+    );
 }
 
 #[test]

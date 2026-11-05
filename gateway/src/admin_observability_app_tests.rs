@@ -4445,11 +4445,14 @@ async fn suggestions_admin_without_engine_answers_not_configured() {
                 history_store: None,
                 draft_store: None,
                 test_suite_store: None,
+                analysis_suppression_store: None,
                 policy_tests_required: false,
                 #[cfg(feature = "postgres")]
                 control_plane: None,
                 #[cfg(feature = "postgres")]
                 membership: None,
+                #[cfg(feature = "postgres")]
+                replay_cluster: None,
                 event_store: None,
                 query_store: None,
                 authority_evidence: authority_events::required::AuthorityEvidenceGate::best_effort(
@@ -8619,6 +8622,7 @@ mod cluster_discovery_tests {
                     draft_store: Some(
                         Arc::new(policy_store.draft_store()) as Arc<dyn storage::PolicyDraftStore>
                     ),
+                    analysis_suppression_store: None,
                     test_suite_store: policy_tests_required.then(|| {
                         Arc::new(policy_store.test_suite_store())
                             as Arc<dyn storage::PolicyTestSuiteStore>
@@ -8628,6 +8632,7 @@ mod cluster_discovery_tests {
                         policy_store.clone() as Arc<dyn storage::PolicyControlPlane>
                     ),
                     membership: None,
+                    replay_cluster: None,
                     event_store: None,
                     query_store: None,
                     authority_evidence:
