@@ -297,11 +297,24 @@ fn evaluate_sections(
 ) -> Result<EvaluatedSections, EvidenceRunError> {
     let deadline = Instant::now() + POLICY_EVIDENCE_DEADLINE;
     let authority = policy_eval::PolicyAuthority::Standalone;
+    // A package is a function of its publication and its cases. This
+    // process's egress controls and global rate lanes describe the gateway
+    // now, not the one that served the publication, so an egress case or a
+    // sequence on a global lane is incomplete here rather than judged by
+    // them; an override's sequence still runs, on the publication's own
+    // limits.
+    let resources = policy_testing::synthetic::SyntheticResources::none();
     let tests = match suite {
         None => None,
         Some(suite) => {
             let outcome =
-                policy_testing::run_against_policy(publication.clone(), authority, &suite, deadline)
+                policy_testing::run_against_policy(
+                    publication.clone(),
+                    authority,
+                    &suite,
+                    &resources,
+                    deadline,
+                )
                     .map_err(|error| match error {
                         policy_testing::RunError::Compile(error) => {
                             tracing::error!(error = ?error, "a publication under evidence could not be compiled");
@@ -345,16 +358,20 @@ fn evaluate_sections(
                     false,
                 ),
             };
-            let outcome =
-                simulate(&pairs, &selection.cases, selection.trace, deadline).map_err(|error| {
-                    match error {
-                        SimulationError::CaseRefused { pointer, code } => {
-                            EvidenceRunError::CaseRefused { pointer, code }
-                        }
-                        SimulationError::DeadlineExceeded => EvidenceRunError::DeadlineExceeded,
-                        SimulationError::Internal(code) => EvidenceRunError::Internal(code),
-                    }
-                })?;
+            let outcome = simulate(
+                &pairs,
+                &selection.cases,
+                selection.trace,
+                &resources,
+                deadline,
+            )
+            .map_err(|error| match error {
+                SimulationError::CaseRefused { pointer, code } => {
+                    EvidenceRunError::CaseRefused { pointer, code }
+                }
+                SimulationError::DeadlineExceeded => EvidenceRunError::DeadlineExceeded,
+                SimulationError::Internal(code) => EvidenceRunError::Internal(code),
+            })?;
             Some(SimulationEvidence {
                 trace: selection.trace,
                 projections: selection.projections,
@@ -537,19 +554,20 @@ pub(super) async fn policy_evidence_endpoint(
     };
     let mut inspection = inspect_policy_for_deployment(&state, rbac_state, &stored_source);
     // The cross-resource checks a publication runs, against the resources
-    // current now, judging the publication as the replacement of what it
-    // replaced (itself, when the history holds nothing before it). No
-    // publisher is named: the caller asking for evidence is not the one who
+    // current now, judging the publication on its own: as the replacement of
+    // itself, so the checks that compare it with what it replaced (an egress
+    // change, the loss of every policy-write role) find nothing to compare.
+    // The history cannot say what it replaced -- a POLICY_FILE edit or a
+    // restart between two publications writes no version, so the version
+    // before it need not be the document that was live -- and the commit
+    // already ran those checks against the policy that was. No publisher is
+    // named either: the caller asking for evidence is not the one who
     // published, and a package must not depend on who asks for it.
     let mut resource_snapshot = None;
     let review = inspection.policy().map(|candidate| {
-        let base = reading
-            .predecessor
-            .as_ref()
-            .map_or(&reading.policy, |(_, predecessor)| predecessor);
         rbac::policy_resources::validate_resources(
             candidate,
-            base,
+            candidate,
             &rbac_state.policy_resource_view(),
             None,
         )

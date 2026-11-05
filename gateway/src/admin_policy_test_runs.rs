@@ -11,7 +11,10 @@
 //! The evaluation itself is the pure runner in `policy_testing`, on a blocking
 //! thread so a large suite cannot stall the async workers, under a deadline,
 //! and behind the same per-replica and per-actor bound simulations use
-//! ([`PolicyEvaluationLimiter`]).
+//! ([`PolicyEvaluationLimiter`]). Egress cases and isolated rate sequences
+//! read the same configuration a simulation does ([`synthetic_resources`]):
+//! the static egress lane and the global rate lanes' configured limits, never
+//! a live bucket, resolver or connection.
 use super::*;
 
 use policy_simulation::request::CandidateSource;
@@ -580,13 +583,14 @@ pub(super) async fn policy_test_runs_endpoint(
     };
 
     let suite_digest = suite.digest.clone();
+    let resources = synthetic_resources(rbac_state);
     // The blocking thread owns the slot, so a request dropped mid-run keeps
     // its slot until the run it started has ended. The deadline starts
     // before compilation, so compiling counts against it.
     let outcome = match slot
         .run_blocking(move || {
             let deadline = Instant::now() + POLICY_TEST_RUN_DEADLINE;
-            policy_testing::run_against_policy(policy, authority, &suite, deadline)
+            policy_testing::run_against_policy(policy, authority, &suite, &resources, deadline)
         })
         .await
     {

@@ -17,6 +17,18 @@ const SESSION_MARKER: &str = "5e551011-0000-4000-8000-000000000001";
 
 fn evidence(source: JournalSource, action: &str) -> JournaledEvidence {
     let (resource_owner, resource_id, prior_version, new_version) = match source {
+        // A create is the Connection's first version and a replace advances
+        // one; a binding change advances the credential revision, here the
+        // first binding of a Connection created without one.
+        JournalSource::ConnectionChange if action == ACTION_CONNECTION_CREATE => {
+            (None, CONNECTION_MARKER, None, Some(1))
+        }
+        JournalSource::ConnectionChange if action == ACTION_CONNECTION_REPLACE => {
+            (None, CONNECTION_MARKER, Some(3), Some(4))
+        }
+        JournalSource::ConnectionChange if action == ACTION_CREDENTIAL_BINDING_CHANGE => {
+            (None, CONNECTION_MARKER, Some(0), Some(1))
+        }
         JournalSource::ConnectionChange => (None, CONNECTION_MARKER, Some(3), None),
         // An issue is the token's first revision; a rotate or a revoke
         // advances one.
@@ -37,9 +49,18 @@ fn evidence(source: JournalSource, action: &str) -> JournaledEvidence {
                 actor_issuer: None,
                 actor_kind: None,
                 actor_auth_mode: None,
+                revision_axis: None,
                 ..evidence(JournalSource::JwtRevocation, action)
             };
         }
+    };
+    // Only a Connection change row names its axis (migration 28).
+    let revision_axis = match source {
+        JournalSource::ConnectionChange if action == ACTION_CREDENTIAL_BINDING_CHANGE => {
+            Some("credential".to_owned())
+        }
+        JournalSource::ConnectionChange => Some("connection".to_owned()),
+        _ => None,
     };
     JournaledEvidence {
         position: 41,
@@ -57,6 +78,7 @@ fn evidence(source: JournalSource, action: &str) -> JournaledEvidence {
         actor_issuer: Some(ACTOR_ISSUER_MARKER.to_owned()),
         actor_kind: Some("principal".to_owned()),
         actor_auth_mode: Some("session_cookie".to_owned()),
+        revision_axis,
     }
 }
 
@@ -76,6 +98,12 @@ fn with_actor(
 
 fn every_delivered_shape() -> Vec<JournaledEvidence> {
     vec![
+        evidence(JournalSource::ConnectionChange, ACTION_CONNECTION_CREATE),
+        evidence(JournalSource::ConnectionChange, ACTION_CONNECTION_REPLACE),
+        evidence(
+            JournalSource::ConnectionChange,
+            ACTION_CREDENTIAL_BINDING_CHANGE,
+        ),
         evidence(JournalSource::ConnectionChange, ACTION_CONNECTION_DELETE),
         evidence(
             JournalSource::ServiceTokenChange,
@@ -177,6 +205,37 @@ fn revisions_follow_the_v1_transition_of_each_operation() {
         ("connection", Some("3"), None)
     );
     assert_eq!(deleted.security.as_deref(), Some("17"));
+
+    // A Connection create starts its specification version chain, a replace
+    // advances it, and a binding change advances the credential revision,
+    // from 0 for a Connection that had no credential authority.
+    for (action, axis, before, after) in [
+        (ACTION_CONNECTION_CREATE, "connection", None, Some("1")),
+        (
+            ACTION_CONNECTION_REPLACE,
+            "connection",
+            Some("3"),
+            Some("4"),
+        ),
+        (
+            ACTION_CREDENTIAL_BINDING_CHANGE,
+            "credential",
+            Some("0"),
+            Some("1"),
+        ),
+    ] {
+        let changed = revision(JournalSource::ConnectionChange, action);
+        assert_eq!(
+            (
+                changed.axis.as_str(),
+                changed.before.as_deref(),
+                changed.after.as_deref(),
+                changed.security.as_deref()
+            ),
+            (axis, before, after, Some("17")),
+            "{action}"
+        );
+    }
 
     // An issue creates the token's first revision: nothing before it.
     let issued = revision(
@@ -472,6 +531,206 @@ fn an_issue_projects_only_as_the_tokens_first_revision() {
             "{source:?}"
         );
     }
+}
+
+/// A Connection create, replace and credential binding change (journaled
+/// since migration 28) are delivered only in the shapes migration 28's CHECK
+/// admits, on the axis the row recorded: a create as the first specification
+/// version, a replace advancing a positive one, and a binding change
+/// advancing the credential revision, which may start at 0. Each names the
+/// Connection, referenced under the Connection domain, and keeps its shared
+/// revision. A row that claims another transition, names no axis or another
+/// action's axis, or comes from another table is refused rather than
+/// delivered.
+#[test]
+fn connection_changes_project_only_on_their_recorded_axis() {
+    let keyring = generated_keyring(Uuid::new_v4());
+    let validator = delivery_schema();
+    for action in [
+        ACTION_CONNECTION_CREATE,
+        ACTION_CONNECTION_REPLACE,
+        ACTION_CREDENTIAL_BINDING_CHANGE,
+    ] {
+        let base = evidence(JournalSource::ConnectionChange, action);
+        let record = project(&base, &keyring).expect("a Connection change projects");
+        assert_eq!(record.operation, action);
+        assert_eq!(record.resource.kind, "connection");
+        assert_eq!(
+            keyring.verify(
+                ReferenceDomain::Connection,
+                &[CONNECTION_MARKER],
+                &record.resource.reference
+            ),
+            Ok(ReferenceCheck::Current)
+        );
+        let value = serde_json::to_value(&record).expect("a record serializes");
+        if let Err(error) = validator.validate(&value) {
+            panic!("the published schema must accept {value}: {error}");
+        }
+
+        let mut unrevisioned = base.clone();
+        unrevisioned.security_revision = None;
+        assert_eq!(
+            project(&unrevisioned, &keyring),
+            Err(ProjectionError::MissingEvidence),
+            "{action}"
+        );
+        let mut unrecorded_axis = base.clone();
+        unrecorded_axis.revision_axis = None;
+        assert_eq!(
+            project(&unrecorded_axis, &keyring),
+            Err(ProjectionError::MissingEvidence),
+            "{action}"
+        );
+        for axis in ["connection", "credential", "token", ""] {
+            if base.revision_axis.as_deref() == Some(axis) {
+                continue;
+            }
+            let mut other_axis = base.clone();
+            other_axis.revision_axis = Some(axis.to_owned());
+            assert_eq!(
+                project(&other_axis, &keyring),
+                Err(ProjectionError::InvalidEvidence),
+                "{action} on {axis:?}"
+            );
+        }
+        // The Connection table alone holds these actions.
+        for source in [
+            JournalSource::ServiceTokenChange,
+            JournalSource::JwtRevocation,
+            JournalSource::AdminSession,
+        ] {
+            assert_eq!(
+                project(&evidence(source, action), &keyring),
+                Err(ProjectionError::UnknownAction),
+                "{action} from {source:?}"
+            );
+        }
+    }
+    // No other table names an axis.
+    let mut token_with_axis = evidence(
+        JournalSource::ServiceTokenChange,
+        ACTION_SERVICE_TOKEN_ROTATE,
+    );
+    token_with_axis.revision_axis = Some("token".to_owned());
+    assert_eq!(
+        project(&token_with_axis, &keyring),
+        Err(ProjectionError::InvalidEvidence)
+    );
+
+    for (action, prior_version, new_version, expected) in [
+        // A create is the first version and nothing before it.
+        (
+            ACTION_CONNECTION_CREATE,
+            Some(0),
+            Some(1),
+            ProjectionError::InvalidEvidence,
+        ),
+        (
+            ACTION_CONNECTION_CREATE,
+            None,
+            Some(2),
+            ProjectionError::InvalidEvidence,
+        ),
+        (
+            ACTION_CONNECTION_CREATE,
+            None,
+            None,
+            ProjectionError::MissingEvidence,
+        ),
+        // A replace advances a positive version.
+        (
+            ACTION_CONNECTION_REPLACE,
+            None,
+            Some(1),
+            ProjectionError::MissingEvidence,
+        ),
+        (
+            ACTION_CONNECTION_REPLACE,
+            Some(0),
+            Some(1),
+            ProjectionError::InvalidEvidence,
+        ),
+        (
+            ACTION_CONNECTION_REPLACE,
+            Some(3),
+            Some(3),
+            ProjectionError::InvalidEvidence,
+        ),
+        (
+            ACTION_CONNECTION_REPLACE,
+            Some(3),
+            None,
+            ProjectionError::MissingEvidence,
+        ),
+        // A binding change advances the credential revision from 0 or more.
+        (
+            ACTION_CREDENTIAL_BINDING_CHANGE,
+            None,
+            Some(1),
+            ProjectionError::MissingEvidence,
+        ),
+        (
+            ACTION_CREDENTIAL_BINDING_CHANGE,
+            Some(-1),
+            Some(1),
+            ProjectionError::InvalidEvidence,
+        ),
+        (
+            ACTION_CREDENTIAL_BINDING_CHANGE,
+            Some(0),
+            Some(0),
+            ProjectionError::InvalidEvidence,
+        ),
+        (
+            ACTION_CREDENTIAL_BINDING_CHANGE,
+            Some(2),
+            Some(1),
+            ProjectionError::InvalidEvidence,
+        ),
+        (
+            ACTION_CREDENTIAL_BINDING_CHANGE,
+            Some(1),
+            None,
+            ProjectionError::MissingEvidence,
+        ),
+        // A delete still needs a positive prior version and no successor.
+        (
+            ACTION_CONNECTION_DELETE,
+            Some(0),
+            None,
+            ProjectionError::InvalidEvidence,
+        ),
+        (
+            ACTION_CONNECTION_DELETE,
+            Some(3),
+            Some(4),
+            ProjectionError::InvalidEvidence,
+        ),
+    ] {
+        let mut refused = evidence(JournalSource::ConnectionChange, action);
+        refused.prior_version = prior_version;
+        refused.new_version = new_version;
+        assert_eq!(
+            project(&refused, &keyring),
+            Err(expected),
+            "{action} {prior_version:?} -> {new_version:?}"
+        );
+    }
+    // A later credential revision advances like any other.
+    let mut rebound = evidence(
+        JournalSource::ConnectionChange,
+        ACTION_CREDENTIAL_BINDING_CHANGE,
+    );
+    rebound.prior_version = Some(4);
+    rebound.new_version = Some(5);
+    let revision = project(&rebound, &keyring)
+        .expect("a later binding change projects")
+        .revision;
+    assert_eq!(
+        (revision.before.as_deref(), revision.after.as_deref()),
+        (Some("4"), Some("5"))
+    );
 }
 
 /// The actor's kind and auth mode are carried as the evidence recorded them

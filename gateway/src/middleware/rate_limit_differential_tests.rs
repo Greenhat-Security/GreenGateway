@@ -1002,6 +1002,7 @@ async fn in_mapped_role_mode_the_live_stage_selects_by_the_verified_organization
                         dispatch: None,
                     },
                     &facts,
+                    &mut crate::policy_eval::stages::NoStages,
                 )
                 .expect("selects");
             let expected = match expected.outcome() {

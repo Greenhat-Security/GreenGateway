@@ -93,6 +93,48 @@ fn side_effect_cases(upstream_origin: &str) -> Value {
     Value::Array(cases)
 }
 
+/// Cases that would, if anything here were live, spend the one-request
+/// bucket, resolve a name, or connect to the upstream: isolated sequences on
+/// the policy override and on the global read lane, and egress cases for the
+/// upstream's own address with and without hypothetical evidence.
+fn synthetic_side_effect_cases(upstream_port: u16) -> Vec<Value> {
+    let upstream = json!({ "scheme": "http", "host": "127.0.0.1", "port": upstream_port });
+    vec![
+        json!({
+            "id": "limited-sequence",
+            "kind": "rate",
+            "request": { "method": "GET", "path": "/limited/a" },
+            "principal": caller(),
+            "sequence": { "at_ms": [0, 0, 0] }
+        }),
+        json!({
+            "id": "anonymous-sequence",
+            "kind": "rate",
+            "request": { "method": "GET", "path": "/limited/a" },
+            "principal": "anonymous",
+            "sequence": { "at_ms": [0, 0] }
+        }),
+        json!({
+            "id": "upstream-egress-hypothetical",
+            "kind": "egress",
+            "destination": upstream,
+            "resolution": {
+                "hypothetical_addresses": [format!("127.0.0.1:{upstream_port}")]
+            }
+        }),
+        json!({
+            "id": "upstream-egress-unresolved",
+            "kind": "egress",
+            "destination": upstream
+        }),
+        json!({
+            "id": "named-egress-unresolved",
+            "kind": "egress",
+            "destination": { "scheme": "https", "host": "resolver-canary.example.test" }
+        }),
+    ]
+}
+
 fn simulation(base_etag: &str, candidate: Value, cases: Value) -> Value {
     json!({
         "schema_version": "policy-simulation.v1",
@@ -117,7 +159,14 @@ struct Harness {
     policy: TempPolicyFile,
 }
 
-fn harness_with_config(mut config: config::Config) -> Harness {
+fn harness_with_config(config: config::Config) -> Harness {
+    harness_with_resolver(config, None)
+}
+
+fn harness_with_resolver(
+    mut config: config::Config,
+    egress_resolver: Option<Arc<dyn egress::DnsResolver>>,
+) -> Harness {
     let capture = audit::sink::tests::CaptureSink::new();
     let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
     let policy = TempPolicyFile::new(
@@ -137,6 +186,7 @@ fn harness_with_config(mut config: config::Config) -> Harness {
         Instant::now(),
         GatewayAppBuildOverrides {
             disable_proxy_health_checks: true,
+            egress_resolver,
             ..GatewayAppBuildOverrides::default()
         },
     )
@@ -666,11 +716,15 @@ async fn a_cancelled_request_keeps_its_slot_until_its_blocking_work_ends() {
     );
 }
 
-/// The acceptance criterion of #243 slice 10: a simulation produces no audit
-/// record but its own, no metric beyond its own request's admission, no
-/// rate-bucket charge, and no upstream traffic -- for cases that, live, would
-/// do all of them. The audit, egress and bucket "none"s are checked against
-/// the live path afterwards, so they cannot pass vacuously.
+/// The acceptance criterion of #243 slices 10 and 12: a simulation produces
+/// no audit record but its own, no metric beyond its own request's
+/// admission, no rate-bucket charge, no tool admission or permit, no name
+/// resolution and no upstream traffic -- for cases that, live, would do all
+/// of them, isolated rate sequences and egress cases for the upstream's own
+/// address included. The audit, resolver, egress and bucket "none"s are
+/// checked against the live path afterwards, so they cannot pass vacuously.
+/// Tool admission is covered by the audit check: the tool runtime records
+/// every admission and refusal, and acquires a permit only after admission.
 #[test]
 fn a_simulation_has_no_side_effect_but_its_own_audit_record() {
     let recorder = PrometheusBuilder::new().build_recorder();
@@ -683,27 +737,78 @@ fn a_simulation_has_no_side_effect_but_its_own_audit_record() {
         .enable_all()
         .build()
         .expect("test runtime should build");
-    let (harness, mut upstream, etag, upstream_origin) = runtime.block_on(async {
+    let resolver = Arc::new(CountingDnsResolver {
+        calls: AtomicUsize::new(0),
+        address_ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+    });
+    let (harness, mut upstream, etag, upstream_origin, upstream_port) = runtime.block_on(async {
         let (upstream_addr, upstream) = spawn_capture_upstream().await;
-        let harness = harness_with_config(proxy_config(upstream_addr));
+        let harness = harness_with_resolver(
+            proxy_config(upstream_addr),
+            Some(Arc::clone(&resolver) as Arc<dyn egress::DnsResolver>),
+        );
         let etag = current_etag(&harness).await;
         (
             harness,
             upstream,
             etag,
             format!("http://127.0.0.1:{}", upstream_addr.port()),
+            upstream_addr.port(),
         )
     });
     let events_before = events_after_policy_read(&harness);
+    let resolutions_before = resolver.calls.load(Ordering::SeqCst);
+    let mut cases = side_effect_cases(&upstream_origin);
+    if let Some(cases) = cases.as_array_mut() {
+        cases.extend(synthetic_side_effect_cases(upstream_port));
+    }
 
     let response = ::metrics::with_local_recorder(&recorder, || {
         runtime.block_on(simulate_request(
             &harness,
             simulator(),
-            simulation(&etag, lockdown_edits(), side_effect_cases(&upstream_origin)).to_string(),
+            simulation(&etag, lockdown_edits(), cases).to_string(),
         ))
     });
     assert_eq!(response.status(), StatusCode::OK);
+    let report = runtime.block_on(json_body(response));
+    let by_id = cases_by_id(&report);
+    let candidate = |id: &str| by_id[id]["results"][0]["candidate"].clone();
+    // The synthetic bucket ran out; the live one, below, did not.
+    assert_eq!(
+        candidate("limited-sequence")["sequence"]["steps"],
+        json!(["allowed", "limited", "limited"])
+    );
+    assert_eq!(
+        candidate("anonymous-sequence")["sequence"]["lane"],
+        json!("global_read")
+    );
+    assert_eq!(
+        candidate("upstream-egress-hypothetical")["logical"],
+        json!("allow")
+    );
+    assert_eq!(
+        candidate("upstream-egress-unresolved")["limitation"],
+        json!("missing_resolution_evidence")
+    );
+    assert_eq!(
+        candidate("named-egress-unresolved")["reason"],
+        json!("host_not_allowed")
+    );
+    assert_eq!(
+        report["synthetic_resources"]["global_rate_lanes"],
+        json!("configured")
+    );
+    assert!(report["synthetic_resources"]["egress_controls_digest"]
+        .as_str()
+        .is_some_and(|digest| digest.starts_with("sha256:")));
+    // Resolver: no case -- not the one without evidence, not the one with a
+    // name -- asked it anything.
+    assert_eq!(
+        resolver.calls.load(Ordering::SeqCst),
+        resolutions_before,
+        "a simulation consulted the resolver"
+    );
 
     // Audit: exactly one new record, the simulation's own -- no would-deny,
     // authorization, tool or upstream record for any simulated case.
@@ -764,6 +869,10 @@ fn a_simulation_has_no_side_effect_but_its_own_audit_record() {
     assert!(
         runtime.block_on(upstream.recv()).is_some(),
         "the live request reaches the upstream"
+    );
+    assert!(
+        resolver.calls.load(Ordering::SeqCst) > resolutions_before,
+        "the live request resolves its upstream through the same resolver"
     );
     let second = runtime
         .block_on(live(&harness))

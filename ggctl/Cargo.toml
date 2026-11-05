@@ -23,6 +23,11 @@ zeroize.workspace = true
 # (`src/credential.rs`): a constant only, no call into it.
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+# The effective user ID, through rustix's safe `geteuid`, so `--ca-file` and
+# `--answers` refuse a file, a directory above it or a link on its path that
+# another account owns (`src/credential.rs`). ggctl already builds rustix
+# with these features through gateway-config's cap-std: an edge, not a crate.
+rustix = { workspace = true, features = ["process"] }
 
 [dev-dependencies]
 # Holds every report this binary writes to the published report schema.

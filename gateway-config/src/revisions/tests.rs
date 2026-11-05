@@ -1,23 +1,28 @@
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    time::UNIX_EPOCH,
-};
+use std::{fs, path::PathBuf, time::UNIX_EPOCH};
 
 use super::*;
 use crate::bundle::{BundleReport, Code};
 use crate::ledger::AuthMode;
+use crate::state_dir::StateDirectory;
 
 /// A role name that must never reach an error, a plan or a record.
 const CANARY: &str = "zqcanary";
 
 // --- fixtures -------------------------------------------------------------------
 
-struct TempDir(PathBuf);
+/// A temporary state directory, held under its lock for as long as the
+/// fixture lives, as a gateway would hold it.
+struct TempDir {
+    path: PathBuf,
+    held: Option<StateDirectory>,
+}
 
 impl Drop for TempDir {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        // Released before the directory is removed: Windows will not remove
+        // a directory with an open file in it.
+        self.held.take();
+        let _ = fs::remove_dir_all(&self.path);
     }
 }
 
@@ -34,11 +39,15 @@ impl TempDir {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
                 .expect("permissions should set");
         }
-        Self(path)
+        let held = StateDirectory::acquire(&path).expect("the state directory locks");
+        Self {
+            path,
+            held: Some(held),
+        }
     }
 
-    fn path(&self) -> &Path {
-        &self.0
+    fn held(&self) -> &StateDirectory {
+        self.held.as_ref().expect("held until the fixture drops")
     }
 }
 
@@ -158,7 +167,7 @@ fn seeded(
 ) {
     let state = TempDir::new(label);
     let (mut ledger, seed) =
-        RevisionLedger::seed(state.path(), &read(files(roles)), operator(), at(0)).expect("seed");
+        RevisionLedger::seed(state.held(), &read(files(roles)), operator(), at(0)).expect("seed");
     ledger.activate(&seed.revision).expect("activate the seed");
     (
         state,
@@ -262,7 +271,7 @@ fn a_plan_reports_the_change_and_its_apply_records_a_live_revision() {
 
     // And the revision survives a reopen with its request.
     drop(service);
-    let mut reopened = RevisionLedger::open(state.path()).expect("reopen");
+    let mut reopened = RevisionLedger::open(state.held()).expect("reopen");
     let verified = reopened.verify().expect("verify");
     assert_eq!(verified.desired, applied.revision);
     assert_eq!(verified.active, Some(applied.revision.revision.clone()));
@@ -393,10 +402,10 @@ fn two_applies_on_one_head_have_exactly_one_winner() {
     );
     assert_eq!(revisions(&mut service), 2);
 
-    // Two services on one ledger, as two processes would hold it: both plan
-    // against the same head and only the first apply is recorded.
+    // Two services on one ledger, through one held state directory: both
+    // plan against the same head and only the first apply is recorded.
     let mut other = RevisionService::new(
-        RevisionLedger::open(state.path()).expect("second handle"),
+        RevisionLedger::open(state.held()).expect("second handle"),
         PublishedSchemasCompiler,
     );
     let here = PlanSubject::Bundle(files(&["auditor", "reviewer"]));
@@ -738,7 +747,7 @@ fn a_live_change_staged_only_leaves_the_active_revision() {
 fn a_ledger_not_yet_activated_takes_staged_revisions_only() {
     let state = TempDir::new("unactivated");
     let (ledger, _seed) = RevisionLedger::seed(
-        state.path(),
+        state.held(),
         &read(files(&["auditor", "operator"])),
         operator(),
         at(0),
@@ -904,6 +913,183 @@ fn a_rollback_is_a_new_forward_revision_from_prior_content() {
     assert_eq!(revisions(&mut service), 3);
 }
 
+fn offline_rollback(plan: &Plan, target: &RevisionId, acknowledged: &[&str]) -> OfflineRollback {
+    OfflineRollback {
+        plan: plan.id.clone(),
+        actor: operator(),
+        target: target.clone(),
+        acknowledged: acknowledged.iter().map(|code| (*code).to_owned()).collect(),
+    }
+}
+
+#[test]
+fn an_offline_rollback_acknowledges_every_risk_by_name_and_stages_a_forward_revision() {
+    let (_state, mut service, seed) = seeded("offline-rollback", &["auditor", "operator"]);
+    let candidate = PlanSubject::Bundle(files(&["auditor"]));
+    let plan = service
+        .create_plan(plan_id(1), admin(), candidate.clone(), at(10))
+        .expect("plan");
+    let second = service
+        .apply(
+            apply_request(&plan, "apply-1", candidate),
+            everything,
+            at(20),
+        )
+        .expect("apply")
+        .revision;
+    assert_eq!(
+        service.state().expect("state").active,
+        Some(second.revision.clone())
+    );
+
+    // The same rollback plan an online caller would get.
+    let target = seed.revision.clone();
+    let plan = service
+        .create_plan(
+            PlanId::offline(),
+            operator(),
+            PlanSubject::Rollback(target.clone()),
+            at(30),
+        )
+        .expect("rollback plan");
+    assert_eq!(plan.base, second.revision);
+    assert_eq!(plan.risk_codes, ["risk.policy_broadened"]);
+    assert_eq!(plan.activation, Some(ActivationClass::Live));
+
+    // Every risk code is named, exactly; nothing else is accepted.
+    for (acknowledged, expected) in [
+        (&[][..], "apply.acknowledgement_required"),
+        (&["risk.unknown_impact"], "plan.acknowledgement_mismatch"),
+        (
+            &["risk.policy_broadened", "risk.unknown_impact"],
+            "plan.acknowledgement_mismatch",
+        ),
+    ] {
+        assert_eq!(
+            code(
+                service
+                    .apply_offline_rollback(offline_rollback(&plan, &target, acknowledged), at(31))
+            ),
+            expected
+        );
+    }
+    // Only the plan's own system actor applies it, for its own target.
+    let mut by_principal = offline_rollback(&plan, &target, &["risk.policy_broadened"]);
+    by_principal.actor = admin();
+    assert_eq!(
+        code(service.apply_offline_rollback(by_principal, at(31))),
+        "apply.offline_actor_required"
+    );
+    let mut by_another = offline_rollback(&plan, &target, &["risk.policy_broadened"]);
+    by_another.actor = LedgerActor::system("another-command").expect("recordable");
+    assert_eq!(
+        code(service.apply_offline_rollback(by_another, at(31))),
+        "plan.unknown"
+    );
+    assert_eq!(
+        code(service.apply_offline_rollback(
+            offline_rollback(&plan, &second.revision, &["risk.policy_broadened"]),
+            at(31)
+        )),
+        "plan.stale"
+    );
+    assert_eq!(revisions(&mut service), 2);
+
+    let applied = service
+        .apply_offline_rollback(
+            offline_rollback(&plan, &target, &["risk.policy_broadened"]),
+            at(32),
+        )
+        .expect("roll back offline");
+    let third = applied.revision;
+    assert_eq!(third.sequence, 3);
+    assert_eq!(
+        third.operation,
+        Operation::Rollback {
+            target: target.clone()
+        }
+    );
+    assert_eq!(third.bundle.source_digest, seed.bundle.source_digest);
+    assert_eq!(third.actor, operator());
+    assert_eq!(third.request, None);
+    // A live change, recorded restart-class: no gateway is running to
+    // activate it, so only the desired pointer moves.
+    assert_eq!(third.activation, ActivationClass::Restart);
+    assert_eq!(third.codes.risk_codes(), ["risk.policy_broadened"]);
+    assert_eq!(
+        third.codes.required_permissions(),
+        [ADMIN_CONFIG_WRITE, ADMIN_POLICY_WRITE]
+    );
+    assert!(applied.desired && !applied.active && applied.restart_pending);
+    let state = service.state().expect("state");
+    assert_eq!(state.desired.revision, third.revision);
+    assert_eq!(state.active, Some(second.revision.clone()));
+    // The plan is consumed, and history was appended to, never rewritten.
+    assert_eq!(
+        code(service.apply_offline_rollback(
+            offline_rollback(&plan, &target, &["risk.policy_broadened"]),
+            at(33)
+        )),
+        "plan.unknown"
+    );
+    let history: Vec<_> = service
+        .history(None, 10)
+        .expect("history")
+        .into_iter()
+        .map(|revision| revision.revision)
+        .collect();
+    assert_eq!(
+        history,
+        [third.revision, second.revision, seed.revision.clone()]
+    );
+
+    // The seed's content again changes nothing.
+    let unchanged = service
+        .create_plan(
+            PlanId::offline(),
+            operator(),
+            PlanSubject::Rollback(seed.revision.clone()),
+            at(40),
+        )
+        .expect("plan");
+    assert_eq!(
+        code(
+            service
+                .apply_offline_rollback(offline_rollback(&unchanged, &seed.revision, &[]), at(41))
+        ),
+        "apply.no_change"
+    );
+    assert_eq!(revisions(&mut service), 3);
+}
+
+#[test]
+fn offline_every_risk_code_is_acknowledgeable_but_only_by_name() {
+    let removed = vec!["risk.admin_access_path_removed".to_owned()];
+    // The one code no online request may acknowledge is acknowledged
+    // offline like any other.
+    assert!(offline_acknowledgement(&removed, &removed).is_ok());
+    let both = vec![
+        "risk.admin_access_path_removed".to_owned(),
+        "risk.policy_broadened".to_owned(),
+    ];
+    let reversed: Vec<String> = both.iter().rev().cloned().collect();
+    assert!(offline_acknowledgement(&both, &reversed).is_ok());
+    let code = |result: Result<(), RevisionError>| result.map_err(|error| error.code());
+    assert_eq!(
+        code(offline_acknowledgement(&both, &[])),
+        Err("apply.acknowledgement_required")
+    );
+    assert_eq!(
+        code(offline_acknowledgement(&both, &removed)),
+        Err("plan.acknowledgement_mismatch")
+    );
+    assert_eq!(
+        code(offline_acknowledgement(&[], &removed)),
+        Err("plan.nothing_to_acknowledge")
+    );
+    assert_eq!(code(offline_acknowledgement(&[], &[])), Ok(()));
+}
+
 /// Validators that have grown stricter since a revision was recorded: they
 /// refuse any policy granting a role named `legacy`.
 struct RefusesLegacy;
@@ -967,7 +1153,7 @@ fn stored_content_is_held_to_the_current_validators() {
     // A rollback to content the current validators refuse is refused, with
     // the reader's own diagnostics.
     let mut stricter = RevisionService::new(
-        RevisionLedger::open(state.path()).expect("reopen"),
+        RevisionLedger::open(state.held()).expect("reopen"),
         StricterCompiler,
     );
     match stricter.create_plan(
@@ -987,7 +1173,7 @@ fn stored_content_is_held_to_the_current_validators() {
     // A head the current validators refuse cannot be planned against.
     let state = TempDir::new("stricter-head");
     let (ledger, _seed) =
-        RevisionLedger::seed(state.path(), &read(files(&["legacy"])), operator(), at(0))
+        RevisionLedger::seed(state.held(), &read(files(&["legacy"])), operator(), at(0))
             .expect("seed");
     let mut stricter = RevisionService::new(ledger, StricterCompiler);
     assert_eq!(
@@ -1264,6 +1450,7 @@ fn errors_are_stable_and_value_free() {
         RevisionError::Forbidden(vec![ADMIN_POLICY_WRITE]),
         RevisionError::RestartRequired,
         RevisionError::RestartPending,
+        RevisionError::OfflineActorRequired,
         RevisionError::Ledger(LedgerError::Full),
     ];
     let mut codes = BTreeSet::new();

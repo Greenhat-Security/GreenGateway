@@ -13,7 +13,10 @@
 //! evaluation is the pure [`policy_simulation::run`] on a blocking thread,
 //! behind a per-replica and a per-actor bound on concurrent simulations
 //! and a deadline, and nothing about it touches a rate bucket, tool permit,
-//! resolver or upstream.
+//! resolver or upstream. An isolated rate sequence runs on a fresh synthetic
+//! bucket built from the selected lane's configured limits, and an egress case
+//! is judged by the egress client's static egress lane over the case's own
+//! hypothetical addresses: both read configuration, never live state.
 //!
 //! The concurrency bound, [`PolicyEvaluationLimiter`], is shared with policy
 //! test runs, historical replay jobs and policy analyses: each endpoint admits
@@ -142,6 +145,27 @@ impl PolicyEvaluationSlot {
         tokio::task::spawn_blocking(move || {
             let _slot = self;
             work()
+        })
+        .await
+    }
+
+    /// Run one step of a longer evaluation on a blocking thread that owns
+    /// this slot, and hand the slot back with the step's output, so an
+    /// evaluation that alternates awaited reads with blocking work holds one
+    /// slot throughout. As with [`Self::run_blocking`], a request dropped
+    /// mid-step leaves the slot with the step, which gives it back when the
+    /// step ends.
+    pub(super) async fn run_blocking_step<T, F>(
+        self,
+        work: F,
+    ) -> Result<(Self, T), tokio::task::JoinError>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        tokio::task::spawn_blocking(move || {
+            let output = work();
+            (self, output)
         })
         .await
     }
@@ -507,6 +531,24 @@ async fn simulation_candidate(
         })
 }
 
+/// What a synthetic run of this gateway's admin API decides egress cases and
+/// rate sequences by: the static egress lane the egress client decides every
+/// destination by, and the global rate lanes' configured limits. Shared with
+/// policy test runs.
+///
+/// An egress case is judged by this process's egress controls, never a
+/// candidate's `egress` section: a policy write cannot change egress without a
+/// restart (`egress_change_requires_restart`), so these are the controls any
+/// published candidate would meet.
+pub(super) fn synthetic_resources(
+    rbac_state: &middleware::rbac::RbacState,
+) -> policy_testing::synthetic::SyntheticResources {
+    policy_testing::synthetic::SyntheticResources {
+        global_rate_lanes: rbac_state.global_rate_lanes(),
+        egress: rbac_state.static_egress_policy(),
+    }
+}
+
 struct SimulationBinding {
     base_etag: String,
     security_revision: Option<i64>,
@@ -519,6 +561,7 @@ struct SimulationBinding {
 fn simulation_report(
     request: &SimulationRequest,
     binding: &SimulationBinding,
+    resources: &policy_testing::synthetic::ResourceBinding,
     outcome: policy_simulation::run::SimulationOutcome,
 ) -> Value {
     let mut base = json!({ "source": "active", "etag": binding.base_etag });
@@ -540,8 +583,11 @@ fn simulation_report(
             "http_context_version": policy_eval::CONTEXT_VERSION,
             "tool_semantics_version": policy_eval::tools::TOOL_SEMANTICS_VERSION,
             "tool_context_version": policy_eval::tools::TOOL_CONTEXT_VERSION,
+            "egress_semantics_version": policy_eval::egress::EGRESS_SEMANTICS_VERSION,
+            "egress_context_version": policy_eval::egress::EGRESS_CONTEXT_VERSION,
             "gateway_version": env!("CARGO_PKG_VERSION"),
         },
+        "synthetic_resources": resources,
         "base": base,
         "candidate": candidate,
         "trace": {
@@ -721,6 +767,8 @@ pub(super) async fn policy_simulations_endpoint(
         stored,
     };
 
+    let resources = synthetic_resources(rbac_state);
+    let resource_binding = resources.binding();
     let simulation = Arc::new(simulation);
     let evaluated = Arc::clone(&simulation);
     // The blocking thread owns the slot, so a request dropped mid-evaluation
@@ -738,7 +786,13 @@ pub(super) async fn policy_simulations_endpoint(
                     );
                     SimulationError::Internal("compile_failed")
                 })?;
-            simulate(&pairs, &evaluated.cases, evaluated.trace, deadline)
+            simulate(
+                &pairs,
+                &evaluated.cases,
+                evaluated.trace,
+                &resources,
+                deadline,
+            )
         })
         .await
     {
@@ -775,7 +829,7 @@ pub(super) async fn policy_simulations_endpoint(
         }
     };
     let summary = outcome.summary.clone();
-    let report = simulation_report(&simulation, &binding, outcome);
+    let report = simulation_report(&simulation, &binding, &resource_binding, outcome);
     let body = match serde_json::to_vec(&report) {
         Ok(body) => body,
         Err(error) => {
