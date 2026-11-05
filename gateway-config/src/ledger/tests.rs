@@ -15,6 +15,7 @@ use crate::bundle::{
     read_bundle, sha256_pin, PublishedSchemasOnly, ReadOptions, MANIFEST_MEDIA_TYPE,
 };
 use crate::canonical_json;
+use crate::state_dir::{StateDirError, LOCK_FILE_NAME};
 
 /// A role name that must never reach an error or a record's metadata.
 const CANARY: &str = "zqcanary";
@@ -47,6 +48,44 @@ impl TempDir {
 
     fn ledger(&self) -> PathBuf {
         self.0.join(LEDGER_FILE_NAME)
+    }
+}
+
+/// A state directory, held under its lock for as long as the fixture lives,
+/// as a gateway or `ggctl` would hold it.
+struct State {
+    held: Option<StateDirectory>,
+    directory: TempDir,
+}
+
+impl Drop for State {
+    fn drop(&mut self) {
+        // Released before the directory is removed: Windows will not remove
+        // a directory with an open file in it.
+        self.held.take();
+    }
+}
+
+impl State {
+    fn new(label: &str) -> Self {
+        let directory = TempDir::new(label);
+        let held = StateDirectory::acquire(directory.path()).expect("the state directory locks");
+        Self {
+            held: Some(held),
+            directory,
+        }
+    }
+
+    fn held(&self) -> &StateDirectory {
+        self.held.as_ref().expect("held until the fixture drops")
+    }
+
+    fn path(&self) -> &Path {
+        self.directory.path()
+    }
+
+    fn ledger(&self) -> PathBuf {
+        self.directory.ledger()
     }
 }
 
@@ -179,17 +218,17 @@ fn rollback_proposal<'a>(
     }
 }
 
-fn seeded(label: &str, role: &str) -> (TempDir, RevisionLedger, RevisionSummary) {
-    let state = TempDir::new(label);
+fn seeded(label: &str, role: &str) -> (State, RevisionLedger, RevisionSummary) {
+    let state = State::new(label);
     let (ledger, seed) =
-        RevisionLedger::seed(state.path(), &bundle(role), operator(), at(0)).expect("seed");
+        RevisionLedger::seed(state.held(), &bundle(role), operator(), at(0)).expect("seed");
     (state, ledger, seed)
 }
 
 /// A connection outside the ledger, as an edit outside the gateway would
 /// use: no defensive mode, no foreign keys, and the append-only triggers in
 /// the way only until it drops them.
-fn outside(state: &TempDir) -> Connection {
+fn outside(state: &State) -> Connection {
     let connection = Connection::open(state.ledger()).expect("an outside connection should open");
     connection
         .execute_batch("PRAGMA foreign_keys = OFF;")
@@ -255,9 +294,9 @@ fn corruption(result: Result<RevisionLedger, LedgerError>) -> Corruption {
 #[test]
 fn a_seeded_ledger_holds_its_bundle_as_the_desired_revision() {
     let bundle = bundle("first");
-    let state = TempDir::new("seed");
+    let state = State::new("seed");
     let (mut ledger, seed) =
-        RevisionLedger::seed(state.path(), &bundle, operator(), at(0)).expect("seed");
+        RevisionLedger::seed(state.held(), &bundle, operator(), at(0)).expect("seed");
 
     assert_eq!(seed.sequence, 1);
     assert_eq!(seed.parent, None);
@@ -309,7 +348,7 @@ fn a_seeded_ledger_holds_its_bundle_as_the_desired_revision() {
 
     // And all of it survives a reopen.
     drop(ledger);
-    let mut reopened = RevisionLedger::open(state.path()).expect("reopen");
+    let mut reopened = RevisionLedger::open(state.held()).expect("reopen");
     assert_eq!(reopened.verify().expect("verify").desired, seed);
     assert_eq!(
         reopened.revision(&seed.revision).expect("read"),
@@ -320,9 +359,9 @@ fn a_seeded_ledger_holds_its_bundle_as_the_desired_revision() {
 #[test]
 fn the_record_format_is_pinned() {
     let bundle = bundle("first");
-    let state = TempDir::new("format");
+    let state = State::new("format");
     let (ledger, seed) =
-        RevisionLedger::seed(state.path(), &bundle, operator(), at(0)).expect("seed");
+        RevisionLedger::seed(state.held(), &bundle, operator(), at(0)).expect("seed");
     drop(ledger);
     let pin = |role: FileRole| {
         bundle
@@ -381,7 +420,7 @@ fn seeding_refuses_an_existing_ledger_or_journal_files() {
     let bundle = bundle("first");
     let (state, ledger, _) = seeded("seed-twice", "first");
     assert_eq!(
-        RevisionLedger::seed(state.path(), &bundle, operator(), at(1)).map(|_| ()),
+        RevisionLedger::seed(state.held(), &bundle, operator(), at(1)).map(|_| ()),
         Err(LedgerError::Exists)
     );
     drop(ledger);
@@ -389,11 +428,11 @@ fn seeding_refuses_an_existing_ledger_or_journal_files() {
     // A previous ledger's journal could be replayed into a new database of
     // the same name.
     for suffix in ["-wal", "-shm", "-journal"] {
-        let state = TempDir::new("leftover-journal");
+        let state = State::new("leftover-journal");
         let leftover = PathBuf::from(format!("{}{suffix}", state.ledger().display()));
         fs::write(&leftover, b"journal").expect("leftover should write");
         assert_eq!(
-            RevisionLedger::seed(state.path(), &bundle, operator(), at(1)).map(|_| ()),
+            RevisionLedger::seed(state.held(), &bundle, operator(), at(1)).map(|_| ()),
             Err(LedgerError::Exists),
             "{suffix}"
         );
@@ -403,19 +442,19 @@ fn seeding_refuses_an_existing_ledger_or_journal_files() {
 
 #[test]
 fn an_interrupted_seed_leaves_no_ledger_and_is_discarded_by_the_next() {
-    let state = TempDir::new("interrupted");
+    let state = State::new("interrupted");
     // What a crash before publication leaves: a temporary database and its
     // hot journal, never the ledger's own name.
     let temporary = PathBuf::from(format!("{}.seed", state.ledger().display()));
     fs::write(&temporary, b"half-written").expect("temporary should write");
     fs::write(format!("{}-journal", temporary.display()), b"journal").expect("journal");
     assert_eq!(
-        RevisionLedger::open(state.path()).map(|_| ()),
+        RevisionLedger::open(state.held()).map(|_| ()),
         Err(LedgerError::Missing)
     );
 
     let (_ledger, seed) =
-        RevisionLedger::seed(state.path(), &bundle("first"), operator(), at(0)).expect("seed");
+        RevisionLedger::seed(state.held(), &bundle("first"), operator(), at(0)).expect("seed");
     assert_eq!(seed.sequence, 1);
     assert!(!temporary.exists());
     let mut names: Vec<_> = fs::read_dir(state.path())
@@ -430,36 +469,123 @@ fn an_interrupted_seed_leaves_no_ledger_and_is_discarded_by_the_next() {
         .filter(|name| !name.ends_with("-wal") && !name.ends_with("-shm"))
         .collect();
     names.sort();
-    assert_eq!(names, [LEDGER_FILE_NAME]);
+    assert_eq!(names, [LEDGER_FILE_NAME, LOCK_FILE_NAME]);
 }
 
 #[test]
 fn opening_refuses_a_missing_ledger_and_unsafe_locations() {
-    let state = TempDir::new("locations");
+    let state = State::new("locations");
     assert_eq!(
-        RevisionLedger::open(state.path()).map(|_| ()),
+        RevisionLedger::open(state.held()).map(|_| ()),
         Err(LedgerError::Missing)
     );
-    assert_eq!(
-        RevisionLedger::open(&state.path().join("absent")).map(|_| ()),
-        Err(LedgerError::UnsafeLocation)
-    );
+    // A state directory that is missing, not a directory, a link or shared
+    // writable is refused before any ledger can be opened in it
+    // (`state_dir::tests`).
     let not_a_directory = state.path().join("file");
     fs::write(&not_a_directory, b"").expect("file should write");
     assert_eq!(
-        RevisionLedger::open(&not_a_directory).map(|_| ()),
-        Err(LedgerError::UnsafeLocation)
-    );
-    assert_eq!(
-        RevisionLedger::seed(&not_a_directory, &bundle("first"), operator(), at(0)).map(|_| ()),
-        Err(LedgerError::UnsafeLocation)
+        StateDirectory::acquire(&not_a_directory).map(|_| ()),
+        Err(StateDirError::NotDirectory)
     );
     fs::create_dir(state.ledger()).expect("directory should create");
-    let error = RevisionLedger::open(state.path()).map(|_| ());
+    let error = RevisionLedger::open(state.held()).map(|_| ());
     assert_eq!(error, Err(LedgerError::UnsafeLocation));
     // No error names a path.
     let shown = error.expect_err("refused").to_string();
     assert!(!shown.contains(LEDGER_FILE_NAME), "{shown}");
+}
+
+/// No ledger opens without its state directory's lock, and an open ledger
+/// keeps the lock held whatever happens to the handle it was opened
+/// through, so a second process can never open it.
+#[test]
+fn an_open_ledger_keeps_its_state_directory_locked() {
+    let directory = TempDir::new("held-by-ledger");
+    let held = StateDirectory::acquire(directory.path()).expect("acquire");
+    let (ledger, _) =
+        RevisionLedger::seed(&held, &bundle("first"), operator(), at(0)).expect("seed");
+    drop(held);
+    assert_eq!(
+        StateDirectory::acquire(directory.path()).map(|_| ()),
+        Err(StateDirError::Locked),
+        "the seeded ledger holds the lock"
+    );
+    drop(ledger);
+
+    let held = StateDirectory::acquire(directory.path()).expect("released with the ledger");
+    let first = RevisionLedger::open(&held).expect("open");
+    let second = RevisionLedger::open(&held).expect("a second handle through the same lock");
+    drop(held);
+    drop(first);
+    assert_eq!(
+        StateDirectory::acquire(directory.path()).map(|_| ()),
+        Err(StateDirError::Locked),
+        "the remaining handle holds the lock"
+    );
+    drop(second);
+    StateDirectory::acquire(directory.path()).expect("released with the last handle");
+}
+
+/// Inspecting verifies everything opening verifies, through a read-only
+/// connection, and changes nothing in the ledger file.
+#[test]
+fn inspecting_verifies_the_whole_ledger_read_only() {
+    let (state, [_, _, third]) = three_revisions("inspect");
+    let before = fs::read(state.ledger()).expect("ledger bytes");
+    let inspected = RevisionLedger::inspect(state.held()).expect("a sound ledger inspects");
+    assert_eq!(inspected.revisions, 3);
+    assert_eq!(inspected.desired.revision, third.revision);
+    assert_eq!(inspected.active, None);
+    assert_eq!(fs::read(state.ledger()).expect("ledger bytes"), before);
+    let mut ledger = RevisionLedger::open(state.held()).expect("open");
+    assert_eq!(ledger.state().expect("state"), inspected);
+    drop(ledger);
+
+    let connection = outside(&state);
+    let edited = String::from_utf8(record_bytes(&connection, 2))
+        .expect("UTF-8")
+        .replace("\"subject\":\"alice\"", "\"subject\":\"mallory\"");
+    past_trigger(
+        &connection,
+        "config_revisions_no_update",
+        &format!(
+            "UPDATE config_revisions SET record = CAST('{edited}' AS BLOB) WHERE sequence = 2"
+        ),
+    );
+    drop(connection);
+    let tampered = fs::read(state.ledger()).expect("ledger bytes");
+    assert_eq!(
+        RevisionLedger::inspect(state.held()),
+        Err(LedgerError::Corrupt(Corruption::RecordHash))
+    );
+    assert_eq!(fs::read(state.ledger()).expect("ledger bytes"), tampered);
+
+    let empty = State::new("inspect-missing");
+    assert_eq!(
+        RevisionLedger::inspect(empty.held()),
+        Err(LedgerError::Missing)
+    );
+    fs::write(empty.ledger(), b"not a ledger").expect("file should write");
+    assert!(matches!(
+        RevisionLedger::inspect(empty.held()),
+        Err(LedgerError::Corrupt(_))
+    ));
+}
+
+/// A state directory whose permissions were widened after it was locked is
+/// refused at the next open and seed.
+#[cfg(unix)]
+#[test]
+fn a_state_directory_widened_after_locking_is_refused() {
+    let state = State::new("unix-widened");
+    set_mode(state.path(), 0o770);
+    assert_eq!(
+        RevisionLedger::seed(state.held(), &bundle("first"), operator(), at(0)).map(|_| ()),
+        Err(LedgerError::UnsafeLocation)
+    );
+    assert!(!state.ledger().exists());
+    set_mode(state.path(), 0o700);
 }
 
 #[cfg(unix)]
@@ -478,23 +604,23 @@ fn opening_refuses_linked_or_shared_writable_ledgers() {
 
     set_mode(&state.ledger(), 0o660);
     assert_eq!(
-        RevisionLedger::open(state.path()).map(|_| ()),
+        RevisionLedger::open(state.held()).map(|_| ()),
         Err(LedgerError::UnsafeLocation)
     );
     set_mode(&state.ledger(), 0o600);
 
     set_mode(state.path(), 0o770);
     assert_eq!(
-        RevisionLedger::open(state.path()).map(|_| ()),
+        RevisionLedger::open(state.held()).map(|_| ()),
         Err(LedgerError::UnsafeLocation)
     );
     set_mode(state.path(), 0o700);
-    RevisionLedger::open(state.path()).expect("the restored ledger opens");
+    RevisionLedger::open(state.held()).expect("the restored ledger opens");
 
-    let linked = TempDir::new("unix-link");
+    let linked = State::new("unix-link");
     std::os::unix::fs::symlink(state.ledger(), linked.ledger()).expect("symlink");
     assert_eq!(
-        RevisionLedger::open(linked.path()).map(|_| ()),
+        RevisionLedger::open(linked.held()).map(|_| ()),
         Err(LedgerError::UnsafeLocation)
     );
 }
@@ -545,7 +671,7 @@ fn revisions_chain_to_their_parents_and_a_stale_head_writes_nothing() {
 #[test]
 fn two_handles_appending_on_one_head_have_exactly_one_winner() {
     let (state, mut first, seed) = seeded("two-handles", "first");
-    let mut second = RevisionLedger::open(state.path()).expect("a second handle");
+    let mut second = RevisionLedger::open(state.held()).expect("a second handle");
     let one = bundle("one");
     let other = bundle("other");
     let winner = first
@@ -634,9 +760,9 @@ fn a_live_revision_activates_only_when_no_restart_is_pending() {
 #[test]
 fn a_rollback_is_a_new_revision_bound_to_its_targets_content() {
     let first = bundle("first");
-    let state = TempDir::new("rollback");
+    let state = State::new("rollback");
     let (mut ledger, seed) =
-        RevisionLedger::seed(state.path(), &first, operator(), at(0)).expect("seed");
+        RevisionLedger::seed(state.held(), &first, operator(), at(0)).expect("seed");
     let second = bundle("second");
     let applied = ledger
         .append(&seed.revision, proposal(&second, ActivationClass::Restart))
@@ -690,7 +816,7 @@ fn a_rollback_is_a_new_revision_bound_to_its_targets_content() {
         [rolled_back.revision, applied.revision, seed.revision]
     );
     drop(ledger);
-    RevisionLedger::open(state.path()).expect("the rolled-back ledger verifies");
+    RevisionLedger::open(state.held()).expect("the rolled-back ledger verifies");
 }
 
 #[test]
@@ -945,11 +1071,11 @@ fn errors_are_value_free_and_stable() {
 /// Three revisions: the seed's bundle, a second bundle, and the seed's
 /// bundle again, so the newest revision shares every document with the
 /// first.
-fn three_revisions(label: &str) -> (TempDir, [RevisionSummary; 3]) {
+fn three_revisions(label: &str) -> (State, [RevisionSummary; 3]) {
     let first = bundle(CANARY);
-    let state = TempDir::new(label);
+    let state = State::new(label);
     let (mut ledger, seed) =
-        RevisionLedger::seed(state.path(), &first, operator(), at(0)).expect("seed");
+        RevisionLedger::seed(state.held(), &first, operator(), at(0)).expect("seed");
     let second = ledger
         .append(
             &seed.revision,
@@ -987,7 +1113,7 @@ fn the_schema_refuses_updates_deletes_and_backward_pointer_moves() {
         .execute_batch("UPDATE config_ledger_pointer SET active_sequence = NULL")
         .is_err());
     drop(connection);
-    let mut ledger = RevisionLedger::open(state.path()).expect("nothing changed");
+    let mut ledger = RevisionLedger::open(state.held()).expect("nothing changed");
     assert_eq!(ledger.state().expect("state").revisions, 3);
     assert!(ledger.revision(&seed.revision).expect("read").is_some());
 }
@@ -1009,7 +1135,7 @@ fn an_edited_record_is_detected() {
     );
     drop(connection);
     assert_eq!(
-        corruption(RevisionLedger::open(state.path())),
+        corruption(RevisionLedger::open(state.held())),
         Corruption::RecordHash
     );
 }
@@ -1026,7 +1152,7 @@ fn a_consistently_forged_record_breaks_the_chain() {
     // The forged row hashes correctly; its successor still names the
     // original.
     assert_eq!(
-        corruption(RevisionLedger::open(state.path())),
+        corruption(RevisionLedger::open(state.held())),
         Corruption::Chain
     );
 }
@@ -1041,7 +1167,7 @@ fn a_forged_head_is_detected_by_the_pointer() {
     forge_record(&connection, 3, &value);
     drop(connection);
     assert_eq!(
-        corruption(RevisionLedger::open(state.path())),
+        corruption(RevisionLedger::open(state.held())),
         Corruption::Pointer
     );
 }
@@ -1066,7 +1192,7 @@ fn a_non_canonical_record_is_refused_even_though_it_hashes_correctly() {
         .expect("restore");
     drop(connection);
     assert_eq!(
-        corruption(RevisionLedger::open(state.path())),
+        corruption(RevisionLedger::open(state.held())),
         Corruption::Record
     );
 }
@@ -1092,7 +1218,7 @@ fn an_edited_or_extra_document_is_detected() {
     );
     drop(connection);
     assert_eq!(
-        corruption(RevisionLedger::open(state.path())),
+        corruption(RevisionLedger::open(state.held())),
         Corruption::Document
     );
 
@@ -1105,7 +1231,7 @@ fn an_edited_or_extra_document_is_detected() {
         )
         .expect("insert");
     assert_eq!(
-        corruption(RevisionLedger::open(state.path())),
+        corruption(RevisionLedger::open(state.held())),
         Corruption::Document
     );
 }
@@ -1120,7 +1246,7 @@ fn a_removed_revision_is_detected() {
         "DELETE FROM config_revisions WHERE sequence = 2",
     );
     assert_eq!(
-        corruption(RevisionLedger::open(state.path())),
+        corruption(RevisionLedger::open(state.held())),
         Corruption::Chain
     );
 
@@ -1132,7 +1258,7 @@ fn a_removed_revision_is_detected() {
         "DELETE FROM config_revisions WHERE sequence = 3",
     );
     assert_eq!(
-        corruption(RevisionLedger::open(state.path())),
+        corruption(RevisionLedger::open(state.held())),
         Corruption::Pointer
     );
 }
@@ -1149,7 +1275,7 @@ fn a_pointer_moved_behind_the_head_is_detected() {
         ),
     );
     assert_eq!(
-        corruption(RevisionLedger::open(state.path())),
+        corruption(RevisionLedger::open(state.held())),
         Corruption::Pointer
     );
 }
@@ -1161,7 +1287,7 @@ fn a_changed_schema_is_detected() {
         .execute_batch("DROP TRIGGER config_revisions_no_delete;")
         .expect("drop");
     assert_eq!(
-        corruption(RevisionLedger::open(state.path())),
+        corruption(RevisionLedger::open(state.held())),
         Corruption::Schema
     );
 
@@ -1172,7 +1298,7 @@ fn a_changed_schema_is_detected() {
         )
         .expect("create");
     assert_eq!(
-        corruption(RevisionLedger::open(state.path())),
+        corruption(RevisionLedger::open(state.held())),
         Corruption::Schema
     );
 }
@@ -1192,7 +1318,7 @@ fn a_damaged_database_file_is_refused() {
     }
     fs::write(state.ledger(), &bytes).expect("damage");
     assert!(matches!(
-        RevisionLedger::open(state.path()),
+        RevisionLedger::open(state.held()),
         Err(LedgerError::Corrupt(_))
     ));
 }
@@ -1204,7 +1330,7 @@ fn a_foreign_or_newer_file_is_refused() {
         .execute_batch("PRAGMA application_id = 1;")
         .expect("pragma");
     assert_eq!(
-        corruption(RevisionLedger::open(state.path())),
+        corruption(RevisionLedger::open(state.held())),
         Corruption::Format
     );
 
@@ -1213,14 +1339,14 @@ fn a_foreign_or_newer_file_is_refused() {
         .execute_batch("PRAGMA user_version = 2;")
         .expect("pragma");
     assert_eq!(
-        RevisionLedger::open(state.path()).map(|_| ()),
+        RevisionLedger::open(state.held()).map(|_| ()),
         Err(LedgerError::Unsupported)
     );
 
-    let state = TempDir::new("empty-file");
+    let state = State::new("empty-file");
     fs::write(state.ledger(), b"").expect("empty ledger file");
     assert_eq!(
-        corruption(RevisionLedger::open(state.path())),
+        corruption(RevisionLedger::open(state.held())),
         Corruption::Format
     );
 }
@@ -1228,7 +1354,7 @@ fn a_foreign_or_newer_file_is_refused() {
 #[test]
 fn a_handle_that_found_corruption_refuses_every_later_call() {
     let (state, [seed, second, third]) = three_revisions("poisoned");
-    let mut ledger = RevisionLedger::open(state.path()).expect("open");
+    let mut ledger = RevisionLedger::open(state.held()).expect("open");
     let pin = second
         .bundle
         .files
@@ -1271,7 +1397,7 @@ fn a_handle_that_found_corruption_refuses_every_later_call() {
 #[test]
 fn an_append_never_chains_onto_an_edited_head() {
     let (state, [_, _, third]) = three_revisions("edited-head");
-    let mut ledger = RevisionLedger::open(state.path()).expect("open");
+    let mut ledger = RevisionLedger::open(state.held()).expect("open");
     let connection = outside(&state);
     let edited = String::from_utf8(record_bytes(&connection, 3))
         .expect("UTF-8")
@@ -1303,7 +1429,7 @@ fn an_append_never_chains_onto_an_edited_head() {
 #[test]
 fn a_rollback_whose_content_was_swapped_is_detected() {
     let (state, [seed, second, third]) = three_revisions("swapped-rollback");
-    let mut ledger = RevisionLedger::open(state.path()).expect("open");
+    let mut ledger = RevisionLedger::open(state.held()).expect("open");
     let rolled_back = ledger
         .append(
             &third.revision,
@@ -1329,7 +1455,7 @@ fn a_rollback_whose_content_was_swapped_is_detected() {
     drop(connection);
     assert_ne!(hash, rolled_back.record_hash);
     assert_eq!(
-        corruption(RevisionLedger::open(state.path())),
+        corruption(RevisionLedger::open(state.held())),
         Corruption::Chain
     );
 }
@@ -1346,7 +1472,7 @@ fn a_documents_source_digest_is_checked_against_the_manifest() {
         format!("sha256:{}", "0".repeat(64))
     );
     assert_eq!(
-        corruption(RevisionLedger::open(state.path())),
+        corruption(RevisionLedger::open(state.held())),
         Corruption::Document
     );
     // Sanity: the frame the check uses is the bundle reader's.
@@ -1372,7 +1498,7 @@ fn a_documents_source_digest_is_checked_against_the_manifest() {
 fn seeded_with_record_edit(
     label: &str,
     edit: impl FnOnce(&mut Value),
-) -> (TempDir, [RevisionSummary; 1]) {
+) -> (State, [RevisionSummary; 1]) {
     let (state, ledger, seed) = seeded(label, "first");
     drop(ledger);
     let connection = outside(&state);
@@ -1395,7 +1521,7 @@ fn a_record_naming_an_unknown_document_version_is_unsupported() {
         value["bundle"]["api_version"] = Value::from("greengateway.dev/v1beta1");
     });
     assert_eq!(
-        RevisionLedger::open(state.path()).map(|_| ()),
+        RevisionLedger::open(state.held()).map(|_| ()),
         Err(LedgerError::Unsupported)
     );
 
@@ -1404,7 +1530,7 @@ fn a_record_naming_an_unknown_document_version_is_unsupported() {
         value["note"] = Value::from("added");
     });
     assert_eq!(
-        corruption(RevisionLedger::open(state.path())),
+        corruption(RevisionLedger::open(state.held())),
         Corruption::Record
     );
 }
@@ -1488,7 +1614,7 @@ fn a_request_is_recorded_with_its_revision_and_indexed_by_its_key() {
     assert_eq!(ledger.state().expect("state").revisions, 2);
 
     drop(ledger);
-    let mut reopened = RevisionLedger::open(state.path()).expect("reopen");
+    let mut reopened = RevisionLedger::open(state.held()).expect("reopen");
     assert_eq!(reopened.verify().expect("verify").desired, second);
     assert_eq!(
         reopened.revision_for_request("apply-1").expect("lookup"),
@@ -1626,7 +1752,7 @@ fn an_edited_request_index_is_detected() {
         "DELETE FROM config_ledger_requests",
     );
     assert_eq!(
-        corruption(RevisionLedger::open(state.path())),
+        corruption(RevisionLedger::open(state.held())),
         Corruption::Request
     );
 
@@ -1638,7 +1764,7 @@ fn an_edited_request_index_is_detected() {
         "UPDATE config_ledger_requests SET sequence = 1",
     );
     assert_eq!(
-        corruption(RevisionLedger::open(state.path())),
+        corruption(RevisionLedger::open(state.held())),
         Corruption::Request
     );
 
@@ -1651,7 +1777,7 @@ fn an_edited_request_index_is_detected() {
         )
         .expect("the row should insert");
     assert_eq!(
-        corruption(RevisionLedger::open(state.path())),
+        corruption(RevisionLedger::open(state.held())),
         Corruption::Request
     );
 }

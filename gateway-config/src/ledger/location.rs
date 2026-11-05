@@ -1,6 +1,11 @@
 //! Where the ledger lives: the checks on the state directory and the ledger
 //! file, and how a seed publishes a new ledger under its name.
 //!
+//! The caller holds the state directory's lock ([`crate::state_dir`]); its
+//! admission rules are checked again here, by path, before every open and
+//! seed, so a directory whose permissions were widened since it was locked
+//! is refused.
+//!
 //! A seed builds the ledger in a temporary file beside it, commits and
 //! flushes it, then hard-links it to [`LEDGER_FILE_NAME`]. Linking never
 //! replaces an existing name, so two seeds cannot both win and a ledger is
@@ -15,6 +20,7 @@ use std::{
 };
 
 use super::{LedgerError, LEDGER_FILE_NAME};
+use crate::state_dir::{is_reparse_point, owner_alone_can_write};
 
 /// What SQLite appends to a database's name for its write-ahead log, shared
 /// memory index and rollback journal. A leftover one could be replayed into
@@ -156,19 +162,11 @@ fn suffixed(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// The state directory must be a directory, not a link or reparse point,
-/// and not writable by group or other, who could otherwise swap the ledger.
+/// The state directory must still meet its admission rules: a directory,
+/// not a link or reparse point, and not writable by group or other, who
+/// could otherwise swap the ledger.
 fn check_directory(state_dir: &Path) -> Result<(), LedgerError> {
-    let metadata = fs::symlink_metadata(state_dir).map_err(|_| LedgerError::UnsafeLocation)?;
-    if metadata.is_dir()
-        && !metadata.file_type().is_symlink()
-        && !is_reparse_point(&metadata)
-        && owner_alone_can_write(&metadata)
-    {
-        Ok(())
-    } else {
-        Err(LedgerError::UnsafeLocation)
-    }
+    crate::state_dir::check_directory(state_dir).map_err(|_| LedgerError::UnsafeLocation)
 }
 
 /// A regular file, not a link or reparse point, that only its owner can
@@ -195,28 +193,4 @@ fn sync_directory(directory: &Path) -> io::Result<()> {
 #[cfg(not(unix))]
 fn sync_directory(_: &Path) -> io::Result<()> {
     Ok(())
-}
-
-#[cfg(unix)]
-fn owner_alone_can_write(metadata: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    metadata.mode() & 0o022 == 0
-}
-
-/// Windows ACLs remain an operator and platform responsibility, as they are
-/// for bundle directories.
-#[cfg(not(unix))]
-fn owner_alone_can_write(_: &fs::Metadata) -> bool {
-    true
-}
-
-#[cfg(windows)]
-fn is_reparse_point(metadata: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    metadata.file_attributes() & 0x0000_0400 != 0
-}
-
-#[cfg(not(windows))]
-fn is_reparse_point(_: &fs::Metadata) -> bool {
-    false
 }

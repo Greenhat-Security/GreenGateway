@@ -342,16 +342,25 @@ impl PostgresConnectionStore {
         finish_read(&client, OPERATION_GET, outcome).await
     }
 
-    /// Create a managed connection: capacity-checked, validated, and
-    /// committed with its first immutable specification version, the
-    /// derived credential bindings, and the shared-state bumps (security
-    /// revision, connections high-water mark, outbox row).
+    /// Create a managed connection on behalf of `actor`: capacity-checked,
+    /// validated, and committed with its first immutable specification
+    /// version, the derived credential bindings, the shared-state bumps
+    /// (security revision, connections high-water mark, outbox row), and its
+    /// durable `connection.create` evidence (`connection_change_evidence`,
+    /// migration 28) with that evidence's journal row (migration 21). An
+    /// actor the evidence cannot record exactly is refused before any
+    /// transaction opens; a refused create writes no evidence, and a create
+    /// whose evidence or journal row cannot be written -- the journal full
+    /// included -- does not commit.
     pub async fn create(
         &self,
         candidate: ConnectionWrite,
-        actor_user_id: &str,
+        actor: &crate::auth::change_actor::ChangeActor,
         collection: Option<super::store::CollectionCheck<'_>>,
     ) -> Result<StoredConnection, ConnectionStoreError> {
+        validate_evidence_actor(actor)?;
+        // One logical operation, minted once per call (see `delete`).
+        let operation_id = uuid::Uuid::new_v4();
         let candidate = validate_candidate(candidate)?;
         let spec_json =
             serde_json::to_string(&candidate).map_err(|source| ConnectionStoreError::Json {
@@ -430,15 +439,34 @@ impl PostgresConnectionStore {
                 &id,
                 revisions.connection,
                 &spec_json,
-                actor_user_id,
+                actor.subject(),
             )
             .await?;
-            bump_connection_state(
+            let security_revision = bump_connection_state(
                 &client,
                 RESOURCE_CONNECTION,
                 &id,
                 None,
                 revisions.connection,
+            )
+            .await?;
+            // The create's evidence carries the outbox row's shared revision
+            // and the Connection's first specification version. A credential
+            // binding the create configures is part of the Connection it
+            // creates, as in the standalone store: only a later replacement
+            // that advances the credential revision is a binding change.
+            record_change_evidence(
+                &client,
+                &ChangeEvidence {
+                    operation_id,
+                    action: EVIDENCE_ACTION_CREATE,
+                    id: &id,
+                    axis: EvidenceAxis::Connection,
+                    prior_version: None,
+                    new_version: Some(revisions.connection),
+                    security_revision,
+                    actor,
+                },
             )
             .await?;
             Ok(StoredConnection {
@@ -462,18 +490,26 @@ impl PostgresConnectionStore {
         }
     }
 
-    /// Replace a connection's specification under its etag
-    /// compare-and-swap, computing the per-axis revisions exactly the way
-    /// the SQLite store does, and committing version/bindings/outbox in
-    /// the same transaction. An identical candidate is a committed no-op
-    /// that returns the current record unchanged.
+    /// Replace a connection's specification on behalf of `actor` under its
+    /// etag compare-and-swap, computing the per-axis revisions exactly the
+    /// way the SQLite store does, and committing version/bindings/outbox and
+    /// the replacement's evidence in the same transaction: one
+    /// `connection.replace` row and, when the credential revision advances,
+    /// one `credential.binding_change` row on the credential axis under the
+    /// same operation ID (migration 28), each journaled. The evidence is
+    /// required as for `create`. An identical candidate is a committed no-op
+    /// that returns the current record unchanged and records nothing.
     pub async fn replace(
         &self,
         id: &ConnectionId,
         expected: &ConnectionEtag,
         candidate: ConnectionWrite,
-        actor_user_id: &str,
+        actor: &crate::auth::change_actor::ChangeActor,
     ) -> Result<StoredConnection, ConnectionStoreError> {
+        validate_evidence_actor(actor)?;
+        // One logical operation, minted once per call: both rows a
+        // credential-changing replacement writes carry it.
+        let operation_id = uuid::Uuid::new_v4();
         let candidate = validate_candidate(candidate)?;
         let spec_json =
             serde_json::to_string(&candidate).map_err(|source| ConnectionStoreError::Json {
@@ -583,10 +619,10 @@ impl PostgresConnectionStore {
                 id,
                 revisions.connection,
                 &spec_json,
-                actor_user_id,
+                actor.subject(),
             )
             .await?;
-            bump_connection_state(
+            let security_revision = bump_connection_state(
                 &client,
                 RESOURCE_CONNECTION,
                 id,
@@ -594,6 +630,42 @@ impl PostgresConnectionStore {
                 revisions.connection,
             )
             .await?;
+            record_change_evidence(
+                &client,
+                &ChangeEvidence {
+                    operation_id,
+                    action: EVIDENCE_ACTION_REPLACE,
+                    id,
+                    axis: EvidenceAxis::Connection,
+                    prior_version: Some(current.revisions.connection),
+                    new_version: Some(revisions.connection),
+                    security_revision,
+                    actor,
+                },
+            )
+            .await?;
+            // A replacement that changed credential authority records that
+            // change too, on its own axis and under the same operation and
+            // shared revision (connections/store.rs `replace`). The bindings
+            // themselves -- secret IDs, header names, purposes -- never enter
+            // the evidence: the Connection's identity and credential revision
+            // name the change.
+            if revisions.credential != current.revisions.credential {
+                record_change_evidence(
+                    &client,
+                    &ChangeEvidence {
+                        operation_id,
+                        action: EVIDENCE_ACTION_CREDENTIAL_CHANGE,
+                        id,
+                        axis: EvidenceAxis::Credential,
+                        prior_version: Some(current.revisions.credential),
+                        new_version: Some(revisions.credential),
+                        security_revision,
+                        actor,
+                    },
+                )
+                .await?;
+            }
             Ok(StoredConnection {
                 id: id.clone(),
                 write: candidate,
@@ -684,7 +756,9 @@ impl PostgresConnectionStore {
                     operation_id,
                     action: EVIDENCE_ACTION_DELETE,
                     id,
-                    prior_version: current.revisions.connection,
+                    axis: EvidenceAxis::Connection,
+                    prior_version: Some(current.revisions.connection),
+                    new_version: None,
                     security_revision,
                     actor,
                 },
@@ -4962,11 +5036,35 @@ async fn bump_connection_state(
 }
 
 /// The closed action vocabulary of `connection_change_evidence`
-/// (migration 16). Values are the proposed authority-event operation
-/// codes (`docs/schemas/authority_event.v1.schema.json`), so a later
-/// projection needs no translation table; the migration's CHECK refuses
-/// anything else.
+/// (migration 16, the create, replace and credential binding change since
+/// migration 28). Values are the proposed authority-event operation codes
+/// (`docs/schemas/authority_event.v1.schema.json`), the ones the standalone
+/// store uses too, so a projection needs no translation table; the
+/// migrations' CHECK refuses anything else.
+const EVIDENCE_ACTION_CREATE: &str = "connection.create";
+const EVIDENCE_ACTION_REPLACE: &str = "connection.replace";
+const EVIDENCE_ACTION_CREDENTIAL_CHANGE: &str = "credential.binding_change";
 const EVIDENCE_ACTION_DELETE: &str = "connection.delete";
+
+/// The revision chain an evidence row's prior and new versions belong to
+/// (migration 28's closed `revision_axis`): the Connection's
+/// `connection_revision` for `connection.*`, its `credential_revision` for
+/// `credential.binding_change`. The migration's CHECK pairs each action
+/// with exactly one axis.
+#[derive(Clone, Copy)]
+enum EvidenceAxis {
+    Connection,
+    Credential,
+}
+
+impl EvidenceAxis {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Connection => "connection",
+            Self::Credential => "credential",
+        }
+    }
+}
 
 /// The longest actor migrations 16 and 23 accept. It is exactly the
 /// principal subject bound authentication enforces, so evidence never
@@ -5017,7 +5115,12 @@ struct ChangeEvidence<'a> {
     operation_id: uuid::Uuid,
     action: &'static str,
     id: &'a ConnectionId,
-    prior_version: u64,
+    /// Which revision chain `prior_version` and `new_version` count.
+    axis: EvidenceAxis,
+    /// The revision on `axis` before the change; `None` for a create.
+    prior_version: Option<u64>,
+    /// The revision on `axis` after the change; `None` for a delete.
+    new_version: Option<u64>,
     security_revision: i64,
     actor: &'a crate::auth::change_actor::ChangeActor,
 }
@@ -5036,15 +5139,23 @@ async fn record_change_evidence(
 ) -> Result<(), ConnectionStoreError> {
     let event_id = uuid::Uuid::new_v4().to_string();
     let operation_id = evidence.operation_id.to_string();
-    let prior_version = u64_to_i64(evidence.id, evidence.prior_version)?;
+    let version = |value: Option<u64>| {
+        value
+            .map(|value| u64_to_i64(evidence.id, value))
+            .transpose()
+    };
+    let prior_version = version(evidence.prior_version)?;
+    let new_version = version(evidence.new_version)?;
     client
         .execute(
             r#"
             INSERT INTO greengateway.connection_change_evidence (
                 event_id, operation_id, actor_user_id, actor_issuer, actor_kind,
-                actor_auth_mode, action, connection_id, prior_version, security_revision
+                actor_auth_mode, action, connection_id, revision_axis, prior_version,
+                new_version, security_revision
             ) VALUES (
-                $1::text::uuid, $2::text::uuid, $3, $4, $5, $6, $7, $8::text::uuid, $9, $10
+                $1::text::uuid, $2::text::uuid, $3, $4, $5, $6, $7, $8::text::uuid, $9, $10,
+                $11, $12
             )
             "#,
             &[
@@ -5056,7 +5167,9 @@ async fn record_change_evidence(
                 &evidence.actor.auth_mode(),
                 &evidence.action,
                 &evidence.id.as_str(),
+                &evidence.axis.as_str(),
                 &prior_version,
+                &new_version,
                 &evidence.security_revision,
             ],
         )
