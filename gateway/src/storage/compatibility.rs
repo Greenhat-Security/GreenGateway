@@ -53,7 +53,7 @@
 //!
 //! Schema presence alone never enables an operation.
 //!
-//! The registry ([`OPERATION_REQUIREMENTS`]) holds four operations. The
+//! The registry ([`OPERATION_REQUIREMENTS`]) holds six operations. The
 //! first (issue #426, PR 2) is committing a policy document in which a role
 //! carries a `description` ([`POLICY_ROLE_DESCRIPTIONS`]). A gateway built
 //! before the field refuses such a document outright -- the role's fields
@@ -69,8 +69,18 @@
 //! [`Capability::OpenApiDiscoveryCatalogs`]) the same way. The fourth (issue
 //! #441) is recording a delegated-token purge for every replica
 //! ([`DELEGATED_TOKEN_PURGES`]), which a gateway built before the record
-//! would not apply; it waits for [`Capability::DelegatedTokenPurges`]. No
-//! operation changes the schema: migration 25, the one step that rolls,
+//! would not apply; it waits for [`Capability::DelegatedTokenPurges`]. The
+//! fifth (issue #243) is committing a policy v1 document, document format 1
+//! ([`POLICY_DOCUMENT_V1`]): a gateway that does not serve format 1 in
+//! cluster mode refuses the whole document, so the write waits until every
+//! live member advertises [`Capability::PolicyDocumentV1`] and reads format
+//! 1, and a member that lacks it and returns later fails closed on the
+//! document rather than misreading it. The sixth (issue #243) is committing
+//! a policy v1 document whose rules carry `conditions`
+//! ([`POLICY_RULE_CONDITIONS`]): a gateway that serves format 1 but not
+//! rule conditions refuses the whole document, so the write also waits
+//! until every live member advertises [`Capability::PolicyRuleConditions`].
+//! No operation changes the schema: migration 25, the one step that rolls,
 //! adds columns nothing writes yet, and the approved-extension list in
 //! `migrations.rs` is empty. Every other operation this binary performs
 //! belongs to the schema-25 contract, which every member serving schema 25
@@ -122,20 +132,34 @@ pub(crate) enum Capability {
     /// without it predates the protocol and can be shown to support
     /// nothing.
     OperationRequirements,
+    /// The member reads, validates and serves a policy v1 document
+    /// (`"schema_version": "1.0.0"`, document format 1) from the cluster
+    /// authority, and advertises document formats `0..=1` (issue #243). A
+    /// member without it refuses such a document, so [`POLICY_DOCUMENT_V1`]
+    /// waits for it.
+    PolicyDocumentV1,
     /// The member reads, validates and serves a policy document whose roles
     /// carry a `description` (issue #426, PR 2). A member without it refuses
     /// such a document, so [`POLICY_ROLE_DESCRIPTIONS`] waits for it.
     PolicyRoleDescriptions,
+    /// The member reads, validates and enforces a policy v1 document whose
+    /// direct rules carry `conditions` over the organization, the source
+    /// network, headers, query parameters and time windows (issue #243). A
+    /// member without it refuses such a document, so
+    /// [`POLICY_RULE_CONDITIONS`] waits for it.
+    PolicyRuleConditions,
 }
 
 impl Capability {
     /// Every capability, in name order.
-    pub(crate) const KNOWN: [Self; 5] = [
+    pub(crate) const KNOWN: [Self; 7] = [
         Self::DelegatedTokenPurges,
         Self::OpenApiDiscoveryCatalogs,
         Self::OpenApiSwagger2Catalogs,
         Self::OperationRequirements,
+        Self::PolicyDocumentV1,
         Self::PolicyRoleDescriptions,
+        Self::PolicyRuleConditions,
     ];
 
     pub(crate) const fn as_str(self) -> &'static str {
@@ -144,7 +168,9 @@ impl Capability {
             Self::OpenApiDiscoveryCatalogs => "openapi_discovery_catalogs",
             Self::OpenApiSwagger2Catalogs => "openapi_swagger2_catalogs",
             Self::OperationRequirements => "operation_requirements",
+            Self::PolicyDocumentV1 => "policy_document_v1",
             Self::PolicyRoleDescriptions => "policy_role_descriptions",
+            Self::PolicyRuleConditions => "policy_rule_conditions",
         }
     }
 
@@ -161,7 +187,9 @@ pub(crate) const BINARY_CAPABILITIES: &[Capability] = &[
     Capability::OpenApiDiscoveryCatalogs,
     Capability::OpenApiSwagger2Catalogs,
     Capability::OperationRequirements,
+    Capability::PolicyDocumentV1,
     Capability::PolicyRoleDescriptions,
+    Capability::PolicyRuleConditions,
 ];
 
 /// The roster column's value for a capability set: the names sorted,
@@ -237,10 +265,11 @@ impl RecognizedCapabilities {
 
 #[cfg(feature = "postgres")]
 pub(crate) use gate::{
-    evaluate, fence_target, Activation, Backfill, BackfillState, BinaryContract, ContractFence,
-    FenceExclusion, FenceTarget, MemberAdvertisement, OperationAdmission, OperationRefusal,
-    OperationRequirement, DELEGATED_TOKEN_PURGES, OPENAPI_DISCOVERY_CATALOGS,
-    OPENAPI_SWAGGER2_CATALOGS, OPERATION_REQUIREMENTS, POLICY_ROLE_DESCRIPTIONS,
+    evaluate, evaluate_without_own_row, fence_target, Activation, Backfill, BackfillState,
+    BinaryContract, ContractFence, FenceExclusion, FenceTarget, MemberAdvertisement,
+    OperationAdmission, OperationRefusal, OperationRequirement, DELEGATED_TOKEN_PURGES,
+    OPENAPI_DISCOVERY_CATALOGS, OPENAPI_SWAGGER2_CATALOGS, OPERATION_REQUIREMENTS,
+    POLICY_DOCUMENT_V1, POLICY_ROLE_DESCRIPTIONS, POLICY_RULE_CONDITIONS,
 };
 
 #[cfg(feature = "postgres")]
@@ -397,6 +426,67 @@ mod gate {
         activation: Activation::LiveMembers,
     };
 
+    /// Committing a policy v1 document (`"schema_version": "1.0.0"`,
+    /// document format 1; issue #243): through the policy API's writes, a
+    /// discovery suggestion's acceptance, or the standalone import.
+    ///
+    /// Every gateway that can share a database with this one refuses a v1
+    /// document it does not serve; none reads it as anything else. A build
+    /// before policy v1 refuses every `schema_version` that does not start
+    /// with `0.`, as every release has since the first policy schema. A
+    /// build with policy v1 but before this operation advertises document
+    /// formats `0..=0` and refuses a stored v1 document as invalid data
+    /// (`postgres_policy`). Either way a running replica stops compiling
+    /// the active revision and holds readiness at
+    /// `security_revision_not_compiled`, serving nothing under the policy it
+    /// had, and a starting one refuses to boot. That is failing closed,
+    /// never a misreading, so live-roster agreement is enough
+    /// ([`Activation::LiveMembers`]). Raising the durable fence instead would
+    /// make the first v1 commit forbid every earlier build from rejoining
+    /// the deployment for good, even after a rollback to a 0.x revision had
+    /// removed the only thing it could not read. A lacking member also
+    /// fails the document-format half of the requirement on its own: its
+    /// advertised document range stops at 0. The document lives in the
+    /// policy tables, so the operation adds no schema object, and
+    /// `minimum_schema` is 17 for the same reason as
+    /// [`POLICY_ROLE_DESCRIPTIONS`].
+    pub(crate) const POLICY_DOCUMENT_V1: OperationRequirement = OperationRequirement {
+        operation: "policy.document_v1",
+        minimum_schema: 17,
+        document_format: Some(1),
+        capability: Capability::PolicyDocumentV1,
+        backfill: Backfill::NotRequired,
+        activation: Activation::LiveMembers,
+    };
+
+    /// Committing a policy v1 document in which any direct rule carries
+    /// `conditions` (issue #243): through the same writes as
+    /// [`POLICY_DOCUMENT_V1`], which such a commit also asks first.
+    ///
+    /// A gateway that serves format 1 but predates enforced rule conditions
+    /// validates them and refuses the whole document
+    /// (`typed_matchers_not_enforced`); none reads it without its
+    /// conditions. A running replica of that build stops compiling the
+    /// active revision and holds readiness at
+    /// `security_revision_not_compiled`, and a starting one refuses to boot.
+    /// That is failing closed, never a misreading, so live-roster agreement
+    /// is enough ([`Activation::LiveMembers`]), for the same reason as
+    /// [`POLICY_DOCUMENT_V1`]: raising the durable fence would forbid every
+    /// earlier build from rejoining even after a document without
+    /// conditions is active again. A `tool_argument` condition is still
+    /// refused by this build too, before the gate is asked. The document
+    /// lives in the policy tables, so no schema object is added, and
+    /// `minimum_schema` is 17 for the same reason as
+    /// [`POLICY_ROLE_DESCRIPTIONS`].
+    pub(crate) const POLICY_RULE_CONDITIONS: OperationRequirement = OperationRequirement {
+        operation: "policy.rule_conditions",
+        minimum_schema: 17,
+        document_format: Some(1),
+        capability: Capability::PolicyRuleConditions,
+        backfill: Backfill::NotRequired,
+        activation: Activation::LiveMembers,
+    };
+
     /// Every operation this binary gates. An operation added later
     /// registers here, advertises a new capability, and calls the gate
     /// before its write.
@@ -405,6 +495,8 @@ mod gate {
         OPENAPI_SWAGGER2_CATALOGS,
         OPENAPI_DISCOVERY_CATALOGS,
         DELEGATED_TOKEN_PURGES,
+        POLICY_DOCUMENT_V1,
+        POLICY_RULE_CONDITIONS,
     ];
 
     /// What this binary serves and advertises: the left-hand side of every
@@ -825,6 +917,45 @@ mod gate {
         fence: &ContractFence,
         backfill: Option<BackfillState>,
     ) -> Result<OperationAdmission, OperationRefusal> {
+        judge(
+            requirement,
+            binary,
+            Some(own_instance),
+            members,
+            fence,
+            backfill,
+        )
+    }
+
+    /// [`evaluate`] for a one-shot command that writes to the deployment
+    /// without a roster row of its own: the standalone import (`gateway
+    /// import-standalone`), which runs beside `gateway migrate up` rather
+    /// than as a replica. Every check is the same except the one that needs
+    /// this process on the roster. A roster with no live member admits,
+    /// because no member can be shown to lack anything, and a member that
+    /// starts afterwards is the one [`Activation::LiveMembers`] already
+    /// accounts for: it fails closed on the data. The admission's
+    /// `live_members` counts the live members, which may be none.
+    pub(crate) fn evaluate_without_own_row(
+        requirement: &OperationRequirement,
+        binary: &BinaryContract,
+        members: &[MemberAdvertisement],
+        fence: &ContractFence,
+        backfill: Option<BackfillState>,
+    ) -> Result<OperationAdmission, OperationRefusal> {
+        judge(requirement, binary, None, members, fence, backfill)
+    }
+
+    /// The decision both gates share; `own_instance` is `None` only for a
+    /// one-shot command.
+    fn judge(
+        requirement: &OperationRequirement,
+        binary: &BinaryContract,
+        own_instance: Option<Uuid>,
+        members: &[MemberAdvertisement],
+        fence: &ContractFence,
+        backfill: Option<BackfillState>,
+    ) -> Result<OperationAdmission, OperationRefusal> {
         let supported_here = binary.capabilities.contains(&requirement.capability)
             && binary.schema.0 >= requirement.minimum_schema
             && requirement
@@ -845,8 +976,10 @@ mod gate {
             }
         }
         let live: Vec<&MemberAdvertisement> = members.iter().filter(|member| member.live).collect();
-        if !live.iter().any(|member| member.instance_id == own_instance) {
-            return Err(OperationRefusal::RosterMissingThisReplica);
+        if let Some(own_instance) = own_instance {
+            if !live.iter().any(|member| member.instance_id == own_instance) {
+                return Err(OperationRefusal::RosterMissingThisReplica);
+            }
         }
         let lacking: Vec<Uuid> = live
             .iter()

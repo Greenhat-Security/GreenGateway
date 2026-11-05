@@ -79,6 +79,58 @@ or collapsing an unsafe representation should produce an equivalent admitted
 request. The existing admission/kernel property covers the shared request-size
 bounds; path-helper properties do not replace that admission check.
 
+### JWT time claims
+
+The [bounded corpus](security-corpus.md) maps every numeric `exp` and `nbf` to
+a fixed distant time, so it reaches neither the leeway edge nor a malformed
+number. Fixed examples in `gateway/src/auth/jwt_tests.rs` cover both. They are
+not generated properties: the edge moves with the current clock, which a seed
+cannot pin. Each calls the production `JwtValidator::decode_with_key`
+(jsonwebtoken 11.1.0) with a token signed by the in-memory RSA test key.
+
+- **Leeway edges.** `JWT_EXP_LEEWAY_SECS` (60) applies to `exp` and `nbf`.
+  An `exp` that lapsed 10 seconds less than the leeway ago is accepted, and
+  one that lapsed 10 seconds more is rejected; an `nbf` 10 seconds less than
+  the leeway ahead is accepted, and one 10 seconds more is rejected. The
+  margin absorbs the validator reading its whole-second clock after the test
+  reads its own, so the tests pin the leeway to within 10 seconds, not the
+  exact second of the edge.
+- **Malformed NumericDates.** `exp` and `nbf` are read only as JSON
+  integers from 0 through `u64::MAX`. RFC 7519 also allows a non-integer
+  NumericDate; the gateway does not accept one. For a valid instant `t`, the
+  test refuses `-1`, `-t`, `t.5`, `t.0`, exponent forms with an integer and a
+  decimal mantissa (`e1`, `E1`, `e9`), `"t"`, `null`, `2^64` and `2^64 + t`.
+  The integer `t` in the same payload is accepted first, so only the form can
+  refuse it, and every form but a `null` `exp` is what a wrapping, saturating,
+  rounding or string-coercing parse, or one that reads `null` as absent, would
+  turn into an accepted token. Every
+  form is refused with the generic `invalid or expired token`, by
+  `decode_with_key` and through `validate_session`. That validator's DNS
+  resolver and revocation store are the corpus doubles that count and panic on
+  use; neither is reached.
+- **Where the refusal happens.** jsonwebtoken refuses every form itself: an
+  `exp` it cannot read as a `u64` counts as missing, and `exp` is required;
+  an `nbf` it cannot read is an invalid claim format while `validate_nbf` is
+  on. `exp` is also read into the validator's own claims as an unsigned
+  integer, which fails first. `nbf` has no second check, and jsonwebtoken's
+  reader rounds a non-negative JSON float to the nearest second: a fractional
+  or exponent-form `nbf` is refused only because the workspace builds
+  `serde_json` with `arbitrary_precision`, which hands any number that is not
+  a plain integer to that reader as unparsed text. Dropping that feature, or a
+  jsonwebtoken change to either behavior, fails the test.
+- **Revocation retention.**
+  `storage::postgres_jwt_revocations::tests::retention_is_the_validator_exp_leeway_plus_at_least_a_second`
+  builds the PostgreSQL revocation store as production does, on a pool it
+  never checks out, and requires its retention to be
+  `JWT_EXP_LEEWAY_SECS + REVOCATION_RETENTION_MARGIN_SECS`, at least one
+  second past the leeway. A leeway changed without the retention fails it. It
+  needs no database and runs whenever the `postgres` feature is on.
+
+```sh
+cargo test -p gateway --locked auth::jwt::tests::
+cargo test -p gateway --locked storage::postgres_jwt_revocations::tests::
+```
+
 ## Reproduce
 
 Use the exact compiler, Node/npm and Python versions in `build-tools.json`, as

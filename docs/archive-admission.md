@@ -1,15 +1,14 @@
 # Archive entry admission
 
-**Status: rules only; nothing reads an archive yet.** This page is the
-reference for the entry admission rules in `gateway-config`
+This page is the reference for the entry admission rules in `gateway-config`
 (`gateway-config/src/archive.rs`, issue #242). They are what
 [ADR-0008](adr/0008-setup-cli-and-configuration-bundles.md) requires of every
-archive GreenGateway reads. No released command reads one: the only archive
-the ADR defines is the backup archive, and `ggctl backup verify` and
-`ggctl backup restore` are a later #242 slice, which also chooses the
-container format under the
-[dependency policy](deployment/cargo-dependency-policy.md). No archive or
-compression library is part of the build.
+archive GreenGateway reads. The only archive the ADR defines is the
+[standalone backup](standalone-backup.md) archive, which `ggctl backup verify`
+and `ggctl backup restore` read, and `ggctl backup create` reads back before it publishes one, through
+these rules. Its container is GreenGateway's own uncompressed framed format,
+chosen under the [dependency policy](deployment/cargo-dependency-policy.md):
+no archive or compression library is part of the build.
 
 Configuration bundles are **directories only**
 ([configuration-bundles.md](configuration-bundles.md)). There is no archive
@@ -132,8 +131,13 @@ Not covered by these rules, and left to the container adapter: the archive
 file's own size; container structure, checksums and end markers
 (`archive.malformed`, `archive.truncated`); and container-specific overlaps,
 such as zip entries that share compressed data. The total-size bound still
-caps what any such overlap can produce. The backup manifest's versions and
-per-entry checksums are the backup slice's to verify.
+caps what any such overlap can produce. The backup reader states tighter
+bounds of its own: at most eight entries, single-segment names of at most 64
+bytes, 64 GiB per entry and 256 GiB in total, an archive no longer than those
+allow, and every declared size within what is left of the archive file, which
+is `archive.truncated` before any of the entry is read. The backup manifest's
+versions and per-entry checksums are its to verify
+([standalone backups](standalone-backup.md#verifying-a-backup)).
 
 ## Codes
 
@@ -164,5 +168,7 @@ per-entry checksums are the backup slice's to verify.
 | `archive.read_failed` | The archive could not be read. |
 | `archive.write_failed` | An entry's data could not be written to its destination. |
 
-A published code never changes meaning. ADR-0008 maps an archive integrity
-failure to `ggctl` exit code `7`; no command reports these codes yet.
+A published code never changes meaning. `ggctl backup verify`,
+`ggctl backup create` and `ggctl backup restore` report these codes as they are, located by the entry's
+position, with exit code `7` (ADR-0008's archive integrity failure), or `1`
+for `archive.read_failed` and `archive.write_failed`.

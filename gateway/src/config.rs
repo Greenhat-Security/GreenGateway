@@ -43,6 +43,7 @@ mod bundle;
 mod environment_reads;
 #[cfg(test)]
 mod fingerprint_tests;
+mod restore;
 mod revisions;
 mod semantic_diff;
 

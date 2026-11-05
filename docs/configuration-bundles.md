@@ -358,9 +358,9 @@ reopened. Specifically:
   and the gateway must not read the same bytes differently.
 
 Bundles are directories only. There is no archive form of a bundle, so no
-archive reader sits in the configuration path; the backup archive (a later #242
-slice) has its own reader, which must apply the
-[archive entry admission rules](archive-admission.md).
+archive reader sits in the configuration path; the
+[standalone backup](standalone-backup.md) archive has its own reader, which
+applies the [archive entry admission rules](archive-admission.md).
 
 ## The YAML subset
 
@@ -440,6 +440,95 @@ ceiling; nothing raises one, and zero never means unlimited.
 | Object key | 128 bytes (`syntax.key_too_long`) | their validators' limits |
 
 An empty document is `syntax.empty_document`.
+
+## The state directory
+
+**Not yet selectable.** In bundle mode with standalone stores, and in ledger
+mode, a standalone deployment will keep every local store beneath one
+directory, `GATEWAY_STATE_DIR`, under the fixed names below
+([ADR-0008](adr/0008-setup-cli-and-configuration-bundles.md#bundle-mode)). Those
+modes replace each store's environment variable with its fixed name, so they
+will refuse the variable. No gateway reads `GATEWAY_STATE_DIR` yet, and in
+environment mode every store stays where its variable puts it. The layout, the
+admission rules and the lock are the shared `gateway-config` library's
+`state_dir` module, which the gateway and `ggctl` both use. Today the revision
+ledger, the `ggctl ledger` commands over it, and `ggctl backup create` and
+`ggctl backup restore` ([standalone backups](standalone-backup.md)) are the only
+things that open through it.
+
+| File | Store | Environment-mode variable |
+| --- | --- | --- |
+| `audit.sqlite3` | The audit store of record | `AUDIT_SQLITE_PATH` |
+| `discovery.sqlite3` | Discovered endpoints and sampled request shapes | `DISCOVERY_SQLITE_PATH` |
+| `principals.sqlite3` | The principal directory | `PRINCIPAL_SQLITE_PATH` |
+| `connections.sqlite3` | Connections and their credential bindings | `CONNECTIONS_SQLITE_PATH` |
+| `service-tokens.sqlite3` | Service tokens | `SERVICE_TOKEN_SQLITE_PATH` |
+| `policy-history.sqlite3` | Policy publication history | `POLICY_HISTORY_SQLITE_PATH` |
+| `config-ledger.sqlite3` | The [configuration revision ledger](configuration-ledger.md) | none |
+| `state.lock` | The directory's lock file | none |
+| `restore-marker.json` | The [restore marker](standalone-backup.md#the-restore-marker) `ggctl backup restore` leaves for the next gateway start, which records it and removes it | none |
+
+SQLite keeps `-wal`, `-shm` and `-journal` files beside each store; they belong
+to it. A test holds this table to the field catalog: every store the catalog
+replaces with a fixed file has exactly one name here. The names never change
+meaning, and a store that moves gets a new one. Admin sessions have no file:
+the standalone store (`ADMIN_SESSION_MODE=standalone_memory`) lives in process
+memory, so a restart still ends every session
+([ADR-0009](adr/0009-shared-admin-sessions.md)). Connections key files stay
+under `CONNECTION_SECRETS_ROOT`, outside the state directory. The policy history
+name is fixed now so no later store can take it. Bundle mode will decide
+whether it keeps a policy history beside a bundle-owned policy; in ledger mode
+the ledger is the history.
+
+**Admission.** The state directory must be a real directory: not a symbolic
+link, junction or other reparse point, and on Unix not writable by group or
+other, who could otherwise replace a store. It is checked by path, then opened
+without following a link at its last component and checked again on the open
+handle. Links in the directories above it are followed, since only someone who
+can write those can redirect the path. Windows ACLs remain the operator's
+responsibility, as they are for bundle directories.
+
+**The lock.** Opening the state directory takes an exclusive operating-system
+advisory lock on `state.lock` (`flock` on Unix, `LockFileEx` on Windows),
+opened beneath the admitted directory without following a link. It never
+waits: if another process, or another handle in the same process, holds the
+lock, the attempt fails with `state_dir.locked`, which the `ggctl ledger`
+commands, the ones that open a state directory, exit with as code 5. The lock is held for as long as the handle and every store opened
+through it live, and is released when the last of them closes or the process
+exits. An open ledger keeps it held. The lock file is created empty and
+owner-only on Unix. Its content is never read or written, and it is never
+removed: removing a held lock file would let a second process lock a new file
+of the same name. The lock is advisory. It keeps the gateway and `ggctl` apart,
+not other programs, and whoever can write the state directory controls the
+deployment.
+
+**Network filesystems.** Locks and SQLite are unsupported on network
+filesystems (ADR-0002). A best-effort check recognises the common ones so that
+`ggctl doctor` can warn with `state_dir.network_filesystem`. It is never a
+reason to refuse, because a filesystem the check does not recognise is no proof
+of a local disk:
+
+- Linux: `statfs` magic numbers for NFS, SMB, CIFS, SMB2, NCP, Coda, AFS, Ceph,
+  9P (which includes WSL 2's Windows drives), Lustre and GPFS. FUSE mounts are
+  not reported, because `sshfs` and `ntfs-3g` share one magic number.
+- macOS: `statfs` type names `nfs`, `smbfs`, `afpfs`, `webdav` and `ftp`.
+- Windows: a canonical UNC path, which is what Windows resolves a mapped network
+  drive to.
+
+| Code | Meaning | `ggctl` exit (ADR-0008) |
+| --- | --- | --- |
+| `state_dir.missing` | Nothing is at the path. | 3 |
+| `state_dir.not_directory` | The path names something other than a directory. | 3 |
+| `state_dir.link` | The path is a symbolic link, junction or reparse point. | 3 |
+| `state_dir.unsafe_permissions` | On Unix, the directory is writable by group or other. | 3 |
+| `state_dir.unsafe_lock_file` | `state.lock` is a link, not a regular file, or on Unix writable by group or other. | 3 |
+| `state_dir.locked` | Another process, or another handle in this one, holds the lock. | 5 |
+| `state_dir.lock_unsupported` | The filesystem cannot take the lock, so exclusive use cannot be promised. | 3 |
+| `state_dir.unavailable` | The directory or the lock file could not be inspected, opened or locked. | 1 |
+| `state_dir.network_filesystem` | A warning: the directory is on a recognised network filesystem. | none |
+
+The codes are value-free like every other: no path and no operating-system
+message.
 
 ## Diagnostics
 

@@ -567,6 +567,47 @@ async fn a_publication_is_read_from_the_history_and_pinned_exactly() {
 }
 
 #[tokio::test]
+async fn revalidation_does_not_judge_a_publication_as_the_replacement_of_its_predecessor() {
+    let capture = audit::sink::tests::CaptureSink::new();
+    let audit_log = || audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+    let policy = policy_file();
+    let audit_db = TempDb::new("policy-evidence-file-edit");
+    let router = evidence_router(audit_log(), &policy, &audit_db);
+    // Version 1, published through the API with the file's egress: none.
+    let initial = live_etag(&router).await;
+    put_policy(&router, &first_document(), &initial).await;
+
+    // The operator gives POLICY_FILE an egress section and restarts. Neither
+    // writes a history version.
+    let mut edited = first_document();
+    edited["egress"] = json!({ "hosts": ["api.example.test"] });
+    fs::write(
+        &policy.path,
+        serde_json::to_string_pretty(&edited).expect("serializes"),
+    )
+    .expect("the policy file should be edited");
+    drop(router);
+    let router = evidence_router(audit_log(), &policy, &audit_db);
+
+    // Version 2 keeps the live egress, so the gateway accepts it; its
+    // egress differs from version 1's, which it never replaced.
+    let mut second = second_document();
+    second["egress"] = edited["egress"].clone();
+    let restarted = live_etag(&router).await;
+    put_policy(&router, &second, &restarted).await;
+
+    let response = request_evidence(&router, admin(), &evidence_body(2)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let report = json_body(response).await["report"].clone();
+    assert_eq!(report["publication"]["predecessor"]["version"], 1);
+    // Revalidation used to judge version 2 as the replacement of version 1
+    // and report `egress_change_requires_restart` for an accepted
+    // publication.
+    assert_eq!(report["validation"]["valid"], true, "{report}");
+    assert_eq!(report["validation"]["diagnostics"], json!([]));
+}
+
+#[tokio::test]
 async fn a_package_is_released_only_once_its_export_is_recorded() {
     let sink = audit::sink::tests::DurableCaptureSink::new();
     let audit_log = audit::AuditLog::new_required(
