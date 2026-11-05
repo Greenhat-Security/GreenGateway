@@ -1,10 +1,13 @@
 # Policy test suites
 
-A policy test suite is a list of synthetic cases: a hypothetical request or
-tool question, the identity facts of a hypothetical caller, and the decision you
-expect the policy to make. `POST /v1{ADMIN_PREFIX}/policy/tests/runs` runs a
-suite against the active policy, or against a candidate you send with it, and
-answers JSON, SARIF 2.1.0 or JUnit XML (issue #243, slice 11).
+A policy test suite is a list of synthetic cases: a hypothetical request, tool
+question, rate sequence or outbound destination, the identity facts of a
+hypothetical caller where the lane has one, and the decision you expect.
+`POST /v1{ADMIN_PREFIX}/policy/tests/runs` runs a suite against the active
+policy, against a candidate you send with it, or against one of your
+server-side drafts or a version of the policy history, and answers JSON, SARIF
+2.1.0 or JUnit XML (issue #243, slice 11; isolated rate sequences and egress
+cases in slice 12).
 
 Every case is decided by the same compiled policy evaluator the gateway uses
 for live traffic (`gateway/src/policy_eval`): the runner builds the same typed
@@ -17,9 +20,12 @@ would. See [the evaluation kernel](architecture/policy-evaluation-kernel.md).
 A passing case means that the policy gives the expected answer for the facts
 the case states. It does not mean that a real request with those facts would
 succeed. Authentication, CSRF, request admission and schema validation, tool
-registry state, request rendering, rate capacity, tool leases, credentials,
-egress and DNS, transport and the upstream are not part of a policy decision
-and are not evaluated; every report lists them in `not_evaluated`.
+registry state, request rendering, live rate capacity, tool leases,
+credentials, an upstream's egress, DNS, transport and the upstream are not part
+of a policy decision and are not evaluated; every report lists them in
+`not_evaluated`. A rate sequence's steps describe a fresh, isolated bucket,
+never a live caller's allowance, and an egress case is judged over the
+addresses it supposes, never ones anything resolved.
 
 A run never passes by default:
 
@@ -33,8 +39,8 @@ A run never passes by default:
 
 A run changes nothing. It does not write or activate the policy (a candidate is
 validated and judged, never stored), emits no data-plane authorization events,
-touches no rate bucket or tool permit, makes no network request, and keeps
-nothing after it answers.
+touches no production rate bucket or tool permit, resolves no name, makes no
+network request, and keeps nothing after it answers.
 
 ## The suite document
 
@@ -95,8 +101,8 @@ and byte rather than character lengths.
 | `description` | Optional, at most 1024 bytes. Never repeated in results. |
 | `cases` | 1 to 512 cases. |
 | `cases[].id` | Unique within the suite, at most 128 bytes, an ASCII letter or digit followed by letters, digits, `.`, `_`, `:` or `-`. Results, SARIF and JUnit identify a case by this id and its JSON Pointer. |
-| `cases[].kind` | `http`, `tool`, `tool_http` or `rate`. Each kind accepts only its own members. |
-| `cases[].principal` | `"anonymous"`, or `subject` (required), `issuer`, `roles` and `auth_method` (required: `bearer_token`, `session_cookie`, `service_token` or `client_certificate`). The issuer is canonicalized as authentication canonicalizes it (a trailing `/` is dropped). |
+| `cases[].kind` | `http`, `tool`, `tool_http`, `rate` or `egress`. Each kind accepts only its own members. |
+| `cases[].principal` | Every kind but `egress`: `"anonymous"`, or `subject` (required), `issuer`, `roles`, `auth_method` (required: `bearer_token`, `session_cookie`, `service_token` or `client_certificate`) and `organization`. The issuer is canonicalized as authentication canonicalizes it (a trailing `/` is dropped). `organization` (1 to 8192 bytes) is the organization the principal's identity provider verified, which a policy's identity mappings may test; omitted, the principal has none. As on the live lanes it is read only in mapped-role mode, and no result repeats it. |
 | `cases[].expect` | What the case asserts; see below. |
 
 ### Case kinds
@@ -127,7 +133,24 @@ and byte rather than character lengths.
 - **`rate`** asks which `rate_limits` override governs `request.method` and
   `request.path` for the principal: first match in order, and never one for an
   anonymous caller, exactly as the live rate stage selects. It does not model
-  bucket capacity.
+  live bucket capacity. An optional `sequence`, `{"at_ms": [0, 0, 250]}`, runs
+  one to 64 requests at virtual instants (milliseconds since the sequence's
+  origin, at most one day, never decreasing) against a fresh bucket built from
+  the selected lane's configured rate and burst: the override's own, or, when
+  no override governs, the global `read` (`GET`, `HEAD`) or `write` lane's.
+  The bucket starts empty, so the first step meets a full burst as a key the
+  live limiter has never seen does, and each step takes the live limiter's own
+  token arithmetic. No production bucket, shared rate state or metric is read
+  or changed. See [isolated rate sequences](policy-simulation.md#isolated-rate-sequences).
+- **`egress`** asks whether the effective egress controls admit
+  `destination` (`scheme`, optional `host` and `port`, and the booleans
+  `userinfo` and `fragment`), decided by the static egress lane the egress
+  client decides by. The only resolution input is an optional
+  `resolution.hypothetical_addresses` list of up to 16 IP socket addresses.
+  Without it, a destination the static checks admit is undecided
+  (`incomplete`, `missing_resolution_evidence`); no DNS lookup ever runs and
+  there is no fallback. An egress case has no `principal`. See
+  [egress cases](policy-simulation.md#egress-cases).
 
 There is no member for a token, cookie, header, query value, body or any other
 credential or request content. A member named like one (`token`,
@@ -146,7 +169,22 @@ For `http`, `tool` and `tool_http` cases:
 | `matched` | Optional: `"none"`, `{"rule": "<rule id>"}` (a direct rule's `id`, or its position for a rule without one, as the other policy APIs name it), or, for `http` only, `{"route": <position>}`. |
 
 Only the members you write are asserted. For `rate` cases, `expect` is
-`{"rate_override": <position>}` or `{"rate_override": null}` for no override.
+`{"rate_override": <position>}` or `{"rate_override": null}` for no override,
+and, for a case with a sequence, optionally `"steps"`: one `allowed` or
+`limited` per step, in order. For `egress` cases, `expect` is `logical`
+(`allow` or `deny`) and an optional `reason`: `allowed`, `missing_host`,
+`userinfo`, `fragment`, `scheme_not_allowed`, `host_not_allowed`,
+`missing_port`, `port_not_allowed`, `empty_resolution`,
+`unexpected_resolved_port` or `non_global_address`. Assertions are subsets of
+the answer -- the lane, the step outcomes, the egress verdict -- never a trace.
+
+An egress case or a sequence that needs configuration a run does not have is
+`incomplete` with `missing_egress_controls` or
+`missing_rate_lane_configuration`. The admin API always supplies both; a
+[policy evidence package](policy-evidence.md) supplies neither, because this
+process's configuration does not describe the gateway that served a historical
+publication (a sequence on an override still runs on the publication's own
+limits).
 
 Routes and rate overrides are named by position because the current policy
 schema gives them no identifiers; a reordered policy changes them.
@@ -173,9 +211,19 @@ If-Match: "sha256:..."            (optional)
   Without it the run judges the active policy: the policy file's
   current snapshot in standalone mode, or the authoritative active document in
   cluster mode.
+- `candidate` (optional, instead of `policy`) names a stored candidate with
+  the members a [simulation's](policy-simulation.md#drafts-and-history-versions)
+  has: `{"source": "draft", "draft_id": "pd_...", "draft_etag":
+  "\"sha256:...\""}` for one of your drafts at that draft ETag, or
+  `{"source": "revision", "version": 7}` for a policy history version. It is
+  read, owner-scoped and validated again exactly as a simulation reads it,
+  and never written. A run has no `base_etag`, so a draft is judged only while
+  it is pinned to the live policy, the one it would be published over;
+  otherwise it is `409 policy_draft_base_stale`. Any other `source` is `400`:
+  an inline document is the `policy` member, and edits need a base.
 - `If-Match` (optional, active policy only) pins the run to the policy ETag you
   reviewed; a different active ETag is `412` and nothing runs. Combining it
-  with a candidate is `400`.
+  with a candidate, inline or stored, is `400`.
 
 The policy's own routes are evaluated before the handler, as for every admin
 route. A policy whose routes gate the admin API -- `dev/policy.json`, for
@@ -191,17 +239,23 @@ pipeline can gate on the header or on `status` without parsing the rendering.
 
 | Status | `reason` | Meaning |
 | --- | --- | --- |
-| `400` | `policy_tests_request_invalid` | The body is not a JSON object, repeats a member name anywhere, has a member other than `suite`, `policy` and `format`, lacks `suite`, names an unknown format, or combines `If-Match` with a candidate. |
+| `400` | `policy_tests_request_invalid` | The body is not a JSON object, repeats a member name anywhere, has a member other than `suite`, `policy`, `candidate` and `format`, lacks `suite`, names an unknown format, names both `policy` and `candidate`, has a `candidate` that is not a well-formed `draft` or `revision` (with `diagnostics` when its members are wrong), or combines `If-Match` with a candidate. |
 | `401`, `403` | -- | Not authenticated, or missing either permission. |
-| `404` | -- | No policy is configured. |
+| `404` | -- | No policy is configured, or a `revision` candidate names a deployment with no policy history. |
+| `404` | `policy_draft_not_found`, `policy_revision_not_found` | The `candidate` names no draft of yours, or a version the history does not hold. |
 | `408` | `policy_tests_request_timeout` | The body did not arrive within five seconds. Nothing ran. |
+| `409` | `policy_draft_base_stale` | The draft is pinned to another base than the live policy. |
+| `410` | `policy_draft_expired` | The draft has expired. |
 | `412` | -- | `If-Match` does not name the active policy. |
+| `412` | `policy_draft_stale` | `draft_etag` is no longer the draft's ETag. |
 | `413` | -- | The body exceeds `MAX_BODY_SIZE` or 2 MiB, whichever is lower. |
 | `422` | `policy_tests_invalid` | The suite is invalid. The body lists at most 64 `diagnostics` (`code`, JSON `pointer`, fixed `message`) and `diagnostics_truncated`. Diagnostics never repeat an input value. |
 | `422` | `policy_candidate_invalid` | The candidate policy is invalid; `errors` are the policy validator's messages. |
+| `422` | `policy_revision_incompatible` | The history version is not a policy this build and deployment accept now. |
 | `429` | `policy_tests_busy` | Four runs are already evaluating on this replica, or this caller already has one running. Nothing was queued. |
 | `500` | -- | The policy under test did not compile. No partial result. |
 | `503` | -- | Cluster mode could not read the active policy, or (`policy_tests_deadline_exceeded`) the run did not finish within five seconds. No partial result. |
+| `503` | `policy_drafts_unavailable`, `policy_history_unavailable` | The drafts store or the policy history the candidate names could not be read. |
 
 Diagnostic codes: `invalid_type`, `missing_field`, `unknown_field`,
 `forbidden_field`, `invalid_value`, `too_long`, `unsupported_schema_version`,
@@ -222,7 +276,13 @@ Diagnostic codes: `invalid_type`, `missing_field`, `unknown_field`,
     "http_semantics_version": "gg-http-alias-v1",
     "http_context_version": 3,
     "tool_semantics_version": "gg-tool-policy-v1",
-    "tool_context_version": 1
+    "tool_context_version": 1,
+    "egress_semantics_version": "gg-static-egress-v1",
+    "egress_context_version": 1
+  },
+  "synthetic_resources": {
+    "egress_controls_digest": "sha256:...",
+    "global_rate_lanes": "configured"
   },
   "gateway_version": "1.0.1",
   "not_evaluated": ["authentication", "csrf", "..."],
@@ -252,18 +312,23 @@ Diagnostic codes: `invalid_type`, `missing_field`, `unknown_field`,
   `policy-tests.v1`. The version defines no normalization beyond JCS, so member
   order and whitespace do not change it and any other change does.
 - `policy.etag` is the active policy's ETag, or for a candidate the ETag it
-  would have once written. `policy.source` is `active` or `inline_candidate`
-  (or `publication` inside a [policy evidence package](policy-evidence.md));
-  cluster mode adds `security_revision`.
+  would have once written. `policy.source` is `active`, `inline_candidate`,
+  `draft` or `revision` (or `publication` inside a
+  [policy evidence package](policy-evidence.md)); cluster mode adds
+  `security_revision` for the active policy. A `draft` adds the `draft_id` and
+  the `draft_revision` it was read at, and a `revision` the `version`.
 - Each case reports its `status` (`passed`, `failed`, `incomplete`, `error`),
   what was `expected`, what the evaluator answered in stable codes (`actual`,
   absent for `error`), which expectations did not hold (`mismatches`, in the
-  order `logical`, `effect`, `reason`, `matched`, `rate_override`), and for an
-  evaluator refusal its stable `error` code.
+  order `logical`, `effect`, `reason`, `matched`, `rate_override`, `steps`),
+  and for an evaluator refusal its stable `error` code. A sequence's step
+  outcomes are `expected.steps` and `actual.steps`.
+- `synthetic_resources` binds the egress controls egress cases were decided by
+  by digest, and says whether the global rate lanes were available.
 
 The report is deterministic: it has no timestamp or duration, so the same
 policy and suite give the same bytes. It never contains a fixture value -- no
-path, host, subject, issuer, role or tool name a case supplied -- only case
+path, host, address, subject, issuer, role or tool name a case supplied -- only case
 ids, expectations, stable codes and the matched rule id or route position.
 
 ### SARIF
@@ -274,8 +339,10 @@ under the rule `policy-test/failed`, `policy-test/incomplete` or
 `policy-test/error`, located by a logical location whose `name` is the case id
 and whose `fullyQualifiedName` is its JSON Pointer. An empty `results` array
 means every case passed; the run's `properties` carry `status`, the suite
-digest, the policy source and ETag, the summary and `not_evaluated`, so an
-all-passing file is distinguishable from an empty one.
+digest, the policy source and ETag (with `policy_draft_id` and
+`policy_draft_revision`, or `policy_version`, for a stored candidate), the
+summary and `not_evaluated`, so an all-passing file is distinguishable from an
+empty one.
 
 ### JUnit
 
@@ -283,7 +350,9 @@ all-passing file is distinguishable from an empty one.
 `policy-tests.v1` with a `testcase` per case (`classname` `policy.<kind>`,
 `name` the case id). A failed or incomplete case carries a `failure`, a refused
 one an `error`; nothing is ever `skipped`. The suite `properties` carry the run
-status, suite digest, policy source and ETag, and the evaluator versions.
+status, suite digest, policy source and ETag, the evaluator versions and, for a
+stored candidate, `policy_draft_id` and `policy_draft_revision` or
+`policy_version`.
 
 ### In a pipeline
 
@@ -306,8 +375,10 @@ under the same identity while the first is still evaluating is `429`
 
 Each completed run emits one `policy.tests_run` audit event with the acting
 principal and the request envelope, `policy_source`, `policy_etag`,
-`security_revision` (cluster mode), `suite_digest`, `status`, the five summary
-counts and the evaluator semantics versions. It never carries a case id, a
+`security_revision` (cluster mode), for a stored candidate its
+`policy_draft_id` and `policy_draft_revision` or its `policy_version`,
+`suite_digest`, `status`, the five summary counts and the evaluator semantics
+versions. It never carries a case id, a
 fixture value, a matched rule or policy content. Refused requests (`4xx`) are
 not recorded as runs.
 
@@ -327,9 +398,8 @@ Not part of this slice, and not to be inferred from it:
   ETag (`GET`/`PUT /policy/tests`), and requiring a passing suite before a
   policy change is activated. Today a suite is submitted with each run and
   nothing is gated on it.
-- Isolated rate-bucket sequences on a virtual clock, egress cases, typed claim,
-  header, query, tool-argument and time-window matchers, and stable route and
-  rate-override identifiers (policy v1).
+- Typed claim, header, query, tool-argument and time-window matchers, and
+  stable route and rate-override identifiers (policy v1).
 - `ggctl policy test` (#242). The runner holds no application state, so that
   command can link it rather than reimplement it.
 

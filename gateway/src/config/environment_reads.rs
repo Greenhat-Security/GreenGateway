@@ -115,12 +115,6 @@ const ENVIRONMENT_READS: &[EnvironmentRead] = &[
         reads: 1,
     },
     EnvironmentRead {
-        file: "src/connections/pg_store_tests.rs",
-        names: ReadNames::Fixed(&["GATEWAY_TEST_POSTGRES_URL_FILE"]),
-        purpose: ReadPurpose::TestHarness,
-        reads: 1,
-    },
-    EnvironmentRead {
         file: "src/import/tests.rs",
         names: ReadNames::Fixed(&["GATEWAY_TEST_POSTGRES_URL_FILE"]),
         purpose: ReadPurpose::TestHarness,
@@ -128,21 +122,15 @@ const ENVIRONMENT_READS: &[EnvironmentRead] = &[
     },
     EnvironmentRead {
         file: "src/storage/contract_tests.rs",
-        names: ReadNames::Fixed(&[
-            "GATEWAY_TEST_POSTGRES_URL_FILE",
-            "GATEWAY_TEST_POSTGRES_BENCHMARK_ROWS",
-        ]),
+        names: ReadNames::Fixed(&["GATEWAY_TEST_POSTGRES_BENCHMARK_ROWS"]),
         purpose: ReadPurpose::TestHarness,
-        reads: 2,
+        reads: 1,
     },
     EnvironmentRead {
         file: "src/storage/migrations.rs",
-        names: ReadNames::Fixed(&[
-            "GATEWAY_TEST_POSTGRES_URL_FILE",
-            "GATEWAY_TEST_POSTGRES_NODDL_URL_FILE",
-        ]),
+        names: ReadNames::Fixed(&["GATEWAY_TEST_POSTGRES_NODDL_URL_FILE"]),
         purpose: ReadPurpose::TestHarness,
-        reads: 2,
+        reads: 1,
     },
     EnvironmentRead {
         file: "src/storage/postgres.rs",
@@ -155,6 +143,17 @@ const ENVIRONMENT_READS: &[EnvironmentRead] = &[
         names: ReadNames::Fixed(&["GATEWAY_TEST_POSTGRES_URL_FILE"]),
         purpose: ReadPurpose::TestHarness,
         reads: 1,
+    },
+    // The shared PostgreSQL harness: the disposable database's DSN, and the
+    // CA bundle that makes a run a verified-TLS run.
+    EnvironmentRead {
+        file: "src/storage/postgres_test_support.rs",
+        names: ReadNames::Fixed(&[
+            "GATEWAY_TEST_POSTGRES_URL_FILE",
+            "GATEWAY_TEST_POSTGRES_TLS_CA_FILE",
+        ]),
+        purpose: ReadPurpose::TestHarness,
+        reads: 2,
     },
 ];
 

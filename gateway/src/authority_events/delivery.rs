@@ -20,6 +20,11 @@
 //! reference domain, so a row reads the same before and after migration 24.
 //! The revision fields follow the v1 transition contract.
 //!
+//! A service-token issue (journaled since migration 27) is delivered as
+//! `service_token.issue` on the `token` axis, with no revision before it and
+//! the token row's first revision, `1`, after it, beside the shared revision
+//! its create took.
+//!
 //! Admin session grants and withdrawals (journaled since migration 26) are
 //! delivered as `admin_session.grant` and `admin_session.withdraw`. Their
 //! evidence records the session's own identity and no actor kind, auth mode
@@ -54,15 +59,21 @@ pub(crate) const DELIVERY_SCHEMA_VERSION: &str = "authority_event_delivery.v1";
 /// evidence, so they are never delivered.
 const RESULT_COMMITTED: &str = "committed";
 
-// The evidence tables' closed action vocabularies (migrations 16 and 18),
-// which are the proposed authority-event operation codes.
+// The evidence tables' closed action vocabularies (migrations 16 and 18,
+// the issue since migration 27), which are the proposed authority-event
+// operation codes.
 const ACTION_CONNECTION_DELETE: &str = "connection.delete";
+const ACTION_SERVICE_TOKEN_ISSUE: &str = "service_token.issue";
 const ACTION_SERVICE_TOKEN_ROTATE: &str = "service_token.rotate";
 const ACTION_SERVICE_TOKEN_REVOKE: &str = "service_token.revoke";
 const ACTION_JWT_REVOKE: &str = "jwt.revoke";
 // Migration 19's admin session vocabulary.
 const ACTION_ADMIN_SESSION_GRANT: &str = "admin_session.grant";
 const ACTION_ADMIN_SESSION_WITHDRAW: &str = "admin_session.withdraw";
+
+/// The revision a created resource starts at: a service token's row revision
+/// after its issue (migration 27's CHECK holds the same value).
+const FIRST_REVISION: i64 = 1;
 
 /// The one revision of an admin session on the `session` axis. A session is
 /// granted once and withdrawn once (migration 19's `UNIQUE (session_id,
@@ -189,6 +200,9 @@ struct ActionShape {
 /// The v1 revision transition of each delivered operation.
 #[derive(Clone, Copy)]
 enum Transition {
+    /// No prior version and [`FIRST_REVISION`] after: a resource that did
+    /// not exist before the change.
+    Create,
     /// A positive prior version and no successor.
     Delete,
     /// A prior version and a strictly greater new one.
@@ -218,6 +232,12 @@ fn action_shape(source: JournalSource, action: &str) -> Option<ActionShape> {
             domain: ReferenceDomain::Connection,
             axis: "connection",
             transition: Transition::Delete,
+        }),
+        (JournalSource::ServiceTokenChange, ACTION_SERVICE_TOKEN_ISSUE) => Some(ActionShape {
+            resource_kind: "service_token",
+            domain: ReferenceDomain::ServiceToken,
+            axis: "token",
+            transition: Transition::Create,
         }),
         (
             JournalSource::ServiceTokenChange,
@@ -276,6 +296,15 @@ pub(crate) fn project(
     }
 
     let (before, after) = match shape.transition {
+        Transition::Create => {
+            if evidence.prior_version.is_some() {
+                return Err(ProjectionError::InvalidEvidence);
+            }
+            if positive(evidence.new_version)? != FIRST_REVISION {
+                return Err(ProjectionError::InvalidEvidence);
+            }
+            (None, Some(FIRST_REVISION))
+        }
         Transition::Delete => {
             let prior = positive(evidence.prior_version)?;
             if evidence.new_version.is_some() {

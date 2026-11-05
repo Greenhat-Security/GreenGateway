@@ -8,10 +8,10 @@
 //! exactly what must not reach a log, an error body or an audit record.
 //!
 //! What a case can say is deliberately narrow. Identity is a typed set of
-//! policy facts -- subject, issuer, roles, authentication method -- and never a
-//! token, cookie, header or credential: there is no field to put one in, and a
-//! member named like one is refused with its own code rather than as an
-//! ordinary typo.
+//! policy facts -- subject, issuer, roles, authentication method and the
+//! organization authentication verified -- and never a token, cookie, header
+//! or credential: there is no field to put one in, and a member named like
+//! one is refused with its own code rather than as an ordinary typo.
 
 use http::Method;
 use serde::Serialize;
@@ -26,7 +26,7 @@ use crate::{
     canonical_json,
     policy_eval::{
         tools::{validate_rendered_http_path, ToolOperation},
-        validate_path, DispatchFacts, LogicalDecision, PolicyEffect, Reason,
+        validate_path, DispatchFacts, LogicalDecision, PolicyEffect, Reason, MAX_FACT_VALUE_BYTES,
     },
     rbac::rule::{
         AUTH_METHOD_BEARER_TOKEN, AUTH_METHOD_CLIENT_CERTIFICATE, AUTH_METHOD_SERVICE_TOKEN,
@@ -60,6 +60,19 @@ pub(crate) const MAX_EXPECTED_INDEX: u64 = 1 << 20;
 /// Longest member name a diagnostic pointer repeats; a longer one is
 /// described instead of quoted.
 const MAX_POINTER_MEMBER_BYTES: usize = 64;
+/// Most steps one isolated rate sequence may take. Each step is one bucket
+/// check, and each is reported, so this bounds both the work and the result.
+pub(crate) const MAX_RATE_SEQUENCE_STEPS: usize = 64;
+/// Latest virtual instant a rate sequence may name, in milliseconds since its
+/// origin: one day, far past any refill a burst could need, and an exact
+/// number in every JSON reader.
+pub(crate) const MAX_VIRTUAL_MS: u64 = 86_400_000;
+/// Most hypothetical addresses one egress case may supply.
+pub(crate) const MAX_HYPOTHETICAL_ADDRESSES: usize = 16;
+/// Longest hypothetical address, in bytes: room for any IPv6 socket address.
+const MAX_ADDRESS_BYTES: usize = 64;
+/// Longest destination scheme an egress case may state, in bytes.
+const MAX_SCHEME_BYTES: usize = 32;
 
 /// Member names that only a credential would be filed under. A case has no
 /// such field, so these are already unknown; naming them separately tells the
@@ -180,7 +193,12 @@ pub(crate) enum CaseInput {
         method: Method,
         path: String,
         principal: SyntheticPrincipal,
-        expect: RateExpectation,
+        sequence: Option<RateSequence>,
+        expect: RateCaseExpectation,
+    },
+    Egress {
+        egress: EgressCase,
+        expect: DecisionExpectation<&'static str>,
     },
 }
 
@@ -191,6 +209,7 @@ impl CaseInput {
             Self::Tool { .. } => CaseKind::Tool,
             Self::ToolHttp { .. } => CaseKind::ToolHttp,
             Self::Rate { .. } => CaseKind::Rate,
+            Self::Egress { .. } => CaseKind::Egress,
         }
     }
 }
@@ -202,6 +221,7 @@ pub(crate) enum CaseKind {
     Tool,
     ToolHttp,
     Rate,
+    Egress,
 }
 
 impl CaseKind {
@@ -211,8 +231,49 @@ impl CaseKind {
             Self::Tool => "tool",
             Self::ToolHttp => "tool_http",
             Self::Rate => "rate",
+            Self::Egress => "egress",
         }
     }
+}
+
+/// An isolated rate sequence: virtual instants, in milliseconds since the
+/// sequence's origin, never decreasing. Each is one request against a fresh
+/// bucket for the lane the case selects (issue #243, slice 12).
+pub(crate) struct RateSequence {
+    pub(crate) at_ms: Vec<u64>,
+}
+
+/// One step of a rate sequence: whether its request was within the bucket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StepOutcome {
+    Allowed,
+    Limited,
+}
+
+impl StepOutcome {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Allowed => "allowed",
+            Self::Limited => "limited",
+        }
+    }
+}
+
+/// A hypothetical outbound destination and the only resolution evidence a
+/// synthetic case can carry: an explicitly hypothetical address list. With no
+/// list the destination has no resolution evidence at all, and nothing is
+/// ever looked up to supply one.
+pub(crate) struct EgressCase {
+    pub(crate) destination: crate::policy_eval::egress::EgressDestination,
+    pub(crate) hypothetical_addresses: Option<Vec<std::net::SocketAddr>>,
+}
+
+/// What a rate case expects: which override governs, and, for a case with a
+/// sequence, optionally the outcome of each of its steps.
+pub(crate) struct RateCaseExpectation {
+    pub(crate) selected: RateExpectation,
+    pub(crate) steps: Option<Vec<StepOutcome>>,
 }
 
 pub(crate) struct HttpRequest {
@@ -233,6 +294,16 @@ pub(crate) enum SyntheticTarget {
 pub(crate) enum SyntheticPrincipal {
     Anonymous,
     Authenticated(Principal),
+}
+
+impl SyntheticPrincipal {
+    /// The principal a live lane would hold for this case, if any.
+    pub(crate) fn principal(&self) -> Option<&Principal> {
+        match self {
+            Self::Anonymous => None,
+            Self::Authenticated(principal) => Some(principal),
+        }
+    }
 }
 
 /// What an HTTP or tool case expects. `logical` is required; the rest are
@@ -366,6 +437,10 @@ pub(crate) enum CaseContext {
         method: Method,
         path: String,
         principal: SyntheticPrincipal,
+        sequence: Option<RateSequence>,
+    },
+    Egress {
+        egress: EgressCase,
     },
 }
 
@@ -376,6 +451,7 @@ impl CaseContext {
             Self::Tool { .. } => CaseKind::Tool,
             Self::ToolHttp { .. } => CaseKind::ToolHttp,
             Self::Rate { .. } => CaseKind::Rate,
+            Self::Egress { .. } => CaseKind::Egress,
         }
     }
 }
@@ -384,7 +460,8 @@ impl CaseContext {
 enum CaseExpectation {
     Http(DecisionExpectation<Reason>),
     Tool(DecisionExpectation<crate::policy_eval::tools::ToolReason>),
-    Rate(RateExpectation),
+    Rate(RateCaseExpectation),
+    Egress(DecisionExpectation<&'static str>),
 }
 
 /// Parse a list of cases at `pointer`: present, an array, non-empty, within
@@ -476,9 +553,41 @@ fn parse_case(value: &Value, pointer: &str, diagnostics: &mut Diagnostics) -> Op
         CaseKind::Rate => {
             parse_rate_expectation(value, &expect_pointer, diagnostics).map(CaseExpectation::Rate)
         }
+        CaseKind::Egress => parse_egress_expectation(value, &expect_pointer, diagnostics)
+            .map(CaseExpectation::Egress),
     });
     if diagnostics.diagnostics.len() != before || diagnostics.truncated {
         return None;
+    }
+    // Step outcomes are asserted against a sequence the case takes, one for
+    // each of its steps; anything else could never be compared.
+    if let (
+        Some(CaseContext::Rate { sequence, .. }),
+        Some(CaseExpectation::Rate(RateCaseExpectation {
+            steps: Some(steps), ..
+        })),
+    ) = (&context, &expect)
+    {
+        let steps_pointer = format!("{expect_pointer}/steps");
+        match sequence {
+            None => {
+                diagnostics.push(
+                    "inconsistent_case",
+                    &steps_pointer,
+                    "steps can only be expected of a case that takes a sequence",
+                );
+                return None;
+            }
+            Some(sequence) if sequence.at_ms.len() != steps.len() => {
+                diagnostics.push(
+                    "inconsistent_case",
+                    &steps_pointer,
+                    "steps must list exactly one outcome for each step of the sequence",
+                );
+                return None;
+            }
+            Some(_) => {}
+        }
     }
     let input = match (context?, expect?) {
         (CaseContext::Http { request, principal }, CaseExpectation::Http(expect)) => {
@@ -521,14 +630,19 @@ fn parse_case(value: &Value, pointer: &str, diagnostics: &mut Diagnostics) -> Op
                 method,
                 path,
                 principal,
+                sequence,
             },
             CaseExpectation::Rate(expect),
         ) => CaseInput::Rate {
             method,
             path,
             principal,
+            sequence,
             expect,
         },
+        (CaseContext::Egress { egress }, CaseExpectation::Egress(expect)) => {
+            CaseInput::Egress { egress, expect }
+        }
         // Both halves are parsed for the one kind read above, so they always
         // pair. Refused with a diagnostic rather than dropped, because a case
         // that vanished without one would leave a suite that runs fewer cases
@@ -586,13 +700,14 @@ fn parse_case_header<'a>(
             Some("tool") => Some(CaseKind::Tool),
             Some("tool_http") => Some(CaseKind::ToolHttp),
             Some("rate") => Some(CaseKind::Rate),
+            Some("egress") => Some(CaseKind::Egress),
             _ => None,
         };
         if kind.is_none() {
             diagnostics.push(
                 "invalid_value",
                 &format!("{pointer}/kind"),
-                "kind must be one of \"http\", \"tool\", \"tool_http\" or \"rate\"",
+                "kind must be one of \"http\", \"tool\", \"tool_http\", \"rate\" or \"egress\"",
             );
         }
         kind
@@ -600,13 +715,36 @@ fn parse_case_header<'a>(
     let mut members: Vec<&str> = match kind {
         // Without a kind the other members have no defined meaning; report
         // only what is wrong regardless of kind.
-        None => vec!["id", "description", "kind", "principal", "request", "tool"],
-        Some(CaseKind::Http | CaseKind::Rate) => {
-            vec!["id", "description", "kind", "principal", "request"]
+        None => vec![
+            "id",
+            "description",
+            "kind",
+            "principal",
+            "request",
+            "tool",
+            "sequence",
+            "destination",
+            "resolution",
+        ],
+        Some(CaseKind::Http) => vec!["id", "description", "kind", "principal", "request"],
+        Some(CaseKind::Rate) => {
+            vec![
+                "id",
+                "description",
+                "kind",
+                "principal",
+                "request",
+                "sequence",
+            ]
         }
         Some(CaseKind::Tool) => vec!["id", "description", "kind", "principal", "tool"],
         Some(CaseKind::ToolHttp) => {
             vec!["id", "description", "kind", "principal", "tool", "request"]
+        }
+        // An outbound destination is decided by the egress controls alone:
+        // no caller identity takes part, so a case states none.
+        Some(CaseKind::Egress) => {
+            vec!["id", "description", "kind", "destination", "resolution"]
         }
     };
     if expectation {
@@ -623,6 +761,23 @@ fn parse_case_context(
     kind: CaseKind,
     diagnostics: &mut Diagnostics,
 ) -> Option<CaseContext> {
+    if kind == CaseKind::Egress {
+        let destination = required(map, "destination", pointer, diagnostics).and_then(|value| {
+            parse_egress_destination(value, &format!("{pointer}/destination"), diagnostics)
+        });
+        let hypothetical_addresses = match map.get("resolution") {
+            None => Some(None),
+            Some(value) => {
+                parse_resolution(value, &format!("{pointer}/resolution"), diagnostics).map(Some)
+            }
+        };
+        return Some(CaseContext::Egress {
+            egress: EgressCase {
+                destination: destination?,
+                hypothetical_addresses: hypothetical_addresses?,
+            },
+        });
+    }
     let principal = required(map, "principal", pointer, diagnostics)
         .and_then(|value| parse_principal(value, &format!("{pointer}/principal"), diagnostics));
     match kind {
@@ -687,14 +842,226 @@ fn parse_case_context(
                     diagnostics,
                 )
             });
+            let sequence = match map.get("sequence") {
+                None => Some(None),
+                Some(value) => {
+                    parse_rate_sequence(value, &format!("{pointer}/sequence"), diagnostics)
+                        .map(Some)
+                }
+            };
             let (method, path) = request?;
             Some(CaseContext::Rate {
                 method,
                 path,
                 principal: principal?,
+                sequence: sequence?,
             })
         }
+        // Decided above, before a principal is asked for.
+        CaseKind::Egress => None,
     }
+}
+
+/// An isolated rate sequence: `{ "at_ms": [<virtual instant>, ...] }`, one
+/// to [`MAX_RATE_SEQUENCE_STEPS`] integers from 0 to [`MAX_VIRTUAL_MS`], none
+/// earlier than the one before it. The instants are a virtual clock the case
+/// states; no step reads the time.
+fn parse_rate_sequence(
+    value: &Value,
+    pointer: &str,
+    diagnostics: &mut Diagnostics,
+) -> Option<RateSequence> {
+    let map = object(value, pointer, diagnostics)?;
+    check_members(map, pointer, &["at_ms"], diagnostics);
+    let steps_pointer = format!("{pointer}/at_ms");
+    let Value::Array(items) = required(map, "at_ms", pointer, diagnostics)? else {
+        diagnostics.push(
+            "invalid_type",
+            &steps_pointer,
+            "at_ms must be an array of virtual instants in milliseconds",
+        );
+        return None;
+    };
+    if items.is_empty() {
+        diagnostics.push(
+            "empty_sequence",
+            &steps_pointer,
+            "a sequence needs at least one step",
+        );
+        return None;
+    }
+    if items.len() > MAX_RATE_SEQUENCE_STEPS {
+        diagnostics.push(
+            "too_many_steps",
+            &steps_pointer,
+            format!("a sequence may take at most {MAX_RATE_SEQUENCE_STEPS} steps"),
+        );
+        return None;
+    }
+    let mut at_ms = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let item_pointer = format!("{steps_pointer}/{index}");
+        let Some(instant) = item.as_u64().filter(|instant| *instant <= MAX_VIRTUAL_MS) else {
+            diagnostics.push(
+                "invalid_value",
+                &item_pointer,
+                format!("a virtual instant is an integer from 0 to {MAX_VIRTUAL_MS} milliseconds"),
+            );
+            return None;
+        };
+        if at_ms.last().is_some_and(|previous| instant < *previous) {
+            diagnostics.push(
+                "sequence_not_monotonic",
+                &item_pointer,
+                "a virtual instant is never earlier than the one before it",
+            );
+            return None;
+        }
+        at_ms.push(instant);
+    }
+    Some(RateSequence { at_ms })
+}
+
+/// A hypothetical outbound destination, in the facts the static egress lane
+/// reads from a URL: its scheme, its host (absent for a URL without one), its
+/// port -- explicit or the scheme's default, absent for a URL with neither --
+/// and whether it carried userinfo or a fragment. Whether is all a case can
+/// say: a destination has no member that could hold credentials, a path or a
+/// query.
+fn parse_egress_destination(
+    value: &Value,
+    pointer: &str,
+    diagnostics: &mut Diagnostics,
+) -> Option<crate::policy_eval::egress::EgressDestination> {
+    let map = object(value, pointer, diagnostics)?;
+    check_members(
+        map,
+        pointer,
+        &["scheme", "host", "port", "userinfo", "fragment"],
+        diagnostics,
+    );
+    let scheme = required(map, "scheme", pointer, diagnostics).and_then(|value| {
+        let pointer = format!("{pointer}/scheme");
+        let scheme = bounded_string(value, &pointer, MAX_SCHEME_BYTES, diagnostics)?;
+        let mut bytes = scheme.bytes();
+        let valid = bytes.next().is_some_and(|byte| byte.is_ascii_lowercase())
+            && bytes.all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"+-.".contains(&byte)
+            });
+        if !valid {
+            diagnostics.push(
+                "invalid_value",
+                &pointer,
+                "scheme must be a lowercase URL scheme",
+            );
+            return None;
+        }
+        Some(scheme)
+    });
+    let host = match map.get("host") {
+        None => Some(None),
+        Some(value) => {
+            let pointer = format!("{pointer}/host");
+            bounded_string(value, &pointer, MAX_REQUEST_HOST_BYTES, diagnostics).and_then(
+                |host| {
+                    if host
+                        .bytes()
+                        .any(|byte| byte <= b' ' || byte == 127 || b"/?#@".contains(&byte))
+                    {
+                        diagnostics.push(
+                            "invalid_host",
+                            &pointer,
+                            "host must be a URL host without whitespace, control characters, '/', '?', '#' or '@'",
+                        );
+                        return None;
+                    }
+                    // The live adapter reads a URL's host lowercased, and
+                    // the controls compare it that way.
+                    Some(Some(host.to_ascii_lowercase()))
+                },
+            )
+        }
+    };
+    let port = match map.get("port") {
+        None => Some(None),
+        Some(value) => match value.as_u64().and_then(|port| u16::try_from(port).ok()) {
+            Some(port) => Some(Some(port)),
+            None => {
+                diagnostics.push(
+                    "invalid_value",
+                    &format!("{pointer}/port"),
+                    "port must be an integer from 0 to 65535",
+                );
+                None
+            }
+        },
+    };
+    let flag = |key: &str, diagnostics: &mut Diagnostics| match map.get(key) {
+        None => Some(false),
+        Some(Value::Bool(flag)) => Some(*flag),
+        Some(_) => {
+            diagnostics.push(
+                "invalid_type",
+                &format!("{pointer}/{key}"),
+                "expected a boolean",
+            );
+            None
+        }
+    };
+    let userinfo = flag("userinfo", diagnostics);
+    let fragment = flag("fragment", diagnostics);
+    Some(crate::policy_eval::egress::EgressDestination::from_parts(
+        scheme?, host?, port?, userinfo?, fragment?,
+    ))
+}
+
+/// The resolution evidence an egress case supplies:
+/// `{ "hypothetical_addresses": ["<ip>:<port>", ...] }`, at most
+/// [`MAX_HYPOTHETICAL_ADDRESSES`], in the order a resolver would answer. The
+/// member name is the label: these are what the author supposes a resolver
+/// would return, never what one did. An empty list is a name that resolves
+/// to nothing.
+fn parse_resolution(
+    value: &Value,
+    pointer: &str,
+    diagnostics: &mut Diagnostics,
+) -> Option<Vec<std::net::SocketAddr>> {
+    let map = object(value, pointer, diagnostics)?;
+    check_members(map, pointer, &["hypothetical_addresses"], diagnostics);
+    let list_pointer = format!("{pointer}/hypothetical_addresses");
+    let Value::Array(items) = required(map, "hypothetical_addresses", pointer, diagnostics)? else {
+        diagnostics.push(
+            "invalid_type",
+            &list_pointer,
+            "hypothetical_addresses must be an array of socket addresses",
+        );
+        return None;
+    };
+    if items.len() > MAX_HYPOTHETICAL_ADDRESSES {
+        diagnostics.push(
+            "too_many_addresses",
+            &list_pointer,
+            format!("at most {MAX_HYPOTHETICAL_ADDRESSES} hypothetical addresses may be supplied"),
+        );
+        return None;
+    }
+    let mut addresses = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let item_pointer = format!("{list_pointer}/{index}");
+        let address = bounded_string(item, &item_pointer, MAX_ADDRESS_BYTES, diagnostics)?;
+        match address.parse::<std::net::SocketAddr>() {
+            Ok(address) => addresses.push(address),
+            Err(_) => {
+                diagnostics.push(
+                    "invalid_address",
+                    &item_pointer,
+                    "a hypothetical address is an IP address and port, such as 192.0.2.10:443 or [2001:db8::10]:443",
+                );
+                return None;
+            }
+        }
+    }
+    Some(addresses)
 }
 
 fn valid_case_id(id: &str) -> bool {
@@ -725,7 +1092,7 @@ fn parse_principal(
     check_members(
         map,
         pointer,
-        &["subject", "issuer", "roles", "auth_method"],
+        &["subject", "issuer", "roles", "auth_method", "organization"],
         diagnostics,
     );
     let subject = required(map, "subject", pointer, diagnostics).and_then(|value| {
@@ -802,7 +1169,21 @@ fn parse_principal(
         }
         method
     });
-    let (subject, issuer, roles, auth_method) = (subject?, issuer?, roles?, auth_method?);
+    // The organization authentication verified, which a live lane reads from
+    // the principal and an identity mapping may test. Absent is a principal
+    // whose authentication verified none, never an unknown one.
+    let organization = match map.get("organization") {
+        None => Some(None),
+        Some(value) => bounded_string(
+            value,
+            &format!("{pointer}/organization"),
+            MAX_FACT_VALUE_BYTES,
+            diagnostics,
+        )
+        .map(Some),
+    };
+    let (subject, issuer, roles, auth_method, organization) =
+        (subject?, issuer?, roles?, auth_method?, organization?);
     // The predicate authentication applies before any principal exists, so a
     // case cannot describe an identity no credential could produce.
     if let Err(problem) = check_principal_shape(&subject, issuer.as_deref(), &roles) {
@@ -819,7 +1200,7 @@ fn parse_principal(
         // Display and session metadata are not policy facts. They stay empty
         // so nothing beyond what a case states can influence a result.
         email: None,
-        org_id: None,
+        org_id: organization,
         roles,
         session_id: String::new(),
         auth_method,
@@ -1261,14 +1642,130 @@ fn parse_rate_expectation(
     value: &Value,
     pointer: &str,
     diagnostics: &mut Diagnostics,
-) -> Option<RateExpectation> {
+) -> Option<RateCaseExpectation> {
     let map = object(value, pointer, diagnostics)?;
-    check_members(map, pointer, &["rate_override"], diagnostics);
-    match required(map, "rate_override", pointer, diagnostics)? {
-        Value::Null => Some(RateExpectation::NoOverride),
-        value => index(value, &format!("{pointer}/rate_override"), diagnostics)
-            .map(RateExpectation::Override),
+    check_members(map, pointer, &["rate_override", "steps"], diagnostics);
+    let selected =
+        required(map, "rate_override", pointer, diagnostics).and_then(|value| match value {
+            Value::Null => Some(RateExpectation::NoOverride),
+            value => index(value, &format!("{pointer}/rate_override"), diagnostics)
+                .map(RateExpectation::Override),
+        });
+    let steps = match map.get("steps") {
+        None => Some(None),
+        Some(value) => {
+            parse_step_outcomes(value, &format!("{pointer}/steps"), diagnostics).map(Some)
+        }
+    };
+    Some(RateCaseExpectation {
+        selected: selected?,
+        steps: steps?,
+    })
+}
+
+/// The outcome expected of each step of a sequence, in order. Only the
+/// outcomes: a test asserts what a bucket answered, never a trace.
+fn parse_step_outcomes(
+    value: &Value,
+    pointer: &str,
+    diagnostics: &mut Diagnostics,
+) -> Option<Vec<StepOutcome>> {
+    let Value::Array(items) = value else {
+        diagnostics.push(
+            "invalid_type",
+            pointer,
+            "steps must be an array of \"allowed\" or \"limited\"",
+        );
+        return None;
+    };
+    let mut steps = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        match item.as_str() {
+            Some("allowed") => steps.push(StepOutcome::Allowed),
+            Some("limited") => steps.push(StepOutcome::Limited),
+            _ => {
+                diagnostics.push(
+                    "invalid_value",
+                    &format!("{pointer}/{index}"),
+                    "a step outcome is \"allowed\" or \"limited\"",
+                );
+                return None;
+            }
+        }
     }
+    Some(steps)
+}
+
+/// What an egress case expects: the static egress lane's verdict, and
+/// optionally the stable reason it gives. As for every lane, `indeterminate`
+/// is not an expectation: a destination admitted without resolution evidence
+/// is undecided, and a run reports it as incomplete, never as a pass.
+fn parse_egress_expectation(
+    value: &Value,
+    pointer: &str,
+    diagnostics: &mut Diagnostics,
+) -> Option<DecisionExpectation<&'static str>> {
+    let map = object(value, pointer, diagnostics)?;
+    check_members(map, pointer, &["logical", "reason"], diagnostics);
+    let logical = required(map, "logical", pointer, diagnostics).and_then(|value| {
+        let logical = match value.as_str() {
+            Some("allow") => Some(LogicalDecision::Allow),
+            Some("deny") => Some(LogicalDecision::Deny),
+            _ => None,
+        };
+        if logical.is_none() {
+            diagnostics.push(
+                "invalid_value",
+                &format!("{pointer}/logical"),
+                "logical must be \"allow\" or \"deny\"",
+            );
+        }
+        logical
+    });
+    let reason = match map.get("reason") {
+        None => Some(None),
+        Some(value) => {
+            let reason = value.as_str().and_then(parse_egress_reason);
+            if reason.is_none() {
+                diagnostics.push(
+                    "invalid_value",
+                    &format!("{pointer}/reason"),
+                    "reason must be one of the stable reason codes the egress lane reports",
+                );
+            }
+            reason.map(Some)
+        }
+    };
+    Some(DecisionExpectation {
+        logical: logical?,
+        effect: None,
+        reason: reason?,
+        matched: None,
+    })
+}
+
+/// The decisive reason codes of the static egress lane: `allowed`, and each
+/// refusal in the order the lane checks. `incomplete` is absent on purpose;
+/// see [`parse_egress_expectation`].
+pub(crate) const EGRESS_REASONS: &[&str] = &[
+    "allowed",
+    "missing_host",
+    "userinfo",
+    "fragment",
+    "scheme_not_allowed",
+    "host_not_allowed",
+    "missing_port",
+    "port_not_allowed",
+    "empty_resolution",
+    "unexpected_resolved_port",
+    "non_global_address",
+];
+
+pub(crate) fn parse_egress_reason(code: &str) -> Option<&'static str> {
+    EGRESS_REASONS
+        .iter()
+        .copied()
+        .find(|reason| *reason == code)
 }
 
 pub(crate) fn index(value: &Value, pointer: &str, diagnostics: &mut Diagnostics) -> Option<usize> {

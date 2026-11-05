@@ -152,6 +152,12 @@ pub struct ToolInvocationContext {
     pub request_id: String,
     pub source_ip: String,
     pub actor: Option<Actor>,
+    /// The organization authentication verified for the principal the call
+    /// entered with (`Principal::org_id`): the one identity fact an identity
+    /// mapping reads that `actor`, audit's projection, does not carry. A
+    /// policy fact only, taken from the authenticated principal and never
+    /// from a header: it is not audited, signed or sent upstream.
+    pub organization: Option<String>,
     /// The caller a Connection's signed caller assertion names, built from the
     /// authenticated principal where the call entered the gateway. Kept apart
     /// from `actor`, which is audit's projection of the same principal: only
@@ -174,6 +180,7 @@ impl Default for ToolInvocationContext {
             request_id: "tool-runtime".to_owned(),
             source_ip: "127.0.0.1".to_owned(),
             actor: None,
+            organization: None,
             caller: None,
             source: ToolInvocationSource::Internal,
             admitted_deadline: None,
@@ -1801,15 +1808,24 @@ fn tool_principal_matches(
                 .any(|allowed_role| principal.roles.iter().any(|role| role == allowed_role)))
 }
 
+/// The principal the tool lane judges for an invocation: its actor's
+/// projection ([`principal_from_tool_actor`]), carrying the organization the
+/// context recorded for it, so an identity mapping reads the same
+/// organization here as on the HTTP lane the call entered by.
 fn principal_from_tool_context(context: &ToolInvocationContext) -> Option<Principal> {
-    principal_from_tool_actor(context.actor.as_ref()?, &context.request_id)
+    let mut principal = principal_from_tool_actor(context.actor.as_ref()?, &context.request_id)?;
+    principal.org_id = context.organization.clone();
+    Some(principal)
 }
 
 /// The principal the tool lane judges for an invocation's `actor`: one of the
 /// three modes the runtime projects, or none, which the lane judges as
 /// anonymous. Policy replay (#243) projects a recorded tool invocation's actor
 /// through this same function, so a replayed tool decision cannot read the
-/// actor differently from the invocation it replays.
+/// actor differently from the invocation it replays. It carries no
+/// organization, because audit records none: a live call adds the one its
+/// context recorded ([`principal_from_tool_context`]), and replay leaves it
+/// not recorded.
 pub(crate) fn principal_from_tool_actor(actor: &Actor, session_id: &str) -> Option<Principal> {
     let auth_method = auth_method_from_audit_mode(&actor.auth_mode)?;
 
@@ -2293,6 +2309,73 @@ mod tests {
             runtime.tool_visible_to_context("tool", &context_with_roles(&["operator"])),
             "non-matching context should still see the tool"
         );
+    }
+
+    /// The tool lane reads the organization the invocation's context carries
+    /// from the authenticated principal (#243), the one identity fact the
+    /// audit actor lacks: an organization mapping admits a call from that
+    /// organization only, and the actor's own claims never stand in for it.
+    #[tokio::test]
+    async fn an_organization_mapping_reads_the_organization_the_context_carries() {
+        const ISSUER: &str = "https://idp.example.test";
+        let policy = Policy::validate_json_value(json!({
+            "schema_version": "1.0.0",
+            "roles": { "operator": { "permissions": [] } },
+            "identity_mappings": [{
+                "id": "acme-operators",
+                "issuer": ISSUER,
+                "organizations": ["acme"],
+                "grant_roles": ["operator"]
+            }],
+            "tools": {
+                "tool": { "allowed_roles": ["operator"], "timeout_ms": 100, "max_concurrent": 1 }
+            }
+        }))
+        .expect("the mapped tool policy validates");
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+        let rbac_state = crate::middleware::rbac::RbacState::new(
+            policy.clone(),
+            Vec::new(),
+            false,
+            audit.clone(),
+        );
+        let config = ToolRuntimeConfig::from_policy(&policy)
+            .expect("the tool policy should configure the runtime");
+        let runtime = ToolRuntime::new_with_rbac_state(config, audit, Some(rbac_state));
+        let context = |organization: Option<&str>| {
+            let mut context = context_with_identity(&["operator"], Some(ISSUER), "bearer_token");
+            context.organization = organization.map(str::to_owned);
+            context
+        };
+
+        assert!(runtime.tool_visible_to_context("tool", &context(Some("acme"))));
+        for organization in [None, Some("globex")] {
+            assert!(
+                !runtime.tool_visible_to_context("tool", &context(organization)),
+                "{organization:?}"
+            );
+        }
+        let admitted = runtime
+            .execute_with_context(
+                "tool",
+                context(Some("acme")),
+                CancellationToken::new(),
+                || async { "admitted" },
+            )
+            .await
+            .expect("the mapped operator is admitted");
+        assert_eq!(admitted, "admitted");
+        let denied = runtime
+            .execute_with_context("tool", context(None), CancellationToken::new(), || async {
+                "should not run"
+            })
+            .await
+            .expect_err("no verified organization grants no role");
+        assert!(matches!(denied, ToolRuntimeError::RoleDenied { .. }));
+        // Audit records the actor, never the organization.
+        let serialized = serde_json::to_string(&capture.events()).expect("events serialize");
+        assert!(!serialized.contains("acme"));
     }
 
     #[tokio::test]
@@ -4311,6 +4394,7 @@ mod tests {
                         auth_mode: "bearer_token".to_owned(),
                     }),
                     source: ToolInvocationSource::AdminPlayground,
+                    organization: None,
                     caller: None,
                     admitted_deadline: None,
                 },
@@ -4773,6 +4857,7 @@ mod tests {
             source_ip: "127.0.0.1".to_owned(),
             actor: None,
             source: ToolInvocationSource::Internal,
+            organization: None,
             caller: None,
             admitted_deadline: None,
         }
@@ -4798,6 +4883,7 @@ mod tests {
                 auth_mode: auth_mode.to_owned(),
             }),
             source: ToolInvocationSource::Internal,
+            organization: None,
             caller: None,
             admitted_deadline: None,
         }

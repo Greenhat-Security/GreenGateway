@@ -1,7 +1,8 @@
 //! `POST /v1{ADMIN_PREFIX}/policy/simulations` (issue #243, slice 10):
 //! evaluate synthetic cases against the active policy and a candidate --
-//! the active policy itself, position-aware edits over it, or an inline
-//! document -- under the `as_authored` and `enforce_all_shadow`
+//! the active policy itself, position-aware edits over it, an inline
+//! document, a server-side draft the caller owns, or a version of the
+//! policy history -- under the `as_authored` and `enforce_all_shadow`
 //! projections, at a `terminal`, `matched` or `full` trace level.
 //!
 //! A simulation is a read with no side effects. It needs
@@ -12,13 +13,23 @@
 //! evaluation is the pure [`policy_simulation::run`] on a blocking thread,
 //! behind a per-replica and a per-actor bound on concurrent simulations
 //! and a deadline, and nothing about it touches a rate bucket, tool permit,
-//! resolver or upstream.
+//! resolver or upstream. An isolated rate sequence runs on a fresh synthetic
+//! bucket built from the selected lane's configured limits, and an egress case
+//! is judged by the egress client's static egress lane over the case's own
+//! hypothetical addresses: both read configuration, never live state.
 //!
 //! The concurrency bound, [`PolicyEvaluationLimiter`], is shared with policy
 //! test runs, historical replay jobs and policy analyses: each endpoint admits
 //! a request only once its body is in hand, and the blocking work owns its
 //! slot, so a slot counts evaluations doing work -- not uploads in flight, and
 //! not work a cancelled request left running.
+//!
+//! So is the candidate: [`resolve_candidate`] builds it for simulations,
+//! replay jobs and analyses, and test runs read their stored candidates
+//! through [`draft_candidate`] and [`revision_candidate`]. A stored candidate
+//! is read under the permissions the endpoint already demands, which include
+//! `admin:policy:read`, the permission that reads a draft or a history
+//! version directly, so naming one never reveals more than reading it would.
 use std::{
     collections::HashSet,
     sync::{
@@ -32,7 +43,7 @@ use super::*;
 
 use policy_simulation::{
     edits::apply_edits,
-    request::{parse_request, CandidateSource, SimulationRequest},
+    request::{parse_request, CandidateSource, SimulationRequest, StoredCandidate},
     run::{compile_pairs, simulate, SimulationError, MAX_TRACE_STAGES},
     RESULT_SCHEMA_VERSION,
 };
@@ -240,29 +251,51 @@ pub(super) enum CandidateRefusal {
     /// The candidate is not a policy a write would accept, or not one this
     /// deployment could commit: the messages a policy write refuses it with.
     Invalid(Vec<String>),
-    /// The base could not be serialized for editing.
+    /// The draft or history version the request names cannot be its
+    /// candidate -- missing, another owner's, expired, stale, pinned to
+    /// another base, unreadable, or not a policy this build evaluates -- and
+    /// the response says which, under a stable reason.
+    Stored(Box<Response>),
+    /// The base or a stored candidate could not be serialized.
     Internal,
 }
 
+/// A request's candidate, ready to evaluate.
+pub(super) struct ResolvedCandidate {
+    /// The candidate, or `None` when it is the base itself.
+    pub(super) policy: Option<rbac::Policy>,
+    /// The draft or history version it was read as, if it was read at all.
+    pub(super) stored: Option<StoredCandidate>,
+}
+
 /// The candidate a request describes, validated exactly as a policy write
-/// validates one, or `None` when the candidate is the base itself. Shared by
-/// simulation and historical replay, which take the same candidate sources.
+/// validates one. Shared by simulation, historical replay and analysis,
+/// which take the same candidate sources; `base` and `base_etag` are the
+/// active policy the request was pinned to, already checked to be live.
 ///
 /// An inline candidate is read from its own bytes by the parser
 /// `PUT .../policy` reads a body with, so a v1 document is held to the same
 /// exact-source rules. An edited candidate has no bytes of its own -- it is
 /// the base with the edits applied -- and is validated as the document that
-/// produces. Either is then refused, as `POST .../policy/validate` and a
-/// test run refuse it, when this deployment could not commit its document
-/// format.
-pub(super) fn resolve_candidate(
+/// produces. A draft or history version is read as [`draft_candidate`] and
+/// [`revision_candidate`] read it. Each is then refused, as
+/// `POST .../policy/validate` and a test run refuse it, when this deployment
+/// could not commit its document format.
+pub(super) async fn resolve_candidate(
     state: &PolicyAdminState,
     rbac_state: &middleware::rbac::RbacState,
+    principal: &auth::Principal,
     base: &rbac::Policy,
+    base_etag: &str,
     source: &CandidateSource,
-) -> Result<Option<rbac::Policy>, CandidateRefusal> {
+) -> Result<ResolvedCandidate, CandidateRefusal> {
     let candidate = match source {
-        CandidateSource::Active => return Ok(None),
+        CandidateSource::Active => {
+            return Ok(ResolvedCandidate {
+                policy: None,
+                stored: None,
+            })
+        }
         CandidateSource::Inline(source) => {
             parse_policy_body(source.get().as_bytes()).map_err(CandidateRefusal::Invalid)?
         }
@@ -276,8 +309,167 @@ pub(super) fn resolve_candidate(
             rbac::Policy::validate_json_value(document)
                 .map_err(|error| CandidateRefusal::Invalid(vec![policy_error_message(&error)]))?
         }
+        CandidateSource::Draft {
+            draft_id,
+            draft_etag,
+        } => {
+            return draft_candidate(
+                state, rbac_state, principal, draft_id, draft_etag, base_etag,
+            )
+            .await
+        }
+        CandidateSource::Revision { version } => {
+            return revision_candidate(state, rbac_state, *version).await
+        }
     };
-    admitted_candidate(state, rbac_state, candidate).map(Some)
+    Ok(ResolvedCandidate {
+        policy: Some(admitted_candidate(state, rbac_state, candidate)?),
+        stored: None,
+    })
+}
+
+/// The caller's draft `draft_id` as a candidate, read by
+/// [`draft_as_candidate`] -- owner-scoped, at the strong ETag `draft_etag`,
+/// pinned to `base_etag` -- and never written. The store validated the
+/// candidate as it read it; it is judged again as a write of it would be
+/// judged now, as draft publication judges it.
+pub(super) async fn draft_candidate(
+    state: &PolicyAdminState,
+    rbac_state: &middleware::rbac::RbacState,
+    principal: &auth::Principal,
+    draft_id: &str,
+    draft_etag: &str,
+    base_etag: &str,
+) -> Result<ResolvedCandidate, CandidateRefusal> {
+    let draft = draft_as_candidate(state, principal, draft_id, draft_etag, base_etag)
+        .await
+        .map_err(CandidateRefusal::Stored)?;
+    let candidate = revalidated(&draft.candidate)?;
+    Ok(ResolvedCandidate {
+        policy: Some(admitted_candidate(state, rbac_state, candidate)?),
+        stored: Some(StoredCandidate::Draft {
+            draft_id: draft.summary.draft_id,
+            revision: draft.summary.revision,
+        }),
+    })
+}
+
+/// Policy history version `version` as a candidate: read from the history
+/// authority -- the SQLite history in standalone mode, the immutable
+/// `policy_documents` rows in cluster mode -- and validated again under this
+/// build and this deployment. A version they would not accept today is
+/// refused as `422 policy_revision_incompatible`, never evaluated as
+/// something other than what it was.
+pub(super) async fn revision_candidate(
+    state: &PolicyAdminState,
+    rbac_state: &middleware::rbac::RbacState,
+    version: i64,
+) -> Result<ResolvedCandidate, CandidateRefusal> {
+    let stored = history_version(state, version)
+        .await
+        .map_err(CandidateRefusal::Stored)?;
+    let candidate = revalidated(&stored)
+        .and_then(|candidate| admitted_candidate(state, rbac_state, candidate))
+        .map_err(|refusal| match refusal {
+            CandidateRefusal::Invalid(errors) => {
+                CandidateRefusal::Stored(Box::new(revision_incompatible(version, errors)))
+            }
+            refusal => refusal,
+        })?;
+    Ok(ResolvedCandidate {
+        policy: Some(candidate),
+        stored: Some(StoredCandidate::Revision { version }),
+    })
+}
+
+/// A stored document as the policy validator of this build judges it.
+fn revalidated(stored: &rbac::Policy) -> Result<rbac::Policy, CandidateRefusal> {
+    let document = serde_json::to_value(stored).map_err(|error| {
+        tracing::error!(error = %error, "failed to serialize a stored candidate");
+        CandidateRefusal::Internal
+    })?;
+    rbac::Policy::validate_json_value(document)
+        .map_err(|error| CandidateRefusal::Invalid(vec![policy_error_message(&error)]))
+}
+
+/// History version `version`'s document, as the history authority holds it.
+async fn history_version(state: &PolicyAdminState, version: i64) -> ResponseResult<rbac::Policy> {
+    let Some(history) = state.history_store.as_ref() else {
+        return Err(Box::new(policy_history_not_configured()));
+    };
+    match history.get_version(version).await {
+        Ok(Some(rbac::policy_history::PolicyVersion {
+            policy: Some(policy),
+            ..
+        })) => Ok(policy),
+        Ok(Some(_)) => {
+            tracing::error!(version, "policy history version omitted its document");
+            Err(Box::new(internal_server_error(
+                "policy history query failed",
+            )))
+        }
+        Ok(None) => Err(Box::new(simulation_refusal(
+            StatusCode::NOT_FOUND,
+            "the policy history has no such version",
+            "policy_revision_not_found",
+        ))),
+        // The store validates a version's document as it reads it, so one
+        // this build cannot read is incompatible, not missing or unavailable.
+        Err(error) if error.kind() == storage::RepositoryErrorKind::InvalidData => {
+            tracing::warn!(error = %error, version, "a policy history version is not a document this build reads");
+            Err(Box::new(revision_incompatible(
+                version,
+                vec![
+                    "the policy history version is not a policy document this build reads"
+                        .to_owned(),
+                ],
+            )))
+        }
+        Err(error) => {
+            tracing::error!(error = %error, version, "failed to read a policy history version as a candidate");
+            Err(Box::new(simulation_refusal(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "policy history is unavailable",
+                "policy_history_unavailable",
+            )))
+        }
+    }
+}
+
+/// The `422` for a history version this build or deployment would not
+/// accept today, with the policy validator's messages.
+fn revision_incompatible(version: i64, errors: Vec<String>) -> Response {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(json!({
+            "error": "the policy history version is not a policy this gateway accepts now",
+            "reason": "policy_revision_incompatible",
+            "version": version,
+            "errors": errors,
+        })),
+    )
+        .into_response()
+}
+
+/// A candidate as a result names it: its source and ETag, the number of
+/// edits that made an `edits` candidate, and the draft or history version a
+/// stored one was read as. Identifiers and counts only, never content.
+pub(super) fn candidate_view(
+    source: &str,
+    etag: &str,
+    edit_count: usize,
+    stored: Option<&StoredCandidate>,
+) -> Value {
+    let mut view = serde_json::Map::new();
+    view.insert("source".to_owned(), json!(source));
+    view.insert("etag".to_owned(), json!(etag));
+    if source == "edits" {
+        view.insert("edits".to_owned(), json!(edit_count));
+    }
+    if let Some(stored) = stored {
+        stored.describe("", &mut view);
+    }
+    Value::Object(view)
 }
 
 /// What a parsed candidate must also satisfy before it is evaluated: proxy
@@ -298,19 +490,42 @@ fn admitted_candidate(
     Ok(candidate)
 }
 
-fn simulation_candidate(
+async fn simulation_candidate(
     state: &PolicyAdminState,
     rbac_state: &middleware::rbac::RbacState,
+    principal: &auth::Principal,
     base: &rbac::Policy,
+    base_etag: &str,
     source: &CandidateSource,
-) -> ResponseResult<Option<rbac::Policy>> {
-    resolve_candidate(state, rbac_state, base, source).map_err(|refusal| {
-        Box::new(match refusal {
-            CandidateRefusal::Edits(diagnostics) => simulation_invalid(&diagnostics),
-            CandidateRefusal::Invalid(errors) => simulation_candidate_refused(errors),
-            CandidateRefusal::Internal => internal_server_error("policy simulation failed"),
+) -> ResponseResult<ResolvedCandidate> {
+    resolve_candidate(state, rbac_state, principal, base, base_etag, source)
+        .await
+        .map_err(|refusal| match refusal {
+            CandidateRefusal::Edits(diagnostics) => Box::new(simulation_invalid(&diagnostics)),
+            CandidateRefusal::Invalid(errors) => Box::new(simulation_candidate_refused(errors)),
+            CandidateRefusal::Stored(response) => response,
+            CandidateRefusal::Internal => {
+                Box::new(internal_server_error("policy simulation failed"))
+            }
         })
-    })
+}
+
+/// What a synthetic run of this gateway's admin API decides egress cases and
+/// rate sequences by: the static egress lane the egress client decides every
+/// destination by, and the global rate lanes' configured limits. Shared with
+/// policy test runs.
+///
+/// An egress case is judged by this process's egress controls, never a
+/// candidate's `egress` section: a policy write cannot change egress without a
+/// restart (`egress_change_requires_restart`), so these are the controls any
+/// published candidate would meet.
+pub(super) fn synthetic_resources(
+    rbac_state: &middleware::rbac::RbacState,
+) -> policy_testing::synthetic::SyntheticResources {
+    policy_testing::synthetic::SyntheticResources {
+        global_rate_lanes: rbac_state.global_rate_lanes(),
+        egress: rbac_state.static_egress_policy(),
+    }
 }
 
 struct SimulationBinding {
@@ -319,26 +534,25 @@ struct SimulationBinding {
     candidate_source: &'static str,
     candidate_etag: String,
     edit_count: usize,
+    stored: Option<StoredCandidate>,
 }
 
 fn simulation_report(
     request: &SimulationRequest,
     binding: &SimulationBinding,
+    resources: &policy_testing::synthetic::ResourceBinding,
     outcome: policy_simulation::run::SimulationOutcome,
 ) -> Value {
     let mut base = json!({ "source": "active", "etag": binding.base_etag });
     if let (Some(revision), Some(base)) = (binding.security_revision, base.as_object_mut()) {
         base.insert("security_revision".to_owned(), json!(revision));
     }
-    let mut candidate = json!({
-        "source": binding.candidate_source,
-        "etag": binding.candidate_etag,
-    });
-    if let (CandidateSource::Edits(_), Some(candidate)) =
-        (&request.candidate, candidate.as_object_mut())
-    {
-        candidate.insert("edits".to_owned(), json!(binding.edit_count));
-    }
+    let candidate = candidate_view(
+        binding.candidate_source,
+        &binding.candidate_etag,
+        binding.edit_count,
+        binding.stored.as_ref(),
+    );
     json!({
         "schema_version": RESULT_SCHEMA_VERSION,
         "mode": "synthetic",
@@ -348,8 +562,11 @@ fn simulation_report(
             "http_context_version": policy_eval::CONTEXT_VERSION,
             "tool_semantics_version": policy_eval::tools::TOOL_SEMANTICS_VERSION,
             "tool_context_version": policy_eval::tools::TOOL_CONTEXT_VERSION,
+            "egress_semantics_version": policy_eval::egress::EGRESS_SEMANTICS_VERSION,
+            "egress_context_version": policy_eval::egress::EGRESS_CONTEXT_VERSION,
             "gateway_version": env!("CARGO_PKG_VERSION"),
         },
+        "synthetic_resources": resources,
         "base": base,
         "candidate": candidate,
         "trace": {
@@ -397,8 +614,14 @@ fn emit_policy_simulation_run(
         "http_semantics_version": policy_eval::HTTP_SEMANTICS_VERSION,
         "tool_semantics_version": policy_eval::tools::TOOL_SEMANTICS_VERSION,
     });
-    if let (Some(revision), Some(payload)) = (binding.security_revision, payload.as_object_mut()) {
-        payload.insert("security_revision".to_owned(), json!(revision));
+    if let Some(payload) = payload.as_object_mut() {
+        if let Some(revision) = binding.security_revision {
+            payload.insert("security_revision".to_owned(), json!(revision));
+        }
+        // Which draft or history version, never its content.
+        if let Some(stored) = &binding.stored {
+            stored.describe("candidate_", payload);
+        }
     }
     state.audit.emit(audit::AuditEvent::new(
         audit::event::POLICY_SIMULATION_RUN,
@@ -482,7 +705,19 @@ pub(super) async fn policy_simulations_endpoint(
         )
             .into_response();
     }
-    let candidate = match simulation_candidate(&state, rbac_state, &base, &simulation.candidate) {
+    let ResolvedCandidate {
+        policy: candidate,
+        stored,
+    } = match simulation_candidate(
+        &state,
+        rbac_state,
+        &principal,
+        &base,
+        &base_etag,
+        &simulation.candidate,
+    )
+    .await
+    {
         Ok(candidate) => candidate,
         Err(response) => return *response,
     };
@@ -508,8 +743,11 @@ pub(super) async fn policy_simulations_endpoint(
             CandidateSource::Edits(edits) => edits.len(),
             _ => 0,
         },
+        stored,
     };
 
+    let resources = synthetic_resources(rbac_state);
+    let resource_binding = resources.binding();
     let simulation = Arc::new(simulation);
     let evaluated = Arc::clone(&simulation);
     // The blocking thread owns the slot, so a request dropped mid-evaluation
@@ -527,7 +765,13 @@ pub(super) async fn policy_simulations_endpoint(
                     );
                     SimulationError::Internal("compile_failed")
                 })?;
-            simulate(&pairs, &evaluated.cases, evaluated.trace, deadline)
+            simulate(
+                &pairs,
+                &evaluated.cases,
+                evaluated.trace,
+                &resources,
+                deadline,
+            )
         })
         .await
     {
@@ -564,7 +808,7 @@ pub(super) async fn policy_simulations_endpoint(
         }
     };
     let summary = outcome.summary.clone();
-    let report = simulation_report(&simulation, &binding, outcome);
+    let report = simulation_report(&simulation, &binding, &resource_binding, outcome);
     let body = match serde_json::to_vec(&report) {
         Ok(body) => body,
         Err(error) => {

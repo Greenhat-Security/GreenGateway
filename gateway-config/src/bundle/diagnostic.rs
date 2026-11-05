@@ -177,6 +177,7 @@ pub enum Code {
     ReservedPath,
     DuplicatePath,
     InvalidDigest,
+    PinNotRewritable,
     SourceUnsupported,
     Unresolved,
     // Secret references.
@@ -259,6 +260,7 @@ impl Code {
         Self::ReservedPath,
         Self::DuplicatePath,
         Self::InvalidDigest,
+        Self::PinNotRewritable,
         Self::SourceUnsupported,
         Self::Unresolved,
         Self::InlineSecretValue,
@@ -511,6 +513,10 @@ impl Code {
             Self::InvalidDigest => (
                 "reference.invalid_digest",
                 "a pinned digest is not 64 lowercase hexadecimal digits",
+            ),
+            Self::PinNotRewritable => (
+                "reference.pin_not_rewritable",
+                "a pin that must change is not written as its 64 digits between quotes, so it cannot be replaced in place",
             ),
             Self::SourceUnsupported => (
                 "reference.source_unsupported",

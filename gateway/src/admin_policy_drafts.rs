@@ -43,6 +43,10 @@
 //! path for a discovery suggestion: it writes the rule the suggestion
 //! proposes into a draft, new or one the caller holds, under these same
 //! rules, and changes neither the live policy nor the suggestion.
+//!
+//! Simulations, policy test runs, analyses and replay jobs can name a draft
+//! as their candidate (issue #243): [`draft_as_candidate`] reads it under the
+//! same owner scope and strong ETag, and never writes it.
 
 use super::*;
 
@@ -127,6 +131,10 @@ pub(super) enum PolicyDraftRefusal {
     EtagInvalid,
     /// The draft changed since the presented ETag was read.
     EtagMismatch,
+    /// A read-only use of the draft (a simulation, test run, analysis or
+    /// replay naming it as its candidate) named a draft ETag that is no
+    /// longer the draft's.
+    Stale,
     /// The live policy is no longer the one the draft was pinned to.
     BaseStale,
     /// A policy ETag the request names is not the live one.
@@ -150,7 +158,9 @@ impl PolicyDraftRefusal {
             Self::Published | Self::BaseStale => StatusCode::CONFLICT,
             Self::EtagRequired => StatusCode::PRECONDITION_REQUIRED,
             Self::EtagInvalid | Self::EmptyPatch => StatusCode::BAD_REQUEST,
-            Self::EtagMismatch | Self::PolicyEtagMismatch => StatusCode::PRECONDITION_FAILED,
+            Self::EtagMismatch | Self::Stale | Self::PolicyEtagMismatch => {
+                StatusCode::PRECONDITION_FAILED
+            }
             Self::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::OwnerQuotaExceeded | Self::DeploymentQuotaExceeded => {
                 StatusCode::TOO_MANY_REQUESTS
@@ -167,6 +177,7 @@ impl PolicyDraftRefusal {
             Self::EtagRequired => "policy_draft_etag_required",
             Self::EtagInvalid => "policy_draft_etag_invalid",
             Self::EtagMismatch => "policy_draft_etag_mismatch",
+            Self::Stale => "policy_draft_stale",
             Self::BaseStale => "policy_draft_base_stale",
             Self::PolicyEtagMismatch => "policy_etag_mismatch",
             Self::TooLarge => "policy_draft_too_large",
@@ -185,6 +196,9 @@ impl PolicyDraftRefusal {
             Self::EtagRequired => "the policy draft ETag precondition is required",
             Self::EtagInvalid => "the policy draft ETag must be exactly one strong entity tag",
             Self::EtagMismatch => "policy draft changed since this ETag was read",
+            Self::Stale => {
+                "policy draft changed since the named draft ETag was read; read the draft again"
+            }
             Self::BaseStale => {
                 "the live policy changed after this draft was pinned; review the draft and rebase it explicitly"
             }
@@ -374,6 +388,42 @@ async fn owned_draft(
         Ok(None) => Err(Box::new(PolicyDraftRefusal::NotFound.response())),
         Err(error) => Err(Box::new(policy_draft_store_failed(&error))),
     }
+}
+
+/// The caller's draft `draft_id`, read as the candidate of a simulation,
+/// test run, analysis or replay pinned to `base_etag`. Nothing is written:
+/// the draft is never rebased, extended or marked.
+///
+/// The draft must belong to the caller (`404` otherwise, exactly as for one
+/// that does not exist), be unexpired (`410`), still be at the strong ETag
+/// `draft_etag` names (`412 policy_draft_stale`), and be pinned to
+/// `base_etag` (`409 policy_draft_base_stale`), so a result compares exactly
+/// the candidate its author reviewed with the base that candidate was edited
+/// from. A published draft is still a candidate: it is frozen, so its ETag
+/// names one document for good.
+pub(super) async fn draft_as_candidate(
+    state: &PolicyAdminState,
+    principal: &auth::Principal,
+    draft_id: &str,
+    draft_etag: &str,
+    base_etag: &str,
+) -> ResponseResult<PolicyDraftRecord> {
+    let Some(store) = state.draft_store.as_ref() else {
+        return Err(Box::new(PolicyDraftRefusal::Unavailable.response()));
+    };
+    let draft = owned_draft(store, &policy_draft_owner(principal), draft_id).await?;
+    if policy_draft_etag(&draft.summary) != draft_etag {
+        return Err(Box::new(PolicyDraftRefusal::Stale.response()));
+    }
+    if draft.summary.base_etag != base_etag {
+        return Err(Box::new(PolicyDraftRefusal::BaseStale.response_with(
+            json!({
+                "base_etag": draft.summary.base_etag,
+                "policy_etag": base_etag,
+            }),
+        )));
+    }
+    Ok(draft)
 }
 
 /// Why a compare-and-set write changed nothing, read back after the fact:
