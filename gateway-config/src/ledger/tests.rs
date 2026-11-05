@@ -527,6 +527,52 @@ fn an_open_ledger_keeps_its_state_directory_locked() {
     StateDirectory::acquire(directory.path()).expect("released with the last handle");
 }
 
+/// Inspecting verifies everything opening verifies, through a read-only
+/// connection, and changes nothing in the ledger file.
+#[test]
+fn inspecting_verifies_the_whole_ledger_read_only() {
+    let (state, [_, _, third]) = three_revisions("inspect");
+    let before = fs::read(state.ledger()).expect("ledger bytes");
+    let inspected = RevisionLedger::inspect(state.held()).expect("a sound ledger inspects");
+    assert_eq!(inspected.revisions, 3);
+    assert_eq!(inspected.desired.revision, third.revision);
+    assert_eq!(inspected.active, None);
+    assert_eq!(fs::read(state.ledger()).expect("ledger bytes"), before);
+    let mut ledger = RevisionLedger::open(state.held()).expect("open");
+    assert_eq!(ledger.state().expect("state"), inspected);
+    drop(ledger);
+
+    let connection = outside(&state);
+    let edited = String::from_utf8(record_bytes(&connection, 2))
+        .expect("UTF-8")
+        .replace("\"subject\":\"alice\"", "\"subject\":\"mallory\"");
+    past_trigger(
+        &connection,
+        "config_revisions_no_update",
+        &format!(
+            "UPDATE config_revisions SET record = CAST('{edited}' AS BLOB) WHERE sequence = 2"
+        ),
+    );
+    drop(connection);
+    let tampered = fs::read(state.ledger()).expect("ledger bytes");
+    assert_eq!(
+        RevisionLedger::inspect(state.held()),
+        Err(LedgerError::Corrupt(Corruption::RecordHash))
+    );
+    assert_eq!(fs::read(state.ledger()).expect("ledger bytes"), tampered);
+
+    let empty = State::new("inspect-missing");
+    assert_eq!(
+        RevisionLedger::inspect(empty.held()),
+        Err(LedgerError::Missing)
+    );
+    fs::write(empty.ledger(), b"not a ledger").expect("file should write");
+    assert!(matches!(
+        RevisionLedger::inspect(empty.held()),
+        Err(LedgerError::Corrupt(_))
+    ));
+}
+
 /// A state directory whose permissions were widened after it was locked is
 /// refused at the next open and seed.
 #[cfg(unix)]
