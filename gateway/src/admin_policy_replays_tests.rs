@@ -1278,7 +1278,10 @@ async fn a_cluster_job_is_admitted_on_one_replica_run_on_another_and_served_by_a
     )
     .await;
     assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(json_body(second).await["reason"], json!("policy_replay_busy"));
+    assert_eq!(
+        json_body(second).await["reason"],
+        json!("policy_replay_busy")
+    );
 
     // Replica B's worker runs the job replica A admitted.
     assert!(replays_b.run_one(&audit_log).await);
@@ -1293,8 +1296,14 @@ async fn a_cluster_job_is_admitted_on_one_replica_run_on_another_and_served_by_a
         "every retained record was read, once"
     );
     let completed = wait_for_lifecycle(&capture, 2);
-    assert_eq!(completed[1].event_type, audit::event::POLICY_REPLAY_COMPLETED);
-    assert_eq!(completed[1].payload["result_digest"], finished["result_digest"]);
+    assert_eq!(
+        completed[1].event_type,
+        audit::event::POLICY_REPLAY_COMPLETED
+    );
+    assert_eq!(
+        completed[1].payload["result_digest"],
+        finished["result_digest"]
+    );
     assert_eq!(
         completed[1].request_id, started[0].request_id,
         "the completion carries the admitting request's envelope"
@@ -1307,7 +1316,10 @@ async fn a_cluster_job_is_admitted_on_one_replica_run_on_another_and_served_by_a
     assert_eq!(other.status(), StatusCode::NOT_FOUND);
     let served = get_job(&router_b, replayer(), &id).await;
     assert_eq!(served.status(), StatusCode::OK);
-    assert_eq!(json_body(served).await["result_digest"], finished["result_digest"]);
+    assert_eq!(
+        json_body(served).await["result_digest"],
+        finished["result_digest"]
+    );
     assert_eq!(
         delete_job(&router_b, replayer(), &id).await.status(),
         StatusCode::NO_CONTENT

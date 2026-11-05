@@ -1397,7 +1397,19 @@ pub(crate) fn classify_postgres_error(error: &PgError) -> RepositoryErrorKind {
         return RepositoryErrorKind::Unavailable;
     }
     let Some(code) = error.code().map(|state| state.code()) else {
-        return RepositoryErrorKind::Internal;
+        // No SQLSTATE: the failure happened below SQL. When its cause is an
+        // I/O error, the transport to the database failed -- a refused,
+        // reset or timed-out connection, or a TLS handshake that rejected
+        // the server's certificate, which the rustls connector reports as
+        // an I/O error -- and the store cannot be used right now. Anything
+        // else (encoding, protocol, configuration) stays internal.
+        let transport =
+            std::error::Error::source(error).is_some_and(|cause| cause.is::<std::io::Error>());
+        return if transport {
+            RepositoryErrorKind::Unavailable
+        } else {
+            RepositoryErrorKind::Internal
+        };
     };
     match code {
         // Query canceled is the statement/lock timeout firing.
@@ -1425,6 +1437,10 @@ pub(crate) fn classify_postgres_error(error: &PgError) -> RepositoryErrorKind {
         _ => RepositoryErrorKind::Internal,
     }
 }
+
+#[cfg(test)]
+#[path = "postgres_test_support.rs"]
+pub(crate) mod test_support;
 
 #[cfg(test)]
 mod tests {
@@ -1888,6 +1904,151 @@ mod tests {
             "expected a connection-create failure, got: {error}"
         );
         let _ = server.await;
+    }
+
+    /// A server that answers the SSLRequest with 'S' and then presents a
+    /// certificate for `db.example.test`, issued by a CA generated for this
+    /// test, on every connection until it is dropped.
+    struct UnverifiableTlsServer {
+        address: std::net::SocketAddr,
+        ca_pem: String,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for UnverifiableTlsServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    impl UnverifiableTlsServer {
+        async fn start() -> Self {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            use tokio_rustls::rustls::pki_types::{
+                CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer,
+            };
+
+            let mut ca_params = rcgen::CertificateParams::default();
+            ca_params.distinguished_name = rcgen::DistinguishedName::new();
+            ca_params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, "GreenGateway PostgreSQL test CA");
+            ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            let ca_key = rcgen::KeyPair::generate().expect("test CA key should generate");
+            let ca_pem = ca_params
+                .self_signed(&ca_key)
+                .expect("test CA certificate should build")
+                .pem();
+            let mut params = rcgen::CertificateParams::new(vec!["db.example.test".to_owned()])
+                .expect("server certificate parameters should build");
+            params.distinguished_name = rcgen::DistinguishedName::new();
+            params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, "db.example.test");
+            params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+            let key = rcgen::KeyPair::generate().expect("server key should generate");
+            let certificate = params
+                .signed_by(&key, &rcgen::Issuer::from_params(&ca_params, &ca_key))
+                .expect("server certificate should build");
+            let server_config = tokio_rustls::rustls::ServerConfig::builder_with_provider(
+                crate::egress::crypto_provider(),
+            )
+            .with_safe_default_protocol_versions()
+            .expect("the provider supports the default versions")
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(certificate.der().to_vec())],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+            )
+            .expect("the server configuration should build");
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("ephemeral listener should bind");
+            let address = listener.local_addr().expect("local address");
+            let task = tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    let acceptor = acceptor.clone();
+                    tokio::spawn(async move {
+                        let mut request = [0_u8; 8];
+                        if socket.read_exact(&mut request).await.is_ok()
+                            && request == [0, 0, 0, 8, 4, 210, 22, 2]
+                            && socket.write_all(b"S").await.is_ok()
+                        {
+                            // The client refuses the certificate, so the
+                            // handshake fails here too; nothing follows it.
+                            let _ = acceptor.accept(socket).await;
+                        }
+                    });
+                }
+            });
+            Self {
+                address,
+                ca_pem,
+                task,
+            }
+        }
+    }
+
+    /// A connection the transport refuses, and a TLS handshake whose server
+    /// certificate fails verification, leave the store unusable right now:
+    /// `unavailable`, which the admin surfaces answer `503`, never
+    /// `internal`. Neither failure renders any part of the DSN. The
+    /// verified-TLS tests in `test_support` pin the same two verdicts
+    /// against a real PostgreSQL.
+    #[tokio::test]
+    async fn refused_and_unverifiable_connections_are_unavailable_not_internal() {
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ephemeral listener should bind");
+        let port = closed.local_addr().expect("local address").port();
+        drop(closed);
+        let mut pg_config = validated_dsn_config(&format!(
+            "postgres://{CANARY_USER}@127.0.0.1:{port}/{CANARY_DB}"
+        ))
+        .expect("the DSN parses");
+        let settings = tls_settings(DatabaseTlsMode::LoopbackDev);
+        apply_session_settings(&mut pg_config, &settings);
+        pg_config.ssl_mode(SslMode::Disable);
+        let foundation = build_pool(pg_config, NoTls, &settings).expect("the pool builds");
+        let error = validate_connectivity(foundation.pool())
+            .await
+            .expect_err("nothing listens on the port");
+        assert_eq!(error.kind(), RepositoryErrorKind::Unavailable, "{error}");
+        assert_no_dsn_material(&error.to_string());
+
+        let server = UnverifiableTlsServer::start().await;
+        let directory = tempdir::create("postgres-foundation-ca");
+        let ca_file = directory.path.join("ca.pem");
+        fs::write(&ca_file, &server.ca_pem).expect("the CA bundle should write");
+        // Untrusted: the issuing CA is in no trust store this client reads.
+        // Misnamed: the CA is trusted, but the certificate names another host
+        // than the one dialled.
+        for tls_ca_file in [None, Some(ca_file.display().to_string())] {
+            let mut pg_config = validated_dsn_config(&format!(
+                "postgres://{CANARY_USER}@{}/{CANARY_DB}",
+                server.address
+            ))
+            .expect("the DSN parses");
+            let settings = DatabaseSettings {
+                tls_ca_file: tls_ca_file.clone(),
+                ..tls_settings(DatabaseTlsMode::Verify)
+            };
+            apply_session_settings(&mut pg_config, &settings);
+            pg_config.ssl_mode(SslMode::Require);
+            let connector = verified_tls_connector(&settings).expect("the connector builds");
+            let foundation = build_pool(pg_config, connector, &settings).expect("the pool builds");
+            let error = validate_connectivity(foundation.pool())
+                .await
+                .expect_err("verification must refuse the certificate");
+            assert_eq!(
+                error.kind(),
+                RepositoryErrorKind::Unavailable,
+                "{error} (extra CA: {tls_ca_file:?})"
+            );
+            assert_no_dsn_material(&error.to_string());
+        }
     }
 
     #[test]

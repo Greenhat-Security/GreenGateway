@@ -2,7 +2,7 @@
 
 Issue #433 split the gateway's environment configuration into a compiler
 (`gateway/src/config/`) and the startup stages that act on what it compiles
-(`gateway/src/bootstrap.rs`). This page is the compiler's contract: what it
+(`gateway/src/bootstrap/stages.rs`). This page is the compiler's contract: what it
 reads, what it returns, how secret material travels through it, what it never
 does, and what the configuration bundles, `ggctl` and doctor work of #242 can
 build on today. It describes the code as it is. Where
@@ -353,14 +353,16 @@ What holds it:
    given one.
 2. **A source scan.**
    `stage_tests::the_configuration_modules_name_no_input_or_output_api` reads
-   `config.rs` and the compiler's modules and refuses any line of code (outside
-   comments) naming a file, socket, resolver, process, Tokio, Hyper, SQLite,
-   or PostgreSQL API, and counts their logging. It sees only those files. The
-   functions they call in other modules (path matching, issuer and cookie-name
-   canonicalization, route and ID shapes, header parsing, and the Connections
-   document validators) are functions of their arguments, but the scan does
-   not prove that. `scripts/check-egress-only.sh` separately refuses the
-   outbound HTTP client anywhere outside `gateway/src/egress.rs`.
+   `config.rs`, the compiler's modules, and the `gateway-config` modules they
+   call into (path matching, issuer and cookie-name canonicalization, the route
+   and Connection ID shapes, the request bounds, the TLS, admin session and
+   discovery settings, and the Connections document validators), and refuses
+   any line of code (outside comments and string literals) naming a file,
+   socket, resolver, process, Tokio, Hyper, SQLite, or PostgreSQL API, and
+   counts their logging. It sees only those files; header parsing, the one
+   other call, is the `http` crate's. `scripts/check-egress-only.sh`
+   separately refuses the outbound HTTP client anywhere outside
+   `gateway/src/egress.rs`.
 3. **Behavior.**
    `stage_tests::the_stages_carry_locators_and_destinations_without_touching_them`
    compiles a configuration of absent files and `.invalid` hosts and finds
@@ -526,14 +528,20 @@ today:
 
 ### Moving the compiler into `gateway-config`
 
-`ggctl` cannot compile environment configuration, because the compiler and
-the validators it calls live in the gateway crate: the Connections secret
-provider, alias, and keyring validators, upstream route validation, issuer
-canonicalization (`auth::principal`), admin session types, inbound TLS and
-client-certificate modes, and the discovery signal defaults. ADR-0008 does
-not allow `ggctl` to approximate the gateway, so moving the compiler means
-moving those validators with it. Until then, any `ggctl` report on
-environment configuration must say it did not run the gateway's compiler.
+`ggctl` cannot compile environment configuration, because the compiler lives
+in the gateway crate. ADR-0008 does not allow `ggctl` to approximate the
+gateway, so moving the compiler means moving the validators it calls with it.
+The first step has landed: those validators, all of them I/O-free, are now
+`gateway-config` modules that the gateway re-exports from their old paths
+([the module map](application-modules.md#shared-configuration-contracts)). They
+are the Connections secret provider, alias and keyring documents and the
+Connection ID grammar, the stable route ID grammar, issuer canonicalization,
+the cookie-name grammar, the JWKS key age bounds, the admin session settings,
+the inbound TLS and client-certificate modes, the request bounds, path
+matching, and the discovery signal and suggestion defaults. The compiler
+itself (`gateway/src/config` and `config.rs`) has not moved yet, so until it
+does, any `ggctl` report on environment configuration must say it did not run
+the gateway's compiler.
 
 ### Local filesystem checks and preflight
 
@@ -559,8 +567,10 @@ which the zero-I/O scan holds to no I/O.
   print it, and a canary in the stage tests' secret fixtures.
 - **A new cross-field rule** gets a `ConfigRule` variant, a fixture in
   `stage_tests::rule_fixture`, and a row in [Rules](#rules).
-- **No I/O in the compiler modules.** Work that needs a file, a store, a
-  provider, or the network belongs to a startup stage.
+- **No I/O in the compiler modules**, or in the `gateway-config` modules
+  they call. Work that needs a file, a store, a provider, or the network
+  belongs to a startup stage. A new `gateway-config` module the stages call
+  gets an entry in the zero-I/O scan.
 - **A changed golden is a behavior change.** The parity fixtures pin legacy
   semantics on purpose; a pull request that changes one says so in the
   CHANGELOG.

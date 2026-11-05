@@ -18,6 +18,11 @@ const SESSION_MARKER: &str = "5e551011-0000-4000-8000-000000000001";
 fn evidence(source: JournalSource, action: &str) -> JournaledEvidence {
     let (resource_owner, resource_id, prior_version, new_version) = match source {
         JournalSource::ConnectionChange => (None, CONNECTION_MARKER, Some(3), None),
+        // An issue is the token's first revision; a rotate or a revoke
+        // advances one.
+        JournalSource::ServiceTokenChange if action == ACTION_SERVICE_TOKEN_ISSUE => {
+            (None, TOKEN_MARKER, None, Some(1))
+        }
         JournalSource::ServiceTokenChange => (None, TOKEN_MARKER, Some(1), Some(2)),
         JournalSource::JwtRevocation => (Some(ISSUER_MARKER), JTI_DIGEST_MARKER, None, None),
         // The read leaves every column the session table lacks empty.
@@ -72,6 +77,10 @@ fn with_actor(
 fn every_delivered_shape() -> Vec<JournaledEvidence> {
     vec![
         evidence(JournalSource::ConnectionChange, ACTION_CONNECTION_DELETE),
+        evidence(
+            JournalSource::ServiceTokenChange,
+            ACTION_SERVICE_TOKEN_ISSUE,
+        ),
         evidence(
             JournalSource::ServiceTokenChange,
             ACTION_SERVICE_TOKEN_ROTATE,
@@ -168,6 +177,21 @@ fn revisions_follow_the_v1_transition_of_each_operation() {
         ("connection", Some("3"), None)
     );
     assert_eq!(deleted.security.as_deref(), Some("17"));
+
+    // An issue creates the token's first revision: nothing before it.
+    let issued = revision(
+        JournalSource::ServiceTokenChange,
+        ACTION_SERVICE_TOKEN_ISSUE,
+    );
+    assert_eq!(
+        (
+            issued.axis.as_str(),
+            issued.before.as_deref(),
+            issued.after.as_deref(),
+            issued.security.as_deref()
+        ),
+        ("token", None, Some("1"), Some("17"))
+    );
 
     for action in [ACTION_SERVICE_TOKEN_ROTATE, ACTION_SERVICE_TOKEN_REVOKE] {
         let advanced = revision(JournalSource::ServiceTokenChange, action);
@@ -348,7 +372,7 @@ fn a_row_that_cannot_be_projected_faithfully_is_refused() {
         ProjectionError::UnknownAction
     );
     assert_eq!(
-        refused(&|evidence| evidence.action = Some("service_token.issue".to_owned())),
+        refused(&|evidence| evidence.action = Some("service_token.create".to_owned())),
         ProjectionError::UnknownAction
     );
     // Out-of-shape stored values.
@@ -392,6 +416,62 @@ fn a_row_that_cannot_be_projected_faithfully_is_refused() {
         refused(&|evidence| evidence.resource_id = Some("x".repeat(4097))),
         ProjectionError::Reference(PseudonymError::InvalidComponents)
     ));
+}
+
+/// A service-token issue (journaled since migration 27) is delivered only as
+/// the token's first revision: a row that claims a revision before it, or
+/// any first revision other than 1, is not an issue migration 27 admits and
+/// is refused rather than delivered. An issue belongs to the token table
+/// alone, and it still requires its shared revision.
+#[test]
+fn an_issue_projects_only_as_the_tokens_first_revision() {
+    let keyring = generated_keyring(Uuid::new_v4());
+    let validator = delivery_schema();
+    let base = evidence(
+        JournalSource::ServiceTokenChange,
+        ACTION_SERVICE_TOKEN_ISSUE,
+    );
+    let record = project(&base, &keyring).expect("an issue projects");
+    assert_eq!(record.operation, ACTION_SERVICE_TOKEN_ISSUE);
+    assert_eq!(record.resource.kind, "service_token");
+    let value = serde_json::to_value(&record).expect("a record serializes");
+    if let Err(error) = validator.validate(&value) {
+        panic!("the published schema must accept {value}: {error}");
+    }
+
+    for (prior_version, new_version, expected) in [
+        (Some(1), Some(1), ProjectionError::InvalidEvidence),
+        (Some(1), Some(2), ProjectionError::InvalidEvidence),
+        (None, Some(2), ProjectionError::InvalidEvidence),
+        (None, Some(0), ProjectionError::InvalidEvidence),
+        (None, None, ProjectionError::MissingEvidence),
+    ] {
+        let mut refused = base.clone();
+        refused.prior_version = prior_version;
+        refused.new_version = new_version;
+        assert_eq!(
+            project(&refused, &keyring),
+            Err(expected),
+            "{prior_version:?} -> {new_version:?}"
+        );
+    }
+    let mut unrevisioned = base.clone();
+    unrevisioned.security_revision = None;
+    assert_eq!(
+        project(&unrevisioned, &keyring),
+        Err(ProjectionError::MissingEvidence)
+    );
+    for source in [
+        JournalSource::ConnectionChange,
+        JournalSource::JwtRevocation,
+        JournalSource::AdminSession,
+    ] {
+        assert_eq!(
+            project(&evidence(source, ACTION_SERVICE_TOKEN_ISSUE), &keyring),
+            Err(ProjectionError::UnknownAction),
+            "{source:?}"
+        );
+    }
 }
 
 /// The actor's kind and auth mode are carried as the evidence recorded them

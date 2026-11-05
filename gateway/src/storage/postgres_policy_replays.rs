@@ -1,4 +1,4 @@
-//! PostgreSQL policy replay job store (issue #243): migration 27's
+//! PostgreSQL policy replay job store (issue #243): migration 28's
 //! `greengateway.policy_replay_jobs`, the durable record behind cluster-mode
 //! historical replay jobs.
 //!
@@ -76,7 +76,8 @@ const PENDING_STATES: &str = "('admitting', 'queued', 'running')";
 /// [`record_from_row`] reads them; `c.now` is the statement's one clock read.
 const RECORD_COLUMNS: &str = "j.job_id, j.owner_issuer, j.owner_subject, j.idempotency_key, \
      j.request_digest, j.actor_json, j.request_id, j.source_ip, j.base_etag, \
-     j.candidate_source, j.candidate_etag, j.edit_count, j.projections, j.engine_version, \
+     j.candidate_source, j.candidate_etag, j.edit_count, j.candidate_draft_id, \
+     j.candidate_draft_revision, j.candidate_version, j.projections, j.engine_version, \
      j.window_from, j.window_to, j.from_epoch_us, j.to_epoch_us, j.high_water, \
      j.selected_records, j.first_position, j.last_position, j.max_records, \
      j.state, j.failure, j.cancel_requested, j.scanned_records, \
@@ -88,7 +89,7 @@ const RECORD_COLUMNS: &str = "j.job_id, j.owner_issuer, j.owner_subject, j.idemp
      CASE WHEN j.result_expires_at > c.now THEN j.result::text END, \
      CASE WHEN j.result_expires_at > c.now THEN j.result_digest END";
 /// How many columns [`RECORD_COLUMNS`] names.
-const RECORD_COLUMN_COUNT: usize = 34;
+const RECORD_COLUMN_COUNT: usize = 37;
 
 /// The bounds the store enforces in SQL. The defaults are the admin
 /// endpoint's; tests shrink them.
@@ -138,6 +139,10 @@ pub(crate) struct PolicyReplayJobSpec {
     pub(crate) candidate_source: String,
     pub(crate) candidate_etag: String,
     pub(crate) edit_count: i32,
+    /// The draft and its revision a `draft` candidate was read as.
+    pub(crate) candidate_draft: Option<(String, i64)>,
+    /// The history version a `revision` candidate was read as.
+    pub(crate) candidate_version: Option<i64>,
     /// The projections, comma-separated in the order the request named them.
     pub(crate) projections: String,
     /// The versions of the evaluator, the replay contexts, the checkpoint and
@@ -393,6 +398,10 @@ impl PostgresPolicyReplayStore {
                     });
                 }
             }
+            let (draft_id, draft_revision) = match &spec.candidate_draft {
+                Some((draft_id, revision)) => (Some(draft_id.as_str()), Some(*revision)),
+                None => (None, None),
+            };
             let counts = transaction
                 .query_one(&counts_sql(), &[&spec.owner.issuer, &spec.owner.subject])
                 .await
@@ -416,11 +425,12 @@ impl PostgresPolicyReplayStore {
                                  candidate_json, edit_count, projections, engine_version, \
                                  window_from, window_to, from_epoch_us, to_epoch_us, \
                                  high_water, selected_records, first_position, last_position, \
-                                 max_records, state, created_at \
+                                 max_records, candidate_draft_id, candidate_draft_revision, \
+                                 candidate_version, state, created_at \
                              ) \
                              SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, \
                                     $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, \
-                                    $25, 'admitting', c.now \
+                                    $25, $26, $27, $28, 'admitting', c.now \
                              FROM c \
                              RETURNING * \
                          ) \
@@ -452,6 +462,9 @@ impl PostgresPolicyReplayStore {
                         &spec.first_position,
                         &spec.last_position,
                         &spec.max_records,
+                        &draft_id,
+                        &draft_revision,
+                        &spec.candidate_version,
                     ],
                 )
                 .await
@@ -966,8 +979,8 @@ fn record_from_row(
     operation: &'static str,
 ) -> Result<PolicyReplayJobRecord, RepositoryError> {
     let get = |index: usize| at + index;
-    let result_json: Option<String> = column(row, get(32), operation)?;
-    let result_digest: Option<String> = column(row, get(33), operation)?;
+    let result_json: Option<String> = column(row, get(35), operation)?;
+    let result_digest: Option<String> = column(row, get(36), operation)?;
     let result = match (result_json, result_digest) {
         (Some(json), Some(digest)) => Some((json, digest)),
         (None, None) => None,
@@ -989,28 +1002,37 @@ fn record_from_row(
             candidate_source: column(row, get(9), operation)?,
             candidate_etag: column(row, get(10), operation)?,
             edit_count: column(row, get(11), operation)?,
-            projections: column(row, get(12), operation)?,
-            engine_version: column(row, get(13), operation)?,
-            window_from: column(row, get(14), operation)?,
-            window_to: column(row, get(15), operation)?,
-            from_epoch_us: column(row, get(16), operation)?,
-            to_epoch_us: column(row, get(17), operation)?,
-            high_water: column(row, get(18), operation)?,
-            selected_records: column(row, get(19), operation)?,
-            first_position: column(row, get(20), operation)?,
-            last_position: column(row, get(21), operation)?,
-            max_records: column(row, get(22), operation)?,
+            candidate_draft: match (
+                column::<Option<String>>(row, get(12), operation)?,
+                column::<Option<i64>>(row, get(13), operation)?,
+            ) {
+                (Some(draft_id), Some(revision)) => Some((draft_id, revision)),
+                (None, None) => None,
+                _ => return Err(invalid_data(operation)),
+            },
+            candidate_version: column(row, get(14), operation)?,
+            projections: column(row, get(15), operation)?,
+            engine_version: column(row, get(16), operation)?,
+            window_from: column(row, get(17), operation)?,
+            window_to: column(row, get(18), operation)?,
+            from_epoch_us: column(row, get(19), operation)?,
+            to_epoch_us: column(row, get(20), operation)?,
+            high_water: column(row, get(21), operation)?,
+            selected_records: column(row, get(22), operation)?,
+            first_position: column(row, get(23), operation)?,
+            last_position: column(row, get(24), operation)?,
+            max_records: column(row, get(25), operation)?,
         },
         status: PolicyReplayJobStatus {
-            state: column(row, get(23), operation)?,
-            failure: column(row, get(24), operation)?,
-            cancel_requested: column(row, get(25), operation)?,
-            scanned_records: column(row, get(26), operation)?,
-            created_at_us: column(row, get(27), operation)?,
-            started_at_us: column(row, get(28), operation)?,
-            finished_at_us: column(row, get(29), operation)?,
-            result_expires_at_us: column(row, get(30), operation)?,
-            result_expired: column(row, get(31), operation)?,
+            state: column(row, get(26), operation)?,
+            failure: column(row, get(27), operation)?,
+            cancel_requested: column(row, get(28), operation)?,
+            scanned_records: column(row, get(29), operation)?,
+            created_at_us: column(row, get(30), operation)?,
+            started_at_us: column(row, get(31), operation)?,
+            finished_at_us: column(row, get(32), operation)?,
+            result_expires_at_us: column(row, get(33), operation)?,
+            result_expired: column(row, get(34), operation)?,
             result,
         },
     })

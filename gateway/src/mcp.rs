@@ -541,6 +541,10 @@ fn invocation_context_from_request(
             .extensions
             .get::<auth::Principal>()
             .map(auth::actor_from_principal),
+        organization: parts
+            .extensions
+            .get::<auth::Principal>()
+            .and_then(|principal| principal.org_id.clone()),
         caller: parts
             .extensions
             .get::<auth::Principal>()

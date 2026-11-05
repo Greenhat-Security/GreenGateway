@@ -135,6 +135,8 @@ fn spec(n: u8, owner: PolicyReplayOwner, key: Option<&str>, digest: &str) -> Pol
         candidate_source: "active".to_owned(),
         candidate_etag: ETAG.to_owned(),
         edit_count: 0,
+        candidate_draft: None,
+        candidate_version: None,
         projections: "as_authored".to_owned(),
         engine_version: "test-engine".to_owned(),
         window_from: "2026-01-01T00:00:00Z".to_owned(),

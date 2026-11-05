@@ -179,6 +179,8 @@ impl Cluster {
             candidate_source: "active".to_owned(),
             candidate_etag: etag,
             edit_count: 0,
+            candidate_draft: None,
+            candidate_version: None,
             projections: "as_authored".to_owned(),
             engine_version: engine.to_owned(),
             window_from: scope.from.clone(),

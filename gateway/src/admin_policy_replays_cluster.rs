@@ -2,7 +2,7 @@
 //! `GET` and `DELETE .../policy/replays`, and the bounded worker every
 //! cluster replica runs.
 //!
-//! A cluster job is a row of migration 27's `greengateway.policy_replay_jobs`
+//! A cluster job is a row of migration 28's `greengateway.policy_replay_jobs`
 //! (`storage::postgres_policy_replays`), so every replica serves every job
 //! and any replica may run one. It reads the cluster audit stream
 //! (`storage::postgres_audit_replay`) through the same engine, under the same
@@ -289,10 +289,24 @@ impl ClusterJob {
 }
 
 fn binding_from(spec: &PolicyReplayJobSpec) -> Option<ReplayJobBinding> {
-    let candidate_source = match spec.candidate_source.as_str() {
-        "active" => "active",
-        "edits" => "edits",
-        "inline" => "inline",
+    let (candidate_source, stored) = match (
+        spec.candidate_source.as_str(),
+        &spec.candidate_draft,
+        spec.candidate_version,
+    ) {
+        ("active", None, None) => ("active", None),
+        ("edits", None, None) => ("edits", None),
+        ("inline", None, None) => ("inline", None),
+        ("draft", Some((draft_id, revision)), None) => (
+            "draft",
+            Some(StoredCandidate::Draft {
+                draft_id: draft_id.clone(),
+                revision: *revision,
+            }),
+        ),
+        ("revision", None, Some(version)) => {
+            ("revision", Some(StoredCandidate::Revision { version }))
+        }
         _ => return None,
     };
     let projections = spec
@@ -309,6 +323,7 @@ fn binding_from(spec: &PolicyReplayJobSpec) -> Option<ReplayJobBinding> {
         candidate_source,
         candidate_etag: spec.candidate_etag.clone(),
         edit_count: usize::try_from(spec.edit_count).ok()?,
+        stored,
         projections,
     })
 }
@@ -509,6 +524,16 @@ impl ClusterPolicyReplays {
             candidate_source: binding.candidate_source.to_owned(),
             candidate_etag: binding.candidate_etag.clone(),
             edit_count: i32::try_from(binding.edit_count).unwrap_or(i32::MAX),
+            candidate_draft: match &binding.stored {
+                Some(StoredCandidate::Draft { draft_id, revision }) => {
+                    Some((draft_id.clone(), *revision))
+                }
+                _ => None,
+            },
+            candidate_version: match &binding.stored {
+                Some(StoredCandidate::Revision { version }) => Some(*version),
+                _ => None,
+            },
             projections: binding.projection_names().join(","),
             engine_version: engine_version(),
             window_from: scope.from.clone(),
@@ -716,7 +741,7 @@ fn rebuilt_pins(
         spec.candidate_source.as_str(),
     ) {
         (None, "active") => None,
-        (Some(json), "edits" | "inline") => Some(
+        (Some(json), "edits" | "inline" | "draft" | "revision") => Some(
             candidate_from_stored(json, &spec.candidate_etag, operation)
                 .map_err(|_| ReplayStop::Failed("pins_unreadable"))?,
         ),

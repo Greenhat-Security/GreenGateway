@@ -1,7 +1,9 @@
-//! Writing a new bundle directory (issue #242 PR 6; ADR-0008, "Bootstrap
-//! model"): what `ggctl init` and `ggctl convert --output` share.
+//! Writing bundles (issue #242; ADR-0008, "Bootstrap model" and "Digests"):
+//! a new bundle directory, which `ggctl init` and `ggctl convert --output`
+//! share, and a new manifest for an existing bundle, which `ggctl pin`
+//! writes ([`replace_manifest`], below).
 //!
-//! A bundle appears at its destination whole or not at all:
+//! A new bundle appears at its destination whole or not at all:
 //!
 //! 1. The destination must not exist, or must be an empty directory that is
 //!    not a link. Anything else is refused and never overwritten.
@@ -26,6 +28,17 @@
 //! write leaves nothing at the destination. A process killed between steps
 //! 2 and 5 can leave the hidden staging directory behind, never the
 //! destination.
+//!
+//! A manifest is replaced the same way, one file instead of a directory: the
+//! new bytes go into a new hidden file beside `bundle.yaml`
+//! (`.bundle.yaml.ggctl-pin-PID-N`, created exclusively, `0600` and checked
+//! on Unix), which is flushed and then renamed over `bundle.yaml`, and on
+//! Unix the directory is flushed. `bundle.yaml` must be a regular file, not
+//! a link, and must still hold the bytes the caller read, checked before the
+//! hidden file is created and again just before the rename. Any failure
+//! removes the hidden file and leaves `bundle.yaml` as it was; a process
+//! killed before the rename can leave the hidden file, which the bundle
+//! reader never opens, and never a partial manifest.
 
 use std::{
     ffi::OsString,
@@ -36,9 +49,14 @@ use std::{
 
 use gateway_config::bundle::{
     self, init::GITATTRIBUTES, PublishedSchemasOnly, ReadOptions, SourceFile, MANIFEST_FILE_NAME,
+    MAX_MANIFEST_BYTES,
 };
 
-use crate::{diagnostic::Code, validate::BundleRead};
+use crate::{
+    credential::{self, FilePermissions, FileProblem},
+    diagnostic::Code,
+    validate::BundleRead,
+};
 
 /// Staging names tried before giving up: each is created exclusively, so a
 /// name that exists is skipped, never reused.
@@ -229,6 +247,177 @@ fn owner_only(options: &mut OpenOptions) {
 #[cfg(not(unix))]
 fn owner_only(_options: &mut OpenOptions) {}
 
+/// Renames one path onto another, replacing a file there. Tests substitute a
+/// failing one to interrupt a write at its last step.
+pub(crate) type Rename = fn(&Path, &Path) -> io::Result<()>;
+
+/// [`Rename`] as the filesystem does it.
+pub(crate) fn rename(from: &Path, to: &Path) -> io::Result<()> {
+    fs::rename(from, to)
+}
+
+/// Why a manifest was not replaced. `bundle.yaml` is as it was in every
+/// case.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReplaceError {
+    /// `bundle.yaml` is a link (on Windows, any reparse point) or not a
+    /// regular file.
+    NotRegularFile,
+    /// `bundle.yaml` no longer holds the bytes the caller read.
+    Changed,
+    /// The new file could not be created, written, flushed or renamed.
+    Unusable,
+    /// Owner-only permissions could not be established (Unix).
+    Permissions,
+}
+
+impl ReplaceError {
+    /// The diagnostic code reporting it.
+    pub(crate) fn code(self) -> Code {
+        match self {
+            Self::NotRegularFile => Code::ManifestLink,
+            Self::Changed => Code::ManifestChanged,
+            Self::Unusable => Code::PinWriteFailed,
+            Self::Permissions => Code::PinPermissionsUnavailable,
+        }
+    }
+}
+
+/// Refuses a `bundle.yaml` in `root` that is a link or not a regular file.
+/// One that is absent, or cannot be examined, passes: the bundle reader then
+/// reports why it cannot read the manifest.
+pub(crate) fn check_manifest_entry(root: &Path) -> Result<(), ReplaceError> {
+    match fs::symlink_metadata(root.join(MANIFEST_FILE_NAME)) {
+        Ok(metadata) if is_link(&metadata) || !metadata.is_file() => {
+            Err(ReplaceError::NotRegularFile)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Replaces `bundle.yaml` in the bundle directory `root`, which must still
+/// hold `expected`, with `manifest`, atomically.
+pub(crate) fn replace_manifest(
+    root: &Path,
+    expected: &[u8],
+    manifest: &[u8],
+    rename: Rename,
+) -> Result<(), ReplaceError> {
+    let target = root.join(MANIFEST_FILE_NAME);
+    check_manifest(&target, expected)?;
+    let replacement = Replacement::create(root, manifest)?;
+    // Checked again just before the rename: another writer may have changed
+    // the manifest meanwhile. A rename cannot compare and swap, so this
+    // narrows that window; it cannot close it.
+    check_manifest(&target, expected)?;
+    rename_retrying(rename, &replacement.path, &target).map_err(|_| ReplaceError::Unusable)?;
+    replacement.placed();
+    // The manifest is replaced; flushing the rename is best effort, and a
+    // failure here must not report a manifest that changed as unchanged.
+    let _ = sync_directory(root);
+    Ok(())
+}
+
+/// Refuses a manifest that is a link or not a regular file, or that no
+/// longer holds `expected`.
+fn check_manifest(path: &Path, expected: &[u8]) -> Result<(), ReplaceError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(ReplaceError::Changed),
+        Err(_) => return Err(ReplaceError::Unusable),
+    };
+    if is_link(&metadata) || !metadata.is_file() {
+        return Err(ReplaceError::NotRegularFile);
+    }
+    // Read as any local file ggctl reads: bounded, and opened without
+    // blocking so a FIFO swapped in cannot stall the comparison.
+    match credential::read_regular_file(
+        path,
+        MAX_MANIFEST_BYTES,
+        FilePermissions::NotWritableByOthers,
+    ) {
+        Ok(current) if current.as_slice() == expected => Ok(()),
+        Ok(_) | Err(FileProblem::TooLarge | FileProblem::UnsafePermissions) => {
+            Err(ReplaceError::Changed)
+        }
+        Err(FileProblem::NotRegularFile) => Err(ReplaceError::NotRegularFile),
+        Err(FileProblem::Unreadable) => Err(ReplaceError::Unusable),
+    }
+}
+
+/// Whether an entry, not followed, is a link: on Windows any reparse point,
+/// as the bundle reader treats one.
+fn is_link(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink() || is_reparse_point(metadata)
+}
+
+#[cfg(windows)]
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+/// The new manifest's hidden file, removed on drop unless it was renamed
+/// into place.
+struct Replacement {
+    path: PathBuf,
+    placed: bool,
+}
+
+impl Replacement {
+    /// Creates the file exclusively under a fresh hidden name, writes
+    /// `manifest` whole, flushes it, and checks it is owner-only.
+    fn create(root: &Path, manifest: &[u8]) -> Result<Self, ReplaceError> {
+        for attempt in 0..STAGING_ATTEMPTS {
+            let name = format!(
+                ".{MANIFEST_FILE_NAME}.ggctl-pin-{}-{attempt}",
+                std::process::id()
+            );
+            let path = root.join(name);
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            owner_only(&mut options);
+            let mut file = match options.open(&path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(_) => return Err(ReplaceError::Unusable),
+            };
+            // From here on the file is this process's own, removed on drop.
+            let replacement = Self {
+                path,
+                placed: false,
+            };
+            file.write_all(manifest)
+                .and_then(|()| file.sync_all())
+                .map_err(|_| ReplaceError::Unusable)?;
+            drop(file);
+            if !is_owner_only(&replacement.path) {
+                return Err(ReplaceError::Permissions);
+            }
+            return Ok(replacement);
+        }
+        Err(ReplaceError::Unusable)
+    }
+
+    fn placed(mut self) {
+        self.placed = true;
+    }
+}
+
+impl Drop for Replacement {
+    fn drop(&mut self) {
+        if !self.placed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
 /// Refuses a staging directory, or a file in it, that group or other can
 /// access: the modes it was created with, unless the filesystem ignored them.
 fn check_owner_only(staging: &Path) -> Result<(), WriteError> {
@@ -283,27 +472,32 @@ fn placement_error(error: io::Error) -> WriteError {
     }
 }
 
-#[cfg(not(windows))]
 fn rename_into_place(staging: &Path, destination: &Path) -> Result<(), WriteError> {
-    fs::rename(staging, destination).map_err(placement_error)
+    rename_retrying(rename, staging, destination).map_err(placement_error)
 }
 
-/// Windows refuses to rename a directory while another process, such as a
-/// virus scanner or the search indexer, holds a file in it open; that is
-/// retried briefly. Nothing else is retried.
+#[cfg(not(windows))]
+fn rename_retrying(rename: Rename, from: &Path, to: &Path) -> io::Result<()> {
+    rename(from, to)
+}
+
+/// Windows refuses to rename a directory, or to replace a file, while
+/// another process, such as a virus scanner or the search indexer, holds a
+/// file in it or the file open; that is retried briefly. Nothing else is
+/// retried.
 #[cfg(windows)]
-fn rename_into_place(staging: &Path, destination: &Path) -> Result<(), WriteError> {
+fn rename_retrying(rename: Rename, from: &Path, to: &Path) -> io::Result<()> {
     const ATTEMPTS: u64 = 5;
-    for attempt in 1..=ATTEMPTS {
-        match fs::rename(staging, destination) {
-            Ok(()) => return Ok(()),
+    let mut attempt = 1;
+    loop {
+        match rename(from, to) {
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied && attempt < ATTEMPTS => {
                 std::thread::sleep(std::time::Duration::from_millis(50 * attempt));
+                attempt += 1;
             }
-            Err(error) => return Err(placement_error(error)),
+            result => return result,
         }
     }
-    Err(WriteError::Unusable)
 }
 
 #[cfg(test)]

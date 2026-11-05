@@ -5952,6 +5952,249 @@ mod cluster_policy_tests {
         assert_eq!(policy_version_count(&pool).await, versions_before);
     }
 
+    /// Cluster mode reads a stored candidate from the cluster's authorities
+    /// (issue #243): a draft from migration 22's table, owner-scoped and at
+    /// the ETag the request names, and a history version from the immutable
+    /// `policy_documents` rows, validated again under this build. A
+    /// simulation of either writes no version, does not touch the draft,
+    /// and reports the draft's id and revision or the version it read.
+    #[tokio::test]
+    async fn cluster_simulations_read_drafts_and_history_versions_as_candidates() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_policy_foundation(&database.dsn).await;
+        let simulating = |id: &str| {
+            format!(
+                r#"{{
+                    "schema_version": "0.1.0",
+                    "id": "{id}",
+                    "default_action": "deny",
+                    "roles": {{ "admin": {{ "permissions":
+                        ["admin:policy:read", "admin:policy:write", "admin:policy:simulate"] }} }},
+                    "rules": [{{ "id": "{id}-rule", "methods": ["GET"], "path": "/{id}/**", "action": "allow" }}]
+                }}"#
+            )
+        };
+        let seed = simulating("seed");
+        let active = PolicyControlPlane::commit(
+            store.as_ref(),
+            PolicyCommitRequest {
+                precondition: PolicyCommitPrecondition::Initialize,
+                candidate: &parse_policy_body(seed.as_bytes()).expect("seed policy should parse"),
+                change: crate::storage::DocumentChange::test_policy("seed"),
+                diff_summary: &DIFF,
+            },
+        )
+        .await
+        .expect("deployment should initialize");
+        let (router, rbac_state) = cluster_policy_router(store.clone());
+        rbac_state
+            .install_revision_snapshot(active.policy.clone(), active.security_revision)
+            .await
+            .expect("the authority's revision should install");
+        let request = |method: Method,
+                       uri: &str,
+                       if_match: Option<&str>,
+                       principal: auth::Principal,
+                       body: String| {
+            let mut builder = Request::builder().method(method).uri(uri);
+            if let Some(if_match) = if_match {
+                builder = builder.header(header::IF_MATCH, if_match);
+            }
+            let mut request = builder
+                .body(Body::from(body))
+                .expect("request should build");
+            request.extensions_mut().insert(principal);
+            request
+        };
+        let simulation = |base_etag: &str, candidate: Value| {
+            json!({
+                "schema_version": "policy-simulation.v1",
+                "base_etag": base_etag,
+                "candidate": candidate,
+                "cases": [{
+                    "id": "drafted-page",
+                    "kind": "http",
+                    "request": { "method": "GET", "path": "/drafted/a" },
+                    "principal": "anonymous"
+                }]
+            })
+            .to_string()
+        };
+
+        let created = router
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                POLICY_DRAFTS_ADMIN_ROUTE,
+                Some(&active.etag),
+                admin_principal(),
+                format!(r#"{{"policy":{}}}"#, simulating("drafted")),
+            ))
+            .await
+            .expect("create should complete");
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let draft_etag = created
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("draft ETag")
+            .to_owned();
+        let (_, draft) = refusal_of(created).await;
+        let draft_id = draft["draft_id"].as_str().expect("draft id").to_owned();
+        let draft_uri = format!("{POLICY_DRAFTS_ADMIN_ROUTE}/{draft_id}");
+        let versions_before = policy_version_count(&pool).await;
+        let draft_source = json!({
+            "source": "draft", "draft_id": draft_id, "draft_etag": draft_etag
+        });
+
+        let (status, simulated) = refusal_of(
+            router
+                .clone()
+                .oneshot(request(
+                    Method::POST,
+                    POLICY_SIMULATIONS_ADMIN_ROUTE,
+                    None,
+                    admin_principal(),
+                    simulation(&active.etag, draft_source.clone()),
+                ))
+                .await
+                .expect("simulation should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{simulated}");
+        assert_eq!(
+            simulated["candidate"],
+            json!({
+                "source": "draft",
+                "etag": draft["candidate_etag"],
+                "draft_id": draft_id,
+                "draft_revision": 1
+            })
+        );
+        assert_eq!(
+            simulated["base"]["security_revision"],
+            json!(active.security_revision)
+        );
+        assert_eq!(
+            simulated["cases"][0]["results"][0]["candidate"]["effective_action"],
+            json!("would_forward")
+        );
+
+        // Another owner's draft is the missing one's `404`.
+        let mut stranger = admin_principal();
+        stranger.user_id = "another-owner".to_owned();
+        let (status, body) = refusal_of(
+            router
+                .clone()
+                .oneshot(request(
+                    Method::POST,
+                    POLICY_SIMULATIONS_ADMIN_ROUTE,
+                    None,
+                    stranger,
+                    simulation(&active.etag, draft_source.clone()),
+                ))
+                .await
+                .expect("simulation should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["reason"], "policy_draft_not_found");
+
+        // A new version goes live; the seed is now history.
+        let committed = router
+            .clone()
+            .oneshot(request(
+                Method::PUT,
+                POLICY_ADMIN_ROUTE,
+                Some(&active.etag),
+                admin_principal(),
+                simulating("current"),
+            ))
+            .await
+            .expect("PUT should complete");
+        let current_etag = etag_of(committed).await;
+        let versions_after_commit = policy_version_count(&pool).await;
+        assert_eq!(versions_after_commit, versions_before + 1);
+        let (status, simulated) = refusal_of(
+            router
+                .clone()
+                .oneshot(request(
+                    Method::POST,
+                    POLICY_SIMULATIONS_ADMIN_ROUTE,
+                    None,
+                    admin_principal(),
+                    simulation(
+                        &current_etag,
+                        json!({ "source": "revision", "version": active.version }),
+                    ),
+                ))
+                .await
+                .expect("simulation should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{simulated}");
+        assert_eq!(
+            simulated["candidate"],
+            json!({ "source": "revision", "etag": active.etag, "version": active.version })
+        );
+        assert_eq!(simulated["base"]["etag"], json!(current_etag));
+        let (status, body) = refusal_of(
+            router
+                .clone()
+                .oneshot(request(
+                    Method::POST,
+                    POLICY_SIMULATIONS_ADMIN_ROUTE,
+                    None,
+                    admin_principal(),
+                    simulation(
+                        &current_etag,
+                        json!({ "source": "revision", "version": active.version + 1_000 }),
+                    ),
+                ))
+                .await
+                .expect("simulation should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["reason"], "policy_revision_not_found");
+
+        // The draft, pinned to the seed, is no longer on the request's base,
+        // and is neither rebased nor written by being asked.
+        let (status, body) = refusal_of(
+            router
+                .clone()
+                .oneshot(request(
+                    Method::POST,
+                    POLICY_SIMULATIONS_ADMIN_ROUTE,
+                    None,
+                    admin_principal(),
+                    simulation(&current_etag, draft_source),
+                ))
+                .await
+                .expect("simulation should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["reason"], "policy_draft_base_stale");
+        let kept = router
+            .clone()
+            .oneshot(request(
+                Method::GET,
+                &draft_uri,
+                None,
+                admin_principal(),
+                String::new(),
+            ))
+            .await
+            .expect("draft read should complete");
+        assert_eq!(etag_of(kept).await, draft_etag);
+        assert_eq!(policy_version_count(&pool).await, versions_after_commit);
+    }
+
     /// A draft publication the commit itself refuses is recorded like one
     /// refused before it (issue #243 review): here the candidate gives a
     /// role a `description`, the operation gate has no roster to ask, and

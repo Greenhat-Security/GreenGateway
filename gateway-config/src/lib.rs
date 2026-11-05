@@ -35,7 +35,16 @@
 //!   overwrites a revision it did not plan against;
 //! - [`semantic_diff`]: the semantic diff between two compiled
 //!   configurations and its risk classification, which `ggctl diff` reports
-//!   for two bundles and the ledger's plans gate applies on.
+//!   for two bundles and the ledger's plans gate applies on;
+//! - the leaves of the environment configuration compiler, which is moving
+//!   here: [`connections`] (the secret alias, keyring and provider documents
+//!   and their validators, and the Connection ID grammar), [`auth`] (issuer
+//!   canonicalization, the JWKS key age bounds, the cookie-name grammar, the
+//!   client-certificate identity source and the admin session settings),
+//!   [`inbound_tls`], [`path_match`], [`request_bounds`], [`upstream_route`]
+//!   (the stable route ID grammar) and [`discovery`] (the signal and
+//!   suggestion defaults). The gateway re-exports each from the module it
+//!   moved out of.
 //!
 //! Still in the gateway crate: the environment configuration compiler
 //! (`config::compile`, extracted by #433 and described in
@@ -44,7 +53,8 @@
 //! [`bundle::ResourceValidators`] argument, so the gateway runs them and
 //! `ggctl`, which cannot link the gateway crate, reports that it did not.
 //!
-//! Nothing here touches the environment, a clock or the network. The bundle
+//! Nothing here touches the environment, a clock or the network, and the
+//! compiler's leaves touch nothing at all. The bundle
 //! reader reads files only beneath the bundle root it is given, and never
 //! writes. The archive guard reads and writes only the readers and writers
 //! it is handed. The ledger is the one store: it reads and writes only its own
@@ -52,13 +62,20 @@
 //! the revision service reads and writes only through it.
 
 pub mod archive;
+pub mod auth;
 pub mod bundle;
 pub mod canonical_json;
 pub mod capabilities;
 pub mod catalog;
+pub mod connections;
+pub mod discovery;
 pub mod documents;
+pub mod inbound_tls;
 pub mod ledger;
 pub mod opaque_id;
+pub mod path_match;
 pub mod permissions;
+pub mod request_bounds;
 pub mod revisions;
 pub mod semantic_diff;
+pub mod upstream_route;

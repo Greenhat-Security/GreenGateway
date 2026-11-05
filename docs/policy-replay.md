@@ -224,6 +224,7 @@ an allow.
 | routing `local`, identity `not_recorded` | both readings; see below |
 | routing `proxy_dispatch` | the classified dispatch with the recorded facts |
 | egress `destination` | the destination with no resolution facts |
+| organization (never recorded) | not recorded: an identity mapping that tests `organizations` is `missing_matcher_fact` |
 
 **MCP identity.** A record that does not say whether its path was an MCP
 alias is decided under both readings, contextless and alias, and answers
@@ -232,6 +233,14 @@ reason, the deciding element and any shadow observation. When they disagree
 the answer is `indeterminate` with `missing_mcp_identity`. Choosing the
 contextless reading would decide an alias request under the wrong
 precedence order.
+
+**Identity mappings.** A record carries no organization, so replay leaves
+the organization not recorded rather than read it as none: a principal whose
+internal roles turn on a mapping that tests `organizations` is
+`indeterminate` with `missing_matcher_fact` in every lane, where live it was
+decided by the organization its provider verified. Mappings that test only
+the issuer, authentication method, subject and claimed roles replay as they
+are served.
 
 **Rate lane.** Rate-lane selection reads the recorded method, path and
 principal, exactly as the live rate stage does, and an anonymous caller
@@ -292,7 +301,7 @@ refuses unknown, repeated and credential-shaped members.
 | Member | Meaning |
 | --- | --- |
 | `base_etag` | Required. The active policy's ETag the request was written against. A different active policy is `412 policy_replay_base_stale`, never a rebase |
-| `candidate` | Required. `active` (the base itself), `edits` (1 to 64 position-aware edits over the base) or `inline` (a complete policy document), with exactly the members a [simulation](policy-simulation.md) candidate has. An edited or inline candidate is validated like a policy write and never stored |
+| `candidate` | Required. `active` (the base itself), `edits` (1 to 64 position-aware edits over the base), `inline` (a complete policy document), `draft` (one of your server-side drafts, by `draft_id` and `draft_etag`) or `revision` (a policy history `version`), with exactly the members a [simulation](policy-simulation.md) candidate has. An edited or inline candidate is validated like a policy write and never stored; a draft or history version is read, owner-scoped and validated again, and never written, as [a simulation reads one](policy-simulation.md#drafts-and-history-versions), when the job is created |
 | `window` | Required. `from` and optional `to`, RFC 3339 date-times with an offset; the window is `[from, to)` over audit timestamps. `to` defaults to the moment the job is created and may not be later; the window must begin before it ends and may cover at most 31 days |
 | `projections` | Optional. The [simulation](policy-simulation.md)'s projections the [impact comparison](#impact-comparison) is reported under, each named once: `as_authored`, `enforce_all_shadow` or both. `["as_authored"]` when omitted |
 | `max_records` | Optional. The most records the job reads, 1 to 100,000; 100,000 when omitted |
@@ -431,7 +440,9 @@ when it is admitted, and one of `policy.replay_completed`,
 `policy.replay_cancelled`, `policy.replay_failed` or (cluster only)
 `policy.replay_interrupted` when it ends. They carry
 the job id, the base and candidate ETags, the request digest, the projections,
-the window and cutoff, counts (the completion's `impact` member counts newly
+the window and cutoff (the start also names a stored candidate by its
+`candidate_draft_id` and `candidate_draft_revision`, or its
+`candidate_version`), counts (the completion's `impact` member counts newly
 allowed, newly denied, enforcement-only, newly forwarded, newly blocked,
 indeterminate and unsupported records per projection), limitation codes and
 the result digest -- never a record, a principal, a path, an element id or
@@ -452,14 +463,15 @@ is what `AUDIT_DURABILITY` makes it: committed to the audit store under
 | `204` | `DELETE`: a finished job was discarded |
 | `400` | A body that is not JSON, or repeats a member (`policy_replay_request_invalid`) |
 | `401`, `403` | Not authenticated, or missing one of the three permissions; nothing is read or started |
-| `404` | No such job for this principal (`policy_replay_job_not_found`) |
-| `409` | An idempotency key reused for a different request |
+| `404` | No such job for this principal (`policy_replay_job_not_found`), or a stored candidate that is not there (`policy_draft_not_found`, `policy_revision_not_found`, or no policy history) |
+| `409` | An idempotency key reused for a different request, or a draft candidate pinned to another base than `base_etag` (`policy_draft_base_stale`) |
 | `408` | The body did not arrive within five seconds (`policy_replay_request_timeout`). Nothing was started |
-| `412` | `base_etag` is not the active policy's ETag |
+| `410` | The draft candidate has expired (`policy_draft_expired`) |
+| `412` | `base_etag` is not the active policy's ETag, or the draft candidate's `draft_etag` is no longer the draft's (`policy_draft_stale`) |
 | `413` | The body is over its bound |
-| `422` | An invalid request, window, edit or candidate |
+| `422` | An invalid request, window, edit or candidate, or a history version this build does not accept now (`policy_revision_incompatible`) |
 | `429` | `policy_replay_busy` or `policy_replay_quota_exhausted` |
-| `503` | `audit_evidence_unavailable` (no standalone audit log or cluster job store, or the audit records could not be read), `policy_replay_audit_unavailable` (the start was not recorded), or `policy_replay_store_unavailable` (cluster mode: the job store could not be read or written) |
+| `503` | `audit_evidence_unavailable` (no standalone audit log or cluster job store, or the audit records could not be read), `policy_replay_audit_unavailable` (the start was not recorded), `policy_replay_store_unavailable` (cluster mode: the job store could not be read or written), or a drafts store or policy history that could not be read (`policy_drafts_unavailable`, `policy_history_unavailable`) |
 
 A job's representation is always sent with `Cache-Control: no-store`.
 
@@ -468,7 +480,8 @@ A job's representation is always sent with `Cache-Control: no-store`.
 A job's representation (`policy-replay-job.v1`) states its state, the
 evaluator and gateway versions, the base ETag and whether it is still the
 active one (`base.current`), its `freshness`, the candidate's source and
-ETag, the projections, the window, the cutoff, the limits applied and its
+ETag (with the `draft_id` and `draft_revision`, or the `version`, of a stored
+candidate), the projections, the window, the cutoff, the limits applied and its
 progress. A finished job adds `result_digest` and `result`, a
 `policy-replay-results.v1` document:
 
@@ -575,7 +588,7 @@ audit log (`AUDIT_SQLITE_PATH` unset) the start route is
 ### Cluster jobs
 
 In cluster mode a job is a row of `greengateway.policy_replay_jobs`
-(migration 27), so every replica answers `GET` and `DELETE` for every job and
+(migration 28), so every replica answers `GET` and `DELETE` for every job and
 any replica may run it. It reads the cluster audit stream through
 [the cluster reader](#the-cluster-reader), under the bounds above, and its
 result is the same `policy-replay-results.v1` document, with `source.kind`
@@ -589,8 +602,9 @@ status codes are the standalone ones.
   a transaction-scoped advisory lock, so two replicas can neither both take
   the last slot nor both admit one key. No job is ever evicted or ended to
   make room. The row pins both policy documents as the gateway serialized
-  them, the cutoff, and the versions of the evaluator, replay context,
-  checkpoint and result the job was admitted under. The job becomes `queued`
+  them (and, for a draft or history candidate, the draft revision or history
+  version it was read as), the cutoff, and the versions of the evaluator,
+  replay context, checkpoint and result the job was admitted under. The job becomes `queued`
   only once its `policy.replay_started` event is accepted; until then no
   replica runs it.
 - **Workers and leases.** Every cluster replica runs one replay worker, so

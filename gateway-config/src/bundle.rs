@@ -44,10 +44,11 @@
 //! it, and a bundle a caller submitted is read exactly as a directory would
 //! be.
 //!
-//! Two modules build on the reader: [`init`] generates the bundle `ggctl
-//! init` writes, and [`convert`] converts a bundle between document versions
-//! for `ggctl convert`. Both hand their output to this reader before anything
-//! treats it as a bundle.
+//! Three modules build on the reader: [`init`] generates the bundle `ggctl
+//! init` writes, [`convert`] converts a bundle between document versions for
+//! `ggctl convert`, and [`pin`] recomputes a bundle's pins for `ggctl pin`,
+//! reading it with every check but the pin comparison. Each hands its output
+//! to this reader before anything treats it as a bundle.
 //!
 //! Nothing selects a bundle for startup yet: bundle mode and the field
 //! catalog that fills the deployment document are later #242 slices.
@@ -57,6 +58,7 @@ mod diagnostic;
 mod document;
 pub mod init;
 mod json;
+pub mod pin;
 mod profile;
 mod resource;
 mod source;
@@ -292,7 +294,12 @@ pub fn read_bundle<V: ResourceValidators>(
     options: ReadOptions,
     validators: &V,
 ) -> BundleReport<V::Policy, V::Tools> {
-    report(BundleDirectory::open(root), options, validators)
+    report(
+        BundleDirectory::open(root),
+        options,
+        validators,
+        &mut Pins::Compare,
+    )
 }
 
 /// Reads and validates a bundle held in memory: the files of one flat bundle
@@ -306,13 +313,38 @@ pub fn read_bundle_files<V: ResourceValidators>(
     options: ReadOptions,
     validators: &V,
 ) -> BundleReport<V::Policy, V::Tools> {
-    report(MemoryFiles::new(files), options, validators)
+    report(
+        MemoryFiles::new(files),
+        options,
+        validators,
+        &mut Pins::Compare,
+    )
+}
+
+/// What the reader does with each referenced file's pin.
+pub(crate) enum Pins {
+    /// Refuses a file whose bytes differ from its pin: every reader but
+    /// [`pin`]'s.
+    Compare,
+    /// Records each file's digest instead of comparing it, for [`pin`].
+    /// Every other check still runs.
+    Record(Vec<RecordedPin>),
+}
+
+/// A referenced file's pin as the manifest wrote it, and the digest of the
+/// file's exact bytes as read.
+#[derive(Clone, Debug)]
+pub(crate) struct RecordedPin {
+    pub(crate) role: FileRole,
+    pub(crate) reference: FileReference,
+    pub(crate) sha256: String,
 }
 
 fn report<S: FileSource, V: ResourceValidators>(
     source: Result<S, BundleDiagnostic>,
     options: ReadOptions,
     validators: &V,
+    pins: &mut Pins,
 ) -> BundleReport<V::Policy, V::Tools> {
     let mut diagnostics = Vec::new();
     let mut manifest = None;
@@ -321,6 +353,7 @@ fn report<S: FileSource, V: ResourceValidators>(
             &mut source,
             options,
             validators,
+            pins,
             &mut manifest,
             &mut diagnostics,
         ),
@@ -341,6 +374,7 @@ fn read<S: FileSource, V: ResourceValidators>(
     directory: &mut S,
     options: ReadOptions,
     validators: &V,
+    pins: &mut Pins,
     summary: &mut Option<ManifestSummary>,
     diagnostics: &mut Vec<BundleDiagnostic>,
 ) -> Option<Bundle<V::Policy, V::Tools>> {
@@ -369,7 +403,12 @@ fn read<S: FileSource, V: ResourceValidators>(
         bytes: manifest_bytes,
     }];
 
-    let deployment = read_deployment(directory, &manifest.deployment, &mut files, diagnostics);
+    let deployment = read_deployment(
+        directory,
+        &manifest.deployment,
+        (&mut files, pins),
+        diagnostics,
+    );
     // The profile's policy invariants apply once the deployment document says
     // which profile it is; without one the bundle is refused anyway.
     let profile = deployment.as_ref().map(|deployment| deployment.profile);
@@ -377,7 +416,7 @@ fn read<S: FileSource, V: ResourceValidators>(
         read_resource(
             directory,
             source,
-            (FileRole::Policy, &mut files),
+            (FileRole::Policy, &mut files, &mut *pins),
             diagnostics,
             |text, version, file, found| {
                 resource::policy(text, version, profile, file, found)
@@ -389,7 +428,7 @@ fn read<S: FileSource, V: ResourceValidators>(
         read_resource(
             directory,
             source,
-            (FileRole::Tools, &mut files),
+            (FileRole::Tools, &mut files, &mut *pins),
             diagnostics,
             |text, version, file, found| {
                 resource::tools(text, version, file, found)
@@ -446,11 +485,13 @@ pub fn sha256_pin(bytes: &[u8]) -> String {
 }
 
 /// Reads a pinned file: the bound, then the pin over the exact bytes, before
-/// anything parses them.
+/// anything parses them. When recording, the file's digest is recorded
+/// instead of compared, and the file is parsed and checked as usual.
 fn read_pinned(
     directory: &mut impl FileSource,
-    reference: &FileReference,
+    (role, reference): (FileRole, &FileReference),
     maximum: usize,
+    pins: &mut Pins,
     diagnostics: &mut Vec<BundleDiagnostic>,
 ) -> Option<Vec<u8>> {
     let bytes = match directory.read(&reference.file, maximum) {
@@ -460,12 +501,21 @@ fn read_pinned(
             return None;
         }
     };
-    if sha256_pin(&bytes) != reference.sha256 {
-        diagnostics.push(BundleDiagnostic::file(
-            Code::DigestMismatch,
-            &reference.file,
-        ));
-        return None;
+    let sha256 = sha256_pin(&bytes);
+    match pins {
+        Pins::Compare if sha256 != reference.sha256 => {
+            diagnostics.push(BundleDiagnostic::file(
+                Code::DigestMismatch,
+                &reference.file,
+            ));
+            return None;
+        }
+        Pins::Compare => {}
+        Pins::Record(recorded) => recorded.push(RecordedPin {
+            role,
+            reference: reference.clone(),
+            sha256,
+        }),
     }
     Some(bytes)
 }
@@ -473,10 +523,16 @@ fn read_pinned(
 fn read_deployment(
     directory: &mut impl FileSource,
     reference: &FileReference,
-    files: &mut Vec<SourceFile>,
+    (files, pins): (&mut Vec<SourceFile>, &mut Pins),
     diagnostics: &mut Vec<BundleDiagnostic>,
 ) -> Option<DeploymentDocument> {
-    let bytes = read_pinned(directory, reference, MAX_DEPLOYMENT_BYTES, diagnostics)?;
+    let bytes = read_pinned(
+        directory,
+        (FileRole::Deployment, reference),
+        MAX_DEPLOYMENT_BYTES,
+        pins,
+        diagnostics,
+    )?;
     let node = parse_document(&bytes, &reference.file, diagnostics)?;
     let Deployment { profile, .. } = document::deployment(&node, &reference.file, diagnostics)?;
     // Bundle documents hold safe integers only, so this cannot fail; if it
@@ -506,7 +562,7 @@ fn read_deployment(
 fn read_resource<T>(
     directory: &mut impl FileSource,
     source: &ResourceSource,
-    (role, files): (FileRole, &mut Vec<SourceFile>),
+    (role, files, pins): (FileRole, &mut Vec<SourceFile>, &mut Pins),
     diagnostics: &mut Vec<BundleDiagnostic>,
     validate: impl FnOnce(&str, &str, &FileName, &mut Vec<BundleDiagnostic>) -> Option<T>,
 ) -> Option<BundledResource<T>> {
@@ -517,7 +573,13 @@ fn read_resource<T>(
             schema_version,
         } => (reference, *schema_version),
     };
-    let bytes = read_pinned(directory, reference, MAX_RESOURCE_BYTES, diagnostics)?;
+    let bytes = read_pinned(
+        directory,
+        (role, reference),
+        MAX_RESOURCE_BYTES,
+        pins,
+        diagnostics,
+    )?;
     let text = decode(&bytes, TextRules::Resource, &reference.file, diagnostics)?;
     let document = validate(text, schema_version, &reference.file, diagnostics)?;
     files.push(SourceFile {

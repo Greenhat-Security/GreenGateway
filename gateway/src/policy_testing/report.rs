@@ -19,6 +19,7 @@ use crate::policy_eval::{
     tools::{TOOL_CONTEXT_VERSION, TOOL_SEMANTICS_VERSION},
     CONTEXT_VERSION, HTTP_SEMANTICS_VERSION,
 };
+use crate::policy_simulation::request::StoredCandidate;
 
 /// The schema version of the JSON report.
 pub(crate) const RESULT_SCHEMA_VERSION: &str = "policy-test-results.v1";
@@ -49,6 +50,11 @@ pub(crate) enum PolicySource {
     Active,
     /// A candidate submitted with the run. Never persisted or activated.
     InlineCandidate,
+    /// A server-side draft the caller owns, read and never written.
+    Draft,
+    /// A version of the policy history, validated again under this build.
+    /// Never reactivated.
+    Revision,
     /// A policy history version, judged for a policy evidence package
     /// (issue #243, slice 20). Never reactivated.
     Publication,
@@ -59,6 +65,8 @@ impl PolicySource {
         match self {
             Self::Active => "active",
             Self::InlineCandidate => "inline_candidate",
+            Self::Draft => "draft",
+            Self::Revision => "revision",
             Self::Publication => "publication",
         }
     }
@@ -74,6 +82,10 @@ pub(crate) struct PolicyBinding {
     /// The cluster security revision the active document was read at.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) security_revision: Option<i64>,
+    /// The draft (`draft_id`, `draft_revision`) or history version
+    /// (`version`) a stored candidate was read as; nothing otherwise.
+    #[serde(flatten)]
+    pub(crate) stored: Option<StoredCandidate>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -280,10 +292,13 @@ pub(crate) fn to_sarif(report: &RunReport) -> Value {
         "summary": report.summary,
         "not_evaluated": report.not_evaluated,
     });
-    if let (Some(revision), Some(properties)) =
-        (report.policy.security_revision, properties.as_object_mut())
-    {
-        properties.insert("security_revision".to_owned(), json!(revision));
+    if let Some(properties) = properties.as_object_mut() {
+        if let Some(revision) = report.policy.security_revision {
+            properties.insert("security_revision".to_owned(), json!(revision));
+        }
+        if let Some(stored) = &report.policy.stored {
+            stored.describe("policy_", properties);
+        }
     }
     json!({
         "$schema": SARIF_SCHEMA,
@@ -345,6 +360,19 @@ pub(crate) fn to_junit(report: &RunReport) -> String {
             xml_escape(name),
             xml_escape(&value)
         ));
+    }
+    // A stored candidate's identifiers, after the fixed properties.
+    if let Some(stored) = &report.policy.stored {
+        for (name, value) in stored.members("policy_") {
+            let value = value
+                .as_str()
+                .map_or_else(|| value.to_string(), str::to_owned);
+            xml.push_str(&format!(
+                "      <property name=\"{}\" value=\"{}\"/>\n",
+                xml_escape(&name),
+                xml_escape(&value)
+            ));
+        }
     }
     xml.push_str("    </properties>\n");
     for case in &report.cases {

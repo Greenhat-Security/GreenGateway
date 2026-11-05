@@ -1023,6 +1023,78 @@ fn an_unrecorded_host_or_principal_is_indeterminate_only_where_it_matters() {
     );
 }
 
+/// Retained observations record no organization, so replay leaves it not
+/// recorded (#243): a principal whose internal roles turn on an organization
+/// mapping is indeterminate in every lane, never guessed into or out of the
+/// role, while mappings that read no organization replay as they are served.
+#[test]
+fn an_organization_mapping_replays_as_not_recorded() {
+    let mapped = |organizations: Option<Value>| {
+        let mut mapping = json!({ "id": "readers", "issuer": ISSUER, "grant_roles": ["reader"] });
+        if let Some(organizations) = organizations {
+            mapping["organizations"] = organizations;
+        }
+        compiled(json!({
+            "schema_version": "1.0.0",
+            "default_action": "deny",
+            "roles": { "reader": { "permissions": ["items:read"] } },
+            "identity_mappings": [mapping],
+            "routes": [{ "id": "items", "path_prefix": "/api", "permission": "items:read" }],
+            "rate_limits": [{
+                "id": "reader-lane",
+                "principal": { "roles": ["reader"] },
+                "requests_per_second": 1,
+                "burst": 1
+            }],
+            "tools": { "lookup": { "allowed_roles": ["reader"] } }
+        }))
+    };
+    let principal = PrincipalRecord::Authenticated(recorded_principal(AuthMethod::Bearer, &[]));
+    let facts = http(Method::GET, "/api/items", principal.clone());
+    let tool = ToolFacts {
+        tool_name: "lookup".to_owned(),
+        principal,
+        egress: EgressRecord::NotRecorded,
+    };
+
+    let by_organization = mapped(Some(json!(["acme"])));
+    assert_eq!(
+        evaluate_http(&by_organization, &facts).expect("evaluates"),
+        HttpReplayOutcome::Indeterminate(HttpReplayLimitation::Kernel(
+            Limitation::MissingMatcherFact
+        ))
+    );
+    assert_eq!(
+        select_rate_lane(&by_organization, &facts)
+            .expect("selects")
+            .limitation(),
+        Some(Limitation::MissingMatcherFact)
+    );
+    assert!(!evaluate_tool(&by_organization, &tool)
+        .expect("evaluates")
+        .is_complete());
+
+    let by_issuer = mapped(None);
+    let HttpReplayOutcome::Decided(decision) =
+        evaluate_http(&by_issuer, &facts).expect("evaluates")
+    else {
+        panic!("a mapping that reads no organization replays");
+    };
+    assert_eq!(decision.logical, LogicalDecision::Allow);
+    assert_eq!(
+        select_rate_lane(&by_issuer, &facts)
+            .expect("selects")
+            .matched(),
+        Some(0)
+    );
+    assert_eq!(
+        evaluate_tool(&by_issuer, &tool)
+            .expect("evaluates")
+            .reason(),
+        ToolReason::Allowed
+    );
+}
+
 #[test]
 fn an_unstated_mcp_identity_decides_only_when_both_readings_agree() {
     let mut facts = http(Method::POST, "/base/mcp", PrincipalRecord::Anonymous);

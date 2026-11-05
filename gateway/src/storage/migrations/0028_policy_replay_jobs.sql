@@ -1,4 +1,4 @@
--- Migration 27: durable historical policy replay jobs for cluster mode
+-- Migration 28: durable historical policy replay jobs for cluster mode
 -- (issue #243).
 --
 -- A replay job decides one window of the cluster audit stream again under a
@@ -28,6 +28,9 @@
 --   document (base_json), and the candidate's source, ETag and document
 --   (candidate_json, NULL when the candidate is the base itself), each the
 --   validated document exactly as the gateway serialized it, at most 1 MiB.
+--   A candidate read from a server-side draft names the draft and its
+--   revision, and one read from the policy history names the version: which
+--   document, never its content beyond candidate_json.
 --   A replica that claims the job re-validates both and requires each to
 --   reproduce its ETag. engine_version names the evaluator, replay-context,
 --   checkpoint and result versions the job was admitted under: a replica of
@@ -89,13 +92,20 @@ CREATE TABLE greengateway.policy_replay_jobs (
     base_etag text NOT NULL CHECK (base_etag ~ '^"sha256:[0-9a-f]{64}"$'),
     base_json text NOT NULL CHECK (octet_length(base_json) <= 1048576),
     candidate_source text NOT NULL CHECK (
-        candidate_source IN ('active', 'edits', 'inline')
+        candidate_source IN ('active', 'edits', 'inline', 'draft', 'revision')
     ),
     candidate_etag text NOT NULL CHECK (candidate_etag ~ '^"sha256:[0-9a-f]{64}"$'),
     candidate_json text CHECK (
         candidate_json IS NULL OR octet_length(candidate_json) <= 1048576
     ),
     edit_count integer NOT NULL CHECK (edit_count >= 0),
+    candidate_draft_id text CHECK (
+        candidate_draft_id IS NULL OR candidate_draft_id ~ '^pd_[0-9a-f]{32}$'
+    ),
+    candidate_draft_revision bigint CHECK (
+        candidate_draft_revision IS NULL OR candidate_draft_revision >= 1
+    ),
+    candidate_version bigint CHECK (candidate_version IS NULL OR candidate_version >= 1),
     projections text NOT NULL CHECK (
         projections IN (
             'as_authored',
@@ -148,6 +158,13 @@ CREATE TABLE greengateway.policy_replay_jobs (
     result_expires_at timestamptz,
     expires_at timestamptz,
     CHECK (to_epoch_us > from_epoch_us),
+    -- The candidate is pinned as its source says: a document for every
+    -- source but the base itself, and the draft or history version it was
+    -- read as for those two sources only.
+    CHECK ((candidate_source = 'active') = (candidate_json IS NULL)),
+    CHECK ((candidate_source = 'draft') = (candidate_draft_id IS NOT NULL)),
+    CHECK ((candidate_draft_id IS NULL) = (candidate_draft_revision IS NULL)),
+    CHECK ((candidate_source = 'revision') = (candidate_version IS NOT NULL)),
     CHECK ((first_position IS NULL) = (last_position IS NULL)),
     CHECK (first_position IS NULL OR first_position <= last_position),
     CHECK (

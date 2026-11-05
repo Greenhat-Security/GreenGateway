@@ -15,7 +15,7 @@
       "const": "GgctlReport"
     },
     "command": {
-      "enum": ["version", "schema", "init", "validate", "convert", "doctor", "diff"]
+      "enum": ["version", "schema", "init", "validate", "pin", "convert", "doctor", "diff"]
     },
     "exitCode": {
       "type": "integer",
@@ -70,6 +70,14 @@
     },
     {
       "if": {
+        "properties": {"command": {"const": "pin"}}
+      },
+      "then": {
+        "properties": {"result": {"$ref": "#/$defs/pinResult"}}
+      }
+    },
+    {
+      "if": {
         "properties": {"command": {"const": "convert"}}
       },
       "then": {
@@ -102,7 +110,7 @@
         "code": {
           "description": "The stable family.reason code. docs/ggctl.md lists every ggctl code by family, and docs/configuration-bundles.md every bundle reader code.",
           "type": "string",
-          "pattern": "^(usage|credential|trust|remote|compat|schema|validate|doctor|diff|init|convert|output|internal|bundle|syntax|json|yaml|reference|secret|resource|profile)\\.[a-z][a-z0-9_]*$"
+          "pattern": "^(usage|credential|trust|remote|compat|schema|validate|doctor|diff|init|convert|pin|output|internal|bundle|syntax|json|yaml|reference|secret|resource|profile)\\.[a-z][a-z0-9_]*$"
         },
         "severity": {
           "enum": ["error", "warning", "info"]
@@ -405,6 +413,60 @@
           "description": "The bundle written to --output as the reader read it back.",
           "$ref": "#/$defs/bundle"
         }
+      }
+    },
+    "pinResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["valid", "files", "changed", "written"],
+      "properties": {
+        "valid": {
+          "description": "Every check of the bundle reader except the comparison of each referenced file with its pin passed, so the bundle could be pinned. The gateway's production policy and tools validators are not part of ggctl and did not run.",
+          "type": "boolean"
+        },
+        "bundle": {
+          "description": "BUNDLE as its manifest declares it, once the manifest was read: never a digest or the profile, since its pins are what is being replaced.",
+          "$ref": "#/$defs/bundle"
+        },
+        "files": {
+          "description": "Each referenced file's pin, the deployment document's first, once the bundle could be pinned; empty otherwise.",
+          "type": "array",
+          "items": {"$ref": "#/$defs/filePin"}
+        },
+        "changed": {
+          "description": "A pin differed from its file's SHA-256, so bundle.yaml had to be rewritten.",
+          "type": "boolean"
+        },
+        "written": {
+          "description": "The new bundle.yaml is in place; only the changed pins' digits differ from the old one. false when every pin already matched.",
+          "type": "boolean"
+        },
+        "pinned": {
+          "description": "The bundle as the reader read it back with every check, its pins included, present only when it was exactly the bundle that was pinned; its sourceDigest is the bundle's new identity.",
+          "$ref": "#/$defs/bundle"
+        }
+      }
+    },
+    "filePin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "file", "previous", "sha256", "changed"],
+      "properties": {
+        "role": {"enum": ["deployment", "policy", "tools"]},
+        "file": {
+          "description": "The bundle-relative file name; it passed the portable file-name grammar.",
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]{0,62}$"
+        },
+        "previous": {
+          "description": "The pin bundle.yaml held.",
+          "$ref": "#/$defs/sha256"
+        },
+        "sha256": {
+          "description": "The SHA-256 of the file's exact bytes as read, which the new bundle.yaml pins.",
+          "$ref": "#/$defs/sha256"
+        },
+        "changed": {"type": "boolean"}
       }
     },
     "diffCommandResult": {

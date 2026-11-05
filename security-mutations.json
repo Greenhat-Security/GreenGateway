@@ -4,7 +4,7 @@
   "targets": [
     {
       "id": "path-prefix",
-      "path": "gateway/src/path_match.rs",
+      "path": "gateway-config/src/path_match.rs",
       "function": "path_match::path_prefix_matches",
       "start_marker": "pub fn path_prefix_matches(",
       "end_marker": "\n}\n",
@@ -30,7 +30,7 @@
     },
     {
       "id": "unsafe-path",
-      "path": "gateway/src/path_match.rs",
+      "path": "gateway-config/src/path_match.rs",
       "function": "path_match::is_unsafe_request_path",
       "start_marker": "pub fn is_unsafe_request_path(",
       "end_marker": "\n}\n",

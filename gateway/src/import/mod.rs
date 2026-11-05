@@ -142,10 +142,11 @@ pub(crate) const IMPORT_ACTOR: &str = "import-standalone";
 ///   job is a number an operator reads during the rehearsal rather than a
 ///   surprise after scale-out.
 /// - `service_token_change_evidence` is the standalone token database's
-///   record of who rotated and revoked each token (issue #425). The token
-///   section carries token rows only, so that history stays in the
+///   record of who issued, rotated and revoked each token (issue #425). The
+///   token section carries token rows only, so that history stays in the
 ///   standalone database: the cluster's own evidence table starts empty and
-///   records the cluster's first change.
+///   records the cluster's first change. An imported token has no issue row
+///   in the cluster; its `created_by` crosses with it.
 /// - `connection_change_evidence` and `connection_local_secret_change_evidence`
 ///   are the standalone Connections database's records of who created,
 ///   replaced and deleted each Connection and who changed each local secret
@@ -170,8 +171,8 @@ const NOT_IMPORTED: &[&str] = &[
     "connection_local_secrets (the local-secret keyring stays with the standalone deployment; \
      credential bindings cross as references and must be re-provisioned in the cluster's \
      secret store)",
-    "service_token_change_evidence (standalone rotate/revoke evidence stays in the standalone \
-     token database; the cluster records its own from its first change)",
+    "service_token_change_evidence (standalone issue, rotate and revoke evidence stays in the \
+     standalone token database; the cluster records its own from its first change)",
     "connection_change_evidence (standalone Connection change evidence stays in the standalone \
      Connections database; the cluster's own evidence table starts empty)",
     "connection_local_secret_change_evidence (standalone local-secret change evidence stays with \

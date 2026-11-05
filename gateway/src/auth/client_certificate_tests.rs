@@ -10,7 +10,7 @@ use crate::auth::{chain::ChainValidator, AuthMethod};
 /// Self-signed is correct here and not a shortcut: this module makes no trust
 /// decision, so the only thing that matters about the certificate is what it
 /// asserts about itself. Verification is exercised end to end in
-/// `gateway/src/inbound_tls_tests.rs`, against a real handshake.
+/// `gateway/src/inbound_tls_client_certificate_tests.rs`, against a real handshake.
 fn certificate_with_sans(sans: Vec<SanType>) -> CertificateDer<'static> {
     let mut params = CertificateParams::default();
     params.subject_alt_names = sans;
