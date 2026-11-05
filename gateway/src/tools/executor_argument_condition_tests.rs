@@ -262,6 +262,24 @@ async fn call(lane: &Lane, request_id: &str, arguments: Value) -> Outcome {
     )
 }
 
+/// The audit events of one call once its last runtime record -- its
+/// success, failure or rejection -- has arrived; audit is delivered off the
+/// calling task.
+async fn settled_events(capture: &CaptureSink, request_id: &str) -> Vec<AuditEvent> {
+    wait_until(Duration::from_secs(2), || {
+        events_of(capture, request_id).iter().any(|event| {
+            [
+                audit::event::TOOL_INVOKE_SUCCESS,
+                audit::event::TOOL_INVOKE_FAILURE,
+                audit::event::TOOL_INVOKE_REJECTED,
+            ]
+            .contains(&event.event_type.as_str())
+        })
+    })
+    .await;
+    events_of(capture, request_id)
+}
+
 fn events_of(capture: &CaptureSink, request_id: &str) -> Vec<AuditEvent> {
     capture
         .events()
@@ -304,7 +322,7 @@ async fn argument_rules_decide_as_the_kernel_does_from_the_eligible_fields_alone
         // Without the arguments the kernel cannot tell: the live lane asked
         // for them rather than guess.
         assert_eq!(kernel(&lane.compiled, None), Outcome::Incomplete);
-        let events = events_of(&lane.capture, &request_id);
+        let events = settled_events(&lane.capture, &request_id).await;
         let decided = events
             .iter()
             .filter(|event| event.event_type.starts_with("authz."))
@@ -368,7 +386,7 @@ async fn invalid_arguments_are_refused_before_the_policy_reads_any_of_them() {
         assert!(details["problems"]
             .as_array()
             .is_some_and(|p| !p.is_empty()));
-        let events = events_of(&lane.capture, &request_id);
+        let events = settled_events(&lane.capture, &request_id).await;
         assert!(
             events
                 .iter()
@@ -397,7 +415,13 @@ async fn a_call_an_argument_rule_refuses_takes_no_permit_or_lease() {
         Outcome::Denied
     );
     assert_eq!(lane.leases.acquired.load(Ordering::SeqCst), 0);
-    let events = events_of(&lane.capture, "denied");
+    // The decision and the rejection, and no start: the tool observation
+    // beside them is the executor's outcome record, not an admission step.
+    let events: Vec<AuditEvent> = settled_events(&lane.capture, "denied")
+        .await
+        .into_iter()
+        .filter(|event| event.event_type != "http.request_observed")
+        .collect();
     assert_eq!(
         events
             .iter()
@@ -449,7 +473,8 @@ async fn a_rule_over_a_field_the_schema_makes_ineligible_refuses_every_call_it_r
             Outcome::Incomplete,
             "{arguments}"
         );
-        let rejected = events_of(&lane.capture, &request_id)
+        let rejected = settled_events(&lane.capture, &request_id)
+            .await
             .into_iter()
             .find(|event| event.event_type == audit::event::TOOL_INVOKE_REJECTED)
             .expect("the refusal is audited");
@@ -556,7 +581,7 @@ async fn a_call_decided_before_any_argument_rule_never_has_its_arguments_read() 
         call(&lane, "closed", json!({ "region": 7, "unexpected": true })).await,
         Outcome::Denied
     );
-    let events = events_of(&lane.capture, "closed");
+    let events = settled_events(&lane.capture, "closed").await;
     let denied = events
         .iter()
         .find(|event| event.event_type == "authz.denied")

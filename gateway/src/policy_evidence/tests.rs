@@ -1016,7 +1016,7 @@ fn a_report_repeats_no_tool_argument() {
         "schema_version": REQUEST_SCHEMA_VERSION,
         "publication": { "version": 12, "etag": PUBLICATION_ETAG },
         "suite": { "schema_version": "policy-tests.v1", "cases": [tested] },
-        "simulation": { "trace": "full", "cases": [invocation("simulated-export")] }
+        "simulation": { "trace": "matched", "cases": [invocation("simulated-export")] }
     }));
     let suite = request.suite.as_ref().expect("suite section");
     let outcome = policy_testing::run_against_policy(
