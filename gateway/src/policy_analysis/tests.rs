@@ -1554,6 +1554,23 @@ fn a_passed_deadline_stops_pairwise_checks_and_marks_the_result_incomplete() {
 }
 
 #[test]
+fn a_passed_deadline_also_stops_the_linear_checks_that_ask_the_evaluator() {
+    let mut document = base(
+        json!([
+            { "path": "/**", "action": "allow" },
+            { "tool_name": "missing", "action": "deny" }
+        ]),
+        json!([]),
+    );
+    document["egress"] = json!({ "cidrs": ["127.0.0.0/8"] });
+    let outcome = run_with(&policy(document), &[], Instant::now());
+    assert!(!outcome.complete);
+    assert_eq!(outcome.limitations, [AnalysisLimitation::DeadlineExceeded]);
+    // No witness was asked for, so nothing that needs one is reported.
+    assert!(outcome.findings.is_empty(), "{:?}", codes(&outcome));
+}
+
+#[test]
 fn findings_beyond_the_cap_truncate_the_result() {
     let rules: Vec<Value> = (0..=MAX_FINDINGS + 1)
         .map(|_| json!({ "path": "/a", "action": "deny" }))

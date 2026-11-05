@@ -404,6 +404,9 @@ impl Run<'_> {
             {
                 continue;
             }
+            if !self.spend() {
+                return Ok(());
+            }
             let every_path = matches_every_path(&segments(&rule.path));
             if !every_path || !rule.principal.is_unconstrained() {
                 self.narrower_broad_rule(index, rule, every_path)?;
@@ -918,6 +921,9 @@ impl Run<'_> {
             else {
                 continue;
             };
+            if !self.spend() {
+                return Ok(());
+            }
             let principal = foreign_issuer_caller(
                 role,
                 rule.principal.auth_methods.first(),
@@ -971,6 +977,9 @@ impl Run<'_> {
             else {
                 continue;
             };
+            if !self.spend() {
+                return Ok(());
+            }
             let confirmed = match foreign_issuer_caller(role, entry.auth_methods.first(), None) {
                 Some(principal) => {
                     self.tool_admits(name, &principal)? && !self.holds_active_role(&principal, role)
@@ -1078,6 +1087,9 @@ impl Run<'_> {
             if !rule.enabled {
                 continue;
             }
+            if !self.spend() {
+                return Ok(());
+            }
             let reason = match policy.tools.get(tool_name) {
                 None => Some("tool_absent"),
                 Some(entry) if !entry.enabled => Some("tool_disabled"),
@@ -1176,6 +1188,9 @@ impl Run<'_> {
             let Some(method) = witness else {
                 continue;
             };
+            if !self.spend() {
+                return Ok(());
+            }
             let confirmed = self.confirm_rate_alone(limit, &method)?;
             let mut finding = finding(
                 FindingCode::RateOverrideLooserThanGlobal,
@@ -1239,6 +1254,9 @@ impl Run<'_> {
             if suffix.contains('.') {
                 continue;
             }
+            if !self.spend() {
+                return Ok(());
+            }
             let witness = format!("{WITNESS_SEGMENT}.{suffix}");
             if !egress_pattern_admits(pattern, &witness)? {
                 continue;
@@ -1257,6 +1275,9 @@ impl Run<'_> {
             let Ok(cidr) = cidr.parse::<IpNet>() else {
                 continue;
             };
+            if !self.spend() {
+                return Ok(());
+            }
             self.non_public_cidr(index, cidr)?;
         }
         for (index, port) in egress.ports.iter().enumerate() {

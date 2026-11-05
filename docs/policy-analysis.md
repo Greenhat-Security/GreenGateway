@@ -409,8 +409,11 @@ The linear checks (defaults, wildcard grants, broad rules and grants,
 tool entries, rate lanes, egress and the cross-resource checks) run first;
 the pairwise checks (coverage, partial overlaps, tool-name rules, the MCP
 alias lane, selected upstreams, routes and rate overrides) stop when the
-budget or deadline is spent, and analysis stops at the findings cap. Any of
-these makes `complete` `false` and names the bound in `limitations`; the
+budget or deadline is spent, and analysis stops at the findings cap. A
+linear check counts each element it asks the evaluator about against the same
+budget and deadline, so a large policy cannot outrun the deadline in the
+linear checks either. Any of these makes `complete` `false` and names the
+bound in `limitations`; the
 findings already reported stand, each established on its own, and nothing is
 said about the elements not reached. A resource the endpoint could not read
 does the same, as `resources_unavailable`: the checks that need it did not
