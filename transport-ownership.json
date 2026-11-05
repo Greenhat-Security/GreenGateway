@@ -8584,7 +8584,7 @@
         "capability-in-macro-input"
       ],
       "scope": "gateway::connections::mcp::refresh_store_error#1",
-      "sha256": "e6c7783aaeba3d4ac8f7aa9defa2e818f23f6f9c85cba18f4d29e40e831b9580",
+      "sha256": "d7fed9341b4062ba45a7b73c835c4ae3aad8aa0d1c9da80c982ee38c30f2e414",
       "owner": "GreenGateway maintainers",
       "purpose": "Connection configuration, shared storage or checked provider/MCP protocol handling in this exact scope."
     },
@@ -15342,16 +15342,6 @@
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
     {
-      "file": "gateway/src/authority_events/dispatcher.rs",
-      "reasons": [
-        "capability-in-macro-input"
-      ],
-      "scope": "gateway::authority_events::dispatcher::sleep_or_stop#1",
-      "sha256": "1a7bff11c99452f9003b7abdbedf2d7941de0140f2f80af7069f0ad981f2d58c",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
-    },
-    {
       "file": "gateway/src/authority_events/sink.rs",
       "reasons": [
         "unexpanded-attribute"
@@ -15397,7 +15387,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::config::authority_events::AuthorityEventSinkSetting#1",
-      "sha256": "f5ef9e35e4d2ca02be18a568f1c64792fbd79433ae4191195d3ca705e1ef31f4",
+      "sha256": "c74d0805c061ae897fa27c1a39da30ad9da3070ee5a7dc9e5b2a7e9684e217a3",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
@@ -15417,7 +15407,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::config::authority_events::AuthorityEvidenceDurability#1",
-      "sha256": "4504d9d256f82b5d0e1bccb9bd5a65f603360b6cd1e057d858a651494a1816c8",
+      "sha256": "fb2fec901399a9d0163dcea0a2dec839f0a413e04004a2993d18fcf748902309",
       "owner": "GreenGateway maintainers",
       "purpose": "Clone/Copy/Debug/Default/PartialEq/Eq derives and #[default] on the two-value AUTHORITY_EVIDENCE_DURABILITY setting; no transport, file or process capability (issue #425)."
     },
@@ -15440,16 +15430,6 @@
       "sha256": "fcfb2792059c7e0101f8eeebf037c18bedf13bbf7dc634eced0a54abb31f3244",
       "owner": "GreenGateway maintainers",
       "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the production plan compiler the standalone ledger's plan, apply and rollback service (#242 PR 11) takes, which ledger startup and the admin routes (later #242 slices) will hold; it only hands that service the existing production policy and tools validators and their JSON forms, and has no transport or process capability."
-    },
-    {
-      "file": "gateway/src/connections/control_plane.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::connections::control_plane::impl  ConnectionControlPlane::secret_resolver_handle#1",
-      "sha256": "16632a67fe234815719e6e6cb113b0443e79b5001e559c70efca8d205682e946",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
     {
       "file": "gateway/src/storage/postgres_authority_events.rs",
@@ -15961,6 +15941,76 @@
       "sha256": "fc1b302367c7376a3ce2327e04e7abc623a558e0ac4258679f52777cdffcb3d4",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed for #242 PR 15 (standalone backup restore): imports MetadataExt on Unix to compare the device numbers of the target state directory and the directory holding it, refusing a mount point that no rename within its parent can move. Read-only metadata; it adds no network or process capability."
+    },
+    {
+      "file": "gateway/src/authority_events/cadence.rs",
+      "reasons": [
+        "capability-in-macro-input"
+      ],
+      "scope": "gateway::authority_events::cadence::sleep_or_stop#1",
+      "sha256": "84732172f99944f988093c4fd0bdfb420106fdb79414ce0e9027b6620947b9e9",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway/src/authority_events/delivery.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::authority_events::delivery::file_attributes#1",
+      "sha256": "915c50cd5262a42e3e29ca4cdd2b3029d6643c0a87e8c47f773aff2d5bb26846",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed standalone authority-event delivery (issue #425): delivery cursors in the SQLite stores that own the evidence, the keyed projection, fixed-label metrics and the shared dispatcher cadence. No new outbound transport authority; the only I/O is the configured local SQLite files and the existing log and file sinks."
+    },
+    {
+      "file": "gateway/src/authority_events/standalone.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::authority_events::standalone::FAILURE_KINDS#1",
+      "sha256": "8f363d2d0e3c7b4ae2739af2c66fa5edd378c0e48d794b982def4c9edaedc195",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed standalone authority-event delivery (issue #425): delivery cursors in the SQLite stores that own the evidence, the keyed projection, fixed-label metrics and the shared dispatcher cadence. No new outbound transport authority; the only I/O is the configured local SQLite files and the existing log and file sinks."
+    },
+    {
+      "file": "gateway/src/authority_events/standalone.rs",
+      "reasons": [
+        "unexpanded-macro"
+      ],
+      "scope": "gateway::authority_events::standalone::record_failure#1",
+      "sha256": "100c88b8e88deee2e01c6e80f2278e457488831155e3b13abe1047247dbfc9a1",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed standalone authority-event delivery (issue #425): delivery cursors in the SQLite stores that own the evidence, the keyed projection, fixed-label metrics and the shared dispatcher cadence. No new outbound transport authority; the only I/O is the configured local SQLite files and the existing log and file sinks."
+    },
+    {
+      "file": "gateway/src/authority_events/standalone.rs",
+      "reasons": [
+        "unexpanded-macro"
+      ],
+      "scope": "gateway::authority_events::standalone::record_backlog#1",
+      "sha256": "ddaa60559c982d5dbdcb4e9d9ce6515bd87570a8d4c3f410c2f6166e56067fc6",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed standalone authority-event delivery (issue #425): delivery cursors in the SQLite stores that own the evidence, the keyed projection, fixed-label metrics and the shared dispatcher cadence. No new outbound transport authority; the only I/O is the configured local SQLite files and the existing log and file sinks."
+    },
+    {
+      "file": "gateway/src/authority_events/standalone.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::authority_events::standalone::impl  SourceLane::committed_position#1",
+      "sha256": "85f95e219bd0bea0ab87ba912092a4cb05ec9a64ea0d41ae74746da51ba391e1",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed standalone authority-event delivery (issue #425): delivery cursors in the SQLite stores that own the evidence, the keyed projection, fixed-label metrics and the shared dispatcher cadence. No new outbound transport authority; the only I/O is the configured local SQLite files and the existing log and file sinks."
+    },
+    {
+      "file": "gateway/src/storage/standalone_authority_events.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::storage::standalone_authority_events::impl  StandaloneEvidenceSource::ALL#1",
+      "sha256": "c45e771d64a73c58cadfc03eb7e92933988a91d08be77a4943addd458b671e53",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed standalone authority-event delivery (issue #425): delivery cursors in the SQLite stores that own the evidence, the keyed projection, fixed-label metrics and the shared dispatcher cadence. No new outbound transport authority; the only I/O is the configured local SQLite files and the existing log and file sinks."
     }
   ]
 }
