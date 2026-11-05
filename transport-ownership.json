@@ -1111,6 +1111,7 @@
           "jsonschema@0.60.2|registry+https://github.com/rust-lang/crates.io-index",
           "proptest@1.11.0|registry+https://github.com/rust-lang/crates.io-index",
           "rusqlite@0.40.2|registry+https://github.com/rust-lang/crates.io-index",
+          "rustix@1.1.5|registry+https://github.com/rust-lang/crates.io-index",
           "serde@1.0.229|registry+https://github.com/rust-lang/crates.io-index",
           "serde_json@1.0.154|registry+https://github.com/rust-lang/crates.io-index",
           "sha2@0.11.1|registry+https://github.com/rust-lang/crates.io-index",
@@ -1274,6 +1275,7 @@
           "libc@0.2.189|registry+https://github.com/rust-lang/crates.io-index",
           "rcgen@0.14.10|registry+https://github.com/rust-lang/crates.io-index",
           "reqwest@0.13.5|registry+https://github.com/rust-lang/crates.io-index",
+          "rustix@1.1.5|registry+https://github.com/rust-lang/crates.io-index",
           "serde@1.0.229|registry+https://github.com/rust-lang/crates.io-index",
           "serde_json@1.0.154|registry+https://github.com/rust-lang/crates.io-index",
           "tokio-rustls@0.26.6|registry+https://github.com/rust-lang/crates.io-index",
@@ -4112,6 +4114,7 @@
           "signal-hook-registry",
           "socket2",
           "sync",
+          "test-util",
           "time",
           "tokio-macros",
           "windows-sys"
@@ -5472,6 +5475,26 @@
           {
             "name": "tokio",
             "rename": null,
+            "kind": "dev",
+            "target": null,
+            "req": "^1.52.3",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [
+              "io-util",
+              "macros",
+              "net",
+              "rt-multi-thread",
+              "signal",
+              "sync",
+              "time",
+              "test-util"
+            ],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "tokio",
+            "rename": null,
             "kind": null,
             "target": null,
             "req": "^1.52.3",
@@ -6235,6 +6258,19 @@
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           {
+            "name": "rustix",
+            "rename": null,
+            "kind": null,
+            "target": "cfg(any(target_os = \"linux\", target_os = \"macos\"))",
+            "req": "^1.1.4",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [
+              "fs"
+            ],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
             "name": "uuid",
             "rename": null,
             "kind": "dev",
@@ -6365,6 +6401,20 @@
             "uses_default_features": true,
             "features": [
               "derive"
+            ],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "rustix",
+            "rename": null,
+            "kind": null,
+            "target": "cfg(unix)",
+            "req": "^1.1.4",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [
+              "fs",
+              "process"
             ],
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
@@ -6703,7 +6753,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::bootstrap::commands::run_one_shot_command#1",
-      "sha256": "8fa3ea7163610a40a47e804589b47e3df9760cdb214bb34967adbf2e9b0d1cfc",
+      "sha256": "7606b550e6d877fbe23747cb751cfffa0f9653ca0ad12be7f1c87004d4baa079",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -6843,7 +6893,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::routing::add_admin_api_routes#1",
-      "sha256": "0df0079ba808b38d1d322ff5bb94b51b23dc1b9be50ba4d9a4322ce467a3af03",
+      "sha256": "e392257c9faecb9cc81d29b8cfc242f1523a312f77ed02a6d34a1e4d6eb715a9",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
@@ -7924,7 +7974,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::cluster_maintenance::MaintenanceRunner#1",
-      "sha256": "e6e8f86a17a71dca347886fb11823d9f68749f17b263ab079f31f0679e0d4653",
+      "sha256": "6dfdbd79584cd40a5ad5f14ba8307fff0355e406fb29c70f0c4c0ca06de4bc78",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -7934,7 +7984,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::cluster_maintenance::impl  MaintenanceRunner::new#1",
-      "sha256": "b767ac044c28d7e27a12514313d53e2c8c00d300f28b7d634fd1c834553a1fb0",
+      "sha256": "051de269a1055492a727e6e280dae3b9a9a713f923bfbbc672a15d6cb38455c8",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -7954,7 +8004,7 @@
         "unexpanded-macro"
       ],
       "scope": "gateway::cluster_maintenance::impl  MaintenanceRunner::run_jobs#1",
-      "sha256": "87444f601a343b0aed37bd3d15e36a97adc3d723a143f0e813ab52beeff2901d",
+      "sha256": "f60dbfa76e2374cbf3371e2ba7026ce6dfd33a45958e0ba0098f0272c3dc51b3",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
@@ -8965,7 +9015,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::record_change_evidence#1",
-      "sha256": "11e3ab16855d4f9ac9e52b88108115452d60cddf89e8549019d52df38cfe02bb",
+      "sha256": "56cf4d967d548ad3311dfe6c7cd55cf48b0e2a35ce80ce883e18f72559c52ace",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -9160,24 +9210,75 @@
       "purpose": "Reviewed for #242 PR 10 (standalone revision ledger): creates the seed's temporary database file beneath the state directory with create_new and, on Unix, mode 0600 through std::os::unix::fs::OpenOptionsExt. Local file creation only; it adds no network or process capability."
     },
     {
-      "file": "gateway-config/src/ledger/location.rs",
+      "file": "gateway-config/src/state_dir.rs",
       "reasons": [
         "capability-import-or-glob"
       ],
-      "scope": "gateway_config::ledger::location::owner_alone_can_write#1",
-      "sha256": "a487c6b6631e24091b1d3bfd421e698411fd856b0b08aa474fcd693ce08f04e5",
+      "scope": "gateway_config::state_dir::is_reparse_point#1",
+      "sha256": "b614645a054675446906c5e5bd9cd95dfc6bdbcdab6ca5c8d79e8f422cbd3882",
       "owner": "GreenGateway maintainers",
-      "purpose": "Reviewed for #242 PR 10 (standalone revision ledger): reads the Unix mode bits of state-directory and ledger-file metadata through std::os::unix::fs::MetadataExt to refuse an entry group or other can write. Read-only metadata; it adds no network or process capability."
+      "purpose": "Reviewed for #242 (standalone state directory; moved here from the revision ledger's location checks): reads the Windows reparse-point attribute of state-directory, lock-file and ledger-file metadata through std::os::windows::fs::MetadataExt to refuse links and junctions. Read-only metadata; it adds no network or process capability."
     },
     {
-      "file": "gateway-config/src/ledger/location.rs",
+      "file": "gateway-config/src/state_dir.rs",
       "reasons": [
         "capability-import-or-glob"
       ],
-      "scope": "gateway_config::ledger::location::is_reparse_point#1",
-      "sha256": "b38daad4bb5a2611dccf7b648e45aa79aa9af9944222f0319f6ec5b8b24f642b",
+      "scope": "gateway_config::state_dir::owner_alone_can_write#1",
+      "sha256": "f6f79cbe6fedfbc2e5d6b350c8cafc01c7654a31162958c6caff88fbe7c03c26",
       "owner": "GreenGateway maintainers",
-      "purpose": "Reviewed for #242 PR 10 (standalone revision ledger): reads the Windows reparse-point attribute of state-directory and ledger-file metadata through std::os::windows::fs::MetadataExt to refuse links and junctions. Read-only metadata; it adds no network or process capability."
+      "purpose": "Reviewed for #242 (standalone state directory; moved here from the revision ledger's location checks): reads the Unix mode bits of state-directory, lock-file and ledger-file metadata through std::os::unix::fs::MetadataExt to refuse an entry group or other can write. Read-only metadata; it adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/state_dir.rs",
+      "reasons": [
+        "capability-import-or-glob",
+        "network-or-process-reference"
+      ],
+      "scope": "gateway_config::state_dir::owner_only#1",
+      "sha256": "8301c68cd1972a550663c8a7545e452e9d0dc763cbf2f69e5333d5781caed181",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 (standalone state directory): sets mode 0600 on a newly created lock file through cap-std's Unix OpenOptionsExt, called by path because its name is a reviewed capability alias, which is also why the guard flags the call. Local file creation mode only; it adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/state_dir.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway_config::state_dir::use cap_fs_ext :: { DirExt as _ , FollowSymlinks , OpenOptionsFollowExt as _ , OpenOptionsSyncExt as _ }#1",
+      "sha256": "08af99e590ccd695cec1fcc5a48a67f625139d56718313dc9db727445cce05a3",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 (standalone state directory): opens the admitted state directory and its lock file without following a link at the last component (open_dir_nofollow, FollowSymlinks::No) and without blocking on a FIFO swapped in for the lock file (nonblock). Local filesystem access beneath one directory only; it adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/state_dir.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway_config::state_dir::use cap_std :: { ambient_authority , fs :: { Dir , OpenOptions as CapabilityOpenOptions } , }#1",
+      "sha256": "195f6c89077f4e307f3177b3c7d3c177e0e7b8004353c1e9b857d2d1b820e3aa",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 (standalone state directory): opens the canonicalized state directory's parent as a cap-std directory and the lock file beneath the directory handle, so the lock is taken on the directory that was admitted. Local filesystem access only; it adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/state_dir/filesystem.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway_config::state_dir::filesystem::platform_kind#1",
+      "sha256": "d7bc41f299db5a5f2d42c247cd4e155c558a034c4252794109f4de9bb9574e27",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 (standalone state directory, Linux): calls rustix::fs::statfs on the state directory path and compares f_type with network-filesystem magic numbers for doctor's best-effort warning. The guard flags rustix as a raw crate; statfs reads filesystem metadata only and adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/state_dir/filesystem.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway_config::state_dir::filesystem::platform_kind#2",
+      "sha256": "ec54e5b48289695a478243eae1cdd78740cebffd8c269a6c323445a25500c7cc",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 (standalone state directory, macOS): calls rustix::fs::statfs on the state directory path and compares f_fstypename with network-filesystem type names for doctor's best-effort warning. The guard flags rustix as a raw crate; statfs reads filesystem metadata only and adds no network or process capability."
     },
     {
       "file": "gateway-config/src/ledger/store.rs",
@@ -12328,7 +12429,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_admin_sessions::transaction#1",
-      "sha256": "c95a8735dc19c08c17ec98d0d06e524679dda3bcd6b6e8e431e749e1f7305022",
+      "sha256": "7a7da4feda6d6b165da0fff0dd2eea7b931ee0274a3050f6c266a492003774d4",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -15236,7 +15337,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_authority_events::journaled_evidence_from_row#1",
-      "sha256": "08b5b3590ed6622748f9e8e805dcf0cdac7b2e324f2deee4f3342b949f9b7439",
+      "sha256": "952269e9c6f8027f9c31a4513c809a38eb34fb4d78b087ed97ba3017e8177f1a",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -15336,19 +15437,29 @@
         "capability-import-or-glob"
       ],
       "scope": "ggctl::credential::permissions_are_safe#1",
-      "sha256": "89ed74d874fd8a97b8e53e21a01d241e093c87470cf01791d988caeb63111e7a",
+      "sha256": "cf13be7114107383518f7daa780dffd53a5a9ba9ada3bc822696e54b4796ec47",
       "owner": "GreenGateway maintainers: operator CLI (#242)",
-      "purpose": "Reviewed for #242 (operator file safety): reads the Unix mode bits of --token-file and --ca-file metadata through PermissionsExt to refuse a credential group or other can access, or a trust anchor they can write. Read-only metadata; no network or process capability."
+      "purpose": "Reviewed for #242 (operator file safety): reads the Unix mode bits of --token-file, --ca-file, --answers and the bundle.yaml ggctl pin compares through PermissionsExt to refuse a credential group or other can access, or another file they can write. Read-only metadata; no network or process capability."
     },
     {
       "file": "ggctl/src/credential.rs",
       "reasons": [
         "capability-import-or-glob"
       ],
-      "scope": "ggctl::credential::check_directories#1",
-      "sha256": "ce92a7e3857cf8330034aed6bc5e575d4bc75e5fcf7723da2e216c97b9300f95",
+      "scope": "ggctl::credential::check_resolution#1",
+      "sha256": "ff910859b93d22d54c3f82226eef06d47ab9f3034b73cfa76051fc68da48002a",
       "owner": "GreenGateway maintainers: operator CLI (#242)",
-      "purpose": "Reviewed for #242 (operator file safety): canonicalizes the --ca-file path and reads the Unix mode bits of the directories holding it and its link target through PermissionsExt, refusing one group or other can write without the sticky bit. Read-only metadata; no network or process capability."
+      "purpose": "Reviewed for #242 (operator file safety): resolves the --ca-file and --answers path one entry at a time from / (a relative path from std::env::current_dir), following each link with std::fs::read_link, and reads each entry's Unix owner and mode bits through MetadataExt, refusing a file, directory or link owned by an account other than root and the running one, or a directory group or other can write without the sticky bit. Read-only metadata; no network or process capability."
+    },
+    {
+      "file": "ggctl/src/credential.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "ggctl::credential::running_account#1",
+      "sha256": "095bb06d5a6f52a5670f4888a764b78ae3a399c7e3d36422e0c122d76918ab3f",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 (operator file safety): reads the effective user ID through rustix::process::geteuid, a safe read-only identity call, so the --ca-file and --answers checks can compare owners against the account running ggctl. It starts, signals or inspects no process and opens no network transport."
     },
     {
       "file": "ggctl/src/credential.rs",

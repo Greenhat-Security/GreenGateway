@@ -89,9 +89,16 @@ WHERE security_revision > :start ORDER BY security_revision;
 SELECT actor_user_id, actor_kind, security_revision, expires_at, committed_at
 FROM greengateway.jwt_revocation_evidence
 WHERE security_revision > :start ORDER BY security_revision;
+
+-- Who changed each Connection (a delete since migration 16; a create, a
+-- replace and its credential binding change since migration 28).
+SELECT action, revision_axis, prior_version, new_version, actor_user_id,
+       actor_kind, connection_id, security_revision, committed_at
+FROM greengateway.connection_change_evidence
+WHERE security_revision > :start ORDER BY security_revision;
 ```
 
-Expected for the incident above: one `jwt_revocation` row (its `resource_id` is a digest, never the `jti`), one `service_token` row naming the token, one `connection` row naming the Connection, and a denylist row attributed to `operator:revoke-jwt` at the revision the command printed. The evidence tables add one `service_token.revoke` row naming the principal who withdrew the token, with its kind, auth mode and issuer, and one JWT evidence row attributed to `operator:revoke-jwt` with kind `system`, each at its outbox row's revision. The admin decisions are in `greengateway.audit_events` as `service_token.changed` and `connection.credential_changed`; each refusal of a withdrawn credential is an `auth.failure` record on the replica that refused it.
+Expected for the incident above: one `jwt_revocation` row (its `resource_id` is a digest, never the `jti`), one `service_token` row naming the token, one `connection` row naming the Connection, and a denylist row attributed to `operator:revoke-jwt` at the revision the command printed. The evidence tables add one `service_token.revoke` row naming the principal who withdrew the token, with its kind, auth mode and issuer, and one JWT evidence row attributed to `operator:revoke-jwt` with kind `system`, each at its outbox row's revision. The rebind adds a `connection.replace` row and a `credential.binding_change` row on the credential axis, naming whoever rebound the Connection, under one operation ID at the rebind's outbox revision; neither names the old or the new secret. The admin decisions are in `greengateway.audit_events` as `service_token.changed` and `connection.credential_changed`; each refusal of a withdrawn credential is an `auth.failure` record on the replica that refused it.
 
 Keep tokens, `jti` values, secret material, secret locators, request IDs, hostnames and raw audit payloads out of shared incident summaries and alert annotations, as [audit delivery](operational-alerts.md#audit-delivery) already requires. Record counts, revisions, event types and times; keep the raw records in restricted storage.
 

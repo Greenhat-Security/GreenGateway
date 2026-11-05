@@ -464,17 +464,20 @@
           "anchor": "async fn connection_put_endpoint("
         }
       ],
-      "boundary": "PostgresConnectionStore::create/replace locks shared Connection state, checks collection/object CAS, writes records, credential bindings, immutable version, shared revision and outbox in one transaction. Credential/TLS revisions derive from replacement.",
-      "record": "connection_versions actor/diff and outbox from/to are atomic; history cascades when Connection is deleted.",
-      "actor": "actor_user_id retained while parent exists; issuer/auth method absent.",
-      "identity": "Connection ID, connection/credential/TLS revisions and shared revision. Identical replace is a no-op; no operation ID.",
-      "delivery": "post_commit_telemetry",
+      "boundary": "PostgresConnectionStore::create/replace refuse an actor the evidence cannot record exactly (ChangeActor::is_recordable) before opening a transaction, then lock shared Connection state, check collection/object CAS, write records, credential bindings, immutable version, shared revision and outbox, append one connection_change_evidence row carrying the outbox row's shared revision (connection.create, or connection.replace plus credential.binding_change under the same operation_id when the replacement advances the credential revision), journal each row, and commit once. An evidence insert or journal append failure rolls the whole change back and is reported as a store failure (503), never as a conflict or validation problem; a full journal refuses the change with 503. Credential/TLS revisions derive from replacement; an identical replace commits nothing and records nothing.",
+      "record": "connection_versions actor/diff and outbox from/to are atomic; that history cascades when the Connection is deleted. Since migration 28, connection_change_evidence (no foreign key) keeps one row per committed create and replace, and one credential.binding_change row per replacement that advances the credential revision: the actor, action, event/operation UUIDs, revision_axis (connection, or credential for the binding change), the revision before and after on that axis (none before a create; 0 before a binding change means no credential authority was configured), the outbox row's shared revision and database-clock committed_at. No specification, endpoint, header name, binding, bound secret ID or locator. Stale ETag, collection conflict, capacity, a lost race, an unrecordable actor and an identical replace write no row. Connections created or replaced before migration 28 have no such rows; nothing is backfilled.",
+      "actor": "The authenticated principal the admin create and put endpoints pass through the control plane and ManagedConnectionStore as a ChangeActor (ChangeActor::from_principal), committed with the change: actor_user_id (the subject, 1 to 4096 bytes), actor_kind (principal or service_token), actor_auth_mode and the canonical actor_issuer of a principal that has one (1 to 4096 bytes). connection_documents still records the subject while the Connection exists. A keyed safe actor reference exists only in what is delivered.",
+      "identity": "Generated event_id and operation_id UUIDs per store call (not bound to a client idempotency key); a credential-changing replacement's two rows share its operation_id and shared revision. Connection ID, the revision transition on the row's axis, shared revision equal to the outbox row's, database-clock committed_at. A lost replace response is reconciled by the row naming the new version, and a retry with the old ETag is a conflict that writes nothing; a lost create response is reconciled by the Connection's create row, and a blind retry creates a second Connection with its own row.",
+      "delivery": "journaled_dispatch",
       "disposition": [
-        "missing_metadata",
-        "missing_delivery"
+        "missing_metadata"
       ],
-      "follow_up": "PR2: extend migration 16's connection_change_evidence (a closed action set) to create/replace in these same transactions, independently of cascading Connection history; record credential changes by Connection identity/revision only, never binding IDs or locators.",
+      "follow_up": "PR2 follow-up: carry a caller-bound operation identity to the store and derive an issuer-scoped subject reference, so the delivered record can become authority_event.v1. Delivery journals each row in the change's transaction and dispatches it as authority_event_delivery.v1: connection.create and connection.replace on the connection axis, credential.binding_change on the credential axis with the Connection as its resource (v1 names a credential_binding resource, which the evidence cannot reference without a binding identifier it deliberately omits). AUTHORITY_EVIDENCE_DURABILITY=required makes a configured sink mandatory and admits this row; nothing qualifies it yet.",
       "sources": [
+        {
+          "path": "gateway/src/storage/migrations/0028_connection_create_replace_evidence.sql",
+          "anchor": "ADD CONSTRAINT connection_change_evidence_versions CHECK ("
+        },
         {
           "path": "gateway/src/connections/pg_store.rs",
           "anchor": "pub async fn create("
@@ -485,10 +488,50 @@
         },
         {
           "path": "gateway/src/connections/pg_store.rs",
+          "anchor": "action: EVIDENCE_ACTION_CREATE,"
+        },
+        {
+          "path": "gateway/src/connections/pg_store.rs",
+          "anchor": "action: EVIDENCE_ACTION_CREDENTIAL_CHANGE,"
+        },
+        {
+          "path": "gateway/src/connections/pg_store.rs",
+          "anchor": "async fn record_change_evidence("
+        },
+        {
+          "path": "gateway/src/connections/pg_store.rs",
           "anchor": "async fn append_version("
+        },
+        {
+          "path": "gateway/src/connections/managed_store.rs",
+          "anchor": "Self::Postgres { store, .. } => store.create(candidate, actor, collection).await,"
+        },
+        {
+          "path": "gateway/src/authority_events/delivery.rs",
+          "anchor": "const ACTION_CREDENTIAL_BINDING_CHANGE: &str = \"credential.binding_change\";"
         }
       ],
       "tests": [
+        {
+          "path": "gateway/src/connections/pg_store_tests.rs",
+          "anchor": "async fn create_and_replace_evidence_names_the_actor_and_survives_delete_and_restart("
+        },
+        {
+          "path": "gateway/src/connections/pg_store_tests.rs",
+          "anchor": "async fn refused_creates_and_replaces_write_no_evidence("
+        },
+        {
+          "path": "gateway/src/connections/pg_store_tests.rs",
+          "anchor": "async fn racing_creates_and_replaces_record_only_the_winner("
+        },
+        {
+          "path": "gateway/src/connections/pg_store_tests.rs",
+          "anchor": "async fn a_failed_evidence_or_journal_write_rolls_back_create_and_replace("
+        },
+        {
+          "path": "gateway/src/connections/pg_store_tests.rs",
+          "anchor": "async fn a_full_journal_refuses_create_and_replace_with_503("
+        },
         {
           "path": "gateway/src/connections/pg_store_tests.rs",
           "anchor": "async fn records_create_replace_delete_with_cas_and_shared_state_bumps("
@@ -498,13 +541,25 @@
           "anchor": "async fn additional_header_bindings_round_trip_and_advance_the_credential_axis("
         },
         {
-          "path": "gateway/src/connections/pg_store_tests.rs",
-          "anchor": "async fn concurrent_same_etag_replaces_produce_exactly_one_winner("
+          "path": "gateway/src/storage/migrations.rs",
+          "anchor": "async fn migration_twenty_eight_admits_connection_create_and_replace_evidence_and_backfills_nothing("
+        },
+        {
+          "path": "gateway/src/authority_events/dispatcher_tests.rs",
+          "anchor": "async fn committed_events_are_delivered_in_commit_order_under_their_evidence_ids("
+        },
+        {
+          "path": "gateway/src/authority_events/dispatcher_tests.rs",
+          "anchor": "async fn capacity_exhaustion_refuses_the_mutation_and_commits_nothing("
+        },
+        {
+          "path": "gateway/src/authority_events/delivery_tests.rs",
+          "anchor": "fn connection_changes_project_only_on_their_recorded_axis("
         }
       ],
       "required_durability_supported": false,
       "required_mode": "admitted",
-      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+      "test_claim": "PostgreSQL-gated regression anchors for the transactional create, replace and credential binding change evidence and its journaled delivery: the actor recorded, refusals and lost races writing nothing, rollback on a failed evidence insert or journal append, a full journal refused with 503, survival after delete and restart, and binding and secret material absent. They do not certify the proposed authority_event.v1 contract."
     },
     {
       "id": "connection_standalone",

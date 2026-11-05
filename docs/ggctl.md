@@ -2,7 +2,7 @@
 
 `ggctl` is GreenGateway's operator command-line tool (issue #242, [ADR-0008](adr/0008-setup-cli-and-configuration-bundles.md)). It is a separate binary: the `gateway` server keeps its name, its no-argument startup, its Docker entrypoint and its one-shot commands (`gateway migrate`, `gateway healthcheck`, `gateway import-standalone`, ...) unchanged.
 
-**Status: alpha.** This build implements `version`, `schema`, `init`, `validate`, `pin`, `convert`, `doctor`, `diff`, `completion` and `help`, the output contract, the exit codes, secure bearer-token input and the version handshake with a running gateway. `init` writes a new [configuration bundle](configuration-bundles.md) for a deployment profile, `validate` and `doctor` check one offline with the gateway's own bundle reader, `pin` rewrites its SHA-256 pins once its files validate, `convert` converts one between document versions, and `diff` compares two bundles semantically and classifies each change's risk. `ggctl` cannot yet plan, apply, export or back up anything, it has no browser wizard (`init --web`), and it cannot yet validate, convert or diff an environment file (`--env`, `--against-env`) or diff against a server (`diff --server`): those are later #242 slices (see the ADR's [rollout](adr/0008-setup-cli-and-configuration-bundles.md#rollout)), and a name this build does not implement is refused as an unknown command (exit 2). Nothing here changes how a gateway is configured or started: no gateway reads a bundle yet.
+**Status: alpha.** This build implements `version`, `schema`, `init`, `validate`, `pin`, `convert`, `doctor`, `diff`, `ledger seed`, `ledger verify`, `ledger rollback`, `completion` and `help`, the output contract, the exit codes, secure bearer-token input and the version handshake with a running gateway. `init` writes a new [configuration bundle](configuration-bundles.md) for a deployment profile, `validate` and `doctor` check one offline with the gateway's own bundle reader, `pin` rewrites its SHA-256 pins once its files validate, `convert` converts one between document versions, and `diff` compares two bundles semantically and classifies each change's risk. The `ledger` commands seed, verify and roll back a standalone state directory's [configuration revision ledger](configuration-ledger.md) offline, under the directory's lock. `ggctl` cannot yet plan, apply, export or back up anything, it has no browser wizard (`init --web`), and it cannot yet validate, convert or diff an environment file (`--env`, `--against-env`) or diff against a server (`diff --server`): those are later #242 slices (see the ADR's [rollout](adr/0008-setup-cli-and-configuration-bundles.md#rollout)), and a name this build does not implement is refused as an unknown command (exit 2). Nothing here changes how a gateway is configured or started: no gateway reads a bundle or starts from a ledger yet.
 
 ## Building
 
@@ -28,12 +28,15 @@ ggctl pin BUNDLE [--strict] [--format human|json]
 ggctl convert BUNDLE --to VERSION (--output DIR | --in-place) [--strict] [--format human|json]
 ggctl doctor BUNDLE [--format human|json]
 ggctl diff BUNDLE --against BUNDLE [--check] [--strict] [--format human|json|sarif]
+ggctl ledger seed BUNDLE --state-dir DIR [--format human|json]
+ggctl ledger verify --state-dir DIR [--format human|json]
+ggctl ledger rollback REVISION --state-dir DIR [--acknowledge RISK_CODE]... [--format human|json]
 ggctl completion bash|zsh|fish|powershell
-ggctl help [COMMAND]
+ggctl help [COMMAND [SUBCOMMAND]]
 ggctl --help | --version
 ```
 
-`ggctl help COMMAND` and `ggctl COMMAND --help` print a command's options. Help and the completion scripts are generated from the same command table the parser uses, so they cannot drift. Man pages, which ADR-0008 also generates from that table, arrive with packaging (#242 PR 18).
+`ggctl help COMMAND` and `ggctl COMMAND --help` print a command's options. `ledger` is a command family: `ggctl help ledger` and `ggctl ledger --help` list its commands, and `ggctl help ledger seed` and `ggctl ledger seed --help` print one. Help and the completion scripts are generated from the same command table the parser uses, so they cannot drift. Man pages, which ADR-0008 also generates from that table, arrive with packaging (#242 PR 18).
 
 ### `version`
 
@@ -47,14 +50,14 @@ Without `KIND`, lists every document kind and version this `ggctl` publishes a J
 
 Creates a new bundle in the directory `--output` for the deployment profile `--profile` (`production`, `migration` or `development`; required): `bundle.yaml`, a deployment document declaring the profile and, in the default standalone topology, a policy that denies by default and enforces its decisions with no route and no role, and a tools document with no tools, each pinned by its SHA-256 digest, plus a `.gitattributes` that keeps their line endings LF. What each profile and topology writes is in [generated bundles](configuration-bundles.md#generated-bundles); the permissive starter policy is never written, and no file holds a secret or a credential. The output is deterministic: the same profile and answers always give the same bytes.
 
-- `--answers FILE` replaces the defaults with a `GatewayInitAnswers` document ([schema](schemas/gateway-init-answers.v1alpha1.schema.json); YAML, or strict JSON when `FILE` ends in `.json`): the bundle's `name`, the `cluster` topology, which leaves policy and tools to the server as Connections are, or an `operator` role bound to one issuer and explicit authentication methods that may read status and configuration capabilities and nothing more. No member can hold a secret value. Because the answers decide which issuer the operator role trusts, `FILE` is read like `--ca-file`: a regular file of at most 64 KiB that, on Unix, is not writable by group or other and is not in a directory they can write without the sticky bit. A problem in the document is reported with the bundle reader's code, located by the position of `--answers` with a JSON Pointer, line and column, never by its path.
+- `--answers FILE` replaces the defaults with a `GatewayInitAnswers` document ([schema](schemas/gateway-init-answers.v1alpha1.schema.json); YAML, or strict JSON when `FILE` ends in `.json`): the bundle's `name`, the `cluster` topology, which leaves policy and tools to the server as Connections are, or an `operator` role bound to one issuer and explicit authentication methods that may read status and configuration capabilities and nothing more. No member can hold a secret value. Because the answers decide which issuer the operator role trusts, `FILE` is read like `--ca-file`: a regular file of at most 64 KiB that, on Unix, no other account can change, either by writing it or by changing what its path resolves to (the rules are under [Remote server](#remote-server)). A problem in the document is reported with the bundle reader's code, located by the position of `--answers` with a JSON Pointer, line and column, never by its path.
 - `--output DIR` must not exist, or must be an empty directory that is not a link; anything else is refused with `output.destination_exists` (exit `5`) and left exactly as it was. `ggctl` never overwrites.
 - The files are written into a new hidden directory beside `DIR` (`.NAME.ggctl-staging-PID-N`, created exclusively), each created new and flushed to storage with the manifest last, read back with the gateway's bundle reader strictly, and only then renamed onto `DIR` (an empty `DIR` is removed first) and the parent directory flushed. Any failure removes the staging directory, so nothing that looks like a bundle is ever left at `DIR`; only a process killed mid-write can leave the hidden staging directory, which is safe to delete. On Unix the directory is `0700` and each file `0600`, checked after writing, and a filesystem that does not keep those modes is refused (`output.permissions_unavailable`). Windows has no mode bits: the new entries inherit the ACL of the directory they are created in, which, as for the bundle reader, is left to the operator.
 - `ggctl` prompts for nothing, starts and deploys nothing, and makes no network request. The human result names the bundle, its digests, files and profile (marking `development` non-production) and the next step: review the files and run `ggctl validate --strict` on `DIR`. `--format json` writes one `GgctlReport` whose `result` holds `created`, `profile`, `topology`, `operator` and, once written, `bundle` as `validate` reports it.
 
 As for `validate`, the gateway's production policy and tools validators are not part of `ggctl`; the gateway's own tests hold every bundle `init` can write to them and to the policy enforcement it configures. No gateway reads a bundle yet, so the generated policy and tools documents are, today, also usable as `POLICY_FILE` and `TOOLS_FILE` in environment mode.
 
-Exit codes: `0` written, `3` invalid answers (or an answers file over 64 KiB), `5` when `DIR` holds anything, `2` for an answers file that is not a regular file or is writable by others, `1` when the answers could not be read or the bundle could not be written.
+Exit codes: `0` written, `3` invalid answers (or an answers file over 64 KiB), `5` when `DIR` holds anything, `2` for an answers file that is not a regular file or that another account could change, `1` when the answers could not be read or the bundle could not be written.
 
 ```sh
 ggctl init --profile production --output deploy/bundle --answers deploy/init-answers.yaml
@@ -171,9 +174,50 @@ Exit codes: `0` when both bundles were compared, `4` with `--check` when they di
   run: ggctl diff deploy/bundle --against deployed/bundle --format sarif > bundle-diff.sarif
 ```
 
+### `ledger seed`
+
+Creates the [configuration revision ledger](configuration-ledger.md) of the standalone state directory `--state-dir` (required) names, with the bundle in the directory `BUNDLE` as its first revision ([ADR-0008, "Seeding a ledger"](adr/0008-setup-cli-and-configuration-bundles.md#bootstrap-model)). The bundle is read with the gateway's own bundle reader strictly, as `validate --strict` reads it, so an entry the manifest does not reference is an error; an invalid bundle is reported like `validate` reports it, and the state directory is not touched. Then `ggctl` takes the state directory's [exclusive lock](configuration-bundles.md#the-state-directory) without waiting, and `RevisionLedger::seed` builds the ledger under a temporary name, commits and flushes it, and links it into place without replacing anything, so an interrupted seed leaves no ledger. The new revision is desired and not active, records `ggctl-ledger` as its system actor, no request and the `restart` activation class: no gateway has compiled it yet.
+
+- A state directory that already holds `config-ledger.sqlite3`, or a previous ledger's `-wal`, `-shm` or `-journal` file, which a new ledger could replay, is refused with `ledger.exists` (exit `5`) and left exactly as it was. A ledger is created only once; there is no option that replaces one.
+- A state directory a gateway or another `ggctl` holds is `state_dir.locked` (exit `5`); one that is missing, a link, not a directory or, on Unix, writable by group or other is refused with its [`state_dir` code](#state_dir-diagnostics) (exit `3`).
+- The gateway's production policy and tools validators are not part of `ggctl` and do not run (`validate.production_validators_not_run`). A gateway starting from the ledger compiles its desired revision again, with them, and refuses to start if it does not compile (`ledger.gateway_recompiles_at_start`). Ledger mode itself (`GATEWAY_CONFIG_SOURCE=ledger`) is a later #242 slice: no gateway starts from a ledger yet.
+- The human result names the bundle as `validate` does, then the desired revision (its `rev-` ID, sequence and operation) and the active one (`none`). `--format json` writes one `GgctlReport` whose `result` holds `valid`, `seeded`, `bundle` and, once seeded, `ledger`: the revision count, the `desired` revision, `active` (`null`) and `restartPending`.
+
+Exit codes: `0` seeded, `3` for an invalid bundle or an unusable state directory, `5` when the state directory is locked or already holds a ledger or a ledger's journal file, `1` when the bundle or the ledger could not be read or written.
+
+```sh
+ggctl ledger seed deploy/bundle --state-dir /var/lib/greengateway
+```
+
+### `ledger verify`
+
+Takes the state directory's exclusive lock, opens its ledger read-only (`RevisionLedger::inspect`) and runs the [full verification](configuration-ledger.md#verification) a gateway runs at start: the location and permissions of the directory and the file, the header, SQLite's `quick_check`, the exact schema and its triggers, every document against its pin, every record, its hash and its place in the chain, every rollback against its target, the request index and the pointer. Nothing in the ledger is written: not its journal mode, not a checkpoint, not a page. SQLite may create its `-wal` and `-shm` files beside a write-ahead ledger to read it, as any reader does, and the lock file is created if it is missing.
+
+The human result is the revision count, the desired revision and the active one, or `configuration ledger corrupt (CLASS)`. `--format json` writes one `GgctlReport` whose `result` holds `verified` and either `ledger` (as for `ledger seed`) or, for a corrupt ledger, `corruption`: the class of what verification found (`integrity`, `format`, `schema`, `record`, `record_hash`, `chain`, `document`, `pointer` or `request`). A hash chain is integrity evidence, not authentication: it detects an edit made outside the gateway, not a whole ledger replaced by a consistent one.
+
+Exit codes: `0` verified, `3` when the ledger is corrupt, missing, of an unsupported format or unsafely placed, `5` when the state directory is locked (a running gateway holds it), `1` when the ledger could not be read.
+
+### `ledger rollback`
+
+The offline lockout recovery path ([ADR-0008, "Recovery and lockout"](adr/0008-setup-cli-and-configuration-bundles.md#bootstrap-model)): when a revision locks every administrator out, stop the gateway and roll the ledger back to a revision that worked. `ggctl` takes the state directory's exclusive lock, opens and verifies the ledger, and plans the rollback to `REVISION` (`rev-` and 32 lowercase hexadecimal digits, as `ledger verify` reports one) through the gateway's own revision service (`RevisionService`) with the published-schemas compiler, under the system actor `ggctl-ledger`: the target's stored content is compiled again and diffed against the desired revision with the [semantic diff](semantic-diff.md), exactly as an online rollback plan is. A change no revision can carry, stored content the reader now refuses, a target that is not a revision of this ledger or is the desired revision, and a rollback that changes nothing are refused, and nothing is written.
+
+- **Every risk code must be acknowledged by name.** Each risk code of the plan is given with its own `--acknowledge RISK_CODE`, which may be repeated; the set must be exactly the plan's codes, no more and no fewer. There is no option that acknowledges them all. Until it matches, nothing is written, and the report shows the plan, its diff, its `riskCodes` and the `unacknowledged` ones, so the operator can read what the rollback changes before acknowledging it.
+- **Every risk code is acknowledgeable offline**, `risk.admin_access_path_removed` included, which no online request can acknowledge. Filesystem access to the state directory is already full control of a standalone deployment, so the offline command asks for no permission either; the plan's union of permissions is reported and recorded, but not checked.
+- **History is only appended to.** The rollback is a new forward revision recording its target, the plan's changed sections, risk codes and permissions, `ggctl-ledger` as its system actor and no request; no revision is changed, removed or reordered. It is recorded with the `restart` activation class whatever its changes are, because no gateway is running to activate it: the desired pointer moves, the active pointer stays, and the next start compiles and activates it. It restores configuration only, never database schema, secret material, Connections or revoked credentials, none of which a ledger holds.
+- The gateway's production policy and tools validators do not run in `ggctl` (`validate.production_validators_not_run`); the gateway compiles the revision again with them at start and refuses to start if it does not compile (`ledger.gateway_recompiles_at_start`).
+- `REVISION` is never echoed: one outside the grammar is a usage error (exit `2`) located by its position, and the report names the target only as the ledger holds it. The human result is the plan's diff, then either the new revision and the pointer or what still needs acknowledging. `--format json` writes one `GgctlReport` whose `result` holds `rolledBack`, `plan` (`base`, `target`, `riskCodes`, `unacknowledged`, `changedSections`, `requiredPermissions`, the online `activation` class and the `diff`), and once rolled back the new `revision` and the `ledger` pointer, or `corruption` for a corrupt ledger.
+
+Exit codes: `0` rolled back, `2` for a `REVISION` that is not a revision ID or an unknown risk code, `3` when the ledger or the target's content is invalid or a risk code is not acknowledged exactly, `5` when the state directory is locked, `1` when the ledger could not be read or written.
+
+```sh
+ggctl ledger verify --state-dir /var/lib/greengateway
+ggctl ledger rollback rev-0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f --state-dir /var/lib/greengateway \
+  --acknowledge risk.admin_access_path_removed --acknowledge risk.policy_broadened
+```
+
 ### `completion`
 
-Writes a completion script to standard output. It completes commands, options, fixed choices, file names for path options and directory names for a `BUNDLE` argument.
+Writes a completion script to standard output. It completes commands, a family's commands after its name (`ggctl ledger <TAB>`), options, fixed choices (risk codes for `--acknowledge`), file names for path options and directory names for a `BUNDLE` argument.
 
 | Shell | Install |
 | --- | --- |
@@ -188,7 +232,7 @@ Writes a completion script to standard output. It completes commands, options, f
 - **Diagnostics go to standard error** in human form. With `--format json` or `--format sarif` they are in the document instead and standard error stays empty.
 - **An argument error found before a command runs** (an unknown option, a refused secret or insecure option, a malformed `--server`) is written to standard error only, exits `2`, and writes no report.
 - **No color, no prompts, no progress output.** `ggctl` reads no configuration file and no environment variable, and makes no network request unless a command is given `--server`.
-- **Files are written only where a command is told to.** `init` and `convert --output` create the one directory `--output` names, and never write anything else, overwrite anything, or echo the path. `pin` replaces only `BUNDLE`'s `bundle.yaml`.
+- **Files are written only where a command is told to.** `init` and `convert --output` create the one directory `--output` names, and never write anything else, overwrite anything, or echo the path. `pin` replaces only `BUNDLE`'s `bundle.yaml`. The `ledger` commands write only beneath `--state-dir`: its lock file, which they create if it is missing; `ledger seed` creates the ledger and never replaces one, `ledger rollback` appends one revision to it, and `ledger verify` writes nothing in it.
 
 A report always has `apiVersion: greengateway.dev/v1alpha1`, `kind: GgctlReport`, the `command`, the process `exitCode` and its stable `outcome` name, the `diagnostics`, and a command-specific `result`. Every diagnostic has a stable `code`, a `severity` (`error`, `warning` or `info`), fixed `message` text, an optional fixed `hint`, a `remediation` anchor and at most one location: when it concerns one argument, that argument's 1-based `location.argument` position; when the bundle reader found it, the bundle-relative `location.file`, a `location.pointer` built from member names the reader defines, and the 1-based `location.line` and `location.column` where the reader has them. Diagnostics are value-free by construction: they never contain an argument, token, URL, path, address, document value, server response or library error text. An unknown option is reported by its position, never by its spelling, because the spelling may be a mistyped secret. A published code never changes meaning; renaming or removing one needs a new report version.
 
@@ -210,7 +254,7 @@ SARIF 2.1.0 output belongs to `validate`, which ADR-0008 gives it, and to `diff`
 | `7` | `integrity` | Backup or archive integrity or restore verification failure. |
 | `8` | `denied` | Authentication or authorization refused. |
 
-When several errors apply, the one that must not be hidden wins: `1` over everything, and `6` only when nothing else went wrong, so a pipeline that retries on `6` never resends work another error left in doubt. Today `4` comes from `diff --check` and `5` only from an `init` or `convert --output` directory that is not empty, or a `bundle.yaml` that changed while `pin` ran; the ETag, plan and lock conflicts of `5`, and `7`, belong to commands later slices add.
+When several errors apply, the one that must not be hidden wins: `1` over everything, and `6` only when nothing else went wrong, so a pipeline that retries on `6` never resends work another error left in doubt. Today `4` comes from `diff --check` and `5` only from an `init` or `convert --output` directory that is not empty, a `bundle.yaml` that changed while `pin` ran, a state directory another process holds locked (`state_dir.locked`), or a `ledger seed` into a state directory that already holds a ledger (`ledger.exists`); the ETag and plan conflicts of `5`, and `7`, belong to commands later slices add.
 
 ## Credentials
 
@@ -231,7 +275,7 @@ printf '%s' "$ADMIN_TOKEN" | ggctl version --server https://gateway.example.test
 
 `--server` takes the admin API base, `https://HOST[:PORT]/v1<ADMIN_PREFIX>` (for the default prefix, `https://HOST/v1/admin`), and `ggctl` never derives or rewrites it:
 
-- HTTPS uses the platform's trust store with normal certificate and hostname verification. `--ca-file PATH` adds the PEM certificates in one regular file of at most 1 MiB as further trust anchors; it does not replace the platform's, and it applies only to an `https` server. It is read like `--token-file`, and because these anchors decide which server receives the token, on Unix another account must not be able to change it: the file may be world-readable (`0644`), but a file writable by group or other (`0664`, `0666`) is refused, and so is one in a directory writable by group or other without the sticky bit, whether that is the directory the path names or, for a symbolic link, the one holding the file it points to (`trust.ca_file_unsafe_permissions`). Windows leaves the file's ACL to the operator. On Linux the platform store honors `SSL_CERT_FILE` and `SSL_CERT_DIR`, as every client using it does. There is no option that disables verification.
+- HTTPS uses the platform's trust store with normal certificate and hostname verification. `--ca-file PATH` adds the PEM certificates in one regular file of at most 1 MiB as further trust anchors; it does not replace the platform's, and it applies only to an `https` server. It is read like `--token-file`, and because these anchors decide which server receives the token, on Unix another account must not be able to change the file or what its path resolves to (`trust.ca_file_unsafe_permissions`). The file may be world-readable (`0644`), but a file writable by group or other (`0664`, `0666`) is refused. `ggctl` then resolves the path from `/` (a relative path from the working directory), following each symbolic link, including any inside a link's target, and refuses it when the file, any directory above it up to `/`, or any link on the way is owned by an account other than root or the one running `ggctl`, or when group or other can write one of those directories without the sticky bit: any of them lets that account put a file of its own in place. A sticky directory such as `/tmp` is accepted for a file you or root own, never for one another account created there first, and a file under a world-writable directory without the sticky bit is refused however deep it is. Running as root, a file another account owns is refused too; `chown` it or copy it somewhere root owns. Windows leaves the file's ACL to the operator. On Linux the platform store honors `SSL_CERT_FILE` and `SSL_CERT_DIR`, as every client using it does. There is no option that disables verification.
 - Plain `http` is accepted only for a loopback IP literal (`127.0.0.0/8` or `::1`), which covers SSH tunnels and `kubectl port-forward`. `localhost` is a name, not a literal, and needs `https`.
 - A user name or password, a query, a fragment, percent-escapes, backslashes, `.` or `..` segments, and any space, tab, line break or other control character are refused, so the base used is exactly the one written.
 - Redirects are refused, never followed. Ambient proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`) are ignored. Requests use HTTP/1.1 without compression or `Referer`.
@@ -294,7 +338,7 @@ Each code below is stable. The exit column is the exit code the diagnostic produ
 | --- | --- | --- |
 | `trust.ca_file_unreadable` | 1 | The CA file could not be opened or read. |
 | `trust.ca_file_not_regular_file` | 2 | The CA file is not a regular file. |
-| `trust.ca_file_unsafe_permissions` | 2 | The CA file, or a directory holding it, is writable by group or other (Unix); a directory may be only with the sticky bit. |
+| `trust.ca_file_unsafe_permissions` | 2 | Another account could change the CA file (Unix): it is writable by group or other; it, a directory above it or a link on its path is owned by an account other than root and the one running `ggctl`; or group or other can write one of those directories without the sticky bit. |
 | `trust.ca_file_too_large` | 2 | The CA file is larger than 1 MiB. |
 | `trust.ca_file_invalid` | 2 | The CA file holds no PEM certificate that can be used as a trust anchor. |
 
@@ -356,7 +400,7 @@ Each code below is stable. The exit column is the exit code the diagnostic produ
 | --- | --- | --- |
 | `init.answers_unreadable` | 1 | The `--answers` file could not be opened or read. |
 | `init.answers_not_regular_file` | 2 | The `--answers` file is not a regular file. |
-| `init.answers_unsafe_permissions` | 2 | The `--answers` file, or a directory holding it, is writable by group or other (Unix); a directory may be only with the sticky bit. |
+| `init.answers_unsafe_permissions` | 2 | Another account could change the `--answers` file (Unix), under the same rules as `trust.ca_file_unsafe_permissions`. |
 | `init.answers_too_large` | 3 | The `--answers` file is larger than 64 KiB. |
 
 A problem inside the answers document is reported with the [bundle reader's code](configuration-bundles.md#diagnostics), such as `schema.unknown_member` or `schema.not_applicable`.
@@ -381,6 +425,48 @@ A problem inside the answers document is reported with the [bundle reader's code
 
 A pin that must change but is not written as its 64 digits between quotes is the [bundle reader's code](configuration-bundles.md#diagnostics) `reference.pin_not_rewritable` (exit `3`), located at the pin.
 
+### State_dir diagnostics
+
+The [state directory](configuration-bundles.md#the-state-directory)'s own codes, located by the position of `--state-dir`. Nothing was read or written when one is reported.
+
+| Code | Exit | Meaning |
+| --- | --- | --- |
+| `state_dir.missing` | 3 | Nothing is at the `--state-dir` path. |
+| `state_dir.not_directory` | 3 | `--state-dir` names something other than a directory. |
+| `state_dir.link` | 3 | `--state-dir` names a symbolic link, junction or reparse point. Name the directory itself. |
+| `state_dir.unsafe_permissions` | 3 | The state directory is writable by group or other (Unix), who could replace a store. |
+| `state_dir.unsafe_lock_file` | 3 | `state.lock` is a link, not a regular file, or writable by group or other (Unix). |
+| `state_dir.locked` | 5 | A gateway or another `ggctl` holds the state directory's lock. Stop the gateway first; `ggctl` never waits. |
+| `state_dir.lock_unsupported` | 3 | The filesystem cannot take an exclusive lock, so exclusive use cannot be promised. Network filesystems are unsupported. |
+| `state_dir.unavailable` | 1 | The state directory or its lock file could not be inspected, opened or locked. |
+
+### Ledger diagnostics
+
+| Code | Exit | Meaning |
+| --- | --- | --- |
+| `ledger.missing` | 3 | The state directory holds no configuration ledger; create one with `ggctl ledger seed`. |
+| `ledger.exists` | 5 | The state directory already holds a ledger, or a previous ledger's `-wal`, `-shm` or `-journal` file, which a new ledger could replay. Nothing was written. |
+| `ledger.unsafe_location` | 3 | The state directory or `config-ledger.sqlite3` is a link, not the expected kind of entry, or writable by group or other (Unix). |
+| `ledger.unsupported` | 3 | The ledger is in a format, or records a document version, this `ggctl` does not support. |
+| `ledger.corrupt` | 3 | The ledger failed [verification](configuration-ledger.md#verification); the result's `corruption` names the class. Nothing was written. |
+| `ledger.full` | 3 | The ledger holds the most revisions it may (1,024) and pruning is a later slice. Nothing was written. |
+| `ledger.refused` | 3 | The ledger refused to record the revision, for example a clock before the Unix epoch. Nothing was written. |
+| `ledger.stale` | 5 | The ledger's head changed while `ggctl` held its lock, which only another handle in the same process could do. Nothing was written. |
+| `ledger.unavailable` | 1 | The ledger could not be read or written: busy, read-only, out of space or another I/O failure. |
+| `ledger.rollback_target_unknown` | 3 | `REVISION` is not a revision of this ledger; it is located by its position and never echoed. |
+| `ledger.rollback_target_is_head` | 3 | `REVISION` is already the desired revision. |
+| `ledger.rollback_target_invalid` | 3 | `REVISION`'s stored content no longer passes the bundle reader's checks; the reader's diagnostics follow. |
+| `ledger.head_invalid` | 3 | The desired revision's stored content no longer passes the reader's checks, so no rollback can be assessed against it. |
+| `ledger.change_not_applicable` | 3 | The rollback changes what no revision can carry (a `bootstrap`, `connection_or_secret`, `cluster_operation`, `coordinated_cutover` or `unsupported` change). |
+| `ledger.change_unclassified` | 3 | The rollback differs in a way the semantic diff could not classify, so it is refused rather than recorded without a code. |
+| `ledger.not_normalizable` | 3 | `REVISION`'s stored content has no canonical form. |
+| `ledger.no_change` | 3 | Rolling back to `REVISION` changes nothing: the desired revision already has its content. |
+| `ledger.acknowledgement_required` | 3 | The rollback carries risk codes and `--acknowledge` named none; the result lists them. Nothing was written. |
+| `ledger.acknowledgement_mismatch` | 3 | `--acknowledge` must name exactly the rollback's risk codes, each once or more, and nothing else. Nothing was written. |
+| `ledger.nothing_to_acknowledge` | 3 | `--acknowledge` was given, but the rollback carries no risk code. Nothing was written. |
+| `ledger.unexpected_refusal` | 1 | The revision service refused the rollback for a reason the offline path does not expect. Nothing was written; report it. |
+| `ledger.gateway_recompiles_at_start` | 0 | Information: a gateway starting from this ledger compiles its desired revision again, with the production policy and tools validators, and refuses to start if it does not compile. |
+
 ### Output diagnostics
 
 | Code | Exit | Meaning |
@@ -400,4 +486,4 @@ A pin that must change but is not written as its 64 digits between quotes is the
 
 ## Platform notes
 
-`ggctl` is tested on Linux, macOS and Windows. Exit codes, stream separation, terminal detection, token-file type and size checks and the remote client behave the same on all three. The owner-only permission check on token files applies on Unix only, and so does the bundle reader's refusal of a group- or other-writable bundle directory or file ([files and the directory](configuration-bundles.md#files-and-the-directory)); on Windows the reader enforces the link, reparse-point, regular-file and name rules, and ACLs are left to the operator. Likewise `init` and `convert --output` create their directory `0700` and its files `0600` on Unix and check those modes, and `pin` writes its new `bundle.yaml` `0600` and checks it, while on Windows the new entries inherit the ACL of the directory they are created in. Shell completion is generated for bash, zsh, fish and PowerShell.
+`ggctl` is tested on Linux, macOS and Windows. Exit codes, stream separation, terminal detection, token-file type and size checks and the remote client behave the same on all three. The owner-only permission check on token files applies on Unix only, as do the owner, mode and path checks on `--ca-file` and `--answers` files, and so does the bundle reader's refusal of a group- or other-writable bundle directory or file ([files and the directory](configuration-bundles.md#files-and-the-directory)); on Windows the reader enforces the link, reparse-point, regular-file and name rules, and ACLs are left to the operator. Likewise `init` and `convert --output` create their directory `0700` and its files `0600` on Unix and check those modes, and `pin` writes its new `bundle.yaml` `0600` and checks it, while on Windows the new entries inherit the ACL of the directory they are created in. Shell completion is generated for bash, zsh, fish and PowerShell.
