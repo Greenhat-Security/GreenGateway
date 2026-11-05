@@ -6027,6 +6027,42 @@ mod cluster_policy_tests {
         member
     }
 
+    /// A live replica of the build that serves policy v1 in cluster mode but
+    /// refuses every rule condition: this schema, document formats `0..=1`
+    /// and every capability that build had, but not `policy_rule_conditions`.
+    async fn insert_pre_conditions_member(
+        pool: &deadpool_postgres::Pool,
+        deployment: &str,
+    ) -> uuid::Uuid {
+        let member = uuid::Uuid::new_v4();
+        let (schema_min, schema_max) = migrations::schema_version_range();
+        pool.get()
+            .await
+            .expect("client")
+            .execute(
+                "INSERT INTO greengateway.cluster_members
+                     (deployment_id, instance_id, boot_id, binary_version,
+                      schema_version_min, schema_version_max,
+                      document_version_min, document_version_max, fingerprint,
+                      capabilities)
+                 VALUES ($1, $2::text::uuid, $3::text::uuid, 'pre-conditions', $4, $5, 0, 1,
+                         repeat('b', 64),
+                         'delegated_token_purges,openapi_discovery_catalogs,'
+                         || 'openapi_swagger2_catalogs,operation_requirements,'
+                         || 'policy_document_v1,policy_role_descriptions')",
+                &[
+                    &deployment,
+                    &member.to_string(),
+                    &uuid::Uuid::new_v4().to_string(),
+                    &schema_min,
+                    &schema_max,
+                ],
+            )
+            .await
+            .expect("a pre-conditions member row inserts");
+        member
+    }
+
     async fn backdate_member(pool: &deadpool_postgres::Pool, member: uuid::Uuid) {
         pool.get()
             .await
@@ -6051,9 +6087,9 @@ mod cluster_policy_tests {
     /// member has left, the same `PUT` commits the document and it is served
     /// back, read from the authority and from history as v1. A rollback to
     /// a 0.x revision needs nothing of the roster and restores that revision
-    /// exactly, never with v1's semantics. A v1 document whose rules carry
-    /// conditions is refused for what this build does not enforce, in
-    /// cluster mode as in standalone, never for its format.
+    /// exactly, never with v1's semantics. A v1 document whose conditions
+    /// read a tool argument is refused for what this build does not enforce,
+    /// in cluster mode as in standalone, never for its format.
     #[tokio::test]
     async fn cluster_policy_v1_documents_wait_for_every_live_member_to_read_them() {
         let Some(admin_dsn) = locator() else {
@@ -6184,18 +6220,18 @@ mod cluster_policy_tests {
             "a refused write commits nothing"
         );
 
-        // Rule conditions are refused for what this build does not enforce,
-        // before any roster is asked.
+        // A tool_argument condition is refused for what this build does
+        // not enforce, before any roster is asked.
         let typed = json!({
             "schema_version": "1.0.0",
             "id": "v1-typed",
             "default_action": "deny",
             "roles": { "admin": { "permissions": ["admin:policy:read", "admin:policy:write"] } },
             "rules": [{
-                "id": "internal-only",
-                "path": "/internal/**",
-                "action": "allow",
-                "conditions": { "source_network": { "cidrs": ["10.0.0.0/8"] } }
+                "id": "eu-exports",
+                "tool_name": "reports.export",
+                "action": "deny",
+                "conditions": { "tool_argument": { "pointer": "/region", "in": ["eu"] } }
             }]
         })
         .to_string();
@@ -6357,6 +6393,152 @@ mod cluster_policy_tests {
         }
     }
 
+    /// A policy v1 document like [`cluster_v1_policy_json`] whose one rule
+    /// allows `/internal/**` only from `10.0.0.0/8`.
+    fn cluster_conditioned_policy_json(id: &str) -> String {
+        json!({
+            "schema_version": "1.0.0",
+            "id": id,
+            "default_action": "deny",
+            "roles": { "admin": { "permissions": ["admin:policy:read", "admin:policy:write"] } },
+            "rules": [{
+                "id": "internal-only",
+                "path": "/internal/**",
+                "action": "allow",
+                "conditions": { "source_network": { "cidrs": ["10.0.0.0/8"] } }
+            }]
+        })
+        .to_string()
+    }
+
+    /// Issue #243's rule conditions through the policy API in cluster mode.
+    /// A replica of the build that serves policy v1 but refuses every rule
+    /// condition reads format 1, so a v1 document without conditions is
+    /// committed while it is live; one whose rules carry conditions is the
+    /// registered operation `policy.rule_conditions` as well, refused with
+    /// `409 capability_not_advertised`, writing no version, audited once
+    /// and naming no member. Once that replica has left, the same `PUT`
+    /// commits the document and its conditions are served back.
+    #[tokio::test]
+    async fn cluster_policy_rule_conditions_wait_for_every_live_member() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_policy_foundation(&database.dsn).await;
+        let seeded = initialize(&store, "conditions-gate-init").await;
+        let deployment = "deploy-cluster-policy-conditions";
+        let membership = registered_replica(&pool, deployment).await;
+        let older = insert_pre_conditions_member(&pool, deployment).await;
+        let capture = audit::sink::tests::CaptureSink::new();
+        let (router, rbac_state) = cluster_policy_router_with(
+            store.clone(),
+            Some(membership),
+            audit::AuditLog::new(Arc::new(capture.clone())),
+        );
+        rbac_state
+            .install_revision_snapshot(seeded.policy.clone(), seeded.security_revision)
+            .await
+            .expect("the authority's revision should install");
+        let before = policy_version_count(&pool).await;
+
+        let (status, body) = refusal_of(
+            router
+                .clone()
+                .oneshot(admin_request(
+                    Method::PUT,
+                    POLICY_ADMIN_ROUTE,
+                    Some((
+                        &seeded.etag,
+                        &cluster_conditioned_policy_json("conditions-held"),
+                    )),
+                ))
+                .await
+                .expect("PUT should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["reason"], "capability_not_advertised");
+        assert!(
+            !body.to_string().contains(&older.to_string()),
+            "a refusal names no member: {body}"
+        );
+        assert_eq!(
+            policy_version_count(&pool).await,
+            before,
+            "a refused write commits nothing"
+        );
+
+        // The same replica reads a v1 document without conditions.
+        let plain = router
+            .clone()
+            .oneshot(admin_request(
+                Method::PUT,
+                POLICY_ADMIN_ROUTE,
+                Some((&seeded.etag, &cluster_v1_policy_json("v1-unconditioned"))),
+            ))
+            .await
+            .expect("PUT should complete");
+        assert_eq!(plain.status(), StatusCode::OK);
+        let plain_etag = plain
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("ETag header")
+            .to_owned();
+        assert_eq!(policy_version_count(&pool).await, before + 1);
+
+        let started = std::time::Instant::now();
+        let refusals = || {
+            capture
+                .events()
+                .into_iter()
+                .filter(|event| event.event_type == "cluster.operation_refused")
+                .collect::<Vec<_>>()
+        };
+        while refusals().is_empty() && started.elapsed() < Duration::from_secs(5) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let refused = refusals();
+        assert_eq!(refused.len(), 1, "one refused write, one audit event");
+        assert_eq!(refused[0].payload["operation"], "policy.rule_conditions");
+        assert_eq!(refused[0].payload["capability"], "policy_rule_conditions");
+        assert_eq!(refused[0].payload["document_format"], 1);
+        assert_eq!(refused[0].payload["lacking_members"], 1);
+        assert!(!refused[0].payload.to_string().contains(&older.to_string()));
+
+        // The older replica's row goes stale: the conditions are committed
+        // and served back exactly.
+        backdate_member(&pool, older).await;
+        let admitted = router
+            .clone()
+            .oneshot(admin_request(
+                Method::PUT,
+                POLICY_ADMIN_ROUTE,
+                Some((
+                    &plain_etag,
+                    &cluster_conditioned_policy_json("conditions-admitted"),
+                )),
+            ))
+            .await
+            .expect("PUT should complete");
+        assert_eq!(admitted.status(), StatusCode::OK);
+        let (_, served) = refusal_of(admitted).await;
+        assert_eq!(
+            served["rules"][0]["conditions"]["source_network"]["cidrs"][0], "10.0.0.0/8",
+            "{served}"
+        );
+        assert_eq!(policy_version_count(&pool).await, before + 2);
+        let active = store
+            .active()
+            .await
+            .expect("active read")
+            .expect("the deployment is initialized");
+        assert!(active.policy.uses_rule_conditions());
+        assert_eq!(refusals().len(), 1, "the admitted write is not refused");
+    }
+
     const MAPPED_ISSUER: &str = "https://idp.example.test";
 
     /// A policy v1 document in mapped-role mode: `admin` reads and writes
@@ -6432,8 +6614,9 @@ mod cluster_policy_tests {
     /// standalone mode judges them, request for request, from the same
     /// 0.x policy: validation and `PUT` refuse a move to mapped-role mode
     /// that leaves the publisher no mapping granting it the policy write
-    /// (`publisher_policy_write_lost` at `/identity_mappings`), refuse rule
-    /// conditions (`typed_matchers_not_enforced`), and commit a mapped
+    /// (`publisher_policy_write_lost` at `/identity_mappings`), refuse a
+    /// `tool_argument` condition (`typed_matchers_not_enforced`), and commit
+    /// a mapped
     /// document that keeps the publisher's write -- in cluster mode once the
     /// operation gate admits format 1 -- and serve it with its mappings.
     /// From then on the management lane judges every principal by the
@@ -6485,10 +6668,10 @@ mod cluster_policy_tests {
             "default_action": "deny",
             "roles": { "admin": { "permissions": ["admin:policy:read", "admin:policy:write"] } },
             "rules": [{
-                "id": "internal-only",
-                "path": "/internal/**",
-                "action": "allow",
-                "conditions": { "source_network": { "cidrs": ["10.0.0.0/8"] } }
+                "id": "eu-exports",
+                "tool_name": "reports.export",
+                "action": "deny",
+                "conditions": { "tool_argument": { "pointer": "/region", "in": ["eu"] } }
             }]
         })
         .to_string();
