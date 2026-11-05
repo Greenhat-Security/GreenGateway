@@ -1961,3 +1961,69 @@ fn the_published_schema_accepts_sequences_and_egress_cases() {
         assert!(!validator.is_valid(&request), "schema: {request}");
     }
 }
+
+/// A simulated invocation states the arguments an inline candidate's
+/// tool-argument conditions read, decides by them at the full trace level,
+/// and repeats none of them; an invocation that states none is
+/// indeterminate, never an allow.
+#[test]
+fn case_arguments_decide_an_inline_candidates_tool_conditions_and_are_never_echoed() {
+    const ARGUMENT_CANARY: &str = "argument-canary-4e9b";
+    const SECRET_CANARY: &str = "secret-canary-0c3a";
+    let candidate = json!({
+        "schema_version": "1.0.0",
+        "tools": { "reports.export": {} },
+        "rules": [
+            {
+                "id": "no-eu-exports",
+                "tool_name": "reports.export",
+                "action": "deny",
+                "conditions": { "tool_argument": { "pointer": "/region", "in": ["eu"] } }
+            }
+        ]
+    });
+    let mut request = document(
+        json!({ "source": "inline", "policy": candidate }),
+        "full",
+        json!(["as_authored"]),
+    );
+    let mut cases = Vec::new();
+    for (id, arguments) in [
+        ("eu", Some(json!({ "region": "eu", "memo": SECRET_CANARY }))),
+        (
+            "elsewhere",
+            Some(json!({ "region": ARGUMENT_CANARY, "memo": SECRET_CANARY })),
+        ),
+        ("unstated", None),
+    ] {
+        let mut case = json!({
+            "id": id,
+            "kind": "tool",
+            "tool": { "name": "reports.export" },
+            "principal": "anonymous"
+        });
+        if let Some(arguments) = arguments {
+            case["facts"] = json!({ "arguments": arguments });
+        }
+        cases.push(case);
+    }
+    request["cases"] = Value::Array(cases);
+    let validator = jsonschema::validator_for(&request_schema()).expect("the schema compiles");
+    if let Err(error) = validator.validate(&request) {
+        panic!("the schema refuses a request the parser accepts: {error}");
+    }
+    let outcome = run(&request);
+    for (id, logical, complete) in [
+        ("eu", "deny", true),
+        ("elsewhere", "allow", true),
+        ("unstated", "indeterminate", false),
+    ] {
+        let tool = &result(case(&outcome, id), "as_authored")["candidate"];
+        assert_eq!(tool["logical"], json!(logical), "{id}: {tool}");
+        assert_eq!(tool["complete"], json!(complete), "{id}: {tool}");
+    }
+    let rendered = serde_json::to_string(&outcome.cases).expect("serializes");
+    for value in [ARGUMENT_CANARY, SECRET_CANARY] {
+        assert!(!rendered.contains(value), "{value} in {rendered}");
+    }
+}

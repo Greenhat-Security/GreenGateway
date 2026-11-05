@@ -363,9 +363,9 @@ an overlap it can show only on a witness the evaluator does not confirm is
 - a rule with typed `conditions` as covering another element, as broad, as
   masking the default or as bypassing a route: its conditions bound what it
   matches in ways no predicate comparison does (a conditioned rule can still
-  be the covered one). Conditions other than `tool_argument` are enforced,
-  so this applies now; identity mappings are enforced too, so the mapped-role
-  rule below applies as well;
+  be the covered one). Every condition leaf is enforced, `tool_argument`
+  included, so this applies now; identity mappings are enforced too, so the
+  mapped-role rule below applies as well;
 - anything about traffic: nothing is unused, unobserved or unreachable
   because retained traffic lacks it.
 

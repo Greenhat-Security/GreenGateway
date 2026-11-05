@@ -7447,3 +7447,6 @@ impl ReleaseGate {
 
 #[path = "executor_caller_assertion_tests.rs"]
 mod caller_assertion_tests;
+
+#[path = "executor_argument_condition_tests.rs"]
+mod argument_condition_tests;
