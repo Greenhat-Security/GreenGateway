@@ -71,6 +71,8 @@ pub(crate) enum AuthorityOperation {
     /// cluster mode has one, and it records it; it is listed so that every
     /// document action names an operation.
     ConfigurationImport,
+    /// The stored policy test suite replaced or first stored (issue #243).
+    PolicyTestsPublish,
 }
 
 impl From<DocumentAction> for AuthorityOperation {
@@ -85,6 +87,7 @@ impl From<DocumentAction> for AuthorityOperation {
             DocumentAction::PolicySuggestionAccept => Self::PolicySuggestionAccept,
             DocumentAction::ToolsPublish => Self::ToolsPublish,
             DocumentAction::ConfigurationImport => Self::ConfigurationImport,
+            DocumentAction::PolicyTestsPublish => Self::PolicyTestsPublish,
         }
     }
 }
@@ -129,6 +132,7 @@ impl AuthorityOperation {
             Self::PolicyFileReload => "policy.file_reload",
             Self::ToolsPublish => "tools.publish",
             Self::ConfigurationImport => "configuration.import",
+            Self::PolicyTestsPublish => "policy_tests.publish",
         }
     }
 
@@ -137,9 +141,10 @@ impl AuthorityOperation {
     /// Cluster mode commits every change here with its evidence row in one
     /// PostgreSQL transaction, and has no policy file to reload. Standalone
     /// mode records none of them: the policy and tools files, their reloads
-    /// and their optional history are separate steps. (The Connections
-    /// database records catalog and overlay publication in its own
-    /// transaction, so those operations are not listed.)
+    /// and their optional history are separate steps, and the stored policy
+    /// test suite's versions name only the writer's subject. (The
+    /// Connections database records catalog and overlay publication in its
+    /// own transaction, so those operations are not listed.)
     pub(crate) const fn required_mode(self, backend: StateBackend) -> RequiredMode {
         match backend {
             StateBackend::Postgres => match self {
@@ -152,7 +157,8 @@ impl AuthorityOperation {
                 | Self::PolicyRuleReorder
                 | Self::PolicySuggestionAccept
                 | Self::ToolsPublish
-                | Self::ConfigurationImport => RequiredMode::Admitted,
+                | Self::ConfigurationImport
+                | Self::PolicyTestsPublish => RequiredMode::Admitted,
             },
             StateBackend::Sqlite => match self {
                 // `import-standalone` imports into PostgreSQL; a standalone

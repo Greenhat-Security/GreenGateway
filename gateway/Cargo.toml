@@ -79,6 +79,10 @@ aws-lc-rs.workspace = true
 proptest.workspace = true
 rcgen.workspace = true
 rustix.workspace = true
+# Paused-clock tests (`start_paused`) for deadlines such as the caller-assertion
+# JWKS build wait. tokio is already a normal dependency; `test-util` adds no
+# package and only reaches test builds, never the binary.
+tokio = { workspace = true, features = ["test-util"] }
 
 # `tests/ha/harness/replica.rs` drains a Windows replica by sending Ctrl+Break
 # to the process group it was spawned in, and parks every replica in a

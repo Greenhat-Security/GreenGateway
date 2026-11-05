@@ -25,6 +25,18 @@
 //! the token row's first revision, `1`, after it, beside the shared revision
 //! its create took.
 //!
+//! A Connection create and replace (journaled since migration 28) are
+//! delivered as `connection.create` and `connection.replace` on the
+//! `connection` axis: a create has no revision before it and the first
+//! specification version, `1`, after it; a replace advances an existing one.
+//! A replace that changed credential authority is also delivered as
+//! `credential.binding_change`, under the same operation ID and shared
+//! revision, on the `credential` axis: the Connection's credential revision
+//! before and after, where `0` before means no credential authority was
+//! configured. Its resource is the Connection, referenced as every other
+//! Connection change is; no binding, secret ID or locator is evidence, so
+//! none can be referenced. The row's recorded axis must be the action's.
+//!
 //! Admin session grants and withdrawals (journaled since migration 26) are
 //! delivered as `admin_session.grant` and `admin_session.withdraw`. Their
 //! evidence records the session's own identity and no actor kind, auth mode
@@ -60,8 +72,12 @@ pub(crate) const DELIVERY_SCHEMA_VERSION: &str = "authority_event_delivery.v1";
 const RESULT_COMMITTED: &str = "committed";
 
 // The evidence tables' closed action vocabularies (migrations 16 and 18,
-// the issue since migration 27), which are the proposed authority-event
-// operation codes.
+// the service-token issue since migration 27, the Connection create, replace
+// and credential binding change since migration 28), which are the proposed
+// authority-event operation codes.
+const ACTION_CONNECTION_CREATE: &str = "connection.create";
+const ACTION_CONNECTION_REPLACE: &str = "connection.replace";
+const ACTION_CREDENTIAL_BINDING_CHANGE: &str = "credential.binding_change";
 const ACTION_CONNECTION_DELETE: &str = "connection.delete";
 const ACTION_SERVICE_TOKEN_ISSUE: &str = "service_token.issue";
 const ACTION_SERVICE_TOKEN_ROTATE: &str = "service_token.rotate";
@@ -72,7 +88,8 @@ const ACTION_ADMIN_SESSION_GRANT: &str = "admin_session.grant";
 const ACTION_ADMIN_SESSION_WITHDRAW: &str = "admin_session.withdraw";
 
 /// The revision a created resource starts at: a service token's row revision
-/// after its issue (migration 27's CHECK holds the same value).
+/// after its issue and a Connection's first specification version
+/// (migrations 27 and 28 hold the same value in their CHECKs).
 const FIRST_REVISION: i64 = 1;
 
 /// The one revision of an admin session on the `session` axis. A session is
@@ -205,8 +222,12 @@ enum Transition {
     Create,
     /// A positive prior version and no successor.
     Delete,
-    /// A prior version and a strictly greater new one.
+    /// A positive prior version and a strictly greater new one.
     Advance,
+    /// A prior version of at least 0 and a strictly greater new one: an axis
+    /// that reads 0 until something is configured on it, as a Connection's
+    /// credential revision does before its first credential binding.
+    AdvanceFromZero,
     /// No prior version; the shared security revision is the new one.
     PublishOnSecurityAxis,
     /// An admin session's grant: no prior revision, [`SESSION_REVISION`]
@@ -227,6 +248,24 @@ impl Transition {
 
 fn action_shape(source: JournalSource, action: &str) -> Option<ActionShape> {
     match (source, action) {
+        (JournalSource::ConnectionChange, ACTION_CONNECTION_CREATE) => Some(ActionShape {
+            resource_kind: "connection",
+            domain: ReferenceDomain::Connection,
+            axis: "connection",
+            transition: Transition::Create,
+        }),
+        (JournalSource::ConnectionChange, ACTION_CONNECTION_REPLACE) => Some(ActionShape {
+            resource_kind: "connection",
+            domain: ReferenceDomain::Connection,
+            axis: "connection",
+            transition: Transition::Advance,
+        }),
+        (JournalSource::ConnectionChange, ACTION_CREDENTIAL_BINDING_CHANGE) => Some(ActionShape {
+            resource_kind: "connection",
+            domain: ReferenceDomain::Connection,
+            axis: "credential",
+            transition: Transition::AdvanceFromZero,
+        }),
         (JournalSource::ConnectionChange, ACTION_CONNECTION_DELETE) => Some(ActionShape {
             resource_kind: "connection",
             domain: ReferenceDomain::Connection,
@@ -294,6 +333,14 @@ pub(crate) fn project(
     if evidence.position < 1 || !committed_at_in_shape(committed_at) {
         return Err(ProjectionError::InvalidEvidence);
     }
+    // A Connection change row names the axis its revisions count (migration
+    // 28, whose CHECK pairs it with the action); no other table has one.
+    match (evidence.source, evidence.revision_axis.as_deref()) {
+        (JournalSource::ConnectionChange, Some(axis)) if axis == shape.axis => {}
+        (JournalSource::ConnectionChange, None) => return Err(ProjectionError::MissingEvidence),
+        (_, None) => {}
+        (_, Some(_)) => return Err(ProjectionError::InvalidEvidence),
+    }
 
     let (before, after) = match shape.transition {
         Transition::Create => {
@@ -314,6 +361,14 @@ pub(crate) fn project(
         }
         Transition::Advance => {
             let prior = positive(evidence.prior_version)?;
+            let new = positive(evidence.new_version)?;
+            if new <= prior {
+                return Err(ProjectionError::InvalidEvidence);
+            }
+            (Some(prior), Some(new))
+        }
+        Transition::AdvanceFromZero => {
+            let prior = non_negative(evidence.prior_version)?;
             let new = positive(evidence.new_version)?;
             if new <= prior {
                 return Err(ProjectionError::InvalidEvidence);
@@ -437,6 +492,14 @@ fn required(value: Option<&str>) -> Result<&str, ProjectionError> {
 fn positive(value: Option<i64>) -> Result<i64, ProjectionError> {
     match value {
         Some(value) if value >= 1 => Ok(value),
+        Some(_) => Err(ProjectionError::InvalidEvidence),
+        None => Err(ProjectionError::MissingEvidence),
+    }
+}
+
+fn non_negative(value: Option<i64>) -> Result<i64, ProjectionError> {
+    match value {
+        Some(value) if value >= 0 => Ok(value),
         Some(_) => Err(ProjectionError::InvalidEvidence),
         None => Err(ProjectionError::MissingEvidence),
     }

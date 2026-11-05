@@ -233,10 +233,11 @@ impl ManagedConnectionStore {
         }
     }
 
-    /// Create on behalf of `actor`. The SQLite store records the whole actor
-    /// as the create's evidence in the same transaction (migration 12 of the
-    /// Connections database, issue #425); the PostgreSQL store records its
-    /// subject on the version row and writes no create evidence yet.
+    /// Create on behalf of `actor`. Both stores record the whole actor as the
+    /// create's evidence in the creating transaction (issue #425): the SQLite
+    /// store's migration 12 and PostgreSQL migration 28, which also journals
+    /// it for delivery. The PostgreSQL store still records the subject on its
+    /// version row as well.
     ///
     /// `collection` is the cross-replica half of the caller's `If-Match`
     /// (see [`CollectionCheck`]). The SQLite arm does not consult it: a
@@ -261,13 +262,14 @@ impl ManagedConnectionStore {
                 .await
             }
             #[cfg(feature = "postgres")]
-            Self::Postgres { store, .. } => {
-                store.create(candidate, actor.subject(), collection).await
-            }
+            Self::Postgres { store, .. } => store.create(candidate, actor, collection).await,
         }
     }
 
-    /// Replace on behalf of `actor`, recorded as [`Self::create`] records it.
+    /// Replace on behalf of `actor`, recorded as [`Self::create`] records it:
+    /// a `connection.replace` row and, when the credential revision
+    /// advances, a `credential.binding_change` row under the same operation.
+    /// An identical replacement records nothing in either store.
     pub async fn replace(
         &self,
         id: &ConnectionId,
@@ -287,11 +289,7 @@ impl ManagedConnectionStore {
                 .await
             }
             #[cfg(feature = "postgres")]
-            Self::Postgres { store, .. } => {
-                store
-                    .replace(id, expected, candidate, actor.subject())
-                    .await
-            }
+            Self::Postgres { store, .. } => store.replace(id, expected, candidate, actor).await,
         }
     }
 
