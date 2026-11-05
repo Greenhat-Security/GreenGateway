@@ -29,6 +29,8 @@ mod auth_app_tests;
 mod authority_evidence_app_tests;
 #[path = "cluster_app_tests.rs"]
 mod cluster_app_tests;
+#[path = "identity_mapping_app_tests.rs"]
+mod identity_mapping_app_tests;
 #[path = "mcp_app_tests.rs"]
 mod mcp_app_tests;
 #[path = "routing_app_tests.rs"]
@@ -2527,11 +2529,14 @@ fn remote_echo_input_schema() -> RmcpJsonObject {
 
 fn create_service_token(store: &auth::SqliteTokenStore, roles: &[&str]) -> String {
     store
-        .create(auth::tokens::CreateTokenRequest {
-            scopes: roles.iter().map(|role| (*role).to_owned()).collect(),
-            created_by: "mcp-test-bootstrap".to_owned(),
-            expires_at: None,
-        })
+        .create(
+            auth::tokens::CreateTokenRequest {
+                scopes: roles.iter().map(|role| (*role).to_owned()).collect(),
+                created_by: "mcp-test-bootstrap".to_owned(),
+                expires_at: None,
+            },
+            &auth::change_actor::ChangeActor::for_test("mcp-test-bootstrap"),
+        )
         .expect("service token should create")
         .plaintext_token
 }
@@ -3572,3 +3577,5 @@ mod admin_policy_replays_tests;
 mod admin_policy_analyses_tests;
 #[path = "admin_policy_evidence_tests.rs"]
 mod admin_policy_evidence_tests;
+#[path = "admin_policy_stored_candidates_tests.rs"]
+mod admin_policy_stored_candidates_tests;

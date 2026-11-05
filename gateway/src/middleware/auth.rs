@@ -429,29 +429,9 @@ pub(crate) fn safe_cookie_value(value: &str) -> bool {
         )
 }
 
-pub(crate) fn safe_cookie_token(value: &str) -> bool {
-    !value.is_empty()
-        && value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric()
-                || matches!(
-                    byte,
-                    b'!' | b'#'
-                        | b'$'
-                        | b'%'
-                        | b'&'
-                        | b'\''
-                        | b'*'
-                        | b'+'
-                        | b'-'
-                        | b'.'
-                        | b'^'
-                        | b'_'
-                        | b'`'
-                        | b'|'
-                        | b'~'
-                )
-        })
-}
+// The cookie-name grammar the configuration compiler shares with `ggctl`
+// (issue #242).
+pub(crate) use gateway_config::auth::safe_cookie_token;
 
 fn audit_context(req: &Request, path: String, client_ip_policy: &ClientIpPolicy) -> AuditContext {
     AuditContext {

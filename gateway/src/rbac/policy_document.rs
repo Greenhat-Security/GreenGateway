@@ -493,8 +493,8 @@ impl IssueCode {
                 "the time window is empty or unordered, or not written as RFC 3339 UTC instants"
             }
             Self::TypedMatchersNotEnforced => {
-                "this gateway validates identity mappings and rule conditions but does not yet \
-                 enforce them, so it accepts no document that uses them"
+                "this gateway validates rule conditions but does not yet enforce them, so it \
+                 accepts no document whose rules carry them"
             }
         }
     }
@@ -646,8 +646,8 @@ impl IssueCode {
                  window includes from and excludes until."
             }
             Self::TypedMatchersNotEnforced => {
-                "Remove identity_mappings and every rule's conditions before publishing; this \
-                 release only validates them."
+                "Remove every rule's conditions before publishing; this release only validates \
+                 them. Identity mappings are enforced and may stay."
             }
             Self::PolicyWriteUnreachable => {
                 "Keep at least one role that grants admin:policy:write, or \"*\", to the \
@@ -1192,43 +1192,39 @@ pub(crate) fn parse_v1_source(source: &[u8], document: &Value) -> Result<Policy,
 /// Structural problems are all reported; semantic validation stops at the
 /// first, as it does for v0.
 ///
-/// A document that uses identity mappings or rule conditions is refused last,
-/// after every other check has passed, with
-/// [`IssueCode::TypedMatchersNotEnforced`]: the kernel evaluates them, but no
-/// serving adapter yet captures the facts they read, and the management lane
-/// does not yet resolve roles through them. Refusing them here refuses them
-/// on every path a policy is accepted by -- startup, reload, replacement,
-/// drafts, simulations, test runs and bundles -- since each reads a v1
-/// document through this function.
+/// A document whose rules carry conditions is refused last, after every
+/// other check has passed, with [`IssueCode::TypedMatchersNotEnforced`]: the
+/// kernel evaluates them, but no serving adapter yet captures the request
+/// facts they read. Refusing them here refuses them on every path a policy is
+/// accepted by -- startup, reload, replacement, drafts, simulations, test
+/// runs and bundles -- since each reads a v1 document through this function.
+/// Identity mappings are served, so they are accepted: every serving lane
+/// resolves internal roles through them from the organization authentication
+/// verified (`CompiledPolicy::serving_facts`).
 pub(crate) fn parse_v1(document: &Value) -> Result<Policy, Vec<PolicyIssue>> {
     let policy = parse_v1_document(document)?;
     refuse_unenforced_matchers(&policy).map_err(|issue| vec![issue])?;
     Ok(policy)
 }
 
-/// [`parse_v1`] without its refusal of the typed matchers this build does not
-/// enforce, for the tests that evaluate them.
+/// [`parse_v1`] without its refusal of the rule conditions this build does
+/// not enforce, for the tests that evaluate them.
 #[cfg(test)]
 pub(crate) fn parse_v1_with_typed_matchers(document: &Value) -> Result<Policy, Vec<PolicyIssue>> {
     parse_v1_document(document)
 }
 
-/// The refusal [`parse_v1`] applies last: at the identity mappings, or else at
-/// the first rule's conditions.
+/// The refusal [`parse_v1`] applies last: at the first rule's conditions.
+/// Identity mappings are not refused; the serving lanes enforce them.
 fn refuse_unenforced_matchers(policy: &Policy) -> Result<(), PolicyIssue> {
-    let pointer = if policy.identity_mappings.is_some() {
-        Some("/identity_mappings".to_owned())
-    } else {
-        policy
-            .rules
-            .iter()
-            .position(|rule| rule.conditions.is_some())
-            .map(|index| format!("/rules/{index}/conditions"))
-    };
-    match pointer {
-        Some(pointer) => Err(PolicyIssue::located(
+    match policy
+        .rules
+        .iter()
+        .position(|rule| rule.conditions.is_some())
+    {
+        Some(index) => Err(PolicyIssue::located(
             IssueCode::TypedMatchersNotEnforced,
-            pointer,
+            format!("/rules/{index}/conditions"),
         )),
         None => Ok(()),
     }

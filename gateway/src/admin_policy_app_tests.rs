@@ -5815,9 +5815,9 @@ mod cluster_policy_tests {
     /// member has left, the same `PUT` commits the document and it is served
     /// back, read from the authority and from history as v1. A rollback to
     /// a 0.x revision needs nothing of the roster and restores that revision
-    /// exactly, never with v1's semantics. A typed-matcher v1 document is
-    /// refused for what this build does not enforce, in cluster mode as in
-    /// standalone, never for its format.
+    /// exactly, never with v1's semantics. A v1 document whose rules carry
+    /// conditions is refused for what this build does not enforce, in
+    /// cluster mode as in standalone, never for its format.
     #[tokio::test]
     async fn cluster_policy_v1_documents_wait_for_every_live_member_to_read_them() {
         let Some(admin_dsn) = locator() else {
@@ -5948,7 +5948,7 @@ mod cluster_policy_tests {
             "a refused write commits nothing"
         );
 
-        // Typed matchers are refused for what this build does not enforce,
+        // Rule conditions are refused for what this build does not enforce,
         // before any roster is asked.
         let typed = json!({
             "schema_version": "1.0.0",
@@ -6121,6 +6121,338 @@ mod cluster_policy_tests {
         }
     }
 
+    const MAPPED_ISSUER: &str = "https://idp.example.test";
+
+    /// A policy v1 document in mapped-role mode: `admin` reads and writes
+    /// the policy, and only the identity mapping grants it, to a principal
+    /// of [`MAPPED_ISSUER`] claiming `idp-admin` in `organization`.
+    fn mapped_v1_policy_json(id: &str, organization: &str) -> String {
+        json!({
+            "schema_version": "1.0.0",
+            "id": id,
+            "default_action": "deny",
+            "roles": {
+                "admin": { "permissions": ["admin:policy:read", "admin:policy:write"] }
+            },
+            "identity_mappings": [{
+                "id": "idp-admins",
+                "issuer": MAPPED_ISSUER,
+                "organizations": [organization],
+                "claimed_roles": ["idp-admin"],
+                "grant_roles": ["admin"]
+            }],
+            "rules": [{ "id": "deny-internal", "path": "/internal/**", "action": "deny" }]
+        })
+        .to_string()
+    }
+
+    fn mapped_principal(
+        issuer: Option<&str>,
+        organization: Option<&str>,
+        roles: &[&str],
+    ) -> auth::Principal {
+        let mut principal = test_principal(roles);
+        principal.issuer = issuer.map(str::to_owned);
+        principal.org_id = organization.map(str::to_owned);
+        principal
+    }
+
+    /// What one mode answers a request: its status, the code and pointer of
+    /// every error diagnostic it reports, and its free-text errors.
+    async fn judged(
+        router: &Router,
+        request: Request<Body>,
+    ) -> (StatusCode, Vec<(String, String)>, String) {
+        let response = router
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("the request should complete");
+        let status = response.status();
+        let body = json_body(response).await;
+        let mut errors: Vec<(String, String)> = body["diagnostics"]
+            .as_array()
+            .map(|diagnostics| {
+                diagnostics
+                    .iter()
+                    .filter(|diagnostic| diagnostic["severity"] == "error")
+                    .map(|diagnostic| {
+                        (
+                            diagnostic["code"].as_str().unwrap_or_default().to_owned(),
+                            diagnostic["pointer"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_owned(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        errors.sort();
+        (status, errors, body["errors"].to_string())
+    }
+
+    /// Identity mappings in cluster mode (issue #243) are judged exactly as
+    /// standalone mode judges them, request for request, from the same
+    /// 0.x policy: validation and `PUT` refuse a move to mapped-role mode
+    /// that leaves the publisher no mapping granting it the policy write
+    /// (`publisher_policy_write_lost` at `/identity_mappings`), refuse rule
+    /// conditions (`typed_matchers_not_enforced`), and commit a mapped
+    /// document that keeps the publisher's write -- in cluster mode once the
+    /// operation gate admits format 1 -- and serve it with its mappings.
+    /// From then on the management lane judges every principal by the
+    /// internal roles its mappings grant from the organization its issuer
+    /// verified: a claimed `admin`, another issuer, another organization or
+    /// none hold nothing.
+    #[tokio::test]
+    async fn cluster_identity_mappings_are_judged_exactly_as_standalone_judges_them() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_policy_foundation(&database.dsn).await;
+        let seeded = initialize(&store, "mapped-seed").await;
+        let membership = registered_replica(&pool, "deploy-cluster-policy-mapped").await;
+        let (cluster, rbac_state) =
+            cluster_policy_router_with(store.clone(), Some(membership), test_audit_log());
+        rbac_state
+            .install_revision_snapshot(seeded.policy.clone(), seeded.security_revision)
+            .await
+            .expect("the authority's revision should install");
+
+        let policy_file = TempPolicyFile::new(&cluster_policy_json("mapped-seed"));
+        let mut config = policy_admin_config_with_sqlite(Some(&policy_file), None);
+        config
+            .rbac_exempt_paths
+            .push(POLICY_VALIDATE_ADMIN_ROUTE.to_owned());
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let standalone = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("the standalone app should build");
+        let (standalone_etag, _) = current_policy(&standalone).await;
+
+        let publisher = || {
+            mapped_principal(
+                Some(MAPPED_ISSUER),
+                Some("org-456"),
+                &["admin", "idp-admin"],
+            )
+        };
+        let conditioned = json!({
+            "schema_version": "1.0.0",
+            "id": "mapped-conditioned",
+            "default_action": "deny",
+            "roles": { "admin": { "permissions": ["admin:policy:read", "admin:policy:write"] } },
+            "rules": [{
+                "id": "internal-only",
+                "path": "/internal/**",
+                "action": "allow",
+                "conditions": { "source_network": { "cidrs": ["10.0.0.0/8"] } }
+            }]
+        })
+        .to_string();
+        let lost = vec![(
+            "publisher_policy_write_lost".to_owned(),
+            "/identity_mappings".to_owned(),
+        )];
+        let typed = vec![(
+            "typed_matchers_not_enforced".to_owned(),
+            "/rules/0/conditions".to_owned(),
+        )];
+        let mut answers = Vec::new();
+
+        for (mode, router, etag) in [
+            ("standalone", &standalone, standalone_etag.as_str()),
+            ("cluster", &cluster, seeded.etag.as_str()),
+        ] {
+            let validated = judged(
+                router,
+                policy_admin_request(
+                    Method::POST,
+                    POLICY_VALIDATE_ADMIN_ROUTE,
+                    Some(publisher()),
+                    Some(mapped_v1_policy_json("mapped-elsewhere", "other-org")),
+                    None,
+                ),
+            )
+            .await;
+            assert_eq!(
+                (validated.0, &validated.1),
+                (StatusCode::BAD_REQUEST, &lost),
+                "{mode}: {}",
+                validated.2
+            );
+            let replaced = judged(
+                router,
+                policy_admin_request(
+                    Method::PUT,
+                    POLICY_ADMIN_ROUTE,
+                    Some(publisher()),
+                    Some(mapped_v1_policy_json("mapped-elsewhere", "other-org")),
+                    Some(etag),
+                ),
+            )
+            .await;
+            assert_eq!(
+                (replaced.0, &replaced.1),
+                (StatusCode::BAD_REQUEST, &lost),
+                "{mode}: {}",
+                replaced.2
+            );
+            let typed_validated = judged(
+                router,
+                policy_admin_request(
+                    Method::POST,
+                    POLICY_VALIDATE_ADMIN_ROUTE,
+                    Some(publisher()),
+                    Some(conditioned.clone()),
+                    None,
+                ),
+            )
+            .await;
+            assert_eq!(
+                (typed_validated.0, &typed_validated.1),
+                (StatusCode::BAD_REQUEST, &typed),
+                "{mode}: {}",
+                typed_validated.2
+            );
+            let refused = judged(
+                router,
+                policy_admin_request(
+                    Method::PUT,
+                    POLICY_ADMIN_ROUTE,
+                    Some(publisher()),
+                    Some(conditioned.clone()),
+                    Some(etag),
+                ),
+            )
+            .await;
+            assert_eq!(refused.0, StatusCode::BAD_REQUEST, "{mode}");
+            assert!(
+                refused.2.contains("does not yet enforce") && !refused.2.contains("cluster mode"),
+                "{mode}: {}",
+                refused.2
+            );
+            assert_eq!(
+                current_policy(router).await.0,
+                etag,
+                "{mode}: nothing was written"
+            );
+
+            let validated = judged(
+                router,
+                policy_admin_request(
+                    Method::POST,
+                    POLICY_VALIDATE_ADMIN_ROUTE,
+                    Some(publisher()),
+                    Some(mapped_v1_policy_json("mapped", "org-456")),
+                    None,
+                ),
+            )
+            .await;
+            assert_eq!(
+                (validated.0, validated.1.is_empty()),
+                (StatusCode::OK, true),
+                "{mode}: {:?}",
+                validated.1
+            );
+            let committed = router
+                .clone()
+                .oneshot(policy_admin_request(
+                    Method::PUT,
+                    POLICY_ADMIN_ROUTE,
+                    Some(publisher()),
+                    Some(mapped_v1_policy_json("mapped", "org-456")),
+                    Some(etag),
+                ))
+                .await
+                .expect("PUT should complete");
+            assert_eq!(committed.status(), StatusCode::OK, "{mode}");
+            let served = json_body(committed).await;
+            assert_eq!(served["schema_version"], "1.0.0", "{mode}");
+            assert_eq!(
+                served["identity_mappings"][0]["id"], "idp-admins",
+                "{mode}: {served}"
+            );
+
+            let mut statuses = Vec::new();
+            for (principal, expected) in [
+                (
+                    mapped_principal(Some(MAPPED_ISSUER), Some("org-456"), &["idp-admin"]),
+                    StatusCode::OK,
+                ),
+                (publisher(), StatusCode::OK),
+                (test_principal(&["admin"]), StatusCode::FORBIDDEN),
+                (
+                    mapped_principal(Some(MAPPED_ISSUER), Some("org-456"), &["admin"]),
+                    StatusCode::FORBIDDEN,
+                ),
+                (
+                    mapped_principal(Some(MAPPED_ISSUER), Some("other-org"), &["idp-admin"]),
+                    StatusCode::FORBIDDEN,
+                ),
+                (
+                    mapped_principal(Some(MAPPED_ISSUER), None, &["idp-admin"]),
+                    StatusCode::FORBIDDEN,
+                ),
+                (
+                    mapped_principal(
+                        Some("https://other.example.test"),
+                        Some("org-456"),
+                        &["idp-admin"],
+                    ),
+                    StatusCode::FORBIDDEN,
+                ),
+            ] {
+                let response = router
+                    .clone()
+                    .oneshot(policy_admin_request(
+                        Method::GET,
+                        POLICY_ADMIN_ROUTE,
+                        Some(principal.clone()),
+                        None,
+                        None,
+                    ))
+                    .await
+                    .expect("GET should complete");
+                assert_eq!(
+                    response.status(),
+                    expected,
+                    "{mode}: {:?} {:?} {:?}",
+                    principal.issuer,
+                    principal.org_id,
+                    principal.roles
+                );
+                statuses.push(response.status());
+            }
+            answers.push((
+                (validated.0, replaced.0, replaced.1),
+                (typed_validated.0, typed_validated.1, refused.0),
+                statuses,
+            ));
+        }
+        assert_eq!(
+            answers[0], answers[1],
+            "standalone and cluster answer alike"
+        );
+
+        let active = store
+            .active()
+            .await
+            .expect("active read")
+            .expect("the deployment is initialized");
+        assert_eq!(active.policy.schema_version, "1.0.0");
+        assert!(
+            active.policy.identity_mappings.is_some(),
+            "the authority serves the mappings"
+        );
+    }
+
     /// A policy v1 candidate is one cluster mode commits once every live
     /// replica reads format 1 (issue #243), so a draft saves one on create
     /// and on patch, and a simulation evaluates an inline one, exactly as
@@ -6267,6 +6599,249 @@ mod cluster_policy_tests {
             "the refused publication changed nothing"
         );
         assert_eq!(kept["state"], "open", "{kept}");
+    }
+
+    /// Cluster mode reads a stored candidate from the cluster's authorities
+    /// (issue #243): a draft from migration 22's table, owner-scoped and at
+    /// the ETag the request names, and a history version from the immutable
+    /// `policy_documents` rows, validated again under this build. A
+    /// simulation of either writes no version, does not touch the draft,
+    /// and reports the draft's id and revision or the version it read.
+    #[tokio::test]
+    async fn cluster_simulations_read_drafts_and_history_versions_as_candidates() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_policy_foundation(&database.dsn).await;
+        let simulating = |id: &str| {
+            format!(
+                r#"{{
+                    "schema_version": "0.1.0",
+                    "id": "{id}",
+                    "default_action": "deny",
+                    "roles": {{ "admin": {{ "permissions":
+                        ["admin:policy:read", "admin:policy:write", "admin:policy:simulate"] }} }},
+                    "rules": [{{ "id": "{id}-rule", "methods": ["GET"], "path": "/{id}/**", "action": "allow" }}]
+                }}"#
+            )
+        };
+        let seed = simulating("seed");
+        let active = PolicyControlPlane::commit(
+            store.as_ref(),
+            PolicyCommitRequest {
+                precondition: PolicyCommitPrecondition::Initialize,
+                candidate: &parse_policy_body(seed.as_bytes()).expect("seed policy should parse"),
+                change: crate::storage::DocumentChange::test_policy("seed"),
+                diff_summary: &DIFF,
+            },
+        )
+        .await
+        .expect("deployment should initialize");
+        let (router, rbac_state) = cluster_policy_router(store.clone());
+        rbac_state
+            .install_revision_snapshot(active.policy.clone(), active.security_revision)
+            .await
+            .expect("the authority's revision should install");
+        let request = |method: Method,
+                       uri: &str,
+                       if_match: Option<&str>,
+                       principal: auth::Principal,
+                       body: String| {
+            let mut builder = Request::builder().method(method).uri(uri);
+            if let Some(if_match) = if_match {
+                builder = builder.header(header::IF_MATCH, if_match);
+            }
+            let mut request = builder
+                .body(Body::from(body))
+                .expect("request should build");
+            request.extensions_mut().insert(principal);
+            request
+        };
+        let simulation = |base_etag: &str, candidate: Value| {
+            json!({
+                "schema_version": "policy-simulation.v1",
+                "base_etag": base_etag,
+                "candidate": candidate,
+                "cases": [{
+                    "id": "drafted-page",
+                    "kind": "http",
+                    "request": { "method": "GET", "path": "/drafted/a" },
+                    "principal": "anonymous"
+                }]
+            })
+            .to_string()
+        };
+
+        let created = router
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                POLICY_DRAFTS_ADMIN_ROUTE,
+                Some(&active.etag),
+                admin_principal(),
+                format!(r#"{{"policy":{}}}"#, simulating("drafted")),
+            ))
+            .await
+            .expect("create should complete");
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let draft_etag = created
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("draft ETag")
+            .to_owned();
+        let (_, draft) = refusal_of(created).await;
+        let draft_id = draft["draft_id"].as_str().expect("draft id").to_owned();
+        let draft_uri = format!("{POLICY_DRAFTS_ADMIN_ROUTE}/{draft_id}");
+        let versions_before = policy_version_count(&pool).await;
+        let draft_source = json!({
+            "source": "draft", "draft_id": draft_id, "draft_etag": draft_etag
+        });
+
+        let (status, simulated) = refusal_of(
+            router
+                .clone()
+                .oneshot(request(
+                    Method::POST,
+                    POLICY_SIMULATIONS_ADMIN_ROUTE,
+                    None,
+                    admin_principal(),
+                    simulation(&active.etag, draft_source.clone()),
+                ))
+                .await
+                .expect("simulation should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{simulated}");
+        assert_eq!(
+            simulated["candidate"],
+            json!({
+                "source": "draft",
+                "etag": draft["candidate_etag"],
+                "draft_id": draft_id,
+                "draft_revision": 1
+            })
+        );
+        assert_eq!(
+            simulated["base"]["security_revision"],
+            json!(active.security_revision)
+        );
+        assert_eq!(
+            simulated["cases"][0]["results"][0]["candidate"]["effective_action"],
+            json!("would_forward")
+        );
+
+        // Another owner's draft is the missing one's `404`.
+        let mut stranger = admin_principal();
+        stranger.user_id = "another-owner".to_owned();
+        let (status, body) = refusal_of(
+            router
+                .clone()
+                .oneshot(request(
+                    Method::POST,
+                    POLICY_SIMULATIONS_ADMIN_ROUTE,
+                    None,
+                    stranger,
+                    simulation(&active.etag, draft_source.clone()),
+                ))
+                .await
+                .expect("simulation should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["reason"], "policy_draft_not_found");
+
+        // A new version goes live; the seed is now history.
+        let committed = router
+            .clone()
+            .oneshot(request(
+                Method::PUT,
+                POLICY_ADMIN_ROUTE,
+                Some(&active.etag),
+                admin_principal(),
+                simulating("current"),
+            ))
+            .await
+            .expect("PUT should complete");
+        let current_etag = etag_of(committed).await;
+        let versions_after_commit = policy_version_count(&pool).await;
+        assert_eq!(versions_after_commit, versions_before + 1);
+        let (status, simulated) = refusal_of(
+            router
+                .clone()
+                .oneshot(request(
+                    Method::POST,
+                    POLICY_SIMULATIONS_ADMIN_ROUTE,
+                    None,
+                    admin_principal(),
+                    simulation(
+                        &current_etag,
+                        json!({ "source": "revision", "version": active.version }),
+                    ),
+                ))
+                .await
+                .expect("simulation should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{simulated}");
+        assert_eq!(
+            simulated["candidate"],
+            json!({ "source": "revision", "etag": active.etag, "version": active.version })
+        );
+        assert_eq!(simulated["base"]["etag"], json!(current_etag));
+        let (status, body) = refusal_of(
+            router
+                .clone()
+                .oneshot(request(
+                    Method::POST,
+                    POLICY_SIMULATIONS_ADMIN_ROUTE,
+                    None,
+                    admin_principal(),
+                    simulation(
+                        &current_etag,
+                        json!({ "source": "revision", "version": active.version + 1_000 }),
+                    ),
+                ))
+                .await
+                .expect("simulation should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["reason"], "policy_revision_not_found");
+
+        // The draft, pinned to the seed, is no longer on the request's base,
+        // and is neither rebased nor written by being asked.
+        let (status, body) = refusal_of(
+            router
+                .clone()
+                .oneshot(request(
+                    Method::POST,
+                    POLICY_SIMULATIONS_ADMIN_ROUTE,
+                    None,
+                    admin_principal(),
+                    simulation(&current_etag, draft_source),
+                ))
+                .await
+                .expect("simulation should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["reason"], "policy_draft_base_stale");
+        let kept = router
+            .clone()
+            .oneshot(request(
+                Method::GET,
+                &draft_uri,
+                None,
+                admin_principal(),
+                String::new(),
+            ))
+            .await
+            .expect("draft read should complete");
+        assert_eq!(etag_of(kept).await, draft_etag);
+        assert_eq!(policy_version_count(&pool).await, versions_after_commit);
     }
 
     /// A draft publication the commit itself refuses is recorded like one

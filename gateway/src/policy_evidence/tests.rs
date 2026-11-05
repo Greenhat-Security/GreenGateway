@@ -391,6 +391,7 @@ fn test_report() -> RunReport {
             source: PolicySource::Publication,
             etag: PUBLICATION_ETAG.to_owned(),
             security_revision: None,
+            stored: None,
         },
         outcome,
     )

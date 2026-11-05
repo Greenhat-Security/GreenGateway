@@ -140,7 +140,7 @@ Expected output: pretty-printed JSON on stdout and exit `0`. The shape:
     "security_outbox (the import announces nothing; a commit appends its own row)",
     "principal_directory (cluster mode has none; the audit log it projects from is imported)",
     "connection_local_secrets (the local-secret keyring stays with the standalone deployment; credential bindings cross as references and must be re-provisioned in the cluster's secret store)",
-    "service_token_change_evidence (standalone rotate/revoke evidence stays in the standalone token database; the cluster records its own from its first change)",
+    "service_token_change_evidence (standalone issue, rotate and revoke evidence stays in the standalone token database; the cluster records its own from its first change)",
     "connection_change_evidence (standalone Connection change evidence stays in the standalone Connections database; the cluster's own evidence table starts empty)",
     "connection_local_secret_change_evidence (standalone local-secret change evidence stays with the local-secret keyring in the standalone Connections database)"
   ],

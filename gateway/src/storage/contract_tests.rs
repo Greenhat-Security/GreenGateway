@@ -468,11 +468,14 @@ async fn sqlite_audit_event_store_classifies_a_non_database_file_as_unavailable(
 /// with revocation that is idempotent, monotonic, and never resurrected.
 async fn service_token_store_contract(store: &dyn ServiceTokenStore) {
     let created = store
-        .create(CreateTokenRequest {
-            scopes: vec!["admin:tokens:read".to_owned()],
-            created_by: "contract-actor".to_owned(),
-            expires_at: None,
-        })
+        .create(
+            CreateTokenRequest {
+                scopes: vec!["admin:tokens:read".to_owned()],
+                created_by: "contract-actor".to_owned(),
+                expires_at: None,
+            },
+            &ChangeActor::for_test("creating-admin"),
+        )
         .await
         .expect("token should create");
 
@@ -561,11 +564,14 @@ async fn service_token_store_contract(store: &dyn ServiceTokenStore) {
     // Rotation mints a new plaintext and invalidates the old one, while
     // preserving the record's identity, scopes, and expiry.
     let live = store
-        .create(CreateTokenRequest {
-            scopes: vec!["admin:tokens:read".to_owned(), "mcp:tools".to_owned()],
-            created_by: "contract-actor".to_owned(),
-            expires_at: Some("2999-01-01T00:00:00Z".to_owned()),
-        })
+        .create(
+            CreateTokenRequest {
+                scopes: vec!["admin:tokens:read".to_owned(), "mcp:tools".to_owned()],
+                created_by: "contract-actor".to_owned(),
+                expires_at: Some("2999-01-01T00:00:00Z".to_owned()),
+            },
+            &ChangeActor::for_test("creating-admin"),
+        )
         .await
         .expect("live token should create");
     let rotated = store
@@ -723,30 +729,44 @@ fn sqlite_token_evidence_text(path: &PathBuf) -> Vec<String> {
 }
 
 /// Assert the change-evidence contract both service-token stores share
-/// (issue #425): every committed rotate and revoke records its actor --
-/// subject, canonical issuer, kind and auth mode -- and action exactly once,
-/// in commit order and under its own operation; a call that changes nothing
-/// records nothing; an actor evidence cannot record exactly is refused
-/// before anything changes; the creator stays the creator; and no row
-/// carries token material.
+/// (issue #425): every committed issue, rotate and revoke records its actor
+/// -- subject, canonical issuer, kind and auth mode -- and action exactly
+/// once, in commit order and under its own operation; a call that changes
+/// nothing records nothing; an actor evidence cannot record exactly is
+/// refused before anything changes; the creator stays the creator; and no
+/// row carries token material.
 async fn service_token_change_evidence_contract(
     store: &dyn ServiceTokenStore,
     evidence: &dyn TokenChangeEvidenceReader,
 ) {
     use crate::auth::AuthMethod;
 
+    // A bearer principal from a provider issues.
     let created = store
-        .create(CreateTokenRequest {
-            scopes: vec!["admin:tokens:read".to_owned()],
-            created_by: "creating-admin".to_owned(),
-            expires_at: None,
-        })
+        .create(
+            CreateTokenRequest {
+                scopes: vec!["admin:tokens:read".to_owned()],
+                created_by: "creating-admin".to_owned(),
+                expires_at: None,
+            },
+            &principal_actor(
+                "creating-admin",
+                Some("https://issuer-idp.example.test"),
+                AuthMethod::Bearer,
+            ),
+        )
         .await
         .expect("token should create");
     let id = created.record.id.clone();
-    assert!(
-        evidence.rows().await.is_empty(),
-        "issuing a token is not a rotate or a revoke"
+    assert_eq!(
+        evidence
+            .rows()
+            .await
+            .iter()
+            .map(|row| (row.action.as_str(), row.token_id.as_str()))
+            .collect::<Vec<_>>(),
+        [("service_token.issue", id.as_str())],
+        "the issue is the token's first evidence row"
     );
 
     // A person signed in through a provider rotates (its issuer recorded in
@@ -819,6 +839,14 @@ async fn service_token_change_evidence_contract(
             .collect::<Vec<_>>(),
         [
             (
+                "service_token.issue",
+                "creating-admin",
+                Some("https://issuer-idp.example.test"),
+                Some("principal"),
+                Some("bearer_token"),
+                id.as_str()
+            ),
+            (
                 "service_token.rotate",
                 "rotating-admin",
                 Some("https://idp.example.test"),
@@ -843,8 +871,12 @@ async fn service_token_change_evidence_contract(
         }
         assert_ne!(row.event_id, row.operation_id);
     }
-    assert_ne!(
-        rows[0].operation_id, rows[1].operation_id,
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.operation_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        rows.len(),
         "each store call is its own operation"
     );
     assert_eq!(
@@ -861,13 +893,28 @@ async fn service_token_change_evidence_contract(
     // An unattributable change is refused before anything changes, and is
     // not mistaken for the caller's parameter error.
     let live = store
-        .create(CreateTokenRequest {
-            scopes: vec!["admin:tokens:read".to_owned()],
-            created_by: "creating-admin".to_owned(),
-            expires_at: None,
-        })
+        .create(
+            CreateTokenRequest {
+                scopes: vec!["admin:tokens:read".to_owned()],
+                created_by: "creating-admin".to_owned(),
+                expires_at: None,
+            },
+            &ChangeActor::for_test("creating-admin"),
+        )
         .await
         .expect("live token should create");
+    let listed = || async {
+        store
+            .list(&TokenListFilters {
+                limit: 100,
+                cursor: None,
+            })
+            .await
+            .expect("tokens should list")
+            .tokens
+            .len()
+    };
+    let tokens_before = listed().await;
     let oversized = "a".repeat(crate::auth::tokens::MAX_TOKEN_CHANGE_ACTOR_BYTES + 1);
     let oversized_issuer = "i".repeat(crate::auth::tokens::MAX_TOKEN_CHANGE_ACTOR_ISSUER_BYTES + 1);
     for actor in [
@@ -889,7 +936,21 @@ async fn service_token_change_evidence_contract(
             .revoke(&live.record.id, &actor)
             .await
             .expect_err("an unrecordable revoke must be refused");
-        for error in [rotate_error, revoke_error] {
+        let issue_error = match store
+            .create(
+                CreateTokenRequest {
+                    scopes: vec!["admin:tokens:read".to_owned()],
+                    created_by: "creating-admin".to_owned(),
+                    expires_at: None,
+                },
+                &actor,
+            )
+            .await
+        {
+            Ok(_) => panic!("an unrecordable issue must be refused: {actor:?}"),
+            Err(error) => error,
+        };
+        for error in [rotate_error, revoke_error, issue_error] {
             assert_eq!(error.kind(), RepositoryErrorKind::InvalidData, "{error}");
             assert_eq!(error.invalid_parameter_name(), None);
         }
@@ -904,7 +965,12 @@ async fn service_token_change_evidence_contract(
         ),
         "the refused changes changed nothing"
     );
-    assert_eq!(evidence.rows().await.len(), 2);
+    assert_eq!(
+        listed().await,
+        tokens_before,
+        "a refused issue minted nothing"
+    );
+    assert_eq!(evidence.rows().await.len(), 4);
     let longest = "a".repeat(crate::auth::tokens::MAX_TOKEN_CHANGE_ACTOR_BYTES);
     let longest_issuer = "i".repeat(crate::auth::tokens::MAX_TOKEN_CHANGE_ACTOR_ISSUER_BYTES);
     let rerotated = store
@@ -916,16 +982,20 @@ async fn service_token_change_evidence_contract(
         .expect("an actor at the principal bounds is recorded")
         .expect("token should exist");
     let rows = evidence.rows().await;
-    assert_eq!(rows.len(), 3);
-    assert_eq!(rows[2].actor_user_id, longest);
+    assert_eq!(rows.len(), 5);
     assert_eq!(
-        rows[2].actor_issuer.as_deref(),
+        (rows[3].action.as_str(), rows[3].token_id.as_str()),
+        ("service_token.issue", live.record.id.as_str())
+    );
+    assert_eq!(rows[4].actor_user_id, longest);
+    assert_eq!(
+        rows[4].actor_issuer.as_deref(),
         Some(longest_issuer.as_str())
     );
     assert_eq!(
         (
-            rows[2].actor_kind.as_deref(),
-            rows[2].actor_auth_mode.as_deref()
+            rows[4].actor_kind.as_deref(),
+            rows[4].actor_auth_mode.as_deref()
         ),
         (Some("principal"), Some("bearer_token"))
     );
@@ -978,21 +1048,326 @@ async fn sqlite_service_token_change_evidence_satisfies_the_contract() {
     .await;
 }
 
+// ---------------------------------------------------------------------------
+// Service-token issue evidence (issue #425; PostgreSQL migration 27)
+// ---------------------------------------------------------------------------
+
+/// What the shared issue-evidence contract needs beyond a store and its
+/// evidence reader: a test-only fault on the evidence insert, a count of the
+/// stored token rows, and a restart. Each backend implements it over its own
+/// database; no production hook exists for any of it.
+#[async_trait::async_trait]
+trait TokenIssueEvidenceHarness: Send + Sync {
+    /// Make every insert into the evidence table fail (`true`), or succeed
+    /// again (`false`).
+    async fn fail_evidence_inserts(&self, fail: bool);
+
+    /// How many token rows the store holds.
+    async fn token_rows(&self) -> i64;
+
+    /// The store a restarted process opens over the same authority.
+    async fn reopen(&self) -> Arc<dyn ServiceTokenStore>;
+}
+
+/// Assert the issue-evidence contract both service-token stores share (issue
+/// #425): a committed issue records its actor -- subject, canonical issuer,
+/// kind and auth mode -- as the token's first evidence row, in the create's
+/// own transaction; an issue whose evidence cannot be written commits no
+/// token and is a store failure, neither a conflict nor the caller's
+/// parameter error; an actor evidence cannot record exactly is refused before
+/// anything is written; no row carries the plaintext the create returned, its
+/// hash, the display prefix or the scopes; the rows survive a restart
+/// unchanged; and a token's issue, rotate and revoke are one contiguous chain
+/// in commit order, each under its own operation.
+async fn service_token_issue_evidence_contract(
+    store: &dyn ServiceTokenStore,
+    evidence: &dyn TokenChangeEvidenceReader,
+    harness: &dyn TokenIssueEvidenceHarness,
+) {
+    use crate::auth::AuthMethod;
+
+    const SCOPE_MARKER: &str = "issue-evidence-scope-marker";
+    let request = || CreateTokenRequest {
+        scopes: vec![SCOPE_MARKER.to_owned()],
+        created_by: "issuing-admin".to_owned(),
+        expires_at: None,
+    };
+
+    // A person signed in through a provider issues; the issuer is recorded
+    // in the canonical form audit and policy use.
+    let issued = store
+        .create(
+            request(),
+            &principal_actor(
+                "issuing-admin",
+                Some(" https://idp.example.test/ "),
+                AuthMethod::Cookie,
+            ),
+        )
+        .await
+        .expect("token should issue");
+    let id = issued.record.id.clone();
+    let rows = evidence.rows().await;
+    assert_eq!(
+        rows.iter()
+            .map(|row| (
+                row.action.as_str(),
+                row.actor_user_id.as_str(),
+                row.actor_issuer.as_deref(),
+                row.actor_kind.as_deref(),
+                row.actor_auth_mode.as_deref(),
+                row.token_id.as_str()
+            ))
+            .collect::<Vec<_>>(),
+        [(
+            "service_token.issue",
+            "issuing-admin",
+            Some("https://idp.example.test"),
+            Some("principal"),
+            Some("session_cookie"),
+            id.as_str()
+        )],
+        "the issue is the token's first evidence row, naming who issued it and how"
+    );
+    for generated in [&rows[0].event_id, &rows[0].operation_id] {
+        uuid::Uuid::parse_str(generated).expect("generated identifiers are UUIDs");
+    }
+    assert_ne!(rows[0].event_id, rows[0].operation_id);
+    assert_eq!(
+        issued.record.created_by, "issuing-admin",
+        "the token row still names its creator"
+    );
+
+    // Required, not best effort: an issue whose evidence cannot be written
+    // commits no token.
+    let tokens_before = harness.token_rows().await;
+    harness.fail_evidence_inserts(true).await;
+    let faulted = store
+        .create(request(), &ChangeActor::for_test("faulted-admin"))
+        .await;
+    harness.fail_evidence_inserts(false).await;
+    let error = match faulted {
+        Ok(_) => panic!("an issue whose evidence cannot commit must fail"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.kind(),
+        RepositoryErrorKind::Internal,
+        "an evidence failure is a store failure, never a conflict: {error}"
+    );
+    assert_eq!(error.invalid_parameter_name(), None);
+    assert_eq!(
+        harness.token_rows().await,
+        tokens_before,
+        "no token row survived its failed evidence"
+    );
+    assert_eq!(evidence.rows().await, rows);
+
+    // An unattributable issue is refused before anything is written.
+    let oversized = "a".repeat(crate::auth::tokens::MAX_TOKEN_CHANGE_ACTOR_BYTES + 1);
+    for actor in [
+        ChangeActor::for_test(""),
+        ChangeActor::for_test(&oversized),
+        ChangeActor::for_test_with_issuer("issuing-admin", ""),
+        ChangeActor::service_token_with_issuer_for_test(
+            "service-token:token_issuer",
+            "https://idp.example.test",
+        ),
+    ] {
+        let error = match store.create(request(), &actor).await {
+            Ok(_) => panic!("an unrecordable issue must be refused: {actor:?}"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), RepositoryErrorKind::InvalidData, "{error}");
+        assert_eq!(error.invalid_parameter_name(), None);
+    }
+    assert_eq!(harness.token_rows().await, tokens_before);
+    assert_eq!(evidence.rows().await, rows);
+
+    // Issue, rotate and revoke are one chain for the token, contiguous in
+    // commit order, and a service token issuing another records its own kind.
+    let rotated = store
+        .rotate(&id, &ChangeActor::for_test("rotating-admin"))
+        .await
+        .expect("rotate should commit")
+        .expect("token should exist");
+    store
+        .revoke(
+            &id,
+            &ChangeActor::service_token_for_test("service-token:token_revoker"),
+        )
+        .await
+        .expect("revoke should commit")
+        .expect("token should exist");
+    let second = store
+        .create(
+            request(),
+            &ChangeActor::service_token_for_test("service-token:token_issuer"),
+        )
+        .await
+        .expect("a service token issues");
+    let rows = evidence.rows().await;
+    assert_eq!(
+        rows.iter()
+            .map(|row| (
+                row.action.as_str(),
+                row.actor_user_id.as_str(),
+                row.actor_kind.as_deref(),
+                row.token_id.as_str()
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "service_token.issue",
+                "issuing-admin",
+                Some("principal"),
+                id.as_str()
+            ),
+            (
+                "service_token.rotate",
+                "rotating-admin",
+                Some("principal"),
+                id.as_str()
+            ),
+            (
+                "service_token.revoke",
+                "service-token:token_revoker",
+                Some("service_token"),
+                id.as_str()
+            ),
+            (
+                "service_token.issue",
+                "service-token:token_issuer",
+                Some("service_token"),
+                second.record.id.as_str()
+            ),
+        ],
+        "the token's chain is issue, rotate, revoke, with nothing between them"
+    );
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.operation_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        rows.len(),
+        "each store call is its own operation"
+    );
+
+    // Identifiers and actors only: no plaintext, hash, display prefix or
+    // scope reaches a row, and nothing of the principal beyond the actor.
+    let stored = evidence.stored_text().await.join("\n");
+    for plaintext in [
+        &issued.plaintext_token,
+        &rotated.plaintext_token,
+        &second.plaintext_token,
+    ] {
+        assert!(
+            !stored.contains(plaintext.as_str()),
+            "plaintext in evidence"
+        );
+        assert!(
+            !stored.contains(crate::auth::tokens::hash_token(plaintext).as_str()),
+            "token hash in evidence"
+        );
+    }
+    for marker in [
+        "ggw_",
+        SCOPE_MARKER,
+        "evidence-actor@example.test",
+        "org-evidence",
+        "token-admin",
+        "session-evidence",
+    ] {
+        assert!(!stored.contains(marker), "{marker} in evidence: {stored}");
+    }
+
+    // A restart reads the same rows, and the restarted store's issue follows
+    // them.
+    let stored_before = evidence.stored_text().await;
+    let restarted = harness.reopen().await;
+    assert_eq!(evidence.stored_text().await, stored_before);
+    let third = restarted
+        .create(request(), &ChangeActor::for_test("restarted-admin"))
+        .await
+        .expect("the restarted store issues");
+    let after = evidence.rows().await;
+    assert_eq!(after.len(), rows.len() + 1);
+    assert_eq!(after[..rows.len()], rows[..], "earlier rows are unchanged");
+    assert_eq!(
+        (
+            after[rows.len()].action.as_str(),
+            after[rows.len()].token_id.as_str()
+        ),
+        ("service_token.issue", third.record.id.as_str())
+    );
+}
+
+struct SqliteTokenIssueHarness {
+    path: PathBuf,
+}
+
+#[async_trait::async_trait]
+impl TokenIssueEvidenceHarness for SqliteTokenIssueHarness {
+    async fn fail_evidence_inserts(&self, fail: bool) {
+        let sql = if fail {
+            "CREATE TRIGGER fail_token_change_evidence \
+             BEFORE INSERT ON service_token_change_evidence \
+             BEGIN SELECT RAISE(ABORT, 'injected evidence failure'); END;"
+        } else {
+            "DROP TRIGGER fail_token_change_evidence;"
+        };
+        rusqlite::Connection::open(&self.path)
+            .expect("token database should open")
+            .execute_batch(sql)
+            .expect("the failure trigger should change");
+    }
+
+    async fn token_rows(&self) -> i64 {
+        rusqlite::Connection::open(&self.path)
+            .expect("token database should open")
+            .query_row("SELECT COUNT(*) FROM service_tokens", [], |row| row.get(0))
+            .expect("token rows should count")
+    }
+
+    async fn reopen(&self) -> Arc<dyn ServiceTokenStore> {
+        Arc::new(SqliteTokenStore::open(&self.path).expect("token store should reopen"))
+    }
+}
+
+#[tokio::test]
+async fn sqlite_service_token_issue_evidence_satisfies_the_contract() {
+    let db = TempDb::new("token-issue-evidence-contract");
+    let store = SqliteTokenStore::open(&db.path).expect("token store should open");
+    service_token_issue_evidence_contract(
+        &store,
+        &SqliteTokenEvidence {
+            path: db.path.clone(),
+        },
+        &SqliteTokenIssueHarness {
+            path: db.path.clone(),
+        },
+    )
+    .await;
+}
+
 /// The evidence outlives the token row and the process: a token row
 /// removed outside the gateway leaves its evidence exactly as it was, a
 /// reopened store reads it unchanged, and a retry against the removed token
-/// records nothing. The revoke row's commit time is the token's own
-/// `revoked_at`.
+/// records nothing. The issue row's commit time is the token's own
+/// `created_at`, and the revoke row's its `revoked_at`.
 #[tokio::test]
 async fn sqlite_change_evidence_survives_token_deletion_and_restart() {
     let db = TempDb::new("token-evidence-restart");
     let store = SqliteTokenStore::open(&db.path).expect("token store should open");
     let created = store
-        .create(CreateTokenRequest {
-            scopes: vec!["admin:tokens:read".to_owned()],
-            created_by: "creating-admin".to_owned(),
-            expires_at: None,
-        })
+        .create(
+            CreateTokenRequest {
+                scopes: vec!["admin:tokens:read".to_owned()],
+                created_by: "creating-admin".to_owned(),
+                expires_at: None,
+            },
+            &ChangeActor::for_test("creating-admin"),
+        )
         .await
         .expect("token should create");
     let id = created.record.id.clone();
@@ -1007,13 +1382,20 @@ async fn sqlite_change_evidence_survives_token_deletion_and_restart() {
         .expect("revoke should commit")
         .expect("token should exist");
     let before = sqlite_token_evidence_text(&db.path);
-    assert_eq!(before.len(), 2, "{before:?}");
+    assert_eq!(before.len(), 3, "{before:?}");
     let revoked_at = revoked.revoked_at.expect("revoke sets revoked_at");
     // The commit time is followed by the actor metadata columns the store
     // adds on open: kind, auth mode and (for this issuer-less principal) no
     // issuer.
     assert!(
-        before[1].ends_with(&format!("|{revoked_at}|principal|bearer_token|NULL")),
+        before[0].ends_with(&format!(
+            "|{}|principal|bearer_token|NULL",
+            created.record.created_at
+        )),
+        "the issue's evidence carries the token's own creation instant: {before:?}"
+    );
+    assert!(
+        before[2].ends_with(&format!("|{revoked_at}|principal|bearer_token|NULL")),
         "the revoke's evidence carries the revoke's own instant: {before:?}"
     );
     drop(store);
@@ -1049,11 +1431,14 @@ async fn sqlite_failed_evidence_insert_rolls_back_rotate_and_revoke() {
     let db = TempDb::new("token-evidence-fault");
     let store = SqliteTokenStore::open(&db.path).expect("token store should open");
     let created = store
-        .create(CreateTokenRequest {
-            scopes: vec!["admin:tokens:read".to_owned()],
-            created_by: "creating-admin".to_owned(),
-            expires_at: None,
-        })
+        .create(
+            CreateTokenRequest {
+                scopes: vec!["admin:tokens:read".to_owned()],
+                created_by: "creating-admin".to_owned(),
+                expires_at: None,
+            },
+            &ChangeActor::for_test("creating-admin"),
+        )
         .await
         .expect("token should create");
     let id = created.record.id.clone();
@@ -1107,7 +1492,14 @@ async fn sqlite_failed_evidence_insert_rolls_back_rotate_and_revoke() {
         before,
         "no hash, prefix or revoked_at change survived the failed evidence"
     );
-    assert!(sqlite_token_evidence(&db.path).is_empty());
+    assert_eq!(
+        sqlite_token_evidence(&db.path)
+            .iter()
+            .map(|row| row.action.as_str())
+            .collect::<Vec<_>>(),
+        ["service_token.issue"],
+        "only the issue's evidence"
+    );
     assert!(
         matches!(
             store
@@ -1125,8 +1517,8 @@ async fn sqlite_failed_evidence_insert_rolls_back_rotate_and_revoke() {
         .expect("the revoke commits once evidence can be written")
         .expect("token should exist");
     let rows = sqlite_token_evidence(&db.path);
-    assert_eq!(rows.len(), 1, "{rows:?}");
-    assert_eq!(rows[0].actor_user_id, "recovered-admin");
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[1].actor_user_id, "recovered-admin");
 }
 
 /// A rotate and a revoke race on two connections to one standalone token
@@ -1171,6 +1563,7 @@ fn sqlite_rotate_and_revoke_race_records_exactly_the_committed_changes() {
                 created_by: "creating-admin".to_owned(),
                 expires_at: None,
             },
+            &ChangeActor::for_test("creating-admin"),
         )
         .expect("token should create");
         let id = created.record.id.clone();
@@ -1223,7 +1616,8 @@ fn sqlite_rotate_and_revoke_race_records_exactly_the_committed_changes() {
             decided += 1;
         }
 
-        let mut expected = Vec::new();
+        // The token's issue always committed before either change.
+        let mut expected = vec![("service_token.issue", "creating-admin")];
         if rotated.is_some() {
             // A rotate after the revoke is refused, so a committed rotate
             // always committed first.
@@ -1307,8 +1701,10 @@ fn sqlite_token_changes_commit_while_another_connection_reads() {
         created_by: "creating-admin".to_owned(),
         expires_at: None,
     };
-    let to_rotate = TokenStore::create(&store, request()).expect("token should create");
-    let to_revoke = TokenStore::create(&store, request()).expect("token should create");
+    let to_rotate = TokenStore::create(&store, request(), &ChangeActor::for_test("creating-admin"))
+        .expect("token should create");
+    let to_revoke = TokenStore::create(&store, request(), &ChangeActor::for_test("creating-admin"))
+        .expect("token should create");
 
     let reader = rusqlite::Connection::open(&db.path).expect("reader should open");
     reader.execute_batch("BEGIN").expect("read should begin");
@@ -1366,6 +1762,14 @@ fn sqlite_token_changes_commit_while_another_connection_reads() {
         recorded,
         vec![
             (
+                "service_token.issue".to_owned(),
+                to_rotate.record.id.clone()
+            ),
+            (
+                "service_token.issue".to_owned(),
+                to_revoke.record.id.clone()
+            ),
+            (
                 "service_token.rotate".to_owned(),
                 to_rotate.record.id.clone()
             ),
@@ -1397,6 +1801,7 @@ fn sqlite_token_rotate_waits_for_a_concurrent_writer_and_judges_its_commit() {
             created_by: "creating-admin".to_owned(),
             expires_at: None,
         },
+        &ChangeActor::for_test("creating-admin"),
     )
     .expect("token should create");
     let id = created.record.id.clone();
@@ -1433,8 +1838,12 @@ fn sqlite_token_rotate_waits_for_a_concurrent_writer_and_judges_its_commit() {
         Ok(_) => panic!("a rotate after a committed revoke must be refused"),
         Err(error) => panic!("the rotate must wait for the writer, not fail: {error}"),
     }
-    assert!(
-        sqlite_token_evidence(&db.path).is_empty(),
+    assert_eq!(
+        sqlite_token_evidence(&db.path)
+            .iter()
+            .map(|row| row.action.as_str())
+            .collect::<Vec<_>>(),
+        ["service_token.issue"],
         "a refused rotate records nothing"
     );
     assert_eq!(
@@ -1464,6 +1873,7 @@ async fn sqlite_token_change_blocked_past_its_budget_is_refused_and_writes_nothi
             created_by: "creating-admin".to_owned(),
             expires_at: None,
         },
+        &ChangeActor::for_test("creating-admin"),
     )
     .expect("token should create");
     let id = created.record.id.clone();
@@ -1522,7 +1932,13 @@ async fn sqlite_token_change_blocked_past_its_budget_is_refused_and_writes_nothi
     writer.execute_batch("ROLLBACK").expect("writer should end");
 
     assert_eq!(token_row(), before, "neither refused change wrote anything");
-    assert!(sqlite_token_evidence(&db.path).is_empty());
+    assert_eq!(
+        sqlite_token_evidence(&db.path)
+            .iter()
+            .map(|row| row.action.as_str())
+            .collect::<Vec<_>>(),
+        ["service_token.issue"]
+    );
     assert!(matches!(
         TokenStore::verify(&store, &created.plaintext_token).expect("verification should query"),
         TokenVerification::Valid(_)
@@ -1531,8 +1947,8 @@ async fn sqlite_token_change_blocked_past_its_budget_is_refused_and_writes_nothi
         .expect("the revoke commits once the writer is done")
         .expect("token should exist");
     let rows = sqlite_token_evidence(&db.path);
-    assert_eq!(rows.len(), 1, "{rows:?}");
-    assert_eq!(rows[0].action, "service_token.revoke");
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[1].action, "service_token.revoke");
 }
 
 /// The standalone store versions its schema by creating what is missing on
@@ -1545,11 +1961,14 @@ async fn sqlite_store_adds_change_evidence_to_a_database_written_without_it() {
     let created = {
         let store = SqliteTokenStore::open(&db.path).expect("token store should open");
         store
-            .create(CreateTokenRequest {
-                scopes: vec!["admin:tokens:read".to_owned()],
-                created_by: "creating-admin".to_owned(),
-                expires_at: None,
-            })
+            .create(
+                CreateTokenRequest {
+                    scopes: vec!["admin:tokens:read".to_owned()],
+                    created_by: "creating-admin".to_owned(),
+                    expires_at: None,
+                },
+                &ChangeActor::for_test("creating-admin"),
+            )
             .await
             .expect("token should create")
     };
@@ -2487,6 +2906,7 @@ impl ServiceTokenStore for GatedTokenStore {
     async fn create(
         &self,
         _request: CreateTokenRequest,
+        _actor: &ChangeActor,
     ) -> Result<crate::auth::tokens::CreatedToken, RepositoryError> {
         unimplemented!("not needed by the executor proof")
     }
@@ -2628,16 +3048,11 @@ pub(crate) mod postgres_audit_tests {
     /// release) removes the interference entirely.
     pub(crate) static DATABASE: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::const_new(()));
 
-    pub(crate) fn locator() -> Option<String> {
-        let key = "GATEWAY_TEST_POSTGRES_URL_FILE".to_owned();
-        let file = std::env::var(&key).ok()?;
-        if file.trim().is_empty() {
-            return None;
-        }
-        let contents = std::fs::read_to_string(file).ok()?;
-        let trimmed = contents.trim();
-        (!trimmed.is_empty()).then(|| trimmed.to_owned())
-    }
+    // The locator, the DSN files and the TLS policy every connection here
+    // takes are the shared harness's, so a verified-TLS run reaches these
+    // databases the way the gateway does (issue #425).
+    pub(crate) use crate::storage::postgres::test_support::{locator, write_dsn_file, DsnFile};
+    use crate::storage::postgres::test_support::{test_pool, unconnected_pool, use_test_tls};
 
     /// One test's disposable database: created on acquisition, dropped
     /// (forced) on release. The `dsn` rewrites only the locator DSN's
@@ -2675,61 +3090,9 @@ pub(crate) mod postgres_audit_tests {
         }
     }
 
-    pub(crate) struct DsnFile {
-        pub(crate) path: String,
-        directory: std::path::PathBuf,
-    }
-
-    impl Drop for DsnFile {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.directory);
-        }
-    }
-
-    pub(crate) fn write_dsn_file(dsn: &str) -> DsnFile {
-        let directory = std::env::temp_dir().join(format!(
-            "greengateway-audit-contract-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&directory).expect("temp directory should create");
-        let path = directory.join("database-url");
-        std::fs::write(&path, format!("{dsn}\n")).expect("DSN file should write");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-                .expect("DSN permissions should set");
-        }
-        DsnFile {
-            path: path.display().to_string(),
-            directory,
-        }
-    }
-
     pub(crate) async fn create_test_database(admin_dsn: &str) -> TestDatabase {
         let name = format!("ggw_audit_test_{}", uuid::Uuid::new_v4().simple());
-        let mut config = crate::config::Config::test_defaults();
-        config.state_backend = crate::config::StateBackend::Postgres;
-        config.deployment_id = Some("deploy-audit-contract".to_owned());
-        config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
-
-        let directory = std::env::temp_dir().join(format!(
-            "greengateway-audit-contract-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&directory).expect("temp directory should create");
-        let admin_path = directory.join("database-url");
-        std::fs::write(&admin_path, format!("{admin_dsn}\n")).expect("DSN file should write");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&admin_path, std::fs::Permissions::from_mode(0o600))
-                .expect("DSN permissions should set");
-        }
-        config.database.url_file = Some(admin_path.display().to_string());
-        let admin = PostgresFoundation::establish(&config)
-            .await
-            .expect("admin connection should establish");
+        let admin = test_pool(admin_dsn).await;
 
         // Single-statement simple protocol: CREATE DATABASE cannot run in a
         // transaction block.
@@ -2741,17 +3104,7 @@ pub(crate) mod postgres_audit_tests {
             .batch_execute(&format!("CREATE DATABASE {name}"))
             .await
             .unwrap_or_else(|error| panic!("test database should create: {error}"));
-
-        let dsn_path = directory.join("database-url-test");
-        std::fs::write(&dsn_path, format!("{admin_dsn}\n")).expect("DSN file should write");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&dsn_path, std::fs::Permissions::from_mode(0o600))
-                .expect("DSN permissions should set");
-        }
         drop(admin);
-        let _ = std::fs::remove_dir_all(&directory);
 
         // Rewrite ONLY the database path segment of the DSN: a plain string
         // replace would also rewrite the username, which for these test
@@ -2764,24 +3117,12 @@ pub(crate) mod postgres_audit_tests {
         // disposable one: DROP DATABASE cannot run on a session that has
         // the target open. (An adversarial review caught this exact leak:
         // every teardown failed with "cannot drop the currently open
-        // database", stranding 800+ MB of test databases per run.)
-        let parsed_admin =
-            tokio_postgres::Config::from_str(admin_dsn).expect("admin DSN should parse");
+        // database", stranding 800+ MB of test databases per run.) It
+        // connects only when the teardown asks, on the teardown's runtime.
         TestDatabase {
             dsn,
             name,
-            admin_pool: deadpool_postgres::Pool::builder(deadpool_postgres::Manager::new(
-                parsed_admin,
-                tokio_postgres::NoTls,
-            ))
-            .config({
-                let mut pool_config = deadpool_postgres::PoolConfig::new(4);
-                pool_config.timeouts.create = Some(std::time::Duration::from_millis(5_000));
-                pool_config
-            })
-            .runtime(deadpool_postgres::Runtime::Tokio1)
-            .build()
-            .expect("admin pool should build"),
+            admin_pool: unconnected_pool(admin_dsn).expect("admin pool should build"),
         }
     }
 
@@ -2791,7 +3132,7 @@ pub(crate) mod postgres_audit_tests {
         config.deployment_id = Some("deploy-audit-contract".to_owned());
         let test_dsn_file = write_dsn_file(&database.dsn);
         config.database.url_file = Some(test_dsn_file.path.clone());
-        config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+        use_test_tls(&mut config.database);
         let foundation = PostgresFoundation::establish(&config)
             .await
             .expect("the test database should establish");
@@ -2847,7 +3188,7 @@ pub(crate) mod postgres_audit_tests {
         config.deployment_id = Some("deploy-readiness-contract".to_owned());
         let test_dsn_file = write_dsn_file(&database.dsn);
         config.database.url_file = Some(test_dsn_file.path.clone());
-        config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+        use_test_tls(&mut config.database);
         let foundation = PostgresFoundation::establish(&config)
             .await
             .expect("the test database should establish");
@@ -3077,7 +3418,7 @@ pub(crate) mod postgres_audit_tests {
         config.state_backend = crate::config::StateBackend::Postgres;
         config.deployment_id = Some("deploy-policy-contract".to_owned());
         config.database.url_file = Some(test_dsn_file.path.clone());
-        config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+        use_test_tls(&mut config.database);
         let foundation = PostgresFoundation::establish(&config)
             .await
             .expect("the test database should establish");
@@ -3101,7 +3442,7 @@ pub(crate) mod postgres_audit_tests {
         config.state_backend = crate::config::StateBackend::Postgres;
         config.deployment_id = Some("deploy-acquire-contract".to_owned());
         config.database.url_file = Some(test_dsn_file.path.clone());
-        config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+        use_test_tls(&mut config.database);
         config.database.pool_max = 1;
         config.database.acquire_timeout_ms = acquire_timeout_ms;
         PostgresFoundation::establish(&config)
@@ -3460,7 +3801,7 @@ pub(crate) mod postgres_audit_tests {
         config.state_backend = crate::config::StateBackend::Postgres;
         config.deployment_id = Some("deploy-token-contract".to_owned());
         config.database.url_file = Some(test_dsn_file.path.clone());
-        config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+        use_test_tls(&mut config.database);
         let foundation = PostgresFoundation::establish(&config)
             .await
             .expect("the test database should establish");
@@ -3674,7 +4015,7 @@ pub(crate) mod postgres_audit_tests {
         config.state_backend = crate::config::StateBackend::Postgres;
         config.deployment_id = Some("deploy-limits-contract".to_owned());
         config.database.url_file = Some(test_dsn_file.path.clone());
-        config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+        use_test_tls(&mut config.database);
         let foundation = PostgresFoundation::establish(&config)
             .await
             .expect("the test database should establish");
@@ -5090,7 +5431,7 @@ pub(crate) mod postgres_audit_tests {
             config.state_backend = crate::config::StateBackend::Postgres;
             config.deployment_id = Some(deployment.to_owned());
             config.database.url_file = Some(test_dsn_file.path.clone());
-            config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+            use_test_tls(&mut config.database);
             config
         };
         let bound_rows = || async {
@@ -5148,11 +5489,14 @@ pub(crate) mod postgres_audit_tests {
         let (store, _pool) = migrated_service_token_store(&database).await;
 
         let refused = store
-            .create(CreateTokenRequest {
-                scopes: vec!["admin:tokens:read".to_owned()],
-                created_by: "x".repeat(600),
-                expires_at: None,
-            })
+            .create(
+                CreateTokenRequest {
+                    scopes: vec!["admin:tokens:read".to_owned()],
+                    created_by: "x".repeat(600),
+                    expires_at: None,
+                },
+                &ChangeActor::for_test("creating-admin"),
+            )
             .await
             .err()
             .unwrap_or_else(|| panic!("a 600-byte creator exceeds the record bound"));
@@ -5463,7 +5807,13 @@ pub(crate) mod postgres_audit_tests {
             "no token has ever changed, so the mark is still the seed"
         );
 
-        let created = store.create(token_request(&["a"])).await.expect("create");
+        let created = store
+            .create(
+                token_request(&["a"]),
+                &ChangeActor::for_test("creating-admin"),
+            )
+            .await
+            .expect("create");
         let after_create = scalar_i64(&pool, SHARED).await;
         assert_eq!(
             after_create,
@@ -5560,9 +5910,9 @@ pub(crate) mod postgres_audit_tests {
     /// them; both succeed; the documented outcome is that the LATER
     /// rotation's plaintext is the live one and every earlier plaintext --
     /// the original and the first rotation's -- is dead. Exactly two
-    /// revisions are spent, and exactly two evidence rows record them: one
-    /// per replica's actor, chained 1 -> 2 -> 3, the later one naming the
-    /// actor whose plaintext is live.
+    /// revisions are spent, and exactly two evidence rows record them after
+    /// the issue's: one per replica's actor, chained 1 -> 2 -> 3, the later
+    /// one naming the actor whose plaintext is live.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_rotations_serialize_and_leave_exactly_one_live_plaintext() {
         let Some(admin_dsn) = locator() else {
@@ -5574,7 +5924,10 @@ pub(crate) mod postgres_audit_tests {
         let (replica_a, pool) = migrated_service_token_store(&database).await;
         let (replica_b, _) = migrated_service_token_store(&database).await;
         let created = replica_a
-            .create(token_request(&["a"]))
+            .create(
+                token_request(&["a"]),
+                &ChangeActor::for_test("creating-admin"),
+            )
             .await
             .expect("create");
         let id = created.record.id.clone();
@@ -5634,12 +5987,13 @@ pub(crate) mod postgres_audit_tests {
                 .map(|row| (row.action.as_str(), row.prior_version, row.new_version))
                 .collect::<Vec<_>>(),
             [
-                ("service_token.rotate", 1, 2),
-                ("service_token.rotate", 2, 3)
+                ("service_token.issue", None, 1),
+                ("service_token.rotate", Some(1), 2),
+                ("service_token.rotate", Some(2), 3)
             ],
-            "one evidence row per committed rotation, chained"
+            "the issue, then one evidence row per committed rotation, chained"
         );
-        let mut actors = evidence
+        let mut actors = evidence[1..]
             .iter()
             .map(|row| row.actor_user_id.as_str())
             .collect::<Vec<_>>();
@@ -5657,8 +6011,8 @@ pub(crate) mod postgres_audit_tests {
     /// rotated token. Either way NO plaintext -- original or rotated -- is
     /// live afterwards, which is the property that matters: a rotation can
     /// never race a revoke into a live token. The evidence is exactly the
-    /// changes that committed: the revoke alone, or the rotate then the
-    /// revoke.
+    /// changes that committed after the issue: the revoke alone, or the
+    /// rotate then the revoke.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn revoke_and_rotate_race_never_leaves_a_live_plaintext() {
         let Some(admin_dsn) = locator() else {
@@ -5674,7 +6028,10 @@ pub(crate) mod postgres_audit_tests {
         let mut saw_rotate_first = false;
         for _ in 0..8 {
             let created = replica_a
-                .create(token_request(&["a"]))
+                .create(
+                    token_request(&["a"]),
+                    &ChangeActor::for_test("creating-admin"),
+                )
                 .await
                 .expect("create");
             let id = created.record.id.clone();
@@ -5709,7 +6066,9 @@ pub(crate) mod postgres_audit_tests {
             assert!(revoked.revoked_at.is_some(), "the revoke always lands");
 
             let mut plaintexts = vec![created.plaintext_token.clone()];
-            let expected: &[(&str, &str, i64, i64)] = match rotate.expect("task") {
+            const ISSUED: (&str, &str, Option<i64>, i64) =
+                ("service_token.issue", "creating-admin", None, 1);
+            let expected: &[(&str, &str, Option<i64>, i64)] = match rotate.expect("task") {
                 Err(error) => {
                     assert_eq!(
                         error.kind(),
@@ -5717,14 +6076,18 @@ pub(crate) mod postgres_audit_tests {
                         "revoke-first: the rotate is refused as a conflict"
                     );
                     saw_revoke_first = true;
-                    &[("service_token.revoke", "revoking-replica", 1, 2)]
+                    &[
+                        ISSUED,
+                        ("service_token.revoke", "revoking-replica", Some(1), 2),
+                    ]
                 }
                 Ok(Some(rotated)) => {
                     plaintexts.push(rotated.plaintext_token);
                     saw_rotate_first = true;
                     &[
-                        ("service_token.rotate", "rotating-replica", 1, 2),
-                        ("service_token.revoke", "revoking-replica", 2, 3),
+                        ISSUED,
+                        ("service_token.rotate", "rotating-replica", Some(1), 2),
+                        ("service_token.revoke", "revoking-replica", Some(2), 3),
                     ]
                 }
                 Ok(None) => panic!("the token exists"),
@@ -5782,7 +6145,8 @@ pub(crate) mod postgres_audit_tests {
         actor_auth_mode: Option<String>,
         action: String,
         token_id: String,
-        prior_version: i64,
+        /// `None` exactly for an issue (migration 27).
+        prior_version: Option<i64>,
         new_version: i64,
         security_revision: i64,
         committed_at: String,
@@ -5900,11 +6264,78 @@ pub(crate) mod postgres_audit_tests {
             .await;
     }
 
+    struct PostgresTokenIssueHarness<'a> {
+        database: &'a TestDatabase,
+        pool: deadpool_postgres::Pool,
+        /// The statement that removes the installed fault, while one is.
+        restore: std::sync::Mutex<Option<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl super::TokenIssueEvidenceHarness for PostgresTokenIssueHarness<'_> {
+        async fn fail_evidence_inserts(&self, fail: bool) {
+            if fail {
+                let restore = fail_inserts_into(&self.pool, "service_token_change_evidence").await;
+                *self.restore.lock().expect("restore lock") = Some(restore);
+                return;
+            }
+            let restore = self
+                .restore
+                .lock()
+                .expect("restore lock")
+                .take()
+                .expect("a fault is installed");
+            self.pool
+                .get()
+                .await
+                .expect("failure trigger cleanup checkout")
+                .batch_execute(&restore)
+                .await
+                .expect("failure trigger should drop");
+        }
+
+        async fn token_rows(&self) -> i64 {
+            scalar_i64(
+                &self.pool,
+                "SELECT COUNT(*) FROM greengateway.service_tokens",
+            )
+            .await
+        }
+
+        async fn reopen(&self) -> Arc<dyn ServiceTokenStore> {
+            let (store, _pool) = migrated_service_token_store(self.database).await;
+            store
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_service_token_issue_evidence_satisfies_the_contract() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_service_token_store(&database).await;
+        super::service_token_issue_evidence_contract(
+            &*store,
+            &PostgresTokenEvidence { pool: pool.clone() },
+            &PostgresTokenIssueHarness {
+                database: &database,
+                pool,
+                restore: std::sync::Mutex::new(None),
+            },
+        )
+        .await;
+    }
+
     /// The cluster evidence row is bound to the change's outbox row -- the
-    /// same shared revision and the same row-revision step -- carries the
-    /// database clock's commit time, and outlives both the token row and
-    /// the process that wrote it. A repeat revoke spends nothing and records
-    /// nothing, and a retry against a removed token records nothing either.
+    /// same shared revision and the same row-revision step, none before an
+    /// issue and 1 after it -- carries the database clock's commit time, and
+    /// outlives both the token row and the process that wrote it. The
+    /// token's issue, rotate and revoke chain its row revisions without a
+    /// gap. A repeat revoke spends nothing and records nothing, and a retry
+    /// against a removed token records nothing either.
     #[tokio::test]
     async fn service_token_change_evidence_matches_the_outbox_and_survives_deletion_and_restart() {
         let Some(admin_dsn) = locator() else {
@@ -5933,7 +6364,13 @@ pub(crate) mod postgres_audit_tests {
             "evidence holds identifiers, revisions and the actor; a new column needs review"
         );
 
-        let created = store.create(token_request(&["a"])).await.expect("create");
+        let created = store
+            .create(
+                token_request(&["a"]),
+                &ChangeActor::for_test("creating-admin"),
+            )
+            .await
+            .expect("create");
         let id = created.record.id.clone();
         store
             .rotate(&id, &ChangeActor::for_test("rotating-admin"))
@@ -5977,31 +6414,40 @@ pub(crate) mod postgres_audit_tests {
             .collect::<Vec<_>>();
         assert_eq!(outbox.len(), 3, "create, rotate, revoke: {outbox:?}");
         let evidence = token_evidence_rows(&pool).await;
-        assert_eq!(evidence.len(), 2, "{evidence:?}");
-        for (row, (revision, from_version, to_version)) in evidence.iter().zip(&outbox[1..]) {
+        assert_eq!(evidence.len(), 3, "{evidence:?}");
+        for (row, (revision, from_version, to_version)) in evidence.iter().zip(&outbox) {
             assert_eq!(row.token_id, id);
             assert_eq!(
                 row.security_revision, *revision,
                 "the outbox row's revision"
             );
-            assert_eq!(Some(row.prior_version), *from_version);
+            assert_eq!(row.prior_version, *from_version);
             assert_eq!(row.new_version, *to_version);
             assert_ne!(row.event_id, row.operation_id);
         }
         assert_eq!(
-            (
-                evidence[0].action.as_str(),
-                evidence[0].actor_user_id.as_str()
-            ),
-            ("service_token.rotate", "rotating-admin")
+            evidence
+                .iter()
+                .map(|row| (
+                    row.action.as_str(),
+                    row.actor_user_id.as_str(),
+                    row.prior_version,
+                    row.new_version
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("service_token.issue", "creating-admin", None, 1),
+                ("service_token.rotate", "rotating-admin", Some(1), 2),
+                ("service_token.revoke", "revoking-admin", Some(2), 3),
+            ]
         );
-        assert_eq!(
-            (
-                evidence[1].action.as_str(),
-                evidence[1].actor_user_id.as_str()
-            ),
-            ("service_token.revoke", "revoking-admin")
-        );
+        for pair in evidence.windows(2) {
+            assert_eq!(
+                pair[1].prior_version,
+                Some(pair[0].new_version),
+                "each change starts at the revision the one before it left"
+            );
+        }
         assert_eq!(
             scalar_i64(
                 &pool,
@@ -6009,7 +6455,7 @@ pub(crate) mod postgres_audit_tests {
                  WHERE committed_at <= now() AND committed_at > now() - interval '1 hour'",
             )
             .await,
-            2,
+            3,
             "committed_at is the database clock's"
         );
         let stored = table_json(&pool, "service_token_change_evidence")
@@ -6105,7 +6551,13 @@ pub(crate) mod postgres_audit_tests {
         let _guard = DATABASE.lock().await;
         let database = create_test_database(&admin_dsn).await;
         let (store, pool) = migrated_service_token_store(&database).await;
-        let created = store.create(token_request(&["a"])).await.expect("create");
+        let created = store
+            .create(
+                token_request(&["a"]),
+                &ChangeActor::for_test("creating-admin"),
+            )
+            .await
+            .expect("create");
         let id = created.record.id.clone();
         const SHARED: &str =
             "SELECT last_revision FROM greengateway.security_revision_state WHERE singleton";
@@ -6153,7 +6605,15 @@ pub(crate) mod postgres_audit_tests {
         );
         assert_eq!(scalar_i64(&pool, SHARED).await, shared_before);
         assert_eq!(store.state_revision().await.expect("mark"), mark_before);
-        assert!(token_evidence_rows(&pool).await.is_empty());
+        assert_eq!(
+            token_evidence_rows(&pool)
+                .await
+                .iter()
+                .map(|row| row.action.as_str())
+                .collect::<Vec<_>>(),
+            ["service_token.issue"],
+            "only the issue's evidence"
+        );
         assert!(
             matches!(
                 store
@@ -6171,10 +6631,10 @@ pub(crate) mod postgres_audit_tests {
             .expect("the revoke commits once evidence can be written")
             .expect("exists");
         let evidence = token_evidence_rows(&pool).await;
-        assert_eq!(evidence.len(), 1, "{evidence:?}");
-        assert_eq!(evidence[0].actor_user_id, "recovered-admin");
+        assert_eq!(evidence.len(), 2, "{evidence:?}");
+        assert_eq!(evidence[1].actor_user_id, "recovered-admin");
         assert_eq!(
-            evidence[0].security_revision,
+            evidence[1].security_revision,
             shared_before + 1,
             "the aborted attempts consumed no revision"
         );
@@ -6613,7 +7073,13 @@ pub(crate) mod postgres_audit_tests {
         let _guard = DATABASE.lock().await;
         let database = create_test_database(&admin_dsn).await;
         let (store, _pool) = migrated_service_token_store(&database).await;
-        let created = store.create(token_request(&["a"])).await.expect("create");
+        let created = store
+            .create(
+                token_request(&["a"]),
+                &ChangeActor::for_test("creating-admin"),
+            )
+            .await
+            .expect("create");
         assert!(matches!(
             store
                 .verify(&created.plaintext_token)
@@ -6653,10 +7119,13 @@ pub(crate) mod postgres_audit_tests {
         );
         // And an expired token is judged by the database clock.
         let expired = store
-            .create(CreateTokenRequest {
-                expires_at: Some("2000-01-01T00:00:00Z".to_owned()),
-                ..token_request(&["a"])
-            })
+            .create(
+                CreateTokenRequest {
+                    expires_at: Some("2000-01-01T00:00:00Z".to_owned()),
+                    ..token_request(&["a"])
+                },
+                &ChangeActor::for_test("creating-admin"),
+            )
             .await
             .expect("create expired");
         assert_eq!(
@@ -7476,7 +7945,7 @@ pub(crate) mod postgres_audit_tests {
         config.state_backend = crate::config::StateBackend::Postgres;
         config.deployment_id = Some("deploy-audit-contract".to_owned());
         config.database.url_file = Some(test_dsn_file.path.clone());
-        config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+        use_test_tls(&mut config.database);
         let foundation = PostgresFoundation::establish(&config)
             .await
             .expect("raw connection should establish");
@@ -7619,7 +8088,7 @@ pub(crate) mod postgres_audit_tests {
         config.state_backend = crate::config::StateBackend::Postgres;
         config.deployment_id = Some("deploy-audit-contract".to_owned());
         config.database.url_file = Some(test_dsn_file.path.clone());
-        config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+        use_test_tls(&mut config.database);
         let foundation_b = PostgresFoundation::establish(&config)
             .await
             .expect("the second pool should establish");
@@ -7627,12 +8096,12 @@ pub(crate) mod postgres_audit_tests {
 
         // The blocker: a raw session, outside both pools, holding the
         // stream table so the batch wedges AFTER it has the advisory lock.
-        let (blocker, connection) = tokio_postgres::connect(&database.dsn, tokio_postgres::NoTls)
+        let blocker_pool =
+            unconnected_pool(&database.dsn).expect("the blocking session's pool should build");
+        let blocker = blocker_pool
+            .get()
             .await
             .expect("the blocking session should establish");
-        let pump = tokio::spawn(async move {
-            let _ = connection.await;
-        });
         blocker
             .batch_execute("BEGIN; LOCK TABLE greengateway.audit_stream IN ACCESS EXCLUSIVE MODE")
             .await
@@ -7725,7 +8194,6 @@ pub(crate) mod postgres_audit_tests {
             .get(0);
         assert_eq!(events, 1, "the cancelled batch must leave no event row");
         drop(blocker);
-        let _ = pump.await;
     }
 
     #[tokio::test]
@@ -7759,7 +8227,7 @@ pub(crate) mod postgres_audit_tests {
             config.state_backend = crate::config::StateBackend::Postgres;
             config.deployment_id = Some("deploy-audit-contract".to_owned());
             config.database.url_file = Some(test_dsn_file.path.clone());
-            config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+            use_test_tls(&mut config.database);
             let foundation = PostgresFoundation::establish(&config)
                 .await
                 .expect("retention connection should establish");
@@ -7827,7 +8295,7 @@ pub(crate) mod postgres_audit_tests {
         config.state_backend = crate::config::StateBackend::Postgres;
         config.deployment_id = Some("deploy-audit-contract".to_owned());
         config.database.url_file = Some(test_dsn_file.path.clone());
-        config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+        use_test_tls(&mut config.database);
         let foundation = PostgresFoundation::establish(&config)
             .await
             .expect("benchmark connection should establish");
@@ -7901,8 +8369,6 @@ pub(crate) mod postgres_audit_tests {
         drop(store);
     }
 
-    use std::str::FromStr as _;
-
     // ------------------------------------------------------------------
     // Durable observations and the fenced discovery projector
     // (issue #241, PR 11)
@@ -7922,7 +8388,7 @@ pub(crate) mod postgres_audit_tests {
         config.state_backend = crate::config::StateBackend::Postgres;
         config.deployment_id = Some("deploy-discovery-contract".to_owned());
         config.database.url_file = Some(test_dsn_file.path.clone());
-        config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+        use_test_tls(&mut config.database);
         let foundation = PostgresFoundation::establish(&config)
             .await
             .expect("the test database should establish");
@@ -11333,20 +11799,94 @@ pub(crate) mod postgres_audit_tests {
         }
     }
 
-    /// A policy v1 document that uses typed matchers (identity mappings and
-    /// rule conditions, issue #243) in the cluster authority. The store
-    /// commits format 1 whatever it carries and keeps the matchers exactly:
-    /// the stored document reads back, under the reader that admits them, as
-    /// the committed policy at the committed ETag. This build enforces no
-    /// typed matcher, so its replicas refuse to serve the document -- the
-    /// active read fails closed as invalid data rather than reading the
-    /// document without them -- and the policy API never hands one to the
-    /// store (`typed_matchers_not_enforced`). Once a release enforces them,
-    /// this commit is the document its replicas serve. Recovery is forward:
-    /// a document this build serves commits over it.
+    /// A policy v1 document with identity mappings (issue #243) in the
+    /// cluster authority is judged exactly as standalone mode judges it:
+    /// this build enforces mappings on every serving lane, so the store
+    /// commits the document, keeps the mappings exactly, and serves it back
+    /// from the active read and from history as the committed policy at the
+    /// committed ETag, in mapped-role mode.
     #[tokio::test]
-    async fn a_typed_matcher_v1_document_commits_in_cluster_mode_and_is_served_only_once_enforced()
-    {
+    async fn a_v1_document_with_identity_mappings_is_served_from_the_cluster_authority() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (store, _pool) = migrated_policy_store(&database).await;
+        let document = json!({
+            "schema_version": "1.0.0",
+            "id": "mapped-roles",
+            "default_action": "deny",
+            "roles": {
+                "admin": { "permissions": ["admin:policy:write"] },
+                "reader": { "permissions": ["data:read"] }
+            },
+            "identity_mappings": [{
+                "id": "idp-readers",
+                "issuer": "https://idp.example.test/",
+                "organizations": ["acme"],
+                "grant_roles": ["reader"]
+            }],
+            "routes": [
+                { "id": "data-read", "methods": ["GET"], "path_prefix": "/data", "permission": "data:read" }
+            ]
+        });
+        let mapped = Policy::validate_json_value(document)
+            .expect("this build accepts identity mappings in both modes");
+        assert!(mapped.identity_mappings.is_some());
+
+        let initial = PolicyControlPlane::commit(
+            &*store,
+            commit_request(
+                PolicyCommitPrecondition::Initialize,
+                &policy_with_role("mapped-base", "reader"),
+                "op-1",
+            ),
+        )
+        .await
+        .expect("initialize should commit");
+        let committed = PolicyControlPlane::commit(
+            &*store,
+            commit_request(
+                PolicyCommitPrecondition::Expected {
+                    etag: initial.etag.clone(),
+                },
+                &mapped,
+                "op-2",
+            ),
+        )
+        .await
+        .expect("a v1 document with identity mappings commits in cluster mode");
+
+        let active = PolicyControlPlane::active(&*store)
+            .await
+            .expect("a document this build enforces is served")
+            .expect("an active policy");
+        assert_eq!(active.etag, committed.etag);
+        assert_eq!(active.policy, mapped, "the mappings are served exactly");
+        let historical = store
+            .get_version(committed.version)
+            .await
+            .expect("history read")
+            .expect("the version is in history");
+        assert_eq!(historical.policy.as_ref(), Some(&mapped));
+    }
+
+    /// A policy v1 document whose rules carry conditions (issue #243) in the
+    /// cluster authority. The store commits format 1 whatever it carries and
+    /// keeps the conditions exactly: the stored document reads back, under
+    /// the reader that admits them, as the committed policy at the committed
+    /// ETag. This build enforces no rule condition, in either mode, so its
+    /// replicas refuse to serve the document -- the active read fails closed
+    /// as invalid data rather than reading the document without them -- and
+    /// the policy API never hands one to the store
+    /// (`typed_matchers_not_enforced`). Once a release enforces them, this
+    /// commit is the document its replicas serve. Recovery is forward: a
+    /// document this build serves commits over it.
+    #[tokio::test]
+    async fn a_v1_document_with_rule_conditions_commits_in_cluster_mode_and_is_served_only_once_enforced(
+    ) {
         let Some(admin_dsn) = locator() else {
             eprintln!("skipping: no test database locator; CI runs this test");
             return;
@@ -11382,7 +11922,7 @@ pub(crate) mod postgres_audit_tests {
             .expect("the typed-matcher document is sound");
         assert!(
             Policy::validate_json_value(document.clone()).is_err(),
-            "this build accepts no document that uses typed matchers"
+            "this build accepts no document whose rules carry conditions"
         );
 
         let initial = PolicyControlPlane::commit(
@@ -11431,7 +11971,7 @@ pub(crate) mod postgres_audit_tests {
 
         let refused = PolicyControlPlane::active(&*store)
             .await
-            .expect_err("matchers this build does not enforce are never served");
+            .expect_err("conditions this build does not enforce are never served");
         assert_eq!(refused.kind(), RepositoryErrorKind::InvalidData);
 
         let recovered = PolicyControlPlane::commit(

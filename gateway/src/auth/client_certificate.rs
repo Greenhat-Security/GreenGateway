@@ -30,7 +30,7 @@
 //! Subject DN is deliberately **not** an available source. See
 //! [`ClientCertIdentitySource`] for why.
 
-use std::{fmt, str::FromStr, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use sha2::{Digest, Sha256};
 use tokio_rustls::rustls::pki_types::CertificateDer;
@@ -63,81 +63,9 @@ pub const MAX_IDENTITY_BYTES: usize = 255;
 // rather than re-judging a value it did not shape.
 const _: () = assert!(MAX_IDENTITY_BYTES <= crate::auth::principal::MAX_PRINCIPAL_SUBJECT_BYTES);
 
-/// Which certificate field carries the caller's identity.
-///
-/// **Why not the subject DN.** A DN is not a string; it is a sequence of
-/// relative distinguished names, each of which may hold several attributes, in
-/// several string encodings. Turning one into text means picking an escaping
-/// and an ordering, libraries disagree about both, and the escaping is where
-/// the bugs live: a CA that lets a requester choose their own `CN` lets them
-/// choose a `CN` containing `,OU=` and produce a rendered DN that collides with
-/// somebody else's. Comparing identities as rendered DNs means comparing the
-/// output of an encoder nobody agreed on. There is no canonical DN renderer in
-/// this dependency graph, and writing one to decide who an authenticated caller
-/// is would be exactly the wrong place to hand-roll ASN.1.
-///
-/// **Why not an email SAN.** `rfc822Name` identifies a mailbox, not a workload,
-/// and mailboxes are reassigned. It is also the SAN type most often left
-/// unconstrained by the name constraints in an internal PKI.
-///
-/// The three that remain are all names the certificate *asserts about itself*
-/// in a single canonical text encoding, and all three are read out of the
-/// already-verified certificate by `rustls-webpki` rather than by a parser
-/// written here.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ClientCertIdentitySource {
-    /// A SPIFFE ID in a URI SAN: `spiffe://<trust-domain>/<path>`.
-    ///
-    /// The strongest of the three, and the recommended choice. SPIFFE requires
-    /// exactly one URI SAN per SVID, the encoding is canonical by
-    /// specification, and the ID is stable across the certificate rotation
-    /// SPIFFE expects to happen hourly -- which is the property that matters
-    /// most, because an identity that changes when a certificate is renewed
-    /// silently breaks every policy that names it.
-    Spiffe,
-    /// Any URI SAN, taken verbatim.
-    ///
-    /// For a private PKI that encodes workload identity as a URI but not as a
-    /// SPIFFE ID.
-    Uri,
-    /// A DNS SAN, lower-cased.
-    ///
-    /// The weakest of the three and the one to reach for last: DNS SANs were
-    /// designed to name the *server* a client is connecting to, so certificates
-    /// routinely carry several of them, and under the exactly-one rule such a
-    /// certificate simply has no identity. Wildcard names are never an identity
-    /// and are discarded before the count.
-    Dns,
-}
-
-impl ClientCertIdentitySource {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Spiffe => "spiffe",
-            Self::Uri => "uri",
-            Self::Dns => "dns",
-        }
-    }
-}
-
-impl FromStr for ClientCertIdentitySource {
-    type Err = &'static str;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.trim() {
-            "spiffe" => Ok(Self::Spiffe),
-            "uri" => Ok(Self::Uri),
-            "dns" => Ok(Self::Dns),
-            _ => Err("expected `spiffe`, `uri`, or `dns`"),
-        }
-    }
-}
-
-impl fmt::Display for ClientCertIdentitySource {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
+// The identity source a listener's settings name, shared with `ggctl` through
+// the configuration compiler (issue #242).
+pub use gateway_config::auth::ClientCertIdentitySource;
 
 /// Why a verified certificate produced no identity.
 ///

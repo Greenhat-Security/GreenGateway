@@ -26,6 +26,9 @@ serde.workspace = true
 serde_json.workspace = true
 # Pinned file digests and the ADR-0004 digest frame.
 sha2.workspace = true
+# The secret provider documents' endpoint and address validators parse the
+# URLs an operator configures (they never dial them).
+url.workspace = true
 
 [dev-dependencies]
 # The bundle reader's seeded, bounded property tests.

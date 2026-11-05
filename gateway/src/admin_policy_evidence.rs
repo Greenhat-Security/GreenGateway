@@ -317,6 +317,8 @@ fn evaluate_sections(
                     source: policy_testing::report::PolicySource::Publication,
                     etag: publication_etag,
                     security_revision: None,
+                    // The package names the publication it judged.
+                    stored: None,
                 },
                 outcome,
             ))

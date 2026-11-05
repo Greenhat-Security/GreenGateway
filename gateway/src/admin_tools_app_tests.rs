@@ -2092,6 +2092,7 @@ mod cluster_tools_tests {
                 created_by: "seed".to_owned(),
                 expires_at: None,
             },
+            &auth::change_actor::ChangeActor::for_test("seed"),
         )
         .await
         .expect("token should create");

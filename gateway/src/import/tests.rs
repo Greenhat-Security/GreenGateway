@@ -1012,6 +1012,7 @@ mod database {
                 created_by: "operator@example.test".to_owned(),
                 expires_at: None,
             },
+            &crate::auth::change_actor::ChangeActor::for_test("operator@example.test"),
         )
         .expect("the live fixture token should mint");
         let revoked = TokenStore::create(
@@ -1021,6 +1022,7 @@ mod database {
                 created_by: "operator@example.test".to_owned(),
                 expires_at: None,
             },
+            &crate::auth::change_actor::ChangeActor::for_test("operator@example.test"),
         )
         .expect("the revoked fixture token should mint");
         TokenStore::revoke(
