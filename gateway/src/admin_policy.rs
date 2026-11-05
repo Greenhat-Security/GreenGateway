@@ -3136,17 +3136,22 @@ pub(super) fn exact_strong_entity_tag(
         .to_str()
         .map_err(|_| ToolPlaygroundIfMatchError::Invalid)?
         .trim();
-    if value.len() > 1_024
-        || value.len() < 2
-        || !value.starts_with('"')
-        || !value.ends_with('"')
-        || !value.as_bytes()[1..value.len() - 1]
-            .iter()
-            .all(|byte| *byte == b'!' || (b'#'..=b'~').contains(byte))
-    {
+    if !is_strong_entity_tag(value) {
         return Err(ToolPlaygroundIfMatchError::Invalid);
     }
     Ok(value.to_owned())
+}
+
+/// Whether `value` is one strong entity tag (RFC 9110 `entity-tag` without
+/// `W/`), at most 1 KiB: a quoted run of `etagc` octets.
+pub(super) fn is_strong_entity_tag(value: &str) -> bool {
+    value.len() <= 1_024
+        && value.len() >= 2
+        && value.starts_with('"')
+        && value.ends_with('"')
+        && value.as_bytes()[1..value.len() - 1]
+            .iter()
+            .all(|byte| *byte == b'!' || (b'#'..=b'~').contains(byte))
 }
 
 pub(super) fn if_match_error_response(error: IfMatchError) -> Response {

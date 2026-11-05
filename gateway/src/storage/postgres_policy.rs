@@ -191,6 +191,13 @@ impl PostgresPolicyStore {
         super::postgres_policy_drafts::PostgresPolicyDraftStore::new(self.pool.clone())
     }
 
+    /// The stored policy test suite over this store's pool (issue #243).
+    /// The suite commits through the same versioned-document transaction as
+    /// the policy, as a resource of its own.
+    pub fn test_suite_store(&self) -> super::postgres_policy_tests::PostgresPolicyTestSuiteStore {
+        super::postgres_policy_tests::PostgresPolicyTestSuiteStore::new(self.pool.clone())
+    }
+
     /// Outbox entries after a revision, oldest-first. The durable half of
     /// reconciliation: correctness never depends on notifications, only on
     /// these rows plus the revision counter.
