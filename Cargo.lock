@@ -1057,6 +1057,7 @@ dependencies = [
  "libc",
  "rcgen",
  "reqwest",
+ "rustix",
  "serde",
  "serde_json",
  "tokio",

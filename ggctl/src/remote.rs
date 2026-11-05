@@ -135,8 +135,8 @@ pub(crate) type TrustAnchors = Vec<reqwest::Certificate>;
 
 /// Loads `--ca-file`: a regular file of at most 1 MiB holding at least one
 /// PEM certificate. These anchors decide which server receives the bearer
-/// token, so on Unix neither the file nor a directory holding it may be
-/// writable by another account ([`FilePermissions::NotWritableByOthers`]).
+/// token, so on Unix no other account may be able to change the file or
+/// what its path resolves to ([`FilePermissions::NotWritableByOthers`]).
 pub(crate) fn load_roots(path: &Path) -> Result<TrustAnchors, Code> {
     let bytes = read_regular_file(
         path,

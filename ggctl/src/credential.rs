@@ -120,10 +120,13 @@ pub(crate) enum FilePermissions {
     /// credential, which reading discloses.
     OwnerOnly,
     /// Group and other may read the file but not write it (mode `0644` is
-    /// fine, `0664` and `0666` are not), and may write a directory holding
-    /// it only when that directory has the sticky bit: a trust anchor, which
-    /// is public but decides where a credential may be sent, so whoever can
-    /// change or replace it can receive the token.
+    /// fine, `0664` and `0666` are not), and no other account may change
+    /// what its path resolves to: the file, every directory above it and
+    /// every link on its path must be owned by root or by the account
+    /// running `ggctl`, and group and other may write one of those
+    /// directories only when it has the sticky bit. This is a trust anchor,
+    /// which is public but decides where a credential may be sent, so
+    /// whoever can change or replace it can receive the token.
     NotWritableByOthers,
 }
 
@@ -136,8 +139,8 @@ pub(crate) enum FilePermissions {
 /// then checked again and, on Unix, must be the very file the path check
 /// examined, so what is read is the file the checks passed: a path swapped
 /// between the two is refused rather than read. [`FilePermissions`] says
-/// what the Unix mode bits, and for a trust anchor the directories holding
-/// it, may allow.
+/// what the Unix mode bits, and for a trust anchor the owners and the
+/// entries its path resolves through, may allow.
 pub(crate) fn read_regular_file(
     path: &Path,
     maximum: usize,
@@ -145,7 +148,7 @@ pub(crate) fn read_regular_file(
 ) -> Result<Zeroizing<Vec<u8>>, FileProblem> {
     let before = std::fs::metadata(path).map_err(|_| FileProblem::Unreadable)?;
     check_metadata(&before, maximum, permissions)?;
-    check_directories(path, permissions)?;
+    check_directories(path, &before, permissions)?;
     let mut file = open_without_blocking(path).map_err(|_| FileProblem::Unreadable)?;
     let opened = file.metadata().map_err(|_| FileProblem::Unreadable)?;
     check_metadata(&opened, maximum, permissions)?;
@@ -188,41 +191,149 @@ fn permissions_are_safe(_metadata: &std::fs::Metadata, _permissions: FilePermiss
     true
 }
 
-/// For a trust anchor, refuses a directory holding it that another account
-/// can write: the one the path names it in and, when that entry is a link,
-/// the one holding the file it resolves to. Either lets that account replace
-/// the file, whatever the file's own mode. The sticky bit stops an account
-/// renaming or removing an entry it does not own, so a sticky directory such
-/// as `/tmp` is accepted, as the gateway accepts one for its TLS material.
+/// For a trust anchor, refuses a path another account could make resolve to
+/// a file of its choosing; see [`check_resolution`].
 #[cfg(unix)]
-fn check_directories(path: &Path, permissions: FilePermissions) -> Result<(), FileProblem> {
-    use std::os::unix::fs::PermissionsExt;
-    const STICKY: u32 = 0o1000;
-    const GROUP_OTHER_WRITE: u32 = 0o022;
+fn check_directories(
+    path: &Path,
+    checked: &std::fs::Metadata,
+    permissions: FilePermissions,
+) -> Result<(), FileProblem> {
     if permissions != FilePermissions::NotWritableByOthers {
         return Ok(());
     }
-    let resolved = std::fs::canonicalize(path).map_err(|_| FileProblem::Unreadable)?;
-    for entry in [path, resolved.as_path()] {
-        // A bare file name has an empty parent: the current directory.
-        let directory = match entry.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent,
-            _ => Path::new("."),
-        };
-        let mode = std::fs::metadata(directory)
-            .map_err(|_| FileProblem::Unreadable)?
-            .permissions()
-            .mode();
-        if mode & GROUP_OTHER_WRITE != 0 && mode & STICKY == 0 {
-            return Err(FileProblem::UnsafePermissions);
-        }
-    }
-    Ok(())
+    check_resolution(path, checked, running_account())
 }
 
 #[cfg(not(unix))]
-fn check_directories(_path: &Path, _permissions: FilePermissions) -> Result<(), FileProblem> {
+fn check_directories(
+    _path: &Path,
+    _checked: &std::fs::Metadata,
+    _permissions: FilePermissions,
+) -> Result<(), FileProblem> {
     Ok(())
+}
+
+/// The account `ggctl` runs as: its effective user ID, the one the kernel
+/// checks every file access against.
+#[cfg(unix)]
+fn running_account() -> u32 {
+    rustix::process::geteuid().as_raw()
+}
+
+/// The most symbolic links one path may resolve through, as on Linux.
+#[cfg(unix)]
+const MAX_LINKS: usize = 40;
+
+/// Resolves `path` one entry at a time from `/` (a relative path from the
+/// working directory), following each symbolic link as the kernel does, and
+/// refuses it unless only root and `account` could change what it resolves
+/// to.
+///
+/// Every entry the path resolves through, each directory, each link and the
+/// file itself, must be owned by root or by `account`: an owner can always
+/// change what it owns, whatever the mode says, and a link's owner chose
+/// where it points. Every directory a name is looked up in must also be
+/// unwritable by group and other unless it has the sticky bit, which stops
+/// an account renaming or removing an entry it does not own. So a sticky
+/// directory such as `/tmp` is accepted for an entry of `account`'s or
+/// root's, never for one another account created there first, and a
+/// directory anywhere above the file counts, not only the one holding it.
+/// The walk must end at the file `checked` describes; a path that changed
+/// in between is refused.
+#[cfg(unix)]
+fn check_resolution(
+    path: &Path,
+    checked: &std::fs::Metadata,
+    account: u32,
+) -> Result<(), FileProblem> {
+    use std::{ffi::OsString, os::unix::fs::MetadataExt, path::PathBuf};
+    const ROOT: u32 = 0;
+    const STICKY: u32 = 0o1000;
+    const GROUP_OTHER_WRITE: u32 = 0o022;
+    let trusted =
+        |metadata: &std::fs::Metadata| metadata.uid() == ROOT || metadata.uid() == account;
+    let safe_directory = |metadata: &std::fs::Metadata| {
+        trusted(metadata)
+            && (metadata.mode() & GROUP_OTHER_WRITE == 0 || metadata.mode() & STICKY != 0)
+    };
+    let examine =
+        |entry: &Path| std::fs::symlink_metadata(entry).map_err(|_| FileProblem::Unreadable);
+
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        // The working directory is reported with no link in it.
+        std::env::current_dir()
+            .map_err(|_| FileProblem::Unreadable)?
+            .join(path)
+    };
+    // The names still to resolve, the next one last.
+    let mut pending: Vec<OsString> = Vec::new();
+    push_names(&absolute, &mut pending);
+    // `resolved` names the entry reached so far with no link in it, and
+    // `current` is that entry's metadata.
+    let mut resolved = PathBuf::from("/");
+    let mut current = examine(&resolved)?;
+    let mut links = 0;
+    while let Some(name) = pending.pop() {
+        // Only a directory holds names; anything else here means the path
+        // changed after the path check resolved it.
+        if !current.is_dir() {
+            return Err(FileProblem::Unreadable);
+        }
+        if name == ".." {
+            // `resolved` holds no link, so its parent is the lexical one,
+            // and no write to `current` can change which directory that is.
+            resolved.pop();
+            current = examine(&resolved)?;
+            continue;
+        }
+        // Whoever can write the directory a name is looked up in can
+        // replace the entry it names.
+        if !safe_directory(&current) {
+            return Err(FileProblem::UnsafePermissions);
+        }
+        let entry = resolved.join(&name);
+        let metadata = examine(&entry)?;
+        if !trusted(&metadata) {
+            return Err(FileProblem::UnsafePermissions);
+        }
+        if metadata.file_type().is_symlink() {
+            links += 1;
+            if links > MAX_LINKS {
+                return Err(FileProblem::Unreadable);
+            }
+            let target = std::fs::read_link(&entry).map_err(|_| FileProblem::Unreadable)?;
+            // A relative target resolves in the directory holding the link.
+            if target.is_absolute() {
+                resolved = PathBuf::from("/");
+                current = examine(&resolved)?;
+            }
+            push_names(&target, &mut pending);
+            continue;
+        }
+        resolved = entry;
+        current = metadata;
+    }
+    check_same_file(checked, &current)
+}
+
+/// Pushes the names in `path` so that popping yields them in order. A root
+/// or `.` component names no entry and is left out; `..` is kept as itself.
+#[cfg(unix)]
+fn push_names(path: &Path, pending: &mut Vec<std::ffi::OsString>) {
+    use std::path::Component;
+    pending.extend(
+        path.components()
+            .rev()
+            .filter_map(|component| match component {
+                Component::Normal(_) | Component::ParentDir => {
+                    Some(component.as_os_str().to_owned())
+                }
+                Component::RootDir | Component::CurDir | Component::Prefix(_) => None,
+            }),
+    );
 }
 
 /// Opens for reading with `O_NONBLOCK`, so opening a FIFO that replaced the

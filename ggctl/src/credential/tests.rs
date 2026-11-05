@@ -203,3 +203,190 @@ fn a_handle_to_another_file_than_the_one_checked_is_refused() {
         Err(FileProblem::Unreadable)
     );
 }
+
+/// The account that owns what a test creates, and an account that owns none
+/// of it. Root may own anything a trust anchor's path resolves through, so a
+/// test run as root first gives `entries` to an unprivileged account.
+#[cfg(unix)]
+fn owner_and_stranger(entries: &[&Path]) -> (u32, u32) {
+    const UNPRIVILEGED: u32 = 65_534;
+    let owner = if running_account() == 0 {
+        for entry in entries {
+            std::os::unix::fs::lchown(entry, Some(UNPRIVILEGED), None).expect("chown");
+        }
+        UNPRIVILEGED
+    } else {
+        running_account()
+    };
+    let stranger = if owner == 1 { 2 } else { 1 };
+    (owner, stranger)
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("mode");
+}
+
+/// An entry created directly in the system temporary directory, removed on
+/// drop.
+#[cfg(unix)]
+struct TempEntry(PathBuf);
+
+#[cfg(unix)]
+impl TempEntry {
+    fn path(name: &str) -> Self {
+        let path =
+            std::env::temp_dir().join(format!("ggctl-credential-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        Self(path)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TempEntry {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// A sticky directory such as `/tmp` stops another account replacing an
+/// entry, not creating the name first: a trust anchor someone else put there
+/// is theirs to rewrite, whatever its mode.
+#[cfg(unix)]
+#[test]
+fn a_trust_anchor_another_account_owns_is_refused_even_in_a_sticky_directory() {
+    let file = TempEntry::path("owned.pem");
+    std::fs::write(&file.0, CANARY).expect("write");
+    set_mode(&file.0, 0o644);
+    let (owner, stranger) = owner_and_stranger(&[&file.0]);
+    let checked = std::fs::metadata(&file.0).expect("metadata");
+    assert_eq!(check_resolution(&file.0, &checked, owner), Ok(()));
+    assert_eq!(
+        check_resolution(&file.0, &checked, stranger),
+        Err(FileProblem::UnsafePermissions)
+    );
+}
+
+/// The directories above the file and the links on its path count as much
+/// as the file: whoever owns one can make the path resolve elsewhere.
+#[cfg(unix)]
+#[test]
+fn every_entry_a_trust_anchor_path_resolves_through_must_be_owned_by_root_or_the_operator() {
+    use std::os::unix::fs::symlink;
+
+    let file = TempFile::new("owned-directory", CANARY.as_bytes());
+    let directory = file.0.parent().expect("parent").to_owned();
+    set_mode(&directory, 0o755);
+    let (owner, stranger) = owner_and_stranger(&[&directory, &file.0]);
+    let checked = std::fs::metadata(&file.0).expect("metadata");
+    assert_eq!(check_resolution(&file.0, &checked, owner), Ok(()));
+    assert_eq!(
+        check_resolution(&file.0, &checked, stranger),
+        Err(FileProblem::UnsafePermissions)
+    );
+
+    // A link the stranger made is refused even though everything it leads
+    // to is root's: root's own `/` stands in for a root-owned file such as a
+    // test CA a package installs.
+    let link = TempEntry::path("owned-link");
+    symlink("/", &link.0).expect("symlink");
+    let (owner, stranger) = owner_and_stranger(&[&link.0]);
+    // What the link leads to, examined without following it: Linux refuses
+    // root to follow a link another account owns in a sticky directory.
+    let checked = std::fs::metadata("/").expect("metadata");
+    assert_eq!(check_resolution(&link.0, &checked, owner), Ok(()));
+    assert_eq!(
+        check_resolution(&link.0, &checked, stranger),
+        Err(FileProblem::UnsafePermissions)
+    );
+}
+
+/// A relative link target resolves in the directory holding the link, and
+/// `..` in the physical parent, so the directory checked is the directory
+/// read: here the one holding `sub`, not `sub` itself.
+#[cfg(unix)]
+#[test]
+fn a_relative_link_and_dot_dot_resolve_where_the_kernel_resolves_them() {
+    use std::os::unix::fs::symlink;
+
+    let file = TempFile::new("relative-link", CANARY.as_bytes());
+    let directory = file.0.parent().expect("parent").to_owned();
+    let sub = directory.join("sub");
+    std::fs::create_dir(&sub).expect("sub");
+    let link = sub.join("link");
+    symlink("../token", &link).expect("symlink");
+    let (owner, _) = owner_and_stranger(&[&directory, &file.0, &sub, &link]);
+    let checked = std::fs::metadata(&file.0).expect("metadata");
+    set_mode(&directory, 0o755);
+    set_mode(&sub, 0o755);
+    assert_eq!(check_resolution(&link, &checked, owner), Ok(()));
+    assert_eq!(
+        check_resolution(&sub.join("..").join("token"), &checked, owner),
+        Ok(())
+    );
+    // No write to `sub` changes what `..` in it is.
+    set_mode(&sub, 0o777);
+    assert_eq!(
+        check_resolution(&sub.join("..").join("token"), &checked, owner),
+        Ok(())
+    );
+    // `sub` holds the link, so it decides where the link leads.
+    assert_eq!(
+        check_resolution(&link, &checked, owner),
+        Err(FileProblem::UnsafePermissions)
+    );
+    set_mode(&sub, 0o755);
+    // The file is looked up in `directory`, wherever the path came from.
+    set_mode(&directory, 0o777);
+    assert_eq!(
+        check_resolution(&link, &checked, owner),
+        Err(FileProblem::UnsafePermissions)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_trust_anchor_path_that_resolves_to_another_file_than_the_one_checked_is_refused() {
+    let first = TempFile::new("resolution-first", CANARY.as_bytes());
+    let second = TempFile::new("resolution-second", CANARY.as_bytes());
+    for file in [&first, &second] {
+        set_mode(file.0.parent().expect("parent"), 0o755);
+    }
+    let (owner, _) = owner_and_stranger(&[
+        first.0.parent().expect("parent"),
+        &first.0,
+        second.0.parent().expect("parent"),
+        &second.0,
+    ]);
+    let checked = std::fs::metadata(&second.0).expect("metadata");
+    assert_eq!(
+        check_resolution(&first.0, &checked, owner),
+        Err(FileProblem::Unreadable)
+    );
+}
+
+/// A cycle of links is refused once more links than Linux follows were
+/// followed, instead of looping.
+#[cfg(unix)]
+#[test]
+fn a_cycle_of_links_is_refused() {
+    use std::os::unix::fs::symlink;
+
+    let file = TempFile::new("link-cycle", CANARY.as_bytes());
+    let directory = file.0.parent().expect("parent").to_owned();
+    set_mode(&directory, 0o755);
+    symlink("b", directory.join("a")).expect("symlink");
+    symlink("a", directory.join("b")).expect("symlink");
+    let (owner, _) = owner_and_stranger(&[
+        &directory,
+        &file.0,
+        &directory.join("a"),
+        &directory.join("b"),
+    ]);
+    let checked = std::fs::metadata(&file.0).expect("metadata");
+    assert_eq!(
+        check_resolution(&directory.join("a"), &checked, owner),
+        Err(FileProblem::Unreadable)
+    );
+}

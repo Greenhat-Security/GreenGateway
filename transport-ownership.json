@@ -1273,6 +1273,7 @@
           "libc@0.2.189|registry+https://github.com/rust-lang/crates.io-index",
           "rcgen@0.14.10|registry+https://github.com/rust-lang/crates.io-index",
           "reqwest@0.13.5|registry+https://github.com/rust-lang/crates.io-index",
+          "rustix@1.1.5|registry+https://github.com/rust-lang/crates.io-index",
           "serde@1.0.229|registry+https://github.com/rust-lang/crates.io-index",
           "serde_json@1.0.154|registry+https://github.com/rust-lang/crates.io-index",
           "tokio-rustls@0.26.6|registry+https://github.com/rust-lang/crates.io-index",
@@ -6353,6 +6354,20 @@
             "uses_default_features": true,
             "features": [
               "derive"
+            ],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "rustix",
+            "rename": null,
+            "kind": null,
+            "target": "cfg(unix)",
+            "req": "^1.1.4",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [
+              "fs",
+              "process"
             ],
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
@@ -15102,10 +15117,20 @@
       "reasons": [
         "capability-import-or-glob"
       ],
-      "scope": "ggctl::credential::check_directories#1",
-      "sha256": "ce92a7e3857cf8330034aed6bc5e575d4bc75e5fcf7723da2e216c97b9300f95",
+      "scope": "ggctl::credential::check_resolution#1",
+      "sha256": "ff910859b93d22d54c3f82226eef06d47ab9f3034b73cfa76051fc68da48002a",
       "owner": "GreenGateway maintainers: operator CLI (#242)",
-      "purpose": "Reviewed for #242 (operator file safety): canonicalizes the --ca-file path and reads the Unix mode bits of the directories holding it and its link target through PermissionsExt, refusing one group or other can write without the sticky bit. Read-only metadata; no network or process capability."
+      "purpose": "Reviewed for #242 (operator file safety): resolves the --ca-file and --answers path one entry at a time from / (a relative path from std::env::current_dir), following each link with std::fs::read_link, and reads each entry's Unix owner and mode bits through MetadataExt, refusing a file, directory or link owned by an account other than root and the running one, or a directory group or other can write without the sticky bit. Read-only metadata; no network or process capability."
+    },
+    {
+      "file": "ggctl/src/credential.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "ggctl::credential::running_account#1",
+      "sha256": "095bb06d5a6f52a5670f4888a764b78ae3a399c7e3d36422e0c122d76918ab3f",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 (operator file safety): reads the effective user ID through rustix::process::geteuid, a safe read-only identity call, so the --ca-file and --answers checks can compare owners against the account running ggctl. It starts, signals or inspects no process and opens no network transport."
     },
     {
       "file": "ggctl/src/credential.rs",
