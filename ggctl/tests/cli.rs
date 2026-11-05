@@ -637,6 +637,113 @@ fn validate_and_doctor_read_a_bundle_offline_with_their_exit_codes() {
     }
 }
 
+/// `--env` end to end: real processes, the published report schema, the
+/// exit codes, and a secret in the file that never reaches either stream.
+#[test]
+fn environment_files_are_validated_diagnosed_and_compared_without_echoing_a_value() {
+    let bundle = Bundle::new("{\"schema_version\": \"0.1.0\", \"default_action\": \"deny\"}\n");
+    bundle.write(
+        "base.env",
+        &format!(
+            "AUTH_ENABLED=true\nTLS_CERT_FILE=/run/tls/a.crt\nTLS_KEY_FILE=/run/{CANARY}/a.key\n"
+        ),
+    );
+    bundle.write(
+        "candidate.env",
+        &format!(
+            "# reviewed\nexport AUTH_ENABLED=false\nTLS_CERT_FILE=/run/tls/a.crt\nTLS_KEY_FILE=/run/{CANARY}/b.key\n{CANARY}={CANARY}\n"
+        ),
+    );
+    bundle.write(
+        "refused.env",
+        &format!("AUTH_MODE={CANARY}\nAUTH_MODE={CANARY}\n"),
+    );
+    let path = |name: &str| bundle.0.join(name).to_str().expect("UTF-8").to_owned();
+    let (base, candidate, refused) = (path("base.env"), path("candidate.env"), path("refused.env"));
+
+    for command in ["validate", "doctor"] {
+        let output = ggctl(&[command, "--env", &candidate, "--format", "json"], None);
+        assert_eq!(output.status.code(), Some(0), "{command}");
+        let found = report(&output);
+        assert_eq!(found["command"], command);
+        assert_no_canary(&output);
+        assert_path_not_echoed(&output, &candidate);
+
+        let output = ggctl(&[command, "--env", &refused, "--format", "json"], None);
+        assert_eq!(output.status.code(), Some(3), "{command}");
+        let found = report(&output);
+        let codes: Vec<_> = found["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .iter()
+            .map(|diagnostic| diagnostic["code"].as_str().expect("code").to_owned())
+            .collect();
+        assert_eq!(
+            codes[..2],
+            ["env.duplicate_key", "config.refused"],
+            "{command}"
+        );
+        assert_no_canary(&output);
+
+        let output = ggctl(&[command, "--env", &refused], None);
+        assert_eq!(output.status.code(), Some(3), "{command}");
+        assert!(text(&output.stderr).contains("  at: argument 2, line 2\n  setting: AUTH_MODE\n"));
+        assert_no_canary(&output);
+        assert_path_not_echoed(&output, &refused);
+    }
+
+    let output = ggctl(
+        &[
+            "validate", "--env", &refused, "--strict", "--format", "sarif",
+        ],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(3));
+    let log: Value = serde_json::from_slice(&output.stdout).expect("one SARIF log");
+    assert_eq!(log["runs"][0]["results"][0]["ruleId"], "env.duplicate_key");
+    assert_eq!(log["runs"][0]["results"][0]["level"], "error");
+    assert_no_canary(&output);
+
+    let output = ggctl(
+        &[
+            "diff",
+            "--env",
+            &candidate,
+            "--against-env",
+            &base,
+            "--check",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(4));
+    let report = report(&output);
+    assert!(report["result"]["diff"]["riskCodes"]
+        .as_array()
+        .expect("risk codes")
+        .contains(&json!("risk.auth_disabled")));
+    assert_no_canary(&output);
+
+    let output = ggctl(
+        &["diff", "--env", &candidate, "--against", bundle.path()],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(3));
+    assert!(text(&output.stderr).contains("diff.not_comparable"));
+
+    let missing = path("missing.env");
+    let output = ggctl(&["validate", "--env", &missing], None);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(text(&output.stderr).starts_with("ggctl: error: env.unreadable: "));
+    assert_path_not_echoed(&output, &missing);
+
+    let output = ggctl(&["validate", bundle.path(), "--env", &candidate], None);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(text(&output.stderr).starts_with("ggctl: error: usage.conflicting_options: "));
+}
+
 #[test]
 fn pin_repins_an_edited_file_and_never_one_that_is_invalid() {
     let bundle = Bundle::new("{\"schema_version\": \"0.1.0\", \"default_action\": \"deny\"}\n");

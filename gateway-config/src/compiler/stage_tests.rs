@@ -1294,38 +1294,8 @@ fn rule_fixture(rule: ConfigRule) -> (&'static [(&'static str, &'static str)], &
     }
 }
 
-const EVERY_RULE: [ConfigRule; 30] = [
-    ConfigRule::Value,
-    ConfigRule::AdminListenerCollision,
-    ConfigRule::GrpcListenerCollision,
-    ConfigRule::TlsMaterialUnpaired,
-    ConfigRule::AdminTlsWithoutAdminListener,
-    ConfigRule::ClientCertificateAuth,
-    ConfigRule::ClientCertIdentitySourceUnused,
-    ConfigRule::AdminSessionSettingsWithoutMode,
-    ConfigRule::AdminSessionIdleTimeoutBounds,
-    ConfigRule::AdminLoginProviderUnusable,
-    ConfigRule::AdminSessionRequirements,
-    ConfigRule::AdminSessionCsrfExemption,
-    ConfigRule::TrustedProxyNetworksRequired,
-    ConfigRule::CookieSessionDelegation,
-    ConfigRule::UpstreamRoutingSourcesExclusive,
-    ConfigRule::HostRoutesRequirePolicy,
-    ConfigRule::SecretsRootRequired,
-    ConfigRule::LocalKeyringRequiresConnectionsStore,
-    ConfigRule::SecretAliasIdReserved,
-    ConfigRule::ClusterMemberStaleWindow,
-    ConfigRule::ClusterModeRequirements,
-    ConfigRule::LocalAuthorityInClusterMode,
-    ConfigRule::AdminSessionStoreBackend,
-    ConfigRule::ClusterSettingInStandaloneMode,
-    ConfigRule::PayloadCaptureDestination,
-    ConfigRule::AuthorityEventSinkRequirements,
-    ConfigRule::AuthorityEventMaterialUnused,
-    ConfigRule::AuthorityPseudonymKeysDistinct,
-    ConfigRule::AuthorityEvidenceDeliveryRequired,
-    ConfigRule::AuthorityEvidenceUnsupportedConfiguration,
-];
+/// Every rule, in declaration order.
+const EVERY_RULE: [ConfigRule; 30] = ConfigRule::ALL;
 
 /// Every rule is reachable, and a refusal under it is reported as a
 /// diagnostic naming the rule, the variable its problem begins with and how

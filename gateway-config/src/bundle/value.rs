@@ -3,13 +3,10 @@
 //! decimals.
 //!
 //! In `v1alpha1` the deployment document's settings come from the field
-//! catalog (issue #242, PR 3), which attaches these forms to the fields that
-//! need them: every sensitive field accepts only a [`SecretReference`], and
-//! every fractional field only a [`Decimal`]. The forms are fixed here, with
-//! the reader, so the published schema and the canonical form can define them
-//! before any field uses them.
-// The field catalog (#242 PR 3) is the caller; until then only the tests are.
-#![cfg_attr(not(test), expect(dead_code))]
+//! catalog (issue #242, PR 3), and [`super::settings`] attaches these forms
+//! to the fields that need them: every field whose value may carry a secret
+//! accepts only a [`SecretReference`], every fractional field only a
+//! [`Decimal`], and no field an [`Unresolved`] placeholder.
 
 use crate::opaque_id::{is_valid_opaque_id, MAX_SECRET_ALIAS_ID_BYTES};
 
@@ -63,6 +60,9 @@ impl SecretReference {
         }
     }
 
+    // The bundle front end that resolves references is a later #242 slice;
+    // until then only the tests read the ID.
+    #[cfg(test)]
     pub(crate) fn alias_id(&self) -> &str {
         &self.alias_id
     }

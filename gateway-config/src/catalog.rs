@@ -30,11 +30,17 @@
 //!   produces and `docs/schemas/configuration-catalog.v1.schema.json`
 //!   describes.
 //!
+//! A deployment field's document path places it in a `GatewayDeployment`
+//! document. The bundle reader (`crate::bundle::settings`) derives the
+//! document's closed sections from those paths and holds each setting to its
+//! entry here, and the published deployment schema and the settings
+//! reference in `docs/configuration-bundles.md` are rendered from them. The
+//! fields that hold a JSON document (`AUTH_PROVIDERS`, `UPSTREAM_ROUTES`,
+//! `MCP_UPSTREAM_SERVERS`) have no path yet: a bundle cannot set them.
+//!
 //! Some of ADR-0008's catalog columns are not here yet, because nothing
-//! decides or checks them today: deployment-document paths (the deployment
-//! schema defines no setting yet, so every [`BundleMapping::Deployment`]
-//! path is `None`), exportability and template placeholders, membership of
-//! the static-configuration fingerprint, and doctor checks.
+//! decides or checks them today: exportability and template placeholders,
+//! membership of the static-configuration fingerprint, and doctor checks.
 
 mod fields;
 #[cfg(test)]
@@ -84,6 +90,18 @@ impl Field {
     /// repository root.
     pub fn documentation(&self) -> String {
         format!("docs/configuration.md#{}", self.id)
+    }
+
+    /// The field's JSON Pointer in a `GatewayDeployment` document, if a
+    /// bundle can set it.
+    pub fn document_path(&self) -> Option<&'static str> {
+        match self.bundle {
+            BundleMapping::Deployment { path } => path,
+            BundleMapping::Bootstrap(_)
+            | BundleMapping::Resource
+            | BundleMapping::NotRepresentable
+            | BundleMapping::Unplaced => None,
+        }
     }
 }
 
@@ -333,8 +351,9 @@ impl StateBackends {
 /// decision the bundle front end implements.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BundleMapping {
-    /// A `GatewayDeployment` field. `path` is its JSON Pointer once the
-    /// deployment schema defines it; until then a bundle cannot set it.
+    /// A `GatewayDeployment` field. `path` is its JSON Pointer beneath
+    /// `/spec`, in snake_case sections; `None` for a field whose document
+    /// form `v1alpha1` does not define yet, which a bundle cannot set.
     Deployment { path: Option<&'static str> },
     /// One of ADR-0008's bootstrap inputs: it stays in the environment beside
     /// a bundle and may not be set inside one.
@@ -545,8 +564,8 @@ mod render {
         kind: &'static str,
         #[serde(skip_serializing_if = "Option::is_none")]
         category: Option<&'static str>,
-        /// Present, and `null` until the deployment schema defines it, for a
-        /// deployment field only.
+        /// Present for a deployment field only: its document path, or `null`
+        /// while `v1alpha1` defines no document form for it.
         #[serde(skip_serializing_if = "Option::is_none")]
         path: Option<Option<&'static str>>,
     }
