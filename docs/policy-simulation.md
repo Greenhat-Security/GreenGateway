@@ -67,9 +67,10 @@ exactly, every object refuses unknown members, and a member named like a
 credential (`token`, `authorization`, `cookie` and similar) is refused with
 `forbidden_field`. A case may state the request facts a rule condition
 reads in an optional `facts` member, exactly as a
-[policy test case](policy-tests.md#request-facts) does; a fact a condition
-reads that the case omits is `indeterminate`, and the simulator never reads
-the clock. The published schema is
+[policy test case](policy-tests.md#request-facts) does, a tool invocation's
+`arguments` included; a fact a condition reads that the case omits is
+`indeterminate`, the simulator never reads the clock, and no stated value,
+an argument least of all, appears in a result or trace. The published schema is
 [`docs/schemas/policy-simulation.v1.schema.json`](schemas/policy-simulation.v1.schema.json);
 the gateway's parser is authoritative and additionally checks path, host and
 origin syntax, identity bounds, unique case ids and byte lengths.

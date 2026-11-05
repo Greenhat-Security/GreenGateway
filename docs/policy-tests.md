@@ -103,7 +103,7 @@ and byte rather than character lengths.
 | `cases[].id` | Unique within the suite, at most 128 bytes, an ASCII letter or digit followed by letters, digits, `.`, `_`, `:` or `-`. Results, SARIF and JUnit identify a case by this id and its JSON Pointer. |
 | `cases[].kind` | `http`, `tool`, `tool_http`, `rate` or `egress`. Each kind accepts only its own members. |
 | `cases[].principal` | Every kind but `egress`: `"anonymous"`, or `subject` (required), `issuer`, `roles`, `auth_method` (required: `bearer_token`, `session_cookie`, `service_token` or `client_certificate`) and `organization`. The issuer is canonicalized as authentication canonicalizes it (a trailing `/` is dropped). `organization` (1 to 8192 bytes) is the organization the principal's identity provider verified, which a policy's identity mappings may test; omitted, the principal has none. As on the live lanes it is read only when an identity mapping or an `organization` condition reads it, and no result repeats it. |
-| `cases[].facts` | `http`, `tool` and `tool_http` only: optional request facts a rule condition reads, `source_ip`, `headers`, `query` and `now`; see [Request facts](#request-facts). |
+| `cases[].facts` | `http`, `tool` and `tool_http` only: optional request facts a rule condition reads, `source_ip`, `headers`, `query`, `now` and, for a tool invocation, `arguments`; see [Request facts](#request-facts). |
 | `cases[].expect` | What the case asserts; see below. |
 
 ### Case kinds
@@ -161,8 +161,8 @@ refused with `forbidden_field` rather than as an ordinary unknown member.
 ### Request facts
 
 A policy v1 rule may carry conditions over the source network, request
-headers, query parameters and a time window. A case states those facts in an
-optional `facts` member, typed and bounded:
+headers, query parameters, a time window and a tool call's arguments. A case
+states those facts in an optional `facts` member, typed and bounded:
 
 | Member | Meaning |
 | --- | --- |
@@ -170,10 +170,14 @@ optional `facts` member, typed and bounded:
 | `headers` | An object from a lowercase header name to the values of its occurrences, in order: `{"x-environment": ["prod", "canary"]}` is two field lines. Each value is a whole field line, compared exactly. |
 | `query` | An object from a decoded parameter name to its decoded values, in order; `""` is a parameter without a value. |
 | `now` | The evaluation instant, `YYYY-MM-DDTHH:MM:SSZ`. |
+| `arguments` | A tool invocation's arguments as they stand once the tool's input schema has accepted them: one JSON object, nested at most 8 levels deep, of at most 128 values with member names of at most 256 bytes and strings of at most 8192 bytes. Only the scalars at the pointers the tool's `tool_argument` conditions read are evaluated, as the live lane reduces a validated call's; the runner has no tool registry, so it neither re-validates them nor judges pointer eligibility, which publication checks. |
 
-`http` cases may state all four; `tool` and `tool_http` cases only
-`source_ip` and `now`, because a tool call carries no headers or query of its
-own (`fact_not_applicable`); `rate` and `egress` cases none, because rate
+`http` cases may state the first four; `tool` cases `source_ip`, `now` and,
+for the `invocation` operation only, `arguments` (a visibility or eligibility
+preview never has a call's arguments, on the live lane or here); `tool_http`
+cases only `source_ip` and `now`, because a tool call carries no headers or
+query of its own and a rendered request no arguments
+(`fact_not_applicable`); `rate` and `egress` cases none, because rate
 overrides carry no conditions and an outbound destination involves no caller. A fact a condition reads that the case does not state is
 unknown: the case is `indeterminate` with `missing_matcher_fact` and is
 reported `incomplete`, never passed, whatever it expected. An empty
@@ -183,9 +187,11 @@ certain no-match. The organization a condition reads is the principal's
 carry a credential, an identity or hop-by-hop routing -- the names a
 condition may not read, such as `authorization`, `cookie`, `x-forwarded-for`,
 `connection`, `x-api-key` or `access_token` -- is refused with
-`forbidden_field`, in any letter case; more than 128 occurrences is
-`too_many_facts`; a value is at most 8192 bytes without control characters.
-No stated value appears in a report or diagnostic.
+`forbidden_field`, in any letter case; more than 128 occurrences, or more
+than 128 argument values, is `too_many_facts`; a value is at most 8192 bytes
+without control characters; arguments that are not an object are
+`invalid_type` and arguments past their other bounds `invalid_value`. No
+stated value appears in a report or diagnostic.
 
 ### Expectations
 

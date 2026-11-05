@@ -440,7 +440,7 @@ fn every_tool_lane_answers_exactly_as_the_kernel_with_the_verified_organization(
             &principal,
             None,
         );
-        let admitted = state.evaluate_tool_authorization(
+        let admitted = state.evaluate_tool_authorization_without_arguments(
             "reports.export",
             Some(&principal),
             None,

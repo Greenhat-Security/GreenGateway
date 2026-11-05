@@ -24,7 +24,10 @@ use crate::{
     },
     connections::{caller_assertion::AttestedCaller, model::ConnectionId},
     middleware::rbac::{MatchedRuleDecision, RbacPolicyState, RbacState, ToolInvocationVerdict},
-    policy_eval::tools::{SourceRequestContext, SourceRequestDecision, TOOL_CONTEXT_VERSION},
+    policy_eval::{
+        tools::{SourceRequestContext, SourceRequestDecision, TOOL_CONTEXT_VERSION},
+        Fact,
+    },
     rbac::{policy, rule::principal_identity_matches, Policy, RuleAction},
     request_bounds::MAX_TOOL_NAME_BYTES,
     tools::lease::{self, ExecutionLease, ExecutionLeaseStore, LeaseAttempt},
@@ -691,7 +694,7 @@ impl ToolRuntime {
         Fut: Future<Output = T>,
     {
         let admitted = self
-            .prepare_invocation(tool_name, &context, &cancel)
+            .prepare_invocation(tool_name, &context, &cancel, no_arguments)
             .await?;
 
         self.emit(
@@ -820,6 +823,7 @@ impl ToolRuntime {
             work,
             failure_reason,
             |_| None,
+            None::<fn(&[String]) -> Result<Fact<Value>, E>>,
         )
         .await
     }
@@ -827,7 +831,21 @@ impl ToolRuntime {
     /// Every entry point that runs work except `execute_with_context` arrives
     /// here, the executor's included; both run the invocation inside
     /// [`ToolRuntime::with_request_policy_snapshot`].
-    pub(crate) async fn execute_result_with_context_and_outcome<F, Fut, T, E, R, O>(
+    ///
+    /// `arguments` is the call's argument stage, for a caller whose call
+    /// carries arguments: admission runs it only when the tool's tool-name
+    /// rules read an argument and nothing else has decided the call (see
+    /// [`RbacState::evaluate_tool_authorization`]), after the policy has
+    /// admitted the caller and before any queue permit, capacity or lease is
+    /// taken. Handed the pointers those rules read, it validates the
+    /// arguments against the tool's input schema and answers with the
+    /// argument fact, or with the work error a failed validation is, which
+    /// refuses the call as that failure would have -- classified by
+    /// `failure_reason` and audited as a rejection, since no work started.
+    /// `None` brings no arguments, so such a rule refuses the call as
+    /// undetermined.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn execute_result_with_context_and_outcome<F, Fut, T, E, R, O, A>(
         &self,
         tool_name: &str,
         context: ToolInvocationContext,
@@ -835,6 +853,7 @@ impl ToolRuntime {
         work: F,
         failure_reason: R,
         application_failure: O,
+        arguments: Option<A>,
     ) -> Result<T, ToolRuntimeError>
     where
         F: FnOnce(ToolInvocationContext) -> Fut,
@@ -842,6 +861,7 @@ impl ToolRuntime {
         E: fmt::Display,
         R: Fn(&E) -> ToolWorkErrorDisposition,
         O: Fn(&T) -> Option<&'static str>,
+        A: FnOnce(&[String]) -> Result<Fact<Value>, E>,
     {
         self.with_request_policy_snapshot(Box::pin(self.run_with_context_and_outcome(
             tool_name,
@@ -850,11 +870,13 @@ impl ToolRuntime {
             work,
             failure_reason,
             application_failure,
+            arguments,
         )))
         .await
     }
 
-    async fn run_with_context_and_outcome<F, Fut, T, E, R, O>(
+    #[allow(clippy::too_many_arguments)]
+    async fn run_with_context_and_outcome<F, Fut, T, E, R, O, A>(
         &self,
         tool_name: &str,
         mut context: ToolInvocationContext,
@@ -862,6 +884,7 @@ impl ToolRuntime {
         work: F,
         failure_reason: R,
         application_failure: O,
+        arguments: Option<A>,
     ) -> Result<T, ToolRuntimeError>
     where
         F: FnOnce(ToolInvocationContext) -> Fut,
@@ -869,9 +892,17 @@ impl ToolRuntime {
         E: fmt::Display,
         R: Fn(&E) -> ToolWorkErrorDisposition,
         O: Fn(&T) -> Option<&'static str>,
+        A: FnOnce(&[String]) -> Result<Fact<Value>, E>,
     {
-        let admitted = self
-            .prepare_invocation(tool_name, &context, &cancel)
+        let admitted =
+            self.prepare_invocation(tool_name, &context, &cancel, |pointers: &[String]| {
+                match arguments {
+                    Some(validate) => validate(pointers).map_err(|error| {
+                        self.refuse_arguments(&context, tool_name, &failure_reason, &error)
+                    }),
+                    None => Ok(Fact::Uncaptured),
+                }
+            })
             .await?;
         let admitted_deadline = time::Instant::now() + admitted.config.timeout;
         context.admitted_deadline = Some(admitted_deadline);
@@ -975,8 +1006,9 @@ impl ToolRuntime {
         tool_name: &str,
         context: &ToolInvocationContext,
         cancel: &CancellationToken,
+        arguments: impl FnOnce(&[String]) -> Result<Fact<Value>, ToolRuntimeError>,
     ) -> Result<AdmittedInvocation, ToolRuntimeError> {
-        let state = self.admit_invocation(tool_name, context)?;
+        let state = self.admit_invocation(tool_name, context, arguments)?;
 
         let queue_permit = match Arc::clone(&self.inner.queue).try_acquire_owned() {
             Ok(permit) => permit,
@@ -1041,21 +1073,77 @@ impl ToolRuntime {
     }
 
     /// The policy half of admission: authorize the call, audit the tool rule
-    /// that decided it, and refuse it if that rule denies. Capacity is
-    /// acquired afterwards, by the caller.
+    /// that decided it, and refuse it if that rule denies. A tool-name rule
+    /// that reads the call's arguments is decided only once `arguments` has
+    /// validated them; a refusal of its own has already been audited there.
+    /// Capacity is acquired afterwards, by the caller.
     fn admit_invocation(
         &self,
         tool_name: &str,
         context: &ToolInvocationContext,
+        arguments: impl FnOnce(&[String]) -> Result<Fact<Value>, ToolRuntimeError>,
     ) -> Result<ToolExecutionState, ToolRuntimeError> {
-        let authorization = match self.authorize_tool_call(tool_name, context) {
-            Ok(authorization) => authorization,
-            Err(error) => {
+        let authorization = match self.authorize_tool_call(tool_name, context, arguments) {
+            Ok(Ok(authorization)) => authorization,
+            Ok(Err(error)) => {
                 self.emit_rejected_error(context, tool_name, &error);
                 return Err(error);
             }
+            Err(argument_refusal) => return Err(argument_refusal),
         };
         self.enforce_tool_rule(tool_name, context, authorization)
+    }
+
+    /// Translate the argument stage's refusal of a call into the error and
+    /// audit record of a call refused before any work started. The error is
+    /// the one the same failure inside the work would have been, so a caller
+    /// is told about invalid arguments exactly as before; the record is a
+    /// rejection carrying the failure's fixed reason and bounded problem
+    /// metadata, never an argument value.
+    fn refuse_arguments<E: fmt::Display>(
+        &self,
+        context: &ToolInvocationContext,
+        tool_name: &str,
+        failure_reason: &impl Fn(&E) -> ToolWorkErrorDisposition,
+        error: &E,
+    ) -> ToolRuntimeError {
+        match failure_reason(error) {
+            ToolWorkErrorDisposition::Failure {
+                reason,
+                details,
+                audit_problems,
+            } => {
+                let mut payload = tool_audit_payload(
+                    tool_name,
+                    "rejected",
+                    Some(reason.unwrap_or("work_error")),
+                    context.source,
+                );
+                if !audit_problems.is_empty() {
+                    payload["problems"] = bounded_audit_problems(&audit_problems);
+                }
+                self.inner.audit.emit(AuditEvent::new(
+                    audit::event::TOOL_INVOKE_REJECTED,
+                    &context.request_id,
+                    &context.source_ip,
+                    context.actor.clone(),
+                    payload,
+                ));
+                ToolRuntimeError::WorkFailed {
+                    tool_name: tool_name.to_owned(),
+                    message: error.to_string(),
+                    reason: reason.map(str::to_owned),
+                    details,
+                }
+            }
+            ToolWorkErrorDisposition::Rejected(reason) => {
+                self.emit_rejected(context, tool_name, &reason);
+                ToolRuntimeError::Rejected {
+                    tool_name: tool_name.to_owned(),
+                    reason,
+                }
+            }
+        }
     }
 
     fn enforce_tool_rule(
@@ -1107,11 +1195,14 @@ impl ToolRuntime {
         Ok(state)
     }
 
+    /// The verdict the policy gives the call, or, as the outer error, the
+    /// argument stage's own refusal of it.
     fn authorize_tool_call(
         &self,
         tool_name: &str,
         context: &ToolInvocationContext,
-    ) -> Result<AuthorizedToolInvocation, ToolRuntimeError> {
+        arguments: impl FnOnce(&[String]) -> Result<Fact<Value>, ToolRuntimeError>,
+    ) -> Result<Result<AuthorizedToolInvocation, ToolRuntimeError>, ToolRuntimeError> {
         let principal = principal_from_tool_context(context);
         if let Some(rbac_state) = &self.inner.rbac_state {
             // The shared evaluator decides (#422 PR 2); this only translates its
@@ -1120,6 +1211,7 @@ impl ToolRuntime {
                 tool_name,
                 principal.as_ref(),
                 context.source_address,
+                arguments,
                 |authorization| {
                     self.prune_idle_limiters(authorization.tools.keys());
                     let (tool, rule_decision) = match authorization.verdict {
@@ -1164,7 +1256,16 @@ impl ToolRuntime {
         }
 
         // Without an RBAC state there is no policy: the runtime's own entries
-        // and default decide, and no rule exists to match the call.
+        // and default decide, and no rule exists to match the call or read its
+        // arguments.
+        Ok(self.authorize_without_policy(tool_name, context))
+    }
+
+    fn authorize_without_policy(
+        &self,
+        tool_name: &str,
+        context: &ToolInvocationContext,
+    ) -> Result<AuthorizedToolInvocation, ToolRuntimeError> {
         let state = self.lookup_tool(tool_name)?;
         if !state.config.enabled {
             return Err(ToolRuntimeError::Disabled {
@@ -1564,19 +1665,7 @@ impl ToolRuntime {
             payload["failure_reason"] = json!(reason);
         }
         if !problems.is_empty() {
-            payload["problems"] = Value::Array(
-                problems
-                    .iter()
-                    .take(16)
-                    .map(|problem| {
-                        json!({
-                            "path": bounded_audit_text(&problem.path, 64),
-                            "keyword": bounded_audit_text(&problem.keyword, 64),
-                            "message": bounded_audit_text(problem.message, 128),
-                        })
-                    })
-                    .collect(),
-            );
+            payload["problems"] = bounded_audit_problems(problems);
         }
         tracing::warn!(
             tool_name = %bounded_audit_text(tool_name, 128),
@@ -1860,6 +1949,30 @@ fn auth_method_from_audit_mode(auth_mode: &str) -> Option<AuthMethod> {
         crate::rbac::rule::AUTH_METHOD_SERVICE_TOKEN => Some(AuthMethod::ServiceToken),
         _ => None,
     }
+}
+
+/// The argument stage of a call that brings none to admission: a task call,
+/// refused whatever its arguments, or work run without any. A tool-name rule
+/// that reads an argument leaves such a call undetermined, and refused.
+fn no_arguments(_pointers: &[String]) -> Result<Fact<Value>, ToolRuntimeError> {
+    Ok(Fact::Uncaptured)
+}
+
+/// At most 16 validation problems, each field bounded, for an audit record.
+fn bounded_audit_problems(problems: &[ToolAuditValidationProblem]) -> Value {
+    Value::Array(
+        problems
+            .iter()
+            .take(16)
+            .map(|problem| {
+                json!({
+                    "path": bounded_audit_text(&problem.path, 64),
+                    "keyword": bounded_audit_text(&problem.keyword, 64),
+                    "message": bounded_audit_text(problem.message, 128),
+                })
+            })
+            .collect(),
+    )
 }
 
 fn tool_audit_payload(
@@ -3796,6 +3909,7 @@ mod tests {
                     audit_problems: Vec::new(),
                 },
                 |is_error| is_error.then_some("mcp_tool_error"),
+                None::<fn(&[String]) -> Result<Fact<Value>, String>>,
             )
             .await
             .unwrap();

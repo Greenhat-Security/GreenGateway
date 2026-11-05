@@ -31,18 +31,17 @@ use crate::{
         request::StoredCandidate,
     },
     policy_testing::suite::Diagnostics,
-    rbac::{matcher::path_pattern_matches, policy_document::parse_v1_with_typed_matchers, Policy},
+    rbac::{matcher::path_pattern_matches, policy_document::parse_v1, Policy},
 };
 
 fn policy(value: Value) -> Policy {
     Policy::validate_json_value(value).expect("test policy validates")
 }
 
-/// A policy v1 document with typed matchers, which this build validates but
-/// does not yet accept for enforcement: parsed as the typed-matcher tests
-/// parse one, so the analyzer's handling of them is pinned before they are.
+/// A policy v1 document with typed matchers, parsed as the typed-matcher
+/// tests parse one.
 fn typed_matcher_policy(value: Value) -> Policy {
-    parse_v1_with_typed_matchers(&value).unwrap_or_else(|issues| panic!("validates: {issues:?}"))
+    parse_v1(&value).unwrap_or_else(|issues| panic!("validates: {issues:?}"))
 }
 
 fn far_deadline() -> Instant {

@@ -33,12 +33,12 @@ use crate::{
     config::Config,
     path_match::{exempt_path_matches, is_unsafe_request_path},
     policy_eval::{
-        stages::NoStages,
+        stages::{NoStages, StageSink, ToolRules, ToolStage},
         tools::{
             ToolEvaluation, ToolEvaluationContext, ToolLimitation, ToolOperation, ToolReason,
             TOOL_CONTEXT_VERSION,
         },
-        EvaluationError, LogicalDecision, PolicyEffect, PrincipalFact, PrincipalIdentity,
+        EvaluationError, Fact, LogicalDecision, PolicyEffect, PrincipalFact, PrincipalIdentity,
         RuleReference,
     },
     rbac::{
@@ -1020,20 +1020,62 @@ impl RbacState {
     /// `source_address` is the canonical client address the call entered
     /// with, when its entry point had one; a `source_network` condition is
     /// undetermined, and refuses, without it.
-    pub(crate) fn evaluate_tool_authorization<R>(
+    ///
+    /// `arguments` is asked for the call's arguments only when the snapshot's
+    /// tool-name rules for `tool_name` read one (`FactNeeds::
+    /// tool_argument_pointers`) and those rules leave the call undetermined
+    /// without them: the entry exists, is enabled and admits the caller, so
+    /// the rules are the only stage left. It is handed the pointers the rules
+    /// read and answers with the argument fact
+    /// (`policy_facts::tool_argument_facts`) once the call's arguments have
+    /// passed the tool's input schema, or with its own refusal of the call,
+    /// which is returned as it is and decides nothing. The call is then
+    /// decided again, by the same snapshot, with that fact. A call any other
+    /// answer decides never has its arguments asked for -- a caller the
+    /// entry refuses is not told how its arguments fare -- and a policy whose
+    /// rules read no argument decides exactly as before.
+    pub(crate) fn evaluate_tool_authorization<R, E>(
+        &self,
+        tool_name: &str,
+        principal: Option<&auth::Principal>,
+        source_address: Option<std::net::IpAddr>,
+        arguments: impl FnOnce(&[String]) -> Result<Fact<Value>, E>,
+        evaluate: impl FnOnce(ToolInvocationAuthorization<'_>) -> R,
+    ) -> Result<R, E> {
+        let policy = self.effective_policy();
+        let verdict = policy.tool_invocation_verdict(
+            tool_name,
+            principal,
+            self.tool_call(source_address),
+            arguments,
+        )?;
+        Ok(evaluate(ToolInvocationAuthorization {
+            tools: policy.compiled.tool_entries(),
+            verdict,
+        }))
+    }
+
+    /// [`Self::evaluate_tool_authorization`] for a call that brings no
+    /// arguments, as a task call does: a rule that reads one leaves it
+    /// undetermined.
+    #[cfg(test)]
+    pub(crate) fn evaluate_tool_authorization_without_arguments<R>(
         &self,
         tool_name: &str,
         principal: Option<&auth::Principal>,
         source_address: Option<std::net::IpAddr>,
         evaluate: impl FnOnce(ToolInvocationAuthorization<'_>) -> R,
     ) -> R {
-        let policy = self.effective_policy();
-        let verdict =
-            policy.tool_invocation_verdict(tool_name, principal, self.tool_call(source_address));
-        evaluate(ToolInvocationAuthorization {
-            tools: policy.compiled.tool_entries(),
-            verdict,
-        })
+        match self.evaluate_tool_authorization(
+            tool_name,
+            principal,
+            source_address,
+            |_| Ok::<_, std::convert::Infallible>(Fact::Uncaptured),
+            evaluate,
+        ) {
+            Ok(result) => result,
+            Err(never) => match never {},
+        }
     }
 
     /// Whether a tool is listed to `principal`, decided by the shared evaluator.
@@ -1135,6 +1177,19 @@ fn principal_fact(principal: Option<&auth::Principal>) -> PrincipalFact {
     principal.map_or(PrincipalFact::Anonymous, |principal| {
         PrincipalFact::Authenticated(PrincipalIdentity::from_principal(principal))
     })
+}
+
+/// Notes whether the tool-name rules left an invocation undetermined: the
+/// one stage a call's arguments can still settle, since every stage before
+/// it -- the entry and the caller's identity -- has then admitted the call.
+struct RulesUndetermined(bool);
+
+impl StageSink<ToolStage> for RulesUndetermined {
+    fn record(&mut self, stage: ToolStage) {
+        if stage == ToolStage::Rules(ToolRules::Undetermined) {
+            self.0 = true;
+        }
+    }
 }
 
 /// Whether a tool answer is the evaluator's own allow with no rule behind it,
@@ -1294,8 +1349,31 @@ impl RbacPolicyState {
         facts: &crate::policy_eval::PolicyFacts,
         rendered: Option<(Method, String)>,
     ) -> Result<ToolEvaluation, ToolPolicyRefusal> {
+        self.answer_tool(
+            operation,
+            tool_name,
+            principal,
+            facts,
+            rendered,
+            &mut NoStages,
+        )
+        .map_err(|refusal| refused(operation, refusal))
+    }
+
+    /// [`Self::evaluate_tool_with_facts`] without the log, reporting each
+    /// stage the evaluator runs to `stages`: for an answer that may yet be
+    /// asked again with more facts, and is logged only if it stands.
+    fn answer_tool(
+        &self,
+        operation: ToolOperation,
+        tool_name: &str,
+        principal: PrincipalFact,
+        facts: &crate::policy_eval::PolicyFacts,
+        rendered: Option<(Method, String)>,
+        stages: &mut impl StageSink<ToolStage>,
+    ) -> Result<ToolEvaluation, ToolPolicyRefusal> {
         if tool_name.len() > MAX_TOOL_NAME_BYTES {
-            return Err(refused(operation, ToolPolicyRefusal::NameOutOfBounds));
+            return Err(ToolPolicyRefusal::NameOutOfBounds);
         }
         let (method, path) = rendered.unzip();
         let context = ToolEvaluationContext {
@@ -1309,7 +1387,7 @@ impl RbacPolicyState {
         };
         match self
             .compiled
-            .evaluate_tool_with_facts(&context, facts, &mut NoStages)
+            .evaluate_tool_with_facts(&context, facts, stages)
         {
             Ok(evaluation)
                 if evaluation.is_complete()
@@ -1317,11 +1395,8 @@ impl RbacPolicyState {
             {
                 Ok(evaluation)
             }
-            Ok(evaluation) => Err(refused(
-                operation,
-                ToolPolicyRefusal::Incomplete(evaluation.limitation()),
-            )),
-            Err(error) => Err(refused(operation, ToolPolicyRefusal::Error(error))),
+            Ok(evaluation) => Err(ToolPolicyRefusal::Incomplete(evaluation.limitation())),
+            Err(error) => Err(ToolPolicyRefusal::Error(error)),
         }
     }
 
@@ -1380,16 +1455,53 @@ impl RbacPolicyState {
             .map_err(|refusal| refused(ToolOperation::RenderedHttp, refusal))
     }
 
-    fn tool_invocation_verdict(
+    /// One invocation's verdict; see [`RbacState::evaluate_tool_authorization`]
+    /// for when `arguments` is asked.
+    fn tool_invocation_verdict<E>(
         &self,
         tool_name: &str,
         principal: Option<&auth::Principal>,
         call: ToolCallFacts<'_>,
-    ) -> ToolInvocationVerdict<'_> {
-        match self.evaluate_tool(ToolOperation::Invocation, tool_name, principal, call, None) {
+        arguments: impl FnOnce(&[String]) -> Result<Fact<Value>, E>,
+    ) -> Result<ToolInvocationVerdict<'_>, E> {
+        let pointers = self.compiled.fact_needs().tool_argument_pointers(tool_name);
+        let answer = if pointers.is_empty() {
+            self.evaluate_tool(ToolOperation::Invocation, tool_name, principal, call, None)
+        } else {
+            let mut facts = tool_call_facts(&self.compiled, principal, call);
+            let mut rules = RulesUndetermined(false);
+            let first = self.answer_tool(
+                ToolOperation::Invocation,
+                tool_name,
+                principal_fact(principal),
+                &facts,
+                None,
+                &mut rules,
+            );
+            let answer = if rules.0 {
+                match arguments(pointers)? {
+                    Fact::Captured(values) => {
+                        facts.tool_arguments = Fact::Captured(values);
+                        self.answer_tool(
+                            ToolOperation::Invocation,
+                            tool_name,
+                            principal_fact(principal),
+                            &facts,
+                            None,
+                            &mut NoStages,
+                        )
+                    }
+                    Fact::Uncaptured => first,
+                }
+            } else {
+                first
+            };
+            answer.map_err(|refusal| refused(ToolOperation::Invocation, refusal))
+        };
+        Ok(match answer {
             Ok(evaluation) => self.invocation_verdict(tool_name, &evaluation),
             Err(refusal) => ToolInvocationVerdict::Refused(refusal),
-        }
+        })
     }
 
     /// Translate one accepted invocation answer for the runtime, asking the

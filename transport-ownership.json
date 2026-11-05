@@ -11001,9 +11001,9 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::middleware::rbac::impl  RbacState::evaluate_tool_authorization#1",
-      "sha256": "0370b17a9b5d0ac912b875882aa1620bf06ff6dbf790dab3b3f9e98f193de30b",
+      "sha256": "07c52c5ac444d7dc3c71a2ed47ebc51154c4c44053a225f21bdbb8ba1c052d35",
       "owner": "GreenGateway maintainers",
-      "purpose": "Issue #243 tool lanes: tool admission now takes the canonical client address the call entered with (std::net::IpAddr, a value) as a policy fact for source_network conditions; a pure data parameter that adds no network, process or transport capability."
+      "purpose": "Issue #243 tool lanes: tool admission now takes the canonical client address the call entered with (std::net::IpAddr, a value) as a policy fact for source_network conditions; a pure data parameter that adds no network, process or transport capability. Reviewed for #243 (tool-argument conditions): the item also takes the argument stage of admission, a callback the tool runtime supplies that validates the call's arguments against the tool's input schema and returns the eligible argument scalars as a typed policy fact (Fact<serde_json::Value>) or the runtime's own refusal; a pure data callback that adds no network, process or transport capability."
     },
     {
       "file": "gateway/src/middleware/rbac.rs",
