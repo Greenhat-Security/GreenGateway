@@ -10,6 +10,7 @@
 
 use super::{
     diagnostic::{BundleDiagnostic, Code, Pointer, Position},
+    settings::{self, Settings},
     source::{FileName, MANIFEST_FILE_NAME},
     syntax::{Member, Node},
 };
@@ -117,10 +118,11 @@ impl Manifest {
 }
 
 /// A valid `GatewayDeployment` document.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Deployment {
     pub(crate) api_version: ApiVersion,
     pub(crate) profile: Profile,
+    pub(crate) settings: Settings,
 }
 
 /// Collects one document's diagnostics.
@@ -511,10 +513,10 @@ fn connections(checker: &mut Checker<'_>, node: &Node, pointer: &Pointer) -> boo
 
 /// Validates a `GatewayDeployment` document.
 ///
-/// In this alpha the specification carries only the profile. The deployment
-/// settings join it from the field catalog (issue #242, PR 3) before bundle
-/// mode can be selected; until then every other member is refused as
-/// unknown, so nothing is silently dropped.
+/// `spec` carries the profile and the deployment settings: every catalog
+/// field with a document path, in the closed sections those paths imply
+/// ([`settings`]). The reader checks each setting's shape and its own
+/// bounds; the compiler does not consume them yet.
 pub(crate) fn deployment(
     node: &Node,
     file: &FileName,
@@ -534,8 +536,11 @@ pub(crate) fn deployment(
         &["apiVersion", "kind", "spec"],
     )?;
     let spec_pointer = root.member("spec");
-    let profile = member(members, "spec")
-        .and_then(|node| checker.object(node, &spec_pointer, &["profile"], &["profile"]))
+    let mut allowed = vec!["profile"];
+    allowed.extend(settings::member_names("/spec"));
+    let spec = member(members, "spec")
+        .and_then(|node| checker.object(node, &spec_pointer, &allowed, &["profile"]));
+    let profile = spec
         .and_then(|spec| member(spec, "profile"))
         .and_then(|node| {
             let pointer = spec_pointer.member("profile");
@@ -549,12 +554,17 @@ pub(crate) fn deployment(
             }
             profile
         });
+    let mut read = Settings::default();
+    if let Some(spec) = spec {
+        settings::read_members(&mut checker, spec, "/spec", &spec_pointer, &mut read);
+    }
     if checker.failed {
         return None;
     }
     Some(Deployment {
         api_version,
         profile: profile?,
+        settings: read,
     })
 }
 

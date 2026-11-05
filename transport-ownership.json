@@ -8225,16 +8225,6 @@
       "purpose": "Reviewed for #242 PR 4: the configuration bundle reader's contained, read-only filesystem access (canonicalized root opened as a cap-std directory, no-follow opens, link count, reparse attribute and Unix mode read from the opened handle). It adds no network or process capability; constructor bodies require separate scope review."
     },
     {
-      "file": "gateway-config/src/bundle/value.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway_config::bundle::value::file_attributes#1",
-      "sha256": "f35344af05310ce62d71cb4418df23165a4f4b7fe61773cdaa9b146fec815541",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the bundle reader's secret-reference, placeholder and decimal value forms, which the field catalog (#242 PR 3) will call; pure parsing of an in-memory tree with no I/O and no transport or process capability."
-    },
-    {
       "file": "gateway-config/src/inbound_tls.rs",
       "reasons": [
         "unexpanded-attribute"
