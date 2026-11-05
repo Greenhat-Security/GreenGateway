@@ -107,6 +107,7 @@ pub enum OpenApiConversionWarningCode {
     ConsumesDefaulted,
     ProducesDefaulted,
     RequestBodyNotMapped,
+    CredentialParameterNotMapped,
     UnsupportedOperationField,
     InvalidParameter,
     UnsupportedParameterLocation,
@@ -137,6 +138,7 @@ impl OpenApiConversionWarningCode {
             Self::ConsumesDefaulted => "consumes_defaulted",
             Self::ProducesDefaulted => "produces_defaulted",
             Self::RequestBodyNotMapped => "request_body_not_mapped",
+            Self::CredentialParameterNotMapped => "credential_parameter_not_mapped",
             Self::UnsupportedOperationField => "unsupported_operation_field",
             Self::InvalidParameter => "invalid_parameter",
             Self::UnsupportedParameterLocation => "unsupported_parameter_location",
@@ -181,6 +183,9 @@ impl OpenApiConversionWarningCode {
             }
             Self::RequestBodyNotMapped => {
                 "the request body has no JSON media type, so its fields are not tool arguments and the tool sends no body"
+            }
+            Self::CredentialParameterNotMapped => {
+                "this parameter carries the credential the operation's security names, which the Connection supplies; it is not a tool argument and generated tools never send it"
             }
             Self::UnsupportedOperationField => {
                 "the operation uses a field that is not part of the document's format; it was left out"

@@ -16,6 +16,9 @@
 //!   a form) is left out of the converted document, and a warning names it.
 //!   Nothing is generated for it, so no tool can send a request the document
 //!   did not describe.
+//! - A `query` or `formData` parameter that carries the credential the
+//!   operation's security names is left out of that operation, with a
+//!   warning: the Connection supplies the credential, so no caller does.
 //! - Lossless or documentation-only differences are converted silently;
 //!   assumptions an operator should know about (`basePath`, defaulted media
 //!   types, security definitions that cannot be converted, request bodies the
@@ -114,6 +117,13 @@ const PARAMETER_FIELDS: [&str; 6] = [
     "collectionFormat",
 ];
 const BODY_PARAMETER_FIELDS: [&str; 5] = ["name", "in", "description", "required", "schema"];
+/// Parameter names that carry an OAuth 2.0 access token: RFC 6750's
+/// `access_token`, and the `token` that APIs such as Slack's use for it.
+const OAUTH2_TOKEN_PARAMETERS: [&str; 2] = ["access_token", "token"];
+/// The JSON Schema type names; OpenAPI 3.0 spells `null` as `nullable`.
+const JSON_SCHEMA_TYPES: [&str; 7] = [
+    "array", "boolean", "integer", "null", "number", "object", "string",
+];
 
 /// A Swagger 2.0 document rewritten as OpenAPI 3.0, with what the operator
 /// should review about the rewrite.
@@ -372,9 +382,66 @@ struct PathParameters<'d> {
 /// What an operation contributes to document-level notes once it converts.
 #[derive(Default)]
 struct OperationNotes {
+    /// Credential parameters left out, as (location, name), in the order
+    /// they were declared.
+    credential_parameters: Vec<(&'static str, String)>,
     request_body_not_mapped: bool,
     consumes_defaulted: bool,
     produces_defaulted: bool,
+}
+
+impl OperationNotes {
+    fn credential_parameter(&mut self, location: &'static str, name: &str) {
+        // A path-level parameter and the operation parameter overriding it
+        // are one parameter, so it is reported once.
+        if !self
+            .credential_parameters
+            .iter()
+            .any(|(noted_location, noted_name)| *noted_location == location && noted_name == name)
+        {
+            self.credential_parameters.push((location, name.to_owned()));
+        }
+    }
+}
+
+/// The parameters that carry the credential an operation's effective
+/// security names. The Connection supplies that credential, so such a
+/// parameter is never a tool argument: a caller could otherwise send a
+/// credential of its own choosing beside, or instead of, the Connection's.
+#[derive(Default)]
+struct CredentialParameters<'d> {
+    /// One of the named schemes is `oauth2`.
+    oauth2: bool,
+    /// The `name` and `in` of every named `apiKey` scheme.
+    api_keys: Vec<(&'d str, &'d str)>,
+}
+
+impl CredentialParameters<'_> {
+    /// Whether a parameter, by its name and its canonical location, carries
+    /// the credential. Names are trimmed, as the generator trims them, and
+    /// compared case-insensitively. Path and header parameters never match:
+    /// generated tools never send a header parameter, and a path parameter
+    /// is part of the operation's address.
+    fn matches(&self, name: &str, location: &str) -> bool {
+        if location != "query" && location != "formData" {
+            return false;
+        }
+        let name = name.trim();
+        (self.oauth2
+            && OAUTH2_TOKEN_PARAMETERS
+                .iter()
+                .any(|token| name.eq_ignore_ascii_case(token)))
+            || self.api_keys.iter().any(|(key_name, key_location)| {
+                key_location.eq_ignore_ascii_case(location)
+                    && key_name.trim().eq_ignore_ascii_case(name)
+            })
+    }
+
+    /// [`Self::matches`] for a parameter already converted to OpenAPI 3.0.
+    fn matches_converted(&self, parameter: &Value) -> bool {
+        converted_parameter_key(parameter)
+            .is_some_and(|(name, location)| self.matches(name, location))
+    }
 }
 
 struct Converter<'d> {
@@ -593,20 +660,38 @@ impl<'d> Converter<'d> {
             Err(Failure::Document(error)) => return Err(error),
             Err(Failure::Operation { code, subject }) => Err((code, subject)),
         };
+        let operations = METHODS
+            .into_iter()
+            .filter_map(|method| {
+                path_item
+                    .get(method)
+                    .map(|operation| (method, operation, self.credential_parameters(operation)))
+            })
+            .collect::<Vec<_>>();
 
         let mut converted = Map::new();
+        // A path-level parameter applies to every operation of the path, so
+        // one that carries a credential for any of them moves into each
+        // operation that keeps it instead.
+        let mut moved = Vec::new();
         if let Ok(parameters) = &path_parameters {
-            if !parameters.converted.is_empty() {
-                converted.insert(
-                    "parameters".to_owned(),
-                    Value::Array(parameters.converted.clone()),
-                );
+            let mut shared = Vec::new();
+            for parameter in &parameters.converted {
+                if operations
+                    .iter()
+                    .any(|(_, _, credentials)| credentials.matches_converted(parameter))
+                {
+                    moved.push(parameter);
+                } else {
+                    shared.push(parameter.clone());
+                }
+            }
+            if !shared.is_empty() {
+                converted.insert("parameters".to_owned(), Value::Array(shared));
             }
         }
-        for method in METHODS {
-            let Some(operation) = path_item.get(method) else {
-                continue;
-            };
+        for (method, operation, credentials) in &operations {
+            let method = *method;
             let parameters = match &path_parameters {
                 Ok(parameters) => parameters,
                 Err((code, subject)) => {
@@ -615,7 +700,7 @@ impl<'d> Converter<'d> {
                     continue;
                 }
             };
-            match self.convert_operation(operation, &parameters.bodies) {
+            match self.convert_operation(operation, credentials, &moved, &parameters.bodies) {
                 Ok((operation, notes)) => {
                     self.record_notes(method, path_template, &notes);
                     converted.insert(method.to_owned(), operation);
@@ -631,6 +716,14 @@ impl<'d> Converter<'d> {
     }
 
     fn record_notes(&mut self, method: &str, path_template: &str, notes: &OperationNotes) {
+        for (_, name) in &notes.credential_parameters {
+            self.warnings.operation(
+                OpenApiConversionWarningCode::CredentialParameterNotMapped,
+                method,
+                path_template,
+                Some(name),
+            );
+        }
         if notes.request_body_not_mapped {
             self.warnings.operation(
                 OpenApiConversionWarningCode::RequestBodyNotMapped,
@@ -666,9 +759,53 @@ impl<'d> Converter<'d> {
         Ok(collected)
     }
 
+    /// The credential parameters of an operation: those its effective
+    /// security (its own `security`, else the document's) names. An empty
+    /// list, or requirements that name no scheme, leave every parameter in.
+    fn credential_parameters(&self, operation: &'d Value) -> CredentialParameters<'d> {
+        let root: &'d Map<String, Value> = self.root;
+        let mut credentials = CredentialParameters::default();
+        let security = operation
+            .as_object()
+            .and_then(|operation| operation.get("security"))
+            .or_else(|| root.get("security"));
+        let Some(requirements) = security.and_then(Value::as_array) else {
+            return credentials;
+        };
+        let definitions = root.get("securityDefinitions").and_then(Value::as_object);
+        for scheme_name in requirements
+            .iter()
+            .filter_map(Value::as_object)
+            .flat_map(Map::keys)
+        {
+            let Some(definition) = definitions
+                .and_then(|definitions| definitions.get(scheme_name))
+                .and_then(Value::as_object)
+            else {
+                continue;
+            };
+            let Some(scheme_type) = definition.get("type").and_then(Value::as_str) else {
+                continue;
+            };
+            if scheme_type.eq_ignore_ascii_case("oauth2") {
+                credentials.oauth2 = true;
+            } else if scheme_type.eq_ignore_ascii_case("apiKey") {
+                if let (Some(name), Some(location)) = (
+                    definition.get("name").and_then(Value::as_str),
+                    definition.get("in").and_then(Value::as_str),
+                ) {
+                    credentials.api_keys.push((name, location));
+                }
+            }
+        }
+        credentials
+    }
+
     fn convert_operation(
         &mut self,
         operation: &'d Value,
+        credentials: &CredentialParameters<'_>,
+        path_moved: &[&Value],
         path_bodies: &[BodyParameter<'d>],
     ) -> Result<(Value, OperationNotes), Failure> {
         let Some(operation) = operation.as_object() else {
@@ -699,11 +836,11 @@ impl<'d> Converter<'d> {
             }
         }
 
-        let mut parameters = Vec::new();
+        let mut declared = Vec::new();
         let mut bodies = path_bodies.to_vec();
         for parameter in parameter_list(operation.get("parameters"))? {
             match self.collect_parameter(parameter)? {
-                Collected::Converted(parameter) => parameters.push(parameter),
+                Collected::Converted(parameter) => declared.push(parameter),
                 Collected::Body(body) => {
                     // An operation parameter overrides the path item's
                     // parameter with the same name and location.
@@ -714,10 +851,43 @@ impl<'d> Converter<'d> {
                 }
             }
         }
+        // Path-level parameters moved off the path item come first, unless
+        // an operation parameter with the same name and location overrides
+        // them. Credential parameters are left out of both.
+        let mut parameters = Vec::with_capacity(path_moved.len() + declared.len());
+        for parameter in path_moved {
+            let key = converted_parameter_key(parameter);
+            if key.is_some()
+                && declared
+                    .iter()
+                    .any(|declared| converted_parameter_key(declared) == key)
+            {
+                continue;
+            }
+            if let Some((name, location)) =
+                key.filter(|(name, location)| credentials.matches(name, location))
+            {
+                notes.credential_parameter(location, name);
+                continue;
+            }
+            self.charge(parameter, 1)?;
+            parameters.push((*parameter).clone());
+        }
+        for parameter in declared {
+            if let Some((name, location)) = converted_parameter_key(&parameter)
+                .filter(|(name, location)| credentials.matches(name, location))
+            {
+                notes.credential_parameter(location, name);
+                continue;
+            }
+            parameters.push(parameter);
+        }
         if !parameters.is_empty() {
             converted.insert("parameters".to_owned(), Value::Array(parameters));
         }
-        if let Some(request_body) = self.request_body(operation, &bodies, &mut notes)? {
+        if let Some(request_body) =
+            self.request_body(operation, &bodies, credentials, &mut notes)?
+        {
             converted.insert("requestBody".to_owned(), request_body);
         }
         if let Some(responses) = operation.get("responses") {
@@ -871,8 +1041,11 @@ impl<'d> Converter<'d> {
         &mut self,
         operation: &'d Map<String, Value>,
         bodies: &[BodyParameter<'d>],
+        credentials: &CredentialParameters<'_>,
         notes: &mut OperationNotes,
     ) -> Result<Option<Value>, Failure> {
+        // Counted before credential fields are left out, so an operation
+        // that mixes a body with form fields is omitted whatever they are.
         let body_count = bodies
             .iter()
             .filter(|body| body.location == BodyLocation::Body)
@@ -881,7 +1054,22 @@ impl<'d> Converter<'d> {
         let request_body = match (body_count, form_count) {
             (0, 0) => return Ok(None),
             (1, 0) => self.body_request_body(operation, &bodies[0], notes)?,
-            (0, _) => self.form_request_body(operation, bodies)?,
+            (0, _) => {
+                let mut fields = Vec::with_capacity(bodies.len());
+                for body in bodies {
+                    if credentials.matches(body.name, "formData") {
+                        notes.credential_parameter("formData", body.name);
+                    } else {
+                        fields.push(*body);
+                    }
+                }
+                // A form whose every field carries the credential has no
+                // field left to send, so the operation has no request body.
+                if fields.is_empty() {
+                    return Ok(None);
+                }
+                self.form_request_body(operation, &fields)?
+            }
             (_, 0) => {
                 return Err(omit(
                     OpenApiConversionWarningCode::MultipleBodyParameters,
@@ -1162,8 +1350,14 @@ impl<'d> Converter<'d> {
         };
         let mut converted = Map::new();
         let mut file_type = false;
+        // A JSON Schema type list has no OpenAPI 3.0 `type`. Its keywords are
+        // written after every other keyword, so they win over `x-nullable`.
+        let type_keywords = object
+            .get("type")
+            .and_then(|value| type_list_keywords(value, object));
         for (keyword, value) in object {
             let value = match keyword.as_str() {
+                "type" if type_keywords.is_some() => continue,
                 "$ref" => match value.as_str() {
                     Some(reference) => Value::String(schema_reference(reference)?),
                     None => self.rewrite_references(value, depth + 1)?,
@@ -1207,6 +1401,9 @@ impl<'d> Converter<'d> {
             converted
                 .entry("format".to_owned())
                 .or_insert_with(|| Value::String("binary".to_owned()));
+        }
+        if let Some(type_keywords) = type_keywords {
+            converted.extend(type_keywords);
         }
         Ok(Value::Object(converted))
     }
@@ -1299,6 +1496,17 @@ fn parameter_list(parameters: Option<&Value>) -> Result<&[Value], Failure> {
     }
 }
 
+/// The name and location of a parameter this module converted to OpenAPI
+/// 3.0, which always carries both, with its location in canonical form.
+fn converted_parameter_key(parameter: &Value) -> Option<(&str, &'static str)> {
+    let name = parameter.get("name")?.as_str()?;
+    let location = parameter.get("in")?.as_str()?;
+    let location = ["query", "header", "path"]
+        .into_iter()
+        .find(|known| *known == location)?;
+    Some((name, location))
+}
+
 /// `Value::pointer` over the root object without cloning it.
 fn pointer_into<'d>(root: &'d Map<String, Value>, pointer: &str) -> Option<&'d Value> {
     let mut tokens = pointer.strip_prefix('/')?.split('/');
@@ -1331,6 +1539,59 @@ fn check_parameter_fields(
         )),
         None => Ok(()),
     }
+}
+
+/// The OpenAPI 3.0 keywords for a JSON Schema `type` that is a list or
+/// `null`, neither of which an OpenAPI 3.0 `type` can be:
+///
+/// - `[T, "null"]`, in either order, is `type: T, nullable: true`, and a
+///   list of one type `[T]` is `type: T`;
+/// - `"null"` or `["null"]` is `nullable: true, enum: [null]`;
+/// - two or more other types are an `anyOf` of one `type` each, plus
+///   `nullable: true` when `null` is listed.
+///
+/// Repeated names count once. `None` copies the value unchanged: a `type`
+/// string other than `null`, an empty list, a list with an entry that is
+/// not a string or not a JSON Schema type name, and a list whose keywords
+/// the schema already uses (`enum` beside a `null` type, `anyOf` beside
+/// several types), because merging them would change what it accepts.
+fn type_list_keywords(value: &Value, schema: &Map<String, Value>) -> Option<Map<String, Value>> {
+    let names = match value {
+        Value::String(name) if name == "null" => vec![name.as_str()],
+        Value::Array(entries) => entries
+            .iter()
+            .map(Value::as_str)
+            .collect::<Option<Vec<_>>>()?,
+        _ => return None,
+    };
+    if names.is_empty() || names.iter().any(|name| !JSON_SCHEMA_TYPES.contains(name)) {
+        return None;
+    }
+    let mut types = Vec::with_capacity(names.len());
+    for name in &names {
+        if *name != "null" && !types.contains(name) {
+            types.push(*name);
+        }
+    }
+    let mut keywords = Map::new();
+    match types.as_slice() {
+        [] if schema.contains_key("enum") => return None,
+        [] => {
+            keywords.insert("enum".to_owned(), json!([null]));
+        }
+        [single] => {
+            keywords.insert("type".to_owned(), Value::String((*single).to_owned()));
+        }
+        _ if schema.contains_key("anyOf") => return None,
+        several => {
+            let alternatives = several.iter().map(|name| json!({ "type": name })).collect();
+            keywords.insert("anyOf".to_owned(), Value::Array(alternatives));
+        }
+    }
+    if names.contains(&"null") {
+        keywords.insert("nullable".to_owned(), Value::Bool(true));
+    }
+    Some(keywords)
 }
 
 fn is_file_type(object: &Map<String, Value>) -> bool {

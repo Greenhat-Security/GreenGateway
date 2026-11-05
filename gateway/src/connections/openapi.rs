@@ -3216,7 +3216,9 @@ mod tests {
         connections::model::ConnectionWrite,
         egress::{EgressClient, EgressConfig},
         rbac::policy::Policy,
-        tools::definitions::{HttpToolMapping, ToolSource, ToolTarget, ToolVisibility},
+        tools::definitions::{
+            HttpToolMapping, QueryParamMapping, ToolSource, ToolTarget, ToolVisibility,
+        },
     };
 
     struct TemporaryDatabase(PathBuf);
@@ -4822,6 +4824,202 @@ paths:
                 .expect("the overlaid tool should replay after restart")
                 .description,
             "Read one billing invoice"
+        );
+    }
+
+    /// An earlier release made a query parameter that carries the
+    /// operation's credential a tool argument of a Swagger 2.0 catalog
+    /// (issue #443). After an upgrade such a stored catalog serves as it was
+    /// stored until a refresh, which regenerates the tool without the
+    /// argument under the same name: the refresh reports it changed once,
+    /// and the next refresh reports nothing.
+    #[tokio::test]
+    async fn swagger2_catalog_stored_with_a_credential_argument_refreshes_without_it() {
+        let database = TemporaryDatabase::new();
+        let mut config = Config::test_defaults();
+        config.connections_sqlite_path = Some(database.0.display().to_string());
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let snapshot = control_plane.runtime_snapshot();
+        let candidate: ConnectionWrite = serde_json::from_value(json!({
+            "display_name": "Managed Swagger Credentials",
+            "enabled": true,
+            "kind": "http_api",
+            "endpoint": { "base_url": "https://billing.example.test", "base_path": "/v1" },
+            "authentication": {"type": "none"},
+            "tls": {},
+            "timeouts": {
+                "connect_timeout_ms": 1000,
+                "request_timeout_ms": 3000,
+                "response_idle_timeout_ms": 1000
+            },
+            "discovery": {
+                "type": "managed_openapi",
+                "use_connection_authentication": false
+            }
+        }))
+        .expect("managed OpenAPI Connection should deserialize");
+        let record = control_plane
+            .create_managed(
+                snapshot.collection_etag(),
+                candidate,
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
+            .await
+            .expect("managed OpenAPI Connection should create");
+        let egress_config = EgressConfig::from_config(&config);
+        let egress_client =
+            Arc::new(EgressClient::new(egress_config.clone()).expect("egress should build"));
+        let http = ConnectionHttpRuntime::new(control_plane.clone(), egress_config, egress_client);
+        let service = OpenApiConnectionCatalogService::load(
+            control_plane.clone(),
+            http.clone(),
+            ToolRegistry::disabled(),
+        )
+        .expect("managed OpenAPI service should load");
+        // The anonymous alternative binds the Connection's `none`
+        // authentication; the query key is still named, so `api_key` is the
+        // operation's credential parameter.
+        let spec = r#"
+swagger: "2.0"
+info: { title: Billing, version: 1.0.0 }
+securityDefinitions:
+  QueryKey: { type: apiKey, in: query, name: api_key }
+paths:
+  /invoices:
+    get:
+      operationId: list_invoices
+      security: [ {}, { QueryKey: [] } ]
+      parameters:
+        - { name: api_key, in: query, type: string }
+        - { name: status, in: query, type: string }
+      responses:
+        "200": { description: Invoices }
+"#;
+        let preview = service
+            .preview(record.id.as_str(), spec)
+            .await
+            .expect("a Swagger 2.0 document should preview");
+        service
+            .register(
+                record.id.as_str(),
+                record.etag().as_str(),
+                preview.spec_revision,
+                preview.catalog_revision,
+                &preview.spec_digest,
+                spec,
+                &["list_invoices".to_owned()],
+                &preview.registration_security_selections,
+                "test-admin",
+            )
+            .await
+            .expect("the converted tool should publish");
+
+        // Rewrite the stored catalog as the earlier release stored it.
+        let store = control_plane
+            .managed_store()
+            .expect("managed store should exist");
+        let stored = store
+            .openapi_catalog(&record.id)
+            .await
+            .expect("catalog should read")
+            .expect("catalog should exist");
+        let earlier_entries = stored
+            .entries
+            .iter()
+            .map(|entry| {
+                let mut definition: ToolDefinition =
+                    serde_json::from_value(entry.definition.clone())
+                        .expect("stored definition should decode");
+                definition.input_schema["properties"]["api_key"] = json!({ "type": "string" });
+                definition.upstream.query_params.insert(
+                    0,
+                    QueryParamMapping {
+                        arg_name: "api_key".to_owned(),
+                        query_name: "api_key".to_owned(),
+                        required: false,
+                    },
+                );
+                if let Some(ToolTarget::Http { mapping, .. }) = &mut definition.target {
+                    *mapping = definition.upstream.clone();
+                }
+                if let ToolSource::OpenApi {
+                    catalog_revision, ..
+                } = &mut definition.source
+                {
+                    *catalog_revision = Some(stored.catalog_revision + 1);
+                }
+                StoredOpenApiCatalogEntry {
+                    definition: serde_json::to_value(definition).expect("definition should encode"),
+                    ..entry.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        store
+            .replace_openapi_catalog(
+                &record.id,
+                &record.etag(),
+                stored.spec_revision,
+                stored.catalog_revision,
+                &stored.spec,
+                &stored.spec_digest,
+                &earlier_entries,
+                "test-admin",
+            )
+            .await
+            .expect("the earlier catalog should store");
+
+        let upgraded_registry = ToolRegistry::disabled();
+        let upgraded = OpenApiConnectionCatalogService::load(
+            control_plane.clone(),
+            http,
+            upgraded_registry.clone(),
+        )
+        .expect("an upgraded replica should load the earlier catalog");
+        assert!(
+            upgraded_registry
+                .get("list_invoices")
+                .expect("the earlier tool should serve as stored")
+                .input_schema["properties"]
+                .get("api_key")
+                .is_some(),
+            "loading never regenerates a stored catalog"
+        );
+
+        let refreshed = upgraded
+            .refresh(record.id.as_str(), record.etag().as_str(), "test-admin")
+            .await
+            .expect("refresh should regenerate the stored document");
+        assert_eq!(
+            (
+                refreshed.added_count,
+                refreshed.changed_count,
+                refreshed.removed_count
+            ),
+            (0, 1, 0)
+        );
+        assert_eq!(refreshed.registered_tool_names, vec!["list_invoices"]);
+        let served = upgraded_registry
+            .get("list_invoices")
+            .expect("the refreshed tool should be served");
+        assert!(served.input_schema["properties"].get("api_key").is_none());
+        assert_eq!(
+            served
+                .upstream
+                .query_params
+                .iter()
+                .map(|mapping| mapping.query_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["status"]
+        );
+
+        let again = upgraded
+            .refresh(record.id.as_str(), record.etag().as_str(), "test-admin")
+            .await
+            .expect("a second refresh should succeed");
+        assert_eq!(
+            (again.added_count, again.changed_count, again.removed_count),
+            (0, 0, 0)
         );
     }
 
