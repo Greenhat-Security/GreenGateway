@@ -610,7 +610,7 @@ fn the_tool_lanes_decide_conditions_from_the_call_context() {
             path: None,
         };
         let expected = compiled
-            .evaluate_tool_with_facts(&context, &facts)
+            .evaluate_tool_with_facts(&context, &facts, &mut NoStages)
             .expect("the kernel answers");
         let live = match operation {
             ToolOperation::Visibility => {
