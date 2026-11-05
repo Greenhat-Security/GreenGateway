@@ -72,10 +72,9 @@ pub(crate) fn process_environment(name: &str) -> Result<String, VarError> {
     env::var(name)
 }
 
-pub use authority_events::{AuthorityEventSettings, AuthorityEvidenceDurability};
-// Named only by the cluster wiring and by tests.
-#[cfg(any(feature = "postgres", test))]
-pub use authority_events::AuthorityEventSinkSetting;
+pub use authority_events::{
+    AuthorityEventSettings, AuthorityEventSinkSetting, AuthorityEvidenceDurability,
+};
 
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:8080";
 static DEFAULT_LISTEN_SOCKET_ADDR: LazyLock<SocketAddr> = LazyLock::new(|| {

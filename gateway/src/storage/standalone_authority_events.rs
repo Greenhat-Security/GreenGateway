@@ -78,7 +78,9 @@ CREATE TABLE IF NOT EXISTS authority_event_cursors (
 );
 "#;
 
-/// One standalone evidence table: a source of delivered events.
+/// One standalone evidence table: a source of delivered events. Each
+/// variant is named for its table, as the journal's sources are.
+#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum StandaloneEvidenceSource {
     /// The token database's issue, rotate and revoke evidence.
