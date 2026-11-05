@@ -4114,6 +4114,7 @@
           "signal-hook-registry",
           "socket2",
           "sync",
+          "test-util",
           "time",
           "tokio-macros",
           "windows-sys"
@@ -5468,6 +5469,26 @@
             "features": [
               "full",
               "visit"
+            ],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "tokio",
+            "rename": null,
+            "kind": "dev",
+            "target": null,
+            "req": "^1.52.3",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [
+              "io-util",
+              "macros",
+              "net",
+              "rt-multi-thread",
+              "signal",
+              "sync",
+              "time",
+              "test-util"
             ],
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
