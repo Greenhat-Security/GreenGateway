@@ -65,11 +65,13 @@ package writes nothing: it is not stored, does not activate or change any
 policy, does not touch or extend a draft, and leaves one
 `policy.evidence_exported` audit event.
 
-Packages are **unsigned**. Signing them with protected keys and verifying them
-offline is a later slice, which needs protected signer references (#240) and
-offline verification in `ggctl` (#242). Until then a package is
+Packages are **unsigned**. Signing them with protected keys and verifying a
+signature against an out-of-band trust root is a later slice (#243 slice 21),
+which needs protected signer references (#240). Until then a package is
 integrity-checkable (its manifest binds every artifact by digest) but says
-nothing about who produced it.
+nothing about who produced it. `ggctl evidence verify` checks that integrity
+offline ([below](#verifying-a-package)) and reports a package that passes as
+`integrity_valid` and `unsigned`, never as trusted.
 
 ## Requesting a package
 
@@ -469,8 +471,14 @@ evidence-complete gate. `limitations` lists, sorted:
 
 ### Verifying a package
 
-A reader can check the manifest without trusting the transport that delivered
-the package:
+`ggctl evidence verify policy-evidence.json` checks a package offline, with the
+gateway's own digest code: the file must be exactly its RFC 8785 bytes, its
+envelope must hold only what its manifest lists, and each artifact must have
+its defined media type and schema version and the stated size and digest. See
+[docs/ggctl.md](ggctl.md#evidence-verify) for its exit codes and report.
+
+A reader without `ggctl` can check the manifest without trusting the transport
+that delivered the package:
 
 ```python
 import hashlib, json, struct
@@ -597,7 +605,8 @@ bound only in standalone mode, where replay jobs exist.
 Not part of this work, and not to be inferred from it:
 
 - Signing (DSSE envelopes, in-toto statements, protected signer references,
-  key rotation) and offline verification with `ggctl` (#240, #242).
+  key rotation) and verifying a signature against a trust root (slice 21,
+  #240, #242). `ggctl evidence verify` checks integrity only.
 - Packages about an inline or edited candidate rather than a publication or a
   stored draft, stored or downloadable-later artifacts, and an Evidence tab in
   the admin UI.

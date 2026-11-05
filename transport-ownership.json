@@ -15897,9 +15897,9 @@
         "capability-import-or-glob"
       ],
       "scope": "ggctl::credential::permissions_are_safe#1",
-      "sha256": "cf13be7114107383518f7daa780dffd53a5a9ba9ada3bc822696e54b4796ec47",
+      "sha256": "5edec6137620cfeaf7ffd3c7d7087fcacfc136a0b46dc37d8d4f21f0d986083d",
       "owner": "GreenGateway maintainers: operator CLI (#242)",
-      "purpose": "Reviewed for #242 (operator file safety): reads the Unix mode bits of --token-file, --ca-file, --answers and the bundle.yaml ggctl pin compares through PermissionsExt to refuse a credential group or other can access, or another file they can write. Read-only metadata; no network or process capability."
+      "purpose": "Reviewed for #242 (operator file safety) and #243 (ggctl policy and evidence documents): reads the Unix mode bits of --token-file, --ca-file, --answers and the bundle.yaml ggctl pin compares through PermissionsExt to refuse a credential group or other can access, or another file they can write; a policy or evidence document, which grants nothing, is accepted in any mode. Read-only metadata; no network or process capability."
     },
     {
       "file": "ggctl/src/credential.rs",
@@ -16087,10 +16087,10 @@
       "reasons": [
         "network-or-process-reference"
       ],
-      "scope": "ggctl::remote::impl  AdminClient::get_json#1",
-      "sha256": "919dd904f3f34d16bb35cc015270dc214805dba8228af411f13406150619572a",
+      "scope": "ggctl::remote::impl  AdminClient::exchange#1",
+      "sha256": "108bb344e1891fe91a3493f84aa99db01ca6f09f3e9c371ec1aa9f9e3cdaec88",
       "owner": "GreenGateway maintainers: operator CLI (#242)",
-      "purpose": "Reviewed for #242 PR 5: ggctl's admin API client, its only network capability. One reqwest client, built in admin_http_client with no proxy, no redirects, no transparent retries, HTTP/1.1, platform certificate and hostname verification plus optional --ca-file trust anchors, and bounded time and response size. It talks only to the operator-named admin API base, is not linked into the gateway, and scripts/check-egress-only.sh pins its builder."
+      "purpose": "Reviewed for #243 (ggctl policy commands): the one request path of ggctl's admin API client, its only network capability. One reqwest client, built in admin_http_client with no proxy, no redirects, no transparent retries, HTTP/1.1, platform certificate and hostname verification plus optional --ca-file trust anchors, and bounded time and response size. It talks only to the operator-named admin API base, is not linked into the gateway, and scripts/check-egress-only.sh pins its builder. exchange sends one GET, POST or DELETE with an optional JSON body and the bearer token to a path below that base; redirects, 401 and 403 are refused, a body is read only when bounded and of the accepted media type, only visible-ASCII values of the headers a command names are returned, and only a GET whose connection was never established is sent again. The version handshake's get_json now calls it."
     },
     {
       "file": "ggctl/src/remote.rs",
@@ -16107,10 +16107,10 @@
       "reasons": [
         "network-or-process-reference"
       ],
-      "scope": "ggctl::remote::is_json#1",
-      "sha256": "0d43a2a52b437659c7e44cf99d58e59eac6e246a40e4765980a9b2f6d1f2871e",
+      "scope": "ggctl::remote::has_media_type#1",
+      "sha256": "21c0b77d407ef16f4560edfe1bf369f028da301473237fb902dbe302a510632f",
       "owner": "GreenGateway maintainers: operator CLI (#242)",
-      "purpose": "Reviewed for #242 PR 5: ggctl's admin API client, its only network capability. One reqwest client, built in admin_http_client with no proxy, no redirects, no transparent retries, HTTP/1.1, platform certificate and hostname verification plus optional --ca-file trust anchors, and bounded time and response size. It talks only to the operator-named admin API base, is not linked into the gateway, and scripts/check-egress-only.sh pins its builder."
+      "purpose": "Reviewed for #243 (ggctl policy commands), replacing is_json: compares the Content-Type of an answer of ggctl's admin API client, its only network capability. One reqwest client, built in admin_http_client with no proxy, no redirects, no transparent retries, HTTP/1.1, platform certificate and hostname verification plus optional --ca-file trust anchors, and bounded time and response size. It talks only to the operator-named admin API base, is not linked into the gateway, and scripts/check-egress-only.sh pins its builder. with the one media type the request accepts (application/json, or application/xml for a JUnit report). Reads a header only; no connection."
     },
     {
       "file": "ggctl/src/remote.rs",
