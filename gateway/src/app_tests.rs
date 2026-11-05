@@ -3561,6 +3561,8 @@ mod issue_257_acceptance_grpc;
 mod issue_360_composite_acceptance;
 #[path = "tests/issue_373_oauth_bootstrap.rs"]
 mod issue_373_oauth_bootstrap;
+#[path = "tests/issue_446_acceptance.rs"]
+mod issue_446_acceptance;
 #[path = "tests/issue_463_caller_assertion_jwks.rs"]
 mod issue_463_caller_assertion_jwks;
 
