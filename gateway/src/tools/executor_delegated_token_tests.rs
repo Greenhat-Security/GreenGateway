@@ -1015,6 +1015,8 @@ async fn a_call_that_names_nobody_is_refused_before_any_exchange() {
         roles: vec!["mail:read".to_owned()],
         session_id: "svc_1".to_owned(),
         auth_method: AuthMethod::ServiceToken,
+        scopes: None,
+        verified_claims: Vec::new(),
     };
     let service_context = context_for(&service, "request-service");
     assert!(service_context.caller.is_none());
@@ -1027,6 +1029,8 @@ async fn a_call_that_names_nobody_is_refused_before_any_exchange() {
         caller: None,
         source: ToolInvocationSource::Mcp,
         admitted_deadline: None,
+        scopes: None,
+        verified_claims: Vec::new(),
     };
 
     for context in [service_context, anonymous] {

@@ -89,6 +89,26 @@
               "type": "string",
               "minLength": 1,
               "maxLength": 8192
+            },
+            "scopes": {
+              "description": "The OAuth scopes the principal's JWT validation verified from its scope or scp claim, which a scope condition or an identity mapping's scopes may test; sorted and de-duplicated as authentication captures them. Omitted, the case states no scope fact, so a matcher that reads scopes is indeterminate, as for a principal whose authentication captured none; [] is a token that granted none. Scopes are never roles.",
+              "type": "array",
+              "maxItems": 256,
+              "items": { "type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[!#-\\[\\]-~]+$" }
+            },
+            "claims": {
+              "description": "The claims the principal's JWT validation verified because its provider lists them in verified_claims, by claim name or dotted path: a string, boolean or number, or a list of at most 32 strings, [] being a claim the token did not carry. A name omitted was not captured, so a claim condition that reads it is indeterminate. Names that are the issuer, subject, audience, validity instants, scopes, email or credential metadata are refused (forbidden_field). The gateway enforces the byte bounds.",
+              "type": "object",
+              "maxProperties": 16,
+              "propertyNames": { "minLength": 1, "maxLength": 256 },
+              "additionalProperties": {
+                "oneOf": [
+                  { "type": "string", "maxLength": 256 },
+                  { "type": "boolean" },
+                  { "type": "number" },
+                  { "type": "array", "maxItems": 32, "items": { "type": "string", "maxLength": 256 } }
+                ]
+              }
             }
           }
         }

@@ -379,6 +379,8 @@ impl SessionValidator for ClientCertificateValidator {
             roles: Vec::new(),
             session_id: identity.fingerprint().to_owned(),
             auth_method: AuthMethod::ClientCertificate,
+            scopes: None,
+            verified_claims: Vec::new(),
         };
         // Holds by construction today (the identity bound sits under the
         // subject bound, roles are empty, the issuer is a constant), and is

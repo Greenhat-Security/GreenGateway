@@ -2015,6 +2015,8 @@ mod tests {
                 roles: vec!["admin".to_owned()],
                 session_id: "inventory-session".to_owned(),
                 auth_method: AuthMethod::Bearer,
+                scopes: None,
+                verified_claims: Vec::new(),
             };
             let inventory = CapabilityInventory::new(registry, control_plane.clone());
 

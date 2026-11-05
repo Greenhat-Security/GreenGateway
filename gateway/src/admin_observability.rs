@@ -2712,6 +2712,8 @@ pub(super) fn representative_principal_for_rule(rule: &rbac::Rule) -> Option<aut
         roles: rule.principal.roles.clone(),
         session_id: "traffic-coverage".to_owned(),
         auth_method,
+        scopes: None,
+        verified_claims: Vec::new(),
     })
 }
 
@@ -2738,6 +2740,8 @@ pub(super) fn representative_principal_for_role(
         roles: vec![role_name.to_owned()],
         session_id: "traffic-coverage".to_owned(),
         auth_method,
+        scopes: None,
+        verified_claims: Vec::new(),
     }
 }
 

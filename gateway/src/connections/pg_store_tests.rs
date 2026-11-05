@@ -3490,6 +3490,8 @@ async fn deletion_evidence_survives_cascade_and_restart_and_reconciles_a_lost_re
         roles: vec!["connections-admin".to_owned()],
         session_id: "session-deleting-admin".to_owned(),
         auth_method: crate::auth::AuthMethod::Cookie,
+        scopes: None,
+        verified_claims: Vec::new(),
     });
 
     let columns: Vec<String> = pool

@@ -388,6 +388,8 @@ fn a_tool_call_captures_the_organization_address_and_instant_only() {
         roles: Vec::new(),
         session_id: String::new(),
         auth_method: AuthMethod::Bearer,
+        scopes: None,
+        verified_claims: Vec::new(),
     };
     let clock = PolicyClock::fixed(NOW);
     let address = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));

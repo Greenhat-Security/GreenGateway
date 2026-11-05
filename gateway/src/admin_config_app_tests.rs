@@ -201,6 +201,8 @@ async fn the_policy_ggctl_init_writes_admits_only_its_bound_operator() {
         roles: vec!["operator".to_owned()],
         session_id: "session-1".to_owned(),
         auth_method,
+        scopes: None,
+        verified_claims: Vec::new(),
     };
     for (answers, issuer, auth_method, expected) in [
         (

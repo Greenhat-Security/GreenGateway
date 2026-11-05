@@ -158,5 +158,7 @@ pub(crate) fn legacy_representative_principal_for_matcher(
         roles: matcher.roles.clone(),
         session_id: "rule-suggestion".to_owned(),
         auth_method,
+        scopes: None,
+        verified_claims: Vec::new(),
     })
 }

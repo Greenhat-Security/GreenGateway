@@ -507,6 +507,285 @@ fn a_case_organization_decides_identity_mappings_as_a_live_lane_does() {
     }
 }
 
+/// A case's `scopes` and `claims` are the verified facts its principal's JWT
+/// validation captured, and decide scope and claim conditions and an
+/// identity mapping's `scopes` in every lane as a live one does: stated, they
+/// are captured; another issuer's never match; omitted, they were not
+/// captured, so the answer is incomplete, never a pass. No rendering repeats
+/// a claim value.
+#[test]
+fn case_scopes_and_claims_decide_identity_matchers_as_a_live_lane_does() {
+    const CLAIM_CANARY: &str = "claim-canary-77e1";
+    let policy = Policy::validate_json_value(json!({
+        "schema_version": "1.0.0",
+        "default_action": "deny",
+        "roles": {
+            "writer": { "permissions": ["orders:write"] },
+            "reader": { "permissions": ["orders:read"] }
+        },
+        "identity_mappings": [
+            { "id": "writers", "issuer": "https://idp.example.test", "scopes": ["orders.write"], "grant_roles": ["writer"] },
+            { "id": "everyone", "issuer": "https://idp.example.test", "grant_roles": ["reader"] }
+        ],
+        "rules": [
+            {
+                "id": "engineering-reports",
+                "path": "/reports/**",
+                "action": "allow",
+                "conditions": { "claim": {
+                    "issuer": "https://idp.example.test",
+                    "name": "department",
+                    "in": ["engineering"]
+                } }
+            },
+            { "id": "reports-closed", "path": "/reports/**", "action": "deny" },
+            {
+                "id": "exports-need-a-scope",
+                "tool_name": "reports.export",
+                "action": "deny",
+                "conditions": { "not": { "scope": {
+                    "issuer": "https://idp.example.test",
+                    "in": ["reports.export"]
+                } } }
+            }
+        ],
+        "routes": [
+            { "id": "orders-write", "methods": ["PUT"], "path_prefix": "/orders", "permission": "orders:write" },
+            { "id": "orders-read", "methods": ["GET"], "path_prefix": "/orders", "permission": "orders:read" }
+        ],
+        "tools": { "reports.export": { "allowed_roles": ["reader"] } }
+    }))
+    .expect("the policy is valid");
+    let principal = |scopes: Option<Value>, claims: Option<Value>, issuer: &str| {
+        let mut principal = json!({
+            "subject": SUBJECT_CANARY,
+            "issuer": issuer,
+            "auth_method": "bearer_token"
+        });
+        if let Some(scopes) = scopes {
+            principal["scopes"] = scopes;
+        }
+        if let Some(claims) = claims {
+            principal["claims"] = claims;
+        }
+        principal
+    };
+    let issuer = "https://idp.example.test";
+    let engineer = principal(
+        Some(json!(["orders.write", "reports.export"])),
+        Some(json!({ "department": "engineering", "nickname": CLAIM_CANARY })),
+        issuer,
+    );
+    let seller = principal(
+        Some(json!(["orders.read"])),
+        Some(json!({ "department": [CLAIM_CANARY, "sales"] })),
+        issuer,
+    );
+    let elsewhere = principal(
+        Some(json!(["orders.write", "reports.export"])),
+        Some(json!({ "department": "engineering" })),
+        "https://other.example.test",
+    );
+    let http = |id: &str, method: &str, path: &str, principal: &Value, expect: Value| {
+        json!({
+            "id": id,
+            "kind": "http",
+            "request": { "method": method, "path": path },
+            "principal": principal,
+            "expect": expect
+        })
+    };
+    let tool = |id: &str, principal: &Value, expect: Value| {
+        json!({
+            "id": id,
+            "kind": "tool",
+            "tool": { "name": "reports.export" },
+            "principal": principal,
+            "expect": expect
+        })
+    };
+    let decided = suite(vec![
+        http(
+            "engineer-writes",
+            "PUT",
+            "/orders/1",
+            &engineer,
+            json!({ "logical": "allow", "matched": { "route": 0 } }),
+        ),
+        http(
+            "seller-cannot-write",
+            "PUT",
+            "/orders/1",
+            &seller,
+            json!({ "logical": "deny", "reason": "missing_permission" }),
+        ),
+        http(
+            "seller-reads",
+            "GET",
+            "/orders/1",
+            &seller,
+            json!({ "logical": "allow", "matched": { "route": 1 } }),
+        ),
+        http(
+            "engineer-reports",
+            "GET",
+            "/reports/q3",
+            &engineer,
+            json!({ "logical": "allow", "matched": { "rule": "engineering-reports" } }),
+        ),
+        http(
+            "seller-no-reports",
+            "GET",
+            "/reports/q3",
+            &seller,
+            json!({ "logical": "deny", "matched": { "rule": "reports-closed" } }),
+        ),
+        http(
+            "elsewhere-no-reports",
+            "GET",
+            "/reports/q3",
+            &elsewhere,
+            json!({ "logical": "deny", "matched": { "rule": "reports-closed" } }),
+        ),
+        tool("engineer-exports", &engineer, json!({ "logical": "allow" })),
+        tool(
+            "seller-no-export",
+            &seller,
+            json!({ "logical": "deny", "matched": { "rule": "exports-need-a-scope" } }),
+        ),
+    ]);
+    let run = |document: &Value| {
+        let parsed = parse_suite(document).expect("the suite is valid");
+        let outcome = run_against_policy(
+            policy.clone(),
+            PolicyAuthority::Standalone,
+            &parsed,
+            &resources(),
+            far_deadline(),
+        )
+        .expect("policy compiles and the run finishes");
+        RunReport::new(parsed.digest.clone(), binding(), outcome)
+    };
+    let report = run(&decided);
+    let failures: Vec<_> = report
+        .cases
+        .iter()
+        .filter(|case| case.status != CaseStatus::Passed)
+        .map(|case| (case.id.clone(), case.status, case.actual.clone()))
+        .collect();
+    assert!(failures.is_empty(), "unexpected outcomes: {failures:?}");
+    let rendered = serde_json::to_string(&report::to_json(&report).expect("json")).expect("text");
+    assert!(!rendered.contains(CLAIM_CANARY));
+
+    // Facts the case does not state were not captured: whatever the case
+    // expects, the answer is incomplete.
+    let unstated = principal(None, None, issuer);
+    let undecided = run(&suite(vec![
+        http(
+            "scopes-unstated",
+            "GET",
+            "/orders/1",
+            &unstated,
+            json!({ "logical": "allow" }),
+        ),
+        http(
+            "claim-unstated",
+            "GET",
+            "/reports/q3",
+            &principal(Some(json!([])), None, issuer),
+            json!({ "logical": "deny" }),
+        ),
+        tool(
+            "export-scopes-unstated",
+            &principal(None, Some(json!({})), issuer),
+            json!({ "logical": "deny" }),
+        ),
+    ]));
+    assert_eq!(undecided.status, RunStatus::Incomplete);
+    for case in &undecided.cases {
+        assert_eq!(case.status, CaseStatus::Incomplete, "{}", case.id);
+        let actual = case.actual.as_ref().expect("an indeterminate answer");
+        assert_eq!(
+            actual.limitation,
+            Some("missing_matcher_fact"),
+            "{}",
+            case.id
+        );
+    }
+
+    // Scopes and claims are bounded and typed; a claim no allowlist may list
+    // is refused as a credential is, and no refused value is repeated.
+    for (member, value, pointer, code) in [
+        (
+            "scopes",
+            json!("orders.write"),
+            "/cases/0/principal/scopes",
+            "invalid_type",
+        ),
+        (
+            "scopes",
+            json!(["orders write"]),
+            "/cases/0/principal/scopes/0",
+            "invalid_value",
+        ),
+        (
+            "scopes",
+            json!(vec!["s"; crate::auth::principal::MAX_PRINCIPAL_SCOPES + 1]),
+            "/cases/0/principal/scopes",
+            "too_many_facts",
+        ),
+        (
+            "claims",
+            json!(["department"]),
+            "/cases/0/principal/claims",
+            "invalid_type",
+        ),
+        (
+            "claims",
+            json!({ "jti": CLAIM_CANARY }),
+            "/cases/0/principal/claims/jti",
+            "forbidden_field",
+        ),
+        (
+            "claims",
+            json!({ "department": { "name": CLAIM_CANARY } }),
+            "/cases/0/principal/claims/department",
+            "invalid_value",
+        ),
+        (
+            "claims",
+            json!({ "department": "x".repeat(crate::auth::principal::MAX_VERIFIED_CLAIM_VALUE_BYTES + 1) }),
+            "/cases/0/principal/claims/department",
+            "invalid_value",
+        ),
+        (
+            "claims",
+            json!({ "groups": vec!["g"; crate::auth::principal::MAX_VERIFIED_CLAIM_VALUES + 1] }),
+            "/cases/0/principal/claims/groups",
+            "invalid_value",
+        ),
+    ] {
+        let mut principal = engineer.clone();
+        principal[member] = value;
+        let document = suite(vec![http(
+            "refused",
+            "GET",
+            "/orders/1",
+            &principal,
+            json!({ "logical": "allow" }),
+        )]);
+        let diagnostics = refused(&document);
+        assert_eq!(
+            codes(&diagnostics),
+            vec![(code, pointer.to_owned())],
+            "{member}"
+        );
+        let rendered =
+            serde_json::to_string(&diagnostics.diagnostics).expect("diagnostics serialize");
+        assert!(!rendered.contains(CLAIM_CANARY), "{rendered}");
+    }
+}
+
 #[test]
 fn a_wrong_expectation_fails_and_names_every_mismatch_in_order() {
     let report = run(&suite(vec![json!({
@@ -1145,6 +1424,8 @@ fn tool_cases_agree_with_the_live_tool_adapters() {
                 roles: vec!["reader".to_owned()],
                 session_id: String::new(),
                 auth_method: AuthMethod::Bearer,
+                scopes: None,
+                verified_claims: Vec::new(),
             }),
         ),
         (
@@ -1157,6 +1438,8 @@ fn tool_cases_agree_with_the_live_tool_adapters() {
                 roles: vec!["auditor".to_owned()],
                 session_id: String::new(),
                 auth_method: AuthMethod::Cookie,
+                scopes: None,
+                verified_claims: Vec::new(),
             }),
         ),
     ];

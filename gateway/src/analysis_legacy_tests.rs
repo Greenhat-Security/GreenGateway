@@ -70,6 +70,8 @@ fn legacy_principal_from_audit_actor(actor: &audit::Actor) -> Option<auth::Princ
         roles: actor.roles.clone().unwrap_or_default(),
         session_id: "audit-history".to_owned(),
         auth_method,
+        scopes: None,
+        verified_claims: Vec::new(),
     })
 }
 
@@ -229,5 +231,7 @@ fn legacy_representative_principal_for_rule(rule: &rbac::Rule) -> Option<auth::P
         roles: rule.principal.roles.clone(),
         session_id: "traffic-coverage".to_owned(),
         auth_method,
+        scopes: None,
+        verified_claims: Vec::new(),
     })
 }

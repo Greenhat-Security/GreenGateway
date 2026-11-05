@@ -1949,6 +1949,8 @@ fn representative_principal_for_matcher(matcher: &PrincipalMatcher) -> Option<Pr
         roles: matcher.roles.clone(),
         session_id: "rule-suggestion".to_owned(),
         auth_method,
+        scopes: None,
+        verified_claims: Vec::new(),
     })
 }
 

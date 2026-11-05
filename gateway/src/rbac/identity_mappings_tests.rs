@@ -21,6 +21,8 @@ fn principal(issuer: Option<&str>, roles: &[&str], auth_method: AuthMethod) -> P
         roles: roles.iter().map(|role| (*role).to_owned()).collect(),
         session_id: String::new(),
         auth_method,
+        scopes: None,
+        verified_claims: Vec::new(),
     }
 }
 
@@ -33,6 +35,7 @@ fn mapping(id: &str, grant_roles: &[&str]) -> IdentityMapping {
         organizations: Vec::new(),
         claimed_roles: Vec::new(),
         grant_roles: grant_roles.iter().map(|role| (*role).to_owned()).collect(),
+        scopes: Vec::new(),
     }
 }
 
@@ -282,6 +285,7 @@ proptest! {
             organizations: Vec::new(),
             claimed_roles: claimed_roles.clone(),
             grant_roles: vec!["internal".to_owned()],
+            scopes: Vec::new(),
         };
         let matcher = PrincipalMatcher {
             roles: claimed_roles,
@@ -299,4 +303,70 @@ proptest! {
         };
         prop_assert_eq!(compiled.effective_roles(&principal, &UNCAPTURED_FACTS), Some(expected));
     }
+}
+
+/// A mapping that lists `scopes` reads the scope fact: it applies when the
+/// principal holds one listed scope, does not when it holds none of them, and
+/// is undetermined -- never "holds none" -- when no scope fact was captured.
+/// The scopes it tests stay external: only `grant_roles` become roles.
+#[test]
+fn a_scope_constraint_reads_the_captured_fact_and_is_never_guessed() {
+    let mut writers = mapping("writers", &["writer"]);
+    writers.scopes = vec!["orders.write".to_owned(), "orders.admin".to_owned()];
+    let compiled = CompiledIdentityMappings::new(&[writers.clone(), mapping("all", &["reader"])]);
+    let alice = principal(Some(ISSUER), &["orders.write"], AuthMethod::Bearer);
+    let scoped = |scopes: Option<&[&str]>| {
+        let mut facts = organization(None);
+        facts.scopes = match scopes {
+            Some(scopes) => {
+                Fact::Captured(scopes.iter().map(|scope| (*scope).to_owned()).collect())
+            }
+            None => Fact::Uncaptured,
+        };
+        facts
+    };
+    assert_eq!(
+        compiled.effective_roles(&alice, &scoped(Some(&["orders.read", "orders.write"]))),
+        Some(vec!["reader".to_owned(), "writer".to_owned()])
+    );
+    // A claimed role of the same name is not a scope.
+    assert_eq!(
+        compiled.effective_roles(&alice, &scoped(Some(&["orders.read"]))),
+        Some(vec!["reader".to_owned()])
+    );
+    assert_eq!(
+        compiled.effective_roles(&alice, &scoped(Some(&[]))),
+        Some(vec!["reader".to_owned()])
+    );
+    assert_eq!(compiled.effective_roles(&alice, &scoped(None)), None);
+    // Another issuer's principal is ruled out before any fact is read.
+    let other = principal(Some("https://other.example.test"), &[], AuthMethod::Bearer);
+    assert_eq!(
+        mapping_applies(&writers, &other, &scoped(None)),
+        Truth::False
+    );
+    // Both constraints must hold, in Kleene logic: a certain miss on the
+    // organization decides even when the scopes are unknown.
+    let mut both = writers.clone();
+    both.organizations = vec!["acme".to_owned()];
+    let mut facts = scoped(None);
+    facts.organization = Fact::Captured(Some("globex".to_owned()));
+    assert_eq!(mapping_applies(&both, &alice, &facts), Truth::False);
+    facts.organization = Fact::Captured(Some("acme".to_owned()));
+    assert_eq!(mapping_applies(&both, &alice, &facts), Truth::Unknown);
+}
+
+#[test]
+fn validation_refuses_a_scope_that_is_no_scope_token() {
+    let roles = roles(&["writer"]);
+    let mut writers = mapping("writers", &["writer"]);
+    writers.scopes = vec!["orders.write".to_owned(), "orders write".to_owned()];
+    let issue = validate_identity_mappings(&[writers.clone()], &roles).expect_err("refused");
+    assert_eq!(issue.code, IssueCode::IdentityMappingValueInvalid);
+    assert_eq!(issue.pointer, "/identity_mappings/0/scopes/1");
+    writers.scopes = vec!["s".to_owned(); MAX_IDENTITY_MAPPING_VALUES + 1];
+    let issue = validate_identity_mappings(&[writers.clone()], &roles).expect_err("refused");
+    assert_eq!(issue.pointer, "/identity_mappings/0/scopes");
+    writers.scopes = vec!["https://api.example.test/orders.write".to_owned()];
+    assert!(validate_identity_mappings(&[writers], &roles).is_ok());
 }

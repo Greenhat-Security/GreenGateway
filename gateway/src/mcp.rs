@@ -545,6 +545,15 @@ fn invocation_context_from_request(
             .extensions
             .get::<auth::Principal>()
             .and_then(|principal| principal.org_id.clone()),
+        scopes: parts
+            .extensions
+            .get::<auth::Principal>()
+            .and_then(|principal| principal.scopes.clone()),
+        verified_claims: parts
+            .extensions
+            .get::<auth::Principal>()
+            .map(|principal| principal.verified_claims.clone())
+            .unwrap_or_default(),
         source_address: client_ip::canonical_client_addr(
             &parts.headers,
             &parts.extensions,
@@ -2397,6 +2406,8 @@ mod tests {
             roles: vec!["operator".to_owned()],
             session_id: "session-123".to_owned(),
             auth_method: auth::AuthMethod::Bearer,
+            scopes: None,
+            verified_claims: Vec::new(),
         });
         request
             .extensions_mut()

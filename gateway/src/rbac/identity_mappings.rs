@@ -10,9 +10,10 @@
 //!
 //! A mapping applies to a principal authenticated by exactly its `issuer`,
 //! after the canonicalization every policy issuer gets, whose authentication
-//! method, subject, verified organization and claimed roles each satisfy the
-//! mapping's list for it when that list is not empty: any listed value
-//! satisfies a list, and every non-empty list must be satisfied. The
+//! method, subject, verified organization, claimed roles and verified OAuth
+//! scopes each satisfy the mapping's list for it when that list is not empty:
+//! any listed value satisfies a list, and every non-empty list must be
+//! satisfied. The
 //! principal's internal roles are the union of `grant_roles` over every
 //! mapping that applies, sorted and de-duplicated, so the result does not
 //! depend on the order mappings are listed in; the order is for the people
@@ -32,6 +33,14 @@
 //! ruled out, and the principal's roles are undetermined: the kernel answers
 //! indeterminate rather than grant or withhold a role on a guess, and every
 //! live lane refuses such an answer.
+//!
+//! A mapping that constrains `scopes` reads the scope fact the same way: the
+//! scopes the principal's JWT validation verified (`Principal::scopes`). A
+//! principal whose authentication captured no scope fact -- one no JWT
+//! validation produced, or a token whose scope claim was past the bounds --
+//! is undetermined under such a mapping, never treated as holding none. Scopes
+//! stay external attributes: a mapping may test them, and only `grant_roles`
+//! ever becomes a role.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -47,6 +56,7 @@ use super::{
     },
 };
 use crate::auth::{
+    claims::is_scope_token,
     principal::{
         canonical_issuer, MAX_PRINCIPAL_ISSUER_BYTES, MAX_PRINCIPAL_ROLE_BYTES,
         MAX_PRINCIPAL_SUBJECT_BYTES,
@@ -83,6 +93,10 @@ pub struct IdentityMapping {
     /// means any.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub claimed_roles: Vec<String>,
+    /// Verified OAuth scopes, of which the principal must hold at least one.
+    /// Empty means any, including a principal with no scope fact.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
     /// The internal roles, defined in `roles`, this mapping grants.
     pub grant_roles: Vec<String>,
 }
@@ -152,6 +166,21 @@ pub(crate) fn validate_identity_mappings(
             ),
         ] {
             validate_values(&pointer, &field_path, member, values, max_bytes)?;
+        }
+        if mapping.scopes.len() > MAX_IDENTITY_MAPPING_VALUES {
+            return Err(too_many_values(&pointer, &field_path, "scopes"));
+        }
+        for (scope_index, scope) in mapping.scopes.iter().enumerate() {
+            if !is_scope_token(scope) {
+                return Err(PolicyIssue::new(
+                    IssueCode::IdentityMappingValueInvalid,
+                    format!("{pointer}/scopes/{scope_index}"),
+                    format!(
+                        "{field_path}.scopes[{scope_index}] must be an OAuth scope token: 1 to \
+                         256 bytes of visible ASCII without a space, a quote or a backslash"
+                    ),
+                ));
+            }
         }
         if mapping.grant_roles.is_empty() {
             return Err(PolicyIssue::new(
@@ -259,7 +288,8 @@ pub(crate) fn admitted_auth_methods(mapping: &IdentityMapping) -> impl Iterator<
 }
 
 /// Whether `mapping` applies to `principal`. Every constraint but the
-/// organization reads the principal itself, which is always known.
+/// organization and the scopes reads the principal itself, which is always
+/// known.
 pub(crate) fn mapping_applies(
     mapping: &IdentityMapping,
     principal: &Principal,
@@ -282,16 +312,28 @@ pub(crate) fn mapping_applies(
     if !identity_holds {
         return Truth::False;
     }
-    if mapping.organizations.is_empty() {
-        return Truth::True;
-    }
-    match &facts.organization {
-        Fact::Uncaptured => Truth::Unknown,
-        Fact::Captured(None) => Truth::False,
-        Fact::Captured(Some(organization)) => {
-            Truth::of(mapping.organizations.contains(organization))
+    let organization = if mapping.organizations.is_empty() {
+        Truth::True
+    } else {
+        match &facts.organization {
+            Fact::Uncaptured => Truth::Unknown,
+            Fact::Captured(None) => Truth::False,
+            Fact::Captured(Some(organization)) => {
+                Truth::of(mapping.organizations.contains(organization))
+            }
         }
-    }
+    };
+    organization.and_then(|| {
+        if mapping.scopes.is_empty() {
+            return Truth::True;
+        }
+        match &facts.scopes {
+            Fact::Uncaptured => Truth::Unknown,
+            Fact::Captured(scopes) => {
+                Truth::of(scopes.iter().any(|scope| mapping.scopes.contains(scope)))
+            }
+        }
+    })
 }
 
 #[cfg(test)]

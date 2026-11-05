@@ -4019,6 +4019,8 @@ mod tests {
             roles: Vec::new(),
             session_id: format!("session-{subject}"),
             auth_method,
+            scopes: None,
+            verified_claims: Vec::new(),
         }
     }
 

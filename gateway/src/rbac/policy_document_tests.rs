@@ -9,8 +9,8 @@ use serde_json::{json, Value};
 
 use super::*;
 use crate::rbac::conditions::{
-    Condition, HeaderCondition, OrganizationCondition, QueryCondition, SourceNetworkCondition,
-    TimeWindowCondition, ToolArgumentCondition,
+    ClaimCondition, Condition, HeaderCondition, OrganizationCondition, QueryCondition,
+    ScopeCondition, SourceNetworkCondition, TimeWindowCondition, ToolArgumentCondition,
 };
 use crate::{
     auth::{AuthMethod, Principal},
@@ -1131,10 +1131,20 @@ fn the_member_vocabularies_match_the_parser() {
         organizations: vec!["o".to_owned()],
         claimed_roles: vec!["c".to_owned()],
         grant_roles: vec!["r".to_owned()],
+        scopes: vec!["s".to_owned()],
     };
     let organization = OrganizationCondition {
         issuer: "i".to_owned(),
         values: vec!["o".to_owned()],
+    };
+    let scope = ScopeCondition {
+        issuer: "i".to_owned(),
+        values: vec!["orders.write".to_owned()],
+    };
+    let claim = ClaimCondition {
+        issuer: "i".to_owned(),
+        name: "department".to_owned(),
+        values: vec![json!("engineering")],
     };
     let source_network = SourceNetworkCondition {
         cidrs: vec!["10.0.0.0/8".to_owned()],
@@ -1206,6 +1216,8 @@ fn the_member_vocabularies_match_the_parser() {
             serde_json::to_value(&organization),
             &ORGANIZATION_CONDITION_MEMBERS,
         ),
+        (serde_json::to_value(&scope), &SCOPE_CONDITION_MEMBERS),
+        (serde_json::to_value(&claim), &CLAIM_CONDITION_MEMBERS),
         (
             serde_json::to_value(&source_network),
             &SOURCE_NETWORK_CONDITION_MEMBERS,
@@ -1239,6 +1251,8 @@ fn the_member_vocabularies_match_the_parser() {
         Condition::Any(Vec::new()),
         Condition::Not(Box::new(Condition::Query(query.clone()))),
         Condition::Organization(organization),
+        Condition::Scope(scope),
+        Condition::Claim(claim),
         Condition::SourceNetwork(source_network),
         Condition::Header(header),
         Condition::Query(query),
@@ -1325,6 +1339,16 @@ fn the_published_v1_schema_matches_the_member_vocabularies() {
             "organization_condition",
             &ORGANIZATION_CONDITION_MEMBERS,
             vec!["issuer", "in"],
+        ),
+        (
+            "scope_condition",
+            &SCOPE_CONDITION_MEMBERS,
+            vec!["issuer", "in"],
+        ),
+        (
+            "claim_condition",
+            &CLAIM_CONDITION_MEMBERS,
+            vec!["issuer", "name", "in"],
         ),
         (
             "source_network_condition",
@@ -1479,6 +1503,8 @@ fn principal(roles: &[&str]) -> Principal {
         email: None,
         org_id: None,
         session_id: "synthetic-session".to_owned(),
+        scopes: None,
+        verified_claims: Vec::new(),
     }
 }
 

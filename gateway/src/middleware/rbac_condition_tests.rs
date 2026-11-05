@@ -124,6 +124,8 @@ fn person(organization: Option<&str>) -> Principal {
         roles: vec!["reader".to_owned()],
         session_id: "synthetic-session".to_owned(),
         auth_method: AuthMethod::Bearer,
+        scopes: None,
+        verified_claims: Vec::new(),
     }
 }
 

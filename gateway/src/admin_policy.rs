@@ -1768,6 +1768,8 @@ pub(super) fn audit_actor_principal_fact(
             roles: actor.roles.clone().unwrap_or_default(),
             session_id: String::new(),
             auth_method,
+            scopes: None,
+            verified_claims: Vec::new(),
         },
     ))
 }

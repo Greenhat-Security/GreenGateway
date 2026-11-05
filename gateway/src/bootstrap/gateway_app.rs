@@ -705,8 +705,9 @@ pub(crate) fn gateway_app_with_process_started_at_and_overrides(
     // What a candidate policy is validated against before it is published
     // (issue #243, slice 8): the live tool registry and Connection control
     // plane, the egress lane the egress client decides by, and this
-    // process's configuration fingerprint. Attached before any admin state
-    // takes its copy of the RBAC state.
+    // process's configuration fingerprint, and the claims each JWT
+    // provider's validation captures. Attached before any admin state takes
+    // its copy of the RBAC state.
     let rbac_state = rbac_state.map(|state| {
         state.with_policy_resources(rbac::policy_resources::PolicyResourceSources {
             tools: tool_registry.clone(),
@@ -717,6 +718,9 @@ pub(crate) fn gateway_app_with_process_started_at_and_overrides(
                 ha::static_config_fingerprint(&config).hex()
             ),
             policy_route: routes.admin.policy_route.clone(),
+            verified_claims: rbac::policy_resources::ClaimAllowlists::from_providers(
+                &config.auth_providers,
+            ),
         })
     });
     // Cluster mode: the registry's local lane belongs to the authoritative

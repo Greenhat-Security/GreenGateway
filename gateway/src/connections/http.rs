@@ -3703,6 +3703,8 @@ mod tests {
             roles: Vec::new(),
             session_id: "session-alice".to_owned(),
             auth_method,
+            scopes: None,
+            verified_claims: Vec::new(),
         }
     }
 

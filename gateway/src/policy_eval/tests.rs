@@ -45,6 +45,8 @@ fn principal(roles: &[&str]) -> Principal {
         email: None,
         org_id: None,
         session_id: "synthetic-session".to_owned(),
+        scopes: None,
+        verified_claims: Vec::new(),
     }
 }
 
@@ -1076,6 +1078,8 @@ proptest! {
             email: None,
             org_id: None,
             session_id: String::new(),
+            scopes: None,
+            verified_claims: Vec::new(),
         };
         let mut input = context(&compiled);
         input.method = Some(method);

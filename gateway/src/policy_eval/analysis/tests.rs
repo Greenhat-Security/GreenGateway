@@ -23,6 +23,8 @@ fn principal(roles: &[&str]) -> Principal {
         email: None,
         org_id: None,
         session_id: "synthetic-session".to_owned(),
+        scopes: None,
+        verified_claims: Vec::new(),
     }
 }
 

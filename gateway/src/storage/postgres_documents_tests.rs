@@ -138,6 +138,8 @@ fn a_principal_actor_records_what_the_principal_carries() {
         roles: vec!["admin".to_owned()],
         session_id: "session".to_owned(),
         auth_method: AuthMethod::Cookie,
+        scopes: None,
+        verified_claims: Vec::new(),
     };
     let actor = ChangeActor::principal(&principal);
     assert_eq!(actor.kind(), "principal");
@@ -326,6 +328,8 @@ async fn committed_document_changes_record_attributed_evidence_and_refusals_reco
         roles: vec!["admin".to_owned()],
         session_id: "session-a".to_owned(),
         auth_method: AuthMethod::ClientCertificate,
+        scopes: None,
+        verified_claims: Vec::new(),
     };
     let initial = policy("evidence-initial", "reader");
     let first = PolicyControlPlane::commit(

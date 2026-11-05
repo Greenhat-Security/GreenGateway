@@ -158,6 +158,16 @@ pub struct ToolInvocationContext {
     /// policy fact only, taken from the authenticated principal and never
     /// from a header: it is not audited, signed or sent upstream.
     pub organization: Option<String>,
+    /// The OAuth scopes authentication verified for the principal the call
+    /// entered with (`Principal::scopes`; `None` when it captured no scope
+    /// fact), which a `scope` condition and an identity mapping's `scopes`
+    /// read. Like `organization`, a policy fact taken from the authenticated
+    /// principal only: never audited, signed or sent upstream.
+    pub scopes: Option<Vec<String>>,
+    /// The allowlisted claims authentication verified for that principal
+    /// (`Principal::verified_claims`), which a `claim` condition reads. A
+    /// policy fact only, like `scopes`.
+    pub verified_claims: Vec<crate::auth::VerifiedClaim>,
     /// The canonical client address the call entered the gateway from
     /// (`client_ip::canonical_client_addr`, under the gateway's trusted-proxy
     /// policy), the fact a `source_network` condition reads. `None` when the
@@ -187,6 +197,8 @@ impl Default for ToolInvocationContext {
             source_ip: "127.0.0.1".to_owned(),
             actor: None,
             organization: None,
+            scopes: None,
+            verified_claims: Vec::new(),
             source_address: None,
             caller: None,
             source: ToolInvocationSource::Internal,
@@ -1822,12 +1834,15 @@ fn tool_principal_matches(
 }
 
 /// The principal the tool lane judges for an invocation: its actor's
-/// projection ([`principal_from_tool_actor`]), carrying the organization the
-/// context recorded for it, so an identity mapping reads the same
-/// organization here as on the HTTP lane the call entered by.
+/// projection ([`principal_from_tool_actor`]), carrying the organization,
+/// scopes and allowlisted claims the context recorded for it, so an identity
+/// mapping or condition reads the same verified facts here as on the HTTP
+/// lane the call entered by.
 fn principal_from_tool_context(context: &ToolInvocationContext) -> Option<Principal> {
     let mut principal = principal_from_tool_actor(context.actor.as_ref()?, &context.request_id)?;
     principal.org_id = context.organization.clone();
+    principal.scopes = context.scopes.clone();
+    principal.verified_claims = context.verified_claims.clone();
     Some(principal)
 }
 
@@ -1836,9 +1851,9 @@ fn principal_from_tool_context(context: &ToolInvocationContext) -> Option<Princi
 /// anonymous. Policy replay (#243) projects a recorded tool invocation's actor
 /// through this same function, so a replayed tool decision cannot read the
 /// actor differently from the invocation it replays. It carries no
-/// organization, because audit records none: a live call adds the one its
-/// context recorded ([`principal_from_tool_context`]), and replay leaves it
-/// not recorded.
+/// organization, scopes or claims, because audit records none: a live call
+/// adds the ones its context recorded ([`principal_from_tool_context`]), and
+/// replay leaves them not recorded.
 pub(crate) fn principal_from_tool_actor(actor: &Actor, session_id: &str) -> Option<Principal> {
     let auth_method = auth_method_from_audit_mode(&actor.auth_mode)?;
 
@@ -1850,6 +1865,8 @@ pub(crate) fn principal_from_tool_actor(actor: &Actor, session_id: &str) -> Opti
         roles: actor.roles.clone().unwrap_or_default(),
         session_id: session_id.to_owned(),
         auth_method,
+        scopes: None,
+        verified_claims: Vec::new(),
     })
 }
 
@@ -2389,6 +2406,101 @@ mod tests {
         // Audit records the actor, never the organization.
         let serialized = serde_json::to_string(&capture.events()).expect("events serialize");
         assert!(!serialized.contains("acme"));
+    }
+
+    /// The tool lane reads the scopes and allowlisted claims the invocation's
+    /// context carries from the authenticated principal (#243), which the
+    /// audit actor lacks: a scope mapping and a claim condition decide a call
+    /// from what that principal's issuer verified, a context that captured no
+    /// scope fact is refused rather than read as holding none, and the actor's
+    /// roles, claimed or a service token's scopes, never stand in for them.
+    #[tokio::test]
+    async fn scope_mappings_and_claim_conditions_read_what_the_context_carries() {
+        const ISSUER: &str = "https://idp.example.test";
+        let policy = Policy::validate_json_value(json!({
+            "schema_version": "1.0.0",
+            "roles": { "operator": { "permissions": [] } },
+            "identity_mappings": [{
+                "id": "tool-operators",
+                "issuer": ISSUER,
+                "scopes": ["tools.run"],
+                "grant_roles": ["operator"]
+            }],
+            "rules": [{
+                "id": "engineering-only",
+                "tool_name": "tool",
+                "action": "deny",
+                "conditions": { "not": { "claim": {
+                    "issuer": ISSUER,
+                    "name": "department",
+                    "in": ["engineering"]
+                } } }
+            }],
+            "tools": {
+                "tool": { "allowed_roles": ["operator"], "timeout_ms": 100, "max_concurrent": 1 }
+            }
+        }))
+        .expect("the mapped tool policy validates");
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+        let rbac_state = crate::middleware::rbac::RbacState::new(
+            policy.clone(),
+            Vec::new(),
+            false,
+            audit.clone(),
+        );
+        let config = ToolRuntimeConfig::from_policy(&policy)
+            .expect("the tool policy should configure the runtime");
+        let runtime = ToolRuntime::new_with_rbac_state(config, audit, Some(rbac_state));
+        let context = |scopes: Option<&[&str]>, department: Option<&str>| {
+            let mut context = context_with_identity(&["tools.run"], Some(ISSUER), "bearer_token");
+            context.scopes =
+                scopes.map(|scopes| scopes.iter().map(|scope| (*scope).to_owned()).collect());
+            context.verified_claims = vec![crate::auth::VerifiedClaim {
+                name: "department".to_owned(),
+                values: department.map(|value| json!(value)).into_iter().collect(),
+            }];
+            context
+        };
+
+        assert!(runtime
+            .tool_visible_to_context("tool", &context(Some(&["tools.run"]), Some("engineering"))));
+        for (scopes, department) in [
+            (Some(&["tools.read"][..]), Some("engineering")),
+            (Some(&["tools.run"][..]), Some("sales")),
+            (Some(&["tools.run"][..]), None),
+            (None, Some("engineering")),
+        ] {
+            assert!(
+                !runtime.tool_visible_to_context("tool", &context(scopes, department)),
+                "{scopes:?} {department:?}"
+            );
+        }
+        let admitted = runtime
+            .execute_with_context(
+                "tool",
+                context(Some(&["tools.run"]), Some("engineering")),
+                CancellationToken::new(),
+                || async { "admitted" },
+            )
+            .await
+            .expect("the scoped engineer is admitted");
+        assert_eq!(admitted, "admitted");
+        for context in [
+            context(Some(&["tools.read"]), Some("engineering")),
+            context(None, Some("engineering")),
+        ] {
+            runtime
+                .execute_with_context("tool", context, CancellationToken::new(), || async {
+                    "should not run"
+                })
+                .await
+                .expect_err("no verified scope grants no role");
+        }
+        // Audit records the actor, never the scopes or claims.
+        let serialized = serde_json::to_string(&capture.events()).expect("events serialize");
+        assert!(!serialized.contains("engineering"));
+        assert!(!serialized.contains("tools.read"));
     }
 
     #[tokio::test]
@@ -4411,6 +4523,8 @@ mod tests {
                     source_address: None,
                     caller: None,
                     admitted_deadline: None,
+                    scopes: None,
+                    verified_claims: Vec::new(),
                 },
                 CancellationToken::new(),
                 || async { 42 },
@@ -4875,6 +4989,8 @@ mod tests {
             source_address: None,
             caller: None,
             admitted_deadline: None,
+            scopes: None,
+            verified_claims: Vec::new(),
         }
     }
 
@@ -4902,6 +5018,8 @@ mod tests {
             source_address: None,
             caller: None,
             admitted_deadline: None,
+            scopes: None,
+            verified_claims: Vec::new(),
         }
     }
 

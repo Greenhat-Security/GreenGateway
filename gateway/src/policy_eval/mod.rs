@@ -77,19 +77,22 @@
 //!
 //! A policy v1 document may map verified identities to internal roles and give
 //! direct rules typed conditions (issue #243, item 16). Both read
-//! [`PolicyFacts`] -- the principal's verified organization, the canonical
-//! client address, named headers and query parameters, validated tool
-//! arguments, an injected clock -- which every lane takes beside its context.
+//! [`PolicyFacts`] -- the principal's verified organization, OAuth scopes and
+//! allowlisted claims, the canonical client address, named headers and query
+//! parameters, validated tool arguments, an injected clock -- which every
+//! lane takes beside its context.
 //!
 //! Identity mappings and every condition leaf but `tool_argument` are served.
 //! Every serving adapter evaluates with the facts the compiled policy reads
-//! ([`CompiledPolicy::fact_needs`]) and no others: the organization
-//! authentication verified for the principal ([`CompiledPolicy::serving_facts`],
-//! `Principal::org_id`, never a request header), and on the lanes that have
-//! them the canonical client address, the referenced headers, the strictly
-//! decoded query parameters and an injected clock (`middleware::policy_facts`).
-//! The HTTP lane, the tool lanes, rate-lane selection and the management lane
-//! all resolve roles from the same organization. A policy that reads no fact
+//! ([`CompiledPolicy::fact_needs`]) and no others: the organization, scopes
+//! and allowlisted claims authentication verified for the principal
+//! ([`CompiledPolicy::serving_facts`]: `Principal::org_id`, `Principal::scopes`
+//! and `Principal::verified_claims`, never a request header), and on the lanes
+//! that have them the canonical client address, the referenced headers, the
+//! strictly decoded query parameters and an injected clock
+//! (`middleware::policy_facts`). The HTTP lane, the tool lanes, rate-lane
+//! selection and the management lane all resolve roles from the same verified
+//! facts. A policy that reads no fact
 //! is evaluated with none captured, exactly as before facts were served.
 //! Validation still refuses a `tool_argument` leaf
 //! (`TypedMatchersNotEnforced`), since admission decides before a call's
@@ -346,7 +349,7 @@ impl CompiledPolicy {
             .identity_mappings
             .as_deref()
             .map(CompiledIdentityMappings::new);
-        let fact_needs = FactNeeds::of(&policy.rules, identity.is_some());
+        let fact_needs = FactNeeds::of(&policy.rules, policy.identity_mappings.as_deref());
         let snapshot = ResourceSnapshot {
             digest,
             authority,
@@ -397,11 +400,15 @@ impl CompiledPolicy {
     /// When an identity mapping or an `organization` condition reads it, that
     /// is the organization authentication verified for the principal: its
     /// `org_id`, and `Captured(None)` when authentication verified none or
-    /// the caller is anonymous. It is read from the authenticated principal
-    /// only, never from a request header, so a caller cannot name its own
-    /// organization. Otherwise nothing is captured: a policy that reads no
-    /// fact decides exactly as it did before facts were served, as the host
-    /// fact is asked for only when a route can turn on it.
+    /// the caller is anonymous. When a `scope` condition or a mapping's
+    /// `scopes` reads them, the principal's verified scopes, uncaptured when
+    /// its authentication captured no scope fact; and for the names `claim`
+    /// conditions read, the principal's verified claims of those names and no
+    /// others. Each is read from the authenticated principal only, never from
+    /// a request header, so a caller cannot name its own organization, scope
+    /// or claim. Otherwise nothing is captured: a policy that reads no fact
+    /// decides exactly as it did before facts were served, as the host fact
+    /// is asked for only when a route can turn on it.
     ///
     /// The request facts -- client address, headers, query, clock -- are
     /// added by the lane that has them (`middleware::policy_facts`), and only
@@ -412,6 +419,31 @@ impl CompiledPolicy {
         if self.fact_needs.organization {
             facts.organization =
                 Fact::Captured(principal.and_then(|principal| principal.org_id.clone()));
+        }
+        if self.fact_needs.scopes {
+            facts.scopes = match principal {
+                // Anonymous: verified to hold none, and no scope matcher is
+                // bound to a caller without an issuer anyway.
+                None => Fact::Captured(Vec::new()),
+                Some(principal) => principal
+                    .scopes
+                    .clone()
+                    .map_or(Fact::Uncaptured, Fact::Captured),
+            };
+        }
+        if !self.fact_needs.claims.is_empty() {
+            facts.claims = Fact::Captured(
+                principal
+                    .map(|principal| {
+                        principal
+                            .verified_claims
+                            .iter()
+                            .filter(|claim| self.fact_needs.claims.contains(&claim.name))
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            );
         }
         facts
     }
@@ -1051,8 +1083,10 @@ fn effect(allowed: bool, mode: EnforcementMode) -> PolicyEffect {
     }
 }
 
-/// A policy-only projection. Never retain email, organization, session ID,
-/// credential material, token claims, or a reference to the original principal.
+/// A policy-only projection. Never retain email, organization, scopes,
+/// verified claims, session ID, credential material, token claims, or a
+/// reference to the original principal: the verified identity facts a typed
+/// matcher reads travel as [`PolicyFacts`] instead.
 #[derive(Clone)]
 pub(crate) struct PrincipalIdentity(Principal);
 
@@ -1066,6 +1100,8 @@ impl PrincipalIdentity {
             email: None,
             org_id: None,
             session_id: String::new(),
+            scopes: None,
+            verified_claims: Vec::new(),
         })
     }
 }
@@ -1384,14 +1420,52 @@ impl FactsUse {
 
 /// Refuses facts past the work bounds every lane states for itself, as it
 /// does for the context. The organization is held to the bound a subject is,
-/// and header and query entries to bounds no request the gateway admits
-/// exceeds.
+/// header and query entries to bounds no request the gateway admits exceeds,
+/// and scopes and claims to the bounds authentication captures them within.
 pub(crate) fn validate_facts(facts: &PolicyFacts) -> Result<(), EvaluationError> {
+    use crate::auth::principal::{
+        MAX_PRINCIPAL_SCOPES, MAX_PRINCIPAL_SCOPE_BYTES, MAX_VERIFIED_CLAIMS,
+        MAX_VERIFIED_CLAIM_NAME_BYTES, MAX_VERIFIED_CLAIM_VALUES, MAX_VERIFIED_CLAIM_VALUE_BYTES,
+    };
     use crate::rbac::conditions::Fact;
 
     if let Fact::Captured(Some(organization)) = &facts.organization {
         if organization.len() > MAX_FACT_VALUE_BYTES {
             return Err(EvaluationError::ContextTooLarge);
+        }
+    }
+    if let Fact::Captured(scopes) = &facts.scopes {
+        if scopes.len() > MAX_PRINCIPAL_SCOPES
+            || scopes
+                .iter()
+                .any(|scope| scope.len() > MAX_PRINCIPAL_SCOPE_BYTES)
+        {
+            return Err(EvaluationError::ContextTooLarge);
+        }
+    }
+    if let Fact::Captured(claims) = &facts.claims {
+        if claims.len() > MAX_VERIFIED_CLAIMS
+            || claims.iter().any(|claim| {
+                claim.name.len() > MAX_VERIFIED_CLAIM_NAME_BYTES
+                    || claim.values.len() > MAX_VERIFIED_CLAIM_VALUES
+                    || claim.values.iter().any(|value| {
+                        value
+                            .as_str()
+                            .is_some_and(|text| text.len() > MAX_VERIFIED_CLAIM_VALUE_BYTES)
+                    })
+            })
+        {
+            return Err(EvaluationError::ContextTooLarge);
+        }
+        // Authentication captures strings, booleans and numbers only; a fact
+        // that holds anything else was not one it could have captured.
+        if claims.iter().any(|claim| {
+            claim
+                .values
+                .iter()
+                .any(|value| !(value.is_string() || value.is_boolean() || value.is_number()))
+        }) {
+            return Err(EvaluationError::InvalidPrincipal);
         }
     }
     for entries in [&facts.headers, &facts.query] {

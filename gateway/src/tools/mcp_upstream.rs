@@ -4873,6 +4873,8 @@ mod tests {
             roles: Vec::new(),
             session_id: format!("session-{subject}"),
             auth_method: crate::auth::AuthMethod::Bearer,
+            scopes: None,
+            verified_claims: Vec::new(),
         })
         .expect("a provider-vouched principal is attestable")
     }

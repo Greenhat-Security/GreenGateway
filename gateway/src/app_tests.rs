@@ -682,6 +682,7 @@ fn admin_oidc_login_config(issuer: &str) -> config::Config {
         client_id: Some("admin-ui".to_owned()),
         client_secret: Some("secret-value".to_owned()),
         redirect_uri: Some("http://gateway.example.test/v1/admin/auth/callback".to_owned()),
+        verified_claims: Vec::new(),
     }];
 
     config
@@ -2915,6 +2916,8 @@ fn test_principal(roles: &[&str]) -> auth::Principal {
         roles: roles.iter().map(|role| (*role).to_owned()).collect(),
         session_id: "session-789".to_owned(),
         auth_method: auth::AuthMethod::Bearer,
+        scopes: None,
+        verified_claims: Vec::new(),
     }
 }
 
@@ -3187,6 +3190,7 @@ fn configure_test_jwt_provider(config: &mut config::Config, jwks_addr: std::net:
         client_id: None,
         client_secret: None,
         redirect_uri: None,
+        verified_claims: Vec::new(),
     }];
 }
 
@@ -3211,6 +3215,7 @@ fn configure_test_cookie_session_provider(config: &mut config::Config, introspec
         client_id: None,
         client_secret: None,
         redirect_uri: None,
+        verified_claims: Vec::new(),
     }];
 }
 

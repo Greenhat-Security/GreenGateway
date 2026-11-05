@@ -30,6 +30,8 @@ fn principal() -> Principal {
         email: Some("synthetic-email@example.test".into()),
         org_id: Some("synthetic-organization".into()),
         session_id: "synthetic-session".into(),
+        scopes: None,
+        verified_claims: Vec::new(),
     }
 }
 
@@ -879,6 +881,8 @@ fn differential_context(
         source_address: None,
         caller: None,
         admitted_deadline: None,
+        scopes: None,
+        verified_claims: Vec::new(),
     }
 }
 

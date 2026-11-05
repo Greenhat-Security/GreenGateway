@@ -1273,6 +1273,8 @@ fn witness_identity(matcher: &PrincipalMatcher) -> Option<Principal> {
         roles: matcher.roles.first().cloned().into_iter().collect(),
         session_id: String::new(),
         auth_method,
+        scopes: None,
+        verified_claims: Vec::new(),
     })
 }
 

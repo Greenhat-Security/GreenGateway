@@ -102,7 +102,7 @@ and byte rather than character lengths.
 | `cases` | 1 to 512 cases. |
 | `cases[].id` | Unique within the suite, at most 128 bytes, an ASCII letter or digit followed by letters, digits, `.`, `_`, `:` or `-`. Results, SARIF and JUnit identify a case by this id and its JSON Pointer. |
 | `cases[].kind` | `http`, `tool`, `tool_http`, `rate` or `egress`. Each kind accepts only its own members. |
-| `cases[].principal` | Every kind but `egress`: `"anonymous"`, or `subject` (required), `issuer`, `roles`, `auth_method` (required: `bearer_token`, `session_cookie`, `service_token` or `client_certificate`) and `organization`. The issuer is canonicalized as authentication canonicalizes it (a trailing `/` is dropped). `organization` (1 to 8192 bytes) is the organization the principal's identity provider verified, which a policy's identity mappings may test; omitted, the principal has none. As on the live lanes it is read only when an identity mapping or an `organization` condition reads it, and no result repeats it. |
+| `cases[].principal` | Every kind but `egress`: `"anonymous"`, or `subject` (required), `issuer`, `roles`, `auth_method` (required: `bearer_token`, `session_cookie`, `service_token` or `client_certificate`), `organization`, `scopes` and `claims`. The issuer is canonicalized as authentication canonicalizes it (a trailing `/` is dropped). `organization` (1 to 8192 bytes) is the organization the principal's identity provider verified, which a policy's identity mappings may test; omitted, the principal has none. `scopes` (at most 256 RFC 6749 scope tokens of at most 256 bytes) are the OAuth scopes the principal's JWT validation verified, which `scope` conditions and mappings' `scopes` test; omitted, the principal has no scope fact (as a session or service token has none), so a matcher that reads scopes is `indeterminate`, and `[]` is a token that granted none. `claims` (at most 16) maps each claim name its provider allowlists in `verified_claims` to what the token carried: a string of at most 256 bytes without control characters, a boolean, a number, or a list of at most 32 such strings, `[]` being a claim the token did not carry; a name omitted was not captured, so a `claim` condition that reads it is `indeterminate`, and a name no allowlist may list (`sub`, `jti`, `email`, `scope`, a credential name and the rest `verified_claims` refuses) is `forbidden_field`. As on the live lanes each is read only when an identity mapping or a condition reads it, and no result repeats one. |
 | `cases[].facts` | `http`, `tool` and `tool_http` only: optional request facts a rule condition reads, `source_ip`, `headers`, `query` and `now`; see [Request facts](#request-facts). |
 | `cases[].expect` | What the case asserts; see below. |
 
@@ -178,8 +178,9 @@ overrides carry no conditions and an outbound destination involves no caller. A 
 unknown: the case is `indeterminate` with `missing_matcher_fact` and is
 reported `incomplete`, never passed, whatever it expected. An empty
 `headers` or `query` object states a request that carried none, which is a
-certain no-match. The organization a condition reads is the principal's
-`organization`, as for identity mappings. A header or query name that can
+certain no-match. The organization, scopes and claims a condition reads are
+the principal's `organization`, `scopes` and `claims`, as for identity
+mappings. A header or query name that can
 carry a credential, an identity or hop-by-hop routing -- the names a
 condition may not read, such as `authorization`, `cookie`, `x-forwarded-for`,
 `connection`, `x-api-key` or `access_token` -- is refused with
