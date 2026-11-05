@@ -673,6 +673,17 @@ pub(crate) async fn run(
         )
         .await?;
     }
+    // One whose conditions read a tool argument needs every live replica to
+    // enforce that leaf as well.
+    if source.writes_policy_tool_argument_conditions() {
+        preflight::live_members_admit(
+            &pool,
+            &deployment_id,
+            target.cluster_member_stale_window(),
+            &crate::storage::compatibility::POLICY_TOOL_ARGUMENT_CONDITIONS,
+        )
+        .await?;
+    }
 
     let policy = sections::PolicySection::plan(&source)?;
     let tools = sections::ToolsSection::plan(&source)?;

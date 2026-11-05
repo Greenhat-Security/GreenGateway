@@ -223,6 +223,22 @@ impl StandaloneSource {
                 .any(conditioned)
     }
 
+    /// Whether the import writes a policy v1 document whose conditions
+    /// contain a `tool_argument` leaf to the cluster, active or in history:
+    /// the gated operation `policy.tool_argument_conditions`, which preflight
+    /// asks the target's live roster for as well.
+    pub(crate) fn writes_policy_tool_argument_conditions(&self) -> bool {
+        let conditioned = |policy: &Policy| {
+            policy.is_document_format_v1() && policy.uses_tool_argument_conditions()
+        };
+        conditioned(&self.policy)
+            || self
+                .history
+                .iter()
+                .filter_map(|version| version.policy.as_ref())
+                .any(conditioned)
+    }
+
     /// Read and validate the whole source. Blocking: the caller runs it on
     /// Tokio's blocking pool.
     pub(crate) fn load(env_file: &Path) -> Result<Self, ImportError> {

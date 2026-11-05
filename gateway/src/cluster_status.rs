@@ -1236,7 +1236,8 @@ mod tests {
                 "operation_requirements",
                 "policy_document_v1",
                 "policy_role_descriptions",
-                "policy_rule_conditions"
+                "policy_rule_conditions",
+                "policy_tool_argument_conditions"
             ],
             "standalone reports what this binary advertises"
         );

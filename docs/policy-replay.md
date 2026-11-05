@@ -225,7 +225,7 @@ an allow.
 | routing `proxy_dispatch` | the classified dispatch with the recorded facts |
 | egress `destination` | the destination with no resolution facts |
 | organization (never recorded) | not recorded: an identity mapping that tests `organizations` is `missing_matcher_fact` |
-| source address, headers, query values, clock (never recorded as condition facts) | not recorded: a rule condition that reads one is `missing_matcher_fact` |
+| source address, headers, query values, clock, tool arguments (never recorded as condition facts) | not recorded: a rule condition that reads one is `missing_matcher_fact` |
 
 **MCP identity.** A record that does not say whether its path was an MCP
 alias is decided under both readings, contextless and alias, and answers
@@ -245,7 +245,11 @@ are served.
 
 **Rule conditions.** Replay captures no condition fact: not the
 organization, the source address a record carries for audit, the headers,
-the query values or the instant of the original decision. A condition that
+the query values, the tool arguments or the instant of the original
+decision. A tool call whose arguments failed the input schema at admission,
+before an argument rule decided it, is recorded as a `tool.invoke_rejected`
+whose reason (`invalid_params` and the like) is no policy result, and is
+counted as `unsupported_tool_rejection`. A condition that
 reads one is unknown, so a decision that turns on it is `indeterminate` with
 `missing_matcher_fact`, never a guessed match or no-match; a condition
 decided without one (an `organization` leaf bound to another issuer, say)

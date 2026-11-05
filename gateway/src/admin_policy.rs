@@ -2733,7 +2733,10 @@ pub(super) async fn commit_policy_mutation(
 /// refuses the whole document. A v1 document whose rules carry
 /// `conditions` is also `policy.rule_conditions` (`policy_rule_conditions`),
 /// because a member that serves format 1 but predates enforced rule
-/// conditions refuses it the same way. A document asks for each operation
+/// conditions refuses it the same way, and one whose conditions contain a
+/// `tool_argument` leaf is also `policy.tool_argument_conditions`
+/// (`policy_tool_argument_conditions`), which a member that enforces only
+/// the other leaves refuses. A document asks for each operation
 /// it performs. The gate reads the roster for every such write, logs and
 /// audits each refusal (`cluster.operation_refused`), and the refused write
 /// commits nothing.
@@ -2819,6 +2822,9 @@ fn policy_document_operations(
         // them (`member_requires_v1`).
         if candidate.uses_rule_conditions() {
             operations.push(&storage::compatibility::POLICY_RULE_CONDITIONS);
+        }
+        if candidate.uses_tool_argument_conditions() {
+            operations.push(&storage::compatibility::POLICY_TOOL_ARGUMENT_CONDITIONS);
         }
     }
     if candidate.uses_role_descriptions() {
