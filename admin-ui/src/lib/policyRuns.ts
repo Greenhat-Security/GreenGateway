@@ -9,6 +9,25 @@ export type PolicyRunCandidate =
   | Readonly<{ kind: 'active' }>
   | Readonly<{ kind: 'inline'; source: string }>;
 
+// A saved server-side draft, named by its id and the strong ETag it was read
+// at. The gateway reads it under the drafts API's owner scope, refuses it
+// once it has changed (`412 policy_draft_stale`) and never writes it, so a
+// result is about exactly the revision a publication of that ETag publishes.
+export type PolicyDraftRunCandidate = Readonly<{
+  kind: 'draft';
+  draftId: string;
+  draftEtag: string;
+}>;
+
+// The `candidate` member for a saved draft.
+export function draftCandidateJson(candidate: PolicyDraftRunCandidate): string {
+  return JSON.stringify({
+    source: 'draft',
+    draft_id: candidate.draftId,
+    draft_etag: candidate.draftEtag,
+  });
+}
+
 // One problem with a run request, located by an RFC 6901 pointer into the
 // request. The message is the gateway's fixed text; it never repeats an
 // input value.

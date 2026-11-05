@@ -251,6 +251,34 @@ fn every_check_and_reason_is_documented() {
         .chain(OTHER_CHECKS.iter().copied())
         .collect();
     assert_eq!(rows(&section("Doctor checks")), checks);
+    assert_eq!(
+        rows(&section("Environment doctor checks")),
+        ENVIRONMENT_CHECKS
+    );
     let reasons: Vec<_> = Reason::ALL.iter().map(|reason| reason.as_str()).collect();
     assert_eq!(rows(&section("Doctor reasons")), reasons);
+}
+
+/// The published report schema names exactly the checks a doctor reports.
+#[test]
+fn the_report_schema_lists_every_check() {
+    let schema = gateway_config::documents::published_schema(
+        gateway_config::documents::API_VERSION_V1ALPHA1,
+        gateway_config::documents::REPORT_KIND,
+    )
+    .expect("the report schema is published");
+    let schema: Value = serde_json::from_str(schema.json).expect("JSON");
+    let listed: Vec<_> = schema["$defs"]["check"]["properties"]["id"]["enum"]
+        .as_array()
+        .expect("an enum of check IDs")
+        .iter()
+        .map(|id| id.as_str().expect("a check ID").to_owned())
+        .collect();
+    let checks: Vec<_> = Stage::ALL
+        .iter()
+        .map(|stage| stage.id())
+        .chain(OTHER_CHECKS.iter().copied())
+        .chain(ENVIRONMENT_CHECKS.iter().copied())
+        .collect();
+    assert_eq!(listed, checks);
 }

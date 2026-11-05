@@ -1003,7 +1003,7 @@ fn manifest_structure_is_closed_and_every_problem_is_reported() {
 }
 
 #[test]
-fn the_deployment_document_carries_only_its_profile_in_this_alpha() {
+fn the_deployment_document_requires_its_profile_and_refuses_unknown_members() {
     let deployment = |spec: &str| {
         format!("apiVersion: greengateway.dev/v1alpha1\nkind: GatewayDeployment\nspec:\n{spec}")
     };
@@ -1022,7 +1022,7 @@ fn the_deployment_document_carries_only_its_profile_in_this_alpha() {
     let cases: [(&str, &[Code]); 4] = [
         ("  profile: staging\n", &[Code::InvalidValue]),
         (
-            "  profile: production\n  listeners: {}\n",
+            "  profile: production\n  later: {}\n",
             &[Code::UnknownMember],
         ),
         ("  profile: [production]\n", &[Code::WrongType]),
@@ -2533,6 +2533,10 @@ fn the_deployment_schema_agrees_with_the_reader() {
         DEPLOYMENT_YAML.replace(
             "  profile: production\n",
             "  profile: production\n  listeners: {}\n",
+        ),
+        DEPLOYMENT_YAML.replace(
+            "  profile: production\n",
+            "  profile: production\n  later: {}\n",
         ),
         DEPLOYMENT_YAML.replace(
             "kind: GatewayDeployment\n",

@@ -14,7 +14,7 @@ import {
   expireAnalysisSuppression,
   fetchAnalysisSuppressions,
   isSuppressionReason,
-  runPolicyAnalysis,
+  runPolicyAnalysisReport,
   type AnalysisFinding,
   type AnalysisReport,
   type AnalysisSuppressionRecord,
@@ -170,7 +170,7 @@ export function AnalyzerFindings({
     setRun({ kind: 'running' });
     setWriteAlert(null);
     try {
-      const answer = await runPolicyAnalysis({
+      const answer = await runPolicyAnalysisReport({
         baseEtag: candidate.liveEtag,
         candidate:
           candidate.kind === 'live'

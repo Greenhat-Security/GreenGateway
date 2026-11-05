@@ -40,6 +40,8 @@ use crate::{
 
 mod bundle;
 #[cfg(test)]
+mod env_file_tests;
+#[cfg(test)]
 mod environment_reads;
 #[cfg(test)]
 mod fingerprint_tests;

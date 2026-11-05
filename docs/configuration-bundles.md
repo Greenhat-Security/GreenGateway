@@ -8,10 +8,11 @@ versioned configuration bundle format and the reader that validates it (issue
 new bundle for a deployment profile ([generated bundles](#generated-bundles)) and
 [`ggctl convert`](ggctl.md#convert) converts one between document versions. Nothing in a released gateway reads a
 bundle yet: there is no startup mode, environment variable, or admin route that
-selects one. Bundle mode and the field catalog that fills the deployment
-document are later #242 slices. Until they land, environment configuration
-([configuration.md](configuration.md)) is the only way to configure a gateway,
-and the format below may still gain deployment settings before it is released.
+selects one. Bundle mode, which maps a deployment document onto the
+configuration compiler, is a later #242 slice. Until it lands, environment
+configuration ([configuration.md](configuration.md)) is the only way to
+configure a gateway, and the format below may still change before it is
+released.
 
 The design this follows is
 [ADR-0008](adr/0008-setup-cli-and-configuration-bundles.md) (setup, operator
@@ -77,7 +78,7 @@ the referenced documents.
 | Document | `apiVersion` | `kind` | Status |
 | --- | --- | --- | --- |
 | Manifest | `greengateway.dev/v1alpha1` | `GatewayBundle` | alpha |
-| Deployment document | `greengateway.dev/v1alpha1` | `GatewayDeployment` | alpha; carries `spec.profile` only |
+| Deployment document | `greengateway.dev/v1alpha1` | `GatewayDeployment` | alpha; the profile and the deployment settings |
 | Policy resource | (its own `schema_version`) | | `0.1.0` only |
 | Tools resource | (its own `schema_version`) | | `0.1.0` only |
 
@@ -125,15 +126,99 @@ the bundle boundary.
 
 ## The deployment document
 
-In this alpha `spec` has exactly one member, `profile`: `production`,
-`migration`, or `development`. The reader fixes the names; the compiler will
-enforce each profile's invariants. The deployment settings themselves join
-`spec` from the field catalog before a gateway can start from a bundle, so a
-document that sets anything else today is refused (`schema.unknown_member`)
-rather than having the setting silently dropped. The compiler compiles
-environment configuration only today; [its
-contract](architecture/configuration-compiler.md#extension-points-for-242)
-says what a bundle front end must add.
+`spec` holds the deployment profile and the deployment settings. The profile is
+`production`, `migration`, or `development`: the reader fixes the names, and the
+compiler will enforce each profile's invariants.
+
+The settings come from the [field catalog](configuration-catalog.json). Every
+catalog field a bundle can set has a document path there, the sections of `spec`
+are exactly the ones those paths imply, and the [published
+schema](schemas/gateway-deployment.v1alpha1.schema.json) and the
+[tables below](#settings) are generated from the same paths, so the three cannot
+disagree. Every section is a closed object (`schema.unknown_member` for any
+other member, and `schema.wrong_type` for a section that is not an object), and
+every section and setting is optional: leaving a setting out means what leaving
+its environment variable unset means. What a setting does is its variable's
+entry in [configuration.md](configuration.md), which each row links.
+
+```yaml
+apiVersion: greengateway.dev/v1alpha1
+kind: GatewayDeployment
+spec:
+  profile: production
+  listeners:
+    public:
+      address: "0.0.0.0:8080"
+    admin:
+      address: "127.0.0.1:9443"
+      prefix: /admin
+  public_url: https://gateway.example.test
+  egress:
+    deny_private_addresses: true
+    allowed_hosts: [api.example.test]
+  rate_limits:
+    read: { requests_per_second: "50", burst: 100 }
+  state:
+    backend: sqlite
+    stores: [audit, connections]
+```
+
+Each setting is held to its catalog entry, and the code says what is wrong
+without repeating the value:
+
+- **Booleans** are `true` or `false`, and **choices** exactly one of their words
+  (`schema.invalid_value`). A value of another JSON type is `schema.wrong_type`,
+  and `null` is never a value: leave the member out instead.
+- **Integers** are JSON integers within the field's own range
+  (`schema.invalid_value`). A document cannot hold an integer beyond the I-JSON
+  safe range (`syntax.integer_out_of_range`), so a field with no maximum of its
+  own goes up to 2^53 - 1 in a bundle.
+- **Fractional settings** are decimal strings (below) within the field's own
+  range (`schema.invalid_value`), compared as the gateway compares the
+  floating-point value the same text gives in the environment. The schema states
+  a decimal's range in its description; the reader enforces it.
+- **Socket addresses, URLs and other strings** are non-empty, with no whitespace
+  at either end (`schema.invalid_value`). A **list** is an array of such strings
+  with no comma in any of them, one per entry of the environment variable's
+  comma-separated list, which trims entries and drops empty ones; the reader
+  reports the entry at fault by its index. An empty array is an empty list: for
+  the lists with a default (`csrf.exempt_paths`, `authentication.exempt_paths`,
+  `authorization.exempt_paths` and `limits.allowed_content_types`) it replaces
+  the default, as an empty environment value does.
+- **`upstream.url`** can carry a credential in its user information or query, so
+  it takes a secret reference (`secret.inline_value` for a URL written inline).
+- **`state.stores`** names the standalone stores a deployment keeps beneath its
+  state directory, each once: `audit`, `discovery`, `principals`, `connections`
+  and `service_tokens` (`schema.invalid_value` for another word or a repeat),
+  each the store of one fixed file in [the state directory](#the-state-directory).
+  In environment mode they are the stores whose `*_SQLITE_PATH` variable is set.
+  The policy publication history is not one of them: ADR-0008 has not decided
+  whether bundle mode keeps one beside a bundle-owned policy.
+
+The reader checks each setting's shape and its own bounds, and nothing else.
+Rules that relate settings (an idle timeout within its session's lifetime, a
+client certificate mode that needs a CA, settings only one state backend reads)
+and each string's own grammar (addresses, URLs, CIDRs, header and cookie names)
+are the configuration compiler's, and the compiler does not read a deployment
+document yet. So a document the reader accepts can still be one the compiler
+would refuse, and no gateway starts from it. The profiles' invariants on these
+settings arrive with the mapping onto the compiler (see
+[deployment profiles](#deployment-profiles)).
+
+Some environment variables have no document form:
+
+- `AUTH_PROVIDERS`, `UPSTREAM_ROUTES` and `MCP_UPSTREAM_SERVERS` hold JSON
+  documents in the environment, which can carry inline credentials. Their
+  document forms are a later #242 slice; until then a bundle cannot configure
+  authentication providers, upstream routes or MCP upstream servers.
+- The host locators (certificate, key, CA, CRL, secret-root, database-URL and
+  audit log files) and the secret-provider wiring are bootstrap inputs that stay
+  in the environment beside a bundle
+  ([ADR-0008](adr/0008-setup-cli-and-configuration-bundles.md#bootstrap-inputs)).
+- `POLICY_FILE`, `TOOLS_FILE` and every `*_SQLITE_PATH` are replaced by bundle
+  resources and by `spec.state.stores`; the legacy single JWT provider
+  (`JWT_*`, `ROLES_CLAIM`) is not representable; and `OPENAPI_SPEC_PATH` and
+  `AUTHORITY_EVENT_FILE` are host paths ADR-0008 has not placed yet.
 
 The value forms those settings will use are fixed now, with the reader and the
 schema's `$defs`:
@@ -152,9 +237,272 @@ schema's `$defs`:
 - **Decimals.** JSON numbers in bundle documents are integers within the I-JSON
   safe range (magnitude at most 2^53 - 1). A fractional setting is a string in the
   grammar `^(0|[1-9][0-9]{0,15})(\.[0-9]{1,6})?$` (`schema.invalid_decimal`
-  otherwise), canonicalized to its shortest exact spelling (`"0.10"` is `"0.1"`).
-  It parses to exactly the floating-point value the same text gives in an
-  environment variable.
+  otherwise), canonicalized to its shortest exact spelling (`"0.10"` is `"0.1"`,
+  `"3.0"` is `"3"`) in the document's canonical form, so a respelled decimal
+  changes neither the canonical bytes nor any digest made from them. It parses
+  to exactly the floating-point value the same text gives in an environment
+  variable. The store list is canonicalized the same way, into the order above.
+
+### Settings
+
+One table per member of `spec`. The value column gives the type and the field's
+own range; the default is the value the document would spell, or what the
+default follows.
+
+<!-- deployment-settings:begin -->
+
+#### `spec.listeners`
+
+The listeners the gateway binds. Certificate, key, CA and CRL files are host locators and stay in the environment.
+
+| Member | Value | Default | Environment mode |
+| --- | --- | --- | --- |
+| `listeners.public.address` | socket address string | `"0.0.0.0:8080"` | [`LISTEN_ADDR`](configuration.md#listen_addr) |
+| `listeners.public.client_certificates` | `off`, `optional` or `required` | `"off"` | [`CLIENT_CERT_MODE`](configuration.md#client_cert_mode) |
+| `listeners.admin.address` | socket address string | unset | [`ADMIN_LISTEN_ADDR`](configuration.md#admin_listen_addr) |
+| `listeners.admin.client_certificates` | `off`, `optional` or `required` | `"off"` | [`ADMIN_CLIENT_CERT_MODE`](configuration.md#admin_client_cert_mode) |
+| `listeners.admin.prefix` | string | `"/admin"` | [`ADMIN_PREFIX`](configuration.md#admin_prefix) |
+| `listeners.grpc.address` | socket address string | unset | [`GRPC_LISTEN_ADDR`](configuration.md#grpc_listen_addr) |
+| `listeners.grpc.max_concurrent_streams` | integer, 1 to 10000 | `100` | [`GRPC_MAX_CONCURRENT_STREAMS`](configuration.md#grpc_max_concurrent_streams) |
+| `listeners.grpc.max_metadata_bytes` | integer bytes, 1024 to 1048576 | `16384` | [`GRPC_MAX_METADATA_BYTES`](configuration.md#grpc_max_metadata_bytes) |
+| `listeners.tls.min_version` | `1.2` or `1.3` | `"1.2"` | [`TLS_MIN_VERSION`](configuration.md#tls_min_version) |
+| `listeners.tls.handshake_timeout_ms` | integer milliseconds, at least 1 | `10000` | [`TLS_HANDSHAKE_TIMEOUT_MS`](configuration.md#tls_handshake_timeout_ms) |
+| `listeners.tls.max_concurrent_handshakes` | integer, at least 1 | `256` | [`TLS_MAX_CONCURRENT_HANDSHAKES`](configuration.md#tls_max_concurrent_handshakes) |
+| `listeners.tls.client_certificate_identity` | `spiffe`, `uri` or `dns` | unset | [`CLIENT_CERT_IDENTITY_SOURCE`](configuration.md#client_cert_identity_source) |
+
+#### `spec.admin_login`
+
+Admin sign-in through an authentication provider.
+
+| Member | Value | Default | Environment mode |
+| --- | --- | --- | --- |
+| `admin_login.provider` | string | unset | [`ADMIN_LOGIN_PROVIDER`](configuration.md#admin_login_provider) |
+| `admin_login.pending_ttl_secs` | integer seconds, at least 1 | `300` | [`ADMIN_LOGIN_PENDING_TTL_SECS`](configuration.md#admin_login_pending_ttl_secs) |
+| `admin_login.pending_max_entries` | integer, at least 1 | `1024` | [`ADMIN_LOGIN_PENDING_MAX_ENTRIES`](configuration.md#admin_login_pending_max_entries) |
+| `admin_login.pending_max_per_ip` | integer, at least 1 | `16` | [`ADMIN_LOGIN_PENDING_MAX_PER_IP`](configuration.md#admin_login_pending_max_per_ip) |
+
+#### `spec.admin_sessions`
+
+Admin sessions.
+
+| Member | Value | Default | Environment mode |
+| --- | --- | --- | --- |
+| `admin_sessions.mode` | `disabled`, `standalone_memory` or `cluster_postgres` | `"disabled"` | [`ADMIN_SESSION_MODE`](configuration.md#admin_session_mode) |
+| `admin_sessions.ttl_secs` | integer seconds, 1 to 86400 | `3600` | [`ADMIN_SESSION_TTL_SECS`](configuration.md#admin_session_ttl_secs) |
+| `admin_sessions.idle_timeout_secs` | integer seconds, at least 0 | follows `admin_sessions.ttl_secs` | [`ADMIN_SESSION_IDLE_TIMEOUT_SECS`](configuration.md#admin_session_idle_timeout_secs) |
+| `admin_sessions.max_entries` | integer, 1 to 100000 | `1024` | [`ADMIN_SESSION_MAX_ENTRIES`](configuration.md#admin_session_max_entries) |
+
+#### `spec.public_url`
+
+| Member | Value | Default | Environment mode |
+| --- | --- | --- | --- |
+| `public_url` | URL string | unset | [`GATEWAY_PUBLIC_URL`](configuration.md#gateway_public_url) |
+
+#### `spec.audit`
+
+The audit trail: durability, the shutdown drain, probe observations and retention.
+
+| Member | Value | Default | Environment mode |
+| --- | --- | --- | --- |
+| `audit.successful_probes_metrics_only` | `true` or `false` | `false` | [`AUDIT_SUCCESSFUL_PROBES_METRICS_ONLY`](configuration.md#audit_successful_probes_metrics_only) |
+| `audit.sqlite_retention_days` | integer days, 0 to 36500 | unset | [`AUDIT_SQLITE_RETENTION_DAYS`](configuration.md#audit_sqlite_retention_days) |
+| `audit.drain_timeout_ms` | integer milliseconds, 1 to 60000 | `5000` | [`AUDIT_DRAIN_TIMEOUT_MS`](configuration.md#audit_drain_timeout_ms) |
+| `audit.durability` | `required` or `best_effort` | `"required"` | [`AUDIT_DURABILITY`](configuration.md#audit_durability) |
+| `audit.durability_timeout_ms` | integer milliseconds, 1 to 60000 | `5000` | [`AUDIT_DURABILITY_TIMEOUT_MS`](configuration.md#audit_durability_timeout_ms) |
+| `audit.postgres_retention_days` | integer days, 0 to 36500 | unset | [`AUDIT_POSTGRES_RETENTION_DAYS`](configuration.md#audit_postgres_retention_days) |
+
+#### `spec.shutdown`
+
+Graceful shutdown.
+
+| Member | Value | Default | Environment mode |
+| --- | --- | --- | --- |
+| `shutdown.drain_delay_ms` | integer milliseconds, 0 to 30000 | `1000` | [`SHUTDOWN_DRAIN_DELAY_MS`](configuration.md#shutdown_drain_delay_ms) |
+| `shutdown.timeout_ms` | integer milliseconds, 1 to 300000 | `30000` | [`SHUTDOWN_TIMEOUT_MS`](configuration.md#shutdown_timeout_ms) |
+
+#### `spec.discovery`
+
+API discovery, payload capture and the discovery signals.
+
+| Member | Value | Default | Environment mode |
+| --- | --- | --- | --- |
+| `discovery.endpoint_limit` | integer, at least 1 | `10000` | [`DISCOVERY_ENDPOINT_LIMIT`](configuration.md#discovery_endpoint_limit) |
+| `discovery.projector.lease_ttl_ms` | integer milliseconds, at least 1000 | `15000` | [`DISCOVERY_PROJECTOR_LEASE_TTL_MS`](configuration.md#discovery_projector_lease_ttl_ms) |
+| `discovery.projector.poll_ms` | integer milliseconds, at least 50 | `250` | [`DISCOVERY_PROJECTOR_POLL_MS`](configuration.md#discovery_projector_poll_ms) |
+| `discovery.projector.batch` | integer, 1 to 5000 | `500` | [`DISCOVERY_PROJECTOR_BATCH`](configuration.md#discovery_projector_batch) |
+| `discovery.payload_capture.enabled` | `true` or `false` | `false` | [`PAYLOAD_CAPTURE_ENABLED`](configuration.md#payload_capture_enabled) |
+| `discovery.payload_capture.sample_rate` | decimal string, at least 0 and below 1 | `"0.1"` | [`PAYLOAD_CAPTURE_SAMPLE_RATE`](configuration.md#payload_capture_sample_rate) |
+| `discovery.signals.schema_mismatch_threshold` | integer, at least 1 | `5` | [`SCHEMA_MISMATCH_SIGNAL_THRESHOLD`](configuration.md#schema_mismatch_signal_threshold) |
+| `discovery.signals.error_rate_spike_threshold` | decimal string, above 0 and at most 1 | `"0.4"` | [`ERROR_RATE_SPIKE_SIGNAL_THRESHOLD`](configuration.md#error_rate_spike_signal_threshold) |
+| `discovery.signals.principal_new_to_endpoint_threshold` | integer, at least 1 | `1` | [`PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD`](configuration.md#principal_new_to_endpoint_signal_threshold) |
+| `discovery.signals.volume_outlier_threshold` | decimal string, above 1 | `"3"` | [`VOLUME_OUTLIER_SIGNAL_THRESHOLD`](configuration.md#volume_outlier_signal_threshold) |
+| `discovery.rule_suggestion_baseline_window_hours` | integer hours, 1 to 876000 | `24` | [`RULE_SUGGESTION_BASELINE_WINDOW_HOURS`](configuration.md#rule_suggestion_baseline_window_hours) |
+
+#### `spec.policy_tests`
+
+The stored policy test suite as a gate on policy changes.
+
+| Member | Value | Default | Environment mode |
+| --- | --- | --- | --- |
+| `policy_tests.required` | `true` or `false` | `false` | [`POLICY_TESTS_REQUIRED`](configuration.md#policy_tests_required) |
+
+#### `spec.cors`
+
+Cross-origin resource sharing.
+
+| Member | Value | Default | Environment mode |
+| --- | --- | --- | --- |
+| `cors.allowed_origins` | array of strings | unset | [`CORS_ALLOW_ORIGINS`](configuration.md#cors_allow_origins) |
+
+#### `spec.limits`
+
+Request bounds, and the media types mutating requests may carry.
+
+| Member | Value | Default | Environment mode |
+| --- | --- | --- | --- |
+| `limits.max_body_bytes` | integer bytes, at least 0 | `1048576` | [`MAX_BODY_SIZE`](configuration.md#max_body_size) |
+| `limits.max_request_path_bytes` | integer bytes, 1 to 8192 | `8192` | [`MAX_REQUEST_PATH_BYTES`](configuration.md#max_request_path_bytes) |
+| `limits.allowed_content_types` | array of strings | `["application/json"]` | [`VALIDATION_ALLOWED_CONTENT_TYPES`](configuration.md#validation_allowed_content_types) |
+
+#### `spec.rate_limits`
+
+The global rate limits applied before authentication, in two lanes.
+
+| Member | Value | Default | Environment mode |
+| --- | --- | --- | --- |
+| `rate_limits.read.requests_per_second` | decimal string, at least 0 | `"50"` | [`RATE_LIMIT_READ_RPS`](configuration.md#rate_limit_read_rps) |
+| `rate_limits.read.burst` | integer, 0 to 4294967295 | `100` | [`RATE_LIMIT_READ_BURST`](configuration.md#rate_limit_read_burst) |
+| `rate_limits.write.requests_per_second` | decimal string, at least 0 | `"10"` | [`RATE_LIMIT_WRITE_RPS`](configuration.md#rate_limit_write_rps) |
+| `rate_limits.write.burst` | integer, 0 to 4294967295 | `20` | [`RATE_LIMIT_WRITE_BURST`](configuration.md#rate_limit_write_burst) |
+| `rate_limits.max_buckets` | integer, at least 1 | `65536` | [`RATE_LIMIT_MAX_BUCKETS`](configuration.md#rate_limit_max_buckets) |
+| `rate_limits.bucket_ttl_ms` | integer milliseconds, at least 1 | `600000` | [`RATE_LIMIT_BUCKET_TTL_MS`](configuration.md#rate_limit_bucket_ttl_ms) |
+
+#### `spec.trusted_proxies`
+
+Which proxies' forwarded client addresses are believed.
+
+| Member | Value | Default | Environment mode |
+| --- | --- | --- | --- |
+| `trusted_proxies.trust_headers` | `true` or `false` | `false` | [`TRUST_PROXY_HEADERS`](configuration.md#trust_proxy_headers) |
+| `trusted_proxies.cidrs` | array of strings | unset | [`TRUSTED_PROXY_CIDRS`](configuration.md#trusted_proxy_cidrs) |
+
+#### `spec.authorization`
+
+Authorization outside the policy document.
+
+| Member | Value | Default | Environment mode |
+| --- | --- | --- | --- |
+| `authorization.exempt_paths` | array of strings | follows `listeners.admin.prefix` | [`RBAC_EXEMPT_PATHS`](configuration.md#rbac_exempt_paths) |
+
+#### `spec.authentication`
+
+Request authentication.
+
+| Member | Value | Default | Environment mode |
+| --- | --- | --- | --- |
+| `authentication.enabled` | `true` or `false` | `true` | [`AUTH_ENABLED`](configuration.md#auth_enabled) |
+| `authentication.mode` | `required` or `observe` | `"required"` | [`AUTH_MODE`](configuration.md#auth_mode) |
+| `authentication.cookie_name` | string | `"session"` | [`AUTH_COOKIE_NAME`](configuration.md#auth_cookie_name) |
+| `authentication.exempt_paths` | array of strings | follows `listeners.admin.prefix` | [`AUTH_EXEMPT_PATHS`](configuration.md#auth_exempt_paths) |
+| `authentication.service_token_cache_ttl_ms` | integer milliseconds, at least 1 | `5000` | [`SERVICE_TOKEN_CACHE_TTL_MS`](configuration.md#service_token_cache_ttl_ms) |
+
+#### `spec.tool_runtime`
+
+Tool execution.
+
+| Member | Value | Default | Environment mode |
+| --- | --- | --- | --- |
+| `tool_runtime.queue_depth` | integer, at least 1 | `1024` | [`TOOL_RUNTIME_QUEUE_DEPTH`](configuration.md#tool_runtime_queue_depth) |
+| `tool_runtime.global_concurrency` | integer, at least 1 | `64` | [`TOOL_RUNTIME_GLOBAL_CONCURRENCY`](configuration.md#tool_runtime_global_concurrency) |
+| `tool_runtime.queue_timeout_ms` | integer milliseconds, at least 1 | `1000` | [`TOOL_RUNTIME_QUEUE_TIMEOUT_MS`](configuration.md#tool_runtime_queue_timeout_ms) |
+| `tool_runtime.lease_ttl_ms` | integer milliseconds, at least 1000 | `15000` | [`TOOL_LEASE_TTL_MS`](configuration.md#tool_lease_ttl_ms) |
+| `tool_runtime.default_timeout_ms` | integer milliseconds, at least 1 | `30000` | [`TOOL_RUNTIME_DEFAULT_TIMEOUT_MS`](configuration.md#tool_runtime_default_timeout_ms) |
+
+#### `spec.cluster`
+
+Cluster identity, membership, readiness and status, in cluster mode.
+
+| Member | Value | Default | Environment mode |
+| --- | --- | --- | --- |
+| `cluster.heartbeat_ms` | integer milliseconds, at least 1000 | `5000` | [`CLUSTER_HEARTBEAT_MS`](configuration.md#cluster_heartbeat_ms) |
+| `cluster.member_stale_ms` | integer milliseconds, at least 1 | `30000` | [`CLUSTER_MEMBER_STALE_MS`](configuration.md#cluster_member_stale_ms) |
+| `cluster.maintenance_interval_ms` | integer milliseconds, at least 1000 | `60000` | [`CLUSTER_MAINTENANCE_INTERVAL_MS`](configuration.md#cluster_maintenance_interval_ms) |
+| `cluster.maintenance_lease_ttl_ms` | integer milliseconds, at least 1000 | `15000` | [`CLUSTER_MAINTENANCE_LEASE_TTL_MS`](configuration.md#cluster_maintenance_lease_ttl_ms) |
+| `cluster.readiness_probe_cache_ms` | integer milliseconds, 0 to 60000 | `1000` | [`READINESS_PROBE_CACHE_MS`](configuration.md#readiness_probe_cache_ms) |
+| `cluster.status_expose_hostnames` | `true` or `false` | `false` | [`CLUSTER_STATUS_EXPOSE_HOSTNAMES`](configuration.md#cluster_status_expose_hostnames) |
+| `cluster.deployment_id` | string | unset | [`DEPLOYMENT_ID`](configuration.md#deployment_id) |
+
+#### `spec.csrf`
+
+Cross-site request forgery protection for cookie-authenticated requests.
+
+| Member | Value | Default | Environment mode |
+| --- | --- | --- | --- |
+| `csrf.enabled` | `true` or `false` | `true` | [`CSRF_ENABLED`](configuration.md#csrf_enabled) |
+| `csrf.cookie_name` | string | `"csrf_token"` | [`CSRF_COOKIE_NAME`](configuration.md#csrf_cookie_name) |
+| `csrf.header_name` | string | `"x-csrf-token"` | [`CSRF_HEADER_NAME`](configuration.md#csrf_header_name) |
+| `csrf.cookie_domain` | string | unset | [`CSRF_COOKIE_DOMAIN`](configuration.md#csrf_cookie_domain) |
+| `csrf.exempt_paths` | array of strings | `["/health", "/livez", "/startupz", "/readyz", "/version", "/metrics"]` | [`CSRF_EXEMPT_PATHS`](configuration.md#csrf_exempt_paths) |
+
+#### `spec.upstream`
+
+The single upstream and the timeouts of proxied requests.
+
+| Member | Value | Default | Environment mode |
+| --- | --- | --- | --- |
+| `upstream.url` | secret reference | unset | [`UPSTREAM_URL`](configuration.md#upstream_url) |
+| `upstream.timeout_ms` | integer milliseconds, at least 1 | follows `egress.timeout_ms` | [`UPSTREAM_TIMEOUT_MS`](configuration.md#upstream_timeout_ms) |
+| `upstream.response_idle_timeout_ms` | integer milliseconds, at least 1 | follows `egress.response_idle_timeout_ms` | [`UPSTREAM_RESPONSE_IDLE_TIMEOUT_MS`](configuration.md#upstream_response_idle_timeout_ms) |
+| `upstream.connect_timeout_ms` | integer milliseconds, at least 1 | follows `egress.connect_timeout_ms` | [`UPSTREAM_CONNECT_TIMEOUT_MS`](configuration.md#upstream_connect_timeout_ms) |
+
+#### `spec.egress`
+
+Requests the gateway itself sends.
+
+| Member | Value | Default | Environment mode |
+| --- | --- | --- | --- |
+| `egress.allowed_hosts` | array of strings | unset | [`EGRESS_ALLOWED_HOSTS`](configuration.md#egress_allowed_hosts) |
+| `egress.timeout_ms` | integer milliseconds, at least 1 | `30000` | [`EGRESS_TIMEOUT_MS`](configuration.md#egress_timeout_ms) |
+| `egress.response_idle_timeout_ms` | integer milliseconds, at least 1 | `30000` | [`EGRESS_RESPONSE_IDLE_TIMEOUT_MS`](configuration.md#egress_response_idle_timeout_ms) |
+| `egress.connect_timeout_ms` | integer milliseconds, at least 1 | `10000` | [`EGRESS_CONNECT_TIMEOUT_MS`](configuration.md#egress_connect_timeout_ms) |
+| `egress.max_response_bytes` | integer bytes, at least 0 | `5242880` | [`EGRESS_MAX_RESPONSE_BYTES`](configuration.md#egress_max_response_bytes) |
+| `egress.max_request_body_bytes` | integer bytes, at least 0 | `1048576` | [`EGRESS_MAX_REQUEST_BODY_BYTES`](configuration.md#egress_max_request_body_bytes) |
+| `egress.nat64_prefixes` | array of strings | unset | [`EGRESS_NAT64_PREFIXES`](configuration.md#egress_nat64_prefixes) |
+| `egress.deny_private_addresses` | `true` or `false` | `true` | [`EGRESS_DENY_PRIVATE_IPS`](configuration.md#egress_deny_private_ips) |
+
+#### `spec.state`
+
+The state backend and, in standalone mode, the stores kept beneath the state directory.
+
+| Member | Value | Default | Environment mode |
+| --- | --- | --- | --- |
+| `state.backend` | `sqlite` or `postgres` | `"sqlite"` | [`STATE_BACKEND`](configuration.md#state_backend) |
+| `state.postgres.tls_mode` | `verify` or `loopback-dev` | `"verify"` | [`DATABASE_TLS_MODE`](configuration.md#database_tls_mode) |
+| `state.postgres.pool_max` | integer, 1 to 256 | `10` | [`DATABASE_POOL_MAX`](configuration.md#database_pool_max) |
+| `state.postgres.connect_timeout_ms` | integer milliseconds, at least 1 | `5000` | [`DATABASE_CONNECT_TIMEOUT_MS`](configuration.md#database_connect_timeout_ms) |
+| `state.postgres.acquire_timeout_ms` | integer milliseconds, at least 1 | `5000` | [`DATABASE_ACQUIRE_TIMEOUT_MS`](configuration.md#database_acquire_timeout_ms) |
+| `state.postgres.statement_timeout_ms` | integer milliseconds, at least 1 | `15000` | [`DATABASE_STATEMENT_TIMEOUT_MS`](configuration.md#database_statement_timeout_ms) |
+| `state.postgres.idle_in_transaction_timeout_ms` | integer milliseconds, at least 1 | `30000` | [`DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS`](configuration.md#database_idle_in_transaction_timeout_ms) |
+| `state.postgres.lock_timeout_ms` | integer milliseconds, at least 1 | `5000` | [`DATABASE_LOCK_TIMEOUT_MS`](configuration.md#database_lock_timeout_ms) |
+| `state.postgres.startup_retry_limit` | integer, 0 to 300 | `5` | [`DATABASE_STARTUP_RETRY_LIMIT`](configuration.md#database_startup_retry_limit) |
+| `state.postgres.auto_migrate` | `true` or `false` | `false` | [`DATABASE_AUTO_MIGRATE`](configuration.md#database_auto_migrate) |
+| `state.postgres.migration_statement_timeout_ms` | integer milliseconds, 1 to 600000 | `60000` | [`DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS`](configuration.md#database_migration_statement_timeout_ms) |
+| `state.stores` | array of distinct `audit`, `discovery`, `principals`, `connections` and `service_tokens` | unset | which of `AUDIT_SQLITE_PATH`, `DISCOVERY_SQLITE_PATH`, `PRINCIPAL_SQLITE_PATH`, `CONNECTIONS_SQLITE_PATH` and `SERVICE_TOKEN_SQLITE_PATH` are set |
+
+#### `spec.authority_evidence`
+
+Authority evidence and its event delivery.
+
+| Member | Value | Default | Environment mode |
+| --- | --- | --- | --- |
+| `authority_evidence.durability` | `required` or `best_effort` | `"best_effort"` | [`AUTHORITY_EVIDENCE_DURABILITY`](configuration.md#authority_evidence_durability) |
+| `authority_evidence.event_sink` | `none`, `log` or `file` | `"none"` | [`AUTHORITY_EVENT_SINK`](configuration.md#authority_event_sink) |
+| `authority_evidence.pseudonym_key_alias` | string | unset | [`AUTHORITY_PSEUDONYM_KEY_ALIAS`](configuration.md#authority_pseudonym_key_alias) |
+| `authority_evidence.previous_pseudonym_key_alias` | string | unset | [`AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS`](configuration.md#authority_pseudonym_previous_key_alias) |
+| `authority_evidence.event_journal_capacity` | integer, 1 to 1000000000 | `1000000` | [`AUTHORITY_EVENT_JOURNAL_CAPACITY`](configuration.md#authority_event_journal_capacity) |
+| `authority_evidence.event_retention_hours` | integer hours, 0 to 87600 | `168` | [`AUTHORITY_EVENT_RETENTION_HOURS`](configuration.md#authority_event_retention_hours) |
+
+<!-- deployment-settings:end -->
 
 ## Referenced policy and tools documents
 
@@ -191,7 +539,7 @@ once it has passed its schema:
 | Profile | Policy invariants |
 | --- | --- |
 | `production` | Deny by default (`profile.policy_default_allow` for `default_action: allow`), enforce mode (`profile.policy_shadow_mode` for `enforcement_mode: shadow` at the top level or on any route), and no role granting the `*` wildcard permission (`profile.wildcard_role`). |
-| `migration` | The production invariants. ADR-0008 lets a migration bundle keep each of those compatibility behaviors once its deployment document acknowledges it, but `v1alpha1` has no acknowledgment list yet (it arrives with the field catalog), so none can be acknowledged and none is allowed. |
+| `migration` | The production invariants. ADR-0008 lets a migration bundle keep each of those compatibility behaviors once its deployment document acknowledges it, but `v1alpha1` has no acknowledgment list yet, so none can be acknowledged and none is allowed. |
 | `development` | None. |
 
 An absent `default_action` is `deny` and an absent `enforcement_mode` is
@@ -199,8 +547,10 @@ An absent `default_action` is `deny` and an absent `enforcement_mode` is
 role is reported at `/roles` and the line of its `*`, never by name. A policy left
 to the server's store (`source: server`) is not checked by the reader. The
 profiles' other invariants (authentication, egress, CSRF, audit durability,
-listeners) concern deployment settings that join `spec` with the field catalog,
-and are enforced from then on.
+listeners) concern deployment settings, which the reader checks for shape and
+bounds only: they are enforced once the compiler reads a deployment document, a
+later #242 slice. Until then a `production` document that, say, turns
+authentication off is accepted by the reader, and no gateway can start from it.
 
 ## Generated bundles
 
@@ -208,10 +558,11 @@ and are enforced from then on.
 accepts strictly, and the gateway's own tests hold every one it can write to the
 production policy and tools validators and to the policy enforcement it
 configures. The output is deterministic: the same profile and answers always
-give the same bytes, and so the same digests. A `v1alpha1` deployment document
-carries the profile and nothing else, so what `init` can write is the same safe
-starting point for every profile, and the profile's other invariants arrive with
-the deployment settings:
+give the same bytes, and so the same digests. `init` writes only the profile
+into the deployment document. Every setting it leaves out keeps its default,
+which is already what the production profile asks for (authentication required,
+private-address egress denied, CSRF on, required audit durability), so what
+`init` writes is the same safe starting point for every profile:
 
 | File | Standalone topology (default) | Cluster topology |
 | --- | --- | --- |

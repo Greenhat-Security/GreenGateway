@@ -9,7 +9,7 @@ import {
   isSuppressionReason,
   projectAnalysisReport,
   projectSuppressionList,
-  runPolicyAnalysis,
+  runPolicyAnalysisReport,
 } from './policyAnalyses';
 
 const LIVE_ETAG = '"sha256:live-1"';
@@ -82,7 +82,7 @@ describe('policy analysis client', () => {
     );
     vi.stubGlobal('fetch', fetch);
     const source = '{ "schema_version": "1.0.0",\n  "rules": [] }';
-    const answer = await runPolicyAnalysis({
+    const answer = await runPolicyAnalysisReport({
       baseEtag: LIVE_ETAG,
       candidate: { kind: 'inline', source },
     });
@@ -218,7 +218,7 @@ describe('policy analysis client', () => {
         ),
       ),
     );
-    await runPolicyAnalysis({ baseEtag: LIVE_ETAG, candidate: { kind: 'active' } });
+    await runPolicyAnalysisReport({ baseEtag: LIVE_ETAG, candidate: { kind: 'active' } });
     await createAnalysisSuppression({
       liveEtag: LIVE_ETAG,
       fingerprint: FINGERPRINT,
