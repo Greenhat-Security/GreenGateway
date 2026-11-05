@@ -1117,16 +1117,12 @@ async fn refresh_managed_openapi_catalog(
     connections::openapi::OpenApiCatalogPublishResult,
     Box<(ConnectionRefreshFailure, Response)>,
 > {
+    let actor = auth::change_actor::ChangeActor::from_principal(principal);
     let mut converted_catalog = connections::openapi::ConvertedCatalogAdmission::NotAsked;
     loop {
         let result = state
             .openapi_catalogs
-            .refresh_with_admission(
-                id.as_str(),
-                current_etag,
-                converted_catalog,
-                &principal.user_id,
-            )
+            .refresh_with_admission(id.as_str(), current_etag, converted_catalog, &actor)
             .await;
         match result {
             Err(connections::openapi::OpenApiCatalogError::ConvertedCatalogNeedsAdmission {
@@ -1230,7 +1226,11 @@ pub(super) async fn connection_refresh_endpoint(
     let refreshed = match &record.write.discovery {
         Some(connections::model::DiscoveryConfig::ManagedMcp { .. }) => state
             .mcp_catalogs
-            .refresh(id.as_str(), current_etag.as_str(), &principal.user_id)
+            .refresh(
+                id.as_str(),
+                current_etag.as_str(),
+                &auth::change_actor::ChangeActor::from_principal(&principal),
+            )
             .await
             .map(ConnectionCatalogRefreshResponse::Mcp)
             .map_err(|error| {
@@ -1712,6 +1712,7 @@ pub(super) async fn connection_openapi_overlay_put_endpoint(
         rbac_state.principal_has_permission(&principal, ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION);
     // At most two passes, as for registration: an overlay over a converted
     // catalog asks the operation gate before anything is written.
+    let actor = auth::change_actor::ChangeActor::from_principal(&principal);
     let mut converted_catalog = connections::openapi::ConvertedCatalogAdmission::NotAsked;
     let updated = loop {
         let result = state
@@ -1723,7 +1724,7 @@ pub(super) async fn connection_openapi_overlay_put_endpoint(
                 params.allow_unresolved_enum_sources,
                 secrets_write_authorized,
                 converted_catalog,
-                &principal.user_id,
+                &actor,
             )
             .await;
         if let (
@@ -1793,7 +1794,11 @@ pub(super) async fn connection_openapi_overlay_delete_endpoint(
     };
     match state
         .openapi_catalogs
-        .delete_overlay(&raw_id, &expected_etag, &principal.user_id)
+        .delete_overlay(
+            &raw_id,
+            &expected_etag,
+            &auth::change_actor::ChangeActor::from_principal(&principal),
+        )
         .await
     {
         Ok(result) => {
@@ -1969,6 +1974,7 @@ pub(super) async fn connection_openapi_register_endpoint(
 
     // At most two passes: the second only after the operation gate admitted
     // a converted document the first pass stopped at, before writing.
+    let actor = auth::change_actor::ChangeActor::from_principal(&principal);
     let mut converted_catalog = connections::openapi::ConvertedCatalogAdmission::NotAsked;
     let registered = loop {
         let result = state
@@ -1983,7 +1989,7 @@ pub(super) async fn connection_openapi_register_endpoint(
                 &requested.selected_tool_names,
                 &confirmations,
                 converted_catalog,
-                &principal.user_id,
+                &actor,
             )
             .await;
         if let (

@@ -847,7 +847,7 @@ mod database {
                     expected_overlay_revision: 0,
                 }),
                 1,
-                "fixture-operator",
+                &crate::auth::change_actor::ChangeActor::for_test("fixture-operator"),
                 &[],
             )
             .expect("the OpenAPI catalog and overlay should publish atomically");

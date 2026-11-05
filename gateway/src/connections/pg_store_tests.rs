@@ -860,7 +860,7 @@ async fn changing_the_catalog_kind_under_a_published_catalog_is_refused() {
             &[],
             &[],
             0,
-            "op-2",
+            &ChangeActor::for_test("op-2"),
         )
         .await
         .expect("catalog replace should win");
@@ -943,7 +943,15 @@ async fn changing_the_catalog_kind_under_a_published_catalog_is_refused() {
     // Withdraw the catalog, and the same replace is now allowed: the
     // guard tracks live rows, it does not pin the kind forever.
     store
-        .replace_mcp_catalog(&created.id, &unchanged.etag(), &[], &[], &[], 1, "op-4")
+        .replace_mcp_catalog(
+            &created.id,
+            &unchanged.etag(),
+            &[],
+            &[],
+            &[],
+            1,
+            &ChangeActor::for_test("op-4"),
+        )
         .await
         .expect("emptying the catalog should win");
     let after_withdrawal = store
@@ -1014,7 +1022,7 @@ async fn mcp_catalog_replaces_with_cas_revisions_dependencies_and_outbox() {
             &[],
             &[],
             0,
-            "op-2",
+            &ChangeActor::for_test("op-2"),
         )
         .await
         .expect("catalog replace should win");
@@ -1075,7 +1083,7 @@ async fn mcp_catalog_replaces_with_cas_revisions_dependencies_and_outbox() {
             &[],
             &[],
             1,
-            "op-4",
+            &ChangeActor::for_test("op-4"),
         )
         .await
         .expect_err("the stale connection etag must lose");
@@ -1104,7 +1112,7 @@ async fn mcp_catalog_replaces_with_cas_revisions_dependencies_and_outbox() {
             &[],
             &[],
             1,
-            "op-5",
+            &ChangeActor::for_test("op-5"),
         )
         .await
         .expect("the fresh etag should win");
@@ -1145,7 +1153,7 @@ async fn a_stale_catalog_revision_is_refused_even_under_a_fresh_connection_etag(
             &[],
             &[],
             0,
-            "replica-a",
+            &ChangeActor::for_test("replica-a"),
         )
         .await
         .expect("the first discovery commits");
@@ -1162,7 +1170,7 @@ async fn a_stale_catalog_revision_is_refused_even_under_a_fresh_connection_etag(
             &[],
             &[],
             0,
-            "replica-b",
+            &ChangeActor::for_test("replica-b"),
         )
         .await
         .expect_err("a discovery from a superseded catalog must be refused");
@@ -1190,7 +1198,7 @@ async fn a_stale_catalog_revision_is_refused_even_under_a_fresh_connection_etag(
             &[],
             &[],
             1,
-            "replica-b",
+            &ChangeActor::for_test("replica-b"),
         )
         .await
         .expect("a refresh from the live catalog commits");
@@ -1307,7 +1315,7 @@ async fn retained_mcp_catalog_bytes_charge_entries_resources_and_templates() {
             std::slice::from_ref(&resource),
             std::slice::from_ref(&template),
             0,
-            "op-2",
+            &ChangeActor::for_test("op-2"),
         )
         .await
         .expect("catalog replace should win");
@@ -1432,7 +1440,7 @@ async fn openapi_overlay_catalog_cas_prune_and_restart_are_atomic() {
                 expected_overlay_revision: 0,
             }),
             1,
-            "overlay-op-2",
+            &ChangeActor::for_test("overlay-op-2"),
             &[],
         )
         .await
@@ -1528,7 +1536,7 @@ async fn openapi_overlay_catalog_cas_prune_and_restart_are_atomic() {
                 expected_overlay_revision: 0,
             }),
             1,
-            "overlay-stale",
+            &ChangeActor::for_test("overlay-stale"),
             &[],
         )
         .await
@@ -1599,7 +1607,7 @@ async fn openapi_overlay_catalog_cas_prune_and_restart_are_atomic() {
                 expected_overlay_revision: 1,
             }),
             2,
-            "overlay-injected-failure",
+            &ChangeActor::for_test("overlay-injected-failure"),
             &[],
         )
         .await
@@ -1647,7 +1655,7 @@ async fn openapi_overlay_catalog_cas_prune_and_restart_are_atomic() {
                 expected_overlay_revision: 1,
             }),
             2,
-            "overlay-op-3",
+            &ChangeActor::for_test("overlay-op-3"),
             &[],
         )
         .await
@@ -1734,7 +1742,7 @@ async fn openapi_overlay_catalog_cas_prune_and_restart_are_atomic() {
                 expected_overlay_revision: 2,
             }),
             2,
-            "overlay-report-only",
+            &ChangeActor::for_test("overlay-report-only"),
             &[],
         )
         .await
@@ -1802,7 +1810,7 @@ async fn openapi_overlay_catalog_cas_prune_and_restart_are_atomic() {
                 expected_overlay_revision: 2,
             }),
             0,
-            "overlay-op-4",
+            &ChangeActor::for_test("overlay-op-4"),
             &[],
         )
         .await
@@ -1837,7 +1845,7 @@ async fn openapi_overlay_catalog_cas_prune_and_restart_are_atomic() {
                 expected_overlay_revision: 0,
             }),
             0,
-            "overlay-orphan-reports",
+            &ChangeActor::for_test("overlay-orphan-reports"),
             &[],
         )
         .await
@@ -1889,7 +1897,7 @@ async fn enum_source_initial_cas_has_one_cross_replica_winner() {
                 expected_overlay_revision: 0,
             }),
             1,
-            "enum-cas-overlay",
+            &ChangeActor::for_test("enum-cas-overlay"),
             &[],
         )
         .await
@@ -2019,7 +2027,7 @@ async fn policy_and_overlay_name_adoption_serialize_in_commit_order_across_repli
                             expected_overlay_revision: 0,
                         }),
                         1,
-                        "overlay-replica",
+                        &ChangeActor::for_test("overlay-replica"),
                         &["policy_first_name".to_owned()],
                     )
                     .await
@@ -2098,7 +2106,7 @@ async fn policy_and_overlay_name_adoption_serialize_in_commit_order_across_repli
                             expected_overlay_revision: 0,
                         }),
                         1,
-                        "overlay-replica",
+                        &ChangeActor::for_test("overlay-replica"),
                         &["overlay_first_name".to_owned()],
                     )
                     .await
@@ -2209,7 +2217,7 @@ async fn published_mcp_catalog(store: &PostgresConnectionStore) -> StoredConnect
             &[mcp_resource("file:///a"), mcp_resource("file:///b")],
             &[],
             0,
-            "op-2",
+            &ChangeActor::for_test("op-2"),
         )
         .await
         .expect("MCP catalog publishes");
@@ -2306,7 +2314,7 @@ async fn persisted_openapi_entry_edited_out_of_band_loads_as_corruption() {
             RESERVATION_SPEC,
             &reservation_spec_digest(),
             &[openapi_entry("billing.list"), openapi_entry("billing.get")],
-            "op-4",
+            &ChangeActor::for_test("op-4"),
         )
         .await
         .expect("OpenAPI catalog publishes");
@@ -2574,7 +2582,7 @@ async fn tool_names_are_reserved_across_lanes_at_the_authority() {
             RESERVATION_SPEC,
             &digest,
             &[openapi_entry("shared_tool")],
-            "op-2",
+            &ChangeActor::for_test("op-2"),
         )
         .await
         .expect("the OpenAPI lane publishes first");
@@ -2620,7 +2628,7 @@ async fn tool_names_are_reserved_across_lanes_at_the_authority() {
             RESERVATION_SPEC,
             &digest,
             &[openapi_entry("shared_tool")],
-            "op-5",
+            &ChangeActor::for_test("op-5"),
         )
         .await
         .expect_err("the name is held by another Connection");
@@ -2649,7 +2657,7 @@ async fn tool_names_are_reserved_across_lanes_at_the_authority() {
             RESERVATION_SPEC,
             &digest,
             &[openapi_entry("renamed_tool")],
-            "op-6",
+            &ChangeActor::for_test("op-6"),
         )
         .await
         .expect("republish without the name");
@@ -2681,7 +2689,7 @@ async fn tool_names_are_reserved_across_lanes_at_the_authority() {
             RESERVATION_SPEC,
             &digest,
             &[openapi_entry("shared_tool"), openapi_entry("renamed_tool")],
-            "op-8",
+            &ChangeActor::for_test("op-8"),
         )
         .await
         .expect_err("the local lane holds it now");
@@ -2775,7 +2783,7 @@ async fn concurrent_cross_lane_publishes_of_one_tool_name_produce_exactly_one_wi
                         RESERVATION_SPEC,
                         &digest,
                         &[openapi_entry(&name)],
-                        "op-o",
+                        &ChangeActor::for_test("op-o"),
                     )
                     .await
                     .is_ok()
@@ -2843,7 +2851,7 @@ async fn openapi_catalog_triple_cas_and_status_append() {
             "{\"openapi\":\"3.1.0\"}",
             "not-a-sha256",
             std::slice::from_ref(&entry),
-            "op-2",
+            &ChangeActor::for_test("op-2"),
         )
         .await
         .expect_err("an invalid digest must be rejected");
@@ -2865,7 +2873,7 @@ async fn openapi_catalog_triple_cas_and_status_append() {
             "{\"openapi\":\"3.1.0\"}",
             &digest,
             std::slice::from_ref(&entry),
-            "op-3",
+            &ChangeActor::for_test("op-3"),
         )
         .await
         .expect("the initial triple CAS (0,0) should win");
@@ -2889,7 +2897,7 @@ async fn openapi_catalog_triple_cas_and_status_append() {
             "{\"openapi\":\"3.1.0\"}",
             &digest,
             std::slice::from_ref(&entry),
-            "op-4",
+            &ChangeActor::for_test("op-4"),
         )
         .await
         .expect_err("the stale catalog revision must lose");
@@ -3114,7 +3122,7 @@ async fn operation_ids_are_bounded_by_characters_not_bytes() {
             RESERVATION_SPEC,
             &reservation_spec_digest(),
             &[entry],
-            "op-2",
+            &ChangeActor::for_test("op-2"),
         )
         .await
         .expect("a 100-character non-ASCII operation id publishes");
@@ -4120,7 +4128,7 @@ async fn concurrent_writes_cannot_both_bind_one_alias_under_two_purposes() {
     );
 }
 
-// ==== Catalog change evidence (issue #425, PR 2c; migration 23) ====
+// ==== Catalog change evidence (issue #425, PR 2c; migrations 23 and 25) ====
 
 /// One `catalog_change_evidence` row, every column, UUIDs and the timestamp
 /// read as text.
@@ -4129,6 +4137,9 @@ struct CatalogEvidenceRow {
     event_id: String,
     operation_id: String,
     actor_user_id: String,
+    actor_issuer: Option<String>,
+    actor_kind: Option<String>,
+    actor_auth_mode: Option<String>,
     action: String,
     connection_id: String,
     prior_version: Option<i64>,
@@ -4147,7 +4158,8 @@ async fn catalog_evidence_rows(pool: &deadpool_postgres::Pool) -> Vec<CatalogEvi
             r#"
             SELECT event_id::text, operation_id::text, actor_user_id, action,
                    connection_id::text, prior_version, new_version, overlay_revision,
-                   security_revision, committed_at::text
+                   security_revision, committed_at::text, actor_issuer, actor_kind,
+                   actor_auth_mode
             FROM greengateway.catalog_change_evidence
             ORDER BY security_revision
             "#,
@@ -4160,6 +4172,9 @@ async fn catalog_evidence_rows(pool: &deadpool_postgres::Pool) -> Vec<CatalogEvi
             event_id: row.get(0),
             operation_id: row.get(1),
             actor_user_id: row.get(2),
+            actor_issuer: row.get(10),
+            actor_kind: row.get(11),
+            actor_auth_mode: row.get(12),
             action: row.get(3),
             connection_id: row.get(4),
             prior_version: row.get(5),
@@ -4238,7 +4253,7 @@ async fn catalog_evidence_survives_replacement_cascade_and_restart() {
             &[mcp_resource("file:///evidence")],
             &[],
             0,
-            "publisher-a",
+            &ChangeActor::for_test("publisher-a"),
         )
         .await
         .expect("the first catalog publishes");
@@ -4251,7 +4266,7 @@ async fn catalog_evidence_survives_replacement_cascade_and_restart() {
             &[],
             &[],
             0,
-            "stale-publisher",
+            &ChangeActor::for_test("stale-publisher"),
         )
         .await
         .expect_err("a stale catalog revision is refused");
@@ -4260,7 +4275,15 @@ async fn catalog_evidence_survives_replacement_cascade_and_restart() {
         "{stale}"
     );
     let unattributed = store
-        .replace_mcp_catalog(&created.id, &created.etag(), &[], &[], &[], 1, "")
+        .replace_mcp_catalog(
+            &created.id,
+            &created.etag(),
+            &[],
+            &[],
+            &[],
+            1,
+            &ChangeActor::for_test(""),
+        )
         .await
         .expect_err("an unattributable publication is refused");
     assert!(
@@ -4277,7 +4300,7 @@ async fn catalog_evidence_survives_replacement_cascade_and_restart() {
                 &[],
                 &[],
                 1,
-                &oversized_actor
+                &ChangeActor::for_test(&oversized_actor)
             )
             .await,
         Err(ConnectionStoreError::Validation { .. })
@@ -4294,7 +4317,7 @@ async fn catalog_evidence_survives_replacement_cascade_and_restart() {
             &[],
             &[],
             1,
-            "publisher-b",
+            &ChangeActor::for_test("publisher-b"),
         )
         .await
         .expect("the second catalog publishes");
@@ -4367,111 +4390,511 @@ async fn catalog_evidence_survives_replacement_cascade_and_restart() {
     }
 }
 
-/// Migration 25 adds the actor columns to `catalog_change_evidence`, and the
-/// step to it rolls (issue #426): this build applies it while replicas of its
-/// prepared release, which never applies it, still publish. Both builds write
-/// that evidence through one function, which names each column it sets, so
-/// on the expanded table a publication commits with its evidence row and the
-/// row records none of the new columns (which the migration's CHECK admits),
-/// whichever of the two builds published it. Recording the actor there is a
-/// later #425 slice. A restart on the expanded schema serves what was
-/// published.
+/// A principal as an admin endpoint receives it, carrying marker values in
+/// every field catalog evidence must not record.
+fn catalog_principal(
+    subject: &str,
+    issuer: Option<&str>,
+    auth_method: crate::auth::AuthMethod,
+) -> crate::auth::Principal {
+    crate::auth::Principal {
+        user_id: subject.to_owned(),
+        issuer: issuer.map(str::to_owned),
+        email: Some("marker-email@example.test".to_owned()),
+        org_id: Some("marker-org".to_owned()),
+        roles: vec!["marker-role".to_owned()],
+        session_id: "marker-session".to_owned(),
+        auth_method,
+    }
+}
+
+/// An overlay put over the current overlay revision.
+fn overlay_put(expected_overlay_revision: u64) -> StoredOverlayWrite {
+    StoredOverlayWrite::Put {
+        schema_version: "0.1.0".to_owned(),
+        overlay_json: r#"{"schema_version":"0.1.0","tools":{}}"#.to_owned(),
+        source_reports_json: r#"{"schema_version":"0.1.0","sources":[]}"#.to_owned(),
+        expected_overlay_revision,
+    }
+}
+
+/// The CHECK constraints on one table that govern its actor metadata
+/// columns, as PostgreSQL renders them.
+async fn actor_metadata_checks(pool: &deadpool_postgres::Pool, table: &str) -> Vec<String> {
+    pool.get()
+        .await
+        .expect("constraint checkout")
+        .query(
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+             WHERE conrelid = $1::text::regclass AND contype = 'c' \
+               AND (pg_get_constraintdef(oid) LIKE '%actor_kind%' \
+                    OR pg_get_constraintdef(oid) LIKE '%actor_issuer%') \
+             ORDER BY 1",
+            &[&table],
+        )
+        .await
+        .expect("constraints should read")
+        .iter()
+        .map(|row| row.get(0))
+        .collect()
+}
+
+/// Every catalog action records the whole actor the admin endpoint built
+/// from the authenticated principal, in migration 25's columns and as a
+/// Connection deletion records it: subject, canonical issuer, kind and auth
+/// mode. An issuer-less principal, a service token and a principal an
+/// identity provider vouched for each publish an MCP catalog, put an OpenAPI
+/// overlay, refresh the OpenAPI catalog and delete the overlay. The table
+/// holds migration 24's pairing CHECK, every row satisfies it, nothing else
+/// the principal carried reaches a row, and a restart reads the same rows.
 #[tokio::test]
-async fn catalog_evidence_on_the_expanded_schema_records_no_actor_metadata_yet() {
+async fn catalog_evidence_records_the_whole_actor_for_every_catalog_action() {
+    use crate::auth::AuthMethod;
+
     let Some(admin_dsn) = locator() else {
         eprintln!("skipping: no test database locator; CI runs this test");
         return;
     };
     let database = create_test_database(&admin_dsn).await;
     let (store, pool) = migrated_store(&database.dsn, 64).await;
+    let catalog_checks = actor_metadata_checks(&pool, "greengateway.catalog_change_evidence").await;
+    assert_eq!(catalog_checks.len(), 2, "{catalog_checks:#?}");
     assert_eq!(
-        count(
-            &pool,
-            "SELECT COUNT(*) FROM greengateway.schema_migrations \
-             WHERE version = 25 AND name = 'catalog_change_evidence_actor_metadata'"
-        )
-        .await,
-        1,
-        "the store runs on the expanded schema"
+        catalog_checks,
+        actor_metadata_checks(&pool, "greengateway.connection_change_evidence").await,
+        "catalog evidence pairs kind, auth mode and issuer exactly as migration 24 does"
     );
-    let created = store
+
+    let actors = [
+        ChangeActor::from_principal(&catalog_principal(
+            "certificate-admin",
+            None,
+            AuthMethod::ClientCertificate,
+        )),
+        ChangeActor::from_principal(&catalog_principal(
+            "service-token:token_1",
+            None,
+            AuthMethod::ServiceToken,
+        )),
+        ChangeActor::from_principal(&catalog_principal(
+            "provider-admin",
+            Some(" https://idp.example.test/ "),
+            AuthMethod::Cookie,
+        )),
+    ];
+    let recorded = [
+        (
+            "certificate-admin",
+            None,
+            Some("principal"),
+            Some("client_certificate"),
+        ),
+        (
+            "service-token:token_1",
+            None,
+            Some("service_token"),
+            Some("service_token"),
+        ),
+        (
+            "provider-admin",
+            Some("https://idp.example.test"),
+            Some("principal"),
+            Some("session_cookie"),
+        ),
+    ];
+
+    let mcp = store
+        .create(mcp_candidate(), "creator", None)
+        .await
+        .expect("MCP connection should create");
+    for (prior, actor) in (0_u64..).zip(&actors) {
+        store
+            .replace_mcp_catalog(
+                &mcp.id,
+                &mcp.etag(),
+                &[mcp_entry("alpha")],
+                &[],
+                &[],
+                prior,
+                actor,
+            )
+            .await
+            .expect("the MCP catalog publishes");
+    }
+
+    let api = store
+        .create(http_candidate("Actor API"), "creator", None)
+        .await
+        .expect("OpenAPI connection should create");
+    let digest = reservation_spec_digest();
+    let entries = [openapi_entry("actor_listing")];
+    let (mut spec_revision, mut catalog_revision) = (0, 0);
+    for actor in &actors {
+        for (overlay, compiled_overlay_revision) in [
+            (Some(overlay_put(0)), 1),
+            (None, 1),
+            (
+                Some(StoredOverlayWrite::Delete {
+                    expected_overlay_revision: 1,
+                }),
+                0,
+            ),
+        ] {
+            let published = store
+                .replace_openapi_catalog_with_overlay(
+                    &api.id,
+                    &api.etag(),
+                    spec_revision,
+                    catalog_revision,
+                    RESERVATION_SPEC,
+                    &digest,
+                    &entries,
+                    overlay.as_ref(),
+                    compiled_overlay_revision,
+                    actor,
+                    &[],
+                )
+                .await
+                .expect("the OpenAPI catalog publishes");
+            assert_eq!(published.overlay_revision, compiled_overlay_revision);
+            (spec_revision, catalog_revision) =
+                (published.spec_revision, published.catalog_revision);
+        }
+    }
+
+    let rows = catalog_evidence_rows(&pool).await;
+    let expected = recorded
+        .iter()
+        .map(|actor| ("catalog.mcp.publish", *actor))
+        .chain(recorded.iter().flat_map(|actor| {
+            [
+                "catalog.overlay.replace",
+                "catalog.openapi.publish",
+                "catalog.overlay.delete",
+            ]
+            .map(|action| (action, *actor))
+        }))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows.iter()
+            .map(|row| (
+                row.action.as_str(),
+                (
+                    row.actor_user_id.as_str(),
+                    row.actor_issuer.as_deref(),
+                    row.actor_kind.as_deref(),
+                    row.actor_auth_mode.as_deref(),
+                )
+            ))
+            .collect::<Vec<_>>(),
+        expected
+    );
+    let (mcp_rows, api_rows): (Vec<_>, Vec<_>) = rows
+        .iter()
+        .cloned()
+        .partition(|row| row.connection_id == mcp.id.as_str());
+    assert_evidence_matches_outbox(&mcp_rows, &catalog_outbox(&pool, &mcp.id).await);
+    assert_evidence_matches_outbox(&api_rows, &catalog_outbox(&pool, &api.id).await);
+
+    // The actor is its subject, issuer, kind and auth mode only: never the
+    // principal's email, organization, roles or session, nor the issuer as
+    // the principal carried it before canonicalization.
+    let stored = pool
+        .get()
+        .await
+        .expect("evidence text checkout")
+        .query(
+            "SELECT row_to_json(e)::text FROM greengateway.catalog_change_evidence e",
+            &[],
+        )
+        .await
+        .expect("evidence rows should encode")
+        .iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for marker in [
+        "marker-email@example.test",
+        "marker-org",
+        "marker-role",
+        "marker-session",
+        "idp.example.test/",
+        " https://",
+        "actor_listing",
+        "listInvoices",
+        "billing.example.test",
+        "mcp.example.test",
+    ] {
+        assert!(
+            !stored.contains(marker),
+            "catalog evidence must not carry {marker}: {stored}"
+        );
+    }
+
+    drop(store);
+    drop(pool);
+    let (_restarted, pool) = migrated_store(&database.dsn, 64).await;
+    assert_eq!(
+        catalog_evidence_rows(&pool).await,
+        rows,
+        "the evidence survives restart unchanged"
+    );
+}
+
+/// Waits for a write an unrecordable actor makes, which must be refused
+/// before the store opens a transaction: the caller holds the lock every
+/// Connection mutation takes first, so a write that reached `BEGIN` would
+/// wait for it and time out here instead of being refused.
+async fn refused_before_the_transaction<T: std::fmt::Debug>(
+    write: impl std::future::Future<Output = Result<T, ConnectionStoreError>>,
+) -> ConnectionStoreError {
+    tokio::time::timeout(std::time::Duration::from_secs(10), write)
+        .await
+        .expect("a refusal before the transaction never waits for the mutation lock")
+        .expect_err("an unrecordable actor is refused")
+}
+
+/// Only a committed catalog change is evidence. For each of the four
+/// catalog actions, an actor evidence cannot record exactly -- an empty or
+/// oversized subject, an empty or oversized issuer, a service token that
+/// claims an issuer -- is refused as a validation failure before any
+/// transaction opens, and a stale catalog or overlay revision is refused
+/// inside one, with a recordable actor. Neither writes evidence, consumes a
+/// revision or changes the catalog.
+#[tokio::test]
+async fn refused_and_stale_catalog_writes_record_no_evidence() {
+    let Some(admin_dsn) = locator() else {
+        eprintln!("skipping: no test database locator; CI runs this test");
+        return;
+    };
+    let database = create_test_database(&admin_dsn).await;
+    let (store, pool) = migrated_store(&database.dsn, 64).await;
+    let publisher = ChangeActor::for_test_with_issuer("publisher", "https://idp.example.test");
+    let mcp = store
         .create(mcp_candidate(), "creator", None)
         .await
         .expect("MCP connection should create");
     store
         .replace_mcp_catalog(
-            &created.id,
-            &created.etag(),
+            &mcp.id,
+            &mcp.etag(),
             &[mcp_entry("alpha")],
             &[],
             &[],
             0,
-            "publisher-a",
+            &publisher,
         )
         .await
-        .expect("a publication commits on schema 25");
-    store
+        .expect("the MCP catalog publishes");
+    let api = store
+        .create(http_candidate("Refused API"), "creator", None)
+        .await
+        .expect("OpenAPI connection should create");
+    let digest = reservation_spec_digest();
+    let entries = [openapi_entry("refused_listing")];
+    let published = store
+        .replace_openapi_catalog_with_overlay(
+            &api.id,
+            &api.etag(),
+            0,
+            0,
+            RESERVATION_SPEC,
+            &digest,
+            &entries,
+            Some(&overlay_put(0)),
+            1,
+            &publisher,
+            &[],
+        )
+        .await
+        .expect("the overlay publishes with its catalog");
+    let evidence_before = catalog_evidence_rows(&pool).await;
+    assert_eq!(evidence_before.len(), 2);
+    let revision_before = security_revision(&pool).await;
+    let delete = StoredOverlayWrite::Delete {
+        expected_overlay_revision: 1,
+    };
+
+    let holder = pool.get().await.expect("lock holder checkout");
+    holder
+        .batch_execute(
+            "BEGIN; SELECT last_revision FROM greengateway.connection_state_revision \
+             WHERE singleton FOR UPDATE",
+        )
+        .await
+        .expect("the Connection mutation lock should be held");
+    for actor in [
+        ChangeActor::for_test(""),
+        ChangeActor::for_test(&"a".repeat(EVIDENCE_ACTOR_MAX_BYTES + 1)),
+        ChangeActor::for_test_with_issuer("refused-admin", ""),
+        ChangeActor::for_test_with_issuer(
+            "refused-admin",
+            &"i".repeat(crate::auth::principal::MAX_PRINCIPAL_ISSUER_BYTES + 1),
+        ),
+        ChangeActor::service_token_with_issuer_for_test(
+            "service-token:refused",
+            "https://idp.example.test",
+        ),
+    ] {
+        let refusals = [
+            refused_before_the_transaction(store.replace_mcp_catalog(
+                &mcp.id,
+                &mcp.etag(),
+                &[mcp_entry("beta")],
+                &[],
+                &[],
+                1,
+                &actor,
+            ))
+            .await,
+            refused_before_the_transaction(store.replace_openapi_catalog_with_overlay(
+                &api.id,
+                &api.etag(),
+                published.spec_revision,
+                published.catalog_revision,
+                RESERVATION_SPEC,
+                &digest,
+                &entries,
+                None,
+                1,
+                &actor,
+                &[],
+            ))
+            .await,
+            refused_before_the_transaction(store.replace_openapi_catalog_with_overlay(
+                &api.id,
+                &api.etag(),
+                published.spec_revision,
+                published.catalog_revision,
+                RESERVATION_SPEC,
+                &digest,
+                &entries,
+                Some(&overlay_put(1)),
+                2,
+                &actor,
+                &[],
+            ))
+            .await,
+            refused_before_the_transaction(store.replace_openapi_catalog_with_overlay(
+                &api.id,
+                &api.etag(),
+                published.spec_revision,
+                published.catalog_revision,
+                RESERVATION_SPEC,
+                &digest,
+                &entries,
+                Some(&delete),
+                0,
+                &actor,
+                &[],
+            ))
+            .await,
+        ];
+        for refusal in refusals {
+            assert!(
+                matches!(refusal, ConnectionStoreError::Validation { .. }),
+                "{refusal}"
+            );
+        }
+    }
+    holder
+        .batch_execute("ROLLBACK")
+        .await
+        .expect("the Connection mutation lock should release");
+    drop(holder);
+
+    // Stale writes by a recordable actor reach the transaction and are
+    // refused there.
+    let stale_actor = ChangeActor::for_test_with_issuer("stale-admin", "https://idp.example.test");
+    let stale_mcp = store
         .replace_mcp_catalog(
-            &created.id,
-            &created.etag(),
+            &mcp.id,
+            &mcp.etag(),
             &[mcp_entry("beta")],
             &[],
             &[],
+            0,
+            &stale_actor,
+        )
+        .await
+        .expect_err("a stale MCP catalog revision is refused");
+    assert!(
+        matches!(stale_mcp, ConnectionStoreError::Conflict { .. }),
+        "{stale_mcp}"
+    );
+    let stale_publish = store
+        .replace_openapi_catalog_with_overlay(
+            &api.id,
+            &api.etag(),
+            published.spec_revision,
+            0,
+            RESERVATION_SPEC,
+            &digest,
+            &entries,
+            None,
             1,
-            "publisher-b",
+            &stale_actor,
+            &[],
         )
         .await
-        .expect("and so does the next");
-    let rows = catalog_evidence_rows(&pool).await;
-    assert_eq!(
-        rows.iter()
-            .map(|row| (
-                row.action.as_str(),
-                row.actor_user_id.as_str(),
-                row.prior_version,
-                row.new_version,
-            ))
-            .collect::<Vec<_>>(),
-        vec![
-            ("catalog.mcp.publish", "publisher-a", None, 1),
-            ("catalog.mcp.publish", "publisher-b", Some(1), 2),
-        ]
+        .expect_err("a stale OpenAPI catalog revision is refused");
+    assert!(
+        matches!(stale_publish, ConnectionStoreError::Conflict { .. }),
+        "{stale_publish}"
     );
-    assert_evidence_matches_outbox(&rows, &catalog_outbox(&pool, &created.id).await);
-    assert_eq!(
-        count(
-            &pool,
-            "SELECT COUNT(*) FROM greengateway.catalog_change_evidence \
-             WHERE actor_kind IS NULL AND actor_auth_mode IS NULL AND actor_issuer IS NULL"
-        )
-        .await,
-        2,
-        "the writer both builds share records no actor metadata, and guesses none"
-    );
-    drop(store);
-    drop(pool);
+    for (overlay, compiled_overlay_revision) in [
+        (overlay_put(0), 1),
+        (
+            StoredOverlayWrite::Delete {
+                expected_overlay_revision: 2,
+            },
+            0,
+        ),
+    ] {
+        let stale_overlay = store
+            .replace_openapi_catalog_with_overlay(
+                &api.id,
+                &api.etag(),
+                published.spec_revision,
+                published.catalog_revision,
+                RESERVATION_SPEC,
+                &digest,
+                &entries,
+                Some(&overlay),
+                compiled_overlay_revision,
+                &stale_actor,
+                &[],
+            )
+            .await
+            .expect_err("a stale overlay revision is refused");
+        assert!(
+            matches!(stale_overlay, ConnectionStoreError::OverlayConflict { .. }),
+            "{stale_overlay}"
+        );
+    }
 
-    // A fresh process on the expanded schema: the auto-migrating startup
-    // path applies and removes nothing, and serves the published catalog.
-    let (restarted, pool) = migrated_store(&database.dsn, 64).await;
+    assert_eq!(catalog_evidence_rows(&pool).await, evidence_before);
     assert_eq!(
-        count(&pool, "SELECT COUNT(*) FROM greengateway.schema_migrations").await,
-        i64::try_from(crate::storage::migrations::manifest_len()).expect("a short manifest")
+        security_revision(&pool).await,
+        revision_before,
+        "no refused catalog write consumed a revision"
     );
-    let catalog = restarted
-        .mcp_catalog(&created.id)
+    let mcp_catalog = store
+        .mcp_catalog(&mcp.id)
         .await
-        .expect("the catalog reads")
-        .expect("the catalog is there");
-    assert_eq!(catalog.catalog_revision, 2);
+        .expect("the MCP catalog reads")
+        .expect("the MCP catalog is there");
+    assert_eq!(mcp_catalog.catalog_revision, 1);
+    let (api_catalog, api_overlay) = store
+        .openapi_catalog_with_overlay(&api.id)
+        .await
+        .expect("the OpenAPI catalog reads");
+    let api_catalog = api_catalog.expect("the OpenAPI catalog is there");
     assert_eq!(
-        catalog
-            .entries
-            .iter()
-            .map(|entry| entry.remote_tool_name.as_str())
-            .collect::<Vec<_>>(),
-        vec!["beta"]
+        (api_catalog.catalog_revision, api_catalog.overlay_revision),
+        (1, 1)
     );
+    assert_eq!(api_overlay.map(|overlay| overlay.overlay_revision), Some(1));
 }
 
 /// Every OpenAPI publication goes through one replacement, and its evidence
@@ -4510,7 +4933,7 @@ async fn openapi_publication_evidence_names_the_overlay_change() {
             &[openapi_entry("evidence_listing")],
             Some(&overlay_put),
             1,
-            "overlay-admin",
+            &ChangeActor::for_test("overlay-admin"),
             &[],
         )
         .await
@@ -4530,7 +4953,7 @@ async fn openapi_publication_evidence_names_the_overlay_change() {
                 &[openapi_entry("evidence_listing")],
                 Some(&overlay_put),
                 1,
-                "stale-admin",
+                &ChangeActor::for_test("stale-admin"),
                 &[],
             )
             .await,
@@ -4548,7 +4971,7 @@ async fn openapi_publication_evidence_names_the_overlay_change() {
             &[openapi_entry("evidence_listing")],
             None,
             first.overlay_revision,
-            "refresher",
+            &ChangeActor::for_test("refresher"),
             &[],
         )
         .await
@@ -4569,7 +4992,7 @@ async fn openapi_publication_evidence_names_the_overlay_change() {
             &[],
             None,
             1,
-            "stale-refresher",
+            &ChangeActor::for_test("stale-refresher"),
             &[],
         )
         .await
@@ -4588,7 +5011,7 @@ async fn openapi_publication_evidence_names_the_overlay_change() {
                 expected_overlay_revision: 1,
             }),
             0,
-            "overlay-remover",
+            &ChangeActor::for_test("overlay-remover"),
             &[],
         )
         .await
@@ -4682,7 +5105,7 @@ async fn a_failed_catalog_evidence_insert_rolls_back_the_publication() {
             &[],
             &[],
             0,
-            "faulted-publisher",
+            &ChangeActor::for_test("faulted-publisher"),
         )
         .await
         .expect_err("a publication whose evidence cannot commit must fail");
@@ -4735,7 +5158,7 @@ async fn a_failed_catalog_evidence_insert_rolls_back_the_publication() {
             &[],
             &[],
             0,
-            "faulted-publisher",
+            &ChangeActor::for_test("faulted-publisher"),
         )
         .await
         .expect("the publication commits once evidence can be written");

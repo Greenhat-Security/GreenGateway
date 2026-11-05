@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
+    auth::change_actor::ChangeActor,
     egress::{EgressError, EgressRequestBody},
     middleware::rbac::RbacState,
     tools::{
@@ -129,10 +130,11 @@ struct OpenApiPublishCandidate<'a> {
     source_plan: Option<OverlaySourcePlan>,
     enum_values: Vec<StoredEnumSourceValueWrite>,
     started: Instant,
-    /// Who is publishing. The authority records it on the immutable
-    /// specification version; standalone mode has no version table and
-    /// ignores it.
-    actor: &'a str,
+    /// Who is publishing. The authority records its subject on the catalog
+    /// and overlay rows and the whole actor on the publication's evidence
+    /// (`catalog_change_evidence`); standalone mode records only the
+    /// subject, on the overlay row an overlay write stores.
+    actor: &'a ChangeActor,
 }
 
 struct OpenApiPublishedCatalog {
@@ -1002,7 +1004,7 @@ impl OpenApiConnectionCatalogService {
         raw_connection_id: &str,
         expected_overlay_etag: &str,
         document: &Value,
-        actor: &str,
+        actor: &ChangeActor,
     ) -> Result<OpenApiOverlayMutationResult, OpenApiOverlayOperationError> {
         self.put_overlay_with_options(
             raw_connection_id,
@@ -1020,7 +1022,7 @@ impl OpenApiConnectionCatalogService {
         expected_overlay_etag: &str,
         document: &Value,
         allow_unresolved_enum_sources: bool,
-        actor: &str,
+        actor: &ChangeActor,
     ) -> Result<OpenApiOverlayMutationResult, OpenApiOverlayOperationError> {
         self.put_overlay_with_authorization(
             raw_connection_id,
@@ -1043,7 +1045,7 @@ impl OpenApiConnectionCatalogService {
         allow_unresolved_enum_sources: bool,
         secrets_write_authorized: bool,
         converted_catalog: ConvertedCatalogAdmission,
-        actor: &str,
+        actor: &ChangeActor,
     ) -> Result<OpenApiOverlayMutationResult, OpenApiOverlayOperationError> {
         let connection_id = ConnectionId::parse(raw_connection_id.to_owned())
             .map_err(|_| OpenApiCatalogError::InvalidConnectionId)?;
@@ -1214,7 +1216,7 @@ impl OpenApiConnectionCatalogService {
         &self,
         raw_connection_id: &str,
         expected_overlay_etag: &str,
-        actor: &str,
+        actor: &ChangeActor,
     ) -> Result<OpenApiOverlayMutationResult, OpenApiOverlayOperationError> {
         let connection_id = ConnectionId::parse(raw_connection_id.to_owned())
             .map_err(|_| OpenApiCatalogError::InvalidConnectionId)?;
@@ -1438,7 +1440,7 @@ impl OpenApiConnectionCatalogService {
         spec: &str,
         selected_tool_names: &[String],
         confirmations: &[OpenApiToolSecuritySelection],
-        actor: &str,
+        actor: &ChangeActor,
     ) -> Result<OpenApiCatalogPublishResult, OpenApiCatalogError> {
         self.register_with_admission(
             raw_connection_id,
@@ -1469,7 +1471,7 @@ impl OpenApiConnectionCatalogService {
         selected_tool_names: &[String],
         confirmations: &[OpenApiToolSecuritySelection],
         converted_catalog: ConvertedCatalogAdmission,
-        actor: &str,
+        actor: &ChangeActor,
     ) -> Result<OpenApiCatalogPublishResult, OpenApiCatalogError> {
         validate_spec_size(spec)?;
         if spec_digest(spec) != expected_spec_digest {
@@ -1578,7 +1580,7 @@ impl OpenApiConnectionCatalogService {
         &self,
         raw_connection_id: &str,
         expected_connection_etag: &str,
-        actor: &str,
+        actor: &ChangeActor,
     ) -> Result<OpenApiCatalogPublishResult, OpenApiCatalogError> {
         self.refresh_with_admission(
             raw_connection_id,
@@ -1600,7 +1602,7 @@ impl OpenApiConnectionCatalogService {
         raw_connection_id: &str,
         expected_connection_etag: &str,
         converted_catalog: ConvertedCatalogAdmission,
-        actor: &str,
+        actor: &ChangeActor,
     ) -> Result<OpenApiCatalogPublishResult, OpenApiCatalogError> {
         let connection_id = ConnectionId::parse(raw_connection_id.to_owned())
             .map_err(|_| OpenApiCatalogError::InvalidConnectionId)?;
@@ -3866,7 +3868,7 @@ paths:
                 spec,
                 &selected_tool_names,
                 &confirmations,
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect_err("the registry install must be refused");
@@ -4013,7 +4015,7 @@ paths:
                 spec,
                 &["get_invoice".to_owned()],
                 &preview.binding.security_selections,
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("an attested Connection registers an uploaded catalog");
@@ -4025,7 +4027,11 @@ paths:
         // registered catalog stays served.
         assert_eq!(
             service
-                .refresh(record.id.as_str(), record.etag().as_str(), "test-admin")
+                .refresh(
+                    record.id.as_str(),
+                    record.etag().as_str(),
+                    &crate::auth::change_actor::ChangeActor::for_test("test-admin")
+                )
                 .await
                 .err(),
             Some(OpenApiCatalogError::CallerAssertionNotEnforced)
@@ -4165,7 +4171,7 @@ paths:
                 spec,
                 &["list_messages".to_owned()],
                 &preview.binding.security_selections,
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("a delegated Connection registers the operation its scopes bind");
@@ -4178,7 +4184,11 @@ paths:
         // registered catalog stays served.
         assert_eq!(
             service
-                .refresh(record.id.as_str(), record.etag().as_str(), "test-admin")
+                .refresh(
+                    record.id.as_str(),
+                    record.etag().as_str(),
+                    &crate::auth::change_actor::ChangeActor::for_test("test-admin")
+                )
                 .await
                 .err(),
             Some(OpenApiCatalogError::CallerAssertionNotEnforced)
@@ -4252,7 +4262,7 @@ paths:
                 spec,
                 &selected_tool_names,
                 &preview.binding.security_selections,
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("exact preview should publish");
@@ -4295,7 +4305,11 @@ paths:
             .runtime()
             .definition_is_current(&held, updated.etag().as_str()));
         service
-            .refresh(record.id.as_str(), updated.etag().as_str(), "test-admin")
+            .refresh(
+                record.id.as_str(),
+                updated.etag().as_str(),
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("a refresh that fetches nothing is served on an attested Connection");
         let refreshed = registry
@@ -4459,7 +4473,7 @@ paths:
                     spec,
                     &["get_invoice".to_owned()],
                     &preview.binding.security_selections,
-                    "test-admin",
+                    &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
                 )
                 .await
                 .expect("an uploaded catalog should register");
@@ -4559,7 +4573,7 @@ paths:
                     spec,
                     &["get_invoice".to_owned()],
                     &[],
-                    "test-admin",
+                    &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
                 )
                 .await
                 .err(),
@@ -4567,7 +4581,11 @@ paths:
         );
         assert_eq!(
             service
-                .refresh(record.id.as_str(), updated.etag().as_str(), "test-admin")
+                .refresh(
+                    record.id.as_str(),
+                    updated.etag().as_str(),
+                    &crate::auth::change_actor::ChangeActor::for_test("test-admin")
+                )
                 .await
                 .err(),
             refused
@@ -4581,7 +4599,7 @@ paths:
                     "schema_version": "0.1.0",
                     "tools": {"get_invoice": {"rename": "read_invoice"}}
                 }),
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .err();
@@ -4748,7 +4766,7 @@ paths:
                 spec,
                 &selected,
                 &confirmations,
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("the selected converted tool should publish");
@@ -4773,7 +4791,7 @@ paths:
                 &OverlayEtag::for_revisions(record.id.as_str(), record.revisions.connection, 1, 0)
                     .to_string(),
                 &overlay,
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("an overlay recompiles the stored Swagger 2.0 document");
@@ -4796,7 +4814,11 @@ paths:
             .expect("the stored Swagger 2.0 document should rebuild its source plan");
 
         let refreshed = service
-            .refresh(record.id.as_str(), record.etag().as_str(), "test-admin")
+            .refresh(
+                record.id.as_str(),
+                record.etag().as_str(),
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("refresh should convert the stored document again");
         assert_eq!(refreshed.changed_count, 0);
@@ -5112,7 +5134,7 @@ paths:
                 openapi_spec,
                 &selected,
                 &preview.registration_security_selections,
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("an OpenAPI 3.x document never needs the gate");
@@ -5132,7 +5154,7 @@ paths:
                 swagger_spec,
                 &selected,
                 &preview.registration_security_selections,
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect_err("a converted catalog needs the gate's admission");
@@ -5162,7 +5184,7 @@ paths:
                 &selected,
                 &preview.registration_security_selections,
                 ConvertedCatalogAdmission::Admitted(OpenApiSourceFormat::Swagger2),
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("an admitted converted catalog registers");
@@ -5179,7 +5201,12 @@ paths:
         )
         .to_string();
         let refused = service
-            .put_overlay(record.id.as_str(), &overlay_etag, &overlay, "test-admin")
+            .put_overlay(
+                record.id.as_str(),
+                &overlay_etag,
+                &overlay,
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect_err("an overlay over a converted catalog needs the gate's admission");
         assert!(matches!(
@@ -5203,12 +5230,16 @@ paths:
                 false,
                 true,
                 ConvertedCatalogAdmission::Admitted(OpenApiSourceFormat::Swagger2),
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("an admitted overlay over a converted catalog stores");
         service
-            .delete_overlay(record.id.as_str(), updated.etag.as_str(), "test-admin")
+            .delete_overlay(
+                record.id.as_str(),
+                updated.etag.as_str(),
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("deleting an overlay is never gated");
 
@@ -5218,7 +5249,11 @@ paths:
             .expect("status history should read")
             .len();
         let refused = service
-            .refresh(record.id.as_str(), record.etag().as_str(), "test-admin")
+            .refresh(
+                record.id.as_str(),
+                record.etag().as_str(),
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect_err("refreshing to a converted catalog needs the gate's admission");
         assert_eq!(
@@ -5241,7 +5276,7 @@ paths:
                 record.id.as_str(),
                 record.etag().as_str(),
                 ConvertedCatalogAdmission::Admitted(OpenApiSourceFormat::Swagger2),
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("an admitted refresh stores the converted catalog again");
@@ -5354,7 +5389,7 @@ paths:
                     &selected,
                     &preview.registration_security_selections,
                     admission,
-                    "test-admin",
+                    &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
                 )
                 .await
                 .expect_err("a Discovery catalog needs its own format's admission");
@@ -5377,7 +5412,7 @@ paths:
                 &selected,
                 &preview.registration_security_selections,
                 ConvertedCatalogAdmission::Admitted(OpenApiSourceFormat::GoogleDiscovery),
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("an admitted Discovery catalog registers");
@@ -5404,7 +5439,7 @@ paths:
                 false,
                 true,
                 ConvertedCatalogAdmission::Admitted(OpenApiSourceFormat::GoogleDiscovery),
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("an admitted overlay over a Discovery catalog stores");
@@ -5527,7 +5562,7 @@ paths:
                 spec,
                 &selected_tool_names,
                 &confirmations,
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("exact preview should publish");
@@ -5552,7 +5587,7 @@ paths:
                     spec,
                     &selected_tool_names,
                     &confirmations,
-                    "test-admin",
+                    &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
                 )
                 .await
                 .err(),
@@ -5573,7 +5608,7 @@ paths:
                     spec,
                     &selected_tool_names,
                     &confirmations,
-                    "test-admin",
+                    &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
                 )
                 .await
                 .err(),
@@ -5654,7 +5689,7 @@ paths:
                 spec,
                 &[],
                 &[],
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("an exact empty registration should clear a disabled catalog");
@@ -5794,7 +5829,7 @@ paths:
                 spec,
                 &selected,
                 &preview.registration_security_selections,
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("initial catalog should publish");
@@ -5829,7 +5864,7 @@ paths:
                 true,
                 false,
                 ConvertedCatalogAdmission::NotAsked,
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect_err("raw source PUT must require secrets-write authority");
@@ -5923,7 +5958,7 @@ paths:
                     record.id, record.revisions.connection
                 ),
                 &document,
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect_err("a stale overlay ETag must be refused");
@@ -5948,7 +5983,7 @@ paths:
                 &OverlayEtag::for_revisions(record.id.as_str(), record.revisions.connection, 1, 0)
                     .to_string(),
                 &document,
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("valid overlay should atomically publish");
@@ -6050,7 +6085,11 @@ paths:
             .definition_is_current(&served, record.etag().as_str()));
 
         let deleted = service
-            .delete_overlay(record.id.as_str(), first_put_etag.as_str(), "test-admin")
+            .delete_overlay(
+                record.id.as_str(),
+                first_put_etag.as_str(),
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("overlay DELETE should atomically publish the bare catalog");
         let delete_etag = deleted.etag.clone();
@@ -6084,7 +6123,7 @@ paths:
                 record.id.as_str(),
                 delete_etag.as_str(),
                 &document,
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("overlay should recreate after deletion");
@@ -6109,7 +6148,7 @@ paths:
                 record.id.as_str(),
                 first_put_etag.as_str(),
                 &document,
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect_err("a pre-delete ETag must not match the recreated overlay");
@@ -6144,7 +6183,7 @@ paths:
                 spec,
                 &["get_invoice".to_owned(), "read_invoice".to_owned()],
                 &registration_preview.registration_security_selections,
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await;
         assert_eq!(
@@ -6162,7 +6201,7 @@ paths:
                 spec,
                 &served_selection,
                 &registration_preview.registration_security_selections,
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("served preview names should round-trip through registration");
@@ -6243,7 +6282,7 @@ paths:
                 spec,
                 &["get_invoice".to_owned()],
                 &preview.registration_security_selections,
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("nonempty catalog should register");
@@ -6262,7 +6301,7 @@ paths:
                 OverlayEtag::for_revisions(record.id.as_str(), record.revisions.connection, 1, 0)
                     .as_str(),
                 &document,
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("overlay should publish against the current catalog");
@@ -6319,7 +6358,7 @@ paths:
                 updated.id.as_str(),
                 current_etag.as_str(),
                 &document,
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect_err("PUT must not compile an old catalog under a current-generation token");
@@ -6328,7 +6367,11 @@ paths:
             OpenApiOverlayOperationError::Catalog(OpenApiCatalogError::StalePreview)
         ));
         let rejected_delete = service
-            .delete_overlay(updated.id.as_str(), current_etag.as_str(), "test-admin")
+            .delete_overlay(
+                updated.id.as_str(),
+                current_etag.as_str(),
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect_err("DELETE must not compile an old catalog under a current-generation token");
         assert!(matches!(
@@ -6433,7 +6476,7 @@ paths:
                 spec,
                 &[],
                 &[],
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("empty catalog should register");
@@ -6443,7 +6486,7 @@ paths:
                 OverlayEtag::for_revisions(record.id.as_str(), record.revisions.connection, 1, 0)
                     .as_str(),
                 &document,
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("first-generation overlay should publish");
@@ -6513,7 +6556,7 @@ paths:
                 spec,
                 &[],
                 &[],
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("restored empty catalog should register from revision zero");
@@ -6528,7 +6571,7 @@ paths:
                 )
                 .as_str(),
                 &document,
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("restored overlay should reuse catalog/document revisions safely");
@@ -6544,7 +6587,7 @@ paths:
                 restored.id.as_str(),
                 old_etag.as_str(),
                 &document,
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect_err("an ETag from the previous Connection generation must be refused");
@@ -6624,7 +6667,7 @@ paths:
                 spec,
                 &[],
                 &[],
-                "replica-a",
+                &crate::auth::change_actor::ChangeActor::for_test("replica-a"),
             )
             .await
             .expect("replica A should publish an empty c1/r1 catalog");
@@ -6704,7 +6747,7 @@ paths:
                 spec,
                 &["get_invoice".to_owned()],
                 &restored_preview.registration_security_selections,
-                "replica-b",
+                &crate::auth::change_actor::ChangeActor::for_test("replica-b"),
             )
             .await
             .expect("replica B should publish a nonempty c3/r1 catalog");
@@ -6854,7 +6897,7 @@ paths:
                 spec,
                 &["get_invoice".to_owned()],
                 &preview.registration_security_selections,
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("catalog should publish");
@@ -6868,7 +6911,7 @@ paths:
                     "schema_version": "0.1.0",
                     "tools": {"get_invoice": {"rename": "unsafe_adoption"}}
                 }),
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect_err("an unowned policy grant must not be adopted by rename");
@@ -6889,7 +6932,7 @@ paths:
                 record.id.as_str(),
                 absent_overlay_etag.as_str(),
                 &invalid_document,
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect_err("unknown generated tool should reject the overlay");
@@ -6926,7 +6969,7 @@ paths:
                 record.id.as_str(),
                 absent_overlay_etag.as_str(),
                 &invalid_transform,
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect_err("a shape over a scalar body property must reject atomically");
@@ -7046,7 +7089,7 @@ paths:
                 initial_spec,
                 &selected,
                 &preview.binding.security_selections,
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect("initial A+B catalog should publish");
@@ -7080,7 +7123,11 @@ paths:
         let server = tokio::spawn(serve_openapi_once(listener, refreshed_spec.to_owned()));
 
         let refreshed = service
-            .refresh(record.id.as_str(), record.etag().as_str(), "test-admin")
+            .refresh(
+                record.id.as_str(),
+                record.etag().as_str(),
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("refresh should successfully prune a deleted operation");
         server
