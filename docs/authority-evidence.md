@@ -913,12 +913,12 @@ disposable PostgreSQL 16, the same pinned image, that accepts TLS and nothing el
   `a_failed_jwt_evidence_insert_rolls_back_the_revoke`), the suggestion acceptance's
   document evidence (`an_accepted_suggestion_records_its_evidence_in_the_acceptance_transaction`)
   and `a_replica_held_at_the_fingerprint_door_never_rewrites_the_journal_capacity`;
-- the whole PostgreSQL Connection store suite (`connections::pg_store`), its deletion
-  and catalog evidence included;
+- the whole PostgreSQL Connection store suite (`connections::pg_store`), its create,
+  replace, credential binding change, deletion and catalog evidence included;
 - `storage::postgres_documents` and `storage::postgres_admin_sessions`;
 - the dispatcher (`authority_events::dispatcher`);
-- `storage::migrations`' evidence and journal migrations: 12 through 16, 18, 21, 24,
-  25 and 26;
+- `storage::migrations`' evidence and journal migrations: 12 through 16, 18, 21 and
+  24 through 28;
 - the app-level `admin_token_rotate_and_revoke_record_the_authenticated_subject_and_issuer_postgres`.
 
 Each run generates a throwaway CA and a server certificate for `127.0.0.1` and
