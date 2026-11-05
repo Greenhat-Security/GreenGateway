@@ -13,6 +13,7 @@ import { hasAdminPermission, useAdminCapabilities } from '../lib/adminCapabiliti
 import { AdminCapabilitiesNotice } from '../lib/AdminCapabilitiesNotice';
 import { subscribeAdminSession } from '../lib/adminSession';
 import { fetchPolicy, type PolicyDocument } from '../lib/policy';
+import { POLICY_ANALYZE_PERMISSION } from '../lib/policyAnalyses';
 import {
   POLICY_DRAFT_BASE_STALE_REASON,
   POLICY_DRAFT_DEPLOYMENT_QUOTA_REASON,
@@ -39,6 +40,19 @@ import {
   type PolicyDraftList,
   type PolicyInspection,
 } from '../lib/policyDrafts';
+import {
+  SUGGESTIONS_READ_PERMISSION,
+  SUGGESTIONS_WRITE_PERMISSION,
+  SUGGESTION_NOT_OPEN_REASON,
+  SUGGESTION_REVISION_MISMATCH_REASON,
+  SUGGESTION_RULE_ABSENT_REASON,
+  SUGGESTION_RULE_ALREADY_PRESENT_REASON,
+  SUGGESTION_RULE_ID_TAKEN_REASON,
+  SUGGESTION_STALE_REASON,
+  SuggestionConflictError,
+  openSuggestionInDraft,
+  type RuleSuggestion,
+} from '../lib/suggestions';
 import {
   STUDIO_SECTIONS,
   blockedUses,
@@ -89,6 +103,18 @@ import { OptimizePanel } from './policy-studio/workbench/OptimizePanel';
 import { SimulatorPanel } from './policy-studio/workbench/SimulatorPanel';
 import { emptySuiteSource, parseSuite } from './policy-studio/workbench/suite';
 import { TestsPanel } from './policy-studio/workbench/TestsPanel';
+import { targetText } from './policy-studio/suggestions/model';
+import {
+  SuggestionReview,
+  type SuggestionBinding,
+} from './policy-studio/suggestions/SuggestionReview';
+import {
+  SuggestionsPanel,
+  type ReviewInto,
+  type ReviewOutcome,
+  type ReviewVerification,
+} from './policy-studio/suggestions/SuggestionsPanel';
+import { useSuggestionList } from './policy-studio/suggestions/useSuggestionList';
 import { RuleWorkspaceNav } from './RuleWorkspaceNav';
 
 export const POLICY_VALIDATE_DEBOUNCE_MS = 400;
@@ -100,12 +126,14 @@ const LEAVE_WARNING =
 const CASES_LEAVE_WARNING =
   'Your simulation and test cases are kept only in this page. Leave the Policy Studio and discard them?';
 
-// The Studio's views: the editors, and the workbench that simulates, tests,
-// replays and reviews a candidate without changing anything.
-type StudioView = 'edit' | 'simulate' | 'test' | 'impact' | 'optimize';
+// The Studio's views: the editors, the discovery suggestions that open into
+// drafts, and the workbench that simulates, tests, replays and reviews a
+// candidate without changing anything.
+type StudioView = 'edit' | 'suggestions' | 'simulate' | 'test' | 'impact' | 'optimize';
 
 const STUDIO_VIEWS: ReadonlyArray<{ id: StudioView; label: string }> = [
   { id: 'edit', label: 'Edit' },
+  { id: 'suggestions', label: 'Suggestions' },
   { id: 'simulate', label: 'Simulate' },
   { id: 'test', label: 'Test' },
   { id: 'impact', label: 'Impact' },
@@ -138,7 +166,8 @@ type BusyAction =
   | 'publish'
   | 'delete'
   | 'convert'
-  | 'check';
+  | 'check'
+  | 'suggestion';
 
 type Confirmation = 'publish' | 'rebase' | 'delete';
 
@@ -155,6 +184,9 @@ type PublishReview = Readonly<{
   inspection: PolicyInspection;
   changed: readonly string[];
   risks: readonly PolicyDiagnostic[];
+  // The suggestion this publication also accepts, chosen in the
+  // confirmation; null publishes without accepting one.
+  binding: SuggestionBinding | null;
 }>;
 
 export function PolicyStudioView() {
@@ -166,6 +198,11 @@ export function PolicyStudioView() {
   const canSimulate =
     canRead && hasAdminPermission(capabilities, POLICY_SIMULATE_PERMISSION);
   const canReplay = canSimulate && hasAdminPermission(capabilities, AUDIT_READ_PERMISSION);
+  const canAnalyze = canRead && hasAdminPermission(capabilities, POLICY_ANALYZE_PERMISSION);
+  const canReadSuggestions = hasAdminPermission(capabilities, SUGGESTIONS_READ_PERMISSION);
+  const [suggestionWriteRejected, setSuggestionWriteRejected] = useState(false);
+  const canWriteSuggestions =
+    !suggestionWriteRejected && hasAdminPermission(capabilities, SUGGESTIONS_WRITE_PERMISSION);
   // Load once after the first grant; a resource 403 must not loop.
   const [readRequested, setReadRequested] = useState(false);
   useEffect(() => {
@@ -212,6 +249,13 @@ export function PolicyStudioView() {
   const [candidateChoice, setCandidateChoice] = useState<'draft' | 'live'>('draft');
   // The cases the Simulator and the Test view share, in page memory only.
   const [suiteSource, setSuiteSource] = useState(emptySuiteSource);
+  // The suggestions, read once their view is first shown, and the drafts in
+  // this page that hold a suggestion's rule. Page memory only.
+  const suggestions = useSuggestionList(canReadSuggestions && view === 'suggestions');
+  const [bindings, setBindings] = useState<readonly SuggestionBinding[]>([]);
+  // What the gateway answered about a bound suggestion since it was bound.
+  const [bindingProblems, setBindingProblems] = useState<ReadonlyMap<string, string>>(new Map());
+  const [reviewInto, setReviewInto] = useState<ReviewInto>('new');
 
   const setSource = useCallback((next: string) => {
     sourceRef.current = next;
@@ -308,6 +352,64 @@ export function PolicyStudioView() {
     () => (live === null ? null : formatCandidate(live.policy)),
     [live],
   );
+
+  // Suggestions: the open draft's bound suggestions, where Review in draft
+  // may write, and why it may not.
+  const openBindings =
+    draftId === null ? [] : bindings.filter((binding) => binding.draftId === draftId);
+  const boundDrafts = useMemo(() => {
+    const bound = new Map<string, string>();
+    for (const binding of bindings) bound.set(binding.suggestion.id, binding.draftId);
+    return bound;
+  }, [bindings]);
+  const suggestionRows = suggestions.list.rows;
+  // Why a publication bound to this suggestion would be refused, from what
+  // the gateway has said about it since it was bound.
+  function bindingStaleReason(binding: SuggestionBinding): string | null {
+    const known = bindingProblems.get(binding.suggestion.id);
+    if (known !== undefined) {
+      return known;
+    }
+    const row = suggestionRows.find((entry) => entry.id === binding.suggestion.id);
+    if (
+      row !== undefined &&
+      (row.state !== 'open' || row.revision !== binding.suggestion.revision)
+    ) {
+      return `The gateway now holds this suggestion at revision ${row.revision}, ${row.state}, so a publication bound to revision ${binding.suggestion.revision} is refused and changes nothing.`;
+    }
+    return null;
+  }
+  const openDraftBlocker =
+    draft === null
+      ? null
+      : isPublished
+        ? 'The open draft was published and accepts no change.'
+        : baseStale
+          ? 'The open draft is pinned to an older live revision. Rebase it first; the gateway never rebases a draft to take a rule.'
+          : null;
+  const draftLimitReached =
+    draftList !== null && draftList.drafts.length >= draftList.limits.max_drafts_per_owner;
+  const suggestionReviewBlockers: string[] = [];
+  if (!canReadSuggestions) {
+    suggestionReviewBlockers.push('Review in draft needs admin:suggestions:read.');
+  }
+  if (!canWrite) {
+    suggestionReviewBlockers.push('Review in draft needs admin:policy:write, as every draft write does.');
+  }
+  if (live === null) {
+    suggestionReviewBlockers.push('The live policy has not been read, so no draft can be pinned to it.');
+  }
+  if (draftList === null) {
+    suggestionReviewBlockers.push('Policy drafts are unavailable, so there is nowhere to review a suggestion.');
+  }
+  if (dirty) {
+    suggestionReviewBlockers.push('Save or discard the edits in the open draft first.');
+  }
+  if ((reviewInto === 'new' || draft === null) && draftLimitReached) {
+    suggestionReviewBlockers.push(
+      `You already hold the maximum of ${draftList?.limits.max_drafts_per_owner ?? 0} drafts. Delete one, or review into the open draft.`,
+    );
+  }
 
   const register: FieldRegistrar = useCallback((pointer: string) => {
     let callback = fieldCallbacks.current.get(pointer);
@@ -799,6 +901,9 @@ export function PolicyStudioView() {
     ) {
       return;
     }
+    const acceptable = canWriteSuggestions
+      ? openBindings.filter((binding) => bindingStaleReason(binding) === null)
+      : [];
     setPublishReview({
       draftId: draft.summary.draft_id,
       draftEtag: draft.etag,
@@ -810,8 +915,23 @@ export function PolicyStudioView() {
       risks: currentInspection.diagnostics.filter(
         (diagnostic) => diagnostic.severity === 'risk',
       ),
+      binding: acceptable.length > 0 ? acceptable[acceptable.length - 1] : null,
     });
     setConfirming('publish');
+  }
+
+  function chooseAcceptance(suggestionId: string | null) {
+    setPublishReview((review) =>
+      review === null
+        ? null
+        : {
+            ...review,
+            binding:
+              suggestionId === null
+                ? null
+                : (openBindings.find((binding) => binding.suggestion.id === suggestionId) ?? null),
+          },
+    );
   }
 
   async function publishDraft() {
@@ -841,14 +961,28 @@ export function PolicyStudioView() {
     setProblem(null);
     setNotice(null);
     const published = draft;
+    const accepted = review.binding;
     try {
       const result = await publishPolicyDraft(
         review.draftId,
         review.draftEtag,
         review.liveEtag,
         review.inspection.resource_snapshot?.digest ?? null,
+        accepted === null
+          ? null
+          : { id: accepted.suggestion.id, revision: accepted.suggestion.revision },
       );
       const warnings: string[] = [];
+      const others = bindings.filter(
+        (binding) =>
+          binding.draftId === review.draftId &&
+          binding.suggestion.id !== accepted?.suggestion.id,
+      );
+      for (const other of others) {
+        warnings.push(
+          `Suggestion ${other.suggestion.id} was not accepted and stays open. If its rule went live with this draft, dismiss it.`,
+        );
+      }
       if (!result.draftStateRecorded) {
         warnings.push(
           'The draft could not be marked published, so it stays open on a base that is no longer live. Delete it, or rebase it before reusing it.',
@@ -858,15 +992,27 @@ export function PolicyStudioView() {
         warnings.push('The change could not be recorded in policy version history.');
       }
       setNotice({
-        title: 'Draft published',
-        message: `The live policy is now revision ${shortEtag(result.etag)}.`,
+        title: accepted === null ? 'Draft published' : 'Draft published and suggestion accepted',
+        message: `The live policy is now revision ${shortEtag(result.etag)}.${
+          accepted === null
+            ? ''
+            : ` Suggestion ${accepted.suggestion.id} was accepted in the same commit.`
+        }`,
         tone: warnings.length > 0 ? 'warning' : 'info',
         details: warnings,
       });
+      setBindings((current) => current.filter((binding) => binding.draftId !== review.draftId));
       await refreshAfterPublication(published.summary.draft_id);
+      refreshSuggestionsIfListed();
     } catch (error) {
-      noteWriteError(error);
-      await handlePublishError(error, published);
+      if (accepted !== null && error instanceof AdminApiError && error.status === 403) {
+        // The draft publication itself is allowed; accepting a suggestion
+        // with it also needs admin:suggestions:write.
+        setSuggestionWriteRejected(true);
+      } else {
+        noteWriteError(error);
+      }
+      await handlePublishError(error, published, accepted);
     } finally {
       endBusy();
       await loadDraftList();
@@ -883,6 +1029,9 @@ export function PolicyStudioView() {
     const deleted = draft;
     try {
       await deletePolicyDraft(deleted.summary.draft_id, deleted.etag);
+      setBindings((current) =>
+        current.filter((binding) => binding.draftId !== deleted.summary.draft_id),
+      );
       closeDraft();
       setNotice({
         title: 'Draft deleted',
@@ -974,10 +1123,17 @@ export function PolicyStudioView() {
           (latestLive !== null && latestLive.etag === current.summary.candidate_etag)
         ) {
           showServerDraft(current, true);
+          setBindings((bound) =>
+            bound.filter((binding) => binding.draftId !== known.summary.draft_id),
+          );
           setProblem(null);
           setNotice({
             title: 'Draft published',
-            message: `The gateway confirms the publication: the live policy is revision ${shortEtag(latestLive?.etag)}.`,
+            message: `The gateway confirms the publication: the live policy is revision ${shortEtag(latestLive?.etag)}.${
+              openBindings.length > 0
+                ? ' Read the suggestions again to see whether one was accepted with it.'
+                : ''
+            }`,
             tone: 'info',
           });
         } else {
@@ -1012,6 +1168,7 @@ export function PolicyStudioView() {
     } finally {
       endBusy();
       await loadDraftList();
+      refreshSuggestionsIfListed();
     }
   }
 
@@ -1118,8 +1275,53 @@ export function PolicyStudioView() {
     }
   }
 
-  async function handlePublishError(error: unknown, published: PolicyDraft) {
+  async function handlePublishError(
+    error: unknown,
+    published: PolicyDraft,
+    accepted: SuggestionBinding | null,
+  ) {
     const reason = refusal(error);
+    if (accepted !== null && reason === SUGGESTION_STALE_REASON) {
+      setBindingProblems((current) =>
+        new Map(current).set(
+          accepted.suggestion.id,
+          `The gateway refused the publication because this suggestion is no longer open at revision ${accepted.suggestion.revision}. It may have been dismissed or accepted elsewhere.`,
+        ),
+      );
+      refreshSuggestionsIfListed();
+      setProblem({
+        kind: 'alert',
+        alert: {
+          title: 'Not published: the suggestion changed',
+          message: `Suggestion ${accepted.suggestion.id} is no longer open at revision ${accepted.suggestion.revision}, so nothing was published and nothing changed. Review the publication again; you can publish the draft without accepting the suggestion.`,
+          tone: 'warning',
+        },
+      });
+      return;
+    }
+    if (accepted !== null && reason === SUGGESTION_RULE_ABSENT_REASON) {
+      setProblem({
+        kind: 'alert',
+        alert: {
+          title: 'Not published: the draft no longer holds the suggested rule',
+          message: `The saved draft does not hold the rule suggestion ${accepted.suggestion.id} proposes (an edit changed it), so publishing it would not accept the suggestion. Nothing was published. Restore the rule, or publish without accepting the suggestion.`,
+          tone: 'warning',
+        },
+      });
+      return;
+    }
+    if (accepted !== null && error instanceof AdminApiError && error.status === 403) {
+      setProblem({
+        kind: 'alert',
+        alert: {
+          title: 'Not published',
+          message:
+            'Accepting a suggestion with a publication needs admin:suggestions:write, which this session does not hold. Nothing was published; you can publish without accepting the suggestion.',
+          tone: 'error',
+        },
+      });
+      return;
+    }
     if (isAmbiguous(error)) {
       setProblem({
         kind: 'publish-unknown',
@@ -1170,6 +1372,407 @@ export function PolicyStudioView() {
         revalidate();
       }
       setProblem({ kind: 'alert', alert: writeAlert(error, 'Draft not published') });
+    }
+  }
+
+  // Review in draft: write the suggestion's rule into a new draft from the
+  // live policy on screen, or into the open draft, and open the result in
+  // the editors. Nothing live changes and the suggestion stays open; a
+  // refusal writes nothing, and a lost answer is checked by reading the
+  // drafts again, never by sending the request again.
+  async function reviewSuggestion(
+    suggestion: RuleSuggestion,
+    into: ReviewInto,
+  ): Promise<ReviewOutcome> {
+    const target =
+      into === 'open' && draft !== null
+        ? { draftId: draft.summary.draft_id, draftEtag: draft.etag, revision: draft.summary.revision }
+        : null;
+    const blockers = [
+      ...suggestionReviewBlockers,
+      ...(target !== null && openDraftBlocker !== null ? [openDraftBlocker] : []),
+    ];
+    if (blockers.length > 0 || live === null) {
+      return {
+        kind: 'problem',
+        alert: {
+          title: 'Not reviewed',
+          message: blockers.join(' ') || 'The live policy has not been read.',
+          tone: 'warning',
+        },
+      };
+    }
+    if (!beginBusy('suggestion')) {
+      return {
+        kind: 'problem',
+        alert: {
+          title: 'Not reviewed',
+          message: 'Another Policy Studio action is still in progress. Try again when it ends.',
+          tone: 'info',
+        },
+      };
+    }
+    const verification: ReviewVerification = {
+      into,
+      knownDraftIds: draftList?.drafts.map((summary) => summary.draft_id) ?? [],
+      target: target === null ? null : { draftId: target.draftId, revision: target.revision },
+    };
+    setProblem(null);
+    setNotice(null);
+    setConfirming(null);
+    try {
+      const opened = await openSuggestionInDraft({
+        id: suggestion.id,
+        revision: suggestion.revision,
+        policyEtag: live.etag,
+        target: target === null ? null : { draftId: target.draftId, draftEtag: target.draftEtag },
+      });
+      const openedId = opened.draft.summary.draft_id;
+      showServerDraft(opened.draft, true);
+      setConversion(null);
+      setBindings((current) => [
+        ...current.filter(
+          (binding) =>
+            !(binding.draftId === openedId && binding.suggestion.id === opened.suggestion.id),
+        ),
+        { draftId: openedId, suggestion: opened.suggestion, ruleId: opened.rule.id, drafted: true },
+      ]);
+      setBindingProblems((current) => withoutKey(current, opened.suggestion.id));
+      setView('edit');
+      setActiveSection('rules');
+      setPendingFocus(pointerTo('rules', opened.position));
+      setNotice({
+        title: 'Suggestion opened in a draft',
+        message: `${opened.created ? 'New draft' : 'Draft'} ${openedId} holds the suggested rule at position ${opened.position}${
+          opened.rule.id !== null ? ` (id ${opened.rule.id})` : ''
+        }, revision ${opened.draft.summary.revision}. Nothing live changed, and the suggestion stays open until this draft is published with it.`,
+        tone: 'info',
+      });
+      return { kind: 'opened' };
+    } catch (error) {
+      return await suggestionReviewRefused(error, suggestion, verification);
+    } finally {
+      endBusy();
+      await loadDraftList();
+    }
+  }
+
+  async function suggestionReviewRefused(
+    error: unknown,
+    suggestion: RuleSuggestion,
+    verification: ReviewVerification,
+  ): Promise<ReviewOutcome> {
+    const reason = refusal(error);
+    const nothing = 'Nothing was written.';
+    if (error instanceof SuggestionConflictError) {
+      if (
+        error.current !== null &&
+        (reason === SUGGESTION_NOT_OPEN_REASON || reason === SUGGESTION_REVISION_MISMATCH_REASON)
+      ) {
+        return {
+          kind: 'problem',
+          current: error.current,
+          alert: {
+            title: 'The suggestion changed',
+            message: `It is no longer open at revision ${suggestion.revision}: the gateway holds revision ${error.current.revision}, ${error.current.state}. ${nothing}`,
+            tone: 'warning',
+          },
+        };
+      }
+      if (reason === SUGGESTION_RULE_ALREADY_PRESENT_REASON) {
+        return verification.target === null
+          ? {
+              kind: 'problem',
+              mark: { kind: 'rule_live' },
+              alert: {
+                title: 'Rule already live',
+                message:
+                  'The live policy already holds the rule this suggestion proposes, so no draft was written. The suggestion is superseded: dismiss it. Accepting it would add the rule twice.',
+                tone: 'warning',
+              },
+            }
+          : {
+              kind: 'problem',
+              offerBind: true,
+              alert: {
+                title: 'Rule already in the open draft',
+                message:
+                  'The open draft already holds the rule this suggestion proposes, so nothing was written. You can publish that draft as this suggestion’s acceptance.',
+                tone: 'info',
+              },
+            };
+      }
+      if (reason === SUGGESTION_RULE_ID_TAKEN_REASON) {
+        return {
+          kind: 'problem',
+          alert: {
+            title: 'Rule id already used',
+            message: `The candidate already uses the rule id this suggestion proposes. Rename that rule in the draft, save it, and review the suggestion again. ${nothing}`,
+            tone: 'warning',
+          },
+        };
+      }
+      if (reason === POLICY_DRAFT_BASE_STALE_REASON) {
+        await loadLive();
+        return {
+          kind: 'problem',
+          alert: {
+            title: 'The open draft is on an older live revision',
+            message: `The gateway does not rebase a draft to take a rule. ${nothing} The live policy has been read again: rebase the draft, then review the suggestion again.`,
+            tone: 'warning',
+          },
+        };
+      }
+      if (reason === POLICY_DRAFT_PUBLISHED_REASON && verification.target !== null) {
+        await reloadDraftWithoutEdits(verification.target.draftId);
+        return {
+          kind: 'problem',
+          alert: {
+            title: 'The open draft was published',
+            message: `It accepts no further change. ${nothing} Review the suggestion into a new draft.`,
+            tone: 'warning',
+          },
+        };
+      }
+      return {
+        kind: 'problem',
+        alert: {
+          title: 'The gateway cannot draft this suggestion',
+          message: `${error.message}. ${nothing}`,
+          tone: 'warning',
+        },
+      };
+    }
+    if (error instanceof AdminApiError) {
+      if (error.status === 412) {
+        if (reason === POLICY_DRAFT_ETAG_MISMATCH_REASON && verification.target !== null) {
+          await reloadDraftWithoutEdits(verification.target.draftId);
+          return {
+            kind: 'problem',
+            alert: {
+              title: 'The open draft changed elsewhere',
+              message: `It changed in another tab or session since it was opened here, and has been read again. ${nothing} Review it, then review the suggestion again.`,
+              tone: 'warning',
+            },
+          };
+        }
+        await loadLive();
+        return {
+          kind: 'problem',
+          alert: {
+            title: 'The live policy changed',
+            message: `The suggestion was reviewed against a live revision that is no longer current (412). ${nothing} The live policy has been read again; review the suggestion against it.`,
+            tone: 'warning',
+          },
+        };
+      }
+      if (error.status === 428) {
+        return {
+          kind: 'problem',
+          alert: {
+            title: 'Precondition missing',
+            message: `The request lacked a revision it must be bound to (428). ${nothing} Reload the Policy Studio.`,
+            tone: 'error',
+          },
+        };
+      }
+      if (error.status === 503) {
+        const unavailable =
+          reason === POLICY_DRAFTS_UNAVAILABLE_REASON
+            ? 'The gateway answered 503: its draft store did not complete the request.'
+            : 'The gateway answered 503: it could not settle the suggestion’s pending acceptances.';
+        return verifyReview(
+          verification,
+          `${unavailable} Your drafts were read again instead of sending it again. `,
+        );
+      }
+      if (error.status === 404 && reason !== POLICY_DRAFT_NOT_FOUND_REASON) {
+        return {
+          kind: 'problem',
+          mark: { kind: 'gone' },
+          refresh: true,
+          alert: {
+            title: 'Suggestion not found',
+            message: `The gateway no longer holds this suggestion, or keeps no suggestions. ${nothing}`,
+            tone: 'warning',
+          },
+        };
+      }
+      if (isDraftGone(error)) {
+        return {
+          kind: 'problem',
+          alert: {
+            title: 'The open draft is gone',
+            message: `It expired or was deleted on the gateway. ${nothing} Review the suggestion into a new draft.`,
+            tone: 'warning',
+          },
+        };
+      }
+      if (error.status === 403) {
+        return {
+          kind: 'problem',
+          alert: {
+            title: 'Permission required',
+            message: `Review in draft needs admin:suggestions:read and admin:policy:write. ${nothing}`,
+            tone: 'error',
+          },
+        };
+      }
+      if (error.status < 500) {
+        const alert = writeAlert(error, 'Not reviewed');
+        return { kind: 'problem', alert: { ...alert, message: `${alert.message} ${nothing}` } };
+      }
+    }
+    return verifyReview(
+      verification,
+      'The gateway did not confirm the request, so it may or may not have written a draft. Your drafts were read again instead of sending it again. ',
+    );
+  }
+
+  // Read the drafts to learn what a review request whose answer was lost
+  // did. Only reads; the request is never sent again on the operator's
+  // behalf.
+  async function verifyReview(
+    verification: ReviewVerification,
+    prefix = '',
+  ): Promise<ReviewOutcome> {
+    try {
+      const listed = await fetchPolicyDrafts();
+      setDraftList(listed);
+      setDraftListAlert(null);
+      if (verification.target !== null) {
+        const current = await fetchPolicyDraft(verification.target.draftId);
+        if (current.summary.revision !== verification.target.revision) {
+          if (
+            draftRef.current?.summary.draft_id === current.summary.draft_id &&
+            sourceRef.current === serverSourceRef.current
+          ) {
+            showServerDraft(current, true);
+          }
+          return {
+            kind: 'problem',
+            offerBind: true,
+            alert: {
+              title: 'The open draft changed',
+              message: `${prefix}The open draft is now at revision ${current.summary.revision} (it was ${verification.target.revision}) and may hold the suggested rule; it is shown as the gateway holds it. Look for the rule under HTTP and MCP rules: if it is there, you can publish the draft as this suggestion’s acceptance.`,
+              tone: 'warning',
+            },
+          };
+        }
+        return {
+          kind: 'problem',
+          verification,
+          alert: {
+            title: 'Not written as of now',
+            message: `${prefix}The open draft is still at revision ${verification.target.revision}. The request may still be in progress: check again before reviewing the suggestion again.`,
+            tone: 'warning',
+          },
+        };
+      }
+      const known = new Set(verification.knownDraftIds);
+      const appeared = listed.drafts
+        .map((summary) => summary.draft_id)
+        .filter((id) => !known.has(id));
+      if (appeared.length > 0) {
+        return {
+          kind: 'problem',
+          newDrafts: appeared,
+          alert: {
+            title: appeared.length === 1 ? 'A new draft appeared' : 'New drafts appeared',
+            message: `${prefix}The gateway now lists ${appeared.join(', ')}, which ${
+              appeared.length === 1 ? 'was' : 'were'
+            } not there before and may hold the suggested rule. Open it to check before reviewing the suggestion again.`,
+            tone: 'warning',
+          },
+        };
+      }
+      return {
+        kind: 'problem',
+        verification,
+        alert: {
+          title: 'No new draft as of now',
+          message: `${prefix}No draft that was not there before is listed. The request may still be in progress: check again before reviewing the suggestion again.`,
+          tone: 'warning',
+        },
+      };
+    } catch {
+      return {
+        kind: 'problem',
+        verification,
+        alert: {
+          title: 'Outcome unknown',
+          message: `${prefix}Your drafts could not be read either. Check again when the connection is back, before reviewing the suggestion again.`,
+          tone: 'error',
+        },
+      };
+    }
+  }
+
+  async function verifyReviewAgain(verification: ReviewVerification): Promise<ReviewOutcome> {
+    if (!beginBusy('check')) {
+      return {
+        kind: 'problem',
+        verification,
+        alert: {
+          title: 'Not checked',
+          message: 'Another Policy Studio action is still in progress. Check again when it ends.',
+          tone: 'info',
+        },
+      };
+    }
+    try {
+      return await verifyReview(verification);
+    } finally {
+      endBusy();
+    }
+  }
+
+  // The open draft already holds the suggestion's rule: publishing it bound
+  // to the suggestion accepts it, if the gateway still finds the rule then.
+  function bindSuggestionToOpenDraft(suggestion: RuleSuggestion) {
+    if (draft === null) {
+      return;
+    }
+    const boundId = draft.summary.draft_id;
+    setBindings((current) => [
+      ...current.filter(
+        (binding) => !(binding.draftId === boundId && binding.suggestion.id === suggestion.id),
+      ),
+      { draftId: boundId, suggestion, ruleId: null, drafted: false },
+    ]);
+    setBindingProblems((current) => withoutKey(current, suggestion.id));
+    setView('edit');
+    setActiveSection('rules');
+    setNotice({
+      title: 'Suggestion bound to the open draft',
+      message: `Publishing draft ${boundId} will accept suggestion ${suggestion.id} at revision ${suggestion.revision}, if the gateway still finds its rule in the draft then. Nothing changed now.`,
+      tone: 'info',
+    });
+  }
+
+  async function reloadDraftWithoutEdits(id: string) {
+    try {
+      const current = await fetchPolicyDraft(id);
+      if (
+        draftRef.current?.summary.draft_id === id &&
+        sourceRef.current === serverSourceRef.current
+      ) {
+        showServerDraft(current, true);
+      }
+    } catch {
+      // Shown as it was.
+    }
+  }
+
+  function showRule(position: number) {
+    setView('edit');
+    setActiveSection('rules');
+    setPendingFocus(pointerTo('rules', position));
+  }
+
+  function refreshSuggestionsIfListed() {
+    if (canReadSuggestions && suggestions.list.loadedAt !== null) {
+      void suggestions.refresh();
     }
   }
 
@@ -1346,7 +1949,7 @@ export function PolicyStudioView() {
           </div>
         ) : null}
 
-        {canRead && view !== 'edit' ? (
+        {canRead && view !== 'edit' && view !== 'suggestions' ? (
           <CandidatePicker
             choice={candidateChoice}
             draft={draft}
@@ -1373,6 +1976,23 @@ export function PolicyStudioView() {
                   dirty={dirty}
                   inspection={currentInspection}
                 />
+
+                {openBindings.map((binding) => (
+                  <SuggestionReview
+                    key={binding.suggestion.id}
+                    binding={binding}
+                    draft={draft}
+                    liveEtag={live?.etag ?? null}
+                    dirty={dirty}
+                    inspection={currentInspection}
+                    checking={validation.kind === 'checking' || (validation.kind === 'ready' && validation.source !== source)}
+                    staleReason={bindingStaleReason(binding)}
+                    canSimulate={canSimulate}
+                    canAnalyze={canAnalyze}
+                    canAccept={canWriteSuggestions}
+                    onShowRule={showRule}
+                  />
+                ))}
 
                 <div className="form-actions policy-studio-actions">
                   <button
@@ -1445,6 +2065,18 @@ export function PolicyStudioView() {
                     live={live}
                     changed={changed}
                     review={confirming === 'publish' ? publishReview : null}
+                    acceptance={
+                      confirming === 'publish' && openBindings.length > 0
+                        ? {
+                            bindings: openBindings.map((binding) => ({
+                              binding,
+                              stale: bindingStaleReason(binding),
+                            })),
+                            canAccept: canWriteSuggestions,
+                            onChoose: chooseAcceptance,
+                          }
+                        : null
+                    }
                     confirmable={
                       confirming !== 'publish' || reviewIsCurrent(publishReview, source)
                     }
@@ -1612,6 +2244,47 @@ export function PolicyStudioView() {
             </div>
           ) : null}
         </div>
+
+        {canRead ? (
+          <div
+            className="policy-studio-view"
+            role="tabpanel"
+            id="policy-studio-view-panel-suggestions"
+            aria-labelledby="policy-studio-view-suggestions"
+            hidden={view !== 'suggestions'}
+          >
+            <SuggestionsPanel
+              handle={suggestions}
+              canList={canReadSuggestions}
+              canDismiss={canWriteSuggestions}
+              reviewBlockers={suggestionReviewBlockers}
+              into={reviewInto}
+              onIntoChange={setReviewInto}
+              openDraft={
+                draft === null
+                  ? null
+                  : {
+                      id: draft.summary.draft_id,
+                      revision: draft.summary.revision,
+                      blocker: openDraftBlocker,
+                    }
+              }
+              positions={{
+                live: live === null ? null : live.policy.rules.length,
+                open:
+                  draft === null || !Array.isArray(draft.policy.rules)
+                    ? null
+                    : draft.policy.rules.length,
+              }}
+              bindings={boundDrafts}
+              busy={busy !== null}
+              onReview={reviewSuggestion}
+              onVerifyReview={verifyReviewAgain}
+              onBind={bindSuggestionToOpenDraft}
+              onOpenDraft={(id) => void openDraft(id)}
+            />
+          </div>
+        ) : null}
 
         {canRead ? (
           <>
@@ -2118,6 +2791,7 @@ function ConfirmationPanel({
   live,
   changed,
   review,
+  acceptance,
   confirmable,
   dirty,
   busy,
@@ -2129,6 +2803,13 @@ function ConfirmationPanel({
   live: LivePolicy;
   changed: readonly string[];
   review: PublishReview | null;
+  // The suggestions whose rules this draft holds, one of which the
+  // publication may accept.
+  acceptance: Readonly<{
+    bindings: ReadonlyArray<Readonly<{ binding: SuggestionBinding; stale: string | null }>>;
+    canAccept: boolean;
+    onChoose: (suggestionId: string | null) => void;
+  }> | null;
   confirmable: boolean;
   dirty: boolean;
   busy: boolean;
@@ -2155,6 +2836,10 @@ function ConfirmationPanel({
             review.changed.length > 0
               ? `Changed sections: ${review.changed.join(', ')}.`
               : 'The candidate is the same as the live policy.'
+          }${
+            review.binding !== null
+              ? ` It also accepts suggestion ${review.binding.suggestion.id} at revision ${review.binding.suggestion.revision}, in the same commit: if that suggestion moved, or the draft no longer holds its rule, nothing is published.`
+              : ''
           }`
       : kind === 'rebase'
         ? `The draft will be pinned to live revision ${shortEtag(live.etag)}${
@@ -2186,6 +2871,42 @@ function ConfirmationPanel({
     >
       <h3 id="policy-studio-confirmation-title">{title}</h3>
       <p id="policy-studio-confirmation-message">{message}</p>
+      {kind === 'publish' && acceptance !== null && review !== null ? (
+        <fieldset className="rule-fieldset policy-studio-acceptance">
+          <legend>Suggestion this publication accepts</legend>
+          {acceptance.bindings.map(({ binding, stale }) => (
+            <label key={binding.suggestion.id} className="policy-studio-suggestion-choice">
+              <input
+                type="radio"
+                name="policy-studio-acceptance"
+                checked={review.binding?.suggestion.id === binding.suggestion.id}
+                disabled={busy || !acceptance.canAccept || stale !== null}
+                onChange={() => acceptance.onChoose(binding.suggestion.id)}
+              />
+              Accept suggestion {binding.suggestion.id} ({targetText(binding.suggestion.proposed_rule)},
+              revision {binding.suggestion.revision})
+              {stale !== null ? ` — stale: ${stale}` : ''}
+            </label>
+          ))}
+          <label className="policy-studio-suggestion-choice">
+            <input
+              type="radio"
+              name="policy-studio-acceptance"
+              checked={review.binding === null}
+              disabled={busy}
+              onChange={() => acceptance.onChoose(null)}
+            />
+            Accept no suggestion: they stay open
+          </label>
+          {!acceptance.canAccept ? (
+            <p className="rule-hint">Accepting a suggestion needs admin:suggestions:write.</p>
+          ) : null}
+          <p className="rule-hint">
+            A publication accepts at most one suggestion. One it does not accept stays open even
+            though its rule goes live; dismiss it afterwards.
+          </p>
+        </fieldset>
+      ) : null}
       {kind === 'publish' && risks.length > 0 ? (
         <div>
           <p>
@@ -2445,6 +3166,15 @@ function publicationBlockers({
 
 function refusal(error: unknown): string | null {
   return error instanceof AdminApiError ? error.code : null;
+}
+
+function withoutKey<T>(map: ReadonlyMap<string, T>, key: string): ReadonlyMap<string, T> {
+  if (!map.has(key)) {
+    return map;
+  }
+  const next = new Map(map);
+  next.delete(key);
+  return next;
 }
 
 function isDraftGone(error: unknown): boolean {
