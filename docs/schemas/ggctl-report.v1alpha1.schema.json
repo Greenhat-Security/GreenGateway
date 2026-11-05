@@ -15,7 +15,7 @@
       "const": "GgctlReport"
     },
     "command": {
-      "enum": ["version", "schema", "init", "validate", "pin", "convert", "doctor", "diff", "ledger seed", "ledger verify", "ledger rollback", "backup create", "backup verify"]
+      "enum": ["version", "schema", "init", "validate", "pin", "convert", "doctor", "diff", "ledger seed", "ledger verify", "ledger rollback", "backup create", "backup verify", "backup restore"]
     },
     "exitCode": {
       "type": "integer",
@@ -139,6 +139,14 @@
       "then": {
         "properties": {"result": {"$ref": "#/$defs/backupVerifyResult"}}
       }
+    },
+    {
+      "if": {
+        "properties": {"command": {"const": "backup restore"}}
+      },
+      "then": {
+        "properties": {"result": {"$ref": "#/$defs/backupRestoreResult"}}
+      }
     }
   ],
   "$defs": {
@@ -150,7 +158,7 @@
         "code": {
           "description": "The stable family.reason code. docs/ggctl.md lists every ggctl code by family, docs/configuration-bundles.md every bundle reader code, and docs/archive-admission.md every archive admission code.",
           "type": "string",
-          "pattern": "^(usage|credential|trust|remote|compat|schema|validate|doctor|diff|init|convert|pin|state_dir|ledger|backup|output|internal|bundle|syntax|json|yaml|reference|secret|resource|profile|archive)\\.[a-z][a-z0-9_]*$"
+          "pattern": "^(usage|credential|trust|remote|compat|schema|validate|doctor|diff|init|convert|pin|state_dir|ledger|backup|restore|output|internal|bundle|syntax|json|yaml|reference|secret|resource|profile|archive)\\.[a-z][a-z0-9_]*$"
         },
         "severity": {
           "enum": ["error", "warning", "info"]
@@ -279,6 +287,35 @@
         "store": {"$ref": "#/$defs/backupStoreId"},
         "backup": {
           "description": "The backup, once it verified.",
+          "$ref": "#/$defs/backup"
+        }
+      }
+    },
+    "backupRestoreResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["restored"],
+      "properties": {
+        "restored": {
+          "description": "The state directory holds the backup's stores and the restore marker the next gateway start records, after every check of ggctl backup verify and the restore's own passed in a staging directory and the staging directory was renamed into its place.",
+          "type": "boolean"
+        },
+        "targetUnchanged": {
+          "description": "Present when nothing was restored: whether the state directory was left as it was, which it is unless restore.rollback_failed was reported.",
+          "type": "boolean"
+        },
+        "store": {"$ref": "#/$defs/backupStoreId"},
+        "restoreId": {
+          "description": "The restore's opaque ID, which its marker and the config.restore_detected event carry.",
+          "type": "string",
+          "pattern": "^rst-[0-9a-f]{32}$"
+        },
+        "replaced": {
+          "description": "The state directory held stores, which --replace-existing-state named and the restore replaced.",
+          "type": "boolean"
+        },
+        "backup": {
+          "description": "The backup restored.",
           "$ref": "#/$defs/backup"
         }
       }
