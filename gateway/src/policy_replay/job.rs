@@ -112,17 +112,36 @@ pub(crate) struct ReplayScope {
 #[derive(Debug)]
 pub(crate) struct ReplaySourceError;
 
-/// Where a run reads its records from: the standalone audit log, or a test's
+/// What a source holds of a job's window when the run ends
+/// ([`ReplaySource::check`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReplaySourceCheck {
+    /// Rows of the window at or below the cutoff stored now.
+    pub(crate) stored: u64,
+    /// Rows at or below the cutoff that the window may have held are gone:
+    /// retention reached past the window's start, or the source has a gap
+    /// inside it. A source that cannot tell says `false`, and its result
+    /// relies on [`Self::stored`] alone.
+    pub(crate) pruned: bool,
+}
+
+/// Where a run reads its records from: the standalone audit log, the
+/// cluster's audit stream (`storage::postgres_audit_replay`), or a test's
 /// rows.
 pub(crate) trait ReplaySource {
+    /// How a result names this source: its `source.kind`.
+    fn kind(&self) -> &'static str;
     /// One page; see [`AuditQueryStore::replay_page`].
     fn page(&self, query: &ReplayPageQuery) -> Result<Vec<(i64, ReplayRow)>, ReplaySourceError>;
-    /// How many rows of the scope's window at or below its cutoff are stored
-    /// now.
-    fn window_count(&self, scope: &ReplayScope) -> Result<u64, ReplaySourceError>;
+    /// What the source holds of the scope's window now.
+    fn check(&self, scope: &ReplayScope) -> Result<ReplaySourceCheck, ReplaySourceError>;
 }
 
 impl ReplaySource for AuditQueryStore {
+    fn kind(&self) -> &'static str {
+        "standalone_audit_log"
+    }
+
     fn page(&self, query: &ReplayPageQuery) -> Result<Vec<(i64, ReplayRow)>, ReplaySourceError> {
         self.replay_page(query).map_err(|error| {
             tracing::error!(error = %error, "policy replay could not read an audit page");
@@ -130,15 +149,23 @@ impl ReplaySource for AuditQueryStore {
         })
     }
 
-    fn window_count(&self, scope: &ReplayScope) -> Result<u64, ReplaySourceError> {
-        self.replay_window_count(
-            scope.from_epoch_us,
-            scope.to_epoch_us,
-            scope.cutoff.high_water,
-        )
-        .map_err(|error| {
-            tracing::error!(error = %error, "policy replay could not count its audit window");
-            ReplaySourceError
+    /// The standalone log keeps no record of what retention removed, so it
+    /// reports only how many of the window's rows are still stored; rows
+    /// pruned before the job was created are simply not in its cutoff.
+    fn check(&self, scope: &ReplayScope) -> Result<ReplaySourceCheck, ReplaySourceError> {
+        let stored = self
+            .replay_window_count(
+                scope.from_epoch_us,
+                scope.to_epoch_us,
+                scope.cutoff.high_water,
+            )
+            .map_err(|error| {
+                tracing::error!(error = %error, "policy replay could not count its audit window");
+                ReplaySourceError
+            })?;
+        Ok(ReplaySourceCheck {
+            stored,
+            pruned: false,
         })
     }
 }
@@ -418,6 +445,7 @@ impl Tally {
     fn render(
         &self,
         policies: &ReplayPolicies,
+        source_kind: &'static str,
         scope: &ReplayScope,
         complete: bool,
         limitations: &[&'static str],
@@ -446,7 +474,7 @@ impl Tally {
             "complete": complete,
             "limitations": limitations,
             "source": {
-                "kind": "standalone_audit_log",
+                "kind": source_kind,
                 "window": { "from": scope.from, "to": scope.to },
                 "high_water": scope.cutoff.high_water,
                 "max_records": scope.max_records,
@@ -473,7 +501,9 @@ impl Tally {
 /// an answer. Reaching the record bound or `deadline` ends the scan with an
 /// incomplete result. A window whose stored rows no longer match the cutoff's
 /// count when the run ends -- rows pruned by retention while it ran -- is
-/// incomplete with `source_changed`, never a silent omission.
+/// incomplete with `source_changed`, and one whose source shows rows the
+/// window may have held are gone, whenever they went, is incomplete with
+/// `source_pruned`: never a silent omission.
 pub(crate) fn run(
     source: &dyn ReplaySource,
     policies: &ReplayPolicies,
@@ -543,14 +573,20 @@ pub(crate) fn run(
     // Rows that vanished from the window, or a scan that read a different
     // number of rows than the cutoff selected, mean the source changed under
     // the job: the result cannot claim to cover the snapshot it was pinned to.
-    let stored = source
-        .window_count(scope)
+    // Rows the window may have held that were gone before the job was
+    // created never reached the cutoff's count; a source that can see where
+    // they were says so, and the result says `source_pruned`.
+    let check = source
+        .check(scope)
         .map_err(|_| ReplayStop::Failed("source_unavailable"))?;
     let scan_ended_naturally = limitations.is_empty();
-    if stored != scope.cutoff.selected
+    if check.stored != scope.cutoff.selected
         || (scan_ended_naturally && tally.scanned != scope.cutoff.selected)
     {
         limitations.push("source_changed");
+    }
+    if check.pruned {
+        limitations.push("source_pruned");
     }
     let replayed = tally.replayed();
     if replayed == 0 {
@@ -558,7 +594,7 @@ pub(crate) fn run(
     }
     limitations.sort_unstable();
     let complete = limitations.is_empty();
-    let result = tally.render(policies, scope, complete, &limitations);
+    let result = tally.render(policies, source.kind(), scope, complete, &limitations);
     let digest = canonical_json::semantic_digest(RESULT_MEDIA_TYPE, RESULT_SCHEMA_VERSION, &result)
         .map_err(|_| ReplayStop::Failed("result_digest_failed"))?;
     Ok(ReplayOutcome {

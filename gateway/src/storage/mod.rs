@@ -46,6 +46,10 @@ pub mod postgres;
 pub mod postgres_admin_sessions;
 #[cfg(feature = "postgres")]
 pub mod postgres_audit;
+/// The cluster audit stream as a historical policy replay source (issue
+/// #243): the PostgreSQL reader behind the replay job engine's source trait.
+#[cfg(feature = "postgres")]
+pub(crate) mod postgres_audit_replay;
 /// The authority-event journal and the dispatcher's durable cursor
 /// (issue #425, PR 3).
 #[cfg(feature = "postgres")]

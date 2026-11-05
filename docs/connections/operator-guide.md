@@ -1970,6 +1970,7 @@ convert it again.
 | --- | --- |
 | `definitions` | `components.schemas`; every `#/definitions/` reference is rewritten to `#/components/schemas/` |
 | `query`, `header` and `path` parameters | parameters with a `schema`; array `collectionFormat` `csv`, `multi`, `ssv` and `pipes` become explicit `style`/`explode` |
+| a `query` or `formData` parameter that carries the operation's credential (see below) | nothing: it is left out of that operation, with a `credential_parameter_not_mapped` warning |
 | one `body` parameter | `requestBody`, one content entry per `consumes` media type |
 | `formData` parameters | a form `requestBody` (`application/x-www-form-urlencoded`, or `multipart/form-data` when the operation consumes it or has a `file` field) |
 | response `schema` | response content, one entry per `produces` media type |
@@ -1977,9 +1978,29 @@ convert it again.
 | `securityDefinitions` | `components.securitySchemes`: `basic` becomes HTTP basic, `apiKey` keeps `in: header` or `in: query`, and the `oauth2` flows `implicit`, `password`, `application` and `accessCode` become `implicit`, `password`, `clientCredentials` and `authorizationCode` |
 | `host`, `basePath`, `schemes` | `servers`, which generated tools do not use |
 | `discriminator`, `type: file`, `x-nullable` | their OpenAPI 3.0 forms |
+| a JSON Schema `type` list in a schema | `[T, "null"]` (in either order) becomes `type: T` with `nullable: true` and `[T]` becomes `type: T`, `"null"` becomes `nullable: true` with `enum: [null]`, and two or more other types become an `anyOf` of one `type` each, plus `nullable: true` when `null` is listed |
 
 Response headers, `examples`, `externalDocs` and vendor extensions outside
-schemas are documentation and are not carried over.
+schemas are documentation and are not carried over. A `type` list whose
+entries are not all JSON Schema type names, or whose keywords the schema
+already uses (an `enum` beside `"null"`, an `anyOf` beside several types), is
+copied unchanged.
+
+An operation's credential parameters carry the credential its security names,
+which the Connection supplies. They follow the operation's effective
+security: its own `security`, else the document's. An empty `security` list,
+or requirements that name no scheme, leave every parameter in. Otherwise a
+`query` or `formData` parameter is a credential parameter, and is left out of
+the operation, when its name is `access_token` (RFC 6750) or `token` and one
+of the named schemes is `oauth2`, or when its name and `in` are those of a
+named `apiKey` scheme. Names are trimmed and compared case-insensitively. A
+left-out parameter is never a tool argument, never required and never sent,
+so a caller cannot supply a credential beside or instead of the one the
+Connection sends. This covers APIs that document their access token as a
+parameter, as Slack's Web API does with `token`. Path and header parameters
+stay as they are; generated tools never send header parameters. A path-level
+parameter that is a credential parameter for any operation of its path is
+copied into each operation that keeps it instead.
 
 Converted schemes bind exactly as their OpenAPI 3.0 forms do. An
 `application` flow binds to an `oauth2_client_credentials` Connection with the
@@ -2002,6 +2023,10 @@ Review them before registering:
   plus the operation path, and the document's `basePath` is not added. Put it
   in the Connection's `base_path` (for an API with `basePath: /api`, set
   `base_path` to `/api`).
+- `credential_parameter_not_mapped`: the parameter named in `subject` carries
+  the operation's credential, as described above, and was left out of the
+  operation. The operation itself is kept. A form whose every field is a
+  credential parameter leaves the operation without a request body.
 - `request_body_not_mapped`: the operation's request body has no JSON media
   type, as with every `formData` body. Generated tools send JSON bodies only,
   so its fields are not tool arguments and the tool sends no body, exactly as
@@ -2072,6 +2097,30 @@ In standalone mode there is no other replica to wait for. In either mode,
 before rolling back to an earlier release, re-register those Connections with
 an OpenAPI 3.x document (or delete their overlays first, so the earlier
 release can still start).
+
+Upgrading from a release that already imports Swagger 2.0: that release kept
+credential parameters as tool arguments and copied JSON Schema `type` lists
+unchanged. A catalog it stored keeps serving exactly as stored, on every
+replica, until a registration, refresh or overlay edit generates it again
+from the stored document; the tools that change keep their names and are
+counted in `changed_count`. Nothing gates this, because both releases
+advertise `openapi_swagger2_catalogs`, so during a rolling upgrade run
+Swagger 2.0 registrations, refreshes and overlay edits on upgraded replicas:
+one that an earlier replica handles stores the credential parameters again.
+Before upgrading, remove every reference to a credential parameter from the
+overlays of Swagger 2.0 catalogs. A credential never belongs in an overlay,
+and once the parameter is gone an overlay tool's `parameters` entry for it
+makes registrations, refreshes and overlay edits fail, while an enum or label
+source whose request `query` supplies it cannot rebuild its source plan, so
+an upgraded replica fails at startup. An overlay written against a schema's
+`type` list compiles against its OpenAPI 3.0 form from the next refresh or
+edit.
+
+Rolling back to that earlier release serves the stored catalogs as they are,
+and its next refresh adds the credential parameters back. Before rolling
+back, remove any enum or label source added since the upgrade whose source
+tool had a required credential parameter: the earlier release requires it
+again, cannot rebuild that source plan and fails at startup.
 
 ## Importing Google Discovery Documents
 

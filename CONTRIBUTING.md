@@ -29,6 +29,21 @@ npm run dev
 
 Open `http://127.0.0.1:5173/admin/`. The Vite dev server proxies `/v1/admin` requests to `http://127.0.0.1:8080` by default; set `GREENGATEWAY_BACKEND_URL` when the backend is listening elsewhere.
 
+### PostgreSQL-gated tests
+
+Tests that need PostgreSQL skip unless `GATEWAY_TEST_POSTGRES_URL_FILE` names a file holding the DSN of a privileged role on a disposable PostgreSQL 16; the harness creates and drops a database of its own per test. CI's `postgres-foundation-pg` shard runs the whole suite that way, over loopback plaintext under the `loopback-dev` exception:
+
+```sh
+docker run -d --name greengateway-test-pg -p 127.0.0.1:5432:5432 \
+  -e POSTGRES_USER=greengateway_ci -e POSTGRES_DB=greengateway_ci \
+  -e POSTGRES_HOST_AUTH_METHOD=trust postgres:16
+printf 'postgres://greengateway_ci@127.0.0.1:5432/greengateway_ci\n' > target/database-url
+chmod 0600 target/database-url
+GATEWAY_TEST_POSTGRES_URL_FILE="$PWD/target/database-url" cargo test -p gateway --locked
+```
+
+The `postgres-foundation-tls` shard runs the authority-evidence suites again against a server that accepts only TLS. Setting `GATEWAY_TEST_POSTGRES_TLS_CA_FILE` to the PEM bundle that server's certificate chains to makes the harness (`storage::postgres::test_support`) connect in `verify` mode through the gateway's own connector, and makes a missing DSN locator a failure instead of a skip. To reproduce the shard, run its `Generate a throwaway CA and server certificate` and `Start PostgreSQL with TLS required` steps from `.github/workflows/ci.yml` with `RUNNER_TEMP` set to a scratch directory, point `GATEWAY_TEST_POSTGRES_URL_FILE` at the DSN above and `GATEWAY_TEST_POSTGRES_TLS_CA_FILE` at `$RUNNER_TEMP/pg-tls/ca.crt`, and run its test step's `cargo test` with the same suite filters. Only those suites take the TLS locator into account; the other PostgreSQL tests still connect in plaintext and fail against a TLS-only server.
+
 ## Picking Up Work
 
 Project work is tracked in GitHub issues. Each feature area has an issue, and each checklist item in that issue is intended to be sized as one pull request.

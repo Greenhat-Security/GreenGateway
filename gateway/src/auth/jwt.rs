@@ -36,17 +36,16 @@ const INVALID_TOKEN: &str = "invalid or expired token";
 /// traffic. The scheduled background refresh is not subject to it -- it is
 /// operator-paced -- but it stamps the same clock, so a storm of misses
 /// right after a scheduled fetch is still throttled.
-const MIN_JWKS_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+///
+/// It is the configuration compiler's floor on the operator's maximum key age
+/// ([`MIN_JWKS_KEY_AGE_SECS_LIMIT`]), so that a key set cannot go stale before
+/// a demand refresh is allowed again.
+const MIN_JWKS_REFRESH_INTERVAL: Duration = Duration::from_secs(MIN_JWKS_KEY_AGE_SECS_LIMIT);
 
-/// The cap on the operator's maximum key age: a day. Past that a withdrawn
-/// key would be honoured for longer than any rotation window an IdP
-/// documents.
-pub const MAX_JWKS_KEY_AGE_SECS_LIMIT: u64 = 86_400;
-/// The floor on the operator's maximum key age: the demand-refresh
-/// throttle. Below it a key set could go stale before a demand refresh was
-/// allowed again, and every request would fail closed against a reachable
-/// issuer until the throttle window passed.
-pub const MIN_JWKS_KEY_AGE_SECS_LIMIT: u64 = MIN_JWKS_REFRESH_INTERVAL.as_secs();
+// The key age bounds the configuration compiler holds `JWT_JWKS_MAX_KEY_AGE_SECS`
+// to, shared with `ggctl` (issue #242).
+pub(crate) use gateway_config::auth::{MAX_JWKS_KEY_AGE_SECS_LIMIT, MIN_JWKS_KEY_AGE_SECS_LIMIT};
+
 /// The `exp` leeway the validator grants (jsonwebtoken's default, made
 /// explicit): a token is accepted until `exp + leeway`, so a revocation
 /// keyed on the token's `exp` must stay effective at least that long past

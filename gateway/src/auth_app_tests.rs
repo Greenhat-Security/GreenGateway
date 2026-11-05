@@ -143,11 +143,14 @@ async fn real_service_token_authenticates_through_full_stack() {
     let token_store =
         auth::tokens::SqliteTokenStore::open(&token_db.path).expect("token store should open");
     let created = token_store
-        .create(auth::tokens::CreateTokenRequest {
-            scopes: vec!["probe-reader".to_owned()],
-            created_by: "bootstrap-admin".to_owned(),
-            expires_at: None,
-        })
+        .create(
+            auth::tokens::CreateTokenRequest {
+                scopes: vec!["probe-reader".to_owned()],
+                created_by: "bootstrap-admin".to_owned(),
+                expires_at: None,
+            },
+            &auth::change_actor::ChangeActor::for_test("bootstrap-admin"),
+        )
         .expect("service token should create");
     let policy = TempPolicyFile::new(&service_token_policy_document());
     let mut config = test_config(Vec::new());
