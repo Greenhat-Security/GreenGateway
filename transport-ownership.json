@@ -10136,6 +10136,16 @@
       "reasons": [
         "network-or-process-reference"
       ],
+      "scope": "gateway::import::preflight::live_members_admit#1",
+      "sha256": "d59eafb65cfd249ac81f7e20ee24fcd615efab9ecc287154cad591629c795cf1",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Read-only cluster roster and contract-fence reads through the import's existing PostgreSQL pool, for the operation gate; no caller-selected HTTP authority and no new connection."
+    },
+    {
+      "file": "gateway/src/import/preflight.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
       "scope": "gateway::import::preflight::occupied_namespace#1",
       "sha256": "8c52c8e9d5c89675a1e01d2a94114baca8c41bb8a187a77b054e17389442e1cc",
       "owner": "GreenGateway maintainers",

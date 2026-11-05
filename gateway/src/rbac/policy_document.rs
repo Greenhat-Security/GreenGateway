@@ -117,7 +117,7 @@ impl PolicySchema {
     }
 
     /// The document format major the cluster roster advertises a range of
-    /// (`cluster_membership::DOCUMENT_VERSION_RANGE`).
+    /// (`cluster_membership::DOCUMENT_VERSION_RANGE`, `0..=1` in this build).
     #[cfg(any(test, feature = "postgres"))]
     pub(crate) const fn document_format_major(self) -> i32 {
         match self {
@@ -412,7 +412,8 @@ impl IssueCode {
                  configuration"
             }
             Self::DocumentFormatUnsupportedInCluster => {
-                "cluster mode does not yet commit documents of this schema_version"
+                "not every live replica of this cluster can be shown to read documents of this \
+                 schema_version, so cluster mode does not commit one yet"
             }
             Self::ConversionRequiresV0 => "only a 0.x document is converted to policy v1",
             Self::PolicyWriteUnreachable => {
@@ -595,8 +596,8 @@ impl IssueCode {
                  current UPSTREAM_ROUTES."
             }
             Self::DocumentFormatUnsupportedInCluster => {
-                "Keep a cluster deployment on a 0.x document until a release that gates v1 \
-                 documents on every replica's capability."
+                "Finish the rollout so every replica runs a release that serves this document \
+                 format, or wait for departed replicas to go stale, then publish again."
             }
             Self::ConversionRequiresV0 => {
                 "The document already is policy v1; validate it instead of converting it."

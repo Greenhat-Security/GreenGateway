@@ -125,9 +125,11 @@ through serde_json's private number tag (`{"$serde_json::private::Number":
 member anywhere in the request is already `400
 policy_simulation_request_invalid`.) An edited candidate has no bytes of its
 own and is validated as the document its edits produce. A candidate whose
-document format this deployment could not commit -- policy v1 in cluster
-mode -- is refused as `POST /v1{ADMIN_PREFIX}/policy/validate` and a policy
-test run refuse it. A candidate that does not validate is `422
+document format this deployment's replicas do not serve is refused as
+`POST /v1{ADMIN_PREFIX}/policy/validate` and a policy test run refuse it;
+cluster mode serves 0.x and policy v1 alike, so a v1 candidate is simulated
+there too, and whether every live replica reads it is asked only when a
+document is committed. A candidate that does not validate is `422
 policy_candidate_invalid`. Server-side drafts and historical revisions are
 not candidate sources yet.
 
