@@ -1,7 +1,8 @@
 //! PostgreSQL authority-event journal and delivery cursor (issue #425, PR 3).
 //!
 //! Migration 21 adds three tables beside the evidence tables of migrations 16
-//! and 18 (and, since migration 26, migration 19's admin session evidence):
+//! and 18 (since migration 26 also migration 19's admin session evidence, and
+//! since migration 30 migration 23's policy, tools and catalog evidence):
 //!
 //! - `authority_event_journal`: one row per committed evidence row, appended
 //!   by the producer in the evidence row's own transaction, naming the
@@ -91,7 +92,7 @@ const RETENTION_SCAN_FACTOR: i64 = 10;
 pub(crate) const MAX_READ_BATCH: usize = 1_000;
 
 /// Which evidence table a journal row indexes. The values are the table
-/// names, and migration 26's CHECK holds the same closed list.
+/// names, and migration 30's CHECK holds the same closed list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum JournalSource {
     ConnectionChange,
@@ -100,14 +101,22 @@ pub(crate) enum JournalSource {
     /// Migration 19's admin session grants and withdrawals, journaled since
     /// migration 26.
     AdminSession,
+    /// Migration 23's policy, tools and policy test suite commits, journaled
+    /// since migration 30.
+    DocumentChange,
+    /// Migration 23's managed catalog publications, journaled since
+    /// migration 30.
+    CatalogChange,
 }
 
 impl JournalSource {
-    pub(crate) const ALL: [Self; 4] = [
+    pub(crate) const ALL: [Self; 6] = [
         Self::ConnectionChange,
         Self::ServiceTokenChange,
         Self::JwtRevocation,
         Self::AdminSession,
+        Self::DocumentChange,
+        Self::CatalogChange,
     ];
 
     pub(crate) const fn table(self) -> &'static str {
@@ -116,6 +125,8 @@ impl JournalSource {
             Self::ServiceTokenChange => "service_token_change_evidence",
             Self::JwtRevocation => "jwt_revocation_evidence",
             Self::AdminSession => "admin_session_evidence",
+            Self::DocumentChange => "document_change_evidence",
+            Self::CatalogChange => "catalog_change_evidence",
         }
     }
 
@@ -200,8 +211,7 @@ pub(crate) fn record_capacity_refusal() {
 /// could not be written for a reason other than capacity. Called once per
 /// refused mutation, where the evidence statement failed: the journal
 /// append counts its own failures, each producer counts its evidence
-/// insert's -- including the policy, tools and catalog producers, whose
-/// evidence is not journaled.
+/// insert's.
 pub(crate) fn record_evidence_failure() {
     ::metrics::counter!(crate::metrics::AUTHORITY_EVENT_EVIDENCE_FAILURES_TOTAL).increment(1);
 }
@@ -220,8 +230,9 @@ pub(crate) struct JournaledEvidence {
     /// The resource's owner, when it has one: the issuer of a JWT
     /// revocation's `jti` digest.
     pub(crate) resource_owner: Option<String>,
-    /// The Connection ID, the token ID, the `jti` digest or the admin
-    /// session ID.
+    /// The Connection ID, the token ID, the `jti` digest, the admin session
+    /// ID, a document's resource type (`policy`, `tools` or `policy_tests`;
+    /// each document is a singleton) or a catalog's Connection ID.
     pub(crate) resource_id: Option<String>,
     pub(crate) prior_version: Option<i64>,
     pub(crate) new_version: Option<i64>,
@@ -229,10 +240,13 @@ pub(crate) struct JournaledEvidence {
     pub(crate) security_revision: Option<i64>,
     /// RFC 3339 UTC with microseconds, from the evidence row.
     pub(crate) committed_at: Option<String>,
-    /// The actor's canonical issuer, kind and auth mode (migration 24). All
-    /// three are `None` for evidence committed before migration 24, which
-    /// recorded none of them, and for admin session evidence, which records
-    /// none of them; the issuer is also `None` for an actor that has none.
+    /// The actor's issuer, kind and auth mode (migration 24, and migration 25
+    /// for catalogs). All three are `None` for evidence committed before
+    /// those migrations, which recorded none of them, and for admin session
+    /// evidence, which records none of them; the issuer is also `None` for
+    /// an actor that has none. Document evidence always records all three,
+    /// in migration 23's vocabulary for a row committed before migration 30,
+    /// which the delivery projection reads in migration 24's.
     pub(crate) actor_issuer: Option<String>,
     pub(crate) actor_kind: Option<String>,
     pub(crate) actor_auth_mode: Option<String>,
@@ -474,25 +488,35 @@ impl PostgresAuthorityEventStore {
 /// Admin session evidence names the session's own identity as its actor
 /// and records no actor kind, auth mode, version or shared revision, so
 /// those columns stay empty for it. Only Connection change evidence names a
-/// revision axis (migration 28).
+/// revision axis (migration 28). Document evidence names its singleton
+/// resource by its resource type and catalog evidence names its Connection;
+/// the overlay revision a catalog was compiled from is not read, because no
+/// delivered field carries it.
 const READ_AFTER_SQL: &str = r#"
 SELECT j.position,
        j.event_id::text,
        j.source,
-       coalesce(c.operation_id, t.operation_id, r.operation_id, a.operation_id)::text,
-       coalesce(c.actor_user_id, t.actor_user_id, r.actor_user_id, a.user_id),
-       coalesce(c.action, t.action, r.action, a.action),
+       coalesce(c.operation_id, t.operation_id, r.operation_id, a.operation_id,
+                d.operation_id, g.operation_id)::text,
+       coalesce(c.actor_user_id, t.actor_user_id, r.actor_user_id, a.user_id,
+                d.actor_user_id, g.actor_user_id),
+       coalesce(c.action, t.action, r.action, a.action, d.action, g.action),
        r.issuer,
-       coalesce(c.connection_id::text, t.token_id, r.jti_hash, a.session_id::text),
-       coalesce(c.prior_version, t.prior_version),
-       coalesce(c.new_version, t.new_version),
-       coalesce(c.security_revision, t.security_revision, r.security_revision),
-       to_char(coalesce(c.committed_at, t.committed_at, r.committed_at, a.committed_at)
+       coalesce(c.connection_id::text, t.token_id, r.jti_hash, a.session_id::text,
+                d.resource_type, g.connection_id::text),
+       coalesce(c.prior_version, t.prior_version, d.prior_version, g.prior_version),
+       coalesce(c.new_version, t.new_version, d.new_version, g.new_version),
+       coalesce(c.security_revision, t.security_revision, r.security_revision,
+                d.security_revision, g.security_revision),
+       to_char(coalesce(c.committed_at, t.committed_at, r.committed_at, a.committed_at,
+                        d.committed_at, g.committed_at)
                    AT TIME ZONE 'UTC',
                'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
-       coalesce(c.actor_issuer, t.actor_issuer, r.actor_issuer),
-       coalesce(c.actor_kind, t.actor_kind, r.actor_kind),
-       coalesce(c.actor_auth_mode, t.actor_auth_mode, r.actor_auth_mode),
+       coalesce(c.actor_issuer, t.actor_issuer, r.actor_issuer, d.actor_issuer,
+                g.actor_issuer),
+       coalesce(c.actor_kind, t.actor_kind, r.actor_kind, d.actor_kind, g.actor_kind),
+       coalesce(c.actor_auth_mode, t.actor_auth_mode, r.actor_auth_mode,
+                d.actor_auth_mode, g.actor_auth_mode),
        c.revision_axis
 FROM greengateway.authority_event_journal j
 LEFT JOIN greengateway.connection_change_evidence c
@@ -503,6 +527,10 @@ LEFT JOIN greengateway.jwt_revocation_evidence r
     ON j.source = 'jwt_revocation_evidence' AND r.event_id = j.event_id
 LEFT JOIN greengateway.admin_session_evidence a
     ON j.source = 'admin_session_evidence' AND a.event_id = j.event_id
+LEFT JOIN greengateway.document_change_evidence d
+    ON j.source = 'document_change_evidence' AND d.event_id = j.event_id
+LEFT JOIN greengateway.catalog_change_evidence g
+    ON j.source = 'catalog_change_evidence' AND g.event_id = j.event_id
 WHERE j.position > $1
 ORDER BY j.position
 LIMIT $2
@@ -622,15 +650,15 @@ fn invalid_data(operation: &'static str) -> RepositoryError {
 mod tests {
     use super::*;
 
-    /// The source vocabulary is migration 26's CHECK, value for value, and
+    /// The source vocabulary is migration 30's CHECK, value for value, and
     /// every value round-trips.
     #[test]
     fn the_journal_sources_are_the_migrations_closed_vocabulary() {
         let journal = include_str!("migrations/0021_authority_event_journal.sql");
-        let migration = include_str!("migrations/0026_admin_session_evidence_journal.sql");
+        let migration = include_str!("migrations/0030_document_and_catalog_evidence_journal.sql");
         let (_, check) = migration
             .split_once("ADD CONSTRAINT authority_event_journal_source_check CHECK (")
-            .expect("migration 26 replaces the source CHECK");
+            .expect("migration 30 replaces the source CHECK");
         let (check, _) = check.split_once(");").expect("the CHECK ends");
         assert_eq!(
             check.matches("_evidence'").count(),
@@ -640,7 +668,7 @@ mod tests {
         for source in JournalSource::ALL {
             assert!(
                 check.contains(&format!("'{}'", source.table())),
-                "migration 26 must allow {}",
+                "migration 30 must allow {}",
                 source.table()
             );
             assert_eq!(JournalSource::from_table(source.table()), Some(source));

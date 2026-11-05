@@ -26,8 +26,8 @@ producer of those three evidence tables appends to in the same transaction, and 
 opt-in dispatcher that delivers it behind a persisted cursor. The third PR 2 slice
 adds migration 23's `greengateway.document_change_evidence`, written by every
 PostgreSQL policy and tools document commit, and `greengateway.catalog_change_evidence`,
-written by every managed MCP and OpenAPI catalog publication; neither is a journal
-source yet, so the dispatcher does not deliver them. Migration 24 adds the actor's
+written by every managed MCP and OpenAPI catalog publication; neither was a journal
+source until migration 30. Migration 24 adds the actor's
 kind, auth mode and issuer to the three journaled tables, and the standalone token
 database gains the same columns. Migration 25 adds the same three columns to
 `catalog_change_evidence`, and every catalog publication records them. Migration 26 makes migration 19's
@@ -38,7 +38,11 @@ service token too, written and journaled in the create's transaction, and the
 standalone token database rebuilds its own table once to admit it. Migration 28 lets
 migration 16's Connection table record a create, a replace and, when a replace
 changes credential authority, a `credential.binding_change` on the credential
-revision axis, each written and journaled in the change's transaction. The first PR 4
+revision axis, each written and journaled in the change's transaction. Migration 30
+makes migration 23's two tables the fifth and sixth journal sources, so every
+policy, tools and catalog change is journaled in its own transaction and
+delivered, and records the document actor in migration 24's vocabulary
+([Policy, tools and catalog delivery](#policy-tools-and-catalog-delivery)). The first PR 4
 slice adds migration 12 of the
 standalone Connections database: Connection create/replace/delete and local-secret
 create/rotate/delete/re-encryption write its `connection_change_evidence` and
@@ -68,7 +72,7 @@ node scripts/check-authority-evidence.mjs
 node --test scripts/test-authority-evidence.mjs
 ```
 
-The existing CI `supply-chain` job runs both commands. The checker covers 31
+The existing CI `supply-chain` job runs both commands. The checker covers 32
 operations in both storage modes, checks live source/test anchors, rejects
 missing/duplicate dispositions, and discovers unreviewed mutation endpoints in
 the four reviewed admin modules. It checks source traceability and contract
@@ -89,12 +93,12 @@ or unconfigured individual stores.
 
 | Authority | Already atomic in PostgreSQL | Remaining evidence work |
 | --- | --- | --- |
-| Policy publish, rollback, rule edits and suggestion acceptance | Immutable document/history, actor subject, action/diff, active pointer, shared revision and outbox, plus one non-cascading `document_change_evidence` row (operation code, event/operation UUIDs, actor kind, subject, issuer and auth mode, prior/new version, the outbox row's shared revision, database-clock time) in the same transaction; suggestion acceptance composes its own state, and so its evidence, in the same transaction | Caller-bound operation identity, safe-reference projection, durable delivery and retention |
-| Tools publication | Shared document transaction plus name reservations and the same `document_change_evidence` row; the first-boot seed and the import's activation are recorded as system actors | Same as policy |
+| Policy publish, rollback, rule edits and suggestion acceptance | Immutable document/history, actor subject, action/diff, active pointer, shared revision and outbox, plus one non-cascading `document_change_evidence` row (operation code, event/operation UUIDs, actor kind, subject, issuer and auth mode, prior/new version, the outbox row's shared revision, database-clock time) in the same transaction, journaled and delivered since migration 30, its actor in migration 24's vocabulary; suggestion acceptance composes its own state, and so its evidence, in the same transaction | A caller-bound operation identity and an issuer-scoped subject reference; standalone policy writes are refused under `required` |
+| Tools publication | Shared document transaction plus name reservations and the same `document_change_evidence` row, journaled and delivered since migration 30; the first-boot seed and the import's activation are recorded as system actors | Same as policy |
 | Stored policy test suite (`policy_tests.publish`, migration 29) | Shared document transaction over its own versions and active pointer, plus the same `document_change_evidence` row, with resource type `policy_tests` | Same as policy. The proposed event names it as a `policy` resource on its own `policy_tests` revision axis, because its versions are not policy versions. Standalone records only the writer's subject on the version row, so `required` refuses the write there |
 | Connection and credential binding changes | Record, bindings, immutable version, shared revision and outbox, plus since migration 28 a non-cascading `connection_change_evidence` row per committed create (`connection.create`, no prior version and version 1) and replace (`connection.replace`, prior and new specification version), and a `credential.binding_change` row on the credential axis (prior and new credential revision) under the same operation ID and shared revision when a replace advances the credential revision: actor (subject, kind, auth mode, canonical issuer), event/operation UUIDs, the outbox row's shared revision, database-clock time, journaled and delivered in the change's transaction. An identical replace records nothing. No binding, secret ID or locator enters a row. Standalone writes the same rows, without a shared revision, in the Connections database's own transaction ([Standalone evidence](#standalone-evidence)) | A caller-bound operation identity and an issuer-scoped subject reference; Connections created or replaced before migration 28 keep only their cascading version history; standalone evidence is not delivered |
 | Connection deletion | Outbox tombstone with prior version and shared revision, plus a non-cascading `connection_change_evidence` row (actor, action, event/operation UUIDs, prior version, the tombstone's shared revision, database-clock time) and its journal row in the same transaction; delivered with keyed safe references since PR 3; since migration 24 the actor's kind, auth mode and canonical issuer too. Standalone writes the same deletion evidence, without a shared revision, in the Connections database's own transaction | A caller-bound operation identity and an issuer-scoped subject reference, without which the delivered record cannot be `authority_event.v1`; standalone evidence is not delivered |
-| Managed MCP/OpenAPI catalog and overlay publication | Catalog/overlay CAS, entries, dependencies, reservations, revision and outbox, plus one non-cascading `catalog_change_evidence` row (action derived from the write, event/operation UUIDs, the actor's subject, kind, auth mode and canonical issuer, catalog revision transition, compiled overlay revision, shared revision, database-clock time) that outlives the replacement and the Connection's deletion | Caller-bound operation identity, an issuer-scoped subject reference, journaling for delivery |
+| Managed MCP/OpenAPI catalog and overlay publication | Catalog/overlay CAS, entries, dependencies, reservations, revision and outbox, plus one non-cascading `catalog_change_evidence` row (action derived from the write, event/operation UUIDs, the actor's subject, kind, auth mode and canonical issuer, catalog revision transition, compiled overlay revision, shared revision, database-clock time) that outlives the replacement and the Connection's deletion, journaled and delivered since migration 30 | Caller-bound operation identity and an issuer-scoped subject reference |
 | Service-token issue | Token row with creator, row/shared revisions and outbox, plus since migration 27 a `service_token_change_evidence` row with action `service_token.issue` (actor, event/operation UUIDs, no prior revision and row revision 1, the create outbox row's shared revision, database-clock time) in the create's transaction, journaled and delivered. Standalone writes the same row in the token database's own create transaction. Neither store records the returned plaintext or its hash | A caller-bound operation identity and an issuer-scoped subject reference; tokens issued before the evidence existed keep only `created_by`; standalone evidence is not delivered |
 | Service-token rotate/revoke | Token change, row/shared revisions and outbox, plus a non-cascading `service_token_change_evidence` row (actor, action, event/operation UUIDs, prior/new row revision, the outbox row's shared revision, database-clock time) in the same transaction; repeated revoke and refused rotate write none. Standalone writes the same evidence in the token database's own transaction. In PostgreSQL the change also journals its evidence and is delivered since PR 3. Both stores record the actor's kind, auth mode and canonical issuer (migration 24 and the token database's own columns) | A caller-bound operation identity and an issuer-scoped subject reference; standalone evidence is not delivered |
 | JWT revocation | Scoped JTI digest, actor row, shared revision and outbox, plus one non-cascading `jwt_revocation_evidence` row per effective revoke (actor, JTI digest, resulting expiry, shared revision) that extension, reactivation and expiry cleanup never rewrite, journaled in the same transaction and delivered since PR 3; since migration 24 the CLI's actor is recorded as kind `system`, auth mode `system` and no issuer | The CLI actor stays system provenance, not a named human; a caller-bound operation identity |
@@ -436,18 +440,22 @@ migration 21; `gateway/src/storage/postgres_authority_events.rs` and
   `jwt_revocation_evidence` appends one `authority_event_journal` row in the same
   transaction as its evidence row, under the evidence row's `event_id`, and since
   migration 26 every cluster admin session grant and withdrawal journals its
-  `admin_session_evidence` row in the statement that writes it. The row
+  `admin_session_evidence` row in the statement that writes it, and since
+  migration 30 every producer of `document_change_evidence` and
+  `catalog_change_evidence` journals its row in the same transaction too. The row
   holds identifiers only. Its position is reserved from the
   `authority_event_state` row, whose lock is held to COMMIT, so position order is
   commit order and the committed journal has no gaps. Evidence committed before
   migration 21 is journaled by the migration in commit order; admin session
-  evidence committed before migration 26 is journaled by that migration, in its
-  own commit order, after everything already journaled.
+  evidence committed before migration 26, and document and catalog evidence
+  committed before migration 30, is journaled by that migration, in its own
+  commit order, after everything already journaled.
 - **Bounded capacity, failing closed.** The same reservation succeeds only while
   fewer than `AUTHORITY_EVENT_JOURNAL_CAPACITY` units are in use: one per retained
   row, plus one held for the withdrawal of every admin session granted and not yet
   withdrawn. When the journal is full, the mutation rolls back as a whole and is
-  answered `503` (a CLI `revoke-jwt` exits with a store error); nothing is
+  answered `503` (a CLI `revoke-jwt` and the offline import exit with a store error,
+  and a first boot whose tools seed is refused does not start); nothing is
   committed and no accepted event is evicted. The one exception is an admin
   session withdrawal, which spends the unit its grant held and is never refused for
   capacity ([below](#admin-session-withdrawals-and-journal-capacity)). This applies
@@ -510,7 +518,8 @@ migration 21; `gateway/src/storage/postgres_authority_events.rs` and
   axis, and a replace advances it; a `credential.binding_change` is on the
   `credential` axis, where `0` before means the Connection had no credential
   authority, and names the Connection as its resource, as every Connection change
-  does. An admin
+  does. Policy, tools and catalog changes (since migration 30) are described
+  [below](#policy-tools-and-catalog-delivery). An admin
   session record carries `null` for the shared security revision, which a session
   does not take. No identifier, token material, `jti`, issuer or secret reaches
   it.
@@ -520,8 +529,7 @@ migration 21; `gateway/src/storage/postgres_authority_events.rs` and
   `_undelivered`, `_oldest_undelivered_age_seconds`, `_delivered_total`,
   `_delivery_failures_total{kind}`, `_capacity_refusals_total` and
   `_evidence_failures_total` (a change refused because the database refused its
-  evidence row or journal entry for any other reason, including the unjournaled
-  policy, tools and catalog evidence below), every label from a fixed
+  evidence row or journal entry for any other reason), every label from a fixed
   vocabulary ([metrics](deployment/postgres.md#metrics)). The
   [operational rule pack](deployment/operational-alerts.md#alert-policy) pages on
   either refusal counter and on a full journal, warns on a filling journal,
@@ -564,13 +572,6 @@ Not covered by PR 3, and still open:
   an issuer-scoped subject reference, after which the delivered record can become
   `authority_event.v1` for the actors that have an issuer. Kind, auth mode and
   issuer are recorded since migration 24 ([Actor metadata](#actor-metadata)).
-- **Policy, tools and catalog evidence.** Migration 23's `document_change_evidence`
-  and `catalog_change_evidence` rows exist but are not journal sources, so they are
-  retained and not delivered. Journaling them adds the journal's capacity
-  reservation to every policy, tools and catalog commit, and to the first-boot
-  tools seed. A change refused because its evidence insert failed is logged with
-  its classified store error and counted by `_evidence_failures_total`, so the
-  rule pack pages on it like any other refused authority change.
 - **Service-token issue (migration 27).** A create writes its
   `service_token_change_evidence` row with action `service_token.issue` after the
   token row and the create outbox row, under the outbox row's shared revision, and
@@ -587,6 +588,74 @@ Not covered by PR 3, and still open:
   nothing of it; an identical replace commits nothing and journals nothing.
   Connections created or replaced before migration 28 have no such rows, and
   nothing is backfilled for them.
+
+### Policy, tools and catalog delivery
+
+Migration 30 (`document_and_catalog_evidence_journal`) makes migration 23's
+`document_change_evidence` and `catalog_change_evidence` the fifth and sixth journal
+sources:
+
+- **Every producer journals in its own transaction.** `postgres_documents::commit_in`,
+  which every policy and tools commit, suggestion acceptance, stored policy test
+  suite write, the first-boot tools seed (system actor `bootstrap`) and the offline
+  import's policy and tools activations (system actor `import-standalone`) run,
+  appends the commit's journal row right after its evidence row. Both Connection
+  store catalog replacements, which every MCP refresh, OpenAPI registration and
+  refresh and overlay put or delete reach, do the same after their catalog evidence
+  row. Each takes one unit of capacity under the rule every producer follows; a full
+  journal refuses the change (`503` from the admin API, a store error from the import,
+  a failed first boot for the seed), commits nothing of it, and is counted by
+  `_capacity_refusals_total`. A failed append is counted by `_evidence_failures_total`
+  and rolls the change back.
+- **Backfill.** The migration journals the evidence both tables already hold, after
+  everything already journaled, in their own commit order (`committed_at`, then event
+  ID) across the two tables, each row at its own commit time, one unit each. It leaves
+  the capacity as it was.
+- **Delivered records.** A document is a singleton, so its resource is the document
+  itself, referenced under its own domain: a `policy` resource on the `policy` axis,
+  a `tools` resource on the `tools` axis, and the stored policy test suite a `policy`
+  resource of its own on the `policy_tests` axis, as the proposed event names it. The
+  import's `configuration.import` is on the axis of the document it activated. A
+  catalog is a `catalog` resource referenced by its Connection under the
+  `resource.catalog` domain, so its reference is never the Connection's, on the
+  `catalog` axis; the overlay revision it was compiled from stays in the evidence row.
+  Each activates a version: `before` is `null` for a document's initialization or a
+  Connection's first catalog of its kind, and `after` is strictly greater (a document's
+  first version is an identity value and need not be `1`). The shared revision is the
+  outbox row's. A pairing of action and document that migration 29's CHECK refuses is
+  refused by the projection too, and stalls delivery at that row.
+- **The document actor in migration 24's vocabulary.** Migration 23 recorded a
+  service-token caller as kind `principal` with auth mode `service_token`, and the
+  issuer as the principal carried it. Since migration 30 `actor_kind` admits
+  `service_token`, and every writer records `auth::change_actor::ChangeActor`: the
+  service token as its own kind and the canonical issuer, as every other evidence
+  table does. A new CHECK, `document_change_evidence_actor_metadata`, pairs each new
+  row's kind with its auth mode exactly as migration 24's tables do. It is `NOT VALID`
+  on purpose and never validated: evidence is append-only, so a row committed before
+  the migration keeps the vocabulary it was written in. The dispatcher reads such a
+  row in the new vocabulary, delivering (`principal`, `service_token`) as kind
+  `service_token` and referencing the issuer after the same canonicalization
+  authentication applies, so the same principal has one issuer reference across every
+  table. The stored row does not change.
+
+Tests: the delivery projection tests in `gateway/src/authority_events/delivery_tests.rs`
+(`document_changes_project_on_the_axis_of_their_document`,
+`catalog_publications_project_on_the_catalog_axis`,
+`legacy_document_actors_are_read_in_migration_24s_vocabulary`, every operation against
+the published schema and synthetic-marker exclusion); the dispatcher's
+`committed_events_are_delivered_in_commit_order_under_their_evidence_ids` (policy,
+Connection, catalog and tools events interleaved with token, JWT and Connection ones,
+in commit order under their evidence IDs) and
+`a_full_journal_refuses_policy_and_catalog_publications_and_commits_nothing` (a policy
+publication, the tools seed and a catalog publication refused at capacity with nothing
+committed, counted once each, then committed once retention frees room); the document
+core's `committed_document_changes_record_attributed_evidence_and_refusals_record_none`;
+the catalog store's `catalog_evidence_survives_replacement_cascade_and_restart`; the
+import's journal rows in `import::tests`; and
+`migration_thirty_journals_document_and_catalog_evidence_and_aligns_the_actor`. The
+PostgreSQL ones run in CI against its disposable loopback database, and the
+dispatcher, migration and evidence suites again over verified TLS
+([Verified-TLS storage tests](#verified-tls-storage-tests)).
 
 ### Admin session withdrawals and journal capacity
 
@@ -724,15 +793,15 @@ release that approved it ([schema 24 to 25](deployment/postgres.md#rolling-upgra
 and recorded nothing in them; this release records the whole actor on every
 catalog publication, refusing before the transaction opens an actor it cannot
 record exactly. A catalog row committed before this release records none of the
-three, and nothing is backfilled. `document_change_evidence` stays outside the
-contract: it records an actor kind, issuer and auth mode in its own vocabulary,
-kind `principal` for every authenticated caller, a service token included (only
-its `service_token` auth mode tells it apart), or `system`, and the issuer as the
-principal carried it rather than in canonical form; aligning it is a later #425
-slice. Neither table is a journal source, so nothing delivers either row (the
-inventory's `policy_postgres`, `tools_postgres`, `configuration_import` and
-`catalog_postgres` rows keep `missing_metadata`, the catalog row for its operation
-identity and safe actor reference).
+three, and nothing is backfilled. `document_change_evidence` joins the contract
+with migration 30 ([Policy, tools and catalog delivery](#policy-tools-and-catalog-delivery)):
+its writers record the same kind, auth mode and canonical issuer, and its rows
+committed before then, which recorded a service token as kind `principal` and the
+issuer as the principal carried it, are delivered in this vocabulary without being
+rewritten. Both tables are journal sources since then. The inventory's
+`policy_postgres`, `tools_postgres`, `policy_tests_postgres`, `configuration_import`
+and `catalog_postgres` rows keep `missing_metadata` for their caller-bound operation
+identity and issuer-scoped subject reference.
 
 ## Standalone evidence
 
@@ -880,9 +949,9 @@ unchanged), and a replica with a different value is not ready in that deployment
 What required mode does not do:
 
 - It refuses no `admitted` row. Several of them are retained but not delivered: the
-  policy, tools and catalog evidence rows are not journal sources (admin-session
-  evidence is, since migration 26), and the
-  standalone token, Connection and local-secret evidence has no dispatcher. A
+  standalone token, Connection and local-secret evidence has no dispatcher. (Every
+  cluster evidence table is a journal source: admin-session evidence since migration
+  26, policy, tools and catalog evidence since migration 30.) A
   cluster Connection's version history still cascades with the Connection; its
   create, replace, credential binding change (since migration 28) and deletion
   evidence rows do not.
@@ -1050,10 +1119,10 @@ only against the loopback database.
    ([Verified-TLS storage tests](#verified-tls-storage-tests)). Since migration 25
    every catalog publication records the whole actor, kind, auth mode and
    canonical issuer as Connection deletion does ([Actor metadata](#actor-metadata)).
-   Still open: the alignment of the document rows' actor vocabulary with migration
-   24's, a caller-bound operation identity, and journaling: neither table is a
-   migration 21 journal source, so the dispatcher does not deliver their rows yet.
-   No scheduled catalog refresh ships, so no system catalog actor is recorded yet.
+   Migration 30 journals both tables and aligns the document rows' actor vocabulary
+   with migration 24's ([Policy, tools and catalog delivery](#policy-tools-and-catalog-delivery)).
+   Still open: a caller-bound operation identity. No scheduled catalog refresh ships,
+   so no system catalog actor is recorded yet.
 4. **Durable dispatch (landed for the journaled evidence).** Migration 21's
    journal, capacity reservation and dispatcher cursor, the leased dispatcher and
    the log and file sinks, as described under [Durable delivery](#durable-delivery).

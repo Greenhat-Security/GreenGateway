@@ -42,7 +42,7 @@ use crate::{
         },
         postgres_service_tokens::import_service_tokens_in,
         postgres_tools::PostgresToolStore,
-        AuditEventStore, ChangeActor, DocumentAction, DocumentChange, PolicyCommitError,
+        AuditEventStore, DocumentAction, DocumentChange, PolicyCommitError,
         PolicyCommitPrecondition, PolicyCommitRequest, PolicyControlPlane, RepositoryError,
         ToolControlPlane,
     },
@@ -66,15 +66,12 @@ const PRINCIPALS_OPERATION: &str = "import_principals_section";
 
 /// What the import's policy and tools activations record as their change
 /// evidence: the import operation, by the gateway under its fixed label, not
-/// by a principal. The history versions it copies keep their own actors and
-/// write no evidence; they were committed by the standalone deployment.
-fn import_change() -> DocumentChange<'static> {
-    DocumentChange {
-        action: DocumentAction::ConfigurationImport,
-        actor: ChangeActor::System {
-            label: IMPORT_ACTOR,
-        },
-    }
+/// by a principal. Each activation journals its evidence row in its own
+/// transaction (migration 30), so a full journal refuses the section. The
+/// history versions it copies keep their own actors and write no evidence;
+/// they were committed by the standalone deployment.
+fn import_change() -> DocumentChange {
+    DocumentChange::system(DocumentAction::ConfigurationImport, IMPORT_ACTOR)
 }
 
 /// Step 2: the policy document and its history.

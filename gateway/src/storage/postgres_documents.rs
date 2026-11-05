@@ -30,7 +30,12 @@
 //!    the actor's kind, subject, issuer and auth mode, the action, fresh
 //!    event and operation IDs, the prior and new versions and the shared
 //!    revision the outbox row took. The evidence row has no foreign key and
-//!    is never rewritten.
+//!    is never rewritten. Since migration 30 the row is also journaled for
+//!    delivery (`postgres_authority_events::append_to_journal`) under its own
+//!    event ID, reserving one unit of the journal's capacity; a full journal
+//!    refuses the commit as unavailable. The actor is recorded in migration
+//!    24's vocabulary: a service token as its own kind, and a principal's
+//!    issuer in canonical form.
 //! 7. `COMMIT` -- once; every step rolls back together, so a commit whose
 //!    evidence cannot be written does not happen, and a refused one (a
 //!    stale ETag, a lost initialize race, a tool name another lane holds)
@@ -77,7 +82,7 @@ pub(crate) struct DocumentCommit<'a> {
     pub document_etag: &'a str,
     /// What the evidence row records. The version row's `actor_user_id`
     /// is the actor's subject (or system label), as it always was.
-    pub change: DocumentChange<'a>,
+    pub change: DocumentChange,
     pub diff_summary_json: &'a str,
     /// The tool names this document publishes into the local lane, to be
     /// reserved at the authority in the same transaction. `None` for
@@ -112,9 +117,10 @@ fn classify_query(error: tokio_postgres::Error, operation: &'static str) -> Repo
 const OPERATION_DOCUMENT_EVIDENCE: &str = "document_change_evidence_append";
 
 /// The longest subject and issuer migration 23 accepts. They are exactly the
-/// principal bounds authentication enforces, so evidence never refuses a
-/// principal a validator produced; the assertions keep the immutable SQL
-/// bounds and the Rust bounds from drifting apart silently.
+/// principal bounds authentication enforces, and the bounds
+/// `ChangeActor::is_recordable` checks, so evidence never refuses a principal
+/// a validator produced; the assertions keep the immutable SQL bounds and the
+/// Rust bounds from drifting apart silently.
 pub(crate) const EVIDENCE_ACTOR_MAX_BYTES: usize = 4096;
 pub(crate) const EVIDENCE_ISSUER_MAX_BYTES: usize = 4096;
 const _: () =
@@ -124,23 +130,16 @@ const _: () =
 
 /// An unattributable or mislabeled change has no evidence to record, so it
 /// is refused before the transaction writes anything rather than committed
-/// anonymously: an empty or oversized subject or issuer, or an action that
-/// cannot describe this resource. An authenticated principal and every
-/// shipped call site satisfy it; migration 23's CHECKs are the backstop.
+/// anonymously: an actor evidence cannot record exactly (an empty or
+/// oversized subject or issuer, or an issuer on an actor that is not a
+/// principal), or an action that cannot describe this resource. An
+/// authenticated principal and every shipped call site satisfy it; the
+/// CHECKs of migrations 23 and 30 are the backstop.
 fn validate_change(
     resource: DocumentResource,
-    change: &DocumentChange<'_>,
+    change: &DocumentChange,
 ) -> Result<(), PolicyCommitError> {
-    let subject = change.actor.user_id();
-    let issuer_in_bounds = change
-        .actor
-        .issuer()
-        .is_none_or(|issuer| !issuer.is_empty() && issuer.len() <= EVIDENCE_ISSUER_MAX_BYTES);
-    if subject.is_empty()
-        || subject.len() > EVIDENCE_ACTOR_MAX_BYTES
-        || !issuer_in_bounds
-        || !change.action.applies_to(resource.resource_type)
-    {
+    if !change.actor.is_recordable() || !change.action.applies_to(resource.resource_type) {
         tracing::error!(
             resource = resource.resource_type,
             action = change.action.code(),
@@ -154,15 +153,20 @@ fn validate_change(
     Ok(())
 }
 
-/// Append the commit's evidence row inside the caller's transaction. Its
-/// `event_id` and `operation_id` are minted here, once; `committed_at` is
-/// the database clock's. Any failure is returned for the caller to roll
-/// back, so the commit it describes never happens without it, and is
-/// counted here like every other producer's refused evidence insert.
+/// Append the commit's evidence row inside the caller's transaction, and
+/// journal it for delivery (migration 30). Its `event_id` and
+/// `operation_id` are minted here, once, and the journal carries the same
+/// event ID; `committed_at` is the database clock's. The actor is recorded
+/// whole, in migration 24's vocabulary: its subject, canonical issuer, kind
+/// and auth mode. Any failure is returned for the caller to roll back, so
+/// the commit it describes never happens without both rows. A full journal
+/// refuses the commit as unavailable rather than evict an accepted event. A
+/// failed evidence insert is counted here, a failed or refused append by the
+/// journal, like every other producer's.
 async fn record_document_change(
     client: &deadpool_postgres::Object,
     resource: DocumentResource,
-    change: &DocumentChange<'_>,
+    change: &DocumentChange,
     prior_version: Option<i64>,
     new_version: i64,
     security_revision: i64,
@@ -183,8 +187,8 @@ async fn record_document_change(
             &[
                 &event_id,
                 &operation_id,
-                &change.actor.kind(),
-                &change.actor.user_id(),
+                &change.actor.kind().as_str(),
+                &change.actor.subject(),
                 &change.actor.issuer(),
                 &change.actor.auth_mode(),
                 &change.action.code(),
@@ -199,7 +203,28 @@ async fn record_document_change(
             super::postgres_authority_events::record_evidence_failure();
             store_error(classify_query(error, OPERATION_DOCUMENT_EVIDENCE))
         })?;
-    Ok(())
+    super::postgres_authority_events::append_to_journal(
+        client,
+        super::postgres_authority_events::JournalSource::DocumentChange,
+        &event_id,
+    )
+    .await
+    .map_err(journal_failure)
+}
+
+/// A full journal is `Unavailable`, which every caller answers `503`; a
+/// failed append is classified like the evidence insert, never as the
+/// precondition failure a stale ETag is.
+fn journal_failure(
+    error: super::postgres_authority_events::JournalAppendError,
+) -> PolicyCommitError {
+    use super::postgres_authority_events::{JournalAppendError, OPERATION_JOURNAL_APPEND};
+    store_error(match error {
+        JournalAppendError::CapacityExhausted => {
+            RepositoryError::new(RepositoryErrorKind::Unavailable, OPERATION_JOURNAL_APPEND)
+        }
+        JournalAppendError::Store(error) => classify_query(error, OPERATION_JOURNAL_APPEND),
+    })
 }
 
 /// Read the active document row (joined for its creation timestamp), or
@@ -365,7 +390,7 @@ pub(crate) async fn commit_in(
             .query_one(
                 insert_sql.as_str(),
                 &[
-                    &commit.change.actor.user_id(),
+                    &commit.change.actor.subject(),
                     &commit.diff_summary_json,
                     &commit.document_json,
                     &commit.document_etag,
