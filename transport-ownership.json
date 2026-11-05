@@ -6732,7 +6732,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::bootstrap::commands::run_one_shot_command#1",
-      "sha256": "8fa3ea7163610a40a47e804589b47e3df9760cdb214bb34967adbf2e9b0d1cfc",
+      "sha256": "7606b550e6d877fbe23747cb751cfffa0f9653ca0ad12be7f1c87004d4baa079",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -7953,7 +7953,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::cluster_maintenance::MaintenanceRunner#1",
-      "sha256": "e6e8f86a17a71dca347886fb11823d9f68749f17b263ab079f31f0679e0d4653",
+      "sha256": "6dfdbd79584cd40a5ad5f14ba8307fff0355e406fb29c70f0c4c0ca06de4bc78",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -7963,7 +7963,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::cluster_maintenance::impl  MaintenanceRunner::new#1",
-      "sha256": "b767ac044c28d7e27a12514313d53e2c8c00d300f28b7d634fd1c834553a1fb0",
+      "sha256": "051de269a1055492a727e6e280dae3b9a9a713f923bfbbc672a15d6cb38455c8",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -7983,7 +7983,7 @@
         "unexpanded-macro"
       ],
       "scope": "gateway::cluster_maintenance::impl  MaintenanceRunner::run_jobs#1",
-      "sha256": "87444f601a343b0aed37bd3d15e36a97adc3d723a143f0e813ab52beeff2901d",
+      "sha256": "f60dbfa76e2374cbf3371e2ba7026ce6dfd33a45958e0ba0098f0272c3dc51b3",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
@@ -12408,7 +12408,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_admin_sessions::transaction#1",
-      "sha256": "c95a8735dc19c08c17ec98d0d06e524679dda3bcd6b6e8e431e749e1f7305022",
+      "sha256": "7a7da4feda6d6b165da0fff0dd2eea7b931ee0274a3050f6c266a492003774d4",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
