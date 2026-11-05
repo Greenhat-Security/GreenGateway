@@ -30,16 +30,15 @@ use super::{
     stage::{Findings, Provenance, RawInput},
     validate_maximum_u64, validate_positive_bounded_u64, StateBackend, STATE_BACKEND,
 };
-use crate::connections::{model::MAX_SECRET_ID_BYTES, secret::is_valid_opaque_id};
+use crate::{connections::MAX_SECRET_ID_BYTES, opaque_id::is_valid_opaque_id};
 
-pub(super) const AUTHORITY_EVIDENCE_DURABILITY: &str = "AUTHORITY_EVIDENCE_DURABILITY";
-pub(super) const AUTHORITY_EVENT_SINK: &str = "AUTHORITY_EVENT_SINK";
-pub(super) const AUTHORITY_EVENT_FILE: &str = "AUTHORITY_EVENT_FILE";
-pub(super) const AUTHORITY_PSEUDONYM_KEY_ALIAS: &str = "AUTHORITY_PSEUDONYM_KEY_ALIAS";
-pub(super) const AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS: &str =
-    "AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS";
-pub(super) const AUTHORITY_EVENT_JOURNAL_CAPACITY: &str = "AUTHORITY_EVENT_JOURNAL_CAPACITY";
-pub(super) const AUTHORITY_EVENT_RETENTION_HOURS: &str = "AUTHORITY_EVENT_RETENTION_HOURS";
+pub const AUTHORITY_EVIDENCE_DURABILITY: &str = "AUTHORITY_EVIDENCE_DURABILITY";
+pub const AUTHORITY_EVENT_SINK: &str = "AUTHORITY_EVENT_SINK";
+pub const AUTHORITY_EVENT_FILE: &str = "AUTHORITY_EVENT_FILE";
+pub const AUTHORITY_PSEUDONYM_KEY_ALIAS: &str = "AUTHORITY_PSEUDONYM_KEY_ALIAS";
+pub const AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS: &str = "AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS";
+pub const AUTHORITY_EVENT_JOURNAL_CAPACITY: &str = "AUTHORITY_EVENT_JOURNAL_CAPACITY";
+pub const AUTHORITY_EVENT_RETENTION_HOURS: &str = "AUTHORITY_EVENT_RETENTION_HOURS";
 
 /// Retained journal rows, delivered or not, before authority mutations are
 /// refused.
@@ -145,7 +144,6 @@ impl Default for AuthorityEventSettings {
 
 impl AuthorityEventSettings {
     /// How long a delivered row stays in the journal.
-    #[cfg_attr(not(feature = "postgres"), allow(dead_code))] // read by the cluster wiring only
     pub fn retention(&self) -> Duration {
         Duration::from_secs(self.retention_hours.saturating_mul(3_600))
     }

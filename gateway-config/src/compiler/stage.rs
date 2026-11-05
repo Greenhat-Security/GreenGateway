@@ -1,6 +1,6 @@
 //! What the configuration compiler's pure stages share (issue #433, PR 2).
 //!
-//! `Config::from_env_vars` still asks for its inputs in the inventory's order
+//! The compiler still asks for its inputs in the inventory's order
 //! and still reports every problem in one pass, in the order it always has.
 //! What changes is where the work happens. Each block of inputs is read once
 //! into [`RawInput`]s. Functions that take only those values then parse each
@@ -91,7 +91,7 @@ impl RawInput {
 
 /// Where a setting's effective value came from.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Source {
+pub enum Source {
     /// The setting is unset, or blank where blank means unset, so its
     /// documented default applies. A default can itself depend on other
     /// settings, as the exempt-path defaults depend on `ADMIN_PREFIX`.
@@ -104,11 +104,10 @@ pub(crate) enum Source {
 ///
 /// Both fields are fixed text chosen by the gateway, so a provenance record
 /// cannot carry a value or a secret locator however it is printed.
-#[allow(dead_code)] // Read by the stage tests; startup builds from the values alone.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct Provenance {
-    pub(crate) setting: &'static str,
-    pub(crate) source: Source,
+pub struct Provenance {
+    pub setting: &'static str,
+    pub source: Source,
 }
 
 /// Where secret material lives -- a file the activation stage opens -- and
@@ -118,15 +117,15 @@ pub(crate) struct Provenance {
 /// says where a deployment keeps its keys, so `Debug` shows only that one is
 /// present.
 #[derive(Clone, Eq, PartialEq)]
-pub(crate) struct SecretLocator(String);
+pub struct SecretLocator(String);
 
 impl SecretLocator {
-    pub(crate) fn new(locator: String) -> Self {
+    pub fn new(locator: String) -> Self {
         Self(locator)
     }
 
     /// The locator, for the activation stage that opens it.
-    pub(crate) fn into_locator(self) -> String {
+    pub fn into_locator(self) -> String {
         self.0
     }
 }
@@ -201,7 +200,7 @@ impl Findings {
 /// The result is always built, with defaults where an input was refused, so
 /// that later stages can still check their own inputs and one pass reports
 /// every problem. It is a validated plan only when no stage found anything,
-/// and `Config::from_env_vars` builds nothing from it otherwise.
+/// and `compile` returns nothing built from it otherwise.
 pub(super) struct Checked<T> {
     value: T,
     findings: Findings,

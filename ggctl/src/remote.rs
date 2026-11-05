@@ -27,7 +27,10 @@ use std::{
     time::Duration,
 };
 
-use gateway_config::capabilities::{self, GatewayCapabilities, ReadError, MAX_CAPABILITIES_BYTES};
+use gateway_config::{
+    capabilities::{self, GatewayCapabilities, ReadError, MAX_CAPABILITIES_BYTES},
+    mcp_client_configs::{self, McpClientConfigs, ServerName, MAX_MCP_CLIENT_CONFIGS_BYTES},
+};
 use url::{Host, Url};
 
 use crate::{
@@ -50,6 +53,8 @@ const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CA_FILE_BYTES: usize = 1024 * 1024;
 /// The capability document, relative to the admin API base.
 const CAPABILITIES_PATH: &str = "/config/capabilities";
+/// The MCP client configuration templates, relative to the admin API base.
+const MCP_CLIENT_CONFIGS_PATH: &str = "/mcp/client-configs";
 const USER_AGENT: &str = concat!("ggctl/", env!("CARGO_PKG_VERSION"));
 
 /// A validated admin API base: `https://HOST[:PORT]/v1<ADMIN_PREFIX>`, or
@@ -213,19 +218,28 @@ impl AdminClient {
         })
     }
 
-    /// An idempotent `GET` of a JSON document below the admin API base.
+    /// An idempotent `GET` of a JSON document below the admin API base, with
+    /// `query` form-encoded. `refusals` names the code for each status the
+    /// route defines beyond those every admin route shares.
     async fn get_json(
         &self,
         suffix: &str,
+        query: &[(&str, &str)],
         maximum: usize,
-        not_found: Code,
+        refusals: &[(u16, Code)],
     ) -> Result<Vec<u8>, Code> {
-        let reply = self.exchange(&Exchange::get(suffix, maximum)).await?;
+        let mut url = self.server.endpoint(suffix);
+        if !query.is_empty() {
+            url.query_pairs_mut().extend_pairs(query);
+        }
+        let reply = self.send(url, &Exchange::get(suffix, maximum)).await?;
         match reply.status {
             200 => reply.body.ok_or(Code::UnexpectedContentType),
-            404 => Err(not_found),
             503 => Err(Code::ServerUnavailable),
-            _ => Err(Code::UnexpectedStatus),
+            status => Err(refusals
+                .iter()
+                .find(|(refused, _)| *refused == status)
+                .map_or(Code::UnexpectedStatus, |(_, code)| *code)),
         }
     }
 
@@ -238,7 +252,14 @@ impl AdminClient {
     /// as a document. Only a `GET` is ever sent twice, and only when its
     /// connection was never established.
     pub(crate) async fn exchange(&self, exchange: &Exchange<'_>) -> Result<Reply, Code> {
-        let url = self.server.endpoint(exchange.path);
+        self.send(self.server.endpoint(exchange.path), exchange)
+            .await
+    }
+
+    /// [`AdminClient::exchange`] to `url`: `exchange.path` below the admin
+    /// API base, with the query [`AdminClient::get_json`] adds when it has
+    /// one.
+    async fn send(&self, url: Url, exchange: &Exchange<'_>) -> Result<Reply, Code> {
         let retries = if exchange.method == Method::Get {
             READ_RETRIES
         } else {
@@ -430,8 +451,9 @@ pub(crate) async fn handshake(client: &AdminClient) -> Result<Handshake, Code> {
     let body = client
         .get_json(
             CAPABILITIES_PATH,
+            &[],
             MAX_CAPABILITIES_BYTES,
-            Code::CapabilitiesUnavailable,
+            &[(404, Code::CapabilitiesUnavailable)],
         )
         .await?;
     Ok(match capabilities::read(&body) {
@@ -448,6 +470,40 @@ pub(crate) async fn handshake(client: &AdminClient) -> Result<Handshake, Code> {
             gateway_version: None,
             reason: Code::CapabilitiesInvalid,
         },
+    })
+}
+
+/// Reads the server's MCP client configuration templates for `ggctl
+/// mcp-config`, naming the server entry `name` when one is given. The shared
+/// reader accepts the document only when every template in it is exactly
+/// what this `ggctl` renders for the URL, name and OAuth flag it states, so a
+/// server can never hand a template through `ggctl` that it would not have
+/// written itself. Neither the version handshake nor `admin:config:read` is
+/// needed: the route has its own permission, `admin:mcp:clients:read`.
+pub(crate) async fn mcp_client_configs(
+    client: &AdminClient,
+    name: Option<&ServerName>,
+) -> Result<McpClientConfigs, Code> {
+    let query: Vec<(&str, &str)> = name
+        .map(|name| ("name", name.as_str()))
+        .into_iter()
+        .collect();
+    let body = client
+        .get_json(
+            MCP_CLIENT_CONFIGS_PATH,
+            &query,
+            MAX_MCP_CLIENT_CONFIGS_BYTES,
+            &[
+                (404, Code::McpConfigsUnavailable),
+                (409, Code::McpPublicUrlUnusable),
+            ],
+        )
+        .await?;
+    mcp_client_configs::read(&body).map_err(|error| match error {
+        mcp_client_configs::ReadError::UnsupportedVersion => Code::McpUnsupportedVersion,
+        mcp_client_configs::ReadError::TooLarge
+        | mcp_client_configs::ReadError::NotADocument
+        | mcp_client_configs::ReadError::Invalid => Code::McpConfigsInvalid,
     })
 }
 

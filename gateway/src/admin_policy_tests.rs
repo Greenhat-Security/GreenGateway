@@ -6,7 +6,10 @@
 //! no enforcement and activates nothing. A test run (`POST
 //! .../policy/tests/runs`) and an evidence package (`POST .../policy/evidence`)
 //! can name it instead of carrying a suite of their own; this module also
-//! resolves that reference for them ([`stored_policy_test_suite`]).
+//! resolves that reference for them ([`stored_policy_test_suite`]). With
+//! `POLICY_TESTS_REQUIRED=true` every policy publication must pass it
+//! (`admin_policy_test_gate`); storing a suite is still never refused for
+//! what it says about the active policy, only reported.
 //!
 //! The rules the handlers keep:
 //!
@@ -231,17 +234,9 @@ fn case_kind_counts(record: &PolicyTestSuiteRecord) -> Value {
     json!(counts)
 }
 
-/// `policy.tests_changed`: the version, digests and counts only.
-fn emit_policy_tests_changed(
-    state: &PolicyAdminState,
-    parts: &http::request::Parts,
-    principal: &auth::Principal,
-    replaced: Option<&str>,
-    record: &PolicyTestSuiteRecord,
-) {
-    let request_id = client_ip::request_id(&parts.headers, &parts.extensions);
-    let source_ip =
-        client_ip::canonical_client_ip(&parts.headers, &parts.extensions, &state.client_ip_policy);
+/// `policy.tests_changed`'s description of a stored version: the version,
+/// digests and counts only.
+fn policy_tests_changed_payload(replaced: Option<&str>, record: &PolicyTestSuiteRecord) -> Value {
     let previous_digest = replaced.map(|etag| {
         etag.strip_prefix('"')
             .and_then(|etag| etag.strip_suffix('"'))
@@ -257,6 +252,24 @@ fn emit_policy_tests_changed(
     });
     if let (Some(revision), Some(payload)) = (record.security_revision, payload.as_object_mut()) {
         payload.insert("security_revision".to_owned(), json!(revision));
+    }
+    payload
+}
+
+/// `policy.tests_changed`, and with tests required, what the gate would
+/// answer for the active policy under the stored suite.
+fn emit_policy_tests_changed(
+    state: &PolicyAdminState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    mut payload: Value,
+    active_policy: Option<&RequiredTestsRun>,
+) {
+    let request_id = client_ip::request_id(&parts.headers, &parts.extensions);
+    let source_ip =
+        client_ip::canonical_client_ip(&parts.headers, &parts.extensions, &state.client_ip_policy);
+    if let (Some(active_policy), Some(payload)) = (active_policy, payload.as_object_mut()) {
+        payload.insert("active_policy".to_owned(), active_policy.to_json());
     }
     state.audit.emit(audit::AuditEvent::new(
         audit::event::POLICY_TESTS_CHANGED,
@@ -429,15 +442,36 @@ pub(super) async fn policy_tests_put_endpoint(
         PolicyTestSuitePrecondition::Expected { etag } => Some(etag.clone()),
         PolicyTestSuitePrecondition::Absent => None,
     };
+    // A suite write and a policy publication on this replica take the same
+    // lock, so a publication's required tests read the suite before this
+    // write or after it, and the report below judges the policy active once
+    // no publication is in flight.
+    let _policy_write_guard = match state.rbac_state.as_ref() {
+        Some(rbac_state) => Some(rbac_state.policy_write_guard().await),
+        None => None,
+    };
     match store.commit(precondition, &document, &principal).await {
         Ok(record) => {
-            emit_policy_tests_changed(&state, &parts, &principal, replaced.as_deref(), &record);
             let status = if replaced.is_some() {
                 StatusCode::OK
             } else {
                 StatusCode::CREATED
             };
-            suite_response(status, &record)
+            let mut response = suite_response(status, &record);
+            // With tests required, the suite is stored whatever the active
+            // policy makes of it -- refusing it could leave no way to store
+            // the suite the next policy must pass -- and what the gate would
+            // answer for the active policy now is reported.
+            let changed = policy_tests_changed_payload(replaced.as_deref(), &record);
+            let active_policy = report_required_tests(&state, record).await;
+            emit_policy_tests_changed(&state, &parts, &principal, changed, active_policy.as_ref());
+            if let Some(active_policy) = active_policy.as_ref() {
+                response.headers_mut().insert(
+                    HeaderName::from_static(POLICY_TESTS_ACTIVE_STATUS_HEADER),
+                    HeaderValue::from_static(active_policy.status()),
+                );
+            }
+            response
         }
         Err(PolicyTestSuiteCommitError::PreconditionFailed) => {
             if replaced.is_some() {

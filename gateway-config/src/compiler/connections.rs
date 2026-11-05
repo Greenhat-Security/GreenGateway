@@ -121,21 +121,20 @@ impl ConnectionInputs {
 /// key's ID and file and every provider document print redacted or as counts,
 /// by their own `Debug`.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ConnectionsPlan {
-    pub(crate) connections_sqlite_path: Option<String>,
-    pub(crate) connection_secrets_root: Option<SecretRootConfig>,
-    pub(crate) connection_secret_aliases: Vec<OperatorSecretAliasConfig>,
-    pub(crate) connection_local_secret_keyring: Vec<LocalSecretKeyConfig>,
-    pub(crate) admin_login_keyring: Vec<LocalSecretKeyConfig>,
-    pub(crate) rate_limit_keyring: Vec<LocalSecretKeyConfig>,
-    pub(crate) connection_vault_provider: VaultProviderConfig,
-    pub(crate) connection_gcp_provider: GcpProviderConfig,
-    pub(crate) connection_azure_provider: AzureProviderConfig,
-    pub(crate) connection_aws_provider: AwsProviderConfig,
-    pub(crate) connection_kubernetes_provider: KubernetesProviderConfig,
+pub struct ConnectionsPlan {
+    pub connections_sqlite_path: Option<String>,
+    pub connection_secrets_root: Option<SecretRootConfig>,
+    pub connection_secret_aliases: Vec<OperatorSecretAliasConfig>,
+    pub connection_local_secret_keyring: Vec<LocalSecretKeyConfig>,
+    pub admin_login_keyring: Vec<LocalSecretKeyConfig>,
+    pub rate_limit_keyring: Vec<LocalSecretKeyConfig>,
+    pub connection_vault_provider: VaultProviderConfig,
+    pub connection_gcp_provider: GcpProviderConfig,
+    pub connection_azure_provider: AzureProviderConfig,
+    pub connection_aws_provider: AwsProviderConfig,
+    pub connection_kubernetes_provider: KubernetesProviderConfig,
     /// Where each of the block's inputs came from, in the order they are read.
-    #[allow(dead_code)] // Read by the stage tests; startup builds from the values alone.
-    pub(crate) provenance: Vec<Provenance>,
+    pub provenance: Vec<Provenance>,
 }
 
 /// Parses the Connections block, then checks the rules between its inputs:

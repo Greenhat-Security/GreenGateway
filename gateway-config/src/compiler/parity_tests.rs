@@ -1,7 +1,8 @@
-//! Golden parity for `Config::from_env_vars` (issue #433, PR 1).
+//! Golden parity for the configuration compiler (issue #433, PR 1).
 //!
-//! The configuration compiler issue #433 extracts must keep the legacy
-//! environment's semantics, so these fixtures pin what the parser does today,
+//! The configuration compiler issue #433 extracted from the gateway's
+//! `Config::from_env_vars` must keep the legacy environment's semantics, so
+//! these fixtures pin what the parser does today,
 //! including where that is surprising, rather than what a reading of it
 //! suggests. Expected values are written out instead of taken from the
 //! `DEFAULT_*` constants, because a fixture that moved with a changed constant
@@ -11,9 +12,10 @@
 
 use std::collections::BTreeSet;
 
-use gateway_config::catalog::{self, Blank};
+use crate::catalog::{self, Blank};
 
 use super::diagnostic::{ConfigDiagnostic, ConfigDiagnosticCode, ConfigRule};
+use super::listeners::TlsMaterial;
 use super::*;
 
 /// What a fixture environment holds for `name`: exactly the listed value, or
@@ -28,11 +30,11 @@ fn fixture_value(fixture: &[(&str, &str)], name: &str) -> Result<String, VarErro
 
 /// Parses a fixture environment: each listed variable has exactly the listed
 /// value, and every other variable is unset.
-fn parse_fixture(fixture: &[(&str, &str)]) -> Result<Config, ConfigError> {
-    Config::from_env_vars(|name| fixture_value(fixture, name))
+fn parse_fixture(fixture: &[(&str, &str)]) -> Result<ConfigPlan, ConfigError> {
+    compile(|name| fixture_value(fixture, name))
 }
 
-fn accepted(fixture: &[(&str, &str)]) -> Config {
+fn accepted(fixture: &[(&str, &str)]) -> ConfigPlan {
     match parse_fixture(fixture) {
         Ok(config) => config,
         Err(error) => panic!("the fixture should be accepted: {fixture:?}\n{error}"),
@@ -52,6 +54,21 @@ fn socket(value: &str) -> SocketAddr {
 
 fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
+}
+
+/// A listener's certificate files, as the gateway's `Config` holds them.
+fn certificate_files(tls: &Option<TlsMaterial>) -> Option<Vec<String>> {
+    tls.clone().map(|tls| tls.into_files().0)
+}
+
+/// A listener's private key files, as the gateway's `Config` holds them.
+fn private_key_files(tls: &Option<TlsMaterial>) -> Option<Vec<String>> {
+    tls.clone().map(|tls| tls.into_files().1)
+}
+
+/// The database settings, as the gateway's `Config` holds them.
+fn database(config: &ConfigPlan) -> DatabaseSettings {
+    config.storage.database.clone().into_settings()
 }
 
 /// The probe paths every exemption list starts from, then `extra`.
@@ -121,92 +138,101 @@ fn an_empty_environment_parses_to_the_legacy_defaults() {
     let config = accepted(&[]);
 
     // Listeners and inbound TLS.
-    assert_eq!(config.listen_addr, socket("0.0.0.0:8080"));
-    assert_eq!(config.admin_listen_addr, None);
-    assert_eq!(config.grpc_listen_addr, None);
-    assert_eq!(config.grpc_max_concurrent_streams, 100);
-    assert_eq!(config.grpc_max_metadata_bytes, 16_384);
-    assert_eq!(config.tls_cert_files, None);
-    assert_eq!(config.tls_key_files, None);
-    assert_eq!(config.admin_tls_cert_files, None);
-    assert_eq!(config.admin_tls_key_files, None);
-    assert_eq!(config.tls_min_version, TlsMinVersion::Tls12);
-    assert_eq!(config.tls_handshake_timeout_ms, 10_000);
-    assert_eq!(config.tls_max_concurrent_handshakes, 256);
-    assert_eq!(config.client_cert_auth, None);
-    assert_eq!(config.admin_client_cert_auth, None);
+    assert_eq!(config.listeners.listen_addr, socket("0.0.0.0:8080"));
+    assert_eq!(config.listeners.admin_listen_addr, None);
+    assert_eq!(config.listeners.grpc_listen_addr, None);
+    assert_eq!(config.listeners.grpc_max_concurrent_streams, 100);
+    assert_eq!(config.listeners.grpc_max_metadata_bytes, 16_384);
+    assert_eq!(certificate_files(&config.listeners.data_tls), None);
+    assert_eq!(private_key_files(&config.listeners.data_tls), None);
+    assert_eq!(certificate_files(&config.listeners.admin_tls), None);
+    assert_eq!(private_key_files(&config.listeners.admin_tls), None);
+    assert_eq!(config.listeners.tls_min_version, TlsMinVersion::Tls12);
+    assert_eq!(config.listeners.tls_handshake_timeout_ms, 10_000);
+    assert_eq!(config.listeners.tls_max_concurrent_handshakes, 256);
+    assert_eq!(config.listeners.client_cert_auth, None);
+    assert_eq!(config.listeners.admin_client_cert_auth, None);
 
     // The admin surface and the public origin.
-    assert_eq!(config.admin_prefix, "/admin");
-    assert_eq!(config.admin_login_provider, None);
-    assert_eq!(config.admin_session, None);
-    assert_eq!(config.admin_login_pending_ttl_secs, 300);
-    assert_eq!(config.admin_login_pending_max_entries, 1_024);
-    assert_eq!(config.admin_login_pending_max_per_ip, 16);
-    assert_eq!(config.gateway_public_url, None);
-    assert!(config.cors_allow_origins.is_empty());
+    assert_eq!(config.identity.admin_prefix, "/admin");
+    assert_eq!(config.identity.admin_login_provider, None);
+    assert_eq!(config.identity.admin_session, None);
+    assert_eq!(config.identity.admin_login_pending_ttl_secs, 300);
+    assert_eq!(config.identity.admin_login_pending_max_entries, 1_024);
+    assert_eq!(config.identity.admin_login_pending_max_per_ip, 16);
+    assert_eq!(config.identity.gateway_public_url, None);
+    assert!(config.runtime.cors_allow_origins.is_empty());
 
     // Authentication and CSRF.
-    assert!(config.auth_enabled);
-    assert_eq!(config.auth_mode, AuthMode::Required);
-    assert_eq!(config.auth_cookie_name, "session");
-    assert_eq!(config.auth_exempt_paths, with_probes(&["/admin"]));
-    assert_eq!(config.rbac_exempt_paths, with_probes(&["/admin"]));
-    assert!(config.auth_providers.is_empty());
-    assert_eq!(config.jwt_jwks_url, None);
-    assert_eq!(config.jwt_jwks_timeout_ms, 2_000);
-    assert_eq!(config.jwt_jwks_max_key_age_secs, 300);
-    assert!(!config.jwt_require_jti);
-    assert_eq!(config.roles_claim, "roles");
-    assert_eq!(config.service_token_cache_ttl_ms, 5_000);
-    assert!(config.csrf_enabled);
-    assert_eq!(config.csrf_cookie_name, "csrf_token");
-    assert_eq!(config.csrf_header_name, "x-csrf-token");
-    assert_eq!(config.csrf_cookie_domain, None);
-    assert_eq!(config.csrf_exempt_paths, with_probes(&[]));
+    assert!(config.identity.auth_enabled);
+    assert_eq!(config.identity.auth_mode, AuthMode::Required);
+    assert_eq!(config.identity.auth_cookie_name, "session");
+    assert_eq!(config.identity.auth_exempt_paths, with_probes(&["/admin"]));
+    assert_eq!(config.identity.rbac_exempt_paths, with_probes(&["/admin"]));
+    assert!(config.identity.auth_providers.is_empty());
+    assert_eq!(config.identity.jwt_jwks_url, None);
+    assert_eq!(config.identity.jwt_jwks_timeout_ms, 2_000);
+    assert_eq!(config.identity.jwt_jwks_max_key_age_secs, 300);
+    assert!(!config.identity.jwt_require_jti);
+    assert_eq!(config.identity.roles_claim, "roles");
+    assert_eq!(config.identity.service_token_cache_ttl_ms, 5_000);
+    assert!(config.identity.csrf_enabled);
+    assert_eq!(config.identity.csrf_cookie_name, "csrf_token");
+    assert_eq!(config.identity.csrf_header_name, "x-csrf-token");
+    assert_eq!(config.identity.csrf_cookie_domain, None);
+    assert_eq!(config.identity.csrf_exempt_paths, with_probes(&[]));
 
     // Request bounds and proxy trust.
-    assert_eq!(config.max_body_size, 1_048_576);
-    assert_eq!(config.max_request_path_bytes, 8_192);
-    assert_eq!(config.rate_limit_read_rps, 50.0);
-    assert_eq!(config.rate_limit_read_burst, 100);
-    assert_eq!(config.rate_limit_write_rps, 10.0);
-    assert_eq!(config.rate_limit_write_burst, 20);
-    assert_eq!(config.rate_limit_max_buckets, 65_536);
-    assert_eq!(config.rate_limit_bucket_ttl_ms, 600_000);
-    assert!(!config.trust_proxy_headers);
-    assert!(config.trusted_proxy_cidrs.is_empty());
+    assert_eq!(config.runtime.max_body_size, 1_048_576);
+    assert_eq!(config.runtime.max_request_path_bytes, 8_192);
+    assert_eq!(config.runtime.rate_limit_read_rps, 50.0);
+    assert_eq!(config.runtime.rate_limit_read_burst, 100);
+    assert_eq!(config.runtime.rate_limit_write_rps, 10.0);
+    assert_eq!(config.runtime.rate_limit_write_burst, 20);
+    assert_eq!(config.runtime.rate_limit_max_buckets, 65_536);
+    assert_eq!(config.runtime.rate_limit_bucket_ttl_ms, 600_000);
+    assert!(!config.proxy.trust_proxy_headers);
+    assert!(config.proxy.trusted_proxy_cidrs.is_empty());
     assert_eq!(
-        config.validation_allowed_content_types,
+        config.runtime.validation_allowed_content_types,
         strings(&["application/json"])
     );
 
     // Storage: standalone, with every local store off until it is named.
-    assert_eq!(config.state_backend, StateBackend::Sqlite);
-    assert_eq!(config.deployment_id, None);
+    assert_eq!(config.storage.state_backend, StateBackend::Sqlite);
+    assert_eq!(config.storage.deployment_id, None);
     for (setting, value) in [
-        ("AUDIT_LOG_FILE", &config.audit_log_file),
-        ("AUDIT_SQLITE_PATH", &config.audit_sqlite_path),
-        ("DISCOVERY_SQLITE_PATH", &config.discovery_sqlite_path),
-        ("PRINCIPAL_SQLITE_PATH", &config.principal_sqlite_path),
-        ("CONNECTIONS_SQLITE_PATH", &config.connections_sqlite_path),
-        ("POLICY_FILE", &config.policy_file),
-        ("TOOLS_FILE", &config.tools_file),
+        ("AUDIT_LOG_FILE", &config.storage.audit_log_file),
+        ("AUDIT_SQLITE_PATH", &config.storage.audit_sqlite_path),
+        (
+            "DISCOVERY_SQLITE_PATH",
+            &config.storage.discovery_sqlite_path,
+        ),
+        (
+            "PRINCIPAL_SQLITE_PATH",
+            &config.storage.principal_sqlite_path,
+        ),
+        (
+            "CONNECTIONS_SQLITE_PATH",
+            &config.connections.connections_sqlite_path,
+        ),
+        ("POLICY_FILE", &config.storage.policy_file),
+        ("TOOLS_FILE", &config.storage.tools_file),
         (
             "POLICY_HISTORY_SQLITE_PATH",
-            &config.policy_history_sqlite_path,
+            &config.storage.policy_history_sqlite_path,
         ),
         (
             "SERVICE_TOKEN_SQLITE_PATH",
-            &config.service_token_sqlite_path,
+            &config.identity.service_token_sqlite_path,
         ),
     ] {
         assert!(value.is_none(), "{setting} defaults to unset");
     }
-    assert_eq!(config.audit_sqlite_retention_days, None);
-    assert_eq!(config.audit_postgres_retention_days, None);
+    assert_eq!(config.storage.audit_sqlite_retention_days, None);
+    assert_eq!(config.storage.audit_postgres_retention_days, None);
     assert_eq!(
-        config.database,
+        database(&config),
         DatabaseSettings {
             pool_max: 10,
             connect_timeout_ms: 5_000,
@@ -225,20 +251,20 @@ fn an_empty_environment_parses_to_the_legacy_defaults() {
 
     // Upstream routing and egress: nothing is routed, private addresses are
     // denied, and every bound is finite.
-    assert_eq!(config.upstream_url, None);
-    assert!(config.upstream_routes.is_empty());
-    assert!(config.mcp_upstream_servers.is_empty());
-    assert_eq!(config.upstream_timeout_ms, None);
-    assert_eq!(config.upstream_response_idle_timeout_ms, None);
-    assert_eq!(config.upstream_connect_timeout_ms, None);
-    assert!(config.egress_allowed_hosts.is_empty());
-    assert_eq!(config.egress_timeout_ms, 30_000);
-    assert_eq!(config.egress_response_idle_timeout_ms, 30_000);
-    assert_eq!(config.egress_connect_timeout_ms, 10_000);
-    assert_eq!(config.egress_max_response_bytes, 5_242_880);
-    assert_eq!(config.egress_max_request_body_bytes, 1_048_576);
-    assert!(config.egress_nat64_prefixes.is_empty());
-    assert!(config.egress_deny_private_ips);
+    assert_eq!(config.proxy.upstream_url, None);
+    assert!(config.proxy.upstream_routes.is_empty());
+    assert!(config.proxy.mcp_upstream_servers.is_empty());
+    assert_eq!(config.proxy.upstream_timeout_ms, None);
+    assert_eq!(config.proxy.upstream_response_idle_timeout_ms, None);
+    assert_eq!(config.proxy.upstream_connect_timeout_ms, None);
+    assert!(config.egress.egress_allowed_hosts.is_empty());
+    assert_eq!(config.egress.egress_timeout_ms, 30_000);
+    assert_eq!(config.egress.egress_response_idle_timeout_ms, 30_000);
+    assert_eq!(config.egress.egress_connect_timeout_ms, 10_000);
+    assert_eq!(config.egress.egress_max_response_bytes, 5_242_880);
+    assert_eq!(config.egress.egress_max_request_body_bytes, 1_048_576);
+    assert!(config.egress.egress_nat64_prefixes.is_empty());
+    assert!(config.egress.egress_deny_private_ips);
 }
 
 /// The inputs whose blank value the field catalog says is treated by `rule`,
@@ -262,12 +288,14 @@ pub(super) fn blank_clears_the_default() -> Vec<&'static str> {
     blank_rule(Blank::ClearsDefault)
 }
 
-fn list_with_a_default<'a>(config: &'a Config, name: &str) -> &'a [String] {
+fn list_with_a_default<'a>(config: &'a ConfigPlan, name: &str) -> &'a [String] {
     match name {
-        "RBAC_EXEMPT_PATHS" => config.rbac_exempt_paths.as_slice(),
-        "VALIDATION_ALLOWED_CONTENT_TYPES" => config.validation_allowed_content_types.as_slice(),
-        "AUTH_EXEMPT_PATHS" => config.auth_exempt_paths.as_slice(),
-        "CSRF_EXEMPT_PATHS" => config.csrf_exempt_paths.as_slice(),
+        "RBAC_EXEMPT_PATHS" => config.identity.rbac_exempt_paths.as_slice(),
+        "VALIDATION_ALLOWED_CONTENT_TYPES" => {
+            config.runtime.validation_allowed_content_types.as_slice()
+        }
+        "AUTH_EXEMPT_PATHS" => config.identity.auth_exempt_paths.as_slice(),
+        "CSRF_EXEMPT_PATHS" => config.identity.csrf_exempt_paths.as_slice(),
         _ => panic!("{name} is not a list setting with a default"),
     }
 }
@@ -352,13 +380,16 @@ fn some_settings_are_trimmed_and_others_are_parsed_exactly_as_given() {
         ("UPSTREAM_TIMEOUT_MS", " 5000 "),
         ("AUDIT_LOG_FILE", " /var/log/greengateway/audit.jsonl "),
     ]);
-    assert_eq!(config.admin_listen_addr, Some(socket("127.0.0.1:9091")));
-    assert_eq!(config.admin_prefix, "/ops");
-    assert_eq!(config.state_backend, StateBackend::Sqlite);
-    assert_eq!(config.tls_min_version, TlsMinVersion::Tls13);
-    assert_eq!(config.upstream_timeout_ms, Some(5_000));
     assert_eq!(
-        config.audit_log_file.as_deref(),
+        config.listeners.admin_listen_addr,
+        Some(socket("127.0.0.1:9091"))
+    );
+    assert_eq!(config.identity.admin_prefix, "/ops");
+    assert_eq!(config.storage.state_backend, StateBackend::Sqlite);
+    assert_eq!(config.listeners.tls_min_version, TlsMinVersion::Tls13);
+    assert_eq!(config.proxy.upstream_timeout_ms, Some(5_000));
+    assert_eq!(
+        config.storage.audit_log_file.as_deref(),
         Some("/var/log/greengateway/audit.jsonl")
     );
 
@@ -418,8 +449,8 @@ fn auth_providers_take_precedence_over_the_legacy_jwt_settings() {
     // issuer exactly as written: unlike AUTH_PROVIDERS, it is not
     // canonicalized.
     let config = accepted(&legacy);
-    assert_eq!(config.auth_providers.len(), 1);
-    let provider = &config.auth_providers[0];
+    assert_eq!(config.identity.auth_providers.len(), 1);
+    let provider = &config.identity.auth_providers[0];
     assert_eq!(provider.name, "legacy");
     assert_eq!(provider.provider_type, AuthProviderType::Jwt);
     assert_eq!(
@@ -439,7 +470,10 @@ fn auth_providers_take_precedence_over_the_legacy_jwt_settings() {
     // A blank AUTH_PROVIDERS is unset, so the legacy provider stays.
     let mut blank = legacy.to_vec();
     blank.push(("AUTH_PROVIDERS", "  "));
-    assert_eq!(accepted(&blank).auth_providers, config.auth_providers);
+    assert_eq!(
+        accepted(&blank).identity.auth_providers,
+        config.identity.auth_providers
+    );
 
     // A non-empty AUTH_PROVIDERS replaces the legacy provider entirely:
     // ROLES_CLAIM no longer applies and the issuer is canonicalized. The
@@ -450,8 +484,8 @@ fn auth_providers_take_precedence_over_the_legacy_jwt_settings() {
         r#"[{"name":"corp","type":"jwt","issuer":"https://corp.example.test/"}]"#,
     ));
     let config = accepted(&both);
-    assert_eq!(config.auth_providers.len(), 1);
-    let provider = &config.auth_providers[0];
+    assert_eq!(config.identity.auth_providers.len(), 1);
+    let provider = &config.identity.auth_providers[0];
     assert_eq!(provider.name, "corp");
     assert_eq!(
         provider.issuer.as_deref(),
@@ -459,14 +493,15 @@ fn auth_providers_take_precedence_over_the_legacy_jwt_settings() {
     );
     assert_eq!(provider.jwks_url, None);
     assert_eq!(provider.roles_claim, "roles");
-    assert_eq!(config.roles_claim, "groups");
+    assert_eq!(config.identity.roles_claim, "groups");
     assert_eq!(
-        config.jwt_jwks_url.as_deref(),
+        config.identity.jwt_jwks_url.as_deref(),
         Some("https://issuer.example.test/.well-known/jwks.json")
     );
 
     // Without a JWKS URL the legacy settings make no provider at all.
     assert!(accepted(&[("JWT_ISSUER", "https://issuer.example.test")])
+        .identity
         .auth_providers
         .is_empty());
 
@@ -486,19 +521,31 @@ fn auth_providers_take_precedence_over_the_legacy_jwt_settings() {
 #[test]
 fn exempt_path_defaults_follow_a_custom_admin_prefix_and_explicit_lists_replace_them() {
     let config = accepted(&[("ADMIN_PREFIX", "/ops/gateway")]);
-    assert_eq!(config.admin_prefix, "/ops/gateway");
-    assert_eq!(config.auth_exempt_paths, with_probes(&["/ops/gateway"]));
-    assert_eq!(config.rbac_exempt_paths, with_probes(&["/ops/gateway"]));
+    assert_eq!(config.identity.admin_prefix, "/ops/gateway");
+    assert_eq!(
+        config.identity.auth_exempt_paths,
+        with_probes(&["/ops/gateway"])
+    );
+    assert_eq!(
+        config.identity.rbac_exempt_paths,
+        with_probes(&["/ops/gateway"])
+    );
     // CSRF exemptions do not follow the admin prefix.
-    assert_eq!(config.csrf_exempt_paths, with_probes(&[]));
+    assert_eq!(config.identity.csrf_exempt_paths, with_probes(&[]));
 
     // An explicit list replaces its own default and leaves the others alone.
     let config = accepted(&[
         ("ADMIN_PREFIX", "/ops/gateway"),
         ("AUTH_EXEMPT_PATHS", "/status, /ping"),
     ]);
-    assert_eq!(config.auth_exempt_paths, strings(&["/status", "/ping"]));
-    assert_eq!(config.rbac_exempt_paths, with_probes(&["/ops/gateway"]));
+    assert_eq!(
+        config.identity.auth_exempt_paths,
+        strings(&["/status", "/ping"])
+    );
+    assert_eq!(
+        config.identity.rbac_exempt_paths,
+        with_probes(&["/ops/gateway"])
+    );
 }
 
 #[test]
@@ -516,12 +563,12 @@ fn admin_login_and_the_standalone_session_add_their_routes_under_a_custom_prefix
         "/v1/operations/auth/login",
         "/v1/operations/auth/callback",
     ]);
-    assert_eq!(config.auth_exempt_paths, expected);
-    assert_eq!(config.rbac_exempt_paths, expected);
+    assert_eq!(config.identity.auth_exempt_paths, expected);
+    assert_eq!(config.identity.rbac_exempt_paths, expected);
     let mut explicit = login.to_vec();
     explicit.push(("AUTH_EXEMPT_PATHS", "/status"));
     assert_eq!(
-        accepted(&explicit).auth_exempt_paths,
+        accepted(&explicit).identity.auth_exempt_paths,
         strings(&[
             "/status",
             "/v1/operations/auth/login",
@@ -541,13 +588,13 @@ fn admin_login_and_the_standalone_session_add_their_routes_under_a_custom_prefix
         "/v1/operations/auth/logout",
         "/v1/operations/auth/config",
     ]);
-    assert_eq!(config.auth_exempt_paths, expected);
-    assert_eq!(config.rbac_exempt_paths, expected);
-    assert_eq!(config.csrf_exempt_paths, with_probes(&[]));
+    assert_eq!(config.identity.auth_exempt_paths, expected);
+    assert_eq!(config.identity.rbac_exempt_paths, expected);
+    assert_eq!(config.identity.csrf_exempt_paths, with_probes(&[]));
     assert_eq!(
-        config.admin_session,
-        Some(crate::auth::admin_session::AdminSessionConfig {
-            storage: crate::auth::admin_session::AdminSessionStorage::StandaloneMemory,
+        config.identity.admin_session,
+        Some(crate::auth::AdminSessionConfig {
+            storage: crate::auth::AdminSessionStorage::StandaloneMemory,
             ttl: std::time::Duration::from_secs(3_600),
             idle_timeout: std::time::Duration::from_secs(3_600),
             max_entries: 1_024,
@@ -564,20 +611,26 @@ fn split_listeners_parse_independently_and_a_shared_address_is_refused() {
         ("ADMIN_TLS_CERT_FILE", "/run/tls/admin.crt"),
         ("ADMIN_TLS_KEY_FILE", "/run/tls/admin.key"),
     ]);
-    assert_eq!(config.listen_addr, socket("0.0.0.0:8080"));
-    assert_eq!(config.admin_listen_addr, Some(socket("127.0.0.1:9091")));
-    assert_eq!(config.grpc_listen_addr, Some(socket("0.0.0.0:50051")));
-    assert_eq!(config.tls_cert_files, None);
+    assert_eq!(config.listeners.listen_addr, socket("0.0.0.0:8080"));
     assert_eq!(
-        config.admin_tls_cert_files,
+        config.listeners.admin_listen_addr,
+        Some(socket("127.0.0.1:9091"))
+    );
+    assert_eq!(
+        config.listeners.grpc_listen_addr,
+        Some(socket("0.0.0.0:50051"))
+    );
+    assert_eq!(certificate_files(&config.listeners.data_tls), None);
+    assert_eq!(
+        certificate_files(&config.listeners.admin_tls),
         Some(strings(&["/run/tls/admin.crt"]))
     );
     assert_eq!(
-        config.admin_tls_key_files,
+        private_key_files(&config.listeners.admin_tls),
         Some(strings(&["/run/tls/admin.key"]))
     );
-    assert!(config.data_inbound_tls().is_none());
-    assert!(config.admin_inbound_tls().is_some());
+    assert!(config.listeners.data_tls.is_none());
+    assert!(config.listeners.admin_tls.is_some());
 
     for (fixture, problem) in [
         (
@@ -640,6 +693,7 @@ fn the_public_origin_cors_and_csrf_settings_keep_their_legacy_shapes() {
     ] {
         assert_eq!(
             accepted(&[("GATEWAY_PUBLIC_URL", url)])
+                .identity
                 .gateway_public_url
                 .as_deref(),
             Some(url)
@@ -678,7 +732,7 @@ fn the_public_origin_cors_and_csrf_settings_keep_their_legacy_shapes() {
         " https://app.example.test , https://admin.example.test ,",
     )]);
     assert_eq!(
-        config.cors_allow_origins,
+        config.runtime.cors_allow_origins,
         strings(&["https://app.example.test", "https://admin.example.test"])
     );
     assert_eq!(
@@ -693,10 +747,13 @@ fn the_public_origin_cors_and_csrf_settings_keep_their_legacy_shapes() {
         ("CSRF_COOKIE_DOMAIN", " .example.test "),
         ("AUTH_COOKIE_NAME", "__Host-session"),
     ]);
-    assert_eq!(config.csrf_header_name, "x-csrf-token");
-    assert_eq!(config.csrf_cookie_name, "__Host-csrf");
-    assert_eq!(config.auth_cookie_name, "__Host-session");
-    assert_eq!(config.csrf_cookie_domain.as_deref(), Some(".example.test"));
+    assert_eq!(config.identity.csrf_header_name, "x-csrf-token");
+    assert_eq!(config.identity.csrf_cookie_name, "__Host-csrf");
+    assert_eq!(config.identity.auth_cookie_name, "__Host-session");
+    assert_eq!(
+        config.identity.csrf_cookie_domain.as_deref(),
+        Some(".example.test")
+    );
     assert_eq!(
         refused(&[("CSRF_COOKIE_DOMAIN", "example.test:443")]).problems,
         ["CSRF_COOKIE_DOMAIN must be a valid cookie Domain attribute, got 'example.test:443'"]
@@ -708,9 +765,9 @@ fn the_public_origin_cors_and_csrf_settings_keep_their_legacy_shapes() {
         ("AUTH_MODE", "observe"),
         ("CSRF_ENABLED", "false"),
     ]);
-    assert!(!config.auth_enabled);
-    assert_eq!(config.auth_mode, AuthMode::Observe);
-    assert!(!config.csrf_enabled);
+    assert!(!config.identity.auth_enabled);
+    assert_eq!(config.identity.auth_mode, AuthMode::Observe);
+    assert!(!config.identity.csrf_enabled);
     // ... but the standalone admin session refuses to run without them.
     assert_eq!(
         refused(&[("ADMIN_SESSION_MODE", "standalone_memory")]).problems,
@@ -1017,7 +1074,7 @@ fn a_rule_checked_between_two_reads_is_reported_between_them() {
     // A composed client-certificate check comes before the refusal of an
     // input read after it, even one that is only refused for not being
     // Unicode.
-    let error = Config::from_env_vars(|name| match name {
+    let error = compile(|name| match name {
         "CLIENT_CERT_CA_FILE" => Ok("/run/tls/clients.pem".to_owned()),
         "ADMIN_CLIENT_CERT_CRL_FILE" => Err(VarError::NotUnicode(non_unicode_value())),
         _ => Err(VarError::NotPresent),
@@ -1072,7 +1129,7 @@ fn a_cluster_setting_that_is_not_unicode_is_refused_once_and_a_projector_setting
             &["AUDIT_POSTGRES_RETENTION_DAYS must be valid Unicode"][..],
         ),
     ] {
-        let error = Config::from_env_vars(|requested| {
+        let error = compile(|requested| {
             if requested == name {
                 Err(VarError::NotUnicode(non_unicode_value()))
             } else {
@@ -1090,22 +1147,25 @@ fn a_cluster_setting_that_is_not_unicode_is_refused_once_and_a_projector_setting
 #[test]
 fn storage_modes_keep_their_requirements_and_refuse_each_others_material() {
     let config = accepted(&postgres_fixture());
-    assert_eq!(config.state_backend, StateBackend::Postgres);
-    assert_eq!(config.deployment_id.as_deref(), Some("deploy-prod-eu"));
+    assert_eq!(config.storage.state_backend, StateBackend::Postgres);
     assert_eq!(
-        config.database.url_file.as_deref(),
+        config.storage.deployment_id.as_deref(),
+        Some("deploy-prod-eu")
+    );
+    assert_eq!(
+        database(&config).url_file.as_deref(),
         Some("/run/secrets/greengateway/database-url")
     );
-    assert_eq!(config.database.tls_mode, DatabaseTlsMode::Verify);
-    assert_eq!(config.rate_limit_keyring.len(), 1);
-    assert_eq!(config.cluster_heartbeat_ms, 5_000);
-    assert_eq!(config.cluster_member_stale_ms, 30_000);
-    assert_eq!(config.cluster_maintenance_interval_ms, 60_000);
-    assert_eq!(config.cluster_maintenance_lease_ttl_ms, 15_000);
-    assert_eq!(config.readiness_probe_cache_ms, 1_000);
-    assert_eq!(config.discovery_projector_lease_ttl_ms, 15_000);
-    assert_eq!(config.discovery_projector_poll_ms, 250);
-    assert_eq!(config.discovery_projector_batch, 500);
+    assert_eq!(database(&config).tls_mode, DatabaseTlsMode::Verify);
+    assert_eq!(config.connections.rate_limit_keyring.len(), 1);
+    assert_eq!(config.storage.cluster_heartbeat_ms, 5_000);
+    assert_eq!(config.storage.cluster_member_stale_ms, 30_000);
+    assert_eq!(config.storage.cluster_maintenance_interval_ms, 60_000);
+    assert_eq!(config.storage.cluster_maintenance_lease_ttl_ms, 15_000);
+    assert_eq!(config.storage.readiness_probe_cache_ms, 1_000);
+    assert_eq!(config.storage.discovery_projector_lease_ttl_ms, 15_000);
+    assert_eq!(config.storage.discovery_projector_poll_ms, 250);
+    assert_eq!(config.storage.discovery_projector_batch, 500);
 
     // PostgreSQL alone names everything it is missing, in one pass.
     let error = refused(&[("STATE_BACKEND", "postgres")]);
@@ -1174,12 +1234,14 @@ fn storage_modes_keep_their_requirements_and_refuse_each_others_material() {
         ("AUDIT_SQLITE_RETENTION_DAYS", "30"),
     ]);
     assert_eq!(
-        config.audit_sqlite_path.as_deref(),
+        config.storage.audit_sqlite_path.as_deref(),
         Some("/var/lib/greengateway/audit.sqlite")
     );
-    assert_eq!(config.audit_sqlite_retention_days, Some(30));
+    assert_eq!(config.storage.audit_sqlite_retention_days, Some(30));
     assert_eq!(
-        accepted(&[("AUDIT_SQLITE_RETENTION_DAYS", "0")]).audit_sqlite_retention_days,
+        accepted(&[("AUDIT_SQLITE_RETENTION_DAYS", "0")])
+            .storage
+            .audit_sqlite_retention_days,
         None
     );
 }
@@ -1381,7 +1443,7 @@ fn authority_event_problems_come_after_the_database_and_before_the_mode_rules() 
         "AUTHORITY_EVENT_JOURNAL_CAPACITY",
         "AUTHORITY_EVENT_RETENTION_HOURS",
     ] {
-        let error = Config::from_env_vars(|requested| {
+        let error = compile(|requested| {
             if requested == name {
                 Err(VarError::NotUnicode(non_unicode_value()))
             } else {
@@ -1417,12 +1479,12 @@ fn egress_settings_normalize_hosts_and_refuse_ambiguous_values() {
         ("EGRESS_NAT64_PREFIXES", "64:ff9b:1::/48"),
     ]);
     assert_eq!(
-        config.egress_allowed_hosts,
+        config.egress.egress_allowed_hosts,
         strings(&["api.example.test", "hooks.example.test"])
     );
-    assert!(!config.egress_deny_private_ips);
+    assert!(!config.egress.egress_deny_private_ips);
     assert_eq!(
-        config.egress_nat64_prefixes,
+        config.egress.egress_nat64_prefixes,
         ["64:ff9b:1::/48"
             .parse::<IpNet>()
             .expect("the fixture prefix is valid")]
@@ -1499,7 +1561,7 @@ fn accepted_configurations_request_every_inventoried_variable_and_nothing_else()
         &split_listeners[..],
     ] {
         let mut requested = BTreeSet::new();
-        let parsed = Config::from_env_vars(|name| {
+        let parsed = compile(|name| {
             requested.insert(name.to_owned());
             fixture_value(fixture, name)
         });
@@ -1608,7 +1670,7 @@ fn a_value_that_is_not_unicode_is_reported_without_its_bytes() {
         ("LISTEN_ADDR", ConfigRule::Value),
         ("CONNECTION_SECRET_ALIASES", ConfigRule::Value),
     ] {
-        let error = Config::from_env_vars(|requested| {
+        let error = compile(|requested| {
             if requested == name {
                 Err(VarError::NotUnicode(non_unicode_value()))
             } else {
@@ -1659,7 +1721,7 @@ fn no_diagnostic_carries_a_value_even_when_every_input_holds_a_canary() {
         .enumerate()
         .map(|(index, name)| (*name, format!("{CANARY_MARKER}-{index}-value")))
         .collect();
-    let error = Config::from_env_vars(|name| {
+    let error = compile(|name| {
         canaries
             .iter()
             .find(|(input, _)| *input == name)

@@ -974,10 +974,10 @@ Enforcement:
   publication bound to a suggestion, asks as `policy.suggestion.accept` before
   its acceptance intent or its rule is written, and a stored policy test suite
   write (`PUT .../policy/tests`) asks as `policy_tests.publish` before its body
-  is read. Connection and local-secret
-  changes, the `connection-secrets reencrypt` command, catalog refreshes, OpenAPI
-  catalog registrations and overlay writes and removals never ask: the Connections
-  database records each of them in the change's own transaction
+  is read. Connection and local-secret changes, the `connection-secrets
+  reencrypt` command, catalog refreshes, OpenAPI catalog registrations and
+  overlay writes and removals never ask: the Connections database records each
+  of them in the change's own transaction
   ([Standalone evidence](#standalone-evidence)).
 - **Background activations.** A watched or `SIGHUP` reload of `POLICY_FILE` or
   `TOOLS_FILE` asks the gate first; a refused reload keeps the active policy or
@@ -1025,8 +1025,9 @@ the `409`, the audit event and that nothing changed, and that Connection,
 local-secret, catalog, overlay and token changes are admitted and write their
 evidence rows; the
 reload helpers in `middleware/rbac_tests.rs` and `tools/definitions.rs` refuse a
-reload and keep the active document; `config_tests.rs`, `config/stage_tests.rs` and
-`ha.rs` cover the startup rules, their diagnostics and the fingerprint.
+reload and keep the active document; `config_tests.rs`,
+`gateway-config/src/compiler/stage_tests.rs` and `ha.rs` cover the startup rules,
+their diagnostics and the fingerprint.
 
 ## Verified-TLS storage tests
 

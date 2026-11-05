@@ -1,0 +1,170 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "GreenGateway MCP Client Configuration Templates Admin API",
+    "version": "0.1.0",
+    "description": "Credential-free MCP client configuration templates (issue #242, ADR-0008 \"MCP client templates\"). The default path is shown with ADMIN_PREFIX=/admin; replace /admin with the configured ADMIN_PREFIX while retaining the /v1 API prefix. With ADMIN_LISTEN_ADDR set the route is served on the admin listener only. Every template names the gateway's own MCP endpoint, which the gateway computes from GATEWAY_PUBLIC_URL exactly as its OAuth protected-resource metadata computes the resource identifier; no request header, forwarding header, or query parameter can change it, and no template points at an upstream Connection. An OAuth template holds only that URL. A token template names the environment variable GREENGATEWAY_MCP_TOKEN in the client's interpolation syntax and never holds a token. Minting a service token remains POST /v1{ADMIN_PREFIX}/tokens under admin:tokens:write and its delegation rules."
+  },
+  "servers": [
+    {
+      "url": "/",
+      "description": "The active GreenGateway listener: the admin listener when ADMIN_LISTEN_ADDR is set, otherwise the data listener."
+    }
+  ],
+  "security": [
+    {
+      "bearerAuth": []
+    },
+    {
+      "cookieAuth": []
+    }
+  ],
+  "tags": [
+    {
+      "name": "MCP clients"
+    }
+  ],
+  "paths": {
+    "/v1/admin/mcp/client-configs": {
+      "get": {
+        "operationId": "getMcpClientConfigs",
+        "tags": ["MCP clients"],
+        "summary": "Get credential-free MCP client configuration templates",
+        "description": "Requires admin:mcp:clients:read, which is neither admin:config:read nor a token permission, and a configured POLICY_FILE. Under a default-deny policy, route GET /v1{ADMIN_PREFIX}/mcp with that permission. Returns, for generic Streamable HTTP, Claude Desktop, Cursor, and VS Code, an OAuth template when the protected-resource metadata advertises an authorization server and a token template for every client but Claude Desktop. Read-only; nothing is audited on success, and a denial is audited as authz.denied like every admin route.",
+        "x-greengateway-permission": "admin:mcp:clients:read",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "query",
+            "required": false,
+            "description": "The server entry name the JSON templates use (default greengateway). Any other query parameter, a repeated name, or a name outside this grammar is refused with 400 and is never echoed.",
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The templates. The shared reader in the gateway-config crate, which ggctl mcp-config uses, accepts the document only when every template is exactly what its version renders.",
+            "headers": {
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "../schemas/mcp-client-configs.v1alpha1.schema.json"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The query is not at most one valid name. Nothing was rendered.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TemplateRefusal"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/AdminError"
+          },
+          "403": {
+            "$ref": "#/components/responses/AdminError"
+          },
+          "404": {
+            "description": "No POLICY_FILE is configured, so no admin read route is served.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The gateway has no GATEWAY_PUBLIC_URL (public_url_not_configured), or the MCP endpoint derived from it holds $, {, } or \\, which client configuration files interpolate or escape, or is longer than 16 KiB (public_url_not_templatable). The gateway never guesses a URL from the request. Nothing was rendered.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TemplateRefusal"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "A validated bearer JWT or ggw_ service token."
+      },
+      "cookieAuth": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "session",
+        "description": "The default session cookie. AUTH_COOKIE_NAME changes this name. The route is a read, so no CSRF token is needed."
+      }
+    },
+    "headers": {
+      "NoStore": {
+        "description": "Template documents are not cacheable.",
+        "schema": {
+          "type": "string",
+          "const": "no-store"
+        }
+      }
+    },
+    "responses": {
+      "AdminError": {
+        "description": "Stable sanitized error body: unauthorized (401) or forbidden (403).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/AdminError"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "AdminError": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["error"],
+        "properties": {
+          "error": {
+            "type": "string"
+          }
+        }
+      },
+      "TemplateRefusal": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["error", "reason"],
+        "properties": {
+          "error": {
+            "description": "Fixed text; never a value from the request or the configuration.",
+            "type": "string"
+          },
+          "reason": {
+            "enum": [
+              "invalid_query",
+              "invalid_server_name",
+              "public_url_not_configured",
+              "public_url_not_templatable"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

@@ -20,7 +20,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 MAX_INPUT_BYTES = 4 * 1024 * 1024
-# gateway/src/config.rs: DEFAULT_DATABASE_POOL_MAX and MAX_DATABASE_POOL_MAX.
+# gateway-config/src/compiler.rs: DEFAULT_DATABASE_POOL_MAX and MAX_DATABASE_POOL_MAX.
 DEFAULT_POOL_MAX = 10
 MAX_POOL_MAX = 256
 # PostgreSQL's MAX_BACKENDS, the largest max_connections the server accepts.

@@ -1172,6 +1172,7 @@ pub(crate) fn gateway_app_with_process_started_at_and_overrides(
         history_store: policy_history_store,
         draft_store: policy_draft_store,
         test_suite_store: policy_test_suite_store,
+        policy_tests_required: config.policy_tests_required,
         #[cfg(feature = "postgres")]
         control_plane: policy_control_plane,
         #[cfg(feature = "postgres")]

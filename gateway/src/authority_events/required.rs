@@ -141,8 +141,8 @@ impl AuthorityOperation {
     /// Cluster mode commits every change here with its evidence row in one
     /// PostgreSQL transaction, and has no policy file to reload. Standalone
     /// mode records none of them: the policy and tools files, their reloads
-    /// and their optional history are separate steps, and the stored policy
-    /// test suite's versions name only the writer's subject. (The
+    /// and their optional history are separate steps, and the stored
+    /// policy test suite's versions name only the writer's subject. (The
     /// Connections database records catalog and overlay publication in its
     /// own transaction, so those operations are not listed.)
     pub(crate) const fn required_mode(self, backend: StateBackend) -> RequiredMode {

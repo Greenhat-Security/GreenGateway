@@ -1108,6 +1108,8 @@
           "cap-fs-ext@4.0.3|registry+https://github.com/rust-lang/crates.io-index",
           "cap-std@4.0.3|registry+https://github.com/rust-lang/crates.io-index",
           "hex@0.4.3|registry+https://github.com/rust-lang/crates.io-index",
+          "http@1.5.0|registry+https://github.com/rust-lang/crates.io-index",
+          "ipnet@2.12.2|registry+https://github.com/rust-lang/crates.io-index",
           "jsonschema@0.60.2|registry+https://github.com/rust-lang/crates.io-index",
           "proptest@1.11.0|registry+https://github.com/rust-lang/crates.io-index",
           "rusqlite@0.40.2|registry+https://github.com/rust-lang/crates.io-index",
@@ -1115,6 +1117,7 @@
           "serde@1.0.229|registry+https://github.com/rust-lang/crates.io-index",
           "serde_json@1.0.154|registry+https://github.com/rust-lang/crates.io-index",
           "sha2@0.11.1|registry+https://github.com/rust-lang/crates.io-index",
+          "tracing@0.1.44|registry+https://github.com/rust-lang/crates.io-index",
           "url@2.5.8|registry+https://github.com/rust-lang/crates.io-index",
           "uuid@1.26.1|registry+https://github.com/rust-lang/crates.io-index"
         ]
@@ -6328,11 +6331,44 @@
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           {
+            "name": "http",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "^1.4.2",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "ipnet",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "^2.11.0",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
             "name": "sha2",
             "rename": null,
             "kind": null,
             "target": null,
             "req": "^0.11.0",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "tracing",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "^0.1.44",
             "optional": false,
             "uses_default_features": true,
             "features": [],
@@ -6893,7 +6929,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::routing::add_admin_api_routes#1",
-      "sha256": "4b8dd97b514c4a67403d66db2519e08b2a178b8d3f89c3d9e029446063a182fe",
+      "sha256": "2f80bbc7d1eea7f419d71501d8ad05c74e1ff28ca1294b08b49e6605be7da65d",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
@@ -7298,6 +7334,16 @@
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
     {
+      "file": "gateway/src/main.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::use admin_policy_test_gate :: *#1",
+      "sha256": "88b5000e16712f3c60014eb72556124fe9cbcd69866f24b9868107a0b9bd0e0c",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
       "file": "gateway/src/admin_policy_simulations.rs",
       "reasons": [
         "capability-import-or-glob"
@@ -7323,6 +7369,16 @@
         "capability-import-or-glob"
       ],
       "scope": "gateway::admin_policy_evidence::use super :: *#1",
+      "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/admin_policy_test_gate.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::admin_policy_test_gate::use super :: *#1",
       "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
@@ -7888,6 +7944,26 @@
       "purpose": "Authentication state or protocol handling; network requests consume the checked EgressClient API."
     },
     {
+      "file": "gateway/src/authority_events/cadence.rs",
+      "reasons": [
+        "capability-in-macro-input"
+      ],
+      "scope": "gateway::authority_events::cadence::sleep_or_stop#1",
+      "sha256": "84732172f99944f988093c4fd0bdfb420106fdb79414ce0e9027b6620947b9e9",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway/src/authority_events/delivery.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::authority_events::delivery::file_attributes#1",
+      "sha256": "915c50cd5262a42e3e29ca4cdd2b3029d6643c0a87e8c47f773aff2d5bb26846",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed standalone authority-event delivery (issue #425): delivery cursors in the SQLite stores that own the evidence, the keyed projection, fixed-label metrics and the shared dispatcher cadence. No new outbound transport authority; the only I/O is the configured local SQLite files and the existing log and file sinks."
+    },
+    {
       "file": "gateway/src/client_ip.rs",
       "reasons": [
         "capability-import-or-glob"
@@ -8083,8 +8159,28 @@
       "reasons": [
         "capability-import-or-glob"
       ],
-      "scope": "gateway::config::use std :: { collections :: { HashMap , HashSet } , env :: { self , VarError } , error :: Error , fmt , net :: SocketAddr , path :: PathBuf , str :: FromStr , sync :: LazyLock , }#1",
-      "sha256": "a82115cd7f23df27472f360ce15ca064c567ff292a12bb255a02f1337f5f4ec2",
+      "scope": "gateway::config::use std :: { env :: { self , VarError } , net :: SocketAddr , path :: PathBuf , }#1",
+      "sha256": "f9068c4ba6cc254e97df1e01cc99e226c7a145f252d6b5f451d18388ad71a019",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/config.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::config::use gateway_config :: compiler :: *#1",
+      "sha256": "f1f9d1777e876e66af73068fce198f503825dc5adc01ec60df2f1c08461c35b4",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Glob re-export of the configuration compiler (gateway_config::compiler, issue #242) at the paths the gateway has always named its settings by; the compiler names no transport, file, process or environment API, which its zero-I/O source scan holds."
+    },
+    {
+      "file": "gateway-config/src/compiler.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway_config::compiler::use std :: { collections :: { HashMap , HashSet } , env :: VarError , error :: Error , fmt , net :: SocketAddr , path :: PathBuf , str :: FromStr , sync :: LazyLock , }#1",
+      "sha256": "3658d7829c4639413132de512131545d84b54304c94a3e51bbaafa1745faeb86",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
@@ -8169,41 +8265,41 @@
       "purpose": "Moved unchanged from gateway::inbound_tls for #242: the listener client-certificate mode the configuration compiler parses. Its only unexpanded input is the `#[default]` variant marker of a standard `Default` derive; a plain enum with no transport, file or process capability."
     },
     {
-      "file": "gateway/src/config.rs",
+      "file": "gateway-config/src/compiler.rs",
       "reasons": [
         "unexpanded-attribute"
       ],
-      "scope": "gateway::config::StateBackend#1",
+      "scope": "gateway_config::compiler::StateBackend#1",
       "sha256": "5b01127d64e2cd12fe7fe2a565ecdca8c1ee988a78b41ad2ea6a885bbf05665c",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
     {
-      "file": "gateway/src/config.rs",
+      "file": "gateway-config/src/compiler.rs",
       "reasons": [
         "unexpanded-attribute"
       ],
-      "scope": "gateway::config::DatabaseTlsMode#1",
+      "scope": "gateway_config::compiler::DatabaseTlsMode#1",
       "sha256": "ad2ac35857d530f78b48d111ec5c77f7824cd76194ad1916d4af7d87a65de8ef",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
     {
-      "file": "gateway/src/config.rs",
+      "file": "gateway-config/src/compiler.rs",
       "reasons": [
         "unexpanded-attribute"
       ],
-      "scope": "gateway::config::UpstreamLoadBalancingStrategy#1",
+      "scope": "gateway_config::compiler::UpstreamLoadBalancingStrategy#1",
       "sha256": "0031658aa35b4a616c8259f3ff0140c864aaf8acd49026ab38085314e386c36f",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
     {
-      "file": "gateway/src/config.rs",
+      "file": "gateway-config/src/compiler.rs",
       "reasons": [
         "unexpanded-attribute"
       ],
-      "scope": "gateway::config::UpstreamRequestBodyMode#1",
+      "scope": "gateway_config::compiler::UpstreamRequestBodyMode#1",
       "sha256": "6784b1ca2fbb5aecac05d65ef310aab6aba6d2d3ba0ab9018e45d7b9bf497fc1",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
@@ -8299,21 +8395,11 @@
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
     {
-      "file": "gateway/src/config.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::config::impl  ConfigError::problems#1",
-      "sha256": "73ec1cd52e14bd0b84a851b33f115fbba88fc1f38ae27efa9abca263a4f9adef",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
-    },
-    {
-      "file": "gateway/src/config.rs",
+      "file": "gateway-config/src/compiler.rs",
       "reasons": [
         "network-or-process-reference"
       ],
-      "scope": "gateway::config::url_host_is_loopback#1",
+      "scope": "gateway_config::compiler::url_host_is_loopback#1",
       "sha256": "ef51ec667a217d2d76d791c03eecc2efea01487c8c2ca36450eae01d85634e64",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
@@ -9339,6 +9425,16 @@
       "sha256": "0a7475b75811083bc93e00a9edc25b3eb62fc2ffea5a8966a48c44ebb108973a",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed for #242 PR 10 (standalone revision ledger): decodes one row of the ledger's local SQLite database through rusqlite's Row, whose name the PostgreSQL client also exports, which is why the guard's conservative global alias union flags it. It adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/mcp_client_configs.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway_config::mcp_client_configs::host_is_loopback#1",
+      "sha256": "a852ed69d98f94c0fda4baaeb76c6a7762df1ea7ca25bb35443f7604fa0e0336",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 (MCP client templates): classifies the parsed host of a gateway MCP URL as loopback (localhost or a loopback IPv4/IPv6 literal) so a template never names a plain-http non-loopback endpoint. url::Host is a value from an already-parsed URL; nothing is resolved or connected."
     },
     {
       "file": "gateway/src/connections/secret.rs",
@@ -11122,9 +11218,9 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::middleware::rbac::RbacPolicyState#1",
-      "sha256": "a30db022f49cba05f303e2135003bcd2a232174669c9d8d7d88468fce6a6b4eb",
+      "sha256": "2410eb116827f9fdee5881d98962cc01594fb3ebfba59b5d86a1e99b72251557",
       "owner": "GreenGateway maintainers",
-      "purpose": "Issue #422 structural attribution: the pre-cutover permission engine (engine) and route vector (routes) join the direct-rule matcher as #[cfg(test)] fields kept only for the frozen differential oracles, so serving snapshots carry only the compiled policy, whose own routes, direct rules and permission engine every HTTP and tool-lane decision, audit attribution and management permission reads. cfg gating and doc comments only; no field, client, socket, TLS, DNS or header authority is added."
+      "purpose": "Issue #422 structural attribution: the pre-cutover permission engine (engine) and route vector (routes) join the direct-rule matcher as #[cfg(test)] fields kept only for the frozen differential oracles, so serving snapshots carry only the compiled policy, whose own routes, direct rules and permission engine every HTTP and tool-lane decision, audit attribution and management permission reads. cfg gating and doc comments only; no field, client, socket, TLS, DNS or header authority is added. Reviewed for #243 (decision facts): each snapshot also holds decision_identity, an Arc of the installed policy's ETag, semantic digest and element ids computed once at install; plain data that adds no client, socket, TLS, DNS or header authority."
     },
     {
       "file": "gateway/src/middleware/rbac.rs",
@@ -11142,9 +11238,9 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::middleware::rbac::impl  RbacState::evaluate_tool_authorization#1",
-      "sha256": "0370b17a9b5d0ac912b875882aa1620bf06ff6dbf790dab3b3f9e98f193de30b",
+      "sha256": "485f2075b7291f8b97da57a2c05c0a3d097abca795782422c859234d5c4c0a3a",
       "owner": "GreenGateway maintainers",
-      "purpose": "Issue #243 tool lanes: tool admission now takes the canonical client address the call entered with (std::net::IpAddr, a value) as a policy fact for source_network conditions; a pure data parameter that adds no network, process or transport capability."
+      "purpose": "Issue #243 tool lanes: tool admission now takes the canonical client address the call entered with (std::net::IpAddr, a value) as a policy fact for source_network conditions; a pure data parameter that adds no network, process or transport capability. Reviewed for #243 (decision facts): the authorization handed to the runtime also carries the verdict's decision facts (codes, versions, digests and policy positions); a pure data value that adds no network, process or transport capability."
     },
     {
       "file": "gateway/src/middleware/rbac.rs",
@@ -11182,9 +11278,9 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::middleware::rbac::rbac_middleware#1",
-      "sha256": "67c5fb7a91f70ca6e31e5898fbc64b9611a43d5f5c1f20405a5c9db1b8231400",
+      "sha256": "4bcdcc906b161c70262d1faadfc5ef2ed17d70c77acbb30be8c3109ecac77cc7",
       "owner": "GreenGateway maintainers",
-      "purpose": "Issue #422 HTTP adapter: evaluate the admitted immutable policy snapshot and translate its result into existing audit and response behavior. Existing cfg/cfg_attr inputs only; no new transport, provider, resolver or process authority. Reviewed for #243: the decision is now asked with the facts serving_facts takes from the authenticated principal (its verified organization in mapped-role mode), a pure data read that adds no transport, provider, resolver or process authority. Reviewed for #243 (request conditions): the facts now come from policy_facts::http_request_facts -- the canonical client address under the state's ClientIpPolicy, the referenced request headers, the strictly decoded query and an injected clock -- and a query that does not decode strictly is refused as policy_query_undecodable; pure reads of the admitted request that add no transport, provider, resolver or process authority."
+      "purpose": "Issue #422 HTTP adapter: evaluate the admitted immutable policy snapshot and translate its result into existing audit and response behavior. Existing cfg/cfg_attr inputs only; no new transport, provider, resolver or process authority. Reviewed for #243: the decision is now asked with the facts serving_facts takes from the authenticated principal (its verified organization in mapped-role mode), a pure data read that adds no transport, provider, resolver or process authority. Reviewed for #243 (request conditions): the facts now come from policy_facts::http_request_facts -- the canonical client address under the state's ClientIpPolicy, the referenced request headers, the strictly decoded query and an injected clock -- and a query that does not decode strictly is refused as policy_query_undecodable; pure reads of the admitted request that add no transport, provider, resolver or process authority. Reviewed for #243 (decision facts): a complete verdict's PolicyDecision now carries PolicyDecisionFacts built from the evaluation context, the captured facts and the evaluation it already holds, for the request's observation; a pure data value that adds no transport, provider, resolver or process authority."
     },
     {
       "file": "gateway/src/middleware/validate.rs",
@@ -11372,9 +11468,9 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::policy_replay::file_attributes#1",
-      "sha256": "54a6a9a8dcff73aefeffeb33ec7c4e3e2a5c5e6cf7351496a4925f485491e960",
+      "sha256": "463a9839a7b1a94a28d2595154ef19b647c7ba5083ab600db2bdd16e92f160ac",
       "owner": "policy replay contexts (#243)",
-      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the policy replay context module: the replay job engine (#243 slice 13) calls the adapters and evaluator and the impact comparison (#243 slice 14) reads the recorded result, while the serialized form and egress replay wait for a record that states them. The module parses and builds replay contexts in memory and asks the pure policy kernel; dead-code gating only, no I/O and no transport or process capability."
+      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the policy replay context module: the replay job engine (#243 slice 13) calls the adapters and evaluator and the impact comparison (#243 slice 14) reads the recorded result, while the serialized form and egress replay wait for a record that states them. The module parses and builds replay contexts in memory and asks the pure policy kernel; dead-code gating only, no I/O and no transport or process capability. Reviewed for #243 (decision facts): the module documentation now describes replay-context.v2 and the recorded decision facts; documentation only, the dead-code gating is unchanged."
     },
     {
       "file": "gateway/src/policy_testing/suite.rs",
@@ -14246,6 +14342,16 @@
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
     {
+      "file": "gateway/src/storage/standalone_authority_events.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::storage::standalone_authority_events::impl  StandaloneEvidenceSource::ALL#1",
+      "sha256": "c45e771d64a73c58cadfc03eb7e92933988a91d08be77a4943addd458b671e53",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed standalone authority-event delivery (issue #425): delivery cursors in the SQLite stores that own the evidence, the keyed projection, fixed-label metrics and the shared dispatcher cadence. No new outbound transport authority; the only I/O is the configured local SQLite files and the existing log and file sinks."
+    },
+    {
       "file": "gateway/src/storage/mod.rs",
       "reasons": [
         "unexpanded-attribute"
@@ -15362,6 +15468,46 @@
       "purpose": "Opens the operator-configured AUTHORITY_EVENT_FILE for appending with std::fs; a local file only, no network, socket or process capability."
     },
     {
+      "file": "gateway/src/authority_events/standalone.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::authority_events::standalone::FAILURE_KINDS#1",
+      "sha256": "8f363d2d0e3c7b4ae2739af2c66fa5edd378c0e48d794b982def4c9edaedc195",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed standalone authority-event delivery (issue #425): delivery cursors in the SQLite stores that own the evidence, the keyed projection, fixed-label metrics and the shared dispatcher cadence. No new outbound transport authority; the only I/O is the configured local SQLite files and the existing log and file sinks."
+    },
+    {
+      "file": "gateway/src/authority_events/standalone.rs",
+      "reasons": [
+        "unexpanded-macro"
+      ],
+      "scope": "gateway::authority_events::standalone::record_failure#1",
+      "sha256": "100c88b8e88deee2e01c6e80f2278e457488831155e3b13abe1047247dbfc9a1",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed standalone authority-event delivery (issue #425): delivery cursors in the SQLite stores that own the evidence, the keyed projection, fixed-label metrics and the shared dispatcher cadence. No new outbound transport authority; the only I/O is the configured local SQLite files and the existing log and file sinks."
+    },
+    {
+      "file": "gateway/src/authority_events/standalone.rs",
+      "reasons": [
+        "unexpanded-macro"
+      ],
+      "scope": "gateway::authority_events::standalone::record_backlog#1",
+      "sha256": "ddaa60559c982d5dbdcb4e9d9ce6515bd87570a8d4c3f410c2f6166e56067fc6",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed standalone authority-event delivery (issue #425): delivery cursors in the SQLite stores that own the evidence, the keyed projection, fixed-label metrics and the shared dispatcher cadence. No new outbound transport authority; the only I/O is the configured local SQLite files and the existing log and file sinks."
+    },
+    {
+      "file": "gateway/src/authority_events/standalone.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::authority_events::standalone::impl  SourceLane::committed_position#1",
+      "sha256": "85f95e219bd0bea0ab87ba912092a4cb05ec9a64ea0d41ae74746da51ba391e1",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed standalone authority-event delivery (issue #425): delivery cursors in the SQLite stores that own the evidence, the keyed projection, fixed-label metrics and the shared dispatcher cadence. No new outbound transport authority; the only I/O is the configured local SQLite files and the existing log and file sinks."
+    },
+    {
       "file": "gateway/src/authority_events/required.rs",
       "reasons": [
         "unexpanded-attribute"
@@ -15382,31 +15528,21 @@
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
     {
-      "file": "gateway/src/config/authority_events.rs",
+      "file": "gateway-config/src/compiler/authority_events.rs",
       "reasons": [
         "unexpanded-attribute"
       ],
-      "scope": "gateway::config::authority_events::AuthorityEventSinkSetting#1",
+      "scope": "gateway_config::compiler::authority_events::AuthorityEventSinkSetting#1",
       "sha256": "c74d0805c061ae897fa27c1a39da30ad9da3070ee5a7dc9e5b2a7e9684e217a3",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
     {
-      "file": "gateway/src/config/authority_events.rs",
+      "file": "gateway-config/src/compiler/authority_events.rs",
       "reasons": [
         "unexpanded-attribute"
       ],
-      "scope": "gateway::config::authority_events::impl  AuthorityEventSettings::retention#1",
-      "sha256": "e5f0f85f57447269aa7d76fd7187872f459993214341bfa959539733fc4d0fbc",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
-    },
-    {
-      "file": "gateway/src/config/authority_events.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::config::authority_events::AuthorityEvidenceDurability#1",
+      "scope": "gateway_config::compiler::authority_events::AuthorityEvidenceDurability#1",
       "sha256": "fb2fec901399a9d0163dcea0a2dec839f0a413e04004a2993d18fcf748902309",
       "owner": "GreenGateway maintainers",
       "purpose": "Clone/Copy/Debug/Default/PartialEq/Eq derives and #[default] on the two-value AUTHORITY_EVIDENCE_DURABILITY setting; no transport, file or process capability (issue #425)."
@@ -15588,6 +15724,26 @@
       ],
       "scope": "gateway::use admin_config :: *#1",
       "sha256": "f7ea42fbe0a39befb09e21a9a49ab5caef8ef939b0a749d731b79a43836992a0",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/admin_mcp_clients.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::admin_mcp_clients::use super :: *#1",
+      "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/main.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::use admin_mcp_clients :: *#1",
+      "sha256": "73464c2de231005b1d5da40dc33d6cbcf529baad3d886b1aa3b09d60f26a0a89",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
@@ -15837,10 +15993,10 @@
       "reasons": [
         "network-or-process-reference"
       ],
-      "scope": "ggctl::remote::impl  AdminClient::exchange#1",
-      "sha256": "108bb344e1891fe91a3493f84aa99db01ca6f09f3e9c371ec1aa9f9e3cdaec88",
+      "scope": "ggctl::remote::impl  AdminClient::send#1",
+      "sha256": "692a3e4a7b2a667d13dafd50802407a04b1d17b4597ee8ae2bfd19477c32d793",
       "owner": "GreenGateway maintainers: operator CLI (#242)",
-      "purpose": "Reviewed for #243 (ggctl policy commands): the one request path of ggctl's admin API client, its only network capability. One reqwest client, built in admin_http_client with no proxy, no redirects, no transparent retries, HTTP/1.1, platform certificate and hostname verification plus optional --ca-file trust anchors, and bounded time and response size. It talks only to the operator-named admin API base, is not linked into the gateway, and scripts/check-egress-only.sh pins its builder. exchange sends one GET, POST or DELETE with an optional JSON body and the bearer token to a path below that base; redirects, 401 and 403 are refused, a body is read only when bounded and of the accepted media type, only visible-ASCII values of the headers a command names are returned, and only a GET whose connection was never established is sent again. The version handshake's get_json now calls it."
+      "purpose": "Reviewed for #243 (ggctl policy commands): the one request path of ggctl's admin API client, its only network capability. One reqwest client, built in admin_http_client with no proxy, no redirects, no transparent retries, HTTP/1.1, platform certificate and hostname verification plus optional --ca-file trust anchors, and bounded time and response size. It talks only to the operator-named admin API base, is not linked into the gateway, and scripts/check-egress-only.sh pins its builder. send, which exchange calls, sends one GET, POST or DELETE with an optional JSON body and the bearer token to a path below that base; redirects, 401 and 403 are refused, a body is read only when bounded and of the accepted media type, only visible-ASCII values of the headers a command names are returned, and only a GET whose connection was never established is sent again. #242 MCP client templates moved this body from exchange into send unchanged, so that get_json can add the mcp-config route's form-encoded query to the same path below the base: exchange and get_json both call it, and the version handshake and mcp-config read through get_json."
     },
     {
       "file": "ggctl/src/remote.rs",
@@ -15941,76 +16097,6 @@
       "sha256": "fc1b302367c7376a3ce2327e04e7abc623a558e0ac4258679f52777cdffcb3d4",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed for #242 PR 15 (standalone backup restore): imports MetadataExt on Unix to compare the device numbers of the target state directory and the directory holding it, refusing a mount point that no rename within its parent can move. Read-only metadata; it adds no network or process capability."
-    },
-    {
-      "file": "gateway/src/authority_events/cadence.rs",
-      "reasons": [
-        "capability-in-macro-input"
-      ],
-      "scope": "gateway::authority_events::cadence::sleep_or_stop#1",
-      "sha256": "84732172f99944f988093c4fd0bdfb420106fdb79414ce0e9027b6620947b9e9",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
-    },
-    {
-      "file": "gateway/src/authority_events/delivery.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::authority_events::delivery::file_attributes#1",
-      "sha256": "915c50cd5262a42e3e29ca4cdd2b3029d6643c0a87e8c47f773aff2d5bb26846",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Reviewed standalone authority-event delivery (issue #425): delivery cursors in the SQLite stores that own the evidence, the keyed projection, fixed-label metrics and the shared dispatcher cadence. No new outbound transport authority; the only I/O is the configured local SQLite files and the existing log and file sinks."
-    },
-    {
-      "file": "gateway/src/authority_events/standalone.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::authority_events::standalone::FAILURE_KINDS#1",
-      "sha256": "8f363d2d0e3c7b4ae2739af2c66fa5edd378c0e48d794b982def4c9edaedc195",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Reviewed standalone authority-event delivery (issue #425): delivery cursors in the SQLite stores that own the evidence, the keyed projection, fixed-label metrics and the shared dispatcher cadence. No new outbound transport authority; the only I/O is the configured local SQLite files and the existing log and file sinks."
-    },
-    {
-      "file": "gateway/src/authority_events/standalone.rs",
-      "reasons": [
-        "unexpanded-macro"
-      ],
-      "scope": "gateway::authority_events::standalone::record_failure#1",
-      "sha256": "100c88b8e88deee2e01c6e80f2278e457488831155e3b13abe1047247dbfc9a1",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Reviewed standalone authority-event delivery (issue #425): delivery cursors in the SQLite stores that own the evidence, the keyed projection, fixed-label metrics and the shared dispatcher cadence. No new outbound transport authority; the only I/O is the configured local SQLite files and the existing log and file sinks."
-    },
-    {
-      "file": "gateway/src/authority_events/standalone.rs",
-      "reasons": [
-        "unexpanded-macro"
-      ],
-      "scope": "gateway::authority_events::standalone::record_backlog#1",
-      "sha256": "ddaa60559c982d5dbdcb4e9d9ce6515bd87570a8d4c3f410c2f6166e56067fc6",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Reviewed standalone authority-event delivery (issue #425): delivery cursors in the SQLite stores that own the evidence, the keyed projection, fixed-label metrics and the shared dispatcher cadence. No new outbound transport authority; the only I/O is the configured local SQLite files and the existing log and file sinks."
-    },
-    {
-      "file": "gateway/src/authority_events/standalone.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::authority_events::standalone::impl  SourceLane::committed_position#1",
-      "sha256": "85f95e219bd0bea0ab87ba912092a4cb05ec9a64ea0d41ae74746da51ba391e1",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Reviewed standalone authority-event delivery (issue #425): delivery cursors in the SQLite stores that own the evidence, the keyed projection, fixed-label metrics and the shared dispatcher cadence. No new outbound transport authority; the only I/O is the configured local SQLite files and the existing log and file sinks."
-    },
-    {
-      "file": "gateway/src/storage/standalone_authority_events.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::storage::standalone_authority_events::impl  StandaloneEvidenceSource::ALL#1",
-      "sha256": "c45e771d64a73c58cadfc03eb7e92933988a91d08be77a4943addd458b671e53",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Reviewed standalone authority-event delivery (issue #425): delivery cursors in the SQLite stores that own the evidence, the keyed projection, fixed-label metrics and the shared dispatcher cadence. No new outbound transport authority; the only I/O is the configured local SQLite files and the existing log and file sinks."
     }
   ]
 }
