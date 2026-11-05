@@ -10,12 +10,15 @@ use arc_swap::ArcSwap;
 use serde::Serialize;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-use crate::tools::{
-    definitions::{
-        McpCatalogPublishError, ToolDefinition, ToolRegistry, ToolRegistryError, ToolSource,
-        ToolTarget,
+use crate::{
+    auth::change_actor::ChangeActor,
+    tools::{
+        definitions::{
+            McpCatalogPublishError, ToolDefinition, ToolRegistry, ToolRegistryError, ToolSource,
+            ToolTarget,
+        },
+        mcp_upstream::{self, McpUpstreamCallError},
     },
-    mcp_upstream::{self, McpUpstreamCallError},
 };
 
 use super::{
@@ -477,7 +480,7 @@ impl McpConnectionCatalogService {
         &self,
         raw_connection_id: &str,
         expected_etag: &str,
-        actor: &str,
+        actor: &ChangeActor,
     ) -> Result<McpCatalogRefreshResult, McpCatalogRefreshError> {
         if !self.control_plane.is_managed_store_configured() {
             return Err(McpCatalogRefreshError::StoreUnavailable);
@@ -1252,7 +1255,11 @@ mod tests {
             .expect("managed MCP catalog service should load");
 
         let refused = service
-            .refresh(record.id.as_str(), record.etag().as_str(), "test-admin")
+            .refresh(
+                record.id.as_str(),
+                record.etag().as_str(),
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .err();
 
@@ -1346,7 +1353,11 @@ mod tests {
                 .expect("managed MCP catalog service should load");
 
         let first = service
-            .refresh(record.id.as_str(), record.etag().as_str(), "test-admin")
+            .refresh(
+                record.id.as_str(),
+                record.etag().as_str(),
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("first complete MCP catalog should publish");
         assert_eq!(first.catalog_revision, 1);
@@ -1356,7 +1367,11 @@ mod tests {
         assert!(registry.get(&public_name).is_some());
 
         let failure = service
-            .refresh(record.id.as_str(), record.etag().as_str(), "test-admin")
+            .refresh(
+                record.id.as_str(),
+                record.etag().as_str(),
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect_err("duplicate remote names should reject the whole refresh");
         assert_eq!(failure, McpCatalogRefreshError::InvalidResponse);
@@ -1460,7 +1475,7 @@ mod tests {
                 .refresh(
                     harness.record.id.as_str(),
                     harness.record.etag().as_str(),
-                    "test-admin",
+                    &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
                 )
                 .await
                 .expect("an absent optional discovery method should be treated as empty");
@@ -1516,7 +1531,7 @@ mod tests {
             .refresh(
                 harness.record.id.as_str(),
                 harness.record.etag().as_str(),
-                "test-admin",
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
             )
             .await
             .expect_err("tools/list remains required when tools are advertised");
@@ -1618,7 +1633,11 @@ mod tests {
         .expect("managed MCP catalog service should load");
 
         service
-            .refresh(record.id.as_str(), record.etag().as_str(), "test-admin")
+            .refresh(
+                record.id.as_str(),
+                record.etag().as_str(),
+                &crate::auth::change_actor::ChangeActor::for_test("test-admin"),
+            )
             .await
             .expect("managed MCP catalog should publish");
         let public_name = format!("{}:alpha", record.id);

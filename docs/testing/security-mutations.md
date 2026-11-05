@@ -14,7 +14,7 @@ measure every possible mutation or prove the gateway correct.
 
 ## Owned scope
 
-The registry names eleven functions and twenty-one source changes. Each
+The registry names fifteen functions and twenty-eight source changes. Each
 target records its file, fully qualified function name, unique source markers,
 function SHA-256, exact test names and exact replacement text. Missing or moved
 functions, changed source, ambiguous anchors and absent tests fail the campaign
@@ -37,6 +37,10 @@ that every selected test still exists, before merge; see
 | `policy_eval::egress::CompiledEgressPolicy::evaluate` | That a destination the static egress checks refuse is refused before any name is resolved | Ask for resolution facts while a static refusal is pending |
 | `policy_eval::egress::CompiledEgressPolicy::admit_destination` | The static egress checks: URL shape, scheme, host and port allowlists | Let an exact host entry admit any host ending in it; ignore the policy port list |
 | `policy_eval::egress::CompiledEgressPolicy::check_answers` | The address checks over resolution facts | Judge only the answer that will be pinned |
+| `policy_eval::CompiledPolicy::decide` | The HTTP decision: direct rules, the deny-only narrowing for a selected upstream, routes, the host-binding refusal and the default | Let any direct rule decide for a selected upstream; let the default decide a selected upstream no route authorizes; make a direct shadow rule's effect an allow; grant a permission route to an anonymous caller |
+| `policy_eval::CompiledPolicy::match_route` | Which route governs a request, and that an MCP alias's request path matches a route only exactly | Prefix-match the alias request path |
+| `policy_eval::effect` | Whether a route or default denial blocks or, in shadow mode, is observed | Allow a shadow-mode denial instead of observing it |
+| `rbac::matcher::RuleMatcher::scan_matching_paths_by_action` | Action-major precedence across an alias pair's identities: deny, then shadow, then allow | Scan the least restrictive action first |
 
 A target is a module-level function, or a method one indentation level into a
 module-level inherent `impl Type {` block. A method's registry name ends
@@ -81,14 +85,31 @@ because the campaign builds and runs only the gateway's test binary
 ownership moves again, update the target, function hash and exact tests in the
 same reviewed change, remove the retired target, and remeasure.
 
-The tool-lane targets select tests that state the evaluator's answers
-outright. The live adapters ask this same evaluator, so a test that only
+Issue #420 (R5-13) closed the remaining gap in that coverage: the registry
+selected the tool, rate, host and egress predicates, but not the HTTP decision
+the RBAC middleware asks for every request it evaluates, and that policy tests,
+simulation and the policy resources ask too. Four targets now cover it.
+`CompiledPolicy::decide` is that decision, behind `evaluate`,
+`evaluate_with_facts` and `evaluate_with_stages`. It takes its stage sink as
+`&mut impl StageSink` instead of a named type parameter, the same function
+after monomorphization, so that its declaration fits the start-marker rule
+above. `CompiledPolicy::match_route` picks the governing route, `effect` turns
+a route or default denial into a block or an observation, and
+`RuleMatcher::scan_matching_paths_by_action` is the scan that gives an MCP
+alias pair's direct rules their action-major order. The single-identity
+first-match scan, `scan_with_dispatch`, is not registered.
+
+The tool-lane and HTTP-lane targets select tests that state the evaluator's
+answers outright. The live adapters ask this same evaluator, so a test that only
 compares the evaluator with them would compare it with itself and kill
 nothing. The rate-lane target compares each selection with the frozen
 pre-cutover selector. The static egress targets select tests that state the
 lane's answers outright, and the named matrix that compares the live adapter
 with the frozen pre-cutover checks; the decision-order target also selects
 the harness whose resolver panics if a refused destination ever reaches it.
+The HTTP-lane parity matrices in `policy_eval::tests` compare the evaluator
+with the live middleware, which asks this evaluator, and separately with the
+frozen pre-cutover middleware; the HTTP-lane targets select none of them.
 
 Only these pure tests run during mutation execution. They need no DNS,
 credential provider, database, upstream server or third-party API: the egress
@@ -115,7 +136,7 @@ python scripts/security_mutations.py --validate-registry
 mkdir -p target/security-mutations
 cargo test --workspace --locked -- --list --format terse > target/security-mutations/test-list.txt
 python scripts/security_mutations.py --check-test-list target/security-mutations/test-list.txt
-python scripts/security_mutations.py --report target/security-mutations/report.json
+python scripts/security_mutations.py --campaign-seconds 12600 --report target/security-mutations/report.json
 ```
 
 The workflow tests additionally require the `PyYAML==6.0.3` parser pinned in
@@ -147,6 +168,8 @@ replace the complete scheduled campaign.
 
 The controller bounds each phase and the complete campaign. CI adds an outer
 job budget covering tool setup and artifact upload as well as measurement.
+The scheduled workflow raises the complete-campaign bound with
+`--campaign-seconds 12600`; the other limits are the controller defaults.
 
 | Resource | Default limit |
 |---|---:|
@@ -155,12 +178,12 @@ job budget covering tool setup and artifact upload as well as measurement.
 | One selected test: wall time | 30 seconds |
 | One selected test: CPU time per process | 20 seconds |
 | Tests and short metadata commands: virtual address space per process | 2,048 MiB |
-| Complete campaign: wall time | 7,200 seconds |
+| Complete campaign: wall time | 7,200 seconds; 12,600 in the scheduled workflow |
 | Cargo build concurrency | One job |
 | Captured build output, per output stream | 8 MiB |
 | Captured test output, per output stream | 64 KiB |
 | Report size | 256 KiB |
-| Scheduled/manual CI job | 150 minutes |
+| Scheduled/manual CI job | 240 minutes |
 
 CPU limits are inherited by child processes; they are not an aggregate CPU
 quota for a compiler process tree. Wall timeouts terminate the process group.
@@ -309,24 +332,66 @@ selected for them respectively, and the named matrix; and
 rebuilds took 104–683 seconds on a shared workstation. This is review
 evidence, not a substitute for the controller's report.
 
+Issue #420 then added the four HTTP-lane targets above and seven mutations,
+so the registry has 28; it retired no registered target. Two tests were added
+with it, `a_permission_route_never_grants_an_anonymous_caller` and
+`a_route_or_default_denial_is_observed_only_in_shadow_mode`, because no
+existing test stated those answers outright: before them, granting a
+permission route to an anonymous caller and allowing a shadow-mode denial
+each survived every other test selected for the HTTP lane. The only
+production change is the signature of `decide` described above. Before
+review, each new mutant was applied to a Windows working tree of the change,
+based on `10f483b`, and all six tests selected for the HTTP-lane targets were
+run with `--exact` under Rust CI 1.98.1 and a local build script that skipped
+the embedded UI build, without the controller's rlimits or process groups.
+All seven were killed by tests selected for their targets:
+`kernel-http-decision/keep-direct-allow-for-selected-upstream` failed
+`a_direct_allow_cannot_authorize_a_selected_upstream_but_a_deny_still_blocks`;
+`kernel-http-decision/default-for-unrouted-upstream` failed that test and
+`a_permissive_default_does_not_authorize_an_unrouted_virtual_upstream`;
+`kernel-http-decision/shadow-rule-allows` and
+`rbac-alias-precedence/least-restrictive-action-first` failed
+`an_alias_uses_the_most_restrictive_action_across_both_identities`;
+`kernel-http-decision/grant-route-without-principal` failed
+`a_permission_route_never_grants_an_anonymous_caller`;
+`kernel-route-match/prefix-match-alias-request-path` failed
+`an_alias_never_inherits_a_broad_prefix_permission_from_its_request_path`;
+and `kernel-enforcement-effect/shadow-denial-allows` failed
+`a_route_or_default_denial_is_observed_only_in_shadow_mode`. Mutant rebuilds
+took 74–665 seconds on a shared workstation, including waits for a build slot.
+This is review evidence, not a substitute for the controller's report.
+
 On GitHub-hosted runners, two nightly campaigns of the eight-mutant registry
 on `main`, on 2026-10-13 and 2026-10-20, took 1,358 and 2,232 seconds. Their
 baseline builds took 284 and 467 seconds, and mutant rebuilds 133–228
-seconds. At those rates 17 mutants take about 2,550–4,350 seconds, and the 21
-after the static egress adoption about 3,080–5,260 seconds, inside the
-7,200-second campaign bound and the 150-minute job. With a baseline like
-those, rebuilds of 21 mutants would have to average about 320 seconds to
-exceed the bound, against about 390 for 17. The controller then fails the
-campaign as timed out rather than reporting a partial score. Re-measure before
+seconds. At those rates 17 mutants were projected at about 2,550–4,350
+seconds, and the 21 after the static egress adoption at about 3,080–5,260
+seconds, inside the 7,200-second campaign bound and the then 150-minute job.
+
+The 21-mutant registry measured slower than that projection. Seven scheduled
+campaigns of it on `main` at `cffd168`, from 2026-10-29 to 2026-11-04, all
+passed, and their campaign step took 5,166–6,733 seconds: 72–94% of the
+7,200-second bound. With baselines like the earlier 284–467 seconds, that is
+about 225–310 seconds a mutant. At those rates the 28 mutants after the
+HTTP-lane adoption take about 6,700–8,900 seconds, and four of those seven
+runs would have passed 7,200 seconds, which the controller fails as timed out
+rather than reporting a partial score. The scheduled workflow therefore passes
+`--campaign-seconds 12600` (3.5 hours), and its job timeout rose from 150 to
+240 minutes, so the job keeps 30 minutes for tool setup and the report upload.
+The controller is unchanged: its default stays 7,200 seconds, and the
+per-build, per-test and memory limits are its defaults. At the slowest
+measured rate, 12,600 seconds holds a baseline and about 39 mutants. These
+estimates come from the campaign step's wall time; the first scheduled
+campaign after merge measures the 28-mutant registry itself. Re-measure before
 adding more mutations.
 
 ## Survivor review and baseline ownership
 
 The checked-in registry is the reviewed baseline, with no exceptions initially.
-Maintainers responsible for the selected path, egress and evaluator decisions
-own recurring failures. The contributor changing a selected function must
-reconcile its source hash, selected tests and measured outcomes in that same
-review. The [pull-request registry check](#pull-request-registry-check)
+Maintainers responsible for the selected path, egress, evaluator and RBAC
+matcher decisions own recurring failures. The contributor changing a selected
+function must reconcile its source hash, selected tests and measured outcomes
+in that same review. The [pull-request registry check](#pull-request-registry-check)
 enforces the registry part of that rule before merge. A scheduled failure is
 not resolved merely by rerunning until green.
 
@@ -441,7 +506,8 @@ manual dispatch without input overrides. The job requires the upstream
 or manual event. Checkout uses the exact event SHA with persisted credentials
 disabled. The workflow grants only `contents: read`, uses immutable action
 references, installs the pinned build tools, tests controller failure handling
-and workflow trust boundaries, then runs the complete registry.
+and workflow trust boundaries, then runs the complete registry under the
+12,600-second campaign bound.
 
 Pull requests run only the registry checks above; no mutant is built or
 measured on a pull request. The existing

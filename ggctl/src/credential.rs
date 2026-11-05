@@ -133,6 +133,11 @@ pub(crate) enum FilePermissions {
     /// may be sent or whom a role trusts, so whoever can change or replace
     /// it gets that decision.
     TrustAnchor,
+    /// Any mode: a document a command only sends for a judgement or checks
+    /// itself (`ggctl policy`, `ggctl evidence verify`), which grants
+    /// nothing and decides where nothing is sent, so what another account
+    /// could do to it changes only what is reported about it.
+    Unrestricted,
 }
 
 /// Reads a whole regular file of at most `maximum` bytes into memory that is
@@ -187,6 +192,7 @@ fn permissions_are_safe(metadata: &std::fs::Metadata, permissions: FilePermissio
     let forbidden = match permissions {
         FilePermissions::OwnerOnly => 0o077,
         FilePermissions::NotWritableByOthers | FilePermissions::TrustAnchor => 0o022,
+        FilePermissions::Unrestricted => 0,
     };
     metadata.permissions().mode() & forbidden == 0
 }

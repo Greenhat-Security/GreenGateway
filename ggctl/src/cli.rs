@@ -4,8 +4,8 @@
 //! (`help.rs`), manual pages (`man.rs`) and shell completion
 //! (`completion.rs`) are generated from it, and the parser accepts exactly
 //! what it lists, so the four cannot drift. A command family (`ggctl ledger`,
-//! `ggctl backup`) is a name whose commands are listed in the table under
-//! their full names (`ledger seed`, `backup create`).
+//! `ggctl backup`, `ggctl policy`) is a name whose commands are listed in the
+//! table under their full names (`ledger seed`, `backup create`).
 //!
 //! Before anything else the parser refuses any argument that looks like a
 //! secret-carrying or verification-disabling option, wherever it appears, so
@@ -22,13 +22,18 @@ use crate::{
 /// What an argument or option value holds; completion uses it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ValueKind {
-    /// A local file path.
+    /// A local path: a file for an option; for an argument, the bundle
+    /// directory (`BUNDLE`) or a backup archive.
     Path,
+    /// A local file read as one document.
+    File,
     /// A URL.
     Url,
     /// A whole number of seconds.
     Seconds,
-    /// A document version string.
+    /// A whole number.
+    Number,
+    /// A document version string, an identifier or an ETag.
     Text,
     /// One of a fixed set of words.
     Choice(&'static [&'static str]),
@@ -110,6 +115,7 @@ impl FamilySpec {
 pub(crate) const FORMAT_HUMAN: &str = "human";
 pub(crate) const FORMAT_JSON: &str = "json";
 pub(crate) const FORMAT_SARIF: &str = "sarif";
+pub(crate) const FORMAT_JUNIT: &str = "junit";
 
 pub(crate) const SHELLS: &[&str] = &["bash", "zsh", "fish", "powershell"];
 pub(crate) const SCHEMA_KINDS: &[&str] = &[
@@ -168,6 +174,11 @@ const COMMAND_NAMES: &[&str] = &[
     "backup create",
     "backup verify",
     "backup restore",
+    "policy lint",
+    "policy test",
+    "policy explain",
+    "policy replay",
+    "evidence verify",
     "completion",
     "help",
 ];
@@ -184,13 +195,21 @@ pub(crate) const HELP_TOPICS: &[&str] = &[
     "diff",
     "ledger",
     "backup",
+    "policy",
+    "evidence",
     "completion",
     "help",
 ];
 const LEDGER_COMMANDS: &[&str] = &["seed", "verify", "rollback"];
 const BACKUP_COMMANDS: &[&str] = &["create", "verify", "restore"];
-/// The second word of every family's commands, once each, for `ggctl help`.
-const SUBCOMMANDS: &[&str] = &["seed", "verify", "rollback", "create", "restore"];
+const POLICY_COMMANDS: &[&str] = &["lint", "test", "explain", "replay"];
+const EVIDENCE_COMMANDS: &[&str] = &["verify"];
+/// The second word of every family's commands, once each, which
+/// `ggctl help FAMILY SUBCOMMAND` accepts; the family decides which of them
+/// it has.
+const SUBCOMMANDS: &[&str] = &[
+    "seed", "verify", "rollback", "create", "restore", "lint", "test", "explain", "replay",
+];
 
 const FORMAT: OptionSpec = OptionSpec {
     name: "--format",
@@ -356,6 +375,90 @@ const REPLACE_EXISTING_STATE: OptionSpec = OptionSpec {
     help: "replace the stores a stopped state directory holds; it must hold nothing but the state-directory layout's entries",
 };
 
+/// `--server` for a command that has no offline form.
+const REQUIRED_SERVER: OptionSpec = OptionSpec {
+    name: "--server",
+    value: Some(("URL", ValueKind::Url)),
+    repeatable: false,
+    help: "the admin API base (required), https://HOST[:PORT]/v1<ADMIN_PREFIX>; plain http only for a loopback IP literal",
+};
+const POLICY_TEST_FORMAT: OptionSpec = OptionSpec {
+    name: "--format",
+    value: Some((
+        "FORMAT",
+        ValueKind::Choice(&[FORMAT_HUMAN, FORMAT_JSON, FORMAT_JUNIT]),
+    )),
+    repeatable: false,
+    help: "human (default), json (one GgctlReport document) or junit (the gateway's JUnit XML report) on standard output",
+};
+const CANDIDATE: OptionSpec = OptionSpec {
+    name: "--candidate",
+    value: Some(("FILE", ValueKind::File)),
+    repeatable: false,
+    help: "a complete policy document to judge instead of the active policy, sent as its exact bytes and never stored",
+};
+const DRAFT: OptionSpec = OptionSpec {
+    name: "--draft",
+    value: Some(("ID", ValueKind::Text)),
+    repeatable: false,
+    help: "one of your server-side policy drafts to judge instead of the active policy, with --draft-etag",
+};
+const DRAFT_ETAG: OptionSpec = OptionSpec {
+    name: "--draft-etag",
+    value: Some(("ETAG", ValueKind::Text)),
+    repeatable: false,
+    help:
+        "the draft's ETag, quotes included, as the drafts API returned it (required with --draft)",
+};
+const BASE_ETAG: OptionSpec = OptionSpec {
+    name: "--base-etag",
+    value: Some(("ETAG", ValueKind::Text)),
+    repeatable: false,
+    help: "the active policy's ETag, quotes included, that the replay was written against (required to start one)",
+};
+const WINDOW: OptionSpec = OptionSpec {
+    name: "--window",
+    value: Some(("FROM[/TO]", ValueKind::Text)),
+    repeatable: false,
+    help: "the audit window to replay: RFC 3339 date-times with an offset; TO defaults to when the job starts (required to start one)",
+};
+const ENFORCE_ALL_SHADOW: OptionSpec = OptionSpec {
+    name: "--enforce-all-shadow",
+    value: None,
+    repeatable: false,
+    help: "also compare with every shadow projected as enforced",
+};
+const MAX_RECORDS: OptionSpec = OptionSpec {
+    name: "--max-records",
+    value: Some(("N", ValueKind::Number)),
+    repeatable: false,
+    help: "the most audit records the job reads, 1 to 100000 (default 100000)",
+};
+const IDEMPOTENCY_KEY: OptionSpec = OptionSpec {
+    name: "--idempotency-key",
+    value: Some(("KEY", ValueKind::Text)),
+    repeatable: false,
+    help: "1 to 128 letters, digits, '.', '_', ':' or '-': the same request under the same key answers with the job it started",
+};
+const JOB: OptionSpec = OptionSpec {
+    name: "--job",
+    value: Some(("ID", ValueKind::Text)),
+    repeatable: false,
+    help: "read the replay job ID instead of starting one",
+};
+const CANCEL: OptionSpec = OptionSpec {
+    name: "--cancel",
+    value: Some(("ID", ValueKind::Text)),
+    repeatable: false,
+    help: "cancel the replay job ID, or discard it once it has finished",
+};
+const WAIT: OptionSpec = OptionSpec {
+    name: "--wait",
+    value: None,
+    repeatable: false,
+    help: "poll the job until it finishes, for at most 10 minutes",
+};
+
 pub(crate) const FAMILIES: &[FamilySpec] = &[
     FamilySpec {
         name: "ledger",
@@ -387,6 +490,35 @@ pub(crate) const FAMILIES: &[FamilySpec] = &[
         ],
         commands: BACKUP_COMMANDS,
         hint: "run `ggctl help backup` for the backup commands",
+    },
+    FamilySpec {
+        name: "policy",
+        summary: "Lint, test, explain and replay policy with a gateway's own evaluator",
+        description: &[
+            "The policy commands send a policy document, a test suite, simulation cases or a \
+             replay request to the gateway --server names, and report what its own validator and \
+             evaluator answer (docs/policy-tests.md, docs/policy-simulation.md, \
+             docs/policy-replay.md). Nothing is judged in ggctl, so nothing can disagree with \
+             the gateway. None of them stores, publishes or activates a policy: lint, test and \
+             explain are side-effect free, and replay starts, reads or cancels a bounded job \
+             that reads the gateway's audit log.",
+            "Each needs an admin bearer token with admin:policy:read; test, explain and replay \
+             also need admin:policy:simulate, and replay admin:audit:read.",
+        ],
+        commands: POLICY_COMMANDS,
+        hint: "run `ggctl help policy` for the policy commands",
+    },
+    FamilySpec {
+        name: "evidence",
+        summary: "Verify a policy evidence package offline",
+        description: &[
+            "Checks a policy evidence package a gateway produced (docs/policy-evidence.md), \
+             with no network request: its manifest, each artifact's ADR-0004 digest, size and \
+             media type. Packages are unsigned, so a verified package is integrity_valid and \
+             unsigned, never trusted.",
+        ],
+        commands: EVIDENCE_COMMANDS,
+        hint: "run `ggctl help evidence` for the evidence commands",
     },
 ];
 
@@ -690,6 +822,168 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         run: crate::backup::restore,
     },
     CommandSpec {
+        name: "policy lint",
+        summary: "Validate a policy document with a gateway's own policy validator",
+        description: &[
+            "Sends the policy document in FILE, as its exact bytes, to the gateway's \
+             POST <server>/policy/validate (permission admin:policy:read) and reports what its \
+             validator found: every diagnostic with its stable code, severity, JSON Pointer, \
+             element ID and the uses it blocks, the document's source and semantic digests, and \
+             the resources its cross-resource checks read. The document is judged as the \
+             replacement of the active policy, for this caller, and never stored.",
+            "Exits 0 for a valid document, 3 for an invalid one (or a warning or risk with \
+             --warnings-as-errors), 2 for a FILE that is not a regular file, 8 when the token \
+             is refused, 6 when the gateway is unavailable and 1 when FILE could not be read \
+             or the request failed. --format sarif reports each diagnostic as a result located \
+             by its JSON Pointer.",
+        ],
+        arguments: &[ArgumentSpec {
+            name: "FILE",
+            kind: ValueKind::File,
+            required: true,
+            help: "the policy document to validate, at most 2 MiB",
+        }],
+        options: &[
+            REQUIRED_SERVER,
+            WARNINGS_AS_ERRORS,
+            CA_FILE,
+            TOKEN_STDIN,
+            TOKEN_FILE,
+            TIMEOUT,
+            VALIDATE_FORMAT,
+        ],
+        run: crate::policy::lint,
+    },
+    CommandSpec {
+        name: "policy test",
+        summary: "Run a policy test suite on a gateway",
+        description: &[
+            "Sends the policy-tests.v1 suite in SUITE to the gateway's \
+             POST <server>/policy/tests/runs (permissions admin:policy:read and \
+             admin:policy:simulate), which decides every case with the evaluator live traffic \
+             uses, against the active policy, a complete --candidate document sent as its exact \
+             bytes, or one of your drafts (--draft and --draft-etag). Nothing is stored or \
+             activated.",
+            "Exits 0 when every case passed and 3 when any case failed, was left undecided or \
+             was refused (policy.tests_not_passed), or when the gateway refused the suite. \
+             --format junit writes the gateway's JUnit XML report as it was answered, and \
+             diagnostics to standard error.",
+        ],
+        arguments: &[ArgumentSpec {
+            name: "SUITE",
+            kind: ValueKind::File,
+            required: true,
+            help: "the policy-tests.v1 suite, at most 2 MiB",
+        }],
+        options: &[
+            REQUIRED_SERVER,
+            CANDIDATE,
+            DRAFT,
+            DRAFT_ETAG,
+            CA_FILE,
+            TOKEN_STDIN,
+            TOKEN_FILE,
+            TIMEOUT,
+            POLICY_TEST_FORMAT,
+        ],
+        run: crate::policy::test,
+    },
+    CommandSpec {
+        name: "policy explain",
+        summary: "Explain how a gateway's policy decides hypothetical cases",
+        description: &[
+            "Sends the policy-simulation.v1 request in CASES, as its exact bytes, to the \
+             gateway's POST <server>/policy/simulations (permissions admin:policy:read and \
+             admin:policy:simulate) and reports, for each case and projection, what the policy \
+             decided, whether a denial is enforced or only shadowed, what the request would meet \
+             and the stable reason, under the candidate and the pinned base the request names. \
+             The request carries its own base_etag, candidate and trace level. Nothing is stored \
+             or activated, and no live state is read or charged.",
+            "Exits 0 when the simulation completed, 3 when the gateway refused the request and \
+             5 when its base_etag or draft is stale.",
+        ],
+        arguments: &[ArgumentSpec {
+            name: "CASES",
+            kind: ValueKind::File,
+            required: true,
+            help: "the policy-simulation.v1 request, at most 2 MiB",
+        }],
+        options: &[
+            REQUIRED_SERVER,
+            CA_FILE,
+            TOKEN_STDIN,
+            TOKEN_FILE,
+            TIMEOUT,
+            FORMAT,
+        ],
+        run: crate::policy::explain,
+    },
+    CommandSpec {
+        name: "policy replay",
+        summary: "Start, read or cancel a historical policy replay job on a gateway",
+        description: &[
+            "Starts a replay job with POST <server>/policy/replays (permissions \
+             admin:policy:read, admin:policy:simulate and admin:audit:read): the gateway decides \
+             the audit records of --window again under a candidate (the active policy, a \
+             complete --candidate document or one of your drafts) and under the active policy \
+             --base-etag pins, and reports what changed as counts. --job reads a job and \
+             --cancel cancels or discards one. --wait polls the job until it finishes. A start \
+             is never resent: when its answer is lost the job may exist, and the same request \
+             under the same --idempotency-key answers with it.",
+            "Exits 0 when the job was started, read, cancelled or, with --wait, completed; 3 \
+             when it completed incomplete, which satisfies no gate; 5 when --base-etag or the \
+             draft is stale or the active policy changed under the finished job; and 1 when it \
+             failed, was cancelled or expired, did not finish within the wait, or the answer to \
+             a start was lost.",
+        ],
+        arguments: &[],
+        options: &[
+            REQUIRED_SERVER,
+            BASE_ETAG,
+            WINDOW,
+            CANDIDATE,
+            DRAFT,
+            DRAFT_ETAG,
+            ENFORCE_ALL_SHADOW,
+            MAX_RECORDS,
+            IDEMPOTENCY_KEY,
+            JOB,
+            CANCEL,
+            WAIT,
+            CA_FILE,
+            TOKEN_STDIN,
+            TOKEN_FILE,
+            TIMEOUT,
+            FORMAT,
+        ],
+        run: crate::policy::replay,
+    },
+    CommandSpec {
+        name: "evidence verify",
+        summary: "Verify a policy evidence package's integrity offline",
+        description: &[
+            "Reads the policy evidence package in PACKAGE, at most 4 MiB, and checks it with no \
+             network request: that it is exactly the RFC 8785 bytes a gateway serves, that its \
+             envelope is a policy-evidence.v1 envelope whose manifest names each artifact once, \
+             in order, with the media type and schema version its name defines, that the \
+             package holds every artifact the manifest names and nothing else, and that each \
+             artifact's size and ADR-0004 digest are the ones its entry states.",
+            "Packages are unsigned: a package that passes is reported as integrity_valid and \
+             unsigned, which shows it is unchanged since its manifest was computed but not who \
+             computed it, and never as trusted. Exits 0 when it passes, 7 when it fails, 3 for \
+             a version or artifact this ggctl does not verify, 2 for a PACKAGE that is not a \
+             regular file and 1 when it could not be read.",
+        ],
+        arguments: &[ArgumentSpec {
+            name: "PACKAGE",
+            kind: ValueKind::File,
+            required: true,
+            help: "the package file, as the gateway served it",
+        }],
+        options: &[FORMAT],
+        run: crate::evidence::verify,
+    },
+    CommandSpec {
         name: "completion",
         summary: "Write a shell completion script",
         description: &[
@@ -711,7 +1005,8 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         summary: "Print help for ggctl or one command",
         description: &[
             "Prints the help for COMMAND, or the overview without one. For a command family \
-             such as ledger or backup, prints the family's commands, or with SUBCOMMAND that command's help.",
+             such as ledger, backup or policy, prints the family's commands, or with \
+             SUBCOMMAND that command's help.",
             "With --man, prints the same text as a manual page in man(7) roff: ggctl(1) for \
              the overview, ggctl-COMMAND(1) for a command or family and \
              ggctl-COMMAND-SUBCOMMAND(1) for a family's command. The release archives carry \
@@ -1042,7 +1337,7 @@ fn checked_value(kind: ValueKind, value: &OsStr, position: usize) -> Result<OsSt
     if value.is_empty() {
         return Err(Diagnostic::at(Code::InvalidValue, position));
     }
-    if kind == ValueKind::Path {
+    if matches!(kind, ValueKind::Path | ValueKind::File) {
         return Ok(value.to_owned());
     }
     let Some(text) = value.to_str() else {
