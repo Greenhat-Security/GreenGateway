@@ -9,9 +9,10 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 
 use super::*;
+use crate::auth::change_actor::{ActorKind, ChangeActor};
 use crate::auth::AuthMethod;
 use crate::rbac::Policy;
-use crate::storage::change_evidence::{ChangeActor, DocumentAction, DocumentChange};
+use crate::storage::change_evidence::{DocumentAction, DocumentChange};
 use crate::storage::contract_tests::postgres_audit_tests::{
     create_test_database, locator, write_dsn_file, TestDatabase, DATABASE,
 };
@@ -25,6 +26,11 @@ const MIGRATION_23: &str = include_str!("migrations/0023_document_and_catalog_ch
 /// Migration 29 replaces migration 23's `action` and `resource_type` CHECKs,
 /// so the vocabulary in force is the one it adds.
 const MIGRATION_29: &str = include_str!("migrations/0029_policy_test_suites.sql");
+/// Migration 32 widens migration 23's `actor_kind` CHECK to migration 24's
+/// vocabulary and pairs every new row's kind with its auth mode.
+const MIGRATION_32: &str =
+    include_str!("migrations/0032_document_and_catalog_evidence_journal.sql");
+const MIGRATION_24: &str = include_str!("migrations/0024_authority_evidence_actor_metadata.sql");
 
 const ALL_ACTIONS: [DocumentAction; 10] = [
     DocumentAction::PolicyPublish,
@@ -144,15 +150,44 @@ fn actor_vocabulary_and_bounds_are_the_migrations() {
     ]
     .iter()
     .map(|method| method.audit_mode().to_owned())
-    .chain([ChangeActor::System { label: "bootstrap" }
-        .auth_mode()
-        .to_owned()])
+    .chain([ChangeActor::system("bootstrap").auth_mode().to_owned()])
     .collect::<BTreeSet<_>>();
     assert_eq!(auth_modes, document_check_values("actor_auth_mode"));
+    // Migration 23's own kinds, which rows committed before migration 32
+    // keep, and migration 32's, which are migration 24's: every kind a
+    // writer records.
     assert_eq!(
         document_check_values("actor_kind"),
         BTreeSet::from(["principal".to_owned(), "system".to_owned()])
     );
+    let alter = MIGRATION_32
+        .split("ALTER TABLE greengateway.document_change_evidence")
+        .nth(1)
+        .expect("migration 32 alters document_change_evidence");
+    assert_eq!(
+        quoted_values(alter, "actor_kind", "migration 32"),
+        [
+            ActorKind::Principal,
+            ActorKind::ServiceToken,
+            ActorKind::System
+        ]
+        .iter()
+        .map(|kind| kind.as_str().to_owned())
+        .collect::<BTreeSet<_>>()
+    );
+    // New rows pair kind and auth mode exactly as migration 24's tables do,
+    // and the pairing holds only for rows written from now on.
+    let words = |sql: &str| sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    let (alter_words, migration_24_words) = (words(alter), words(MIGRATION_24));
+    for pairing in [
+        "(actor_kind = 'principal' AND actor_auth_mode IN ('bearer_token', 'session_cookie', 'client_certificate'))",
+        "(actor_kind = 'service_token' AND actor_auth_mode = 'service_token' AND actor_issuer IS NULL)",
+        "(actor_kind = 'system' AND actor_auth_mode = 'system' AND actor_issuer IS NULL)",
+    ] {
+        assert!(alter_words.contains(pairing), "{pairing}");
+        assert!(migration_24_words.contains(pairing), "{pairing}");
+    }
+    assert!(alter.contains(") NOT VALID;"));
     assert!(MIGRATION_23.contains(&format!(
         "octet_length(actor_user_id) BETWEEN 1 AND {EVIDENCE_ACTOR_MAX_BYTES}"
     )));
@@ -161,36 +196,56 @@ fn actor_vocabulary_and_bounds_are_the_migrations() {
     )));
 }
 
+/// A document change records its actor as every other authority-evidence
+/// writer does (`ChangeActor::from_principal`): the canonical issuer, and a
+/// service-token caller as its own kind.
 #[test]
-fn a_principal_actor_records_what_the_principal_carries() {
+fn a_principal_actor_records_migration_24s_vocabulary() {
     let mut principal = crate::auth::Principal {
         user_id: "alice".to_owned(),
-        issuer: Some("https://issuer.example".to_owned()),
+        issuer: Some(" https://issuer.example/ ".to_owned()),
         email: None,
         org_id: None,
         roles: vec!["admin".to_owned()],
         session_id: "session".to_owned(),
         auth_method: AuthMethod::Cookie,
     };
-    let actor = ChangeActor::principal(&principal);
-    assert_eq!(actor.kind(), "principal");
-    assert_eq!(actor.user_id(), "alice");
+    let actor = DocumentChange::by_principal(DocumentAction::PolicyPublish, &principal).actor;
+    assert_eq!(actor.kind(), ActorKind::Principal);
+    assert_eq!(actor.subject(), "alice");
     assert_eq!(actor.issuer(), Some("https://issuer.example"));
     assert_eq!(actor.auth_mode(), "session_cookie");
+    assert!(actor.is_recordable());
 
     // An empty issuer names no issuer.
     principal.issuer = Some(String::new());
-    assert_eq!(ChangeActor::principal(&principal).issuer(), None);
+    let actor = DocumentChange::by_principal(DocumentAction::PolicyPublish, &principal).actor;
+    assert_eq!(actor.issuer(), None);
 
-    let system = ChangeActor::System { label: "bootstrap" };
+    let token = DocumentChange::by_principal(
+        DocumentAction::ToolsPublish,
+        &crate::auth::Principal {
+            user_id: "service-token:token_1".to_owned(),
+            issuer: None,
+            auth_method: AuthMethod::ServiceToken,
+            ..principal.clone()
+        },
+    )
+    .actor;
+    assert_eq!(
+        (token.kind(), token.auth_mode(), token.issuer()),
+        (ActorKind::ServiceToken, "service_token", None)
+    );
+
+    let system = DocumentChange::system(DocumentAction::ToolsPublish, "bootstrap").actor;
     assert_eq!(
         (
             system.kind(),
-            system.user_id(),
+            system.subject(),
             system.issuer(),
             system.auth_mode()
         ),
-        ("system", "bootstrap", None, "system")
+        (ActorKind::System, "bootstrap", None, "system")
     );
 }
 
@@ -316,11 +371,11 @@ fn tools_document(names: &[&str]) -> Value {
 static DIFF: std::sync::LazyLock<Value> =
     std::sync::LazyLock::new(|| json!({ "action": "evidence_fixture" }));
 
-fn request<'a>(
+fn request(
     precondition: PolicyCommitPrecondition,
-    candidate: &'a Policy,
-    change: DocumentChange<'a>,
-) -> PolicyCommitRequest<'a> {
+    candidate: &Policy,
+    change: DocumentChange,
+) -> PolicyCommitRequest<'_> {
     PolicyCommitRequest {
         precondition,
         candidate,
@@ -329,16 +384,34 @@ fn request<'a>(
     }
 }
 
+/// The journal as `(event_id, source)`, in position order.
+async fn journal(pool: &deadpool_postgres::Pool) -> Vec<(String, String)> {
+    pool.get()
+        .await
+        .expect("journal checkout")
+        .query(
+            "SELECT event_id::text, source FROM greengateway.authority_event_journal \
+             ORDER BY position",
+            &[],
+        )
+        .await
+        .expect("journal rows should read")
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect()
+}
+
 fn is_uuid_v4(value: &str) -> bool {
     uuid::Uuid::parse_str(value).is_ok_and(|uuid| uuid.get_version_num() == 4)
 }
 
 /// Every committed policy and tools change leaves exactly one evidence row
-/// carrying the actor as the principal presented it (kind, subject, issuer,
-/// auth mode), the operation the caller named, fresh event and operation
-/// IDs, and the versions and shared revision of its outbox row. The tools
-/// seed is the gateway's own write. Refused commits -- a stale ETag, a lost
-/// initialize race, a tool name another lane holds -- leave none.
+/// carrying the actor in migration 24's vocabulary (kind, subject, canonical
+/// issuer, auth mode), the operation the caller named, fresh event and
+/// operation IDs, and the versions and shared revision of its outbox row, and
+/// journals it under its own event ID in commit order. The tools seed is the
+/// gateway's own write. Refused commits -- a stale ETag, a lost initialize
+/// race, a tool name another lane holds -- leave none and journal none.
 #[tokio::test]
 async fn committed_document_changes_record_attributed_evidence_and_refusals_record_none() {
     let Some(admin_dsn) = locator() else {
@@ -353,7 +426,8 @@ async fn committed_document_changes_record_attributed_evidence_and_refusals_reco
 
     let alice = crate::auth::Principal {
         user_id: "alice".to_owned(),
-        issuer: Some("https://issuer.example".to_owned()),
+        // Recorded in canonical form.
+        issuer: Some("https://issuer.example/".to_owned()),
         email: None,
         org_id: None,
         roles: vec!["admin".to_owned()],
@@ -396,12 +470,11 @@ async fn committed_document_changes_record_attributed_evidence_and_refusals_reco
     .await;
     assert_eq!(stale.err(), Some(PolicyCommitError::PreconditionFailed));
     assert_eq!(count(&pool, "document_change_evidence").await, 1);
+    assert_eq!(count(&pool, "authority_event_journal").await, 1);
 
-    let bob = ChangeActor::Principal {
-        subject: "bob",
-        issuer: None,
-        auth_method: &AuthMethod::ServiceToken,
-    };
+    // A service-token caller, which migration 23's vocabulary recorded as
+    // kind `principal`.
+    let bob = ChangeActor::service_token_for_test("bob");
     let second = PolicyControlPlane::commit(
         &policies,
         request(
@@ -490,7 +563,7 @@ async fn committed_document_changes_record_attributed_evidence_and_refusals_reco
             ),
         ),
         (
-            ("principal", "bob", None, "service_token"),
+            ("service_token", "bob", None, "service_token"),
             (
                 "policy.rollback",
                 "policy",
@@ -570,6 +643,14 @@ async fn committed_document_changes_record_attributed_evidence_and_refusals_reco
         .flat_map(|row| [row.event_id.clone(), row.operation_id.clone()])
         .collect::<BTreeSet<_>>();
     assert_eq!(distinct.len(), rows.len() * 2, "no identity is reused");
+    // Each row is journaled under its own event ID, in commit order, and
+    // nothing else is: the refused commits journaled nothing.
+    assert_eq!(
+        journal(&pool).await,
+        rows.iter()
+            .map(|row| (row.event_id.clone(), "document_change_evidence".to_owned()))
+            .collect::<Vec<_>>()
+    );
 
     // The rows hold identifiers, revisions and the actor only: nothing of
     // either document.
@@ -639,6 +720,7 @@ async fn a_failed_document_evidence_insert_rolls_back_the_whole_commit() {
         .expect("revision reads");
     let outbox_before = outbox(&pool).await;
     let evidence_before = evidence(&pool).await;
+    let journal_before = journal(&pool).await;
     // The recorder is this thread's, and the test's current-thread runtime
     // runs both stores on this thread.
     let recorder = crate::audit::sink::tests::CountingRecorder::default();
@@ -726,6 +808,7 @@ async fn a_failed_document_evidence_insert_rolls_back_the_whole_commit() {
     );
     assert_eq!(outbox(&pool).await, outbox_before);
     assert_eq!(evidence(&pool).await, evidence_before);
+    assert_eq!(journal(&pool).await, journal_before);
     assert_eq!(
         policies
             .revision_source()
@@ -774,19 +857,19 @@ async fn unattributable_or_mislabeled_changes_are_refused_and_principal_bounds_a
         DocumentChange::test_policy(&too_long_subject),
         DocumentChange {
             action: DocumentAction::PolicyPublish,
-            actor: ChangeActor::Principal {
-                subject: "alice",
-                issuer: Some(""),
-                auth_method: &AuthMethod::Bearer,
-            },
+            actor: ChangeActor::for_test_with_issuer("alice", ""),
         },
         DocumentChange {
             action: DocumentAction::PolicyPublish,
-            actor: ChangeActor::Principal {
-                subject: "alice",
-                issuer: Some(&too_long_issuer),
-                auth_method: &AuthMethod::Bearer,
-            },
+            actor: ChangeActor::for_test_with_issuer("alice", &too_long_issuer),
+        },
+        // Only a principal is vouched for by an issuer.
+        DocumentChange {
+            action: DocumentAction::PolicyPublish,
+            actor: ChangeActor::service_token_with_issuer_for_test(
+                "service-token:token_1",
+                "https://issuer.example",
+            ),
         },
         // A tools action cannot describe a policy commit.
         DocumentChange::test_tools("alice"),
@@ -794,7 +877,11 @@ async fn unattributable_or_mislabeled_changes_are_refused_and_principal_bounds_a
     for change in refused {
         let outcome = PolicyControlPlane::commit(
             &policies,
-            request(PolicyCommitPrecondition::Initialize, &candidate, change),
+            request(
+                PolicyCommitPrecondition::Initialize,
+                &candidate,
+                change.clone(),
+            ),
         )
         .await;
         assert!(
@@ -806,6 +893,7 @@ async fn unattributable_or_mislabeled_changes_are_refused_and_principal_bounds_a
     assert_eq!(count(&pool, "policy_documents").await, 0);
     assert_eq!(count(&pool, "security_outbox").await, 0);
     assert_eq!(count(&pool, "document_change_evidence").await, 0);
+    assert_eq!(count(&pool, "authority_event_journal").await, 0);
 
     PolicyControlPlane::commit(
         &policies,
@@ -814,11 +902,7 @@ async fn unattributable_or_mislabeled_changes_are_refused_and_principal_bounds_a
             &candidate,
             DocumentChange {
                 action: DocumentAction::PolicyPublish,
-                actor: ChangeActor::Principal {
-                    subject: &longest_subject,
-                    issuer: Some(&longest_issuer),
-                    auth_method: &AuthMethod::Bearer,
-                },
+                actor: ChangeActor::for_test_with_issuer(&longest_subject, &longest_issuer),
             },
         ),
     )

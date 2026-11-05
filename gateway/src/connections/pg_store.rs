@@ -843,12 +843,12 @@ impl PostgresConnectionStore {
     /// addition -- the shared security revision, the connections
     /// high-water mark, the outbox row and the replacement's durable
     /// evidence (`catalog_change_evidence`, migration 23, with the whole
-    /// actor since migration 25), all in the one transaction. The evidence
-    /// outlives the catalog row it describes, which the next replacement
-    /// deletes and a Connection delete cascades; a refused or failed
-    /// replacement writes none, and a replacement whose evidence cannot be
-    /// written does not commit. The catalog row itself keeps the actor's
-    /// subject, as before.
+    /// actor since migration 25, journaled since migration 32), all in the
+    /// one transaction. The evidence outlives the catalog row it describes,
+    /// which the next replacement deletes and a Connection delete cascades;
+    /// a refused or failed replacement writes none, and a replacement whose
+    /// evidence cannot be written or journaled does not commit. The catalog
+    /// row itself keeps the actor's subject, as before.
     #[allow(clippy::too_many_arguments)]
     pub async fn replace_mcp_catalog(
         &self,
@@ -1646,7 +1646,7 @@ impl PostgresConnectionStore {
 
     /// The OpenAPI catalog replacement every OpenAPI publication goes
     /// through: a registration, a refresh, and an overlay put or delete.
-    /// Like the MCP replacement it commits its durable evidence
+    /// Like the MCP replacement it commits and journals its durable evidence
     /// (`catalog_change_evidence`, migration 23, with the whole actor since
     /// migration 25) in the same transaction, named by what the write did to
     /// the overlay: an overlay put is `catalog.overlay.replace`, an overlay
@@ -5175,17 +5175,7 @@ async fn record_change_evidence(
         &event_id,
     )
     .await
-    .map_err(|error| {
-        use crate::storage::postgres_authority_events::{
-            JournalAppendError, OPERATION_JOURNAL_APPEND,
-        };
-        match error {
-            JournalAppendError::CapacityExhausted => ConnectionStoreError::Unavailable {
-                operation: OPERATION_JOURNAL_APPEND,
-            },
-            JournalAppendError::Store(error) => pg_error(OPERATION_JOURNAL_APPEND, error),
-        }
-    })
+    .map_err(journal_failure)
 }
 
 /// The closed action vocabulary of `catalog_change_evidence` (migration
@@ -5217,14 +5207,16 @@ struct CatalogChangeEvidence<'a> {
     actor: &'a crate::auth::change_actor::ChangeActor,
 }
 
-/// Append one catalog evidence row inside the caller's transaction. The
-/// row's `event_id` is minted here, once; `committed_at` is the database
-/// clock's. The actor is recorded whole, as [`record_change_evidence`]
-/// records it: subject, canonical issuer, kind and auth mode, in migration
-/// 25's columns under migration 24's pairing CHECK. Any failure is returned
-/// for the caller to roll back, so the publication it describes never
-/// commits without it. A failed insert is counted here, as the journaled
-/// producers count theirs.
+/// Append one catalog evidence row inside the caller's transaction, and
+/// journal it for delivery (migration 32). The row's `event_id` is minted
+/// here, once, and the journal carries the same one; `committed_at` is the
+/// database clock's. The actor is recorded whole, as
+/// [`record_change_evidence`] records it: subject, canonical issuer, kind and
+/// auth mode, in migration 25's columns under migration 24's pairing CHECK.
+/// Any failure is returned for the caller to roll back, so the publication
+/// it describes never commits without both rows. A full journal refuses the
+/// publication as unavailable rather than evict an accepted event. A failed
+/// insert is counted here, a failed or refused append by the journal.
 async fn record_catalog_change_evidence(
     client: &deadpool_postgres::Object,
     evidence: &CatalogChangeEvidence<'_>,
@@ -5272,7 +5264,27 @@ async fn record_catalog_change_evidence(
             crate::storage::postgres_authority_events::record_evidence_failure();
             pg_error(OPERATION_CATALOG_CHANGE_EVIDENCE, error)
         })?;
-    Ok(())
+    crate::storage::postgres_authority_events::append_to_journal(
+        client,
+        crate::storage::postgres_authority_events::JournalSource::CatalogChange,
+        &event_id,
+    )
+    .await
+    .map_err(journal_failure)
+}
+
+/// A full journal refuses the change as unavailable (`503`); a failed append
+/// is classified like any other statement of the change.
+fn journal_failure(
+    error: crate::storage::postgres_authority_events::JournalAppendError,
+) -> ConnectionStoreError {
+    use crate::storage::postgres_authority_events::{JournalAppendError, OPERATION_JOURNAL_APPEND};
+    match error {
+        JournalAppendError::CapacityExhausted => ConnectionStoreError::Unavailable {
+            operation: OPERATION_JOURNAL_APPEND,
+        },
+        JournalAppendError::Store(error) => pg_error(OPERATION_JOURNAL_APPEND, error),
+    }
 }
 
 /// Open a mutating transaction: `BEGIN`, then immediately take the one
