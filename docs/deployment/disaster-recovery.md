@@ -6,7 +6,7 @@ Use [operational alerts](operational-alerts.md) to identify the failing signal a
 
 **The rule: the deployment is the database plus the secret store plus the static configuration. Rebuild all three or you have not rebuilt the deployment.** Gateway replicas are disposable and hold nothing durable; they are the easy part and they are not the part that fails.
 
-This runbook is for the case where the primary is gone and is not coming back — a destroyed instance, a lost region, a database whose data is unrecoverable. For a primary that is merely down or has failed over to a standby, use [the failover runbook](failover.md). For rewinding a database that is intact but wrong, use [the backup and recovery runbook](backup-and-recovery.md).
+This runbook is for the case where the primary is gone and is not coming back — a destroyed instance, a lost region, a database whose data is unrecoverable. For a primary that is merely down or has failed over to a standby, use [the failover runbook](failover.md). For rewinding a database that is intact but wrong, use [the backup and recovery runbook](backup-and-recovery.md). A standalone deployment, whose stores live in one state directory rather than PostgreSQL, has its own [standalone disaster-recovery runbook](standalone-disaster-recovery.md).
 
 ## What must exist to rebuild
 
