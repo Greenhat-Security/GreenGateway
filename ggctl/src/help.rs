@@ -231,6 +231,16 @@ mod tests {
             .find(|command| command.name == "backup verify")
             .expect("backup verify");
         assert_eq!(usage(verify), "ggctl backup verify FILE [OPTIONS]");
+        let lint = COMMANDS
+            .iter()
+            .find(|command| command.name == "policy lint")
+            .expect("policy lint");
+        assert_eq!(usage(lint), "ggctl policy lint FILE [OPTIONS]");
+        let replay = COMMANDS
+            .iter()
+            .find(|command| command.name == "policy replay")
+            .expect("policy replay");
+        assert_eq!(usage(replay), "ggctl policy replay [OPTIONS]");
     }
 
     #[test]

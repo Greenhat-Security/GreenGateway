@@ -11287,7 +11287,7 @@ pub(crate) mod postgres_audit_tests {
             members[0].capabilities,
             "delegated_token_purges,openapi_discovery_catalogs,openapi_swagger2_catalogs,\
              operation_requirements,policy_document_v1,policy_role_descriptions,\
-             policy_rule_conditions"
+             policy_rule_conditions,policy_tool_argument_conditions"
         );
         assert!(RecognizedCapabilities::parse(&members[0].capabilities)
             .contains(Capability::OperationRequirements));
@@ -11303,6 +11303,8 @@ pub(crate) mod postgres_audit_tests {
             .contains(Capability::PolicyDocumentV1));
         assert!(RecognizedCapabilities::parse(&members[0].capabilities)
             .contains(Capability::PolicyRuleConditions));
+        assert!(RecognizedCapabilities::parse(&members[0].capabilities)
+            .contains(Capability::PolicyToolArgumentConditions));
         assert_eq!(
             (
                 members[0].document_version_min,
@@ -11338,7 +11340,7 @@ pub(crate) mod postgres_audit_tests {
             store.members(window).await.expect("members")[0].capabilities,
             "delegated_token_purges,openapi_discovery_catalogs,openapi_swagger2_catalogs,\
              operation_requirements,policy_document_v1,policy_role_descriptions,\
-             policy_rule_conditions"
+             policy_rule_conditions,policy_tool_argument_conditions"
         );
 
         let older = insert_pre_protocol_member(&pool).await;

@@ -27,7 +27,10 @@ use tower::ServiceExt;
 
 use super::{
     evaluate::{evaluate_http, evaluate_tool, HttpReplayLimitation, HttpReplayOutcome},
-    impact::{compare_recorded, http_answer, tool_answer, RecordedComparison, ReplayPolicy},
+    impact::{
+        compare_recorded, http_answer, tool_answer, RecordedComparison, RecordedProvenance,
+        ReplayPolicy,
+    },
     legacy::{adapt_audit_event, LegacyRecord},
     HostRecord, McpIdentity, PrincipalRecord, RecordedPolicy, RecordedPrincipal, ReplayFacts,
     RoutingRecord,
@@ -37,7 +40,9 @@ use crate::{
     auth::{AuthMethod, Principal},
     client_ip::ClientIpPolicy,
     middleware::{
-        decision::{AuthOutcome, PolicyDecision, PolicyDecisionOutcome},
+        decision::{
+            AuthOutcome, PolicyDecision, PolicyDecisionOutcome, POLICY_DECISION_FACTS_MEMBER,
+        },
         observation::{observation_middleware, ObservationState},
         rbac::{rbac_middleware, RbacState},
     },
@@ -270,9 +275,19 @@ fn expected_principal(principal: Option<&Principal>) -> PrincipalRecord {
     })
 }
 
-fn expected_routing(classification: &Classification, path: &str) -> RoutingRecord {
+/// The routing a record states. An alias is stated only by decision facts.
+fn expected_routing(
+    classification: &Classification,
+    path: &str,
+    with_decision_facts: bool,
+) -> RoutingRecord {
     match classification {
         Classification::Unclassified => RoutingRecord::NotRecorded,
+        Classification::Local if path == ALIAS && with_decision_facts => {
+            RoutingRecord::Local(McpIdentity::Alias {
+                canonical_path: crate::auth::protected_resource::MCP_RESOURCE_PATH.to_owned(),
+            })
+        }
         Classification::Local if path == ALIAS => RoutingRecord::Local(McpIdentity::NotRecorded),
         Classification::Local => RoutingRecord::Local(McpIdentity::Canonical),
         Classification::Dispatch(context) => RoutingRecord::ProxyDispatch(DispatchFacts {
@@ -307,6 +322,7 @@ async fn replayed_http_decisions_are_the_live_middleware_decisions() {
     let mut alias_indeterminate = 0_usize;
     let mut unclassified = 0_usize;
     let mut indexed = 0_usize;
+    let mut with_recorded_facts = 0_usize;
     let mut outcomes = HashMap::<&'static str, usize>::new();
     for mode in ["enforce", "shadow"] {
         let policy = http_policy(mode);
@@ -378,6 +394,7 @@ async fn replayed_http_decisions_are_the_live_middleware_decisions() {
         })
         .await;
 
+        let base_etag = crate::policy_etag(&policy).expect("the live test policy has an ETag");
         for request in &requests {
             let observation = events
                 .iter()
@@ -386,140 +403,189 @@ async fn replayed_http_decisions_are_the_live_middleware_decisions() {
                         && event.request_id == request.request_id
                 })
                 .expect("every request is observed");
-            let LegacyRecord::Replayable(context) = adapt_audit_event(observation) else {
-                panic!("{} is replayable", request.request_id);
-            };
-            let ReplayFacts::Http(facts) = &context.facts else {
-                panic!("an HTTP observation has HTTP facts");
-            };
-            let label = format!(
-                "{mode} {} {} host={:?} principal={:?}",
-                request.method,
-                request.path,
-                request.host,
-                request
-                    .principal
-                    .as_ref()
-                    .map(|principal| &principal.user_id)
-            );
-            // The facts are the request's, field by field.
-            assert_eq!(facts.method, request.method, "{label}");
-            assert_eq!(facts.path, request.path, "{label}");
-            assert!(
-                facts.principal == expected_principal(request.principal.as_ref()),
-                "{label}"
-            );
-            assert!(
-                facts.request_host
-                    == request
-                        .host
-                        .map_or(HostRecord::Absent, |host| HostRecord::Present(
-                            host.to_owned()
-                        )),
-                "{label}"
-            );
-            assert!(
-                facts.routing == expected_routing(&request.classification, request.path),
-                "{label}"
-            );
-            // The recorded result is the live decision.
             let live = &request.decision;
+            // Every verdict carries its facts; a request the policy stage
+            // refused to answer carries none.
             assert_eq!(
-                context.recorded.policy,
-                recorded_policy(live.outcome),
-                "{label}"
+                live.facts.is_some(),
+                live.reason != "policy_evaluation_incomplete",
+                "{} {}",
+                request.method,
+                request.path
             );
-            assert_eq!(
-                context.recorded.reason.as_deref(),
-                Some(live.reason),
-                "{label}"
-            );
-            assert_eq!(
-                context.recorded.matched_rule_id, live.matched_rule_id,
-                "{label}"
-            );
-            assert_eq!(context.recorded.permission, live.permission, "{label}");
-            assert_eq!(context.recorded.path_prefix, live.path_prefix, "{label}");
-            // The impact comparison reads the same record against the same
-            // policy and finds what was recorded.
-            let comparison = compare_recorded(
-                &replay_policy,
-                http_answer(&replay_policy, facts).expect("a recorded request is answered"),
-                &context.recorded,
-                context.source,
-            );
-
-            match evaluate_http(&compiled, facts).expect("a recorded request evaluates") {
-                HttpReplayOutcome::Decided(replayed) => {
-                    decided += 1;
-                    assert_eq!(comparison, RecordedComparison::Agrees, "{label}");
-                    if request.path == "/base/indexed" && replayed.reason.as_str() == "matched_rule"
-                    {
-                        indexed += 1;
-                    }
-                    if request.path == ALIAS {
-                        alias_decided += 1;
-                    }
-                    *outcomes.entry(live.reason).or_default() += 1;
-                    assert_eq!(live_outcome(replayed.effect), live.outcome, "{label}");
-                    assert_eq!(replayed.reason.as_str(), live.reason, "{label}");
-                    match replayed.matched {
-                        Some(RuleReference::Direct(index)) => assert_eq!(
-                            live.matched_rule_id,
-                            Some(
-                                policy.rules[index]
-                                    .id
-                                    .clone()
-                                    .unwrap_or_else(|| index.to_string())
-                            ),
+            if let Some(facts) = &live.facts {
+                assert_eq!(
+                    observation.payload[POLICY_DECISION_FACTS_MEMBER],
+                    facts.to_json(),
+                    "the observation records the verdict's own facts"
+                );
+            }
+            // The record as this gateway writes it, and the same record as
+            // one written before decision facts existed.
+            let mut legacy = observation.clone();
+            legacy
+                .payload
+                .as_object_mut()
+                .expect("an observation payload is an object")
+                .remove(POLICY_DECISION_FACTS_MEMBER);
+            for (record, read_facts) in [(observation, true), (&legacy, false)] {
+                let with_facts = read_facts && live.facts.is_some();
+                let LegacyRecord::Replayable(context) = adapt_audit_event(record) else {
+                    panic!("{} is replayable", request.request_id);
+                };
+                let ReplayFacts::Http(facts) = &context.facts else {
+                    panic!("an HTTP observation has HTTP facts");
+                };
+                let label = format!(
+                    "{mode} {} {} host={:?} principal={:?} facts={with_facts}",
+                    request.method,
+                    request.path,
+                    request.host,
+                    request
+                        .principal
+                        .as_ref()
+                        .map(|principal| &principal.user_id)
+                );
+                // The facts are the request's, field by field.
+                assert_eq!(facts.method, request.method, "{label}");
+                assert_eq!(facts.path, request.path, "{label}");
+                assert!(
+                    facts.principal == expected_principal(request.principal.as_ref()),
+                    "{label}"
+                );
+                assert!(
+                    facts.request_host
+                        == request
+                            .host
+                            .map_or(HostRecord::Absent, |host| HostRecord::Present(
+                                host.to_owned()
+                            )),
+                    "{label}"
+                );
+                assert!(
+                    facts.routing
+                        == expected_routing(&request.classification, request.path, with_facts),
+                    "{label}"
+                );
+                // The recorded result is the live decision.
+                assert_eq!(
+                    context.recorded.policy,
+                    recorded_policy(live.outcome),
+                    "{label}"
+                );
+                assert_eq!(
+                    context.recorded.reason.as_deref(),
+                    Some(live.reason),
+                    "{label}"
+                );
+                assert_eq!(
+                    context.recorded.matched_rule_id, live.matched_rule_id,
+                    "{label}"
+                );
+                assert_eq!(context.recorded.permission, live.permission, "{label}");
+                assert_eq!(context.recorded.path_prefix, live.path_prefix, "{label}");
+                // And its facts are the live verdict's, naming this policy.
+                match (&context.recorded.decision, &live.facts) {
+                    (Some(recorded), Some(live_facts)) => {
+                        assert!(with_facts, "{label}");
+                        assert_eq!(recorded.to_json(), live_facts.to_json(), "{label}");
+                        assert_eq!(recorded.policy_etag, base_etag, "{label}");
+                        assert_eq!(
+                            RecordedProvenance::of(&context.recorded, &base_etag),
+                            RecordedProvenance::BasePolicy,
                             "{label}"
-                        ),
-                        Some(RuleReference::Route(index)) => {
-                            assert_eq!(
-                                live.permission.as_deref(),
-                                Some(policy.routes[index].permission.as_str()),
-                                "{label}"
-                            );
-                            assert_eq!(
-                                live.path_prefix.as_deref(),
-                                Some(policy.routes[index].path_prefix.as_str()),
-                                "{label}"
-                            );
-                        }
-                        None => assert_eq!(live.matched_rule_id, None, "{label}"),
+                        );
+                        with_recorded_facts += 1;
                     }
+                    (None, _) => assert!(!with_facts, "{label}"),
+                    (Some(_), None) => panic!("{label}: facts the live verdict did not have"),
                 }
-                // Live could not answer an unclassified request either, and
-                // refused it; replay says the same fact is missing.
-                HttpReplayOutcome::Indeterminate(HttpReplayLimitation::Kernel(
-                    Limitation::MissingDispatchFact,
-                )) => {
-                    assert!(
-                        matches!(request.classification, Classification::Unclassified),
-                        "{label}"
-                    );
-                    assert_eq!(live.outcome, PolicyDecisionOutcome::Denied, "{label}");
-                    assert_eq!(live.reason, "policy_evaluation_incomplete", "{label}");
-                    assert_eq!(
-                        comparison,
-                        RecordedComparison::RecordedNotPolicyVerdict,
-                        "{label}"
-                    );
-                    unclassified += 1;
+                // The impact comparison reads the same record against the same
+                // policy and finds what was recorded.
+                let comparison = compare_recorded(
+                    &replay_policy,
+                    http_answer(&replay_policy, facts).expect("a recorded request is answered"),
+                    &context.recorded,
+                    context.source,
+                    &base_etag,
+                );
+
+                match evaluate_http(&compiled, facts).expect("a recorded request evaluates") {
+                    HttpReplayOutcome::Decided(replayed) => {
+                        decided += 1;
+                        assert_eq!(comparison, RecordedComparison::Agrees, "{label}");
+                        if request.path == "/base/indexed"
+                            && replayed.reason.as_str() == "matched_rule"
+                        {
+                            indexed += 1;
+                        }
+                        if request.path == ALIAS && with_facts {
+                            alias_decided += 1;
+                        }
+                        *outcomes.entry(live.reason).or_default() += 1;
+                        assert_eq!(live_outcome(replayed.effect), live.outcome, "{label}");
+                        assert_eq!(replayed.reason.as_str(), live.reason, "{label}");
+                        match replayed.matched {
+                            Some(RuleReference::Direct(index)) => assert_eq!(
+                                live.matched_rule_id,
+                                Some(
+                                    policy.rules[index]
+                                        .id
+                                        .clone()
+                                        .unwrap_or_else(|| index.to_string())
+                                ),
+                                "{label}"
+                            ),
+                            Some(RuleReference::Route(index)) => {
+                                assert_eq!(
+                                    live.permission.as_deref(),
+                                    Some(policy.routes[index].permission.as_str()),
+                                    "{label}"
+                                );
+                                assert_eq!(
+                                    live.path_prefix.as_deref(),
+                                    Some(policy.routes[index].path_prefix.as_str()),
+                                    "{label}"
+                                );
+                            }
+                            None => assert_eq!(live.matched_rule_id, None, "{label}"),
+                        }
+                    }
+                    // Live could not answer an unclassified request either, and
+                    // refused it; replay says the same fact is missing.
+                    HttpReplayOutcome::Indeterminate(HttpReplayLimitation::Kernel(
+                        Limitation::MissingDispatchFact,
+                    )) => {
+                        assert!(
+                            matches!(request.classification, Classification::Unclassified),
+                            "{label}"
+                        );
+                        assert_eq!(live.outcome, PolicyDecisionOutcome::Denied, "{label}");
+                        assert_eq!(live.reason, "policy_evaluation_incomplete", "{label}");
+                        assert_eq!(
+                            comparison,
+                            RecordedComparison::RecordedNotPolicyVerdict,
+                            "{label}"
+                        );
+                        unclassified += 1;
+                    }
+                    // A record without decision facts does not say the alias was
+                    // an alias, and the two readings disagree: no answer, rather
+                    // than the wrong one. One with them says, and is decided.
+                    HttpReplayOutcome::Indeterminate(HttpReplayLimitation::MissingMcpIdentity) => {
+                        assert_eq!(request.path, ALIAS, "{label}");
+                        assert!(!with_facts, "{label}");
+                        assert_eq!(comparison, RecordedComparison::BaseIndeterminate, "{label}");
+                        alias_indeterminate += 1;
+                    }
+                    other => panic!("{label}: unexpected {other:?}"),
                 }
-                // The record does not say the alias was an alias, and the
-                // two readings disagree: no answer, rather than the wrong one.
-                HttpReplayOutcome::Indeterminate(HttpReplayLimitation::MissingMcpIdentity) => {
-                    assert_eq!(request.path, ALIAS, "{label}");
-                    assert_eq!(comparison, RecordedComparison::BaseIndeterminate, "{label}");
-                    alias_indeterminate += 1;
-                }
-                other => panic!("{label}: unexpected {other:?}"),
             }
         }
     }
     // The corpus reaches every branch it claims to prove.
-    assert!(decided > 400, "{decided}");
+    assert!(decided > 800, "{decided}");
+    assert!(with_recorded_facts > 400, "{with_recorded_facts}");
     assert!(alias_decided > 0 && alias_indeterminate > 0);
     assert!(unclassified > 0);
     // A rule without an id is recorded by its position, and found by it.
@@ -576,6 +642,7 @@ async fn replayed_tool_admissions_are_the_live_runtime_decisions() {
             .expect("the tool test policy compiles");
     let replay_policy =
         ReplayPolicy::compile(policy.clone()).expect("the tool test policy compiles");
+    let base_etag = crate::policy_etag(&policy).expect("the tool test policy has an ETag");
     let capture = CaptureSink::new();
     let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
     let runtime = ToolRuntime::new_with_rbac_state(
@@ -668,11 +735,25 @@ async fn replayed_tool_admissions_are_the_live_runtime_decisions() {
                 tool_answer(&replay_policy, facts).expect("a recorded invocation is answered"),
                 &context.recorded,
                 context.source,
+                &base_etag,
             ),
             RecordedComparison::Agrees,
             "{label}"
         );
         let replayed = evaluate_tool(&compiled, facts).expect("a recorded invocation evaluates");
+        // The record names the policy and the verdict that decided it.
+        let decision = context
+            .recorded
+            .decision
+            .as_ref()
+            .unwrap_or_else(|| panic!("{label}: an admission record carries decision facts"));
+        assert_eq!(decision.policy_etag, base_etag, "{label}");
+        assert_eq!(decision.reason, replayed.reason().as_str(), "{label}");
+        assert_eq!(
+            RecordedProvenance::of(&context.recorded, &base_etag),
+            RecordedProvenance::BasePolicy,
+            "{label}"
+        );
         *by_reason.entry(replayed.reason().as_str()).or_default() += 1;
         if *admitted {
             assert!(
@@ -735,4 +816,82 @@ fn a_tool_rule_record_carries_the_runtime_projection_of_its_actor() {
         panic!("tool facts");
     };
     assert!(facts.principal == PrincipalRecord::Anonymous);
+}
+
+/// The decision facts a live verdict records hold codes, versions, digests
+/// and policy positions: no value the request carried reaches them.
+#[tokio::test]
+async fn live_decision_facts_repeat_no_request_value() {
+    const SUBJECT: &str = "facts-subject-canary-7e01";
+    const EMAIL: &str = "facts-email-canary@example.test";
+    const REQUEST_ID: &str = "facts-request-id-canary-c4d2";
+    const QUERY: &str = "facts-query-canary-90ab";
+    const HEADER: &str = "facts-header-canary-1f3e";
+    const USER_AGENT: &str = "facts-user-agent-canary-55aa";
+    const PATH: &str = "/api/items/facts-path-canary-3b9c";
+    let capture = CaptureSink::new();
+    let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+    let mut principal = principal(SUBJECT, AuthMethod::Bearer, &["reader"]);
+    principal.email = Some(EMAIL.to_owned());
+    let response = live_router(
+        http_policy("enforce"),
+        &audit,
+        Classification::Dispatch(ProxyRouteObservationContext::new_with_route_id(
+            "payments".to_owned(),
+            None,
+            Some("/api".to_owned()),
+            "https://payments.example.test".to_owned(),
+        )),
+        Some(principal),
+    )
+    .oneshot(
+        http::Request::builder()
+            .method(Method::GET)
+            .uri(format!("{PATH}?q={QUERY}"))
+            .header(crate::REQUEST_ID_HEADER, REQUEST_ID)
+            .header(http::header::HOST, HOST)
+            .header(http::header::USER_AGENT, USER_AGENT)
+            .header("x-facts-canary", HEADER)
+            .body(Body::empty())
+            .expect("request builds"),
+    )
+    .await
+    .expect("request completes");
+    assert!(response
+        .extensions()
+        .get::<PolicyDecision>()
+        .and_then(|decision| decision.facts.as_ref())
+        .is_some());
+    let events = wait_for(&capture, |events| {
+        events
+            .iter()
+            .any(|event| event.event_type == "http.request_observed")
+    })
+    .await;
+    let observation = events
+        .iter()
+        .find(|event| event.event_type == "http.request_observed")
+        .expect("the request is observed");
+    let facts = observation.payload[POLICY_DECISION_FACTS_MEMBER].to_string();
+    assert!(facts.contains("policy-decision.v1"), "{facts}");
+    for canary in [
+        SUBJECT,
+        EMAIL,
+        REQUEST_ID,
+        QUERY,
+        HEADER,
+        USER_AGENT,
+        PATH,
+        ISSUER,
+        HOST,
+        "payments.example.test",
+        "items:read",
+        "reader",
+        "org-1",
+    ] {
+        assert!(
+            !facts.contains(canary),
+            "the facts repeat {canary}: {facts}"
+        );
+    }
 }

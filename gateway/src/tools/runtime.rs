@@ -23,7 +23,10 @@ use crate::{
         DEFAULT_TOOL_RUNTIME_QUEUE_DEPTH, DEFAULT_TOOL_RUNTIME_QUEUE_TIMEOUT_MS,
     },
     connections::{caller_assertion::AttestedCaller, model::ConnectionId},
-    middleware::rbac::{MatchedRuleDecision, RbacPolicyState, RbacState, ToolInvocationVerdict},
+    middleware::{
+        decision::{PolicyDecisionFacts, POLICY_DECISION_FACTS_MEMBER},
+        rbac::{MatchedRuleDecision, RbacPolicyState, RbacState, ToolInvocationVerdict},
+    },
     policy_eval::{
         tools::{SourceRequestContext, SourceRequestDecision, TOOL_CONTEXT_VERSION},
         Fact,
@@ -344,6 +347,8 @@ struct AdmittedInvocation {
     /// Cancelled by a lease's renewal task when the lease is lost; None
     /// when no lease is held (standalone mode).
     lease_lost: Option<CancellationToken>,
+    /// The facts policy admitted the invocation with, for its start record.
+    decision_facts: Option<PolicyDecisionFacts>,
 }
 
 impl AdmittedInvocation {
@@ -697,12 +702,13 @@ impl ToolRuntime {
             .prepare_invocation(tool_name, &context, &cancel, no_arguments)
             .await?;
 
-        self.emit(
+        self.emit_with_decision_facts(
             audit::event::TOOL_INVOKE_START,
             &context,
             tool_name,
             "started",
             None,
+            admitted.decision_facts.as_ref(),
         );
 
         tokio::select! {
@@ -908,12 +914,13 @@ impl ToolRuntime {
         context.admitted_deadline = Some(admitted_deadline);
         let work_context = context.clone();
 
-        self.emit(
+        self.emit_with_decision_facts(
             audit::event::TOOL_INVOKE_START,
             &context,
             tool_name,
             "started",
             None,
+            admitted.decision_facts.as_ref(),
         );
 
         tokio::select! {
@@ -976,7 +983,7 @@ impl ToolRuntime {
                                 })
                             }
                             ToolWorkErrorDisposition::Rejected(reason) => {
-                                self.emit_rejected(&context, tool_name, &reason);
+                                self.emit_rejected(&context, tool_name, &reason, None);
                                 Err(ToolRuntimeError::Rejected {
                                     tool_name: tool_name.to_owned(),
                                     reason,
@@ -1008,12 +1015,12 @@ impl ToolRuntime {
         cancel: &CancellationToken,
         arguments: impl FnOnce(&[String]) -> Result<Fact<Value>, ToolRuntimeError>,
     ) -> Result<AdmittedInvocation, ToolRuntimeError> {
-        let state = self.admit_invocation(tool_name, context, arguments)?;
+        let (state, decision_facts) = self.admit_invocation(tool_name, context, arguments)?;
 
         let queue_permit = match Arc::clone(&self.inner.queue).try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
-                self.emit_rejected(context, tool_name, "queue_full");
+                self.emit_rejected(context, tool_name, "queue_full", decision_facts.as_ref());
                 return Err(ToolRuntimeError::Rejected {
                     tool_name: tool_name.to_owned(),
                     reason: "queue_full".to_owned(),
@@ -1043,7 +1050,7 @@ impl ToolRuntime {
 
         let permits = tokio::select! {
             _ = cancel.cancelled() => {
-                self.emit_rejected(context, tool_name, "cancelled");
+                self.emit_rejected(context, tool_name, "cancelled", decision_facts.as_ref());
                 return Err(ToolRuntimeError::Cancelled {
                     tool_name: tool_name.to_owned(),
                 });
@@ -1052,11 +1059,21 @@ impl ToolRuntime {
                 match result {
                     Ok(Ok(permits)) => permits,
                     Ok(Err(error)) => {
-                        self.emit_rejected_error(context, tool_name, &error);
+                        self.emit_rejected_error(
+                            context,
+                            tool_name,
+                            &error,
+                            decision_facts.as_ref(),
+                        );
                         return Err(error);
                     }
                     Err(_) => {
-                        self.emit_rejected(context, tool_name, "queue_timeout");
+                        self.emit_rejected(
+                            context,
+                            tool_name,
+                            "queue_timeout",
+                            decision_facts.as_ref(),
+                        );
                         return Err(ToolRuntimeError::QueueTimeout {
                             tool_name: tool_name.to_owned(),
                         });
@@ -1069,6 +1086,7 @@ impl ToolRuntime {
             config: state.config,
             _permits: permits,
             lease_lost,
+            decision_facts,
         })
     }
 
@@ -1076,22 +1094,28 @@ impl ToolRuntime {
     /// that decided it, and refuse it if that rule denies. A tool-name rule
     /// that reads the call's arguments is decided only once `arguments` has
     /// validated them; a refusal of its own has already been audited there.
-    /// Capacity is acquired afterwards, by the caller.
+    /// Capacity is acquired afterwards, by the caller, with the facts policy
+    /// decided by, which every admission record of the invocation carries.
     fn admit_invocation(
         &self,
         tool_name: &str,
         context: &ToolInvocationContext,
         arguments: impl FnOnce(&[String]) -> Result<Fact<Value>, ToolRuntimeError>,
-    ) -> Result<ToolExecutionState, ToolRuntimeError> {
-        let authorization = match self.authorize_tool_call(tool_name, context, arguments) {
-            Ok(Ok(authorization)) => authorization,
-            Ok(Err(error)) => {
-                self.emit_rejected_error(context, tool_name, &error);
+    ) -> Result<(ToolExecutionState, Option<PolicyDecisionFacts>), ToolRuntimeError> {
+        // The argument stage's own refusal is returned as it is: it has
+        // already been audited, and policy decided nothing.
+        let (decision_facts, authorization) =
+            self.authorize_tool_call(tool_name, context, arguments)?;
+        let authorization = match authorization {
+            Ok(authorization) => authorization,
+            Err(error) => {
+                self.emit_rejected_error(context, tool_name, &error, decision_facts.as_ref());
                 return Err(error);
             }
-            Err(argument_refusal) => return Err(argument_refusal),
         };
-        self.enforce_tool_rule(tool_name, context, authorization)
+        let state =
+            self.enforce_tool_rule(tool_name, context, authorization, decision_facts.as_ref())?;
+        Ok((state, decision_facts))
     }
 
     /// Translate the argument stage's refusal of a call into the error and
@@ -1137,7 +1161,7 @@ impl ToolRuntime {
                 }
             }
             ToolWorkErrorDisposition::Rejected(reason) => {
-                self.emit_rejected(context, tool_name, &reason);
+                self.emit_rejected(context, tool_name, &reason, None);
                 ToolRuntimeError::Rejected {
                     tool_name: tool_name.to_owned(),
                     reason,
@@ -1151,6 +1175,7 @@ impl ToolRuntime {
         tool_name: &str,
         context: &ToolInvocationContext,
         authorization: AuthorizedToolInvocation,
+        decision_facts: Option<&PolicyDecisionFacts>,
     ) -> Result<ToolExecutionState, ToolRuntimeError> {
         let state = authorization.state;
 
@@ -1165,6 +1190,7 @@ impl ToolRuntime {
                         tool_name,
                         principal.as_ref(),
                         &matched_rule_id,
+                        decision_facts,
                     );
                 }
                 RuleAction::Shadow => {
@@ -1174,6 +1200,7 @@ impl ToolRuntime {
                         tool_name,
                         principal.as_ref(),
                         &matched_rule_id,
+                        decision_facts,
                     );
                 }
                 RuleAction::Deny => {
@@ -1183,8 +1210,9 @@ impl ToolRuntime {
                         tool_name,
                         principal.as_ref(),
                         &matched_rule_id,
+                        decision_facts,
                     );
-                    self.emit_rejected(context, tool_name, "matched_rule");
+                    self.emit_rejected(context, tool_name, "matched_rule", decision_facts);
                     return Err(ToolRuntimeError::Rejected {
                         tool_name: tool_name.to_owned(),
                         reason: "matched_rule".to_owned(),
@@ -1195,14 +1223,21 @@ impl ToolRuntime {
         Ok(state)
     }
 
-    /// The verdict the policy gives the call, or, as the outer error, the
-    /// argument stage's own refusal of it.
+    /// Authorize one call, with the facts policy decided it by: `None`
+    /// without a policy, or for a refusal, which policy did not answer. The
+    /// outer error is the argument stage's own refusal of the call.
     fn authorize_tool_call(
         &self,
         tool_name: &str,
         context: &ToolInvocationContext,
         arguments: impl FnOnce(&[String]) -> Result<Fact<Value>, ToolRuntimeError>,
-    ) -> Result<Result<AuthorizedToolInvocation, ToolRuntimeError>, ToolRuntimeError> {
+    ) -> Result<
+        (
+            Option<PolicyDecisionFacts>,
+            Result<AuthorizedToolInvocation, ToolRuntimeError>,
+        ),
+        ToolRuntimeError,
+    > {
         let principal = principal_from_tool_context(context);
         if let Some(rbac_state) = &self.inner.rbac_state {
             // The shared evaluator decides (#422 PR 2); this only translates its
@@ -1214,53 +1249,68 @@ impl ToolRuntime {
                 arguments,
                 |authorization| {
                     self.prune_idle_limiters(authorization.tools.keys());
+                    let decision_facts = authorization.decision_facts;
                     let (tool, rule_decision) = match authorization.verdict {
                         ToolInvocationVerdict::Entry {
                             tool,
                             rule_decision,
                         } => (tool, rule_decision),
                         ToolInvocationVerdict::UnknownTool => {
-                            return Err(ToolRuntimeError::UnknownTool {
-                                tool_name: tool_name.to_owned(),
-                            })
+                            return (
+                                decision_facts,
+                                Err(ToolRuntimeError::UnknownTool {
+                                    tool_name: tool_name.to_owned(),
+                                }),
+                            )
                         }
                         ToolInvocationVerdict::Disabled => {
-                            return Err(ToolRuntimeError::Disabled {
-                                tool_name: tool_name.to_owned(),
-                            })
+                            return (
+                                decision_facts,
+                                Err(ToolRuntimeError::Disabled {
+                                    tool_name: tool_name.to_owned(),
+                                }),
+                            )
                         }
                         ToolInvocationVerdict::RoleNotAllowed { allowed_roles } => {
-                            return Err(ToolRuntimeError::RoleDenied {
-                                tool_name: tool_name.to_owned(),
-                                allowed_roles: allowed_roles.to_vec(),
-                            })
+                            return (
+                                decision_facts,
+                                Err(ToolRuntimeError::RoleDenied {
+                                    tool_name: tool_name.to_owned(),
+                                    allowed_roles: allowed_roles.to_vec(),
+                                }),
+                            )
                         }
                         ToolInvocationVerdict::Refused(refusal) => {
-                            return Err(ToolRuntimeError::Rejected {
-                                tool_name: tool_name.to_owned(),
-                                reason: refusal.reason().to_owned(),
-                            })
+                            return (
+                                decision_facts,
+                                Err(ToolRuntimeError::Rejected {
+                                    tool_name: tool_name.to_owned(),
+                                    reason: refusal.reason().to_owned(),
+                                }),
+                            )
                         }
                     };
                     let config = tool_config_from_policy(tool);
                     let limiter = self.limiter_for_tool(tool_name, config.max_concurrent);
-                    Ok(AuthorizedToolInvocation {
-                        state: ToolExecutionState {
-                            config,
-                            limiter: Some(limiter),
-                        },
-                        rule_decision,
-                    })
+                    (
+                        decision_facts,
+                        Ok(AuthorizedToolInvocation {
+                            state: ToolExecutionState {
+                                config,
+                                limiter: Some(limiter),
+                            },
+                            rule_decision,
+                        }),
+                    )
                 },
             );
         }
-
-        // Without an RBAC state there is no policy: the runtime's own entries
-        // and default decide, and no rule exists to match the call or read its
-        // arguments.
-        Ok(self.authorize_without_policy(tool_name, context))
+        Ok((None, self.authorize_without_policy(tool_name, context)))
     }
 
+    /// Without an RBAC state there is no policy: the runtime's own entries
+    /// and default decide, and no rule exists to match the call or read its
+    /// arguments.
     fn authorize_without_policy(
         &self,
         tool_name: &str,
@@ -1574,6 +1624,7 @@ impl ToolRuntime {
         context: &ToolInvocationContext,
         tool_name: &str,
         error: &ToolRuntimeError,
+        decision_facts: Option<&PolicyDecisionFacts>,
     ) {
         let reason = match error {
             ToolRuntimeError::UnknownTool { .. } => "unknown_tool",
@@ -1587,16 +1638,25 @@ impl ToolRuntime {
             ToolRuntimeError::LeaseLost { .. } => "lease_lost",
             ToolRuntimeError::WorkFailed { .. } => "work_error",
         };
-        self.emit_rejected(context, tool_name, reason);
+        self.emit_rejected(context, tool_name, reason, decision_facts);
     }
 
-    fn emit_rejected(&self, context: &ToolInvocationContext, tool_name: &str, reason: &str) {
-        self.emit(
+    /// A `tool.invoke_rejected` record. One written at admission carries the
+    /// facts policy decided by; one written after the work started has none.
+    fn emit_rejected(
+        &self,
+        context: &ToolInvocationContext,
+        tool_name: &str,
+        reason: &str,
+        decision_facts: Option<&PolicyDecisionFacts>,
+    ) {
+        self.emit_with_decision_facts(
             audit::event::TOOL_INVOKE_REJECTED,
             context,
             tool_name,
             "rejected",
             Some(reason),
+            decision_facts,
         );
     }
 
@@ -1607,20 +1667,23 @@ impl ToolRuntime {
         tool_name: &str,
         principal: Option<&Principal>,
         matched_rule_id: &str,
+        decision_facts: Option<&PolicyDecisionFacts>,
     ) {
+        let mut payload = json!({
+            "tool_name": tool_name,
+            "path": tool_observation_path(tool_name),
+            "method": MCP_TOOL_OBSERVATION_METHOD,
+            "reason": "matched_rule",
+            "matched_rule_id": matched_rule_id,
+            "invocation_source": context.source.as_str(),
+        });
+        with_decision_facts(&mut payload, decision_facts);
         self.inner.audit.emit(AuditEvent::new(
             event_type,
             &context.request_id,
             &context.source_ip,
             principal.map(crate::auth::actor_from_principal),
-            json!({
-                "tool_name": tool_name,
-                "path": tool_observation_path(tool_name),
-                "method": MCP_TOOL_OBSERVATION_METHOD,
-                "reason": "matched_rule",
-                "matched_rule_id": matched_rule_id,
-                "invocation_source": context.source.as_str(),
-            }),
+            payload,
         ));
     }
 
@@ -1689,12 +1752,26 @@ impl ToolRuntime {
         outcome: &'static str,
         reason: Option<&str>,
     ) {
+        self.emit_with_decision_facts(event_type, context, tool_name, outcome, reason, None);
+    }
+
+    fn emit_with_decision_facts(
+        &self,
+        event_type: &'static str,
+        context: &ToolInvocationContext,
+        tool_name: &str,
+        outcome: &'static str,
+        reason: Option<&str>,
+        decision_facts: Option<&PolicyDecisionFacts>,
+    ) {
+        let mut payload = tool_audit_payload(tool_name, outcome, reason, context.source);
+        with_decision_facts(&mut payload, decision_facts);
         self.inner.audit.emit(AuditEvent::new(
             event_type,
             &context.request_id,
             &context.source_ip,
             context.actor.clone(),
-            tool_audit_payload(tool_name, outcome, reason, context.source),
+            payload,
         ));
     }
 }
@@ -1992,6 +2069,14 @@ fn tool_audit_payload(
     }
 
     payload
+}
+
+/// Add the facts policy decided an invocation by to one of its admission
+/// records: codes, versions, digests and policy positions, never an argument.
+fn with_decision_facts(payload: &mut Value, decision_facts: Option<&PolicyDecisionFacts>) {
+    if let (Some(facts), Some(object)) = (decision_facts, payload.as_object_mut()) {
+        object.insert(POLICY_DECISION_FACTS_MEMBER.to_owned(), facts.to_json());
+    }
 }
 
 fn tool_observation_path(tool_name: &str) -> String {

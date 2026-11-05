@@ -54,7 +54,8 @@ use url::Url;
 
 use super::{
     decision::{
-        audit_unavailable_response, PolicyDecision, PolicyDecisionOutcome, AUDIT_UNAVAILABLE_REASON,
+        audit_unavailable_response, PolicyDecision, PolicyDecisionFacts, PolicyDecisionIdentity,
+        PolicyDecisionOutcome, AUDIT_UNAVAILABLE_REASON,
     },
     policy_facts::{http_request_facts, tool_call_facts, FactsRefusal, PolicyClock, ToolCallFacts},
     rate_limit::RateLimitState,
@@ -428,6 +429,11 @@ pub(crate) struct RbacPolicyState {
     /// regress it.
     #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
     security_revision: i64,
+    /// The identity this snapshot's decision facts name -- its ETag, semantic
+    /// digest and element ids -- computed once per install from `compiled`'s
+    /// own policy and shared by every verdict. `None` when it could not be
+    /// computed: verdicts are then recorded without decision facts.
+    decision_identity: Option<Arc<PolicyDecisionIdentity>>,
     /// The same policy compiled for the pure kernel, built once per install.
     ///
     /// It lives here rather than on [`RbacState`] deliberately. A request is
@@ -457,6 +463,9 @@ pub(crate) struct ToolInvocationAuthorization<'a> {
     /// limiters of tools the policy no longer carries.
     pub tools: &'a HashMap<String, ToolPolicyEntry>,
     pub verdict: ToolInvocationVerdict<'a>,
+    /// The facts of the verdict, for the invocation's admission records;
+    /// `None` for a refusal, which the policy stage did not answer.
+    pub decision_facts: Option<PolicyDecisionFacts>,
 }
 
 /// The evaluator's invocation answer, translated for the runtime. Each variant
@@ -1043,7 +1052,7 @@ impl RbacState {
         evaluate: impl FnOnce(ToolInvocationAuthorization<'_>) -> R,
     ) -> Result<R, E> {
         let policy = self.effective_policy();
-        let verdict = policy.tool_invocation_verdict(
+        let (verdict, decision_facts) = policy.tool_invocation_verdict(
             tool_name,
             principal,
             self.tool_call(source_address),
@@ -1052,6 +1061,7 @@ impl RbacState {
         Ok(evaluate(ToolInvocationAuthorization {
             tools: policy.compiled.tool_entries(),
             verdict,
+            decision_facts,
         }))
     }
 
@@ -1278,6 +1288,7 @@ impl RbacPolicyState {
             .enumerate()
             .map(|(rule_index, rule)| rule.id.clone().unwrap_or_else(|| rule_index.to_string()))
             .collect();
+        let decision_identity = PolicyDecisionIdentity::of_compiled(&compiled).map(Arc::new);
 
         Ok(Self {
             #[cfg(test)]
@@ -1292,6 +1303,7 @@ impl RbacPolicyState {
             #[cfg(test)]
             routes,
             security_revision,
+            decision_identity,
             compiled,
         })
     }
@@ -1455,20 +1467,31 @@ impl RbacPolicyState {
             .map_err(|refusal| refused(ToolOperation::RenderedHttp, refusal))
     }
 
-    /// One invocation's verdict; see [`RbacState::evaluate_tool_authorization`]
-    /// for when `arguments` is asked.
+    /// One invocation's verdict, with the facts it was decided with when the
+    /// lane answered: a refusal has none. See
+    /// [`RbacState::evaluate_tool_authorization`] for when `arguments` is
+    /// asked.
     fn tool_invocation_verdict<E>(
         &self,
         tool_name: &str,
         principal: Option<&auth::Principal>,
         call: ToolCallFacts<'_>,
         arguments: impl FnOnce(&[String]) -> Result<Fact<Value>, E>,
-    ) -> Result<ToolInvocationVerdict<'_>, E> {
+    ) -> Result<(ToolInvocationVerdict<'_>, Option<PolicyDecisionFacts>), E> {
+        // The facts the evaluator is given, held here so the verdict's
+        // decision facts state exactly what it was decided with, the call's
+        // arguments included once they were asked for and captured.
+        let mut facts = tool_call_facts(&self.compiled, principal, call);
         let pointers = self.compiled.fact_needs().tool_argument_pointers(tool_name);
         let answer = if pointers.is_empty() {
-            self.evaluate_tool(ToolOperation::Invocation, tool_name, principal, call, None)
+            self.evaluate_tool_with_facts(
+                ToolOperation::Invocation,
+                tool_name,
+                principal_fact(principal),
+                &facts,
+                None,
+            )
         } else {
-            let mut facts = tool_call_facts(&self.compiled, principal, call);
             let mut rules = RulesUndetermined(false);
             let first = self.answer_tool(
                 ToolOperation::Invocation,
@@ -1499,9 +1522,29 @@ impl RbacPolicyState {
             answer.map_err(|refusal| refused(ToolOperation::Invocation, refusal))
         };
         Ok(match answer {
-            Ok(evaluation) => self.invocation_verdict(tool_name, &evaluation),
-            Err(refusal) => ToolInvocationVerdict::Refused(refusal),
+            Ok(evaluation) => self.answered_invocation(tool_name, &evaluation, &facts),
+            Err(refusal) => (ToolInvocationVerdict::Refused(refusal), None),
         })
+    }
+
+    /// [`Self::invocation_verdict`] for one accepted answer, with the facts it
+    /// was decided with when the translation is a verdict: a refusal has none.
+    fn answered_invocation(
+        &self,
+        tool_name: &str,
+        evaluation: &ToolEvaluation,
+        facts: &crate::policy_eval::PolicyFacts,
+    ) -> (ToolInvocationVerdict<'_>, Option<PolicyDecisionFacts>) {
+        let verdict = self.invocation_verdict(tool_name, evaluation);
+        let decision_facts = match verdict {
+            ToolInvocationVerdict::Refused(_) => None,
+            _ => PolicyDecisionFacts::tool_invocation(
+                self.decision_identity.as_ref(),
+                facts,
+                evaluation,
+            ),
+        };
+        (verdict, decision_facts)
     }
 
     /// Translate one accepted invocation answer for the runtime, asking the
@@ -2075,7 +2118,7 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
             return refusal.answer().await;
         }
     };
-    let (decision, records) = match apply_http_evaluation(
+    let (mut decision, records) = match apply_http_evaluation(
         &state,
         &policy,
         &context,
@@ -2097,6 +2140,14 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
             return refusal.answer().await;
         }
     };
+    // The facts this verdict was decided with, named against the snapshot
+    // that decided it, for the request's observation.
+    decision.facts = PolicyDecisionFacts::http(
+        policy.decision_identity.as_ref(),
+        &input,
+        &matcher_facts,
+        &evaluation,
+    );
     drop(policy);
     // Required audit durability (issue #425): the decision is acted on --
     // forwarded, or answered with its 403 -- only once its records are in
@@ -2169,6 +2220,7 @@ fn denied_decision(reason: &'static str) -> PolicyDecision {
         permission: None,
         path_prefix: None,
         matched_rule_id: None,
+        facts: None,
     }
 }
 
@@ -2266,6 +2318,7 @@ fn apply_http_evaluation(
             permission: None,
             path_prefix: None,
             matched_rule_id: None,
+            facts: None,
         },
     };
     Ok((decision, DecisionRecords { observed, verdict }))
@@ -2595,6 +2648,7 @@ fn decision_for_rule(
         permission: Some(rule.permission.clone()),
         path_prefix: Some(rule.path_prefix.clone()),
         matched_rule_id: None,
+        facts: None,
     }
 }
 
@@ -2609,6 +2663,7 @@ fn decision_for_direct_rule(
         permission: None,
         path_prefix: None,
         matched_rule_id: Some(matched_rule_id),
+        facts: None,
     }
 }
 
