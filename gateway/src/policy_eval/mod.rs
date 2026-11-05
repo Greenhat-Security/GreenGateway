@@ -80,12 +80,18 @@
 //! [`PolicyFacts`] -- the principal's verified organization, the canonical
 //! client address, named headers and query parameters, validated tool
 //! arguments, an injected clock -- which every lane takes beside its context.
-//! The entry points the serving adapters call pass [`UNCAPTURED_FACTS`]: no
-//! adapter captures them yet, and policy validation refuses a document that
-//! uses either (`TypedMatchersNotEnforced`), so no served policy reads one.
-//! Should one ever reach a lane, a mapping or condition that reads an
+//!
+//! Identity mappings are served. Every serving adapter asks
+//! [`CompiledPolicy::serving_facts`] for the facts it evaluates with, which in
+//! mapped-role mode carry the organization authentication verified for the
+//! principal (`Principal::org_id`, never a request header), and passes them to
+//! the `_with_facts` entry points: the HTTP lane, the tool lanes, rate-lane
+//! selection and the management lane all resolve roles from the same fact.
+//! Rule conditions are not served yet: policy validation still refuses a
+//! document that uses them (`TypedMatchersNotEnforced`), and no adapter
+//! captures the request facts they read. A mapping or condition that reads an
 //! uncaptured fact makes the answer [`Limitation::MissingMatcherFact`], never a
-//! guessed match.
+//! guessed match, and every live lane refuses an indeterminate answer.
 //!
 //! In mapped-role mode each lane resolves the principal's internal roles once,
 //! on entry, and judges every role constraint -- route permissions, rule
@@ -136,9 +142,7 @@ use stages::{
     RateStage, RouteMatch, StageSink, UpstreamBinding,
 };
 
-#[cfg(test)]
-pub(crate) use crate::rbac::conditions::Fact;
-pub(crate) use crate::rbac::conditions::{PolicyFacts, UNCAPTURED_FACTS};
+pub(crate) use crate::rbac::conditions::{Fact, PolicyFacts, UNCAPTURED_FACTS};
 
 /// Most header or query entries one evaluation's facts may carry.
 pub(crate) const MAX_FACT_ENTRIES: usize = 128;
@@ -371,14 +375,43 @@ impl CompiledPolicy {
         Some(Cow::Owned(mapped))
     }
 
+    /// The facts a serving lane captures for `principal` under this policy.
+    ///
+    /// In mapped-role mode that is the organization authentication verified
+    /// for the principal: its `org_id`, and `Captured(None)` when
+    /// authentication verified none or the caller is anonymous. It is read
+    /// from the authenticated principal only, never from a request header,
+    /// so a caller cannot name its own organization. Otherwise nothing is
+    /// captured, because nothing a served policy without identity mappings
+    /// can contain reads a fact (rule conditions are refused at validation):
+    /// claimed-role mode stays exactly as it was, as the host fact is asked
+    /// for only when a route can turn on it.
+    ///
+    /// The other facts -- client address, headers, query, tool arguments,
+    /// clock -- stay uncaptured on every serving lane until rule conditions
+    /// are served.
+    pub(crate) fn serving_facts(&self, principal: Option<&Principal>) -> PolicyFacts {
+        let mut facts = PolicyFacts::uncaptured();
+        if self.identity.is_some() {
+            facts.organization =
+                Fact::Captured(principal.and_then(|principal| principal.org_id.clone()));
+        }
+        facts
+    }
+
     /// The principal the management lane asks this policy's permission
-    /// engine about: [`Self::effective_principal`], with no fact captured.
+    /// engine about: [`Self::effective_principal`], with the facts a serving
+    /// lane captures for it ([`Self::serving_facts`]).
     ///
     /// Management permission checks have no indeterminate answer, so a
-    /// principal whose internal roles cannot be told holds none: it is
+    /// principal whose internal roles cannot be told, or whose facts are past
+    /// the bounds every lane refuses ([`validate_facts`]), holds none: it is
     /// refused every permission, never granted one on a guess.
     pub(crate) fn management_principal<'a>(&self, principal: &'a Principal) -> Cow<'a, Principal> {
-        self.effective_principal(principal, &UNCAPTURED_FACTS)
+        let facts = self.serving_facts(Some(principal));
+        validate_facts(&facts)
+            .ok()
+            .and_then(|()| self.effective_principal(principal, &facts))
             .unwrap_or_else(|| {
                 let mut stripped = principal.clone();
                 stripped.roles = Vec::new();
@@ -532,23 +565,12 @@ impl CompiledPolicy {
         self.select_rate_lane_with_facts(context, &UNCAPTURED_FACTS, &mut NoStages)
     }
 
-    /// [`Self::select_rate_lane`], reporting each stage it runs to `stages`.
-    ///
-    /// The selection code, not a copy of it: `select_rate_lane` is this with
-    /// a sink that keeps nothing. See [`stages`].
-    pub(crate) fn select_rate_lane_with_stages(
-        &self,
-        context: &PolicyEvaluationContext,
-        stages: &mut impl StageSink<RateStage>,
-    ) -> Result<RateLaneSelection, EvaluationError> {
-        self.select_rate_lane_with_facts(context, &UNCAPTURED_FACTS, stages)
-    }
-
     /// [`Self::select_rate_lane`] with the facts an identity mapping may
     /// read. Rate overrides carry no conditions, so only mapped-role mode
     /// reads them, to resolve the roles an override's principal constrains.
-    /// Each stage it runs is reported to `stages`; the live rate adapter
-    /// passes [`NoStages`].
+    /// Each stage it runs is reported to `stages`: the selection code, not a
+    /// copy of it. The live rate adapter passes [`NoStages`], which keeps
+    /// nothing; a simulation passes a collecting sink. See [`stages`].
     pub(crate) fn select_rate_lane_with_facts(
         &self,
         context: &PolicyEvaluationContext,
@@ -679,6 +701,9 @@ impl CompiledPolicy {
         }
     }
 
+    /// The HTTP decision with no typed-matcher fact captured, for a consumer
+    /// whose input records none: replay, the analyzer, coverage. The live
+    /// adapter calls [`Self::evaluate_with_facts`].
     pub(crate) fn evaluate(
         &self,
         context: &PolicyEvaluationContext,
@@ -686,21 +711,25 @@ impl CompiledPolicy {
         self.decide(context, &UNCAPTURED_FACTS, &mut NoStages)
     }
 
-    /// [`Self::evaluate`], reporting each stage it runs to `stages`.
+    /// [`Self::evaluate_with_facts`], reporting each stage it runs to
+    /// `stages`.
     ///
-    /// This is the decision code, not a copy of it: `evaluate` is this
-    /// function with a sink that keeps nothing, so a stage trace can only ever
-    /// describe the decision production makes. See [`stages`].
+    /// This is the decision code, not a copy of it: `evaluate_with_facts` is
+    /// this function with a sink that keeps nothing, so a stage trace can only
+    /// ever describe the decision production makes. See [`stages`].
     pub(crate) fn evaluate_with_stages<S: StageSink>(
         &self,
         context: &PolicyEvaluationContext,
+        facts: &PolicyFacts,
         stages: &mut S,
     ) -> Result<Evaluation, EvaluationError> {
-        self.decide(context, &UNCAPTURED_FACTS, stages)
+        self.decide(context, facts, stages)
     }
 
-    /// [`Self::evaluate`] with the facts typed matchers read.
-    #[cfg(test)]
+    /// [`Self::evaluate`] with the facts typed matchers read: the call the
+    /// live HTTP adapter makes, with [`Self::serving_facts`]. A direct shadow
+    /// rule's observation is part of the same decision, so it is judged by
+    /// the same internal roles as the verdict.
     pub(crate) fn evaluate_with_facts(
         &self,
         context: &PolicyEvaluationContext,

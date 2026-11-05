@@ -635,6 +635,7 @@ fn an_organization_mapping_without_its_fact_is_indeterminate_in_every_lane() {
     let result = compiled
         .evaluate_with_stages(
             &http(&compiled, "/data/1", authenticated(&alice)),
+            &UNCAPTURED_FACTS,
             &mut stages,
         )
         .unwrap();
@@ -659,8 +660,16 @@ fn an_organization_mapping_without_its_fact_is_indeterminate_in_every_lane() {
             .limitation(),
         Some(ToolLimitation::MatcherFact)
     );
-    // The management lane has no indeterminate answer: no permission.
+    // The management lane reads the organization from the principal itself,
+    // as every serving lane does: none verified grants nothing, and the
+    // organization the issuer verified grants the mapped role.
     assert!(compiled.management_principal(&alice).roles.is_empty());
+    let mut acme_alice = alice.clone();
+    acme_alice.org_id = Some("acme".to_owned());
+    assert_eq!(
+        compiled.management_principal(&acme_alice).roles,
+        vec!["reader".to_owned()]
+    );
     // An anonymous caller holds no role in either mode, so nothing is unknown.
     let anonymous = compiled
         .evaluate(&http(&compiled, "/data/1", PrincipalFact::Anonymous))

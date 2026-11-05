@@ -418,7 +418,8 @@ branch, and the traced and untraced decisions to each other.
 parser and context builders, compiles the base and each candidate with
 `from_validated_policy` (the base keeps the authority it was read under, a
 candidate is `Standalone`), and asks `evaluate_with_stages`,
-`evaluate_tool_with_stages` and `select_rate_lane_with_stages`. Its
+`evaluate_tool_with_facts` and `select_rate_lane_with_facts` with a collecting
+sink and the facts a live lane captures for the case's principal. Its
 `enforce_all_shadow` projection is a `Policy` value with every shadow made
 enforcing, compiled for the run; the kernel has no shadow switch of its own.
 Edits are applied to the JSON of the pinned base and the result is validated as

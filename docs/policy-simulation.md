@@ -5,10 +5,11 @@ hypothetical requests, tool questions, rate sequences and outbound
 destinations, before anything changes.
 `POST /v1{ADMIN_PREFIX}/policy/simulations` evaluates the cases against the
 active policy and a candidate -- the active policy itself, position-aware edits
-over it, or a complete document you send -- and explains each decision at the
-trace level you ask for, as written and with every shadow projected as
-enforced (issue #243, slice 10; tool and rate stage traces, isolated rate
-sequences and egress cases in slice 12).
+over it, a complete document you send, one of your server-side drafts, or a
+version of the policy history -- and explains each decision at the trace level
+you ask for, as written and with every shadow projected as enforced (issue
+#243, slice 10; tool and rate stage traces, isolated rate sequences and egress
+cases in slice 12).
 
 A simulation is the exploratory sibling of a [policy test suite](policy-tests.md):
 its cases are `policy-tests.v1` cases without an `expect`, parsed by the same
@@ -121,6 +122,10 @@ origin syntax, identity bounds, unique case ids and byte lengths.
   pinned base, in order, each to the result of the ones before it.
 - `{"source": "inline", "policy": {...}}` simulates a complete policy document
   submitted with the request.
+- `{"source": "draft", "draft_id": "pd_...", "draft_etag": "\"sha256:...\""}`
+  simulates one of your server-side drafts as it is at that draft ETag, and
+  `{"source": "revision", "version": 7}` a version of the policy history; see
+  [Drafts and history versions](#drafts-and-history-versions).
 
 An edited or inline candidate is validated exactly as a policy write
 validates one -- the 0.x or v1 rules its `schema_version` selects, and the
@@ -136,8 +141,48 @@ own and is validated as the document its edits produce. A candidate whose
 document format this deployment could not commit -- policy v1 in cluster
 mode -- is refused as `POST /v1{ADMIN_PREFIX}/policy/validate` and a policy
 test run refuse it. A candidate that does not validate is `422
-policy_candidate_invalid`. Server-side drafts and historical revisions are
-not candidate sources yet.
+policy_candidate_invalid`.
+
+### Drafts and history versions
+
+A stored candidate is read when the request is served, never written, and
+reported by its identity. Policy test runs, policy analyses and replay jobs
+read one exactly as described here.
+
+- **A draft** (`draft_id`, at most 64 bytes, and `draft_etag`, at most 256) is
+  read through the drafts store under the drafts API's own owner scope. It
+  must be yours: another principal's draft, including the same subject's from
+  another issuer, is `404 policy_draft_not_found`, exactly as one that does not
+  exist. It must be unexpired (`410 policy_draft_expired`) and still at
+  `draft_etag`, the strong ETag `GET /v1{ADMIN_PREFIX}/policy/drafts/{id}`
+  returned (`412 policy_draft_stale` once it has changed). And it must be
+  pinned to `base_etag`: a draft edited from another policy is `409
+  policy_draft_base_stale`, with the draft's `base_etag` and the request's as
+  `policy_etag`. Nothing is rebased; to compare the draft with a newer base,
+  re-pin it with `PATCH` first. A published draft is frozen, so its ETag keeps
+  naming one document, and it can still be read this way. Reading a draft
+  never writes it: its revision, ETag and expiry stay as they were, and no
+  `policy.draft_changed` is emitted. Its candidate is validated again under
+  this build and deployment, as an inline candidate is (`422
+  policy_candidate_invalid`). A deployment whose drafts store is unavailable
+  answers `503 policy_drafts_unavailable`.
+- **A history version** (`version`, a positive integer) is read from the
+  history authority -- the SQLite policy history in standalone mode, the
+  immutable `policy_documents` rows in cluster mode -- as
+  `GET /v1{ADMIN_PREFIX}/policy/history` lists it, and validated again under
+  this build and deployment, as a write of it would be today. A version they
+  would not accept, a document this build cannot read included, is `422
+  policy_revision_incompatible` with the `version` and the validator's
+  `errors`; it is never evaluated as something other than what it was. A
+  version the history does not hold is `404 policy_revision_not_found`, a
+  history that cannot be read `503 policy_history_unavailable`, and a
+  deployment with no history `404`. Nothing is reactivated.
+
+Naming a stored candidate needs no permission beyond the request's own. Every
+endpoint that takes one already requires `admin:policy:read`, which is what
+reading a draft or a history version directly needs, and checks it before
+anything is read, so a caller without it learns nothing about whether a draft
+exists. Using your draft needs no `admin:policy:write`.
 
 ### Position-aware edits
 
@@ -216,16 +261,23 @@ Content-Type: application/json
 | `200` | -- | The simulation completed. `Cache-Control: no-store`. |
 | `400` | `policy_simulation_request_invalid` | The body is not JSON or repeats a member name anywhere. |
 | `401`, `403` | -- | Not authenticated, or missing either permission. |
-| `404` | -- | No policy is configured. |
-| `412` | `policy_simulation_base_stale` | `base_etag` is not the active policy's ETag, which `current_etag` carries. Nothing ran; no rebase is attempted. |
+| `404` | -- | No policy is configured, or a `revision` candidate names a deployment with no policy history. |
+| `404` | `policy_draft_not_found` | A `draft` candidate names no draft of yours. |
+| `404` | `policy_revision_not_found` | A `revision` candidate names a version the history does not hold. |
+| `409` | `policy_draft_base_stale` | A `draft` candidate is pinned to another base than `base_etag`. |
+| `410` | `policy_draft_expired` | A `draft` candidate has expired. |
+| `412` | `policy_simulation_base_stale` | `base_etag` is not the active policy's ETag, which `current_etag` carries. Nothing ran; no rebase is attempted. Checked before a stored candidate is read. |
+| `412` | `policy_draft_stale` | A `draft` candidate's `draft_etag` is no longer the draft's ETag. |
 | `413` | -- | The body exceeds `MAX_BODY_SIZE` or 2 MiB, whichever is lower. |
 | `422` | `policy_simulation_invalid` | The request, or an edit applied to the base, is invalid. At most 64 `diagnostics` (`code`, JSON `pointer`, fixed `message`) and `diagnostics_truncated`. Diagnostics never repeat an input value. |
 | `422` | `policy_candidate_invalid` | The candidate policy does not validate; `errors` are the policy validator's messages. |
+| `422` | `policy_revision_incompatible` | A `revision` candidate is not a policy this build and deployment accept now; `version` and `errors` say which and why. |
 | `422` | `policy_simulation_case_refused` | The evaluator refused a case's facts; `pointer` and `code` name it. |
 | `422` | `policy_simulation_result_too_large` | The result would exceed 8 MiB. Nothing is cut short; simulate fewer cases or a lower trace level. |
 | `429` | `policy_simulation_busy` | Four simulations are already evaluating on this replica, or this caller already has one running. Nothing was queued. |
 | `500` | -- | An evaluator invariant failed or a policy did not compile. No partial result. |
 | `503` | -- | Cluster mode could not read the active policy, or (`policy_simulation_deadline_exceeded`) the evaluation did not finish within two seconds. No partial result. |
+| `503` | `policy_drafts_unavailable`, `policy_history_unavailable` | The drafts store or the policy history a stored candidate names could not be read. |
 
 Simulation does not need the audit query store: it reads no retained traffic.
 
@@ -305,7 +357,11 @@ plus `empty_simulation`, `empty_edits`, `too_many_edits`,
   and version `policy-simulation.v1`. The audit event carries the same value.
 - `base.etag` is the pinned active ETag (cluster mode adds
   `security_revision`); `candidate.etag` is the ETag the candidate would have
-  once written, and equals the base's for the `active` source.
+  once written -- the digest that identifies it -- and equals the base's for
+  the `active` source. A `draft` candidate adds the `draft_id` and the
+  `draft_revision` it was read at, and a `revision` candidate the `version`:
+  `{"source": "draft", "etag": "\"sha256:...\"", "draft_id": "pd_...",
+  "draft_revision": 3}`.
 - Each case has one entry per projection. When the candidate is not the base,
   each entry also has the `base` answer under the same projection and
   `changed`, which compares outcomes -- logical decision, enforcement,
@@ -419,7 +475,9 @@ succeeds or that the upstream answers.
 Each completed simulation emits one `policy.simulation_run` audit event with
 the acting principal and the request envelope, `request_digest`, `base_etag`,
 `security_revision` (cluster mode), `candidate_source`, `candidate_etag`, the
-number of `edits`, the `trace` level, the `projections`, the number of `cases`,
+number of `edits`, for a stored candidate its `candidate_draft_id` and
+`candidate_draft_revision` or its `candidate_version`, the `trace` level, the
+`projections`, the number of `cases`,
 the `summary` counts and the evaluator semantics versions. It never carries a
 case id, a fixture value, an edit, a matched element or policy content. A
 refused request (`4xx`) is not recorded as a simulation.
@@ -437,8 +495,7 @@ the base.
 
 Not part of this slice, and not to be inferred from it:
 
-- Server-side drafts and historical revisions as candidate sources, and
-  routing derived server-side from the pinned configuration snapshot.
+- Routing derived server-side from the pinned configuration snapshot.
 - Egress for a candidate `egress` section, and egress evaluated as part of an
   HTTP or tool case's upstream.
 - Trusted, pinned resolution evidence: the only resolution input today is a

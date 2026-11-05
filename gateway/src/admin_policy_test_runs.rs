@@ -1,6 +1,8 @@
 //! `POST /v1{ADMIN_PREFIX}/policy/tests/runs` (issue #243, slice 11): run a
-//! `policy-tests.v1` suite against the active policy, or against a candidate
-//! submitted with the run, and answer JSON, SARIF or JUnit.
+//! `policy-tests.v1` suite against the active policy, against a candidate
+//! submitted with the run, or against a stored candidate -- a server-side
+//! draft the caller owns, or a version of the policy history -- and answer
+//! JSON, SARIF or JUnit.
 //!
 //! A run is a read. It needs `admin:policy:read` and `admin:policy:simulate`,
 //! both checked before the body is read, persists nothing, activates nothing,
@@ -15,6 +17,8 @@
 //! a live bucket, resolver or connection.
 use super::*;
 
+use policy_simulation::request::CandidateSource;
+use policy_testing::report::PolicySource;
 use serde_json::value::RawValue;
 
 /// Most runs evaluating at once on this replica. A run is CPU-only and
@@ -46,10 +50,23 @@ enum PolicyTestFormat {
 /// The request members and what they hold, before the suite is parsed.
 struct PolicyTestRunRequest {
     suite: Value,
+    candidate: Option<PolicyTestCandidate>,
+    format: PolicyTestFormat,
+}
+
+/// What a run judges in place of the active policy.
+enum PolicyTestCandidate {
     /// The exact bytes of the `policy` member, read later by the parser a
     /// policy write reads its body with.
-    candidate: Option<Box<RawValue>>,
-    format: PolicyTestFormat,
+    Inline(Box<RawValue>),
+    /// The caller's draft, at the strong draft ETag the `candidate` member
+    /// names.
+    Draft {
+        draft_id: String,
+        draft_etag: String,
+    },
+    /// A version of the policy history.
+    Revision { version: i64 },
 }
 
 /// The request bytes' `policy` member, unread.
@@ -90,11 +107,11 @@ fn parse_policy_test_run_request(body: &Bytes) -> ResponseResult<PolicyTestRunRe
     };
     if members
         .keys()
-        .any(|key| !matches!(key.as_str(), "suite" | "policy" | "format"))
+        .any(|key| !matches!(key.as_str(), "suite" | "policy" | "candidate" | "format"))
     {
         return Err(Box::new(policy_tests_refusal(
             StatusCode::BAD_REQUEST,
-            "policy test run body accepts only suite, policy and format",
+            "policy test run body accepts only suite, policy, candidate and format",
             "policy_tests_request_invalid",
         )));
     }
@@ -120,10 +137,17 @@ fn parse_policy_test_run_request(body: &Bytes) -> ResponseResult<PolicyTestRunRe
     };
     // The member is there (the body was just read with it) and named once;
     // a `null` candidate stays a candidate, and is refused as one.
-    let candidate = match members.remove("policy") {
-        None => None,
-        Some(_) => match serde_json::from_slice::<PolicyTestRunCandidateBytes<'_>>(body) {
-            Ok(member) => Some(member.policy.to_owned()),
+    let candidate = match (members.remove("policy"), members.remove("candidate")) {
+        (None, None) => None,
+        (Some(_), Some(_)) => {
+            return Err(Box::new(policy_tests_refusal(
+                StatusCode::BAD_REQUEST,
+                "a policy test run judges an inline policy or a stored candidate, not both",
+                "policy_tests_request_invalid",
+            )))
+        }
+        (Some(_), None) => match serde_json::from_slice::<PolicyTestRunCandidateBytes<'_>>(body) {
+            Ok(member) => Some(PolicyTestCandidate::Inline(member.policy.to_owned())),
             Err(_) => {
                 return Err(Box::new(policy_tests_refusal(
                     StatusCode::BAD_REQUEST,
@@ -132,6 +156,7 @@ fn parse_policy_test_run_request(body: &Bytes) -> ResponseResult<PolicyTestRunRe
                 )))
             }
         },
+        (None, Some(candidate)) => Some(stored_test_candidate(body, &candidate)?),
     };
     Ok(PolicyTestRunRequest {
         suite,
@@ -140,66 +165,136 @@ fn parse_policy_test_run_request(body: &Bytes) -> ResponseResult<PolicyTestRunRe
     })
 }
 
+/// The `candidate` member: a draft or a history version, with exactly the
+/// members a simulation's candidate of the same source has, parsed by the
+/// simulation's parser. An inline document is the `policy` member's, and a
+/// run has no base for edits to apply to.
+fn stored_test_candidate(body: &[u8], value: &Value) -> ResponseResult<PolicyTestCandidate> {
+    let mut diagnostics = policy_testing::suite::Diagnostics::new();
+    let source = policy_simulation::request::parse_candidate(body, value, &mut diagnostics);
+    if !diagnostics.is_empty() {
+        return Err(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "the policy test run candidate is invalid",
+                    "reason": "policy_tests_request_invalid",
+                    "diagnostics": diagnostics.diagnostics,
+                    "diagnostics_truncated": diagnostics.truncated,
+                })),
+            )
+                .into_response(),
+        ));
+    }
+    match source {
+        Some(CandidateSource::Draft {
+            draft_id,
+            draft_etag,
+        }) => Ok(PolicyTestCandidate::Draft {
+            draft_id,
+            draft_etag,
+        }),
+        Some(CandidateSource::Revision { version }) => {
+            Ok(PolicyTestCandidate::Revision { version })
+        }
+        _ => Err(Box::new(policy_tests_refusal(
+            StatusCode::BAD_REQUEST,
+            "a policy test run candidate is a draft or a revision; send a candidate document as policy",
+            "policy_tests_request_invalid",
+        ))),
+    }
+}
+
+/// The policy a run judges, the authority it was read under, and its binding.
+type PolicyUnderTest = (
+    rbac::Policy,
+    policy_eval::PolicyAuthority,
+    policy_testing::report::PolicyBinding,
+);
+
 /// The policy a run judges and its binding: the active document as its
 /// authority holds it, or a validated candidate.
 async fn policy_under_test(
     state: &PolicyAdminState,
     rbac_state: &middleware::rbac::RbacState,
+    principal: &auth::Principal,
     headers: &HeaderMap,
-    candidate: Option<Box<RawValue>>,
-) -> ResponseResult<(
-    rbac::Policy,
-    policy_eval::PolicyAuthority,
-    policy_testing::report::PolicyBinding,
-)> {
-    if let Some(candidate) = candidate {
-        // `If-Match` names the live policy. Against a candidate it would be
-        // a precondition nothing checks, so it is refused rather than
-        // silently ignored.
-        if headers.contains_key(header::IF_MATCH) {
-            return Err(Box::new(policy_tests_refusal(
-                StatusCode::BAD_REQUEST,
-                "If-Match pins the active policy and cannot be combined with a candidate policy",
-                "policy_tests_request_invalid",
-            )));
-        }
-        // The validation `POST /policy/validate` and `PUT /policy` apply,
-        // read from the member's own bytes as they read a body, so a
-        // candidate is judged as the gateway would accept it.
-        let candidate = match parse_policy_body(candidate.get().as_bytes()) {
-            Ok(candidate) => candidate,
-            Err(errors) => return Err(Box::new(policy_candidate_refused(errors))),
-        };
-        if let Err(error) = rbac_state.validate_proxy_dispatch_policy(&candidate) {
-            return Err(Box::new(policy_candidate_invalid(&error)));
-        }
-        // `POST /policy/validate` also refuses a document format this
-        // deployment cannot commit (cluster mode and policy v1), so a run
-        // refuses it too rather than judge a candidate the gateway would not
-        // accept.
-        if let Some(detail) = deployment_document_format_refusal(state, &candidate) {
-            return Err(Box::new(policy_candidate_refused(vec![detail])));
-        }
-        let etag = match policy_etag(&candidate) {
-            Ok(etag) => etag,
-            Err(error) => {
-                tracing::error!(error = %error, "failed to compute candidate policy ETag");
-                return Err(Box::new(internal_server_error(
-                    "policy ETag computation failed",
-                )));
-            }
-        };
-        return Ok((
-            candidate,
-            policy_eval::PolicyAuthority::Standalone,
-            policy_testing::report::PolicyBinding {
-                source: policy_testing::report::PolicySource::InlineCandidate,
-                etag,
-                security_revision: None,
-            },
-        ));
+    candidate: Option<PolicyTestCandidate>,
+) -> ResponseResult<PolicyUnderTest> {
+    let Some(candidate) = candidate else {
+        return active_policy_under_test(state, rbac_state, headers).await;
+    };
+    // `If-Match` names the live policy. Against a candidate it would be a
+    // precondition nothing checks, so it is refused rather than silently
+    // ignored.
+    if headers.contains_key(header::IF_MATCH) {
+        return Err(Box::new(policy_tests_refusal(
+            StatusCode::BAD_REQUEST,
+            "If-Match pins the active policy and cannot be combined with a candidate policy",
+            "policy_tests_request_invalid",
+        )));
     }
+    let (source, resolved) = match candidate {
+        PolicyTestCandidate::Inline(candidate) => {
+            return inline_policy_under_test(state, rbac_state, &candidate);
+        }
+        PolicyTestCandidate::Draft {
+            draft_id,
+            draft_etag,
+        } => {
+            // A run has no `base_etag`: a draft is judged only while it is
+            // still pinned to the live policy, the one it would be published
+            // over.
+            let (_, live_etag, _) = simulation_base(state, rbac_state).await?;
+            let resolved = draft_candidate(
+                state,
+                rbac_state,
+                principal,
+                &draft_id,
+                &draft_etag,
+                &live_etag,
+            )
+            .await;
+            (PolicySource::Draft, resolved)
+        }
+        PolicyTestCandidate::Revision { version } => (
+            PolicySource::Revision,
+            revision_candidate(state, rbac_state, version).await,
+        ),
+    };
+    // Read and validated as a simulation reads a stored candidate, and
+    // judged with no live revision, as an inline candidate is.
+    let resolved = resolved.map_err(|refusal| match refusal {
+        CandidateRefusal::Invalid(errors) => Box::new(policy_candidate_refused(errors)),
+        CandidateRefusal::Stored(response) => response,
+        CandidateRefusal::Edits(_) | CandidateRefusal::Internal => {
+            Box::new(internal_server_error("policy test run failed"))
+        }
+    })?;
+    // A stored candidate is always a document of its own, never the base.
+    let Some(candidate) = resolved.policy else {
+        tracing::error!("a stored policy test candidate resolved to no document");
+        return Err(Box::new(internal_server_error("policy test run failed")));
+    };
+    let etag = candidate_etag(&candidate)?;
+    Ok((
+        candidate,
+        policy_eval::PolicyAuthority::Standalone,
+        policy_testing::report::PolicyBinding {
+            source,
+            etag,
+            security_revision: None,
+            stored: resolved.stored,
+        },
+    ))
+}
 
+/// The active policy, under an optional `If-Match` pin.
+async fn active_policy_under_test(
+    state: &PolicyAdminState,
+    rbac_state: &middleware::rbac::RbacState,
+    headers: &HeaderMap,
+) -> ResponseResult<PolicyUnderTest> {
     // Cluster mode judges the authoritative active document, exactly what
     // `GET /policy` serves and a commit compares against, at the revision it
     // was read.
@@ -227,9 +322,10 @@ async fn policy_under_test(
                 security_revision: active.security_revision,
             },
             policy_testing::report::PolicyBinding {
-                source: policy_testing::report::PolicySource::Active,
+                source: PolicySource::Active,
                 etag: active.etag,
                 security_revision: Some(active.security_revision),
+                stored: None,
             },
         ));
     }
@@ -250,11 +346,54 @@ async fn policy_under_test(
         policy,
         policy_eval::PolicyAuthority::Standalone,
         policy_testing::report::PolicyBinding {
-            source: policy_testing::report::PolicySource::Active,
+            source: PolicySource::Active,
             etag,
             security_revision: None,
+            stored: None,
         },
     ))
+}
+
+/// An inline candidate, validated as `POST /policy/validate` and
+/// `PUT /policy` validate one -- read from the member's own bytes as they
+/// read a body -- so it is judged as the gateway would accept it.
+fn inline_policy_under_test(
+    state: &PolicyAdminState,
+    rbac_state: &middleware::rbac::RbacState,
+    candidate: &RawValue,
+) -> ResponseResult<PolicyUnderTest> {
+    let candidate = match parse_policy_body(candidate.get().as_bytes()) {
+        Ok(candidate) => candidate,
+        Err(errors) => return Err(Box::new(policy_candidate_refused(errors))),
+    };
+    if let Err(error) = rbac_state.validate_proxy_dispatch_policy(&candidate) {
+        return Err(Box::new(policy_candidate_invalid(&error)));
+    }
+    // `POST /policy/validate` also refuses a document format this
+    // deployment cannot commit (cluster mode and policy v1), so a run
+    // refuses it too rather than judge a candidate the gateway would not
+    // accept.
+    if let Some(detail) = deployment_document_format_refusal(state, &candidate) {
+        return Err(Box::new(policy_candidate_refused(vec![detail])));
+    }
+    let etag = candidate_etag(&candidate)?;
+    Ok((
+        candidate,
+        policy_eval::PolicyAuthority::Standalone,
+        policy_testing::report::PolicyBinding {
+            source: PolicySource::InlineCandidate,
+            etag,
+            security_revision: None,
+            stored: None,
+        },
+    ))
+}
+
+fn candidate_etag(candidate: &rbac::Policy) -> ResponseResult<String> {
+    policy_etag(candidate).map_err(|error| {
+        tracing::error!(error = %error, "failed to compute candidate policy ETag");
+        Box::new(internal_server_error("policy ETag computation failed"))
+    })
 }
 
 /// An optional pin: absent runs against whatever is active, present must
@@ -308,10 +447,14 @@ fn emit_policy_tests_run(
         "http_semantics_version": report.evaluator.http_semantics_version,
         "tool_semantics_version": report.evaluator.tool_semantics_version,
     });
-    if let (Some(revision), Some(payload)) =
-        (report.policy.security_revision, payload.as_object_mut())
-    {
-        payload.insert("security_revision".to_owned(), json!(revision));
+    if let Some(payload) = payload.as_object_mut() {
+        if let Some(revision) = report.policy.security_revision {
+            payload.insert("security_revision".to_owned(), json!(revision));
+        }
+        // Which draft or history version, never its content.
+        if let Some(stored) = &report.policy.stored {
+            stored.describe("policy_", payload);
+        }
     }
     state.audit.emit(audit::AuditEvent::new(
         audit::event::POLICY_TESTS_RUN,
@@ -425,11 +568,18 @@ pub(super) async fn policy_test_runs_endpoint(
                 .into_response();
         }
     };
-    let (policy, authority, binding) =
-        match policy_under_test(&state, rbac_state, &parts.headers, run_request.candidate).await {
-            Ok(view) => view,
-            Err(response) => return *response,
-        };
+    let (policy, authority, binding) = match policy_under_test(
+        &state,
+        rbac_state,
+        &principal,
+        &parts.headers,
+        run_request.candidate,
+    )
+    .await
+    {
+        Ok(view) => view,
+        Err(response) => return *response,
+    };
 
     let suite_digest = suite.digest.clone();
     let resources = synthetic_resources(rbac_state);

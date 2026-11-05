@@ -469,7 +469,7 @@ mod tests {
         for (name, context, expected) in cases {
             let mut stages = Vec::new();
             let traced = compiled
-                .evaluate_with_stages(&context, &mut stages)
+                .evaluate_with_stages(&context, &crate::policy_eval::UNCAPTURED_FACTS, &mut stages)
                 .expect("evaluates");
             assert_eq!(
                 compiled.evaluate(&context).expect("evaluates"),
@@ -494,7 +494,7 @@ mod tests {
         input.request_host = HostFact::Missing;
         let mut stages = Vec::new();
         compiled
-            .evaluate_with_stages(&input, &mut stages)
+            .evaluate_with_stages(&input, &crate::policy_eval::UNCAPTURED_FACTS, &mut stages)
             .expect("evaluates");
         assert_eq!(stages[1], HttpStage::RequestHost(HostUse::NotRequired));
         assert_eq!(
@@ -512,7 +512,9 @@ mod tests {
         let mut input = context(&compiled, "/orders/1");
         input.path = Some("relative".to_owned());
         let mut stages = Vec::new();
-        assert!(compiled.evaluate_with_stages(&input, &mut stages).is_err());
+        assert!(compiled
+            .evaluate_with_stages(&input, &crate::policy_eval::UNCAPTURED_FACTS, &mut stages)
+            .is_err());
         assert!(stages.is_empty());
     }
 
@@ -691,7 +693,11 @@ mod tests {
         for (name, context, expected) in cases {
             let mut stages = Vec::new();
             let traced = compiled
-                .evaluate_tool_with_stages(&context, &mut stages)
+                .evaluate_tool_with_facts(
+                    &context,
+                    &crate::policy_eval::UNCAPTURED_FACTS,
+                    &mut stages,
+                )
                 .expect("evaluates");
             assert_eq!(
                 compiled.evaluate_tool(&context).expect("evaluates"),
@@ -714,7 +720,11 @@ mod tests {
         rendered.method = None;
         let mut stages = Vec::new();
         compiled
-            .evaluate_tool_with_stages(&rendered, &mut stages)
+            .evaluate_tool_with_facts(
+                &rendered,
+                &crate::policy_eval::UNCAPTURED_FACTS,
+                &mut stages,
+            )
             .expect("evaluates");
         assert_eq!(stages, [ToolStage::Facts(Some(ToolLimitation::Method))]);
     }
@@ -788,7 +798,11 @@ mod tests {
         for (name, context, expected) in cases {
             let mut stages = Vec::new();
             let traced = compiled
-                .select_rate_lane_with_stages(&context, &mut stages)
+                .select_rate_lane_with_facts(
+                    &context,
+                    &crate::policy_eval::UNCAPTURED_FACTS,
+                    &mut stages,
+                )
                 .expect("selects");
             assert_eq!(
                 compiled.select_rate_lane(&context).expect("selects"),

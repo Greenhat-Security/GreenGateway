@@ -83,6 +83,12 @@
             },
             "auth_method": {
               "enum": ["bearer_token", "session_cookie", "service_token", "client_certificate"]
+            },
+            "organization": {
+              "description": "The organization authentication verified for the principal, which an identity mapping may test. Omitted, the principal has none, exactly as a principal whose provider verified none. It is read only in mapped-role mode, as on the live lanes.",
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 8192
             }
           }
         }

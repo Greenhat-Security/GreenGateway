@@ -350,8 +350,8 @@ class ArithmeticTests(unittest.TestCase):
         self.assertIn(f"pub const MAX_DATABASE_POOL_MAX: usize = {sizing.MAX_POOL_MAX};", config)
 
     def test_every_cluster_one_shot_command_has_a_connection_cost(self):
-        bootstrap = (ROOT / "gateway/src/bootstrap.rs").read_text(encoding="utf-8")
-        words = set(re.findall(r'word == \*"([a-z-]+)"', bootstrap))
+        commands = (ROOT / "gateway/src/bootstrap/commands.rs").read_text(encoding="utf-8")
+        words = set(re.findall(r'word == \*"([a-z-]+)"', commands))
         self.assertTrue(words)
         self.assertEqual(words - set(sizing.COMMANDS), set())
 

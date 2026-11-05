@@ -403,22 +403,12 @@ impl CompiledPolicy {
         self.evaluate_tool_with_facts(context, &UNCAPTURED_FACTS, &mut NoStages)
     }
 
-    /// [`Self::evaluate_tool`], reporting each stage it runs to `stages`.
-    ///
-    /// The decision code, not a copy of it: `evaluate_tool` is this with a
-    /// sink that keeps nothing. See [`super::stages`].
-    pub(crate) fn evaluate_tool_with_stages(
-        &self,
-        context: &ToolEvaluationContext,
-        stages: &mut impl StageSink<ToolStage>,
-    ) -> Result<ToolEvaluation, EvaluationError> {
-        self.evaluate_tool_with_facts(context, &UNCAPTURED_FACTS, stages)
-    }
-
     /// [`Self::evaluate_tool`] with the facts typed matchers read: an
     /// identity mapping's organization, and whatever a tool-name or rendered
     /// HTTP rule's conditions read. Each stage it runs is reported to
-    /// `stages`; the live adapters pass [`NoStages`].
+    /// `stages`: the decision code, not a copy of it. The live adapters pass
+    /// [`NoStages`], which keeps nothing; a simulation passes a collecting
+    /// sink. See [`super::stages`].
     pub(crate) fn evaluate_tool_with_facts(
         &self,
         context: &ToolEvaluationContext,

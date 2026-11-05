@@ -635,6 +635,42 @@ fn validate_and_doctor_read_a_bundle_offline_with_their_exit_codes() {
 }
 
 #[test]
+fn pin_repins_an_edited_file_and_never_one_that_is_invalid() {
+    let bundle = Bundle::new("{\"schema_version\": \"0.1.0\", \"default_action\": \"deny\"}\n");
+    bundle.write(
+        "policy.json",
+        "{\"schema_version\": \"0.1.0\", \"default_action\": \"deny\", \"enforcement_mode\": \"enforce\"}\n",
+    );
+    let output = ggctl(&["validate", bundle.path()], None);
+    assert_eq!(output.status.code(), Some(3));
+    assert!(text(&output.stderr).contains("bundle.digest_mismatch"));
+
+    let output = ggctl(&["pin", bundle.path(), "--format", "json"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    let found = report(&output);
+    assert_eq!(found["command"], "pin");
+    assert_eq!(found["result"]["written"], true);
+    assert_path_not_echoed(&output, bundle.path());
+    let output = ggctl(&["validate", bundle.path(), "--strict"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+
+    // An allow-by-default policy is refused, and the manifest is untouched.
+    let manifest = std::fs::read(bundle.0.join("bundle.yaml")).expect("the manifest");
+    bundle.write(
+        "policy.json",
+        &format!("{{\"schema_version\": \"0.1.0\", \"id\": \"{CANARY}\", \"default_action\": \"allow\"}}\n"),
+    );
+    let output = ggctl(&["pin", bundle.path()], None);
+    assert_eq!(output.status.code(), Some(3));
+    assert!(text(&output.stderr).contains("profile.policy_default_allow"));
+    assert_no_canary(&output);
+    assert_eq!(
+        std::fs::read(bundle.0.join("bundle.yaml")).expect("the manifest"),
+        manifest
+    );
+}
+
+#[test]
 fn init_writes_a_bundle_that_validates_strictly_and_converts_to_itself() {
     // An empty parent: init creates the bundle directory in it.
     let parent = Bundle::new("{\"schema_version\": \"0.1.0\"}\n");

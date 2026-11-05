@@ -887,6 +887,144 @@ async fn anonymous_requests_pass_the_policy_stage_unselected_and_uncharged() {
     assert_eq!(selection.outcome(), RateLaneOutcome::NoOverride);
 }
 
+/// In mapped-role mode the live stage selects by the internal roles the
+/// identity mappings grant (#243), from the organization the principal's own
+/// issuer verified: exactly what the kernel selects when handed that fact by
+/// hand. A claimed role named like an internal one, another issuer's
+/// organization and a service token's scopes select nothing they would not
+/// select without them.
+#[tokio::test]
+async fn in_mapped_role_mode_the_live_stage_selects_by_the_verified_organization() {
+    const ISSUER: &str = "https://idp-a.example.test";
+    let policy = Policy::validate_json_value(json!({
+        "schema_version": "1.0.0",
+        "roles": {
+            "admin": { "permissions": ["data:read"] },
+            "reader": { "permissions": ["data:read"] }
+        },
+        "identity_mappings": [
+            {
+                "id": "acme-admins",
+                "issuer": ISSUER,
+                "organizations": ["acme"],
+                "claimed_roles": ["Platform-Admins"],
+                "grant_roles": ["admin"]
+            },
+            { "id": "acme-readers", "issuer": ISSUER, "organizations": ["acme"], "grant_roles": ["reader"] }
+        ],
+        "rate_limits": [
+            { "id": "admins", "principal": { "roles": ["admin"] }, "requests_per_second": RATES[0], "burst": 7 },
+            { "id": "reader-data", "principal": { "roles": ["reader"] }, "path": "/data/**", "requests_per_second": RATES[1], "burst": 3 }
+        ]
+    }))
+    .expect("the mapped fixture validates");
+    let live = side(&policy, false);
+    let installed = live.rbac.installed_compiled_policy();
+    let compiled = installed.compiled();
+    let with_organization = |subject: &str,
+                             issuer: Option<&str>,
+                             organization: Option<&str>,
+                             roles: &[&str],
+                             auth_method| {
+        let mut identity = principal(subject, issuer.unwrap_or(ISSUER), roles, auth_method);
+        identity.issuer = issuer.map(str::to_owned);
+        identity.org_id = organization.map(str::to_owned);
+        identity
+    };
+    let principals = [
+        with_organization(
+            "admin",
+            Some(ISSUER),
+            Some("acme"),
+            &["Platform-Admins"],
+            AuthMethod::Bearer,
+        ),
+        with_organization(
+            "member",
+            Some(ISSUER),
+            Some("acme"),
+            &[],
+            AuthMethod::Bearer,
+        ),
+        with_organization(
+            "outsider",
+            Some(ISSUER),
+            Some("globex"),
+            &["Platform-Admins"],
+            AuthMethod::Bearer,
+        ),
+        with_organization(
+            "unverified",
+            Some(ISSUER),
+            None,
+            &["Platform-Admins"],
+            AuthMethod::Bearer,
+        ),
+        with_organization(
+            "named",
+            Some(ISSUER),
+            None,
+            &["admin", "reader"],
+            AuthMethod::Bearer,
+        ),
+        with_organization(
+            "elsewhere",
+            Some("https://idp-b.example.test"),
+            Some("acme"),
+            &["Platform-Admins"],
+            AuthMethod::Bearer,
+        ),
+        with_organization(
+            "service-token:synthetic",
+            None,
+            Some("acme"),
+            &["admin", "reader"],
+            AuthMethod::ServiceToken,
+        ),
+    ];
+    let mut selected = 0;
+    for identity in &principals {
+        for path in ["/data/1", "/other"] {
+            let mut facts = crate::policy_eval::PolicyFacts::uncaptured();
+            facts.organization = crate::policy_eval::Fact::Captured(identity.org_id.clone());
+            let expected = compiled
+                .select_rate_lane_with_facts(
+                    &PolicyEvaluationContext {
+                        version: CONTEXT_VERSION,
+                        snapshot: compiled.snapshot(),
+                        method: Some(Method::GET),
+                        path: Some(path.to_owned()),
+                        principal: PrincipalFact::Authenticated(PrincipalIdentity::from_principal(
+                            identity,
+                        )),
+                        target: HttpTarget::Missing,
+                        request_host: HostFact::Missing,
+                        dispatch: None,
+                    },
+                    &facts,
+                    &mut crate::policy_eval::stages::NoStages,
+                )
+                .expect("selects");
+            let expected = match expected.outcome() {
+                RateLaneOutcome::NoOverride => None,
+                RateLaneOutcome::Override { limit, .. } => {
+                    Some((limit.requests_per_second(), limit.burst()))
+                }
+                RateLaneOutcome::Indeterminate(limitation) => {
+                    panic!("every organization is captured: {limitation:?}")
+                }
+            };
+            let actual = live_selection(&live.state, &Method::GET, path, Some(identity))
+                .expect("the live stage selects")
+                .map(|(_, requests_per_second, burst)| (requests_per_second, burst));
+            assert_eq!(actual, expected, "{} {path}", identity.user_id);
+            selected += usize::from(actual.is_some());
+        }
+    }
+    // Only the acme admin (both paths) and member (data only) select one.
+    assert_eq!(selected, 3);
+}
+
 /// A stage no RBAC state attached -- a gateway with no policy -- selects
 /// nothing and charges nothing, as before.
 #[tokio::test]

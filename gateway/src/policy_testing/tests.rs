@@ -10,7 +10,9 @@ use super::{
     synthetic::{test_resources, SyntheticResources},
     RunError,
 };
-use crate::{policy_eval::PolicyAuthority, rbac::Policy};
+use crate::{
+    policy_eval::PolicyAuthority, policy_simulation::request::StoredCandidate, rbac::Policy,
+};
 
 /// Values a case supplies that no rendering may repeat. Each is unusual
 /// enough that finding it in output can only mean it leaked from a fixture.
@@ -300,6 +302,7 @@ fn binding() -> PolicyBinding {
         source: PolicySource::Active,
         etag: "\"sha256:test\"".to_owned(),
         security_revision: None,
+        stored: None,
     }
 }
 
@@ -367,6 +370,141 @@ fn every_case_kind_decides_through_the_evaluator_and_passes() {
             errors: 0,
         }
     );
+}
+
+/// A case's `organization` is the organization authentication verified for
+/// its principal, and decides an identity mapping in every lane exactly as
+/// it would on a live one (#243): stated, it is captured; omitted, the
+/// principal has none; another issuer's never applies. No rendering repeats
+/// it.
+#[test]
+fn a_case_organization_decides_identity_mappings_as_a_live_lane_does() {
+    const ORGANIZATION_CANARY: &str = "organization-canary-5d1e";
+    let mapped = Policy::validate_json_value(json!({
+        "schema_version": "1.0.0",
+        "default_action": "deny",
+        "roles": { "reader": { "permissions": ["orders:read"] } },
+        "identity_mappings": [{
+            "id": "canary-readers",
+            "issuer": "https://idp.example.test",
+            "organizations": [ORGANIZATION_CANARY],
+            "grant_roles": ["reader"]
+        }],
+        "routes": [{ "id": "orders", "methods": ["GET"], "path_prefix": "/orders", "permission": "orders:read" }],
+        "rate_limits": [{
+            "id": "readers",
+            "principal": { "roles": ["reader"] },
+            "requests_per_second": 5,
+            "burst": 10
+        }],
+        "tools": { "reports.export": { "allowed_roles": ["reader"] } }
+    }))
+    .expect("the mapped policy is valid");
+    let member = json!({
+        "subject": SUBJECT_CANARY,
+        "issuer": "https://idp.example.test/",
+        "organization": ORGANIZATION_CANARY,
+        "auth_method": "bearer_token"
+    });
+    let mut outsider = member.clone();
+    outsider["organization"] = json!("another-organization");
+    let mut unverified = member.clone();
+    unverified
+        .as_object_mut()
+        .expect("object")
+        .remove("organization");
+    let mut elsewhere = member.clone();
+    elsewhere["issuer"] = json!("https://other.example.test");
+    let mut cases = Vec::new();
+    for (name, principal, admitted) in [
+        ("member", member, true),
+        ("outsider", outsider, false),
+        ("unverified", unverified, false),
+        ("elsewhere", elsewhere, false),
+    ] {
+        let (logical, reason, tool_reason, rate_override) = if admitted {
+            ("allow", "matched_rule", "allowed", json!(0))
+        } else {
+            (
+                "deny",
+                "missing_permission",
+                "role_not_allowed",
+                Value::Null,
+            )
+        };
+        cases.push(json!({
+            "id": format!("{name}-reads-orders"),
+            "kind": "http",
+            "request": { "method": "GET", "path": "/orders/1" },
+            "principal": principal,
+            "expect": { "logical": logical, "reason": reason }
+        }));
+        cases.push(json!({
+            "id": format!("{name}-invokes-export"),
+            "kind": "tool",
+            "tool": { "name": "reports.export" },
+            "principal": principal,
+            "expect": { "logical": logical, "reason": tool_reason }
+        }));
+        cases.push(json!({
+            "id": format!("{name}-rate-override"),
+            "kind": "rate",
+            "request": { "method": "GET", "path": "/orders/1" },
+            "principal": principal,
+            "expect": { "rate_override": rate_override }
+        }));
+    }
+    let document = suite(cases);
+    let parsed = parse_suite(&document).expect("the suite is valid");
+    let outcome = run_against_policy(
+        mapped,
+        PolicyAuthority::Standalone,
+        &parsed,
+        &resources(),
+        far_deadline(),
+    )
+    .expect("policy compiles and the run finishes");
+    let report = RunReport::new(parsed.digest.clone(), binding(), outcome);
+    let failures: Vec<_> = report
+        .cases
+        .iter()
+        .filter(|case| case.status != CaseStatus::Passed)
+        .map(|case| (case.id.clone(), case.status, case.actual.clone()))
+        .collect();
+    assert!(failures.is_empty(), "unexpected outcomes: {failures:?}");
+    let rendered = serde_json::to_string(&report::to_json(&report).expect("json")).expect("text");
+    assert!(!rendered.contains(ORGANIZATION_CANARY));
+
+    // Under a policy without mappings the organization reads nothing.
+    let mut claimed = suite(vec![json!({
+        "id": "organization-is-not-a-role",
+        "kind": "http",
+        "request": { "method": "GET", "path": "/orders/1" },
+        "principal": {
+            "subject": "subject-1",
+            "organization": ORGANIZATION_CANARY,
+            "roles": ["reader"],
+            "auth_method": "bearer_token"
+        },
+        "expect": { "logical": "allow", "matched": { "route": 0 } }
+    })]);
+    assert_eq!(run(&claimed).status, RunStatus::Passed);
+    // An organization is a bounded, non-empty string, refused at its pointer.
+    for value in [
+        json!(""),
+        json!(7),
+        json!("o".repeat(crate::policy_eval::MAX_FACT_VALUE_BYTES + 1)),
+    ] {
+        claimed["cases"][0]["principal"]["organization"] = value;
+        let diagnostics = refused(&claimed);
+        assert_eq!(
+            codes(&diagnostics)
+                .into_iter()
+                .map(|(_, pointer)| pointer)
+                .collect::<Vec<_>>(),
+            vec!["/cases/0/principal/organization".to_owned()]
+        );
+    }
 }
 
 #[test]
@@ -782,6 +920,63 @@ fn junit_counts_failures_and_escapes_attributes() {
     assert_eq!(xml.matches("<testcase ").count(), total);
 }
 
+/// A stored candidate is named in every rendering by its identifiers: a
+/// draft by id and revision, a history version by number. An active or
+/// inline policy has no stored identity, and no rendering invents one.
+#[test]
+fn every_rendering_names_the_stored_candidate_it_judged() {
+    let mut report = run_passing();
+    report.policy.source = PolicySource::Draft;
+    report.policy.stored = Some(StoredCandidate::Draft {
+        draft_id: "pd_0123456789abcdef0123456789abcdef".to_owned(),
+        revision: 2,
+    });
+    let json = report::to_json(&report).expect("json");
+    assert_eq!(
+        json["policy"],
+        json!({
+            "source": "draft",
+            "etag": "\"sha256:test\"",
+            "draft_id": "pd_0123456789abcdef0123456789abcdef",
+            "draft_revision": 2
+        })
+    );
+    let sarif = report::to_sarif(&report);
+    let properties = &sarif["runs"][0]["properties"];
+    assert_eq!(properties["policy_source"], json!("draft"));
+    assert_eq!(
+        properties["policy_draft_id"],
+        json!("pd_0123456789abcdef0123456789abcdef")
+    );
+    assert_eq!(properties["policy_draft_revision"], json!(2));
+    let xml = report::to_junit(&report);
+    assert!(xml.contains("<property name=\"policy_source\" value=\"draft\"/>"));
+    assert!(xml.contains(
+        "<property name=\"policy_draft_id\" value=\"pd_0123456789abcdef0123456789abcdef\"/>"
+    ));
+    assert!(xml.contains("<property name=\"policy_draft_revision\" value=\"2\"/>"));
+
+    report.policy.source = PolicySource::Revision;
+    report.policy.stored = Some(StoredCandidate::Revision { version: 9 });
+    let json = report::to_json(&report).expect("json");
+    assert_eq!(
+        json["policy"],
+        json!({ "source": "revision", "etag": "\"sha256:test\"", "version": 9 })
+    );
+    assert_eq!(
+        report::to_sarif(&report)["runs"][0]["properties"]["policy_version"],
+        json!(9)
+    );
+    assert!(report::to_junit(&report).contains("<property name=\"policy_version\" value=\"9\"/>"));
+
+    let active = report::to_json(&run_passing()).expect("json");
+    assert_eq!(
+        active["policy"],
+        json!({ "source": "active", "etag": "\"sha256:test\"" })
+    );
+    assert!(!report::to_junit(&run_passing()).contains("policy_version"));
+}
+
 fn suite_schema() -> Value {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../docs/schemas/policy-tests.v1.schema.json");
@@ -798,12 +993,40 @@ fn suite_schema() -> Value {
 fn the_published_schema_agrees_with_the_parser() {
     let schema = suite_schema();
     let validator = jsonschema::validator_for(&schema).expect("the schema compiles");
-    let accepted = suite(passing_cases());
+    // One document for every kind: an isolated sequence on a principal with
+    // a verified organization and an egress case sit beside the others.
+    let mut cases = passing_cases();
+    cases[1]["principal"]["organization"] = json!("acme");
+    let organized = cases[1]["principal"].clone();
+    cases.push(json!({
+        "id": "organized-sequence",
+        "kind": "rate",
+        "request": { "method": "GET", "path": "/orders/1" },
+        "principal": organized.clone(),
+        "sequence": { "at_ms": [0, 5, 5] },
+        "expect": { "rate_override": null, "steps": ["allowed", "allowed", "limited"] }
+    }));
+    let mut egress = egress_case(
+        json!({ "scheme": "https", "host": "api.example.test", "port": 443 }),
+        Some(json!({ "hypothetical_addresses": ["203.0.113.7:443"] })),
+        json!({ "logical": "allow" }),
+    );
+    egress["id"] = json!("organized-egress");
+    cases.push(egress);
+    let accepted = suite(cases);
     assert!(parse_suite(&accepted).is_ok());
     if let Err(error) = validator.validate(&accepted) {
         panic!("the schema refuses a suite the parser accepts: {error}");
     }
+    let last = accepted["cases"].as_array().map_or(0, Vec::len) - 1;
     let mut refusals = Vec::new();
+    // An egress case has no principal, so none with an organization either.
+    let mut document = accepted.clone();
+    document["cases"][last]["principal"] = organized;
+    refusals.push(document);
+    let mut document = accepted.clone();
+    document["cases"][last - 1]["principal"]["organization"] = json!("");
+    refusals.push(document);
     let mut document = suite(passing_cases());
     document["schema_version"] = json!("policy-tests.v2");
     refusals.push(document);
@@ -825,6 +1048,11 @@ fn the_published_schema_agrees_with_the_parser() {
     let mut cases = passing_cases();
     cases[16]["expect"] = json!({});
     refusals.push(suite(cases));
+    for organization in [json!(""), json!(["acme"])] {
+        let mut cases = passing_cases();
+        cases[1]["principal"]["organization"] = organization;
+        refusals.push(suite(cases));
+    }
     for document in refusals {
         assert!(parse_suite(&document).is_err(), "parser: {document}");
         assert!(!validator.is_valid(&document), "schema: {document}");

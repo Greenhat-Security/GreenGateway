@@ -3,11 +3,13 @@
 //!
 //! Each case becomes the context a live adapter builds -- through the same
 //! builders the policy test runner uses -- and is asked of the same
-//! [`CompiledPolicy`] methods: `evaluate_with_stages` (which *is* `evaluate`,
-//! with a collecting sink) for HTTP, `evaluate_tool_with_stages` for the tool
-//! lanes and `select_rate_lane_with_stages` for rate overrides. An isolated
-//! rate sequence runs on a fresh bucket for the selected lane, and an egress
-//! case is asked of the static egress lane, both through
+//! [`CompiledPolicy`] methods, with the facts a live lane captures for the
+//! case's principal (`case_facts`): `evaluate_with_stages` (which *is*
+//! `evaluate_with_facts`, with a collecting sink) for HTTP,
+//! `evaluate_tool_with_facts` for the tool lanes and
+//! `select_rate_lane_with_facts` for rate overrides, each with a collecting
+//! sink. An isolated rate sequence runs on a fresh bucket for the selected
+//! lane, and an egress case is asked of the static egress lane, both through
 //! [`crate::policy_testing::synthetic`]. Nothing here matches a rule.
 //!
 //! Results carry case ids, stable codes, element positions and, for an admin
@@ -29,12 +31,12 @@ use crate::{
         },
         tools::{ToolEvaluationContext, ToolOperation, ToolReason},
         CompileError, CompiledPolicy, EvaluationError, LogicalDecision, PolicyAuthority,
-        PolicyEffect, RateLaneOutcome, Reason, RuleReference,
+        PolicyEffect, PolicyFacts, RateLaneOutcome, Reason, RuleReference,
     },
     policy_testing::{
         runner::{
-            evaluation_error_code, http_context, limitation_code, logical_code, rate_context,
-            step_codes, tool_context, tool_limitation_code,
+            case_facts, evaluation_error_code, http_context, limitation_code, logical_code,
+            rate_context, step_codes, tool_context, tool_limitation_code,
         },
         suite::{CaseContext, EgressCase, StepOutcome, SyntheticCase},
         synthetic::{
@@ -393,7 +395,7 @@ fn evaluate_case(
             let context = http_context(compiled.snapshot(), request, principal);
             let mut stages = Vec::with_capacity(MAX_HTTP_STAGES);
             let evaluation = compiled
-                .evaluate_with_stages(&context, &mut stages)
+                .evaluate_with_stages(&context, &case_facts(compiled, principal), &mut stages)
                 .map_err(refused)?;
             let outcome = decision_outcome(
                 evaluation.logical(),
@@ -442,7 +444,8 @@ fn evaluate_case(
             principal,
         } => {
             let context = tool_context(compiled.snapshot(), *operation, tool_name, principal, None);
-            tool_evaluated(policy, *operation, &context, trace, budget).map_err(refused)
+            let facts = case_facts(compiled, principal);
+            tool_evaluated(policy, *operation, &context, &facts, trace, budget).map_err(refused)
         }
         CaseContext::ToolHttp {
             tool_name,
@@ -457,8 +460,16 @@ fn evaluate_case(
                 principal,
                 Some((method, path)),
             );
-            tool_evaluated(policy, ToolOperation::RenderedHttp, &context, trace, budget)
-                .map_err(refused)
+            let facts = case_facts(compiled, principal);
+            tool_evaluated(
+                policy,
+                ToolOperation::RenderedHttp,
+                &context,
+                &facts,
+                trace,
+                budget,
+            )
+            .map_err(refused)
         }
         CaseContext::Rate {
             method,
@@ -469,7 +480,11 @@ fn evaluate_case(
             let context = rate_context(compiled.snapshot(), method, path, principal);
             let mut stages = Vec::with_capacity(MAX_RATE_STAGES);
             let selection = compiled
-                .select_rate_lane_with_stages(&context, &mut stages)
+                .select_rate_lane_with_facts(
+                    &context,
+                    &case_facts(compiled, principal),
+                    &mut stages,
+                )
                 .map_err(refused)?;
             let mut view = Map::new();
             view.insert("lane".to_owned(), json!("rate_selection"));
@@ -567,13 +582,14 @@ fn tool_evaluated(
     policy: &SimulatedPolicy,
     operation: ToolOperation,
     context: &ToolEvaluationContext,
+    facts: &PolicyFacts,
     trace: TraceLevel,
     budget: &mut StageBudget,
 ) -> Result<Evaluated, EvaluationError> {
     let mut stages = Vec::with_capacity(MAX_TOOL_STAGES);
     let evaluation = policy
         .compiled
-        .evaluate_tool_with_stages(context, &mut stages)?;
+        .evaluate_tool_with_facts(context, facts, &mut stages)?;
     let outcome = decision_outcome(
         evaluation.logical(),
         evaluation.effect(),

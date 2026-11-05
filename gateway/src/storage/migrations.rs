@@ -2044,13 +2044,16 @@ mod tests {
 
     // --- real-database tests -------------------------------------------------
     //
-    // Gated on the same test-harness locator as the foundation tests: a file
-    // naming a DSN a disposable database answers (CI sets it; a checkout
-    // without a database skips instead of failing). The tests share that one
-    // database, so a module mutex serializes them and each starts by
-    // dropping the gateway schema for a clean slate.
+    // Gated on the shared test-harness locator (`postgres::test_support`): a
+    // file naming a DSN a disposable database answers (CI sets it; a checkout
+    // without a database skips instead of failing), reached under the
+    // harness's TLS policy. The tests share that one database, so a module
+    // mutex serializes them and each starts by dropping the gateway schema
+    // for a clean slate.
 
     use tokio::sync::Mutex;
+
+    use super::super::postgres::test_support;
 
     /// Serializes the real-database tests: they share one disposable
     /// database and each starts by resetting its schema. Async-aware
@@ -2058,18 +2061,7 @@ mod tests {
     static REAL_DATABASE: Mutex<()> = Mutex::const_new(());
 
     fn real_dsn() -> Option<String> {
-        let key = test_dsn_file_key();
-        let file = std::env::var(&key).ok()?;
-        if file.trim().is_empty() {
-            return None;
-        }
-        let contents = std::fs::read_to_string(file).ok()?;
-        let trimmed = contents.trim();
-        (!trimmed.is_empty()).then(|| trimmed.to_owned())
-    }
-
-    fn test_dsn_file_key() -> String {
-        "GATEWAY_TEST_POSTGRES_URL_FILE".to_owned()
+        test_support::locator()
     }
 
     fn no_ddl_dsn() -> Option<String> {
@@ -2084,10 +2076,7 @@ mod tests {
     }
 
     fn test_settings() -> DatabaseSettings {
-        DatabaseSettings {
-            tls_mode: crate::config::DatabaseTlsMode::LoopbackDev,
-            ..DatabaseSettings::default()
-        }
+        test_support::test_settings()
     }
 
     /// A DSN file the bounded reader accepts, plus a guard keeping the
@@ -2210,9 +2199,10 @@ mod tests {
         config.state_backend = crate::config::StateBackend::Postgres;
         config.deployment_id = Some("deploy-migration-tests".to_owned());
         config.database.url_file = Some(guard.path.clone());
-        // The test database is the loopback-dev shape CI and local runs use;
-        // verify mode would (correctly) refuse it.
-        config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+        // Verified TLS when the run names a CA bundle, otherwise the
+        // loopback-dev shape of a plaintext test database; verify mode
+        // would (correctly) refuse that one.
+        test_support::use_test_tls(&mut config.database);
         config
     }
 
