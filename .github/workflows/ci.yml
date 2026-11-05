@@ -1086,7 +1086,7 @@ jobs:
       # `cargo audit` reads Cargo.lock and the advisory database and compiles
       # nothing, so this job restores no Rust cache.
       - name: Install cargo-audit
-        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2
         with:
           tool: cargo-audit@0.22.2
           checksum: true
@@ -1684,7 +1684,7 @@ jobs:
         with:
           rust: none
           node: 'false'
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -1732,7 +1732,7 @@ jobs:
         with:
           rust: none
           node: 'false'
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -1834,7 +1834,7 @@ jobs:
       - name: Set up verified Buildx and pinned BuildKit
         uses: ./.github/actions/buildx
       - name: Log in to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
