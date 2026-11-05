@@ -1,6 +1,7 @@
-//! What a policy or tools document commit's durable evidence says about it
-//! (issue #425, PR 2c): the closed action vocabulary of migration 23's
-//! `document_change_evidence` and, in cluster mode, the actor it records.
+//! What a policy, tools or policy test suite document commit's durable
+//! evidence says about it (issue #425, PR 2c): the closed action vocabulary of
+//! `document_change_evidence` (migration 23, widened by migration 28) and, in
+//! cluster mode, the actor it records.
 //!
 //! The rows are written by the transaction they describe
 //! (`postgres_documents::commit_in`), and only there. This module defines what
@@ -10,8 +11,8 @@
 
 /// The operation a policy or tools document commit performed, in the proposed
 /// authority-event vocabulary (`docs/schemas/authority_event.v1.schema.json`).
-/// Each code is exactly one of the values migration 23's `action` CHECK
-/// accepts.
+/// Each code is exactly one of the values the `action` CHECK accepts
+/// (migration 23's, replaced by migration 28's).
 ///
 /// Standalone policy writes pass one too. They record no evidence row: their
 /// file and optional SQLite history are separate steps until the #242
@@ -37,6 +38,9 @@ pub enum DocumentAction {
     /// The offline standalone import's activation of a policy or tools
     /// document (`import-standalone`).
     ConfigurationImport,
+    /// The stored policy test suite replaced or first stored
+    /// (`PUT /admin/policy/tests`, issue #243).
+    PolicyTestsPublish,
 }
 
 #[cfg(feature = "postgres")]
@@ -53,6 +57,7 @@ impl DocumentAction {
             Self::PolicySuggestionAccept => "policy.suggestion.accept",
             Self::ToolsPublish => "tools.publish",
             Self::ConfigurationImport => "configuration.import",
+            Self::PolicyTestsPublish => "policy_tests.publish",
         }
     }
 
@@ -71,6 +76,7 @@ impl DocumentAction {
             | Self::PolicySuggestionAccept => resource_type == "policy",
             Self::ToolsPublish => resource_type == "tools",
             Self::ConfigurationImport => matches!(resource_type, "policy" | "tools"),
+            Self::PolicyTestsPublish => resource_type == "policy_tests",
         }
     }
 }

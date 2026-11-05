@@ -17,8 +17,8 @@ A package can cover:
 - **Validation**: the publication revalidated by this build with the checks
   `POST /policy/validate` applies, including the cross-resource checks and the
   resource snapshot they read.
-- **Tests**: a [policy test suite](policy-tests.md) you send, run against the
-  published document.
+- **Tests**: a [policy test suite](policy-tests.md) you send, or the stored
+  suite pinned by its ETag, run against the published document.
 - **Simulation**: [synthetic cases](policy-simulation.md) you send, decided
   under the published document and the version it replaced.
 - **Historical impact**: the result of a finished [replay job](policy-replay.md#replay-jobs)
@@ -87,8 +87,15 @@ The body is a `policy-evidence-request.v1` document, published as
   2^53 - 1. `publication.etag` (optional) pins the document you reviewed: a
   stored document with a different policy ETag is `409`.
 - `suite` (optional) is a complete `policy-tests.v1` suite, parsed exactly as
-  `POST /policy/tests/runs` parses one. Its diagnostics are located under
-  `/suite`.
+  `POST /policy/tests/runs` parses one, or a reference to the
+  [stored suite](policy-tests.md#storing-a-suite-beside-the-policy):
+  `{"source": "stored", "etag": "\"sha256:...\""}`. The ETag is required, so a
+  package binds the stored version its reader reviewed and never whichever is
+  stored when it is assembled; the request digest covers it. A stored suite
+  that no longer carries that ETag is `409` (`policy_evidence_suite_mismatch`)
+  and no package is produced; no stored suite is `404`
+  (`policy_tests_not_found`), and a store that cannot be read `503`
+  (`policy_tests_unavailable`). Diagnostics are located under `/suite`.
 - `simulation` (optional) holds `cases` (1 to 256 `policy-simulation.v1`
   cases), `projections` (`as_authored` and `enforce_all_shadow`; default
   `["as_authored"]`) and `trace` (`terminal`, the default, or `matched`). A
@@ -114,7 +121,7 @@ directly:
 
 | Section | Additional permissions |
 | --- | --- |
-| `suite` or `simulation` | `admin:policy:simulate` |
+| `suite` (inline or the stored suite) or `simulation` | `admin:policy:simulate` |
 | `replay_job_id` | `admin:policy:simulate` and `admin:audit:read` |
 
 A replay job is served only to the principal that started it, as on the replay
@@ -175,7 +182,7 @@ the same inputs differ only in `generated_at`.
 | `publication` | `version`; `policy` (`schema_version`, `etag`, `semantic_digest` or `null`); `predecessor` (the history version immediately before it, with the same identity, or `null`); and `predecessor_check` |
 | `approval` | The approval as recorded (below) |
 | `validation` | `basis` (`revalidated_by_this_build`), `valid`, up to 100 `diagnostics` in the form `POST /policy/validate` reports them, `diagnostics_truncated`, and the `resource_snapshot` the cross-resource checks read |
-| `tests` | `{"included": false}`, or `included` and `results`: the `policy-test-results.v1` report, whose `policy.source` is `publication` |
+| `tests` | `{"included": false}`, or `included` and `results`: the `policy-test-results.v1` report, whose `policy.source` is `publication`, and whose `suite.stored` names the stored version (`version` and `etag`) when the request named the stored suite |
 | `simulation` | `{"included": false}`, or `included`, `mode` (`synthetic`), `trace`, `projections`, `base` (the predecessor's version and ETag, or `null`), `candidate` (the publication's), `not_evaluated`, `summary` and per-case `cases` as a simulation reports them |
 | `replay` | `{"included": false}`, or `included`, `mode` (`historical_replay`), `state`, the job's `request_digest`, `evaluator`, `base` and `candidate` ETags, `projections`, `window`, `cutoff`, `limits`, `not_replayed`, `predecessor_check`, `result_digest` and the `policy-replay-results.v1` `result` |
 | `completeness`, `limitations` | `complete` exactly when `limitations` is empty |

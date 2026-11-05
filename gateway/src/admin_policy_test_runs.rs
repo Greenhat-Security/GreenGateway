@@ -4,6 +4,10 @@
 //! draft the caller owns, or a version of the policy history -- and answer
 //! JSON, SARIF or JUnit.
 //!
+//! The suite is submitted with the run, or named as the stored suite
+//! (`{"suite": {"source": "stored", "etag": ...}}`, see
+//! `admin_policy_tests`), optionally pinned to the ETag the caller reviewed.
+//!
 //! A run is a read. It needs `admin:policy:read` and `admin:policy:simulate`,
 //! both checked before the body is read, persists nothing, activates nothing,
 //! and emits one `policy.tests_run` audit record that carries digests, the
@@ -47,9 +51,18 @@ enum PolicyTestFormat {
     Junit,
 }
 
+/// Which suite a run decides: one submitted with it, or the stored one.
+enum SuiteSelection {
+    Inline(Value),
+    /// The stored suite, pinned to `etag` when the reference names one.
+    Stored {
+        etag: Option<String>,
+    },
+}
+
 /// The request members and what they hold, before the suite is parsed.
 struct PolicyTestRunRequest {
-    suite: Value,
+    suite: SuiteSelection,
     candidate: Option<PolicyTestCandidate>,
     format: PolicyTestFormat,
 }
@@ -135,6 +148,14 @@ fn parse_policy_test_run_request(body: &Bytes) -> ResponseResult<PolicyTestRunRe
             "policy_tests_request_invalid",
         )));
     };
+    let suite = match suite {
+        // A suite has no `source` member, so one that names it is a
+        // reference, and nothing else.
+        Value::Object(reference) if reference.contains_key("source") => {
+            parse_stored_suite_reference(&reference)?
+        }
+        suite => SuiteSelection::Inline(suite),
+    };
     // The member is there (the body was just read with it) and named once;
     // a `null` candidate stays a candidate, and is refused as one.
     let candidate = match (members.remove("policy"), members.remove("candidate")) {
@@ -211,6 +232,33 @@ type PolicyUnderTest = (
     policy_eval::PolicyAuthority,
     policy_testing::report::PolicyBinding,
 );
+
+/// `{"source": "stored", "etag": "\"sha256:...\""}`: the stored suite,
+/// pinned to the strong ETag when one is named.
+fn parse_stored_suite_reference(
+    reference: &serde_json::Map<String, Value>,
+) -> ResponseResult<SuiteSelection> {
+    let invalid = || {
+        Box::new(policy_tests_refusal(
+            StatusCode::BAD_REQUEST,
+            "a stored suite reference is {\"source\": \"stored\"} with an optional strong ETag in etag",
+            "policy_tests_request_invalid",
+        ))
+    };
+    if reference
+        .keys()
+        .any(|key| !matches!(key.as_str(), "source" | "etag"))
+        || reference.get("source") != Some(&Value::String("stored".to_owned()))
+    {
+        return Err(invalid());
+    }
+    let etag = match reference.get("etag") {
+        None => None,
+        Some(Value::String(etag)) if is_strong_entity_tag(etag) => Some(etag.clone()),
+        Some(_) => return Err(invalid()),
+    };
+    Ok(SuiteSelection::Stored { etag })
+}
 
 /// The policy a run judges and its binding: the active document as its
 /// authority holds it, or a validated candidate.
@@ -437,6 +485,7 @@ fn emit_policy_tests_run(
     let mut payload = json!({
         "policy_source": report.policy.source.as_str(),
         "policy_etag": report.policy.etag,
+        "suite_source": if report.suite.stored.is_some() { "stored" } else { "inline" },
         "suite_digest": report.suite.digest,
         "status": report.status.as_str(),
         "total": report.summary.total,
@@ -454,6 +503,9 @@ fn emit_policy_tests_run(
         // Which draft or history version, never its content.
         if let Some(stored) = &report.policy.stored {
             stored.describe("policy_", payload);
+        }
+        if let Some(stored) = report.suite.stored.as_ref() {
+            payload.insert("suite_version".to_owned(), json!(stored.version));
         }
     }
     state.audit.emit(audit::AuditEvent::new(
@@ -553,19 +605,35 @@ pub(super) async fn policy_test_runs_endpoint(
         Ok(run_request) => run_request,
         Err(response) => return *response,
     };
-    let suite = match policy_testing::suite::parse_suite(&run_request.suite) {
-        Ok(suite) => suite,
-        Err(diagnostics) => {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({
-                    "error": "policy test suite is invalid",
-                    "reason": "policy_tests_invalid",
-                    "diagnostics": diagnostics.diagnostics,
-                    "diagnostics_truncated": diagnostics.truncated,
-                })),
-            )
-                .into_response();
+    let (suite, stored) = match run_request.suite {
+        SuiteSelection::Inline(suite) => match policy_testing::suite::parse_suite(&suite) {
+            Ok(suite) => (suite, None),
+            Err(diagnostics) => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({
+                        "error": "policy test suite is invalid",
+                        "reason": "policy_tests_invalid",
+                        "diagnostics": diagnostics.diagnostics,
+                        "diagnostics_truncated": diagnostics.truncated,
+                    })),
+                )
+                    .into_response();
+            }
+        },
+        // Read under the permissions this route already checked: a run of
+        // the stored suite needs exactly what reading it needs.
+        SuiteSelection::Stored { etag } => {
+            match stored_policy_test_suite(&state, etag.as_deref()).await {
+                Ok(record) => (
+                    record.suite,
+                    Some(policy_testing::report::StoredSuiteBinding {
+                        version: record.version,
+                        etag: record.etag,
+                    }),
+                ),
+                Err(refusal) => return refusal.response(),
+            }
         }
     };
     let (policy, authority, binding) = match policy_under_test(
@@ -613,7 +681,8 @@ pub(super) async fn policy_test_runs_endpoint(
             return internal_server_error("policy test run failed");
         }
     };
-    let report = policy_testing::report::RunReport::new(suite_digest, binding, outcome);
+    let report = policy_testing::report::RunReport::new(suite_digest, binding, outcome)
+        .with_stored_suite(stored);
     emit_policy_tests_run(&state, &parts, &principal, &report);
     policy_tests_response(&report, run_request.format)
 }

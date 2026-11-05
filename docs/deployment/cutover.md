@@ -35,6 +35,8 @@ Standalone service-token change evidence — the `service_token_change_evidence`
 
 Standalone policy drafts (the `policy_drafts` table of the policy history database) are left behind too. A draft is unpublished working state pinned to a standalone policy ETag, and the cluster starts with none; an owner who still needs one recreates it against the imported policy, from the standalone file if it is kept.
 
+The stored policy test suite (the `policy_test_suite_versions` table of the same database) is not imported either, and is named in `not_imported`. Read it from the standalone deployment with `GET /v1{ADMIN_PREFIX}/policy/tests` before the cutover, and store it in the cluster afterwards with `PUT` and `If-None-Match: *`; the cluster then records that write with its own evidence row. Preflight counts the cluster's two suite tables as authoritative, so a namespace that already holds a suite is not an empty one.
+
 The command also never moves secret material. Credential bindings are imported as references; the secrets stay in your secret store, and local-secret keyring material is not touched. A cluster deployment binds credentials through an external secret provider — `CONNECTION_LOCAL_SECRET_KEYRING` is rejected in cluster mode.
 
 If your standalone deployment used the encrypted local-secret keyring, that has a consequence you should see as a **number** before the night rather than as a failed request after it: those secrets live in rows inside `CONNECTIONS_SQLITE_PATH`, nothing carries them across, and every binding that resolved through one resolves through nothing until you re-provision it. The report says how many there are (`source.connection_local_secrets`) and names the omission in `not_imported` (`connection_local_secrets`). A non-zero count is a re-provisioning task on the checklist below, not a defect.
@@ -142,7 +144,8 @@ Expected output: pretty-printed JSON on stdout and exit `0`. The shape:
     "connection_local_secrets (the local-secret keyring stays with the standalone deployment; credential bindings cross as references and must be re-provisioned in the cluster's secret store)",
     "service_token_change_evidence (standalone issue, rotate and revoke evidence stays in the standalone token database; the cluster records its own from its first change)",
     "connection_change_evidence (standalone Connection change evidence stays in the standalone Connections database; the cluster's own evidence table starts empty)",
-    "connection_local_secret_change_evidence (standalone local-secret change evidence stays with the local-secret keyring in the standalone Connections database)"
+    "connection_local_secret_change_evidence (standalone local-secret change evidence stays with the local-secret keyring in the standalone Connections database)",
+    "policy_test_suite_versions (the standalone stored policy test suite stays in the standalone policy history database; store it in the cluster with PUT .../policy/tests and If-None-Match: *)"
   ],
   "duration_ms": 8590
 }

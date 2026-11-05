@@ -16,9 +16,9 @@
 //!   body is read: a package needs `admin:policy:read` and
 //!   `admin:policy:evidence:read`. A section adds the permissions its own
 //!   endpoint needs, checked before any history read or evaluation: a suite
-//!   or cases need `admin:policy:simulate`, and a replay job also
-//!   `admin:audit:read`. Nobody learns through a package what they could not
-//!   read directly.
+//!   (inline or the stored one) or cases need `admin:policy:simulate`, and a
+//!   replay job also `admin:audit:read`. Nobody learns through a package what
+//!   they could not read directly.
 //! - **Server authority.** Every digest, ETag, validation result, test
 //!   result and simulation outcome in a package is computed here from the
 //!   history and the request's own inputs; a caller cannot supply a result or
@@ -39,7 +39,7 @@ use policy_evidence::{
         assemble, EvidenceInputs, PackageError, PolicyIdentity, PredecessorRecord,
         PublicationRecord, ReplayEvidence, SimulationEvidence, ValidationOutcome,
     },
-    request::{parse_request, EvidenceRequest, SimulationSelection},
+    request::{parse_request, EvidenceRequest, SimulationSelection, SuiteSelection},
     PACKAGE_MEDIA_TYPE,
 };
 use policy_simulation::run::{compile_pairs, simulate, SimulationError};
@@ -285,6 +285,13 @@ struct EvaluatedSections {
     simulation: Option<SimulationEvidence>,
 }
 
+/// A suite to decide, and the stored version it is when it is the stored
+/// suite.
+type SuiteToDecide = (
+    policy_testing::suite::Suite,
+    Option<policy_testing::report::StoredSuiteBinding>,
+);
+
 /// Decide the suite against the publication, and the simulation cases
 /// against it and, when it still compiles, its predecessor. Pure and
 /// CPU-bound: run on a blocking thread.
@@ -292,7 +299,7 @@ fn evaluate_sections(
     publication: rbac::Policy,
     publication_etag: String,
     predecessor: Option<rbac::Policy>,
-    suite: Option<policy_testing::suite::Suite>,
+    suite: Option<SuiteToDecide>,
     simulation: Option<SimulationSelection>,
 ) -> Result<EvaluatedSections, EvidenceRunError> {
     let deadline = Instant::now() + POLICY_EVIDENCE_DEADLINE;
@@ -306,7 +313,7 @@ fn evaluate_sections(
     let resources = policy_testing::synthetic::SyntheticResources::none();
     let tests = match suite {
         None => None,
-        Some(suite) => {
+        Some((suite, stored)) => {
             let outcome =
                 policy_testing::run_against_policy(
                     publication.clone(),
@@ -324,17 +331,20 @@ fn evaluate_sections(
                             EvidenceRunError::DeadlineExceeded
                         }
                     })?;
-            Some(policy_testing::report::RunReport::new(
-                suite.digest.clone(),
-                policy_testing::report::PolicyBinding {
-                    source: policy_testing::report::PolicySource::Publication,
-                    etag: publication_etag,
-                    security_revision: None,
-                    // The package names the publication it judged.
-                    stored: None,
-                },
-                outcome,
-            ))
+            Some(
+                policy_testing::report::RunReport::new(
+                    suite.digest.clone(),
+                    policy_testing::report::PolicyBinding {
+                        source: policy_testing::report::PolicySource::Publication,
+                        etag: publication_etag,
+                        security_revision: None,
+                        // The package names the publication it judged.
+                        stored: None,
+                    },
+                    outcome,
+                )
+                .with_stored_suite(stored),
+            )
         }
     };
     let simulation = match simulation {
@@ -490,6 +500,31 @@ pub(super) async fn policy_evidence_endpoint(
     let Some(history) = state.history_store.as_ref() else {
         return policy_history_not_configured();
     };
+    // The stored suite a request names is read once, here, and must still be
+    // the version it pinned; the report then binds that version.
+    let suite = match evidence_request.suite.take() {
+        None => None,
+        Some(SuiteSelection::Inline(suite)) => Some((suite, None)),
+        Some(SuiteSelection::Stored { etag }) => {
+            match stored_policy_test_suite(&state, Some(etag.as_str())).await {
+                Ok(record) => Some((
+                    record.suite,
+                    Some(policy_testing::report::StoredSuiteBinding {
+                        version: record.version,
+                        etag: record.etag,
+                    }),
+                )),
+                Err(StoredSuiteRefusal::EtagMismatch) => {
+                    return evidence_refusal(
+                        StatusCode::CONFLICT,
+                        "the stored policy test suite is not the one the request pinned",
+                        "policy_evidence_suite_mismatch",
+                    );
+                }
+                Err(refusal) => return refusal.response(),
+            }
+        }
+    };
 
     let reading = match read_history(history.as_ref(), evidence_request.publication.version).await {
         Ok(reading) => reading,
@@ -579,7 +614,7 @@ pub(super) async fn policy_evidence_endpoint(
         resource_snapshot = Some(snapshot);
     }
     let blocks_requested_evaluation = inspection.diagnostics().iter().any(|diagnostic| {
-        (evidence_request.suite.is_some() && diagnostic.blocks.tests)
+        (suite.is_some() && diagnostic.blocks.tests)
             || (evidence_request.simulation.is_some() && diagnostic.blocks.simulation)
     });
     if blocks_requested_evaluation {
@@ -599,7 +634,6 @@ pub(super) async fn policy_evidence_endpoint(
         resource_snapshot,
     };
 
-    let suite = evidence_request.suite.take();
     let simulation = evidence_request.simulation.take();
     let (tests_included, simulation_included) = (suite.is_some(), simulation.is_some());
     let publication_policy = reading.policy;

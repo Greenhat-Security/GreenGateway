@@ -18,7 +18,9 @@
 //! `publication.version` names the policy history version the package is
 //! about; the optional `publication.etag` pins the document the caller
 //! reviewed. `suite` is a complete `policy-tests.v1` suite, parsed by the
-//! test-suite parser; `simulation` holds `policy-simulation.v1` cases and
+//! test-suite parser, or `{"source": "stored", "etag": ...}`, the stored
+//! suite pinned to the strong ETag the caller reviewed; `simulation` holds
+//! `policy-simulation.v1` cases and
 //! projections, parsed by the functions a simulation parses them with, at a
 //! `terminal` or `matched` trace level. `replay_job_id` names a finished
 //! replay job of the caller's. Every section but `publication` is optional,
@@ -53,6 +55,16 @@ pub(crate) struct PublicationSelector {
     pub(crate) etag: Option<String>,
 }
 
+/// Which suite a package's tests section decides.
+///
+/// It does not derive `Debug`: an inline suite holds fixture values.
+pub(crate) enum SuiteSelection {
+    /// A complete suite carried by the request.
+    Inline(Suite),
+    /// The stored suite, which must still carry this strong ETag.
+    Stored { etag: String },
+}
+
 /// The synthetic cases a package's simulation section decides.
 ///
 /// It does not derive `Debug`: cases hold fixture values.
@@ -71,7 +83,7 @@ pub(crate) struct EvidenceRequest {
     /// differ only in whitespace or member order name one set of inputs.
     pub(crate) digest: String,
     pub(crate) publication: PublicationSelector,
-    pub(crate) suite: Option<Suite>,
+    pub(crate) suite: Option<SuiteSelection>,
     pub(crate) simulation: Option<SimulationSelection>,
     pub(crate) replay_job_id: Option<String>,
 }
@@ -128,7 +140,7 @@ pub(crate) fn parse_request(value: &Value) -> Result<EvidenceRequest, Diagnostic
         .and_then(|value| parse_publication(value, &mut diagnostics));
     let suite = root
         .get("suite")
-        .and_then(|value| parse_embedded_suite(value, &mut diagnostics));
+        .and_then(|value| parse_suite_member(value, &mut diagnostics));
     let simulation = root
         .get("simulation")
         .and_then(|value| parse_simulation(value, &mut diagnostics));
@@ -202,6 +214,42 @@ fn parse_publication(value: &Value, diagnostics: &mut Diagnostics) -> Option<Pub
         version: version?,
         etag,
     })
+}
+
+/// The suite member: a reference to the stored suite when it names a
+/// `source` (a suite has no such member), otherwise a complete suite.
+fn parse_suite_member(value: &Value, diagnostics: &mut Diagnostics) -> Option<SuiteSelection> {
+    match value {
+        Value::Object(reference) if reference.contains_key("source") => {
+            parse_stored_suite_reference(reference, diagnostics)
+        }
+        _ => parse_embedded_suite(value, diagnostics).map(SuiteSelection::Inline),
+    }
+}
+
+/// `{"source": "stored", "etag": "..."}`. The ETag is required: a package
+/// binds the exact suite its reader reviewed, never whichever is stored when
+/// it is assembled.
+fn parse_stored_suite_reference(
+    reference: &serde_json::Map<String, Value>,
+    diagnostics: &mut Diagnostics,
+) -> Option<SuiteSelection> {
+    check_members(reference, "/suite", &["source", "etag"], diagnostics);
+    let stored =
+        matches!(reference.get("source"), Some(Value::String(source)) if source == "stored");
+    if !stored {
+        diagnostics.push(
+            "invalid_value",
+            "/suite/source",
+            "source must be \"stored\"",
+        );
+    }
+    let etag = required(reference, "etag", "/suite", diagnostics)
+        .and_then(|value| bounded_string(value, "/suite/etag", MAX_BASE_ETAG_BYTES, diagnostics));
+    match (stored, etag) {
+        (true, Some(etag)) => Some(SuiteSelection::Stored { etag }),
+        _ => None,
+    }
 }
 
 /// The suite member, parsed by the test-suite parser, with every diagnostic
