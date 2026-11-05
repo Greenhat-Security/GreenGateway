@@ -204,6 +204,69 @@ fn help_completion_and_schema_are_artifacts_on_standard_output() {
     );
 }
 
+/// The release archives ship `ggctl help --man` output as their man pages;
+/// each must cover what the binary's own help lists.
+#[test]
+fn every_command_has_a_manual_page_naming_every_option_its_help_lists() {
+    let manual = ggctl(&["help", "--man"], None);
+    assert_eq!(manual.status.code(), Some(0));
+    assert!(manual.stderr.is_empty());
+    let manual = text(&manual.stdout);
+    assert!(manual.contains("\n.TH GGCTL 1 "));
+    assert!(!manual.contains('\r'));
+
+    let overview = text(&ggctl(&["help"], None).stdout);
+    let listed = overview
+        .split("\nCommands:\n")
+        .nth(1)
+        .and_then(|rest| rest.split("\n\n").next())
+        .expect("the overview lists the commands");
+    // A name and its summary are two spaces apart; a family's command is
+    // listed by its full name, such as `ledger seed`.
+    let commands: Vec<&str> = listed
+        .lines()
+        .filter(|line| line.starts_with("  ") && !line.starts_with("   "))
+        .filter_map(|line| line.trim_start().split("  ").next())
+        .collect();
+    assert!(
+        commands.contains(&"validate")
+            && commands.contains(&"ledger seed")
+            && commands.contains(&"backup create")
+    );
+    let mut topics: Vec<&str> = commands
+        .iter()
+        .filter_map(|command| command.split_once(' ').map(|(family, _)| family))
+        .collect();
+    topics.dedup();
+    assert_eq!(topics, ["ledger", "backup", "policy", "evidence"]);
+    topics.extend(&commands);
+    for command in topics {
+        // A page is named by its words joined with hyphens, and roff escapes
+        // every hyphen, including those inside a name such as `mcp-config`.
+        let name = command.replace([' ', '-'], "\\-");
+        assert!(
+            manual.contains(&format!("\\fBggctl\\-{name}\\fR(1)")),
+            "{command}"
+        );
+        let words: Vec<&str> = command.split(' ').collect();
+        let page = ggctl(&[&["help", "--man"][..], &words].concat(), None);
+        assert_eq!(page.status.code(), Some(0), "{command}");
+        let page = text(&page.stdout);
+        assert!(
+            page.contains(&format!(".TH GGCTL\\-{} 1 ", name.to_ascii_uppercase())),
+            "{command}"
+        );
+        let help = text(&ggctl(&[&["help"][..], &words].concat(), None).stdout);
+        for option in help.lines().filter_map(|line| line.strip_prefix("  --")) {
+            let name = option.split_whitespace().next().expect("an option name");
+            assert!(
+                page.contains(&format!("\\fB\\-\\-{}\\fR", name.replace('-', "\\-"))),
+                "{command} --{name}"
+            );
+        }
+    }
+}
+
 #[test]
 fn argument_errors_exit_2_and_never_echo_the_argument() {
     for arguments in [
@@ -643,6 +706,113 @@ fn validate_and_doctor_read_a_bundle_offline_with_their_exit_codes() {
         assert!(text(&output.stderr).contains("bundle.root_unavailable"));
         assert_path_not_echoed(&output, missing);
     }
+}
+
+/// `--env` end to end: real processes, the published report schema, the
+/// exit codes, and a secret in the file that never reaches either stream.
+#[test]
+fn environment_files_are_validated_diagnosed_and_compared_without_echoing_a_value() {
+    let bundle = Bundle::new("{\"schema_version\": \"0.1.0\", \"default_action\": \"deny\"}\n");
+    bundle.write(
+        "base.env",
+        &format!(
+            "AUTH_ENABLED=true\nTLS_CERT_FILE=/run/tls/a.crt\nTLS_KEY_FILE=/run/{CANARY}/a.key\n"
+        ),
+    );
+    bundle.write(
+        "candidate.env",
+        &format!(
+            "# reviewed\nexport AUTH_ENABLED=false\nTLS_CERT_FILE=/run/tls/a.crt\nTLS_KEY_FILE=/run/{CANARY}/b.key\n{CANARY}={CANARY}\n"
+        ),
+    );
+    bundle.write(
+        "refused.env",
+        &format!("AUTH_MODE={CANARY}\nAUTH_MODE={CANARY}\n"),
+    );
+    let path = |name: &str| bundle.0.join(name).to_str().expect("UTF-8").to_owned();
+    let (base, candidate, refused) = (path("base.env"), path("candidate.env"), path("refused.env"));
+
+    for command in ["validate", "doctor"] {
+        let output = ggctl(&[command, "--env", &candidate, "--format", "json"], None);
+        assert_eq!(output.status.code(), Some(0), "{command}");
+        let found = report(&output);
+        assert_eq!(found["command"], command);
+        assert_no_canary(&output);
+        assert_path_not_echoed(&output, &candidate);
+
+        let output = ggctl(&[command, "--env", &refused, "--format", "json"], None);
+        assert_eq!(output.status.code(), Some(3), "{command}");
+        let found = report(&output);
+        let codes: Vec<_> = found["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .iter()
+            .map(|diagnostic| diagnostic["code"].as_str().expect("code").to_owned())
+            .collect();
+        assert_eq!(
+            codes[..2],
+            ["env.duplicate_key", "config.refused"],
+            "{command}"
+        );
+        assert_no_canary(&output);
+
+        let output = ggctl(&[command, "--env", &refused], None);
+        assert_eq!(output.status.code(), Some(3), "{command}");
+        assert!(text(&output.stderr).contains("  at: argument 2, line 2\n  setting: AUTH_MODE\n"));
+        assert_no_canary(&output);
+        assert_path_not_echoed(&output, &refused);
+    }
+
+    let output = ggctl(
+        &[
+            "validate", "--env", &refused, "--strict", "--format", "sarif",
+        ],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(3));
+    let log: Value = serde_json::from_slice(&output.stdout).expect("one SARIF log");
+    assert_eq!(log["runs"][0]["results"][0]["ruleId"], "env.duplicate_key");
+    assert_eq!(log["runs"][0]["results"][0]["level"], "error");
+    assert_no_canary(&output);
+
+    let output = ggctl(
+        &[
+            "diff",
+            "--env",
+            &candidate,
+            "--against-env",
+            &base,
+            "--check",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(4));
+    let report = report(&output);
+    assert!(report["result"]["diff"]["riskCodes"]
+        .as_array()
+        .expect("risk codes")
+        .contains(&json!("risk.auth_disabled")));
+    assert_no_canary(&output);
+
+    let output = ggctl(
+        &["diff", "--env", &candidate, "--against", bundle.path()],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(3));
+    assert!(text(&output.stderr).contains("diff.not_comparable"));
+
+    let missing = path("missing.env");
+    let output = ggctl(&["validate", "--env", &missing], None);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(text(&output.stderr).starts_with("ggctl: error: env.unreadable: "));
+    assert_path_not_echoed(&output, &missing);
+
+    let output = ggctl(&["validate", bundle.path(), "--env", &candidate], None);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(text(&output.stderr).starts_with("ggctl: error: usage.conflicting_options: "));
 }
 
 #[test]

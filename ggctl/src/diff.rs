@@ -1,13 +1,20 @@
-//! `ggctl diff BUNDLE --against BUNDLE [--check] [--strict]
-//! [--format human|json|sarif]` (issue #242, PR 9; ADR-0008, "Plan, risk
-//! acknowledgment, and conditional apply").
+//! `ggctl diff (BUNDLE | --env FILE) (--against BUNDLE | --against-env FILE)
+//! [--check] [--strict] [--format human|json|sarif]` (issue #242, PR 9;
+//! ADR-0008, "Plan, risk acknowledgment, and conditional apply").
 //!
 //! Both bundles are read by the shared reader with the production
 //! validators, exactly as `ggctl validate` reads them, and compared by
 //! `gateway_config::semantic_diff::compare_production_bundles`, the diff the
 //! revision ledger's plans make, by the documents those validators built:
-//! the CLI cannot approximate either. The change is from the `--against`
-//! bundle to `BUNDLE`. Everything written is value-free because the diff is:
+//! the CLI cannot approximate either. Two environment files are each
+//! compiled by the gateway's own configuration compiler, exactly as
+//! `ggctl validate --env` compiles one, and their plans compared by
+//! `compiler::semantic_diff::plans`, setting by setting. An environment file
+//! and a bundle are read and reported but never compared: no front end maps
+//! a bundle onto the compiler's settings yet, and an environment plan holds
+//! no policy or tools document, so there is no common ground to compare
+//! (`diff.not_comparable`). The change is from the `--against` side to the
+//! other. Everything written is value-free because the diff is:
 //!
 //! - human: one line per change, then the sorted risk codes;
 //! - `--format json`: one `GgctlReport` whose `result` carries the
@@ -17,14 +24,12 @@
 //!   field as a logical location, so CI can annotate a review. A change that
 //!   carries no risk code is not a finding and is not a result.
 //!
-//! `--check` adds `diff.drift_found` (exit `4`) when anything differs. A
-//! bundle that is invalid is not compared: the command reports the reader's
+//! `--check` adds `diff.drift_found` (exit `4`) when anything differs. An
+//! input that is invalid is not compared: the command reports its
 //! diagnostics and exits as `ggctl validate` would.
 
-use std::path::Path;
-
 use gateway_config::{
-    bundle::{self, ProductionValidators, ReadOptions},
+    compiler,
     semantic_diff::{compare_production_bundles, Change, Display, SemanticDiff, Severity, Shown},
 };
 use serde::Serialize;
@@ -33,9 +38,10 @@ use serde_json::{json, Value};
 use crate::{
     cli::Invocation,
     diagnostic::{Code, Diagnostic, Exit},
+    env::{self, EnvRead, EnvRecord, Source},
     report::{self, Format, Io, ReportDiagnostic},
     sarif,
-    validate::{self, BundleRecord},
+    validate::{self, BundleRead, BundleRecord},
 };
 
 /// Where every risk code is described.
@@ -43,8 +49,10 @@ const RISK_CODES_ANCHOR: &str = "docs/semantic-diff.md#risk-codes";
 
 /// The `diff` result.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct DiffCommandResult<'a> {
-    /// Both bundles were read with no error, so they were compared.
+    /// Both inputs were read with no error and could be compared, so they
+    /// were.
     valid: bool,
     /// `BUNDLE`, the candidate. Present once its manifest was read.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -52,29 +60,96 @@ struct DiffCommandResult<'a> {
     /// The `--against` bundle, the base. Present once its manifest was read.
     #[serde(skip_serializing_if = "Option::is_none")]
     against: Option<BundleRecord>,
-    /// The changes from `--against` to `BUNDLE`, when both were read.
+    /// The `--env` file, the candidate. Present once it was parsed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    environment: Option<EnvRecord>,
+    /// The `--against-env` file, the base. Present once it was parsed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    against_environment: Option<EnvRecord>,
+    /// The changes from the base to the candidate, when both were compared.
     #[serde(skip_serializing_if = "Option::is_none")]
     diff: Option<&'a SemanticDiff>,
 }
 
+/// One side of a diff, as far as it was read. Both reads are large, a
+/// compiled plan especially, so each is boxed.
+enum Side {
+    Bundle(Box<BundleRead>),
+    Env(Box<EnvRead>),
+}
+
+impl Side {
+    fn read(source: Source<'_>, strict: bool) -> Self {
+        match source {
+            Source::Bundle(path) => Self::Bundle(Box::new(validate::read_path(path, strict))),
+            Source::Env { argument, path } => {
+                Self::Env(Box::new(env::read(argument, path, strict)))
+            }
+        }
+    }
+
+    fn diagnostics(&self) -> Vec<ReportDiagnostic> {
+        match self {
+            Self::Bundle(read) => validate::diagnostics(read),
+            Self::Env(read) => read.diagnostics.clone(),
+        }
+    }
+
+    fn bundle(&self) -> Option<BundleRecord> {
+        match self {
+            Self::Bundle(read) => BundleRecord::of(read),
+            Self::Env(_) => None,
+        }
+    }
+
+    fn environment(&self) -> Option<EnvRecord> {
+        match self {
+            Self::Bundle(_) => None,
+            Self::Env(read) => read.record(),
+        }
+    }
+}
+
 pub(crate) fn run(invocation: &Invocation, io: &mut Io<'_>) -> Exit {
     let strict = invocation.flag("--strict").is_some();
-    let (Some(candidate), Some((_, against))) = (
-        validate::read(invocation, strict),
-        invocation.value("--against"),
-    ) else {
-        return report::error(io, Diagnostic::new(Code::MissingArgument));
+    let sources = validate::source(invocation).and_then(|candidate| {
+        let base = env::source(
+            invocation,
+            invocation.value("--against").map(|(_, path)| path),
+            "--against-env",
+        )?;
+        Ok((candidate, base))
+    });
+    let (candidate, base) = match sources {
+        Ok((candidate, base)) => (Side::read(candidate, strict), Side::read(base, strict)),
+        Err(diagnostic) => return report::error(io, diagnostic),
     };
-    let base = bundle::read_bundle(
-        Path::new(against),
-        ReadOptions { strict },
-        &ProductionValidators,
-    );
-    let mut diagnostics = validate::diagnostics(&candidate);
-    diagnostics.extend(validate::diagnostics(&base));
-    let diff = match (&base.bundle, &candidate.bundle) {
-        (Some(base), Some(candidate)) => Some(compare_production_bundles(base, candidate)),
-        _ => None,
+    let mut diagnostics = candidate.diagnostics();
+    diagnostics.extend(base.diagnostics());
+    let diff = match (&base, &candidate) {
+        (Side::Bundle(base), Side::Bundle(candidate)) => match (&base.bundle, &candidate.bundle) {
+            (Some(base), Some(candidate)) => Some(compare_production_bundles(base, candidate)),
+            _ => None,
+        },
+        (Side::Env(base), Side::Env(candidate)) => match (base.plan(), candidate.plan()) {
+            (Some(base), Some(candidate)) => Some(compiler::semantic_diff::plans(base, candidate)),
+            _ => None,
+        },
+        (Side::Bundle(_), Side::Env(_)) | (Side::Env(_), Side::Bundle(_)) => {
+            // Located at the option that names the environment file.
+            let argument = ["--env", "--against-env"]
+                .into_iter()
+                .find_map(|option| invocation.value(option))
+                .map(|(position, _)| position);
+            diagnostics.push(
+                Diagnostic {
+                    argument,
+                    ..Diagnostic::new(Code::NotComparable)
+                }
+                .into(),
+            );
+            None
+        }
     };
     if let (Some(diff), Some(position)) = (&diff, invocation.flag("--check")) {
         if exit(diff, true) == Exit::Drift {
@@ -83,10 +158,16 @@ pub(crate) fn run(invocation: &Invocation, io: &mut Io<'_>) -> Exit {
     }
     let result = DiffCommandResult {
         valid: diff.is_some(),
-        bundle: BundleRecord::of(&candidate),
-        against: BundleRecord::of(&base),
+        bundle: candidate.bundle(),
+        against: base.bundle(),
+        environment: candidate.environment(),
+        against_environment: base.environment(),
         diff: diff.as_ref(),
     };
+    let comparable = !matches!(
+        (&base, &candidate),
+        (Side::Bundle(_), Side::Env(_)) | (Side::Env(_), Side::Bundle(_))
+    );
     match Format::of(invocation) {
         Format::Sarif => {
             let empty = SemanticDiff::default();
@@ -100,7 +181,11 @@ pub(crate) fn run(invocation: &Invocation, io: &mut Io<'_>) -> Exit {
             report::finish_report(io, format, "diff", &result, &diagnostics, |result, out| {
                 match result.diff {
                     Some(diff) => out.write_all(human(diff).as_bytes()),
-                    None => writeln!(out, "not compared: a bundle is invalid"),
+                    None if !comparable => writeln!(
+                        out,
+                        "not compared: an environment file and a bundle cannot be compared"
+                    ),
+                    None => writeln!(out, "not compared: an input is invalid"),
                 }
             })
         }
@@ -189,7 +274,13 @@ fn severity_name(severity: Option<Severity>) -> &'static str {
 pub(crate) fn sarif_log(diff: &SemanticDiff, diagnostics: &[ReportDiagnostic]) -> Value {
     let mut log = sarif::log(diagnostics);
     let run = &mut log["runs"][0];
-    if let Some(base) = run["originalUriBaseIds"][sarif::BUNDLE_ROOT].as_object_mut() {
+    // Read without indexing, which would insert the base into a log that
+    // has no bundle-relative location.
+    if let Some(base) = run
+        .get_mut("originalUriBaseIds")
+        .and_then(|bases| bases.get_mut(sarif::BUNDLE_ROOT))
+        .and_then(Value::as_object_mut)
+    {
         base.insert(
             "description".to_owned(),
             json!({"text": "The bundle directory a diagnostic concerns: BUNDLE or --against."}),

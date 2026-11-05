@@ -21,7 +21,9 @@
 //!    characters, then a strict JSON or safe-subset YAML parse into one tree,
 //!    with duplicate keys refused and every structural bound charged while
 //!    parsing.
-//! 3. `document`: exact `apiVersion`/`kind` dispatch and closed objects.
+//! 3. `document`: exact `apiVersion`/`kind` dispatch and closed objects,
+//!    and `settings`: the deployment settings, typed and bounded by their
+//!    catalog entries.
 //! 4. Digests: each referenced file's exact bytes must match the manifest's
 //!    pin before it is parsed, and the bundle's source digest frames the
 //!    manifest bytes with ADR-0004's `GGDIGEST` frame.
@@ -49,8 +51,10 @@
 //! reading it with every check but the pin comparison. Each hands its output
 //! to this reader before anything treats it as a bundle.
 //!
-//! Nothing selects a bundle for startup yet: bundle mode and the field
-//! catalog that fills the deployment document are later #242 slices.
+//! The deployment document's settings come from the field catalog
+//! ([`settings`]): the reader checks their shape and their own bounds. Nothing
+//! selects a bundle for startup yet, and the compiler does not consume the
+//! settings: bundle mode is a later #242 slice.
 
 pub mod convert;
 mod diagnostic;
@@ -60,6 +64,7 @@ mod json;
 pub mod pin;
 mod profile;
 mod resource;
+pub(crate) mod settings;
 mod source;
 mod syntax;
 mod value;
@@ -86,10 +91,15 @@ use crate::{
 pub use diagnostic::{BundleDiagnostic, Code, Pointer, Position, Severity};
 pub use document::{ApiVersion, Profile, POLICY_SCHEMA_VERSIONS, TOOLS_SCHEMA_VERSIONS};
 pub use resource::{MAX_RESOURCE_BYTES, POLICY_TOP_LEVEL_MEMBERS};
+pub use settings::{
+    render_deployment_reference, render_deployment_schema, Section, StandaloneStore,
+    DEPLOYMENT_SCHEMA_DOCUMENT, SECTIONS, STANDALONE_STORES, STORES_PATH,
+};
 pub use source::{FileName, MANIFEST_FILE_NAME, MAX_BUNDLE_BYTES, MAX_DIRECTORY_ENTRIES};
 
 pub(crate) use document::is_dns_label;
 use document::{Deployment, FileReference, Manifest, ResourceSource};
+use profile::ProfileRules;
 use source::{BundleDirectory, FileSource, MemoryFiles};
 use syntax::{decode_text, Node, SyntaxError, TextRules, DOCUMENT_LIMITS};
 
@@ -303,7 +313,9 @@ pub struct DeploymentDocument {
     pub sha256: String,
     pub profile: Profile,
     /// RFC 8785 bytes of the document, the same whether it was written as
-    /// YAML or JSON.
+    /// YAML or JSON, with each decimal setting in its shortest exact
+    /// spelling and the store list and acknowledged behaviors in canonical
+    /// order.
     pub canonical_json: Vec<u8>,
 }
 
@@ -443,8 +455,12 @@ fn read<S: FileSource, V: ResourceValidators>(
         diagnostics,
     );
     // The profile's policy invariants apply once the deployment document says
-    // which profile it is; without one the bundle is refused anyway.
-    let profile = deployment.as_ref().map(|deployment| deployment.profile);
+    // which profile it is and what it acknowledges; without one the bundle is
+    // refused anyway.
+    let (deployment, rules) = match deployment {
+        Some((deployment, rules)) => (Some(deployment), Some(rules)),
+        None => (None, None),
+    };
     let policy = manifest.policy.as_ref().map(|source| {
         read_resource(
             directory,
@@ -452,7 +468,7 @@ fn read<S: FileSource, V: ResourceValidators>(
             (FileRole::Policy, &mut files, &mut *pins),
             diagnostics,
             |text, version, file, found| {
-                resource::policy(text, version, profile, file, found)
+                resource::policy(text, version, rules.as_ref(), file, found)
                     .and_then(|document| refused_unless(validators.policy(document), file, found))
             },
         )
@@ -558,7 +574,7 @@ fn read_deployment(
     reference: &FileReference,
     (files, pins): (&mut Vec<SourceFile>, &mut Pins),
     diagnostics: &mut Vec<BundleDiagnostic>,
-) -> Option<DeploymentDocument> {
+) -> Option<(DeploymentDocument, ProfileRules)> {
     let bytes = read_pinned(
         directory,
         (FileRole::Deployment, reference),
@@ -567,10 +583,20 @@ fn read_deployment(
         diagnostics,
     )?;
     let node = parse_document(&bytes, &reference.file, diagnostics)?;
-    let Deployment { profile, .. } = document::deployment(&node, &reference.file, diagnostics)?;
+    let Deployment {
+        profile, settings, ..
+    } = document::deployment(&node, &reference.file, diagnostics)?;
+    // Decimals take their shortest exact spelling and the word sets their
+    // canonical order, so neither changes the canonical bytes.
+    let mut document = node.to_json();
+    settings.canonicalize(&mut document);
+    let rules = ProfileRules {
+        profile,
+        acknowledged: settings.acknowledged(),
+    };
     // Bundle documents hold safe integers only, so this cannot fail; if it
     // ever did, the document is refused rather than given no canonical form.
-    let Ok(canonical_json) = canonical_json::canonical_json_bytes(&node.to_json()) else {
+    let Ok(canonical_json) = canonical_json::canonical_json_bytes(&document) else {
         diagnostics.push(BundleDiagnostic::file(
             Code::NumberNotInteger,
             &reference.file,
@@ -582,12 +608,15 @@ fn read_deployment(
         name: reference.file.clone(),
         bytes,
     });
-    Some(DeploymentDocument {
-        file: reference.file.clone(),
-        sha256: reference.sha256.clone(),
-        profile,
-        canonical_json,
-    })
+    Some((
+        DeploymentDocument {
+            file: reference.file.clone(),
+            sha256: reference.sha256.clone(),
+            profile,
+            canonical_json,
+        },
+        rules,
+    ))
 }
 
 /// `None` when the resource was refused. A resource the bundle supplies is

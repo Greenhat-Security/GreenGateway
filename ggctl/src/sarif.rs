@@ -7,6 +7,12 @@
 //! file, line and column the reader reported. File locations are relative to
 //! the `BUNDLE_ROOT` base, which the log describes but never resolves: the
 //! bundle's own path is an argument, and no argument is echoed.
+//!
+//! An environment file (`--env`, `--against-env`) has no bundle-relative
+//! name, and its path is an argument too, so it is listed in `run.artifacts`
+//! by the position of the option naming it, with no location, and a result
+//! about one of its lines refers to it by index, with the line as its
+//! region and the setting, when there is one, as a logical location.
 
 use serde_json::{json, Value};
 
@@ -35,6 +41,17 @@ pub(crate) fn log(diagnostics: &[ReportDiagnostic]) -> Value {
             })
         })
         .collect();
+    // The environment files results are about, by the argument naming each,
+    // in first-seen order.
+    let mut files: Vec<usize> = Vec::new();
+    for diagnostic in diagnostics {
+        if let Some(LocationRecord::Line { argument, .. }) = diagnostic.location() {
+            if !files.contains(&argument) {
+                files.push(argument);
+            }
+        }
+    }
+    let mut bundle_relative = false;
     let results: Vec<Value> = diagnostics
         .iter()
         .map(|diagnostic| {
@@ -52,46 +69,89 @@ pub(crate) fn log(diagnostics: &[ReportDiagnostic]) -> Value {
                 "level": level(diagnostic),
                 "message": {"text": text},
             });
-            if let Some(LocationRecord::File {
-                file,
-                pointer,
-                line,
-                column,
-            }) = diagnostic.location()
-            {
-                let mut physical = json!({
-                    "artifactLocation": {"uri": file, "uriBaseId": BUNDLE_ROOT},
-                });
-                if let (Some(line), Some(column)) = (line, column) {
-                    physical["region"] = json!({"startLine": line, "startColumn": column});
+            let setting = diagnostic
+                .field()
+                .map(|field| json!([{"fullyQualifiedName": field, "kind": "variable"}]));
+            match diagnostic.location() {
+                Some(LocationRecord::File {
+                    file,
+                    pointer,
+                    line,
+                    column,
+                }) => {
+                    bundle_relative = true;
+                    let mut physical = json!({
+                        "artifactLocation": {"uri": file, "uriBaseId": BUNDLE_ROOT},
+                    });
+                    if let (Some(line), Some(column)) = (line, column) {
+                        physical["region"] = json!({"startLine": line, "startColumn": column});
+                    }
+                    let mut location = json!({"physicalLocation": physical});
+                    if !pointer.is_empty() {
+                        location["logicalLocations"] =
+                            json!([{"fullyQualifiedName": pointer, "kind": "member"}]);
+                    }
+                    result["locations"] = json!([location]);
                 }
-                let mut location = json!({"physicalLocation": physical});
-                if !pointer.is_empty() {
-                    location["logicalLocations"] =
-                        json!([{"fullyQualifiedName": pointer, "kind": "member"}]);
+                Some(LocationRecord::Line { argument, line }) => {
+                    let file = files
+                        .iter()
+                        .position(|listed| *listed == argument)
+                        .unwrap_or_default();
+                    let mut location = json!({
+                        "physicalLocation": {
+                            "artifactLocation": {"index": file},
+                            "region": {"startLine": line},
+                        },
+                    });
+                    if let Some(setting) = setting {
+                        location["logicalLocations"] = setting;
+                    }
+                    result["locations"] = json!([location]);
                 }
-                result["locations"] = json!([location]);
+                // A setting the file does not assign has no line.
+                _ => {
+                    if let Some(setting) = setting {
+                        result["locations"] = json!([{"logicalLocations": setting}]);
+                    }
+                }
             }
             result
         })
         .collect();
+    let mut run = json!({
+        "tool": {
+            "driver": {
+                "name": "ggctl",
+                "version": env!("CARGO_PKG_VERSION"),
+                "rules": rule_values,
+            }
+        },
+        "columnKind": "unicodeCodePoints",
+        "results": results,
+    });
+    if bundle_relative {
+        run["originalUriBaseIds"] = json!({
+            BUNDLE_ROOT: {"description": {"text": "The bundle directory given to ggctl validate."}}
+        });
+    }
+    if !files.is_empty() {
+        run["artifacts"] = files
+            .iter()
+            .map(|argument| {
+                json!({
+                    "description": {
+                        "text": format!("The environment file named by argument {argument}."),
+                    },
+                    "roles": ["analysisTarget"],
+                })
+            })
+            .collect();
+    }
     json!({
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
         "version": "2.1.0",
-        "runs": [{
-            "tool": {
-                "driver": {
-                    "name": "ggctl",
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "rules": rule_values,
-                }
-            },
-            "originalUriBaseIds": {
-                BUNDLE_ROOT: {"description": {"text": "The bundle directory given to ggctl validate."}}
-            },
-            "columnKind": "unicodeCodePoints",
-            "results": results,
-        }]
+        "runs": [run],
     })
 }
 

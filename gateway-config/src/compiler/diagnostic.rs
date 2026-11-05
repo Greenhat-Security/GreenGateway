@@ -187,6 +187,86 @@ pub enum ConfigRule {
     AuthorityEvidenceUnsupportedConfiguration,
 }
 
+impl ConfigRule {
+    /// Every rule, in declaration order.
+    pub const ALL: [Self; 30] = [
+        Self::Value,
+        Self::AdminListenerCollision,
+        Self::GrpcListenerCollision,
+        Self::TlsMaterialUnpaired,
+        Self::AdminTlsWithoutAdminListener,
+        Self::ClientCertificateAuth,
+        Self::ClientCertIdentitySourceUnused,
+        Self::AdminSessionSettingsWithoutMode,
+        Self::AdminSessionIdleTimeoutBounds,
+        Self::AdminLoginProviderUnusable,
+        Self::AdminSessionRequirements,
+        Self::AdminSessionCsrfExemption,
+        Self::TrustedProxyNetworksRequired,
+        Self::CookieSessionDelegation,
+        Self::UpstreamRoutingSourcesExclusive,
+        Self::HostRoutesRequirePolicy,
+        Self::SecretsRootRequired,
+        Self::LocalKeyringRequiresConnectionsStore,
+        Self::SecretAliasIdReserved,
+        Self::ClusterMemberStaleWindow,
+        Self::ClusterModeRequirements,
+        Self::LocalAuthorityInClusterMode,
+        Self::AdminSessionStoreBackend,
+        Self::ClusterSettingInStandaloneMode,
+        Self::PayloadCaptureDestination,
+        Self::AuthorityEventSinkRequirements,
+        Self::AuthorityEventMaterialUnused,
+        Self::AuthorityPseudonymKeysDistinct,
+        Self::AuthorityEvidenceDeliveryRequired,
+        Self::AuthorityEvidenceUnsupportedConfiguration,
+    ];
+
+    /// The rule's stable name: its variant name in lowercase snake case.
+    ///
+    /// `ggctl`'s report format (`GgctlReport`, issue #242) carries it, so a
+    /// published name never changes meaning; renaming or removing one needs a
+    /// new report version.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Value => "value",
+            Self::AdminListenerCollision => "admin_listener_collision",
+            Self::GrpcListenerCollision => "grpc_listener_collision",
+            Self::TlsMaterialUnpaired => "tls_material_unpaired",
+            Self::AdminTlsWithoutAdminListener => "admin_tls_without_admin_listener",
+            Self::ClientCertificateAuth => "client_certificate_auth",
+            Self::ClientCertIdentitySourceUnused => "client_cert_identity_source_unused",
+            Self::AdminSessionSettingsWithoutMode => "admin_session_settings_without_mode",
+            Self::AdminSessionIdleTimeoutBounds => "admin_session_idle_timeout_bounds",
+            Self::AdminLoginProviderUnusable => "admin_login_provider_unusable",
+            Self::AdminSessionRequirements => "admin_session_requirements",
+            Self::AdminSessionCsrfExemption => "admin_session_csrf_exemption",
+            Self::TrustedProxyNetworksRequired => "trusted_proxy_networks_required",
+            Self::CookieSessionDelegation => "cookie_session_delegation",
+            Self::UpstreamRoutingSourcesExclusive => "upstream_routing_sources_exclusive",
+            Self::HostRoutesRequirePolicy => "host_routes_require_policy",
+            Self::SecretsRootRequired => "secrets_root_required",
+            Self::LocalKeyringRequiresConnectionsStore => {
+                "local_keyring_requires_connections_store"
+            }
+            Self::SecretAliasIdReserved => "secret_alias_id_reserved",
+            Self::ClusterMemberStaleWindow => "cluster_member_stale_window",
+            Self::ClusterModeRequirements => "cluster_mode_requirements",
+            Self::LocalAuthorityInClusterMode => "local_authority_in_cluster_mode",
+            Self::AdminSessionStoreBackend => "admin_session_store_backend",
+            Self::ClusterSettingInStandaloneMode => "cluster_setting_in_standalone_mode",
+            Self::PayloadCaptureDestination => "payload_capture_destination",
+            Self::AuthorityEventSinkRequirements => "authority_event_sink_requirements",
+            Self::AuthorityEventMaterialUnused => "authority_event_material_unused",
+            Self::AuthorityPseudonymKeysDistinct => "authority_pseudonym_keys_distinct",
+            Self::AuthorityEvidenceDeliveryRequired => "authority_evidence_delivery_required",
+            Self::AuthorityEvidenceUnsupportedConfiguration => {
+                "authority_evidence_unsupported_configuration"
+            }
+        }
+    }
+}
+
 /// The problems the compiler's stages found, each with the rule that refused
 /// it, in the order they are reported.
 ///
@@ -350,6 +430,25 @@ mod tests {
         // A prefix of a name is not the name.
         assert_eq!(attributed_variable("ADMIN_LISTEN must be set"), None);
         assert_eq!(attributed_variable(""), None);
+    }
+
+    /// A rule's stable name is its variant name in snake case, so the two
+    /// cannot drift apart, and no two rules share one.
+    #[test]
+    fn every_rule_has_a_unique_snake_case_name_spelled_like_its_variant() {
+        let mut seen = std::collections::BTreeSet::new();
+        for rule in ConfigRule::ALL {
+            let variant = format!("{rule:?}");
+            let mut expected = String::new();
+            for character in variant.chars() {
+                if character.is_ascii_uppercase() && !expected.is_empty() {
+                    expected.push('_');
+                }
+                expected.push(character.to_ascii_lowercase());
+            }
+            assert_eq!(rule.as_str(), expected, "{variant}");
+            assert!(seen.insert(rule.as_str()), "{variant}");
+        }
     }
 
     #[test]

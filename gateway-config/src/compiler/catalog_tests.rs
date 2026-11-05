@@ -11,6 +11,12 @@
 //! accepted when no diagnostic refuses that input under `ConfigRule::Value`,
 //! whatever rules relating it to other settings say.
 //!
+//! The deployment document is held to the compiler the same way: a value
+//! the bundle reader accepts for a setting on its own is exactly a value the
+//! compiler accepts from the environment, at every bound and for generated
+//! values between them, and a decimal's canonical spelling compiles to what
+//! its written spelling does.
+//!
 //! The second half holds the configuration reference, `.env.example`,
 //! ADR-0008's bootstrap inputs, the compiler contract's sensitivity table and
 //! the deployment schema to the catalog, so none of them can drift from it.
@@ -19,10 +25,15 @@
 
 use std::{collections::BTreeSet, env::VarError, fs, path::Path};
 
-use crate::catalog::{
-    self, Blank, BootstrapCategory, BundleMapping, DecimalBound, DefaultValue, Field, FieldType,
-    Sensitivity, StateBackends, FIELDS,
+use crate::{
+    bundle::{self, settings},
+    catalog::{
+        self, Blank, BootstrapCategory, BundleMapping, DecimalBound, DefaultValue, Field,
+        FieldType, Sensitivity, StateBackends, FIELDS,
+    },
 };
+use proptest::prelude::*;
+use proptest::test_runner::{Config, RngAlgorithm, RngSeed};
 use serde_json::Value;
 
 use super::{diagnostic::ConfigRule, inventory, ConfigError, ConfigPlan};
@@ -588,23 +599,48 @@ fn the_secret_fields_are_the_compiler_contracts_sensitive_inputs() {
     assert_eq!(documented, catalog);
 }
 
+/// The leaf members beneath a schema object, by JSON Pointer from the
+/// document root, and whether every object on the way is closed.
+fn schema_leaves(schema: &Value, pointer: &str, leaves: &mut BTreeSet<String>) {
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        leaves.insert(pointer.to_owned());
+        return;
+    };
+    assert_eq!(
+        schema["additionalProperties"], false,
+        "{pointer} is a closed section"
+    );
+    for (name, member) in properties {
+        schema_leaves(member, &format!("{pointer}/{name}"), leaves);
+    }
+}
+
 /// A field reaches a bundle only through the deployment schema: each setting
-/// the schema defines under `spec` (beside the profile, which is the bundle's
-/// own) is a catalog field's document path and the reverse. The schema also
-/// defines the typed forms the catalog's deployment fields will use.
+/// the schema defines beneath `spec`, in its closed sections, is a catalog
+/// field's document path and the reverse. The profile and the members
+/// `bundle::settings::OWN_MEMBERS` lists (the store list, the listener
+/// intents, the admin login client and the acknowledged compatibility
+/// behaviors) are the document's own, not fields. The schema is
+/// rendered from the catalog (`bundle::settings::tests` holds the committed
+/// file to the rendering), and it defines the typed forms the catalog's
+/// deployment fields use.
 #[test]
 fn the_deployment_schema_defines_exactly_the_catalogs_document_paths() {
-    let schema: Value = serde_json::from_str(&repository_text(
-        "docs/schemas/gateway-deployment.v1alpha1.schema.json",
-    ))
-    .expect("the deployment schema is JSON");
-    let defined: BTreeSet<String> = schema["properties"]["spec"]["properties"]
-        .as_object()
-        .expect("the deployment schema defines spec members")
-        .keys()
-        .filter(|member| member.as_str() != "profile")
-        .map(|member| format!("/spec/{member}"))
-        .collect();
+    let schema: Value = serde_json::from_str(&repository_text(bundle::DEPLOYMENT_SCHEMA_DOCUMENT))
+        .expect("the deployment schema is JSON");
+    let mut defined = BTreeSet::new();
+    schema_leaves(&schema["properties"]["spec"], "/spec", &mut defined);
+    assert!(
+        defined.remove("/spec/profile"),
+        "the schema defines the profile"
+    );
+    for member in bundle::settings::OWN_MEMBERS {
+        assert!(
+            defined.remove(member.path),
+            "the schema defines {}",
+            member.path
+        );
+    }
     let catalog: BTreeSet<String> = FIELDS
         .iter()
         .filter_map(|field| match field.bundle {
@@ -613,11 +649,15 @@ fn the_deployment_schema_defines_exactly_the_catalogs_document_paths() {
         })
         .collect();
     assert_eq!(defined, catalog);
+    assert!(
+        repository_text(bundle::DEPLOYMENT_SCHEMA_DOCUMENT) == bundle::render_deployment_schema(),
+        "the committed deployment schema is the one rendered from the catalog"
+    );
 
     let deployment = |predicate: fn(&Field) -> bool| {
-        FIELDS.iter().any(|field| {
-            matches!(field.bundle, BundleMapping::Deployment { .. }) && predicate(field)
-        })
+        FIELDS
+            .iter()
+            .any(|field| field.document_path().is_some() && predicate(field))
     };
     if deployment(|field| matches!(field.field_type, FieldType::Decimal(_))) {
         assert_eq!(
@@ -630,5 +670,151 @@ fn the_deployment_schema_defines_exactly_the_catalogs_document_paths() {
             schema["$defs"]["secretReference"].is_object(),
             "a deployment field that can carry a secret takes a secret reference"
         );
+    }
+}
+
+/// The deployment fields whose bounds the catalog states: integers, decimals,
+/// choices and booleans, which never carry a secret.
+fn bounded_settings() -> Vec<&'static Field> {
+    FIELDS
+        .iter()
+        .filter(|field| field.document_path().is_some())
+        .filter(|field| {
+            matches!(
+                field.field_type,
+                FieldType::Integer(_)
+                    | FieldType::Decimal(_)
+                    | FieldType::Choice(_)
+                    | FieldType::Boolean
+            )
+        })
+        .collect()
+}
+
+/// The document spelling of an environment value: integers and booleans as
+/// JSON literals, decimals and words as JSON strings.
+fn document_value(field: &Field, environment: &str) -> String {
+    match field.field_type {
+        FieldType::Integer(_) | FieldType::Boolean => environment.to_owned(),
+        _ => Value::String(environment.to_owned()).to_string(),
+    }
+}
+
+/// Whether the reader and the compiler agree on `value` for `field`.
+fn document_agrees(field: &'static Field, value: &str) -> bool {
+    settings::accepts(field, &document_value(field, value)) == accepts_on_its_own(field, value)
+}
+
+/// At every bound the catalog states, and just past it, the document accepts
+/// a setting exactly when the compiler accepts the same value from the
+/// environment. The document cannot hold an integer beyond the I-JSON safe
+/// range, so a field with no bound of its own is bounded there.
+#[test]
+fn the_deployment_document_accepts_exactly_what_the_compiler_accepts() {
+    let safe = (1_u64 << 53) - 1;
+    for field in bounded_settings() {
+        let name = field.environment;
+        let values: Vec<String> = match field.field_type {
+            FieldType::Integer(range) => {
+                let maximum = range.maximum.min(safe);
+                let mut values = vec![
+                    range.minimum.to_string(),
+                    maximum.to_string(),
+                    "-1".to_owned(),
+                ];
+                values.extend(range.minimum.checked_sub(1).map(|below| below.to_string()));
+                if maximum < safe {
+                    values.push((maximum + 1).to_string());
+                }
+                values
+            }
+            FieldType::Decimal(range) => {
+                let mut values = vec![
+                    range.minimum.value.to_owned(),
+                    stepped(range.minimum, true),
+                    "1000000".to_owned(),
+                ];
+                if range.minimum.value != "0" {
+                    values.push(stepped(range.minimum, false));
+                }
+                if let Some(maximum) = range.maximum {
+                    values.extend([
+                        maximum.value.to_owned(),
+                        stepped(maximum, true),
+                        stepped(maximum, false),
+                    ]);
+                }
+                values
+            }
+            FieldType::Choice(words) => words
+                .iter()
+                .map(|word| (*word).to_owned())
+                .chain(["catalog-probe".to_owned()])
+                .collect(),
+            _ => vec!["true".to_owned(), "false".to_owned()],
+        };
+        for value in values {
+            assert!(
+                document_agrees(field, &value),
+                "{name}={value}: the document and the compiler disagree"
+            );
+        }
+    }
+}
+
+fn property_config() -> Config {
+    Config {
+        cases: 192,
+        rng_algorithm: RngAlgorithm::ChaCha,
+        rng_seed: RngSeed::Fixed(242_117),
+        max_shrink_iters: 512,
+        ..Config::default()
+    }
+}
+
+fn settings_of(predicate: fn(&FieldType) -> bool) -> Vec<&'static Field> {
+    bounded_settings()
+        .into_iter()
+        .filter(|field| predicate(&field.field_type))
+        .collect()
+}
+
+proptest! {
+    #![proptest_config(property_config())]
+
+    /// Between and beyond the bounds, an integer the document accepts is
+    /// exactly one the compiler accepts.
+    #[test]
+    fn generated_integer_settings_agree_with_the_compiler(
+        field in proptest::sample::select(settings_of(|field_type| matches!(field_type, FieldType::Integer(_)))),
+        value in prop_oneof![0_i64..=1_100_000, -5_i64..0, 0_i64..=9_007_199_254_740_991],
+    ) {
+        let value = value.to_string();
+        prop_assert!(document_agrees(field, &value), "{}={}", field.environment, value);
+    }
+
+    /// A decimal the document accepts is one the compiler accepts, and its
+    /// canonical spelling compiles to exactly what the written one does.
+    #[test]
+    fn generated_decimal_settings_agree_with_the_compiler_and_canonicalize_exactly(
+        field in proptest::sample::select(settings_of(|field_type| matches!(field_type, FieldType::Decimal(_)))),
+        integer in prop_oneof!["0", "1", "[1-9][0-9]{0,3}", "[1-9][0-9]{0,15}"],
+        fraction in proptest::option::of("[0-9]{1,6}"),
+    ) {
+        let text = match &fraction {
+            Some(fraction) => format!("{integer}.{fraction}"),
+            None => integer.clone(),
+        };
+        prop_assert!(document_agrees(field, &text), "{}={}", field.environment, text);
+        if let Some(canonical) = settings::canonical_decimal(field, &text) {
+            let mut written = context(field);
+            written.push((field.environment, text.as_str()));
+            let mut respelled = context(field);
+            respelled.push((field.environment, canonical.as_str()));
+            prop_assert!(
+                accepted(&written) == accepted(&respelled),
+                "{}: {} and {} compile differently", field.environment, text, canonical
+            );
+        }
     }
 }

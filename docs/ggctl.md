@@ -2,7 +2,7 @@
 
 `ggctl` is GreenGateway's operator command-line tool (issue #242, [ADR-0008](adr/0008-setup-cli-and-configuration-bundles.md)). It is a separate binary: the `gateway` server keeps its name, its no-argument startup, its Docker entrypoint and its one-shot commands (`gateway migrate`, `gateway healthcheck`, `gateway import-standalone`, ...) unchanged.
 
-**Status: alpha.** This build implements `version`, `schema`, `init`, `validate`, `pin`, `convert`, `doctor`, `diff`, `ledger seed`, `ledger verify`, `ledger rollback`, `backup create`, `backup verify`, `backup restore`, the `policy` commands (`lint`, `test`, `explain`, `replay`), `evidence verify`, `mcp-config`, `completion` and `help`, the output contract, the exit codes, secure bearer-token input and the version handshake with a running gateway. `init` writes a new [configuration bundle](configuration-bundles.md) for a deployment profile, `validate` and `doctor` check one offline with the gateway's own bundle reader, `pin` rewrites its SHA-256 pins once its files validate, `convert` converts one between document versions, and `diff` compares two bundles semantically and classifies each change's risk. The `ledger` commands seed, verify and roll back a standalone state directory's [configuration revision ledger](configuration-ledger.md) offline, under the directory's lock. The `backup` commands back up the stores beneath a standalone state directory offline, under the directory's lock, verify a backup completely, and restore one into an empty or stopped state directory, which they leave as it was on any failure ([standalone backups](standalone-backup.md)). The [policy commands](#policy-commands) ask a gateway's own policy validator and evaluator (issue #243), and [`evidence verify`](#evidence-verify) checks a policy evidence package's integrity offline. `mcp-config` writes a credential-free MCP client configuration template from a running gateway. `ggctl` cannot yet plan, apply or export anything, it has no browser wizard (`init --web`), and it cannot yet validate, convert or diff an environment file (`--env`, `--against-env`) or diff against a server (`diff --server`): those are later #242 slices (see the ADR's [rollout](adr/0008-setup-cli-and-configuration-bundles.md#rollout)), and a name this build does not implement is refused as an unknown command (exit 2). Nothing here changes how a gateway is configured or started: no gateway reads a bundle or starts from a ledger yet.
+**Status: alpha.** This build implements `version`, `schema`, `init`, `validate`, `pin`, `convert`, `doctor`, `diff`, `ledger seed`, `ledger verify`, `ledger rollback`, `backup create`, `backup verify`, `backup restore`, the `policy` commands (`lint`, `test`, `explain`, `replay`), `evidence verify`, `mcp-config`, `completion` and `help`, the output contract, the exit codes, secure bearer-token input and the version handshake with a running gateway. `init` writes a new [configuration bundle](configuration-bundles.md) for a deployment profile, `validate` and `doctor` check one offline with the gateway's own bundle reader, `pin` rewrites its SHA-256 pins once its files validate, `convert` converts one between document versions, and `diff` compares two bundles semantically and classifies each change's risk. `validate`, `doctor` and `diff` also take an [environment file](#environment-files) instead of a bundle (`--env`, `--against-env`), for a deployment that stays in environment mode, and run the gateway's own configuration compiler over it. The `ledger` commands seed, verify and roll back a standalone state directory's [configuration revision ledger](configuration-ledger.md) offline, under the directory's lock. The `backup` commands back up the stores beneath a standalone state directory offline, under the directory's lock, verify a backup completely, and restore one into an empty or stopped state directory, which they leave as it was on any failure ([standalone backups](standalone-backup.md)). The [policy commands](#policy-commands) ask a gateway's own policy validator and evaluator (issue #243), and [`evidence verify`](#evidence-verify) checks a policy evidence package's integrity offline. `mcp-config` writes a credential-free MCP client configuration template from a running gateway. `ggctl` cannot yet plan, apply or export anything, it has no browser wizard (`init --web`), and it cannot yet convert an environment file (`convert --env`) or diff against a server (`diff --server`): those are later #242 slices (see the ADR's [rollout](adr/0008-setup-cli-and-configuration-bundles.md#rollout)), and a name this build does not implement is refused as an unknown command (exit 2). Nothing here changes how a gateway is configured or started: no gateway reads a bundle or starts from a ledger yet.
 
 ## Building
 
@@ -13,9 +13,75 @@ cargo build --locked --release -p ggctl
 # target/release/ggctl (ggctl.exe on Windows)
 ```
 
-It is not yet part of the release artifacts or the container image; packaging, checksums, SBOM and signing for Linux, macOS and Windows come with #242 PR 18. CI builds and tests it on all three platforms.
+A `ggctl-vMAJOR.MINOR.PATCH` tag builds it for Linux, macOS and Windows with checksums, SBOMs and signed build provenance; see [release artifacts](#release-artifacts). It is not part of the container image. CI builds and tests it on all three platforms.
 
-The configuration contracts it shares with the gateway live in the `gateway-config` library crate, which both binaries link: the published document schemas, the `GatewayCapabilities` handshake document, RFC 8785 canonical JSON and the ADR-0004 digest frame, the configuration bundle reader, and the environment configuration compiler (`gateway_config::compiler`, extracted by #433 and moved there by #242; see [its contract](architecture/configuration-compiler.md)), which no `ggctl` command runs yet, and the production policy and tools validators: the validating parses of policy and tools documents (`gateway_config::rbac` and `gateway_config::tools`, moved there by #242) that the gateway's policy and tools loaders run. Every `ggctl` command that reads a bundle runs them on its bundled policy and tools documents, exactly as the gateway would, so a bundle `ggctl` accepts is one the gateway's loaders accept. Loading, watching and evaluating policy and tools stay in the gateway.
+The configuration contracts it shares with the gateway live in the `gateway-config` library crate, which both binaries link: the published document schemas, the `GatewayCapabilities` handshake document, RFC 8785 canonical JSON and the ADR-0004 digest frame, the configuration bundle reader, the environment configuration compiler (`gateway_config::compiler`, extracted by #433 and moved there by #242; see [its contract](architecture/configuration-compiler.md)), which `validate`, `doctor` and `diff` run over an environment file, the `KEY=VALUE` environment file grammar (`gateway_config::env_file`) that `gateway import-standalone` reads too, and the production policy and tools validators: the validating parses of policy and tools documents (`gateway_config::rbac` and `gateway_config::tools`, moved there by #242) that the gateway's policy and tools loaders run. Every `ggctl` command that reads a bundle runs them on its bundled policy and tools documents, exactly as the gateway would, so a bundle `ggctl` accepts is one the gateway's loaders accept. Loading, watching and evaluating policy and tools stay in the gateway.
+
+## Release artifacts
+
+Pushing a `ggctl-vMAJOR.MINOR.PATCH` tag runs [`.github/workflows/release-ggctl.yml`](../.github/workflows/release-ggctl.yml), which drafts a GitHub release for a maintainer to publish ([releasing ggctl](RELEASING.md#releasing-ggctl)). For `VERSION` it holds one archive per target:
+
+| Target | Archive | Built on | Runs on |
+| --- | --- | --- | --- |
+| `x86_64-unknown-linux-gnu` | `ggctl-VERSION-x86_64-unknown-linux-gnu.tar.gz` | Ubuntu 22.04 | Linux with glibc 2.35 or later |
+| `aarch64-unknown-linux-gnu` | `ggctl-VERSION-aarch64-unknown-linux-gnu.tar.gz` | Ubuntu 22.04 on Arm | Linux with glibc 2.35 or later |
+| `x86_64-apple-darwin` | `ggctl-VERSION-x86_64-apple-darwin.tar.gz` | macOS 15 on Intel | macOS 11 or later |
+| `aarch64-apple-darwin` | `ggctl-VERSION-aarch64-apple-darwin.tar.gz` | macOS 15 | macOS 11 or later |
+| `x86_64-pc-windows-msvc` | `ggctl-VERSION-x86_64-pc-windows-msvc.zip` | Windows Server 2025 | 64-bit Windows 10 or later |
+
+The Linux binaries link the system's glibc dynamically; they are not static musl binaries. They are built on Ubuntu 22.04, and the release fails if one needs a glibc symbol version newer than 2.35. The C code `ggctl` compiles in (SQLite and AWS-LC) is linked statically on every platform, and the Windows binary also links the C runtime statically, so it needs no Visual C++ redistributable. Each archive holds one directory, `ggctl-VERSION-TARGET/`, with:
+
+- `ggctl` (`ggctl.exe` on Windows) and `LICENSE`;
+- `man/man1/ggctl.1` and a page for every command and command family (`ggctl-validate.1`, `ggctl-ledger.1`, `ggctl-ledger-seed.1`, ...), written by that binary's `ggctl help --man` and refused at packaging unless each says everything its `ggctl help` says;
+- `completion/ggctl.bash`, `completion/_ggctl` (zsh), `completion/ggctl.fish` and `completion/ggctl.ps1`, written by that binary's `ggctl completion`.
+
+Beside the archives the release holds:
+
+| File | What it is |
+| --- | --- |
+| `ggctl-VERSION-TARGET.spdx.json` | The archive's SPDX 2.3 SBOM: the archive and the executable with their SHA-256 digests, and the Cargo packages the executable is compiled from for that target (normal and build dependencies, never dev-dependencies) with each registry package's `Cargo.lock` checksum. It is generated from Cargo's resolved metadata, not by scanning the binary. |
+| `SHA256SUMS` | The SHA-256 of every archive and SBOM, in `sha256sum` format. |
+| `ggctl-VERSION.provenance.sigstore.jsonl` | The SLSA v1 build-provenance attestation over every archive, every SBOM and `SHA256SUMS`. |
+| `ggctl-VERSION-TARGET.sbom.sigstore.jsonl` | The SPDX attestation that binds the archive to its SBOM. |
+| `ggctl-VERSION-release.json` | An index naming each archive's digest, its SBOM and the attestations that cover them. |
+
+The attestations are [GitHub artifact attestations](https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/use-artifact-attestations) signed through Sigstore by the release workflow at the tagged commit. They are also stored with the repository, so `gh attestation verify` finds them without the bundle files.
+
+Each target is built with `cargo build --locked --release` by the production compiler in `build-tools.json`, on a runner of its own platform, and then built again from an empty target directory; the release fails unless both builds package to byte-identical archives and SBOMs. That shows the build of a commit is deterministic on that runner image, not that another machine reproduces it. Before anything is published, the release job requires every archive to have its `SHA256SUMS` entry, an SBOM that names its digest and both attestations (`scripts/ggctl_release.py check`), and verifies every attestation with the GitHub CLI version pinned in `build-tools.json` and the constraints below. A pull request that can change a release runs the same builds and checks as a dry run: read-only, with no secret, nothing signed and nothing published.
+
+There is no install script, no package-manager package and no self-updater: `ggctl` never downloads or replaces itself. Upgrading is downloading and verifying the next release.
+
+### Verifying a release
+
+Download the archive for your platform and `SHA256SUMS`, then check the digest:
+
+```sh
+sha256sum --check --ignore-missing SHA256SUMS        # Linux
+shasum -a 256 --check --ignore-missing SHA256SUMS    # macOS
+```
+
+```powershell
+$archive = 'ggctl-VERSION-x86_64-pc-windows-msvc.zip'
+$expected = ((Get-Content SHA256SUMS) | Where-Object { $_.EndsWith("  $archive") }).Split(' ')[0]
+(Get-FileHash $archive -Algorithm SHA256).Hash.ToLower() -eq $expected
+```
+
+A matching checksum shows the download is the file `SHA256SUMS` names, not who built either. Verify that with the build provenance, using the GitHub CLI (`gh attestation`):
+
+```sh
+gh attestation verify ggctl-VERSION-x86_64-unknown-linux-gnu.tar.gz \
+  --repo Greenhat-Security/GreenGateway \
+  --signer-workflow Greenhat-Security/GreenGateway/.github/workflows/release-ggctl.yml \
+  --source-ref refs/tags/ggctl-vVERSION \
+  --cert-oidc-issuer https://token.actions.githubusercontent.com \
+  --deny-self-hosted-runners
+```
+
+Add `--source-digest COMMIT` when you know the tagged commit from a reviewed record. The same command with `--predicate-type https://spdx.dev/Document/v2.3` verifies the SBOM attestation; with `--format json`, its `verificationResult.statement.predicate` is the SBOM, and it must equal the downloaded `.spdx.json`. Verifying `SHA256SUMS` the same way covers every file it lists. Without network access to GitHub, pass the release's bundle with `--bundle` (`ggctl-VERSION.provenance.sigstore.jsonl` for provenance, `ggctl-VERSION-TARGET.sbom.sigstore.jsonl` for the SBOM) and trust roots obtained separately with `gh attestation trusted-root` with `--custom-trusted-root`, as [offline image verification](RELEASING.md#offline-verification) describes.
+
+A verified attestation shows that the file was built by this repository's release workflow from the tagged commit on a GitHub-hosted runner. It is not a review of the code, and the SBOM is an inventory, not a vulnerability verdict.
+
+Then extract the archive and put `ggctl` on your `PATH`. The man pages go in a `man1` directory on your `MANPATH` (for example `/usr/local/share/man/man1`), and the completion scripts where [`completion`](#completion) says.
 
 ## Commands
 
@@ -23,11 +89,11 @@ The configuration contracts it shares with the gateway live in the `gateway-conf
 ggctl version [--server URL] [--ca-file PATH] [--token-stdin | --token-file PATH] [--timeout SECONDS] [--format human|json]
 ggctl schema [KIND] [--api-version VERSION] [--format human|json]
 ggctl init --profile production|migration|development --output DIR [--answers FILE] [--format human|json]
-ggctl validate BUNDLE [--strict] [--warnings-as-errors] [--format human|json|sarif]
+ggctl validate (BUNDLE | --env FILE) [--strict] [--warnings-as-errors] [--format human|json|sarif]
 ggctl pin BUNDLE [--strict] [--format human|json]
 ggctl convert BUNDLE --to VERSION (--output DIR | --in-place) [--strict] [--format human|json]
-ggctl doctor BUNDLE [--format human|json]
-ggctl diff BUNDLE --against BUNDLE [--check] [--strict] [--format human|json|sarif]
+ggctl doctor (BUNDLE | --env FILE) [--format human|json]
+ggctl diff (BUNDLE | --env FILE) (--against BUNDLE | --against-env FILE) [--check] [--strict] [--format human|json|sarif]
 ggctl ledger seed BUNDLE --state-dir DIR [--format human|json]
 ggctl ledger verify --state-dir DIR [--format human|json]
 ggctl ledger rollback REVISION --state-dir DIR [--acknowledge RISK_CODE]... [--format human|json]
@@ -42,11 +108,11 @@ ggctl policy replay --server URL [REMOTE] --cancel ID [--format human|json]
 ggctl evidence verify PACKAGE [--format human|json]
 ggctl mcp-config --server URL --client generic|claude-desktop|cursor|vscode [--auth oauth|token] [--name NAME] [--ca-file PATH] [--token-stdin | --token-file PATH] [--timeout SECONDS]
 ggctl completion bash|zsh|fish|powershell
-ggctl help [COMMAND [SUBCOMMAND]]
+ggctl help [COMMAND [SUBCOMMAND]] [--man]
 ggctl --help | --version
 ```
 
-`REMOTE` stands for `[--ca-file PATH] [--token-stdin | --token-file PATH] [--timeout SECONDS]`, as for `version`. `ggctl help COMMAND` and `ggctl COMMAND --help` print a command's options. `ledger`, `backup`, `policy` and `evidence` are command families: `ggctl help ledger` and `ggctl ledger --help` list a family's commands, and `ggctl help ledger seed` and `ggctl ledger seed --help` print one. Help and the completion scripts are generated from the same command table the parser uses, so they cannot drift. Man pages, which ADR-0008 also generates from that table, arrive with packaging (#242 PR 18).
+`REMOTE` stands for `[--ca-file PATH] [--token-stdin | --token-file PATH] [--timeout SECONDS]`, as for `version`. `ggctl help COMMAND` and `ggctl COMMAND --help` print a command's options. `ledger`, `backup`, `policy` and `evidence` are command families: `ggctl help ledger` and `ggctl ledger --help` list a family's commands, and `ggctl help ledger seed` and `ggctl ledger seed --help` print one. `ggctl help --man` prints the same text as the ggctl(1) manual page, `ggctl help --man COMMAND` as ggctl-COMMAND(1) for a command or family, and `ggctl help --man ledger seed` as ggctl-ledger-seed(1), in man(7) roff; the [release archives](#release-artifacts) carry these pages under `man/man1`. Help, the man pages and the completion scripts are generated from the same command table the parser uses, so they cannot drift, and the tests hold every page to the help it repeats.
 
 ### `version`
 
@@ -76,7 +142,7 @@ ggctl validate deploy/bundle --strict
 
 ### `validate`
 
-Reads the bundle in the directory `BUNDLE` with the bundle reader the gateway uses ([configuration bundles](configuration-bundles.md)) and reports every problem it finds, not just the first: unsafe or oversized files, the YAML subset and strict JSON, exact document versions, closed documents, references and SHA-256 pins, the published policy and tools schemas, and the deployment profile's policy invariants. It reads only beneath `BUNDLE`, writes nothing, makes no network request and reads no environment variable. `BUNDLE` must be valid UTF-8.
+Reads the bundle in the directory `BUNDLE` with the bundle reader the gateway uses ([configuration bundles](configuration-bundles.md)) and reports every problem it finds, not just the first: unsafe or oversized files, the YAML subset and strict JSON, exact document versions, closed documents, the deployment settings' types and their own bounds, references and SHA-256 pins, the published policy and tools schemas, and the deployment profile's policy invariants. It reads only beneath `BUNDLE`, writes nothing, makes no network request and reads no environment variable. `BUNDLE` must be valid UTF-8.
 
 - The human result names the bundle and says `valid` or `invalid` with counts; for a valid bundle it adds the source digest, the files and the profile, marking a `development` profile `non-production`. Each diagnostic goes to standard error with its file, line, column and JSON Pointer.
 - `--format json` writes one `GgctlReport` whose `result` holds `valid` and, once the manifest was read, what it declares (`bundle`); digests and the profile appear only when every stage passed. Diagnostics carry `location.file`, `location.pointer` and, where the reader has them, `location.line` and `location.column`.
@@ -85,7 +151,14 @@ Reads the bundle in the directory `BUNDLE` with the bundle reader the gateway us
 
 A bundled policy or tools document is also held to the gateway's production validator for it, after the bundle's own rules and its published schema: the policy and tools loaders' own validating parse. It refuses what only it checks (for example two route hosts that differ only in case, or two tools of one name) with `resource.invalid`, by code alone, because a validator's message can quote document values. In the JSON result each bundled resource then says `productionValidator: passed`. A digest is integrity metadata, not a signature: a valid bundle is not thereby a trusted one.
 
-Exit codes: `0` valid, `3` invalid (or any warning with `--warnings-as-errors`), `1` when the bundle could not be read at all (`bundle.root_unavailable`, `bundle.read_failed`, `bundle.changed_during_read`).
+With `--env FILE` instead of `BUNDLE`, `validate` reads an [environment file](#environment-files) and reports every problem in it and every setting the gateway's configuration compiler refuses, each located by line and named by setting and rule, never by value:
+
+- The human result says `valid` or `invalid` with counts, then how many gateway settings the file sets and how many other keys it sets, which are never named.
+- `--format json` writes one `GgctlReport` whose `result` holds `valid` and, once the file was parsed, `environment`: `settings` (the gateway settings it assigns, in the order the compiler reads them), `otherVariables` and `duplicateKeys` (counts). Diagnostics carry `location.argument` (the position of `--env`) and, for a line, `location.line`, and `field` (the setting) and `rule` (the [compiler rule](#configuration-rules)) where there are any.
+- `--format sarif` covers the same findings: the file is listed in `run.artifacts` by the position of `--env`, never by its path, and each finding on a line refers to it by index with the line as its region and the setting as a logical location.
+- `--strict` makes a key assigned twice an error instead of a warning (`env.duplicate_key`). `--warnings-as-errors` exits `3` on any warning.
+
+Exit codes: `0` valid, `3` invalid (or any warning with `--warnings-as-errors`), `1` when the bundle or file could not be read at all (`bundle.root_unavailable`, `bundle.read_failed`, `bundle.changed_during_read`, `env.unreadable`).
 
 In CI, validate the bundle a change touches and keep the SARIF log for review:
 
@@ -94,7 +167,12 @@ In CI, validate the bundle a change touches and keep the SARIF log for review:
   run: ggctl validate deploy/bundle --strict --warnings-as-errors --format sarif > bundle.sarif
 ```
 
-The step fails on exit `3` or `1`; upload `bundle.sarif` with the CI system's SARIF tooling if it annotates reviews.
+The step fails on exit `3` or `1`; upload `bundle.sarif` with the CI system's SARIF tooling if it annotates reviews. A deployment that stays in environment mode validates its environment file the same way:
+
+```yaml
+- name: Validate the gateway environment
+  run: ggctl validate --env deploy/gateway.env --strict --warnings-as-errors --format sarif > env.sarif
+```
 
 ### `pin`
 
@@ -139,6 +217,8 @@ Every check has a stable `id`, a `severity` (`error` for a required check, whose
 
 The human result lists each check's status, ID and reason on standard output and ends with whether a required check failed; the reader's diagnostics go to standard error. `--format json` writes one `GgctlReport` whose `result` holds `bundle` (as for `validate`) and `checks`. Exit codes: `0` when no required check failed, `3` when one did (with `doctor.required_check_failed`), `1` when the bundle could not be read.
 
+With `--env FILE` instead of `BUNDLE`, the doctor reads the [environment file](#environment-files) as `validate --env` does and runs its [own checks](#environment-doctor-checks): whether the file is usable and the gateway's configuration compiler accepts it, which are required, and then, because environment mode has no deployment profile, what the compiled configuration shows against ADR-0008's `production` profile, as advice that warns and never fails. Only the invariants the compiled configuration itself shows are evaluated; the policy invariants (default deny, enforce mode, no wildcard role) are in the document `POLICY_FILE` names, which the doctor does not read, so that check is `skipped` while a policy file is set. The doctor has no `--strict`, so a key assigned twice is advice. `result` holds `environment` (as for `validate`) and `checks`, and the exit codes are the same, `1` when the file could not be read.
+
 ### Doctor checks
 
 | Check | Severity | What it covers |
@@ -154,6 +234,22 @@ The human result lists each check's status, ID and reason on standard output and
 | `resources.production_validators` | error | The bundled policy and tools documents against the production validators the gateway's loaders run: `pass` once the bundle was read, `fail` with the resources stage's first code (`resource.invalid` covers a published-schema and a production-validator refusal alike), `skipped` when the bundle supplies neither document or the reader stopped before them. |
 | `deployment.profile` | warning | Whether the deployment is a production one: `warning` for `migration` and `development`. |
 
+### Environment doctor checks
+
+| Check | Severity | What it covers |
+| --- | --- | --- |
+| `environment.file` | error | The environment file: a regular file of at most 1 MiB, not writable by group or other on Unix, UTF-8, and every line blank, a comment or an assignment. Its reason is the first `env` code found. |
+| `environment.duplicate_keys` | warning | No key is assigned twice (`env.duplicate_key`). |
+| `environment.compiler` | error | The gateway's configuration compiler accepts the variables the file sets. Its reason is the first `config` code found. |
+| `production.authentication` | warning | Authentication is on and required: `AUTH_ENABLED` is not `false` and `AUTH_MODE` is not `observe`. |
+| `production.policy` | warning | A policy is configured: `warning` without `POLICY_FILE`, `skipped` with one, because its invariants are in the policy document, which this check does not read. |
+| `production.csrf` | warning | CSRF protection is on (`CSRF_ENABLED`). |
+| `production.private_egress` | warning | Private-address egress is denied (`EGRESS_DENY_PRIVATE_IPS`). |
+| `production.audit_durability` | warning | Audit durability is `required` (`AUDIT_DURABILITY`). |
+| `production.client_secrets` | warning | No `AUTH_PROVIDERS` entry holds its client secret inline; the production profile allows a secret only as a reference. |
+
+The production checks are `skipped` with `doctor.incomplete` when the file is not a valid environment configuration, because advice about a configuration the gateway would refuse is not advice about what the file configures.
+
 ### Doctor reasons
 
 | Reason | Meaning |
@@ -164,6 +260,13 @@ The human result lists each check's status, ID and reason on standard output and
 | `doctor.not_declared` | The bundle declares nothing this check applies to. |
 | `doctor.migration_profile` | The deployment uses the `migration` profile, meant for moving an existing deployment over, not as a final state. |
 | `doctor.development_profile` | The deployment uses the `development` profile, which is not for production. |
+| `doctor.authentication_not_required` | The environment turns authentication off or to `observe`, which the production profile forbids. |
+| `doctor.policy_not_configured` | The environment sets no `POLICY_FILE`, so no policy authorizes requests, which the production profile forbids. |
+| `doctor.policy_not_read` | The environment names a policy file, whose invariants an offline check of the environment file does not read; validate it as a bundle's policy instead. |
+| `doctor.csrf_disabled` | The environment turns CSRF protection off, which the production profile forbids. |
+| `doctor.private_egress_allowed` | The environment allows egress to private addresses, which the production profile forbids. |
+| `doctor.audit_best_effort` | The environment makes audit durability `best_effort`, which the production profile forbids. |
+| `doctor.inline_client_secret` | An `AUTH_PROVIDERS` entry holds its client secret inline, where the production profile allows only a secret reference. |
 
 `doctor.validator_unavailable` is deprecated: earlier releases, which could not run the production validators, reported `resources.production_validators` as `skipped` with it. No release reports it now, and the reason is reserved.
 
@@ -176,9 +279,11 @@ Compares the bundle in the directory `BUNDLE` with the one `--against` names, se
 - `--format sarif` writes one SARIF 2.1.0 log: the readers' diagnostics as `validate` writes them, then one rule per risk code (level `error` for a `high` code, `warning` for `medium`, `note` for `low`) and one result per risk code of each change, located at the change's field as a logical location. A change without a code is not a finding and has no result. This extends ADR-0008, which gave SARIF to `validate` only.
 - `--check` exits `4` when the bundles differ at all (`diff.drift_found`), whatever the risk. `--strict` applies to both bundles as it does for `validate`.
 
+With `--env FILE` and `--against-env FILE` instead, `diff` compiles both [environment files](#environment-files) as `validate --env` does and compares the two compiled configurations setting by setting with the same semantic diff (each change's `field` is the setting's name), so spelling, order, `export`, comments, whitespace a setting ignores and a spelled-out default never register. The result holds `environment` and `againstEnvironment` in place of `bundle` and `against`; `--check`, `--strict` and the formats behave as for two bundles. An environment file and a bundle are read and reported but never compared, in either direction: no front end maps a bundle onto the compiler's settings yet, and an environment configuration holds no policy or tools document, so there is nothing in common to compare (`diff.not_comparable`, exit `3`).
+
 A bundle that is invalid is not compared: the readers' diagnostics are reported, BUNDLE's first, and the result says `valid: false`. Diagnostics name bundle-relative files, so a diagnostic about a file both bundles have does not say which bundle it concerns; read `bundle` and `against` in the result, or validate each bundle on its own.
 
-Exit codes: `0` when both bundles were compared, `4` with `--check` when they differ, `3` when either is invalid, `1` when either could not be read, `2` without `--against`. To gate a change in CI on the risk it carries, compare the proposed bundle with the deployed one and fail on what the codes say:
+Exit codes: `0` when both were compared, `4` with `--check` when they differ, `3` when either is invalid or they cannot be compared, `1` when either could not be read, `2` without `--against` or `--against-env`, or with both. To gate a change in CI on the risk it carries, compare the proposed bundle with the deployed one and fail on what the codes say:
 
 ```yaml
 - name: Review the configuration change
@@ -366,7 +471,7 @@ printf '%s' "$ADMIN_TOKEN" | ggctl mcp-config --server https://gateway.example.t
 
 ### `completion`
 
-Writes a completion script to standard output. It completes commands, a family's commands after its name (`ggctl ledger <TAB>`), options, fixed choices (risk codes for `--acknowledge`), file names for path options, document arguments and a backup archive argument, and directory names for a `BUNDLE` argument.
+Writes a completion script to standard output. It completes commands, a family's commands after its name (`ggctl ledger <TAB>`), options, fixed choices (risk codes for `--acknowledge`), file names for path options, document arguments and a backup archive argument, and directory names for a `BUNDLE` argument. The [release archives](#release-artifacts) carry the same four scripts under `completion/`.
 
 | Shell | Install |
 | --- | --- |
@@ -375,19 +480,30 @@ Writes a completion script to standard output. It completes commands, a family's
 | fish | `ggctl completion fish > ~/.config/fish/completions/ggctl.fish` |
 | PowerShell | `ggctl completion powershell >> $PROFILE` |
 
+## Environment files
+
+`--env FILE` (`validate`, `doctor`, `diff`) and `--against-env FILE` (`diff`) read a `KEY=VALUE` environment file, so that a deployment that stays in environment mode gets the same offline checks in CI as a bundle (ADR-0008). The file is read as data: `ggctl` never runs or sources it, never expands anything in it, and never reads its own process environment in its place. It is compiled by the gateway's own configuration compiler with every setting the file does not assign unset, exactly as `Config::from_env_vars` would compile a process environment holding only those variables, so `ggctl` and the gateway reach the same verdict on the same file.
+
+- **The file**: a regular file (a symbolic link to one is followed, as mounted secrets use them) of at most 1 MiB, opened without blocking, and valid UTF-8. On Unix it must not be writable by group or other, as the bundle reader requires of bundle files. Its path is never echoed: findings name the position of the option.
+- **The grammar** is the one `gateway import-standalone --from` reads (`gateway_config::env_file`), the plain shape `.env.example` ships and `docker compose env_file` and systemd `EnvironmentFile` read: each line loses its surrounding whitespace and is ignored when empty or starting with `#`; otherwise one leading `export ` is dropped, and the line must hold `=` with a non-empty key before the first one (`env.malformed_line`). The value is everything after that `=`, verbatim: quotes, leading spaces, further `=` and `#` are kept, and nothing is unquoted, unescaped or interpolated, so `AUTH_MODE="required"` sets the value `"required"`, quotes included, as the import does. A line never continues onto the next.
+- **A key assigned twice** keeps its last value, as every reader of such a file applies it, and is reported at the repeating line (`env.duplicate_key`): a warning, and an error under `--strict`, because a reviewer may read the first assignment.
+- **Findings are value-free**: each names the line and, when the key is one of the compiler's inventoried settings, that setting as the inventory spells it, plus the [rule](#configuration-rules) the compiler refused it under. A key outside the inventory is counted, never named, because such a key could be anything; no value, line text, path or compiler message reaches standard output, standard error, a report or a SARIF log.
+
 ## Output contract
 
 - **Standard output carries only what was asked for**: an artifact (a schema, a completion script, help, an MCP client template), the human result, with `--format json` exactly one `GgctlReport` document ([schema](schemas/ggctl-report.v1alpha1.schema.json)), with `validate`, `diff` or `policy lint --format sarif` exactly one SARIF 2.1.0 log, or with `policy test --format junit` exactly the gateway's JUnit XML report.
 - **Diagnostics go to standard error** in human form. With `--format json` or `--format sarif` they are in the document instead and standard error stays empty. A JUnit report has no place for them, so with `--format junit` they stay on standard error.
 - **An argument error found before a command runs** (an unknown option, a refused secret or insecure option, a malformed `--server`) is written to standard error only, exits `2`, and writes no report.
-- **No color, no prompts, no progress output.** `ggctl` reads no configuration file and no environment variable, and makes no network request unless a command is given `--server`.
+- **No color, no prompts, no progress output.** `ggctl` reads no configuration file of its own and no environment variable, reads only the files and directories its arguments name, and makes no network request unless a command is given `--server`.
 - **Files are written only where a command is told to.** `init` and `convert --output` create the one directory `--output` names, and never write anything else, overwrite anything, or echo the path. `pin` replaces only `BUNDLE`'s `bundle.yaml`. The `ledger` commands write only beneath `--state-dir`: its lock file, which they create if it is missing; `ledger seed` creates the ledger and never replaces one, `ledger rollback` appends one revision to it, and `ledger verify` writes nothing in it. `backup create` creates the archive at `--output` and nothing else that stays: in `--state-dir` it writes only the lock file, if that is missing, and the hidden working, partial and verification entries it makes beside `--output` are removed. `backup verify` writes only a hidden staging directory beside `FILE`, which it removes. `backup restore` writes only a hidden staging directory beside `--state-dir`, which becomes `--state-dir` or is removed, and the lock file in `--state-dir`, which it removes again when the restore fails and the directory had none; the replaced directory, renamed aside, is removed. `mcp-config` writes only to standard output and never opens a client's configuration file.
 
 A report always has `apiVersion: greengateway.dev/v1alpha1`, `kind: GgctlReport`, the `command`, the process `exitCode` and its stable `outcome` name, the `diagnostics`, and a command-specific `result`. Every diagnostic has a stable `code`, a `severity` (`error`, `warning` or `info`), fixed `message` text, an optional fixed `hint`, a `remediation` anchor and at most one location: when it concerns one argument, that argument's 1-based `location.argument` position; when the bundle reader found it, the bundle-relative `location.file`, a `location.pointer` built from member names the reader defines, and the 1-based `location.line` and `location.column` where the reader has them. Diagnostics are value-free by construction: they never contain an argument, token, URL, path, address, document value, server response or library error text. An unknown option is reported by its position, never by its spelling, because the spelling may be a mistyped secret. A published code never changes meaning; renaming or removing one needs a new report version.
 
 A report about a bundle carries the bundle reader's own codes (the `bundle`, `syntax`, `json`, `yaml`, `compat`, `schema`, `reference`, `secret`, `resource` and `profile` families), each listed in [configuration bundles](configuration-bundles.md#diagnostics), which is its remediation anchor. No code is spelled the same in both lists. A reader warning exits `0` on its own; a reader error exits `3`, or `1` when the bundle could not be read at all.
 
-SARIF 2.1.0 output belongs to `validate`, which ADR-0008 gives it, to `diff`, which reports its risk codes as results, and to `policy lint`, which reports the policy validator's diagnostics as results.
+A report about an environment file carries the [`env`](#env-diagnostics) and [`config`](#config-diagnostics) codes below. Such a diagnostic is located by `location.argument`, the position of the option naming the file, and `location.line` where it concerns one line, and carries `field`, the inventoried setting it concerns, and `rule`, the [compiler rule](#configuration-rules) that refused it, where there are any.
+
+SARIF 2.1.0 output belongs to `validate`, which ADR-0008 gives it, to `diff`, which reports its risk codes as results, and to `policy lint`, which reports the policy validator's diagnostics as results. For an environment file, the log lists the file in `run.artifacts` by the position of the option naming it and locates a finding by that artifact's index and the line.
 
 ## Exit codes
 
@@ -462,7 +578,7 @@ Each code below is stable. The exit column is the exit code the diagnostic produ
 | `usage.missing_argument` | 2 | A required argument is missing. |
 | `usage.invalid_value` | 2 | A value is empty, not one of the command's choices, or out of range. |
 | `usage.argument_not_utf8` | 2 | An argument is not valid UTF-8. Only a path given as its own argument may be. |
-| `usage.conflicting_options` | 2 | Two options that exclude each other were both given: `--token-stdin` and `--token-file`, a `--candidate` and a `--draft`, or `--job`, `--cancel` and the options that start a replay. |
+| `usage.conflicting_options` | 2 | Two options that exclude each other were both given: `--token-stdin` and `--token-file`, `BUNDLE` and `--env`, `--against` and `--against-env`, a `--candidate` and a `--draft`, or `--job`, `--cancel` and the options that start a replay. |
 | `usage.option_requires_server` | 2 | `--ca-file`, `--token-stdin`, `--token-file` or `--timeout` was given without `--server`. |
 | `usage.server_required` | 2 | A policy command was given no `--server`; it has no offline form. |
 | `usage.missing_option` | 2 | An option the command, or another option given, needs was not given: `--draft` and `--draft-etag` go together, and starting a replay needs `--base-etag` and `--window`. |
@@ -601,7 +717,69 @@ Each code below is stable. The exit column is the exit code the diagnostic produ
 
 | Code | Exit | Meaning |
 | --- | --- | --- |
-| `diff.drift_found` | 4 | `--check` was given and the bundles differ. |
+| `diff.drift_found` | 4 | `--check` was given and the two configurations differ. |
+| `diff.not_comparable` | 3 | One side is an environment file and the other a bundle, which configure different things; nothing was compared. |
+
+### Env diagnostics
+
+| Code | Exit | Meaning |
+| --- | --- | --- |
+| `env.unreadable` | 1 | The environment file could not be opened or read, for example because it does not exist. |
+| `env.not_regular_file` | 3 | The environment file is not a regular file, such as a directory or a FIFO. |
+| `env.unsafe_permissions` | 3 | The environment file is writable by group or other (Unix). |
+| `env.too_large` | 3 | The environment file is larger than 1 MiB. |
+| `env.not_utf8` | 3 | The environment file is not valid UTF-8. |
+| `env.malformed_line` | 3 | A line is neither blank, a comment nor a `KEY=VALUE` assignment with a key; located by its line, never its text. |
+| `env.duplicate_key` | 3 | A key is assigned again: located at the repeating line, and named only when it is a gateway setting. An error under `--strict`; otherwise a warning that exits `0`. |
+
+### Config diagnostics
+
+One code per way the gateway's configuration compiler found the setting a refusal begins with. Each is located at the line of the setting's effective (last) assignment, when the file assigns it, and names the setting and the [rule](#configuration-rules), never the value or the compiler's own message, which may quote one.
+
+| Code | Exit | Meaning |
+| --- | --- | --- |
+| `config.unset` | 3 | The refusal begins with a setting the file does not set, such as one another setting requires. |
+| `config.empty` | 3 | The setting is set to an empty or whitespace-only value that was refused. |
+| `config.not_unicode` | 3 | The setting's value is not valid Unicode. An environment file is UTF-8, so its findings never have this code; it exists because the compiler's other readers can produce it. |
+| `config.refused` | 3 | The setting is set to a value that was refused, on its own or together with another setting. |
+| `config.unattributed` | 3 | The refusal begins with no inventoried setting. No refusal the compiler reports today has this shape. |
+
+### Configuration rules
+
+The `rule` of a `config` diagnostic: the compiler check that refused it (`gateway_config::compiler::diagnostic::ConfigRule`, described in [the compiler contract](architecture/configuration-compiler.md#rules)). `value` is the refusal of one setting's own value; every other rule relates settings. A published rule name never changes meaning; renaming or removing one needs a new report version.
+
+| Rule | Refuses |
+| --- | --- |
+| `value` | A setting's own value: it does not parse, is out of bounds, or is not an accepted word. |
+| `admin_listener_collision` | `ADMIN_LISTEN_ADDR` on the data listener's address. |
+| `grpc_listener_collision` | `GRPC_LISTEN_ADDR` on the data or admin listener's address. |
+| `tls_material_unpaired` | Certificate and key files not set together, or not one key per certificate chain. |
+| `admin_tls_without_admin_listener` | Admin TLS material without a separate admin listener. |
+| `client_certificate_auth` | Client-certificate authentication without TLS, a CA bundle or an identity source, or a CA or CRL file while the mode is `off`. |
+| `client_cert_identity_source_unused` | An identity source while both listeners' client-certificate modes are `off`. |
+| `admin_session_settings_without_mode` | Admin session settings without a session mode that reads them. |
+| `admin_session_idle_timeout_bounds` | An idle timeout outside 1 and the session's absolute lifetime. |
+| `admin_login_provider_unusable` | An `ADMIN_LOGIN_PROVIDER` that cannot serve the admin login. |
+| `admin_session_requirements` | An admin session store without the login, authentication, CSRF protection or HTTPS redirect it relies on. |
+| `admin_session_csrf_exemption` | CSRF exemptions for admin API routes while an admin session store is on. |
+| `trusted_proxy_networks_required` | `TRUST_PROXY_HEADERS` without a trusted proxy network. |
+| `cookie_session_delegation` | A route delegating the cookie session without the authentication and CSRF settings it relies on, or overlapping an exemption. |
+| `upstream_routing_sources_exclusive` | `UPSTREAM_URL` and `UPSTREAM_ROUTES` together. |
+| `host_routes_require_policy` | A host-bound route without `POLICY_FILE`. |
+| `secrets_root_required` | A file-backed secret alias or a keyring without `CONNECTION_SECRETS_ROOT`. |
+| `local_keyring_requires_connections_store` | `CONNECTION_LOCAL_SECRET_KEYRING` without `CONNECTIONS_SQLITE_PATH`. |
+| `secret_alias_id_reserved` | A provider alias reusing an operator secret alias's ID. |
+| `cluster_member_stale_window` | A `CLUSTER_MEMBER_STALE_MS` shorter than the heartbeats a live replica may miss. |
+| `cluster_mode_requirements` | `STATE_BACKEND=postgres` without the deployment ID, the database URL file or a keyring it requires. |
+| `local_authority_in_cluster_mode` | A local file or SQLite store while PostgreSQL is the authority. |
+| `admin_session_store_backend` | An admin session store the state backend cannot host. |
+| `cluster_setting_in_standalone_mode` | A cluster-only setting while `STATE_BACKEND` is `sqlite`. |
+| `payload_capture_destination` | Standalone payload capture without `DISCOVERY_SQLITE_PATH`. |
+| `authority_event_sink_requirements` | An authority-event sink without its pseudonym key alias or, for the file sink, its file. |
+| `authority_event_material_unused` | Authority-event material the configured sink never reads. |
+| `authority_pseudonym_keys_distinct` | The current and previous pseudonym key aliases naming the same alias. |
+| `authority_evidence_delivery_required` | `AUTHORITY_EVIDENCE_DURABILITY=required` in cluster mode with no authority-event sink to deliver it. |
+| `authority_evidence_unsupported_configuration` | `AUTHORITY_EVIDENCE_DURABILITY=required` with a setting that enables an authority change the evidence inventory marks unsupported in this mode. |
 
 ### Init diagnostics
 
@@ -753,4 +931,4 @@ The `backup restore` codes beyond the backup codes above, which it reports for a
 
 ## Platform notes
 
-`ggctl` is tested on Linux, macOS and Windows. Exit codes, stream separation, terminal detection, token-file and document type and size checks, the remote client and evidence verification behave the same on all three. The owner-only permission check on token files applies on Unix only, as do the owner, mode and path checks on `--ca-file` and `--answers` files, and so does the bundle reader's refusal of a group- or other-writable bundle directory or file ([files and the directory](configuration-bundles.md#files-and-the-directory)); on Windows the reader enforces the link, reparse-point, regular-file and name rules, and ACLs are left to the operator. Likewise `init` and `convert --output` create their directory `0700` and its files `0600` on Unix and check those modes, and `pin` writes its new `bundle.yaml` `0600` and checks it, and `backup create` writes its archive `0600` and its working and staging directories `0700` and checks the archive, and `backup restore` stages `0600` stores in a `0700` directory and checks both, while on Windows the new entries inherit the ACL of the directory they are created in. Shell completion is generated for bash, zsh, fish and PowerShell.
+`ggctl` is tested on Linux, macOS and Windows. Exit codes, stream separation, terminal detection, token-file and document type and size checks, the remote client and evidence verification behave the same on all three. The owner-only permission check on token files applies on Unix only, as do the owner, mode and path checks on `--ca-file` and `--answers` files, and so do the bundle reader's refusal of a group- or other-writable bundle directory or file ([files and the directory](configuration-bundles.md#files-and-the-directory)) and the same refusal of an environment file; on Windows the reader enforces the link, reparse-point, regular-file and name rules, and ACLs are left to the operator. Likewise `init` and `convert --output` create their directory `0700` and its files `0600` on Unix and check those modes, and `pin` writes its new `bundle.yaml` `0600` and checks it, and `backup create` writes its archive `0600` and its working and staging directories `0700` and checks the archive, and `backup restore` stages `0600` stores in a `0700` directory and checks both, while on Windows the new entries inherit the ACL of the directory they are created in. Shell completion is generated for bash, zsh, fish and PowerShell.

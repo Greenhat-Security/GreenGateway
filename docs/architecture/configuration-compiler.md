@@ -31,7 +31,7 @@ same goldens (`gateway-config/src/compiler/parity_tests.rs`).
   settings by, and `Config::from_env_vars` is `compile` followed by the
   gateway's conversion (`config::into_config`); it adds no rule of its own.
 - **Shared with `ggctl`.** The compiler is a public module of the library both
-  binaries link, so `ggctl` can run the gateway's own compiler rather than an
+  binaries link, so `ggctl` runs the gateway's own compiler rather than an
   approximation of it (see [The compiler in
   `gateway-config`](#the-compiler-in-gateway-config)). The gateway keeps
   `Config`, the process-environment reader, the conversion and every startup
@@ -43,10 +43,9 @@ same goldens (`gateway-config/src/compiler/parity_tests.rs`).
 | --- | --- | --- |
 | `gateway` with no arguments: `bootstrap::start_serving` | `config::process_environment`, the process environment | Converts the plan with `config::into_config` and runs the startup stages on it (see [Startup](#startup)). A refused configuration is printed and the process exits with status 1 before any stage runs. |
 | The one-shot commands: `migrate`, `connection-secret`, `revoke-jwt`, `jwt-revocations-cleanup`, `rate-limit-buckets-cleanup`, `cluster-members`, `maintenance-run`, and `import-standalone`'s own configuration | `Config::from_env`, the same reader | Uses the converted `Config`. A refusal is returned as the command's error, in the same operator-facing form. |
-| `gateway import-standalone --from FILE`, for the source deployment | The variables parsed from `FILE`, as a map | Refuses the import with `ImportError::StandaloneConfigInvalid`, naming only the settings that failed, never their values. |
-| Tests | Fixture maps and recording doubles | Parity goldens, stage and catalog tests in `gateway-config`; the gateway's `config_tests` and startup-stage tests. |
-
-No `ggctl` command calls the compiler yet.
+| `gateway import-standalone --from FILE`, for the source deployment | The variables `gateway_config::env_file` parses from `FILE`, as a map | Refuses the import with `ImportError::StandaloneConfigInvalid`, naming only the settings that failed, never their values. |
+| `ggctl validate`, `ggctl doctor` and `ggctl diff` with `--env FILE` (and `--against-env FILE`) | `gateway_config::env_file::EnvFile::var`: the variables the file sets, parsed with the same grammar as the import's, every other input unset | Reports each diagnostic as a `config` code with the rule's stable name, located by the line of its setting ([docs/ggctl.md](../ggctl.md#environment-files)); the doctor evaluates an accepted plan against the production profile as advice, and the diff compares two plans with `semantic_diff::plans`. |
+| Tests | Fixture maps and recording doubles | Parity goldens, stage and catalog tests in `gateway-config`; the gateway's `config_tests`, startup-stage tests and `config/env_file_tests.rs`, which holds what the environment file path decides to `Config::from_env_vars`. |
 
 ## Inputs
 
@@ -236,9 +235,9 @@ in the legacy order:
   begins with, a code describing how that variable was set, the rule that
   refused it, and a message built from those and fixed text alone. Nothing in
   a diagnostic is copied from a value or from a problem's wording, so it is
-  value-free by construction rather than by redaction. No production path
-  reports diagnostics yet; `import-standalone` keeps only the leading setting
-  names of the problems instead.
+  value-free by construction rather than by redaction. `ggctl --env` reports
+  them; `import-standalone` keeps only the leading setting names of the
+  problems instead.
 
 Both are public on `gateway_config::compiler::ConfigError`, as `problems()`
 and `diagnostics()`.
@@ -293,9 +292,13 @@ holds this table to `diagnostic::ConfigRule`.
 | `AuthorityEvidenceDeliveryRequired` | `AUTHORITY_EVIDENCE_DURABILITY=required` in cluster mode with `AUTHORITY_EVENT_SINK=none`, which would journal evidence that is never delivered. |
 | `AuthorityEvidenceUnsupportedConfiguration` | `AUTHORITY_EVIDENCE_DURABILITY=required` with a setting that enables an authority change the evidence inventory marks unsupported in this mode: `ADMIN_SESSION_MODE=standalone_memory`. |
 
-Codes and rules are Rust enums. They have no serialized names yet: the first
-report format that carries them must assign stable codes, and from then on a
-rule's meaning is part of that format's contract.
+Codes and rules are Rust enums. `ConfigRule::as_str` gives every rule
+(`ConfigRule::ALL`) a stable name, its variant name in snake case
+(`admin_listener_collision`), and `ggctl`'s report format (`GgctlReport`)
+publishes those names and one `config` code per code (`config.refused`,
+`config.unset`, ...; see [docs/ggctl.md](../ggctl.md#config-diagnostics)).
+From now on a rule's meaning is part of that format's contract: renaming or
+removing one needs a new report version.
 
 ## Sensitivity wrappers
 
@@ -316,7 +319,11 @@ type whose `Debug` output does not show it:
 
 The client secret is the one secret value in the plan. The legacy document
 holds it inline; making it a reference is an input-format change for #242's
-bundle format, not a change to this stage.
+bundle format, not a change to this stage. The deployment document already
+takes it only as a secret reference (`admin_login.client_secret`), and the
+URLs and static headers above only as references or not at all
+([structured settings](../configuration-bundles.md#structured-settings)); the
+compiler does not read a deployment document yet.
 
 What the contract covers, and what holds it:
 
@@ -482,17 +489,23 @@ holding the string a reader returned, and `Source` has two variants,
 
 The bundle reader in `gateway-config` (`bundle::read_bundle`) validates a
 bundle's files, digests, documents, and profile today. Its deployment document
-has one member, `spec.profile`, and nothing maps a bundle onto compiler
-inputs. Profile invariants on deployment settings (authentication required,
-private-address egress denied, and so on) are not enforced by the compiler
-yet.
+carries the profile and every catalog field with a document path, in the
+closed sections those paths imply (`bundle::settings`), each held to its
+catalog type and its own bounds; the parity tests below hold those bounds to
+this compiler. Nothing maps a bundle onto compiler inputs yet, so the
+cross-field rules and each value's own grammar are not applied to a document,
+and profile invariants on deployment settings (authentication required,
+private-address egress denied, and so on) are not enforced yet. A front end
+gives a decimal setting the `f64` its text parses to, which is the value the
+same text gives in the environment.
 
 ### Reports
 
-`ConfigDiagnostic` is the form a validate or doctor report should carry for
+`ConfigDiagnostic` is the form a validate or doctor report carries for
 environment configuration: it is value-free by construction and names the
-setting, how it was set, and the rule. The report format must give codes and
-rules stable string names (see [Rules](#rules)). Provenance is recorded per
+setting, how it was set, and the rule. `ggctl --env` reports it with stable
+codes and rule names (see [Rules](#rules)), located by the line of the
+setting's effective assignment. Provenance is recorded per
 input and is what a status or Setup Center view needs to explain where a
 field came from; `ConfigPlan::provenance` returns it, and no report or admin
 API carries it yet.
@@ -528,7 +541,9 @@ beside it:
 | `.env.example` | Every field assigned once, to its default or left blank where blank means unset, so copying the file configures exactly the defaults | `catalog_tests::the_env_example_assigns_every_field_its_default` |
 | Bootstrap inputs | ADR-0008's bootstrap table | `catalog_tests::the_bootstrap_fields_are_adr_0008s_bootstrap_inputs` |
 | Sensitivity | The [sensitivity wrappers](#sensitivity-wrappers) table | `catalog_tests::the_secret_fields_are_the_compiler_contracts_sensitive_inputs` |
-| Document paths | The deployment schema's settings | `catalog_tests::the_deployment_schema_defines_exactly_the_catalogs_document_paths` |
+| Document paths | The deployment schema's settings, and the schema rendered from the catalog | `catalog_tests::the_deployment_schema_defines_exactly_the_catalogs_document_paths`, `bundle::settings::tests::the_committed_schema_is_the_rendered_schema` |
+| Deployment-document bounds | The values the compiler accepts on their own, at every bound and for generated values | `catalog_tests::the_deployment_document_accepts_exactly_what_the_compiler_accepts`, `generated_integer_settings_agree_with_the_compiler`, `generated_decimal_settings_agree_with_the_compiler_and_canonicalize_exactly` |
+| Structured forms of the JSON documents | The compiler's own types (`RawAuthProviderConfig`, `UpstreamRouteConfig` and the route types, `McpUpstreamServerConfig`), and the environment form | `bundle::settings::structured_tests::every_form_lists_exactly_its_compiler_types_members`, `every_environment_fixture_converts_to_a_document_that_compiles_to_the_same_values` |
 | Cloudflare | `GREEN_GATEWAY_ENV_KEYS` and the Cloudflare guide | `env_example::cloudflare_forwarding_matches_supported_gateway_env_vars` |
 | The rendered catalog | `render_json` and its schema | `catalog::tests::the_committed_catalog_is_the_rendered_catalog`, `the_rendered_catalog_matches_its_published_schema` |
 
@@ -541,13 +556,11 @@ catalog's range is what a value is accepted or refused for on its own.
 What the catalog does not hold yet, because nothing decides or checks it
 today:
 
-- **Document paths.** The deployment schema defines no setting beside the
-  profile, so no deployment field has a path and a bundle cannot set any of
-  them.
-- **Two host paths ADR-0008 does not place.** `OPENAPI_SPEC_PATH` and
-  `AUTHORITY_EVENT_FILE` are neither bootstrap inputs nor bundle resources;
-  the catalog marks them `unplaced`, and the bundle front end must refuse
-  them until the ADR decides.
+- **A host path ADR-0008 does not place.** `AUTHORITY_EVENT_FILE` is
+  neither a bootstrap input nor a bundle resource; the catalog marks it
+  `unplaced`, and the bundle front end must refuse it until the ADR decides.
+  (`OPENAPI_SPEC_PATH`, which the ADR makes not representable in `v1alpha1`,
+  is catalogued `not_representable` with the legacy JWT provider.)
 - **Exportability and template placeholders, membership of the
   static-configuration fingerprint, and doctor checks.** `ha.rs` stays the
   authority on the fingerprint.
@@ -584,9 +597,10 @@ every setting. The bundle diff with the production policy and tools
 validators followed them into `gateway-config` with those validators
 (`semantic_diff::compare_production_bundles`).
 
-`ggctl` can now compile environment configuration with the gateway's own
-compiler. No `ggctl` command does yet; one that does reports diagnostics,
-never problems, because problems may quote values.
+`ggctl validate`, `ggctl doctor` and `ggctl diff` compile an environment file
+(`--env`) with the gateway's own compiler, through the `KEY=VALUE` grammar in
+`gateway_config::env_file` that `gateway import-standalone` reads too, and
+report diagnostics, never problems, because problems may quote values.
 
 ### Local filesystem checks and preflight
 

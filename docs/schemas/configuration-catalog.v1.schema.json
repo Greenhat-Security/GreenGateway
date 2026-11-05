@@ -188,8 +188,9 @@
           "properties": {
             "kind": { "const": "deployment" },
             "path": {
-              "description": "The field's JSON Pointer in a GatewayDeployment document, or null until the deployment schema defines it.",
-              "type": ["string", "null"]
+              "description": "The field's JSON Pointer in a GatewayDeployment document, beneath /spec, or null while the document version defines no form for it.",
+              "type": ["string", "null"],
+              "pattern": "^/spec(/[a-z][a-z0-9_]*)+$"
             }
           }
         },

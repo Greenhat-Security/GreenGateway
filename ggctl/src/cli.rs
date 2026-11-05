@@ -1,11 +1,11 @@
 //! The command table and the argument parser.
 //!
 //! One static table defines every command, argument and option. Help text
-//! (`help.rs`) and shell completion (`completion.rs`) are generated from it,
-//! and the parser accepts exactly what it lists, so the three cannot drift.
-//! A command family (`ggctl ledger`, `ggctl backup`, `ggctl policy`) is a
-//! name whose commands are listed in the table under their full names
-//! (`ledger seed`, `backup create`).
+//! (`help.rs`), manual pages (`man.rs`) and shell completion
+//! (`completion.rs`) are generated from it, and the parser accepts exactly
+//! what it lists, so the four cannot drift. A command family (`ggctl ledger`,
+//! `ggctl backup`, `ggctl policy`) is a name whose commands are listed in the
+//! table under their full names (`ledger seed`, `backup create`).
 //!
 //! Before anything else the parser refuses any argument that looks like a
 //! secret-carrying or verification-disabling option, wherever it appears, so
@@ -244,6 +244,20 @@ const STRICT: OptionSpec = OptionSpec {
     help:
         "refuse, rather than warn about, a bundle directory entry the manifest does not reference",
 };
+/// `--strict` for a command that also reads an environment file.
+const STRICT_OR_ENV: OptionSpec = OptionSpec {
+    name: "--strict",
+    value: None,
+    repeatable: false,
+    help: "refuse, rather than warn about, a bundle directory entry the manifest does not \
+           reference, or a key an environment file assigns twice",
+};
+const ENV: OptionSpec = OptionSpec {
+    name: "--env",
+    value: Some(("FILE", ValueKind::Path)),
+    repeatable: false,
+    help: "a KEY=VALUE environment file to read instead of BUNDLE: read as data, never sourced",
+};
 const WARNINGS_AS_ERRORS: OptionSpec = OptionSpec {
     name: "--warnings-as-errors",
     value: None,
@@ -254,19 +268,33 @@ const AGAINST: OptionSpec = OptionSpec {
     name: "--against",
     value: Some(("BUNDLE", ValueKind::Path)),
     repeatable: false,
-    help: "the bundle directory to compare BUNDLE with (required): the change is from it to BUNDLE",
+    help: "the bundle directory to compare with: the change is from it",
+};
+const AGAINST_ENV: OptionSpec = OptionSpec {
+    name: "--against-env",
+    value: Some(("FILE", ValueKind::Path)),
+    repeatable: false,
+    help: "the environment file to compare with instead of --against: the change is from it",
 };
 const CHECK: OptionSpec = OptionSpec {
     name: "--check",
     value: None,
     repeatable: false,
-    help: "exit 4 when the bundles differ at all",
+    help: "exit 4 when the two configurations differ at all",
 };
 const BUNDLE: ArgumentSpec = ArgumentSpec {
     name: "BUNDLE",
     kind: ValueKind::Path,
     required: true,
     help: "the bundle directory, which holds bundle.yaml",
+};
+/// `BUNDLE` for a command that reads an environment file with `--env`
+/// instead; the command requires exactly one of the two.
+const BUNDLE_OR_ENV: ArgumentSpec = ArgumentSpec {
+    name: "BUNDLE",
+    kind: ValueKind::Path,
+    required: false,
+    help: "the bundle directory, which holds bundle.yaml; give it or --env FILE",
 };
 const REVISION: ArgumentSpec = ArgumentSpec {
     name: "REVISION",
@@ -358,6 +386,12 @@ const API_VERSION: OptionSpec = OptionSpec {
     value: Some(("VERSION", ValueKind::Text)),
     repeatable: false,
     help: "the document version to print (default: the newest this ggctl publishes)",
+};
+const MAN: OptionSpec = OptionSpec {
+    name: "--man",
+    value: None,
+    repeatable: false,
+    help: "print the same text as a manual page in man(7) roff",
 };
 const STATE_DIR: OptionSpec = OptionSpec {
     name: "--state-dir",
@@ -602,19 +636,24 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "validate",
-        summary: "Validate a configuration bundle offline",
+        summary: "Validate a configuration bundle or an environment file offline",
         description: &[
             "Reads the bundle in the directory BUNDLE with the gateway's own bundle reader and \
              reports every problem it finds: unsafe files and bounds, the YAML subset and strict \
-             JSON, exact document versions, closed documents, references and SHA-256 pins, the \
-             published policy and tools schemas, and the deployment profile's policy invariants. \
+             JSON, exact document versions, closed documents, the deployment settings' types and \
+             their own bounds, references and SHA-256 pins, the published policy and tools \
+             schemas, and the deployment profile's policy invariants. \
              It makes no network request, reads no environment variable and writes nothing.",
+            "With --env FILE instead, reads a KEY=VALUE environment file as data, in the grammar \
+             gateway import-standalone reads, and runs the gateway's own configuration compiler \
+             over the variables it sets and nothing else. Findings name a line and a setting, \
+             never a value; a key assigned twice is a warning, and an error with --strict.",
             "A bundled policy or tools document is also held to the production validator the \
-             gateway's loader runs. Exits 0 for a valid bundle, 3 for an invalid one (or any \
-             warning with --warnings-as-errors), and 1 when the bundle could not be read.",
+             gateway's loader runs. Exits 0 when valid, 3 when invalid (or any warning with \
+             --warnings-as-errors), and 1 when the bundle or file could not be read.",
         ],
-        arguments: &[BUNDLE],
-        options: &[STRICT, WARNINGS_AS_ERRORS, VALIDATE_FORMAT],
+        arguments: &[BUNDLE_OR_ENV],
+        options: &[ENV, STRICT_OR_ENV, WARNINGS_AS_ERRORS, VALIDATE_FORMAT],
         run: crate::validate::run,
     },
     CommandSpec {
@@ -661,23 +700,26 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "doctor",
-        summary: "Diagnose a configuration bundle offline",
+        summary: "Diagnose a configuration bundle or an environment file offline",
         description: &[
             "Runs the offline checks on the bundle in the directory BUNDLE: each stage of the \
              gateway's bundle reader as its own check, the deployment profile, and the checks \
              ggctl cannot run here. Every check has a stable ID, a severity, a status (pass, \
              warning, fail or skipped), a reason code and a duration; skipped never counts as \
              pass. It makes no network request, reads no environment variable and writes nothing.",
-            "Exits 0 when no required check failed, 3 when one did, and 1 when the bundle could \
-             not be read.",
+            "With --env FILE instead, checks the environment file and runs the gateway's \
+             configuration compiler over it as required checks, then evaluates what it \
+             configures against the production profile as advice, which warns and never fails.",
+            "Exits 0 when no required check failed, 3 when one did, and 1 when the bundle or file \
+             could not be read.",
         ],
-        arguments: &[BUNDLE],
-        options: &[FORMAT],
+        arguments: &[BUNDLE_OR_ENV],
+        options: &[ENV, FORMAT],
         run: crate::doctor::run,
     },
     CommandSpec {
         name: "diff",
-        summary: "Compare two configuration bundles semantically and classify each change's risk",
+        summary: "Compare two configurations semantically and classify each change's risk",
         description: &[
             "Reads BUNDLE and the --against bundle with the gateway's own bundle reader, as \
              validate does, and compares what they configure rather than their text: the \
@@ -686,12 +728,23 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
              tightens a control, and stable risk codes (docs/semantic-diff.md); no value is \
              ever shown, and a secret only as a changed reference. It makes no network request, \
              reads no environment variable and writes nothing.",
-            "Exits 0 when both bundles were compared, 4 with --check when they differ, 3 when \
-             either bundle is invalid (they are then not compared), and 1 when one could not be \
-             read. --format sarif reports each risk code of each change as a result.",
+            "With --env FILE and --against-env FILE instead, compiles both environment files with \
+             the gateway's own configuration compiler and compares the two plans setting by \
+             setting. An environment file and a bundle configure different things and are not \
+             compared (diff.not_comparable).",
+            "Exits 0 when both were compared, 4 with --check when they differ, 3 when either is \
+             invalid or they cannot be compared (they are then not compared), and 1 when one \
+             could not be read. --format sarif reports each risk code of each change as a result.",
         ],
-        arguments: &[BUNDLE],
-        options: &[AGAINST, CHECK, STRICT, VALIDATE_FORMAT],
+        arguments: &[BUNDLE_OR_ENV],
+        options: &[
+            ENV,
+            AGAINST,
+            AGAINST_ENV,
+            CHECK,
+            STRICT_OR_ENV,
+            VALIDATE_FORMAT,
+        ],
         run: crate::diff::run,
     },
     CommandSpec {
@@ -1059,6 +1112,11 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             "Prints the help for COMMAND, or the overview without one. For a command family \
              such as ledger, backup or policy, prints the family's commands, or with \
              SUBCOMMAND that command's help.",
+            "With --man, prints the same text as a manual page in man(7) roff: ggctl(1) for \
+             the overview, ggctl-COMMAND(1) for a command or family and \
+             ggctl-COMMAND-SUBCOMMAND(1) for a family's command. The release archives carry \
+             these pages under man/man1. For example: ggctl help --man validate > \
+             ggctl-validate.1",
         ],
         arguments: &[
             ArgumentSpec {
@@ -1074,7 +1132,7 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
                 help: "a command of the COMMAND family",
             },
         ],
-        options: &[],
+        options: &[MAN],
         run: crate::help::run,
     },
 ];
@@ -1137,6 +1195,8 @@ pub(crate) enum Parsed {
     Run(Invocation),
     /// `--help`, `-h` or `help`.
     Help(HelpTopic),
+    /// `help --man`: the same as a manual page.
+    Manual(HelpTopic),
     /// `--version`.
     Version,
 }
@@ -1237,7 +1297,11 @@ pub(crate) fn parse(arguments: &[OsString]) -> Result<Parsed, Diagnostic> {
         return Ok(Parsed::Help(HelpTopic::Spec(command)));
     }
     if command.name == "help" {
-        return help_topic(&invocation).map(Parsed::Help);
+        let topic = help_topic(&invocation)?;
+        if invocation.flag("--man").is_some() {
+            return Ok(Parsed::Manual(topic));
+        }
+        return Ok(Parsed::Help(topic));
     }
     Ok(Parsed::Run(invocation))
 }

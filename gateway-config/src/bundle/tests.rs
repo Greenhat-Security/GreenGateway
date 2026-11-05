@@ -1003,7 +1003,7 @@ fn manifest_structure_is_closed_and_every_problem_is_reported() {
 }
 
 #[test]
-fn the_deployment_document_carries_only_its_profile_in_this_alpha() {
+fn the_deployment_document_requires_its_profile_and_refuses_unknown_members() {
     let deployment = |spec: &str| {
         format!("apiVersion: greengateway.dev/v1alpha1\nkind: GatewayDeployment\nspec:\n{spec}")
     };
@@ -1022,7 +1022,7 @@ fn the_deployment_document_carries_only_its_profile_in_this_alpha() {
     let cases: [(&str, &[Code]); 4] = [
         ("  profile: staging\n", &[Code::InvalidValue]),
         (
-            "  profile: production\n  listeners: {}\n",
+            "  profile: production\n  later: {}\n",
             &[Code::UnknownMember],
         ),
         ("  profile: [production]\n", &[Code::WrongType]),
@@ -1567,6 +1567,77 @@ fn a_bundled_policy_is_held_to_its_deployment_profile_invariants() {
     bundle.write("bundle.yaml", bundle.manifest().as_bytes());
     let report = bundle.read();
     assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+}
+
+#[test]
+fn a_migration_document_keeps_exactly_the_behaviors_it_acknowledges() {
+    let policy = concat!(
+        "{\n",
+        "  \"schema_version\": \"0.1.0\",\n",
+        "  \"default_action\": \"allow\",\n",
+        "  \"enforcement_mode\": \"shadow\",\n",
+        "  \"roles\": {\"ops\": {\"permissions\": [\"*\"]}}\n",
+        "}\n",
+    );
+    let read = |profile: &str, acknowledged: &str| {
+        let bundle = TempBundle::complete("acknowledged");
+        let deployment = format!(
+            "apiVersion: greengateway.dev/v1alpha1\nkind: GatewayDeployment\nspec:\n  profile: {profile}\n  compatibility:\n    acknowledged: [{acknowledged}]\n"
+        );
+        bundle.write("deployment.yaml", deployment.as_bytes());
+        bundle.write("policy.json", policy.as_bytes());
+        bundle.write("bundle.yaml", bundle.manifest().as_bytes());
+        bundle.read()
+    };
+    let found = |report: &Report| -> Vec<(Code, Severity)> {
+        report
+            .diagnostics
+            .iter()
+            .map(|diagnostic| (diagnostic.code, diagnostic.severity))
+            .collect()
+    };
+
+    // Every behavior acknowledged: each is still reported, as a warning, and
+    // the bundle is read.
+    let report = read(
+        "migration",
+        "wildcard_role, policy_shadow_mode, policy_default_allow",
+    );
+    assert_eq!(
+        found(&report),
+        [
+            (Code::PolicyDefaultAllow, Severity::Warning),
+            (Code::PolicyShadowMode, Severity::Warning),
+            (Code::PolicyWildcardRole, Severity::Warning),
+        ]
+    );
+    assert!(report.bundle.is_some());
+
+    // A behavior left unacknowledged stays an error.
+    let report = read("migration", "policy_shadow_mode");
+    assert_eq!(
+        found(&report),
+        [
+            (Code::PolicyDefaultAllow, Severity::Error),
+            (Code::PolicyShadowMode, Severity::Warning),
+            (Code::PolicyWildcardRole, Severity::Error),
+        ]
+    );
+    assert!(report.bundle.is_none());
+    let report = read("migration", "");
+    assert!(found(&report)
+        .iter()
+        .all(|(_, severity)| *severity == Severity::Error));
+    assert_eq!(found(&report).len(), 3);
+
+    // Production cannot acknowledge anything: its document is refused.
+    let report = read("production", "policy_default_allow");
+    assert_eq!(found(&report), [(Code::NotApplicable, Severity::Error)]);
+    assert_eq!(
+        report.diagnostics[0].pointer.to_string(),
+        "/spec/compatibility/acknowledged"
+    );
+    assert!(report.bundle.is_none());
 }
 
 #[test]
@@ -2533,6 +2604,10 @@ fn the_deployment_schema_agrees_with_the_reader() {
         DEPLOYMENT_YAML.replace(
             "  profile: production\n",
             "  profile: production\n  listeners: {}\n",
+        ),
+        DEPLOYMENT_YAML.replace(
+            "  profile: production\n",
+            "  profile: production\n  later: {}\n",
         ),
         DEPLOYMENT_YAML.replace(
             "kind: GatewayDeployment\n",
