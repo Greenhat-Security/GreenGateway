@@ -1,0 +1,172 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://greengateway.dev/schemas/policy-analysis-results.v1.schema.json",
+  "title": "GreenGateway policy analysis result",
+  "description": "Draft 2020-12 JSON Schema for the JSON rendering of a policy-analysis-results.v1 document, as POST /v1{ADMIN_PREFIX}/policy/analyses answers it. It pins the members every result and every finding carries and closes their vocabularies: finding codes, severities, proof bases, evaluation lanes, sections, access effects and limitations. The finding code list is in the fixed order the SARIF rendering's rule indexes follow. Members not listed here are not refused, so a reader must not take an unknown member's absence of meaning for a statement about the policy. Findings never carry a path, permission, caller, host, address or port from the policy; elements are named by section, JSON Pointer, position, stable id, and a role's or tool's name.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "mode",
+    "request_digest",
+    "analyzer",
+    "base",
+    "analyzed",
+    "resources",
+    "complete",
+    "limitations",
+    "budget",
+    "summary",
+    "findings"
+  ],
+  "properties": {
+    "schema_version": {"const": "policy-analysis-results.v1"},
+    "mode": {"const": "structural"},
+    "request_digest": {"$ref": "#/$defs/digest"},
+    "analyzer": {
+      "type": "object",
+      "required": ["version", "http_semantics_version", "http_context_version", "tool_semantics_version", "tool_context_version", "gateway_version"]
+    },
+    "base": {"type": "object", "required": ["source", "etag"], "properties": {"source": {"const": "active"}}},
+    "analyzed": {
+      "type": "object",
+      "required": ["source", "etag"],
+      "properties": {"source": {"enum": ["active", "edits", "inline", "draft", "revision"]}}
+    },
+    "resources": {
+      "type": "object",
+      "required": ["mcp_alias_paths"],
+      "properties": {"mcp_alias_paths": {"type": "integer", "minimum": 0}}
+    },
+    "complete": {"type": "boolean"},
+    "limitations": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/limitation"}},
+    "budget": {
+      "type": "object",
+      "required": ["comparisons", "max_comparisons", "max_findings"]
+    },
+    "summary": {
+      "type": "object",
+      "required": ["findings", "patches", "by_severity", "by_proof_basis", "by_code"],
+      "properties": {
+        "by_code": {"type": "object", "propertyNames": {"$ref": "#/$defs/code"}}
+      }
+    },
+    "findings": {"type": "array", "maxItems": 1000, "items": {"$ref": "#/$defs/finding"}}
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "code": {
+      "enum": [
+        "default_allow",
+        "global_shadow_enforcement",
+        "broad_unconstrained_allow",
+        "broad_unconstrained_shadow",
+        "wildcard_grant_without_issuer",
+        "rule_unreachable",
+        "rule_shadowed",
+        "route_unreachable",
+        "route_shadowed",
+        "route_bypassed",
+        "rate_override_unreachable",
+        "rate_override_shadowed",
+        "rule_partially_shadowed",
+        "mcp_alias_rule_overridden",
+        "mcp_alias_route_precedence",
+        "selected_upstream_allow_ignored",
+        "tool_rule_never_decides",
+        "tool_rule_grant_narrowed",
+        "issuerless_role_grant",
+        "wildcard_permission",
+        "broad_path_grant",
+        "all_methods_grant",
+        "rate_override_looser_than_global",
+        "egress_broad_wildcard_host",
+        "egress_non_public_cidr",
+        "egress_unusual_port",
+        "egress_change_requires_restart",
+        "role_not_defined",
+        "route_permission_ungranted",
+        "tool_not_registered",
+        "connection_endpoint_egress_denied",
+        "name_case_collision",
+        "policy_write_unreachable"
+      ]
+    },
+    "limitation": {
+      "enum": ["comparison_budget_exhausted", "deadline_exceeded", "findings_truncated", "resources_unavailable"]
+    },
+    "severity": {"enum": ["high", "medium", "low"]},
+    "proof_basis": {"enum": ["proven", "heuristic", "inconclusive"]},
+    "lane": {
+      "enum": ["http", "mcp_alias", "selected_upstream", "rendered_tool_http", "source_request", "tool", "rate"]
+    },
+    "section": {
+      "enum": [
+        "default_action",
+        "enforcement_mode",
+        "roles",
+        "rules",
+        "routes",
+        "rate_limits",
+        "tools",
+        "egress",
+        "identity_mappings"
+      ]
+    },
+    "element": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["section", "pointer"],
+      "properties": {
+        "section": {"$ref": "#/$defs/section"},
+        "pointer": {"type": "string", "pattern": "^(/.*)?$"},
+        "position": {"type": "integer", "minimum": 0},
+        "id": {"type": "string", "minLength": 1},
+        "name": {"type": "string", "minLength": 1}
+      }
+    },
+    "patch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["format", "applies_to_etag", "access_effect", "edits"],
+      "properties": {
+        "format": {"const": "policy-simulation.v1/edits"},
+        "applies_to_etag": {"type": "string", "minLength": 1},
+        "access_effect": {"enum": ["equivalent", "narrowing", "expanding", "unknown"]},
+        "edits": {"type": "array", "minItems": 1, "items": {"type": "object"}}
+      }
+    },
+    "finding": {
+      "type": "object",
+      "required": [
+        "code",
+        "fingerprint",
+        "severity",
+        "proof_basis",
+        "element",
+        "never_decides_in",
+        "may_decide_in",
+        "rationale",
+        "remediation",
+        "details",
+        "limitations"
+      ],
+      "properties": {
+        "code": {"$ref": "#/$defs/code"},
+        "fingerprint": {"$ref": "#/$defs/digest"},
+        "severity": {"$ref": "#/$defs/severity"},
+        "proof_basis": {"$ref": "#/$defs/proof_basis"},
+        "element": {"$ref": "#/$defs/element"},
+        "related": {"$ref": "#/$defs/element"},
+        "never_decides_in": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/lane"}},
+        "may_decide_in": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/lane"}},
+        "rationale": {"type": "string", "minLength": 1},
+        "remediation": {"type": "string", "minLength": 1},
+        "details": {"type": "object"},
+        "patch": {"$ref": "#/$defs/patch"},
+        "limitations": {"type": "array", "uniqueItems": true, "items": {"enum": ["witness_unconfirmed"]}}
+      },
+      "if": {"properties": {"proof_basis": {"const": "inconclusive"}}},
+      "then": {"not": {"required": ["patch"]}, "properties": {"limitations": {"contains": {"const": "witness_unconfirmed"}}}}
+    }
+  }
+}

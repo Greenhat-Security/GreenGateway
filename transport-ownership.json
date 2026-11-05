@@ -7388,6 +7388,16 @@
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
     {
+      "file": "gateway/src/policy_analysis/checks.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::policy_analysis::checks::use std :: { collections :: { BTreeSet , HashMap , HashSet } , net :: { IpAddr , SocketAddr } , time :: Instant , }#1",
+      "sha256": "3bb8c8354043e27995c872b895f451168be2b1a4956c7c314d4cc5f96b475afd",
+      "owner": "policy analysis (#243)",
+      "purpose": "Import the IpAddr and SocketAddr value types so the pure policy analyzer can hand the static egress lane a witness address and resolution facts when it confirms an egress CIDR finding. Value types only: the analyzer resolves no name, opens no socket and builds no client; every DNS lookup and transport stays in crate::egress."
+    },
+    {
       "file": "gateway/src/main.rs",
       "reasons": [
         "capability-import-or-glob"
