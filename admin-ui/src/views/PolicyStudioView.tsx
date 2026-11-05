@@ -11,6 +11,7 @@ import {
 import { AdminApiError } from '../lib/api';
 import { hasAdminPermission, useAdminCapabilities } from '../lib/adminCapabilities';
 import { AdminCapabilitiesNotice } from '../lib/AdminCapabilitiesNotice';
+import { subscribeAdminSession } from '../lib/adminSession';
 import { fetchPolicy, type PolicyDocument } from '../lib/policy';
 import {
   POLICY_DRAFT_BASE_STALE_REASON,
@@ -71,6 +72,12 @@ import {
   ToolsSection,
   type FieldRegistrar,
 } from './policy-studio/sections';
+import {
+  heldPolicyEdits,
+  holdPolicyEdits,
+  releaseHeldPolicyEdits,
+  type HeldPolicyEdits,
+} from './policy-studio/heldEdits';
 import { StudioAlertPanel, type StudioAlert } from './policy-studio/StudioAlert';
 import {
   AUDIT_READ_PERMISSION,
@@ -135,6 +142,21 @@ type BusyAction =
 
 type Confirmation = 'publish' | 'rebase' | 'delete';
 
+// What a publish confirmation shows, read when it opens: the saved draft
+// revision, the live revision it replaces, and the validation answer for
+// that exact text, with the changes and risks taken from it. Confirming
+// publishes exactly this, or nothing.
+type PublishReview = Readonly<{
+  draftId: string;
+  draftEtag: string;
+  revision: number;
+  liveEtag: string;
+  source: string;
+  inspection: PolicyInspection;
+  changed: readonly string[];
+  risks: readonly PolicyDiagnostic[];
+}>;
+
 export function PolicyStudioView() {
   const capabilities = useAdminCapabilities();
   const [writeRejected, setWriteRejected] = useState(false);
@@ -156,9 +178,13 @@ export function PolicyStudioView() {
   const [draftListAlert, setDraftListAlert] = useState<StudioAlert | null>(null);
   const [isLoading, setIsLoading] = useState(true);
 
-  const [draft, setDraft] = useState<PolicyDraft | null>(null);
-  const [serverSource, setServerSource] = useState('');
+  const [draft, setDraftState] = useState<PolicyDraft | null>(null);
+  const [serverSource, setServerSourceState] = useState('');
   const [source, setSourceState] = useState('');
+  // The same three values as they are now, for the session listener that
+  // holds unsaved edits: it runs before the next render.
+  const draftRef = useRef<PolicyDraft | null>(null);
+  const serverSourceRef = useRef('');
   const sourceRef = useRef('');
   const [activeSection, setActiveSection] = useState<StudioSection>('overview');
   const [validation, setValidation] = useState<ValidationState>({ kind: 'idle' });
@@ -167,6 +193,7 @@ export function PolicyStudioView() {
   const [problem, setProblem] = useState<StudioProblem | null>(null);
   const [notice, setNotice] = useState<StudioAlert | null>(null);
   const [confirming, setConfirming] = useState<Confirmation | null>(null);
+  const [publishReview, setPublishReview] = useState<PublishReview | null>(null);
   const [conversion, setConversion] = useState<PolicyConversion | null>(null);
   // Asks for the same text to be validated again: the resources the
   // cross-resource checks read can change while the text does not.
@@ -189,6 +216,13 @@ export function PolicyStudioView() {
   const setSource = useCallback((next: string) => {
     sourceRef.current = next;
     setSourceState(next);
+  }, []);
+
+  const setDraft = useCallback((next: PolicyDraft | null, nextServerSource: string) => {
+    draftRef.current = next;
+    serverSourceRef.current = nextServerSource;
+    setDraftState(next);
+    setServerSourceState(nextServerSource);
   }, []);
 
   const parsed = useMemo(() => parseCandidate(source), [source]);
@@ -214,6 +248,32 @@ export function PolicyStudioView() {
     live !== null && parsed.ok ? changedMembers(live.policy, parsed.document) : [];
   const changesEgress =
     live !== null && parsed.ok && egressChanged(live.policy, parsed.document);
+  const publishBlockers = publicationBlockers({
+    canWrite,
+    isPublished,
+    dirty,
+    live,
+    baseStale,
+    inspection: currentInspection,
+    changesEgress,
+  });
+
+  // Whether a reviewed publication is still exactly what would be
+  // published: nothing blocks it, and the text on screen, its validation
+  // answer, the saved draft and the live revision are the ones reviewed.
+  function reviewIsCurrent(review: PublishReview | null, shownSource: string): boolean {
+    return (
+      review !== null &&
+      publishBlockers.length === 0 &&
+      currentInspection === review.inspection &&
+      shownSource === review.source &&
+      draft !== null &&
+      draft.summary.draft_id === review.draftId &&
+      draft.etag === review.draftEtag &&
+      live !== null &&
+      live.etag === review.liveEtag
+    );
+  }
 
   const suite = useMemo(() => parseSuite(suiteSource), [suiteSource]);
   const holdsCases = suite.ok ? suite.cases.length > 0 : suiteSource !== emptySuiteSource();
@@ -298,6 +358,35 @@ export function PolicyStudioView() {
     }
   }, [confirming]);
 
+  // A publish confirmation is for the candidate, validation and revisions
+  // it shows: a change to any of them withdraws it, so it has to be
+  // reviewed again.
+  useEffect(() => {
+    setConfirming((current) => (current === 'publish' ? null : current));
+  }, [source, validation, draft, live]);
+
+  // Any admin request answered 401 ends the session and replaces this view.
+  // The unsaved edits are held for the next session first: this listener
+  // runs when the session ends, before the view goes.
+  useEffect(
+    () =>
+      subscribeAdminSession((event) => {
+        const shown = draftRef.current;
+        if (
+          event.kind === 'unauthenticated' &&
+          shown !== null &&
+          sourceRef.current !== serverSourceRef.current
+        ) {
+          holdPolicyEdits({
+            draft: shown,
+            serverSource: serverSourceRef.current,
+            source: sourceRef.current,
+          });
+        }
+      }),
+    [],
+  );
+
   function actionRef(action: Confirmation) {
     return (element: HTMLButtonElement | null) => {
       if (element) actionRefs.current.set(action, element);
@@ -362,6 +451,52 @@ export function PolicyStudioView() {
       isCurrent = false;
     };
   }, [readRequested, loadLive, loadDraftList]);
+
+  // Edits held when the last session ended come back only once the gateway
+  // answers their draft to this session. Drafts are owner-scoped and
+  // another owner's answers 404, so a different principal never sees them.
+  useEffect(() => {
+    const held = heldPolicyEdits();
+    if (!readRequested || held === null || !beginBusy('open')) {
+      return;
+    }
+    let isCurrent = true;
+    void (async () => {
+      try {
+        const current = await fetchPolicyDraft(held.draft.summary.draft_id);
+        if (!isCurrent) return;
+        releaseHeldPolicyEdits();
+        restoreHeldEdits(held, current);
+      } catch (error) {
+        if (!isCurrent) return;
+        if (refusal(error) === POLICY_DRAFT_EXPIRED_REASON) {
+          // Only the owner is told a draft expired.
+          releaseHeldPolicyEdits();
+          restoreHeldEdits(held, null);
+        } else if (error instanceof AdminApiError && error.status === 401) {
+          // Still signed out: they stay held for the next session.
+        } else if (error instanceof AdminApiError && error.status < 500) {
+          releaseHeldPolicyEdits();
+        } else {
+          setProblem({
+            kind: 'alert',
+            alert: {
+              title: 'Unsaved edits not restored yet',
+              message:
+                'The draft your unsaved edits belong to could not be read. They are still held in this page; open the Policy Studio again to retry.',
+              tone: 'warning',
+            },
+          });
+        }
+      } finally {
+        if (isCurrent) endBusy();
+      }
+    })();
+    return () => {
+      isCurrent = false;
+      endBusy();
+    };
+  }, [readRequested]);
 
   // Validation as you type: the exact text, debounced, and only the answer
   // for the text still on screen is kept.
@@ -439,10 +574,52 @@ export function PolicyStudioView() {
 
   function showServerDraft(next: PolicyDraft, replaceLocal: boolean) {
     const formatted = formatCandidate(next.policy);
-    setDraft(next);
-    setServerSource(formatted);
+    setDraft(next, formatted);
     if (replaceLocal) {
       setSource(formatted);
+    }
+  }
+
+  // Held edits come back as unsaved edits, never saved on the operator's
+  // behalf. `current` is the draft as the gateway holds it now, or null
+  // when it expired.
+  function restoreHeldEdits(held: HeldPolicyEdits, current: PolicyDraft | null) {
+    setActiveSection('overview');
+    if (current !== null && current.summary.state === 'published') {
+      showServerDraft(current, false);
+      setSource(held.source);
+      setProblem({
+        kind: 'draft-gone',
+        message:
+          'Your unsaved edits are restored, but this draft was published while you were signed out and accepts no further change.',
+      });
+    } else if (current !== null && current.etag === held.draft.etag) {
+      showServerDraft(current, false);
+      setSource(held.source);
+      setNotice({
+        title: 'Unsaved edits restored',
+        message:
+          'The edits you had not saved when your session ended are back. Nothing was saved or published; review them and save the draft.',
+        tone: 'info',
+      });
+    } else {
+      // Keep the revision the edits were made on, so saving them is
+      // refused rather than written over a newer one.
+      setDraft(held.draft, held.serverSource);
+      setSource(held.source);
+      setProblem(
+        current === null
+          ? {
+              kind: 'draft-gone',
+              message:
+                'Your unsaved edits are restored, but this draft expired on the gateway while you were signed out.',
+            }
+          : {
+              kind: 'draft-changed',
+              message:
+                'Your unsaved edits are restored, but the draft changed in another tab or session while you were signed out. They were not saved.',
+            },
+      );
     }
   }
 
@@ -612,8 +789,52 @@ export function PolicyStudioView() {
     }
   }
 
+  // Opens the publish confirmation on what would be published now.
+  function reviewPublication() {
+    if (
+      publishBlockers.length > 0 ||
+      draft === null ||
+      live === null ||
+      currentInspection === null
+    ) {
+      return;
+    }
+    setPublishReview({
+      draftId: draft.summary.draft_id,
+      draftEtag: draft.etag,
+      revision: draft.summary.revision,
+      liveEtag: live.etag,
+      source,
+      inspection: currentInspection,
+      changed,
+      risks: currentInspection.diagnostics.filter(
+        (diagnostic) => diagnostic.severity === 'risk',
+      ),
+    });
+    setConfirming('publish');
+  }
+
   async function publishDraft() {
-    if (!editable || draft === null || live === null || !beginBusy('publish')) {
+    const review = publishReview;
+    if (!editable || draft === null || live === null || review === null) {
+      return;
+    }
+    // Publish exactly what was reviewed, or nothing: the confirmation is
+    // withdrawn on any change, and this refuses one that slipped through.
+    if (!reviewIsCurrent(review, sourceRef.current)) {
+      setConfirming(null);
+      setProblem({
+        kind: 'alert',
+        alert: {
+          title: 'Not published',
+          message:
+            'The draft, its validation or the live policy changed after the publication was reviewed, so nothing was sent. Review the publication again.',
+          tone: 'warning',
+        },
+      });
+      return;
+    }
+    if (!beginBusy('publish')) {
       return;
     }
     setConfirming(null);
@@ -622,10 +843,10 @@ export function PolicyStudioView() {
     const published = draft;
     try {
       const result = await publishPolicyDraft(
-        published.summary.draft_id,
-        published.etag,
-        live.etag,
-        currentInspection?.resource_snapshot?.digest ?? null,
+        review.draftId,
+        review.draftEtag,
+        review.liveEtag,
+        review.inspection.resource_snapshot?.digest ?? null,
       );
       const warnings: string[] = [];
       if (!result.draftStateRecorded) {
@@ -839,8 +1060,7 @@ export function PolicyStudioView() {
   }
 
   function closeDraft() {
-    setDraft(null);
-    setServerSource('');
+    setDraft(null, '');
     setSource('');
     setConversion(null);
     setValidation({ kind: 'idle' });
@@ -996,15 +1216,6 @@ export function PolicyStudioView() {
     tabRefs.current.get(section)?.focus();
   }
 
-  const publishBlockers = publicationBlockers({
-    canWrite,
-    isPublished,
-    dirty,
-    live,
-    baseStale,
-    inspection: currentInspection,
-    changesEgress,
-  });
   const ownedDrafts = draftList?.drafts.length ?? 0;
   const ownerLimit = draftList?.limits.max_drafts_per_owner ?? null;
   const createBlocked =
@@ -1200,7 +1411,7 @@ export function PolicyStudioView() {
                     aria-describedby={
                       publishBlockers.length > 0 ? 'policy-studio-publish-blockers' : undefined
                     }
-                    onClick={() => setConfirming('publish')}
+                    onClick={reviewPublication}
                   >
                     {busy === 'publish' ? 'Publishing' : 'Publish draft'}
                   </button>
@@ -1225,16 +1436,17 @@ export function PolicyStudioView() {
                   </div>
                 ) : null}
 
-                {confirming !== null && live !== null ? (
+                {confirming !== null &&
+                live !== null &&
+                (confirming !== 'publish' || publishReview !== null) ? (
                   <ConfirmationPanel
                     kind={confirming}
                     draft={draft}
                     live={live}
                     changed={changed}
-                    risks={
-                      currentInspection?.diagnostics.filter(
-                        (diagnostic) => diagnostic.severity === 'risk',
-                      ) ?? []
+                    review={confirming === 'publish' ? publishReview : null}
+                    confirmable={
+                      confirming !== 'publish' || reviewIsCurrent(publishReview, source)
                     }
                     dirty={dirty}
                     busy={busy !== null}
@@ -1898,12 +2110,15 @@ function ChangesPanel({
   );
 }
 
+// A publish confirmation shows only its review, read when it opened; the
+// others describe the draft as it is now.
 function ConfirmationPanel({
   kind,
   draft,
   live,
   changed,
-  risks,
+  review,
+  confirmable,
   dirty,
   busy,
   onConfirm,
@@ -1913,7 +2128,8 @@ function ConfirmationPanel({
   draft: PolicyDraft;
   live: LivePolicy;
   changed: readonly string[];
-  risks: readonly PolicyDiagnostic[];
+  review: PublishReview | null;
+  confirmable: boolean;
   dirty: boolean;
   busy: boolean;
   onConfirm: () => void;
@@ -1924,6 +2140,7 @@ function ConfirmationPanel({
     confirmRef.current?.focus();
   }, [kind]);
 
+  const risks = kind === 'publish' ? (review?.risks ?? []) : [];
   const title =
     kind === 'publish'
       ? 'Publish this draft?'
@@ -1932,11 +2149,13 @@ function ConfirmationPanel({
         : 'Delete this draft?';
   const message =
     kind === 'publish'
-      ? `Publishing replaces live revision ${shortEtag(live.etag)} with revision ${draft.summary.revision} of this draft, for every request, at once. ${
-          changed.length > 0
-            ? `Changed sections: ${changed.join(', ')}.`
-            : 'The candidate is the same as the live policy.'
-        }`
+      ? review === null
+        ? 'Nothing has been reviewed for publication.'
+        : `Publishing replaces live revision ${shortEtag(review.liveEtag)} with revision ${review.revision} of this draft, for every request, at once. ${
+            review.changed.length > 0
+              ? `Changed sections: ${review.changed.join(', ')}.`
+              : 'The candidate is the same as the live policy.'
+          }`
       : kind === 'rebase'
         ? `The draft will be pinned to live revision ${shortEtag(live.etag)}${
             dirty ? ', with your unsaved edits saved,' : ''
@@ -1987,7 +2206,7 @@ function ConfirmationPanel({
           ref={confirmRef}
           type="button"
           className={kind === 'delete' ? 'rule-danger-button' : 'primary-button'}
-          disabled={busy}
+          disabled={busy || !confirmable}
           onClick={onConfirm}
         >
           {confirmLabel}
@@ -2281,7 +2500,8 @@ function writeAlert(error: unknown, title: string): StudioAlert {
     if (error.status === 401) {
       return {
         title: 'Sign in required',
-        message: 'Your admin session ended. Sign in again; your edits are kept until you leave the page.',
+        message:
+          'Your admin session ended. Sign in again without leaving this page: your unsaved edits are held until then, and come back when the gateway confirms the new session owns this draft.',
         tone: 'warning',
       };
     }

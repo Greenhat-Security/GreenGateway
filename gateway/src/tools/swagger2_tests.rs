@@ -1260,59 +1260,69 @@ fn warnings_are_bounded_and_truncation_is_reported() {
         .is_some_and(|subject| subject.len() <= 256)));
 }
 
+/// Slack's Web API takes its OAuth access token as a `token` query or form
+/// parameter beside the `Authorization` header, so a hand conversion would
+/// make the credential a tool argument.
+fn slack_style_document() -> Value {
+    json!({
+        "swagger": "2.0",
+        "info": { "title": "Slack-style Web API", "version": "1.0.0" },
+        "host": "chat.example.test",
+        "basePath": "/api",
+        "schemes": ["https"],
+        "produces": ["application/json"],
+        "securityDefinitions": {
+            "chatAuth": {
+                "type": "oauth2",
+                "flow": "accessCode",
+                "authorizationUrl": "https://chat.example.test/oauth/authorize",
+                "tokenUrl": "https://chat.example.test/api/oauth.access",
+                "scopes": { "channels:history": "Read history", "chat:write": "Post" }
+            }
+        },
+        "paths": {
+            "/conversations.history": {
+                "get": {
+                    "operationId": "conversations_history",
+                    "description": "Fetches a conversation's history.",
+                    "security": [ { "chatAuth": ["channels:history"] } ],
+                    "parameters": [
+                        { "name": "token", "in": "header", "required": true, "type": "string" },
+                        { "name": "token", "in": "query", "required": true, "type": "string" },
+                        { "name": "channel", "in": "query", "required": true, "type": "string" },
+                        { "name": "limit", "in": "query", "type": "integer" },
+                        { "name": "inclusive", "in": "query", "type": "boolean" }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "ok",
+                            "schema": { "type": "object", "properties": { "ok": { "type": "boolean" } } }
+                        }
+                    }
+                }
+            },
+            "/chat.postMessage": {
+                "post": {
+                    "operationId": "chat_postMessage",
+                    "consumes": ["application/x-www-form-urlencoded", "application/json"],
+                    "security": [ { "chatAuth": ["chat:write"] } ],
+                    "parameters": [
+                        { "name": "token", "in": "header", "required": true, "type": "string" },
+                        { "name": "token", "in": "query", "type": "string" },
+                        { "name": "token", "in": "formData", "required": true, "type": "string" },
+                        { "name": "channel", "in": "formData", "required": true, "type": "string" }
+                    ],
+                    "responses": { "200": { "description": "ok" } }
+                }
+            }
+        }
+    })
+}
+
 fn slack_style_generation() -> OpenApiToolGeneration {
     generate_tools_from_api_document_str(
         "slack-style.json",
-        &conversion_source(json!({
-            "swagger": "2.0",
-            "info": { "title": "Slack-style Web API", "version": "1.0.0" },
-            "host": "chat.example.test",
-            "basePath": "/api",
-            "schemes": ["https"],
-            "produces": ["application/json"],
-            "securityDefinitions": {
-                "chatAuth": {
-                    "type": "oauth2",
-                    "flow": "accessCode",
-                    "authorizationUrl": "https://chat.example.test/oauth/authorize",
-                    "tokenUrl": "https://chat.example.test/api/oauth.access",
-                    "scopes": { "channels:history": "Read history", "chat:write": "Post" }
-                }
-            },
-            "paths": {
-                "/conversations.history": {
-                    "get": {
-                        "operationId": "conversations_history",
-                        "description": "Fetches a conversation's history.",
-                        "security": [ { "chatAuth": ["channels:history"] } ],
-                        "parameters": [
-                            { "name": "token", "in": "header", "required": true, "type": "string" },
-                            { "name": "channel", "in": "query", "required": true, "type": "string" },
-                            { "name": "limit", "in": "query", "type": "integer" },
-                            { "name": "inclusive", "in": "query", "type": "boolean" }
-                        ],
-                        "responses": {
-                            "200": {
-                                "description": "ok",
-                                "schema": { "type": "object", "properties": { "ok": { "type": "boolean" } } }
-                            }
-                        }
-                    }
-                },
-                "/chat.postMessage": {
-                    "post": {
-                        "operationId": "chat_postMessage",
-                        "consumes": ["application/x-www-form-urlencoded", "application/json"],
-                        "security": [ { "chatAuth": ["chat:write"] } ],
-                        "parameters": [
-                            { "name": "token", "in": "header", "required": true, "type": "string" },
-                            { "name": "channel", "in": "formData", "required": true, "type": "string" }
-                        ],
-                        "responses": { "200": { "description": "ok" } }
-                    }
-                }
-            }
-        })),
+        &conversion_source(slack_style_document()),
     )
     .expect("Slack-style Swagger 2.0 document should generate")
 }
@@ -1352,12 +1362,556 @@ fn slack_style_document_generates_its_query_operations() {
         vec![
             warning(Code::BasePathNotInPaths, None, None, Some("/api")),
             warning(
+                Code::CredentialParameterNotMapped,
+                Some("POST"),
+                Some("/chat.postMessage"),
+                Some("token")
+            ),
+            warning(
+                Code::CredentialParameterNotMapped,
+                Some("POST"),
+                Some("/chat.postMessage"),
+                Some("token")
+            ),
+            warning(
                 Code::RequestBodyNotMapped,
                 Some("POST"),
                 Some("/chat.postMessage"),
                 None
             ),
+            warning(
+                Code::CredentialParameterNotMapped,
+                Some("GET"),
+                Some("/conversations.history"),
+                Some("token")
+            ),
         ]
+    );
+}
+
+/// The `token` the Slack-style document declares in its query and its form
+/// is the access token its `oauth2` scheme names. The Connection supplies
+/// that credential, so the required query token, the optional one and the
+/// form field are all left out: a caller can neither send one nor be asked
+/// for one. The header token is left to the generator, which never sends
+/// header parameters.
+#[test]
+fn slack_style_credential_parameters_are_not_tool_arguments() {
+    let generation = slack_style_generation();
+    for definition in &generation.definitions {
+        assert!(
+            definition.input_schema["properties"].get("token").is_none(),
+            "{} must not take the credential as an argument",
+            definition.name
+        );
+        assert!(
+            definition.input_schema["required"]
+                .as_array()
+                .is_none_or(|required| !required.contains(&json!("token"))),
+            "{} must not require the credential",
+            definition.name
+        );
+        assert!(
+            definition
+                .upstream
+                .query_params
+                .iter()
+                .all(|mapping| mapping.arg_name != "token" && mapping.query_name != "token"),
+            "{} must never send the credential",
+            definition.name
+        );
+    }
+    let post = generation
+        .definitions
+        .iter()
+        .find(|definition| definition.name == "chat_postMessage")
+        .expect("post tool should be generated");
+    assert!(post.upstream.query_params.is_empty());
+    assert!(post.upstream.body.is_none());
+
+    let conversion = converted(slack_style_document());
+    assert_eq!(
+        conversion.document["paths"]["/chat.postMessage"]["post"]["parameters"],
+        json!([
+            { "name": "token", "in": "header", "required": true, "schema": { "type": "string" } }
+        ])
+    );
+    assert_eq!(
+        conversion.document["paths"]["/chat.postMessage"]["post"]["requestBody"],
+        json!({
+            "required": true,
+            "content": {
+                "application/x-www-form-urlencoded": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["channel"],
+                        "properties": { "channel": { "type": "string" } }
+                    }
+                }
+            }
+        })
+    );
+    assert_eq!(
+        conversion.document["paths"]["/conversations.history"]["get"]["parameters"]
+            .as_array()
+            .expect("history parameters should convert")
+            .iter()
+            .map(|parameter| (parameter["name"].clone(), parameter["in"].clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            (json!("token"), json!("header")),
+            (json!("channel"), json!("query")),
+            (json!("limit"), json!("query")),
+            (json!("inclusive"), json!("query")),
+        ]
+    );
+}
+
+fn parameter_keys(conversion: &Swagger2Conversion, path: &str, method: &str) -> Vec<String> {
+    conversion.document["paths"][path][method]["parameters"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|parameter| {
+            format!(
+                "{}:{}",
+                parameter["in"].as_str().unwrap_or_default(),
+                parameter["name"].as_str().unwrap_or_default()
+            )
+        })
+        .collect()
+}
+
+/// Only an operation whose effective security names a scheme has
+/// credential parameters: an explicit empty `security`, or requirements that
+/// name no scheme, leave `token` a tool argument, and so does a scheme that
+/// is neither `oauth2` nor `apiKey`. A path-level parameter that is a
+/// credential for one operation only moves into the operations that keep it.
+#[test]
+fn unsecured_operations_keep_their_token_parameters() {
+    let conversion = converted(json!({
+        "swagger": "2.0",
+        "securityDefinitions": {
+            "oauth": { "type": "oauth2", "flow": "application", "tokenUrl": "https://idp.example.test/token", "scopes": {} },
+            "basic": { "type": "basic" }
+        },
+        "security": [ { "oauth": [] } ],
+        "paths": {
+            "/public": {
+                "get": {
+                    "operationId": "public",
+                    "security": [],
+                    "parameters": [ { "name": "token", "in": "query", "type": "string" } ]
+                }
+            },
+            "/anonymous": {
+                "get": {
+                    "operationId": "anonymous",
+                    "security": [ {} ],
+                    "parameters": [ { "name": "access_token", "in": "query", "type": "string" } ]
+                }
+            },
+            "/basic": {
+                "get": {
+                    "operationId": "basic",
+                    "security": [ { "basic": [] } ],
+                    "parameters": [ { "name": "token", "in": "query", "type": "string" } ]
+                }
+            },
+            "/undefined": {
+                "get": {
+                    "operationId": "undefined",
+                    "security": [ { "missing": [] } ],
+                    "parameters": [ { "name": "token", "in": "query", "type": "string" } ]
+                }
+            },
+            "/inherited/{token}": {
+                "get": {
+                    "operationId": "inherited",
+                    "parameters": [
+                        { "name": "Access_Token", "in": "query", "type": "string" },
+                        { "name": "token ", "in": "query", "type": "string" },
+                        { "name": "token", "in": "path", "required": true, "type": "string" },
+                        { "name": "cursor", "in": "query", "type": "string" }
+                    ]
+                }
+            },
+            "/mixed": {
+                "parameters": [
+                    { "name": "token", "in": "query", "type": "string" },
+                    { "name": "cursor", "in": "query", "type": "string" }
+                ],
+                "get": { "operationId": "mixedRead", "security": [] },
+                "put": {
+                    "operationId": "mixedOverride",
+                    "security": [],
+                    "parameters": [ { "name": "token", "in": "query", "required": true, "type": "integer" } ]
+                },
+                "post": { "operationId": "mixedWrite" }
+            }
+        }
+    }));
+    assert_eq!(
+        parameter_keys(&conversion, "/public", "get"),
+        vec!["query:token"]
+    );
+    assert_eq!(
+        parameter_keys(&conversion, "/anonymous", "get"),
+        vec!["query:access_token"]
+    );
+    assert_eq!(
+        parameter_keys(&conversion, "/basic", "get"),
+        vec!["query:token"]
+    );
+    assert_eq!(
+        parameter_keys(&conversion, "/undefined", "get"),
+        vec!["query:token"]
+    );
+    assert_eq!(
+        parameter_keys(&conversion, "/inherited/{token}", "get"),
+        vec!["path:token", "query:cursor"],
+        "names are trimmed and compared case-insensitively, and path parameters stay"
+    );
+    assert_eq!(
+        conversion.document["paths"]["/mixed"]["parameters"],
+        json!([ { "name": "cursor", "in": "query", "schema": { "type": "string" } } ]),
+        "a credential for any operation leaves the path item"
+    );
+    assert_eq!(
+        parameter_keys(&conversion, "/mixed", "get"),
+        vec!["query:token"]
+    );
+    assert_eq!(
+        conversion.document["paths"]["/mixed"]["put"]["parameters"],
+        json!([ { "name": "token", "in": "query", "required": true, "schema": { "type": "integer" } } ]),
+        "an operation parameter still overrides a moved path-level one"
+    );
+    assert!(conversion.document["paths"]["/mixed"]["post"]
+        .get("parameters")
+        .is_none());
+    assert_eq!(
+        conversion.warnings,
+        vec![
+            warning(
+                Code::CredentialParameterNotMapped,
+                Some("GET"),
+                Some("/inherited/{token}"),
+                Some("Access_Token")
+            ),
+            warning(
+                Code::CredentialParameterNotMapped,
+                Some("GET"),
+                Some("/inherited/{token}"),
+                Some("token ")
+            ),
+            warning(
+                Code::CredentialParameterNotMapped,
+                Some("POST"),
+                Some("/mixed"),
+                Some("token")
+            ),
+        ]
+    );
+
+    let generation = generate_tools_from_api_document_str(
+        "mixed.json",
+        &conversion_source(json!({
+            "swagger": "2.0",
+            "securityDefinitions": {
+                "oauth": { "type": "oauth2", "flow": "application", "tokenUrl": "https://idp.example.test/token", "scopes": {} }
+            },
+            "paths": {
+                "/search": {
+                    "parameters": [ { "name": "token", "in": "query", "required": true, "type": "string" } ],
+                    "get": { "operationId": "search" },
+                    "post": { "operationId": "searchSecured", "security": [ { "oauth": [] } ] }
+                }
+            }
+        })),
+    )
+    .expect("a mixed document should generate");
+    let required = |name: &str| {
+        generation
+            .definitions
+            .iter()
+            .find(|definition| definition.name == name)
+            .map(|definition| definition.input_schema["required"].clone())
+            .expect("tool should be generated")
+    };
+    assert_eq!(
+        required("search"),
+        json!(["token"]),
+        "an unsecured operation keeps a token parameter as it is"
+    );
+    assert_eq!(required("searchSecured"), json!([]));
+}
+
+/// A query parameter with the `name` and `in` of an `apiKey` scheme the
+/// operation names is that scheme's credential. A key carried in a header
+/// leaves a query parameter of the same name alone, and an `apiKey` scheme
+/// does not make `token` a credential.
+#[test]
+fn api_key_query_parameters_are_left_out() {
+    let document = json!({
+        "swagger": "2.0",
+        "securityDefinitions": {
+            "QueryKey": { "type": "apiKey", "in": "query", "name": "api_key" },
+            "HeaderKey": { "type": "apiKey", "in": "header", "name": "X-Key" }
+        },
+        "paths": {
+            "/widgets": {
+                "get": {
+                    "operationId": "listWidgets",
+                    "security": [ { "HeaderKey": [] }, { "QueryKey": [] } ],
+                    "parameters": [
+                        { "name": "API_KEY", "in": "query", "type": "string" },
+                        { "name": "X-Key", "in": "query", "type": "string" },
+                        { "name": "X-Key", "in": "header", "type": "string" },
+                        { "name": "token", "in": "query", "type": "string" }
+                    ]
+                },
+                "post": {
+                    "operationId": "createWidget",
+                    "security": [ { "QueryKey": [] } ],
+                    "consumes": ["application/x-www-form-urlencoded"],
+                    "parameters": [
+                        { "name": "api_key", "in": "formData", "type": "string" },
+                        { "name": "name", "in": "formData", "type": "string" }
+                    ]
+                }
+            }
+        }
+    });
+    let conversion = converted(document.clone());
+    assert_eq!(
+        parameter_keys(&conversion, "/widgets", "get"),
+        vec!["query:X-Key", "header:X-Key", "query:token"]
+    );
+    assert_eq!(
+        conversion.document["paths"]["/widgets"]["post"]["requestBody"]["content"]
+            ["application/x-www-form-urlencoded"]["schema"]["properties"],
+        json!({
+            "api_key": { "type": "string" },
+            "name": { "type": "string" }
+        }),
+        "a key carried in the query does not match a form field of the same name"
+    );
+    assert_eq!(
+        conversion.warnings,
+        vec![
+            warning(
+                Code::CredentialParameterNotMapped,
+                Some("GET"),
+                Some("/widgets"),
+                Some("API_KEY")
+            ),
+            warning(
+                Code::RequestBodyNotMapped,
+                Some("POST"),
+                Some("/widgets"),
+                None
+            ),
+        ]
+    );
+    let generation =
+        generate_tools_from_api_document_str("api-key.json", &conversion_source(document))
+            .expect("an apiKey document should generate");
+    let list = generation
+        .definitions
+        .iter()
+        .find(|definition| definition.name == "listWidgets")
+        .expect("list tool should be generated");
+    assert_eq!(
+        list.upstream
+            .query_params
+            .iter()
+            .map(|mapping| mapping.query_name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["X-Key", "token"]
+    );
+}
+
+/// A form whose only field is the credential leaves the operation without
+/// a request body. A body beside form fields still leaves the operation
+/// out, whatever the form fields are.
+#[test]
+fn a_form_of_credentials_only_has_no_request_body() {
+    let conversion = converted(json!({
+        "swagger": "2.0",
+        "securityDefinitions": {
+            "oauth": { "type": "oauth2", "flow": "application", "tokenUrl": "https://idp.example.test/token", "scopes": {} }
+        },
+        "security": [ { "oauth": [] } ],
+        "paths": {
+            "/auth.test": {
+                "post": {
+                    "operationId": "authTest",
+                    "consumes": ["application/x-www-form-urlencoded"],
+                    "parameters": [ { "name": "token", "in": "formData", "required": true, "type": "string" } ]
+                }
+            },
+            "/mixed": {
+                "post": {
+                    "operationId": "mixed",
+                    "parameters": [
+                        { "name": "token", "in": "formData", "type": "string" },
+                        { "name": "body", "in": "body", "schema": { "type": "object" } }
+                    ]
+                }
+            }
+        }
+    }));
+    assert_eq!(
+        conversion.document["paths"]["/auth.test"]["post"],
+        json!({ "operationId": "authTest" })
+    );
+    assert!(conversion.document["paths"]["/mixed"].get("post").is_none());
+    assert_eq!(
+        conversion.warnings,
+        vec![
+            warning(
+                Code::CredentialParameterNotMapped,
+                Some("POST"),
+                Some("/auth.test"),
+                Some("token")
+            ),
+            warning(
+                Code::BodyAndFormParameters,
+                Some("POST"),
+                Some("/mixed"),
+                None
+            ),
+        ]
+    );
+}
+
+/// JSON Schema `type` lists and `null`, which an OpenAPI 3.0 `type` cannot
+/// be, become `nullable`, `enum: [null]` or `anyOf`; anything else stays
+/// exactly as written.
+#[test]
+fn json_schema_type_lists_convert_to_their_openapi_3_forms() {
+    let cases = [
+        (
+            json!({ "type": ["string", "null"] }),
+            json!({ "type": "string", "nullable": true }),
+        ),
+        (
+            json!({ "type": ["null", "integer"], "minimum": 1 }),
+            json!({ "type": "integer", "nullable": true, "minimum": 1 }),
+        ),
+        (json!({ "type": ["boolean"] }), json!({ "type": "boolean" })),
+        (
+            json!({ "type": ["string", "string", "null"] }),
+            json!({ "type": "string", "nullable": true }),
+        ),
+        (
+            json!({ "type": "null" }),
+            json!({ "nullable": true, "enum": [null] }),
+        ),
+        (
+            json!({ "type": ["null"] }),
+            json!({ "nullable": true, "enum": [null] }),
+        ),
+        (
+            json!({ "type": ["null", "null"] }),
+            json!({ "nullable": true, "enum": [null] }),
+        ),
+        (
+            json!({ "type": ["string", "integer"], "maxLength": 8 }),
+            json!({ "anyOf": [ { "type": "string" }, { "type": "integer" } ], "maxLength": 8 }),
+        ),
+        (
+            json!({ "type": ["integer", "null", "object"] }),
+            json!({ "anyOf": [ { "type": "integer" }, { "type": "object" } ], "nullable": true }),
+        ),
+        (
+            json!({ "type": ["string", "null"], "x-nullable": false }),
+            json!({ "type": "string", "nullable": true }),
+        ),
+        (
+            json!({ "type": ["array", "null"], "items": { "$ref": "#/definitions/Tag" } }),
+            json!({ "type": "array", "nullable": true, "items": { "$ref": "#/components/schemas/Tag" } }),
+        ),
+        // Copied unchanged, as before type lists were converted.
+        (json!({ "type": "string" }), json!({ "type": "string" })),
+        (json!({ "type": [] }), json!({ "type": [] })),
+        (
+            json!({ "type": ["string", 1] }),
+            json!({ "type": ["string", 1] }),
+        ),
+        (
+            json!({ "type": ["string", "date"] }),
+            json!({ "type": ["string", "date"] }),
+        ),
+        (
+            json!({ "type": ["file", "null"] }),
+            json!({ "type": ["file", "null"] }),
+        ),
+        (
+            json!({ "type": ["String", "null"] }),
+            json!({ "type": ["String", "null"] }),
+        ),
+        (json!({ "type": 7 }), json!({ "type": 7 })),
+        (
+            json!({ "type": "null", "enum": ["a"] }),
+            json!({ "type": "null", "enum": ["a"] }),
+        ),
+        (
+            json!({ "type": ["string", "integer"], "anyOf": [ { "minLength": 1 } ] }),
+            json!({ "type": ["string", "integer"], "anyOf": [ { "minLength": 1 } ] }),
+        ),
+    ];
+    for (schema, expected) in cases {
+        let conversion = converted(json!({
+            "swagger": "2.0",
+            "definitions": {
+                "Case": schema.clone(),
+                "Nested": { "type": "object", "properties": { "value": schema.clone() } }
+            },
+            "paths": {}
+        }));
+        assert_eq!(
+            conversion.document["components"]["schemas"]["Case"], expected,
+            "{schema}"
+        );
+        assert_eq!(
+            conversion.document["components"]["schemas"]["Nested"]["properties"]["value"], expected,
+            "{schema} inside properties"
+        );
+        assert!(conversion.warnings.is_empty());
+    }
+
+    let generation = generate_tools_from_api_document_str(
+        "type-lists.json",
+        &conversion_source(json!({
+            "swagger": "2.0",
+            "paths": {
+                "/notes": {
+                    "post": {
+                        "operationId": "createNote",
+                        "parameters": [ {
+                            "name": "body",
+                            "in": "body",
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "title": { "type": ["string", "null"] },
+                                    "rank": { "type": ["integer", "string"] }
+                                }
+                            }
+                        } ]
+                    }
+                }
+            }
+        })),
+    )
+    .expect("a document with type lists should generate");
+    assert_eq!(
+        generation.definitions[0].input_schema["properties"],
+        json!({
+            "title": { "type": "string", "nullable": true },
+            "rank": { "anyOf": [ { "type": "integer" }, { "type": "string" } ] }
+        })
     );
 }
 
@@ -1433,6 +1987,7 @@ fn warning_codes_have_stable_names_messages_and_omission_flags() {
         Code::ConsumesDefaulted,
         Code::ProducesDefaulted,
         Code::RequestBodyNotMapped,
+        Code::CredentialParameterNotMapped,
         Code::UnsupportedOperationField,
         Code::InvalidParameter,
         Code::UnsupportedParameterLocation,

@@ -7,9 +7,14 @@
 //! snapshot and translate the result for `tools::runtime` and inventory.
 
 use super::{
-    framed_digest, validate_facts, validate_path, CompiledPolicy, EvaluationError, FactsUse,
-    LogicalDecision, PolicyEffect, PolicyFacts, PrincipalFact, ResourceSnapshot, RuleReference,
-    MAX_TRACE_BYTES, UNCAPTURED_FACTS,
+    framed_digest,
+    stages::{
+        DirectAction, DirectMatch, IdentityCheck, NoStages, StageSink, ToolEntry, ToolRules,
+        ToolStage,
+    },
+    validate_facts, validate_path, CompiledPolicy, EvaluationError, FactsUse, LogicalDecision,
+    PolicyEffect, PolicyFacts, PrincipalFact, ResourceSnapshot, RuleReference, MAX_TRACE_BYTES,
+    UNCAPTURED_FACTS,
 };
 use crate::{
     auth::Principal,
@@ -395,16 +400,20 @@ impl CompiledPolicy {
         &self,
         context: &ToolEvaluationContext,
     ) -> Result<ToolEvaluation, EvaluationError> {
-        self.evaluate_tool_with_facts(context, &UNCAPTURED_FACTS)
+        self.evaluate_tool_with_facts(context, &UNCAPTURED_FACTS, &mut NoStages)
     }
 
     /// [`Self::evaluate_tool`] with the facts typed matchers read: an
     /// identity mapping's organization, and whatever a tool-name or rendered
-    /// HTTP rule's conditions read.
+    /// HTTP rule's conditions read. Each stage it runs is reported to
+    /// `stages`: the decision code, not a copy of it. The live adapters pass
+    /// [`NoStages`], which keeps nothing; a simulation passes a collecting
+    /// sink. See [`super::stages`].
     pub(crate) fn evaluate_tool_with_facts(
         &self,
         context: &ToolEvaluationContext,
         facts: &PolicyFacts,
+        stages: &mut impl StageSink<ToolStage>,
     ) -> Result<ToolEvaluation, EvaluationError> {
         context.validate(self.snapshot())?;
         validate_facts(facts)?;
@@ -424,20 +433,40 @@ impl CompiledPolicy {
             complete: true,
             limitation: None,
         };
-        let Some(name) = &context.tool_name else {
-            return Ok(result.incomplete(ToolLimitation::ToolName));
-        };
-        let effective = match &context.principal {
-            PrincipalFact::Missing if context.operation != ToolOperation::CompositeLeaf => {
-                return Ok(result.incomplete(ToolLimitation::Principal))
+        // Every fact the operation reads, in the order a missing one is
+        // reported: the tool name, the principal (a composite leaf needs
+        // none), its internal roles, then a rendered request's method and
+        // path.
+        let mut missing = None;
+        let mut effective = None;
+        match (&context.tool_name, &context.principal) {
+            (None, _) => missing = Some(ToolLimitation::ToolName),
+            (Some(_), PrincipalFact::Missing)
+                if context.operation != ToolOperation::CompositeLeaf =>
+            {
+                missing = Some(ToolLimitation::Principal)
             }
-            PrincipalFact::Authenticated(identity) => {
+            (Some(_), PrincipalFact::Authenticated(identity)) => {
                 match self.effective_principal(&identity.0, facts) {
-                    Some(effective) => Some(effective),
-                    None => return Ok(result.incomplete(ToolLimitation::MatcherFact)),
+                    Some(principal) => effective = Some(principal),
+                    None => missing = Some(ToolLimitation::MatcherFact),
                 }
             }
-            _ => None,
+            _ => {}
+        }
+        if missing.is_none() && context.operation == ToolOperation::RenderedHttp {
+            if context.method.is_none() {
+                missing = Some(ToolLimitation::Method);
+            } else if context.path.is_none() {
+                missing = Some(ToolLimitation::Path);
+            }
+        }
+        stages.record(ToolStage::Facts(missing));
+        if let Some(limitation) = missing {
+            return Ok(result.incomplete(limitation));
+        }
+        let Some(name) = &context.tool_name else {
+            return Err(EvaluationError::InternalInvariant);
         };
         let principal = effective.as_deref();
         let preview = matches!(
@@ -445,11 +474,8 @@ impl CompiledPolicy {
             ToolOperation::Visibility | ToolOperation::PolicyEligibility
         );
         let decision = if context.operation == ToolOperation::RenderedHttp {
-            let Some(method) = &context.method else {
-                return Ok(result.incomplete(ToolLimitation::Method));
-            };
-            let Some(path) = &context.path else {
-                return Ok(result.incomplete(ToolLimitation::Path));
+            let (Some(method), Some(path)) = (&context.method, &context.path) else {
+                return Err(EvaluationError::InternalInvariant);
             };
             result.reason = ToolReason::NoHttpRule;
             // This is intentionally neither contextless dispatch nor the HTTP
@@ -463,6 +489,7 @@ impl CompiledPolicy {
             )
         } else {
             let Some(tool) = self.engine.policy().tools.get(name) else {
+                stages.record(ToolStage::Entry(ToolEntry::Absent));
                 return Ok(result.deny(if preview {
                     ToolReason::NotInPolicy
                 } else {
@@ -470,22 +497,26 @@ impl CompiledPolicy {
                 }));
             };
             if !tool.enabled {
+                stages.record(ToolStage::Entry(ToolEntry::Disabled));
                 return Ok(result.deny(if preview {
                     ToolReason::PolicyDisabled
                 } else {
                     ToolReason::Disabled
                 }));
             }
+            stages.record(ToolStage::Entry(ToolEntry::Enabled));
             if context.operation == ToolOperation::CompositeLeaf {
                 return Ok(result);
             }
             if !tool_principal_matches(tool, principal) {
+                stages.record(ToolStage::Identity(IdentityCheck::Refused));
                 return Ok(result.deny(if preview {
                     ToolReason::PrincipalNotEligible
                 } else {
                     ToolReason::RoleNotAllowed
                 }));
             }
+            stages.record(ToolStage::Identity(IdentityCheck::Admitted));
             if preview {
                 result.reason = ToolReason::Eligible;
             }
@@ -495,9 +526,17 @@ impl CompiledPolicy {
             RuleScan::Matched(decision) => Some(decision),
             RuleScan::NoMatch => None,
             RuleScan::Undetermined { .. } => {
-                return Ok(result.incomplete(ToolLimitation::MatcherFact))
+                stages.record(ToolStage::Rules(ToolRules::Undetermined));
+                return Ok(result.incomplete(ToolLimitation::MatcherFact));
             }
         };
+        stages.record(ToolStage::Rules(match &decision {
+            Some(decision) => ToolRules::Matched(DirectMatch {
+                rule: decision.rule_index,
+                action: DirectAction::from(&decision.action),
+            }),
+            None => ToolRules::NoMatch,
+        }));
         if let Some(decision) = decision {
             result.matched = Some(RuleReference::Direct(decision.rule_index));
             if preview {
