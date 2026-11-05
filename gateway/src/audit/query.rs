@@ -331,7 +331,9 @@ pub struct ShadowRuleWouldDenySample {
 }
 
 /// The rows of the audit log a historical replay job reads, fixed when the
-/// job is created ([`AuditQueryStore::replay_cutoff`]).
+/// job is created ([`AuditQueryStore::replay_cutoff`]). The cluster audit
+/// stream's reader (`storage::postgres_audit_replay`) fills the same fields
+/// with stream positions where this log has row ids.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ReplayCutoff {
     /// The newest row id stored when the job was created.
