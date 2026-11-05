@@ -26,8 +26,9 @@
 //! strictness, not behaviour -- and two members a 0.x document cannot carry:
 //! `identity_mappings` and rule `conditions` (`super::identity_mappings`,
 //! `super::conditions`). This build validates both and the kernel evaluates
-//! both, but no serving path enforces them yet, so a document that uses
-//! either is refused with every check but that one reported first.
+//! both. The serving lanes enforce identity mappings and every condition
+//! leaf but `tool_argument`, so a document whose conditions use that leaf is
+//! refused, with every check but that one reported first.
 //!
 //! ## Diagnostics
 //!
