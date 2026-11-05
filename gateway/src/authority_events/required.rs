@@ -48,10 +48,11 @@ pub(crate) const REFUSAL_REASON: &str = "authority_evidence_unsupported";
 /// Only changes some deployment mode refuses are listed. An operation every
 /// mode that performs it records in its own transaction never asks:
 /// Connection create, replace and delete, local-secret changes and
-/// re-encryption (the standalone Connections database's own evidence
-/// tables), service-token issue, rotation and revocation, and JWT
-/// revocation. The inventory test holds that rule too: an operation no gate
-/// asks about must be `admitted` or `unavailable` wherever its row says.
+/// re-encryption, managed catalog publication and overlay writes and
+/// removals (the standalone Connections database's own evidence tables),
+/// service-token issue, rotation and revocation, and JWT revocation. The
+/// inventory test holds that rule too: an operation no gate asks about must
+/// be `admitted` or `unavailable` wherever its row says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AuthorityOperation {
     PolicyPublish,
@@ -66,10 +67,6 @@ pub(crate) enum AuthorityOperation {
     /// OpenAPI tools registered through the admin API, or a watched or
     /// signalled reload of `TOOLS_FILE`.
     ToolsPublish,
-    CatalogMcpPublish,
-    CatalogOpenapiPublish,
-    CatalogOverlayReplace,
-    CatalogOverlayDelete,
     /// The offline import's activation of a policy or tools document. Only
     /// cluster mode has one, and it records it; it is listed so that every
     /// document action names an operation.
@@ -134,10 +131,6 @@ impl AuthorityOperation {
             Self::PolicySuggestionAccept => "policy.suggestion.accept",
             Self::PolicyFileReload => "policy.file_reload",
             Self::ToolsPublish => "tools.publish",
-            Self::CatalogMcpPublish => "catalog.mcp.publish",
-            Self::CatalogOpenapiPublish => "catalog.openapi.publish",
-            Self::CatalogOverlayReplace => "catalog.overlay.replace",
-            Self::CatalogOverlayDelete => "catalog.overlay.delete",
             Self::ConfigurationImport => "configuration.import",
             Self::PolicyTestsPublish => "policy_tests.publish",
         }
@@ -148,10 +141,10 @@ impl AuthorityOperation {
     /// Cluster mode commits every change here with its evidence row in one
     /// PostgreSQL transaction, and has no policy file to reload. Standalone
     /// mode records none of them: the policy and tools files, their reloads
-    /// and their optional history are separate steps, the Connections
-    /// database keeps the current catalog and overlay but no evidence of who
-    /// published them, and the stored policy test suite's versions name only
-    /// the writer's subject.
+    /// and their optional history are separate steps, and the stored
+    /// policy test suite's versions name only the writer's subject. (The
+    /// Connections database records catalog and overlay publication in its
+    /// own transaction, so those operations are not listed.)
     pub(crate) const fn required_mode(self, backend: StateBackend) -> RequiredMode {
         match backend {
             StateBackend::Postgres => match self {
@@ -164,10 +157,6 @@ impl AuthorityOperation {
                 | Self::PolicyRuleReorder
                 | Self::PolicySuggestionAccept
                 | Self::ToolsPublish
-                | Self::CatalogMcpPublish
-                | Self::CatalogOpenapiPublish
-                | Self::CatalogOverlayReplace
-                | Self::CatalogOverlayDelete
                 | Self::ConfigurationImport
                 | Self::PolicyTestsPublish => RequiredMode::Admitted,
             },
