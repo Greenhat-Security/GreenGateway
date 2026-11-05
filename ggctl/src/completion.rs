@@ -584,7 +584,7 @@ mod tests {
             "complete -c ggctl -n '__fish_seen_subcommand_from policy; and __fish_seen_subcommand_from lint' -F\n"
         ));
         assert!(powershell.contains(
-            "$command -in @('validate', 'pin', 'convert', 'doctor', 'diff', 'ledger seed', 'backup verify', 'policy lint', 'policy test', 'policy explain', 'evidence verify')"
+            "$command -in @('validate', 'pin', 'convert', 'doctor', 'diff', 'ledger seed', 'backup verify', 'backup restore', 'policy lint', 'policy test', 'policy explain', 'evidence verify')"
         ));
         for script in [&bash, &zsh, &fish] {
             // Single quotes pair up once escaped quotes are removed.
@@ -652,7 +652,7 @@ mod tests {
         let [bash, zsh, fish, powershell] = scripts().map(|(_, script)| script);
         assert!(bash.contains("compgen -W 'version schema init validate pin convert doctor diff ledger backup policy evidence completion help'"));
         assert!(bash.contains(
-            "        backup)\n            if [ \"$COMP_CWORD\" -eq 2 ]; then\n                COMPREPLY=($(compgen -W 'create verify --help -h' -- \"$cur\"))"
+            "        backup)\n            if [ \"$COMP_CWORD\" -eq 2 ]; then\n                COMPREPLY=($(compgen -W 'create verify restore --help -h' -- \"$cur\"))"
         ));
         assert!(bash.contains("            command=\"$command ${COMP_WORDS[2]}\"\n"));
         assert!(bash.contains("        'backup create')\n"));
@@ -666,12 +666,13 @@ mod tests {
         assert!(zsh.contains("      command=\"$command ${words[2]}\"\n"));
         assert!(zsh.contains("    'backup create')\n      _arguments \\\n        '--state-dir["));
         assert!(fish.contains(
-            "complete -c ggctl -n '__fish_seen_subcommand_from backup; and not __fish_seen_subcommand_from create verify' -a verify -d "
+            "complete -c ggctl -n '__fish_seen_subcommand_from backup; and not __fish_seen_subcommand_from create verify restore' -a verify -d "
         ));
         assert!(fish.contains(
             "complete -c ggctl -n '__fish_seen_subcommand_from backup; and __fish_seen_subcommand_from create' -l state-dir -r -F"
         ));
-        assert!(powershell.contains("        'backup' = @('create', 'verify', '--help', '-h')\n"));
+        assert!(powershell
+            .contains("        'backup' = @('create', 'verify', 'restore', '--help', '-h')\n"));
         assert!(powershell.contains(
             "        'backup create' = @('--state-dir', '--output', '--format', '--help', '-h')\n"
         ));

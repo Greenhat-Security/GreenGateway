@@ -2730,8 +2730,11 @@ pub(super) async fn commit_policy_mutation(
 /// member, draining ones included, advertises its capability
 /// (`policy_document_v1`, which also needs a document range reaching
 /// format 1, and `policy_role_descriptions`), because a member without it
-/// refuses the whole document. A v1 document with role descriptions asks
-/// for both. The gate reads the roster for every such write, logs and
+/// refuses the whole document. A v1 document whose rules carry
+/// `conditions` is also `policy.rule_conditions` (`policy_rule_conditions`),
+/// because a member that serves format 1 but predates enforced rule
+/// conditions refuses it the same way. A document asks for each operation
+/// it performs. The gate reads the roster for every such write, logs and
 /// audits each refusal (`cluster.operation_refused`), and the refused write
 /// commits nothing.
 ///
@@ -2812,6 +2815,11 @@ fn policy_document_operations(
     let mut operations = Vec::new();
     if candidate.is_document_format_v1() {
         operations.push(&storage::compatibility::POLICY_DOCUMENT_V1);
+        // Only a v1 document can carry conditions; the 0.x reader refuses
+        // them (`member_requires_v1`).
+        if candidate.uses_rule_conditions() {
+            operations.push(&storage::compatibility::POLICY_RULE_CONDITIONS);
+        }
     }
     if candidate.uses_role_descriptions() {
         operations.push(&storage::compatibility::POLICY_ROLE_DESCRIPTIONS);

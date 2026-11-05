@@ -317,6 +317,26 @@ fn a_backup_command_is_its_family_and_a_second_word() {
     let invocation = runnable(&["backup", "verify", "/backups/state.ggbk"]);
     assert_eq!(invocation.command.name, "backup verify");
     assert_eq!(invocation.positional(0), Some((3, "/backups/state.ggbk")));
+    let invocation = runnable(&[
+        "backup",
+        "restore",
+        "/backups/state.ggbk",
+        "--state-dir",
+        "/state",
+        "--replace-existing-state",
+    ]);
+    assert_eq!(invocation.command.name, "backup restore");
+    assert_eq!(invocation.positional(0), Some((3, "/backups/state.ggbk")));
+    assert_eq!(invocation.text("--state-dir"), Some((4, "/state")));
+    assert_eq!(invocation.flag("--replace-existing-state"), Some(6));
+    let invocation = runnable(&[
+        "backup",
+        "restore",
+        "/backups/state.ggbk",
+        "--state-dir",
+        "/state",
+    ]);
+    assert_eq!(invocation.flag("--replace-existing-state"), None);
 
     for (words, code, position) in [
         (&["backup"][..], Code::MissingCommand, None),
@@ -329,6 +349,30 @@ fn a_backup_command_is_its_family_and_a_second_word() {
         ),
         (&["create"], Code::UnknownCommand, Some(1)),
         (&["backup", "verify"], Code::MissingArgument, None),
+        (
+            &[
+                "backup",
+                "restore",
+                "/a.ggbk",
+                "--state-dir",
+                "/a",
+                "--replace-existing-state=yes",
+            ],
+            Code::UnexpectedValue,
+            Some(6),
+        ),
+        (
+            &[
+                "backup",
+                "restore",
+                "/a.ggbk",
+                "--state-dir",
+                "/a",
+                "--force",
+            ],
+            Code::UnknownOption,
+            Some(6),
+        ),
         (
             &["backup", "verify", "/a.ggbk", "extra"],
             Code::UnexpectedArgument,

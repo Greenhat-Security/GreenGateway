@@ -966,16 +966,16 @@
           "anchor": "async fn connection_openapi_overlay_delete_endpoint("
         }
       ],
-      "boundary": "MCP/OpenAPI replacements and overlay updates share the Connection-state transaction and revision/CAS checks; entries, reservations, dependencies, outbox and one catalog_change_evidence row commit together. Registration, refresh and overlay put/delete all reach the OpenAPI replacement. An empty or oversized actor is refused before the transaction opens; an evidence insert failure rolls the publication back.",
-      "record": "Current catalog/overlay rows keep their actor and are still replaced or cascaded. catalog_change_evidence (migration 23) has no foreign key and keeps one row per publication: action, event/operation UUIDs, actor subject, Connection ID, prior/new catalog revision, the overlay revision the catalog was compiled from, the outbox row's shared revision and committed_at. A stale catalog or overlay revision, a conflict or a limit writes none.",
-      "actor": "actor_user_id (the authenticated principal subject, 1 to 4096 bytes, the principal bound) survives replacement and Connection deletion. Every catalog writer is an admin endpoint. Actor kind, issuer, auth mode and a keyed safe actor reference are still absent: migration 24 adds the first three to connection_change_evidence for Connection deletion, not to catalog_change_evidence, whose writers still pass the subject alone.",
+      "boundary": "MCP/OpenAPI replacements and overlay updates share the Connection-state transaction and revision/CAS checks; entries, reservations, dependencies, outbox and one catalog_change_evidence row commit together. Registration, refresh and overlay put/delete all reach the OpenAPI replacement. An actor evidence cannot record exactly (an empty or oversized subject or issuer, or an issuer on a service token) is refused before the transaction opens; an evidence insert failure rolls the publication back.",
+      "record": "Current catalog/overlay rows keep their actor's subject and are still replaced or cascaded. catalog_change_evidence (migration 23, with migration 25's actor columns) has no foreign key and keeps one row per publication: action, event/operation UUIDs, the whole actor, Connection ID, prior/new catalog revision, the overlay revision the catalog was compiled from, the outbox row's shared revision and committed_at. A stale catalog or overlay revision, a conflict or a limit writes none.",
+      "actor": "Every catalog writer is an admin endpoint, which builds the ChangeActor from the authenticated Principal; the store records it whole, as Connection deletion does: actor_user_id (the subject, 1 to 4096 bytes, the principal bound), actor_kind, actor_auth_mode and, for a principal that has one, the canonical actor_issuer, in migration 25's columns under migration 24's pairing CHECK. They survive replacement and Connection deletion. Rows committed before this build record none of the three new columns, and nothing is backfilled. A keyed safe actor reference is still absent.",
       "identity": "Generated event/operation UUIDs; catalog.mcp.publish, catalog.openapi.publish, catalog.overlay.replace or catalog.overlay.delete, derived from the write; the catalog revision transition of the connection_catalog outbox row (its 0 stored as NULL), overlay revision and shared revision. Catalog revisions restart when a Connection re-enters a managed kind, so evidence is ordered by security revision. No client-bound operation ID.",
       "delivery": "post_commit_telemetry",
       "disposition": [
         "missing_metadata",
         "missing_delivery"
       ],
-      "follow_up": "PR2 follow-up: carry the whole ChangeActor (kind, issuer and auth mode, as Connection deletion records them since migration 24) and a caller-bound operation identity to the Connection store's catalog writers; a scheduled refresh, if one is added, needs a system actor this table cannot express yet. Catalogs removed by a Connection kind change are connection.replace evidence. Journal catalog_change_evidence (not a migration 21 journal source yet) so the dispatcher delivers it.",
+      "follow_up": "PR2 follow-up: carry a caller-bound operation identity to the Connection store's catalog writers; a scheduled refresh, if one is added, records a system actor, which the table can now express. Catalogs removed by a Connection kind change are connection.replace evidence. Journal catalog_change_evidence (not a migration 21 journal source yet) so the dispatcher delivers it.",
       "sources": [
         {
           "path": "gateway/src/connections/pg_store.rs",
@@ -991,11 +991,19 @@
         },
         {
           "path": "gateway/src/connections/pg_store.rs",
+          "anchor": "fn validate_evidence_actor("
+        },
+        {
+          "path": "gateway/src/connections/pg_store.rs",
           "anchor": "async fn record_catalog_change_evidence("
         },
         {
           "path": "gateway/src/storage/migrations/0023_document_and_catalog_change_evidence.sql",
           "anchor": "CREATE TABLE greengateway.catalog_change_evidence ("
+        },
+        {
+          "path": "gateway/src/storage/migrations/0025_catalog_change_evidence_actor_metadata.sql",
+          "anchor": "ADD CONSTRAINT catalog_change_evidence_actor_metadata CHECK ("
         }
       ],
       "tests": [
@@ -1010,6 +1018,14 @@
         {
           "path": "gateway/src/connections/pg_store_tests.rs",
           "anchor": "async fn catalog_evidence_survives_replacement_cascade_and_restart("
+        },
+        {
+          "path": "gateway/src/connections/pg_store_tests.rs",
+          "anchor": "async fn catalog_evidence_records_the_whole_actor_for_every_catalog_action("
+        },
+        {
+          "path": "gateway/src/connections/pg_store_tests.rs",
+          "anchor": "async fn refused_and_stale_catalog_writes_record_no_evidence("
         },
         {
           "path": "gateway/src/connections/pg_store_tests.rs",

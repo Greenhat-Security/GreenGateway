@@ -1675,16 +1675,18 @@ impl StatusResponse {
     }
 }
 
-/// What the accept handler has already established when it hands the
-/// request to the cluster path: the state it answers from, the request
-/// itself, who is accepting, and the RBAC state both permissions were
-/// checked against.
-#[cfg(feature = "postgres")]
-pub(super) struct SuggestionAcceptContext<'a> {
+/// What a handler that accepts a suggestion (the accept route, or a draft
+/// publication bound to one) has already established when it hands the
+/// request to the commit: the state it answers from, the request itself,
+/// who is accepting, the RBAC state both permissions were checked against,
+/// and the policy write lane it holds from preparing the candidate until
+/// the commit.
+pub(super) struct SuggestionAcceptContext<'a, 'guard> {
     pub(super) state: &'a SuggestionsAdminState,
     pub(super) parts: &'a http::request::Parts,
     pub(super) principal: &'a auth::Principal,
     pub(super) rbac_state: &'a middleware::rbac::RbacState,
+    pub(super) policy_write_guard: &'a middleware::rbac::PolicyWriteGuard<'guard>,
 }
 
 /// How many stream rows one durable poll fetches: large enough that a
@@ -2127,10 +2129,11 @@ impl RulePatch {
 /// rule sits in it.
 ///
 /// Preparation and commit are separate steps because suggestion
-/// acceptance in cluster mode (issue #241, PR 12) commits this candidate
-/// INSIDE the suggestion's transaction rather than through
-/// [`persist_policy_mutation`]. Both paths must build and validate the
-/// candidate identically, so they share this.
+/// acceptance commits this candidate through its own sequence: INSIDE the
+/// suggestion's transaction in cluster mode (issue #241, PR 12), behind a
+/// durable acceptance intent in standalone mode (issue #243), rather than
+/// through [`persist_policy_mutation`]. Every path must build and validate
+/// the candidate identically, so they share this.
 pub(super) struct PreparedPolicyRuleCreate {
     pub(super) before_policy: rbac::Policy,
     /// What the commit must present as its compare-and-swap value.
