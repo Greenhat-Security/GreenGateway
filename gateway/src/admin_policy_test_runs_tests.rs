@@ -465,6 +465,7 @@ fn limited_router(
             draft_store: None,
             test_suite_store: None,
             analysis_suppression_store: None,
+            policy_tests_required: false,
             #[cfg(feature = "postgres")]
             control_plane: None,
             #[cfg(feature = "postgres")]

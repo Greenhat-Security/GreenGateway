@@ -535,6 +535,10 @@ pub(super) struct PolicyAdminState {
     /// mode. `None` leaves the suppression routes answering `503` and every
     /// analysis reporting its suppressions unavailable.
     pub(super) analysis_suppression_store: Option<Arc<dyn storage::AnalysisSuppressionStore>>,
+    /// `POLICY_TESTS_REQUIRED`: every policy publication must first pass
+    /// the stored suite (`admin_policy_test_gate`). With no `test_suite_store`
+    /// it is refused instead.
+    pub(super) policy_tests_required: bool,
     /// Cluster mode's authoritative control plane. Present exactly when
     /// `policy_file` is absent-but-cluster: mutations commit through its
     /// CAS transaction instead of the file, and history is its documents.

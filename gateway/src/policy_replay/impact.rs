@@ -19,8 +19,18 @@
 //! Recorded against base says how far the base, decided today, is from what
 //! was recorded -- a policy or resource that changed since, or a record that
 //! was never a policy verdict. The two are kept apart: a difference between
-//! recorded and base says nothing about the candidate, and a v1 record cannot
-//! say whether the policy, the configuration or the evaluator changed.
+//! recorded and base says nothing about the candidate, and is never counted
+//! as one.
+//!
+//! A record that carries decision facts says which policy (by ETag) and
+//! which evaluator (semantics and context version) decided it. A
+//! difference such a record shows is labelled for what it names:
+//! `recorded_under_other_policy` when the policy was not the base,
+//! `evaluator_changed` when it was but the evaluator was not this build's.
+//! Only a difference the facts do not explain -- a record without them, or
+//! one decided by the base under this evaluator -- stays `outcome_differs`
+//! or `attribution_differs`. Every record is also counted by that
+//! provenance.
 //!
 //! ## Transitions
 //!
@@ -76,9 +86,12 @@ use super::{
     HttpFacts, RecordedPolicy, RecordedResult, ReplaySource, ToolFacts,
 };
 use crate::{
+    middleware::decision::DecisionLane,
     policy_eval::{
-        tools::ToolReason, CompileError, CompiledPolicy, EvaluationError, LogicalDecision,
-        PolicyAuthority, PolicyEffect, RateLaneOutcome, Reason, RuleReference,
+        tools::{ToolReason, TOOL_CONTEXT_VERSION, TOOL_SEMANTICS_VERSION},
+        CompileError, CompiledPolicy, EvaluationError, LogicalDecision, PolicyAuthority,
+        PolicyEffect, RateLaneOutcome, Reason, RuleReference, CONTEXT_VERSION,
+        HTTP_SEMANTICS_VERSION,
     },
     policy_simulation::{
         run::{enforcement_and_effect, MAX_ECHOED_POLICY_STRING_BYTES},
@@ -204,6 +217,9 @@ pub(crate) struct ReplayPolicies {
     as_authored: PolicyPair,
     enforce_all_shadow: Option<PolicyPair>,
     projections: Vec<Projection>,
+    /// The base's ETag as authored, which a record's decision facts name
+    /// when the base is the policy that decided it.
+    base_etag: String,
 }
 
 impl ReplayPolicies {
@@ -222,10 +238,14 @@ impl ReplayPolicies {
         } else {
             None
         };
+        // The same function the live install path names its snapshot with,
+        // over the base as authored. A validated policy always serializes.
+        let base_etag = crate::policy_etag(base).map_err(|_| CompileError::InvalidPolicy)?;
         Ok(Self {
             as_authored: PolicyPair::compile(base, candidate, Projection::AsAuthored)?,
             enforce_all_shadow,
             projections: projections.to_vec(),
+            base_etag,
         })
     }
 }
@@ -1349,13 +1369,24 @@ impl RateAnswer {
 }
 
 /// How a recorded result compares with the base's answer for the same
-/// record. Declared in rendering priority.
+/// record. Declared in rendering priority: differences nothing explains
+/// first, then those the record's decision facts explain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum RecordedComparison {
-    /// The base decides differently from what was recorded.
+    /// The base decides differently from what was recorded, and the record
+    /// does not say it was decided by another policy or evaluator.
     OutcomeDiffers,
-    /// The same outcome, with a different reason or deciding element.
+    /// The same outcome, with a different reason or deciding element, and
+    /// nothing the record states explains it.
     AttributionDiffers,
+    /// A difference -- outcome or attribution -- in a record whose facts
+    /// name the base policy decided by another evaluator semantics or
+    /// context version.
+    EvaluatorChanged,
+    /// A difference in a record whose facts name another policy than the
+    /// base: what changed is the policy the record was decided under, not
+    /// anything the candidate does.
+    RecordedUnderOtherPolicy,
     /// The base decides as recorded, for the reason and by the element the
     /// record names, as far as the record states them.
     Agrees,
@@ -1369,9 +1400,11 @@ pub(crate) enum RecordedComparison {
 }
 
 impl RecordedComparison {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 8] = [
         Self::OutcomeDiffers,
         Self::AttributionDiffers,
+        Self::EvaluatorChanged,
+        Self::RecordedUnderOtherPolicy,
         Self::Agrees,
         Self::RecordedNotPolicyVerdict,
         Self::BaseIndeterminate,
@@ -1382,6 +1415,8 @@ impl RecordedComparison {
         match self {
             Self::OutcomeDiffers => "outcome_differs",
             Self::AttributionDiffers => "attribution_differs",
+            Self::EvaluatorChanged => "evaluator_changed",
+            Self::RecordedUnderOtherPolicy => "recorded_under_other_policy",
             Self::Agrees => "agrees",
             Self::RecordedNotPolicyVerdict => "recorded_not_policy_verdict",
             Self::BaseIndeterminate => "base_indeterminate",
@@ -1392,8 +1427,69 @@ impl RecordedComparison {
     fn is_compared(self) -> bool {
         matches!(
             self,
-            Self::OutcomeDiffers | Self::AttributionDiffers | Self::Agrees
+            Self::OutcomeDiffers
+                | Self::AttributionDiffers
+                | Self::EvaluatorChanged
+                | Self::RecordedUnderOtherPolicy
+                | Self::Agrees
         )
+    }
+}
+
+/// Under what a record was decided, as its decision facts state it, against
+/// the job's base and this build's evaluator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum RecordedProvenance {
+    /// The base policy, decided by this build's evaluator.
+    BasePolicy,
+    /// Another policy than the base.
+    OtherPolicy,
+    /// The base policy, decided by another evaluator semantics or context
+    /// version.
+    OtherEvaluator,
+    /// The record carries no decision facts.
+    NotRecorded,
+}
+
+impl RecordedProvenance {
+    const ALL: [Self; 4] = [
+        Self::BasePolicy,
+        Self::OtherPolicy,
+        Self::OtherEvaluator,
+        Self::NotRecorded,
+    ];
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::BasePolicy => "base_policy",
+            Self::OtherPolicy => "other_policy",
+            Self::OtherEvaluator => "other_evaluator",
+            Self::NotRecorded => "not_recorded",
+        }
+    }
+
+    /// A record's provenance. A record decided under another policy is
+    /// `OtherPolicy` whatever evaluator decided it: its positions and
+    /// elements belong to that policy, so the evaluator is not what the
+    /// comparison could isolate.
+    pub(crate) fn of(recorded: &RecordedResult, base_etag: &str) -> Self {
+        let Some(decision) = &recorded.decision else {
+            return Self::NotRecorded;
+        };
+        if decision.policy_etag != base_etag {
+            return Self::OtherPolicy;
+        }
+        let (semantics_version, context_version) = match decision.lane {
+            DecisionLane::Http => (HTTP_SEMANTICS_VERSION, CONTEXT_VERSION),
+            DecisionLane::Tool => (TOOL_SEMANTICS_VERSION, TOOL_CONTEXT_VERSION),
+        };
+        if decision.semantics_version != semantics_version
+            || decision.context_version != context_version
+        {
+            Self::OtherEvaluator
+        } else {
+            Self::BasePolicy
+        }
     }
 }
 
@@ -1470,8 +1566,41 @@ fn attribution_matches(policy: &ReplayPolicy, element: Element, recorded: &Recor
 /// none at all for a decision no element made. A record that states no
 /// reason (a tool invocation policy admitted) is compared by outcome only,
 /// and one that dropped an over-long attribution says so and is compared
-/// without it.
+/// without it. A difference is then labelled by the record's provenance
+/// (see [`labelled_by_provenance`]).
 pub(crate) fn compare_recorded(
+    policy: &ReplayPolicy,
+    base: Answer,
+    recorded: &RecordedResult,
+    source: ReplaySource,
+    base_etag: &str,
+) -> RecordedComparison {
+    labelled_by_provenance(
+        compare_recorded_verdict(policy, base, recorded, source),
+        RecordedProvenance::of(recorded, base_etag),
+    )
+}
+
+/// A difference a record's decision facts explain, labelled for what they
+/// name; any other comparison as it is.
+fn labelled_by_provenance(
+    comparison: RecordedComparison,
+    provenance: RecordedProvenance,
+) -> RecordedComparison {
+    match (comparison, provenance) {
+        (
+            RecordedComparison::OutcomeDiffers | RecordedComparison::AttributionDiffers,
+            RecordedProvenance::OtherPolicy,
+        ) => RecordedComparison::RecordedUnderOtherPolicy,
+        (
+            RecordedComparison::OutcomeDiffers | RecordedComparison::AttributionDiffers,
+            RecordedProvenance::OtherEvaluator,
+        ) => RecordedComparison::EvaluatorChanged,
+        (comparison, _) => comparison,
+    }
+}
+
+fn compare_recorded_verdict(
     policy: &ReplayPolicy,
     base: Answer,
     recorded: &RecordedResult,
@@ -1520,6 +1649,8 @@ type RecordedRow<'a> = (
 struct RecordedTally<'a> {
     records: u64,
     comparisons: BTreeMap<RecordedComparison, u64>,
+    /// Every record, by what its decision facts say it was decided under.
+    provenance: BTreeMap<RecordedProvenance, u64>,
     /// The records the base decided and the record states as a verdict.
     matrix: BTreeMap<RecordedRow<'a>, u64>,
 }
@@ -1531,9 +1662,14 @@ impl<'a> RecordedTally<'a> {
         base: Answer,
         recorded: &RecordedResult,
         source: ReplaySource,
+        base_etag: &str,
     ) {
         self.records += 1;
-        let comparison = compare_recorded(policy, base, recorded, source);
+        bump(
+            &mut self.provenance,
+            RecordedProvenance::of(recorded, base_etag),
+        );
+        let comparison = compare_recorded(policy, base, recorded, source, base_etag);
         bump(&mut self.comparisons, comparison);
         if let (Answer::Decided(decided), true) = (base, comparison.is_compared()) {
             let recorded_reason = recorded
@@ -1573,6 +1709,11 @@ impl<'a> RecordedTally<'a> {
                 &self.comparisons,
                 RecordedComparison::as_str,
             ),
+            "provenance": code_counts(
+                &RecordedProvenance::ALL,
+                &self.provenance,
+                RecordedProvenance::as_str,
+            ),
             "matrix": matrix,
             "matrix_omitted": matrix_omitted,
         })
@@ -1601,12 +1742,14 @@ impl<'a> RecordedTally<'a> {
         json!({
             "records": self.records,
             "comparisons": checkpoint::dump_closed(&self.comparisons, RecordedComparison::as_str),
+            "provenance": checkpoint::dump_closed(&self.provenance, RecordedProvenance::as_str),
             "matrix": matrix,
         })
     }
 
     fn restore(value: &'a Value) -> Restored<Self> {
-        let object = checkpoint::exact_object(value, &["records", "comparisons", "matrix"])?;
+        let object =
+            checkpoint::exact_object(value, &["records", "comparisons", "provenance", "matrix"])?;
         let mut matrix = BTreeMap::new();
         for row in checkpoint::array(checkpoint::member(object, "matrix")?)? {
             let [comparison, recorded_policy, recorded_reason, base_policy, base_reason, count] =
@@ -1637,6 +1780,13 @@ impl<'a> RecordedTally<'a> {
                 &RecordedComparison::ALL,
                 RecordedComparison::as_str,
                 checkpoint::member(object, "comparisons")?,
+            )?,
+            // Every record of a run is counted by provenance too: a resumed
+            // run that dropped these would report fewer than it read.
+            provenance: checkpoint::restore_closed(
+                &RecordedProvenance::ALL,
+                RecordedProvenance::as_str,
+                checkpoint::member(object, "provenance")?,
             )?,
             matrix,
         })
@@ -1686,8 +1836,13 @@ impl<'a> ImpactTally<'a> {
             None => candidate,
             Some(base) => http_answer(base, facts)?,
         };
-        self.recorded_http
-            .observe(pair.base(), base, recorded, ReplaySource::HttpObservation);
+        self.recorded_http.observe(
+            pair.base(),
+            base,
+            recorded,
+            ReplaySource::HttpObservation,
+            &policies.base_etag,
+        );
         if let Some(tally) = &mut self.as_authored {
             tally.http.observe(pair, base, candidate);
         }
@@ -1739,7 +1894,7 @@ impl<'a> ImpactTally<'a> {
             Some(base) => tool_answer(base, facts)?,
         };
         self.recorded_tool
-            .observe(pair.base(), base, recorded, source);
+            .observe(pair.base(), base, recorded, source, &policies.base_etag);
         if let Some(tally) = &mut self.as_authored {
             tally.tool.observe(pair, base, candidate);
         }

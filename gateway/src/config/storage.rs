@@ -75,8 +75,8 @@ use super::{
     MIN_CLUSTER_MAINTENANCE_LEASE_TTL_MS, MIN_CLUSTER_STALE_HEARTBEATS,
     MIN_DISCOVERY_PROJECTOR_LEASE_TTL_MS, MIN_DISCOVERY_PROJECTOR_POLL_MS, MIN_TOOL_LEASE_TTL_MS,
     OPENAPI_SPEC_PATH, PAYLOAD_CAPTURE_ENABLED, POLICY_FILE, POLICY_HISTORY_SQLITE_PATH,
-    PRINCIPAL_SQLITE_PATH, RATE_LIMIT_KEYRING, READINESS_PROBE_CACHE_MS, SERVICE_TOKEN_SQLITE_PATH,
-    STATE_BACKEND, TOOLS_FILE, TOOL_LEASE_TTL_MS,
+    POLICY_TESTS_REQUIRED, PRINCIPAL_SQLITE_PATH, RATE_LIMIT_KEYRING, READINESS_PROBE_CACHE_MS,
+    SERVICE_TOKEN_SQLITE_PATH, STATE_BACKEND, TOOLS_FILE, TOOL_LEASE_TTL_MS,
 };
 use crate::auth::admin_session::AdminSessionStorage;
 
@@ -334,13 +334,14 @@ pub(super) fn compile_discovery_stores(inputs: DiscoveryStoreInputs) -> Checked<
     )
 }
 
-/// The documents' and the policy history store's inputs, as the reader
-/// returned them.
+/// The documents', the policy history store's and the policy test gate's
+/// inputs, as the reader returned them.
 pub(super) struct DocumentInputs {
     openapi_spec_path: RawInput,
     policy_file: RawInput,
     tools_file: RawInput,
     policy_history_sqlite_path: RawInput,
+    policy_tests_required: RawInput,
 }
 
 impl DocumentInputs {
@@ -354,16 +355,21 @@ impl DocumentInputs {
                 POLICY_HISTORY_SQLITE_PATH,
                 get_var(POLICY_HISTORY_SQLITE_PATH),
             ),
+            policy_tests_required: RawInput::new(
+                POLICY_TESTS_REQUIRED,
+                get_var(POLICY_TESTS_REQUIRED),
+            ),
         }
     }
 }
 
-/// The documents and the policy history store, parsed.
+/// The documents, the policy history store and the policy test gate, parsed.
 pub(super) struct Documents {
     openapi_spec_path: Option<PathBuf>,
     policy_file: Option<String>,
     tools_file: Option<String>,
     policy_history_sqlite_path: Option<String>,
+    policy_tests_required: bool,
     provenance: Vec<Provenance>,
 }
 
@@ -397,17 +403,28 @@ pub(super) fn compile_documents(inputs: DocumentInputs) -> Checked<Documents> {
             problems,
         )
     });
+    let policy_tests_required = findings.input(POLICY_TESTS_REQUIRED, |problems| {
+        parse_var(
+            POLICY_TESTS_REQUIRED,
+            inputs.policy_tests_required.value(),
+            false,
+            "boolean",
+            problems,
+        )
+    });
     Checked::new(
         Documents {
             openapi_spec_path,
             policy_file,
             tools_file,
             policy_history_sqlite_path,
+            policy_tests_required,
             provenance: vec![
                 inputs.openapi_spec_path.provenance(),
                 inputs.policy_file.provenance(),
                 inputs.tools_file.provenance(),
                 inputs.policy_history_sqlite_path.provenance(),
+                inputs.policy_tests_required.provenance(),
             ],
         },
         findings,
@@ -878,6 +895,7 @@ pub(crate) struct StoragePlan {
     pub(crate) policy_file: Option<String>,
     pub(crate) tools_file: Option<String>,
     pub(crate) policy_history_sqlite_path: Option<String>,
+    pub(crate) policy_tests_required: bool,
     pub(crate) tool_lease_ttl_ms: u64,
     pub(crate) cluster_heartbeat_ms: u64,
     pub(crate) cluster_member_stale_ms: u64,
@@ -1220,6 +1238,7 @@ pub(super) fn compile(
             policy_file: documents.policy_file,
             tools_file: documents.tools_file,
             policy_history_sqlite_path: documents.policy_history_sqlite_path,
+            policy_tests_required: documents.policy_tests_required,
             tool_lease_ttl_ms: cluster.tool_lease_ttl_ms,
             cluster_heartbeat_ms: cluster.cluster_heartbeat_ms,
             cluster_member_stale_ms: cluster.cluster_member_stale_ms,

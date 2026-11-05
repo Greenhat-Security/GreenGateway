@@ -133,6 +133,7 @@ fn authentication_egress_policy_evidence_and_unknown_risks_are_high() {
         RiskCode::PolicyBroadened,
         RiskCode::ExemptionsBroadened,
         RiskCode::EvidenceNotRequired,
+        RiskCode::PolicyTestsNotRequired,
         RiskCode::UnknownImpact,
     ] {
         assert_eq!(code.severity(), Severity::High, "{}", code.as_str());

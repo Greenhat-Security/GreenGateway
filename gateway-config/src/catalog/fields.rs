@@ -924,6 +924,18 @@ pub const FIELDS: &[Field] = &[
         cloudflare: Cloudflare::Forwarded,
     },
     Field {
+        id: "policy_tests_required",
+        environment: "POLICY_TESTS_REQUIRED",
+        domain: Domain::Storage,
+        field_type: FieldType::Boolean,
+        default: DefaultValue::Literal("false"),
+        blank: Blank::Refused,
+        sensitivity: Sensitivity::Public,
+        state_backends: StateBackends::Both,
+        bundle: BundleMapping::Deployment { path: None },
+        cloudflare: Cloudflare::Forwarded,
+    },
+    Field {
         id: "cors_allow_origins",
         environment: "CORS_ALLOW_ORIGINS",
         domain: Domain::RuntimeSettings,

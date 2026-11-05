@@ -154,30 +154,15 @@ impl SuppressionRefusal {
 
 /// The ADR-0004 semantic digest of a policy v1 document -- the digest `POST
 /// .../policy/validate` reports for the same document -- or `None` for a
-/// document format without a normative normalization (0.x).
+/// document format without a normative normalization (0.x). The one
+/// definition `rbac::policy_document::accepted_policy_semantic_digest` is
+/// also what the installed snapshot's decision facts name, so a suppression,
+/// an analysis, an evidence package and a recorded decision agree on it.
 pub(super) fn policy_semantic_digest(policy: &rbac::Policy) -> ResponseResult<Option<String>> {
-    if rbac::policy_document::PolicySchema::of_version(&policy.schema_version)
-        != Some(rbac::policy_document::PolicySchema::V1)
-    {
-        return Ok(None);
-    }
-    let digest = serde_json::to_value(policy).ok().and_then(|normalized| {
-        canonical_json::semantic_digest(
-            rbac::policy_document::POLICY_MEDIA_TYPE,
-            rbac::policy_document::POLICY_V1_SCHEMA_VERSION,
-            &normalized,
-        )
-        .ok()
-    });
-    match digest {
-        Some(digest) => Ok(Some(digest)),
-        None => {
-            tracing::error!("a policy v1 document has no canonical form");
-            Err(Box::new(internal_server_error(
-                "policy digest computation failed",
-            )))
-        }
-    }
+    rbac::policy_document::accepted_policy_semantic_digest(policy).map_err(|_| {
+        tracing::error!("a policy v1 document has no canonical form");
+        Box::new(internal_server_error("policy digest computation failed"))
+    })
 }
 
 /// The suppressions an analysis reads, as the analysis module takes them.

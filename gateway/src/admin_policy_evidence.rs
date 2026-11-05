@@ -167,7 +167,9 @@ fn stored_policy_identity(policy: &rbac::Policy) -> ResponseResult<PolicyIdentit
         schema_version: policy.schema_version.clone(),
         etag,
         // A 0.x document has no normative normalization, so no semantic
-        // digest: the report says so rather than inventing one.
+        // digest: the report says so rather than inventing one. The
+        // installed snapshot's decision facts name the same digest for the
+        // same policy.
         semantic_digest: policy_semantic_digest(policy)?,
     })
 }
