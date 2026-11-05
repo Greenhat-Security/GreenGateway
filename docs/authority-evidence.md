@@ -627,8 +627,8 @@ completes), `a_withdrawal_whose_journal_row_cannot_be_written_does_not_happen` a
 `every_grant_and_withdrawal_leaves_one_evidence_row` (every evidence row journaled,
 every held unit spent); `storage::migrations`' `migration_twenty_six_journals_session_evidence_and_holds_withdrawals`;
 and the delivery projection tests in `gateway/src/authority_events/delivery_tests.rs`.
-The PostgreSQL ones run in CI against its disposable loopback database, not verified
-TLS.
+The PostgreSQL ones run in CI against its disposable loopback database, and again
+over verified TLS ([Verified-TLS storage tests](#verified-tls-storage-tests)).
 
 ## Actor metadata
 
@@ -674,7 +674,8 @@ commit-order dispatcher test, and the app-level
 `admin_token_rotate_and_revoke_record_the_authenticated_subject_and_issuer_sqlite`
 and `_postgres` in `gateway/src/admin_tokens_app_tests.rs`, which drive the admin endpoints with principals from two identity
 providers and a service token and read the evidence rows back. The PostgreSQL ones
-run in CI against its disposable loopback database, not verified TLS.
+run in CI against its disposable loopback database, and again over verified TLS
+([Verified-TLS storage tests](#verified-tls-storage-tests)).
 
 Migration 23's two tables are outside this contract, and migration 24 leaves them
 unchanged. `document_change_evidence` records an actor kind, issuer and auth mode
@@ -865,6 +866,63 @@ reload helpers in `middleware/rbac_tests.rs` and `tools/definitions.rs` refuse a
 reload and keep the active document; `config_tests.rs`, `config/stage_tests.rs` and
 `ha.rs` cover the startup rules, their diagnostics and the fingerprint.
 
+## Verified-TLS storage tests
+
+The PostgreSQL evidence suites run twice in CI, in two shards of the required
+`postgres-foundation` check. `postgres-foundation-pg` runs the whole gateway suite
+against a service container over loopback plaintext, under the documented
+`loopback-dev` exception. `postgres-foundation-tls` runs these suites again against a
+disposable PostgreSQL 16, the same pinned image, that accepts TLS and nothing else:
+
+- in `storage::contract_tests`, the service-token and JWT revocation evidence tests
+  (`postgres_service_token_change_evidence_satisfies_the_contract`,
+  `service_token_change_evidence_matches_the_outbox_and_survives_deletion_and_restart`,
+  `a_failed_token_evidence_insert_rolls_back_the_rotate_and_the_revoke`,
+  `revoke_and_rotate_race_never_leaves_a_live_plaintext`,
+  `jwt_revocation_evidence_survives_extension_reactivation_and_cleanup`,
+  `a_failed_jwt_evidence_insert_rolls_back_the_revoke`), the suggestion acceptance's
+  document evidence (`an_accepted_suggestion_records_its_evidence_in_the_acceptance_transaction`)
+  and `a_replica_held_at_the_fingerprint_door_never_rewrites_the_journal_capacity`;
+- the whole PostgreSQL Connection store suite (`connections::pg_store`), its deletion
+  and catalog evidence included;
+- `storage::postgres_documents` and `storage::postgres_admin_sessions`;
+- the dispatcher (`authority_events::dispatcher`);
+- `storage::migrations`' evidence and journal migrations: 12 through 16, 18, 21, 24,
+  25 and 26;
+- the app-level `admin_token_rotate_and_revoke_record_the_authenticated_subject_and_issuer_postgres`.
+
+Each run generates a throwaway CA and a server certificate for `127.0.0.1` and
+`localhost` in the runner's temporary directory, and deletes the CA key once it has
+signed; no key is committed or kept. The server runs with `ssl=on` and a `pg_hba`
+that admits `hostssl` and rejects `hostnossl`. The suites reach it through the test
+harness, `storage::postgres::test_support`: with `GATEWAY_TEST_POSTGRES_TLS_CA_FILE`
+naming the CA, every pool and session it builds runs in `DATABASE_TLS_MODE=verify`
+with that file as `DATABASE_TLS_CA_FILE`, through the gateway's own DSN validation,
+`enforce_tls_policy`, session settings and rustls connector, so the certificate's
+chain and the name dialled are verified on every connection.
+
+What this proves:
+
+- The evidence writes, rollbacks, journal appends, capacity refusals and deliveries
+  those tests assert hold on verified-TLS sessions exactly as on plaintext ones.
+- No suite in the shard can have passed over plaintext or by skipping.
+  `a_verified_tls_run_reaches_its_database_only_over_tls` asserts that the harness's
+  sessions are TLS (`pg_stat_ssl`) and that the server refuses a plaintext one. With
+  the CA locator set, a missing DSN locator panics instead of skipping, and the shard
+  fails when one of its filters selects no test.
+- A server certificate from another CA
+  (`a_server_certificate_from_another_authority_is_unavailable_and_names_no_dsn`) and
+  one that does not name the address dialled, reached through a relay on `127.0.0.2`
+  (`a_server_certificate_for_another_name_is_unavailable_and_names_no_dsn`), are both
+  refused. The connectivity check every store shares classifies the refusal as
+  `unavailable`, startup reports it as the cause of exhausting its retry budget, and
+  neither error renders any part of the DSN.
+
+What it does not prove: password or client-certificate authentication (the test
+server trusts every TLS client), certificate rotation, a managed provider's server,
+or anything about the rest of the gateway suite, whose PostgreSQL tests still run
+only against the loopback database.
+
 ## Next reviewable slices and validation gates
 
 1. **PostgreSQL Connection deletion evidence (landed).** The delete transaction
@@ -876,7 +934,8 @@ reload and keep the active document; `config_tests.rs`, `config/stage_tests.rs` 
    stale ETag, dependency rejection, a missing record, two writers, a forced
    evidence-insert failure and its rollback, and reconciling a lost response
    from the evidence row; CI runs them against its disposable loopback database,
-   not verified TLS. Migration 24 adds the deleting actor's kind, auth mode and
+   and again over verified TLS ([Verified-TLS storage tests](#verified-tls-storage-tests)).
+   Migration 24 adds the deleting actor's kind, auth mode and
    canonical issuer ([Actor metadata](#actor-metadata)). Still open for this row: a
    caller-bound operation identity at the store boundary.
 2. **Service-token and JWT metadata (landed).** `ServiceTokenStore` rotate and
@@ -895,7 +954,8 @@ reload and keep the active document; `config_tests.rs`, `config/stage_tests.rs` 
    rotate/revoke races, actor survival after token deletion and restart, a
    forced evidence-insert failure and its rollback, extension, reactivation and
    cleanup, and synthetic token-material exclusion; the PostgreSQL ones run in
-   CI against its disposable loopback database, not verified TLS. Migration 24
+   CI against its disposable loopback database, and again over verified TLS
+   ([Verified-TLS storage tests](#verified-tls-storage-tests)). Migration 24
    (and the standalone token database's own columns) adds the actor's kind, auth
    mode and canonical issuer, and records the CLI's system label as kind `system`
    ([Actor metadata](#actor-metadata)). Still open: a caller-bound operation
@@ -927,8 +987,10 @@ reload and keep the active document; `config_tests.rs`, `config/stage_tests.rs` 
    refusals that write nothing, forced evidence-insert failure and its rollback
    (including inside a suggestion acceptance), principal bounds, survival after
    catalog replacement, Connection deletion and restart, and the overlay
-   vocabulary; CI runs them against its disposable loopback database, not
-   verified TLS. Still open: issuer and auth mode for catalog publications (their
+   vocabulary; CI runs them against its disposable loopback database, and all but
+   the import's (`import::tests`) again over verified TLS
+   ([Verified-TLS storage tests](#verified-tls-storage-tests)).
+   Still open: issuer and auth mode for catalog publications (their
    writers carry the subject only; Connection deletion records both since
    migration 24), the alignment of the document rows' actor vocabulary with
    migration 24's ([Actor metadata](#actor-metadata)), a caller-bound
@@ -948,7 +1010,9 @@ reload and keep the active document; `config_tests.rs`, `config/stage_tests.rs` 
    undelivered row, capacity exhaustion refusing every producer while committing
    nothing, the running dispatcher's lease and shutdown, and migration 21's
    backfill; the request-audit sink regressions are unchanged. CI runs them against
-   its disposable loopback database, not verified TLS. Migration 26 adds the
+   its disposable loopback database, and runs the dispatcher and migration tests
+   again over verified TLS ([Verified-TLS storage tests](#verified-tls-storage-tests)).
+   Migration 26 adds the
    cluster admin session evidence as a journal source, with a unit of capacity held
    for each session's withdrawal ([Admin session withdrawals and journal capacity](#admin-session-withdrawals-and-journal-capacity)),
    moving the serving contract from exactly schema 25 to exactly schema 26, a

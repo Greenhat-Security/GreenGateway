@@ -2628,16 +2628,11 @@ pub(crate) mod postgres_audit_tests {
     /// release) removes the interference entirely.
     pub(crate) static DATABASE: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::const_new(()));
 
-    pub(crate) fn locator() -> Option<String> {
-        let key = "GATEWAY_TEST_POSTGRES_URL_FILE".to_owned();
-        let file = std::env::var(&key).ok()?;
-        if file.trim().is_empty() {
-            return None;
-        }
-        let contents = std::fs::read_to_string(file).ok()?;
-        let trimmed = contents.trim();
-        (!trimmed.is_empty()).then(|| trimmed.to_owned())
-    }
+    // The locator, the DSN files and the TLS policy every connection here
+    // takes are the shared harness's, so a verified-TLS run reaches these
+    // databases the way the gateway does (issue #425).
+    pub(crate) use crate::storage::postgres::test_support::{locator, write_dsn_file, DsnFile};
+    use crate::storage::postgres::test_support::{test_pool, unconnected_pool, use_test_tls};
 
     /// One test's disposable database: created on acquisition, dropped
     /// (forced) on release. The `dsn` rewrites only the locator DSN's
@@ -2675,61 +2670,9 @@ pub(crate) mod postgres_audit_tests {
         }
     }
 
-    pub(crate) struct DsnFile {
-        pub(crate) path: String,
-        directory: std::path::PathBuf,
-    }
-
-    impl Drop for DsnFile {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.directory);
-        }
-    }
-
-    pub(crate) fn write_dsn_file(dsn: &str) -> DsnFile {
-        let directory = std::env::temp_dir().join(format!(
-            "greengateway-audit-contract-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&directory).expect("temp directory should create");
-        let path = directory.join("database-url");
-        std::fs::write(&path, format!("{dsn}\n")).expect("DSN file should write");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-                .expect("DSN permissions should set");
-        }
-        DsnFile {
-            path: path.display().to_string(),
-            directory,
-        }
-    }
-
     pub(crate) async fn create_test_database(admin_dsn: &str) -> TestDatabase {
         let name = format!("ggw_audit_test_{}", uuid::Uuid::new_v4().simple());
-        let mut config = crate::config::Config::test_defaults();
-        config.state_backend = crate::config::StateBackend::Postgres;
-        config.deployment_id = Some("deploy-audit-contract".to_owned());
-        config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
-
-        let directory = std::env::temp_dir().join(format!(
-            "greengateway-audit-contract-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&directory).expect("temp directory should create");
-        let admin_path = directory.join("database-url");
-        std::fs::write(&admin_path, format!("{admin_dsn}\n")).expect("DSN file should write");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&admin_path, std::fs::Permissions::from_mode(0o600))
-                .expect("DSN permissions should set");
-        }
-        config.database.url_file = Some(admin_path.display().to_string());
-        let admin = PostgresFoundation::establish(&config)
-            .await
-            .expect("admin connection should establish");
+        let admin = test_pool(admin_dsn).await;
 
         // Single-statement simple protocol: CREATE DATABASE cannot run in a
         // transaction block.
@@ -2741,17 +2684,7 @@ pub(crate) mod postgres_audit_tests {
             .batch_execute(&format!("CREATE DATABASE {name}"))
             .await
             .unwrap_or_else(|error| panic!("test database should create: {error}"));
-
-        let dsn_path = directory.join("database-url-test");
-        std::fs::write(&dsn_path, format!("{admin_dsn}\n")).expect("DSN file should write");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&dsn_path, std::fs::Permissions::from_mode(0o600))
-                .expect("DSN permissions should set");
-        }
         drop(admin);
-        let _ = std::fs::remove_dir_all(&directory);
 
         // Rewrite ONLY the database path segment of the DSN: a plain string
         // replace would also rewrite the username, which for these test
@@ -2764,24 +2697,12 @@ pub(crate) mod postgres_audit_tests {
         // disposable one: DROP DATABASE cannot run on a session that has
         // the target open. (An adversarial review caught this exact leak:
         // every teardown failed with "cannot drop the currently open
-        // database", stranding 800+ MB of test databases per run.)
-        let parsed_admin =
-            tokio_postgres::Config::from_str(admin_dsn).expect("admin DSN should parse");
+        // database", stranding 800+ MB of test databases per run.) It
+        // connects only when the teardown asks, on the teardown's runtime.
         TestDatabase {
             dsn,
             name,
-            admin_pool: deadpool_postgres::Pool::builder(deadpool_postgres::Manager::new(
-                parsed_admin,
-                tokio_postgres::NoTls,
-            ))
-            .config({
-                let mut pool_config = deadpool_postgres::PoolConfig::new(4);
-                pool_config.timeouts.create = Some(std::time::Duration::from_millis(5_000));
-                pool_config
-            })
-            .runtime(deadpool_postgres::Runtime::Tokio1)
-            .build()
-            .expect("admin pool should build"),
+            admin_pool: unconnected_pool(admin_dsn).expect("admin pool should build"),
         }
     }
 
@@ -2791,7 +2712,7 @@ pub(crate) mod postgres_audit_tests {
         config.deployment_id = Some("deploy-audit-contract".to_owned());
         let test_dsn_file = write_dsn_file(&database.dsn);
         config.database.url_file = Some(test_dsn_file.path.clone());
-        config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+        use_test_tls(&mut config.database);
         let foundation = PostgresFoundation::establish(&config)
             .await
             .expect("the test database should establish");
@@ -2847,7 +2768,7 @@ pub(crate) mod postgres_audit_tests {
         config.deployment_id = Some("deploy-readiness-contract".to_owned());
         let test_dsn_file = write_dsn_file(&database.dsn);
         config.database.url_file = Some(test_dsn_file.path.clone());
-        config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+        use_test_tls(&mut config.database);
         let foundation = PostgresFoundation::establish(&config)
             .await
             .expect("the test database should establish");
@@ -3077,7 +2998,7 @@ pub(crate) mod postgres_audit_tests {
         config.state_backend = crate::config::StateBackend::Postgres;
         config.deployment_id = Some("deploy-policy-contract".to_owned());
         config.database.url_file = Some(test_dsn_file.path.clone());
-        config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+        use_test_tls(&mut config.database);
         let foundation = PostgresFoundation::establish(&config)
             .await
             .expect("the test database should establish");
@@ -3101,7 +3022,7 @@ pub(crate) mod postgres_audit_tests {
         config.state_backend = crate::config::StateBackend::Postgres;
         config.deployment_id = Some("deploy-acquire-contract".to_owned());
         config.database.url_file = Some(test_dsn_file.path.clone());
-        config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+        use_test_tls(&mut config.database);
         config.database.pool_max = 1;
         config.database.acquire_timeout_ms = acquire_timeout_ms;
         PostgresFoundation::establish(&config)
@@ -3460,7 +3381,7 @@ pub(crate) mod postgres_audit_tests {
         config.state_backend = crate::config::StateBackend::Postgres;
         config.deployment_id = Some("deploy-token-contract".to_owned());
         config.database.url_file = Some(test_dsn_file.path.clone());
-        config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+        use_test_tls(&mut config.database);
         let foundation = PostgresFoundation::establish(&config)
             .await
             .expect("the test database should establish");
@@ -3674,7 +3595,7 @@ pub(crate) mod postgres_audit_tests {
         config.state_backend = crate::config::StateBackend::Postgres;
         config.deployment_id = Some("deploy-limits-contract".to_owned());
         config.database.url_file = Some(test_dsn_file.path.clone());
-        config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+        use_test_tls(&mut config.database);
         let foundation = PostgresFoundation::establish(&config)
             .await
             .expect("the test database should establish");
@@ -5090,7 +5011,7 @@ pub(crate) mod postgres_audit_tests {
             config.state_backend = crate::config::StateBackend::Postgres;
             config.deployment_id = Some(deployment.to_owned());
             config.database.url_file = Some(test_dsn_file.path.clone());
-            config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+            use_test_tls(&mut config.database);
             config
         };
         let bound_rows = || async {
@@ -7476,7 +7397,7 @@ pub(crate) mod postgres_audit_tests {
         config.state_backend = crate::config::StateBackend::Postgres;
         config.deployment_id = Some("deploy-audit-contract".to_owned());
         config.database.url_file = Some(test_dsn_file.path.clone());
-        config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+        use_test_tls(&mut config.database);
         let foundation = PostgresFoundation::establish(&config)
             .await
             .expect("raw connection should establish");
@@ -7619,7 +7540,7 @@ pub(crate) mod postgres_audit_tests {
         config.state_backend = crate::config::StateBackend::Postgres;
         config.deployment_id = Some("deploy-audit-contract".to_owned());
         config.database.url_file = Some(test_dsn_file.path.clone());
-        config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+        use_test_tls(&mut config.database);
         let foundation_b = PostgresFoundation::establish(&config)
             .await
             .expect("the second pool should establish");
@@ -7627,12 +7548,12 @@ pub(crate) mod postgres_audit_tests {
 
         // The blocker: a raw session, outside both pools, holding the
         // stream table so the batch wedges AFTER it has the advisory lock.
-        let (blocker, connection) = tokio_postgres::connect(&database.dsn, tokio_postgres::NoTls)
+        let blocker_pool =
+            unconnected_pool(&database.dsn).expect("the blocking session's pool should build");
+        let blocker = blocker_pool
+            .get()
             .await
             .expect("the blocking session should establish");
-        let pump = tokio::spawn(async move {
-            let _ = connection.await;
-        });
         blocker
             .batch_execute("BEGIN; LOCK TABLE greengateway.audit_stream IN ACCESS EXCLUSIVE MODE")
             .await
@@ -7725,7 +7646,6 @@ pub(crate) mod postgres_audit_tests {
             .get(0);
         assert_eq!(events, 1, "the cancelled batch must leave no event row");
         drop(blocker);
-        let _ = pump.await;
     }
 
     #[tokio::test]
@@ -7759,7 +7679,7 @@ pub(crate) mod postgres_audit_tests {
             config.state_backend = crate::config::StateBackend::Postgres;
             config.deployment_id = Some("deploy-audit-contract".to_owned());
             config.database.url_file = Some(test_dsn_file.path.clone());
-            config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+            use_test_tls(&mut config.database);
             let foundation = PostgresFoundation::establish(&config)
                 .await
                 .expect("retention connection should establish");
@@ -7827,7 +7747,7 @@ pub(crate) mod postgres_audit_tests {
         config.state_backend = crate::config::StateBackend::Postgres;
         config.deployment_id = Some("deploy-audit-contract".to_owned());
         config.database.url_file = Some(test_dsn_file.path.clone());
-        config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+        use_test_tls(&mut config.database);
         let foundation = PostgresFoundation::establish(&config)
             .await
             .expect("benchmark connection should establish");
@@ -7901,8 +7821,6 @@ pub(crate) mod postgres_audit_tests {
         drop(store);
     }
 
-    use std::str::FromStr as _;
-
     // ------------------------------------------------------------------
     // Durable observations and the fenced discovery projector
     // (issue #241, PR 11)
@@ -7922,7 +7840,7 @@ pub(crate) mod postgres_audit_tests {
         config.state_backend = crate::config::StateBackend::Postgres;
         config.deployment_id = Some("deploy-discovery-contract".to_owned());
         config.database.url_file = Some(test_dsn_file.path.clone());
-        config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+        use_test_tls(&mut config.database);
         let foundation = PostgresFoundation::establish(&config)
             .await
             .expect("the test database should establish");

@@ -59,7 +59,7 @@ async fn migrated_pool(database: &TestDatabase) -> deadpool_postgres::Pool {
     config.state_backend = crate::config::StateBackend::Postgres;
     config.deployment_id = Some(DEPLOYMENT.to_owned());
     config.database.url_file = Some(dsn_file.path.clone());
-    config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+    crate::storage::postgres::test_support::use_test_tls(&mut config.database);
     let foundation = PostgresFoundation::establish(&config)
         .await
         .expect("the test database should establish");
