@@ -41,7 +41,7 @@ fn this_binary_advertises_a_bounded_canonical_set_it_recognizes() {
         rendered,
         "delegated_token_purges,openapi_discovery_catalogs,openapi_swagger2_catalogs,\
          operation_requirements,policy_document_v1,policy_role_descriptions,\
-         policy_rule_conditions"
+         policy_rule_conditions,policy_tool_argument_conditions"
     );
     let recognized = RecognizedCapabilities::parse(&rendered);
     assert_eq!(recognized.unrecognized(), 0);
@@ -57,7 +57,8 @@ fn this_binary_advertises_a_bounded_canonical_set_it_recognizes() {
             "operation_requirements",
             "policy_document_v1",
             "policy_role_descriptions",
-            "policy_rule_conditions"
+            "policy_rule_conditions",
+            "policy_tool_argument_conditions"
         ]
     );
 }
@@ -88,6 +89,23 @@ fn a_pre_conditions_members_advertisement_lacks_the_policy_rule_conditions_capab
     assert_eq!(earlier.unrecognized(), 0);
     assert!(earlier.contains(Capability::PolicyDocumentV1));
     assert!(!earlier.contains(Capability::PolicyRuleConditions));
+    assert!(!earlier.contains(Capability::PolicyToolArgumentConditions));
+}
+
+/// What the build that enforced rule conditions before tool-argument
+/// conditions advertises is still understood, and grants everything it
+/// implemented except the tool-argument leaf.
+#[test]
+fn a_pre_tool_argument_members_advertisement_lacks_the_policy_tool_argument_conditions_capability()
+{
+    let earlier = RecognizedCapabilities::parse(
+        "delegated_token_purges,openapi_discovery_catalogs,openapi_swagger2_catalogs,\
+         operation_requirements,policy_document_v1,policy_role_descriptions,\
+         policy_rule_conditions",
+    );
+    assert_eq!(earlier.unrecognized(), 0);
+    assert!(earlier.contains(Capability::PolicyRuleConditions));
+    assert!(!earlier.contains(Capability::PolicyToolArgumentConditions));
 }
 
 /// What a schema-18 gateway built before role descriptions advertises
@@ -103,6 +121,7 @@ fn a_prepared_members_advertisement_lacks_the_successors_capability() {
     assert!(!prepared.contains(Capability::OpenApiDiscoveryCatalogs));
     assert!(!prepared.contains(Capability::PolicyDocumentV1));
     assert!(!prepared.contains(Capability::PolicyRuleConditions));
+    assert!(!prepared.contains(Capability::PolicyToolArgumentConditions));
     assert_eq!(prepared.unrecognized(), 0);
 }
 
@@ -298,10 +317,22 @@ mod gate_tests {
                 OPENAPI_DISCOVERY_CATALOGS,
                 DELEGATED_TOKEN_PURGES,
                 POLICY_DOCUMENT_V1,
-                POLICY_RULE_CONDITIONS
+                POLICY_RULE_CONDITIONS,
+                POLICY_TOOL_ARGUMENT_CONDITIONS
             ],
             "registering an operation is a protocol change: review its requirement, its new \
              capability and the docs in ha-state-model.md section 7 before updating this test"
+        );
+        assert_eq!(
+            POLICY_TOOL_ARGUMENT_CONDITIONS,
+            OperationRequirement {
+                operation: "policy.tool_argument_conditions",
+                minimum_schema: 17,
+                document_format: Some(1),
+                capability: Capability::PolicyToolArgumentConditions,
+                backfill: Backfill::NotRequired,
+                activation: Activation::LiveMembers,
+            }
         );
         assert_eq!(
             POLICY_RULE_CONDITIONS,
@@ -732,7 +763,7 @@ mod gate_tests {
         const CURRENT: &str = "delegated_token_purges,openapi_discovery_catalogs,\
                                openapi_swagger2_catalogs,operation_requirements,\
                                policy_document_v1,policy_role_descriptions,\
-                               policy_rule_conditions";
+                               policy_rule_conditions,policy_tool_argument_conditions";
         let reads = |instance_id: Uuid, live: bool, capabilities: &str| MemberAdvertisement {
             document_version: (0, 1),
             ..member(instance_id, live, capabilities)
@@ -778,6 +809,71 @@ mod gate_tests {
         assert_eq!(
             gate(
                 &POLICY_RULE_CONDITIONS,
+                &shipped,
+                OWN,
+                &[current, successor]
+            ),
+            Ok(OperationAdmission { live_members: 2 })
+        );
+    }
+
+    /// Issue #243's tool-argument conditions against a mixed roster. A
+    /// member of the build that enforced the other conditions before this
+    /// leaf admits a document with those conditions, and holds one with a
+    /// `tool_argument` leaf until it has left; a member of this build admits
+    /// both.
+    #[test]
+    fn policy_tool_argument_conditions_wait_for_every_member_built_before_the_leaf() {
+        const EARLIER: &str = "delegated_token_purges,openapi_discovery_catalogs,\
+                               openapi_swagger2_catalogs,operation_requirements,\
+                               policy_document_v1,policy_role_descriptions,\
+                               policy_rule_conditions";
+        let current_set = advertisement(BINARY_CAPABILITIES).expect("the shipped set fits");
+        let reads = |instance_id: Uuid, live: bool, capabilities: &str| MemberAdvertisement {
+            document_version: (0, 1),
+            ..member(instance_id, live, capabilities)
+        };
+        let shipped = BinaryContract::shipped();
+        let current = reads(OWN, true, &current_set);
+
+        let earlier = reads(PEER, true, EARLIER);
+        assert_eq!(
+            gate(
+                &POLICY_TOOL_ARGUMENT_CONDITIONS,
+                &shipped,
+                OWN,
+                &[current.clone(), earlier.clone()]
+            ),
+            Err(OperationRefusal::MembersLackRequirement {
+                lacking: vec![PEER],
+                live: 2
+            })
+        );
+        assert_eq!(
+            gate(
+                &POLICY_RULE_CONDITIONS,
+                &shipped,
+                OWN,
+                &[current.clone(), earlier]
+            ),
+            Ok(OperationAdmission { live_members: 2 }),
+            "the earlier member still admits the other conditions"
+        );
+
+        let departed = reads(PEER, false, EARLIER);
+        assert_eq!(
+            gate(
+                &POLICY_TOOL_ARGUMENT_CONDITIONS,
+                &shipped,
+                OWN,
+                &[current.clone(), departed]
+            ),
+            Ok(OperationAdmission { live_members: 1 })
+        );
+        let successor = reads(PEER, true, &current_set);
+        assert_eq!(
+            gate(
+                &POLICY_TOOL_ARGUMENT_CONDITIONS,
                 &shipped,
                 OWN,
                 &[current, successor]
