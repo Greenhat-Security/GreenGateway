@@ -5429,6 +5429,7 @@ mod cluster_policy_tests {
                 ),
                 control_plane: Some(store as Arc<dyn storage::PolicyControlPlane>),
                 membership,
+                replay_cluster: None,
                 event_store: None,
                 query_store: None,
                 authority_evidence: authority_events::required::AuthorityEvidenceGate::best_effort(

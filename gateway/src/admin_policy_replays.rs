@@ -2,9 +2,10 @@
 //! /v1{ADMIN_PREFIX}/policy/replays/{id}` (issue #243, slice 13): start, poll
 //! and cancel a bounded historical replay job.
 //!
-//! A job decides one window of the standalone audit log again under a
-//! candidate -- the active policy itself, position-aware edits over it, or an
-//! inline document -- and under the active policy it was written against,
+//! A job decides one window of retained audit records again -- the
+//! standalone audit log, or the cluster audit stream in cluster mode -- under
+//! a candidate -- the active policy itself, position-aware edits over it, or
+//! an inline document -- and under the active policy it was written against,
 //! through the shared policy kernel, and compares the two with each other and
 //! with what was recorded. The engine is [`policy_replay::job`] and the
 //! comparison [`policy_replay::impact`]; this module owns the job's
@@ -43,14 +44,24 @@
 //! ([`MAX_RETAINED_POLICY_REPLAYS_PER_ACTOR`] per principal). Over any bound
 //! is `429`; no job is ever evicted to make room for another.
 //!
-//! ## Standalone, and process-local
+//! ## Standalone jobs are process-local
 //!
-//! Jobs live in this replica's memory. Shutting the application down cancels
-//! them, and a restart forgets them: a job id from before it is `404`, never
-//! resumed, and never a partial result. Cluster mode
-//! answers every route `503 policy_replay_unsupported_in_cluster`, because a
-//! replicated job needs the durable leases of #241, and a replica-local job
-//! would read one replica's view of a shared audit authority.
+//! A standalone job lives in this replica's memory. Shutting the application
+//! down cancels it, and a restart forgets it: a job id from before it is
+//! `404`, never resumed, and never a partial result.
+//!
+//! ## Cluster jobs are durable
+//!
+//! In cluster mode a job is a row of the shared job table, which every
+//! replica serves and any replica's worker runs under a durable lease,
+//! checkpointing after every page so a replica that takes it over resumes it
+//! exactly once: see the [`cluster`] module. The routes, permissions,
+//! request, representation, states and result are the same, with one more
+//! state, `interrupted`, for a job a replica took over but could not
+//! continue. Its quotas are the deployment's, counted in SQL: at most
+//! [`MAX_PENDING_POLICY_REPLAYS`] jobs pending across the deployment and one
+//! per principal, and at most [`MAX_RETAINED_POLICY_REPLAYS`] unexpired jobs
+//! ([`MAX_RETAINED_POLICY_REPLAYS_PER_ACTOR`] per principal).
 use std::{
     collections::HashMap,
     sync::{Mutex, MutexGuard, PoisonError},
@@ -58,15 +69,23 @@ use std::{
 
 use super::*;
 
+#[cfg(feature = "postgres")]
+use policy_replay::request::ResolvedWindow;
 use policy_replay::{
     impact::ReplayPolicies,
     job::{
-        ReplayControl, ReplayScope, ReplayStop, MAX_REPLAY_PAGE_BYTES, MAX_REPLAY_RECORD_BYTES,
-        REPLAY_PAGE_RECORDS, REPLAY_RUN_DEADLINE,
+        ReplayControl, ReplayOutcome, ReplayScope, ReplayStop, MAX_REPLAY_PAGE_BYTES,
+        MAX_REPLAY_RECORD_BYTES, REPLAY_PAGE_RECORDS, REPLAY_RUN_DEADLINE,
     },
     request::{parse_request, resolve_window, ReplayRequest},
 };
 use policy_simulation::{request::CandidateSource, Projection};
+
+#[cfg(feature = "postgres")]
+#[path = "admin_policy_replays_cluster.rs"]
+mod cluster;
+#[cfg(feature = "postgres")]
+pub(crate) use cluster::ClusterPolicyReplays;
 
 /// Most replay jobs queued or running at once across this replica: the
 /// bound of the replay route's [`PolicyEvaluationLimiter`], which also holds
@@ -107,6 +126,11 @@ enum ReplayJobState {
     CompletedIncomplete,
     Failed,
     Cancelled,
+    /// A cluster job a replica took over but could not continue: its pins or
+    /// its checkpoint could not be rebuilt under this build's engine, or it
+    /// was taken over too often. Never a standalone job's state.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+    Interrupted,
     Expired,
 }
 
@@ -119,8 +143,31 @@ impl ReplayJobState {
             Self::CompletedIncomplete => "completed_incomplete",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
             Self::Expired => "expired",
         }
+    }
+
+    /// A cluster job's state as its row stores it: a job being admitted
+    /// reads as `queued`, and a finished one whose result has expired as
+    /// `expired`. `None` for a state this build does not write.
+    #[cfg(feature = "postgres")]
+    fn from_stored(state: &str, result_expired: bool) -> Option<Self> {
+        let state = match state {
+            "admitting" | "queued" => Self::Queued,
+            "running" => Self::Running,
+            "completed" => Self::Completed,
+            "completed_incomplete" => Self::CompletedIncomplete,
+            "failed" => Self::Failed,
+            "cancelled" => Self::Cancelled,
+            "interrupted" => Self::Interrupted,
+            _ => return None,
+        };
+        Some(if result_expired && !state.is_pending() {
+            Self::Expired
+        } else {
+            state
+        })
     }
 
     fn is_pending(self) -> bool {
@@ -190,6 +237,60 @@ impl ReplayJob {
         // while it was held cannot leave it half-updated.
         self.record.lock().unwrap_or_else(PoisonError::into_inner)
     }
+
+    /// The job as its representations read it, under its record's lock.
+    fn view<'a>(&'a self, record: &'a ReplayJobRecord) -> ReplayJobView<'a> {
+        let finished_at = record.finished.map(|(_, finished)| finished);
+        ReplayJobView {
+            id: &self.id,
+            state: record.state,
+            failure: record.failure,
+            cancel_requested: record.cancel_requested,
+            created_at: Some(self.created_at),
+            started_at: record.started_at,
+            finished_at,
+            result_expires_at: finished_at.and_then(|finished| {
+                time::Duration::try_from(POLICY_REPLAY_RESULT_TTL)
+                    .ok()
+                    .and_then(|ttl| finished.checked_add(ttl))
+            }),
+            request_digest: &self.request_digest,
+            binding: &self.binding,
+            scope: &self.scope,
+            scanned: self.control.scanned(),
+            result: record.result.as_deref(),
+        }
+    }
+}
+
+/// A job as its representations read it, whichever store holds it: the
+/// standalone registry, or the cluster's job table.
+struct ReplayJobView<'a> {
+    id: &'a str,
+    state: ReplayJobState,
+    failure: Option<&'a str>,
+    cancel_requested: bool,
+    created_at: Option<OffsetDateTime>,
+    started_at: Option<OffsetDateTime>,
+    finished_at: Option<OffsetDateTime>,
+    result_expires_at: Option<OffsetDateTime>,
+    request_digest: &'a str,
+    binding: &'a ReplayJobBinding,
+    scope: &'a ReplayScope,
+    /// Records read so far.
+    scanned: u64,
+    result: Option<&'a ReplayJobResult>,
+}
+
+/// A request validated and pinned, ready to be admitted as a cluster job.
+#[cfg(feature = "postgres")]
+struct PreparedReplay {
+    request: ReplayRequest,
+    window: ResolvedWindow,
+    base: rbac::Policy,
+    /// `None` when the candidate is the base itself.
+    candidate: Option<rbac::Policy>,
+    binding: ReplayJobBinding,
 }
 
 /// Why a job was not admitted.
@@ -352,16 +453,40 @@ pub(super) struct ReplayJobEvidence {
 pub(super) enum ReplayJobEvidenceRefusal {
     /// No job of this principal's has the id, as for any replay route.
     NotFound,
-    /// The job holds no result: it is pending, failed, cancelled or expired,
-    /// named by its state.
+    /// The job holds no result: it is pending, failed, cancelled,
+    /// interrupted or expired, named by its state.
     Unfinished(&'static str),
+    /// The cluster job store could not be read.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+    Unavailable,
+}
+
+/// The result of `principal`'s job `id`, for an evidence package. Served
+/// exactly as `GET .../policy/replays/{id}` serves a job: only to the
+/// principal that started it, and only while its result is retained. In
+/// cluster mode the job is read from the shared job store, so evidence can
+/// bind a job that ran on any replica.
+pub(super) async fn replay_job_evidence(
+    state: &PolicyAdminState,
+    jobs: &PolicyReplayJobs,
+    principal: &auth::Principal,
+    id: &str,
+) -> Result<ReplayJobEvidence, ReplayJobEvidenceRefusal> {
+    #[cfg(feature = "postgres")]
+    if state.control_plane.is_some() {
+        return match state.replay_cluster.as_ref() {
+            Some(cluster) => cluster.evidence(principal, id).await,
+            None => Err(ReplayJobEvidenceRefusal::Unavailable),
+        };
+    }
+    #[cfg(not(feature = "postgres"))]
+    let _ = state;
+    jobs.evidence(principal, id)
 }
 
 impl PolicyReplayJobs {
-    /// The result of `principal`'s job `id`, for an evidence package. Served
-    /// exactly as `GET .../policy/replays/{id}` serves a job: only to the
-    /// principal that started it, and only while its result is retained.
-    pub(super) fn evidence(
+    /// A standalone job's evidence; see [`replay_job_evidence`].
+    fn evidence(
         &self,
         principal: &auth::Principal,
         id: &str,
@@ -373,64 +498,72 @@ impl PolicyReplayJobs {
             return Err(ReplayJobEvidenceRefusal::NotFound);
         };
         let record = job.record();
-        let complete = match record.state {
-            ReplayJobState::Completed => true,
-            ReplayJobState::CompletedIncomplete => false,
-            state => return Err(ReplayJobEvidenceRefusal::Unfinished(state.as_str())),
-        };
-        let Some(result) = record.result.as_ref() else {
-            return Err(ReplayJobEvidenceRefusal::Unfinished(record.state.as_str()));
-        };
-        let mut candidate = json!({
-            "source": job.binding.candidate_source,
-            "etag": job.binding.candidate_etag,
-        });
-        if job.binding.candidate_source == "edits" {
-            if let Some(candidate) = candidate.as_object_mut() {
-                candidate.insert("edits".to_owned(), json!(job.binding.edit_count));
-            }
-        }
-        // The job id is left out: it names a process-local job its owner
-        // can poll, and the result digest already ties the section to the
-        // job's `policy.replay_completed` record.
-        let view = json!({
-            "included": true,
-            "mode": "historical_replay",
-            "state": record.state.as_str(),
-            "request_digest": job.request_digest,
-            "evaluator": {
-                "http_semantics_version": policy_eval::HTTP_SEMANTICS_VERSION,
-                "http_context_version": policy_eval::CONTEXT_VERSION,
-                "tool_semantics_version": policy_eval::tools::TOOL_SEMANTICS_VERSION,
-                "tool_context_version": policy_eval::tools::TOOL_CONTEXT_VERSION,
-                "replay_context_version": policy_replay::REPLAY_CONTEXT_SCHEMA_VERSION,
-            },
-            "base": { "source": "active", "etag": job.binding.base_etag },
-            "candidate": candidate,
-            "projections": job.binding.projection_names(),
-            "window": { "from": job.scope.from, "to": job.scope.to },
-            "cutoff": {
-                "high_water": job.scope.cutoff.high_water,
-                "selected_records": job.scope.cutoff.selected,
-            },
-            "limits": {
-                "max_records": job.scope.max_records,
-                "deadline_ms": duration_millis(REPLAY_RUN_DEADLINE),
-                "page_records": REPLAY_PAGE_RECORDS,
-                "max_page_bytes": MAX_REPLAY_PAGE_BYTES,
-                "max_record_bytes": MAX_REPLAY_RECORD_BYTES,
-            },
-            "not_replayed": policy_replay::job::NOT_REPLAYED,
-            "result_digest": result.digest,
-            "result": result.document,
-        });
-        Ok(ReplayJobEvidence {
-            candidate_etag: job.binding.candidate_etag.clone(),
-            base_etag: job.binding.base_etag.clone(),
-            complete,
-            view,
-        })
+        evidence_from_view(&job.view(&record))
     }
+}
+
+/// A job's section of an evidence package, from its view: only a finished
+/// job whose result is still held has one.
+fn evidence_from_view(
+    job: &ReplayJobView<'_>,
+) -> Result<ReplayJobEvidence, ReplayJobEvidenceRefusal> {
+    let complete = match job.state {
+        ReplayJobState::Completed => true,
+        ReplayJobState::CompletedIncomplete => false,
+        state => return Err(ReplayJobEvidenceRefusal::Unfinished(state.as_str())),
+    };
+    let Some(result) = job.result else {
+        return Err(ReplayJobEvidenceRefusal::Unfinished(job.state.as_str()));
+    };
+    let mut candidate = json!({
+        "source": job.binding.candidate_source,
+        "etag": job.binding.candidate_etag,
+    });
+    if job.binding.candidate_source == "edits" {
+        if let Some(candidate) = candidate.as_object_mut() {
+            candidate.insert("edits".to_owned(), json!(job.binding.edit_count));
+        }
+    }
+    // The job id is left out: it names a job its owner can poll while it
+    // is retained, and the result digest already ties the section to the
+    // job's `policy.replay_completed` record.
+    let view = json!({
+        "included": true,
+        "mode": "historical_replay",
+        "state": job.state.as_str(),
+        "request_digest": job.request_digest,
+        "evaluator": {
+            "http_semantics_version": policy_eval::HTTP_SEMANTICS_VERSION,
+            "http_context_version": policy_eval::CONTEXT_VERSION,
+            "tool_semantics_version": policy_eval::tools::TOOL_SEMANTICS_VERSION,
+            "tool_context_version": policy_eval::tools::TOOL_CONTEXT_VERSION,
+            "replay_context_version": policy_replay::REPLAY_CONTEXT_SCHEMA_VERSION,
+        },
+        "base": { "source": "active", "etag": job.binding.base_etag },
+        "candidate": candidate,
+        "projections": job.binding.projection_names(),
+        "window": { "from": job.scope.from, "to": job.scope.to },
+        "cutoff": {
+            "high_water": job.scope.cutoff.high_water,
+            "selected_records": job.scope.cutoff.selected,
+        },
+        "limits": {
+            "max_records": job.scope.max_records,
+            "deadline_ms": duration_millis(REPLAY_RUN_DEADLINE),
+            "page_records": REPLAY_PAGE_RECORDS,
+            "max_page_bytes": MAX_REPLAY_PAGE_BYTES,
+            "max_record_bytes": MAX_REPLAY_RECORD_BYTES,
+        },
+        "not_replayed": policy_replay::job::NOT_REPLAYED,
+        "result_digest": result.digest,
+        "result": result.document,
+    });
+    Ok(ReplayJobEvidence {
+        candidate_etag: job.binding.candidate_etag.clone(),
+        base_etag: job.binding.base_etag.clone(),
+        complete,
+        view,
+    })
 }
 
 /// The application is going away: cancel every job, so a running one stops
@@ -547,9 +680,9 @@ fn rfc3339(time: Option<OffsetDateTime>) -> Value {
         .map_or(Value::Null, Value::String)
 }
 
-/// The three permissions every replay route needs, and standalone mode.
-/// Checked before a body is read or a job looked up, so an unauthorized
-/// caller learns nothing about any job.
+/// The three permissions every replay route needs. Checked before a body is
+/// read or a job looked up, so an unauthorized caller learns nothing about
+/// any job.
 fn authorized_replay_state<'a>(
     state: &'a PolicyAdminState,
     principal: &auth::Principal,
@@ -566,15 +699,37 @@ fn authorized_replay_state<'a>(
             )));
         }
     }
+    Ok(rbac_state)
+}
+
+/// Where this application's replay jobs live.
+#[derive(Clone, Copy)]
+enum ReplayBackend<'a> {
+    /// This replica's memory, reading the standalone audit log.
+    Standalone(&'a Arc<storage::SqliteAuditEventStore>),
+    /// The cluster's job table, reading the cluster audit stream.
+    #[cfg(feature = "postgres")]
+    Cluster(&'a Arc<ClusterPolicyReplays>),
+}
+
+/// The backend a replay route serves, or the `503` for none: cluster mode
+/// without its job store, or standalone mode without an audit query store.
+fn replay_backend(state: &PolicyAdminState) -> Result<ReplayBackend<'_>, Response> {
     #[cfg(feature = "postgres")]
     if state.control_plane.is_some() {
-        return Err(Box::new(replay_refusal(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "historical policy replay is not available in cluster mode",
-            "policy_replay_unsupported_in_cluster",
-        )));
+        return state
+            .replay_cluster
+            .as_ref()
+            .map(ReplayBackend::Cluster)
+            .ok_or_else(|| {
+                policy_evidence_unavailable("policy replay requires the cluster replay job store")
+            });
     }
-    Ok(rbac_state)
+    state
+        .query_store
+        .as_ref()
+        .map(ReplayBackend::Standalone)
+        .ok_or_else(|| policy_evidence_unavailable("policy replay requires an audit query store"))
 }
 
 /// Whether a job's result describes the live policy. A result is immutable
@@ -589,8 +744,7 @@ fn freshness_view(base_current: Option<bool>) -> Value {
     }
 }
 
-fn job_view(job: &ReplayJob, base_current: Option<bool>) -> Value {
-    let record = job.record();
+fn job_view(job: &ReplayJobView<'_>, base_current: Option<bool>) -> Value {
     let mut base = json!({ "source": "active", "etag": job.binding.base_etag });
     if let (Some(current), Some(base)) = (base_current, base.as_object_mut()) {
         base.insert("current".to_owned(), json!(current));
@@ -604,20 +758,15 @@ fn job_view(job: &ReplayJob, base_current: Option<bool>) -> Value {
             candidate.insert("edits".to_owned(), json!(job.binding.edit_count));
         }
     }
-    let expires_at = record.finished.and_then(|(_, finished)| {
-        time::Duration::try_from(POLICY_REPLAY_RESULT_TTL)
-            .ok()
-            .and_then(|ttl| finished.checked_add(ttl))
-    });
     let mut view = json!({
         "schema_version": POLICY_REPLAY_JOB_SCHEMA_VERSION,
         "job_id": job.id,
-        "state": record.state.as_str(),
-        "cancel_requested": record.cancel_requested,
-        "created_at": rfc3339(Some(job.created_at)),
-        "started_at": rfc3339(record.started_at),
-        "finished_at": rfc3339(record.finished.map(|(_, finished)| finished)),
-        "result_expires_at": rfc3339(expires_at),
+        "state": job.state.as_str(),
+        "cancel_requested": job.cancel_requested,
+        "created_at": rfc3339(job.created_at),
+        "started_at": rfc3339(job.started_at),
+        "finished_at": rfc3339(job.finished_at),
+        "result_expires_at": rfc3339(job.result_expires_at),
         "request_digest": job.request_digest,
         "evaluator": {
             "http_semantics_version": policy_eval::HTTP_SEMANTICS_VERSION,
@@ -644,15 +793,15 @@ fn job_view(job: &ReplayJob, base_current: Option<bool>) -> Value {
             "max_record_bytes": MAX_REPLAY_RECORD_BYTES,
         },
         "progress": {
-            "scanned_records": job.control.scanned(),
+            "scanned_records": job.scanned,
             "selected_records": job.scope.cutoff.selected,
         },
     });
     if let Some(view) = view.as_object_mut() {
-        if let Some(failure) = record.failure {
+        if let Some(failure) = job.failure {
             view.insert("failure".to_owned(), json!({ "reason": failure }));
         }
-        if let Some(result) = &record.result {
+        if let Some(result) = job.result {
             view.insert("result_digest".to_owned(), json!(result.digest));
             view.insert("result".to_owned(), result.document.clone());
         }
@@ -660,12 +809,21 @@ fn job_view(job: &ReplayJob, base_current: Option<bool>) -> Value {
     view
 }
 
-fn job_response(status: StatusCode, job: &ReplayJob, base_current: Option<bool>) -> Response {
+fn respond_view(
+    status: StatusCode,
+    job: &ReplayJobView<'_>,
+    base_current: Option<bool>,
+) -> Response {
     let mut response = (status, Json(job_view(job, base_current))).into_response();
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
+}
+
+fn job_response(status: StatusCode, job: &ReplayJob, base_current: Option<bool>) -> Response {
+    let record = job.record();
+    respond_view(status, &job.view(&record), base_current)
 }
 
 fn lifecycle_event(job: &ReplayJob, event_type: &str, payload: Value) -> audit::AuditEvent {
@@ -690,21 +848,54 @@ async fn record_lifecycle(
 }
 
 fn started_payload(job: &ReplayJob) -> Value {
+    started_payload_for(&job.id, &job.request_digest, &job.binding, &job.scope)
+}
+
+fn started_payload_for(
+    id: &str,
+    request_digest: &str,
+    binding: &ReplayJobBinding,
+    scope: &ReplayScope,
+) -> Value {
     json!({
-        "job_id": job.id,
-        "request_digest": job.request_digest,
-        "base_etag": job.binding.base_etag,
-        "candidate_source": job.binding.candidate_source,
-        "candidate_etag": job.binding.candidate_etag,
-        "edits": job.binding.edit_count,
-        "projections": job.binding.projection_names(),
-        "window_from": job.scope.from,
-        "window_to": job.scope.to,
-        "high_water": job.scope.cutoff.high_water,
-        "selected_records": job.scope.cutoff.selected,
-        "max_records": job.scope.max_records,
+        "job_id": id,
+        "request_digest": request_digest,
+        "base_etag": binding.base_etag,
+        "candidate_source": binding.candidate_source,
+        "candidate_etag": binding.candidate_etag,
+        "edits": binding.edit_count,
+        "projections": binding.projection_names(),
+        "window_from": scope.from,
+        "window_to": scope.to,
+        "high_water": scope.cutoff.high_water,
+        "selected_records": scope.cutoff.selected,
+        "max_records": scope.max_records,
         "http_semantics_version": policy_eval::HTTP_SEMANTICS_VERSION,
         "tool_semantics_version": policy_eval::tools::TOOL_SEMANTICS_VERSION,
+    })
+}
+
+/// A finished run's `policy.replay_completed` payload: digests, codes and
+/// counts only.
+fn completed_payload(
+    id: &str,
+    state: ReplayJobState,
+    outcome: &ReplayOutcome,
+    scope: &ReplayScope,
+    duration_ms: u64,
+) -> Value {
+    json!({
+        "job_id": id,
+        "state": state.as_str(),
+        "complete": outcome.complete,
+        "limitations": outcome.limitations,
+        "result_digest": outcome.digest,
+        "selected_records": scope.cutoff.selected,
+        "scanned_records": outcome.scanned,
+        "replayable_records": outcome.result["records"]["replayable"],
+        "replayed_records": outcome.replayed,
+        "impact": outcome.impact,
+        "duration_ms": duration_ms,
     })
 }
 
@@ -734,22 +925,30 @@ async fn finish_without_result(
             )
             .await,
         ),
-        ReplayStop::Failed(reason) => (
-            ReplayJobState::Failed,
-            Some(reason),
-            record_lifecycle(
-                audit,
-                job,
-                audit::event::POLICY_REPLAY_FAILED,
-                json!({
-                    "job_id": job.id,
-                    "reason": reason,
-                    "scanned_records": scanned,
-                    "duration_ms": duration_ms,
-                }),
+        // Only a cluster run is ever released; a standalone job that met
+        // one could not say what it read, so it fails.
+        ReplayStop::Failed(_) | ReplayStop::Released => {
+            let reason = match stop {
+                ReplayStop::Failed(reason) => reason,
+                _ => "internal",
+            };
+            (
+                ReplayJobState::Failed,
+                Some(reason),
+                record_lifecycle(
+                    audit,
+                    job,
+                    audit::event::POLICY_REPLAY_FAILED,
+                    json!({
+                        "job_id": job.id,
+                        "reason": reason,
+                        "scanned_records": scanned,
+                        "duration_ms": duration_ms,
+                    }),
+                )
+                .await,
             )
-            .await,
-        ),
+        }
     };
     if let Err(error) = recorded {
         tracing::error!(error = %error, "policy replay job's terminal audit event was not recorded");
@@ -847,25 +1046,18 @@ async fn run_replay_job(
     } else {
         ReplayJobState::CompletedIncomplete
     };
-    let records = &outcome.result["records"];
     // The result is published only once its completion is on the record.
     let recorded = record_lifecycle(
         &audit,
         &job,
         audit::event::POLICY_REPLAY_COMPLETED,
-        json!({
-            "job_id": job.id,
-            "state": state.as_str(),
-            "complete": outcome.complete,
-            "limitations": outcome.limitations,
-            "result_digest": outcome.digest,
-            "selected_records": job.scope.cutoff.selected,
-            "scanned_records": outcome.scanned,
-            "replayable_records": records["replayable"],
-            "replayed_records": outcome.replayed,
-            "impact": outcome.impact,
-            "duration_ms": duration_millis(started.elapsed()),
-        }),
+        completed_payload(
+            &job.id,
+            state,
+            &outcome,
+            &job.scope,
+            duration_millis(started.elapsed()),
+        ),
     )
     .await;
     if let Err(error) = recorded {
@@ -902,8 +1094,9 @@ pub(super) async fn policy_replay_create_endpoint(
         Ok(rbac_state) => rbac_state,
         Err(response) => return *response,
     };
-    let Some(query_store) = state.query_store.as_ref() else {
-        return policy_evidence_unavailable("policy replay requires an audit query store");
+    let backend = match replay_backend(&state) {
+        Ok(backend) => backend,
+        Err(response) => return response,
     };
     let body_limit = state.max_body_size.min(MAX_POLICY_REPLAY_BODY_BYTES);
     let body_deadline = tokio::time::Instant::now() + POLICY_REPLAY_BODY_DEADLINE;
@@ -945,18 +1138,37 @@ pub(super) async fn policy_replay_create_endpoint(
     // names may still hold this actor's. It reads only the active policy's
     // ETag, to say whether that job's result is still current.
     if let Some(key) = replay.idempotency_key.as_deref() {
-        if let Some(existing) = jobs.find_idempotent(&owner, key) {
-            return if existing.request_digest == replay.digest {
-                let current = base_is_current(&state, rbac_state, &existing).await;
-                job_response(StatusCode::OK, &existing, current)
-            } else {
-                replay_idempotency_conflict()
-            };
+        match backend {
+            ReplayBackend::Standalone(_) => {
+                if let Some(existing) = jobs.find_idempotent(&owner, key) {
+                    return if existing.request_digest == replay.digest {
+                        let current =
+                            base_etag_is_current(&state, rbac_state, &existing.binding.base_etag)
+                                .await;
+                        job_response(StatusCode::OK, &existing, current)
+                    } else {
+                        replay_idempotency_conflict()
+                    };
+                }
+            }
+            #[cfg(feature = "postgres")]
+            ReplayBackend::Cluster(cluster) => {
+                match cluster
+                    .answer_retry(&state, rbac_state, &principal, key, &replay.digest)
+                    .await
+                {
+                    Ok(Some(response)) | Err(response) => return response,
+                    Ok(None) => {}
+                }
+            }
         }
     }
     // Admitted once the body is in hand, so a slot bounds jobs rather than
     // uploads in flight, and one actor holds at most one. A refusal from
-    // here on, before the job is queued, gives the slot back.
+    // here on, before the job is queued, gives the slot back. A cluster job
+    // may run on any replica, so there the slot bounds this replica's
+    // admissions in flight and comes back when the request ends; the
+    // deployment's pending jobs are counted by the job store.
     let Some(slot) = jobs
         .admission
         .try_acquire(policy_evaluation_actor(&principal))
@@ -1001,6 +1213,39 @@ pub(super) async fn policy_replay_create_endpoint(
         }
     };
 
+    let edit_count = match &replay.candidate {
+        CandidateSource::Edits(edits) => edits.len(),
+        _ => 0,
+    };
+    let binding = ReplayJobBinding {
+        base_etag,
+        candidate_source: replay.candidate.as_str(),
+        candidate_etag,
+        edit_count,
+        projections: replay.projections.clone(),
+    };
+    let query_store = match backend {
+        ReplayBackend::Standalone(query_store) => query_store,
+        #[cfg(feature = "postgres")]
+        ReplayBackend::Cluster(cluster) => {
+            let response = cluster
+                .admit(
+                    &state,
+                    &principal,
+                    &parts,
+                    PreparedReplay {
+                        request: replay,
+                        window,
+                        base,
+                        candidate,
+                        binding,
+                    },
+                )
+                .await;
+            drop(slot);
+            return response;
+        }
+    };
     if let Some(refusal) = jobs.precheck(&owner).and_then(admission_refusal) {
         return refusal;
     }
@@ -1020,10 +1265,6 @@ pub(super) async fn policy_replay_create_endpoint(
         tracing::error!("operating-system randomness is unavailable for a replay job id");
         return internal_server_error("policy replay job could not be created");
     };
-    let edit_count = match &replay.candidate {
-        CandidateSource::Edits(edits) => edits.len(),
-        _ => 0,
-    };
     let job = Arc::new(ReplayJob {
         id,
         owner,
@@ -1037,13 +1278,7 @@ pub(super) async fn policy_replay_create_endpoint(
             &parts.extensions,
             &state.client_ip_policy,
         ),
-        binding: ReplayJobBinding {
-            base_etag,
-            candidate_source: replay.candidate.as_str(),
-            candidate_etag,
-            edit_count,
-            projections: replay.projections.clone(),
-        },
+        binding,
         scope: ReplayScope {
             from: window.from,
             to: window.to,
@@ -1106,12 +1341,18 @@ fn admission_refusal(admission: ReplayAdmission) -> Option<Response> {
         ReplayAdmission::Admitted => None,
         ReplayAdmission::Existing(existing) => Some(job_response(StatusCode::OK, &existing, None)),
         ReplayAdmission::IdempotencyConflict => Some(replay_idempotency_conflict()),
-        ReplayAdmission::QuotaExhausted => Some(replay_refusal(
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many policy replay results are held; delete finished jobs or wait for them to expire",
-            "policy_replay_quota_exhausted",
-        )),
+        ReplayAdmission::QuotaExhausted => Some(replay_quota_exhausted()),
     }
+}
+
+/// The principal, or the replica (the deployment, in cluster mode), holds as
+/// many unexpired jobs as it may.
+fn replay_quota_exhausted() -> Response {
+    replay_refusal(
+        StatusCode::TOO_MANY_REQUESTS,
+        "too many policy replay results are held; delete finished jobs or wait for them to expire",
+        "policy_replay_quota_exhausted",
+    )
 }
 
 /// The replay route's admission slot was refused: a job of this actor's is
@@ -1132,17 +1373,18 @@ fn replay_idempotency_conflict() -> Response {
     )
 }
 
-/// Whether the active policy is still the one `job` was pinned to: a result
-/// stays the answer for its pinned policies, but is stale for the live one.
-async fn base_is_current(
+/// Whether the active policy is still the one a job was pinned to, by its
+/// ETag: a result stays the answer for its pinned policies, but is stale for
+/// the live one.
+async fn base_etag_is_current(
     state: &PolicyAdminState,
     rbac_state: &middleware::rbac::RbacState,
-    job: &ReplayJob,
+    base_etag: &str,
 ) -> Option<bool> {
     simulation_base(state, rbac_state)
         .await
         .ok()
-        .map(|(_, etag, _)| etag == job.binding.base_etag)
+        .map(|(_, etag, _)| etag == base_etag)
 }
 
 /// `GET .../policy/replays/{id}`: the caller's job, its progress and, once
@@ -1165,10 +1407,20 @@ pub(super) async fn policy_replay_get_endpoint(
     if !is_policy_replay_job_id(&job_id) {
         return replay_job_not_found();
     }
+    #[cfg(feature = "postgres")]
+    if state.control_plane.is_some() {
+        return match replay_backend(&state) {
+            Ok(ReplayBackend::Cluster(cluster)) => {
+                cluster.read(&state, rbac_state, &principal, &job_id).await
+            }
+            Ok(ReplayBackend::Standalone(_)) => replay_job_not_found(),
+            Err(response) => response,
+        };
+    }
     let Some(job) = jobs.find(&replay_owner(&principal), &job_id) else {
         return replay_job_not_found();
     };
-    let current = base_is_current(&state, rbac_state, &job).await;
+    let current = base_etag_is_current(&state, rbac_state, &job.binding.base_etag).await;
     job_response(StatusCode::OK, &job, current)
 }
 
@@ -1191,6 +1443,16 @@ pub(super) async fn policy_replay_delete_endpoint(
     }
     if !is_policy_replay_job_id(&job_id) {
         return replay_job_not_found();
+    }
+    #[cfg(feature = "postgres")]
+    if state.control_plane.is_some() {
+        return match replay_backend(&state) {
+            Ok(ReplayBackend::Cluster(cluster)) => {
+                cluster.cancel(&state, &principal, &job_id).await
+            }
+            Ok(ReplayBackend::Standalone(_)) => replay_job_not_found(),
+            Err(response) => response,
+        };
     }
     let Some(job) = jobs.find(&replay_owner(&principal), &job_id) else {
         return replay_job_not_found();

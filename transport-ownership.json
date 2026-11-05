@@ -7066,6 +7066,16 @@
       "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
     },
     {
+      "file": "gateway/src/audit/event.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::audit::event::POLICY_REPLAY_INTERRUPTED#1",
+      "sha256": "b4a586094188f2d52f5671213fa11bd6c55ca0fdd4d6f7c4562991865a583355",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "Narrow cfg_attr(not(feature = \"postgres\"), allow(dead_code)) on the policy.replay_interrupted event name, which only cluster replay jobs record. An audit vocabulary entry; dead-code gating only, no transport or process capability."
+    },
+    {
       "file": "gateway/src/admin_policy_test_runs.rs",
       "reasons": [
         "capability-import-or-glob"
@@ -7104,6 +7114,76 @@
       "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/admin_policy_replays_cluster.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::admin_policy_replays::cluster::use super :: *#1",
+      "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "Glob import of the parent admin_policy_replays module (and through it the application composition root) for the cluster replay job routes and worker, the same boundary the sibling admin modules use; it brings in no transport, socket or process capability of its own."
+    },
+    {
+      "file": "gateway/src/admin_policy_replays_cluster.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::admin_policy_replays::cluster::ClusterPolicyReplays#1",
+      "sha256": "cb5b7eaae2b966e54f312e26e4f62ff471d5c098cf639f831a02efbcaf7469d8",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "Holds the deployment's shared PostgreSQL pool and database settings for the cluster replay job store and the audit stream reader; no connection constructor, socket or caller-selected authority."
+    },
+    {
+      "file": "gateway/src/admin_policy_replays_cluster.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::admin_policy_replays::cluster::impl  ClusterPolicyReplays::new#1",
+      "sha256": "41fccd90c14d00e2cae68c160c107c911d72f5e29aa436d674c119c3652da287",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "Builds the cluster replay job store over the deployment's existing shared PostgreSQL pool; no connection constructor, socket or caller-selected authority."
+    },
+    {
+      "file": "gateway/src/admin_policy_replays_cluster.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::admin_policy_replays::cluster::impl  ClusterPolicyReplays::with_store#1",
+      "sha256": "79587302fb31988c044bdd002933f531f0dc43b3b6dd4afafc3fbe7c9518d8b4",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "Keeps the existing shared PostgreSQL pool beside the replay job store so the audit stream reader can be built per run; no connection constructor, socket or caller-selected authority."
+    },
+    {
+      "file": "gateway/src/admin_policy_replays_cluster.rs",
+      "reasons": [
+        "capability-in-macro-input"
+      ],
+      "scope": "gateway::admin_policy_replays::cluster::impl  ClusterPolicyReplays::work#1",
+      "sha256": "a2200ae041829f66d7da1615908dd6264fe88ad3ff1fb35f6deffb688f7070a8",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "tokio::select! in the replay worker's idle wait: shutdown, a local admission's wake-up, or the poll timer. Local task coordination only; no network, socket or process capability."
+    },
+    {
+      "file": "gateway/src/admin_policy_replays.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::admin_policy_replays::ReplayJobState#1",
+      "sha256": "25fdca6b32d077304ade6ca860ce9d5a17cb272eed18eee89f13acb6ceb23ba1",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "Narrow cfg_attr(not(feature = \"postgres\"), allow(dead_code)) on the interrupted job state, which only cluster replay jobs reach. Dead-code gating only; no transport or process capability."
+    },
+    {
+      "file": "gateway/src/admin_policy_replays.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::admin_policy_replays::ReplayJobEvidenceRefusal#1",
+      "sha256": "020aad7f73cd33d64b93c493e35538798a3661d6b587464840f9b985a08de036",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "Narrow cfg_attr(not(feature = \"postgres\"), allow(dead_code)) on the evidence refusal for an unreadable cluster replay job store. Dead-code gating only; no transport or process capability."
     },
     {
       "file": "gateway/src/admin_policy_evidence.rs",
@@ -12042,16 +12122,6 @@
     {
       "file": "gateway/src/storage/postgres.rs",
       "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::storage::postgres::CheckoutClass#1",
-      "sha256": "532b97bf248ee8a1a4904beaee15d0689000aa766a5bdc1b2d23c7693568a469",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) on the PolicyReplay checkout-class variant, which only the cluster replay reader constructs until cluster replay routes run jobs (#243). A metric label vocabulary entry; dead-code gating only, no transport or process capability."
-    },
-    {
-      "file": "gateway/src/storage/postgres.rs",
-      "reasons": [
         "unexpanded-macro"
       ],
       "scope": "gateway::storage::postgres::record_pool_acquire#1",
@@ -12360,16 +12430,6 @@
       "sha256": "a3ae50a4c225309e969e2992b81a42ffc30aa9b18ade0e67684a1f44b7243573",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
-    },
-    {
-      "file": "gateway/src/storage/postgres_audit_replay.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::storage::postgres_audit_replay::file_attributes#1",
-      "sha256": "d1ee2ab112c8deac63271147fa247f89152e1c59017006284f9afdaec760ff93",
-      "owner": "policy replay contexts (#243)",
-      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the cluster audit stream replay reader: cluster replay routes answer 503 until jobs run under #241's durable leases, so only tests call it. Dead-code gating only; the module reads the audit tables through the shared pool and adds no transport or process capability."
     },
     {
       "file": "gateway/src/storage/postgres_audit_replay.rs",
@@ -13551,6 +13611,96 @@
       "sha256": "b9618bf4127da4a3c48146f04769b3bf1026ac7481910dafc4f502dbfdacaf3b",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_policy_replays.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::storage::postgres_policy_replays::use tokio_postgres :: Row#1",
+      "sha256": "94c30df958d8d1ce64631e157a5f68d87dd645fc38b9694e548a6b7ab5c3521f",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "Imports the PostgreSQL driver's row type to decode replay job rows read through the shared pool; no connection constructor, socket or caller-selected authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_policy_replays.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_policy_replays::PostgresPolicyReplayStore#1",
+      "sha256": "c594c6951c2f6ea015b7ef1483d57846183cb3aa105541e67e27923d335d83d3",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "PostgreSQL repository operations for cluster policy replay jobs through the shared infrastructure pool, under the policy_replay checkout class; no caller-selected HTTP authority and no new network or process capability."
+    },
+    {
+      "file": "gateway/src/storage/postgres_policy_replays.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_policy_replays::impl  PostgresPolicyReplayStore::new#1",
+      "sha256": "3614e7c9abc4c6483bd0be66790c6b48ceb977cbc2f83bb50f132c519af9cb1e",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "PostgreSQL repository operations for cluster policy replay jobs through the shared infrastructure pool, under the policy_replay checkout class; no caller-selected HTTP authority and no new network or process capability."
+    },
+    {
+      "file": "gateway/src/storage/postgres_policy_replays.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_policy_replays::impl  PostgresPolicyReplayStore::refusal#1",
+      "sha256": "f38bbfe1ef33c9b8f4412e728afeeeaa08a6658967383ab19dc8eb8efb817531",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "PostgreSQL repository operations for cluster policy replay jobs through the shared infrastructure pool, under the policy_replay checkout class; no caller-selected HTTP authority and no new network or process capability."
+    },
+    {
+      "file": "gateway/src/storage/postgres_policy_replays.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_policy_replays::prune_with#1",
+      "sha256": "161ac09bf146318f9db44511a65e1aa4b8e976abee3529e700b9129b50bf1541",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "PostgreSQL repository operations for cluster policy replay jobs through the shared infrastructure pool, under the policy_replay checkout class; no caller-selected HTTP authority and no new network or process capability."
+    },
+    {
+      "file": "gateway/src/storage/postgres_policy_replays.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_policy_replays::lease_status#1",
+      "sha256": "ab743f47899d83ee3536e5df3114fe621792651bf46d8523260e8adfccc0d54f",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "PostgreSQL repository operations for cluster policy replay jobs through the shared infrastructure pool, under the policy_replay checkout class; no caller-selected HTTP authority and no new network or process capability."
+    },
+    {
+      "file": "gateway/src/storage/postgres_policy_replays.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_policy_replays::record_from_row#1",
+      "sha256": "2adf70890b92b2cd3a43dd7161c8d13348eeb22abad73a53656a2dcdd77864e4",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "PostgreSQL repository operations for cluster policy replay jobs through the shared infrastructure pool, under the policy_replay checkout class; no caller-selected HTTP authority and no new network or process capability."
+    },
+    {
+      "file": "gateway/src/storage/postgres_policy_replays.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_policy_replays::column#1",
+      "sha256": "d6746ed1403271704187641e982eff6a1a2d55cebb35f2a40c3c03609ea3c448",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "PostgreSQL repository operations for cluster policy replay jobs through the shared infrastructure pool, under the policy_replay checkout class; no caller-selected HTTP authority and no new network or process capability."
+    },
+    {
+      "file": "gateway/src/storage/postgres_policy_replays.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_policy_replays::classify#1",
+      "sha256": "1682e99e0827031e77a705d0b8b98340d13d0bf12392b3db0d18e31018d91e33",
+      "owner": "policy replay contexts (#243)",
+      "purpose": "PostgreSQL repository operations for cluster policy replay jobs through the shared infrastructure pool, under the policy_replay checkout class; no caller-selected HTTP authority and no new network or process capability."
     },
     {
       "file": "gateway/src/storage/postgres_rate_limits.rs",

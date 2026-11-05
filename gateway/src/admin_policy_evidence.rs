@@ -219,31 +219,39 @@ async fn read_history(
 /// candidate must be the published document. Its base need not be the
 /// predecessor -- a job run after publication compares the published policy
 /// with itself -- but the report says whether it was.
-fn bound_replay_job(
+async fn bound_replay_job(
+    state: &PolicyAdminState,
     jobs: &PolicyReplayJobs,
     principal: &auth::Principal,
     job_id: &str,
     publication_etag: &str,
     predecessor_etag: Option<&str>,
 ) -> ResponseResult<ReplayEvidence> {
-    let job = jobs.evidence(principal, job_id).map_err(|refusal| {
-        Box::new(match refusal {
-            ReplayJobEvidenceRefusal::NotFound => evidence_refusal(
-                StatusCode::NOT_FOUND,
-                "policy replay job was not found",
-                "policy_evidence_replay_job_not_found",
-            ),
-            ReplayJobEvidenceRefusal::Unfinished(state) => (
-                StatusCode::CONFLICT,
-                Json(json!({
-                    "error": "the replay job holds no result to include",
-                    "reason": "policy_evidence_replay_job_unfinished",
-                    "state": state,
-                })),
-            )
-                .into_response(),
-        })
-    })?;
+    let job = replay_job_evidence(state, jobs, principal, job_id)
+        .await
+        .map_err(|refusal| {
+            Box::new(match refusal {
+                ReplayJobEvidenceRefusal::NotFound => evidence_refusal(
+                    StatusCode::NOT_FOUND,
+                    "policy replay job was not found",
+                    "policy_evidence_replay_job_not_found",
+                ),
+                ReplayJobEvidenceRefusal::Unavailable => evidence_refusal(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "the policy replay job store is unavailable; retry later",
+                    "policy_replay_store_unavailable",
+                ),
+                ReplayJobEvidenceRefusal::Unfinished(state) => (
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "error": "the replay job holds no result to include",
+                        "reason": "policy_evidence_replay_job_unfinished",
+                        "state": state,
+                    })),
+                )
+                    .into_response(),
+            })
+        })?;
     // A job's result describes the candidate it replayed. Anything but the
     // published document would be evidence about some other policy.
     if job.candidate_etag != publication_etag {
@@ -459,15 +467,6 @@ pub(super) async fn policy_evidence_endpoint(
             return admin_permission_denied_response(permission.to_owned());
         }
     }
-    // Replay jobs exist only in standalone mode; a cluster has none to bind.
-    #[cfg(feature = "postgres")]
-    if evidence_request.replay_job_id.is_some() && state.control_plane.is_some() {
-        return evidence_refusal(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "historical policy replay is not available in cluster mode",
-            "policy_evidence_replay_unsupported_in_cluster",
-        );
-    }
     let Some(history) = state.history_store.as_ref() else {
         return policy_history_not_configured();
     };
@@ -510,12 +509,15 @@ pub(super) async fn policy_evidence_endpoint(
                 .as_ref()
                 .map(|predecessor| predecessor.policy.etag.as_str());
             match bound_replay_job(
+                &state,
                 &replay_jobs,
                 &principal,
                 job_id,
                 &publication_identity.etag,
                 predecessor_etag,
-            ) {
+            )
+            .await
+            {
                 Ok(replay) => Some(replay),
                 Err(response) => return *response,
             }

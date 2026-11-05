@@ -77,6 +77,8 @@ pub mod postgres_policy;
 #[cfg(feature = "postgres")]
 pub mod postgres_policy_drafts;
 #[cfg(feature = "postgres")]
+pub(crate) mod postgres_policy_replays;
+#[cfg(feature = "postgres")]
 pub mod postgres_rate_limits;
 #[cfg(feature = "postgres")]
 pub mod postgres_service_tokens;

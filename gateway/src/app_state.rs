@@ -510,6 +510,11 @@ pub(super) struct PolicyAdminState {
     /// refuses every gated write.
     #[cfg(feature = "postgres")]
     pub(super) membership: Option<Arc<cluster_membership::ClusterMembership>>,
+    /// Cluster mode's durable replay jobs (issue #243): migration 27's job
+    /// table and the audit stream they read. Present in cluster mode; a
+    /// cluster without it answers every replay route `503`.
+    #[cfg(feature = "postgres")]
+    pub(super) replay_cluster: Option<Arc<ClusterPolicyReplays>>,
     pub(super) event_store: Option<Arc<dyn storage::AuditEventStore>>,
     pub(super) query_store: Option<Arc<storage::SqliteAuditEventStore>>,
     /// Asked before every policy mutation (issue #425, PR 4): standalone
