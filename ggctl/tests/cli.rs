@@ -855,3 +855,339 @@ fn init_writes_a_bundle_that_validates_strictly_and_converts_to_itself() {
     assert_eq!(output.status.code(), Some(3));
     assert!(text(&output.stderr).contains("convert.unsupported_version"));
 }
+
+/// A standalone state directory under the system temporary directory,
+/// removed on drop.
+struct StateDir(std::path::PathBuf);
+
+impl Drop for StateDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+impl StateDir {
+    fn new() -> Self {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "ggctl-cli-state-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("the state directory should create");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+                .expect("permissions should set");
+        }
+        Self(root)
+    }
+
+    fn path(&self) -> &str {
+        self.0
+            .to_str()
+            .expect("the temporary directory should be UTF-8")
+    }
+
+    fn revisions(&self) -> u64 {
+        let held = gateway_config::state_dir::StateDirectory::acquire(&self.0)
+            .expect("the state directory locks");
+        gateway_config::ledger::RevisionLedger::inspect(&held)
+            .expect("the ledger verifies")
+            .revisions
+    }
+}
+
+/// A role name that must never reach the output.
+const ROLE_CANARY: &str = "zqcanaryrole";
+
+/// A deny-by-default policy granting each of `roles` one permission.
+fn roles_policy(roles: &[&str]) -> String {
+    let roles: Vec<String> = roles
+        .iter()
+        .map(|role| format!("\"{role}\": {{\"permissions\": [\"admin:policy:read\"]}}"))
+        .collect();
+    format!(
+        "{{\"schema_version\": \"0.1.0\", \"default_action\": \"deny\", \"roles\": {{{}}}}}\n",
+        roles.join(", ")
+    )
+}
+
+/// Starts `ggctl` without waiting for it.
+fn spawn(arguments: &[&str]) -> std::process::Child {
+    Command::new(env!("CARGO_BIN_EXE_ggctl"))
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("ggctl should start")
+}
+
+/// Appends a revision `bundle` as a gateway applying it online would, by a
+/// principal whose subject is the canary.
+fn apply_online(state: &StateDir, bundle: &Bundle) -> String {
+    use gateway_config::ledger::{
+        ActivationClass, AuthMode, LedgerActor, Operation, Proposal, RevisionCodes, RevisionLedger,
+    };
+    let held = gateway_config::state_dir::StateDirectory::acquire(&state.0)
+        .expect("the state directory locks");
+    let mut ledger = RevisionLedger::open(&held).expect("the ledger opens");
+    let read = gateway_config::bundle::read_bundle(
+        &bundle.0,
+        gateway_config::bundle::ReadOptions { strict: true },
+        &gateway_config::bundle::PublishedSchemasOnly,
+    );
+    let candidate = read.bundle.expect("the bundle reads");
+    let head = ledger.state().expect("state").desired.revision;
+    let actor = LedgerActor::principal(CANARY, Some("provider:corp"), AuthMode::BearerToken)
+        .expect("recordable");
+    ledger
+        .append(
+            &head,
+            Proposal {
+                bundle: &candidate,
+                actor,
+                operation: Operation::Apply,
+                activation: ActivationClass::Live,
+                codes: RevisionCodes::none(),
+                request: None,
+                recorded_at: std::time::SystemTime::now(),
+            },
+        )
+        .expect("the revision appends")
+        .revision
+        .as_str()
+        .to_owned()
+}
+
+#[test]
+fn the_ledger_commands_seed_verify_and_roll_back_offline_without_echoing_anything() {
+    let wide = Bundle::new(&roles_policy(&["auditor", ROLE_CANARY]));
+    let state = StateDir::new();
+    let output = ggctl(
+        &[
+            "ledger",
+            "seed",
+            wide.path(),
+            "--state-dir",
+            state.path(),
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stdout));
+    let seeded = report(&output);
+    assert_eq!(seeded["command"], "ledger seed");
+    assert_eq!(seeded["result"]["seeded"], true);
+    assert!(output.stderr.is_empty());
+    let seed = seeded["result"]["ledger"]["desired"]["revision"]
+        .as_str()
+        .expect("the seed's ID")
+        .to_owned();
+    assert_no_canary(&output);
+    assert!(!text(&output.stdout).contains(ROLE_CANARY));
+    assert_path_not_echoed(&output, wide.path());
+    assert_path_not_echoed(&output, state.path());
+
+    // Seeding again, or over a leftover journal, is refused.
+    let output = ggctl(
+        &["ledger", "seed", wide.path(), "--state-dir", state.path()],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(5));
+    assert!(text(&output.stderr).contains("ggctl: error: ledger.exists: "));
+    let leftover = StateDir::new();
+    std::fs::write(leftover.0.join("config-ledger.sqlite3-journal"), b"journal")
+        .expect("the leftover should write");
+    let output = ggctl(
+        &[
+            "ledger",
+            "seed",
+            wide.path(),
+            "--state-dir",
+            leftover.path(),
+        ],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(5));
+    assert!(text(&output.stderr).contains("ggctl: error: ledger.exists: "));
+    assert!(!leftover.0.join("config-ledger.sqlite3").exists());
+
+    let narrow = Bundle::new(&roles_policy(&["auditor"]));
+    let second = apply_online(&state, &narrow);
+
+    // The rollback restores a role: nothing is written until its risk code
+    // is named.
+    let output = ggctl(
+        &[
+            "ledger",
+            "rollback",
+            &seed,
+            "--state-dir",
+            state.path(),
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(3));
+    let refused = report(&output);
+    assert_eq!(
+        refused["result"]["plan"]["unacknowledged"],
+        json!(["risk.policy_broadened"])
+    );
+    assert_eq!(state.revisions(), 2);
+    let output = ggctl(
+        &[
+            "ledger",
+            "rollback",
+            &seed,
+            "--state-dir",
+            state.path(),
+            "--acknowledge",
+            "risk.policy_broadened",
+        ],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert!(text(&output.stdout)
+        .starts_with(&format!("rollback of {second} to the content of {seed}:\n")));
+    assert!(text(&output.stderr).contains("ggctl: info: ledger.gateway_recompiles_at_start: "));
+    assert_no_canary(&output);
+    assert!(!text(&output.stdout).contains(ROLE_CANARY));
+    assert_path_not_echoed(&output, state.path());
+
+    let output = ggctl(
+        &[
+            "ledger",
+            "verify",
+            "--state-dir",
+            state.path(),
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let verified = report(&output);
+    let desired = &verified["result"]["ledger"]["desired"];
+    assert_eq!(verified["result"]["ledger"]["revisions"], 3);
+    assert_eq!(desired["operation"], "rollback");
+    assert_eq!(desired["rollbackOf"], seed.as_str());
+    assert_eq!(desired["actorKind"], "system");
+    assert_eq!(desired["appliedOnline"], false);
+    assert_no_canary(&output);
+
+    // An edit outside the gateway is caught, and its class reported.
+    let ledger = state.0.join("config-ledger.sqlite3");
+    for suffix in ["-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", ledger.display()));
+    }
+    let mut bytes = std::fs::read(&ledger).expect("the ledger");
+    let found: Vec<usize> = bytes
+        .windows(ROLE_CANARY.len())
+        .enumerate()
+        .filter(|(_, window)| *window == ROLE_CANARY.as_bytes())
+        .map(|(index, _)| index)
+        .collect();
+    // The role is in the seed's policy, which the rollback shares: one
+    // stored document. Changing it breaks its pin.
+    assert_eq!(found.len(), 1, "the role's copies in the ledger");
+    bytes[found[0]] = b'Z';
+    std::fs::write(&ledger, &bytes).expect("the edit should write");
+    let output = ggctl(
+        &[
+            "ledger",
+            "verify",
+            "--state-dir",
+            state.path(),
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(3));
+    let corrupt = report(&output);
+    assert_eq!(
+        corrupt["result"],
+        json!({"verified": false, "corruption": "document"})
+    );
+    assert_eq!(corrupt["diagnostics"][0]["code"], "ledger.corrupt");
+    assert_eq!(std::fs::read(&ledger).expect("the ledger"), bytes);
+}
+
+#[test]
+fn a_held_state_directory_exits_5_and_two_ggctl_processes_have_one_winner() {
+    let bundle = Bundle::new(&roles_policy(&["auditor"]));
+    let state = StateDir::new();
+    let held = gateway_config::state_dir::StateDirectory::acquire(&state.0)
+        .expect("the test holds the lock");
+    for arguments in [
+        &["ledger", "seed", bundle.path(), "--state-dir", state.path()][..],
+        &["ledger", "verify", "--state-dir", state.path()],
+    ] {
+        let output = ggctl(arguments, None);
+        assert_eq!(output.status.code(), Some(5), "{arguments:?}");
+        assert!(text(&output.stderr).contains("ggctl: error: state_dir.locked: "));
+    }
+    assert!(!state.0.join("config-ledger.sqlite3").exists());
+    drop(held);
+
+    // Two seeds at once: exactly one creates the ledger. The other finds the
+    // directory locked or, if it came second, the ledger there; both exit 5.
+    let children: Vec<_> = (0..2)
+        .map(|_| spawn(&["ledger", "seed", bundle.path(), "--state-dir", state.path()]))
+        .collect();
+    let mut exits: Vec<_> = children
+        .into_iter()
+        .map(|child| child.wait_with_output().expect("ggctl should finish"))
+        .map(|output| output.status.code())
+        .collect();
+    exits.sort();
+    assert_eq!(exits, [Some(0), Some(5)]);
+    assert_eq!(state.revisions(), 1);
+
+    // Two rollbacks at once: exactly one appends a revision.
+    let output = ggctl(
+        &[
+            "ledger",
+            "verify",
+            "--state-dir",
+            state.path(),
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    let seed = report(&output)["result"]["ledger"]["desired"]["revision"]
+        .as_str()
+        .expect("the seed's ID")
+        .to_owned();
+    apply_online(
+        &state,
+        &Bundle::new(&roles_policy(&["auditor", "operator"])),
+    );
+    let children: Vec<_> = (0..2)
+        .map(|_| spawn(&["ledger", "rollback", &seed, "--state-dir", state.path()]))
+        .collect();
+    let outcomes: Vec<_> = children
+        .into_iter()
+        .map(|child| child.wait_with_output().expect("ggctl should finish"))
+        .map(|output| (output.status.code(), text(&output.stderr)))
+        .collect();
+    let winners = outcomes.iter().filter(|(code, _)| *code == Some(0)).count();
+    assert_eq!(winners, 1, "{outcomes:?}");
+    // The loser found the lock held, or the rollback already made.
+    assert!(
+        outcomes.iter().any(|(code, stderr)| {
+            (*code == Some(5) && stderr.contains("state_dir.locked"))
+                || (*code == Some(3) && stderr.contains("ledger.no_change"))
+        }),
+        "{outcomes:?}"
+    );
+    assert_eq!(state.revisions(), 3);
+}

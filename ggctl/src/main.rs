@@ -6,9 +6,10 @@
 //! `diff`), the stable exit codes, shell completion, secure bearer-token
 //! input, the version handshake with a running gateway, offline bundle
 //! validation, pinning, diagnosis and semantic diff with the gateway's own
-//! bundle reader and diff engine, and the same offline validation, diagnosis
-//! and diff of an environment file with the gateway's own configuration
-//! compiler (`gateway-config`).
+//! bundle reader and diff engine, the same offline validation, diagnosis and
+//! diff of an environment file with the gateway's own configuration compiler
+//! (`gateway-config`), and the offline commands over a standalone revision
+//! ledger (`ggctl ledger`).
 //!
 //! `ggctl` reads no configuration file of its own and no environment
 //! variable, reads only the files its arguments name, never accepts a secret
@@ -25,6 +26,7 @@ mod doctor;
 mod env;
 mod help;
 mod init;
+mod ledger;
 mod output;
 mod pin;
 mod remote;

@@ -15,7 +15,7 @@
       "const": "GgctlReport"
     },
     "command": {
-      "enum": ["version", "schema", "init", "validate", "pin", "convert", "doctor", "diff"]
+      "enum": ["version", "schema", "init", "validate", "pin", "convert", "doctor", "diff", "ledger seed", "ledger verify", "ledger rollback"]
     },
     "exitCode": {
       "type": "integer",
@@ -99,6 +99,30 @@
       "then": {
         "properties": {"result": {"$ref": "#/$defs/diffCommandResult"}}
       }
+    },
+    {
+      "if": {
+        "properties": {"command": {"const": "ledger seed"}}
+      },
+      "then": {
+        "properties": {"result": {"$ref": "#/$defs/ledgerSeedResult"}}
+      }
+    },
+    {
+      "if": {
+        "properties": {"command": {"const": "ledger verify"}}
+      },
+      "then": {
+        "properties": {"result": {"$ref": "#/$defs/ledgerVerifyResult"}}
+      }
+    },
+    {
+      "if": {
+        "properties": {"command": {"const": "ledger rollback"}}
+      },
+      "then": {
+        "properties": {"result": {"$ref": "#/$defs/ledgerRollbackResult"}}
+      }
     }
   ],
   "$defs": {
@@ -110,7 +134,7 @@
         "code": {
           "description": "The stable family.reason code. docs/ggctl.md lists every ggctl code by family, and docs/configuration-bundles.md every bundle reader code.",
           "type": "string",
-          "pattern": "^(usage|credential|trust|remote|compat|schema|validate|doctor|diff|env|config|init|convert|pin|output|internal|bundle|syntax|json|yaml|reference|secret|resource|profile)\\.[a-z][a-z0-9_]*$"
+          "pattern": "^(usage|credential|trust|remote|compat|schema|validate|doctor|diff|env|config|init|convert|pin|state_dir|ledger|output|internal|bundle|syntax|json|yaml|reference|secret|resource|profile)\\.[a-z][a-z0-9_]*$"
         },
         "severity": {
           "enum": ["error", "warning", "info"]
@@ -126,7 +150,7 @@
         "remediation": {
           "description": "A repository documentation anchor.",
           "type": "string",
-          "pattern": "^docs/(ggctl\\.md#[a-z]+-diagnostics|configuration-bundles\\.md#diagnostics)$"
+          "pattern": "^docs/(ggctl\\.md#[a-z_]+-diagnostics|configuration-bundles\\.md#diagnostics)$"
         },
         "location": {
           "oneOf": [
@@ -590,6 +614,202 @@
           "description": "The changes from the base to the candidate, present when valid.",
           "$ref": "#/$defs/diffResult"
         }
+      }
+    },
+    "ledgerSeedResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["valid", "seeded"],
+      "properties": {
+        "valid": {
+          "description": "The bundle reader accepted BUNDLE strictly: an entry the manifest does not reference is an error. The gateway's production policy and tools validators are not part of ggctl and did not run.",
+          "type": "boolean"
+        },
+        "seeded": {
+          "description": "The state directory's new ledger holds the bundle as its first revision, desired and not active.",
+          "type": "boolean"
+        },
+        "bundle": {
+          "description": "BUNDLE, once its manifest was read.",
+          "$ref": "#/$defs/bundle"
+        },
+        "corruption": {"$ref": "#/$defs/ledgerCorruption"},
+        "ledger": {
+          "description": "The new ledger's pointer, once seeded.",
+          "$ref": "#/$defs/ledgerPointer"
+        }
+      }
+    },
+    "ledgerVerifyResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verified"],
+      "properties": {
+        "verified": {
+          "description": "Every check of the ledger passed, read-only: location and permissions, page structure, schema, every record and its hash, the chain, every document and the pointer.",
+          "type": "boolean"
+        },
+        "corruption": {"$ref": "#/$defs/ledgerCorruption"},
+        "ledger": {
+          "description": "The ledger's pointer, when verified.",
+          "$ref": "#/$defs/ledgerPointer"
+        }
+      }
+    },
+    "ledgerRollbackResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rolledBack"],
+      "properties": {
+        "rolledBack": {
+          "description": "A new forward revision restores the target's content. The gateway's production policy and tools validators are not part of ggctl and did not run.",
+          "type": "boolean"
+        },
+        "corruption": {"$ref": "#/$defs/ledgerCorruption"},
+        "plan": {
+          "description": "The rollback as the revision service planned it, once planned.",
+          "$ref": "#/$defs/ledgerRollbackPlan"
+        },
+        "revision": {
+          "description": "The revision appended, once rolled back.",
+          "$ref": "#/$defs/ledgerRevision"
+        },
+        "ledger": {
+          "description": "The ledger's pointer, once rolled back.",
+          "$ref": "#/$defs/ledgerPointer"
+        }
+      }
+    },
+    "ledgerCorruption": {
+      "description": "Present when the ledger failed verification: the class of what was found (docs/configuration-ledger.md#verification).",
+      "enum": ["integrity", "format", "schema", "record", "record_hash", "chain", "document", "pointer", "request"]
+    },
+    "revisionId": {
+      "type": "string",
+      "pattern": "^rev-[0-9a-f]{32}$"
+    },
+    "ledgerPointer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["revisions", "desired", "active", "restartPending"],
+      "properties": {
+        "revisions": {
+          "description": "How many revisions the ledger holds.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "desired": {
+          "description": "The newest revision, which is always the desired one.",
+          "$ref": "#/$defs/ledgerRevision"
+        },
+        "active": {
+          "description": "The revision a gateway last compiled and activated; null until one has.",
+          "oneOf": [{"$ref": "#/$defs/revisionId"}, {"type": "null"}]
+        },
+        "restartPending": {
+          "description": "The desired revision is not the active one: a gateway starting from the ledger activates it.",
+          "type": "boolean"
+        }
+      }
+    },
+    "ledgerRevision": {
+      "description": "One revision as the ledger records it, without its actor's identity or any document content.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["revision", "sequence", "recordHash", "operation", "actorKind", "activation", "recordedAtMs", "appliedOnline", "changedSections", "riskCodes", "bundle"],
+      "properties": {
+        "revision": {"$ref": "#/$defs/revisionId"},
+        "sequence": {"type": "integer", "minimum": 1},
+        "recordHash": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "operation": {"enum": ["seed", "apply", "rollback"]},
+        "rollbackOf": {
+          "description": "For a rollback, the revision whose content it restores.",
+          "$ref": "#/$defs/revisionId"
+        },
+        "actorKind": {"enum": ["principal", "service_token", "system"]},
+        "activation": {
+          "description": "When the revision takes effect. A seed and an offline rollback are restart: no gateway is running to activate them.",
+          "enum": ["live", "restart"]
+        },
+        "recordedAtMs": {
+          "description": "Milliseconds since the Unix epoch, as the writer stamped it.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "appliedOnline": {
+          "description": "The revision records the online request it was applied under; false for a seed and for an offline command's revision.",
+          "type": "boolean"
+        },
+        "changedSections": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/configSection"}
+        },
+        "riskCodes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/riskCode"}
+        },
+        "bundle": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["apiVersion", "name", "profile", "sourceDigest"],
+          "properties": {
+            "apiVersion": {"const": "greengateway.dev/v1alpha1"},
+            "name": {"type": "string"},
+            "profile": {"enum": ["production", "migration", "development"]},
+            "sourceDigest": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            }
+          }
+        }
+      }
+    },
+    "ledgerRollbackPlan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["base", "target", "riskCodes", "unacknowledged", "changedSections", "requiredPermissions", "activation", "diff"],
+      "properties": {
+        "base": {
+          "description": "The desired revision the rollback was planned against.",
+          "$ref": "#/$defs/revisionId"
+        },
+        "target": {
+          "description": "REVISION, as the ledger holds it.",
+          "$ref": "#/$defs/revisionId"
+        },
+        "riskCodes": {
+          "description": "The change's risk codes, sorted: each must be named with --acknowledge. Every code is acknowledgeable offline, risk.admin_access_path_removed included.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/riskCode"}
+        },
+        "unacknowledged": {
+          "description": "The risk codes --acknowledge did not name.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/riskCode"}
+        },
+        "changedSections": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/configSection"}
+        },
+        "requiredPermissions": {
+          "description": "The union of permissions the change would need online. An offline command checks none: filesystem access to the state directory is already full control of the deployment.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^admin:[a-z:]+$"}
+        },
+        "activation": {
+          "description": "How the change would take effect online; null when it changes nothing. The revision an offline rollback appends is restart-class whatever this is.",
+          "oneOf": [{"enum": ["live", "restart"]}, {"type": "null"}]
+        },
+        "diff": {"$ref": "#/$defs/diffResult"}
       }
     },
     "diffResult": {
