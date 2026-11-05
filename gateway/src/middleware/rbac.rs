@@ -642,6 +642,24 @@ impl RbacState {
         self
     }
 
+    /// The static egress lane the egress client decides every destination
+    /// by, when policy resources are attached: the instance itself, for a
+    /// synthetic egress case that must be judged as the client would judge
+    /// it. Nothing is resolved or connected by holding it.
+    pub(crate) fn static_egress_policy(
+        &self,
+    ) -> Option<Arc<crate::policy_eval::egress::CompiledEgressPolicy>> {
+        self.policy_resources
+            .as_deref()
+            .map(|sources| Arc::clone(&sources.egress))
+    }
+
+    /// The configured limits of the global rate lanes, when the rate stage is
+    /// attached: configuration, read without touching a bucket.
+    pub(crate) fn global_rate_lanes(&self) -> Option<super::rate_limit::GlobalRateLanes> {
+        self.rate_limit.as_ref().map(RateLimitState::global_lanes)
+    }
+
     /// What the policy resources say now, read once, for one validation.
     pub(crate) fn policy_resource_view(&self) -> crate::rbac::policy_resources::PolicyResourceView {
         let security_revision = self.cluster_security_revision();

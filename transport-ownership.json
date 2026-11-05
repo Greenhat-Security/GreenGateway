@@ -10738,26 +10738,6 @@
       "reasons": [
         "unexpanded-attribute"
       ],
-      "scope": "gateway::middleware::rate_limit::RateLimitState#1",
-      "sha256": "cf85bf6902b7579b8990bad07c7e47fb01d70d86726c5712acb467c15a7cdf22",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
-    },
-    {
-      "file": "gateway/src/middleware/rate_limit.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::middleware::rate_limit::LaneLimit#1",
-      "sha256": "3b1491b0b3151ff33ccf2ee6c3a11b56d7aa21b0290d5bf39e07d3886f6a43c0",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
-    },
-    {
-      "file": "gateway/src/middleware/rate_limit.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
       "scope": "gateway::middleware::rate_limit::PolicyMatch#1",
       "sha256": "9bf9b847a71d294575cfd36a034e4d6318e6acadec763449eda2ae6bb0258302",
       "owner": "GreenGateway maintainers",
@@ -10769,9 +10749,29 @@
         "unexpanded-macro"
       ],
       "scope": "gateway::middleware::rate_limit::impl  RateLimiter::check_at#1",
-      "sha256": "d20f2c5c52678e735e180f60ef905ac4797210e1f95cae76155a81c862c34260",
+      "sha256": "db64e28ea5f441bd42bc3b6206c25ef15e6a20e4038cb91ae4f35313b2d8c755",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway/src/policy_testing/suite.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::policy_testing::suite::EgressCase#1",
+      "sha256": "8ee40b0dbb1284044e79dd994e442b15a3b773473b20162af3818fa80194032d",
+      "owner": "policy simulation and tests egress cases (#243)",
+      "purpose": "Hold a synthetic egress case's explicitly hypothetical resolution answers as the SocketAddr value type the pure static egress lane decides over. A value type only: the case parser and the synthetic runner resolve no name, open no socket and build no client; nothing here can reach the network."
+    },
+    {
+      "file": "gateway/src/policy_testing/suite.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::policy_testing::suite::parse_resolution#1",
+      "sha256": "a04604a95889edf53fb814da4352550c99816c3a2f01149eea792593eece83f3",
+      "owner": "policy simulation and tests egress cases (#243)",
+      "purpose": "Parse a synthetic egress case's hypothetical address list with SocketAddr's string parser, bounded in count and length. Parsing text into a value only: no name is resolved, no socket is opened, and an address that is not a literal IP socket address is refused rather than looked up."
     },
     {
       "file": "gateway/src/middleware/rate_limit.rs",

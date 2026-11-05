@@ -133,7 +133,7 @@ use crate::{
 
 use stages::{
     DefaultMatch, DirectAction, DirectMatch, HostUse, HttpStage, NoStages, PermissionCheck,
-    RouteMatch, StageSink, UpstreamBinding,
+    RateStage, RouteMatch, StageSink, UpstreamBinding,
 };
 
 #[cfg(test)]
@@ -529,16 +529,31 @@ impl CompiledPolicy {
         &self,
         context: &PolicyEvaluationContext,
     ) -> Result<RateLaneSelection, EvaluationError> {
-        self.select_rate_lane_with_facts(context, &UNCAPTURED_FACTS)
+        self.select_rate_lane_with_facts(context, &UNCAPTURED_FACTS, &mut NoStages)
+    }
+
+    /// [`Self::select_rate_lane`], reporting each stage it runs to `stages`.
+    ///
+    /// The selection code, not a copy of it: `select_rate_lane` is this with
+    /// a sink that keeps nothing. See [`stages`].
+    pub(crate) fn select_rate_lane_with_stages(
+        &self,
+        context: &PolicyEvaluationContext,
+        stages: &mut impl StageSink<RateStage>,
+    ) -> Result<RateLaneSelection, EvaluationError> {
+        self.select_rate_lane_with_facts(context, &UNCAPTURED_FACTS, stages)
     }
 
     /// [`Self::select_rate_lane`] with the facts an identity mapping may
     /// read. Rate overrides carry no conditions, so only mapped-role mode
     /// reads them, to resolve the roles an override's principal constrains.
+    /// Each stage it runs is reported to `stages`; the live rate adapter
+    /// passes [`NoStages`].
     pub(crate) fn select_rate_lane_with_facts(
         &self,
         context: &PolicyEvaluationContext,
         facts: &PolicyFacts,
+        stages: &mut impl StageSink<RateStage>,
     ) -> Result<RateLaneSelection, EvaluationError> {
         context.validate(self.snapshot)?;
         validate_facts(facts)?;
@@ -559,6 +574,7 @@ impl CompiledPolicy {
             None
         };
         if let Some(limitation) = limitation {
+            stages.record(RateStage::Facts(Some(limitation)));
             return Ok(RateLaneSelection {
                 binding,
                 outcome: RateLaneOutcome::Indeterminate(limitation),
@@ -571,19 +587,24 @@ impl CompiledPolicy {
             Ok(Some(effective)) => effective,
             // The live bypass, above.
             Ok(None) => {
+                stages.record(RateStage::Facts(None));
+                stages.record(RateStage::AnonymousBypass(true));
                 return Ok(RateLaneSelection {
                     binding,
                     outcome: RateLaneOutcome::NoOverride,
-                })
+                });
             }
             Err(Limitation::MissingMatcherFact) => {
+                stages.record(RateStage::Facts(Some(Limitation::MissingMatcherFact)));
                 return Ok(RateLaneSelection {
                     binding,
                     outcome: RateLaneOutcome::Indeterminate(Limitation::MissingMatcherFact),
-                })
+                });
             }
             Err(_) => return Err(EvaluationError::InternalInvariant),
         };
+        stages.record(RateStage::Facts(None));
+        stages.record(RateStage::AnonymousBypass(false));
         let principal: &Principal = &effective;
         let selected = self
             .engine
@@ -599,6 +620,7 @@ impl CompiledPolicy {
                         .as_ref()
                         .is_none_or(|pattern| path_pattern_matches(pattern, path))
             });
+        stages.record(RateStage::Overrides(selected.map(|(index, _)| index)));
         Ok(RateLaneSelection {
             binding,
             outcome: match selected {

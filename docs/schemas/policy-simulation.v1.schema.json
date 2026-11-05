@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://greengateway.dev/schemas/policy-simulation.v1.schema.json",
   "title": "GreenGateway policy simulation request",
-  "description": "Draft 2020-12 JSON Schema for a policy-simulation.v1 request: a pinned base ETag, a candidate (the active policy, position-aware edits over it, or an inline policy document), a trace level, projections and synthetic cases. Cases are policy-tests.v1 cases without expect. The gateway's parser is authoritative and also enforces what JSON Schema cannot state here: path, host and origin syntax, principal shape bounds, unique case ids, byte (not character) limits, and that an edit's position exists. Whether a candidate is a valid policy is the policy validator's answer. Unknown members are refused everywhere.",
+  "description": "Draft 2020-12 JSON Schema for a policy-simulation.v1 request: a pinned base ETag, a candidate (the active policy, position-aware edits over it, or an inline policy document), a trace level, projections and synthetic cases. Cases are policy-tests.v1 cases without expect. The gateway's parser is authoritative and also enforces what JSON Schema cannot state here: path, host and origin syntax, principal shape bounds, unique case ids, that a rate sequence's virtual instants never decrease, that a hypothetical address is an IP socket address, byte (not character) limits, and that an edit's position exists. Whether a candidate is a valid policy is the policy validator's answer. Unknown members are refused everywhere.",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "base_etag", "candidate", "cases"],
@@ -30,6 +30,43 @@
     "dispatch_fact": {"type": "string", "minLength": 1, "maxLength": 4096},
     "tool_name": {"type": "string", "minLength": 1, "maxLength": 4096},
     "position": {"type": "integer", "minimum": 0, "maximum": 1048576},
+    "rate_sequence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["at_ms"],
+      "properties": {
+        "at_ms": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {"type": "integer", "minimum": 0, "maximum": 86400000}
+        }
+      }
+    },
+    "egress_destination": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scheme"],
+      "properties": {
+        "scheme": {"type": "string", "minLength": 1, "maxLength": 32, "pattern": "^[a-z][a-z0-9+.-]*$"},
+        "host": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "port": {"type": "integer", "minimum": 0, "maximum": 65535},
+        "userinfo": {"type": "boolean"},
+        "fragment": {"type": "boolean"}
+      }
+    },
+    "egress_resolution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hypothetical_addresses"],
+      "properties": {
+        "hypothetical_addresses": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {"type": "string", "minLength": 1, "maxLength": 64}
+        }
+      }
+    },
     "principal": {
       "oneOf": [
         {"const": "anonymous"},
@@ -202,11 +239,11 @@
     },
     "case": {
       "type": "object",
-      "required": ["id", "kind", "principal"],
+      "required": ["id", "kind"],
       "oneOf": [
         {
           "additionalProperties": false,
-          "required": ["request"],
+          "required": ["principal", "request"],
           "properties": {
             "id": {"$ref": "#/$defs/case_id"},
             "description": {"$ref": "#/$defs/description"},
@@ -217,7 +254,7 @@
         },
         {
           "additionalProperties": false,
-          "required": ["tool"],
+          "required": ["principal", "tool"],
           "properties": {
             "id": {"$ref": "#/$defs/case_id"},
             "description": {"$ref": "#/$defs/description"},
@@ -236,7 +273,7 @@
         },
         {
           "additionalProperties": false,
-          "required": ["tool", "request"],
+          "required": ["principal", "tool", "request"],
           "properties": {
             "id": {"$ref": "#/$defs/case_id"},
             "description": {"$ref": "#/$defs/description"},
@@ -253,13 +290,25 @@
         },
         {
           "additionalProperties": false,
-          "required": ["request"],
+          "required": ["principal", "request"],
           "properties": {
             "id": {"$ref": "#/$defs/case_id"},
             "description": {"$ref": "#/$defs/description"},
             "kind": {"const": "rate"},
             "principal": {"$ref": "#/$defs/principal"},
-            "request": {"$ref": "#/$defs/method_and_path"}
+            "request": {"$ref": "#/$defs/method_and_path"},
+            "sequence": {"$ref": "#/$defs/rate_sequence"}
+          }
+        },
+        {
+          "additionalProperties": false,
+          "required": ["destination"],
+          "properties": {
+            "id": {"$ref": "#/$defs/case_id"},
+            "description": {"$ref": "#/$defs/description"},
+            "kind": {"const": "egress"},
+            "destination": {"$ref": "#/$defs/egress_destination"},
+            "resolution": {"$ref": "#/$defs/egress_resolution"}
           }
         }
       ]

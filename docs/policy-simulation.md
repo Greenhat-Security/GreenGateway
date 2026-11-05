@@ -1,12 +1,14 @@
 # Policy simulation
 
 A policy simulation asks what the policy would decide for a batch of
-hypothetical requests and tool questions, before anything changes.
+hypothetical requests, tool questions, rate sequences and outbound
+destinations, before anything changes.
 `POST /v1{ADMIN_PREFIX}/policy/simulations` evaluates the cases against the
 active policy and a candidate -- the active policy itself, position-aware edits
 over it, or a complete document you send -- and explains each decision at the
 trace level you ask for, as written and with every shadow projected as
-enforced (issue #243, slice 10).
+enforced (issue #243, slice 10; tool and rate stage traces, isolated rate
+sequences and egress cases in slice 12).
 
 A simulation is the exploratory sibling of a [policy test suite](policy-tests.md):
 its cases are `policy-tests.v1` cases without an `expect`, parsed by the same
@@ -16,7 +18,8 @@ question.
 
 Every case is decided by the compiled policy evaluator the gateway uses for
 live traffic (`gateway/src/policy_eval`), through the same context builders the
-test runner uses. The HTTP stage trace is reported by that evaluator as it runs
+test runner uses. The HTTP, tool and rate stage traces are reported by that
+evaluator as it runs
 (see [the evaluation kernel](architecture/policy-evaluation-kernel.md#stage-trace-and-synthetic-simulation-243-slice-10)),
 so a trace can only describe the decision production makes.
 
@@ -25,9 +28,12 @@ so a trace can only describe the decision production makes.
 A result is the policy's answer for the facts a case states. It is not a
 prediction that a real request with those facts would succeed: authentication,
 CSRF, request admission and schema validation, tool registry state, request
-rendering, rate capacity, tool leases, credentials, egress and DNS, transport
-and the upstream are not part of a policy decision and are not evaluated. Every
-result lists them in `not_evaluated`.
+rendering, live rate capacity, tool leases, credentials, an upstream's egress,
+DNS, transport and the upstream are not part of a policy decision and are not
+evaluated. Every result lists them in `not_evaluated`. An egress case
+evaluates the static egress lane for the destination it states, and nothing
+else; an isolated rate sequence describes a fresh synthetic bucket, never a
+live caller's allowance.
 
 Three answers are always reported separately, so a shadowed deny is never read
 as an allow:
@@ -46,9 +52,11 @@ no upstream. The simulation request itself is admitted like any admin `POST`:
 it is counted, passes the generic write limiter and gets the access record
 every HTTP request gets. Beyond that, the only record it leaves is one
 `policy.simulation_run` audit event. A test drives cases that, live, would
-charge a one-request rate bucket, record a would-deny, admit a tool and
-dispatch to a reachable upstream, proves none of that happened, and checks the
-audit, bucket and upstream against the live path afterwards
+charge a one-request rate bucket, record a would-deny, admit a tool, resolve
+the upstream's name and dispatch to a reachable upstream -- isolated sequences
+that exhaust their synthetic copy of that bucket and egress cases for the
+upstream's own address among them -- proves none of that happened, and checks
+the audit, resolver, bucket and upstream against the live path afterwards
 (`admin_policy_simulations_tests`).
 
 ## The request
@@ -172,14 +180,15 @@ something it can infer.
 
 | Level | Adds |
 | --- | --- |
-| `terminal` | The outcome only: `logical`, `enforcement`, `effective_action`, stable `reason`, `complete` and any stable `limitation`. A rate case gives the selected override's position. |
-| `matched` | The element that decided (`matched`): a rule by position, action and `id`; a route by position, `id` (v1), required `permission` and `permission_granted`. For HTTP, the shadow rule that was only `observation` beside a host-bound route's decision. A rate case adds the override's `id` (v1), `requests_per_second` and `burst`. |
-| `full` | For HTTP cases, one step per evaluator stage in order -- `facts`, `request_host`, `direct_rules`, `upstream_host_binding`, `routes`, `default` -- each `matched`, `no_match`, `not_applicable`, `skipped` (after the decision) or `unknown` (after an undecided answer), with the element, permission check and enforcement mode where they apply. Tool and rate cases add nothing beyond `matched`. |
+| `terminal` | The outcome only: `logical`, `enforcement`, `effective_action`, stable `reason`, `complete` and any stable `limitation`. A rate case gives the selected override's position, and a sequence's lane and step outcomes. |
+| `matched` | The element that decided (`matched`): a rule by position, action and `id`; a route by position, `id` (v1), required `permission` and `permission_granted`. For HTTP, the shadow rule that was only `observation` beside a host-bound route's decision. A rate case adds the override's `id` (v1), `requests_per_second` and `burst`, and a sequence the limits its bucket was built from. An egress case adds the position in its hypothetical address list of the address that would be pinned (`pinned_address`) or that was refused (`refused_address`) -- never the address. |
+| `full` | One step per evaluator stage of the case's lane, in order, each `matched`, `no_match`, `not_applicable`, `skipped` (after the decision) or `unknown` (after an undecided answer). HTTP: `facts`, `request_host`, `direct_rules`, `upstream_host_binding`, `routes`, `default`, with the element, permission check and enforcement mode where they apply. A tool operation: `facts`, `tool_entry` (with `enabled`), `tool_identity`, `tool_rules` (with the matched rule and its action). A rendered tool request: `facts`, `rendered_http_rules`. A rate case: `facts`, `anonymous_bypass` (`matched` when the live bypass for a request without a principal applied), `rate_overrides` (with the matched override by position and `id`). Egress cases have no stages. |
 
 A full trace is bounded: a simulation returns at most 4096 stage steps in
-total. Past that, an evaluation reports `stages_truncated: true` in place of
-its steps and the result's `trace.stages_truncated` is `true`; its decision is
-still reported in full. An authored id or permission longer than 128 bytes is
+total, across every lane. Past that, an evaluation reports
+`stages_truncated: true` in place of its steps and the result's
+`trace.stages_truncated` is `true`; its decision is still reported in full.
+An evaluation's steps are listed whole or not at all. An authored id or permission longer than 128 bytes is
 reported by position only, with `id_omitted` or `permission_omitted`.
 
 ## Running a simulation
@@ -236,7 +245,13 @@ plus `empty_simulation`, `empty_edits`, `too_many_edits`,
     "http_context_version": 3,
     "tool_semantics_version": "gg-tool-policy-v1",
     "tool_context_version": 1,
+    "egress_semantics_version": "gg-static-egress-v1",
+    "egress_context_version": 1,
     "gateway_version": "1.0.1"
+  },
+  "synthetic_resources": {
+    "egress_controls_digest": "sha256:...",
+    "global_rate_lanes": "configured"
   },
   "base": { "source": "active", "etag": "\"sha256:...\"" },
   "candidate": { "source": "edits", "etag": "\"sha256:...\"", "edits": 2 },
@@ -249,6 +264,7 @@ plus `empty_simulation`, `empty_edits`, `too_many_edits`,
       "as_authored": {
         "would_forward": 0, "would_block": 1, "unknown": 0, "shadowed": 0,
         "rate_override": 1, "no_rate_override": 0, "rate_unknown": 0,
+        "egress_allow": 0, "egress_deny": 0, "egress_unknown": 0,
         "changed_from_base": 1
       },
       "enforce_all_shadow": { "...": 0 }
@@ -297,9 +313,12 @@ plus `empty_simulation`, `empty_edits`, `too_many_edits`,
   positions, which an insert shifts without changing anything.
 - With both projections, `projection_changed` says whether promoting every
   shadow changes the candidate's answer for the case.
-- `summary` counts, per projection, the candidate's effective actions, the
-  shadowed denials, the rate selections and the cases that changed from the
-  base.
+- `summary` counts, per projection, the candidate's effective actions for
+  HTTP and tool cases, the shadowed denials, the rate selections, the egress
+  verdicts and the cases that changed from the base.
+- `synthetic_resources` names what egress cases and rate sequences were
+  decided by: the digest of the egress controls (never a host, port or range)
+  and whether the global rate lanes' configured limits were available.
 
 A result never contains a fixture value -- no path, host, subject, issuer,
 role, origin or tool name a case supplied -- only case ids and pointers, stable
@@ -309,8 +328,91 @@ no timestamp or duration.
 
 A rate case reports which `rate_limits` override the live rate stage would
 select (`selected`: `override`, `no_override` or `indeterminate`) and its
-configured limits. It does not model bucket capacity, and it never reads a
+configured limits. It does not model live bucket capacity, and it never reads a
 production bucket.
+
+### Isolated rate sequences
+
+A rate case may add `"sequence": { "at_ms": [0, 0, 250, 1000] }`: one to 64
+virtual instants, in milliseconds since the sequence's origin (at most one
+day), never decreasing. Each instant is one request, checked in order against
+a fresh bucket built for the sequence alone from the selected lane's
+configured rate and burst -- the selected override's own limits, or, when no
+override governs, the global `read` lane's (for `GET` and `HEAD`) or `write`
+lane's from `RATE_LIMIT_READ_*` / `RATE_LIMIT_WRITE_*`, as the live limiter
+splits them. The bucket starts empty: no bucket exists until the first step,
+which meets a full burst, exactly as a key the live limiter has never seen
+does. Each step takes the live limiter's own token arithmetic.
+
+```json
+"sequence": {
+  "lane": "policy_override", "key_class": "principal",
+  "bucket": "isolated_empty", "clock": "virtual",
+  "requests_per_second": 2.5, "burst": 5,
+  "steps": ["allowed", "allowed", "allowed", "allowed", "allowed", "limited", "allowed"],
+  "allowed": 6, "limited": 1, "complete": true
+}
+```
+
+`lane` is `policy_override`, `global_read` or `global_write`; `key_class` is
+the class of key the live lane buckets by (`principal` or `client_ip`). The
+limits appear from the `matched` level. A sequence never reads, creates,
+charges or evicts a production bucket, the shared PostgreSQL rate state, a
+bucket gauge or any metric, so it says what a key with no history would meet,
+never what any live caller has left. It models one bucket only: the global
+lane a request also passes before an override, the cluster's shared rate
+authority, bucket eviction and other callers sharing a key are not modelled.
+A sequence whose lane the selection could not decide does not run
+(`"complete": false`); one that needs the global lanes when their
+configuration is unavailable is `missing_rate_lane_configuration`, and the
+rate result is incomplete either way.
+
+### Egress cases
+
+An egress case asks whether the effective egress controls admit an outbound
+destination. It states the destination's facts and, optionally, the only
+resolution input a case can carry -- an explicitly hypothetical address list:
+
+```json
+{
+  "id": "billing-api",
+  "kind": "egress",
+  "destination": { "scheme": "https", "host": "billing.example.test", "port": 443 },
+  "resolution": { "hypothetical_addresses": ["192.0.2.10:443"] }
+}
+```
+
+`destination` has `scheme`, `host` (omit it for a URL without one), `port`
+(the URL's explicit port or its scheme's default; omit it only when there is
+neither) and the booleans `userinfo` and `fragment` (whether the URL carried
+them -- there is no member for their values, a path or a query). An egress case
+has no `principal`. `hypothetical_addresses` lists up to 16 IP socket
+addresses in the order a resolver would answer; an empty list is a name that
+resolves to nothing.
+
+The case is decided by the static egress lane the gateway's egress client
+decides every destination by (`gateway/src/policy_eval/egress.rs`), with the
+same checks in the same order: shape, scheme, host allowlist and patterns,
+port allowlist, then every answer's port and, with `EGRESS_DENY_PRIVATE_IPS`,
+whether it is non-global outside the policy CIDRs. A destination the static
+checks refuse is refused with its reason (`host_not_allowed`,
+`port_not_allowed` and so on) whether or not addresses are supplied. One they
+admit, with no `resolution`, is `indeterminate` with the limitation
+`missing_resolution_evidence`: no DNS lookup ever runs, and there is no
+fallback. With hypothetical addresses the verdict is `allowed`, or
+`unexpected_resolved_port`, `empty_resolution` or `non_global_address`.
+
+The controls are this process's effective egress controls -- `EGRESS_ALLOWED_HOSTS`,
+auto-seeded infrastructure hosts, the live policy's `egress` section and the
+non-global switch -- never a candidate's `egress` section: egress changes are
+not applied by a policy write and need a restart
+(`egress_change_requires_restart`), so these are the controls any published
+candidate would meet. An egress case's base and candidate answers are
+therefore always the same. The result binds the controls by
+`synthetic_resources.egress_controls_digest`, and never repeats a host, scheme
+or address. An egress allow says the destination would be admitted and its
+first answer pinned; it is no promise that a connection is made, that TLS
+succeeds or that the upstream answers.
 
 ## Audit
 
@@ -337,8 +439,10 @@ Not part of this slice, and not to be inferred from it:
 
 - Server-side drafts and historical revisions as candidate sources, and
   routing derived server-side from the pinned configuration snapshot.
-- Stage traces for the tool and rate lanes, and egress cases.
-- Isolated rate-bucket sequences on a virtual clock.
+- Egress for a candidate `egress` section, and egress evaluated as part of an
+  HTTP or tool case's upstream.
+- Trusted, pinned resolution evidence: the only resolution input today is a
+  case's hypothetical list.
 - Historical replay over retained traffic, which is
   [its own job API](policy-replay.md#replay-jobs).
 

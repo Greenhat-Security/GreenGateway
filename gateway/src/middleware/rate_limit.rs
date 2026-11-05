@@ -64,18 +64,16 @@ pub struct RateLimitState {
     /// and never replace shared enforcement. None in standalone mode.
     #[cfg(feature = "postgres")]
     shared: Option<Arc<crate::storage::PostgresRateLimitStore>>,
-    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
     read_limit: LaneLimit,
-    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
     write_limit: LaneLimit,
 }
 
-/// A configured limit as the shared store decides it.
-#[derive(Clone, Copy, Debug)]
-#[cfg_attr(not(feature = "postgres"), allow(dead_code))]
-struct LaneLimit {
-    requests_per_second: f64,
-    burst: u32,
+/// A configured limit: what the shared store decides by, and what a policy
+/// simulation's [`IsolatedBucket`] is built from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct LaneLimit {
+    pub(crate) requests_per_second: f64,
+    pub(crate) burst: u32,
 }
 
 /// The shared decision a request still needs after the local buckets
@@ -233,8 +231,10 @@ struct RateLaneRefused {
     audit: AuditLog,
 }
 
+/// A global lane: `GET` and `HEAD` are charged in `read`, every other
+/// method in `write`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Lane {
+pub(crate) enum Lane {
     Read,
     Write,
 }
@@ -354,6 +354,101 @@ impl RateLimitState {
             Lane::Write => self.write.clone(),
         }
     }
+
+    /// The configured limits of the two global lanes, for a policy
+    /// simulation's isolated rate sequences (issue #243). Configuration only:
+    /// no bucket is read, created or charged.
+    pub(crate) fn global_lanes(&self) -> GlobalRateLanes {
+        GlobalRateLanes {
+            read: self.read_limit,
+            write: self.write_limit,
+        }
+    }
+}
+
+/// The configured limits of the global lanes, by lane.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct GlobalRateLanes {
+    read: LaneLimit,
+    write: LaneLimit,
+}
+
+impl GlobalRateLanes {
+    /// Lanes with these limits, for a test that needs no configuration.
+    #[cfg(test)]
+    pub(crate) fn new(read: LaneLimit, write: LaneLimit) -> Self {
+        Self { read, write }
+    }
+
+    /// The global lane a request with `method` is charged in, and that
+    /// lane's configured limit: the split [`rate_limit_request`] makes.
+    pub(crate) fn for_method(&self, method: &Method) -> (Lane, LaneLimit) {
+        let lane = lane_for(method);
+        let limit = match lane {
+            Lane::Read => self.read,
+            Lane::Write => self.write,
+        };
+        (lane, limit)
+    }
+}
+
+/// One token bucket's step: refill it for `elapsed_secs` at `rps`, up to
+/// `burst`, then spend one token if a whole one is there.
+///
+/// The live limiter and a policy simulation's [`IsolatedBucket`] both take
+/// every step through this, so a synthetic sequence answers exactly what a
+/// live bucket with the same history would. A fresh bucket starts full and
+/// takes its first step with no elapsed time, which keeps a zero burst
+/// refusing the very first request.
+#[inline]
+fn spend_token(tokens: &mut f64, elapsed_secs: f64, rps: f64, burst: f64) -> bool {
+    *tokens = (*tokens + (elapsed_secs * rps)).min(burst);
+    if *tokens >= 1.0 {
+        *tokens -= 1.0;
+        true
+    } else {
+        false
+    }
+}
+
+/// A token bucket for one synthetic key on a virtual clock (issue #243):
+/// what a policy simulation or test runs an isolated rate sequence against.
+///
+/// It is built for one sequence and dropped with it. It starts empty -- no
+/// bucket exists until the first step, which meets a full burst, as a key the
+/// live limiter has never seen does -- and it is never stored, shared, evicted
+/// or reported: no production bucket store, gauge, metric or shared rate
+/// authority is read or changed, so a sequence can neither spend nor observe
+/// any live caller's allowance.
+pub(crate) struct IsolatedBucket {
+    rps: f64,
+    burst: f64,
+    /// Tokens left and the virtual instant of the last step, once there was
+    /// one.
+    state: Option<(f64, Duration)>,
+}
+
+impl IsolatedBucket {
+    pub(crate) fn new(limit: LaneLimit) -> Self {
+        Self {
+            rps: limit.requests_per_second,
+            burst: f64::from(limit.burst),
+            state: None,
+        }
+    }
+
+    /// Whether a request at virtual instant `at` -- time since the
+    /// sequence's origin -- is allowed. An instant before the previous one
+    /// refills nothing, as an earlier `Instant` does live.
+    pub(crate) fn check_at(&mut self, at: Duration) -> bool {
+        let (mut tokens, elapsed) = match self.state {
+            None => (self.burst, 0.0),
+            Some((tokens, last)) => (tokens, at.saturating_sub(last).as_secs_f64()),
+        };
+        let allowed = spend_token(&mut tokens, elapsed, self.rps, self.burst);
+        self.state = Some((tokens, at));
+        allowed
+    }
 }
 
 #[derive(Clone)]
@@ -409,17 +504,10 @@ impl RateLimiter {
 
         if let Some(bucket) = buckets.map.get_mut(&hashed) {
             let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
-
-            bucket.tokens = (bucket.tokens + (elapsed * self.rps)).min(self.burst);
             bucket.last_refill = now;
             bucket.referenced = true;
 
-            if bucket.tokens >= 1.0 {
-                bucket.tokens -= 1.0;
-                true
-            } else {
-                false
-            }
+            spend_token(&mut bucket.tokens, elapsed, self.rps, self.burst)
         } else {
             if buckets.map.len() >= buckets.capacity {
                 buckets.evict_one(now);
@@ -438,10 +526,7 @@ impl RateLimiter {
                 // -- never protects itself, and active keys do.
                 referenced: false,
             };
-            let allowed = bucket.tokens >= 1.0;
-            if allowed {
-                bucket.tokens -= 1.0;
-            }
+            let allowed = spend_token(&mut bucket.tokens, 0.0, self.rps, self.burst);
             buckets.map.insert(hashed, bucket);
             buckets.hand.push_back(hashed);
             buckets.live_buckets.fetch_add(1, Ordering::Relaxed);
@@ -1102,6 +1187,64 @@ mod tests {
         assert!(limiter.check("key"));
         assert!(limiter.check("key"));
         assert!(!limiter.check("key"));
+    }
+
+    /// A policy simulation's isolated bucket answers exactly what a live
+    /// bucket with the same history answers: the same arithmetic, the same
+    /// full first burst, the same refill, and a zero burst refusing the first
+    /// request. It also leaves the live limiter it is compared with untouched.
+    #[test]
+    fn an_isolated_bucket_answers_what_a_live_bucket_with_the_same_history_does() {
+        let schedules: [&[u64]; 4] = [
+            &[0, 0, 0, 0, 0],
+            &[0, 0, 0, 400, 400, 900, 2_500, 2_500, 2_500, 2_501],
+            &[0, 1, 2, 3, 1_000, 1_000, 60_000],
+            &[5, 5, 5, 5_005],
+        ];
+        let limits = [(2.0, 3), (0.5, 1), (1_000.0, 2), (1.0, 0), (0.0, 2)];
+        for (rps, burst) in limits {
+            for schedule in schedules {
+                let live = RateLimiter::new(
+                    rps,
+                    burst,
+                    TEST_BUCKET_CAPACITY,
+                    TEST_BUCKET_TTL,
+                    "read",
+                    Arc::new(AtomicUsize::new(0)),
+                );
+                let origin = Instant::now();
+                let mut isolated = IsolatedBucket::new(LaneLimit {
+                    requests_per_second: rps,
+                    burst,
+                });
+                for at in schedule {
+                    let at = Duration::from_millis(*at);
+                    assert_eq!(
+                        isolated.check_at(at),
+                        live.check_at("key", origin + at),
+                        "rps {rps}, burst {burst}, schedule {schedule:?}, step at {at:?}"
+                    );
+                }
+            }
+        }
+        // The isolated bucket is a value of its own: building and spending
+        // one creates no bucket in any live store.
+        let live = RateLimiter::new(
+            1.0,
+            1,
+            TEST_BUCKET_CAPACITY,
+            TEST_BUCKET_TTL,
+            "read",
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let mut isolated = IsolatedBucket::new(LaneLimit {
+            requests_per_second: 1.0,
+            burst: 1,
+        });
+        assert!(isolated.check_at(Duration::ZERO));
+        assert!(!isolated.check_at(Duration::ZERO));
+        assert_eq!(store_len(&live), 0);
+        assert!(live.check("key"), "the live bucket still holds its burst");
     }
 
     #[test]
