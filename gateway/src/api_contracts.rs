@@ -445,9 +445,12 @@ pub(super) struct PolicyRulePreviewResponse {
     /// `malformed_observation`. Empty when every scanned observation was
     /// judged.
     pub(super) unevaluated_reasons: BTreeMap<&'static str, u64>,
-    /// The window held more observations than the scan ceiling allowed, so
-    /// `match_count` covers only the newest `scanned_event_count` of them.
+    /// The window held more observations than the scan judged -- the scan
+    /// ceiling or the deadline stopped it -- so `match_count` covers only the
+    /// newest `scanned_event_count` of them.
     pub(super) scan_truncated: bool,
+    /// The scan's deadline, rather than its row ceiling, truncated it.
+    pub(super) deadline_exceeded: bool,
     /// Every observation in the window was scanned and judged. Never true for
     /// a truncated scan or one with an unevaluated observation: a partial
     /// count is not evidence of the whole window.
@@ -1227,6 +1230,13 @@ pub(super) struct GatewayAppBuildOverrides {
     pub(super) cluster_status_source: Option<Arc<dyn cluster_status::ClusterStatusSource>>,
     #[cfg(test)]
     pub(super) egress_resolver: Option<Arc<dyn egress::DnsResolver>>,
+    /// Test seam: a CA bundle the gateway's own egress trusts, as an
+    /// operator's platform trust store would. A Connection's `tls` profile
+    /// covers only its upstream; token endpoints such as a delegated issuer's
+    /// are reached with this trust alone, so a router-level test needs it to
+    /// reach an in-process TLS issuer (issue #446).
+    #[cfg(test)]
+    pub(super) egress_tls_ca_bundle_path: Option<std::path::PathBuf>,
     /// Test seam: the pending-login backend the admin login flow uses,
     /// so a handler test can stand in an unavailable store.
     #[cfg(test)]
@@ -1665,16 +1675,18 @@ impl StatusResponse {
     }
 }
 
-/// What the accept handler has already established when it hands the
-/// request to the cluster path: the state it answers from, the request
-/// itself, who is accepting, and the RBAC state both permissions were
-/// checked against.
-#[cfg(feature = "postgres")]
-pub(super) struct SuggestionAcceptContext<'a> {
+/// What a handler that accepts a suggestion (the accept route, or a draft
+/// publication bound to one) has already established when it hands the
+/// request to the commit: the state it answers from, the request itself,
+/// who is accepting, the RBAC state both permissions were checked against,
+/// and the policy write lane it holds from preparing the candidate until
+/// the commit.
+pub(super) struct SuggestionAcceptContext<'a, 'guard> {
     pub(super) state: &'a SuggestionsAdminState,
     pub(super) parts: &'a http::request::Parts,
     pub(super) principal: &'a auth::Principal,
     pub(super) rbac_state: &'a middleware::rbac::RbacState,
+    pub(super) policy_write_guard: &'a middleware::rbac::PolicyWriteGuard<'guard>,
 }
 
 /// How many stream rows one durable poll fetches: large enough that a
@@ -2117,10 +2129,11 @@ impl RulePatch {
 /// rule sits in it.
 ///
 /// Preparation and commit are separate steps because suggestion
-/// acceptance in cluster mode (issue #241, PR 12) commits this candidate
-/// INSIDE the suggestion's transaction rather than through
-/// [`persist_policy_mutation`]. Both paths must build and validate the
-/// candidate identically, so they share this.
+/// acceptance commits this candidate through its own sequence: INSIDE the
+/// suggestion's transaction in cluster mode (issue #241, PR 12), behind a
+/// durable acceptance intent in standalone mode (issue #243), rather than
+/// through [`persist_policy_mutation`]. Every path must build and validate
+/// the candidate identically, so they share this.
 pub(super) struct PreparedPolicyRuleCreate {
     pub(super) before_policy: rbac::Policy,
     /// What the commit must present as its compare-and-swap value.

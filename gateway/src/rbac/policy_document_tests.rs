@@ -1034,7 +1034,7 @@ fn a_deployment_refusal_blocks_publication_without_hiding_the_document() {
     inspection.refuse(
         IssueCode::DocumentFormatUnsupportedInCluster,
         "/schema_version",
-        "cluster mode reads only 0.x documents".to_owned(),
+        "a live replica does not read document format 1".to_owned(),
     );
 
     assert!(!inspection.is_valid());
@@ -1052,7 +1052,7 @@ fn a_deployment_refusal_blocks_publication_without_hiding_the_document() {
     );
     assert_eq!(
         inspection.into_policy().expect_err("refused"),
-        vec!["cluster mode reads only 0.x documents".to_owned()]
+        vec!["a live replica does not read document format 1".to_owned()]
     );
 }
 
@@ -1576,24 +1576,26 @@ fn typed_matcher_v1() -> Value {
 }
 
 #[test]
-fn this_release_serves_identity_mappings_and_refuses_to_serve_rule_conditions() {
+fn this_release_serves_request_conditions_and_refuses_tool_argument_conditions() {
     let document = typed_matcher_v1();
     let inspection = inspect(&document);
     // Sound in every other respect: the only diagnostic is the refusal,
-    // located at the first rule that carries conditions, with the rule's own
-    // id, and nothing is published. The identity mappings are not refused.
+    // located at the first rule whose conditions read a tool argument, with
+    // that rule's own id, and nothing is published. The identity mappings and
+    // the HTTP rule's organization, network, header, query and time leaves are
+    // not refused.
     assert_eq!(
         codes_and_pointers(&inspection),
         vec![(
             "typed_matchers_not_enforced",
-            "/rules/0/conditions".to_owned()
+            "/rules/1/conditions".to_owned()
         )]
     );
     assert!(!inspection.is_valid());
     assert!(inspection.policy().is_none());
     assert_eq!(inspection.semantic_digest(), None);
     let refusal = diagnostic(&inspection, IssueCode::TypedMatchersNotEnforced);
-    assert_eq!(refusal.element_id.as_deref(), Some("staging-reads"));
+    assert_eq!(refusal.element_id.as_deref(), Some("eu-exports"));
     assert_eq!(
         refusal.blocks,
         DiagnosticBlocks {
@@ -1603,51 +1605,79 @@ fn this_release_serves_identity_mappings_and_refuses_to_serve_rule_conditions() 
             evidence: true
         }
     );
-    // The message names what is refused and never the mappings it serves.
+    // The message names what is refused and never what it serves.
+    assert!(refusal.message.contains("tool_argument"));
     assert!(!refusal.message.contains("identity mapping"));
     assert!(refusal
         .remediation
-        .contains("Identity mappings are enforced"));
+        .contains("Identity mappings and the other conditions are enforced"));
 
-    // Without the conditions, the mappings are a publishable policy: valid,
-    // with a semantic digest, through every loader that admits a policy --
-    // startup and reload, replacement, and the in-memory validation drafts
-    // and bundles use.
-    let mut mappings_only = document.clone();
-    for rule in mappings_only["rules"]
+    // Without the tool-argument rule, the mappings and the request conditions
+    // are a publishable policy: valid, with a semantic digest, through every
+    // loader that admits a policy -- startup and reload, replacement, and the
+    // in-memory validation drafts and bundles use.
+    let mut served = document.clone();
+    served["rules"]
         .as_array_mut()
         .expect("rules")
-        .iter_mut()
-    {
-        rule.as_object_mut().expect("rule").remove("conditions");
-    }
-    let inspection = inspect(&mappings_only);
+        .retain(|rule| rule["id"] != json!("eu-exports"));
+    let inspection = inspect(&served);
     assert_eq!(codes_and_pointers(&inspection), Vec::new());
     assert!(inspection.is_valid());
     assert!(inspection.semantic_digest().is_some());
-    let source = serde_json::to_vec(&mappings_only).expect("serialize");
+    let source = serde_json::to_vec(&served).expect("serialize");
     for policy in [
         Policy::from_source(&source, None).expect("startup accepts it"),
-        Policy::validate_json_value(mappings_only.clone()).expect("validation accepts it"),
+        Policy::validate_json_value(served.clone()).expect("validation accepts it"),
     ] {
         let mappings = policy.identity_mappings.as_deref().expect("mappings");
         assert_eq!(mappings[0].id, "idp-admins");
         assert_eq!(mappings[0].issuer, "https://idp.example.test");
+        assert!(policy.rules[0].conditions.is_some());
     }
     // An empty mapping list is mapped-role mode too, and accepted the same
     // way: a policy in which no principal holds any role.
-    let mut empty_mappings = mappings_only.clone();
+    let mut empty_mappings = served.clone();
     empty_mappings["identity_mappings"] = json!([]);
     assert!(inspect(&empty_mappings).is_valid());
 
-    // Every loader refuses the conditions, wherever the mappings are.
+    // A tool-argument leaf is refused wherever it sits in the tree: under
+    // `not`, inside `any`, beside leaves that are served.
+    for nested in [
+        json!({ "not": { "tool_argument": { "pointer": "/region", "in": ["eu"] } } }),
+        json!({ "any": [
+            { "time_window": { "until": "2027-01-01T00:00:00Z" } },
+            { "all": [{ "tool_argument": { "pointer": "/region", "in": ["eu"] } }] }
+        ] }),
+    ] {
+        let mut candidate = served.clone();
+        candidate["rules"]
+            .as_array_mut()
+            .expect("rules")
+            .push(json!({
+                "id": "nested-export",
+                "tool_name": "reports.export",
+                "action": "deny",
+                "conditions": nested
+            }));
+        assert_eq!(
+            codes_and_pointers(&inspect(&candidate)),
+            vec![(
+                "typed_matchers_not_enforced",
+                "/rules/1/conditions".to_owned()
+            )],
+            "{nested}"
+        );
+    }
+
+    // Every loader refuses the tool-argument conditions.
     let source = serde_json::to_vec(&document).expect("serialize");
     for error in [
         Policy::from_source(&source, None).expect_err("startup refuses it"),
         Policy::validate_json_value(document.clone()).expect_err("validation refuses it"),
     ] {
         assert!(
-            error.to_string().contains("/rules/0/conditions"),
+            error.to_string().contains("/rules/1/conditions"),
             "unexpected error: {error}"
         );
     }

@@ -29,6 +29,7 @@ export const OPERATIONS = [
   "policy.rule.reorder",
   "policy.rule.update",
   "policy.suggestion.accept",
+  "policy_tests.publish",
   "secret.create",
   "secret.delete",
   "secret.external_rotate",
@@ -46,7 +47,7 @@ const REVISION_OPERATIONS = {
     "policy.rollback", "policy.rule.create", "policy.rule.delete", "policy.rule.reorder", "policy.rule.update", "policy.suggestion.accept",
     "secret.rotate", "secret.external_rotate", "service_token.rotate", "service_token.revoke"],
   publish: ["catalog.mcp.publish", "catalog.openapi.publish", "configuration.activate", "configuration.import",
-    "jwt.revoke", "policy.file_reload", "policy.publish", "tools.publish"],
+    "jwt.revoke", "policy.file_reload", "policy.publish", "policy_tests.publish", "tools.publish"],
   delete: ["admin_session.withdraw", "connection.delete", "secret.delete"],
   export: ["configuration.export"],
   maintenance: ["secret.reencrypt"],
@@ -111,7 +112,7 @@ function validateSchemaValue(value, definition, location = "$") {
 
 const resourceFor = (operation) => ({
   admin_session: "admin_session",
-  policy: "policy", tools: "tools", connection: "connection", credential: "credential_binding",
+  policy: "policy", policy_tests: "policy", tools: "tools", connection: "connection", credential: "credential_binding",
   catalog: "catalog", service_token: "service_token", jwt: "jwt_revocation", configuration: "configuration",
   secret: operation === "secret.external_rotate" ? "external_secret" : "local_secret",
 })[operation.split(".")[0]];
@@ -150,6 +151,7 @@ export function validateEvent(event) {
   if (event.operation === "jwt.revoke") check(security !== null && after === security, "JWT event axis must use the shared security revision");
   const expectedAxis = event.operation.startsWith("admin_session.") ? "session"
     : event.operation.startsWith("policy.") ? "policy"
+    : event.operation.startsWith("policy_tests.") ? "policy_tests"
     : event.operation.startsWith("tools.") ? "tools"
     : event.operation.startsWith("connection.") ? "connection"
     : event.operation.startsWith("credential.") ? "credential"

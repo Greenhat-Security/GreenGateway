@@ -8,7 +8,7 @@ use serde_json::Value;
 use super::*;
 use crate::audit::sink::tests::CaptureSink;
 
-const EVERY_OPERATION: [AuthorityOperation; 10] = [
+const EVERY_OPERATION: [AuthorityOperation; 11] = [
     AuthorityOperation::PolicyPublish,
     AuthorityOperation::PolicyRollback,
     AuthorityOperation::PolicyRuleCreate,
@@ -19,6 +19,7 @@ const EVERY_OPERATION: [AuthorityOperation; 10] = [
     AuthorityOperation::PolicyFileReload,
     AuthorityOperation::ToolsPublish,
     AuthorityOperation::ConfigurationImport,
+    AuthorityOperation::PolicyTestsPublish,
 ];
 
 /// The operation whose gate covers an inventory operation code, or `None`

@@ -68,6 +68,7 @@ mod tests {
             ApplyRequest, PlanSubject, PublishedSchemasCompiler, RevisionError, RevisionService,
             ADMIN_CONFIG_WRITE, ADMIN_POLICY_WRITE, ADMIN_TOOLS_WRITE,
         },
+        state_dir::StateDirectory,
     };
 
     use super::*;
@@ -98,8 +99,10 @@ mod tests {
             Self(path)
         }
 
-        fn path(&self) -> &Path {
-            &self.0
+        /// The directory, held under its lock. A ledger opened through it
+        /// keeps the lock held for as long as the ledger is open.
+        fn held(&self) -> StateDirectory {
+            StateDirectory::acquire(&self.0).expect("the state directory locks")
         }
     }
 
@@ -177,7 +180,7 @@ mod tests {
     /// production service over it.
     fn production_service(state: &TempDir) -> RevisionService<ProductionCompiler> {
         let (mut ledger, seed) = RevisionLedger::seed(
-            state.path(),
+            &state.held(),
             &production_bundle(files(DENY)),
             LedgerActor::system("ggctl-ledger-seed").expect("system"),
             at(0),
@@ -217,7 +220,7 @@ mod tests {
         // The schema-only compiler, which is all `ggctl` can run, accepts it.
         let schema_state = TempDir::new();
         let (ledger, _seed) = RevisionLedger::seed(
-            schema_state.path(),
+            &schema_state.held(),
             &production_bundle(files(DENY)),
             LedgerActor::system("ggctl-ledger-seed").expect("system"),
             at(0),

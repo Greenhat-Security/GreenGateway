@@ -3,34 +3,36 @@
 use std::fmt::Write as _;
 
 use crate::{
-    cli::{CommandSpec, Invocation, COMMANDS},
+    cli::{self, CommandSpec, FamilySpec, HelpTopic, Invocation, COMMANDS},
     diagnostic::Exit,
     report::{self, Io},
 };
 
 const WIDTH: usize = 80;
 
-/// `ggctl help [COMMAND]`. The parser answers it as a help request; this is
-/// the same answer for a caller that runs the invocation directly.
+/// `ggctl help [COMMAND [SUBCOMMAND]]`. The parser answers it as a help
+/// request; this is the same answer for a caller that runs the invocation
+/// directly.
 pub(crate) fn run(invocation: &Invocation, io: &mut Io<'_>) -> Exit {
-    let topic = invocation
-        .positional(0)
-        .and_then(|(_, name)| COMMANDS.iter().find(|command| command.name == name));
-    report::artifact(io, &text(topic))
+    match cli::help_topic(invocation) {
+        Ok(topic) => report::artifact(io, &text(topic)),
+        Err(diagnostic) => report::error(io, diagnostic),
+    }
 }
 
-/// The overview, or one command's help.
-pub(crate) fn text(command: Option<&CommandSpec>) -> String {
-    match command {
-        Some(command) => command_help(command),
-        None => overview(),
+/// The overview, a command family's help, or one command's help.
+pub(crate) fn text(topic: HelpTopic) -> String {
+    match topic {
+        HelpTopic::Overview => overview(),
+        HelpTopic::Family(family) => family_help(family),
+        HelpTopic::Spec(command) => command_help(command),
     }
 }
 
 fn overview() -> String {
     let mut text = format!(
         "ggctl {} - the GreenGateway operator CLI\n\n\
-         Usage: ggctl <COMMAND> [OPTIONS]\n       ggctl help [COMMAND]\n\nCommands:\n",
+         Usage: ggctl <COMMAND> [OPTIONS]\n       ggctl help [COMMAND [SUBCOMMAND]]\n\nCommands:\n",
         env!("CARGO_PKG_VERSION")
     );
     let width = COMMANDS
@@ -55,6 +57,28 @@ fn overview() -> String {
     );
     text.push('\n');
     push_paragraph(&mut text, "", "Reference: docs/ggctl.md");
+    text
+}
+
+fn family_help(family: &FamilySpec) -> String {
+    let mut text = format!(
+        "Usage: ggctl {} <COMMAND> [OPTIONS]\n       ggctl help {} [COMMAND]\n\n",
+        family.name, family.name
+    );
+    for paragraph in family.description {
+        push_paragraph(&mut text, "", paragraph);
+        text.push('\n');
+    }
+    text.push_str("Commands:\n");
+    let width = family
+        .commands
+        .iter()
+        .map(|word| word.len())
+        .max()
+        .unwrap_or(0);
+    for (word, command) in family.commands.iter().zip(family.members()) {
+        push_entry(&mut text, word, width, command.summary);
+    }
     text
 }
 
@@ -152,7 +176,7 @@ mod tests {
 
     #[test]
     fn the_overview_lists_every_command_and_exit_code() {
-        let overview = text(None);
+        let overview = text(HelpTopic::Overview);
         for command in COMMANDS {
             assert!(
                 overview.contains(&format!("\n  {}", command.name)),
@@ -172,7 +196,7 @@ mod tests {
     #[test]
     fn command_help_lists_every_argument_and_option() {
         for command in COMMANDS {
-            let help = text(Some(command));
+            let help = text(HelpTopic::Spec(command));
             assert!(help.starts_with(&format!("Usage: ggctl {}", command.name)));
             for argument in command.arguments {
                 assert!(help.contains(argument.name), "{}", argument.name);
@@ -197,5 +221,34 @@ mod tests {
             .find(|command| command.name == "completion")
             .expect("completion");
         assert_eq!(usage(completion), "ggctl completion SHELL");
+        let rollback = COMMANDS
+            .iter()
+            .find(|command| command.name == "ledger rollback")
+            .expect("ledger rollback");
+        assert_eq!(usage(rollback), "ggctl ledger rollback REVISION [OPTIONS]");
+        let verify = COMMANDS
+            .iter()
+            .find(|command| command.name == "backup verify")
+            .expect("backup verify");
+        assert_eq!(usage(verify), "ggctl backup verify FILE [OPTIONS]");
+    }
+
+    #[test]
+    fn family_help_lists_the_family_commands() {
+        for family in cli::FAMILIES {
+            let help = text(HelpTopic::Family(family));
+            assert!(help.starts_with(&format!("Usage: ggctl {} <COMMAND>", family.name)));
+            let members: Vec<_> = family.members().collect();
+            assert_eq!(members.len(), family.commands.len());
+            for (word, command) in family.commands.iter().zip(members) {
+                assert!(
+                    help.contains(&format!("\n  {word}  ")),
+                    "{}: {word}",
+                    family.name
+                );
+                assert!(help.contains(command.summary.split(' ').next().unwrap_or("")));
+            }
+            assert!(help.lines().all(|line| line.len() <= WIDTH), "{help}");
+        }
     }
 }
