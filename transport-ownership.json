@@ -15921,6 +15921,46 @@
       "sha256": "20384981a436de131afe8257495ef57025659ae96bdcbd9cde301e0cae28d20d",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway/src/config/restore.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::config::restore::file_attributes#1",
+      "sha256": "8e22caf29fe6590ed0d9fa20b0a1d6a587b5935f30836b2073e7f477913fdb56",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the gateway's restore-marker start step, which the bundle and ledger startup modes (later #242 slices) will call: it reads the marker through the shared library, records config.restore_detected through the existing audit log and removes the marker, and has no transport or process capability."
+    },
+    {
+      "file": "gateway-config/src/backup/marker.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway_config::backup::marker::use cap_fs_ext :: { FollowSymlinks , OpenOptionsFollowExt as _ , OpenOptionsSyncExt as _ }#1",
+      "sha256": "9c15e3a6c284601e78f748e33b0858a66193afed8893e44523b0710940fd4850",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 PR 15 (standalone backup restore): opens the restore marker beneath the held state directory without following a link and without blocking on a FIFO swapped into its place, so a marker that is not a regular file is refused from its open handle. Local filesystem access only; it adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/backup/marker.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway_config::backup::marker::use cap_std :: { ambient_authority , fs :: { Dir , OpenOptions as CapabilityOpenOptions } , }#1",
+      "sha256": "195f6c89077f4e307f3177b3c7d3c177e0e7b8004353c1e9b857d2d1b820e3aa",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 PR 15 (standalone backup restore): opens the held state directory as a cap-std directory so the restore marker is read beneath the directory that was locked, never through a link. Local filesystem access only; it adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/backup/restore.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway_config::backup::restore::refuse_mount_point#1",
+      "sha256": "fc1b302367c7376a3ce2327e04e7abc623a558e0ac4258679f52777cdffcb3d4",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed for #242 PR 15 (standalone backup restore): imports MetadataExt on Unix to compare the device numbers of the target state directory and the directory holding it, refusing a mount point that no rename within its parent can move. Read-only metadata; it adds no network or process capability."
     }
   ]
 }
