@@ -57,12 +57,16 @@ use super::{
     decision::{
         audit_unavailable_response, PolicyDecision, PolicyDecisionOutcome, AUDIT_UNAVAILABLE_REASON,
     },
+    policy_facts::{http_request_facts, tool_call_facts, FactsRefusal, PolicyClock, ToolCallFacts},
     rate_limit::RateLimitState,
 };
 
 const AUTHZ_ALLOWED: &str = "authz.allowed";
 const AUTHZ_DENIED: &str = "authz.denied";
 const AUTHZ_WOULD_DENY: &str = "authz.would_deny";
+/// The refusal of a request whose query does not decode strictly, under a
+/// policy whose conditions read a query parameter.
+const POLICY_QUERY_UNDECODABLE: &str = "policy_query_undecodable";
 const POLICY_RELOAD_DEBOUNCE: Duration = Duration::from_millis(200);
 
 /// Why a strict security-revision check refused to let a request proceed.
@@ -291,6 +295,9 @@ pub struct RbacState {
     /// (issue #243, slice 8), attached once at startup. A state built without
     /// them validates with every one reported unavailable.
     policy_resources: Option<Arc<crate::rbac::policy_resources::PolicyResourceSources>>,
+    /// The clock a `time_window` condition is judged by: the system clock,
+    /// or a fixed one a test injects. Every clone shares it.
+    policy_clock: PolicyClock,
 }
 
 /// Proof that a caller owns this [`RbacState`]'s policy-write lane.
@@ -527,22 +534,32 @@ pub(crate) struct ToolPolicyEligibility {
 }
 
 /// One policy snapshot's inventory eligibility answers, for a caller that
-/// previews many tools and must not straddle a policy install between them.
-pub(crate) struct ToolEligibilitySnapshot(Arc<RbacPolicyState>);
+/// previews many tools and must not straddle a policy install between them,
+/// with the clock a time window is judged by.
+pub(crate) struct ToolEligibilitySnapshot(Arc<RbacPolicyState>, PolicyClock);
 
 impl ToolEligibilitySnapshot {
     /// Whether `principal` may invoke `tool_name` under this snapshot, without
     /// emitting audit events or beginning execution. A shadow rule leaves a tool
     /// eligible; a refusal is ineligible with the refusal's reason.
+    ///
+    /// A preview has no call, so it has no client address: a tool rule
+    /// whose conditions read one leaves the tool ineligible with
+    /// `policy_evaluation_incomplete`, never eligible on a guess.
     pub(crate) fn eligibility(
         &self,
         tool_name: &str,
         principal: &auth::Principal,
     ) -> ToolPolicyEligibility {
+        let call = ToolCallFacts {
+            source_address: None,
+            clock: &self.1,
+        };
         match self.0.evaluate_tool(
             ToolOperation::PolicyEligibility,
             tool_name,
             Some(principal),
+            call,
             None,
         ) {
             Ok(evaluation) => ToolPolicyEligibility {
@@ -631,6 +648,22 @@ impl RbacState {
             mcp_route_paths,
             proxy_dispatch_inventory: Arc::new(ProxyDispatchInventory::default()),
             policy_resources: None,
+            policy_clock: PolicyClock::System,
+        }
+    }
+
+    /// Judge `time_window` conditions by `clock` instead of the system clock.
+    #[cfg(test)]
+    pub(crate) fn with_policy_clock(mut self, clock: PolicyClock) -> Self {
+        self.policy_clock = clock;
+        self
+    }
+
+    /// What a tool lane knows of a call entering from `source_address`.
+    fn tool_call(&self, source_address: Option<std::net::IpAddr>) -> ToolCallFacts<'_> {
+        ToolCallFacts {
+            source_address,
+            clock: &self.policy_clock,
         }
     }
 
@@ -985,14 +1018,19 @@ impl RbacState {
     ///
     /// `principal` is the identity the caller projects, which for the tool
     /// runtime is its Actor projection, not necessarily the inbound principal.
+    /// `source_address` is the canonical client address the call entered
+    /// with, when its entry point had one; a `source_network` condition is
+    /// undetermined, and refuses, without it.
     pub(crate) fn evaluate_tool_authorization<R>(
         &self,
         tool_name: &str,
         principal: Option<&auth::Principal>,
+        source_address: Option<std::net::IpAddr>,
         evaluate: impl FnOnce(ToolInvocationAuthorization<'_>) -> R,
     ) -> R {
         let policy = self.effective_policy();
-        let verdict = policy.tool_invocation_verdict(tool_name, principal);
+        let verdict =
+            policy.tool_invocation_verdict(tool_name, principal, self.tool_call(source_address));
         evaluate(ToolInvocationAuthorization {
             tools: policy.compiled.tool_entries(),
             verdict,
@@ -1005,9 +1043,16 @@ impl RbacState {
         &self,
         tool_name: &str,
         principal: Option<&auth::Principal>,
+        source_address: Option<std::net::IpAddr>,
     ) -> bool {
         self.effective_policy()
-            .evaluate_tool(ToolOperation::Visibility, tool_name, principal, None)
+            .evaluate_tool(
+                ToolOperation::Visibility,
+                tool_name,
+                principal,
+                self.tool_call(source_address),
+                None,
+            )
             .is_ok_and(|evaluation| evaluation.effect() == PolicyEffect::Allow)
     }
 
@@ -1045,6 +1090,7 @@ impl RbacState {
         method: &str,
         path: &str,
         principal: Option<&auth::Principal>,
+        source_address: Option<std::net::IpAddr>,
     ) -> Result<Option<MatchedRuleDecision>, ToolPolicyRefusal> {
         // Rendering passes an `http::Method`'s own text, so this cannot fail
         // for a served call; an unparsable method is refused, not guessed.
@@ -1055,6 +1101,7 @@ impl RbacState {
             ToolOperation::RenderedHttp,
             tool_name,
             principal,
+            self.tool_call(source_address),
             Some((method, path.to_owned())),
         )?;
         policy.rendered_http_rule(&evaluation)
@@ -1078,7 +1125,7 @@ impl RbacState {
     /// The request's policy snapshot, read once, for previewing the
     /// eligibility of many tools from the same snapshot.
     pub(crate) fn tool_eligibility_snapshot(&self) -> ToolEligibilitySnapshot {
-        ToolEligibilitySnapshot(self.effective_policy())
+        ToolEligibilitySnapshot(self.effective_policy(), self.policy_clock.clone())
     }
 }
 
@@ -1212,18 +1259,19 @@ impl RbacPolicyState {
     }
 
     /// Ask the shared evaluator one tool-lane question of this snapshot about
-    /// `principal`, with the facts this snapshot's serving lanes capture for
-    /// it ([`crate::policy_eval::CompiledPolicy::serving_facts`]): in
-    /// mapped-role mode, the organization authentication verified for it, so
-    /// its internal roles are the ones every other lane resolves.
+    /// `principal`, with the facts a tool lane captures for it and the call
+    /// ([`tool_call_facts`]): the organization authentication verified for
+    /// it, so its internal roles are the ones every other lane resolves, and
+    /// the source address and instant when the policy's conditions read them.
     fn evaluate_tool(
         &self,
         operation: ToolOperation,
         tool_name: &str,
         principal: Option<&auth::Principal>,
+        call: ToolCallFacts<'_>,
         rendered: Option<(Method, String)>,
     ) -> Result<ToolEvaluation, ToolPolicyRefusal> {
-        let facts = self.compiled.serving_facts(principal);
+        let facts = tool_call_facts(&self.compiled, principal, call);
         self.evaluate_tool_with_facts(
             operation,
             tool_name,
@@ -1337,8 +1385,9 @@ impl RbacPolicyState {
         &self,
         tool_name: &str,
         principal: Option<&auth::Principal>,
+        call: ToolCallFacts<'_>,
     ) -> ToolInvocationVerdict<'_> {
-        match self.evaluate_tool(ToolOperation::Invocation, tool_name, principal, None) {
+        match self.evaluate_tool(ToolOperation::Invocation, tool_name, principal, call, None) {
             Ok(evaluation) => self.invocation_verdict(tool_name, &evaluation),
             Err(refusal) => ToolInvocationVerdict::Refused(refusal),
         }
@@ -1846,9 +1895,35 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
         ),
         dispatch,
     };
-    // The facts identity mappings read, from the authenticated principal
-    // alone: in mapped-role mode its verified organization, never a header.
-    let matcher_facts = compiled.serving_facts(principal.as_ref());
+    // The facts the policy's typed matchers read, and no others: the
+    // principal's verified organization, never a header, and the request
+    // facts its conditions name (`policy_facts`). A query that does not
+    // decode strictly, or facts past the evaluator's bounds, are refused
+    // here rather than decided on.
+    let matcher_facts = match http_request_facts(
+        compiled,
+        principal.as_ref(),
+        req.headers(),
+        req.uri(),
+        req.extensions(),
+        &state.client_ip_policy,
+        &state.policy_clock,
+    ) {
+        Ok(facts) => facts,
+        Err(refusal) => {
+            let (reason, error) = match refusal {
+                FactsRefusal::QueryUndecodable => (POLICY_QUERY_UNDECODABLE, None),
+                FactsRefusal::TooLarge => (
+                    "policy_evaluation_error",
+                    Some(crate::policy_eval::EvaluationError::ContextTooLarge),
+                ),
+            };
+            let refusal =
+                evaluation_failed(&state, &context, principal.as_ref(), reason, None, error);
+            drop(policy);
+            return refusal.answer().await;
+        }
+    };
     // The classifier derives these two contexts together. Never accept a
     // missing or different host-binding authority as a contextless allow.
     let evaluation = if observation.and_then(|facts| facts.authorization_context()) != proxy_context

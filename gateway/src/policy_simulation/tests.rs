@@ -1409,6 +1409,88 @@ fn the_published_schema_agrees_with_the_parser() {
     }
 }
 
+/// A simulated case states the request facts an inline candidate's
+/// conditions read, decides by them at every trace level, and repeats none
+/// of them; a fact it does not state is indeterminate, never an allow.
+#[test]
+fn case_facts_decide_an_inline_candidates_conditions_and_are_never_echoed() {
+    const HEADER_CANARY: &str = "header-canary-2c4f";
+    const QUERY_CANARY: &str = "query-canary-8a1d";
+    let candidate = json!({
+        "schema_version": "1.0.0",
+        "default_action": "allow",
+        "rules": [
+            {
+                "id": "office-only",
+                "path": "/exports/**",
+                "action": "deny",
+                "conditions": { "not": { "all": [
+                    { "source_network": { "cidrs": ["10.0.0.0/8"] } },
+                    { "header": { "name": "x-environment", "in": ["prod"] } },
+                    { "query": { "name": "format", "in": ["csv"] } },
+                    { "time_window": { "until": "2027-01-01T00:00:00Z" } }
+                ] } }
+            }
+        ]
+    });
+    let mut request = document(
+        json!({ "source": "inline", "policy": candidate }),
+        "full",
+        json!(["as_authored"]),
+    );
+    let stated = json!({
+        "source_ip": "10.1.2.3",
+        "headers": { "x-environment": [HEADER_CANARY, "prod"] },
+        "query": { "format": [QUERY_CANARY, "csv"] },
+        "now": "2026-06-01T00:00:00Z"
+    });
+    let mut outside = stated.clone();
+    outside["source_ip"] = json!("203.0.113.9");
+    let mut unstated_clock = stated.clone();
+    unstated_clock
+        .as_object_mut()
+        .expect("object")
+        .remove("now");
+    let mut cases = Vec::new();
+    for (id, facts) in [
+        ("office", Some(stated)),
+        ("outside", Some(outside)),
+        ("no-clock", Some(unstated_clock)),
+        ("no-facts", None),
+    ] {
+        let mut case = json!({
+            "id": id,
+            "kind": "http",
+            "request": { "method": "GET", "path": "/exports/q3" },
+            "principal": "anonymous"
+        });
+        if let Some(facts) = facts {
+            case["facts"] = facts;
+        }
+        cases.push(case);
+    }
+    request["cases"] = Value::Array(cases);
+    let validator = jsonschema::validator_for(&request_schema()).expect("the schema compiles");
+    if let Err(error) = validator.validate(&request) {
+        panic!("the schema refuses a request the parser accepts: {error}");
+    }
+    let outcome = run(&request);
+    for (id, logical, complete) in [
+        ("office", "allow", true),
+        ("outside", "deny", true),
+        ("no-clock", "indeterminate", false),
+        ("no-facts", "indeterminate", false),
+    ] {
+        let http = &result(case(&outcome, id), "as_authored")["candidate"];
+        assert_eq!(http["logical"], json!(logical), "{id}: {http}");
+        assert_eq!(http["complete"], json!(complete), "{id}: {http}");
+    }
+    let rendered = serde_json::to_string(&outcome.cases).expect("serializes");
+    for value in [HEADER_CANARY, QUERY_CANARY, "10.1.2.3", "203.0.113.9"] {
+        assert!(!rendered.contains(value), "{value} in {rendered}");
+    }
+}
+
 fn with_cases(candidate: Value, trace: &str, projections: Value, cases: Value) -> Value {
     let mut request = document(candidate, trace, projections);
     request["cases"] = cases;

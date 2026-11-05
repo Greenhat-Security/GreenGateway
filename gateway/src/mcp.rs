@@ -548,6 +548,11 @@ fn invocation_context_from_request(
             .extensions
             .get::<auth::Principal>()
             .and_then(|principal| principal.org_id.clone()),
+        source_address: client_ip::canonical_client_addr(
+            &parts.headers,
+            &parts.extensions,
+            client_ip_policy,
+        ),
         caller: parts
             .extensions
             .get::<auth::Principal>()

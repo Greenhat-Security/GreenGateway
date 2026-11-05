@@ -158,6 +158,12 @@ pub struct ToolInvocationContext {
     /// policy fact only, taken from the authenticated principal and never
     /// from a header: it is not audited, signed or sent upstream.
     pub organization: Option<String>,
+    /// The canonical client address the call entered the gateway from
+    /// (`client_ip::canonical_client_addr`, under the gateway's trusted-proxy
+    /// policy), the fact a `source_network` condition reads. `None` when the
+    /// entry point had no connection peer, and for internal calls: the
+    /// `source_ip` audit records for those is a placeholder, never a fact.
+    pub source_address: Option<std::net::IpAddr>,
     /// The caller a Connection's signed caller assertion names, built from the
     /// authenticated principal where the call entered the gateway. Kept apart
     /// from `actor`, which is audit's projection of the same principal: only
@@ -181,6 +187,7 @@ impl Default for ToolInvocationContext {
             source_ip: "127.0.0.1".to_owned(),
             actor: None,
             organization: None,
+            source_address: None,
             caller: None,
             source: ToolInvocationSource::Internal,
             admitted_deadline: None,
@@ -1112,6 +1119,7 @@ impl ToolRuntime {
             return rbac_state.evaluate_tool_authorization(
                 tool_name,
                 principal.as_ref(),
+                context.source_address,
                 |authorization| {
                     self.prune_idle_limiters(authorization.tools.keys());
                     let (tool, rule_decision) = match authorization.verdict {
@@ -1196,27 +1204,32 @@ impl ToolRuntime {
             return true;
         };
         let principal = principal_from_tool_context(context);
-        let decision =
-            match rbac_state.evaluate_tool_http_rule(tool_name, method, path, principal.as_ref()) {
-                Ok(decision) => decision,
-                Err(refusal) => {
-                    // No answer is a block, audited like a denying rule but
-                    // with the refusal's stable reason and no rule attributed.
-                    self.emit_http_rule_event(
-                        AUTHZ_DENIED,
-                        context,
-                        principal.as_ref(),
-                        HttpRuleAudit {
-                            tool_name,
-                            method,
-                            path,
-                            reason: refusal.reason(),
-                            matched_rule_id: None,
-                        },
-                    );
-                    return false;
-                }
-            };
+        let decision = match rbac_state.evaluate_tool_http_rule(
+            tool_name,
+            method,
+            path,
+            principal.as_ref(),
+            context.source_address,
+        ) {
+            Ok(decision) => decision,
+            Err(refusal) => {
+                // No answer is a block, audited like a denying rule but
+                // with the refusal's stable reason and no rule attributed.
+                self.emit_http_rule_event(
+                    AUTHZ_DENIED,
+                    context,
+                    principal.as_ref(),
+                    HttpRuleAudit {
+                        tool_name,
+                        method,
+                        path,
+                        reason: refusal.reason(),
+                        matched_rule_id: None,
+                    },
+                );
+                return false;
+            }
+        };
 
         let Some(decision) = decision else {
             return true;
@@ -1287,7 +1300,7 @@ impl ToolRuntime {
     ) -> bool {
         if let Some(rbac_state) = &self.inner.rbac_state {
             let principal = principal_from_tool_context(context);
-            return rbac_state.tool_visible(tool_name, principal.as_ref());
+            return rbac_state.tool_visible(tool_name, principal.as_ref(), context.source_address);
         }
 
         let Ok(state) = self.lookup_tool(tool_name) else {
@@ -4395,6 +4408,7 @@ mod tests {
                     }),
                     source: ToolInvocationSource::AdminPlayground,
                     organization: None,
+                    source_address: None,
                     caller: None,
                     admitted_deadline: None,
                 },
@@ -4858,6 +4872,7 @@ mod tests {
             actor: None,
             source: ToolInvocationSource::Internal,
             organization: None,
+            source_address: None,
             caller: None,
             admitted_deadline: None,
         }
@@ -4884,6 +4899,7 @@ mod tests {
             }),
             source: ToolInvocationSource::Internal,
             organization: None,
+            source_address: None,
             caller: None,
             admitted_deadline: None,
         }

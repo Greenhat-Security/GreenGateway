@@ -11286,7 +11286,8 @@ pub(crate) mod postgres_audit_tests {
         assert_eq!(
             members[0].capabilities,
             "delegated_token_purges,openapi_discovery_catalogs,openapi_swagger2_catalogs,\
-             operation_requirements,policy_document_v1,policy_role_descriptions"
+             operation_requirements,policy_document_v1,policy_role_descriptions,\
+             policy_rule_conditions"
         );
         assert!(RecognizedCapabilities::parse(&members[0].capabilities)
             .contains(Capability::OperationRequirements));
@@ -11300,6 +11301,8 @@ pub(crate) mod postgres_audit_tests {
             .contains(Capability::OpenApiDiscoveryCatalogs));
         assert!(RecognizedCapabilities::parse(&members[0].capabilities)
             .contains(Capability::PolicyDocumentV1));
+        assert!(RecognizedCapabilities::parse(&members[0].capabilities)
+            .contains(Capability::PolicyRuleConditions));
         assert_eq!(
             (
                 members[0].document_version_min,
@@ -11334,7 +11337,8 @@ pub(crate) mod postgres_audit_tests {
         assert_eq!(
             store.members(window).await.expect("members")[0].capabilities,
             "delegated_token_purges,openapi_discovery_catalogs,openapi_swagger2_catalogs,\
-             operation_requirements,policy_document_v1,policy_role_descriptions"
+             operation_requirements,policy_document_v1,policy_role_descriptions,\
+             policy_rule_conditions"
         );
 
         let older = insert_pre_protocol_member(&pool).await;
@@ -11877,12 +11881,14 @@ pub(crate) mod postgres_audit_tests {
     /// cluster authority. The store commits format 1 whatever it carries and
     /// keeps the conditions exactly: the stored document reads back, under
     /// the reader that admits them, as the committed policy at the committed
-    /// ETag. This build enforces no rule condition, in either mode, so its
-    /// replicas refuse to serve the document -- the active read fails closed
-    /// as invalid data rather than reading the document without them -- and
-    /// the policy API never hands one to the store
-    /// (`typed_matchers_not_enforced`). Once a release enforces them, this
-    /// commit is the document its replicas serve. Recovery is forward: a
+    /// ETag. This build enforces every condition leaf but `tool_argument`, so
+    /// a document whose conditions read the organization, the source network
+    /// and a header is served exactly as committed. One with a `tool_argument`
+    /// condition is not: its replicas refuse to serve it -- the active read
+    /// fails closed as invalid data rather than reading the document without
+    /// it -- and the policy API never hands one to the store
+    /// (`typed_matchers_not_enforced`). Once a release enforces that leaf too,
+    /// this commit is the document its replicas serve. Recovery is forward: a
     /// document this build serves commits over it.
     #[tokio::test]
     async fn a_v1_document_with_rule_conditions_commits_in_cluster_mode_and_is_served_only_once_enforced(
@@ -11894,9 +11900,9 @@ pub(crate) mod postgres_audit_tests {
         let _guard = DATABASE.lock().await;
         let database = create_test_database(&admin_dsn).await;
         let (store, pool) = migrated_policy_store(&database).await;
-        let document = json!({
+        let served_document = json!({
             "schema_version": "1.0.0",
-            "id": "typed-matchers",
+            "id": "request-conditions",
             "default_action": "deny",
             "roles": {
                 "admin": { "permissions": ["admin:policy:write"] },
@@ -11912,9 +11918,37 @@ pub(crate) mod postgres_audit_tests {
                 "id": "internal-reads",
                 "path": "/data/**",
                 "action": "allow",
+                "conditions": { "all": [
+                    { "organization": { "issuer": "https://idp.example.test/", "in": ["acme"] } },
+                    { "any": [
+                        { "source_network": { "cidrs": ["10.0.0.0/8"] } },
+                        { "header": { "name": "x-environment", "in": ["staging"] } }
+                    ] }
+                ] }
+            }]
+        });
+        let served = Policy::validate_json_value(served_document)
+            .expect("this build serves organization, source-network and header conditions");
+        let mut document = json!({
+            "schema_version": "1.0.0",
+            "id": "typed-matchers",
+            "default_action": "deny",
+            "roles": {
+                "admin": { "permissions": ["admin:policy:write"] },
+                "reader": { "permissions": ["data:read"] }
+            },
+            "rules": [{
+                "id": "internal-reads",
+                "path": "/data/**",
+                "action": "allow",
+                "conditions": { "source_network": { "cidrs": ["10.0.0.0/8"] } }
+            }, {
+                "id": "eu-exports",
+                "tool_name": "reports.export",
+                "action": "deny",
                 "conditions": { "any": [
                     { "source_network": { "cidrs": ["10.0.0.0/8"] } },
-                    { "header": { "name": "x-environment", "in": ["staging"] } }
+                    { "tool_argument": { "pointer": "/region", "in": ["eu"] } }
                 ] }
             }]
         });
@@ -11922,7 +11956,7 @@ pub(crate) mod postgres_audit_tests {
             .expect("the typed-matcher document is sound");
         assert!(
             Policy::validate_json_value(document.clone()).is_err(),
-            "this build accepts no document whose rules carry conditions"
+            "this build accepts no document whose conditions read a tool argument"
         );
 
         let initial = PolicyControlPlane::commit(
@@ -11935,14 +11969,33 @@ pub(crate) mod postgres_audit_tests {
         )
         .await
         .expect("initialize should commit");
-        let committed = PolicyControlPlane::commit(
+        let conditioned = PolicyControlPlane::commit(
             &*store,
             commit_request(
                 PolicyCommitPrecondition::Expected {
                     etag: initial.etag.clone(),
                 },
-                &typed,
+                &served,
                 "op-2",
+            ),
+        )
+        .await
+        .expect("a document with served conditions commits in cluster mode");
+        let active = PolicyControlPlane::active(&*store)
+            .await
+            .expect("a document this build enforces is served")
+            .expect("an active policy");
+        assert_eq!(active.etag, conditioned.etag);
+        assert_eq!(active.policy, served, "the conditions are served exactly");
+
+        let committed = PolicyControlPlane::commit(
+            &*store,
+            commit_request(
+                PolicyCommitPrecondition::Expected {
+                    etag: conditioned.etag.clone(),
+                },
+                &typed,
+                "op-3",
             ),
         )
         .await
@@ -11971,8 +12024,14 @@ pub(crate) mod postgres_audit_tests {
 
         let refused = PolicyControlPlane::active(&*store)
             .await
-            .expect_err("conditions this build does not enforce are never served");
+            .expect_err("a tool_argument condition this build does not enforce is never served");
         assert_eq!(refused.kind(), RepositoryErrorKind::InvalidData);
+
+        // Without the tool_argument leaf the same document is one this build
+        // serves; the refusal is that leaf's alone.
+        document["rules"][1]["conditions"] =
+            json!({ "source_network": { "cidrs": ["10.0.0.0/8"] } });
+        assert!(Policy::validate_json_value(document).is_ok());
 
         let recovered = PolicyControlPlane::commit(
             &*store,
@@ -11981,7 +12040,7 @@ pub(crate) mod postgres_audit_tests {
                     etag: committed.etag.clone(),
                 },
                 &contract_policy_v1("recovered"),
-                "op-3",
+                "op-4",
             ),
         )
         .await

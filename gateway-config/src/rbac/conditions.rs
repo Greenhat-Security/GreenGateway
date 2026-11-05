@@ -249,6 +249,27 @@ pub fn query_name_is_readable(name: &str) -> bool {
             .any(|fragment| name.contains(fragment))
 }
 
+impl Condition {
+    /// Whether any leaf of the tree reads a tool call's arguments: the one
+    /// leaf no serving lane captures a fact for yet, because the arguments a
+    /// leaf may read are the schema-validated ones and admission decides
+    /// before it validates them.
+    pub fn reads_tool_arguments(&self) -> bool {
+        match self {
+            Self::All(operands) | Self::Any(operands) => {
+                operands.iter().any(Self::reads_tool_arguments)
+            }
+            Self::Not(operand) => operand.reads_tool_arguments(),
+            Self::ToolArgument(_) => true,
+            Self::Organization(_)
+            | Self::SourceNetwork(_)
+            | Self::Header(_)
+            | Self::Query(_)
+            | Self::TimeWindow(_) => false,
+        }
+    }
+}
+
 /// Canonicalizes the issuers a condition binds, as role and rule issuers are.
 pub fn canonicalize_condition_issuers(condition: &mut Condition) {
     match condition {
