@@ -116,7 +116,7 @@ pub(crate) async fn start_serving<S: StartupStages>(
     get_var: impl FnMut(&str) -> Result<String, std::env::VarError>,
 ) -> Result<(), StartupFailure> {
     let plan = config::compile(get_var).map_err(StartupFailure::Configuration)?;
-    let config = plan.into_config();
+    let config = config::into_config(plan);
     // Each stage's future is boxed: an unoptimized build would otherwise
     // hold all of them inline, and the main thread's stack on Windows is
     // 1 MiB.

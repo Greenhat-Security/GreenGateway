@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://greengateway.dev/schemas/mcp-client-configs.v1alpha1.schema.json",
+  "title": "GreenGateway MCP Client Configuration Templates",
+  "description": "What a running gateway serves at GET /v1{ADMIN_PREFIX}/mcp/client-configs (admin:mcp:clients:read) and what ggctl mcp-config reads: credential-free configuration templates for MCP clients, all naming the gateway's own MCP endpoint, which the gateway computes from GATEWAY_PUBLIC_URL as its protected-resource metadata does. An OAuth template holds only that URL; a token template names the fixed environment variable GREENGATEWAY_MCP_TOKEN in the client's interpolation syntax and never a token. The document is closed: a member this version does not define, a duplicate member, or a value outside its grammar makes it unreadable. This schema is necessary but not sufficient: the shared reader in the gateway-config crate is authoritative, and accepts a document only when every template is exactly what this version renders for the stated mcpUrl, serverName and oauth.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "kind", "mcpUrl", "serverName", "oauth", "tokenVariable", "templates"],
+  "properties": {
+    "apiVersion": {
+      "description": "Exact document version. No other version, prefix, or spelling is accepted.",
+      "const": "greengateway.dev/v1alpha1"
+    },
+    "kind": {
+      "const": "McpClientConfigs"
+    },
+    "mcpUrl": {
+      "description": "The gateway's MCP endpoint in canonical URL form: https (http only for a loopback host), a path ending at /mcp, an optional query, no user information or fragment, and none of the characters $ { } \\ that client configuration files interpolate or escape.",
+      "type": "string",
+      "maxLength": 16384,
+      "pattern": "^https?://[^\\s?#$\\\\{}]+/mcp(\\?[^\\s#$\\\\{}]*)?$"
+    },
+    "serverName": {
+      "description": "The server entry name the JSON templates use.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"
+    },
+    "oauth": {
+      "description": "Whether the gateway's protected-resource metadata advertises an authorization server. OAuth templates are present only when it does.",
+      "type": "boolean"
+    },
+    "tokenVariable": {
+      "description": "The environment variable every token template reads the bearer token from.",
+      "const": "GREENGATEWAY_MCP_TOKEN"
+    },
+    "templates": {
+      "description": "For each client in the order generic, claude-desktop, cursor, vscode: its OAuth template when oauth is true, then its token template when it has one. Claude Desktop has no token template.",
+      "type": "array",
+      "maxItems": 7,
+      "items": {
+        "$ref": "#/$defs/template"
+      }
+    }
+  },
+  "$defs": {
+    "template": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["client", "auth", "format", "locations", "content"],
+      "properties": {
+        "client": {
+          "enum": ["generic", "claude-desktop", "cursor", "vscode"]
+        },
+        "auth": {
+          "description": "oauth: the client discovers the authorization server from the gateway's protected-resource metadata. token: the client sends the bearer token it reads from tokenVariable.",
+          "enum": ["oauth", "token"]
+        },
+        "format": {
+          "description": "json: a JSON document, the client's configuration file. url: one line holding the MCP URL, for a client that takes it in its own interface.",
+          "enum": ["json", "url"]
+        },
+        "locations": {
+          "description": "Where the client reads a file holding this template, relative to a project or the user's home directory; empty for a client that takes the template in its own interface.",
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          }
+        },
+        "content": {
+          "description": "The template, ending in a line feed.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32768,
+          "pattern": "\\n$"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "client": { "const": "claude-desktop" } }
+          },
+          "then": {
+            "properties": {
+              "auth": { "const": "oauth" },
+              "format": { "const": "url" },
+              "locations": { "maxItems": 0 }
+            }
+          },
+          "else": {
+            "properties": {
+              "format": { "const": "json" }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

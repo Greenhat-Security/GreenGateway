@@ -42,7 +42,7 @@
       "description": "No corresponding gateway-owned operation/delivery is shipped in this mode; required authority-event delivery cannot be inferred from provider audit or future plans.",
       "sources": [
         {
-          "path": "gateway/src/config/storage.rs",
+          "path": "gateway-config/src/compiler/storage.rs",
           "anchor": "fn reject_local_authority_in_postgres_mode("
         }
       ]
@@ -319,7 +319,7 @@
       "follow_up": "Keep this operation refused; do not introduce a local file authority fallback.",
       "sources": [
         {
-          "path": "gateway/src/config/storage.rs",
+          "path": "gateway-config/src/compiler/storage.rs",
           "anchor": "fn reject_local_authority_in_postgres_mode("
         }
       ],
@@ -693,7 +693,7 @@
         "missing_metadata",
         "missing_delivery"
       ],
-      "follow_up": "PR4 follow-up: a caller-bound operation identity at the store, and delivery from this same database (standalone mode has no journal or dispatcher), with no audit-database dual write. Catalog/overlay publication in this database is its own row; the PostgreSQL create/replace evidence (connection_postgres) is still open. Issuer, actor kind and auth mode are recorded.",
+      "follow_up": "PR4 follow-up: a caller-bound operation identity at the store, and delivery from this same database (standalone mode has no journal or dispatcher), with no audit-database dual write. Catalog/overlay publication in this database is its own row (catalog_standalone); the PostgreSQL create/replace evidence (connection_postgres) is still open. Issuer, actor kind and auth mode are recorded.",
       "sources": [
         {
           "path": "gateway/src/connections/store.rs",
@@ -1069,17 +1069,21 @@
           "anchor": "async fn connection_openapi_overlay_delete_endpoint("
         }
       ],
-      "boundary": "Immediate SQLite catalog transaction checks Connection/catalog/overlay CAS and writes catalogs, dependencies and overlay together.",
-      "record": "Current catalog revisions/entries; overlay retains current actor, ordinary catalog replacement has no immutable actor/event history.",
-      "actor": "Admin telemetry and current overlay actor cannot establish actor for every retained historical change.",
-      "identity": "Connection/catalog/overlay revisions; no common operation ID or durable deletion evidence.",
+      "boundary": "SqliteConnectionStore::replace_mcp_catalog_expecting and replace_openapi_catalog_with_overlay_and_enum_values refuse an actor the evidence cannot record exactly (ChangeActor::is_recordable) before anything is read, then run one IMMEDIATE transaction on the CONNECTIONS_SQLITE_PATH database: check the Connection ETag and the catalog (for OpenAPI also the spec and overlay) revisions, write the catalog, its dependencies, the overlay and the enum values its compile resolved, append one catalog_change_evidence row and commit once. Registration, refresh and overlay put/delete all reach the OpenAPI replacement. The action is named by what the write did to the overlay, as the PostgreSQL writer names it: an overlay put is catalog.overlay.replace, an overlay delete catalog.overlay.delete, an MCP publication catalog.mcp.publish, and an OpenAPI registration or refresh (no overlay change, or only refreshed source reports) catalog.openapi.publish. The catalog services install the published catalog only after that commit. An evidence insert failure rolls the publication back and is reported as a store failure (503), never as a validation problem, a conflict or an invalid upstream response. Enum-value refreshes and status observations publish no catalog and write no row.",
+      "record": "Current catalog revisions, entries and dependencies and the overlay (with its last writer's subject) are replaced atomically. The same database's catalog_change_evidence table (Connections schema migration 13, no foreign key) keeps one append-only row per committed publication: actor (subject, kind, auth mode and, for a principal that has one, canonical issuer, with migration 12's bounds and pairing CHECK and every column required), action, event/operation UUIDs, Connection ID, the catalog revision before (none for a first catalog) and after, the overlay revision the published catalog was compiled from (0 for none; none for MCP), a commit-ordered sequence and the publication's own committed_at, under PostgreSQL migration 23's action vocabulary and revision CHECKs. No specification, digest, tool or resource name, definition, overlay document, source report, enum value, endpoint or binding. A stale Connection ETag, a stale catalog, spec or overlay revision, a mismatched compiled overlay revision, a bound, a kind mismatch and an unrecordable actor write none. Rows outlive the catalogs they replaced and the Connection whose deletion cascades the current ones; they are never pruned, and import-standalone does not carry them.",
+      "actor": "The authenticated principal the refresh, OpenAPI registration and overlay endpoints pass through the MCP and OpenAPI catalog services and the managed-store adapter as a ChangeActor, committed with the publication: the subject (1 to 4096 bytes), actor_kind (principal or service_token), actor_auth_mode and the canonical actor_issuer of a principal that has one (1 to 4096 bytes). A keyed safe actor reference is absent.",
+      "identity": "Generated event_id/operation_id UUIDs per store call (not bound to a client idempotency key), Connection ID, the catalog revision transition and compiled overlay revision, store sequence and the process-clock committed_at (the catalog's refreshed_at). Standalone mode has no shared security revision and no database clock; catalog revisions restart when a Connection re-enters a managed kind, so a Connection's rows are ordered by sequence.",
       "delivery": "post_commit_telemetry",
       "disposition": [
         "missing_metadata",
         "missing_delivery"
       ],
-      "follow_up": "PR4: append evidence within the catalog transaction, including scheduled refresh and overlay removal; exclude enum-value refresh and status observations unless they change publication authority.",
+      "follow_up": "PR4 follow-up: a caller-bound operation identity at the store, and delivery from this same database (standalone mode has no journal or dispatcher), with no audit-database dual write. Catalogs removed by a Connection kind change are connection.replace evidence (connection_standalone). Issuer, actor kind and auth mode are recorded.",
       "sources": [
+        {
+          "path": "gateway/src/connections/store.rs",
+          "anchor": "CREATE TABLE catalog_change_evidence ("
+        },
         {
           "path": "gateway/src/connections/store.rs",
           "anchor": "pub fn replace_mcp_catalog_expecting("
@@ -1087,9 +1091,65 @@
         {
           "path": "gateway/src/connections/store.rs",
           "anchor": "pub fn replace_openapi_catalog_with_overlay_and_enum_values("
+        },
+        {
+          "path": "gateway/src/connections/store.rs",
+          "anchor": "action: CATALOG_EVIDENCE_ACTION_MCP_PUBLISH,"
+        },
+        {
+          "path": "gateway/src/connections/store.rs",
+          "anchor": "Some(StoredOverlayWrite::Delete { .. }) => CATALOG_EVIDENCE_ACTION_OVERLAY_DELETE,"
+        },
+        {
+          "path": "gateway/src/connections/store.rs",
+          "anchor": "fn record_catalog_change_evidence("
+        },
+        {
+          "path": "gateway/src/connections/store.rs",
+          "anchor": "pub(crate) fn is_evidence_append_failure(&self) -> bool"
+        },
+        {
+          "path": "gateway/src/connections/managed_store.rs",
+          "anchor": "store.replace_mcp_catalog_expecting("
         }
       ],
       "tests": [
+        {
+          "path": "gateway/src/connections/store_tests.rs",
+          "anchor": "fn catalog_publications_record_evidence_that_survives_deletion_and_restart("
+        },
+        {
+          "path": "gateway/src/connections/store_tests.rs",
+          "anchor": "fn catalog_evidence_records_no_catalog_material_and_nothing_for_unpublished_writes("
+        },
+        {
+          "path": "gateway/src/connections/store_tests.rs",
+          "anchor": "fn refused_catalog_publications_write_no_evidence("
+        },
+        {
+          "path": "gateway/src/connections/store_tests.rs",
+          "anchor": "fn a_failed_catalog_evidence_insert_rolls_back_the_publication("
+        },
+        {
+          "path": "gateway/src/connections/store_tests.rs",
+          "anchor": "fn migration_thirteen_adds_an_empty_catalog_evidence_table_to_an_existing_database("
+        },
+        {
+          "path": "gateway/src/connections/store_tests.rs",
+          "anchor": "fn migration_thirteen_refuses_catalog_evidence_rows_that_do_not_fit_their_action("
+        },
+        {
+          "path": "gateway/src/connections/store_tests.rs",
+          "anchor": "fn catalog_change_evidence_matches_migration_twelve_and_postgresql("
+        },
+        {
+          "path": "gateway/src/connections/mcp.rs",
+          "anchor": "fn a_rejected_storage_constraint_is_not_reported_as_a_retryable_outage("
+        },
+        {
+          "path": "gateway/src/authority_evidence_app_tests.rs",
+          "anchor": "async fn required_evidence_admits_standalone_catalog_publication_and_records_it("
+        },
         {
           "path": "gateway/src/connections/store_tests.rs",
           "anchor": "fn mcp_catalog_replacement_is_atomic_revisioned_and_dependency_aware("
@@ -1100,8 +1160,8 @@
         }
       ],
       "required_durability_supported": false,
-      "required_mode": "refused",
-      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+      "required_mode": "admitted",
+      "test_claim": "Standalone regression anchors for the catalog and overlay publication evidence in the Connections database's own transactions: every action with three actor shapes, survival of replacement, Connection deletion and restart, refused and stale publications and unrecordable actors, forced insert failure and rollback with its store-failure classification, the migration onto an existing database, the CHECKs pinned to migration 12 and PostgreSQL migration 23, synthetic-marker exclusion, and the required-mode admin endpoints recording the authenticated principal. They do not certify the proposed authority-event contract or delivery."
     },
     {
       "id": "local_secrets",
@@ -1238,7 +1298,7 @@
       "follow_up": "Keep local-secret administration unavailable in cluster mode; external provider rotation is a separate authority and cannot share the gateway transaction.",
       "sources": [
         {
-          "path": "gateway/src/config/storage.rs",
+          "path": "gateway-config/src/compiler/storage.rs",
           "anchor": "CONNECTION_LOCAL_SECRET_KEYRING,"
         },
         {
@@ -1989,11 +2049,11 @@
           "anchor": "const PRUNE_SESSIONS_SQL: &str"
         },
         {
-          "path": "gateway/src/config/storage.rs",
+          "path": "gateway-config/src/compiler/storage.rs",
           "anchor": "standalone_memory is unsupported with {STATE_BACKEND}=postgres"
         },
         {
-          "path": "gateway/src/config/storage.rs",
+          "path": "gateway-config/src/compiler/storage.rs",
           "anchor": "cluster_postgres requires {STATE_BACKEND}=postgres"
         },
         {

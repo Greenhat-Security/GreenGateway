@@ -364,7 +364,8 @@ fn a_serving_error_is_classified_by_whether_the_gateway_became_ready() {
 /// returns, and it finds the directory still absent: nothing was created
 /// on the way there, no SQLite store, audit file or keyring. The compiler is
 /// handed no resolver, client, store or provider to call, and the source
-/// scan in `config/stage_tests.rs` holds that it reaches for none.
+/// scan in `gateway-config/src/compiler/stage_tests.rs` holds that it
+/// reaches for none.
 #[test]
 fn compiling_touches_nothing_the_configuration_names() {
     let root =

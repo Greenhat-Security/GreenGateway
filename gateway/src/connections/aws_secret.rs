@@ -103,7 +103,7 @@ const STS_FORM_ENCODE: &AsciiSet = &NON_ALPHANUMERIC
 // the configuration compiler (issue #242).
 pub(crate) use gateway_config::connections::aws_secret::{
     parse_secret_arn, validate_aws_provider_config, AwsAuthConfig, AwsProviderConfig,
-    AwsProviderConfigError, MAX_AWS_PROVIDER_CONFIG_BYTES,
+    AwsProviderConfigError,
 };
 // The parts of the document only tests assemble by hand.
 #[cfg(test)]

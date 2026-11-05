@@ -3,7 +3,7 @@
 //! validation and the tool runtime -- compiled in pure stages (issue #433,
 //! PR 2).
 //!
-//! `Config::from_env_vars` reads these in six blocks with other domains'
+//! The compiler reads these in six blocks with other domains'
 //! settings between them, and each block is requested where the legacy parser
 //! requested it, so the read order does not move:
 //!
@@ -50,12 +50,9 @@ use super::{
     VALIDATION_ALLOWED_CONTENT_TYPES, VOLUME_OUTLIER_SIGNAL_THRESHOLD,
 };
 use crate::discovery::{
-    signals::{
-        DEFAULT_ERROR_RATE_SPIKE_SIGNAL_THRESHOLD,
-        DEFAULT_PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD,
-        DEFAULT_SCHEMA_MISMATCH_SIGNAL_THRESHOLD, DEFAULT_VOLUME_OUTLIER_SIGNAL_THRESHOLD,
-    },
-    suggestions::DEFAULT_RULE_SUGGESTION_BASELINE_WINDOW_HOURS,
+    DEFAULT_ERROR_RATE_SPIKE_SIGNAL_THRESHOLD, DEFAULT_PRINCIPAL_NEW_TO_ENDPOINT_SIGNAL_THRESHOLD,
+    DEFAULT_RULE_SUGGESTION_BASELINE_WINDOW_HOURS, DEFAULT_SCHEMA_MISMATCH_SIGNAL_THRESHOLD,
+    DEFAULT_VOLUME_OUTLIER_SIGNAL_THRESHOLD,
 };
 
 /// The shutdown drain's inputs, and the request path's audit durability
@@ -767,37 +764,36 @@ pub(super) struct RuntimeBlocks {
 
 /// The validated runtime bounds.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct RuntimePlan {
-    pub(crate) shutdown_drain_delay_ms: u64,
-    pub(crate) shutdown_timeout_ms: u64,
-    pub(crate) audit_drain_timeout_ms: u64,
-    pub(crate) audit_durability: AuditDurability,
-    pub(crate) audit_durability_timeout_ms: u64,
-    pub(crate) payload_capture_enabled: bool,
-    pub(crate) payload_capture_sample_rate: f64,
-    pub(crate) schema_mismatch_signal_threshold: u64,
-    pub(crate) error_rate_spike_signal_threshold: f64,
-    pub(crate) principal_new_to_endpoint_signal_threshold: u64,
-    pub(crate) volume_outlier_signal_threshold: f64,
-    pub(crate) rule_suggestion_baseline_window_hours: u64,
-    pub(crate) cors_allow_origins: Vec<String>,
-    pub(crate) max_body_size: usize,
-    pub(crate) max_request_path_bytes: usize,
-    pub(crate) rate_limit_read_rps: f64,
-    pub(crate) rate_limit_read_burst: u32,
-    pub(crate) rate_limit_write_rps: f64,
-    pub(crate) rate_limit_write_burst: u32,
-    pub(crate) rate_limit_max_buckets: usize,
-    pub(crate) rate_limit_bucket_ttl_ms: u64,
-    pub(crate) validation_allowed_content_types: Vec<String>,
-    pub(crate) tool_runtime_queue_depth: usize,
-    pub(crate) tool_runtime_global_concurrency: usize,
-    pub(crate) tool_runtime_queue_timeout_ms: u64,
-    pub(crate) tool_runtime_default_timeout_ms: u64,
+pub struct RuntimePlan {
+    pub shutdown_drain_delay_ms: u64,
+    pub shutdown_timeout_ms: u64,
+    pub audit_drain_timeout_ms: u64,
+    pub audit_durability: AuditDurability,
+    pub audit_durability_timeout_ms: u64,
+    pub payload_capture_enabled: bool,
+    pub payload_capture_sample_rate: f64,
+    pub schema_mismatch_signal_threshold: u64,
+    pub error_rate_spike_signal_threshold: f64,
+    pub principal_new_to_endpoint_signal_threshold: u64,
+    pub volume_outlier_signal_threshold: f64,
+    pub rule_suggestion_baseline_window_hours: u64,
+    pub cors_allow_origins: Vec<String>,
+    pub max_body_size: usize,
+    pub max_request_path_bytes: usize,
+    pub rate_limit_read_rps: f64,
+    pub rate_limit_read_burst: u32,
+    pub rate_limit_write_rps: f64,
+    pub rate_limit_write_burst: u32,
+    pub rate_limit_max_buckets: usize,
+    pub rate_limit_bucket_ttl_ms: u64,
+    pub validation_allowed_content_types: Vec<String>,
+    pub tool_runtime_queue_depth: usize,
+    pub tool_runtime_global_concurrency: usize,
+    pub tool_runtime_queue_timeout_ms: u64,
+    pub tool_runtime_default_timeout_ms: u64,
     /// Where each of the six blocks' inputs came from, in the order they are
     /// read.
-    #[allow(dead_code)] // Read by the stage tests; startup builds from the values alone.
-    pub(crate) provenance: Vec<Provenance>,
+    pub provenance: Vec<Provenance>,
 }
 
 /// Parses the last runtime block and builds the plan.

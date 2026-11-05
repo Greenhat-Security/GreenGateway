@@ -303,6 +303,7 @@ pub fn static_config_fingerprint(config: &Config) -> StaticConfigFingerprint {
     insert_rate_limit_settings(&mut input, config);
     insert_secret_generation_ids(&mut input, config);
     insert_authority_event_settings(&mut input, config);
+    insert_policy_publication_settings(&mut input, config);
 
     let mut hasher = Sha256::new();
     hasher.update(FINGERPRINT_DOMAIN.as_bytes());
@@ -360,6 +361,16 @@ fn insert_authority_event_settings(input: &mut BTreeMap<String, String>, config:
             "authority_evidence_durability".into(),
             settings.durability.as_str().to_owned(),
         );
+    }
+}
+
+fn insert_policy_publication_settings(input: &mut BTreeMap<String, String>, config: &Config) {
+    // A replica that publishes a policy change its peers would refuse for
+    // its stored tests is not enforcing the same contract (issue #243).
+    // Absent when off, the default, so a deployment that never sets it keeps
+    // its fingerprint.
+    if config.policy_tests_required {
+        input.insert("policy_tests_required".into(), "true".to_owned());
     }
 }
 
@@ -1518,6 +1529,26 @@ mod tests {
                     AuthorityEventSinkSetting::File("/var/lib/gateway-b/events.jsonl".to_owned())
             }),
             "the file sink's path is a per-replica detail"
+        );
+    }
+
+    #[test]
+    fn fingerprint_covers_required_policy_tests_only_when_on() {
+        let base = Config::test_defaults();
+        assert!(!base.policy_tests_required);
+        let mut required = base.clone();
+        required.policy_tests_required = true;
+        assert_ne!(
+            static_config_fingerprint(&required),
+            static_config_fingerprint(&base),
+            "a replica that gates publication on the stored suite must not agree with one that does not"
+        );
+        let mut off = base.clone();
+        off.policy_tests_required = false;
+        assert_eq!(
+            static_config_fingerprint(&off),
+            static_config_fingerprint(&base),
+            "off, the default, adds nothing a deployment's fingerprint did not have"
         );
     }
 

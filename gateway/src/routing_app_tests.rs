@@ -1173,6 +1173,23 @@ async fn split_admin_listener_enforces_auth_and_rbac_on_admin_api() {
     admin_server.abort();
 }
 
+/// The admin UI serves the baseline `permissions-policy` itself (issue
+/// #242): the console never uses the asynchronous clipboard API, so the
+/// browser is told to refuse it, and copying stays the operator's own
+/// select-and-copy.
+fn assert_admin_ui_denies_the_clipboard(headers: &HeaderMap) {
+    let values: Vec<_> = headers.get_all("permissions-policy").iter().collect();
+    assert_eq!(values.len(), 1, "exactly one permissions-policy");
+    assert_eq!(values[0], middleware::headers::PERMISSIONS_POLICY);
+    let policy = values[0].to_str().expect("ASCII policy");
+    for directive in ["clipboard-read=()", "clipboard-write=()"] {
+        assert!(
+            policy.split(", ").any(|entry| entry == directive),
+            "{policy}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn admin_ui_shell_is_served_without_principal() {
     let recorder = PrometheusBuilder::new().build_recorder();
@@ -1198,6 +1215,7 @@ async fn admin_ui_shell_is_served_without_principal() {
         response.headers()["content-security-policy"],
         ADMIN_UI_CONTENT_SECURITY_POLICY
     );
+    assert_admin_ui_denies_the_clipboard(response.headers());
     assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
     let body = body_string(response).await;
     assert!(body.contains(r#"<div id="root"></div>"#));
@@ -1241,6 +1259,7 @@ async fn admin_ui_real_embedded_javascript_asset_is_served() {
             || content_type.starts_with("application/javascript"),
         "unexpected JavaScript content type: {content_type}"
     );
+    assert_admin_ui_denies_the_clipboard(response.headers());
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("body should read");

@@ -378,6 +378,22 @@ impl Policy {
         self.rules.iter().any(|rule| rule.conditions.is_some())
     }
 
+    /// Whether any direct rule's conditions contain a `tool_argument` leaf,
+    /// which a gateway that enforces the other conditions but predates
+    /// tool-argument conditions refuses. Cluster-mode writers ask the
+    /// operation gate before committing such a document
+    /// (`storage::compatibility::POLICY_TOOL_ARGUMENT_CONDITIONS`).
+    #[cfg(feature = "postgres")]
+    pub(crate) fn uses_tool_argument_conditions(&self) -> bool {
+        self.rules.iter().any(|rule| {
+            rule.conditions.as_ref().is_some_and(|conditions| {
+                let mut leaves = Vec::new();
+                conditions.tool_argument_leaves("", &mut leaves);
+                !leaves.is_empty()
+            })
+        })
+    }
+
     /// Whether this is a policy v1 document (document format 1), which a
     /// gateway that does not serve format 1 in cluster mode refuses.
     /// Cluster-mode writers ask the operation gate before committing one
@@ -3685,6 +3701,7 @@ mod tests {
             policy_file,
             tools_file: None,
             policy_history_sqlite_path: None,
+            policy_tests_required: false,
             cors_allow_origins: Vec::new(),
             max_body_size: 1_048_576,
             max_request_path_bytes: crate::config::DEFAULT_MAX_REQUEST_PATH_BYTES,

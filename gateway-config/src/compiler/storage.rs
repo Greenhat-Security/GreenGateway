@@ -2,7 +2,7 @@
 //! cluster's coordination settings, the state backend and PostgreSQL --
 //! compiled in pure stages (issue #433, PR 2).
 //!
-//! `Config::from_env_vars` reads these in six blocks with other domains'
+//! The compiler reads these in six blocks with other domains'
 //! settings between them, and each block is requested where the legacy parser
 //! requested it, so the read order does not move:
 //!
@@ -75,10 +75,10 @@ use super::{
     MIN_CLUSTER_MAINTENANCE_LEASE_TTL_MS, MIN_CLUSTER_STALE_HEARTBEATS,
     MIN_DISCOVERY_PROJECTOR_LEASE_TTL_MS, MIN_DISCOVERY_PROJECTOR_POLL_MS, MIN_TOOL_LEASE_TTL_MS,
     OPENAPI_SPEC_PATH, PAYLOAD_CAPTURE_ENABLED, POLICY_FILE, POLICY_HISTORY_SQLITE_PATH,
-    PRINCIPAL_SQLITE_PATH, RATE_LIMIT_KEYRING, READINESS_PROBE_CACHE_MS, SERVICE_TOKEN_SQLITE_PATH,
-    STATE_BACKEND, TOOLS_FILE, TOOL_LEASE_TTL_MS,
+    POLICY_TESTS_REQUIRED, PRINCIPAL_SQLITE_PATH, RATE_LIMIT_KEYRING, READINESS_PROBE_CACHE_MS,
+    SERVICE_TOKEN_SQLITE_PATH, STATE_BACKEND, TOOLS_FILE, TOOL_LEASE_TTL_MS,
 };
-use crate::auth::admin_session::AdminSessionStorage;
+use crate::auth::AdminSessionStorage;
 
 /// The audit sinks' inputs, as the reader returned them.
 pub(super) struct AuditStoreInputs {
@@ -334,13 +334,14 @@ pub(super) fn compile_discovery_stores(inputs: DiscoveryStoreInputs) -> Checked<
     )
 }
 
-/// The documents' and the policy history store's inputs, as the reader
-/// returned them.
+/// The documents', the policy history store's and the policy test gate's
+/// inputs, as the reader returned them.
 pub(super) struct DocumentInputs {
     openapi_spec_path: RawInput,
     policy_file: RawInput,
     tools_file: RawInput,
     policy_history_sqlite_path: RawInput,
+    policy_tests_required: RawInput,
 }
 
 impl DocumentInputs {
@@ -354,16 +355,21 @@ impl DocumentInputs {
                 POLICY_HISTORY_SQLITE_PATH,
                 get_var(POLICY_HISTORY_SQLITE_PATH),
             ),
+            policy_tests_required: RawInput::new(
+                POLICY_TESTS_REQUIRED,
+                get_var(POLICY_TESTS_REQUIRED),
+            ),
         }
     }
 }
 
-/// The documents and the policy history store, parsed.
+/// The documents, the policy history store and the policy test gate, parsed.
 pub(super) struct Documents {
     openapi_spec_path: Option<PathBuf>,
     policy_file: Option<String>,
     tools_file: Option<String>,
     policy_history_sqlite_path: Option<String>,
+    policy_tests_required: bool,
     provenance: Vec<Provenance>,
 }
 
@@ -397,17 +403,28 @@ pub(super) fn compile_documents(inputs: DocumentInputs) -> Checked<Documents> {
             problems,
         )
     });
+    let policy_tests_required = findings.input(POLICY_TESTS_REQUIRED, |problems| {
+        parse_var(
+            POLICY_TESTS_REQUIRED,
+            inputs.policy_tests_required.value(),
+            false,
+            "boolean",
+            problems,
+        )
+    });
     Checked::new(
         Documents {
             openapi_spec_path,
             policy_file,
             tools_file,
             policy_history_sqlite_path,
+            policy_tests_required,
             provenance: vec![
                 inputs.openapi_spec_path.provenance(),
                 inputs.policy_file.provenance(),
                 inputs.tools_file.provenance(),
                 inputs.policy_history_sqlite_path.provenance(),
+                inputs.policy_tests_required.provenance(),
             ],
         },
         findings,
@@ -812,24 +829,25 @@ pub(super) struct StorageBlocks {
 /// the connection string is a [`SecretLocator`]: the string carries the
 /// database credentials, so the plan never prints where it is kept.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct DatabasePlan {
-    pub(crate) pool_max: usize,
-    pub(crate) connect_timeout_ms: u64,
-    pub(crate) acquire_timeout_ms: u64,
-    pub(crate) statement_timeout_ms: u64,
-    pub(crate) idle_in_transaction_timeout_ms: u64,
-    pub(crate) lock_timeout_ms: u64,
-    pub(crate) startup_retry_limit: u64,
-    pub(crate) auto_migrate: bool,
-    pub(crate) migration_statement_timeout_ms: u64,
-    pub(crate) tls_mode: DatabaseTlsMode,
-    pub(crate) tls_ca_file: Option<String>,
-    pub(crate) url_file: Option<SecretLocator>,
+pub struct DatabasePlan {
+    pub pool_max: usize,
+    pub connect_timeout_ms: u64,
+    pub acquire_timeout_ms: u64,
+    pub statement_timeout_ms: u64,
+    pub idle_in_transaction_timeout_ms: u64,
+    pub lock_timeout_ms: u64,
+    pub startup_retry_limit: u64,
+    pub auto_migrate: bool,
+    pub migration_statement_timeout_ms: u64,
+    pub tls_mode: DatabaseTlsMode,
+    pub tls_ca_file: Option<String>,
+    pub url_file: Option<SecretLocator>,
 }
 
 impl DatabasePlan {
-    /// The legacy `Config` field.
-    pub(super) fn into_settings(self) -> DatabaseSettings {
+    /// The database settings, with the URL file's locator handed over as
+    /// the path activation opens.
+    pub fn into_settings(self) -> DatabaseSettings {
         let DatabasePlan {
             pool_max,
             connect_timeout_ms,
@@ -863,39 +881,39 @@ impl DatabasePlan {
 
 /// The validated storage settings.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct StoragePlan {
-    pub(crate) audit_log_file: Option<String>,
-    pub(crate) audit_sqlite_path: Option<String>,
-    pub(crate) audit_sqlite_retention_days: Option<u32>,
-    pub(crate) audit_successful_probes_metrics_only: bool,
-    pub(crate) discovery_sqlite_path: Option<String>,
-    pub(crate) discovery_endpoint_limit: usize,
-    pub(crate) discovery_projector_lease_ttl_ms: u64,
-    pub(crate) discovery_projector_poll_ms: u64,
-    pub(crate) discovery_projector_batch: usize,
-    pub(crate) principal_sqlite_path: Option<String>,
-    pub(crate) openapi_spec_path: Option<PathBuf>,
-    pub(crate) policy_file: Option<String>,
-    pub(crate) tools_file: Option<String>,
-    pub(crate) policy_history_sqlite_path: Option<String>,
-    pub(crate) tool_lease_ttl_ms: u64,
-    pub(crate) cluster_heartbeat_ms: u64,
-    pub(crate) cluster_member_stale_ms: u64,
-    pub(crate) cluster_maintenance_interval_ms: u64,
-    pub(crate) cluster_maintenance_lease_ttl_ms: u64,
-    pub(crate) readiness_probe_cache_ms: u64,
-    pub(crate) cluster_status_expose_hostnames: bool,
-    pub(crate) audit_postgres_retention_days: Option<u32>,
-    pub(crate) state_backend: StateBackend,
-    pub(crate) deployment_id: Option<String>,
-    pub(crate) database: DatabasePlan,
+pub struct StoragePlan {
+    pub audit_log_file: Option<String>,
+    pub audit_sqlite_path: Option<String>,
+    pub audit_sqlite_retention_days: Option<u32>,
+    pub audit_successful_probes_metrics_only: bool,
+    pub discovery_sqlite_path: Option<String>,
+    pub discovery_endpoint_limit: usize,
+    pub discovery_projector_lease_ttl_ms: u64,
+    pub discovery_projector_poll_ms: u64,
+    pub discovery_projector_batch: usize,
+    pub principal_sqlite_path: Option<String>,
+    pub openapi_spec_path: Option<PathBuf>,
+    pub policy_file: Option<String>,
+    pub tools_file: Option<String>,
+    pub policy_history_sqlite_path: Option<String>,
+    pub policy_tests_required: bool,
+    pub tool_lease_ttl_ms: u64,
+    pub cluster_heartbeat_ms: u64,
+    pub cluster_member_stale_ms: u64,
+    pub cluster_maintenance_interval_ms: u64,
+    pub cluster_maintenance_lease_ttl_ms: u64,
+    pub readiness_probe_cache_ms: u64,
+    pub cluster_status_expose_hostnames: bool,
+    pub audit_postgres_retention_days: Option<u32>,
+    pub state_backend: StateBackend,
+    pub deployment_id: Option<String>,
+    pub database: DatabasePlan,
     /// Authority-event delivery (issue #425, PR 3). The pseudonym key aliases
     /// name secrets and are never the secrets themselves.
-    pub(crate) authority_events: AuthorityEventSettings,
+    pub authority_events: AuthorityEventSettings,
     /// Where each of the six blocks' inputs came from, in the order they are
     /// read.
-    #[allow(dead_code)] // Read by the stage tests; startup builds from the values alone.
-    pub(crate) provenance: Vec<Provenance>,
+    pub provenance: Vec<Provenance>,
 }
 
 /// The state backend and PostgreSQL, each input parsed on its own.
@@ -1220,6 +1238,7 @@ pub(super) fn compile(
             policy_file: documents.policy_file,
             tools_file: documents.tools_file,
             policy_history_sqlite_path: documents.policy_history_sqlite_path,
+            policy_tests_required: documents.policy_tests_required,
             tool_lease_ttl_ms: cluster.tool_lease_ttl_ms,
             cluster_heartbeat_ms: cluster.cluster_heartbeat_ms,
             cluster_member_stale_ms: cluster.cluster_member_stale_ms,
