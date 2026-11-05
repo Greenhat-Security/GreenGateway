@@ -7119,6 +7119,7 @@ fn invocation_context() -> ToolInvocationContext {
         source_ip: "203.0.113.10".to_owned(),
         actor: None,
         source: ToolInvocationSource::Internal,
+        organization: None,
         caller: None,
         admitted_deadline: None,
     }
@@ -7136,6 +7137,7 @@ fn invocation_context_with_roles(roles: &[&str]) -> ToolInvocationContext {
             auth_mode: "bearer_token".to_owned(),
         }),
         source: ToolInvocationSource::Internal,
+        organization: None,
         caller: None,
         admitted_deadline: None,
     }

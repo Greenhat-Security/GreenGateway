@@ -1,4 +1,5 @@
-//! The HTTP lane's stage trace (issue #243, slice 10).
+//! The stage traces of the HTTP, tool and rate lanes (issue #243, slices 10
+//! and 12).
 //!
 //! [`CompiledPolicy::evaluate`](super::CompiledPolicy::evaluate) decides a
 //! request in a fixed order: the facts it needs, the host routes are matched
@@ -17,17 +18,27 @@
 //! positions and the enforcement mode that applied -- never an authored path,
 //! permission, identifier or any value from the evaluated context.
 //!
+//! The tool lane ([`ToolStage`]) and the rate lane ([`RateStage`]) report
+//! through the same sink, each in its own stage vocabulary, from
+//! `evaluate_tool_with_facts` and `select_rate_lane_with_facts` themselves.
+//!
 //! A stage the evaluator did not reach is not recorded. Whether that means
 //! "decided earlier" or "unknown because a fact was missing" follows from the
 //! evaluation's own outcome, which the consumer always holds beside the trace.
 
 use crate::rbac::{EnforcementMode, RuleAction};
 
-use super::Limitation;
+use super::{tools::ToolLimitation, Limitation};
 
 /// Most stages one evaluation records: each stage below is recorded at most
 /// once, so a collecting sink never needs more room than this.
 pub(crate) const MAX_HTTP_STAGES: usize = 7;
+/// Most stages one tool-lane evaluation records: each [`ToolStage`] at most
+/// once.
+pub(crate) const MAX_TOOL_STAGES: usize = 4;
+/// Most stages one rate-lane selection records: each [`RateStage`] at most
+/// once.
+pub(crate) const MAX_RATE_STAGES: usize = 3;
 
 /// One stage of the HTTP lane, as [`CompiledPolicy::evaluate`] ran it.
 ///
@@ -137,22 +148,100 @@ pub(crate) struct DefaultMatch {
     pub(crate) mode: EnforcementMode,
 }
 
-/// Receives the stages of one evaluation, in the order they ran.
-pub(crate) trait StageSink {
-    fn record(&mut self, stage: HttpStage);
+/// One stage of the tool lane, as
+/// [`CompiledPolicy::evaluate_tool_with_facts`] ran it.
+///
+/// A tool operation runs `Facts`, `Entry`, `Identity` and `Rules` in that
+/// order; a rendered tool request runs `Facts` and `Rules` only, because it
+/// is decided by the direct HTTP rules alone.
+///
+/// [`CompiledPolicy::evaluate_tool_with_facts`]: super::CompiledPolicy::evaluate_tool_with_facts
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToolStage {
+    /// Whether every fact the operation reads was supplied -- the tool name,
+    /// the principal and, in mapped-role mode, its internal roles, and for a
+    /// rendered request its method and path -- or the first one that was not.
+    /// A missing fact ends the evaluation as indeterminate.
+    Facts(Option<ToolLimitation>),
+    /// The named tool's policy entry.
+    Entry(ToolEntry),
+    /// Whether the principal meets the entry's identity constraints: its
+    /// allowed roles, issuers and authentication methods.
+    Identity(IdentityCheck),
+    /// The direct rules the operation consults: the tool-name rules, or for a
+    /// rendered request the HTTP rules under unknown dispatch.
+    Rules(ToolRules),
+}
+
+/// The named tool's policy entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToolEntry {
+    /// The policy has no entry for the tool.
+    Absent,
+    /// The entry exists and is disabled.
+    Disabled,
+    /// The entry exists and is enabled.
+    Enabled,
+}
+
+/// The outcome of a tool entry's identity constraints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IdentityCheck {
+    /// The principal meets every constraint, or the entry states none.
+    Admitted,
+    /// The principal does not meet them, or there is none to meet them.
+    Refused,
+}
+
+/// What the tool lane's direct rules found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToolRules {
+    /// No rule matched.
+    NoMatch,
+    /// The first rule that matched, under the lane's own precedence.
+    Matched(DirectMatch),
+    /// A rule's conditions read a fact that was not captured, before any
+    /// rule certainly matched. The evaluation ends as indeterminate.
+    Undetermined,
+}
+
+/// One stage of the rate lane, as
+/// [`CompiledPolicy::select_rate_lane_with_facts`] ran it.
+///
+/// [`CompiledPolicy::select_rate_lane_with_facts`]: super::CompiledPolicy::select_rate_lane_with_facts
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RateStage {
+    /// Whether method, path, principal and, in mapped-role mode, its internal
+    /// roles were all supplied, or the first one that was not. A missing fact
+    /// ends the selection as indeterminate.
+    Facts(Option<Limitation>),
+    /// Whether the live bypass for an anonymous caller applied: `true` means
+    /// no override is consulted at all, as live rate limiting consults none
+    /// for a request without a principal.
+    AnonymousBypass(bool),
+    /// The first override that matched, by position in the pinned source
+    /// order, or none.
+    Overrides(Option<usize>),
+}
+
+/// Receives the stages of one evaluation, in the order they ran. A lane
+/// reports its own stage type; the default is the HTTP lane's.
+pub(crate) trait StageSink<S = HttpStage> {
+    fn record(&mut self, stage: S);
 }
 
 /// The sink the live adapters use: it keeps nothing and allocates nothing.
 pub(crate) struct NoStages;
 
-impl StageSink for NoStages {
+impl<S> StageSink<S> for NoStages {
     #[inline]
-    fn record(&mut self, _stage: HttpStage) {}
+    fn record(&mut self, _stage: S) {}
 }
 
-/// Collects every stage. The evaluator records at most [`MAX_HTTP_STAGES`].
-impl StageSink for Vec<HttpStage> {
-    fn record(&mut self, stage: HttpStage) {
+/// Collects every stage. The evaluator records at most [`MAX_HTTP_STAGES`],
+/// [`MAX_TOOL_STAGES`] or [`MAX_RATE_STAGES`] stages per evaluation.
+impl<S> StageSink<S> for Vec<S> {
+    fn record(&mut self, stage: S) {
         self.push(stage);
     }
 }
@@ -166,6 +255,7 @@ mod tests {
     use crate::{
         auth::{AuthMethod, Principal},
         policy_eval::{
+            tools::{ToolEvaluationContext, ToolOperation, TOOL_CONTEXT_VERSION},
             CompiledPolicy, DispatchFacts, HostFact, HttpTarget, PolicyAuthority,
             PolicyEvaluationContext, PrincipalFact, PrincipalIdentity, CONTEXT_VERSION,
         },
@@ -379,7 +469,7 @@ mod tests {
         for (name, context, expected) in cases {
             let mut stages = Vec::new();
             let traced = compiled
-                .evaluate_with_stages(&context, &mut stages)
+                .evaluate_with_stages(&context, &crate::policy_eval::UNCAPTURED_FACTS, &mut stages)
                 .expect("evaluates");
             assert_eq!(
                 compiled.evaluate(&context).expect("evaluates"),
@@ -404,7 +494,7 @@ mod tests {
         input.request_host = HostFact::Missing;
         let mut stages = Vec::new();
         compiled
-            .evaluate_with_stages(&input, &mut stages)
+            .evaluate_with_stages(&input, &crate::policy_eval::UNCAPTURED_FACTS, &mut stages)
             .expect("evaluates");
         assert_eq!(stages[1], HttpStage::RequestHost(HostUse::NotRequired));
         assert_eq!(
@@ -422,7 +512,305 @@ mod tests {
         let mut input = context(&compiled, "/orders/1");
         input.path = Some("relative".to_owned());
         let mut stages = Vec::new();
-        assert!(compiled.evaluate_with_stages(&input, &mut stages).is_err());
+        assert!(compiled
+            .evaluate_with_stages(&input, &crate::policy_eval::UNCAPTURED_FACTS, &mut stages)
+            .is_err());
         assert!(stages.is_empty());
+    }
+
+    fn lanes_policy() -> CompiledPolicy {
+        let policy = Policy::validate_json_value(json!({
+            "schema_version": "0.1.0",
+            "default_action": "deny",
+            "rules": [
+                {
+                    "id": "deny-export-for-interns",
+                    "tool_name": "export",
+                    "principal": { "roles": ["intern"] },
+                    "action": "deny"
+                },
+                { "id": "render-block", "methods": ["POST"], "path": "/render/blocked", "action": "deny" }
+            ],
+            "tools": {
+                "export": { "allowed_roles": ["reader", "intern"] },
+                "off": { "enabled": false }
+            },
+            "rate_limits": [
+                {
+                    "principal": { "roles": ["reader"] },
+                    "path": "/orders/**",
+                    "requests_per_second": 5,
+                    "burst": 10
+                },
+                { "path": "/orders/**", "requests_per_second": 1, "burst": 1 }
+            ]
+        }))
+        .expect("policy validates");
+        CompiledPolicy::from_validated_policy(policy, PolicyAuthority::Standalone)
+            .expect("policy compiles")
+    }
+
+    fn with_roles(roles: &[&str]) -> PrincipalFact {
+        PrincipalFact::Authenticated(PrincipalIdentity::from_principal(&Principal {
+            user_id: "lane-subject".to_owned(),
+            issuer: None,
+            email: None,
+            org_id: None,
+            roles: roles.iter().map(|role| (*role).to_owned()).collect(),
+            session_id: String::new(),
+            auth_method: AuthMethod::Bearer,
+        }))
+    }
+
+    fn tool(
+        compiled: &CompiledPolicy,
+        operation: ToolOperation,
+        name: Option<&str>,
+        principal: PrincipalFact,
+        rendered: Option<(Method, &str)>,
+    ) -> ToolEvaluationContext {
+        ToolEvaluationContext {
+            version: TOOL_CONTEXT_VERSION,
+            snapshot: compiled.snapshot(),
+            operation,
+            tool_name: name.map(str::to_owned),
+            principal,
+            method: rendered.as_ref().map(|(method, _)| method.clone()),
+            path: rendered.map(|(_, path)| path.to_owned()),
+        }
+    }
+
+    #[test]
+    fn the_tool_stage_trace_describes_exactly_the_decision_evaluate_tool_makes() {
+        let compiled = lanes_policy();
+        let invocation = ToolOperation::Invocation;
+        let facts = ToolStage::Facts(None);
+        let enabled = ToolStage::Entry(ToolEntry::Enabled);
+        let admitted = ToolStage::Identity(IdentityCheck::Admitted);
+        let cases: Vec<(&str, ToolEvaluationContext, Vec<ToolStage>)> = vec![
+            (
+                "an admitted caller with no rule is allowed",
+                tool(
+                    &compiled,
+                    invocation,
+                    Some("export"),
+                    with_roles(&["reader"]),
+                    None,
+                ),
+                vec![
+                    facts,
+                    enabled,
+                    admitted,
+                    ToolStage::Rules(ToolRules::NoMatch),
+                ],
+            ),
+            (
+                "a tool-name deny decides after the entry and identity checks",
+                tool(
+                    &compiled,
+                    invocation,
+                    Some("export"),
+                    with_roles(&["intern"]),
+                    None,
+                ),
+                vec![
+                    facts,
+                    enabled,
+                    admitted,
+                    ToolStage::Rules(ToolRules::Matched(DirectMatch {
+                        rule: 0,
+                        action: DirectAction::Deny,
+                    })),
+                ],
+            ),
+            (
+                "an unknown tool stops at its entry",
+                tool(
+                    &compiled,
+                    invocation,
+                    Some("missing"),
+                    with_roles(&["reader"]),
+                    None,
+                ),
+                vec![facts, ToolStage::Entry(ToolEntry::Absent)],
+            ),
+            (
+                "a disabled tool stops at its entry",
+                tool(
+                    &compiled,
+                    invocation,
+                    Some("off"),
+                    with_roles(&["reader"]),
+                    None,
+                ),
+                vec![facts, ToolStage::Entry(ToolEntry::Disabled)],
+            ),
+            (
+                "a caller without an allowed role stops at the identity check",
+                tool(
+                    &compiled,
+                    invocation,
+                    Some("export"),
+                    with_roles(&["outsider"]),
+                    None,
+                ),
+                vec![facts, enabled, ToolStage::Identity(IdentityCheck::Refused)],
+            ),
+            (
+                "an uncaptured tool name stops at the facts",
+                tool(&compiled, invocation, None, with_roles(&["reader"]), None),
+                vec![ToolStage::Facts(Some(ToolLimitation::ToolName))],
+            ),
+            (
+                "an uncaptured principal stops at the facts",
+                tool(
+                    &compiled,
+                    invocation,
+                    Some("export"),
+                    PrincipalFact::Missing,
+                    None,
+                ),
+                vec![ToolStage::Facts(Some(ToolLimitation::Principal))],
+            ),
+            (
+                "a rendered request is decided by the HTTP rules alone",
+                tool(
+                    &compiled,
+                    ToolOperation::RenderedHttp,
+                    Some("export"),
+                    with_roles(&["reader"]),
+                    Some((Method::POST, "/render/blocked")),
+                ),
+                vec![
+                    facts,
+                    ToolStage::Rules(ToolRules::Matched(DirectMatch {
+                        rule: 1,
+                        action: DirectAction::Deny,
+                    })),
+                ],
+            ),
+        ];
+        for (name, context, expected) in cases {
+            let mut stages = Vec::new();
+            let traced = compiled
+                .evaluate_tool_with_facts(
+                    &context,
+                    &crate::policy_eval::UNCAPTURED_FACTS,
+                    &mut stages,
+                )
+                .expect("evaluates");
+            assert_eq!(
+                compiled.evaluate_tool(&context).expect("evaluates"),
+                traced,
+                "{name}: the traced decision must be the live decision"
+            );
+            assert_eq!(stages, expected, "{name}");
+            assert!(stages.len() <= MAX_TOOL_STAGES, "{name}");
+        }
+        // A rendered request without its method: the context is refused as
+        // inconsistent unless the operation is rendered, so build one that
+        // carries a path only.
+        let mut rendered = tool(
+            &compiled,
+            ToolOperation::RenderedHttp,
+            Some("export"),
+            with_roles(&["reader"]),
+            Some((Method::POST, "/render/blocked")),
+        );
+        rendered.method = None;
+        let mut stages = Vec::new();
+        compiled
+            .evaluate_tool_with_facts(
+                &rendered,
+                &crate::policy_eval::UNCAPTURED_FACTS,
+                &mut stages,
+            )
+            .expect("evaluates");
+        assert_eq!(stages, [ToolStage::Facts(Some(ToolLimitation::Method))]);
+    }
+
+    fn rate(
+        compiled: &CompiledPolicy,
+        method: Option<Method>,
+        path: &str,
+        principal: PrincipalFact,
+    ) -> PolicyEvaluationContext {
+        PolicyEvaluationContext {
+            version: CONTEXT_VERSION,
+            snapshot: compiled.snapshot(),
+            method,
+            path: Some(path.to_owned()),
+            principal,
+            target: HttpTarget::Missing,
+            request_host: HostFact::Missing,
+            dispatch: None,
+        }
+    }
+
+    #[test]
+    fn the_rate_stage_trace_describes_exactly_the_selection_select_rate_lane_makes() {
+        let compiled = lanes_policy();
+        let get = Some(Method::GET);
+        let facts = RateStage::Facts(None);
+        let authenticated = RateStage::AnonymousBypass(false);
+        let cases: Vec<(&str, PolicyEvaluationContext, Vec<RateStage>)> = vec![
+            (
+                "the first matching override governs",
+                rate(&compiled, get.clone(), "/orders/1", with_roles(&["reader"])),
+                vec![facts, authenticated, RateStage::Overrides(Some(0))],
+            ),
+            (
+                "an override the principal does not meet is passed over",
+                rate(&compiled, get.clone(), "/orders/1", with_roles(&["other"])),
+                vec![facts, authenticated, RateStage::Overrides(Some(1))],
+            ),
+            (
+                "no override matches",
+                rate(
+                    &compiled,
+                    get.clone(),
+                    "/elsewhere",
+                    with_roles(&["reader"]),
+                ),
+                vec![facts, authenticated, RateStage::Overrides(None)],
+            ),
+            (
+                "an anonymous caller takes the live bypass",
+                rate(
+                    &compiled,
+                    get.clone(),
+                    "/orders/1",
+                    PrincipalFact::Anonymous,
+                ),
+                vec![facts, RateStage::AnonymousBypass(true)],
+            ),
+            (
+                "an uncaptured method stops at the facts",
+                rate(&compiled, None, "/orders/1", with_roles(&["reader"])),
+                vec![RateStage::Facts(Some(Limitation::MissingMethod))],
+            ),
+            (
+                "an uncaptured principal stops at the facts",
+                rate(&compiled, get, "/orders/1", PrincipalFact::Missing),
+                vec![RateStage::Facts(Some(Limitation::MissingPrincipalFact))],
+            ),
+        ];
+        for (name, context, expected) in cases {
+            let mut stages = Vec::new();
+            let traced = compiled
+                .select_rate_lane_with_facts(
+                    &context,
+                    &crate::policy_eval::UNCAPTURED_FACTS,
+                    &mut stages,
+                )
+                .expect("selects");
+            assert_eq!(
+                compiled.select_rate_lane(&context).expect("selects"),
+                traced,
+                "{name}: the traced selection must be the live selection"
+            );
+            assert_eq!(stages, expected, "{name}");
+            assert!(stages.len() <= MAX_RATE_STAGES, "{name}");
+        }
     }
 }

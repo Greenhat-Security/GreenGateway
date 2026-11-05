@@ -74,6 +74,9 @@ pub(crate) struct FileReference {
     pub(crate) file: FileName,
     /// 64 lowercase hexadecimal digits over the file's exact bytes.
     pub(crate) sha256: String,
+    /// Where the `sha256` scalar starts in the manifest, so `ggctl pin` can
+    /// replace exactly its digits ([`super::pin`]).
+    pub(crate) sha256_position: Position,
 }
 
 /// Where a policy or tools resource comes from.
@@ -372,11 +375,14 @@ fn file_reference(
     let members = checker.object(node, pointer, &["path", "sha256"], &["path", "sha256"])?;
     let file = member(members, "path")
         .and_then(|node| path(checker, node, &pointer.member("path"), extensions));
-    let sha256 =
-        member(members, "sha256").and_then(|node| digest(checker, node, &pointer.member("sha256")));
+    let sha256 = member(members, "sha256").and_then(|node| {
+        digest(checker, node, &pointer.member("sha256")).map(|sha256| (sha256, node.position))
+    });
+    let (sha256, sha256_position) = sha256?;
     Some(FileReference {
         file: file?,
-        sha256: sha256?,
+        sha256,
+        sha256_position,
     })
 }
 
@@ -459,12 +465,16 @@ fn json_resource(
                 }
                 version
             });
-            let sha256 = member(members, "sha256")
-                .and_then(|node| digest(checker, node, &pointer.member("sha256")));
+            let sha256 = member(members, "sha256").and_then(|node| {
+                digest(checker, node, &pointer.member("sha256"))
+                    .map(|sha256| (sha256, node.position))
+            });
+            let (sha256, sha256_position) = sha256?;
             Some(ResourceSource::Bundle {
                 reference: FileReference {
                     file: file?,
-                    sha256: sha256?,
+                    sha256,
+                    sha256_position,
                 },
                 schema_version: schema_version?,
             })

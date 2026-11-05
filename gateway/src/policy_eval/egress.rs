@@ -310,6 +310,23 @@ impl EgressEvaluation {
         self.outcome
     }
 
+    /// The logical decision the lane reached: allow, deny, or
+    /// indeterminate when it lacked the resolution facts.
+    pub(crate) fn logical(&self) -> LogicalDecision {
+        self.logical
+    }
+
+    /// What the decision does to the destination. An indeterminate answer
+    /// blocks: the lane never admits a destination it could not judge.
+    pub(crate) fn effect(&self) -> PolicyEffect {
+        self.effect
+    }
+
+    /// Whether the static egress domain was decided completely.
+    pub(crate) fn is_complete(&self) -> bool {
+        self.complete
+    }
+
     /// Fixed-schema JSON trace: bounded enums, ordinals and digests only. No
     /// host, scheme, port or address escapes.
     #[cfg_attr(

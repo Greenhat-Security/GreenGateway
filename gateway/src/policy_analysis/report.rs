@@ -19,6 +19,7 @@ use crate::policy_eval::{
     tools::{TOOL_CONTEXT_VERSION, TOOL_SEMANTICS_VERSION},
     CONTEXT_VERSION, HTTP_SEMANTICS_VERSION,
 };
+use crate::policy_simulation::request::StoredCandidate;
 
 const SARIF_SCHEMA: &str = "https://json.schemastore.org/sarif-2.1.0.json";
 const TOOL_NAME: &str = "greengateway-policy-analyzer";
@@ -32,11 +33,13 @@ pub(crate) struct AnalysisBinding<'a> {
     pub(crate) base_etag: &'a str,
     /// Cluster mode: the security revision the base was read at.
     pub(crate) security_revision: Option<i64>,
-    /// `active`, `edits` or `inline`.
+    /// `active`, `edits`, `inline`, `draft` or `revision`.
     pub(crate) source: &'static str,
     /// The ETag of the analyzed document, which every position names.
     pub(crate) analyzed_etag: &'a str,
     pub(crate) edit_count: usize,
+    /// The draft or history version the analyzed document was read as.
+    pub(crate) stored: Option<&'a StoredCandidate>,
     pub(crate) mcp_alias_paths: usize,
 }
 
@@ -90,8 +93,13 @@ pub(crate) fn to_json(
         base.insert("security_revision".to_owned(), json!(revision));
     }
     let mut analyzed = json!({ "source": binding.source, "etag": binding.analyzed_etag });
-    if let (true, Some(analyzed)) = (binding.source == "edits", analyzed.as_object_mut()) {
-        analyzed.insert("edits".to_owned(), json!(binding.edit_count));
+    if let Some(analyzed) = analyzed.as_object_mut() {
+        if binding.source == "edits" {
+            analyzed.insert("edits".to_owned(), json!(binding.edit_count));
+        }
+        if let Some(stored) = binding.stored {
+            stored.describe("", analyzed);
+        }
     }
     Ok(json!({
         "schema_version": RESULT_SCHEMA_VERSION,
@@ -269,10 +277,13 @@ pub(crate) fn to_sarif(
         "summary": summary(outcome),
         "analyzer": analyzer_versions(),
     });
-    if let (Some(revision), Some(properties)) =
-        (binding.security_revision, properties.as_object_mut())
-    {
-        properties.insert("security_revision".to_owned(), json!(revision));
+    if let Some(properties) = properties.as_object_mut() {
+        if let Some(revision) = binding.security_revision {
+            properties.insert("security_revision".to_owned(), json!(revision));
+        }
+        if let Some(stored) = binding.stored {
+            stored.describe("analyzed_", properties);
+        }
     }
     Ok(json!({
         "$schema": SARIF_SCHEMA,

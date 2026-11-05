@@ -302,7 +302,7 @@ async fn token_rotation_delegation_contract_postgres() {
     config.state_backend = config::StateBackend::Postgres;
     config.deployment_id = Some("deploy-token-rotation-contract".to_owned());
     config.database.url_file = Some(dsn_file.path.clone());
-    config.database.tls_mode = config::DatabaseTlsMode::LoopbackDev;
+    storage::postgres::test_support::use_test_tls(&mut config.database);
     let foundation = storage::postgres::PostgresFoundation::establish(&config)
         .await
         .expect("test database should establish");
@@ -515,7 +515,7 @@ async fn admin_token_rotate_and_revoke_record_the_authenticated_subject_and_issu
     config.state_backend = config::StateBackend::Postgres;
     config.deployment_id = Some("deploy-token-change-actor".to_owned());
     config.database.url_file = Some(dsn_file.path.clone());
-    config.database.tls_mode = config::DatabaseTlsMode::LoopbackDev;
+    storage::postgres::test_support::use_test_tls(&mut config.database);
     let foundation = storage::postgres::PostgresFoundation::establish(&config)
         .await
         .expect("test database should establish");

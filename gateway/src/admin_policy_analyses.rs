@@ -1,6 +1,7 @@
 //! `POST /v1{ADMIN_PREFIX}/policy/analyses` (issue #243, slice 15): analyze
 //! the structure of the active policy or a candidate -- position-aware edits
-//! over it, or an inline document -- and answer stable findings with advisory
+//! over it, an inline document, a server-side draft the caller owns, or a
+//! version of the policy history -- and answer stable findings with advisory
 //! candidate patches, as JSON or SARIF 2.1.0.
 //!
 //! An analysis is a read with no side effects. It needs `admin:policy:read`
@@ -94,8 +95,14 @@ fn emit_policy_analysis_run(
         "http_semantics_version": policy_eval::HTTP_SEMANTICS_VERSION,
         "tool_semantics_version": policy_eval::tools::TOOL_SEMANTICS_VERSION,
     });
-    if let (Some(revision), Some(payload)) = (binding.security_revision, payload.as_object_mut()) {
-        payload.insert("security_revision".to_owned(), json!(revision));
+    if let Some(payload) = payload.as_object_mut() {
+        if let Some(revision) = binding.security_revision {
+            payload.insert("security_revision".to_owned(), json!(revision));
+        }
+        // Which draft or history version, never its content.
+        if let Some(stored) = binding.stored {
+            stored.describe("candidate_", payload);
+        }
     }
     state.audit.emit(audit::AuditEvent::new(
         audit::event::POLICY_ANALYSIS_RUN,
@@ -179,10 +186,23 @@ pub(super) async fn policy_analyses_endpoint(
         )
             .into_response();
     }
-    let candidate = match resolve_candidate(&state, rbac_state, &base, &analysis.candidate) {
+    let ResolvedCandidate {
+        policy: candidate,
+        stored,
+    } = match resolve_candidate(
+        &state,
+        rbac_state,
+        &principal,
+        &base,
+        &base_etag,
+        &analysis.candidate,
+    )
+    .await
+    {
         Ok(candidate) => candidate,
         Err(CandidateRefusal::Edits(diagnostics)) => return analysis_invalid(&diagnostics),
         Err(CandidateRefusal::Invalid(errors)) => return simulation_candidate_refused(errors),
+        Err(CandidateRefusal::Stored(response)) => return *response,
         Err(CandidateRefusal::Internal) => return internal_server_error("policy analysis failed"),
     };
     let analyzed_etag = match candidate.as_ref().map(policy_etag) {
@@ -241,6 +261,7 @@ pub(super) async fn policy_analyses_endpoint(
             CandidateSource::Edits(edits) => edits.len(),
             _ => 0,
         },
+        stored: stored.as_ref(),
         mcp_alias_paths: alias_count,
     };
     let (content_type, rendered) = match analysis.format {

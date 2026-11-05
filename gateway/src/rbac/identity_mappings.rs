@@ -23,10 +23,15 @@
 //! role: a source of service-token identity needs a reviewed model of its
 //! own. An anonymous caller holds no role in either mode.
 //!
-//! A mapping that constrains `organizations` reads the organization fact. If
-//! that fact was not captured, the mapping can neither be applied nor ruled
-//! out, and the principal's roles are undetermined: the kernel answers
-//! indeterminate rather than grant or withhold a role on a guess.
+//! A mapping that constrains `organizations` reads the organization fact. A
+//! serving lane captures it from the authenticated principal
+//! (`Principal::org_id`, which only the principal's own issuer verified),
+//! never from a request header, so a mapping can only ever see the
+//! organization that issuer vouched for. If that fact was not captured -- a
+//! retained request replayed, say -- the mapping can neither be applied nor
+//! ruled out, and the principal's roles are undetermined: the kernel answers
+//! indeterminate rather than grant or withhold a role on a guess, and every
+//! live lane refuses such an answer.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -36,7 +41,10 @@ use super::{
     conditions::{is_bounded_text, Fact, PolicyFacts, Truth},
     policy::RoleEntry,
     policy_document::{IssueCode, PolicyIssue},
-    rule::{auth_method_policy_value, valid_auth_method_name},
+    rule::{
+        auth_method_policy_value, valid_auth_method_name, ALL_AUTH_METHOD_NAMES,
+        AUTH_METHOD_SERVICE_TOKEN,
+    },
 };
 use crate::auth::{
     principal::{
@@ -236,6 +244,18 @@ impl CompiledIdentityMappings {
         }
         Some(granted.into_iter().map(str::to_owned).collect())
     }
+}
+
+/// The authentication methods of the principals `mapping` can apply to: the
+/// ones it lists, or every method when it lists none, less `service_token`.
+/// A service-token principal carries no issuer and every mapping is bound to
+/// one, so no mapping applies to a service token whatever it lists.
+pub(crate) fn admitted_auth_methods(mapping: &IdentityMapping) -> impl Iterator<Item = &str> {
+    ALL_AUTH_METHOD_NAMES.iter().copied().filter(|method| {
+        *method != AUTH_METHOD_SERVICE_TOKEN
+            && (mapping.auth_methods.is_empty()
+                || mapping.auth_methods.iter().any(|listed| listed == method))
+    })
 }
 
 /// Whether `mapping` applies to `principal`. Every constraint but the

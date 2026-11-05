@@ -8,18 +8,14 @@ use uuid::Uuid;
 
 pub const CONNECTION_SCHEMA_VERSION: &str = "0.1.0";
 pub const MAX_CONNECTIONS: usize = 256;
-pub const MAX_CREDENTIALS: usize = 512;
 pub const MAX_MANAGED_SPEC_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_CATALOG_ENTRIES: usize = 4_096;
 pub const MAX_MANAGED_OPENAPI_CATALOG_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_STATUS_HISTORY_ROWS: usize = 4_096;
 pub const MAX_CONCURRENT_REFRESHES: usize = 4;
-pub const MAX_CONNECTION_ID_BYTES: usize = 128;
-pub const MAX_DISPLAY_NAME_CHARS: usize = 128;
 pub const MAX_DESCRIPTION_CHARS: usize = 1_024;
 pub const MAX_URL_BYTES: usize = 2_048;
 pub const MAX_PATH_BYTES: usize = 1_024;
-pub const MAX_SECRET_ID_BYTES: usize = 128;
 pub const MAX_HEADER_NAME_BYTES: usize = 64;
 pub const MAX_ADDITIONAL_HEADERS: usize = 4;
 pub const MAX_CLIENT_ID_BYTES: usize = 256;
@@ -32,6 +28,13 @@ pub const MAX_TIMEOUT_MS: u64 = 120_000;
 pub const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 10_000;
 pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
 pub const DEFAULT_RESPONSE_IDLE_TIMEOUT_MS: u64 = 30_000;
+// The limits the Connections documents share with the model, and the
+// Connection ID grammar, which the configuration compiler shares with `ggctl`
+// (issue #242).
+pub(crate) use gateway_config::connections::{
+    is_valid_connection_id, MAX_CONNECTION_ID_BYTES, MAX_CREDENTIALS, MAX_DISPLAY_NAME_CHARS,
+    MAX_SECRET_ID_BYTES,
+};
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ConnectionId(String);
@@ -39,7 +42,7 @@ pub struct ConnectionId(String);
 impl ConnectionId {
     pub fn parse(value: impl Into<String>) -> Result<Self, ConnectionValidationError> {
         let value = value.into();
-        if is_valid_stable_id(&value, MAX_CONNECTION_ID_BYTES) {
+        if is_valid_connection_id(&value) {
             Ok(Self(value))
         } else {
             Err(ConnectionValidationError::new(
@@ -942,10 +945,6 @@ impl ConnectionWrite {
         }
         bound
     }
-}
-
-pub fn is_valid_connection_id(value: &str) -> bool {
-    is_valid_stable_id(value, MAX_CONNECTION_ID_BYTES)
 }
 
 /// Longest assertion lifetime an operator may configure.

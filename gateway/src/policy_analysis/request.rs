@@ -13,7 +13,7 @@
 //! `base_etag` is required, exactly as for a simulation: an analysis is
 //! pinned to the active policy it was written against, so every position a
 //! finding or a patch names means what its author read. `candidate` takes the
-//! simulation's three sources, parsed by the simulation's own parser.
+//! simulation's sources, parsed by the simulation's own parser.
 
 use serde_json::Value;
 

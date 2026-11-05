@@ -1,19 +1,11 @@
 use super::*;
 use crate::auth::change_actor::ChangeActor;
 use crate::connections::status::ConnectionOperationalState;
-use crate::storage::postgres::PostgresFoundation;
+use crate::storage::postgres::{
+    test_support::{locator, test_pool, unconnected_pool, use_test_tls},
+    PostgresFoundation,
+};
 use serde_json::json;
-
-fn locator() -> Option<String> {
-    let key = "GATEWAY_TEST_POSTGRES_URL_FILE".to_owned();
-    let file = std::env::var(&key).ok()?;
-    if file.trim().is_empty() {
-        return None;
-    }
-    let contents = std::fs::read_to_string(file).ok()?;
-    let trimmed = contents.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_owned())
-}
 
 struct DsnFile {
     path: String,
@@ -62,16 +54,15 @@ impl Drop for TestDatabase {
                 return;
             };
             runtime.block_on(async move {
-                let Ok((client, connection)) =
-                    tokio_postgres::connect(&admin_dsn, tokio_postgres::NoTls).await
-                else {
+                let Ok(pool) = unconnected_pool(&admin_dsn) else {
                     return;
                 };
-                let connection = tokio::spawn(connection);
+                let Ok(client) = pool.get().await else {
+                    return;
+                };
                 let _ = client
                     .batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
                     .await;
-                let _ = connection.await;
             });
         });
     }
@@ -79,16 +70,16 @@ impl Drop for TestDatabase {
 
 async fn create_test_database(admin_dsn: &str) -> TestDatabase {
     let name = format!("ggw_conn_test_{}", uuid::Uuid::new_v4().simple());
-    let (client, connection) = tokio_postgres::connect(admin_dsn, tokio_postgres::NoTls)
+    let admin = test_pool(admin_dsn).await;
+    admin
+        .pool()
+        .get()
         .await
-        .expect("admin connection");
-    let connection_task = tokio::spawn(connection);
-    client
+        .expect("admin connection")
         .batch_execute(&format!("CREATE DATABASE {name}"))
         .await
         .expect("test database should create");
-    drop(client);
-    let _ = connection_task.await;
+    drop(admin);
     let database_start = admin_dsn
         .rfind('/')
         .expect("locator DSN has a database path segment");
@@ -109,7 +100,7 @@ async fn migrated_store(
     config.state_backend = crate::config::StateBackend::Postgres;
     config.deployment_id = Some("deploy-conn-pg".to_owned());
     config.database.url_file = Some(dsn_file.path.clone());
-    config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+    use_test_tls(&mut config.database);
     let foundation = PostgresFoundation::establish(&config)
         .await
         .expect("test database should establish");

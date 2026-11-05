@@ -1,17 +1,23 @@
 //! Decides every case of a suite through the shared evaluator.
 //!
 //! The runner builds the same typed contexts the live adapters build and asks
-//! the same [`CompiledPolicy`] methods: `evaluate` for HTTP, `evaluate_tool` for
-//! the tool lane and rendered tool requests, and `select_rate_lane` for rate
-//! overrides. It never matches a rule itself, so a test can only ever report
-//! what production decides for the same facts.
+//! the same [`CompiledPolicy`] methods: `evaluate_with_facts` for HTTP,
+//! `evaluate_tool_with_facts` for the tool lane and rendered tool requests, and
+//! `select_rate_lane_with_facts` for rate overrides, each with the facts a live
+//! lane captures for the case's principal ([`case_facts`]). An isolated rate
+//! sequence runs on a fresh bucket through the live limiter's own token
+//! arithmetic, and an egress case is asked of the static egress lane the
+//! egress client decides by ([`super::synthetic`]). It never matches a rule
+//! itself, so a test can only ever report what production decides for the
+//! same facts.
 //!
-//! The run is pure. It reads the compiled policy and the suite and returns a
-//! report, or nothing once its deadline passes; it performs no I/O, takes no
-//! lock, emits no audit event, and touches no rate bucket, tool permit or
-//! upstream. Fixture values live only in the suite while the run reads them:
-//! the report carries case ids, expectations and stable outcome codes, never
-//! a path, host, subject, role or tool name a case supplied.
+//! The run is pure. It reads the compiled policy, the suite and the synthetic
+//! resources and returns a report, or nothing once its deadline passes; it
+//! performs no I/O, takes no lock, emits no audit event, and touches no
+//! production rate bucket, tool permit, resolver or upstream. Fixture values
+//! live only in the suite while the run reads them: the report carries case
+//! ids, expectations and stable outcome codes, never a path, host, address,
+//! subject, role or tool name a case supplied.
 
 use std::time::Instant;
 
@@ -19,18 +25,26 @@ use serde::Serialize;
 
 use http::Method;
 
-use super::suite::{
-    Case, CaseInput, CaseKind, DecisionExpectation, HttpRequest, MatchedExpectation,
-    RateExpectation, Suite, SyntheticPrincipal, SyntheticTarget,
+use super::{
+    suite::{
+        Case, CaseInput, CaseKind, DecisionExpectation, HttpRequest, MatchedExpectation,
+        RateExpectation, StepOutcome, Suite, SyntheticPrincipal, SyntheticTarget,
+    },
+    synthetic::{
+        egress_limitation, egress_reason, evaluate_egress, run_sequence, EgressAnswer,
+        ResourceBinding, SequenceRun, SyntheticResources, MISSING_EGRESS_CONTROLS,
+        MISSING_RATE_LANE_CONFIGURATION,
+    },
 };
 use crate::{
     policy_eval::{
+        stages::NoStages,
         tools::{
             ToolEvaluationContext, ToolLimitation, ToolOperation, ToolReason, TOOL_CONTEXT_VERSION,
         },
         CompiledPolicy, EvaluationError, HostFact, HttpTarget, Limitation, LogicalDecision,
-        PolicyEffect, PolicyEvaluationContext, PrincipalFact, PrincipalIdentity, RateLaneOutcome,
-        Reason, ResourceSnapshot, RuleReference, CONTEXT_VERSION,
+        PolicyEffect, PolicyEvaluationContext, PolicyFacts, PrincipalFact, PrincipalIdentity,
+        RateLaneOutcome, Reason, ResourceSnapshot, RuleReference, CONTEXT_VERSION,
     },
     rbac::Policy,
 };
@@ -162,6 +176,10 @@ pub(crate) struct ExpectedView {
     /// for none. Absent on every other kind.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) rate_override: Option<Option<usize>>,
+    /// For a rate case with a sequence: the outcome expected of each step,
+    /// when the case states them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) steps: Option<Vec<&'static str>>,
 }
 
 /// What the evaluator answered, in stable codes only.
@@ -177,6 +195,10 @@ pub(crate) struct ActualView {
     pub(crate) matched: Option<MatchedView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) rate_override: Option<Option<usize>>,
+    /// For a rate case with a sequence: each step's outcome against the
+    /// isolated bucket, when the sequence ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) steps: Option<Vec<&'static str>>,
     pub(crate) complete: bool,
     pub(crate) limitation: Option<&'static str>,
 }
@@ -201,6 +223,8 @@ pub(crate) struct CaseResult {
 pub(crate) struct RunOutcome {
     pub(crate) summary: Summary,
     pub(crate) cases: Vec<CaseResult>,
+    /// The configuration egress cases and sequences were decided by.
+    pub(crate) resources: ResourceBinding,
 }
 
 impl RunOutcome {
@@ -215,10 +239,12 @@ impl RunOutcome {
 pub(crate) struct DeadlineExceeded;
 
 /// Run every case of `suite` against `policy`, in suite order, deciding no
-/// case once `deadline` has passed.
+/// case once `deadline` has passed. Egress cases and rate sequences read
+/// `resources`, and only that.
 pub(crate) fn run_suite(
     policy: &PolicyUnderTest,
     suite: &Suite,
+    resources: &SyntheticResources,
     deadline: Instant,
 ) -> Result<RunOutcome, DeadlineExceeded> {
     let mut summary = Summary::default();
@@ -229,7 +255,7 @@ pub(crate) fn run_suite(
         if Instant::now() > deadline {
             return Err(DeadlineExceeded);
         }
-        let result = run_case(policy, case);
+        let result = run_case(policy, case, resources);
         summary.total += 1;
         match result.status {
             CaseStatus::Passed => summary.passed += 1,
@@ -239,7 +265,11 @@ pub(crate) fn run_suite(
         }
         cases.push(result);
     }
-    Ok(RunOutcome { summary, cases })
+    Ok(RunOutcome {
+        summary,
+        cases,
+        resources: resources.binding(),
+    })
 }
 
 fn principal_fact(principal: &SyntheticPrincipal) -> PrincipalFact {
@@ -249,6 +279,14 @@ fn principal_fact(principal: &SyntheticPrincipal) -> PrincipalFact {
             PrincipalFact::Authenticated(PrincipalIdentity::from_principal(principal))
         }
     }
+}
+
+/// The facts a live lane captures for a case's principal under `compiled`
+/// ([`CompiledPolicy::serving_facts`]): in mapped-role mode the organization
+/// the case states, and none when it states none. Shared with the simulator,
+/// so a case decides by exactly the facts a served request would.
+pub(crate) fn case_facts(compiled: &CompiledPolicy, principal: &SyntheticPrincipal) -> PolicyFacts {
+    compiled.serving_facts(principal.principal())
 }
 
 /// The context the live HTTP adapter builds for a synthetic request.
@@ -329,7 +367,7 @@ pub(crate) fn rate_context(
     }
 }
 
-fn run_case(policy: &PolicyUnderTest, case: &Case) -> CaseResult {
+fn run_case(policy: &PolicyUnderTest, case: &Case, resources: &SyntheticResources) -> CaseResult {
     let compiled = &policy.compiled;
     match &case.input {
         CaseInput::Http {
@@ -339,7 +377,7 @@ fn run_case(policy: &PolicyUnderTest, case: &Case) -> CaseResult {
         } => {
             let context = http_context(compiled.snapshot(), request, principal);
             let expected = expected_decision(expect, Reason::as_str);
-            match compiled.evaluate(&context) {
+            match compiled.evaluate_with_facts(&context, &case_facts(compiled, principal)) {
                 Ok(evaluation) => {
                     let matched = matched_view(policy, evaluation.matched());
                     let mismatches = compare_decision(
@@ -356,6 +394,7 @@ fn run_case(policy: &PolicyUnderTest, case: &Case) -> CaseResult {
                         reason: Some(evaluation.reason().as_str()),
                         matched: Some(matched),
                         rate_override: None,
+                        steps: None,
                         complete: evaluation.is_complete(),
                         limitation: evaluation.limitation().map(limitation_code),
                     };
@@ -380,6 +419,7 @@ fn run_case(policy: &PolicyUnderTest, case: &Case) -> CaseResult {
             policy,
             case,
             tool_context(compiled.snapshot(), *operation, tool_name, principal, None),
+            &case_facts(compiled, principal),
             expect,
         ),
         CaseInput::ToolHttp {
@@ -398,18 +438,20 @@ fn run_case(policy: &PolicyUnderTest, case: &Case) -> CaseResult {
                 principal,
                 Some((method, path)),
             ),
+            &case_facts(compiled, principal),
             expect,
         ),
         CaseInput::Rate {
             method,
             path,
             principal,
+            sequence,
             expect,
         } => {
             let context = rate_context(compiled.snapshot(), method, path, principal);
-            let expected_override = match expect {
+            let expected_override = match expect.selected {
                 RateExpectation::NoOverride => None,
-                RateExpectation::Override(index) => Some(*index),
+                RateExpectation::Override(index) => Some(index),
             };
             let expected = ExpectedView {
                 logical: None,
@@ -417,29 +459,105 @@ fn run_case(policy: &PolicyUnderTest, case: &Case) -> CaseResult {
                 reason: None,
                 matched: None,
                 rate_override: Some(expected_override),
+                steps: expect.steps.as_deref().map(step_codes),
             };
-            match compiled.select_rate_lane(&context) {
+            match compiled.select_rate_lane_with_facts(
+                &context,
+                &case_facts(compiled, principal),
+                &mut NoStages,
+            ) {
                 Ok(selection) => {
                     let (selected, limitation) = match selection.outcome() {
                         RateLaneOutcome::NoOverride => (Some(None), None),
                         RateLaneOutcome::Override { index, .. } => (Some(Some(index)), None),
                         RateLaneOutcome::Indeterminate(limitation) => (None, Some(limitation)),
                     };
+                    let mut complete = selected.is_some();
+                    let mut limitation = limitation.map(limitation_code);
+                    let mut steps = None;
+                    if let Some(sequence) = sequence {
+                        match run_sequence(selection.outcome(), method, sequence, resources) {
+                            SequenceRun::Ran { steps: ran, .. } => steps = Some(ran),
+                            // Already incomplete, with the selection's own
+                            // limitation.
+                            SequenceRun::Undecided => {}
+                            SequenceRun::LaneConfigurationUnavailable => {
+                                complete = false;
+                                limitation = Some(MISSING_RATE_LANE_CONFIGURATION);
+                            }
+                        }
+                    }
+                    let mut mismatches = Vec::new();
+                    if selected != Some(expected_override) {
+                        mismatches.push("rate_override");
+                    }
+                    if expect
+                        .steps
+                        .as_ref()
+                        .is_some_and(|expected| steps.as_ref() != Some(expected))
+                    {
+                        mismatches.push("steps");
+                    }
                     let actual = ActualView {
                         logical: None,
                         effect: None,
                         reason: None,
                         matched: None,
                         rate_override: selected,
-                        complete: selected.is_some(),
-                        limitation: limitation.map(limitation_code),
+                        steps: steps.as_deref().map(step_codes),
+                        complete,
+                        limitation,
                     };
-                    let mismatches = if selected == Some(expected_override) {
-                        Vec::new()
-                    } else {
-                        vec!["rate_override"]
+                    decided(case, expected, actual, complete, mismatches)
+                }
+                Err(error) => refused(case, expected, error),
+            }
+        }
+        CaseInput::Egress { egress, expect } => {
+            let expected = expected_decision(expect, egress_code);
+            match evaluate_egress(egress, resources) {
+                Ok(EgressAnswer::Decided(evaluation)) => {
+                    let reason = egress_reason(evaluation.outcome());
+                    let mismatches = compare_decision(
+                        expect,
+                        evaluation.logical(),
+                        evaluation.effect(),
+                        !evaluation.is_complete(),
+                        |expected| *expected == reason,
+                        &MatchedView::None,
+                    );
+                    let actual = ActualView {
+                        logical: Some(logical_code(evaluation.logical())),
+                        effect: Some(effect_code(evaluation.effect())),
+                        reason: Some(reason),
+                        matched: None,
+                        rate_override: None,
+                        steps: None,
+                        complete: evaluation.is_complete(),
+                        limitation: egress_limitation(&evaluation),
                     };
-                    decided(case, expected, actual, selected.is_some(), mismatches)
+                    decided(
+                        case,
+                        expected,
+                        actual,
+                        evaluation.is_complete()
+                            && evaluation.logical() != LogicalDecision::Indeterminate,
+                        mismatches,
+                    )
+                }
+                // No controls, no answer: incomplete, never a guess.
+                Ok(EgressAnswer::ControlsUnavailable) => {
+                    let actual = ActualView {
+                        logical: None,
+                        effect: None,
+                        reason: None,
+                        matched: None,
+                        rate_override: None,
+                        steps: None,
+                        complete: false,
+                        limitation: Some(MISSING_EGRESS_CONTROLS),
+                    };
+                    decided(case, expected, actual, false, Vec::new())
                 }
                 Err(error) => refused(case, expected, error),
             }
@@ -447,14 +565,28 @@ fn run_case(policy: &PolicyUnderTest, case: &Case) -> CaseResult {
     }
 }
 
+/// An egress reason is already its stable code.
+fn egress_code(reason: &'static str) -> &'static str {
+    reason
+}
+
+/// Step outcomes as their stable codes.
+pub(crate) fn step_codes(steps: &[StepOutcome]) -> Vec<&'static str> {
+    steps.iter().map(|step| step.as_str()).collect()
+}
+
 fn evaluate_tool_case(
     policy: &PolicyUnderTest,
     case: &Case,
     context: ToolEvaluationContext,
+    facts: &PolicyFacts,
     expect: &DecisionExpectation<ToolReason>,
 ) -> CaseResult {
     let expected = expected_decision(expect, ToolReason::as_str);
-    match policy.compiled.evaluate_tool(&context) {
+    match policy
+        .compiled
+        .evaluate_tool_with_facts(&context, facts, &mut NoStages)
+    {
         Ok(evaluation) => {
             let matched = matched_view(policy, evaluation.matched());
             let mismatches = compare_decision(
@@ -471,6 +603,7 @@ fn evaluate_tool_case(
                 reason: Some(evaluation.reason().as_str()),
                 matched: Some(matched),
                 rate_override: None,
+                steps: None,
                 complete: evaluation.is_complete(),
                 limitation: evaluation.limitation().map(tool_limitation_code),
             };
@@ -586,6 +719,7 @@ where
             MatchedExpectation::Route(index) => MatchedView::Route(*index),
         }),
         rate_override: None,
+        steps: None,
     }
 }
 

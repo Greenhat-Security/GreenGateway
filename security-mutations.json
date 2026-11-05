@@ -4,7 +4,7 @@
   "targets": [
     {
       "id": "path-prefix",
-      "path": "gateway/src/path_match.rs",
+      "path": "gateway-config/src/path_match.rs",
       "function": "path_match::path_prefix_matches",
       "start_marker": "pub fn path_prefix_matches(",
       "end_marker": "\n}\n",
@@ -30,7 +30,7 @@
     },
     {
       "id": "unsafe-path",
-      "path": "gateway/src/path_match.rs",
+      "path": "gateway-config/src/path_match.rs",
       "function": "path_match::is_unsafe_request_path",
       "start_marker": "pub fn is_unsafe_request_path(",
       "end_marker": "\n}\n",
@@ -108,7 +108,7 @@
       "function": "policy_eval::CompiledPolicy::select_rate_lane_with_facts",
       "start_marker": "    pub(crate) fn select_rate_lane_with_facts(",
       "end_marker": "\n    }\n",
-      "source_sha256": "540bfd4ceeb21ed5e4a83aabc6e212f95510745731d25f3b02799fc760c10636",
+      "source_sha256": "ac4f2f2e80e458f316afd1d688da60073612b981398bafec34e7ede4b0e25b54",
       "tests": [
         "policy_eval::tests::rate_lane_selection_matches_the_frozen_selector"
       ],
@@ -136,7 +136,7 @@
       "function": "policy_eval::CompiledPolicy::evaluate_tool_with_facts",
       "start_marker": "    pub(crate) fn evaluate_tool_with_facts(",
       "end_marker": "\n    }\n",
-      "source_sha256": "9e381337e49583a3ac6fe5216d62ee2ca7c1eae4c353166d85e2c0d779c4b923",
+      "source_sha256": "79be339df340fd57a6a1e7be907f23a2a59bbfa7a205da42da5ef7fca0ac0194",
       "tests": [
         "policy_eval::tools::tests::a_disabled_entry_and_a_denying_tool_or_rendered_rule_each_block_on_their_own",
         "policy_eval::tools::tests::rendered_http_accepts_valid_segment_escapes_and_rejects_malformed_escapes"
