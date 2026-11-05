@@ -46,6 +46,12 @@ pub const POLICY_REPLAY_COMPLETED: &str = "policy.replay_completed";
 pub const POLICY_REPLAY_CANCELLED: &str = "policy.replay_cancelled";
 /// A replay job failed with a stable reason and produced no result.
 pub const POLICY_REPLAY_FAILED: &str = "policy.replay_failed";
+/// A cluster replay job a replica took over could not be continued: its
+/// pinned policies or its checkpoint could not be rebuilt under this build's
+/// engine, or it was taken over too often. Records the job id, a stable
+/// reason and the records it had read; no result is ever published for it.
+#[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+pub const POLICY_REPLAY_INTERRUPTED: &str = "policy.replay_interrupted";
 /// A policy evidence package was assembled and released (issue #243, slice
 /// 20). Records the publication version, its ETag and semantic digest, the
 /// request and report digests, completeness and limitation codes; never a

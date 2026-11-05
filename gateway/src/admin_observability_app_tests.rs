@@ -4449,6 +4449,8 @@ async fn suggestions_admin_without_engine_answers_not_configured() {
                 control_plane: None,
                 #[cfg(feature = "postgres")]
                 membership: None,
+                #[cfg(feature = "postgres")]
+                replay_cluster: None,
                 event_store: None,
                 query_store: None,
                 authority_evidence: authority_events::required::AuthorityEvidenceGate::best_effort(
@@ -8471,6 +8473,7 @@ mod cluster_discovery_tests {
                         policy_store.clone() as Arc<dyn storage::PolicyControlPlane>
                     ),
                     membership: None,
+                    replay_cluster: None,
                     event_store: None,
                     query_store: None,
                     authority_evidence:

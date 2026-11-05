@@ -70,6 +70,7 @@ use std::{cmp::Reverse, collections::BTreeMap};
 use serde_json::{json, Map, Value};
 
 use super::{
+    checkpoint::{self, CheckpointError, Restored},
     evaluate::{evaluate_http, evaluate_tool, select_rate_lane, HttpReplayOutcome},
     job::ReplayStop,
     HttpFacts, RecordedPolicy, RecordedResult, ReplaySource, ToolFacts,
@@ -256,7 +257,7 @@ pub(crate) struct Decided {
 impl Decided {
     /// The answer in the result's vocabulary, which keeps the logical
     /// decision, its enforcement and the effective action apart.
-    pub(crate) fn state(&self) -> State {
+    pub(crate) fn state(&self) -> State<'static> {
         let (enforcement, effective_action) = enforcement_and_effect(self.logical, self.effect);
         State {
             logical: logical_code(self.logical),
@@ -267,22 +268,43 @@ impl Decided {
     }
 }
 
-/// A decided outcome as a result states it.
+/// A decided outcome as a result states it. Its codes are the evaluator's
+/// own, or the same codes read back from a run's checkpoint ([`super::job`]),
+/// which is what the lifetime is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct State {
-    pub(crate) logical: &'static str,
-    pub(crate) enforcement: &'static str,
-    pub(crate) effective_action: &'static str,
-    pub(crate) reason: &'static str,
+pub(crate) struct State<'a> {
+    pub(crate) logical: &'a str,
+    pub(crate) enforcement: &'a str,
+    pub(crate) effective_action: &'a str,
+    pub(crate) reason: &'a str,
 }
 
-impl State {
+impl<'a> State<'a> {
     fn render(self) -> Value {
         json!({
             "logical": self.logical,
             "enforcement": self.enforcement,
             "effective_action": self.effective_action,
             "reason": self.reason,
+        })
+    }
+
+    fn dump(self) -> Value {
+        json!([
+            self.logical,
+            self.enforcement,
+            self.effective_action,
+            self.reason
+        ])
+    }
+
+    fn restore(value: &'a Value) -> Restored<Self> {
+        let [logical, enforcement, effective_action, reason] = checkpoint::tuple(value)?;
+        Ok(Self {
+            logical: checkpoint::code(logical)?,
+            enforcement: checkpoint::code(enforcement)?,
+            effective_action: checkpoint::code(effective_action)?,
+            reason: checkpoint::code(reason)?,
         })
     }
 }
@@ -301,6 +323,41 @@ pub(crate) enum Element {
     ToolEntry(usize),
     /// The invoked tool has no entry in the policy.
     NoToolEntry,
+}
+
+impl Element {
+    fn dump(self) -> Value {
+        match self {
+            Self::Rule(position) => json!(["rule", position]),
+            Self::Route(position) => json!(["route", position]),
+            Self::Default => json!(["default"]),
+            Self::HostBinding => json!(["host_binding"]),
+            Self::ToolEntry(position) => json!(["tool_entry", position]),
+            Self::NoToolEntry => json!(["no_tool_entry"]),
+        }
+    }
+
+    fn restore(value: &Value) -> Restored<Self> {
+        let parts = checkpoint::array(value)?;
+        let kind = parts.first().ok_or(CheckpointError)?;
+        let position = || match parts {
+            [_, position] => checkpoint::position(position),
+            _ => Err(CheckpointError),
+        };
+        let unit = |element: Self| match parts {
+            [_] => Ok(element),
+            _ => Err(CheckpointError),
+        };
+        match checkpoint::code(kind)? {
+            "rule" => position().map(Self::Rule),
+            "route" => position().map(Self::Route),
+            "default" => unit(Self::Default),
+            "host_binding" => unit(Self::HostBinding),
+            "tool_entry" => position().map(Self::ToolEntry),
+            "no_tool_entry" => unit(Self::NoToolEntry),
+            _ => Err(CheckpointError),
+        }
+    }
 }
 
 /// Which rate-limit override one policy selects for a record. Selection
@@ -568,6 +625,8 @@ enum Forwarding {
 }
 
 impl Forwarding {
+    const ALL: [Self; 3] = [Self::NewlyForwarded, Self::NewlyBlocked, Self::Unchanged];
+
     fn between(base: PolicyEffect, candidate: PolicyEffect) -> Self {
         match (
             base == PolicyEffect::Block,
@@ -695,20 +754,20 @@ fn rate_element_view(policy: &ReplayPolicy, position: Option<usize>) -> Value {
 
 /// One lane's base-to-candidate comparison under one projection.
 #[derive(Default)]
-struct LaneComparison {
+struct LaneComparison<'a> {
     records: u64,
     transitions: BTreeMap<Transition, u64>,
     newly_forwarded: u64,
     newly_blocked: u64,
-    matrix: BTreeMap<(Transition, Forwarding, State, State), u64>,
+    matrix: BTreeMap<(Transition, Forwarding, State<'a>, State<'a>), u64>,
     /// Changed records only, by the element that decided under each policy.
     elements: BTreeMap<(Transition, Forwarding, Element, Element), u64>,
-    base_limitations: BTreeMap<&'static str, u64>,
-    candidate_limitations: BTreeMap<&'static str, u64>,
-    refusals: BTreeMap<&'static str, u64>,
+    base_limitations: BTreeMap<&'a str, u64>,
+    candidate_limitations: BTreeMap<&'a str, u64>,
+    refusals: BTreeMap<&'a str, u64>,
 }
 
-impl LaneComparison {
+impl<'a> LaneComparison<'a> {
     fn observe(&mut self, pair: &PolicyPair, base: Answer, candidate: Answer) {
         self.records += 1;
         let (base, candidate) = match (base, candidate) {
@@ -819,16 +878,123 @@ impl LaneComparison {
             "refusals": self.refusals,
         })
     }
+
+    /// Every count, losslessly, for a run's checkpoint.
+    fn dump(&self) -> Value {
+        let matrix = self
+            .matrix
+            .iter()
+            .map(|((transition, forwarding, base, candidate), count)| {
+                json!([
+                    transition.as_str(),
+                    forwarding.as_str(),
+                    base.dump(),
+                    candidate.dump(),
+                    count
+                ])
+            })
+            .collect::<Vec<_>>();
+        let elements = self
+            .elements
+            .iter()
+            .map(|((transition, forwarding, base, candidate), count)| {
+                json!([
+                    transition.as_str(),
+                    forwarding.as_str(),
+                    base.dump(),
+                    candidate.dump(),
+                    count
+                ])
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "records": self.records,
+            "transitions": checkpoint::dump_closed(&self.transitions, Transition::as_str),
+            "newly_forwarded": self.newly_forwarded,
+            "newly_blocked": self.newly_blocked,
+            "matrix": matrix,
+            "elements": elements,
+            "base_limitations": self.base_limitations,
+            "candidate_limitations": self.candidate_limitations,
+            "refusals": self.refusals,
+        })
+    }
+
+    fn restore(value: &'a Value) -> Restored<Self> {
+        let object = checkpoint::exact_object(
+            value,
+            &[
+                "records",
+                "transitions",
+                "newly_forwarded",
+                "newly_blocked",
+                "matrix",
+                "elements",
+                "base_limitations",
+                "candidate_limitations",
+                "refusals",
+            ],
+        )?;
+        let mut matrix = BTreeMap::new();
+        for row in checkpoint::array(checkpoint::member(object, "matrix")?)? {
+            let [transition, forwarding, base, candidate, count] = checkpoint::tuple(row)?;
+            checkpoint::insert(
+                &mut matrix,
+                (
+                    checkpoint::closed(&Transition::ALL, Transition::as_str, transition)?,
+                    checkpoint::closed(&Forwarding::ALL, Forwarding::as_str, forwarding)?,
+                    State::restore(base)?,
+                    State::restore(candidate)?,
+                ),
+                count,
+            )?;
+        }
+        let mut elements = BTreeMap::new();
+        for row in checkpoint::array(checkpoint::member(object, "elements")?)? {
+            let [transition, forwarding, base, candidate, count] = checkpoint::tuple(row)?;
+            checkpoint::insert(
+                &mut elements,
+                (
+                    checkpoint::closed(&Transition::ALL, Transition::as_str, transition)?,
+                    checkpoint::closed(&Forwarding::ALL, Forwarding::as_str, forwarding)?,
+                    Element::restore(base)?,
+                    Element::restore(candidate)?,
+                ),
+                count,
+            )?;
+        }
+        Ok(Self {
+            records: checkpoint::total(checkpoint::member(object, "records")?)?,
+            transitions: checkpoint::restore_closed(
+                &Transition::ALL,
+                Transition::as_str,
+                checkpoint::member(object, "transitions")?,
+            )?,
+            newly_forwarded: checkpoint::total(checkpoint::member(object, "newly_forwarded")?)?,
+            newly_blocked: checkpoint::total(checkpoint::member(object, "newly_blocked")?)?,
+            matrix,
+            elements,
+            base_limitations: checkpoint::restore_codes(checkpoint::member(
+                object,
+                "base_limitations",
+            )?)?,
+            candidate_limitations: checkpoint::restore_codes(checkpoint::member(
+                object,
+                "candidate_limitations",
+            )?)?,
+            refusals: checkpoint::restore_codes(checkpoint::member(object, "refusals")?)?,
+        })
+    }
 }
 
 /// Both decision lanes under one projection.
 #[derive(Default)]
-struct ProjectionTally {
-    http: LaneComparison,
-    tool: LaneComparison,
+struct ProjectionTally<'a> {
+    http: LaneComparison<'a>,
+    tool: LaneComparison<'a>,
 }
 
-impl ProjectionTally {
+impl<'a> ProjectionTally<'a> {
     fn total(&self, transition: Transition) -> u64 {
         self.http.count(transition) + self.tool.count(transition)
     }
@@ -893,6 +1059,18 @@ impl ProjectionTally {
             "newly_blocked": self.http.newly_blocked + self.tool.newly_blocked,
             "indeterminate": self.total(Transition::Indeterminate),
             "unsupported_context": self.total(Transition::UnsupportedContext),
+        })
+    }
+
+    fn dump(&self) -> Value {
+        json!({ "http": self.http.dump(), "tool": self.tool.dump() })
+    }
+
+    fn restore(value: &'a Value) -> Restored<Self> {
+        let object = checkpoint::exact_object(value, &["http", "tool"])?;
+        Ok(Self {
+            http: LaneComparison::restore(checkpoint::member(object, "http")?)?,
+            tool: LaneComparison::restore(checkpoint::member(object, "tool")?)?,
         })
     }
 }
@@ -966,17 +1144,17 @@ impl LimitChange {
 /// The base-to-candidate comparison of rate-override selection. A projection
 /// changes no override, so there is one, for the policies as authored.
 #[derive(Default)]
-struct RateComparison {
+struct RateComparison<'a> {
     records: u64,
     transitions: BTreeMap<RateTransition, u64>,
     limits: BTreeMap<LimitChange, u64>,
     elements: BTreeMap<(RateTransition, Option<usize>, Option<usize>), u64>,
-    base_limitations: BTreeMap<&'static str, u64>,
-    candidate_limitations: BTreeMap<&'static str, u64>,
-    refusals: BTreeMap<&'static str, u64>,
+    base_limitations: BTreeMap<&'a str, u64>,
+    candidate_limitations: BTreeMap<&'a str, u64>,
+    refusals: BTreeMap<&'a str, u64>,
 }
 
-impl RateComparison {
+impl<'a> RateComparison<'a> {
     fn observe(&mut self, pair: &PolicyPair, base: RateAnswer, candidate: RateAnswer) {
         self.records += 1;
         let transition = match (base, candidate) {
@@ -1087,6 +1265,76 @@ impl RateComparison {
                 "candidate": self.candidate_limitations,
             },
             "refusals": self.refusals,
+        })
+    }
+
+    fn dump(&self) -> Value {
+        let elements = self
+            .elements
+            .iter()
+            .map(|((transition, base, candidate), count)| {
+                json!([transition.as_str(), base, candidate, count])
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "records": self.records,
+            "transitions": checkpoint::dump_closed(&self.transitions, RateTransition::as_str),
+            "limits": checkpoint::dump_closed(&self.limits, LimitChange::as_str),
+            "elements": elements,
+            "base_limitations": self.base_limitations,
+            "candidate_limitations": self.candidate_limitations,
+            "refusals": self.refusals,
+        })
+    }
+
+    fn restore(value: &'a Value) -> Restored<Self> {
+        let object = checkpoint::exact_object(
+            value,
+            &[
+                "records",
+                "transitions",
+                "limits",
+                "elements",
+                "base_limitations",
+                "candidate_limitations",
+                "refusals",
+            ],
+        )?;
+        let mut elements = BTreeMap::new();
+        for row in checkpoint::array(checkpoint::member(object, "elements")?)? {
+            let [transition, base, candidate, count] = checkpoint::tuple(row)?;
+            checkpoint::insert(
+                &mut elements,
+                (
+                    checkpoint::closed(&RateTransition::ALL, RateTransition::as_str, transition)?,
+                    checkpoint::optional_position(base)?,
+                    checkpoint::optional_position(candidate)?,
+                ),
+                count,
+            )?;
+        }
+        Ok(Self {
+            records: checkpoint::total(checkpoint::member(object, "records")?)?,
+            transitions: checkpoint::restore_closed(
+                &RateTransition::ALL,
+                RateTransition::as_str,
+                checkpoint::member(object, "transitions")?,
+            )?,
+            limits: checkpoint::restore_closed(
+                &LimitChange::ALL,
+                LimitChange::as_str,
+                checkpoint::member(object, "limits")?,
+            )?,
+            elements,
+            base_limitations: checkpoint::restore_codes(checkpoint::member(
+                object,
+                "base_limitations",
+            )?)?,
+            candidate_limitations: checkpoint::restore_codes(checkpoint::member(
+                object,
+                "candidate_limitations",
+            )?)?,
+            refusals: checkpoint::restore_codes(checkpoint::member(object, "refusals")?)?,
         })
     }
 }
@@ -1258,25 +1506,25 @@ pub(crate) fn compare_recorded(
 
 /// `(comparison, recorded policy, recorded reason, base policy, base
 /// reason)`: one row of a recorded comparison, all codes from closed sets.
-type RecordedRow = (
+type RecordedRow<'a> = (
     RecordedComparison,
-    &'static str,
-    Option<&'static str>,
-    &'static str,
-    &'static str,
+    &'a str,
+    Option<&'a str>,
+    &'a str,
+    &'a str,
 );
 
 /// One lane's recorded-against-base comparison. It reads the base as
 /// authored, the policy the live gateway decided by.
 #[derive(Default)]
-struct RecordedTally {
+struct RecordedTally<'a> {
     records: u64,
     comparisons: BTreeMap<RecordedComparison, u64>,
     /// The records the base decided and the record states as a verdict.
-    matrix: BTreeMap<RecordedRow, u64>,
+    matrix: BTreeMap<RecordedRow<'a>, u64>,
 }
 
-impl RecordedTally {
+impl<'a> RecordedTally<'a> {
     fn observe(
         &mut self,
         policy: &ReplayPolicy,
@@ -1329,18 +1577,84 @@ impl RecordedTally {
             "matrix_omitted": matrix_omitted,
         })
     }
+
+    fn dump(&self) -> Value {
+        let matrix = self
+            .matrix
+            .iter()
+            .map(
+                |(
+                    (comparison, recorded_policy, recorded_reason, base_policy, base_reason),
+                    count,
+                )| {
+                    json!([
+                        comparison.as_str(),
+                        recorded_policy,
+                        recorded_reason,
+                        base_policy,
+                        base_reason,
+                        count
+                    ])
+                },
+            )
+            .collect::<Vec<_>>();
+        json!({
+            "records": self.records,
+            "comparisons": checkpoint::dump_closed(&self.comparisons, RecordedComparison::as_str),
+            "matrix": matrix,
+        })
+    }
+
+    fn restore(value: &'a Value) -> Restored<Self> {
+        let object = checkpoint::exact_object(value, &["records", "comparisons", "matrix"])?;
+        let mut matrix = BTreeMap::new();
+        for row in checkpoint::array(checkpoint::member(object, "matrix")?)? {
+            let [comparison, recorded_policy, recorded_reason, base_policy, base_reason, count] =
+                checkpoint::tuple(row)?;
+            let recorded_reason = match recorded_reason {
+                Value::Null => None,
+                reason => Some(checkpoint::code(reason)?),
+            };
+            checkpoint::insert(
+                &mut matrix,
+                (
+                    checkpoint::closed(
+                        &RecordedComparison::ALL,
+                        RecordedComparison::as_str,
+                        comparison,
+                    )?,
+                    checkpoint::code(recorded_policy)?,
+                    recorded_reason,
+                    checkpoint::code(base_policy)?,
+                    checkpoint::code(base_reason)?,
+                ),
+                count,
+            )?;
+        }
+        Ok(Self {
+            records: checkpoint::total(checkpoint::member(object, "records")?)?,
+            comparisons: checkpoint::restore_closed(
+                &RecordedComparison::ALL,
+                RecordedComparison::as_str,
+                checkpoint::member(object, "comparisons")?,
+            )?,
+            matrix,
+        })
+    }
 }
 
-/// Every comparison one job keeps.
-pub(crate) struct ImpactTally {
-    as_authored: Option<ProjectionTally>,
-    enforce_all_shadow: Option<ProjectionTally>,
-    rate: RateComparison,
-    recorded_http: RecordedTally,
-    recorded_tool: RecordedTally,
+/// Every comparison one job keeps. Its codes are borrowed for `'a`: the
+/// evaluator's own, `'static`, and those of a checkpoint the run resumed
+/// from, which outlives the run ([`Self::restore`]).
+pub(crate) struct ImpactTally<'a> {
+    as_authored: Option<ProjectionTally<'a>>,
+    enforce_all_shadow: Option<ProjectionTally<'a>>,
+    rate: RateComparison<'a>,
+    recorded_http: RecordedTally<'a>,
+    recorded_tool: RecordedTally<'a>,
 }
 
-impl ImpactTally {
+impl<'a> ImpactTally<'a> {
     pub(crate) fn new(policies: &ReplayPolicies) -> Self {
         Self {
             as_authored: policies
@@ -1486,5 +1800,53 @@ impl ImpactTally {
             );
         }
         Value::Object(summary)
+    }
+
+    /// Every count, losslessly, for a run's checkpoint: what [`Self::restore`]
+    /// reads back into the same tally.
+    pub(crate) fn dump(&self) -> Value {
+        json!({
+            "as_authored": self.as_authored.as_ref().map(ProjectionTally::dump),
+            "enforce_all_shadow": self.enforce_all_shadow.as_ref().map(ProjectionTally::dump),
+            "rate": self.rate.dump(),
+            "recorded_http": self.recorded_http.dump(),
+            "recorded_tool": self.recorded_tool.dump(),
+        })
+    }
+
+    /// The tally a dump of one for the same `policies` describes. A dump of a
+    /// different shape -- another projection set, a member missing or
+    /// unknown, a code that is not one, a zero or repeated count -- is
+    /// refused whole.
+    pub(crate) fn restore(policies: &ReplayPolicies, value: &'a Value) -> Restored<Self> {
+        let object = checkpoint::exact_object(
+            value,
+            &[
+                "as_authored",
+                "enforce_all_shadow",
+                "rate",
+                "recorded_http",
+                "recorded_tool",
+            ],
+        )?;
+        let fresh = Self::new(policies);
+        let projection = |expected: bool, value: &'a Value| match (expected, value) {
+            (false, Value::Null) => Ok(None),
+            (true, value @ Value::Object(_)) => ProjectionTally::restore(value).map(Some),
+            _ => Err(CheckpointError),
+        };
+        Ok(Self {
+            as_authored: projection(
+                fresh.as_authored.is_some(),
+                checkpoint::member(object, "as_authored")?,
+            )?,
+            enforce_all_shadow: projection(
+                fresh.enforce_all_shadow.is_some(),
+                checkpoint::member(object, "enforce_all_shadow")?,
+            )?,
+            rate: RateComparison::restore(checkpoint::member(object, "rate")?)?,
+            recorded_http: RecordedTally::restore(checkpoint::member(object, "recorded_http")?)?,
+            recorded_tool: RecordedTally::restore(checkpoint::member(object, "recorded_tool")?)?,
+        })
     }
 }

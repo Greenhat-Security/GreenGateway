@@ -70,6 +70,11 @@ describe('policy replay client', () => {
     expect(projectReplayJob(withoutResult)).toBeNull();
     expect(projectReplayJob({ ...replayJob('completed_incomplete', ['no_data']), state: 'completed' })).toBeNull();
     expect(projectReplayJob({ ...replayJob('failed'), failure: undefined })).toBeNull();
+    // A cluster job a replica could not continue says why, and has no result.
+    expect(
+      projectReplayJob({ ...replayJob('interrupted'), failure: { reason: 'takeover_limit' } }),
+    ).toMatchObject({ state: 'interrupted', failure: 'takeover_limit', result: null });
+    expect(projectReplayJob(replayJob('interrupted'))).toBeNull();
     expect(projectReplayJob({ ...replayJob('queued'), job_id: 'rpl_../../x' })).toBeNull();
   });
 

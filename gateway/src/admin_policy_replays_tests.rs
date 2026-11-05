@@ -783,6 +783,8 @@ fn replay_admin_state(
         control_plane: None,
         #[cfg(feature = "postgres")]
         membership: None,
+        #[cfg(feature = "postgres")]
+        replay_cluster: None,
         event_store: Some(store.clone() as Arc<dyn storage::AuditEventStore>),
         query_store: Some(store),
         authority_evidence: authority_events::required::AuthorityEvidenceGate::best_effort(),
@@ -1099,15 +1101,16 @@ impl storage::PolicyControlPlane for UnconsultedControlPlane {
     }
 }
 
-/// Fail closed in cluster mode: a replica-local job would read one
-/// replica's view of a shared audit authority, and replicated jobs need the
-/// durable leases of #241. Every route answers `503` with a stable reason
-/// after the permission checks and before any work -- no body is parsed, no
-/// cutoff read, no job admitted, no lifecycle recorded and no authority
-/// consulted.
+/// Fail closed in cluster mode without the cluster job store: a
+/// replica-local job would read one replica's view of a shared audit
+/// authority, so a cluster that has no shared job table runs no job at all.
+/// Every route answers `503` with a stable reason after the permission
+/// checks and before any work -- no body is parsed, no cutoff read, no job
+/// admitted, no lifecycle recorded and no authority consulted -- even with a
+/// standalone audit log at hand.
 #[cfg(feature = "postgres")]
 #[tokio::test]
-async fn cluster_mode_refuses_every_replay_route_before_any_work() {
+async fn cluster_mode_without_a_job_store_refuses_every_replay_route_before_any_work() {
     let capture = audit::sink::tests::CaptureSink::new();
     let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
     let audit_db = TempDb::new("policy-replay-cluster");
@@ -1133,7 +1136,7 @@ async fn cluster_mode_refuses_every_replay_route_before_any_work() {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             json_body(response).await["reason"],
-            json!("policy_replay_unsupported_in_cluster")
+            json!(POLICY_EVIDENCE_UNAVAILABLE_REASON)
         );
     }
     // The permission checks still come first.
@@ -1156,6 +1159,178 @@ async fn cluster_mode_refuses_every_replay_route_before_any_work() {
         audit_row_count(&audit_db.path),
         i64::try_from(retained_window().len()).expect("fits")
     );
+}
+
+/// Cluster mode end to end, against a real PostgreSQL: one replica's route
+/// admits a job into the shared job table and records its start, another
+/// replica's route answers an idempotent retry with the same job and refuses
+/// the owner a second pending one, another replica's worker runs it over the
+/// cluster audit stream, and any replica serves its result and discards it.
+/// Gated on the test harness locator: CI sets it, a checkout without a
+/// database skips.
+#[cfg(feature = "postgres")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cluster_job_is_admitted_on_one_replica_run_on_another_and_served_by_any() {
+    use crate::storage::{
+        contract_tests::postgres_audit_tests::{
+            create_test_database, locator, write_dsn_file, DATABASE,
+        },
+        migrations,
+        postgres::PostgresFoundation,
+        postgres_audit::PostgresAuditEventStore,
+        postgres_policy::PostgresPolicyStore,
+        AuditEventStore, PolicyCommitPrecondition, PolicyCommitRequest, PolicyControlPlane,
+    };
+
+    let Some(admin_dsn) = locator() else {
+        eprintln!("skipping: no test database locator; CI runs this test");
+        return;
+    };
+    let _guard = DATABASE.lock().await;
+    let database = create_test_database(&admin_dsn).await;
+    let dsn_file = write_dsn_file(&database.dsn);
+    let mut config = config::Config::test_defaults();
+    config.state_backend = config::StateBackend::Postgres;
+    config.deployment_id = Some("deploy-replay-routes".to_owned());
+    config.database.url_file = Some(dsn_file.path.clone());
+    config.database.tls_mode = config::DatabaseTlsMode::LoopbackDev;
+    let foundation = PostgresFoundation::establish(&config)
+        .await
+        .expect("the test database should establish");
+    migrations::apply_missing_for_startup(foundation.pool(), &config.database)
+        .await
+        .expect("the schema should migrate");
+    let pool = foundation.pool().clone();
+    let policy = rbac::Policy::validate_json_value(replays_policy_document())
+        .expect("the test policy validates");
+    let store = Arc::new(PostgresPolicyStore::new(pool.clone()));
+    let active = PolicyControlPlane::commit(
+        store.as_ref(),
+        PolicyCommitRequest {
+            precondition: PolicyCommitPrecondition::Initialize,
+            candidate: &policy,
+            change: crate::storage::DocumentChange::test_policy("seed"),
+            diff_summary: &json!({ "action": "test" }),
+        },
+    )
+    .await
+    .expect("the deployment initializes");
+    let retained = retained_window();
+    PostgresAuditEventStore::new(pool.clone(), None)
+        .insert_events(&retained)
+        .await
+        .expect("the retained window commits");
+
+    let capture = audit::sink::tests::CaptureSink::new();
+    let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+    let replica = |replays: &Arc<ClusterPolicyReplays>| {
+        let rbac_state =
+            middleware::rbac::RbacState::new(policy.clone(), Vec::new(), false, test_audit_log());
+        let state = PolicyAdminState {
+            policy_file: None,
+            rbac_state: Some(rbac_state),
+            history_store: None,
+            draft_store: None,
+            test_suite_store: None,
+            control_plane: Some(Arc::clone(&store) as Arc<dyn storage::PolicyControlPlane>),
+            membership: None,
+            replay_cluster: Some(Arc::clone(replays)),
+            event_store: None,
+            query_store: None,
+            authority_evidence: authority_events::required::AuthorityEvidenceGate::best_effort(),
+            audit: audit_log.clone(),
+            client_ip_policy: client_ip::ClientIpPolicy::default(),
+            max_body_size: 1024 * 1024,
+        };
+        replay_routes(&Arc::new(PolicyReplayJobs::new())).with_state(state)
+    };
+    let replays_a = Arc::new(ClusterPolicyReplays::new(
+        pool.clone(),
+        &config.database,
+        uuid::Uuid::new_v4(),
+    ));
+    let replays_b = Arc::new(ClusterPolicyReplays::new(
+        pool.clone(),
+        &config.database,
+        uuid::Uuid::new_v4(),
+    ));
+    let (router_a, router_b) = (replica(&replays_a), replica(&replays_b));
+
+    let mut body = replay_body(&active.etag, json!({ "source": "active" }));
+    body["idempotency_key"] = json!("cluster-nightly");
+    let body = body.to_string();
+    let response = start(&router_a, replayer(), body.clone()).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let admitted = json_body(response).await;
+    assert_eq!(admitted["state"], json!("queued"));
+    let id = job_id(&admitted);
+    let started = wait_for_lifecycle(&capture, 1);
+    assert_eq!(started[0].event_type, audit::event::POLICY_REPLAY_STARTED);
+    assert_eq!(started[0].payload["job_id"], json!(id));
+
+    // Another replica: the same key and request are the same job; a second
+    // pending job of this principal's is refused, not queued behind it.
+    let retried = start(&router_b, replayer(), body).await;
+    assert_eq!(retried.status(), StatusCode::OK);
+    assert_eq!(job_id(&json_body(retried).await), id);
+    let second = start(
+        &router_b,
+        replayer(),
+        replay_body(&active.etag, lockdown_edits()).to_string(),
+    )
+    .await;
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        json_body(second).await["reason"],
+        json!("policy_replay_busy")
+    );
+
+    // Replica B's worker runs the job replica A admitted.
+    assert!(replays_b.run_one(&audit_log).await);
+    let finished = finished(&router_a, replayer(), &id).await;
+    assert_eq!(finished["state"], json!("completed"), "{finished}");
+    assert_eq!(finished["freshness"]["state"], json!("current"));
+    let result = &finished["result"];
+    assert_eq!(result["source"]["kind"], json!("cluster_audit_stream"));
+    assert_eq!(
+        result["records"]["scanned"],
+        json!(retained.len()),
+        "every retained record was read, once"
+    );
+    let completed = wait_for_lifecycle(&capture, 2);
+    assert_eq!(
+        completed[1].event_type,
+        audit::event::POLICY_REPLAY_COMPLETED
+    );
+    assert_eq!(
+        completed[1].payload["result_digest"],
+        finished["result_digest"]
+    );
+    assert_eq!(
+        completed[1].request_id, started[0].request_id,
+        "the completion carries the admitting request's envelope"
+    );
+    let rendered = finished.to_string();
+    assert!(!rendered.contains(SUBJECT_CANARY) && !rendered.contains(PATH_CANARY));
+
+    // Only the principal that started it sees it; any replica discards it.
+    let other = get_job(&router_b, operator("someone-else"), &id).await;
+    assert_eq!(other.status(), StatusCode::NOT_FOUND);
+    let served = get_job(&router_b, replayer(), &id).await;
+    assert_eq!(served.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(served).await["result_digest"],
+        finished["result_digest"]
+    );
+    assert_eq!(
+        delete_job(&router_b, replayer(), &id).await.status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        get_job(&router_a, replayer(), &id).await.status(),
+        StatusCode::NOT_FOUND
+    );
+    drop(database);
 }
 
 /// The acceptance criterion of #243 slice 13, after the simulation API's: a

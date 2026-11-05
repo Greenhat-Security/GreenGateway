@@ -333,7 +333,7 @@ manifest names. Without a signature it does not show who produced it.
 | `404` | | No policy history is configured |
 | `408` | `policy_evidence_request_timeout` | The body did not arrive within five seconds |
 | `409` | `policy_evidence_publication_mismatch` | `publication.etag` is not the stored document's ETag |
-| `409` | `policy_evidence_replay_job_unfinished` | The job holds no result: pending, failed, cancelled or expired (`state` names which) |
+| `409` | `policy_evidence_replay_job_unfinished` | The job holds no result: pending, failed, cancelled, interrupted or expired (`state` names which) |
 | `409` | `policy_evidence_replay_binding_stale` | The job's candidate is not the published document |
 | `413` | | The body exceeds `MAX_BODY_SIZE` or 2 MiB, whichever is lower |
 | `422` | `policy_evidence_invalid` | The request is invalid; `diagnostics` say why |
@@ -344,7 +344,7 @@ manifest names. Without a signature it does not show who produced it.
 | `503` | `policy_evidence_history_unavailable` | The history could not be read |
 | `503` | `policy_evidence_deadline_exceeded` | The suite and cases were not decided within five seconds |
 | `503` | `policy_evidence_audit_unavailable` | The export could not be recorded; no package was released |
-| `503` | `policy_evidence_replay_unsupported_in_cluster` | A replay job was named in cluster mode, which has none |
+| `503` | `policy_replay_store_unavailable` | Cluster mode: the replay job store could not be read |
 
 ## Privacy
 
