@@ -1,0 +1,210 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://greengateway.dev/schemas/gateway-backup.v1alpha1.schema.json",
+  "title": "GreenGateway Standalone Backup Manifest",
+  "description": "The manifest that is the first entry, gateway-backup.json, of every standalone backup archive ggctl backup create writes (docs/standalone-backup.md). It records the program and SQLite versions that wrote the archive, the archive container version, the logical inventory of every store of the standalone state-directory layout, one entry per physical database with its exact length, SHA-256 and SQLite description (header versions, pages, a schema digest and the rows of each table), the configuration revision ledger's state when it is included, and the counts all of these imply. The document is closed: a member this version does not define, a duplicate member, a missing member or a value outside its grammar makes it unreadable, and so does any inconsistency between the inventory, the entries and the counts; a reader that does not implement this exact apiVersion and kind treats the backup as incompatible. The digests are integrity evidence, not authenticity: whoever can write an archive can write a consistent one. This schema is necessary but not sufficient: the reader in the gateway-config crate is authoritative.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "kind", "archive", "source", "createdBy", "createdAtMs", "sqliteVersion", "stores", "entries", "counts"],
+  "properties": {
+    "apiVersion": {
+      "description": "Exact document version. No other version, prefix, or spelling is accepted.",
+      "const": "greengateway.dev/v1alpha1"
+    },
+    "kind": {
+      "const": "GatewayBackup"
+    },
+    "archive": {
+      "description": "The archive container: GreenGateway's framed format, version 1.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["format", "version"],
+      "properties": {
+        "format": {"const": "ggbk"},
+        "version": {"const": 1}
+      }
+    },
+    "source": {
+      "description": "What was backed up: a standalone state directory, held under its lock. PostgreSQL and cluster state is never backed up this way.",
+      "const": "standalone_state_directory"
+    },
+    "createdBy": {
+      "description": "The program, and its version, that wrote the archive.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["program", "version"],
+      "properties": {
+        "program": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{0,31}$"
+        },
+        "version": {
+          "type": "string",
+          "maxLength": 64,
+          "pattern": "^[0-9][0-9A-Za-z.+-]*$"
+        }
+      }
+    },
+    "createdAtMs": {
+      "description": "Milliseconds since the Unix epoch, as the writer stamped it.",
+      "$ref": "#/$defs/count"
+    },
+    "sqliteVersion": {
+      "description": "The SQLite library version that took the snapshots.",
+      "type": "string",
+      "maxLength": 32,
+      "pattern": "^[0-9]+(\\.[0-9]+){1,3}$"
+    },
+    "stores": {
+      "description": "The logical inventory: every store of the state-directory layout once, in the layout's order. An included store names the entry that holds it: its own file, or for a store whose file was another name for an earlier store's file, that store's entry.",
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "prefixItems": [
+        {"$ref": "#/$defs/store", "properties": {"store": {"const": "audit"}, "file": {"const": "audit.sqlite3"}}},
+        {"$ref": "#/$defs/store", "properties": {"store": {"const": "discovery"}, "file": {"const": "discovery.sqlite3"}}},
+        {"$ref": "#/$defs/store", "properties": {"store": {"const": "principals"}, "file": {"const": "principals.sqlite3"}}},
+        {"$ref": "#/$defs/store", "properties": {"store": {"const": "connections"}, "file": {"const": "connections.sqlite3"}}},
+        {"$ref": "#/$defs/store", "properties": {"store": {"const": "service_tokens"}, "file": {"const": "service-tokens.sqlite3"}}},
+        {"$ref": "#/$defs/store", "properties": {"store": {"const": "policy_history"}, "file": {"const": "policy-history.sqlite3"}}},
+        {"$ref": "#/$defs/store", "properties": {"store": {"const": "config_ledger"}, "file": {"const": "config-ledger.sqlite3"}}}
+      ],
+      "items": false
+    },
+    "entries": {
+      "description": "The archive's entries after the manifest, in archive order: one per physical database, named after the file of the first store it holds.",
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 7,
+      "items": {"$ref": "#/$defs/entry"}
+    },
+    "ledger": {
+      "description": "Present exactly when the configuration revision ledger is included: its state as the ledger's full verification reported it.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["revisions", "desired", "active", "bundleApiVersion"],
+      "properties": {
+        "revisions": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "desired": {"$ref": "#/$defs/revisionId"},
+        "active": {
+          "description": "The revision a gateway last activated; null until one has.",
+          "oneOf": [{"$ref": "#/$defs/revisionId"}, {"type": "null"}]
+        },
+        "bundleApiVersion": {
+          "description": "The document version of the desired revision's bundle.",
+          "const": "greengateway.dev/v1alpha1"
+        }
+      }
+    },
+    "counts": {
+      "description": "What the inventory and entries imply: stores in the layout and included, database entries, their bytes, tables and rows.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stores", "includedStores", "entries", "bytes", "tables", "rows"],
+      "properties": {
+        "stores": {"const": 7},
+        "includedStores": {"type": "integer", "minimum": 1, "maximum": 7},
+        "entries": {"type": "integer", "minimum": 1, "maximum": 7},
+        "bytes": {"$ref": "#/$defs/count"},
+        "tables": {"$ref": "#/$defs/count"},
+        "rows": {"$ref": "#/$defs/count"}
+      }
+    }
+  },
+  "$defs": {
+    "count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "revisionId": {
+      "type": "string",
+      "pattern": "^rev-[0-9a-f]{32}$"
+    },
+    "stateFile": {
+      "enum": ["audit.sqlite3", "discovery.sqlite3", "principals.sqlite3", "connections.sqlite3", "service-tokens.sqlite3", "policy-history.sqlite3", "config-ledger.sqlite3"]
+    },
+    "store": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["store", "file", "included"],
+      "properties": {
+        "store": {"type": "string"},
+        "file": {"$ref": "#/$defs/stateFile"},
+        "included": {"type": "boolean"},
+        "entry": {"$ref": "#/$defs/stateFile"}
+      },
+      "if": {"properties": {"included": {"const": true}}},
+      "then": {"required": ["entry"]},
+      "else": {"not": {"required": ["entry"]}}
+    },
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "bytes", "sha256", "database"],
+      "properties": {
+        "name": {"$ref": "#/$defs/stateFile"},
+        "bytes": {
+          "description": "The entry's exact length: the database's page size times its pages.",
+          "$ref": "#/$defs/count"
+        },
+        "sha256": {
+          "description": "Lowercase hexadecimal SHA-256 of the entry's exact bytes.",
+          "$ref": "#/$defs/sha256"
+        },
+        "database": {
+          "description": "The database as SQLite describes it. Every entry is in rollback-journal mode and passed PRAGMA integrity_check when it was written.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["applicationId", "userVersion", "pageSize", "pages", "schemaSha256", "tables"],
+          "properties": {
+            "applicationId": {
+              "description": "PRAGMA application_id: 1195855943 (GGLG) for the ledger, 0 for the gateway's stores.",
+              "type": "integer",
+              "minimum": -2147483648,
+              "maximum": 2147483647
+            },
+            "userVersion": {
+              "description": "PRAGMA user_version: the ledger's format version, 0 for the gateway's stores.",
+              "type": "integer",
+              "minimum": -2147483648,
+              "maximum": 2147483647
+            },
+            "pageSize": {"enum": [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]},
+            "pages": {"$ref": "#/$defs/count"},
+            "schemaSha256": {
+              "description": "Lowercase hexadecimal SHA-256 of the compact JSON array of every sqlite_schema row with SQL, as [type, name, tbl_name, sql] sorted: the store's schema version as the gateway's migrations leave it.",
+              "$ref": "#/$defs/sha256"
+            },
+            "tables": {
+              "description": "Every table outside SQLite's own, sorted by name, with its row count.",
+              "type": "array",
+              "maxItems": 256,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["name", "rows"],
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "maxLength": 128,
+                    "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+                  },
+                  "rows": {"$ref": "#/$defs/count"}
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

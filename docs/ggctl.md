@@ -2,7 +2,7 @@
 
 `ggctl` is GreenGateway's operator command-line tool (issue #242, [ADR-0008](adr/0008-setup-cli-and-configuration-bundles.md)). It is a separate binary: the `gateway` server keeps its name, its no-argument startup, its Docker entrypoint and its one-shot commands (`gateway migrate`, `gateway healthcheck`, `gateway import-standalone`, ...) unchanged.
 
-**Status: alpha.** This build implements `version`, `schema`, `init`, `validate`, `pin`, `convert`, `doctor`, `diff`, `ledger seed`, `ledger verify`, `ledger rollback`, `completion` and `help`, the output contract, the exit codes, secure bearer-token input and the version handshake with a running gateway. `init` writes a new [configuration bundle](configuration-bundles.md) for a deployment profile, `validate` and `doctor` check one offline with the gateway's own bundle reader, `pin` rewrites its SHA-256 pins once its files validate, `convert` converts one between document versions, and `diff` compares two bundles semantically and classifies each change's risk. The `ledger` commands seed, verify and roll back a standalone state directory's [configuration revision ledger](configuration-ledger.md) offline, under the directory's lock. `ggctl` cannot yet plan, apply, export or back up anything, it has no browser wizard (`init --web`), and it cannot yet validate, convert or diff an environment file (`--env`, `--against-env`) or diff against a server (`diff --server`): those are later #242 slices (see the ADR's [rollout](adr/0008-setup-cli-and-configuration-bundles.md#rollout)), and a name this build does not implement is refused as an unknown command (exit 2). Nothing here changes how a gateway is configured or started: no gateway reads a bundle or starts from a ledger yet.
+**Status: alpha.** This build implements `version`, `schema`, `init`, `validate`, `pin`, `convert`, `doctor`, `diff`, `ledger seed`, `ledger verify`, `ledger rollback`, `backup create`, `backup verify`, `completion` and `help`, the output contract, the exit codes, secure bearer-token input and the version handshake with a running gateway. `init` writes a new [configuration bundle](configuration-bundles.md) for a deployment profile, `validate` and `doctor` check one offline with the gateway's own bundle reader, `pin` rewrites its SHA-256 pins once its files validate, `convert` converts one between document versions, and `diff` compares two bundles semantically and classifies each change's risk. The `ledger` commands seed, verify and roll back a standalone state directory's [configuration revision ledger](configuration-ledger.md) offline, under the directory's lock. The `backup` commands back up the stores beneath a standalone state directory offline, under the directory's lock, and verify a backup completely ([standalone backups](standalone-backup.md)). `ggctl` cannot yet plan, apply, export or restore anything, it has no browser wizard (`init --web`), and it cannot yet validate, convert or diff an environment file (`--env`, `--against-env`) or diff against a server (`diff --server`): those are later #242 slices (see the ADR's [rollout](adr/0008-setup-cli-and-configuration-bundles.md#rollout)), and a name this build does not implement is refused as an unknown command (exit 2). Nothing here changes how a gateway is configured or started: no gateway reads a bundle or starts from a ledger yet.
 
 ## Building
 
@@ -97,12 +97,14 @@ ggctl diff BUNDLE --against BUNDLE [--check] [--strict] [--format human|json|sar
 ggctl ledger seed BUNDLE --state-dir DIR [--format human|json]
 ggctl ledger verify --state-dir DIR [--format human|json]
 ggctl ledger rollback REVISION --state-dir DIR [--acknowledge RISK_CODE]... [--format human|json]
+ggctl backup create --state-dir DIR --output FILE [--format human|json]
+ggctl backup verify FILE [--format human|json]
 ggctl completion bash|zsh|fish|powershell
 ggctl help [COMMAND [SUBCOMMAND]] [--man]
 ggctl --help | --version
 ```
 
-`ggctl help COMMAND` and `ggctl COMMAND --help` print a command's options. `ledger` is a command family: `ggctl help ledger` and `ggctl ledger --help` list its commands, and `ggctl help ledger seed` and `ggctl ledger seed --help` print one. `ggctl help --man` prints the same text as the ggctl(1) manual page, `ggctl help --man COMMAND` as ggctl-COMMAND(1) for a command or family, and `ggctl help --man ledger seed` as ggctl-ledger-seed(1), in man(7) roff; the [release archives](#release-artifacts) carry these pages under `man/man1`. Help, the man pages and the completion scripts are generated from the same command table the parser uses, so they cannot drift, and the tests hold every page to the help it repeats.
+`ggctl help COMMAND` and `ggctl COMMAND --help` print a command's options. `ledger` and `backup` are command families: `ggctl help ledger` and `ggctl ledger --help` list a family's commands, and `ggctl help ledger seed` and `ggctl ledger seed --help` print one. `ggctl help --man` prints the same text as the ggctl(1) manual page, `ggctl help --man COMMAND` as ggctl-COMMAND(1) for a command or family, and `ggctl help --man ledger seed` as ggctl-ledger-seed(1), in man(7) roff; the [release archives](#release-artifacts) carry these pages under `man/man1`. Help, the man pages and the completion scripts are generated from the same command table the parser uses, so they cannot drift, and the tests hold every page to the help it repeats.
 
 ### `version`
 
@@ -110,7 +112,7 @@ Prints the `ggctl` version and the document versions whose schemas it publishes.
 
 ### `schema`
 
-Without `KIND`, lists every document kind and version this `ggctl` publishes a JSON Schema (Draft 2020-12) for. With `KIND` (`GatewayBundle`, `GatewayDeployment`, `GatewayInitAnswers`, `GatewayCapabilities` or `GgctlReport`), writes that schema to standard output, byte for byte as committed under [`docs/schemas`](schemas/) with LF line endings on every platform. `--api-version` selects a document version (default: the newest published); a version with no published schema exits `3`. Printing a schema writes an artifact, so `--format` is refused there. A schema is necessary but not sufficient: the gateway's reader is authoritative.
+Without `KIND`, lists every document kind and version this `ggctl` publishes a JSON Schema (Draft 2020-12) for. With `KIND` (`GatewayBundle`, `GatewayDeployment`, `GatewayInitAnswers`, `GatewayCapabilities`, `GgctlReport` or `GatewayBackup`), writes that schema to standard output, byte for byte as committed under [`docs/schemas`](schemas/) with LF line endings on every platform. `--api-version` selects a document version (default: the newest published); a version with no published schema exits `3`. Printing a schema writes an artifact, so `--format` is refused there. A schema is necessary but not sufficient: the gateway's reader is authoritative.
 
 ### `init`
 
@@ -281,9 +283,34 @@ ggctl ledger rollback rev-0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f --state-dir /var/lib/
   --acknowledge risk.admin_access_path_removed --acknowledge risk.policy_broadened
 ```
 
+### `backup create`
+
+Backs up the stores beneath the standalone state directory `--state-dir` (required) names into the new archive `--output` (required) names, as [standalone backups](standalone-backup.md#creating-a-backup) describes. `ggctl` takes the state directory's [exclusive lock](configuration-bundles.md#the-state-directory) without waiting, so the gateway must be stopped. Each store of the layout that exists is snapshotted with SQLite's `VACUUM INTO` from a read-only connection, never copied file by file, and neither the store nor its write-ahead log is written; two names for one file are snapshotted once; the ledger must pass its full verification and every snapshot SQLite's integrity check. Nothing else in the directory is read. The archive is written to a new hidden file beside `--output`, owner-only on Unix, flushed, read back with every check of `backup verify`, and only then linked to `--output`, which must not exist and is never replaced. A failure leaves nothing at `--output`.
+
+- A backup is never written to standard output: `--output -` is refused (`backup.stdout_refused`, exit `2`).
+- A backup holds no pending login, session, cache, plaintext token, secret value or key. The Connections store keeps its secrets as #240 ciphertext, and the key files under `CONNECTION_SECRETS_ROOT` that decrypt them are a separate artifact to back up separately; a backup that includes the Connections store says so (`backup.secret_keys_not_included`, information).
+- The human result names each store with its entry, tables and rows, the counts, the program and SQLite versions and, for the ledger, its revisions. `--format json` writes one `GgctlReport` whose `result` holds `created` and, once written, `backup`: the manifest's versions, the seven stores of the layout in order (`store`, `included`, `entry`, `tables`, `rows`), the counts and the `ledger`'s revision count, `desired` and `active` revisions and `restartPending`. A refusal about one store names it as `result.store` (`audit`, `discovery`, `principals`, `connections`, `service_tokens`, `policy_history` or `config_ledger`); no path is ever echoed.
+
+Exit codes: `0` written, `3` for a store that is a link, not a regular file, writable by group or other, or corrupt, a ledger that does not verify or shares its file, an unusable state directory, or one that holds no store, `5` when the state directory is locked or `--output` exists, `7` when what was written did not verify, `1` when a store or the archive could not be read or written.
+
+### `backup verify`
+
+Reads the archive `FILE` completely through the shared [archive admission rules](archive-admission.md), into a new hidden staging directory beside it that is removed afterwards, and checks everything [standalone backups](standalone-backup.md#verifying-a-backup) lists: each entry header before its data, the `GatewayBackup` manifest as a closed document of a version this `ggctl` reads, exactly the manifest's entries in its order with each one's SHA-256, the archive's own digest, and each database's rollback-journal mode, integrity check, header versions, schema digest and table rows, and the ledger's full verification and revisions. It never changes the archive and writes nothing else. `FILE` must be valid UTF-8, and it is never echoed.
+
+- The human result is the store list, as `backup create` reports it. `--format json` writes one `GgctlReport` whose `result` holds `verified` and, once verified, `backup`; a refusal about one store names it as `result.store`.
+- A refusal by the admission rules carries their own code (the `archive` family, listed in [archive admission](archive-admission.md#codes), which is its remediation anchor) and is located by the 1-based position of the entry (`location.entry`) and, for a clash, of the earlier entry (`location.conflictsWith`); an entry's name is never echoed.
+- A digest is integrity evidence, not authenticity: whoever can write an archive can write a consistent one.
+
+Exit codes: `0` verified, `7` for any integrity failure (truncation, tampering, traversal, links or special entries, duplicate or case-colliding entries, a bomb, an unsupported version, a database that fails its checks), `3` when `FILE` is a link or not a regular file, `1` when it or the staging directory could not be read or written.
+
+```sh
+ggctl backup create --state-dir /var/lib/greengateway --output /backups/greengateway.ggbk
+ggctl backup verify /backups/greengateway.ggbk
+```
+
 ### `completion`
 
-Writes a completion script to standard output. It completes commands, a family's commands after its name (`ggctl ledger <TAB>`), options, fixed choices (risk codes for `--acknowledge`), file names for path options and directory names for a `BUNDLE` argument. The [release archives](#release-artifacts) carry the same four scripts under `completion/`.
+Writes a completion script to standard output. It completes commands, a family's commands after its name (`ggctl ledger <TAB>`), options, fixed choices (risk codes for `--acknowledge`), file names for path options and for a backup archive argument, and directory names for a `BUNDLE` argument. The [release archives](#release-artifacts) carry the same four scripts under `completion/`.
 
 | Shell | Install |
 | --- | --- |
@@ -298,7 +325,7 @@ Writes a completion script to standard output. It completes commands, a family's
 - **Diagnostics go to standard error** in human form. With `--format json` or `--format sarif` they are in the document instead and standard error stays empty.
 - **An argument error found before a command runs** (an unknown option, a refused secret or insecure option, a malformed `--server`) is written to standard error only, exits `2`, and writes no report.
 - **No color, no prompts, no progress output.** `ggctl` reads no configuration file and no environment variable, and makes no network request unless a command is given `--server`.
-- **Files are written only where a command is told to.** `init` and `convert --output` create the one directory `--output` names, and never write anything else, overwrite anything, or echo the path. `pin` replaces only `BUNDLE`'s `bundle.yaml`. The `ledger` commands write only beneath `--state-dir`: its lock file, which they create if it is missing; `ledger seed` creates the ledger and never replaces one, `ledger rollback` appends one revision to it, and `ledger verify` writes nothing in it.
+- **Files are written only where a command is told to.** `init` and `convert --output` create the one directory `--output` names, and never write anything else, overwrite anything, or echo the path. `pin` replaces only `BUNDLE`'s `bundle.yaml`. The `ledger` commands write only beneath `--state-dir`: its lock file, which they create if it is missing; `ledger seed` creates the ledger and never replaces one, `ledger rollback` appends one revision to it, and `ledger verify` writes nothing in it. `backup create` creates the archive at `--output` and nothing else that stays: in `--state-dir` it writes only the lock file, if that is missing, and the hidden working, partial and verification entries it makes beside `--output` are removed. `backup verify` writes only a hidden staging directory beside `FILE`, which it removes.
 
 A report always has `apiVersion: greengateway.dev/v1alpha1`, `kind: GgctlReport`, the `command`, the process `exitCode` and its stable `outcome` name, the `diagnostics`, and a command-specific `result`. Every diagnostic has a stable `code`, a `severity` (`error`, `warning` or `info`), fixed `message` text, an optional fixed `hint`, a `remediation` anchor and at most one location: when it concerns one argument, that argument's 1-based `location.argument` position; when the bundle reader found it, the bundle-relative `location.file`, a `location.pointer` built from member names the reader defines, and the 1-based `location.line` and `location.column` where the reader has them. Diagnostics are value-free by construction: they never contain an argument, token, URL, path, address, document value, server response or library error text. An unknown option is reported by its position, never by its spelling, because the spelling may be a mistyped secret. A published code never changes meaning; renaming or removing one needs a new report version.
 
@@ -320,7 +347,7 @@ SARIF 2.1.0 output belongs to `validate`, which ADR-0008 gives it, and to `diff`
 | `7` | `integrity` | Backup or archive integrity or restore verification failure. |
 | `8` | `denied` | Authentication or authorization refused. |
 
-When several errors apply, the one that must not be hidden wins: `1` over everything, and `6` only when nothing else went wrong, so a pipeline that retries on `6` never resends work another error left in doubt. Today `4` comes from `diff --check` and `5` only from an `init` or `convert --output` directory that is not empty, a `bundle.yaml` that changed while `pin` ran, a state directory another process holds locked (`state_dir.locked`), or a `ledger seed` into a state directory that already holds a ledger (`ledger.exists`); the ETag and plan conflicts of `5`, and `7`, belong to commands later slices add.
+When several errors apply, the one that must not be hidden wins: `1` over everything, and `6` only when nothing else went wrong, so a pipeline that retries on `6` never resends work another error left in doubt. Today `4` comes from `diff --check` and `5` only from an `init` or `convert --output` directory that is not empty, a `bundle.yaml` that changed while `pin` ran, a state directory another process holds locked (`state_dir.locked`), a `ledger seed` into a state directory that already holds a ledger (`ledger.exists`), or a `backup create --output` that exists; `7` comes from a backup archive that does not verify. The ETag and plan conflicts of `5` belong to commands later slices add.
 
 ## Credentials
 
@@ -533,6 +560,43 @@ The [state directory](configuration-bundles.md#the-state-directory)'s own codes,
 | `ledger.unexpected_refusal` | 1 | The revision service refused the rollback for a reason the offline path does not expect. Nothing was written; report it. |
 | `ledger.gateway_recompiles_at_start` | 0 | Information: a gateway starting from this ledger compiles its desired revision again, with the production policy and tools validators, and refuses to start if it does not compile. |
 
+### Backup diagnostics
+
+The [standalone backup](standalone-backup.md) codes. A store or `--state-dir` problem is located by the position of `--state-dir` and names the store as `result.store`; an `--output` problem by the position of `--output`; an archive problem by the position of `FILE`. When `backup create` reports any error, nothing is at `--output`. A refusal by the archive admission rules carries their own `archive` code instead ([archive admission](archive-admission.md#codes)): exit `7`, or `1` for `archive.read_failed` and `archive.write_failed`.
+
+| Code | Exit | Meaning |
+| --- | --- | --- |
+| `backup.stdout_refused` | 2 | `--output -`: a backup is never written to standard output. Name a new file. |
+| `backup.output_exists` | 5 | Something exists at `--output`, which a backup never replaces. It was left as it was. |
+| `backup.output_unusable` | 1 | The archive or its working files could not be created, written, flushed or linked into place beside `--output`, for example because its directory does not exist, is read-only, is out of space, or is on a filesystem without hard links. |
+| `backup.permissions_unavailable` | 1 | The filesystem did not keep mode `0600` on the archive (Unix). |
+| `backup.nothing_to_back_up` | 3 | The state directory holds none of the stores of the layout. Check `--state-dir`. |
+| `backup.store_link` | 3 | A store's file is a symbolic link, junction or reparse point. |
+| `backup.store_not_regular_file` | 3 | A store's name is a directory, FIFO, device or socket. |
+| `backup.store_unsafe_permissions` | 3 | A store's file is writable by group or other (Unix), who could have changed it. |
+| `backup.store_unavailable` | 1 | A store could not be opened, read or snapshotted: busy, or a rollback journal left by a crash that a read-only connection cannot roll back. Start and stop the gateway once, then back up again. |
+| `backup.store_corrupt` | 3 | A store is not a SQLite database a backup can describe, or fails SQLite's integrity check. |
+| `backup.ledger_invalid` | 3 | The configuration revision ledger does not pass its [verification](configuration-ledger.md#verification); run `ggctl ledger verify`. |
+| `backup.ledger_shared` | 3 | The configuration revision ledger is the same file as another store, which no ledger can be. |
+| `backup.archive_unreadable` | 1 | `FILE` could not be opened or read, for example because it does not exist. |
+| `backup.archive_not_regular_file` | 3 | `FILE` is a symbolic link, junction or reparse point, or not a regular file. Name the archive itself. |
+| `backup.archive_too_large` | 7 | `FILE` is longer than any backup can be. |
+| `backup.staging_unavailable` | 1 | The staging directory beside the archive could not be created, written or read. |
+| `backup.not_a_backup` | 7 | `FILE` is not a GreenGateway backup archive. |
+| `backup.unsupported_archive_version` | 7 | The archive is a container version this `ggctl` does not read. |
+| `backup.manifest_missing` | 7 | The archive's first entry is not its `gateway-backup.json` manifest. |
+| `backup.manifest_invalid` | 7 | The manifest is not a valid `GatewayBackup` document: an unknown, duplicate or missing member, a value outside its grammar, or an inventory, entry list and counts that disagree. |
+| `backup.unsupported_manifest_version` | 7 | The manifest is not a `GatewayBackup` document version this `ggctl` reads. |
+| `backup.unexpected_entry` | 7 | An entry is not the next one the manifest lists. |
+| `backup.entry_missing` | 7 | The archive ends before an entry the manifest lists. |
+| `backup.archive_digest_mismatch` | 7 | The archive's end record does not hold the SHA-256 of the archive before it. |
+| `backup.checksum_mismatch` | 7 | An entry's bytes do not match the SHA-256 the manifest records; `result.store` names the store. |
+| `backup.store_integrity_failed` | 7 | An entry is not a SQLite database in rollback-journal mode that passes SQLite's integrity check. |
+| `backup.store_mismatch` | 7 | An entry's header versions, pages, schema digest or table rows are not what the manifest records. |
+| `backup.ledger_verification_failed` | 7 | The archive's ledger does not pass the ledger's verification. |
+| `backup.ledger_mismatch` | 7 | The archive's ledger verifies but does not hold the revisions the manifest names. |
+| `backup.secret_keys_not_included` | 0 | Information: the backup holds the Connections store's secrets as ciphertext only. Back up the key files under `CONNECTION_SECRETS_ROOT` separately, or they cannot be decrypted after a restore. |
+
 ### Output diagnostics
 
 | Code | Exit | Meaning |
@@ -552,4 +616,4 @@ The [state directory](configuration-bundles.md#the-state-directory)'s own codes,
 
 ## Platform notes
 
-`ggctl` is tested on Linux, macOS and Windows. Exit codes, stream separation, terminal detection, token-file type and size checks and the remote client behave the same on all three. The owner-only permission check on token files applies on Unix only, as do the owner, mode and path checks on `--ca-file` and `--answers` files, and so does the bundle reader's refusal of a group- or other-writable bundle directory or file ([files and the directory](configuration-bundles.md#files-and-the-directory)); on Windows the reader enforces the link, reparse-point, regular-file and name rules, and ACLs are left to the operator. Likewise `init` and `convert --output` create their directory `0700` and its files `0600` on Unix and check those modes, and `pin` writes its new `bundle.yaml` `0600` and checks it, while on Windows the new entries inherit the ACL of the directory they are created in. Shell completion is generated for bash, zsh, fish and PowerShell.
+`ggctl` is tested on Linux, macOS and Windows. Exit codes, stream separation, terminal detection, token-file type and size checks and the remote client behave the same on all three. The owner-only permission check on token files applies on Unix only, as do the owner, mode and path checks on `--ca-file` and `--answers` files, and so does the bundle reader's refusal of a group- or other-writable bundle directory or file ([files and the directory](configuration-bundles.md#files-and-the-directory)); on Windows the reader enforces the link, reparse-point, regular-file and name rules, and ACLs are left to the operator. Likewise `init` and `convert --output` create their directory `0700` and its files `0600` on Unix and check those modes, and `pin` writes its new `bundle.yaml` `0600` and checks it, and `backup create` writes its archive `0600` and its working and staging directories `0700` and checks the archive, while on Windows the new entries inherit the ACL of the directory they are created in. Shell completion is generated for bash, zsh, fish and PowerShell.
