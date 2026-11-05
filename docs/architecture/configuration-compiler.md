@@ -484,10 +484,15 @@ holding the string a reader returned, and `Source` has two variants,
 
 The bundle reader in `gateway-config` (`bundle::read_bundle`) validates a
 bundle's files, digests, documents, and profile today. Its deployment document
-has one member, `spec.profile`, and nothing maps a bundle onto compiler
-inputs. Profile invariants on deployment settings (authentication required,
-private-address egress denied, and so on) are not enforced by the compiler
-yet.
+carries the profile and every catalog field with a document path, in the
+closed sections those paths imply (`bundle::settings`), each held to its
+catalog type and its own bounds; the parity tests below hold those bounds to
+this compiler. Nothing maps a bundle onto compiler inputs yet, so the
+cross-field rules and each value's own grammar are not applied to a document,
+and profile invariants on deployment settings (authentication required,
+private-address egress denied, and so on) are not enforced yet. A front end
+gives a decimal setting the `f64` its text parses to, which is the value the
+same text gives in the environment.
 
 ### Reports
 
@@ -531,7 +536,8 @@ beside it:
 | `.env.example` | Every field assigned once, to its default or left blank where blank means unset, so copying the file configures exactly the defaults | `catalog_tests::the_env_example_assigns_every_field_its_default` |
 | Bootstrap inputs | ADR-0008's bootstrap table | `catalog_tests::the_bootstrap_fields_are_adr_0008s_bootstrap_inputs` |
 | Sensitivity | The [sensitivity wrappers](#sensitivity-wrappers) table | `catalog_tests::the_secret_fields_are_the_compiler_contracts_sensitive_inputs` |
-| Document paths | The deployment schema's settings | `catalog_tests::the_deployment_schema_defines_exactly_the_catalogs_document_paths` |
+| Document paths | The deployment schema's settings, and the schema rendered from the catalog | `catalog_tests::the_deployment_schema_defines_exactly_the_catalogs_document_paths`, `bundle::settings::tests::the_committed_schema_is_the_rendered_schema` |
+| Deployment-document bounds | The values the compiler accepts on their own, at every bound and for generated values | `catalog_tests::the_deployment_document_accepts_exactly_what_the_compiler_accepts`, `generated_integer_settings_agree_with_the_compiler`, `generated_decimal_settings_agree_with_the_compiler_and_canonicalize_exactly` |
 | Cloudflare | `GREEN_GATEWAY_ENV_KEYS` and the Cloudflare guide | `env_example::cloudflare_forwarding_matches_supported_gateway_env_vars` |
 | The rendered catalog | `render_json` and its schema | `catalog::tests::the_committed_catalog_is_the_rendered_catalog`, `the_rendered_catalog_matches_its_published_schema` |
 
@@ -544,9 +550,9 @@ catalog's range is what a value is accepted or refused for on its own.
 What the catalog does not hold yet, because nothing decides or checks it
 today:
 
-- **Document paths.** The deployment schema defines no setting beside the
-  profile, so no deployment field has a path and a bundle cannot set any of
-  them.
+- **Document paths for the JSON documents.** `AUTH_PROVIDERS`,
+  `UPSTREAM_ROUTES` and `MCP_UPSTREAM_SERVERS` are deployment fields without a
+  path, so a bundle cannot set them yet.
 - **Two host paths ADR-0008 does not place.** `OPENAPI_SPEC_PATH` and
   `AUTHORITY_EVENT_FILE` are neither bootstrap inputs nor bundle resources;
   the catalog marks them `unplaced`, and the bundle front end must refuse
