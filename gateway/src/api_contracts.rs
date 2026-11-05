@@ -1230,6 +1230,13 @@ pub(super) struct GatewayAppBuildOverrides {
     pub(super) cluster_status_source: Option<Arc<dyn cluster_status::ClusterStatusSource>>,
     #[cfg(test)]
     pub(super) egress_resolver: Option<Arc<dyn egress::DnsResolver>>,
+    /// Test seam: a CA bundle the gateway's own egress trusts, as an
+    /// operator's platform trust store would. A Connection's `tls` profile
+    /// covers only its upstream; token endpoints such as a delegated issuer's
+    /// are reached with this trust alone, so a router-level test needs it to
+    /// reach an in-process TLS issuer (issue #446).
+    #[cfg(test)]
+    pub(super) egress_tls_ca_bundle_path: Option<std::path::PathBuf>,
     /// Test seam: the pending-login backend the admin login flow uses,
     /// so a handler test can stand in an unavailable store.
     #[cfg(test)]

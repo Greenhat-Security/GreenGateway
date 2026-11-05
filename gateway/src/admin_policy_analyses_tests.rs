@@ -28,7 +28,10 @@ fn analyses_policy_document() -> Value {
             "analyst-only": { "permissions": [ADMIN_POLICY_ANALYZE_PERMISSION] },
             "simulator": {
                 "permissions": [ADMIN_POLICY_READ_PERMISSION, ADMIN_POLICY_SIMULATE_PERMISSION]
-            }
+            },
+            // Grants the route's permission, so the cross-resource checks
+            // find no route that no caller can pass.
+            "clerk": { "permissions": ["orders:read"] }
         },
         "rules": [
             { "methods": ["GET"], "path": format!("/{PATH_CANARY}/**"), "action": "allow" },
@@ -291,6 +294,39 @@ async fn an_edited_candidate_is_analyzed_as_edited_and_an_invalid_one_refused() 
         json!("policy_analysis_invalid")
     );
     assert_eq!(analysis_run_events(&harness, 1).len(), 1);
+}
+
+#[tokio::test]
+async fn a_candidate_is_judged_against_the_active_policy_and_the_resources() {
+    let harness = harness();
+    let (etag, _) = current_policy(&harness.router).await;
+    // The candidate drops the only role that grants admin:policy:write and
+    // adds an egress host: both are changes from the active policy.
+    let mut candidate = analyses_policy_document();
+    candidate["roles"]
+        .as_object_mut()
+        .expect("roles")
+        .remove("admin");
+    candidate["egress"] = json!({ "hosts": ["api.example.test"] });
+    let response = analyze_request(
+        &harness,
+        analyst(),
+        analysis(&etag, json!({ "source": "inline", "policy": candidate })).to_string(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let report = json_body(response).await;
+    assert_eq!(report["complete"], json!(true), "{report}");
+    let codes: Vec<&str> = report["findings"]
+        .as_array()
+        .expect("findings")
+        .iter()
+        .filter_map(|finding| finding["code"].as_str())
+        .collect();
+    for code in ["policy_write_unreachable", "egress_change_requires_restart"] {
+        assert!(codes.contains(&code), "{code} in {codes:?}");
+    }
+    assert!(!report.to_string().contains("api.example.test"));
 }
 
 #[tokio::test]
