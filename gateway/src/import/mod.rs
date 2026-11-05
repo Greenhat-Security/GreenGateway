@@ -662,6 +662,17 @@ pub(crate) async fn run(
         )
         .await?;
     }
+    // One whose rules carry conditions also needs every live replica to
+    // enforce them; a replica that serves v1 without them refuses it.
+    if source.writes_policy_rule_conditions() {
+        preflight::live_members_admit(
+            &pool,
+            &deployment_id,
+            target.cluster_member_stale_window(),
+            &crate::storage::compatibility::POLICY_RULE_CONDITIONS,
+        )
+        .await?;
+    }
 
     let policy = sections::PolicySection::plan(&source)?;
     let tools = sections::ToolsSection::plan(&source)?;

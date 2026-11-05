@@ -1235,7 +1235,8 @@ mod tests {
                 "openapi_swagger2_catalogs",
                 "operation_requirements",
                 "policy_document_v1",
-                "policy_role_descriptions"
+                "policy_role_descriptions",
+                "policy_rule_conditions"
             ],
             "standalone reports what this binary advertises"
         );

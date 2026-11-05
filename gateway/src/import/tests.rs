@@ -1573,6 +1573,112 @@ mod database {
         assert_eq!(active.policy.rules[0].id.as_deref(), Some("deny-admin"));
     }
 
+    /// Issue #243: a standalone policy v1 document whose rules carry
+    /// conditions imports into cluster mode only while every live replica
+    /// of the target enforces them. A replica of the build that serves v1
+    /// but refuses every rule condition -- document formats `0..=1` and
+    /// `policy_document_v1`, but not `policy_rule_conditions` -- refuses a
+    /// dry run and an apply with `target_operation_refused` naming
+    /// `policy.rule_conditions`, and nothing authoritative is written. Once
+    /// it has left, the apply imports the document with its conditions.
+    #[tokio::test]
+    async fn a_policy_v1_import_with_rule_conditions_waits_for_every_live_member_to_enforce_them() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let deployment = "deploy-import-v1-conditions";
+        let (config, _dsn_file) = target_config(&database.dsn, deployment);
+        let pool = migrate(&config).await;
+        let fixture = build_fixture("policy-v1-conditions", 1, 0);
+        let conditioned = json!({
+            "schema_version": "1.0.0",
+            "id": "live-v1-conditions",
+            "default_action": "deny",
+            "roles": { "admin": { "permissions": ["data:read", "policy:write"] } },
+            "rules": [{
+                "id": "internal-only",
+                "path": "/internal/**",
+                "action": "allow",
+                "conditions": { "source_network": { "cidrs": ["10.0.0.0/8"] } }
+            }]
+        });
+        std::fs::write(
+            fixture.directory.join("policy.json"),
+            serde_json::to_vec_pretty(&conditioned).expect("the v1 policy should serialize"),
+        )
+        .expect("the v1 policy file should write");
+
+        let (schema_min, schema_max) = migrations::schema_version_range();
+        let older = uuid::Uuid::new_v4();
+        pool.get()
+            .await
+            .expect("checkout")
+            .execute(
+                "INSERT INTO greengateway.cluster_members
+                     (deployment_id, instance_id, boot_id, binary_version,
+                      schema_version_min, schema_version_max,
+                      document_version_min, document_version_max, fingerprint,
+                      capabilities)
+                 VALUES ($1, $2::text::uuid, $3::text::uuid, 'older', $4, $5, 0, 1,
+                         repeat('a', 64),
+                         'operation_requirements,policy_document_v1,policy_role_descriptions')",
+                &[
+                    &deployment,
+                    &older.to_string(),
+                    &uuid::Uuid::new_v4().to_string(),
+                    &schema_min,
+                    &schema_max,
+                ],
+            )
+            .await
+            .expect("an older member row inserts");
+
+        for mode in [ImportMode::DryRun, ImportMode::Apply] {
+            let Err(refused) = run(&request(&fixture, mode), &config).await else {
+                panic!("{mode:?}: a live member that refuses conditions must refuse the import");
+            };
+            assert_eq!(refused.code(), "target_operation_refused", "{mode:?}");
+            let rendered = refused.to_string();
+            assert!(
+                rendered.contains("policy.rule_conditions")
+                    && rendered.contains("capability_not_advertised"),
+                "{mode:?}: the refusal names the operation and the reason: {rendered}"
+            );
+            assert!(
+                !rendered.contains(&older.to_string()),
+                "{mode:?}: the refusal names no member: {rendered}"
+            );
+        }
+        assert_eq!(
+            count_of(&pool, "SELECT count(*) FROM greengateway.policy_documents").await,
+            0,
+            "nothing was imported"
+        );
+
+        execute(
+            &pool,
+            &format!(
+                "DELETE FROM greengateway.cluster_members WHERE instance_id = '{older}'::uuid"
+            ),
+        )
+        .await;
+        let report = match run(&request(&fixture, ImportMode::Apply), &config).await {
+            Ok(report) => report,
+            Err(error) => {
+                panic!("the import should apply once no lacking member is live: {error}")
+            }
+        };
+        assert_eq!(report.validation.status, "verified");
+        let active = PolicyControlPlane::active(&PostgresPolicyStore::new(pool.clone()))
+            .await
+            .expect("the cluster reads the imported policy")
+            .expect("the import activated a policy");
+        assert_eq!(active.policy.rules[0].id.as_deref(), Some("internal-only"));
+        assert!(active.policy.rules[0].conditions.is_some());
+    }
+
     /// The namespace-empty refusal, falsified: a single row in ONE
     /// authoritative table is enough, and `--resume` is the only way past
     /// it.

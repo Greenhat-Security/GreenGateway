@@ -395,7 +395,11 @@ fn evaluate_case(
             let context = http_context(compiled.snapshot(), request, principal);
             let mut stages = Vec::with_capacity(MAX_HTTP_STAGES);
             let evaluation = compiled
-                .evaluate_with_stages(&context, &case_facts(compiled, principal), &mut stages)
+                .evaluate_with_stages(
+                    &context,
+                    &case_facts(compiled, principal, &case.facts),
+                    &mut stages,
+                )
                 .map_err(refused)?;
             let outcome = decision_outcome(
                 evaluation.logical(),
@@ -444,7 +448,7 @@ fn evaluate_case(
             principal,
         } => {
             let context = tool_context(compiled.snapshot(), *operation, tool_name, principal, None);
-            let facts = case_facts(compiled, principal);
+            let facts = case_facts(compiled, principal, &case.facts);
             tool_evaluated(policy, *operation, &context, &facts, trace, budget).map_err(refused)
         }
         CaseContext::ToolHttp {
@@ -460,7 +464,7 @@ fn evaluate_case(
                 principal,
                 Some((method, path)),
             );
-            let facts = case_facts(compiled, principal);
+            let facts = case_facts(compiled, principal, &case.facts);
             tool_evaluated(
                 policy,
                 ToolOperation::RenderedHttp,
@@ -482,7 +486,7 @@ fn evaluate_case(
             let selection = compiled
                 .select_rate_lane_with_facts(
                     &context,
-                    &case_facts(compiled, principal),
+                    &case_facts(compiled, principal, &case.facts),
                     &mut stages,
                 )
                 .map_err(refused)?;
