@@ -815,6 +815,91 @@ fn each_trace_level_explains_as_much_as_it_names() {
     assert!(!full.stages_truncated);
 }
 
+/// A case's organization decides a candidate's identity mappings in the
+/// simulator exactly as the organization authentication verified does on a
+/// live lane (#243), and no result repeats it.
+#[test]
+fn a_case_organization_decides_an_inline_candidates_identity_mappings() {
+    const ORGANIZATION_CANARY: &str = "organization-canary-0b7e";
+    let candidate = json!({
+        "schema_version": "1.0.0",
+        "default_action": "deny",
+        "roles": { "reader": { "permissions": ["orders:read"] } },
+        "identity_mappings": [{
+            "id": "canary-readers",
+            "issuer": "https://idp.example.test",
+            "organizations": [ORGANIZATION_CANARY],
+            "grant_roles": ["reader"]
+        }],
+        "routes": [{ "id": "orders", "path_prefix": "/orders", "permission": "orders:read" }],
+        "rate_limits": [{
+            "id": "readers",
+            "principal": { "roles": ["reader"] },
+            "requests_per_second": 1,
+            "burst": 1
+        }]
+    });
+    let principal = |organization: Option<&str>| {
+        let mut principal = json!({
+            "subject": SUBJECT_CANARY,
+            "issuer": "https://idp.example.test",
+            "auth_method": "bearer_token"
+        });
+        if let Some(organization) = organization {
+            principal["organization"] = json!(organization);
+        }
+        principal
+    };
+    let mut request = document(
+        json!({ "source": "inline", "policy": candidate }),
+        "matched",
+        json!(["as_authored"]),
+    );
+    let mut cases = Vec::new();
+    for (id, organization) in [
+        ("member", Some(ORGANIZATION_CANARY)),
+        ("outsider", Some("another-organization")),
+        ("unverified", None),
+    ] {
+        cases.push(json!({
+            "id": format!("{id}-orders"),
+            "kind": "http",
+            "request": { "method": "GET", "path": "/orders/7" },
+            "principal": principal(organization)
+        }));
+        cases.push(json!({
+            "id": format!("{id}-rate"),
+            "kind": "rate",
+            "request": { "method": "GET", "path": "/orders/7" },
+            "principal": principal(organization)
+        }));
+    }
+    request["cases"] = Value::Array(cases);
+    let validator = jsonschema::validator_for(&request_schema()).expect("the schema compiles");
+    if let Err(error) = validator.validate(&request) {
+        panic!("the schema refuses a request the parser accepts: {error}");
+    }
+    let outcome = run(&request);
+    for (id, admitted) in [("member", true), ("outsider", false), ("unverified", false)] {
+        let http = &result(case(&outcome, &format!("{id}-orders")), "as_authored")["candidate"];
+        assert_eq!(
+            http["logical"],
+            json!(if admitted { "allow" } else { "deny" }),
+            "{id}"
+        );
+        assert_eq!(http["complete"], json!(true), "{id}");
+        let rate = &result(case(&outcome, &format!("{id}-rate")), "as_authored")["candidate"];
+        assert_eq!(
+            rate["selected"],
+            json!(if admitted { "override" } else { "no_override" }),
+            "{id}"
+        );
+    }
+    assert!(!serde_json::to_string(&outcome.cases)
+        .expect("serializes")
+        .contains(ORGANIZATION_CANARY));
+}
+
 #[test]
 fn tool_and_rate_cases_answer_from_their_own_lanes() {
     let outcome = run(&document(

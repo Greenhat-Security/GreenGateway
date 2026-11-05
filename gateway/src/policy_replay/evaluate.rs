@@ -16,6 +16,12 @@
 //! | routing `local`, MCP identity `not_recorded` | both of the two above; see [`evaluate_http`] |
 //! | routing `proxy_dispatch` | `HttpTarget::ProxyDispatch` with the recorded facts |
 //! | egress destination | `EgressDestination`, with `ResolutionFact::Missing` |
+//! | organization (never recorded) | `PolicyFacts::organization` uncaptured: every lane asks the uncaptured entry point |
+//!
+//! A record carries no organization, so an identity mapping that tests one
+//! answers `missing_matcher_fact` here, where the live lane read the
+//! organization the principal's provider verified. Replay never reads it as
+//! none, which would withhold a role the live lane granted.
 //!
 //! The tool lane projects the recorded principal the way the live tool runtime
 //! projects an invocation's actor, through the runtime's own function

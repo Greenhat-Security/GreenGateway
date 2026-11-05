@@ -275,9 +275,9 @@ does not report:
 - a rule with typed `conditions` as covering another element, as broad, as
   masking the default or as bypassing a route: its conditions bound what it
   matches in ways no predicate comparison does (a conditioned rule can still
-  be the covered one). This build validates conditions and identity mappings
-  but accepts no document that uses them yet, so this, and the mapped-role
-  rule below, take effect once they are enforced;
+  be the covered one). This build validates conditions but accepts no
+  document that uses them yet, so this takes effect once they are enforced;
+  identity mappings are enforced, so the mapped-role rule below applies now;
 - anything about traffic: nothing is unused, unobserved or unreachable
   because retained traffic lacks it.
 

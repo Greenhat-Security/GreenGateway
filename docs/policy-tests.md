@@ -96,7 +96,7 @@ and byte rather than character lengths.
 | `cases` | 1 to 512 cases. |
 | `cases[].id` | Unique within the suite, at most 128 bytes, an ASCII letter or digit followed by letters, digits, `.`, `_`, `:` or `-`. Results, SARIF and JUnit identify a case by this id and its JSON Pointer. |
 | `cases[].kind` | `http`, `tool`, `tool_http` or `rate`. Each kind accepts only its own members. |
-| `cases[].principal` | `"anonymous"`, or `subject` (required), `issuer`, `roles` and `auth_method` (required: `bearer_token`, `session_cookie`, `service_token` or `client_certificate`). The issuer is canonicalized as authentication canonicalizes it (a trailing `/` is dropped). |
+| `cases[].principal` | `"anonymous"`, or `subject` (required), `issuer`, `roles`, `auth_method` (required: `bearer_token`, `session_cookie`, `service_token` or `client_certificate`) and `organization`. The issuer is canonicalized as authentication canonicalizes it (a trailing `/` is dropped). `organization` (1 to 8192 bytes) is the organization the principal's identity provider verified, which a policy's identity mappings may test; omitted, the principal has none. As on the live lanes it is read only in mapped-role mode, and no result repeats it. |
 | `cases[].expect` | What the case asserts; see below. |
 
 ### Case kinds

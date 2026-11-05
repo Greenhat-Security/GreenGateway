@@ -1,10 +1,12 @@
 //! Decides every case of a suite through the shared evaluator.
 //!
 //! The runner builds the same typed contexts the live adapters build and asks
-//! the same [`CompiledPolicy`] methods: `evaluate` for HTTP, `evaluate_tool` for
-//! the tool lane and rendered tool requests, and `select_rate_lane` for rate
-//! overrides. It never matches a rule itself, so a test can only ever report
-//! what production decides for the same facts.
+//! the same [`CompiledPolicy`] methods: `evaluate_with_facts` for HTTP,
+//! `evaluate_tool_with_facts` for the tool lane and rendered tool requests, and
+//! `select_rate_lane_with_facts` for rate overrides, each with the facts a live
+//! lane captures for the case's principal ([`case_facts`]). It never matches a
+//! rule itself, so a test can only ever report what production decides for
+//! the same facts.
 //!
 //! The run is pure. It reads the compiled policy and the suite and returns a
 //! report, or nothing once its deadline passes; it performs no I/O, takes no
@@ -29,8 +31,8 @@ use crate::{
             ToolEvaluationContext, ToolLimitation, ToolOperation, ToolReason, TOOL_CONTEXT_VERSION,
         },
         CompiledPolicy, EvaluationError, HostFact, HttpTarget, Limitation, LogicalDecision,
-        PolicyEffect, PolicyEvaluationContext, PrincipalFact, PrincipalIdentity, RateLaneOutcome,
-        Reason, ResourceSnapshot, RuleReference, CONTEXT_VERSION,
+        PolicyEffect, PolicyEvaluationContext, PolicyFacts, PrincipalFact, PrincipalIdentity,
+        RateLaneOutcome, Reason, ResourceSnapshot, RuleReference, CONTEXT_VERSION,
     },
     rbac::Policy,
 };
@@ -251,6 +253,14 @@ fn principal_fact(principal: &SyntheticPrincipal) -> PrincipalFact {
     }
 }
 
+/// The facts a live lane captures for a case's principal under `compiled`
+/// ([`CompiledPolicy::serving_facts`]): in mapped-role mode the organization
+/// the case states, and none when it states none. Shared with the simulator,
+/// so a case decides by exactly the facts a served request would.
+pub(crate) fn case_facts(compiled: &CompiledPolicy, principal: &SyntheticPrincipal) -> PolicyFacts {
+    compiled.serving_facts(principal.principal())
+}
+
 /// The context the live HTTP adapter builds for a synthetic request.
 ///
 /// Shared with the simulator ([`crate::policy_simulation`]), so a simulated
@@ -339,7 +349,7 @@ fn run_case(policy: &PolicyUnderTest, case: &Case) -> CaseResult {
         } => {
             let context = http_context(compiled.snapshot(), request, principal);
             let expected = expected_decision(expect, Reason::as_str);
-            match compiled.evaluate(&context) {
+            match compiled.evaluate_with_facts(&context, &case_facts(compiled, principal)) {
                 Ok(evaluation) => {
                     let matched = matched_view(policy, evaluation.matched());
                     let mismatches = compare_decision(
@@ -380,6 +390,7 @@ fn run_case(policy: &PolicyUnderTest, case: &Case) -> CaseResult {
             policy,
             case,
             tool_context(compiled.snapshot(), *operation, tool_name, principal, None),
+            &case_facts(compiled, principal),
             expect,
         ),
         CaseInput::ToolHttp {
@@ -398,6 +409,7 @@ fn run_case(policy: &PolicyUnderTest, case: &Case) -> CaseResult {
                 principal,
                 Some((method, path)),
             ),
+            &case_facts(compiled, principal),
             expect,
         ),
         CaseInput::Rate {
@@ -418,7 +430,7 @@ fn run_case(policy: &PolicyUnderTest, case: &Case) -> CaseResult {
                 matched: None,
                 rate_override: Some(expected_override),
             };
-            match compiled.select_rate_lane(&context) {
+            match compiled.select_rate_lane_with_facts(&context, &case_facts(compiled, principal)) {
                 Ok(selection) => {
                     let (selected, limitation) = match selection.outcome() {
                         RateLaneOutcome::NoOverride => (Some(None), None),
@@ -451,10 +463,11 @@ fn evaluate_tool_case(
     policy: &PolicyUnderTest,
     case: &Case,
     context: ToolEvaluationContext,
+    facts: &PolicyFacts,
     expect: &DecisionExpectation<ToolReason>,
 ) -> CaseResult {
     let expected = expected_decision(expect, ToolReason::as_str);
-    match policy.compiled.evaluate_tool(&context) {
+    match policy.compiled.evaluate_tool_with_facts(&context, facts) {
         Ok(evaluation) => {
             let matched = matched_view(policy, evaluation.matched());
             let mismatches = compare_decision(

@@ -540,7 +540,7 @@ impl ToolEligibilitySnapshot {
         match self.0.evaluate_tool(
             ToolOperation::PolicyEligibility,
             tool_name,
-            principal_fact(Some(principal)),
+            Some(principal),
             None,
         ) {
             Ok(evaluation) => ToolPolicyEligibility {
@@ -987,12 +987,7 @@ impl RbacState {
         principal: Option<&auth::Principal>,
     ) -> bool {
         self.effective_policy()
-            .evaluate_tool(
-                ToolOperation::Visibility,
-                tool_name,
-                principal_fact(principal),
-                None,
-            )
+            .evaluate_tool(ToolOperation::Visibility, tool_name, principal, None)
             .is_ok_and(|evaluation| evaluation.effect() == PolicyEffect::Allow)
     }
 
@@ -1002,10 +997,11 @@ impl RbacState {
     /// supplied. A refusal is not enabled.
     pub(crate) fn composite_leaf_enabled(&self, tool_name: &str) -> bool {
         self.effective_policy()
-            .evaluate_tool(
+            .evaluate_tool_with_facts(
                 ToolOperation::CompositeLeaf,
                 tool_name,
                 PrincipalFact::Missing,
+                &crate::policy_eval::UNCAPTURED_FACTS,
                 None,
             )
             .is_ok_and(|evaluation| evaluation.effect() == PolicyEffect::Allow)
@@ -1038,7 +1034,7 @@ impl RbacState {
         let evaluation = policy.evaluate_tool(
             ToolOperation::RenderedHttp,
             tool_name,
-            principal_fact(principal),
+            principal,
             Some((method, path.to_owned())),
         )?;
         policy.rendered_http_rule(&evaluation)
@@ -1195,17 +1191,40 @@ impl RbacPolicyState {
         &self.rule_ids
     }
 
+    /// Ask the shared evaluator one tool-lane question of this snapshot about
+    /// `principal`, with the facts this snapshot's serving lanes capture for
+    /// it ([`crate::policy_eval::CompiledPolicy::serving_facts`]): in
+    /// mapped-role mode, the organization authentication verified for it, so
+    /// its internal roles are the ones every other lane resolves.
+    fn evaluate_tool(
+        &self,
+        operation: ToolOperation,
+        tool_name: &str,
+        principal: Option<&auth::Principal>,
+        rendered: Option<(Method, String)>,
+    ) -> Result<ToolEvaluation, ToolPolicyRefusal> {
+        let facts = self.compiled.serving_facts(principal);
+        self.evaluate_tool_with_facts(
+            operation,
+            tool_name,
+            principal_fact(principal),
+            &facts,
+            rendered,
+        )
+    }
+
     /// Ask the shared evaluator one tool-lane question of this snapshot.
     ///
     /// A tool name longer than any policy may carry is refused before the
     /// evaluator is asked, so its own size refusal is never what decides a
     /// served call. An incomplete answer and an evaluator error are refusals,
     /// never a default; each is logged here, once, with bounded diagnostics.
-    fn evaluate_tool(
+    fn evaluate_tool_with_facts(
         &self,
         operation: ToolOperation,
         tool_name: &str,
         principal: PrincipalFact,
+        facts: &crate::policy_eval::PolicyFacts,
         rendered: Option<(Method, String)>,
     ) -> Result<ToolEvaluation, ToolPolicyRefusal> {
         if tool_name.len() > MAX_TOOL_NAME_BYTES {
@@ -1221,7 +1240,7 @@ impl RbacPolicyState {
             method,
             path,
         };
-        match self.compiled.evaluate_tool(&context) {
+        match self.compiled.evaluate_tool_with_facts(&context, facts) {
             Ok(evaluation)
                 if evaluation.is_complete()
                     && evaluation.logical() != LogicalDecision::Indeterminate =>
@@ -1296,12 +1315,7 @@ impl RbacPolicyState {
         tool_name: &str,
         principal: Option<&auth::Principal>,
     ) -> ToolInvocationVerdict<'_> {
-        match self.evaluate_tool(
-            ToolOperation::Invocation,
-            tool_name,
-            principal_fact(principal),
-            None,
-        ) {
+        match self.evaluate_tool(ToolOperation::Invocation, tool_name, principal, None) {
             Ok(evaluation) => self.invocation_verdict(tool_name, &evaluation),
             Err(refusal) => ToolInvocationVerdict::Refused(refusal),
         }
@@ -1809,13 +1823,16 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
         ),
         dispatch,
     };
+    // The facts identity mappings read, from the authenticated principal
+    // alone: in mapped-role mode its verified organization, never a header.
+    let matcher_facts = compiled.serving_facts(principal.as_ref());
     // The classifier derives these two contexts together. Never accept a
     // missing or different host-binding authority as a contextless allow.
     let evaluation = if observation.and_then(|facts| facts.authorization_context()) != proxy_context
     {
         Err(crate::policy_eval::EvaluationError::InconsistentContext)
     } else {
-        compiled.evaluate(&input)
+        compiled.evaluate_with_facts(&input, &matcher_facts)
     };
     let evaluation = match evaluation {
         Ok(result)
