@@ -1,6 +1,6 @@
 //! Tests for the shared outbound TLS configuration in [`super::tls`].
 //!
-//! Two parts, and they guard different things.
+//! Three parts, and they guard different things.
 //!
 //! # Part one: the differential trust cases
 //!
@@ -45,20 +45,33 @@
 //! does, both silently. These tests observe both rather than trusting the
 //! reading of reqwest's source: ALPN is no longer pinned by `.http1_only()`, and
 //! `add_root_certificate` no longer contributes trust.
+//!
+//! # Part three: what the TLS stream reports when its transport fails
+//!
+//! An upstream response that ends with the connection, rather than with a
+//! `Content-Length` or a final chunk, is complete only if the stream really
+//! ended. tokio-rustls 0.26.5 dropped a transport error that arrived in the
+//! same read as data, and turned a `ConnectionAborted` into a clean end of
+//! stream, so such a body could be cut short and still read as whole. That
+//! needs a transport that fails exactly once at a chosen point, which a real
+//! socket cannot be made to do, so this part drives the shared config over an
+//! in-memory one.
 
 use std::{
     collections::HashSet,
     net::SocketAddr,
+    pin::Pin,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
+    task::{Context, Poll},
 };
 
 use async_trait::async_trait;
 use reqwest::Method;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf},
     net::{TcpListener, TcpStream},
     task::JoinHandle,
 };
@@ -1023,4 +1036,136 @@ async fn wait_for_negotiated_alpn(server: &TestServer) -> Option<Vec<u8>> {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Part three: what the TLS stream reports when its transport fails
+// ---------------------------------------------------------------------------
+
+/// An in-memory transport that, once armed, fails with `ConnectionAborted`
+/// where it would otherwise wait for more bytes.
+///
+/// Bytes already in the pipe are read first, so the failure lands strictly
+/// after them: inside the read that returns the last of them, when that read
+/// still has room for more.
+struct AbortsWhenDrained {
+    inner: DuplexStream,
+    armed: Arc<AtomicBool>,
+}
+
+impl AsyncRead for AbortsWhenDrained {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match Pin::new(&mut self.inner).poll_read(cx, buf) {
+            Poll::Pending if self.armed.load(Ordering::SeqCst) => Poll::Ready(Err(
+                std::io::Error::from(std::io::ErrorKind::ConnectionAborted),
+            )),
+            other => other,
+        }
+    }
+}
+
+impl AsyncWrite for AbortsWhenDrained {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// A transport error that follows data is reported, not folded into a clean
+/// end of stream.
+///
+/// The fixture writes one record and stays connected, and then the transport
+/// fails. The first read must return the record and the second the
+/// transport's error. tokio-rustls 0.26.5 answered the second read with
+/// `Ok(0)`, which is also how an upstream that finished a close-delimited
+/// response ends it, so hyper would have taken a body cut off here as
+/// complete. 0.26.6 keeps the error for the next read.
+#[tokio::test]
+async fn a_transport_abort_after_data_is_an_error_not_the_end_of_the_stream() {
+    const BODY: &[u8] = b"the first part of a close-delimited body";
+
+    install_test_provider();
+    let host = "abort.example.test";
+    let ca = certificate_authority("GreenGateway Transport Abort Test CA");
+    let server_leaf = leaf(&ca, host, rcgen::ExtendedKeyUsagePurpose::ServerAuth);
+    let server_config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from(server_leaf.certificate_der.clone())],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                server_leaf.private_key_der.clone(),
+            )),
+        )
+        .expect("test server config should build");
+    let client_config = hand_built_config(Some(&ca.pem()), None, Construction::Production)
+        .expect("the shared config should build");
+
+    let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+    let (written, wait_for_written) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut stream = TlsAcceptor::from(Arc::new(server_config))
+            .accept(server_io)
+            .await
+            .expect("the fixture handshake should complete");
+        stream
+            .write_all(BODY)
+            .await
+            .expect("the fixture should write");
+        stream.flush().await.expect("the fixture should flush");
+        let _ = written.send(());
+        // Stay connected: closing here would be an end of stream, another case.
+        std::future::pending::<()>().await;
+    });
+
+    let armed = Arc::new(AtomicBool::new(false));
+    let transport = AbortsWhenDrained {
+        inner: client_io,
+        armed: Arc::clone(&armed),
+    };
+    let name = ServerName::try_from(host.to_owned()).expect("test host should be a server name");
+    let mut stream = TlsConnector::from(Arc::new(client_config))
+        .connect(name, transport)
+        .await
+        .expect("the client handshake should complete");
+
+    // Armed only once the record is in the pipe, so one read takes the record
+    // and then, with room to spare, meets the failed transport.
+    wait_for_written
+        .await
+        .expect("the fixture should have written");
+    armed.store(true, Ordering::SeqCst);
+
+    let mut buffer = [0_u8; 1024];
+    let read = stream
+        .read(&mut buffer)
+        .await
+        .expect("the record should be read before the failure");
+    assert_eq!(&buffer[..read], BODY);
+
+    let outcome = stream.read(&mut buffer).await;
+    server.abort();
+    let error = outcome.expect_err(
+        "a transport abort after data must be an error; `Ok(0)` is how a finished \
+         close-delimited response ends",
+    );
+    assert_eq!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionAborted,
+        "the transport's own error should reach the reader: {error}"
+    );
 }
