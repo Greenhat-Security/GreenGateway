@@ -299,7 +299,10 @@ fn migrations_are_ordered_idempotent_and_restart_safe() {
         .expect("migration query should run")
         .collect::<Result<Vec<_>, _>>()
         .expect("migration rows should read");
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+    assert_eq!(
+        versions,
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+    );
 }
 
 #[test]
@@ -627,7 +630,10 @@ fn migration_five_preserves_populated_v4_catalog_state() {
         .expect("migration query should run")
         .collect::<Result<Vec<_>, _>>()
         .expect("migration rows should read");
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+    assert_eq!(
+        versions,
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+    );
 }
 
 #[test]
@@ -729,7 +735,10 @@ fn migration_six_preserves_populated_v5_mcp_catalog_state() {
         .expect("migration query should run")
         .collect::<Result<Vec<_>, _>>()
         .expect("migration rows should read");
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+    assert_eq!(
+        versions,
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+    );
 }
 
 #[test]
@@ -1071,7 +1080,10 @@ fn migrations_eight_and_nine_preserve_bindings_and_openapi_catalogs() {
         .expect("migration query should run")
         .collect::<Result<Vec<_>, _>>()
         .expect("migration rows should read");
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+    assert_eq!(
+        versions,
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+    );
     assert!(connection
         .prepare("SELECT source_digest, values_json FROM connection_enum_source_values LIMIT 0")
         .is_ok());
@@ -5061,7 +5073,7 @@ fn a_failed_evidence_insert_rolls_back_create_replace_and_delete() {
 /// A database written before migration 12 gains both evidence tables,
 /// empty, on its first open by this build: nothing is fabricated for the
 /// records that already exist, and the first change afterwards is recorded.
-/// The pre-12 file is made by removing what migrations 12 and 13 add, so it
+/// The pre-12 file is made by removing what migrations 12 to 14 add, so it
 /// holds exactly today's record shape.
 #[test]
 fn migration_twelve_adds_empty_evidence_tables_to_an_existing_database() {
@@ -5074,6 +5086,9 @@ fn migration_twelve_adds_empty_evidence_tables_to_an_existing_database() {
         .expect("database should open")
         .execute_batch(
             r#"
+            DROP TABLE authority_event_cursors;
+            DROP TABLE authority_event_state;
+            DELETE FROM connection_schema_migrations WHERE version = 14;
             DROP TABLE catalog_change_evidence;
             DELETE FROM connection_schema_migrations WHERE version = 13;
             DROP TABLE connection_change_evidence;
@@ -6227,7 +6242,7 @@ fn a_failed_catalog_evidence_insert_rolls_back_the_publication() {
 /// evidence table, empty, on its first open by this build: nothing is
 /// fabricated for the catalogs that already exist, not even from the
 /// overlay's actor, and the first publication afterwards is recorded. The
-/// pre-13 file is made by removing what migration 13 adds, so it holds
+/// pre-13 file is made by removing what migrations 13 and 14 add, so it holds
 /// exactly today's catalog shape.
 #[test]
 fn migration_thirteen_adds_an_empty_catalog_evidence_table_to_an_existing_database() {
@@ -6284,6 +6299,9 @@ fn migration_thirteen_adds_an_empty_catalog_evidence_table_to_an_existing_databa
     assert_eq!(overlay_author, "overlay-author");
     file.execute_batch(
         r#"
+            DROP TABLE authority_event_cursors;
+            DROP TABLE authority_event_state;
+            DELETE FROM connection_schema_migrations WHERE version = 14;
             DROP TABLE catalog_change_evidence;
             DELETE FROM connection_schema_migrations WHERE version = 13;
             "#,

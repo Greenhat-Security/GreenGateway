@@ -147,6 +147,27 @@ test("the in-memory session authority stays unsupported and the shared one recor
   assert.ok(byMode.postgres.sources.some((ref) => ref.anchor.includes("reserved_withdrawals")));
 });
 
+test("standalone evidence rows are delivered from their own stores and only they are", () => {
+  const groups = inventory().groups;
+  const delivered = groups.filter((group) => group.delivery === "standalone_cursor_dispatch").map((group) => group.id).sort();
+  assert.deepEqual(delivered, [
+    "catalog_standalone",
+    "connection_delete_standalone",
+    "connection_standalone",
+    "local_secrets",
+    "token_change_standalone",
+    "token_issue_standalone",
+  ]);
+  for (const group of groups.filter((group) => delivered.includes(group.id))) {
+    assert.deepEqual(group.modes, ["standalone"], group.id);
+    assert.equal(group.required_mode, "admitted", group.id);
+    assert.ok(!group.disposition.includes("missing_delivery"), group.id);
+  }
+  const profile = inventory().delivery_profiles.standalone_cursor_dispatch;
+  assert.ok(profile.sources.some((ref) => ref.anchor.includes("MIGRATION_14_SQL")));
+  assert.ok(profile.sources.some((ref) => ref.anchor.includes("run_standalone_dispatcher")));
+});
+
 test("required mode never admits an unsupported row or waves through a reachable one", () => {
   const groups = inventory().groups;
   for (const group of groups) {

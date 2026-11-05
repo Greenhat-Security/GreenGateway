@@ -474,12 +474,20 @@ pub(crate) fn gateway_app_with_process_started_at_and_overrides(
     let routes = GatewayRoutes::from_config(&config);
     warn_on_mcp_exempt_prefix_overlaps(&routes, &config);
     warn_on_unowned_exempt_paths(&routes, &config);
-    let service_token_store: Option<Arc<dyn storage::ServiceTokenStore>> = config
+    let sqlite_token_store = config
         .service_token_sqlite_path
         .as_deref()
         .map(auth::SqliteTokenStore::open)
-        .transpose()?
-        .map(|store| Arc::new(store) as Arc<dyn storage::ServiceTokenStore>);
+        .transpose()?;
+    // Standalone mode with an authority-event sink: the stores that own
+    // evidence, delivered by `run()` once it can await the keyring.
+    let standalone_authority_events = standalone_authority_event_startup(
+        &config,
+        sqlite_token_store.as_ref(),
+        &connection_control_plane,
+    );
+    let service_token_store: Option<Arc<dyn storage::ServiceTokenStore>> =
+        sqlite_token_store.map(|store| Arc::new(store) as Arc<dyn storage::ServiceTokenStore>);
     // Cluster mode serves tokens from the authority; SERVICE_TOKEN_SQLITE_PATH
     // is rejected there (config.rs), so the two never coexist.
     #[cfg(feature = "postgres")]
@@ -1371,6 +1379,7 @@ pub(crate) fn gateway_app_with_process_started_at_and_overrides(
         grpc,
         #[cfg(feature = "postgres")]
         authority_events: authority_event_startup,
+        standalone_authority_events,
     })
 }
 
@@ -1471,6 +1480,42 @@ fn authority_event_startup(
         holder: seed.instance_id,
         readiness: membership.readiness(),
     })
+}
+
+/// What `run()` needs to start standalone authority-event delivery, when
+/// this is a standalone gateway with a sink configured: every configured
+/// store that owns evidence, each its own evidence authority, and the
+/// resolver the keyring comes from. Kept out of the app builder for the
+/// same stack-frame reason as the cluster startup.
+#[inline(never)]
+fn standalone_authority_event_startup(
+    config: &config::Config,
+    token_store: Option<&auth::SqliteTokenStore>,
+    connection_control_plane: &connections::control_plane::ConnectionControlPlane,
+) -> Option<authority_events::standalone::StandaloneAuthorityEventStartup> {
+    if config.state_backend != config::StateBackend::Sqlite
+        || config.authority_events.sink == config::AuthorityEventSinkSetting::None
+    {
+        return None;
+    }
+    let mut authorities: Vec<
+        Arc<dyn storage::standalone_authority_events::StandaloneEvidenceAuthority>,
+    > = Vec::new();
+    if let Some(store) = token_store {
+        authorities.push(Arc::new(store.clone()));
+    }
+    if let Ok(connections::managed_store::ManagedConnectionStore::Sqlite(store)) =
+        connection_control_plane.managed_store()
+    {
+        authorities.push(Arc::new(store.clone()));
+    }
+    Some(
+        authority_events::standalone::StandaloneAuthorityEventStartup {
+            authorities,
+            resolver: connection_control_plane.secret_resolver_handle(),
+            settings: config.authority_events.clone(),
+        },
+    )
 }
 
 pub(crate) fn policy_history_sqlite_path(config: &config::Config) -> Option<PathBuf> {

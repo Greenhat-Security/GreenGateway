@@ -168,12 +168,20 @@ fn the_schema_enumerates_exactly_the_delivered_operations() {
         .iter()
         .map(|value| value.as_str().expect("operations are strings"))
         .collect();
+    // What either mode delivers: the journal's operations and the
+    // standalone stores' (`super::super::standalone_delivery`).
     let shapes = every_delivered_shape();
     let mut delivered: Vec<&str> = shapes
         .iter()
         .map(|evidence| evidence.action.as_deref().expect("fixture has an action"))
+        .chain(
+            crate::authority_events::standalone_delivery::STANDALONE_SHAPES
+                .iter()
+                .map(|shape| shape.action),
+        )
         .collect();
     delivered.sort_unstable();
+    delivered.dedup();
     assert_eq!(operations, delivered);
     // A schema the record does not satisfy is not a closed contract.
     assert_eq!(schema["additionalProperties"], Value::Bool(false));

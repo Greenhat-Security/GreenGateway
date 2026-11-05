@@ -160,6 +160,11 @@ pub(crate) const IMPORT_ACTOR: &str = "import-standalone";
 ///   catalogs and overlays only, so that history stays in the standalone
 ///   database too; the cluster's own catalog evidence table starts empty and
 ///   records the cluster's first publication (the import writes none).
+/// - `authority_event_state` and `authority_event_cursors` in those two
+///   databases are each store's delivery state for that evidence: its
+///   authority ID and how far a sink has accepted it. They stay with the
+///   evidence they describe; the cluster delivers from its own journal under
+///   its own authority ID.
 /// - `policy_test_suite_versions` is the standalone policy history
 ///   database's stored policy test suite (issue #243). The cluster starts
 ///   with none; the operator stores the suite again with `If-None-Match: *`.
@@ -187,6 +192,9 @@ const NOT_IMPORTED: &[&str] = &[
      the local-secret keyring in the standalone Connections database)",
     "catalog_change_evidence (standalone catalog and overlay publication evidence stays in the \
      standalone Connections database; the cluster's own catalog evidence table starts empty)",
+    "authority_event_state and authority_event_cursors of the standalone token and Connections \
+     databases (each store's evidence delivery state stays with its evidence; the cluster delivers \
+     from its own journal under its own authority ID)",
     "policy_test_suite_versions (the standalone stored policy test suite stays in the standalone \
      policy history database; store it in the cluster with PUT .../policy/tests and \
      If-None-Match: *)",

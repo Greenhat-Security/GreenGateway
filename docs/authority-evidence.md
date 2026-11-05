@@ -10,8 +10,9 @@ credential binding change evidence, the keyed safe-reference derivation
 ([Actor metadata](#actor-metadata)), the cluster admin session evidence in the
 journal ([Admin session withdrawals and journal capacity](#admin-session-withdrawals-and-journal-capacity)),
 the PR 4 standalone slices (Connection, local-secret, and catalog and overlay
-evidence, [Standalone evidence](#standalone-evidence)) and PR 4's refusal of unsupported
-changes ([Required-durability mode](#required-durability-mode)).
+evidence, [Standalone evidence](#standalone-evidence)), standalone delivery from the
+stores that own that evidence ([Standalone delivery](#standalone-delivery)) and PR 4's
+refusal of unsupported changes ([Required-durability mode](#required-durability-mode)).
 Reviewed source: `ebb579e6444d437bf477d0617b8841d1eea34cfc`.
 
 This inventory identifies existing atomic records and the work needed for required
@@ -44,9 +45,11 @@ standalone Connections database: Connection create/replace/delete and local-secr
 create/rotate/delete/re-encryption write its `connection_change_evidence` and
 `connection_local_secret_change_evidence` rows, with the whole actor, in their own
 SQLite transactions, and migration 13 of the same database adds
-`catalog_change_evidence` for managed catalog and overlay publication. None of them
-is a standalone revision ledger, and no row is qualified for the required-durability
-contract.
+`catalog_change_evidence` for managed catalog and overlay publication. Migration 14
+of the same database, and the token database's open-time schema, add the delivery
+state those tables are delivered after, so a standalone gateway with a sink delivers
+them without a journal. None of them is a standalone revision ledger, and no row is
+qualified for the required-durability contract.
 `AUTHORITY_EVIDENCE_DURABILITY=required` ([Required-durability mode](#required-durability-mode))
 refuses the rows that cannot be evidenced rather than qualifying any. Storage
 selection is unchanged.
@@ -94,11 +97,11 @@ or unconfigured individual stores.
 | Policy publish, rollback, rule edits and suggestion acceptance | Immutable document/history, actor subject, action/diff, active pointer, shared revision and outbox, plus one non-cascading `document_change_evidence` row (operation code, event/operation UUIDs, actor kind, subject, issuer and auth mode, prior/new version, the outbox row's shared revision, database-clock time) in the same transaction; suggestion acceptance composes its own state, and so its evidence, in the same transaction | Caller-bound operation identity, safe-reference projection, durable delivery and retention |
 | Tools publication | Shared document transaction plus name reservations and the same `document_change_evidence` row; the first-boot seed and the import's activation are recorded as system actors | Same as policy |
 | Stored policy test suite (`policy_tests.publish`, migration 29) | Shared document transaction over its own versions and active pointer, plus the same `document_change_evidence` row, with resource type `policy_tests` | Same as policy. The proposed event names it as a `policy` resource on its own `policy_tests` revision axis, because its versions are not policy versions. Standalone records only the writer's subject on the version row, so `required` refuses the write there |
-| Connection and credential binding changes | Record, bindings, immutable version, shared revision and outbox, plus since migration 28 a non-cascading `connection_change_evidence` row per committed create (`connection.create`, no prior version and version 1) and replace (`connection.replace`, prior and new specification version), and a `credential.binding_change` row on the credential axis (prior and new credential revision) under the same operation ID and shared revision when a replace advances the credential revision: actor (subject, kind, auth mode, canonical issuer), event/operation UUIDs, the outbox row's shared revision, database-clock time, journaled and delivered in the change's transaction. An identical replace records nothing. No binding, secret ID or locator enters a row. Standalone writes the same rows, without a shared revision, in the Connections database's own transaction ([Standalone evidence](#standalone-evidence)) | A caller-bound operation identity and an issuer-scoped subject reference; Connections created or replaced before migration 28 keep only their cascading version history; standalone evidence is not delivered |
-| Connection deletion | Outbox tombstone with prior version and shared revision, plus a non-cascading `connection_change_evidence` row (actor, action, event/operation UUIDs, prior version, the tombstone's shared revision, database-clock time) and its journal row in the same transaction; delivered with keyed safe references since PR 3; since migration 24 the actor's kind, auth mode and canonical issuer too. Standalone writes the same deletion evidence, without a shared revision, in the Connections database's own transaction | A caller-bound operation identity and an issuer-scoped subject reference, without which the delivered record cannot be `authority_event.v1`; standalone evidence is not delivered |
-| Managed MCP/OpenAPI catalog and overlay publication | Catalog/overlay CAS, entries, dependencies, reservations, revision and outbox, plus one non-cascading `catalog_change_evidence` row (action derived from the write, event/operation UUIDs, the actor's subject, kind, auth mode and canonical issuer, catalog revision transition, compiled overlay revision, shared revision, database-clock time) that outlives the replacement and the Connection's deletion. Standalone writes the same evidence, without a shared revision, in the Connections database's own transaction (its migration 13) | Caller-bound operation identity, an issuer-scoped subject reference, journaling for delivery; standalone evidence is not delivered |
-| Service-token issue | Token row with creator, row/shared revisions and outbox, plus since migration 27 a `service_token_change_evidence` row with action `service_token.issue` (actor, event/operation UUIDs, no prior revision and row revision 1, the create outbox row's shared revision, database-clock time) in the create's transaction, journaled and delivered. Standalone writes the same row in the token database's own create transaction. Neither store records the returned plaintext or its hash | A caller-bound operation identity and an issuer-scoped subject reference; tokens issued before the evidence existed keep only `created_by`; standalone evidence is not delivered |
-| Service-token rotate/revoke | Token change, row/shared revisions and outbox, plus a non-cascading `service_token_change_evidence` row (actor, action, event/operation UUIDs, prior/new row revision, the outbox row's shared revision, database-clock time) in the same transaction; repeated revoke and refused rotate write none. Standalone writes the same evidence in the token database's own transaction. In PostgreSQL the change also journals its evidence and is delivered since PR 3. Both stores record the actor's kind, auth mode and canonical issuer (migration 24 and the token database's own columns) | A caller-bound operation identity and an issuer-scoped subject reference; standalone evidence is not delivered |
+| Connection and credential binding changes | Record, bindings, immutable version, shared revision and outbox, plus since migration 28 a non-cascading `connection_change_evidence` row per committed create (`connection.create`, no prior version and version 1) and replace (`connection.replace`, prior and new specification version), and a `credential.binding_change` row on the credential axis (prior and new credential revision) under the same operation ID and shared revision when a replace advances the credential revision: actor (subject, kind, auth mode, canonical issuer), event/operation UUIDs, the outbox row's shared revision, database-clock time, journaled and delivered in the change's transaction. An identical replace records nothing. No binding, secret ID or locator enters a row. Standalone writes the same rows, without a shared revision, in the Connections database's own transaction ([Standalone evidence](#standalone-evidence)) | A caller-bound operation identity and an issuer-scoped subject reference; Connections created or replaced before migration 28 keep only their cascading version history; standalone records are delivered without a shared security revision |
+| Connection deletion | Outbox tombstone with prior version and shared revision, plus a non-cascading `connection_change_evidence` row (actor, action, event/operation UUIDs, prior version, the tombstone's shared revision, database-clock time) and its journal row in the same transaction; delivered with keyed safe references since PR 3; since migration 24 the actor's kind, auth mode and canonical issuer too. Standalone writes the same deletion evidence, without a shared revision, in the Connections database's own transaction | A caller-bound operation identity and an issuer-scoped subject reference, without which the delivered record cannot be `authority_event.v1`; standalone records are delivered without a shared security revision |
+| Managed MCP/OpenAPI catalog and overlay publication | Catalog/overlay CAS, entries, dependencies, reservations, revision and outbox, plus one non-cascading `catalog_change_evidence` row (action derived from the write, event/operation UUIDs, the actor's subject, kind, auth mode and canonical issuer, catalog revision transition, compiled overlay revision, shared revision, database-clock time) that outlives the replacement and the Connection's deletion. Standalone writes the same evidence, without a shared revision, in the Connections database's own transaction (its migration 13) | Caller-bound operation identity, an issuer-scoped subject reference, journaling for delivery; standalone records are delivered without a shared security revision |
+| Service-token issue | Token row with creator, row/shared revisions and outbox, plus since migration 27 a `service_token_change_evidence` row with action `service_token.issue` (actor, event/operation UUIDs, no prior revision and row revision 1, the create outbox row's shared revision, database-clock time) in the create's transaction, journaled and delivered. Standalone writes the same row in the token database's own create transaction. Neither store records the returned plaintext or its hash | A caller-bound operation identity and an issuer-scoped subject reference; tokens issued before the evidence existed keep only `created_by`; standalone records are delivered without a shared security revision |
+| Service-token rotate/revoke | Token change, row/shared revisions and outbox, plus a non-cascading `service_token_change_evidence` row (actor, action, event/operation UUIDs, prior/new row revision, the outbox row's shared revision, database-clock time) in the same transaction; repeated revoke and refused rotate write none. Standalone writes the same evidence in the token database's own transaction. In PostgreSQL the change also journals its evidence and is delivered since PR 3. Both stores record the actor's kind, auth mode and canonical issuer (migration 24 and the token database's own columns) | A caller-bound operation identity and an issuer-scoped subject reference; standalone records are delivered without a shared security revision |
 | JWT revocation | Scoped JTI digest, actor row, shared revision and outbox, plus one non-cascading `jwt_revocation_evidence` row per effective revoke (actor, JTI digest, resulting expiry, shared revision) that extension, reactivation and expiry cleanup never rewrite, journaled in the same transaction and delivered since PR 3; since migration 24 the CLI's actor is recorded as kind `system`, auth mode `system` and no issuer | The CLI actor stays system provenance, not a named human; a caller-bound operation identity |
 | Admin session grant/withdrawal (#424) | With `ADMIN_SESSION_MODE=cluster_postgres`, the session row, one non-cascading `admin_session_evidence` row (event/operation UUIDs, session ID, action, reason, subject and issuer, absolute deadline, database-clock time) and, since migration 26, its journal row commit together in one statement for each grant and each withdrawal; a replacement's withdrawal and grant share one operation ID. Delivered since migration 26 on the `session` axis with keyed safe references; a grant holds journal capacity for its withdrawal, so no withdrawal is refused at capacity ([Admin session withdrawals and journal capacity](#admin-session-withdrawals-and-journal-capacity)) | Actor kind and auth mode (the evidence records neither, so a withdrawal by the prune or a provider rejection is named by the session's subject, not as a system actor), an issuer-scoped subject reference, the withdrawal reason in the delivered record, and a caller-bound operation identity. Standalone sessions are process-local memory with no durable record and stay `unsupported_future_operation` |
 
@@ -560,8 +563,9 @@ Not covered by PR 3, and still open:
 - **Admin session metadata.** Admin session evidence is journaled and delivered
   since migration 26, but records no actor kind or auth mode, and the delivered
   record has no field for the withdrawal's reason.
-- **Standalone mode.** There is no journal and no dispatcher; the SQLite token,
-  Connection and local-secret evidence is not delivered.
+- **Standalone mode** has no journal; its evidence is delivered straight from the
+  SQLite stores that own it, after a cursor in each
+  ([Standalone delivery](#standalone-delivery)).
 - **The v1 contract.** A caller-bound operation identity at the store boundary and
   an issuer-scoped subject reference, after which the delivered record can become
   `authority_event.v1` for the actors that have an issuer. Kind, auth mode and
@@ -807,10 +811,11 @@ What standalone evidence lacks compared with cluster mode:
 - **No shared security revision and no database clock.** `committed_at` is the
   gateway process's clock (the change's own `updated_at`, or a rotation's
   `rotated_at`), and each revision is per record.
-- **No delivery.** There is no journal or dispatcher; the rows are read from the
-  file. The change's only delivered record is still the post-commit admin audit
-  event (or the maintenance command's printed counts), which stays bounded
-  telemetry.
+- **No journal.** With `AUTHORITY_EVENT_SINK` set, the rows are delivered from the
+  tables themselves, after a cursor kept in the same file
+  ([Standalone delivery](#standalone-delivery)). With no sink, the change's only
+  delivered record is still the post-commit admin audit event (or the maintenance
+  command's printed counts), which stays bounded telemetry.
 - **No retention and no capacity bound.** Rows are never pruned, so each table
   grows by one small row per change. A restore of the file rewinds the evidence
   with the state it describes.
@@ -828,6 +833,100 @@ What standalone evidence lacks compared with cluster mode:
   the file-backed policy, tools and configuration authorities, which wait for
   #242's ledger. A token issued before the token table admitted the issue action
   has no issue row; `created_by` stays its only record.
+
+## Standalone delivery
+
+A standalone gateway has no journal and needs none: each SQLite store that owns an
+authority already keeps that authority's evidence in tables whose `sequence` is an
+`AUTOINCREMENT` assigned while the writer holds the file's write lock. Within one
+table, sequence order is therefore commit order, a sequence is never reused, and no
+sequence below a committed one can commit later, so a cursor over the table itself
+never skips a row. The dispatcher (`gateway/src/authority_events/standalone.rs`)
+delivers those tables directly; nothing is copied anywhere inside the change's
+transaction.
+
+**Each store is its own evidence authority.** This is a design decision, not an
+accident of layout: the token database and the Connections database are separate
+files that cannot commit atomically with each other, and either can be restored or
+moved alone. Each therefore has its own persisted `authority_id` in its own
+`authority_event_state` table, written once by the first dispatcher start and never
+changed, and its references are derived under it. A consumer that receives both
+sees two authorities, and deduplicates on `(authority_id, event_id)` exactly as for
+cluster delivery. If an operator points `SERVICE_TOKEN_SQLITE_PATH` and
+`CONNECTIONS_SQLITE_PATH` at the same file, that file is one authority with one
+`authority_id`, and every table still has its own cursor.
+
+| Store | Delivery state created by | Sources (one cursor each) |
+| --- | --- | --- |
+| `SERVICE_TOKEN_SQLITE_PATH` | the token store's open-time schema | `service_token_change_evidence` |
+| `CONNECTIONS_SQLITE_PATH` | Connections schema migration 14 | `connection_change_evidence`, `connection_local_secret_change_evidence`, `catalog_change_evidence` |
+
+Both create the same two tables: `authority_event_state` (the authority ID and when
+it was written) and `authority_event_cursors` (per source, the last sequence a sink
+accepted and how many events it accepted in total). Both start empty and fabricate
+nothing: the first start delivers every row the tables already hold, from sequence 1.
+
+**Delivery.** With `AUTHORITY_EVENT_SINK=log` or `file`, startup resolves the pseudonym
+keyring once per store under that store's authority ID, through the same aliases and
+secret providers as cluster mode, opens each source's cursor (creating it at 0), and
+audits each load as `authority_event.keyring_loaded` with the store's name, its
+authority ID and the key IDs. Any failure refuses startup. Then one task, outside every
+authority transaction, delivers every source in turn: it reads at most 100 rows after
+the cursor, projects them into `authority_event_delivery.v1` records
+(`gateway/src/authority_events/standalone_delivery.rs`), offers them to the sink and
+only after the sink accepted advances the cursor with a compare-and-set in an IMMEDIATE
+transaction. A sink failure is retried with the same 0.5 s to 60 s backoff and the
+same batch; an advance that fails after acceptance is retried alone; a crash between
+acceptance and the advance offers the batch again after restart with the same event
+IDs and, under the same key, identical bytes. A row that cannot be projected
+faithfully stalls its own table at that row, counted and logged; the other tables
+keep delivering, and nothing is ever skipped. Delivery delays no change: a sink outage
+costs only disk, because standalone evidence has no capacity bound and no retention.
+
+**What a standalone record says differently.** `sequence` is the row's sequence in its
+own table, so it orders events within an operation family (`service_token.*`;
+`connection.*` and `credential.*`; `secret.*`; `catalog.*`), not across them.
+`revision.security` is `null`: a standalone store has no shared security revision.
+Service-token records carry `null` before and after: the token database keeps no token
+revision, and nothing is invented. Local-secret changes sit on the `secret` axis with
+the secret's version, referenced by its gateway-minted ID. A re-encryption batch names
+no secret and changes no version, so it sits on the `maintenance` axis with no
+revisions, and its resource is the local-secret store as a whole, referenced from the
+fixed component `connection_local_secrets`, which no secret ID (a UUID) can equal.
+Catalog publications sit on the `catalog` axis with the catalog revision before (none
+for a first catalog) and after, referenced as the Connection's catalog; the compiled
+overlay revision stays in the evidence row. A credential binding change is the
+Connection's, on the `credential` axis, exactly as cluster mode delivers it.
+
+**Signals.** `greengateway_standalone_authority_event_undelivered{store}` (rows above
+the cursors, summed per store) and
+`greengateway_standalone_authority_event_oldest_undelivered_age_seconds{store}` are
+published after every pass, so they exist only where a sink is configured, and
+`greengateway_standalone_authority_event_delivery_failures_total{store,kind}` counts
+failed steps by `evidence_read`, `projection`, `sink` or `cursor_advance`. The
+[operational rule pack](deployment/operational-alerts.md#standalone-authority-event-delivery)
+warns on sustained lag and on repeated failures.
+
+**Operations.** A restore of a file rewinds its evidence and its cursor together, so
+events delivered after the backup are delivered again under the same event IDs, and
+the authority ID survives. To stop delivering, unset the sink; the cursors stay, and a
+later sink resumes after them. To deliver a file's evidence again from the start,
+delete its `authority_event_cursors` rows while the gateway is stopped. A second
+process on the same file would deliver the same rows too; the cursor's
+compare-and-set keeps it from moving backwards or counting a batch twice, and a
+dispatcher whose cursor moved under it re-reads it. `import-standalone` carries
+neither the evidence nor its delivery state: let the standalone gateway catch up
+(both undelivered gauges at 0) before a cutover.
+
+Tests: `gateway/src/authority_events/standalone_tests.rs` (delivery in commit order
+under each store's own authority from the real stores, a crash between acceptance and
+the advance redelivering identical records, a sink outage, a restart resuming after
+the cursor, a stalled table, the file sink, startup keying and auditing, the running
+task), `standalone_delivery_tests.rs` (every action against the published schema
+and the tables' CHECK vocabularies, every revision transition, refusals, and
+synthetic markers in every identifier the projection reads, none of which reaches a
+record), and `gateway/src/storage/standalone_authority_events.rs` for the cursor
+protocol.
 
 ## Required-durability mode
 
@@ -860,9 +959,10 @@ outside the gateway:
 Enforcement:
 
 - **Startup.** The configuration compiler refuses `required` with
-  `STATE_BACKEND=postgres` and `AUTHORITY_EVENT_SINK=none` (rule
-  `AuthorityEvidenceDeliveryRequired`): the replica would journal evidence that is
-  retained but never delivered. It refuses `required` with
+  `AUTHORITY_EVENT_SINK=none` in either mode (rule
+  `AuthorityEvidenceDeliveryRequired`): a cluster replica would journal evidence that
+  is retained but never delivered, and a standalone gateway's stores would record
+  evidence that is never delivered. It refuses `required` with
   `ADMIN_SESSION_MODE=standalone_memory` (rule
   `AuthorityEvidenceUnsupportedConfiguration`). Both problems name
   `AUTHORITY_EVIDENCE_DURABILITY`, so the value-free diagnostics attribute them to it.
@@ -890,18 +990,19 @@ Enforcement:
 The gate reads two configuration values and nothing else. It never waits on a
 store, the dispatcher or a sink, so proxy admission and every admin change still
 wait only on their own local commits, never on a downstream acknowledgement. In
-cluster mode the dispatcher delivers after the commit, outside every authority
+either mode the dispatcher delivers after the commit, outside every authority
 transaction, exactly as under `best_effort`; required mode only makes sure a sink is
-configured to deliver to. `required` is part of the static configuration
+configured to deliver to. In cluster mode `required` is part of the static configuration
 fingerprint (absent under `best_effort`, so the default leaves fingerprints
 unchanged), and a replica with a different value is not ready in that deployment.
 
 What required mode does not do:
 
 - It refuses no `admitted` row. Several of them are retained but not delivered: the
-  policy, tools and catalog evidence rows are not journal sources (admin-session
-  evidence is, since migration 26), and the
-  standalone token, Connection, local-secret and catalog evidence has no dispatcher. A
+  cluster policy, tools and catalog evidence rows are not journal sources
+  (admin-session evidence is, since migration 26). The standalone token, Connection,
+  local-secret and catalog evidence is delivered from its own stores, which required
+  mode makes sure a sink is configured for ([Standalone delivery](#standalone-delivery)). A
   cluster Connection's version history still cascades with the Connection; its
   create, replace, credential binding change (since migration 28) and deletion
   evidence rows do not.

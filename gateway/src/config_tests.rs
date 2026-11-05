@@ -6511,11 +6511,12 @@ fn authority_evidence_durability_defaults_to_best_effort_and_parses_both_values(
             AuthorityEvidenceDurability::BestEffort
         );
     }
-    let standalone = Config::from_env_vars(standalone_vars(&[(
-        "AUTHORITY_EVIDENCE_DURABILITY",
-        "required",
-    )]))
-    .expect("standalone mode has no sink to require");
+    let standalone = Config::from_env_vars(standalone_vars(&[
+        ("AUTHORITY_EVIDENCE_DURABILITY", "required"),
+        ("AUTHORITY_EVENT_SINK", "log"),
+        ("AUTHORITY_PSEUDONYM_KEY_ALIAS", "pseudonym-2026-10"),
+    ]))
+    .expect("standalone mode delivers its stores' evidence to the sink");
     assert_eq!(
         standalone.authority_events.durability,
         AuthorityEvidenceDurability::Required
@@ -6628,7 +6629,11 @@ fn required_authority_evidence_refuses_process_local_admin_sessions() {
         .expect("best effort keeps the standalone session store");
 
     let mut required = session.to_vec();
-    required.push(("AUTHORITY_EVIDENCE_DURABILITY", "required"));
+    required.extend([
+        ("AUTHORITY_EVIDENCE_DURABILITY", "required"),
+        ("AUTHORITY_EVENT_SINK", "log"),
+        ("AUTHORITY_PSEUDONYM_KEY_ALIAS", "pseudonym-2026-10"),
+    ]);
     let error = Config::from_env_vars(standalone_vars(&required))
         .expect_err("required refuses in-memory sessions");
     assert_eq!(
@@ -6646,32 +6651,115 @@ fn required_authority_evidence_refuses_process_local_admin_sessions() {
         ("ADMIN_LOGIN_PROVIDER", "primary"),
         ("ADMIN_PREFIX", "/operations"),
         ("AUTHORITY_EVIDENCE_DURABILITY", "required"),
+        ("AUTHORITY_EVENT_SINK", "log"),
+        ("AUTHORITY_PSEUDONYM_KEY_ALIAS", "pseudonym-2026-10"),
     ]))
     .expect("bearer-only admin login keeps no session to record");
 }
 
+/// Standalone mode delivers its SQLite stores' own evidence, so it reads
+/// the sink, the event file and the key aliases under the same rules as
+/// cluster mode; it has no journal, so the journal's capacity and retention
+/// are refused there.
 #[test]
-fn every_authority_event_setting_is_refused_in_standalone_mode() {
+fn standalone_mode_reads_the_delivery_settings_and_refuses_the_journal_settings() {
     for (name, value) in [
-        ("AUTHORITY_EVENT_SINK", "log"),
-        ("AUTHORITY_EVENT_FILE", "/tmp/events.jsonl"),
-        ("AUTHORITY_PSEUDONYM_KEY_ALIAS", "pseudonym-a"),
-        ("AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS", "pseudonym-b"),
         ("AUTHORITY_EVENT_JOURNAL_CAPACITY", "10"),
         ("AUTHORITY_EVENT_RETENTION_HOURS", "1"),
     ] {
-        let error = Config::from_env_vars(|key| {
-            if key == name {
-                Ok(value.to_owned())
-            } else {
-                Err(VarError::NotPresent)
-            }
-        })
-        .expect_err("standalone mode has no journal")
-        .to_string();
+        let error = Config::from_env_vars(standalone_vars(&[(name, value)]))
+            .expect_err("standalone mode has no journal")
+            .to_string();
         assert!(
-            error.contains(&format!("{name} is set while STATE_BACKEND is sqlite")),
+            error.contains(&format!(
+                "{name} is set while STATE_BACKEND is sqlite; standalone mode has no authority-event journal"
+            )),
             "{name}: {error}"
+        );
+    }
+
+    let config = Config::from_env_vars(standalone_vars(&[
+        ("AUTHORITY_EVENT_SINK", "file"),
+        (
+            "AUTHORITY_EVENT_FILE",
+            "/var/lib/greengateway/authority-events.jsonl",
+        ),
+        ("AUTHORITY_PSEUDONYM_KEY_ALIAS", "pseudonym-2026-10"),
+        (
+            "AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS",
+            "pseudonym-2026-04",
+        ),
+    ]))
+    .expect("a complete standalone file sink validates");
+    assert_eq!(
+        config.authority_events.sink,
+        AuthorityEventSinkSetting::File("/var/lib/greengateway/authority-events.jsonl".to_owned())
+    );
+    assert_eq!(
+        config
+            .authority_events
+            .pseudonym_key_aliases()
+            .collect::<Vec<_>>(),
+        ["pseudonym-2026-10", "pseudonym-2026-04"]
+    );
+
+    // The sink's own rules are the cluster's.
+    for (vars, expected) in [
+        (
+            vec![("AUTHORITY_EVENT_SINK", "log")],
+            "AUTHORITY_PSEUDONYM_KEY_ALIAS is required when AUTHORITY_EVENT_SINK is set",
+        ),
+        (
+            vec![
+                ("AUTHORITY_EVENT_SINK", "file"),
+                ("AUTHORITY_PSEUDONYM_KEY_ALIAS", "pseudonym-a"),
+            ],
+            "AUTHORITY_EVENT_FILE is required when AUTHORITY_EVENT_SINK=file",
+        ),
+        (
+            vec![("AUTHORITY_PSEUDONYM_KEY_ALIAS", "pseudonym-a")],
+            "AUTHORITY_PSEUDONYM_KEY_ALIAS is set while AUTHORITY_EVENT_SINK is none",
+        ),
+        (
+            vec![
+                ("AUTHORITY_EVENT_SINK", "log"),
+                ("AUTHORITY_PSEUDONYM_KEY_ALIAS", "pseudonym-a"),
+                ("AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS", "pseudonym-a"),
+            ],
+            "must name different aliases",
+        ),
+    ] {
+        let error = Config::from_env_vars(standalone_vars(&vars))
+            .expect_err("the sink's requirements hold in standalone mode")
+            .to_string();
+        assert!(error.contains(expected), "{vars:?}: {error}");
+    }
+}
+
+/// Required mode refuses a standalone gateway with no sink: the evidence its
+/// stores record would never be delivered.
+#[test]
+fn required_authority_evidence_needs_a_sink_in_standalone_mode() {
+    for vars in [
+        vec![("AUTHORITY_EVIDENCE_DURABILITY", "required")],
+        vec![
+            ("AUTHORITY_EVIDENCE_DURABILITY", "required"),
+            ("AUTHORITY_EVENT_SINK", "none"),
+        ],
+    ] {
+        let error = Config::from_env_vars(standalone_vars(&vars)).expect_err("no sink is refused");
+        assert_eq!(
+            error.problems,
+            ["AUTHORITY_EVIDENCE_DURABILITY=required needs AUTHORITY_EVENT_SINK=log or file when STATE_BACKEND=sqlite; with none, the authority evidence the standalone stores record is never delivered"],
+            "{vars:?}"
+        );
+        assert_eq!(
+            error.diagnostics()[0].rule,
+            diagnostic::ConfigRule::AuthorityEvidenceDeliveryRequired
+        );
+        assert_eq!(
+            error.diagnostics()[0].variable,
+            Some("AUTHORITY_EVIDENCE_DURABILITY")
         );
     }
 }

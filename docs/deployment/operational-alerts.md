@@ -82,6 +82,7 @@ below have no application labels; scrape labels identify the replica.
 | `greengateway_authority_event_journal_retained`, `_capacity`, `_oldest_undelivered_age_seconds` | [Journal statistics](../../gateway/src/authority_events/dispatcher.rs), published by the maintenance leader after every successful retention step and by the dispatcher's leader after every step. | One shared table, so a reading says nothing about the replica exporting it, and a former leader keeps exporting its last reading. Without `AUTHORITY_EVENT_SINK` every retained event counts as undelivered. |
 | `greengateway_cluster_maintenance_leader`, `greengateway_leader_task_last_success_age_seconds{task="authority_event_retention"}` | [Maintenance singleton](../../gateway/src/cluster_maintenance.rs): `1` on the replica holding the maintenance lease and `0` after its term; on that leader, how long ago the retention job last succeeded according to the fenced ledger. | Leader-only, and a job that never succeeded has no age series. They say which journal reading is current, not whether the journal is healthy. |
 | `greengateway_authority_event_delivery_failures_total{kind}`, `greengateway_cluster_lease_age_seconds{scope="authority_event_dispatcher"}` | [Dispatcher](../../gateway/src/authority_events/dispatcher.rs): failed steps by a fixed `kind`, and how long this replica has held the dispatcher lease (`0` after its term). Only a replica with `AUTHORITY_EVENT_SINK` set ever creates either series. | Lazy; their presence is how the rules tell a configured sink from none. `kind="fenced"` is a leadership handover, not a failed delivery. |
+| `greengateway_standalone_authority_event_undelivered{store}`, `greengateway_standalone_authority_event_oldest_undelivered_age_seconds{store}`, `greengateway_standalone_authority_event_delivery_failures_total{store,kind}` | [Standalone dispatcher](../../gateway/src/authority_events/standalone.rs), in a standalone process with `AUTHORITY_EVENT_SINK` set: the evidence rows of each SQLite store above its delivery cursors, the age of the oldest of them by the gateway's clock against the row's own commit time, published after every pass, and failed steps by a fixed `kind` (`evidence_read`, `projection`, `sink`, `cursor_advance`). `store` is `service_tokens` or `connections`. | Standalone mode only. The gauges exist only where a sink is configured; a stopped dispatcher leaves its last reading. The failure counter is created by its first failure. |
 | `up{job="greengateway"}`, `greengateway_monitoring:target_expected` | Scrape success and separately maintained target inventory. | Scrape success is transport evidence. Inventory is operator intent, not application telemetry. |
 
 Every counter a single-event rule reads (audit loss, audit flush failure, audit
@@ -144,6 +145,8 @@ environment variable that changes a Prometheus threshold.
 | `GreenGatewayAuthorityEventJournalFilling` | warning | The current maintenance leader reports the journal's units in use above 80% of capacity for 5 minutes | [Authority-event journal](#authority-event-journal): restore delivery or retention before the journal is full. |
 | `GreenGatewayAuthorityEventDeliveryLag` | warning | With a dispatcher configured, a current maintenance leader with a recent retention success reports the oldest undelivered event older than 120 seconds, for 5 minutes | [Authority-event delivery](#authority-event-delivery): find the stalled sink or dispatcher. |
 | `GreenGatewayAuthorityEventDeliveryFailures` | warning | Observed dispatcher failures other than `fenced` in every 5-minute window for 10 minutes | [Authority-event delivery](#authority-event-delivery): read the failing step's `kind` and the replica's log. |
+| `GreenGatewayStandaloneAuthorityEventDeliveryLag` | warning | On a standalone gateway with a sink, the oldest undelivered evidence row of any store older than 120 seconds, for 5 minutes | [Standalone authority-event delivery](#standalone-authority-event-delivery): find the stalled sink or table. |
+| `GreenGatewayStandaloneAuthorityEventDeliveryFailures` | warning | On a standalone gateway, observed standalone dispatcher failures in every 5-minute window for 10 minutes | [Standalone authority-event delivery](#standalone-authority-event-delivery): read the failing step's `kind` and `store` and the gateway's log. |
 | `GreenGatewayAuthorityEventJournalUnobserved` | warning | A scraped cluster deployment has no maintenance leader that exports the retained, capacity and oldest-age gauges with a retention success under 300 seconds old, for 10 minutes | [Authority-event journal](#authority-event-journal): restore the leader, its retention job or the exported gauges. |
 
 The cluster rules select `deployment_mode="cluster"`; standalone deployments
@@ -168,9 +171,12 @@ Durability refusals are judged the same way, per replica and in both modes: each
 one is a request the gateway answered `503`, whatever its lifecycle phase.
 
 The authority-event rules also select `deployment_mode="cluster"`: standalone mode
-has no journal. The one exception is `GreenGatewayStandaloneEvidenceWriteFailures`,
+has no journal. The exceptions are `GreenGatewayStandaloneEvidenceWriteFailures`,
 which selects `deployment_mode="standalone"` and reads the SQLite stores' own
-counter. The refusal counters of both modes are judged per replica, like audit
+counter, and the two standalone delivery rules, which read the standalone
+dispatcher's own series per process: a standalone gateway is the only deliverer of
+its files, so they need no leader gate, and the lag gauge exists only where a sink is
+configured, so a gateway without one is never judged. The refusal counters of both modes are judged per replica, like audit
 loss, and are not suppressed during startup or drain, because every increase is an
 authority change that did not happen. The journal gauges describe one shared
 table and are published only by a leader, while every former leader keeps
@@ -454,6 +460,36 @@ Delivery resumes from the persisted cursor and is at least once, so consumers
 deduplicate on `(authority_id, event_id)`. Do not turn the sink off to clear the
 alert: a dispatcher that once claimed the cursor keeps holding undelivered events,
 and the journal then fills.
+
+### Standalone authority-event delivery
+
+The gateway operator restores delivery; the security/audit owner decides whether the
+downstream system needs a backfill. A standalone gateway with `AUTHORITY_EVENT_SINK`
+delivers each SQLite store's own evidence tables after a cursor kept in that file
+([standalone delivery](../authority-evidence.md#standalone-delivery)). Delivery runs
+outside every authority transaction and standalone evidence has no capacity bound, so
+a stalled sink delays evidence, costs disk, and refuses nothing. `store` names the
+file (`service_tokens` is `SERVICE_TOKEN_SQLITE_PATH`, `connections` is
+`CONNECTIONS_SQLITE_PATH`); the log names the table and the cursor. By
+`greengateway_standalone_authority_event_delivery_failures_total{kind}`:
+
+- `sink`: the sink refused the batch. For `AUTHORITY_EVENT_SINK=file`, check the
+  file's directory, free space and permissions; for `log`, the log pipeline.
+- `projection`: an evidence row cannot be delivered faithfully, so that table is
+  stalled at that row while the store's other tables keep delivering. The log names
+  the table and the sequence; this needs an engineering decision and is never fixed
+  by skipping or editing the row.
+- `evidence_read`, `cursor_advance`: the SQLite file; start with that file's
+  `greengateway_sqlite_storage_checks_total{store,outcome="failure"}`, as for
+  [standalone evidence failures](#standalone-evidence-failures). A `cursor_advance`
+  logged as a cursor that moved under the dispatcher means a second process uses the
+  same file.
+
+Delivery resumes from the persisted cursors after a restart and is at least once, so
+consumers deduplicate on `(authority_id, event_id)`; each store has its own
+`authority_id`. Unsetting the sink stops delivery and the alerts with it, but the
+evidence keeps accumulating undelivered, and `AUTHORITY_EVIDENCE_DURABILITY=required`
+refuses to start without a sink.
 
 ### Artifact verification failure
 

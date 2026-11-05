@@ -20,11 +20,14 @@ type Fixture = BTreeMap<&'static str, &'static str>;
 
 /// A strict starting point: loopback only, TLS 1.3 floor, one egress host,
 /// a policy, an audit file, a discovery store, and required authority
-/// evidence (audit durability is `required` by default).
+/// evidence with the sink it needs (audit durability is `required` by
+/// default).
 fn base() -> Fixture {
     BTreeMap::from([
         ("LISTEN_ADDR", "127.0.0.1:8080"),
         ("AUTHORITY_EVIDENCE_DURABILITY", "required"),
+        ("AUTHORITY_EVENT_SINK", "log"),
+        ("AUTHORITY_PSEUDONYM_KEY_ALIAS", "pseudonym-a"),
         ("TLS_MIN_VERSION", "1.3"),
         ("EGRESS_ALLOWED_HOSTS", "api.example.test"),
         ("POLICY_FILE", "/etc/greengateway/policy.json"),

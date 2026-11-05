@@ -991,6 +991,27 @@ CREATE INDEX idx_catalog_change_evidence_connection
 ON catalog_change_evidence(connection_id, sequence);
 "#;
 
+// Migration 14: the delivery state of migrations 12 and 13's evidence
+// (issue #425). Standalone mode has no journal, so the evidence tables
+// themselves are what is delivered: their AUTOINCREMENT sequences are
+// commit order. The migration adds the two tables the token database
+// creates on open too, with one definition
+// (`storage::standalone_authority_events::AUTHORITY_EVENT_TABLES_SQL`):
+//
+// - authority_event_state: this file's persisted authority_id, written once
+//   by the first dispatcher start. The Connections database is its own
+//   evidence authority.
+// - authority_event_cursors: per evidence table, the last sequence a sink
+//   accepted and the number of events it accepted.
+//
+// Both start empty: nothing is fabricated, and the first dispatcher start
+// delivers every evidence row already here, from sequence 1. No evidence
+// row is changed or copied, and nothing references the evidence tables.
+// `IF NOT EXISTS`, unlike every migration before it, because a token store
+// configured on the same file creates the same tables on open.
+const MIGRATION_14_SQL: &str =
+    crate::storage::standalone_authority_events::AUTHORITY_EVENT_TABLES_SQL;
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -1043,6 +1064,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 13,
         sql: MIGRATION_13_SQL,
+    },
+    Migration {
+        version: 14,
+        sql: MIGRATION_14_SQL,
     },
 ];
 
@@ -1134,6 +1159,32 @@ pub struct SqliteConnectionStore {
     path: PathBuf,
     connection: Arc<Mutex<Connection>>,
     maximum_connections: usize,
+}
+
+/// The Connections database is its own evidence authority: its three
+/// evidence tables are delivered after cursors kept beside them (migration
+/// 14, issue #425).
+impl crate::storage::standalone_authority_events::StandaloneEvidenceAuthority
+    for SqliteConnectionStore
+{
+    fn evidence_store(&self) -> crate::storage::StandaloneEvidenceStore {
+        crate::storage::StandaloneEvidenceStore::Connections
+    }
+
+    fn evidence_sources(
+        &self,
+    ) -> &'static [crate::storage::standalone_authority_events::StandaloneEvidenceSource] {
+        use crate::storage::standalone_authority_events::StandaloneEvidenceSource;
+        &[
+            StandaloneEvidenceSource::ConnectionChange,
+            StandaloneEvidenceSource::LocalSecretChange,
+            StandaloneEvidenceSource::CatalogChange,
+        ]
+    }
+
+    fn evidence_connection(&self) -> MutexGuard<'_, Connection> {
+        self.connection_guard()
+    }
 }
 
 /// The standalone record surface. Create, replace and delete are told who is
@@ -4315,6 +4366,8 @@ fn validate_schema(connection: &Connection, path: &Path) -> Result<(), Connectio
         "SELECT sequence, event_id, operation_id, actor_user_id, actor_issuer, actor_kind, actor_auth_mode, action, connection_id, prior_version, new_version, committed_at FROM connection_change_evidence LIMIT 0",
         "SELECT sequence, event_id, operation_id, actor_user_id, actor_issuer, actor_kind, actor_auth_mode, action, secret_id, prior_version, new_version, reencrypted_count, committed_at FROM connection_local_secret_change_evidence LIMIT 0",
         "SELECT sequence, event_id, operation_id, actor_user_id, actor_issuer, actor_kind, actor_auth_mode, action, connection_id, prior_version, new_version, overlay_revision, committed_at FROM catalog_change_evidence LIMIT 0",
+        "SELECT singleton, authority_id, created_at FROM authority_event_state LIMIT 0",
+        "SELECT source, position, delivered_events, advanced_at FROM authority_event_cursors LIMIT 0",
     ] {
         connection
             .prepare(query)

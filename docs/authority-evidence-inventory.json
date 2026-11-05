@@ -67,6 +67,31 @@
           "anchor": "pub(crate) struct AuthorityEventRetention"
         }
       ]
+    },
+    "standalone_cursor_dispatch": {
+      "description": "Standalone mode has no journal. Each SQLite store that owns an authority (the token database, and the Connections database for Connection, local-secret and catalog evidence) is its own evidence authority, with a persisted authority_id in its authority_event_state table, written once. Its evidence tables' AUTOINCREMENT sequences are commit order within each table, and each table is delivered after its own cursor in the same file's authority_event_cursors (token database open-time schema; Connections schema migration 14). With AUTHORITY_EVENT_SINK=log or file, one task reads at most 100 rows after each cursor, projects them into authority_event_delivery.v1 records whose actor and resource are keyed safe references under that store's authority_id, offers them to the sink, and only then advances the cursor by compare-and-set in an IMMEDIATE transaction: at least once, deduplicated on (authority_id, event_id), retried with the 0.5 s to 60 s backoff, never skipping a row, and stalling a table at a row it cannot project. The record carries no shared security revision (null), no token revision (null before and after) and, for a re-encryption batch, no secret (a fixed local-secret-store reference on the maintenance axis). Nothing is delivered inside the authority's transaction, and evidence is never pruned. With AUTHORITY_EVENT_SINK=none nothing is delivered, and AUTHORITY_EVIDENCE_DURABILITY=required refuses to start. Not authority_event.v1, for the same reasons as journaled_dispatch.",
+      "sources": [
+        {
+          "path": "gateway/src/storage/standalone_authority_events.rs",
+          "anchor": "pub(crate) const AUTHORITY_EVENT_TABLES_SQL"
+        },
+        {
+          "path": "gateway/src/storage/standalone_authority_events.rs",
+          "anchor": "pub(crate) fn advance("
+        },
+        {
+          "path": "gateway/src/authority_events/standalone.rs",
+          "anchor": "pub(crate) async fn run_standalone_dispatcher("
+        },
+        {
+          "path": "gateway/src/authority_events/standalone_delivery.rs",
+          "anchor": "pub(crate) fn project_standalone("
+        },
+        {
+          "path": "gateway/src/connections/store.rs",
+          "anchor": "const MIGRATION_14_SQL"
+        }
+      ]
     }
   },
   "groups": [
@@ -688,12 +713,11 @@
       "record": "Current records and revisions are atomic. The same database's connection_change_evidence table (Connections schema migration 12, no foreign key) keeps one append-only row per committed create, replace and credential-axis change: actor (subject, kind, auth mode and, for a principal that has one, canonical issuer, with the same pairing CHECK as PostgreSQL migration 24 and every column required), action, event/operation UUIDs, Connection ID, the revision before and after on the action's axis (connection_revision; credential_revision for credential.binding_change), a commit-ordered sequence and the change's own committed_at. No specification, endpoint, binding or bound secret ID. Rows are never pruned, and import-standalone does not carry them.",
       "actor": "The authenticated principal the admin endpoints pass through the control plane and the managed-store adapter as a ChangeActor, committed with the change: the subject (1 to 4096 bytes), actor_kind (principal or service_token), actor_auth_mode and the canonical actor_issuer of a principal that has one (1 to 4096 bytes). A keyed safe actor reference is absent.",
       "identity": "Generated event_id/operation_id UUIDs per store call (not bound to a client idempotency key), Connection ID, prior/new revision per axis, store sequence and the process-clock committed_at (the record's updated_at). Standalone mode has no shared security revision and no database clock.",
-      "delivery": "post_commit_telemetry",
+      "delivery": "standalone_cursor_dispatch",
       "disposition": [
-        "missing_metadata",
-        "missing_delivery"
+        "missing_metadata"
       ],
-      "follow_up": "PR4 follow-up: a caller-bound operation identity at the store, and delivery from this same database (standalone mode has no journal or dispatcher), with no audit-database dual write. Catalog/overlay publication in this database is its own row (catalog_standalone); the PostgreSQL create/replace evidence (connection_postgres) is still open. Issuer, actor kind and auth mode are recorded.",
+      "follow_up": "PR4 follow-up: a caller-bound operation identity at the store. Delivered from this same database since Connections schema migration 14 (standalone_cursor_dispatch), with no audit-database dual write; a credential.binding_change is delivered as the Connection's, on the credential axis. Catalog/overlay publication in this database is its own row (catalog_standalone). Issuer, actor kind and auth mode are recorded.",
       "sources": [
         {
           "path": "gateway/src/connections/store.rs",
@@ -756,6 +780,10 @@
         {
           "path": "gateway/src/connections/store_tests.rs",
           "anchor": "fn change_evidence_bounds_match_the_migration("
+        },
+        {
+          "path": "gateway/src/authority_events/standalone_tests.rs",
+          "anchor": "async fn every_owning_stores_evidence_is_delivered_in_commit_order_under_its_own_authority("
         }
       ],
       "required_durability_supported": false,
@@ -891,12 +919,11 @@
       "record": "connection_change_evidence (no foreign key) keeps the deletion's actor (subject, kind, auth mode and, for a principal that has one, canonical issuer, with the same pairing CHECK as PostgreSQL migration 24 and every column required), action, event/operation UUIDs, Connection ID and prior connection revision with no successor after the record, bindings, catalogs and status have cascaded, beside the record's earlier create/replace rows. Stale ETag, dependency, missing record and an unrecordable actor write no row.",
       "actor": "The authenticated principal passed through the managed-store adapter as a ChangeActor, the same one the PostgreSQL store records: subject (1 to 4096 bytes), actor_kind, actor_auth_mode and canonical actor_issuer, committed with the delete and retained after it.",
       "identity": "Generated event_id/operation_id UUIDs, Connection ID, prior revision, store sequence and process-clock committed_at. A lost delete response is reconciled from the Connection's evidence rows; a blind retry is NotFound and records nothing.",
-      "delivery": "post_commit_telemetry",
+      "delivery": "standalone_cursor_dispatch",
       "disposition": [
-        "missing_metadata",
-        "missing_delivery"
+        "missing_metadata"
       ],
-      "follow_up": "PR4 follow-up: a caller-bound operation identity and delivery from this same database; standalone mode has no journal. Issuer, actor kind and auth mode are recorded.",
+      "follow_up": "PR4 follow-up: a caller-bound operation identity. Delivered from this same database since Connections schema migration 14 (standalone_cursor_dispatch); standalone mode has no journal. Issuer, actor kind and auth mode are recorded.",
       "sources": [
         {
           "path": "gateway/src/connections/store.rs",
@@ -931,6 +958,10 @@
         {
           "path": "gateway/src/connections/store_tests.rs",
           "anchor": "fn empty_openapi_catalog_is_removed_on_incompatible_update_and_delete_cascades("
+        },
+        {
+          "path": "gateway/src/authority_events/standalone_tests.rs",
+          "anchor": "async fn a_sink_outage_retries_the_same_batch_and_never_advances_past_it("
         }
       ],
       "required_durability_supported": false,
@@ -1073,12 +1104,11 @@
       "record": "Current catalog revisions, entries and dependencies and the overlay (with its last writer's subject) are replaced atomically. The same database's catalog_change_evidence table (Connections schema migration 13, no foreign key) keeps one append-only row per committed publication: actor (subject, kind, auth mode and, for a principal that has one, canonical issuer, with migration 12's bounds and pairing CHECK and every column required), action, event/operation UUIDs, Connection ID, the catalog revision before (none for a first catalog) and after, the overlay revision the published catalog was compiled from (0 for none; none for MCP), a commit-ordered sequence and the publication's own committed_at, under PostgreSQL migration 23's action vocabulary and revision CHECKs. No specification, digest, tool or resource name, definition, overlay document, source report, enum value, endpoint or binding. A stale Connection ETag, a stale catalog, spec or overlay revision, a mismatched compiled overlay revision, a bound, a kind mismatch and an unrecordable actor write none. Rows outlive the catalogs they replaced and the Connection whose deletion cascades the current ones; they are never pruned, and import-standalone does not carry them.",
       "actor": "The authenticated principal the refresh, OpenAPI registration and overlay endpoints pass through the MCP and OpenAPI catalog services and the managed-store adapter as a ChangeActor, committed with the publication: the subject (1 to 4096 bytes), actor_kind (principal or service_token), actor_auth_mode and the canonical actor_issuer of a principal that has one (1 to 4096 bytes). A keyed safe actor reference is absent.",
       "identity": "Generated event_id/operation_id UUIDs per store call (not bound to a client idempotency key), Connection ID, the catalog revision transition and compiled overlay revision, store sequence and the process-clock committed_at (the catalog's refreshed_at). Standalone mode has no shared security revision and no database clock; catalog revisions restart when a Connection re-enters a managed kind, so a Connection's rows are ordered by sequence.",
-      "delivery": "post_commit_telemetry",
+      "delivery": "standalone_cursor_dispatch",
       "disposition": [
-        "missing_metadata",
-        "missing_delivery"
+        "missing_metadata"
       ],
-      "follow_up": "PR4 follow-up: a caller-bound operation identity at the store, and delivery from this same database (standalone mode has no journal or dispatcher), with no audit-database dual write. Catalogs removed by a Connection kind change are connection.replace evidence (connection_standalone). Issuer, actor kind and auth mode are recorded.",
+      "follow_up": "PR4 follow-up: a caller-bound operation identity at the store. Delivered from this same database since Connections schema migration 14 (standalone_cursor_dispatch), with no audit-database dual write, on the catalog axis under a reference to the Connection's catalog; the compiled overlay revision stays in the row. Catalogs removed by a Connection kind change are connection.replace evidence (connection_standalone). Issuer, actor kind and auth mode are recorded.",
       "sources": [
         {
           "path": "gateway/src/connections/store.rs",
@@ -1157,6 +1187,10 @@
         {
           "path": "gateway/src/connections/store_tests.rs",
           "anchor": "fn openapi_overlay_catalog_reports_and_enum_prune_are_one_atomic_revision("
+        },
+        {
+          "path": "gateway/src/authority_events/standalone_tests.rs",
+          "anchor": "async fn an_unprojectable_row_stalls_its_table_and_is_never_skipped("
         }
       ],
       "required_durability_supported": false,
@@ -1192,12 +1226,11 @@
       "record": "Current sealed record, version and timestamps; rotation replaces material and deletion removes it. connection_local_secret_change_evidence (Connections schema migration 12, no foreign key) keeps one append-only row per committed create, rotate, delete and non-empty re-encryption batch: actor (subject, kind, auth mode and, for a principal that has one, canonical issuer, with the same pairing CHECK as PostgreSQL migration 24 and every column required), action, event/operation UUIDs, the gateway-minted secret ID and its version before/after, or for a batch only how many envelopes it rewrote. Never the label, purpose, plaintext, ciphertext, nonce or key ID. Not found, purpose mismatch, dependency conflict and an empty batch write none.",
       "actor": "Admin endpoints pass the authenticated principal as a ChangeActor: subject (1 to 4096 bytes), actor_kind, actor_auth_mode and canonical actor_issuer. The connection-secrets reencrypt command records the fixed label operator:connection-secrets-reencrypt as a system actor (kind and auth mode system, no issuer), which is not a named human.",
       "identity": "Generated event/operation UUIDs per store call, the local secret ID with its version axis (no successor on delete), or the batch count in the maintenance shape with no revision, store sequence and process-clock committed_at (a rotation's rotated_at). The secret ID is an internal identifier; a delivered event would need a keyed reference for it.",
-      "delivery": "post_commit_telemetry",
+      "delivery": "standalone_cursor_dispatch",
       "disposition": [
-        "missing_metadata",
-        "missing_delivery"
+        "missing_metadata"
       ],
-      "follow_up": "PR4 follow-up: a caller-bound operation identity, and delivery from this same database with keyed references for the secret ID. import-standalone does not carry these rows. Issuer, actor kind and auth mode are recorded.",
+      "follow_up": "PR4 follow-up: a caller-bound operation identity. Delivered from this same database since Connections schema migration 14 (standalone_cursor_dispatch), with a keyed reference for the secret ID; a re-encryption batch, which names no secret, is delivered on the maintenance axis under a fixed reference to the local-secret store. import-standalone does not carry these rows. Issuer, actor kind and auth mode are recorded.",
       "sources": [
         {
           "path": "gateway/src/connections/store.rs",
@@ -1256,6 +1289,10 @@
         {
           "path": "gateway/src/admin_connections_app_tests.rs",
           "anchor": "async fn connection_secret_admin_crud_is_safe_permissioned_and_preconditioned("
+        },
+        {
+          "path": "gateway/src/authority_events/standalone_delivery_tests.rs",
+          "anchor": "fn revisions_follow_each_tables_transition("
         }
       ],
       "required_durability_supported": false,
@@ -1464,12 +1501,11 @@
       "record": "Token row with hash and created_by/created_at as before. The same database's service_token_change_evidence (no foreign key) keeps one append-only service_token.issue row per committed create: actor (subject, kind, auth mode and canonical issuer), event/operation UUIDs, token ID and committed_at (the token's own created_at), never the returned plaintext, its hash, the display prefix or the scopes. Tokens created before this build have no issue row and keep created_by as their only record; nothing is backfilled. import-standalone does not carry these rows.",
       "actor": "The authenticated principal the admin create endpoint passes through ServiceTokenStore as a ChangeActor, committed with the create: the subject (1 to 4096 bytes), actor_kind (principal or service_token), actor_auth_mode and the canonical actor_issuer of a principal that has one (1 to 4096 bytes). created_by still names the creator on the token row.",
       "identity": "Generated event_id/operation_id UUIDs, token ID, a store sequence and the process-clock committed_at. SQLite token rows have no revision chain, so the row records no prior/new revision; no caller-bound operation ID.",
-      "delivery": "post_commit_telemetry",
+      "delivery": "standalone_cursor_dispatch",
       "disposition": [
-        "missing_metadata",
-        "missing_delivery"
+        "missing_metadata"
       ],
-      "follow_up": "PR4: a store-owned revision per change; delivery from this same database, with no audit-database dual write.",
+      "follow_up": "PR4: a store-owned revision per change (the delivered record says null before and after rather than inventing one). Delivered from this same database after a cursor created on open (standalone_cursor_dispatch), with no audit-database dual write.",
       "sources": [
         {
           "path": "gateway/src/auth/tokens.rs",
@@ -1524,6 +1560,10 @@
         {
           "path": "gateway/src/admin_tokens_app_tests.rs",
           "anchor": "async fn admin_token_create_records_the_authenticated_actor_as_issue_evidence_sqlite("
+        },
+        {
+          "path": "gateway/src/authority_events/standalone_tests.rs",
+          "anchor": "async fn a_restart_resumes_after_the_cursor_under_the_persisted_authority("
         }
       ],
       "required_durability_supported": false,
@@ -1693,12 +1733,11 @@
       "record": "Current hash/revoked_at replaces earlier state and the creator is unchanged. The same database's service_token_change_evidence table (created on open, no foreign key) keeps one append-only row per committed rotate/revoke: actor (subject, kind, auth mode and canonical issuer, the last three in columns the store adds to an older database on open, with the same CHECK as PostgreSQL migration 24), action, event/operation UUIDs and committed_at, never token material. Repeated revoke, rotate of a revoked token and an unknown ID write none. import-standalone does not carry these rows.",
       "actor": "The authenticated principal the admin endpoint passes through ServiceTokenStore as a ChangeActor, committed with the change: the subject (1 to 4096 bytes), actor_kind (principal or service_token), actor_auth_mode and the canonical actor_issuer of a principal that has one (1 to 4096 bytes). Rows written before the store added those columns record none of the three, and none is guessed.",
       "identity": "Generated event_id/operation_id UUIDs, token ID, a store sequence and the process-clock committed_at (the revoke's own revoked_at). SQLite token rows have no revision chain, so the row records no prior/new revision; no caller-bound operation ID.",
-      "delivery": "post_commit_telemetry",
+      "delivery": "standalone_cursor_dispatch",
       "disposition": [
-        "missing_metadata",
-        "missing_delivery"
+        "missing_metadata"
       ],
-      "follow_up": "PR4: a store-owned revision per change; delivery from this same database, with no audit-database dual write. Token issue is recorded in the same table (token_issue_standalone). Issuer, actor kind and auth mode are recorded.",
+      "follow_up": "PR4: a store-owned revision per change (the delivered record says null before and after rather than inventing one). Delivered from this same database after a cursor created on open (standalone_cursor_dispatch), with no audit-database dual write. Token issue is recorded in the same table (token_issue_standalone). Issuer, actor kind and auth mode are recorded.",
       "sources": [
         {
           "path": "gateway/src/auth/tokens.rs",
@@ -1765,6 +1804,10 @@
         {
           "path": "gateway/src/auth/tokens.rs",
           "anchor": "fn an_older_evidence_table_gains_the_actor_columns_once_and_keeps_its_rows("
+        },
+        {
+          "path": "gateway/src/authority_events/standalone_tests.rs",
+          "anchor": "async fn a_crash_between_acceptance_and_the_cursor_advance_redelivers_identical_records("
         }
       ],
       "required_durability_supported": false,

@@ -12,8 +12,8 @@
 //! Three places enforce it:
 //!
 //! - **Startup.** A configuration that enables an unsupported change on its
-//!   own (`ADMIN_SESSION_MODE=standalone_memory`), or a cluster replica that
-//!   would journal evidence without a sink to deliver it, is refused by the
+//!   own (`ADMIN_SESSION_MODE=standalone_memory`), or a gateway of either mode
+//!   that would record evidence without a sink to deliver it, is refused by the
 //!   configuration compiler (`config::authority_events`, `config::storage`).
 //! - **Requests.** Every admin endpoint that makes one of the changes below
 //!   asks [`AuthorityEvidenceGate::admit`] once the caller is authorized and

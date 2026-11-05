@@ -5587,7 +5587,11 @@ async fn catalog_evidence_records_the_whole_actor_for_every_catalog_action() {
     }
 
     let api = store
-        .create(http_candidate("Actor API"), &ChangeActor::for_test("creator"), None)
+        .create(
+            http_candidate("Actor API"),
+            &ChangeActor::for_test("creator"),
+            None,
+        )
         .await
         .expect("OpenAPI connection should create");
     let digest = reservation_spec_digest();
@@ -5751,7 +5755,11 @@ async fn refused_and_stale_catalog_writes_record_no_evidence() {
         .await
         .expect("the MCP catalog publishes");
     let api = store
-        .create(http_candidate("Refused API"), &ChangeActor::for_test("creator"), None)
+        .create(
+            http_candidate("Refused API"),
+            &ChangeActor::for_test("creator"),
+            None,
+        )
         .await
         .expect("OpenAPI connection should create");
     let digest = reservation_spec_digest();

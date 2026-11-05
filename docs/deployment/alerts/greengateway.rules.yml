@@ -254,6 +254,31 @@ groups:
           summary: Standalone authority changes were refused because their evidence could not be written
           runbook_url: https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#standalone-evidence-failures
 
+      # Standalone delivery (no journal): the dispatcher publishes its backlog
+      # gauges only where AUTHORITY_EVENT_SINK is set, so the gauge's presence is
+      # the gate, and each standalone process is its own deliverer.
+      - alert: GreenGatewayStandaloneAuthorityEventDeliveryLag
+        expr: |
+          max by (job, instance, deployment_mode) (
+            greengateway_standalone_authority_event_oldest_undelivered_age_seconds{job="greengateway",deployment_mode="standalone"} > 120
+          )
+          and on (job, instance) (up{job="greengateway",deployment_mode="standalone"} == 1)
+        for: 5m
+        labels: {severity: warning, owner: gateway-operations}
+        annotations:
+          summary: Committed standalone authority events are waiting for delivery
+          runbook_url: https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#standalone-authority-event-delivery
+
+      - alert: GreenGatewayStandaloneAuthorityEventDeliveryFailures
+        expr: |
+          sum by (job, instance, deployment_mode) (increase(greengateway_standalone_authority_event_delivery_failures_total{job="greengateway",deployment_mode="standalone"}[5m])) > 0
+          and on (job, instance) (up{job="greengateway",deployment_mode="standalone"} == 1)
+        for: 10m
+        labels: {severity: warning, owner: gateway-operations}
+        annotations:
+          summary: Standalone authority-event delivery steps keep failing
+          runbook_url: https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#standalone-authority-event-delivery
+
       # Retained rows fall only through retention, so a leader whose retention is
       # failing still reports a lower bound: capacity rules need no freshness gate.
       - alert: GreenGatewayAuthorityEventJournalFull

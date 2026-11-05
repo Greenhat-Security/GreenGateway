@@ -53,6 +53,15 @@
 //! refused with a [`ProjectionError`] and the dispatcher stops there rather
 //! than skipping it. No error carries an identifier, a reference or key
 //! material.
+//!
+//! The record, its errors and the actor projection are shared with standalone
+//! mode, whose evidence rows are delivered straight from the SQLite stores
+//! that own them (`super::standalone_delivery`); only the journal's own
+//! projection below needs the `postgres` feature.
+
+// A build without the `postgres` feature projects standalone rows only, so
+// the journal's actions and transitions have no caller there.
+#![cfg_attr(not(feature = "postgres"), allow(dead_code))]
 
 use std::fmt;
 
@@ -61,6 +70,7 @@ use uuid::Uuid;
 
 use super::pseudonym::{PseudonymError, PseudonymKeyring, ReferenceDomain};
 use crate::auth::change_actor::{auth_mode_agrees, ActorKind};
+#[cfg(feature = "postgres")]
 use crate::storage::postgres_authority_events::{JournalSource, JournaledEvidence};
 
 /// The `schema_version` of every delivered record.
@@ -69,7 +79,7 @@ pub(crate) const DELIVERY_SCHEMA_VERSION: &str = "authority_event_delivery.v1";
 /// The only result a delivered record carries: the evidence describes a
 /// committed change. Refused, rolled-back and no-op changes write no
 /// evidence, so they are never delivered.
-const RESULT_COMMITTED: &str = "committed";
+pub(super) const RESULT_COMMITTED: &str = "committed";
 
 // The evidence tables' closed action vocabularies (migrations 16 and 18,
 // the service-token issue since migration 27, the Connection create, replace
@@ -246,6 +256,7 @@ impl Transition {
     }
 }
 
+#[cfg(feature = "postgres")]
 fn action_shape(source: JournalSource, action: &str) -> Option<ActionShape> {
     match (source, action) {
         (JournalSource::ConnectionChange, ACTION_CONNECTION_CREATE) => Some(ActionShape {
@@ -310,6 +321,7 @@ fn action_shape(source: JournalSource, action: &str) -> Option<ActionShape> {
 }
 
 /// Project one journaled evidence row under `keyring`.
+#[cfg(feature = "postgres")]
 pub(crate) fn project(
     evidence: &JournaledEvidence,
     keyring: &PseudonymKeyring,
@@ -407,7 +419,13 @@ pub(crate) fn project(
         _ => return Err(ProjectionError::MissingEvidence),
     }
     .map_err(ProjectionError::Reference)?;
-    let actor = project_actor(evidence, actor, keyring)?;
+    let actor = project_actor(
+        actor,
+        evidence.actor_kind.as_deref(),
+        evidence.actor_auth_mode.as_deref(),
+        evidence.actor_issuer.as_deref(),
+        keyring,
+    )?;
 
     Ok(DeliveryRecord {
         schema_version: DELIVERY_SCHEMA_VERSION.to_owned(),
@@ -432,23 +450,22 @@ pub(crate) fn project(
     })
 }
 
-/// The actor as the evidence recorded it. A row records its kind, auth mode
-/// and issuer together or not at all (migration 24's CHECK), in a pairing
-/// authentication produces; anything else is out of shape. An issuer is
-/// referenced, never carried.
-fn project_actor(
-    evidence: &JournaledEvidence,
+/// The actor as the evidence recorded it: its recorded `subject`, and its
+/// `kind`, `auth_mode` and `issuer` as stored. A row records the last three
+/// together or not at all (migration 24's CHECK, and the standalone tables'
+/// own), in a pairing authentication produces; anything else is out of
+/// shape. An issuer is referenced, never carried.
+pub(super) fn project_actor(
     subject: &str,
+    kind: Option<&str>,
+    auth_mode: Option<&str>,
+    issuer: Option<&str>,
     keyring: &PseudonymKeyring,
 ) -> Result<DeliveryActor, ProjectionError> {
     let recorded_ref = keyring
         .derive(ReferenceDomain::ActorRecorded, &[subject])
         .map_err(ProjectionError::Reference)?;
-    let (kind, auth_mode, issuer_ref) = match (
-        evidence.actor_kind.as_deref(),
-        evidence.actor_auth_mode.as_deref(),
-        evidence.actor_issuer.as_deref(),
-    ) {
+    let (kind, auth_mode, issuer_ref) = match (kind, auth_mode, issuer) {
         // Committed before migration 24: nothing to say, and nothing guessed.
         (None, None, None) => (None, None, None),
         (Some(kind), Some(auth_mode), issuer) => {
@@ -483,13 +500,13 @@ fn project_actor(
     })
 }
 
-fn required(value: Option<&str>) -> Result<&str, ProjectionError> {
+pub(super) fn required(value: Option<&str>) -> Result<&str, ProjectionError> {
     value
         .filter(|value| !value.is_empty())
         .ok_or(ProjectionError::MissingEvidence)
 }
 
-fn positive(value: Option<i64>) -> Result<i64, ProjectionError> {
+pub(super) fn positive(value: Option<i64>) -> Result<i64, ProjectionError> {
     match value {
         Some(value) if value >= 1 => Ok(value),
         Some(_) => Err(ProjectionError::InvalidEvidence),
@@ -497,7 +514,7 @@ fn positive(value: Option<i64>) -> Result<i64, ProjectionError> {
     }
 }
 
-fn non_negative(value: Option<i64>) -> Result<i64, ProjectionError> {
+pub(super) fn non_negative(value: Option<i64>) -> Result<i64, ProjectionError> {
     match value {
         Some(value) if value >= 0 => Ok(value),
         Some(_) => Err(ProjectionError::InvalidEvidence),
@@ -507,7 +524,7 @@ fn non_negative(value: Option<i64>) -> Result<i64, ProjectionError> {
 
 /// The lowercase hyphenated form of a versioned RFC 4122 UUID, the shape the
 /// schema requires. The stores mint v4 UUIDs; anything else is refused.
-fn canonical_uuid(value: &str) -> Result<String, ProjectionError> {
+pub(super) fn canonical_uuid(value: &str) -> Result<String, ProjectionError> {
     let parsed = Uuid::parse_str(value).map_err(|_| ProjectionError::InvalidEvidence)?;
     let version = parsed.get_version_num();
     if !(1..=8).contains(&version) || parsed.get_variant() != uuid::Variant::RFC4122 {
@@ -516,9 +533,10 @@ fn canonical_uuid(value: &str) -> Result<String, ProjectionError> {
     Ok(parsed.hyphenated().to_string())
 }
 
-/// `YYYY-MM-DDTHH:MM:SS[.fraction]Z`, as the store's `to_char` renders the
-/// database clock.
-fn committed_at_in_shape(value: &str) -> bool {
+/// `YYYY-MM-DDTHH:MM:SS[.fraction]Z`, as the PostgreSQL store's `to_char`
+/// renders the database clock and as a standalone store formats its process
+/// clock (RFC 3339 in UTC).
+pub(super) fn committed_at_in_shape(value: &str) -> bool {
     let bytes = value.as_bytes();
     if bytes.len() < 20 || bytes.len() > MAX_COMMITTED_AT_CHARS || !value.is_ascii() {
         return false;
@@ -547,6 +565,6 @@ fn committed_at_in_shape(value: &str) -> bool {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "postgres"))]
 #[path = "delivery_tests.rs"]
 mod tests;

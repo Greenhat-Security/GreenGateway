@@ -94,6 +94,9 @@ pub(crate) mod postgres_tool_names;
 pub mod postgres_tools;
 mod principal;
 mod service_token;
+/// The standalone stores' authority-event delivery state: the persisted
+/// authority ID and a cursor per evidence table (issue #425).
+pub(crate) mod standalone_authority_events;
 
 // `pub(crate)`: the PostgreSQL sink's tests (`audit::postgres_sink`) reuse
 // its per-test database helpers rather than carrying a second copy.
@@ -320,15 +323,18 @@ fn join_error_operation(join_error: &tokio::task::JoinError) -> &'static str {
     "repository_blocking_task"
 }
 
-/// The standalone SQLite store whose evidence insert refused an authority
-/// change. Each variant is also the fixed `store` label of
-/// `greengateway_standalone_evidence_failures_total`, spelled as
+/// The standalone SQLite store that owns an authority's evidence: the one
+/// whose evidence insert refused a change, or whose evidence is delivered.
+/// Each variant is also the fixed `store` label of
+/// `greengateway_standalone_evidence_failures_total` and of the standalone
+/// authority-event delivery metrics, spelled as
 /// `greengateway_sqlite_storage_checks_total` spells that file.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StandaloneEvidenceStore {
-    /// `SERVICE_TOKEN_SQLITE_PATH`: service-token rotate and revoke.
+    /// `SERVICE_TOKEN_SQLITE_PATH`: service-token issue, rotate and revoke.
     ServiceTokens,
-    /// `CONNECTIONS_SQLITE_PATH`: Connection and local-secret changes.
+    /// `CONNECTIONS_SQLITE_PATH`: Connection, local-secret and catalog
+    /// changes.
     Connections,
 }
 

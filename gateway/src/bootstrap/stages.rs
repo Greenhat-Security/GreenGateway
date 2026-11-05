@@ -349,6 +349,19 @@ impl StartupStages for ProcessStartup {
             }
             apps
         };
+        // Standalone delivery starts the same way, for the same reason: its
+        // keyring may sit behind a network secret provider, and a gateway
+        // configured to deliver evidence never serves without it.
+        let apps = {
+            let mut apps = apps;
+            if let Some(startup) = apps.standalone_authority_events.take() {
+                if let Err(error) = Box::pin(startup.start(&lifecycle, &audit_log)).await {
+                    stop_unserved_gateway(&lifecycle, shutdown_budget).await;
+                    return Err(Box::new(error));
+                }
+            }
+            apps
+        };
         Ok(ActivatedGateway {
             apps,
             listen,

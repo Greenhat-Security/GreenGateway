@@ -1317,7 +1317,8 @@ fn rule_fixture(rule: ConfigRule) -> (&'static [(&'static str, &'static str)], &
             ],
             "AUTHORITY_EVIDENCE_DURABILITY",
         ),
-        // The standalone session store best effort accepts.
+        // The standalone session store best effort accepts, with the sink
+        // required mode needs.
         ConfigRule::AuthorityEvidenceUnsupportedConfiguration => (
             &[
                 ("AUTH_PROVIDERS", ADMIN_LOGIN_PROVIDER_DOCUMENT),
@@ -1325,6 +1326,8 @@ fn rule_fixture(rule: ConfigRule) -> (&'static [(&'static str, &'static str)], &
                 ("ADMIN_PREFIX", "/operations"),
                 ("ADMIN_SESSION_MODE", "standalone_memory"),
                 ("AUTHORITY_EVIDENCE_DURABILITY", "required"),
+                ("AUTHORITY_EVENT_SINK", "log"),
+                ("AUTHORITY_PSEUDONYM_KEY_ALIAS", "pseudonym-a"),
             ],
             "AUTHORITY_EVIDENCE_DURABILITY",
         ),

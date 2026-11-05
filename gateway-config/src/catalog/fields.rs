@@ -1972,9 +1972,9 @@ pub const FIELDS: &[Field] = &[
         default: DefaultValue::Literal("none"),
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
-        state_backends: StateBackends::Cluster,
+        state_backends: StateBackends::Both,
         bundle: BundleMapping::Deployment { path: None },
-        cloudflare: Cloudflare::Excluded(CloudflareExclusion::ClusterMode),
+        cloudflare: Cloudflare::Forwarded,
     },
     // A host path, like AUDIT_LOG_FILE, that ADR-0008's bootstrap table does
     // not list.
@@ -1986,9 +1986,9 @@ pub const FIELDS: &[Field] = &[
         default: DefaultValue::Unset,
         blank: Blank::Unset,
         sensitivity: Sensitivity::HostPath,
-        state_backends: StateBackends::Cluster,
+        state_backends: StateBackends::Both,
         bundle: BundleMapping::Unplaced,
-        cloudflare: Cloudflare::Excluded(CloudflareExclusion::ClusterMode),
+        cloudflare: Cloudflare::Forwarded,
     },
     Field {
         id: "authority_pseudonym_key_alias",
@@ -1998,9 +1998,9 @@ pub const FIELDS: &[Field] = &[
         default: DefaultValue::Unset,
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
-        state_backends: StateBackends::Cluster,
+        state_backends: StateBackends::Both,
         bundle: BundleMapping::Deployment { path: None },
-        cloudflare: Cloudflare::Excluded(CloudflareExclusion::ClusterMode),
+        cloudflare: Cloudflare::Forwarded,
     },
     Field {
         id: "authority_pseudonym_previous_key_alias",
@@ -2010,9 +2010,9 @@ pub const FIELDS: &[Field] = &[
         default: DefaultValue::Unset,
         blank: Blank::Unset,
         sensitivity: Sensitivity::Public,
-        state_backends: StateBackends::Cluster,
+        state_backends: StateBackends::Both,
         bundle: BundleMapping::Deployment { path: None },
-        cloudflare: Cloudflare::Excluded(CloudflareExclusion::ClusterMode),
+        cloudflare: Cloudflare::Forwarded,
     },
     Field {
         id: "authority_event_journal_capacity",
