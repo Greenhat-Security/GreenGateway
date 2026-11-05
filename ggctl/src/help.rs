@@ -21,8 +21,9 @@ pub(crate) const OVERVIEW_USAGE: &[&str] = &[
 
 /// The overview's closing paragraphs.
 pub(crate) const OVERVIEW_NOTES: &[&str] = &[
-    "ggctl reads no configuration file and no environment variable, and makes no network \
-     request unless a command is given --server. It never accepts a secret as an argument: \
+    "ggctl reads no configuration file of its own and no environment variable, reads only \
+     the files its arguments name, and makes no network request unless a command is given \
+     --server. It never accepts a secret as an argument: \
      pass an admin bearer token with --token-stdin or --token-file.",
     "Reference: docs/ggctl.md",
 ];
