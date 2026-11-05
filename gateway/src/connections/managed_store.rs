@@ -619,7 +619,7 @@ impl ManagedConnectionStore {
         resources: &[StoredMcpResource],
         resource_templates: &[StoredMcpResourceTemplate],
         expected_catalog_revision: u64,
-        actor: &str,
+        actor: &ChangeActor,
     ) -> Result<StoredMcpCatalog, ConnectionStoreError> {
         // `expected_catalog_revision` is the catalog's own compare-and-swap
         // (`0` = no catalog yet). The connection ETag does not move on a
@@ -629,6 +629,7 @@ impl ManagedConnectionStore {
         // commit last. Both arms enforce it.
         match self {
             Self::Sqlite(store) => {
+                // Standalone MCP catalogs record no actor yet (#425).
                 let _ = actor;
                 let store = store.clone();
                 let id = id.clone();
@@ -877,7 +878,7 @@ impl ManagedConnectionStore {
         spec: &str,
         spec_digest: &str,
         entries: &[StoredOpenApiCatalogEntry],
-        actor: &str,
+        actor: &ChangeActor,
     ) -> Result<StoredOpenApiCatalog, ConnectionStoreError> {
         self.replace_openapi_catalog_with_overlay(
             id,
@@ -907,7 +908,7 @@ impl ManagedConnectionStore {
         entries: &[StoredOpenApiCatalogEntry],
         overlay: Option<&StoredOverlayWrite>,
         compiled_overlay_revision: u64,
-        actor: &str,
+        actor: &ChangeActor,
         policy_protected_names: &[String],
     ) -> Result<StoredOpenApiCatalog, ConnectionStoreError> {
         self.replace_openapi_catalog_with_overlay_and_enum_values(
@@ -939,13 +940,12 @@ impl ManagedConnectionStore {
         entries: &[StoredOpenApiCatalogEntry],
         overlay: Option<&StoredOverlayWrite>,
         compiled_overlay_revision: u64,
-        actor: &str,
+        actor: &ChangeActor,
         policy_protected_names: &[String],
         enum_values: &[StoredEnumSourceValueWrite],
     ) -> Result<StoredOpenApiCatalog, ConnectionStoreError> {
         match self {
             Self::Sqlite(store) => {
-                let _ = actor;
                 let store = store.clone();
                 let id = id.clone();
                 let expected_connection_etag = expected_connection_etag.clone();
@@ -953,7 +953,7 @@ impl ManagedConnectionStore {
                 let spec_digest = spec_digest.to_owned();
                 let entries = entries.to_vec();
                 let overlay = overlay.cloned();
-                let actor = actor.to_owned();
+                let actor = actor.clone();
                 let policy_protected_names = policy_protected_names.to_vec();
                 let enum_values = enum_values.to_vec();
                 blocking("openapi catalog replace", move || {

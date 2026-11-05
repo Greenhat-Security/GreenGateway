@@ -8833,7 +8833,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::record_catalog_change_evidence#1",
-      "sha256": "7703bb8317269a4a230827f47c4761d4f810735be51a5ca044ed1adb1db13c24",
+      "sha256": "abc43238557be529f6656cc1b01ebbb264cf8fa246026b68de4c9ba72f79f8e9",
       "owner": "GreenGateway maintainers",
       "purpose": "Appends one catalog change-evidence row through the caller's open PostgreSQL transaction (issue #425) and counts a refused insert on the in-process evidence-failure counter (issue #440); no new connection, endpoint or transport."
     },

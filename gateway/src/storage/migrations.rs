@@ -396,10 +396,11 @@ impl SchemaCompatibility {
 // the migration role ran the successor's `migrate up` while the prepared
 // replicas served, and both wrote the one table that migration changes with
 // the same explicit column list (`connections::pg_store::
-// record_catalog_change_evidence`). This build is not that successor: it
-// carries migration 25 byte for byte, so its migrator records the approved
-// checksum, but it serves only schema 26, so from a prepared fleet it is a
-// coordinated drain/migrate/restart like every other step.
+// record_catalog_change_evidence` as both releases had it, without the three
+// columns). This build is not that successor: it carries migration 25 byte
+// for byte, so its migrator records the approved checksum, but it serves only
+// schema 26, so from a prepared fleet it is a coordinated drain/migrate/restart
+// like every other step. Its catalog writer records all three columns.
 // `migration_twenty_five_is_the_extension_its_prepared_release_approved` pins
 // the manifest entry to the checksum that release approved, and the
 // published matrix's rolling step to both.
@@ -2542,7 +2543,7 @@ mod tests {
                         }
                     }),
                 }],
-                "migration-fixture",
+                &crate::auth::change_actor::ChangeActor::for_test("migration-fixture"),
             )
             .await
             .expect("fixture catalog should publish");
@@ -3585,8 +3586,9 @@ mod tests {
                 .expect("migrations through 24 should apply");
         }
 
-        // The column list `record_catalog_change_evidence` writes, in this
-        // build and in its prepared release alike.
+        // The column list `record_catalog_change_evidence` wrote in the
+        // prepared release and in the schema-25 release alike; this build
+        // also writes the three columns migration 25 adds.
         const PREPARED_INSERT: &str = "INSERT INTO greengateway.catalog_change_evidence \
                  (event_id, operation_id, actor_user_id, action, connection_id, \
                   prior_version, new_version, overlay_revision, security_revision) \
