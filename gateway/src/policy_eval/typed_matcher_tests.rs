@@ -230,7 +230,7 @@ proptest! {
         let plain = compile(document(without));
         let reader = person(Some(ISSUER), &["reader"], AuthMethod::Bearer);
         let with_facts = conditioned
-            .evaluate_tool_with_facts(&tool(&conditioned, authenticated(&reader)), &at(NOW))
+            .evaluate_tool_with_facts(&tool(&conditioned, authenticated(&reader)), &at(NOW), &mut NoStages)
             .unwrap();
         let expected = plain.evaluate_tool(&tool(&plain, authenticated(&reader))).unwrap();
         prop_assert_eq!(with_facts.logical(), expected.logical());
@@ -413,7 +413,11 @@ fn every_lane_refuses_to_guess_a_conditional_rule_it_cannot_evaluate() {
     let mut facts = PolicyFacts::uncaptured();
     facts.tool_arguments = Fact::Captured(json!({ "region": "eu" }));
     let result = compiled
-        .evaluate_tool_with_facts(&tool(&compiled, authenticated(&reader)), &facts)
+        .evaluate_tool_with_facts(
+            &tool(&compiled, authenticated(&reader)),
+            &facts,
+            &mut NoStages,
+        )
         .unwrap();
     assert_eq!(
         (result.logical(), result.reason()),
@@ -421,7 +425,11 @@ fn every_lane_refuses_to_guess_a_conditional_rule_it_cannot_evaluate() {
     );
     facts.tool_arguments = Fact::Captured(json!({ "region": "us" }));
     let result = compiled
-        .evaluate_tool_with_facts(&tool(&compiled, authenticated(&reader)), &facts)
+        .evaluate_tool_with_facts(
+            &tool(&compiled, authenticated(&reader)),
+            &facts,
+            &mut NoStages,
+        )
         .unwrap();
     assert_eq!(result.matched(), None);
 
@@ -681,7 +689,7 @@ fn an_organization_mapping_without_its_fact_is_indeterminate_in_every_lane() {
     );
     assert_eq!(
         compiled
-            .select_rate_lane_with_facts(&input, &facts)
+            .select_rate_lane_with_facts(&input, &facts, &mut NoStages)
             .unwrap()
             .matched(),
         Some(0)
@@ -777,13 +785,17 @@ fn facts_past_the_kernel_work_bounds_are_refused() {
         );
         assert_eq!(
             compiled
-                .evaluate_tool_with_facts(&tool(&compiled, PrincipalFact::Anonymous), &facts)
+                .evaluate_tool_with_facts(
+                    &tool(&compiled, PrincipalFact::Anonymous),
+                    &facts,
+                    &mut NoStages
+                )
                 .map(|_| ()),
             Err(EvaluationError::ContextTooLarge)
         );
         assert_eq!(
             compiled
-                .select_rate_lane_with_facts(&input, &facts)
+                .select_rate_lane_with_facts(&input, &facts, &mut NoStages)
                 .map(|_| ()),
             Err(EvaluationError::ContextTooLarge)
         );
