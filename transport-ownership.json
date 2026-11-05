@@ -10788,9 +10788,9 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::mcp::invocation_context_from_request#1",
-      "sha256": "1d2210f8eb3aec9cb1a92a08f5a2c5a8522e5a507c13b7f64b31d92735eb9cfd",
+      "sha256": "ba4b2c68cb3cba2fc1dcf8990e556d1e394735176b205563aa472e958e3b12f6",
       "owner": "GreenGateway maintainers",
-      "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review. Reviewed for #463: the item now also projects the authenticated Principal into the caller a signed caller assertion names (AttestedCaller::from_principal), a pure data copy that adds no network, process or transport capability."
+      "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review. Reviewed for #463: the item now also projects the authenticated Principal into the caller a signed caller assertion names (AttestedCaller::from_principal), a pure data copy that adds no network, process or transport capability. Reviewed for #243: the item also copies the authenticated Principal's verified organization (org_id) into the invocation context as a policy fact identity mappings read, a pure data copy that adds no network, process or transport capability."
     },
     {
       "file": "gateway/src/mcp.rs",
@@ -10979,9 +10979,9 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::middleware::rbac::rbac_middleware#1",
-      "sha256": "71ad797e8337593c2d836296f7d97b3807e46f869223143a6fd84b76740be163",
+      "sha256": "0b8e6218f00d6b632fc8b31ee7d57b7d87bfd5c31eddb982ed993d7657489b3b",
       "owner": "GreenGateway maintainers",
-      "purpose": "Issue #422 HTTP adapter: evaluate the admitted immutable policy snapshot and translate its result into existing audit and response behavior. Existing cfg/cfg_attr inputs only; no new transport, provider, resolver or process authority."
+      "purpose": "Issue #422 HTTP adapter: evaluate the admitted immutable policy snapshot and translate its result into existing audit and response behavior. Existing cfg/cfg_attr inputs only; no new transport, provider, resolver or process authority. Reviewed for #243: the decision is now asked with the facts serving_facts takes from the authenticated principal (its verified organization in mapped-role mode), a pure data read that adds no transport, provider, resolver or process authority."
     },
     {
       "file": "gateway/src/middleware/validate.rs",
@@ -11708,16 +11708,6 @@
       "sha256": "abf89a0dd5d2b68df48d2445831118062ac113c2f71cf08f3d392ad95b31637d",
       "owner": "policy evaluation typed matchers (#243)",
       "purpose": "The IpAddr value type for the canonical client address a source_network rule condition compares against policy CIDRs (issue #243, item 16). The address is a fact the caller supplies after trusted-proxy processing; the module only compares it with ipnet networks. No socket, resolver, connection or other network or process capability is introduced."
-    },
-    {
-      "file": "gateway/src/rbac/conditions.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::rbac::conditions::Fact#1",
-      "sha256": "8e0ffdb22c8f511ede041f1af313d228e69bf826c43f913254192913933d1ed7",
-      "owner": "policy evaluation typed matchers (#243)",
-      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) on the Captured variant of the typed-matcher fact, which no serving adapter constructs yet: policy validation refuses every document that uses identity mappings or rule conditions until an adapter captures their facts (#243, item 16). Dead-code gating only; no transport or process capability."
     },
     {
       "file": "gateway/src/rbac/policy.rs",
@@ -15297,6 +15287,26 @@
       "sha256": "29e10e1e2d0d1c1007e04707a14336f88c1af4564961dca384bd0c2e05df63a9",
       "owner": "GreenGateway maintainers: operator CLI (#242)",
       "purpose": "Reviewed for #242 PR 6 (ggctl init and convert): imports OpenOptionsExt to give each new bundle file mode 0600 on Unix when it is created with create_new. Local filesystem only; no network or process capability."
+    },
+    {
+      "file": "ggctl/src/output.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "ggctl::output::is_reparse_point#1",
+      "sha256": "6d1fa81e6bfd8253541831ad0154e2fe7be3b4eace213f4a4eca1635436cfa3e",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 (ggctl pin): imports the Windows MetadataExt to read the file attributes of the bundle.yaml entry, not followed, so a reparse point is refused like a link before the manifest is replaced, as the bundle reader refuses one. Read-only metadata; no network or process capability."
+    },
+    {
+      "file": "ggctl/src/output.rs",
+      "reasons": [
+        "capability-in-macro-input"
+      ],
+      "scope": "ggctl::output::impl  Replacement::create#1",
+      "sha256": "090b5c4f9d03d0196dbc22a32aafae1d1045ba3dbac1c050e5f2b3ff74141067",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 (ggctl pin): names the hidden replacement manifest beside bundle.yaml from the fixed manifest name, this process's own ID (std::process::id, read only, inside format!) and an attempt counter, creates it exclusively with create_new (mode 0600 on Unix), and writes and flushes it before it is renamed over bundle.yaml. Local filesystem only; no process is spawned or signalled and no network capability."
     },
     {
       "file": "ggctl/src/output.rs",

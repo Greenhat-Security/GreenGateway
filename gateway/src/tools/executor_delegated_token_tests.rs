@@ -1022,6 +1022,7 @@ async fn a_call_that_names_nobody_is_refused_before_any_exchange() {
         request_id: "request-anonymous".to_owned(),
         source_ip: "203.0.113.10".to_owned(),
         actor: None,
+        organization: None,
         caller: None,
         source: ToolInvocationSource::Mcp,
         admitted_deadline: None,

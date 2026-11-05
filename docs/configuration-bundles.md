@@ -254,7 +254,8 @@ are dropped, as the gateway compares issuers), or the `provider:<name>`
 boundary of an authentication provider configured without an issuer, with the
 name percent-encoded as the gateway encodes it. `operator` with
 `topology: cluster` is `schema.not_applicable`, because a cluster's policy is the
-server's. With a custom `ADMIN_PREFIX`, edit the two routes and the policy's pin.
+server's. With a custom `ADMIN_PREFIX`, edit the two routes, then run `ggctl pin`
+to update the policy's pin.
 
 ## Digests
 
@@ -262,6 +263,17 @@ server's. With a custom `ADMIN_PREFIX`, edit the two routes and the policy's pin
   bytes before the file is parsed (`bundle.digest_mismatch`), so a document whose
   bytes differ from what was reviewed is never interpreted. Pins are what
   `sha256sum` prints, so CI and reviewers can verify them with standard tools.
+- **Re-pinning.** [`ggctl pin BUNDLE`](ggctl.md#pin) is the only command that
+  rewrites pins, and it pins only files that validate. It reads the bundle with
+  this reader and every check but the pin comparison, and writes nothing unless
+  they all pass. Then it replaces only the digits of each pin that differs from
+  its file's SHA-256, so the rest of `bundle.yaml` stays byte for byte, comments
+  and order included, and replaces `bundle.yaml` atomically (a new hidden file,
+  flushed, renamed over it). A pin it must change has to be written as its 64
+  digits between double or single quotes, as `ggctl init` writes it; any other
+  spelling is `reference.pin_not_rewritable`. A linked `bundle.yaml`, as in a
+  Kubernetes atomic-writer volume, is never replaced. After an edit, run
+  `ggctl pin` and review the change together with the file it pins.
 - **Source digest.** The bundle's identity is `sha256:` and 64 lowercase hex
   digits over ADR-0004's `GGDIGEST` frame of the manifest's exact bytes, with
   kind `source`, media type `application/vnd.greengateway.bundle+yaml`, and the
@@ -511,6 +523,7 @@ can appear in one. A published code never changes meaning.
 | `reference.reserved_path` | A reference names `bundle.yaml`. |
 | `reference.duplicate_path` | Two references name the same file. |
 | `reference.invalid_digest` | A pin is not 64 lowercase hex digits. |
+| `reference.pin_not_rewritable` | `ggctl pin` must change a pin that is not written as its 64 digits between quotes (plain, or with escapes), so it cannot replace it in place; quote it. |
 | `reference.source_unsupported` | The resource cannot come from this source in this version. |
 | `reference.unresolved` | An unresolved placeholder. |
 | `secret.inline_value` | A sensitive setting holds a literal value. |
