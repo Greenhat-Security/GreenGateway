@@ -225,7 +225,6 @@ pub(crate) enum Code {
     McpConfigsInvalid,
     McpOauthUnavailable,
     // Bundle validation and the offline doctor.
-    ProductionValidatorsNotRun,
     WarningsAsErrors,
     RequiredCheckFailed,
     // The semantic diff.
@@ -469,7 +468,6 @@ impl Code {
         Self::McpUnsupportedVersion,
         Self::McpConfigsInvalid,
         Self::McpOauthUnavailable,
-        Self::ProductionValidatorsNotRun,
         Self::WarningsAsErrors,
         Self::RequiredCheckFailed,
         Self::DriftFound,
@@ -962,11 +960,6 @@ impl Code {
                 "mcp.oauth_unavailable",
                 "the server advertises no authorization server for its MCP endpoint, so it offers no OAuth template",
                 Invalid,
-            ),
-            Self::ProductionValidatorsNotRun => (
-                "validate.production_validators_not_run",
-                "the gateway's production policy and tools validators are not part of ggctl and did not run; the gateway can still refuse a document these checks accept",
-                Success,
             ),
             Self::WarningsAsErrors => (
                 "validate.warnings_as_errors",

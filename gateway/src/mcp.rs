@@ -508,7 +508,10 @@ fn mcp_tool_from_definition(definition: &ToolDefinition) -> Result<Tool, ErrorDa
         Arc::new(input_schema),
     );
     tool.title = definition.title.clone();
-    tool.annotations = definition.annotations.clone().map(Into::into);
+    tool.annotations = definition
+        .annotations
+        .clone()
+        .map(crate::tools::definitions::mcp_tool_annotations);
     Ok(tool)
 }
 
@@ -1057,6 +1060,7 @@ mod tests {
     use rmcp::model::{ClientJsonRpcMessage, ClientRequest};
 
     use super::*;
+    use crate::rbac::policy::PolicyFile;
     use crate::{
         audit::{self, AuditSink},
         config,

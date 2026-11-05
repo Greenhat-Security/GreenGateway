@@ -1,49 +1,14 @@
+//! Encoding and decoding values with the wire codecs a tool transform names.
+//! Which codecs exist, and their options, is
+//! `gateway_config::tools::codecs` (issue #242), re-exported here.
+
 pub mod decimal_scale;
 pub mod json_string;
 pub mod markdown_blocks;
 
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Codec {
-    DecimalScale {
-        scale: u8,
-        #[serde(default)]
-        wire_encoding: DecimalWireEncoding,
-        #[serde(default = "default_max_integer_digits")]
-        max_integer_digits: u8,
-    },
-    MarkdownBlocks {
-        dialect: MarkdownDialect,
-        #[serde(default = "default_markdown_input_bytes")]
-        max_input_bytes: usize,
-    },
-    JsonString,
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DecimalWireEncoding {
-    #[default]
-    IntegerString,
-    Integer,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MarkdownDialect {
-    Blocknote,
-}
-
-pub const fn default_max_integer_digits() -> u8 {
-    24
-}
-
-pub const fn default_markdown_input_bytes() -> usize {
-    65_536
-}
+pub use gateway_config::tools::codecs::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodecError {

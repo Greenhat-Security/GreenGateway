@@ -7,6 +7,7 @@
 //! be compared bucket for bucket.
 
 use super::*;
+use crate::rbac::rule::PrincipalMatch;
 use crate::rbac::{
     matcher::{method_matches, path_pattern_matches},
     Policy,

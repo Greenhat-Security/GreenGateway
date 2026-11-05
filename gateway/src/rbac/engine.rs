@@ -1,6 +1,6 @@
 use crate::auth;
 
-use super::policy::Policy;
+use super::policy::{Policy, RoleIdentity};
 
 /// Stateless role-to-permission policy evaluator.
 pub struct PolicyEngine {

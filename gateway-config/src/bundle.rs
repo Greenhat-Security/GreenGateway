@@ -30,10 +30,9 @@
 //! 5. `resource`: referenced policy and tools documents are read as strict
 //!    JSON at their exact declared `schema_version` and must pass their
 //!    published schemas; then the caller's [`ResourceValidators`] run. The
-//!    gateway supplies its production policy and tools validators there.
-//!    Those validators still live in the gateway crate, which `ggctl` cannot
-//!    link, so `ggctl` runs [`PublishedSchemasOnly`] and says so in every
-//!    report.
+//!    gateway and `ggctl` both pass [`ProductionValidators`], the policy and
+//!    tools loaders' own validating parses, which live in this crate
+//!    ([`crate::rbac`] and [`crate::tools`]).
 //! 6. `profile`: a bundled policy is held to the deployment profile's
 //!    invariants -- deny by default, enforce mode, no wildcard role for
 //!    `production` and, until acknowledgments exist, `migration`.
@@ -72,6 +71,8 @@ mod value;
 mod yaml;
 
 #[cfg(test)]
+mod production_tests;
+#[cfg(test)]
 mod property_tests;
 #[cfg(test)]
 mod tests;
@@ -81,7 +82,11 @@ use std::{collections::BTreeMap, path::Path};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::canonical_json;
+use crate::{
+    canonical_json,
+    rbac::Policy,
+    tools::definitions::{definitions_from_json_value, ToolDefinition},
+};
 
 pub use diagnostic::{BundleDiagnostic, Code, Pointer, Position, Severity};
 pub use document::{ApiVersion, Profile, POLICY_SCHEMA_VERSIONS, TOOLS_SCHEMA_VERSIONS};
@@ -132,13 +137,41 @@ pub trait ResourceValidators {
     fn tools(&self, document: Value) -> Option<Self::Tools>;
 }
 
+/// The production policy and tools validators: the validating parses
+/// environment mode loads the same documents with
+/// ([`Policy::validate_json_value`] and [`definitions_from_json_value`]), so
+/// a bundle these accept is one the gateway's policy and tools loaders
+/// accept. The gateway and `ggctl` both read bundles with these.
+///
+/// A validator's error can quote document values, so it is dropped here and
+/// the reader reports `resource.invalid` by code alone.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProductionValidators;
+
+impl ResourceValidators for ProductionValidators {
+    type Policy = Policy;
+    type Tools = Vec<ToolDefinition>;
+
+    fn policy(&self, document: Value) -> Option<Policy> {
+        Policy::validate_json_value(document).ok()
+    }
+
+    fn tools(&self, document: Value) -> Option<Vec<ToolDefinition>> {
+        definitions_from_json_value(document, None).ok()
+    }
+}
+
+/// A bundle the reader accepted with the [`ProductionValidators`]: its
+/// policy and tools documents as those validators built them.
+pub type ProductionBundle = Bundle<Policy, Vec<ToolDefinition>>;
+
 /// Runs no production validator: a referenced document that passed the
 /// bundle's own checks and its published schema is accepted as its JSON
-/// value.
+/// value, as it was written.
 ///
-/// For a caller that cannot link the production validators -- `ggctl` --
-/// which must then report that they did not run. A bundle this accepts may
-/// still be refused by the gateway.
+/// For the tests of the reader's own stages, which must not depend on what
+/// the production validators decide. Every command reads bundles with the
+/// [`ProductionValidators`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PublishedSchemasOnly;
 
