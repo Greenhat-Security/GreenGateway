@@ -6893,7 +6893,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::routing::add_admin_api_routes#1",
-      "sha256": "e392257c9faecb9cc81d29b8cfc242f1523a312f77ed02a6d34a1e4d6eb715a9",
+      "sha256": "0e8c07209feac6e90a65a6d9ee789a4aeeb2e51a21f92751ed4c8c21d08d2633",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
@@ -7274,6 +7274,26 @@
       ],
       "scope": "gateway::use admin_policy_test_runs :: *#1",
       "sha256": "fa6cd2e48a9cc10d258e091e44bf8f8211f2d602bd2d9c4e54552efc493f593d",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/admin_policy_tests.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::admin_policy_tests::use super :: *#1",
+      "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/main.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::use admin_policy_tests :: *#1",
+      "sha256": "40680c762f47b373d061da66d5de6e9751791e3241b46713dbf172230939d162",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
@@ -11918,7 +11938,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::storage::change_evidence::DocumentAction#1",
-      "sha256": "091f0c17aaf2b628bb899f652314f931902f6c6ca7dcff8a83aeafdc9ae9589b",
+      "sha256": "4edae494041651164ea43a93d09e06b129d3ef3ada50e9292fea8a0b4127b007",
       "owner": "GreenGateway maintainers",
       "purpose": "Closed action vocabulary of document change evidence; its derive/cfg_attr attributes add no transport capability (issue #425)."
     },
@@ -12061,6 +12081,16 @@
       "sha256": "9cd89ca573aa9bae93b82c4efe1852be2090e407d60cf70deafa8359fec5255d",
       "owner": "GreenGateway maintainers",
       "purpose": "Decodes one standalone policy draft SQLite row; no network, process or HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/policy_tests.rs",
+      "reasons": [
+        "unexpanded-macro"
+      ],
+      "scope": "gateway::storage::policy_tests::impl  SqlitePolicyTestSuiteStore::connection_guard#1",
+      "sha256": "fb0dbf1cfc0a7c7a32c4e8c6a1033cbe8274614e46e2649cf326b6b4e3c9b9be",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Lock-poison recovery counter for the standalone stored policy test suite SQLite connection; metrics instrumentation only, no network, process or HTTP authority."
     },
     {
       "file": "gateway/src/storage/postgres.rs",
@@ -13782,6 +13812,26 @@
       ],
       "scope": "gateway::storage::postgres_policy_drafts::classify_query#1",
       "sha256": "b9618bf4127da4a3c48146f04769b3bf1026ac7481910dafc4f502dbfdacaf3b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_policy_tests.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_policy_tests::PostgresPolicyTestSuiteStore#1",
+      "sha256": "72f070d0576a2f9da1e35fd04736d32bfa3155eaadf84edf02673d38b3b34cf9",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_policy_tests.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres_policy_tests::impl  PostgresPolicyTestSuiteStore::new#1",
+      "sha256": "b7f6eb577ecc5caca349286454af5d5731a6b4045ee0e3e1d93a323cf34fe90f",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },

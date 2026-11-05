@@ -28,13 +28,32 @@
       }
     },
     "suite": {
-      "description": "A complete policy-tests.v1 suite, run against the published document.",
-      "type": "object",
-      "required": ["schema_version", "cases"],
-      "properties": {
-        "schema_version": { "const": "policy-tests.v1" },
-        "cases": { "type": "array", "minItems": 1, "maxItems": 512 }
-      }
+      "description": "A complete policy-tests.v1 suite, run against the published document, or a reference to the stored suite, pinned to the strong ETag the caller reviewed. An object that names a source is a reference and nothing else.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["schema_version", "cases"],
+          "not": { "required": ["source"] },
+          "properties": {
+            "schema_version": { "const": "policy-tests.v1" },
+            "cases": { "type": "array", "minItems": 1, "maxItems": 512 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["source", "etag"],
+          "properties": {
+            "source": { "const": "stored" },
+            "etag": {
+              "description": "The stored suite's strong ETag, its semantic digest in quotes. A stored suite with any other ETag is refused with 409.",
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            }
+          }
+        }
+      ]
     },
     "simulation": {
       "description": "Synthetic cases decided under the published document and the history version before it.",
