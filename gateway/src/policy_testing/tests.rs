@@ -9,7 +9,9 @@ use super::{
     suite::{parse_suite, Diagnostics, MAX_CASES, SUITE_SCHEMA_VERSION},
     RunError,
 };
-use crate::{policy_eval::PolicyAuthority, rbac::Policy};
+use crate::{
+    policy_eval::PolicyAuthority, policy_simulation::request::StoredCandidate, rbac::Policy,
+};
 
 /// Values a case supplies that no rendering may repeat. Each is unusual
 /// enough that finding it in output can only mean it leaked from a fixture.
@@ -250,6 +252,7 @@ fn binding() -> PolicyBinding {
         source: PolicySource::Active,
         etag: "\"sha256:test\"".to_owned(),
         security_revision: None,
+        stored: None,
     }
 }
 
@@ -847,6 +850,63 @@ fn junit_counts_failures_and_escapes_attributes() {
     ));
     assert!(xml.contains("<testcase classname=\"policy.rate\" name=\"reader-rate-override\"/>"));
     assert_eq!(xml.matches("<testcase ").count(), total);
+}
+
+/// A stored candidate is named in every rendering by its identifiers: a
+/// draft by id and revision, a history version by number. An active or
+/// inline policy has no stored identity, and no rendering invents one.
+#[test]
+fn every_rendering_names_the_stored_candidate_it_judged() {
+    let mut report = run_passing();
+    report.policy.source = PolicySource::Draft;
+    report.policy.stored = Some(StoredCandidate::Draft {
+        draft_id: "pd_0123456789abcdef0123456789abcdef".to_owned(),
+        revision: 2,
+    });
+    let json = report::to_json(&report).expect("json");
+    assert_eq!(
+        json["policy"],
+        json!({
+            "source": "draft",
+            "etag": "\"sha256:test\"",
+            "draft_id": "pd_0123456789abcdef0123456789abcdef",
+            "draft_revision": 2
+        })
+    );
+    let sarif = report::to_sarif(&report);
+    let properties = &sarif["runs"][0]["properties"];
+    assert_eq!(properties["policy_source"], json!("draft"));
+    assert_eq!(
+        properties["policy_draft_id"],
+        json!("pd_0123456789abcdef0123456789abcdef")
+    );
+    assert_eq!(properties["policy_draft_revision"], json!(2));
+    let xml = report::to_junit(&report);
+    assert!(xml.contains("<property name=\"policy_source\" value=\"draft\"/>"));
+    assert!(xml.contains(
+        "<property name=\"policy_draft_id\" value=\"pd_0123456789abcdef0123456789abcdef\"/>"
+    ));
+    assert!(xml.contains("<property name=\"policy_draft_revision\" value=\"2\"/>"));
+
+    report.policy.source = PolicySource::Revision;
+    report.policy.stored = Some(StoredCandidate::Revision { version: 9 });
+    let json = report::to_json(&report).expect("json");
+    assert_eq!(
+        json["policy"],
+        json!({ "source": "revision", "etag": "\"sha256:test\"", "version": 9 })
+    );
+    assert_eq!(
+        report::to_sarif(&report)["runs"][0]["properties"]["policy_version"],
+        json!(9)
+    );
+    assert!(report::to_junit(&report).contains("<property name=\"policy_version\" value=\"9\"/>"));
+
+    let active = report::to_json(&run_passing()).expect("json");
+    assert_eq!(
+        active["policy"],
+        json!({ "source": "active", "etag": "\"sha256:test\"" })
+    );
+    assert!(!report::to_junit(&run_passing()).contains("policy_version"));
 }
 
 fn suite_schema() -> Value {

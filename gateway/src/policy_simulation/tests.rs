@@ -8,7 +8,10 @@ use serde_json::{json, Value};
 
 use super::{
     edits::{apply_edits, parse_edits},
-    request::{parse_request, CandidateSource, SimulationRequest, MAX_SIMULATION_CASES},
+    request::{
+        parse_request, CandidateSource, SimulationRequest, MAX_HISTORY_VERSION,
+        MAX_SIMULATION_CASES,
+    },
     run::{compile_pairs, simulate, SimulationError, SimulationOutcome, MAX_TRACE_STAGES},
     Projection, TraceLevel, SIMULATION_SCHEMA_VERSION,
 };
@@ -150,6 +153,9 @@ fn candidate_of(request: &SimulationRequest, base: &Policy) -> Option<Policy> {
             .unwrap_or_else(|diagnostics| panic!("edits apply: {:?}", codes(&diagnostics)));
             Some(Policy::validate_json_value(document).expect("candidate validates"))
         }
+        CandidateSource::Draft { .. } | CandidateSource::Revision { .. } => {
+            panic!("a stored candidate is read by the endpoint, not built from the request")
+        }
     }
 }
 
@@ -210,6 +216,118 @@ fn a_minimal_request_defaults_to_a_terminal_as_authored_simulation() {
     assert!(request.digest.starts_with("sha256:"));
 }
 
+/// A draft or history version is named by the request and read later, by
+/// the endpoint: the parser holds each to exactly its members and bounds,
+/// and keeps the identifiers it was given.
+#[test]
+fn stored_candidates_are_named_by_exactly_their_members() {
+    let draft = parse(&document(
+        json!({ "source": "draft", "draft_id": "pd_0123", "draft_etag": "\"sha256:d\"" }),
+        "terminal",
+        json!(["as_authored"]),
+    ))
+    .expect("a draft candidate parses");
+    let CandidateSource::Draft {
+        draft_id,
+        draft_etag,
+    } = &draft.candidate
+    else {
+        panic!("a draft candidate");
+    };
+    assert_eq!(
+        (draft_id.as_str(), draft_etag.as_str()),
+        ("pd_0123", "\"sha256:d\"")
+    );
+    assert_eq!(draft.candidate.as_str(), "draft");
+    let revision = parse(&document(
+        json!({ "source": "revision", "version": 12 }),
+        "terminal",
+        json!(["as_authored"]),
+    ))
+    .expect("a revision candidate parses");
+    assert!(matches!(
+        revision.candidate,
+        CandidateSource::Revision { version: 12 }
+    ));
+    assert_eq!(revision.candidate.as_str(), "revision");
+    let highest = parse(&document(
+        json!({ "source": "revision", "version": MAX_HISTORY_VERSION }),
+        "terminal",
+        json!(["as_authored"]),
+    ));
+    assert!(highest.is_ok());
+
+    for (candidate, expected) in [
+        (
+            json!({ "source": "draft", "draft_etag": "\"sha256:d\"" }),
+            vec![("missing_field", "/candidate/draft_id")],
+        ),
+        (
+            json!({ "source": "draft", "draft_id": "pd_0123" }),
+            vec![("missing_field", "/candidate/draft_etag")],
+        ),
+        (
+            json!({ "source": "draft", "draft_id": "", "draft_etag": "\"sha256:d\"" }),
+            vec![("invalid_value", "/candidate/draft_id")],
+        ),
+        (
+            json!({ "source": "draft", "draft_id": "x".repeat(65), "draft_etag": "\"sha256:d\"" }),
+            vec![("too_long", "/candidate/draft_id")],
+        ),
+        (
+            json!({ "source": "draft", "draft_id": "pd_0123", "draft_etag": "x".repeat(257) }),
+            vec![("too_long", "/candidate/draft_etag")],
+        ),
+        (
+            json!({ "source": "draft", "draft_id": 7, "draft_etag": "\"sha256:d\"" }),
+            vec![("invalid_type", "/candidate/draft_id")],
+        ),
+        (
+            json!({ "source": "draft", "draft_id": "pd_0123", "draft_etag": "\"sha256:d\"", "policy": {} }),
+            vec![("unknown_field", "/candidate/policy")],
+        ),
+        (
+            json!({ "source": "revision" }),
+            vec![("missing_field", "/candidate/version")],
+        ),
+        (
+            json!({ "source": "revision", "version": 0 }),
+            vec![("invalid_value", "/candidate/version")],
+        ),
+        (
+            json!({ "source": "revision", "version": -3 }),
+            vec![("invalid_value", "/candidate/version")],
+        ),
+        (
+            json!({ "source": "revision", "version": 1.5 }),
+            vec![("invalid_value", "/candidate/version")],
+        ),
+        (
+            json!({ "source": "revision", "version": "7" }),
+            vec![("invalid_value", "/candidate/version")],
+        ),
+        (
+            json!({ "source": "revision", "version": MAX_HISTORY_VERSION + 1 }),
+            vec![("invalid_value", "/candidate/version")],
+        ),
+        (
+            json!({ "source": "revision", "version": 7, "draft_id": "pd_0123" }),
+            vec![("unknown_field", "/candidate/draft_id")],
+        ),
+    ] {
+        let diagnostics = refused(&document(
+            candidate.clone(),
+            "terminal",
+            json!(["as_authored"]),
+        ));
+        let expected: Vec<(&str, String)> = expected
+            .into_iter()
+            .map(|(code, pointer)| (code, pointer.to_owned()))
+            .collect();
+        assert_eq!(codes(&diagnostics), expected, "{candidate}");
+    }
+}
+
 #[test]
 fn schema_dispatch_is_exact_and_unknown_or_credential_members_are_refused() {
     for version in [
@@ -253,7 +371,7 @@ fn schema_dispatch_is_exact_and_unknown_or_credential_members_are_refused() {
 
 #[test]
 fn every_request_member_is_bounded_and_typed() {
-    let mut request = document(json!({ "source": "draft" }), "verbose", json!([]));
+    let mut request = document(json!({ "source": "branch" }), "verbose", json!([]));
     request.as_object_mut().expect("object").remove("base_etag");
     assert_eq!(
         codes(&refused(&request)),
@@ -1097,6 +1215,16 @@ fn the_published_schema_agrees_with_the_parser() {
             "matched",
             json!(["as_authored"]),
         ),
+        document(
+            json!({ "source": "draft", "draft_id": "pd_0123456789abcdef0123456789abcdef", "draft_etag": "\"sha256:d\"" }),
+            "terminal",
+            json!(["as_authored"]),
+        ),
+        document(
+            json!({ "source": "revision", "version": 3 }),
+            "terminal",
+            json!(["as_authored"]),
+        ),
     ];
     let mut minimal = document(
         json!({ "source": "active" }),
@@ -1158,6 +1286,17 @@ fn the_published_schema_agrees_with_the_parser() {
         "terminal",
         json!(["as_authored"]),
     ));
+    for candidate in [
+        json!({ "source": "draft", "draft_id": "pd_0123" }),
+        json!({ "source": "draft", "draft_id": "", "draft_etag": "\"sha256:d\"" }),
+        json!({ "source": "draft", "draft_id": "pd_0123", "draft_etag": "\"sha256:d\"", "version": 1 }),
+        json!({ "source": "revision" }),
+        json!({ "source": "revision", "version": 0 }),
+        json!({ "source": "revision", "version": "1" }),
+        json!({ "source": "revision", "version": 1, "policy": {} }),
+    ] {
+        refusals.push(document(candidate, "terminal", json!(["as_authored"])));
+    }
     for edit in [
         json!({ "op": "append", "section": "rules", "value": {} }),
         json!({ "op": "insert", "section": "rules", "value": {} }),

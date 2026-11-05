@@ -300,7 +300,7 @@ refuses unknown, repeated and credential-shaped members.
 | Member | Meaning |
 | --- | --- |
 | `base_etag` | Required. The active policy's ETag the request was written against. A different active policy is `412 policy_replay_base_stale`, never a rebase |
-| `candidate` | Required. `active` (the base itself), `edits` (1 to 64 position-aware edits over the base) or `inline` (a complete policy document), with exactly the members a [simulation](policy-simulation.md) candidate has. An edited or inline candidate is validated like a policy write and never stored |
+| `candidate` | Required. `active` (the base itself), `edits` (1 to 64 position-aware edits over the base), `inline` (a complete policy document), `draft` (one of your server-side drafts, by `draft_id` and `draft_etag`) or `revision` (a policy history `version`), with exactly the members a [simulation](policy-simulation.md) candidate has. An edited or inline candidate is validated like a policy write and never stored; a draft or history version is read, owner-scoped and validated again, and never written, as [a simulation reads one](policy-simulation.md#drafts-and-history-versions), when the job is created |
 | `window` | Required. `from` and optional `to`, RFC 3339 date-times with an offset; the window is `[from, to)` over audit timestamps. `to` defaults to the moment the job is created and may not be later; the window must begin before it ends and may cover at most 31 days |
 | `projections` | Optional. The [simulation](policy-simulation.md)'s projections the [impact comparison](#impact-comparison) is reported under, each named once: `as_authored`, `enforce_all_shadow` or both. `["as_authored"]` when omitted |
 | `max_records` | Optional. The most records the job reads, 1 to 100,000; 100,000 when omitted |
@@ -380,7 +380,9 @@ Every job leaves exactly its own lifecycle records: `policy.replay_started`
 when it is admitted, and one of `policy.replay_completed`,
 `policy.replay_cancelled` or `policy.replay_failed` when it ends. They carry
 the job id, the base and candidate ETags, the request digest, the projections,
-the window and cutoff, counts (the completion's `impact` member counts newly
+the window and cutoff (the start also names a stored candidate by its
+`candidate_draft_id` and `candidate_draft_revision`, or its
+`candidate_version`), counts (the completion's `impact` member counts newly
 allowed, newly denied, enforcement-only, newly forwarded, newly blocked,
 indeterminate and unsupported records per projection), limitation codes and
 the result digest -- never a record, a principal, a path, an element id or
@@ -401,14 +403,15 @@ is what `AUDIT_DURABILITY` makes it: committed to the audit store under
 | `204` | `DELETE`: a finished job was discarded |
 | `400` | A body that is not JSON, or repeats a member (`policy_replay_request_invalid`) |
 | `401`, `403` | Not authenticated, or missing one of the three permissions; nothing is read or started |
-| `404` | No such job for this principal (`policy_replay_job_not_found`) |
-| `409` | An idempotency key reused for a different request |
+| `404` | No such job for this principal (`policy_replay_job_not_found`), or a stored candidate that is not there (`policy_draft_not_found`, `policy_revision_not_found`, or no policy history) |
+| `409` | An idempotency key reused for a different request, or a draft candidate pinned to another base than `base_etag` (`policy_draft_base_stale`) |
 | `408` | The body did not arrive within five seconds (`policy_replay_request_timeout`). Nothing was started |
-| `412` | `base_etag` is not the active policy's ETag |
+| `410` | The draft candidate has expired (`policy_draft_expired`) |
+| `412` | `base_etag` is not the active policy's ETag, or the draft candidate's `draft_etag` is no longer the draft's (`policy_draft_stale`) |
 | `413` | The body is over its bound |
-| `422` | An invalid request, window, edit or candidate |
+| `422` | An invalid request, window, edit or candidate, or a history version this build does not accept now (`policy_revision_incompatible`) |
 | `429` | `policy_replay_busy` or `policy_replay_quota_exhausted` |
-| `503` | `audit_evidence_unavailable` (no standalone audit log, or it could not be read), `policy_replay_audit_unavailable` (the start was not recorded), or `policy_replay_unsupported_in_cluster` |
+| `503` | `audit_evidence_unavailable` (no standalone audit log, or it could not be read), `policy_replay_audit_unavailable` (the start was not recorded), `policy_replay_unsupported_in_cluster`, or a drafts store or policy history that could not be read (`policy_drafts_unavailable`, `policy_history_unavailable`) |
 
 A job's representation is always sent with `Cache-Control: no-store`.
 
@@ -417,7 +420,8 @@ A job's representation is always sent with `Cache-Control: no-store`.
 A job's representation (`policy-replay-job.v1`) states its state, the
 evaluator and gateway versions, the base ETag and whether it is still the
 active one (`base.current`), its `freshness`, the candidate's source and
-ETag, the projections, the window, the cutoff, the limits applied and its
+ETag (with the `draft_id` and `draft_revision`, or the `version`, of a stored
+candidate), the projections, the window, the cutoff, the limits applied and its
 progress. A finished job adds `result_digest` and `result`, a
 `policy-replay-results.v1` document:
 
