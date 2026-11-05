@@ -29,7 +29,7 @@
       "description": "One-shot operator command prints bounded result or report; it does not dispatch durable authority events. Existing outbox rows are separate from that output.",
       "sources": [
         {
-          "path": "gateway/src/bootstrap.rs",
+          "path": "gateway/src/bootstrap/commands.rs",
           "anchor": "operator:revoke-jwt"
         },
         {
@@ -1557,7 +1557,7 @@
       "follow_up": "PR2 follow-up: a caller-bound operation identity; an authenticated revoke path, if one ships, records a principal actor through the same ChangeActor, and the CLI must still never pretend to authenticate a named operator. Delivery (PR3) journals each effective revoke in its transaction and dispatches it independently of denylist cleanup; AUTHORITY_EVIDENCE_DURABILITY=required makes a configured sink mandatory and admits this row; nothing qualifies it yet.",
       "sources": [
         {
-          "path": "gateway/src/bootstrap.rs",
+          "path": "gateway/src/bootstrap/commands.rs",
           "anchor": "&auth::change_actor::ChangeActor::system(\"operator:revoke-jwt\"),"
         },
         {
@@ -1659,7 +1659,7 @@
       "follow_up": "Keep required-durability JWT revocation unsupported until an actual standalone authority and atomic evidence exist.",
       "sources": [
         {
-          "path": "gateway/src/bootstrap.rs",
+          "path": "gateway/src/bootstrap/commands.rs",
           "anchor": "gateway revoke-jwt requires STATE_BACKEND=postgres"
         },
         {
@@ -1926,8 +1926,8 @@
           "anchor": "pub fn from_env("
         },
         {
-          "path": "gateway/src/bootstrap.rs",
-          "anchor": "pub(super) async fn start_serving<"
+          "path": "gateway/src/bootstrap/stages.rs",
+          "anchor": "pub(crate) async fn start_serving<"
         }
       ],
       "tests": [
