@@ -76,9 +76,6 @@ proc-macro2 = "1.0.106"
 # binary already links this crate through jsonwebtoken; the edge only makes it
 # nameable from tests.
 aws-lc-rs.workspace = true
-# The same library the binary links, with its test-only policy reading
-# (`parse_v1_with_typed_matchers`) visible to the kernel and analyzer tests.
-gateway-config = { workspace = true, features = ["test-support"] }
 proptest.workspace = true
 rcgen.workspace = true
 rustix.workspace = true

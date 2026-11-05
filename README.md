@@ -245,6 +245,7 @@ Current MCP capabilities include:
 - Bidirectional scalar/composite, exact decimal-micros, and Markdown/BlockNote transforms
 - Ordered and fan-out composite tools with reverse-order compensation
 - Runtime enum and label sources projected into `tools/list` with fail-closed call validation
+- Credential-free client configuration templates for generic Streamable HTTP, Claude Desktop, Cursor, and VS Code, from the admin UI, the admin API, or `ggctl mcp-config` ([guide](docs/mcp-clients.md))
 
 This lets you apply the same identity, policy, audit, and traffic-review model to MCP tools that you use for HTTP APIs.
 

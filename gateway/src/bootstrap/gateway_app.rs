@@ -1165,6 +1165,7 @@ pub(crate) fn gateway_app_with_process_started_at_and_overrides(
         history_store: policy_history_store,
         draft_store: policy_draft_store,
         test_suite_store: policy_test_suite_store,
+        policy_tests_required: config.policy_tests_required,
         #[cfg(feature = "postgres")]
         control_plane: policy_control_plane,
         #[cfg(feature = "postgres")]
@@ -1196,7 +1197,6 @@ pub(crate) fn gateway_app_with_process_started_at_and_overrides(
         openapi_catalogs: openapi_catalog_service,
         tests: connections::test::ConnectionTestService::new(connection_http_runtime.clone()),
         rbac_state: rbac_state.clone(),
-        authority_evidence,
         audit: audit_log.clone(),
         client_ip_policy: client_ip_policy.clone(),
         max_body_size: config.max_body_size,

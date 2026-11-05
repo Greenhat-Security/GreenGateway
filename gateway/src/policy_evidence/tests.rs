@@ -1041,3 +1041,108 @@ fn a_package_matches_the_published_package_schema() {
         assert!(errors.is_empty(), "{errors:?}");
     }
 }
+
+/// A suite and synthetic cases that state a tool invocation's arguments are
+/// decided by them, and the package repeats none of the values.
+#[test]
+fn a_report_repeats_no_tool_argument() {
+    const ARGUMENT_CANARY: &str = "evidence-argument-canary-2b7d";
+    let document = json!({
+        "schema_version": "1.0.0",
+        "default_action": "deny",
+        "tools": { "reports.export": {} },
+        "rules": [
+            {
+                "id": "no-eu-exports",
+                "tool_name": "reports.export",
+                "action": "deny",
+                "conditions": { "tool_argument": { "pointer": "/region", "in": ["eu"] } }
+            },
+            { "id": "exports-open", "tool_name": "reports.export", "action": "allow" }
+        ]
+    });
+    let invocation = |id: &str| {
+        json!({
+            "id": id,
+            "kind": "tool",
+            "tool": { "name": "reports.export" },
+            "principal": "anonymous",
+            "facts": { "arguments": { "region": ARGUMENT_CANARY, "memo": ARGUMENT_CANARY } }
+        })
+    };
+    let mut tested = invocation("export-elsewhere");
+    tested["expect"] = json!({ "logical": "allow", "matched": { "rule": "exports-open" } });
+    let request = parsed(&json!({
+        "schema_version": REQUEST_SCHEMA_VERSION,
+        "publication": { "version": 12, "etag": PUBLICATION_ETAG },
+        "suite": { "schema_version": "policy-tests.v1", "cases": [tested] },
+        "simulation": { "trace": "matched", "cases": [invocation("simulated-export")] }
+    }));
+    let Some(SuiteSelection::Inline(suite)) = request.suite.as_ref() else {
+        panic!("the request carries its suite");
+    };
+    let outcome = policy_testing::run_against_policy(
+        policy(document.clone()),
+        PolicyAuthority::Standalone,
+        suite,
+        &SyntheticResources::none(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .expect("suite runs");
+    let tests = RunReport::new(
+        suite.digest.clone(),
+        PolicyBinding {
+            source: PolicySource::Publication,
+            etag: PUBLICATION_ETAG.to_owned(),
+            security_revision: None,
+            stored: None,
+        },
+        outcome,
+    );
+    let selection = request.simulation.as_ref().expect("simulation section");
+    let pairs = compile_pairs(
+        &policy(predecessor_document()),
+        PolicyAuthority::Standalone,
+        Some(&policy(document.clone())),
+        &selection.projections,
+    )
+    .expect("policies compile");
+    let simulated = simulate(
+        &pairs,
+        &selection.cases,
+        selection.trace,
+        &SyntheticResources::none(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap_or_else(|error| panic!("cases simulate: {error:?}"));
+    let package = assemble(
+        EvidenceInputs {
+            request_digest: request.digest.clone(),
+            publication: PublicationRecord {
+                version: 12,
+                recorded_at: "2026-10-28T11:00:00Z".to_owned(),
+                diff_summary: draft_summary(PREDECESSOR_ETAG),
+                policy: identity(PUBLICATION_ETAG, Some(SEMANTIC_DIGEST)),
+            },
+            predecessor: None,
+            validation: validation_of(&document),
+            tests: Some(tests),
+            simulation: Some(SimulationEvidence {
+                trace: selection.trace,
+                projections: selection.projections.clone(),
+                compared_with_predecessor: true,
+                outcome: simulated,
+            }),
+            replay: None,
+        },
+        GENERATED_AT,
+    )
+    .expect("package assembles");
+    let report = package_value(&package.bytes)["report"].clone();
+    assert_eq!(report["tests"]["results"]["status"], "passed");
+    let text = String::from_utf8(package.bytes).expect("UTF-8");
+    assert!(
+        !text.contains(ARGUMENT_CANARY),
+        "the package repeats an argument"
+    );
+}

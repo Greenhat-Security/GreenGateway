@@ -14,6 +14,9 @@ use std::{
     thread,
 };
 
+use gateway_config::mcp_client_configs::{
+    Auth, ClientKind, Format, McpClientConfigs, McpUrl, ServerName,
+};
 use serde_json::{json, Value};
 use tokio_rustls::rustls::{
     self,
@@ -755,6 +758,243 @@ fn init_writes_a_bundle_that_validates_strictly_and_converts_to_itself() {
     );
     assert_eq!(output.status.code(), Some(3));
     assert!(text(&output.stderr).contains("convert.unsupported_version"));
+}
+
+fn mcp_document(name: &str, oauth: bool) -> McpClientConfigs {
+    McpClientConfigs::render(
+        &McpUrl::new("https://gateway.example.test/base/mcp").expect("valid URL"),
+        &ServerName::new(name).expect("valid name"),
+        oauth,
+    )
+    .expect("renders")
+}
+
+/// Runs `ggctl mcp-config` in `directory`, with the canary token piped in.
+fn mcp_config(directory: &std::path::Path, base: &str, extra: &[&str]) -> Output {
+    let mut arguments = vec!["mcp-config", "--server", base, "--token-stdin"];
+    arguments.extend_from_slice(extra);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ggctl"))
+        .args(&arguments)
+        .current_dir(directory)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("ggctl should start");
+    // A command refused before it reads the token may already have closed
+    // its standard input.
+    let _ = child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(CANARY.as_bytes());
+    child.wait_with_output().expect("ggctl should finish")
+}
+
+#[test]
+fn mcp_config_writes_exactly_the_served_template_and_never_a_client_file_or_the_token() {
+    let document = mcp_document("greengateway", true);
+    let body = serde_json::to_string(&document).expect("serializes");
+    let gateway = FakeGateway::start(http_response("200 OK", &body), None);
+    // Client files ggctl must never open, edit or replace.
+    let directory = TempDirectory::new("mcp-config");
+    for file in [".cursor/mcp.json", ".vscode/mcp.json"] {
+        let path = directory.0.join(file);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("client directory");
+        std::fs::write(&path, "{\"sentinel\": true}\n").expect("client file");
+    }
+    let mut requests = 0;
+    for client in ClientKind::ALL {
+        for auth in Auth::ALL {
+            if !client.supports(auth) {
+                continue;
+            }
+            let output = mcp_config(
+                &directory.0,
+                &gateway.base("http"),
+                &["--client", client.as_str(), "--auth", auth.as_str()],
+            );
+            requests += 1;
+            assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+            assert!(output.stderr.is_empty());
+            assert_no_canary(&output);
+            let stdout = text(&output.stdout);
+            let template = document.template(client, auth).expect("served");
+            assert_eq!(stdout, template.content);
+            match template.format {
+                Format::Json => {
+                    let parsed: Value = serde_json::from_str(&stdout).expect("JSON template");
+                    assert!(parsed
+                        .to_string()
+                        .contains("https://gateway.example.test/base/mcp"));
+                }
+                Format::Url => assert_eq!(
+                    url::Url::parse(stdout.trim_end()).expect("URL").as_str(),
+                    "https://gateway.example.test/base/mcp"
+                ),
+            }
+            assert_eq!(
+                stdout.contains("GREENGATEWAY_MCP_TOKEN"),
+                auth == Auth::Token
+            );
+        }
+    }
+    let seen = gateway.requests();
+    assert_eq!(seen.len(), requests);
+    for request in &seen {
+        assert!(
+            request.starts_with("GET /v1/admin/mcp/client-configs HTTP/1.1\r\n"),
+            "{request}"
+        );
+        assert!(request.contains(&format!("authorization: Bearer {CANARY}\r\n")));
+    }
+    for file in [".cursor/mcp.json", ".vscode/mcp.json"] {
+        assert_eq!(
+            std::fs::read_to_string(directory.0.join(file)).expect("client file"),
+            "{\"sentinel\": true}\n"
+        );
+    }
+    let mut left: Vec<_> = std::fs::read_dir(&directory.0)
+        .expect("directory")
+        .map(|entry| entry.expect("entry").file_name())
+        .collect();
+    left.sort();
+    assert_eq!(left, [".cursor", ".vscode"]);
+}
+
+#[test]
+fn mcp_config_names_the_server_entry_and_refuses_a_hostile_name_unsent() {
+    let named = serde_json::to_string(&mcp_document("prod-gw", true)).expect("serializes");
+    let gateway = FakeGateway::start(http_response("200 OK", &named), None);
+    let directory = TempDirectory::new("mcp-config-name");
+    let output = mcp_config(
+        &directory.0,
+        &gateway.base("http"),
+        &["--client", "vscode", "--name", "prod-gw"],
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    let parsed: Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    assert_eq!(
+        parsed["servers"]["prod-gw"]["url"],
+        "https://gateway.example.test/base/mcp"
+    );
+    assert!(gateway.requests()[0]
+        .starts_with("GET /v1/admin/mcp/client-configs?name=prod-gw HTTP/1.1\r\n"));
+
+    // A server that answers with another name is not trusted with this one.
+    let output = mcp_config(&directory.0, &gateway.base("http"), &["--client", "vscode"]);
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stdout.is_empty());
+    assert!(text(&output.stderr).contains("mcp.client_configs_invalid"));
+
+    for hostile in ["a\"b", "${env:HOME}", "__proto__", "a b", "-x"] {
+        let output = mcp_config(
+            &directory.0,
+            &gateway.base("http"),
+            &["--client", "cursor", "--name", hostile],
+        );
+        assert_eq!(output.status.code(), Some(2), "{hostile}");
+        assert!(output.stdout.is_empty());
+        assert!(!text(&output.stderr).contains(hostile), "{hostile}");
+    }
+    assert_eq!(gateway.requests().len(), 2);
+}
+
+#[test]
+fn mcp_config_failures_write_nothing_and_have_their_documented_exit_codes() {
+    let mut tampered = serde_json::to_value(mcp_document("greengateway", true)).expect("JSON");
+    tampered["templates"][4]["content"] = format!("Bearer {CANARY}\n").into();
+    let mut newer = serde_json::to_value(mcp_document("greengateway", true)).expect("JSON");
+    newer["apiVersion"] = "greengateway.dev/v1beta1".into();
+    let no_oauth = serde_json::to_string(&mcp_document("greengateway", false)).expect("JSON");
+    let directory = TempDirectory::new("mcp-config-failures");
+    for (response, client, exit, code) in [
+        (
+            http_response(
+                "409 Conflict",
+                r#"{"error":"MCP client configuration templates require GATEWAY_PUBLIC_URL","reason":"public_url_not_configured"}"#,
+            ),
+            "cursor",
+            3,
+            "mcp.public_url_unusable",
+        ),
+        (
+            http_response("404 Not Found", "{}"),
+            "cursor",
+            3,
+            "mcp.client_configs_unavailable",
+        ),
+        (
+            http_response("403 Forbidden", "{}"),
+            "cursor",
+            8,
+            "remote.forbidden",
+        ),
+        (
+            http_response("401 Unauthorized", "{}"),
+            "cursor",
+            8,
+            "remote.unauthenticated",
+        ),
+        (
+            http_response("200 OK", &tampered.to_string()),
+            "cursor",
+            3,
+            "mcp.client_configs_invalid",
+        ),
+        (
+            http_response("200 OK", &newer.to_string()),
+            "cursor",
+            3,
+            "mcp.unsupported_version",
+        ),
+        (
+            http_response("200 OK", &no_oauth),
+            "claude-desktop",
+            3,
+            "mcp.oauth_unavailable",
+        ),
+    ] {
+        let gateway = FakeGateway::start(response, None);
+        let output = mcp_config(&directory.0, &gateway.base("http"), &["--client", client]);
+        assert_eq!(output.status.code(), Some(exit), "{code}");
+        assert!(output.stdout.is_empty(), "{code}");
+        assert!(
+            text(&output.stderr).contains(code),
+            "{code}: {}",
+            text(&output.stderr)
+        );
+        assert_no_canary(&output);
+        assert_eq!(gateway.connections.load(Ordering::SeqCst), 1, "{code}");
+    }
+
+    // Refused before anything is read or sent.
+    let gateway = FakeGateway::start(http_response("200 OK", &no_oauth), None);
+    for (extra, code) in [
+        (
+            &["--client", "claude-desktop", "--auth", "token"][..],
+            "mcp.no_token_template",
+        ),
+        (
+            &["--client", "cursor", "--format", "json"],
+            "usage.unknown_option",
+        ),
+        (&["--client", "zed"], "usage.invalid_value"),
+        (&[], "usage.missing_argument"),
+    ] {
+        let output = mcp_config(&directory.0, &gateway.base("http"), extra);
+        assert_eq!(output.status.code(), Some(2), "{code}");
+        assert!(output.stdout.is_empty());
+        assert!(
+            text(&output.stderr).contains(code),
+            "{code}: {}",
+            text(&output.stderr)
+        );
+    }
+    assert_eq!(gateway.connections.load(Ordering::SeqCst), 0);
+    let output = ggctl(&["mcp-config", "--client", "cursor"], None);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(text(&output.stderr).contains("usage.missing_argument"));
 }
 
 /// A standalone state directory under the system temporary directory,

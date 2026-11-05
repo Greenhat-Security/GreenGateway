@@ -27,8 +27,8 @@
 //! `identity_mappings` and rule `conditions` (`super::identity_mappings`,
 //! `super::conditions`). This build validates both and the kernel evaluates
 //! both. The serving lanes enforce identity mappings and every condition
-//! leaf but `tool_argument`, so a document whose conditions use that leaf is
-//! refused, with every check but that one reported first.
+//! leaf; a `tool_argument` leaf is decided only once the call's arguments
+//! have passed the tool's input schema.
 //!
 //! ## Diagnostics
 //!
@@ -81,6 +81,33 @@ pub const POLICY_V1_SCHEMA_VERSION: &str = "1.0.0";
 /// kernel frames its source digests with, so one document has one source
 /// digest wherever it is computed.
 pub const POLICY_MEDIA_TYPE: &str = "application/json";
+
+/// The ADR-0004 semantic digest of a policy this gateway accepted: for a v1
+/// document, the digest `POST .../policy/validate` reports for it, over its
+/// normalized form; for a 0.x document `None`, because that format has no
+/// normative normalization and so no semantic digest. A policy with no
+/// canonical form is refused; callers then name no digest rather than
+/// invent one.
+pub fn accepted_policy_semantic_digest(policy: &Policy) -> Result<Option<String>, NoCanonicalForm> {
+    match PolicySchema::of_version(&policy.schema_version) {
+        Some(PolicySchema::V1) => {
+            let normalized = serde_json::to_value(policy).map_err(|_| NoCanonicalForm)?;
+            canonical_json::semantic_digest(
+                POLICY_MEDIA_TYPE,
+                POLICY_V1_SCHEMA_VERSION,
+                &normalized,
+            )
+            .map(Some)
+            .map_err(|_| NoCanonicalForm)
+        }
+        _ => Ok(None),
+    }
+}
+
+/// A v1 policy that does not serialize to a canonical form. Unreachable for
+/// a validated document, whose numbers are all in the I-JSON range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NoCanonicalForm;
 
 /// The most structural problems one inspection reports. A document past it
 /// is already refused; listing every element of a 1 MiB document would only
@@ -177,6 +204,7 @@ pub enum IssueCode {
     PolicyWriteUnreachable,
     PublisherPolicyWriteLost,
     EgressChangeRequiresRestart,
+    ConditionPointerIneligible,
     RoleNotDefined,
     RoutePermissionUngranted,
     ToolRuleNeverDecides,
@@ -199,7 +227,6 @@ pub enum IssueCode {
     ConditionCidrInvalid,
     ConditionPointerInvalid,
     ConditionTimeInvalid,
-    TypedMatchersNotEnforced,
 }
 
 impl IssueCode {
@@ -250,6 +277,7 @@ impl IssueCode {
         Self::PolicyWriteUnreachable,
         Self::PublisherPolicyWriteLost,
         Self::EgressChangeRequiresRestart,
+        Self::ConditionPointerIneligible,
         Self::RoleNotDefined,
         Self::RoutePermissionUngranted,
         Self::ToolRuleNeverDecides,
@@ -272,7 +300,6 @@ impl IssueCode {
         Self::ConditionCidrInvalid,
         Self::ConditionPointerInvalid,
         Self::ConditionTimeInvalid,
-        Self::TypedMatchersNotEnforced,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -322,6 +349,7 @@ impl IssueCode {
             Self::PolicyWriteUnreachable => "policy_write_unreachable",
             Self::PublisherPolicyWriteLost => "publisher_policy_write_lost",
             Self::EgressChangeRequiresRestart => "egress_change_requires_restart",
+            Self::ConditionPointerIneligible => "condition_pointer_ineligible",
             Self::RoleNotDefined => "role_not_defined",
             Self::RoutePermissionUngranted => "route_permission_ungranted",
             Self::ToolRuleNeverDecides => "tool_rule_never_decides",
@@ -344,7 +372,6 @@ impl IssueCode {
             Self::ConditionCidrInvalid => "condition_cidr_invalid",
             Self::ConditionPointerInvalid => "condition_pointer_invalid",
             Self::ConditionTimeInvalid => "condition_time_invalid",
-            Self::TypedMatchersNotEnforced => "typed_matchers_not_enforced",
         }
     }
 
@@ -434,6 +461,10 @@ impl IssueCode {
                 "the egress section differs from the live policy's, and egress changes apply \
                  only when the gateway starts"
             }
+            Self::ConditionPointerIneligible => {
+                "the tool argument pointer does not resolve through the tool's input schema to \
+                 a scalar property that is not secret-marked, so no call could be decided by it"
+            }
             Self::RoleNotDefined => {
                 "the role is not defined under roles; it matches only principals that carry \
                  it, and grants them no permission"
@@ -497,10 +528,6 @@ impl IssueCode {
             }
             Self::ConditionTimeInvalid => {
                 "the time window is empty or unordered, or not written as RFC 3339 UTC instants"
-            }
-            Self::TypedMatchersNotEnforced => {
-                "this gateway validates tool_argument conditions but does not yet enforce them, \
-                 so it accepts no document whose rule conditions read a tool argument"
             }
         }
     }
@@ -655,11 +682,6 @@ impl IssueCode {
                 "Write from and until as YYYY-MM-DDTHH:MM:SSZ, with from earlier than until; the \
                  window includes from and excludes until."
             }
-            Self::TypedMatchersNotEnforced => {
-                "Remove every tool_argument condition before publishing; this release only \
-                 validates them. Identity mappings and the other conditions are enforced and \
-                 may stay."
-            }
             Self::PolicyWriteUnreachable => {
                 "Keep at least one role that grants admin:policy:write, or \"*\", to the \
                  principals who administer the policy."
@@ -671,6 +693,11 @@ impl IssueCode {
             Self::EgressChangeRequiresRestart => {
                 "Keep the live policy's egress section; edit POLICY_FILE and restart the \
                  gateway to change egress."
+            }
+            Self::ConditionPointerIneligible => {
+                "Point at a property the tool's input schema declares under properties, with \
+                 a string, integer, number or boolean type, not writeOnly, not format \
+                 password, and no $ref or allOf, anyOf, oneOf, not or if on the way."
             }
             Self::RoleNotDefined => "Define the role under roles, or correct its spelling.",
             Self::RoutePermissionUngranted => {
@@ -820,7 +847,8 @@ impl DiagnosticBlocks {
                 DiagnosticSeverity::Error,
                 IssueCode::PolicyWriteUnreachable
                 | IssueCode::PublisherPolicyWriteLost
-                | IssueCode::EgressChangeRequiresRestart,
+                | IssueCode::EgressChangeRequiresRestart
+                | IssueCode::ConditionPointerIneligible,
             ) => Self {
                 simulation: false,
                 tests: false,
@@ -1207,49 +1235,15 @@ pub fn parse_v1_source(source: &[u8], document: &Value) -> Result<Policy, Vec<Po
 /// Structural problems are all reported; semantic validation stops at the
 /// first, as it does for v0.
 ///
-/// A document whose rule conditions read a tool argument is refused last,
-/// after every other check has passed, with
-/// [`IssueCode::TypedMatchersNotEnforced`]: the kernel evaluates such a leaf,
-/// but tool admission decides before the call's arguments are validated, so
-/// no serving lane captures the fact it reads. Refusing it here refuses it on
-/// every path a policy is accepted by -- startup, reload, replacement,
-/// drafts, simulations, test runs and bundles, in the gateway and in `ggctl`
-/// -- since each reads a v1 document through this function. Identity
-/// mappings and every other condition leaf are served, so they are accepted:
-/// each serving lane captures the facts they read (the gateway's
-/// `middleware::policy_facts`).
+/// Identity mappings and every condition leaf are served: each serving lane
+/// captures the facts they read (the gateway's `middleware::policy_facts`), a
+/// tool lane the arguments a `tool_argument` leaf reads only once the call's
+/// arguments have passed the tool's input schema. Whether a `tool_argument`
+/// pointer is one a tool's schema lets a condition read is a question for the
+/// tool registry, so cross-resource validation asks it before publication
+/// ([`IssueCode::ConditionPointerIneligible`]).
 pub fn parse_v1(document: &Value) -> Result<Policy, Vec<PolicyIssue>> {
-    let policy = parse_v1_document(document)?;
-    refuse_unenforced_matchers(&policy).map_err(|issue| vec![issue])?;
-    Ok(policy)
-}
-
-/// [`parse_v1`] without its refusal of the tool-argument conditions this
-/// build does not enforce, for the tests that evaluate them. Only a test
-/// build has it:
-/// this crate's own tests, and the gateway's through the `test-support`
-/// feature its dev-dependency enables.
-#[cfg(any(test, feature = "test-support"))]
-pub fn parse_v1_with_typed_matchers(document: &Value) -> Result<Policy, Vec<PolicyIssue>> {
     parse_v1_document(document)
-}
-
-/// The refusal [`parse_v1`] applies last: at the conditions of the first
-/// rule whose tree reads a tool argument anywhere, under any combinator.
-/// Identity mappings and the other leaves are not refused; the serving lanes
-/// enforce them.
-fn refuse_unenforced_matchers(policy: &Policy) -> Result<(), PolicyIssue> {
-    match policy.rules.iter().position(|rule| {
-        rule.conditions
-            .as_ref()
-            .is_some_and(super::conditions::Condition::reads_tool_arguments)
-    }) {
-        Some(index) => Err(PolicyIssue::located(
-            IssueCode::TypedMatchersNotEnforced,
-            format!("/rules/{index}/conditions"),
-        )),
-        None => Ok(()),
-    }
 }
 
 fn parse_v1_document(document: &Value) -> Result<Policy, Vec<PolicyIssue>> {

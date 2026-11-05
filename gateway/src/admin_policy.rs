@@ -2286,6 +2286,7 @@ pub(super) fn policy_file_size_refusal(candidate: &rbac::Policy) -> Option<Strin
 
 /// The request a publication is checked for: who is publishing, how they
 /// reached the gateway, and the state that judges them.
+#[derive(Clone, Copy)]
 pub(super) struct PublicationRequest<'a> {
     pub(super) state: &'a PolicyAdminState,
     pub(super) rbac_state: &'a middleware::rbac::RbacState,
@@ -2295,10 +2296,13 @@ pub(super) struct PublicationRequest<'a> {
 
 /// What the cross-resource checks said about a publication that went
 /// ahead, for its `policy.changed` record: the resource snapshot it was
-/// checked against, and the risks it carried.
+/// checked against, and the risks it carried; and, when
+/// `POLICY_TESTS_REQUIRED` is on, the stored suite that admitted it
+/// ([`admit_required_policy_tests`]).
 pub(super) struct PublicationReview {
     pub(super) resource_snapshot_digest: Option<String>,
     pub(super) risks: Vec<&'static str>,
+    pub(super) required_tests: Option<RequiredTestsPassed>,
 }
 
 /// The cross-resource, lockout and risk checks of `candidate` as the
@@ -2351,6 +2355,7 @@ pub(super) fn admit_policy_resources(
                 codes,
                 policy_etag: live_etag,
                 resource_snapshot_digest: review.snapshot().digest(),
+                required_tests: None,
             },
         );
     };
@@ -2368,6 +2373,7 @@ pub(super) fn admit_policy_resources(
         return Ok(PublicationReview {
             resource_snapshot_digest: review.snapshot().digest().map(str::to_owned),
             risks: review.risk_codes(),
+            required_tests: None,
         });
     }
     refuse(&review.blocking_codes());
@@ -2467,6 +2473,13 @@ pub(super) enum PolicyCommitRefusal {
     /// `AUTHORITY_EVIDENCE_DURABILITY=required` refused a change this
     /// deployment mode records no evidence of (issue #425, PR 4).
     AuthorityEvidenceUnsupported,
+    /// `POLICY_TESTS_REQUIRED` is on and the stored suite did not pass
+    /// against the candidate, or there is no suite to run (issue #243).
+    /// [`admit_required_policy_tests`] has already audited it as
+    /// `policy.publication_refused`.
+    RequiredTestsFailed,
+    /// `POLICY_TESTS_REQUIRED` is on and the suite store could not be read.
+    RequiredTestsUnavailable,
     /// No authority is configured, or it could not write the candidate.
     Failed,
 }
@@ -2492,7 +2505,7 @@ impl PolicyMutationFailure {
         Self::Incomplete(Box::new(response))
     }
 
-    fn into_response(self) -> Box<Response> {
+    pub(super) fn into_response(self) -> Box<Response> {
         match self {
             Self::Refused(_, response) | Self::Incomplete(response) => response,
         }
@@ -2550,13 +2563,14 @@ pub(super) async fn commit_policy_mutation(
     validate_policy_mutation_candidate(context.rbac_state, before_policy, candidate).map_err(
         |response| PolicyMutationFailure::Refused(PolicyCommitRefusal::CandidateInvalid, response),
     )?;
-    let review = admit_policy_resources(
-        PublicationRequest {
-            state: context.state,
-            rbac_state: context.rbac_state,
-            parts: context.parts,
-            principal: context.principal,
-        },
+    let publication = PublicationRequest {
+        state: context.state,
+        rbac_state: context.rbac_state,
+        parts: context.parts,
+        principal: context.principal,
+    };
+    let mut review = admit_policy_resources(
+        publication,
         before_policy,
         expected_etag,
         candidate,
@@ -2565,6 +2579,17 @@ pub(super) async fn commit_policy_mutation(
     .map_err(|response| {
         PolicyMutationFailure::Refused(PolicyCommitRefusal::ResourcesRefused, response)
     })?;
+    // With `POLICY_TESTS_REQUIRED` on, the stored suite must pass against
+    // the candidate, still under the write lock and before any authority
+    // sees it (issue #243).
+    review.required_tests = admit_required_policy_tests(
+        publication,
+        expected_etag,
+        candidate,
+        &diff_summary,
+        review.resource_snapshot_digest.as_deref(),
+    )
+    .await?;
 
     // Cluster mode: one transaction through the authority -- new immutable
     // version, revision advance, history row, and outbox record commit
@@ -2736,7 +2761,10 @@ pub(super) async fn commit_policy_mutation(
 /// refuses the whole document. A v1 document whose rules carry
 /// `conditions` is also `policy.rule_conditions` (`policy_rule_conditions`),
 /// because a member that serves format 1 but predates enforced rule
-/// conditions refuses it the same way. A document asks for each operation
+/// conditions refuses it the same way, and one whose conditions contain a
+/// `tool_argument` leaf is also `policy.tool_argument_conditions`
+/// (`policy_tool_argument_conditions`), which a member that enforces only
+/// the other leaves refuses. A document asks for each operation
 /// it performs. The gate reads the roster for every such write, logs and
 /// audits each refusal (`cluster.operation_refused`), and the refused write
 /// commits nothing.
@@ -2822,6 +2850,9 @@ fn policy_document_operations(
         // them (`member_requires_v1`).
         if candidate.uses_rule_conditions() {
             operations.push(&storage::compatibility::POLICY_RULE_CONDITIONS);
+        }
+        if candidate.uses_tool_argument_conditions() {
+            operations.push(&storage::compatibility::POLICY_TOOL_ARGUMENT_CONDITIONS);
         }
     }
     if candidate.uses_role_descriptions() {

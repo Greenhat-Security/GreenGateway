@@ -20,6 +20,7 @@
 //! `not` leaves unknown unknown. The kernel turns an unknown rule into an
 //! indeterminate decision, never an allow.
 
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 
 use ipnet::IpNet;
@@ -57,8 +58,10 @@ pub(crate) struct PolicyFacts {
     pub(crate) headers: Fact<Vec<(String, String)>>,
     /// Decoded query parameters, one entry per occurrence, in request order.
     pub(crate) query: Fact<Vec<(String, String)>>,
-    /// The tool call's schema-validated arguments, secret-marked fields
-    /// already removed.
+    /// The tool call's schema-validated arguments, reduced to the eligible
+    /// scalars the policy's `tool_argument` leaves read for that tool: every
+    /// other field, a secret-marked one included, is removed before the
+    /// kernel sees them (`middleware::policy_facts::tool_argument_facts`).
     pub(crate) tool_arguments: Fact<Value>,
     /// The evaluation instant, in whole seconds since the Unix epoch.
     pub(crate) now: Fact<i64>,
@@ -109,8 +112,11 @@ pub(crate) struct FactNeeds {
     pub(crate) headers: Vec<String>,
     /// The query parameter names `query` leaves read, sorted and unique.
     pub(crate) query: Vec<String>,
-    /// A `tool_argument` leaf reads the call's validated arguments.
-    pub(crate) tool_arguments: bool,
+    /// The argument pointers `tool_argument` leaves read, by the tool their
+    /// tool-name rule names, each list sorted and unique. A tool lane
+    /// validates a call's arguments before it decides a rule that reads one,
+    /// and captures the values at these pointers and no others.
+    pub(crate) tool_arguments: BTreeMap<String, Vec<String>>,
     /// A `time_window` leaf reads the evaluation instant.
     pub(crate) now: bool,
 }
@@ -123,31 +129,57 @@ impl FactNeeds {
             organization: identity_mappings,
             ..Self::default()
         };
-        for conditions in rules.iter().filter_map(|rule| rule.conditions.as_ref()) {
-            needs.add(conditions);
+        for rule in rules {
+            if let Some(conditions) = &rule.conditions {
+                needs.add(conditions, rule.tool_name.as_deref());
+            }
         }
         needs.headers.sort_unstable();
         needs.headers.dedup();
         needs.query.sort_unstable();
         needs.query.dedup();
+        for pointers in needs.tool_arguments.values_mut() {
+            pointers.sort_unstable();
+            pointers.dedup();
+        }
         needs
     }
 
-    fn add(&mut self, condition: &Condition) {
+    /// `tool_name` is the tool the condition's rule names. Validation admits
+    /// a `tool_argument` leaf only in a tool-name rule, so one anywhere else
+    /// -- only in a policy assembled in memory -- reads nothing a lane
+    /// captures, and stays undetermined.
+    fn add(&mut self, condition: &Condition, tool_name: Option<&str>) {
         match condition {
             Condition::All(operands) | Condition::Any(operands) => {
                 for operand in operands {
-                    self.add(operand);
+                    self.add(operand, tool_name);
                 }
             }
-            Condition::Not(operand) => self.add(operand),
+            Condition::Not(operand) => self.add(operand, tool_name),
             Condition::Organization(_) => self.organization = true,
             Condition::SourceNetwork(_) => self.source_ip = true,
             Condition::Header(leaf) => self.headers.push(leaf.name.to_ascii_lowercase()),
             Condition::Query(leaf) => self.query.push(leaf.name.clone()),
-            Condition::ToolArgument(_) => self.tool_arguments = true,
+            Condition::ToolArgument(leaf) => {
+                if let Some(tool_name) = tool_name {
+                    self.tool_arguments
+                        .entry(tool_name.to_owned())
+                        .or_default()
+                        .push(leaf.pointer.clone());
+                }
+            }
             Condition::TimeWindow(_) => self.now = true,
         }
+    }
+
+    /// The argument pointers the tool-name rules for `tool_name` read, sorted
+    /// and unique. Empty when none reads one, so a call to that tool is
+    /// decided exactly as it was before arguments were served.
+    pub(crate) fn tool_argument_pointers(&self, tool_name: &str) -> &[String] {
+        self.tool_arguments
+            .get(tool_name)
+            .map_or(&[], Vec::as_slice)
     }
 
     /// Whether a request fact -- anything beyond the organization, which a
@@ -156,8 +188,54 @@ impl FactNeeds {
         self.source_ip
             || !self.headers.is_empty()
             || !self.query.is_empty()
-            || self.tool_arguments
+            || !self.tool_arguments.is_empty()
             || self.now
+    }
+}
+
+/// The scalars of `arguments` at `pointers`, each at the same place in a
+/// fresh object, and nothing else: the argument fact a `tool_argument` leaf
+/// reads. A pointer the arguments do not reach, or that reaches an array or
+/// an object, contributes nothing, so a leaf over it does not match -- as a
+/// leaf over an argument the call did not pass does not.
+pub(crate) fn referenced_tool_arguments(arguments: &Value, pointers: &[String]) -> Value {
+    let mut referenced = serde_json::Map::new();
+    for pointer in pointers {
+        let Some(scalar) = arguments
+            .pointer(pointer)
+            .filter(|value| matches!(value, Value::String(_) | Value::Number(_) | Value::Bool(_)))
+        else {
+            continue;
+        };
+        let Some(tokens) = pointer.strip_prefix('/') else {
+            continue;
+        };
+        let tokens: Vec<String> = tokens
+            .split('/')
+            .map(|token| token.replace("~1", "/").replace("~0", "~"))
+            .collect();
+        insert_scalar(&mut referenced, &tokens, scalar);
+    }
+    Value::Object(referenced)
+}
+
+/// Places `scalar` at `tokens` below `object`, making the objects on the way.
+/// Nothing is placed where a scalar already sits on the way, which the
+/// pointer that reached `scalar` could not have walked through.
+fn insert_scalar(object: &mut serde_json::Map<String, Value>, tokens: &[String], scalar: &Value) {
+    match tokens {
+        [] => {}
+        [last] => {
+            object.insert(last.clone(), scalar.clone());
+        }
+        [first, rest @ ..] => {
+            if let Value::Object(next) = object
+                .entry(first.clone())
+                .or_insert_with(|| Value::Object(serde_json::Map::new()))
+            {
+                insert_scalar(next, rest, scalar);
+            }
+        }
     }
 }
 

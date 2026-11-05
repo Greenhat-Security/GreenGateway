@@ -18,12 +18,32 @@
 //!   parameter, from an explicit name the gateway checks is not one that can
 //!   carry credentials, identity or hop-by-hop routing.
 //! - `tool_argument`: one scalar of a tool call's schema-validated arguments,
-//!   by bounded JSON Pointer.
+//!   by bounded JSON Pointer, and only one the tool's input schema makes
+//!   eligible ([`tool_argument_pointer_eligible`]).
 //! - `time_window`: a half-open UTC interval over an injected clock.
 //!
 //! An HTTP path rule may read the first, second, third, fourth and last; a
 //! tool-name rule the first, second, fifth and last. Validation refuses the
 //! rest, so a leaf never sits where its fact cannot exist.
+//!
+//! ## Which tool arguments a leaf may read
+//!
+//! A `tool_argument` pointer is eligible for a tool only when it resolves
+//! through the tool's input schema by declared `properties` alone: every
+//! schema it passes through has `"type": "object"` and declares the next
+//! token under `properties`, and the schema it ends at has a `type` of
+//! exactly `"string"`, `"integer"`, `"number"` or `"boolean"`. No schema on
+//! the way may be `writeOnly` (anything but `false`), have `format`
+//! `"password"`, or compose or reference others (`$ref`, `$dynamicRef`,
+//! `allOf`, `anyOf`, `oneOf`, `not`, `if`, `then`, `else`,
+//! `dependentSchemas`, `patternProperties`), since a schema elsewhere could
+//! then mark the field secret or widen what it accepts. Anything else -- an
+//! array index, an undeclared or additional property, a `$ref` -- is
+//! ineligible. Publication refuses a rule that reads an ineligible pointer of
+//! a registered tool (`condition_pointer_ineligible`), and a tool lane whose
+//! tool's schema has since made one ineligible captures no arguments at all,
+//! so a rule that reads them is undetermined and refused rather than decided
+//! without a value the schema calls secret.
 //!
 //! Scopes and other verified claims are not leaves yet: authentication keeps
 //! no verified fact for them apart from the claimed roles, so a leaf over them
@@ -250,22 +270,32 @@ pub fn query_name_is_readable(name: &str) -> bool {
 }
 
 impl Condition {
-    /// Whether any leaf of the tree reads a tool call's arguments: the one
-    /// leaf no serving lane captures a fact for yet, because the arguments a
-    /// leaf may read are the schema-validated ones and admission decides
-    /// before it validates them.
-    pub fn reads_tool_arguments(&self) -> bool {
+    /// Every `tool_argument` leaf of the tree, in document order: the RFC
+    /// 6901 location of its `pointer` member below `location`, the tree's own
+    /// location (`/rules/{index}/conditions`), and the argument pointer it
+    /// reads.
+    pub fn tool_argument_leaves<'a>(&'a self, location: &str, leaves: &mut Vec<(String, &'a str)>) {
         match self {
             Self::All(operands) | Self::Any(operands) => {
-                operands.iter().any(Self::reads_tool_arguments)
+                let operator = if matches!(self, Self::All(_)) {
+                    "all"
+                } else {
+                    "any"
+                };
+                for (index, operand) in operands.iter().enumerate() {
+                    operand.tool_argument_leaves(&format!("{location}/{operator}/{index}"), leaves);
+                }
             }
-            Self::Not(operand) => operand.reads_tool_arguments(),
-            Self::ToolArgument(_) => true,
+            Self::Not(operand) => operand.tool_argument_leaves(&format!("{location}/not"), leaves),
+            Self::ToolArgument(leaf) => leaves.push((
+                format!("{location}/tool_argument/pointer"),
+                leaf.pointer.as_str(),
+            )),
             Self::Organization(_)
             | Self::SourceNetwork(_)
             | Self::Header(_)
             | Self::Query(_)
-            | Self::TimeWindow(_) => false,
+            | Self::TimeWindow(_) => {}
         }
     }
 }
@@ -672,6 +702,71 @@ fn is_bounded_json_pointer(pointer: &str) -> bool {
         }
     }
     count <= MAX_TOOL_ARGUMENT_POINTER_TOKENS
+}
+
+/// Schema keywords that compose or reference other schemas. A schema on a
+/// pointer's path that carries one is also judged by schemas the path does
+/// not show, which could mark the field secret or widen what it accepts.
+const COMPOSING_SCHEMA_KEYWORDS: &[&str] = &[
+    "$ref",
+    "$dynamicRef",
+    "allOf",
+    "anyOf",
+    "oneOf",
+    "not",
+    "if",
+    "then",
+    "else",
+    "dependentSchemas",
+    "patternProperties",
+];
+
+/// Whether a `tool_argument` leaf may read `pointer` of a tool whose input
+/// schema is `schema`: the pointer resolves through declared `properties` of
+/// object schemas to a schema of one scalar `type`, and no schema on the way
+/// is secret-marked or composed (see the module documentation). Every other
+/// pointer is ineligible, the empty one included.
+pub fn tool_argument_pointer_eligible(schema: &Value, pointer: &str) -> bool {
+    let Some(tokens) = pointer.strip_prefix('/') else {
+        return false;
+    };
+    let mut node = schema;
+    for token in tokens.split('/') {
+        if !plain_schema(node) || node.get("type").and_then(Value::as_str) != Some("object") {
+            return false;
+        }
+        let token = token.replace("~1", "/").replace("~0", "~");
+        match node
+            .get("properties")
+            .and_then(Value::as_object)
+            .and_then(|properties| properties.get(&token))
+        {
+            Some(next) => node = next,
+            None => return false,
+        }
+    }
+    plain_schema(node)
+        && matches!(
+            node.get("type").and_then(Value::as_str),
+            Some("string" | "integer" | "number" | "boolean")
+        )
+}
+
+/// An object schema that is not secret-marked and composes no other.
+fn plain_schema(node: &Value) -> bool {
+    let Some(schema) = node.as_object() else {
+        return false;
+    };
+    schema
+        .get("writeOnly")
+        .is_none_or(|write_only| *write_only == Value::Bool(false))
+        && !schema
+            .get("format")
+            .and_then(Value::as_str)
+            .is_some_and(|format| format.eq_ignore_ascii_case("password"))
+        && !COMPOSING_SCHEMA_KEYWORDS
+            .iter()
+            .any(|keyword| schema.contains_key(*keyword))
 }
 
 /// Seconds since the Unix epoch of an RFC 3339 instant written in its one

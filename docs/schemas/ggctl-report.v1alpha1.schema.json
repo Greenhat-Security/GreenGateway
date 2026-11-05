@@ -198,7 +198,7 @@
         "code": {
           "description": "The stable family.reason code. docs/ggctl.md lists every ggctl code by family, docs/configuration-bundles.md every bundle reader code, and docs/archive-admission.md every archive admission code.",
           "type": "string",
-          "pattern": "^(usage|credential|trust|remote|input|policy|evidence|compat|schema|validate|doctor|diff|init|convert|pin|state_dir|ledger|backup|restore|output|internal|bundle|syntax|json|yaml|reference|secret|resource|profile|archive)\\.[a-z][a-z0-9_]*$"
+          "pattern": "^(usage|credential|trust|remote|input|policy|evidence|compat|schema|mcp|validate|doctor|diff|init|convert|pin|state_dir|ledger|backup|restore|output|internal|bundle|syntax|json|yaml|reference|secret|resource|profile|archive)\\.[a-z][a-z0-9_]*$"
         },
         "severity": {
           "enum": ["error", "warning", "info"]
@@ -979,6 +979,7 @@
         "risk.plaintext_transport",
         "risk.policy_broadened",
         "risk.policy_default_allow",
+        "risk.policy_tests_not_required",
         "risk.private_egress_allowed",
         "risk.profile_changed",
         "risk.public_origin_changed",

@@ -217,6 +217,13 @@ pub(crate) enum Code {
     CapabilitiesInvalid,
     // Published schemas.
     UnsupportedSchemaVersion,
+    // MCP client configuration templates.
+    McpNoTokenTemplate,
+    McpConfigsUnavailable,
+    McpPublicUrlUnusable,
+    McpUnsupportedVersion,
+    McpConfigsInvalid,
+    McpOauthUnavailable,
     // Bundle validation and the offline doctor.
     WarningsAsErrors,
     RequiredCheckFailed,
@@ -337,6 +344,7 @@ pub(crate) const FAMILIES: &[&str] = &[
     "evidence",
     "compat",
     "schema",
+    "mcp",
     "validate",
     "doctor",
     "diff",
@@ -436,6 +444,12 @@ impl Code {
         Self::UnsupportedCapabilitiesVersion,
         Self::CapabilitiesInvalid,
         Self::UnsupportedSchemaVersion,
+        Self::McpNoTokenTemplate,
+        Self::McpConfigsUnavailable,
+        Self::McpPublicUrlUnusable,
+        Self::McpUnsupportedVersion,
+        Self::McpConfigsInvalid,
+        Self::McpOauthUnavailable,
         Self::WarningsAsErrors,
         Self::RequiredCheckFailed,
         Self::DriftFound,
@@ -567,6 +581,7 @@ impl Code {
             "evidence" => "docs/ggctl.md#evidence-diagnostics",
             "compat" => "docs/ggctl.md#compat-diagnostics",
             "schema" => "docs/ggctl.md#schema-diagnostics",
+            "mcp" => "docs/ggctl.md#mcp-diagnostics",
             "validate" => "docs/ggctl.md#validate-diagnostics",
             "doctor" => "docs/ggctl.md#doctor-diagnostics",
             "diff" => "docs/ggctl.md#diff-diagnostics",
@@ -881,6 +896,36 @@ impl Code {
             Self::UnsupportedSchemaVersion => (
                 "schema.unsupported_api_version",
                 "this ggctl publishes no schema for that kind at that document version",
+                Invalid,
+            ),
+            Self::McpNoTokenTemplate => (
+                "mcp.no_token_template",
+                "Claude Desktop takes a remote server by its URL and authorizes it with OAuth, so it has no token template",
+                Usage,
+            ),
+            Self::McpConfigsUnavailable => (
+                "mcp.client_configs_unavailable",
+                "the server does not serve MCP client configuration templates (HTTP 404)",
+                Invalid,
+            ),
+            Self::McpPublicUrlUnusable => (
+                "mcp.public_url_unusable",
+                "the server has no GATEWAY_PUBLIC_URL, or its MCP endpoint cannot be written into a client configuration (HTTP 409)",
+                Invalid,
+            ),
+            Self::McpUnsupportedVersion => (
+                "mcp.unsupported_version",
+                "the server's template document is a version this ggctl does not read",
+                Invalid,
+            ),
+            Self::McpConfigsInvalid => (
+                "mcp.client_configs_invalid",
+                "the server's template document is not exactly one this ggctl renders, so no template from it is written",
+                Invalid,
+            ),
+            Self::McpOauthUnavailable => (
+                "mcp.oauth_unavailable",
+                "the server advertises no authorization server for its MCP endpoint, so it offers no OAuth template",
                 Invalid,
             ),
             Self::WarningsAsErrors => (

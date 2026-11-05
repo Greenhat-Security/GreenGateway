@@ -62,9 +62,3 @@ rustix.workspace = true
 proptest.workspace = true
 # Unique temporary bundle directories for the reader's tests.
 uuid.workspace = true
-
-[features]
-# Exposes the test-only policy v1 reading that admits rule conditions
-# (`rbac::policy_document::parse_v1_with_typed_matchers`) to the gateway's
-# tests, through the gateway's dev-dependency. Never enabled by a build.
-test-support = []

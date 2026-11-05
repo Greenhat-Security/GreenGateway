@@ -2,6 +2,7 @@ import { AdminApiError, adminFetchJsonResponse } from './api';
 import { adminApiUrl } from './config';
 import {
   boundedCodes,
+  draftCandidateJson,
   isBoundedText,
   isCode,
   isCount,
@@ -9,6 +10,7 @@ import {
   isPointer,
   jsonObjectText,
   projectRunRefusal,
+  type PolicyDraftRunCandidate,
   type PolicyRunCandidate,
   type PolicyRunRefusal,
 } from './policyRuns';
@@ -147,7 +149,7 @@ export type SimulationAnswer =
 
 export type SimulationRequest = Readonly<{
   baseEtag: string;
-  candidate: PolicyRunCandidate;
+  candidate: PolicyRunCandidate | PolicyDraftRunCandidate;
   trace: SimulationTraceLevel;
   projections: readonly SimulationProjection[];
   // `policy-tests.v1` cases without `expect`.
@@ -194,7 +196,9 @@ function simulationRequestBody(request: SimulationRequest): string {
   const candidate =
     request.candidate.kind === 'active'
       ? '{"source":"active"}'
-      : `{"source":"inline","policy":${jsonObjectText(request.candidate.source)}}`;
+      : request.candidate.kind === 'draft'
+        ? draftCandidateJson(request.candidate)
+        : `{"source":"inline","policy":${jsonObjectText(request.candidate.source)}}`;
   return [
     '{"schema_version":',
     JSON.stringify(POLICY_SIMULATION_SCHEMA_VERSION),

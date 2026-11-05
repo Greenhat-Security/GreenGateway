@@ -210,6 +210,7 @@ pub(crate) async fn rbac_middleware(
                 permission: None,
                 path_prefix: None,
                 matched_rule_id: None,
+                facts: None,
             },
         );
     }
@@ -275,6 +276,7 @@ pub(crate) async fn rbac_middleware(
                         permission: None,
                         path_prefix: None,
                         matched_rule_id: None,
+                        facts: None,
                     },
                 );
             }
@@ -477,6 +479,7 @@ pub(crate) async fn rbac_middleware(
                 permission: None,
                 path_prefix: None,
                 matched_rule_id: None,
+                facts: None,
             },
         );
     }
@@ -493,6 +496,7 @@ pub(crate) async fn rbac_middleware(
                 permission: None,
                 path_prefix: None,
                 matched_rule_id: None,
+                facts: None,
             };
             let _ = emit_allowed(
                 &state,
@@ -521,6 +525,7 @@ pub(crate) async fn rbac_middleware(
                         permission: None,
                         path_prefix: None,
                         matched_rule_id: None,
+                        facts: None,
                     },
                 )
             }
@@ -541,6 +546,7 @@ pub(crate) async fn rbac_middleware(
                         permission: None,
                         path_prefix: None,
                         matched_rule_id: None,
+                        facts: None,
                     },
                 )
             }

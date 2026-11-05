@@ -353,6 +353,21 @@ impl Policy {
         self.rules.iter().any(|rule| rule.conditions.is_some())
     }
 
+    /// Whether any direct rule's conditions contain a `tool_argument` leaf,
+    /// which a gateway that enforces the other conditions but predates
+    /// tool-argument conditions refuses. Cluster-mode writers ask the
+    /// operation gate before committing such a document (the gateway's
+    /// `storage::compatibility::POLICY_TOOL_ARGUMENT_CONDITIONS`).
+    pub fn uses_tool_argument_conditions(&self) -> bool {
+        self.rules.iter().any(|rule| {
+            rule.conditions.as_ref().is_some_and(|conditions| {
+                let mut leaves = Vec::new();
+                conditions.tool_argument_leaves("", &mut leaves);
+                !leaves.is_empty()
+            })
+        })
+    }
+
     /// Whether this is a policy v1 document (document format 1), which a
     /// gateway that does not serve format 1 in cluster mode refuses.
     /// Cluster-mode writers ask the operation gate before committing one

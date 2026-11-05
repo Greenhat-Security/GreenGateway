@@ -482,7 +482,7 @@ async fn a_client_cannot_spoof_its_source_network() {
     );
 
     let principal = person(Some("acme"));
-    let allowed = state.evaluate_tool_authorization(
+    let allowed = state.evaluate_tool_authorization_without_arguments(
         "reports.export",
         Some(&principal),
         None,
@@ -508,7 +508,7 @@ async fn a_time_window_includes_from_and_excludes_until() {
         let (status, _) = decide(&state, None, &probe("/maintenance/x", &[], None)).await;
         assert_eq!(status == StatusCode::FORBIDDEN, in_window, "HTTP at {now}");
         // The tool lane reads the same clock, through the state's clone.
-        let admitted = state.evaluate_tool_authorization(
+        let admitted = state.evaluate_tool_authorization_without_arguments(
             "reports.export",
             Some(&principal),
             Some("10.1.2.3".parse().expect("an address")),
@@ -616,7 +616,7 @@ fn the_tool_lanes_decide_conditions_from_the_call_context() {
             ToolOperation::Visibility => {
                 state.tool_visible("reports.export", Some(&principal), Some(address))
             }
-            _ => state.evaluate_tool_authorization(
+            _ => state.evaluate_tool_authorization_without_arguments(
                 "reports.export",
                 Some(&principal),
                 Some(address),

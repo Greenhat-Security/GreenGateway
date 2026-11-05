@@ -2752,6 +2752,7 @@ mod tests {
             policy_file: None,
             tools_file: None,
             policy_history_sqlite_path: None,
+            policy_tests_required: false,
             cors_allow_origins: Vec::new(),
             max_body_size: 1_048_576,
             max_request_path_bytes: crate::config::DEFAULT_MAX_REQUEST_PATH_BYTES,
