@@ -4,7 +4,8 @@
 //! Each case becomes the context a live adapter builds -- through the same
 //! builders the policy test runner uses -- and is asked of the same
 //! [`CompiledPolicy`] methods, with the facts a live lane captures for the
-//! case's principal (`case_facts`): `evaluate_with_stages` (which *is*
+//! case's principal (`case_facts`, and `tool_case_facts` with a tool
+//! invocation's arguments): `evaluate_with_stages` (which *is*
 //! `evaluate_with_facts`, with a collecting sink) for HTTP,
 //! `evaluate_tool_with_facts` for the tool lanes and
 //! `select_rate_lane_with_facts` for rate overrides, each with a collecting
@@ -36,7 +37,7 @@ use crate::{
     policy_testing::{
         runner::{
             case_facts, evaluation_error_code, http_context, limitation_code, logical_code,
-            rate_context, step_codes, tool_context, tool_limitation_code,
+            rate_context, step_codes, tool_case_facts, tool_context, tool_limitation_code,
         },
         suite::{CaseContext, EgressCase, StepOutcome, SyntheticCase},
         synthetic::{
@@ -448,7 +449,7 @@ fn evaluate_case(
             principal,
         } => {
             let context = tool_context(compiled.snapshot(), *operation, tool_name, principal, None);
-            let facts = case_facts(compiled, principal, &case.facts);
+            let facts = tool_case_facts(compiled, principal, &case.facts, tool_name);
             tool_evaluated(policy, *operation, &context, &facts, trace, budget).map_err(refused)
         }
         CaseContext::ToolHttp {

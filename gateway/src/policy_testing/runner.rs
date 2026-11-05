@@ -46,7 +46,7 @@ use crate::{
         PolicyEffect, PolicyEvaluationContext, PolicyFacts, PrincipalFact, PrincipalIdentity,
         RateLaneOutcome, Reason, ResourceSnapshot, RuleReference, CONTEXT_VERSION,
     },
-    rbac::Policy,
+    rbac::{conditions::referenced_tool_arguments, Policy},
 };
 
 /// A policy compiled for a run, with the effective identifier of each direct
@@ -320,6 +320,27 @@ pub(crate) fn case_facts(
     facts
 }
 
+/// [`case_facts`] for a tool case, with the arguments the case states for
+/// the invocation reduced as the live lane reduces a validated call's: to the
+/// scalars at the pointers the tool-name rules for `tool_name` read
+/// ([`FactNeeds::tool_argument_pointers`](crate::policy_eval::FactNeeds)),
+/// and nothing else. A case that states none leaves a rule that reads one
+/// undetermined, as a call that brought none would be. Shared with the
+/// simulator.
+pub(crate) fn tool_case_facts(
+    compiled: &CompiledPolicy,
+    principal: &SyntheticPrincipal,
+    stated: &CaseFacts,
+    tool_name: &str,
+) -> PolicyFacts {
+    let mut facts = case_facts(compiled, principal, stated);
+    let pointers = compiled.fact_needs().tool_argument_pointers(tool_name);
+    if let (false, Some(arguments)) = (pointers.is_empty(), &stated.arguments) {
+        facts.tool_arguments = Fact::Captured(referenced_tool_arguments(arguments, pointers));
+    }
+    facts
+}
+
 /// The entries whose name is one of `names`, in their stated order.
 fn referenced(entries: &[(String, String)], names: &[String]) -> Vec<(String, String)> {
     entries
@@ -461,7 +482,7 @@ fn run_case(policy: &PolicyUnderTest, case: &Case, resources: &SyntheticResource
             policy,
             case,
             tool_context(compiled.snapshot(), *operation, tool_name, principal, None),
-            &case_facts(compiled, principal, &case.facts),
+            &tool_case_facts(compiled, principal, &case.facts, tool_name),
             expect,
         ),
         CaseInput::ToolHttp {

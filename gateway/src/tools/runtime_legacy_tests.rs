@@ -27,7 +27,7 @@ impl ToolRuntime {
         tool_name: &str,
         context: &ToolInvocationContext,
     ) -> Result<ToolRuntimeToolConfig, ToolRuntimeError> {
-        self.admit_invocation(tool_name, context)
+        self.admit_invocation(tool_name, context, no_arguments)
             .map(|(state, _)| state.config)
     }
 
