@@ -160,7 +160,7 @@ test("required mode never admits an unsupported row or waves through a reachable
   assert.equal(byId.connection_standalone, "admitted");
   assert.equal(byId.connection_delete_standalone, "admitted");
   assert.equal(byId.local_secrets, "admitted");
-  assert.equal(byId.catalog_standalone, "refused");
+  assert.equal(byId.catalog_standalone, "admitted");
   assert.equal(byId.configuration_activation, "not_refused");
 
   const unknown = inventory();

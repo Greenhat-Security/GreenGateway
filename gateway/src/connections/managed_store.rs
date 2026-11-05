@@ -629,14 +629,13 @@ impl ManagedConnectionStore {
         // commit last. Both arms enforce it.
         match self {
             Self::Sqlite(store) => {
-                // Standalone MCP catalogs record no actor yet (#425).
-                let _ = actor;
                 let store = store.clone();
                 let id = id.clone();
                 let expected = expected.clone();
                 let entries = entries.to_vec();
                 let resources = resources.to_vec();
                 let resource_templates = resource_templates.to_vec();
+                let actor = actor.clone();
                 blocking("mcp catalog replace", move || {
                     store.replace_mcp_catalog_expecting(
                         &id,
@@ -645,6 +644,7 @@ impl ManagedConnectionStore {
                         &resources,
                         &resource_templates,
                         Some(expected_catalog_revision),
+                        &actor,
                     )
                 })
                 .await

@@ -538,9 +538,6 @@ pub(super) struct ConnectionAdminState {
     pub(super) openapi_catalogs: connections::openapi::OpenApiConnectionCatalogService,
     pub(super) tests: connections::test::ConnectionTestService,
     pub(super) rbac_state: Option<middleware::rbac::RbacState>,
-    /// Asked before every Connection, catalog and local-secret change
-    /// (issue #425, PR 4).
-    pub(super) authority_evidence: authority_events::required::AuthorityEvidenceGate,
     pub(super) audit: audit::AuditLog,
     pub(super) client_ip_policy: client_ip::ClientIpPolicy,
     pub(super) max_body_size: usize,

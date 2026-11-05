@@ -154,6 +154,12 @@ pub(crate) const IMPORT_ACTOR: &str = "import-standalone";
 ///   records and bindings only, so that history stays in the standalone
 ///   database: the cluster's own Connection evidence table starts empty (it
 ///   records deletions today), and cluster mode has no local secrets.
+/// - `catalog_change_evidence` is the same database's record of who
+///   published each managed MCP and OpenAPI catalog and each overlay (that
+///   store's migration 13). The Connections section carries the current
+///   catalogs and overlays only, so that history stays in the standalone
+///   database too; the cluster's own catalog evidence table starts empty and
+///   records the cluster's first publication (the import writes none).
 const NOT_IMPORTED: &[&str] = &[
     "cluster_members",
     "maintenance_jobs",
@@ -176,6 +182,8 @@ const NOT_IMPORTED: &[&str] = &[
      Connections database; the cluster's own evidence table starts empty)",
     "connection_local_secret_change_evidence (standalone local-secret change evidence stays with \
      the local-secret keyring in the standalone Connections database)",
+    "catalog_change_evidence (standalone catalog and overlay publication evidence stays in the \
+     standalone Connections database; the cluster's own catalog evidence table starts empty)",
 ];
 
 /// The command line, after `import-standalone`.
