@@ -453,11 +453,24 @@ fn evaluate_sections(work: EvaluationWork) -> Result<EvaluatedSections, Evidence
     } = work;
     let deadline = Instant::now() + POLICY_EVIDENCE_DEADLINE;
     let authority = policy_eval::PolicyAuthority::Standalone;
+    // A package is a function of its candidate and its cases. This
+    // process's egress controls and global rate lanes describe the gateway
+    // now, not the one that served a publication or will serve a draft, so
+    // an egress case or a sequence on a global lane is incomplete here
+    // rather than judged by them; an override's sequence still runs, on the
+    // candidate's own limits.
+    let resources = policy_testing::synthetic::SyntheticResources::none();
     let tests = match suite {
         None => None,
         Some(suite) => {
             let outcome =
-                policy_testing::run_against_policy(candidate.clone(), authority, &suite, deadline)
+                policy_testing::run_against_policy(
+                    candidate.clone(),
+                    authority,
+                    &suite,
+                    &resources,
+                    deadline,
+                )
                     .map_err(|error| match error {
                         policy_testing::RunError::Compile(error) => {
                             tracing::error!(error = ?error, "a candidate under evidence could not be compiled");
@@ -501,16 +514,20 @@ fn evaluate_sections(work: EvaluationWork) -> Result<EvaluatedSections, Evidence
                     false,
                 ),
             };
-            let outcome =
-                simulate(&pairs, &selection.cases, selection.trace, deadline).map_err(|error| {
-                    match error {
-                        SimulationError::CaseRefused { pointer, code } => {
-                            EvidenceRunError::CaseRefused { pointer, code }
-                        }
-                        SimulationError::DeadlineExceeded => EvidenceRunError::DeadlineExceeded,
-                        SimulationError::Internal(code) => EvidenceRunError::Internal(code),
-                    }
-                })?;
+            let outcome = simulate(
+                &pairs,
+                &selection.cases,
+                selection.trace,
+                &resources,
+                deadline,
+            )
+            .map_err(|error| match error {
+                SimulationError::CaseRefused { pointer, code } => {
+                    EvidenceRunError::CaseRefused { pointer, code }
+                }
+                SimulationError::DeadlineExceeded => EvidenceRunError::DeadlineExceeded,
+                SimulationError::Internal(code) => EvidenceRunError::Internal(code),
+            })?;
             Some(SimulationEvidence {
                 trace: selection.trace,
                 projections: selection.projections,

@@ -40,6 +40,7 @@ use crate::{
         self,
         report::{PolicyBinding, PolicySource, RunReport},
         suite::{parse_suite, Diagnostics},
+        synthetic::SyntheticResources,
     },
     rbac::{
         policy_document::inspect_source,
@@ -476,6 +477,7 @@ fn test_report(source: PolicySource) -> RunReport {
         policy(publication_document()),
         PolicyAuthority::Standalone,
         &suite,
+        &SyntheticResources::none(),
         Instant::now() + Duration::from_secs(5),
     )
     .expect("suite runs");
@@ -505,6 +507,7 @@ fn simulation_evidence() -> SimulationEvidence {
         &pairs,
         &selection.cases,
         selection.trace,
+        &SyntheticResources::none(),
         Instant::now() + Duration::from_secs(5),
     )
     .unwrap_or_else(|error| panic!("cases simulate: {error:?}"));

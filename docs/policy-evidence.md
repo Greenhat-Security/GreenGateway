@@ -315,7 +315,12 @@ them, the package is still produced and reports `valid: false`.
 **Simulation.** The cases are decided under the candidate and, as the base,
 under what it replaces. A predecessor that no longer compiles under this build
 leaves the candidate judged alone (`base: null`,
-`simulation_base_not_evaluable`).
+`simulation_base_not_evaluable`). A package supplies no egress controls and no
+global rate lanes, in tests and cases alike, because this process's
+configuration does not describe the gateway that served a publication or will
+serve a draft: an egress case, or a rate sequence on a global lane, is
+`incomplete` (`missing_egress_controls`, `missing_rate_lane_configuration`),
+and a sequence on an override runs on the candidate's own limits.
 
 **Historical impact.** A replay job's result describes the candidate it
 replayed, so a job is bound only when its candidate's policy ETag is the
