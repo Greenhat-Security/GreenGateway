@@ -70,17 +70,20 @@ struct DiffCommandResult<'a> {
     diff: Option<&'a SemanticDiff>,
 }
 
-/// One side of a diff, as far as it was read.
+/// One side of a diff, as far as it was read. A compiled plan is large, so
+/// an environment file's side is boxed.
 enum Side {
     Bundle(BundleRead),
-    Env(EnvRead),
+    Env(Box<EnvRead>),
 }
 
 impl Side {
     fn read(source: Source<'_>, strict: bool) -> Self {
         match source {
             Source::Bundle(path) => Self::Bundle(validate::read_path(path, strict)),
-            Source::Env { argument, path } => Self::Env(env::read(argument, path, strict)),
+            Source::Env { argument, path } => {
+                Self::Env(Box::new(env::read(argument, path, strict)))
+            }
         }
     }
 

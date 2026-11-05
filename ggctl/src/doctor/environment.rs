@@ -102,10 +102,7 @@ fn keeps(kept: bool, otherwise: Reason) -> (Status, Reason) {
 }
 
 /// The first of the file's diagnostics that `matches`.
-fn first<'a>(
-    read: &'a EnvRead,
-    matches: impl Fn(&ReportDiagnostic) -> bool,
-) -> Option<&'a ReportDiagnostic> {
+fn first(read: &EnvRead, matches: impl Fn(&ReportDiagnostic) -> bool) -> Option<&ReportDiagnostic> {
     read.diagnostics
         .iter()
         .find(|diagnostic| matches(diagnostic))
