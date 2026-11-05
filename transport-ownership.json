@@ -6671,9 +6671,139 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::bootstrap::run#1",
-      "sha256": "472210ce4d2b59a4ea19965ca4066285c8b6c76d6dd4bf0017e2ff0073d186e9",
+      "sha256": "6fb57058490dbaa64873a9184f761d3305a6a950525c1336ee56979641408509",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
+    },
+    {
+      "file": "gateway/src/bootstrap/commands.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::bootstrap::commands::use super :: *#1",
+      "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/bootstrap/commands.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::bootstrap::commands::run_one_shot_command#1",
+      "sha256": "8fa3ea7163610a40a47e804589b47e3df9760cdb214bb34967adbf2e9b0d1cfc",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
+    },
+    {
+      "file": "gateway/src/bootstrap.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::bootstrap::use commands :: *#1",
+      "sha256": "a91c225bc683c4baf4023dc1db17820aecf2a786c491c1b810e4fdb2a668cf0d",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/bootstrap/stages.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::bootstrap::stages::use super :: *#1",
+      "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/bootstrap.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::bootstrap::use stages :: *#1",
+      "sha256": "76a6fc8eae002e97349588a955b66c1f2eb5c137b618b1968d3591230023d9da",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/bootstrap/cluster_preflight.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::bootstrap::cluster_preflight::use super :: *#1",
+      "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/bootstrap.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::bootstrap::use cluster_preflight :: *#1",
+      "sha256": "58f50f60dce3191e81d3b73362fa2f985364e5f67e2e90727c97ba9b2804282e",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/bootstrap/gateway_app.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::bootstrap::gateway_app::use super :: *#1",
+      "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/bootstrap.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::bootstrap::use gateway_app :: *#1",
+      "sha256": "cbfbf3da095e6c103b1baced242466786301b98485d14a735d6fd8fde0b3784f",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/bootstrap/identity.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::bootstrap::identity::use super :: *#1",
+      "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/bootstrap.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::bootstrap::use identity :: *#1",
+      "sha256": "ac576fa0b45978ebe8a97c0a76dfa34659477d69f139a0b56bec368b9013c080",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/bootstrap/tool_bindings.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::bootstrap::tool_bindings::use super :: *#1",
+      "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/bootstrap.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::bootstrap::use tool_bindings :: *#1",
+      "sha256": "7d22bb37429f6d5dfcc6d409298b72754d891243c1261d7ea5f37b6488892a41",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
     {
       "file": "gateway/src/main.rs",

@@ -2,7 +2,7 @@
 
 Issue #433 split the gateway's environment configuration into a compiler
 (`gateway/src/config/`) and the startup stages that act on what it compiles
-(`gateway/src/bootstrap.rs`). This page is the compiler's contract: what it
+(`gateway/src/bootstrap/stages.rs`). This page is the compiler's contract: what it
 reads, what it returns, how secret material travels through it, what it never
 does, and what the configuration bundles, `ggctl` and doctor work of #242 can
 build on today. It describes the code as it is. Where

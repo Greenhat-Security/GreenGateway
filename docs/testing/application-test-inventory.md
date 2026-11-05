@@ -5,7 +5,10 @@ application-level suite that drives the composed router, its middleware and
 its admin API. Issue #434 moved its tests into subsystem test modules next to
 the code they exercise. This page records what the file held before that work
 started and where each family went, so every move can be checked against a
-count instead of a read-through.
+count instead of a read-through. The issue's last slice applied the same rule
+to startup (`bootstrap.rs`) and to the inbound TLS suite
+(`inbound_tls_tests.rs`);
+[the third move](#the-third-move-startup-and-the-inbound-tls-suite) records it.
 
 ## How the tests were counted
 
@@ -134,8 +137,9 @@ in the test or in the one fixture it calls.
 
 ## Acceptance evidence
 
-The last check of the issue measured both moves once more, after `main` had
-moved on, and checked everything that names a test or a test file.
+The issue's selector and documentation slice measured both application moves
+once more, after `main` had moved on, and checked everything that names a test
+or a test file.
 
 **Every test still runs once.** On `origin/main` at `952e3677`, which has the
 first move but not the second, and on that same commit with the second move
@@ -206,3 +210,99 @@ in `app_tests.rs`; no family module contains an allowlisted value or a private
 key block. The moved lines are byte for byte the lines the full-history scan
 already reads in `app_tests.rs`, so no fingerprint or allowlist entry was moved
 or added.
+
+## The third move: startup and the inbound TLS suite
+
+The last slice of #434 split the two other large files the issue names. It was
+measured on `origin/main` at `cffd168f`, before and after the move.
+
+**Startup.** `bootstrap.rs` is production code, so splitting it moved no test.
+Its 3396 lines are now `bootstrap.rs`, which keeps `run` and the module wiring,
+and six modules under `bootstrap/`, one per startup concern, listed in [the
+module map](../architecture/application-modules.md). `bootstrap_tests.rs`, the
+9 tests that run the serving stages against a recording double, is still
+declared from `bootstrap.rs`, so they keep their `bootstrap::tests::<name>`
+paths. Compared as a multiset, the new files hold every line `bootstrap.rs`
+held except the ones the move had to change:
+
+- an item's visibility where its new module needed it. What was `pub(super)`
+  in `bootstrap` is `pub(crate)` in its module and re-exported from
+  `bootstrap.rs`, and what was private but is used from another module (or
+  from `bootstrap_tests.rs`) is `pub(super)`, so every item is visible exactly
+  where it was. rustfmt rewrapped the two of these lines that grew too long.
+- the one-shot commands' early returns. The commands left `run` for
+  `run_one_shot_command`, which returns `Ok(true)` when a command ran, so its 8
+  `return Ok(());` lines became `return Ok(true);`, and the `healthcheck`
+  probe's result is now checked with `?` before its own `return Ok(true);`.
+- the `#[cfg(feature = "postgres")]` attributes of the two cluster preflight
+  items, which the declaration and re-export of their module now carry.
+
+A second commit moved two blocks of the gateway build that read only the
+configuration and the route table, the suggestion engine's proxy routes and
+the warning about unowned exempt paths, into functions with the same bodies,
+called where the blocks ran.
+
+**The inbound TLS suite.** `inbound_tls_tests.rs` held the 87 tests of
+`inbound_tls::tests`, 10 of them Unix-only, divided by section comments. Each
+section family is now a module of `inbound_tls::tests` in a file of its own:
+
+| Family | Code it exercises | Module | Tests |
+| --- | --- | --- | --- |
+| The listener path: plaintext when TLS is not configured, a handshake end to end, the handshake bound, saturation shedding, and the negotiated protocol floor and ALPN | `TlsListener`, `accept_loop`, `HandshakeLimits` | `inbound_tls_listener_tests.rs` (`listener`) | 11 |
+| Material at startup: missing, malformed, mismatched or oversized material, and on Unix the private key's permission rules and projected material | `load_server_config`, `read_material`, `open_material_directory` | `inbound_tls_material_tests.rs` (`material`) | 19, 8 of them Unix-only |
+| Client-certificate authentication and its failure labels | `load_client_verifier`, `client_identity`, `classify_client_certificate_failure` | `inbound_tls_client_certificate_tests.rs` (`client_certificates`) | 15 |
+| Session resumption on client-certificate listeners | `disable_session_resumption` | `inbound_tls_session_resumption_tests.rs` (`session_resumption`) | 6 |
+| Credential precedence over a real listener | the credential order of `middleware::auth` | `inbound_tls_credential_precedence_tests.rs` (`credential_precedence`) | 6 |
+| SNI chain selection and the chain-set rules | `SniServerCertResolver`, `load_certified_chains`, `validate_server_name` | `inbound_tls_sni_tests.rs` (`sni`) | 17 |
+| Material reload | `reload_listener_material` and the material watcher | `inbound_tls_reload_tests.rs` (`reload`) | 13, 2 of them Unix-only |
+
+A fixture counts once with its impl blocks and with its `cfg(unix)` twin. Of
+the 70 fixtures the file held, 28 were used by one family alone and moved with
+it. The other 42 stay in `inbound_tls_tests.rs`: 17 of the 19 at the top of the
+file (`tls_request` and `plaintext_request` were the listener family's alone),
+and 25 defined among the client-certificate and SNI tests that later families
+use too, now under two short headers. `pem_encode`, defined among the SNI
+tests but used by one client-certificate test alone, moved to
+`client_certificates`. Both import blocks stay in `inbound_tls_tests.rs`.
+
+**Every test still runs once.** On `cffd168f` and on the same commit with this
+move, the listing, taken as above on Windows, has 4254 tests, with the same
+multiset of test names and no path listed twice. Exactly 77 paths differ, each
+`inbound_tls::tests::<name>` becoming `inbound_tls::tests::<family>::<name>`.
+The 10 Unix-only tests, which a Windows build compiles to nothing, are in
+`material` and `reload`, so on Linux their paths change the same way; a Linux
+`cargo check --workspace --all-targets` of the moved tree, with default
+features and with `--no-default-features`, compiles them.
+
+**Nothing changed on the way.** Compared line by line as a multiset, the eight
+TLS test files hold every line `inbound_tls_tests.rs` held, and none is
+missing. The 63 new lines are the wiring (a `#[path]` and `mod` pair per family
+and `use super::*;` at the top of each), each module's doc comment and the two
+fixture headers.
+
+**Every selector still selects.** A moved TLS test keeps its name, so a filter
+on the name still selects it, and an `--exact` filter names
+`inbound_tls::tests::<family>::<name>`. No CI workflow, script, registry or
+document names an inbound TLS test, `security-mutations.json` names none, and
+the CI test-list check passes on the new listing. What named `bootstrap.rs` by
+path was updated with the split: the authority evidence inventory's citations
+of the `revoke-jwt` command and of `start_serving`, which
+`check-authority-evidence.mjs` resolves, the pool-sizing test that reads the
+cluster command words, ADR-0008 and the compiler contract.
+`config/inventory.rs` still finds the tracing subscriber that reads `NO_COLOR`
+in `bootstrap.rs`, where `run` builds it.
+
+**Coverage floors still apply.** No file that `.github/security-coverage.json`
+floors changed. The startup code moved to production files under
+`gateway/src/bootstrap/`, which the gateway coverage run instruments as it did
+`bootstrap.rs`, and the TLS suite is still `#[cfg(test)]` under
+`inbound_tls.rs`, compiled into the same test binary.
+
+**Secret scanning needed no new exception.** No `.gitleaksignore` entry names
+`bootstrap.rs` or the TLS suite, the suite generates its certificates and keys
+at run time, and its moved lines are byte for byte the lines the full-history
+scan already reads in `inbound_tls_tests.rs`, so no fingerprint or allowlist
+entry was moved or added. `transport-ownership.json` gained a record for each
+new glob import and re-export and for `run_one_shot_command`, whose only
+capability is the `std::process::exit` it had in `run`, and `run`'s record has
+its new hash; no network or process authority was added.
