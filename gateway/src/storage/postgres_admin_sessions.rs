@@ -780,6 +780,15 @@ type StepFuture<'a, T> =
 /// succeeds, rolled back when it fails. A refusal the step reports as a
 /// value (capacity, no pending login) changed nothing, so committing it is
 /// harmless; the prune it ran first is kept.
+///
+/// Both ends are sent from inside this future, so a caller that drops it
+/// part-way leaves the transaction open on `client`, holding whatever row
+/// locks its statements took -- the journal's state row, once a withdrawal
+/// has run. Whoever owns the connection ends it: the pool rolls a pooled
+/// connection back before handing it out again (`postgres::build_pool`),
+/// and the maintenance runner closes its dedicated session when a step
+/// overruns its budget instead of running the next job on it
+/// (`cluster_maintenance`).
 async fn transaction<'a, T, F>(
     client: &'a tokio_postgres::Client,
     operation: &'static str,

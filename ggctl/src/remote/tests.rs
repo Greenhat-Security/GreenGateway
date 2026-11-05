@@ -848,3 +848,67 @@ fn a_ca_file_in_a_directory_writable_by_group_or_other_is_refused() {
         Err(Code::CaFileUnsafePermissions)
     );
 }
+
+/// Whoever can write any directory above the CA file can rename the
+/// directory holding it away and put one of their own in its place, so
+/// every directory up to `/` counts, not only the one holding the file.
+#[cfg(unix)]
+#[test]
+fn a_ca_file_below_a_directory_writable_by_group_or_other_is_refused() {
+    let pem = pki(IpAddr::V4(Ipv4Addr::LOCALHOST)).ca_pem;
+    for (mode, refused) in [
+        (0o777, true),
+        (0o770, true),
+        (0o707, true),
+        (0o1777, false),
+        (0o755, false),
+    ] {
+        let directory = CaDirectory::new(&format!("above-{mode:o}"));
+        let nested = directory.0.join("nested");
+        std::fs::create_dir(&nested).expect("nested directory");
+        set_mode(&nested, 0o755);
+        let path = nested.join("ca.pem");
+        std::fs::write(&path, pem.as_bytes()).expect("write");
+        set_mode(&path, 0o644);
+        set_mode(&directory.0, mode);
+        let expected = if refused {
+            Err(Code::CaFileUnsafePermissions)
+        } else {
+            Ok(1)
+        };
+        assert_eq!(
+            load_roots(&path).map(|roots| roots.len()),
+            expected,
+            "{mode:o}"
+        );
+    }
+}
+
+/// A link inside the path, not only at its end, is followed and judged by
+/// the directories its target resolves through: here `shared` holds the
+/// directory the link leads to, and its writer could swap that directory.
+#[cfg(unix)]
+#[test]
+fn a_ca_file_reached_through_a_directory_link_is_judged_along_its_target() {
+    use std::os::unix::fs::symlink;
+
+    let pem = pki(IpAddr::V4(Ipv4Addr::LOCALHOST)).ca_pem;
+    let shared = CaDirectory::new("link-directory-target");
+    let real = shared.0.join("real");
+    std::fs::create_dir(&real).expect("real directory");
+    set_mode(&real, 0o755);
+    let file = real.join("ca.pem");
+    std::fs::write(&file, pem.as_bytes()).expect("write");
+    set_mode(&file, 0o644);
+    let private = CaDirectory::new("link-directory");
+    symlink(&real, private.0.join("via")).expect("symlink");
+    let path = private.0.join("via").join("ca.pem");
+
+    set_mode(&shared.0, 0o755);
+    assert_eq!(load_roots(&path).map(|roots| roots.len()), Ok(1));
+    set_mode(&shared.0, 0o777);
+    assert_eq!(
+        load_roots(&path).map(|_| ()),
+        Err(Code::CaFileUnsafePermissions)
+    );
+}

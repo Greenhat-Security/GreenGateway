@@ -184,6 +184,13 @@ pub(super) const DEFAULT_PRINCIPAL_ANOMALY_HISTORY_LIMIT: usize = 20;
 pub(super) const DEFAULT_RULE_PREVIEW_SAMPLE_LIMIT: usize = 20;
 pub(super) const MAX_RULE_PREVIEW_SAMPLE_LIMIT: usize = 100;
 pub(super) const MAX_RULE_PREVIEW_SCAN_ROWS: usize = 100_000;
+/// Most rule previews scanning at once across this replica, and one at a time
+/// per actor. Over either bound is `429`, never queued.
+pub(super) const MAX_CONCURRENT_POLICY_RULE_PREVIEWS: usize = 4;
+/// The wall-clock bound on one rule preview's scan, its audit-store reads
+/// included. A scan still running at it stops where it is and answers
+/// `scan_truncated` and `deadline_exceeded`, never a complete count.
+pub(super) const POLICY_RULE_PREVIEW_DEADLINE: Duration = Duration::from_secs(10);
 
 #[derive(rust_embed::RustEmbed)]
 #[folder = "../admin-ui/dist/"]
