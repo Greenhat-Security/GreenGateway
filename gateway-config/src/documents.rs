@@ -19,6 +19,9 @@ pub const INIT_ANSWERS_KIND: &str = "GatewayInitAnswers";
 pub const CAPABILITIES_KIND: &str = "GatewayCapabilities";
 /// The machine-readable report `ggctl --format json` writes.
 pub const REPORT_KIND: &str = "GgctlReport";
+/// The credential-free MCP client configuration templates a running gateway
+/// serves and `ggctl mcp-config` reads.
+pub const MCP_CLIENT_CONFIGS_KIND: &str = "McpClientConfigs";
 
 /// One published JSON Schema (Draft 2020-12).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -63,6 +66,12 @@ pub const PUBLISHED_SCHEMAS: &[PublishedSchema] = &[
         kind: REPORT_KIND,
         file_name: "ggctl-report.v1alpha1.schema.json",
         json: include_str!("../../docs/schemas/ggctl-report.v1alpha1.schema.json"),
+    },
+    PublishedSchema {
+        api_version: API_VERSION_V1ALPHA1,
+        kind: MCP_CLIENT_CONFIGS_KIND,
+        file_name: "mcp-client-configs.v1alpha1.schema.json",
+        json: include_str!("../../docs/schemas/mcp-client-configs.v1alpha1.schema.json"),
     },
 ];
 

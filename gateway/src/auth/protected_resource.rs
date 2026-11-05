@@ -49,6 +49,13 @@ impl ProtectedResourceMetadataConfig {
             .to_owned()
     }
 
+    /// Whether the metadata document lists an authorization server, from
+    /// which an OAuth-capable MCP client can obtain a token for this
+    /// resource.
+    pub(crate) fn advertises_authorization_server(&self) -> bool {
+        !self.authorization_servers.is_empty()
+    }
+
     pub(crate) fn metadata_url(&self) -> String {
         public_url_with_path(&self.mcp_resource(), WELL_KNOWN_PATH)
     }

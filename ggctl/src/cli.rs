@@ -25,7 +25,7 @@ pub(crate) enum ValueKind {
     Url,
     /// A whole number of seconds.
     Seconds,
-    /// A document version string.
+    /// Text: a document version or a server entry name.
     Text,
     /// One of a fixed set of words.
     Choice(&'static [&'static str]),
@@ -76,9 +76,15 @@ pub(crate) const SCHEMA_KINDS: &[&str] = &[
     gateway_config::documents::INIT_ANSWERS_KIND,
     gateway_config::documents::CAPABILITIES_KIND,
     gateway_config::documents::REPORT_KIND,
+    gateway_config::documents::MCP_CLIENT_CONFIGS_KIND,
 ];
 /// The deployment profiles, as `gateway_config::bundle::Profile` names them.
 pub(crate) const PROFILES: &[&str] = &["production", "migration", "development"];
+/// The MCP clients, as `gateway_config::mcp_client_configs::ClientKind` names them.
+pub(crate) const MCP_CLIENTS: &[&str] = &["generic", "claude-desktop", "cursor", "vscode"];
+/// How a template's client authenticates, as
+/// `gateway_config::mcp_client_configs::Auth` names it.
+pub(crate) const MCP_AUTHS: &[&str] = &["oauth", "token"];
 const COMMAND_NAMES: &[&str] = &[
     "version",
     "schema",
@@ -88,6 +94,7 @@ const COMMAND_NAMES: &[&str] = &[
     "convert",
     "doctor",
     "diff",
+    "mcp-config",
     "completion",
     "help",
 ];
@@ -183,6 +190,22 @@ const IN_PLACE: OptionSpec = OptionSpec {
     name: "--in-place",
     value: None,
     help: "convert BUNDLE where it is instead of writing --output",
+};
+const CLIENT: OptionSpec = OptionSpec {
+    name: "--client",
+    value: Some(("CLIENT", ValueKind::Choice(MCP_CLIENTS))),
+    help:
+        "generic, claude-desktop, cursor or vscode (required): the client whose template to write",
+};
+const AUTH: OptionSpec = OptionSpec {
+    name: "--auth",
+    value: Some(("AUTH", ValueKind::Choice(MCP_AUTHS))),
+    help: "oauth (default), which names only the URL, or token, which reads GREENGATEWAY_MCP_TOKEN from the client's environment",
+};
+const NAME: OptionSpec = OptionSpec {
+    name: "--name",
+    value: Some(("NAME", ValueKind::Text)),
+    help: "the server entry name: 1 to 64 ASCII letters, digits, - and _, starting with a letter or digit (default greengateway)",
 };
 const API_VERSION: OptionSpec = OptionSpec {
     name: "--api-version",
@@ -339,6 +362,36 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         arguments: &[BUNDLE],
         options: &[AGAINST, CHECK, STRICT, VALIDATE_FORMAT],
         run: crate::diff::run,
+    },
+    CommandSpec {
+        name: "mcp-config",
+        summary: "Write a credential-free MCP client configuration template from a gateway",
+        description: &[
+            "Reads the gateway's MCP client configuration templates (GET \
+             <server>/mcp/client-configs, permission admin:mcp:clients:read) and writes the one \
+             for --client and --auth to standard output exactly as served: a JSON file for \
+             generic, cursor and vscode, the URL line for claude-desktop. The URL is the gateway's \
+             own MCP endpoint, which it computes from its GATEWAY_PUBLIC_URL; ggctl has no option \
+             to supply or change it.",
+            "No template holds a credential: an oauth template names only the URL, and a token \
+             template reads the bearer token from the client's GREENGATEWAY_MCP_TOKEN environment \
+             variable. ggctl never opens, creates or edits a client's configuration file; redirect \
+             the output where it belongs. Exits 0 when written, 3 when the gateway has no usable \
+             GATEWAY_PUBLIC_URL, offers no oauth template or serves a document this ggctl does \
+             not render, 2 for claude-desktop with --auth token, and 8 when the read is refused.",
+        ],
+        arguments: &[],
+        options: &[
+            SERVER,
+            CLIENT,
+            AUTH,
+            NAME,
+            CA_FILE,
+            TOKEN_STDIN,
+            TOKEN_FILE,
+            TIMEOUT,
+        ],
+        run: crate::mcp_config::run,
     },
     CommandSpec {
         name: "completion",

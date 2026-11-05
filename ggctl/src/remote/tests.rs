@@ -455,6 +455,116 @@ async fn an_unreadable_document_is_an_incompatible_server_not_a_partial_read() {
     }
 }
 
+fn mcp_document(name: &str, oauth: bool) -> McpClientConfigs {
+    McpClientConfigs::render(
+        &gateway_config::mcp_client_configs::McpUrl::new("https://gateway.example.test/base/mcp")
+            .expect("valid URL"),
+        &ServerName::new(name).expect("valid name"),
+        oauth,
+    )
+    .expect("renders")
+}
+
+#[tokio::test]
+async fn mcp_client_configs_are_read_with_the_name_and_the_bearer_token_only() {
+    for (name, oauth) in [(None, true), (Some("prod-gw_2"), false)] {
+        let expected = mcp_document(name.unwrap_or("greengateway"), oauth);
+        let body = serde_json::to_string(&expected).expect("serializes");
+        let (address, seen) = serve(
+            Some(http_response("200 OK", "application/json", &body)),
+            None,
+        )
+        .await;
+        let name = name.map(|name| ServerName::new(name).expect("valid name"));
+        assert_eq!(
+            mcp_client_configs(&plain_client(address), name.as_ref()).await,
+            Ok(expected)
+        );
+        let requests = seen.requests();
+        assert_eq!(requests.len(), 1);
+        let request = requests[0].to_ascii_lowercase();
+        let line = match &name {
+            None => "get /v1/admin/mcp/client-configs http/1.1\r\n".to_owned(),
+            Some(name) => format!(
+                "get /v1/admin/mcp/client-configs?name={} http/1.1\r\n",
+                name.as_str().to_ascii_lowercase()
+            ),
+        };
+        assert!(request.starts_with(&line), "{request}");
+        assert!(request.contains(&format!(
+            "authorization: bearer {}",
+            CANARY.to_ascii_lowercase()
+        )));
+        assert!(!request.contains("cookie"));
+    }
+}
+
+#[tokio::test]
+async fn mcp_client_config_refusals_and_unrendered_documents_have_their_own_codes() {
+    let mut newer = serde_json::to_value(mcp_document("greengateway", true)).expect("JSON");
+    newer["apiVersion"] = "greengateway.dev/v1beta1".into();
+    let mut tampered = serde_json::to_value(mcp_document("greengateway", true)).expect("JSON");
+    tampered["templates"][1]["content"] = format!("Bearer {CANARY}\n").into();
+    for (response, code) in [
+        (
+            http_response("404 Not Found", "application/json", "{}"),
+            Code::McpConfigsUnavailable,
+        ),
+        (
+            http_response(
+                "409 Conflict",
+                "application/json",
+                r#"{"error":"x","reason":"public_url_not_configured"}"#,
+            ),
+            Code::McpPublicUrlUnusable,
+        ),
+        (
+            http_response("400 Bad Request", "application/json", "{}"),
+            Code::UnexpectedStatus,
+        ),
+        (
+            http_response("403 Forbidden", "application/json", "{}"),
+            Code::Forbidden,
+        ),
+        (
+            http_response("200 OK", "application/json", &newer.to_string()),
+            Code::McpUnsupportedVersion,
+        ),
+        (
+            http_response("200 OK", "application/json", &tampered.to_string()),
+            Code::McpConfigsInvalid,
+        ),
+        (
+            http_response("200 OK", "application/json", "[]"),
+            Code::McpConfigsInvalid,
+        ),
+        (
+            http_response(
+                "200 OK",
+                "text/plain",
+                &serde_json::to_string(&mcp_document("greengateway", true)).expect("JSON"),
+            ),
+            Code::UnexpectedContentType,
+        ),
+    ] {
+        let (address, _) = serve(Some(response), None).await;
+        assert_eq!(
+            mcp_client_configs(&plain_client(address), None).await,
+            Err(code)
+        );
+    }
+    // The capability document's route keeps its own refusals only.
+    let (address, _) = serve(
+        Some(http_response("409 Conflict", "application/json", "{}")),
+        None,
+    )
+    .await;
+    assert_eq!(
+        handshake(&plain_client(address)).await,
+        Err(Code::UnexpectedStatus)
+    );
+}
+
 #[tokio::test]
 async fn responses_are_bounded_with_or_without_a_length() {
     let large = "x".repeat(MAX_CAPABILITIES_BYTES + 1);

@@ -2,7 +2,7 @@
 
 `ggctl` is GreenGateway's operator command-line tool (issue #242, [ADR-0008](adr/0008-setup-cli-and-configuration-bundles.md)). It is a separate binary: the `gateway` server keeps its name, its no-argument startup, its Docker entrypoint and its one-shot commands (`gateway migrate`, `gateway healthcheck`, `gateway import-standalone`, ...) unchanged.
 
-**Status: alpha.** This build implements `version`, `schema`, `init`, `validate`, `pin`, `convert`, `doctor`, `diff`, `completion` and `help`, the output contract, the exit codes, secure bearer-token input and the version handshake with a running gateway. `init` writes a new [configuration bundle](configuration-bundles.md) for a deployment profile, `validate` and `doctor` check one offline with the gateway's own bundle reader, `pin` rewrites its SHA-256 pins once its files validate, `convert` converts one between document versions, and `diff` compares two bundles semantically and classifies each change's risk. `ggctl` cannot yet plan, apply, export or back up anything, it has no browser wizard (`init --web`), and it cannot yet validate, convert or diff an environment file (`--env`, `--against-env`) or diff against a server (`diff --server`): those are later #242 slices (see the ADR's [rollout](adr/0008-setup-cli-and-configuration-bundles.md#rollout)), and a name this build does not implement is refused as an unknown command (exit 2). Nothing here changes how a gateway is configured or started: no gateway reads a bundle yet.
+**Status: alpha.** This build implements `version`, `schema`, `init`, `validate`, `pin`, `convert`, `doctor`, `diff`, `mcp-config`, `completion` and `help`, the output contract, the exit codes, secure bearer-token input and the version handshake with a running gateway. `init` writes a new [configuration bundle](configuration-bundles.md) for a deployment profile, `validate` and `doctor` check one offline with the gateway's own bundle reader, `pin` rewrites its SHA-256 pins once its files validate, `convert` converts one between document versions, `diff` compares two bundles semantically and classifies each change's risk, and `mcp-config` writes a credential-free MCP client configuration template from a running gateway. `ggctl` cannot yet plan, apply, export or back up anything, it has no browser wizard (`init --web`), and it cannot yet validate, convert or diff an environment file (`--env`, `--against-env`) or diff against a server (`diff --server`): those are later #242 slices (see the ADR's [rollout](adr/0008-setup-cli-and-configuration-bundles.md#rollout)), and a name this build does not implement is refused as an unknown command (exit 2). Nothing here changes how a gateway is configured or started: no gateway reads a bundle yet.
 
 ## Building
 
@@ -28,6 +28,7 @@ ggctl pin BUNDLE [--strict] [--format human|json]
 ggctl convert BUNDLE --to VERSION (--output DIR | --in-place) [--strict] [--format human|json]
 ggctl doctor BUNDLE [--format human|json]
 ggctl diff BUNDLE --against BUNDLE [--check] [--strict] [--format human|json|sarif]
+ggctl mcp-config --server URL --client generic|claude-desktop|cursor|vscode [--auth oauth|token] [--name NAME] [--ca-file PATH] [--token-stdin | --token-file PATH] [--timeout SECONDS]
 ggctl completion bash|zsh|fish|powershell
 ggctl help [COMMAND]
 ggctl --help | --version
@@ -41,7 +42,7 @@ Prints the `ggctl` version and the document versions whose schemas it publishes.
 
 ### `schema`
 
-Without `KIND`, lists every document kind and version this `ggctl` publishes a JSON Schema (Draft 2020-12) for. With `KIND` (`GatewayBundle`, `GatewayDeployment`, `GatewayInitAnswers`, `GatewayCapabilities` or `GgctlReport`), writes that schema to standard output, byte for byte as committed under [`docs/schemas`](schemas/) with LF line endings on every platform. `--api-version` selects a document version (default: the newest published); a version with no published schema exits `3`. Printing a schema writes an artifact, so `--format` is refused there. A schema is necessary but not sufficient: the gateway's reader is authoritative.
+Without `KIND`, lists every document kind and version this `ggctl` publishes a JSON Schema (Draft 2020-12) for. With `KIND` (`GatewayBundle`, `GatewayDeployment`, `GatewayInitAnswers`, `GatewayCapabilities`, `GgctlReport` or `McpClientConfigs`), writes that schema to standard output, byte for byte as committed under [`docs/schemas`](schemas/) with LF line endings on every platform. `--api-version` selects a document version (default: the newest published); a version with no published schema exits `3`. Printing a schema writes an artifact, so `--format` is refused there. A schema is necessary but not sufficient: the gateway's reader is authoritative.
 
 ### `init`
 
@@ -171,6 +172,22 @@ Exit codes: `0` when both bundles were compared, `4` with `--check` when they di
   run: ggctl diff deploy/bundle --against deployed/bundle --format sarif > bundle-diff.sarif
 ```
 
+### `mcp-config`
+
+Reads the gateway's MCP client configuration templates (`GET <server>/mcp/client-configs`, permission `admin:mcp:clients:read`; see [MCP client templates](mcp-clients.md)) and writes the one `--client` and `--auth` select to standard output, byte for byte as the gateway rendered it and with LF line endings: a JSON file for `generic`, `cursor` and `vscode`, and the URL line for `claude-desktop`. `--auth` is `oauth` (the default), whose template holds only the URL, or `token`, whose template reads the bearer token from the client's `GREENGATEWAY_MCP_TOKEN` environment variable; Claude Desktop has no token template, so `--client claude-desktop --auth token` is refused before anything is sent (`mcp.no_token_template`, exit `2`). `--name` chooses the JSON templates' server entry name (1 to 64 ASCII letters, digits, `-` and `_`, starting with a letter or digit; default `greengateway`) and is sent as the route's `name` parameter; a name outside that grammar is refused before anything is sent and never echoed.
+
+- The URL is the gateway's own MCP endpoint, which it computes from its `GATEWAY_PUBLIC_URL`. `ggctl` has no option to supply or change it, and `--server` is only the admin API it reads the templates from.
+- The document is read with the same `gateway-config` reader the gateway renders it with, and a template is written only when the whole document is exactly what this `ggctl` renders for the URL, name and OAuth flag it states. A template with a token, another URL or an extra member is refused whole (`mcp.client_configs_invalid`), and so is a document naming another server entry than the one asked for.
+- No template holds a credential, and the admin token from `--token-stdin` or `--token-file`, which authenticates the read, appears nowhere in the output. The handshake and `admin:config:read` are not needed.
+- `ggctl` never opens, creates or edits a client's configuration file. Where the template goes is the operator's redirect; merge it into a file that already lists other servers rather than replacing that file.
+- The template is an artifact, so there is no `--format`. Diagnostics go to standard error.
+
+Exit codes: `0` written, `3` when the gateway has no `GATEWAY_PUBLIC_URL` or one that cannot be templated (`mcp.public_url_unusable`), does not serve the route (`mcp.client_configs_unavailable`), offers no OAuth template because it advertises no authorization server (`mcp.oauth_unavailable`), or serves a document this `ggctl` does not read, `8` when the read is refused, `6` when the gateway cannot be reached, and `2` for an argument error.
+
+```sh
+printf '%s' "$ADMIN_TOKEN" | ggctl mcp-config --server https://gateway.example.test/v1/admin --token-stdin --client cursor --auth token > .cursor/mcp.json
+```
+
 ### `completion`
 
 Writes a completion script to standard output. It completes commands, options, fixed choices, file names for path options and directory names for a `BUNDLE` argument.
@@ -184,11 +201,11 @@ Writes a completion script to standard output. It completes commands, options, f
 
 ## Output contract
 
-- **Standard output carries only what was asked for**: an artifact (a schema, a completion script, help), the human result, with `--format json` exactly one `GgctlReport` document ([schema](schemas/ggctl-report.v1alpha1.schema.json)), or with `validate --format sarif` or `diff --format sarif` exactly one SARIF 2.1.0 log.
+- **Standard output carries only what was asked for**: an artifact (a schema, a completion script, help, an MCP client template), the human result, with `--format json` exactly one `GgctlReport` document ([schema](schemas/ggctl-report.v1alpha1.schema.json)), or with `validate --format sarif` or `diff --format sarif` exactly one SARIF 2.1.0 log.
 - **Diagnostics go to standard error** in human form. With `--format json` or `--format sarif` they are in the document instead and standard error stays empty.
 - **An argument error found before a command runs** (an unknown option, a refused secret or insecure option, a malformed `--server`) is written to standard error only, exits `2`, and writes no report.
 - **No color, no prompts, no progress output.** `ggctl` reads no configuration file and no environment variable, and makes no network request unless a command is given `--server`.
-- **Files are written only where a command is told to.** `init` and `convert --output` create the one directory `--output` names, and never write anything else, overwrite anything, or echo the path. `pin` replaces only `BUNDLE`'s `bundle.yaml`.
+- **Files are written only where a command is told to.** `init` and `convert --output` create the one directory `--output` names, and never write anything else, overwrite anything, or echo the path. `pin` replaces only `BUNDLE`'s `bundle.yaml`. `mcp-config` writes only to standard output and never opens a client's configuration file.
 
 A report always has `apiVersion: greengateway.dev/v1alpha1`, `kind: GgctlReport`, the `command`, the process `exitCode` and its stable `outcome` name, the `diagnostics`, and a command-specific `result`. Every diagnostic has a stable `code`, a `severity` (`error`, `warning` or `info`), fixed `message` text, an optional fixed `hint`, a `remediation` anchor and at most one location: when it concerns one argument, that argument's 1-based `location.argument` position; when the bundle reader found it, the bundle-relative `location.file`, a `location.pointer` built from member names the reader defines, and the 1-based `location.line` and `location.column` where the reader has them. Diagnostics are value-free by construction: they never contain an argument, token, URL, path, address, document value, server response or library error text. An unknown option is reported by its position, never by its spelling, because the spelling may be a mistyped secret. A published code never changes meaning; renaming or removing one needs a new report version.
 
@@ -311,7 +328,7 @@ Each code below is stable. The exit column is the exit code the diagnostic produ
 | `remote.transport_failed` | 1 | The request failed after the connection was established. |
 | `remote.redirect_refused` | 1 | The server answered with a redirect; check the admin prefix. |
 | `remote.unauthenticated` | 8 | HTTP 401: supply a valid admin token. |
-| `remote.forbidden` | 8 | HTTP 403: the principal lacks the route's permission (`admin:config:read` for the handshake). |
+| `remote.forbidden` | 8 | HTTP 403: the principal lacks the route's permission (`admin:config:read` for the handshake, `admin:mcp:clients:read` for `mcp-config`). |
 | `remote.server_unavailable` | 6 | HTTP 503: a dependency of the server is unavailable. |
 | `remote.unexpected_status` | 1 | Any other HTTP status. |
 | `remote.response_too_large` | 1 | The response is larger than `ggctl` accepts. |
@@ -330,6 +347,17 @@ Each code below is stable. The exit column is the exit code the diagnostic produ
 | Code | Exit | Meaning |
 | --- | --- | --- |
 | `schema.unsupported_api_version` | 3 | No schema is published for that kind at that document version. |
+
+### Mcp diagnostics
+
+| Code | Exit | Meaning |
+| --- | --- | --- |
+| `mcp.no_token_template` | 2 | `--client claude-desktop --auth token`: Claude Desktop takes a remote server by its URL and authorizes it with OAuth, so it has no token template. Nothing was sent. |
+| `mcp.client_configs_unavailable` | 3 | HTTP 404 for the templates: a gateway older than this route, a wrong admin prefix, or no `POLICY_FILE`. |
+| `mcp.public_url_unusable` | 3 | HTTP 409: the gateway has no `GATEWAY_PUBLIC_URL`, or its MCP endpoint holds `$`, `{`, `}` or `\` or is longer than 16 KiB. Set or fix it and restart the gateway. |
+| `mcp.unsupported_version` | 3 | The template document is a version this `ggctl` does not read. |
+| `mcp.client_configs_invalid` | 3 | The template document is not exactly one this `ggctl` renders, or names another server entry than the one asked for; no template from it was written. |
+| `mcp.oauth_unavailable` | 3 | The gateway advertises no authorization server, so it offers no OAuth template; configure a JWT provider with an `issuer`, or use `--auth token`. |
 
 ### Validate diagnostics
 

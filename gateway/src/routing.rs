@@ -287,6 +287,10 @@ pub(super) fn add_admin_api_routes(
                     get(config_capabilities_endpoint),
                 )
                 .route(
+                    routes.admin.mcp_client_configs_route.as_str(),
+                    get(mcp_client_configs_endpoint),
+                )
+                .route(
                     &format!("{}/capabilities", routes.admin.api_prefix),
                     get(admin_capabilities_endpoint),
                 )

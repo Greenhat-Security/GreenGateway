@@ -145,6 +145,16 @@ pub(super) fn config_rbac_not_configured() -> Response {
         .into_response()
 }
 
+pub(super) fn mcp_clients_rbac_not_configured() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "MCP client configuration API requires POLICY_FILE to be configured".to_owned(),
+        }),
+    )
+        .into_response()
+}
+
 pub(super) fn status_rbac_not_configured() -> Response {
     (
         StatusCode::NOT_FOUND,

@@ -18,6 +18,8 @@ pub(super) const ADMIN_AUTH_CALLBACK_ROUTE: &str = "/v1/admin/auth/callback";
 pub(super) const ADMIN_CAPABILITIES_ROUTE: &str = "/v1/admin/capabilities";
 pub(super) const STATUS_ADMIN_ROUTE: &str = "/v1/admin/status";
 pub(super) const CONFIG_CAPABILITIES_ADMIN_ROUTE: &str = "/v1/admin/config/capabilities";
+/// Credential-free MCP client configuration templates (issue #242).
+pub(super) const MCP_CLIENT_CONFIGS_ADMIN_ROUTE: &str = "/v1/admin/mcp/client-configs";
 pub(super) const CLUSTER_ADMIN_ROUTE: &str = "/v1/admin/cluster";
 pub(super) const CLUSTER_REPLICAS_ADMIN_ROUTE: &str = "/v1/admin/cluster/replicas";
 pub(super) const POLICY_ADMIN_ROUTE: &str = "/v1/admin/policy";
@@ -122,6 +124,10 @@ pub(super) const ADMIN_STATUS_READ_PERMISSION: &str = "admin:status:read";
 /// (issue #242, ADR-0008). Later slices extend what it grants; it never grants
 /// a write.
 pub(super) const ADMIN_CONFIG_READ_PERMISSION: &str = "admin:config:read";
+/// Reads the MCP client configuration templates (issue #242, ADR-0008). It
+/// is not `admin:config:read` and implies nothing else: the templates name
+/// only the gateway's public MCP endpoint and hold no credential.
+pub(super) const ADMIN_MCP_CLIENTS_READ_PERMISSION: &str = "admin:mcp:clients:read";
 pub(super) const ADMIN_CLUSTER_READ_PERMISSION: &str = connections::permissions::ADMIN_CLUSTER_READ;
 pub(super) const ADMIN_POLICY_READ_PERMISSION: &str = "admin:policy:read";
 pub(super) const ADMIN_POLICY_WRITE_PERMISSION: &str = "admin:policy:write";
@@ -249,6 +255,7 @@ pub(super) struct AdminRoutes {
     pub(super) auth_callback_route: String,
     pub(super) status_route: String,
     pub(super) config_capabilities_route: String,
+    pub(super) mcp_client_configs_route: String,
     pub(super) cluster_route: String,
     pub(super) cluster_replicas_route: String,
     pub(super) policy_route: String,
@@ -364,6 +371,7 @@ impl AdminRoutes {
             auth_callback_route: format!("{api_prefix}/auth/callback"),
             status_route: format!("{api_prefix}/status"),
             config_capabilities_route: format!("{api_prefix}/config/capabilities"),
+            mcp_client_configs_route: format!("{api_prefix}/mcp/client-configs"),
             cluster_route: format!("{api_prefix}/cluster"),
             cluster_replicas_route: format!("{api_prefix}/cluster/replicas"),
             policy_route: format!("{api_prefix}/policy"),

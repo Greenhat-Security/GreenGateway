@@ -21,6 +21,7 @@ mod diff;
 mod doctor;
 mod help;
 mod init;
+mod mcp_config;
 mod output;
 mod pin;
 mod remote;
@@ -136,7 +137,8 @@ mod tests {
              greengateway.dev/v1alpha1  GatewayDeployment\n\
              greengateway.dev/v1alpha1  GatewayInitAnswers\n\
              greengateway.dev/v1alpha1  GatewayCapabilities\n\
-             greengateway.dev/v1alpha1  GgctlReport\n"
+             greengateway.dev/v1alpha1  GgctlReport\n\
+             greengateway.dev/v1alpha1  McpClientConfigs\n"
         );
 
         let (exit, captured) = run_words(&[

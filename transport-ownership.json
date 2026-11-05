@@ -6843,7 +6843,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::routing::add_admin_api_routes#1",
-      "sha256": "0df0079ba808b38d1d322ff5bb94b51b23dc1b9be50ba4d9a4322ce467a3af03",
+      "sha256": "feb30b25044bc9f1d4eac51cb367a435c6ce3c0108bb313c62a42fc25a955350",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
@@ -9208,6 +9208,16 @@
       "sha256": "0a7475b75811083bc93e00a9edc25b3eb62fc2ffea5a8966a48c44ebb108973a",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed for #242 PR 10 (standalone revision ledger): decodes one row of the ledger's local SQLite database through rusqlite's Row, whose name the PostgreSQL client also exports, which is why the guard's conservative global alias union flags it. It adds no network or process capability."
+    },
+    {
+      "file": "gateway-config/src/mcp_client_configs.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway_config::mcp_client_configs::host_is_loopback#1",
+      "sha256": "a852ed69d98f94c0fda4baaeb76c6a7762df1ea7ca25bb35443f7604fa0e0336",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 (MCP client templates): classifies the parsed host of a gateway MCP URL as loopback (localhost or a loopback IPv4/IPv6 literal) so a template never names a plain-http non-loopback endpoint. url::Host is a value from an already-parsed URL; nothing is resolved or connected."
     },
     {
       "file": "gateway/src/connections/secret.rs",
@@ -15281,6 +15291,26 @@
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
     {
+      "file": "gateway/src/admin_mcp_clients.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::admin_mcp_clients::use super :: *#1",
+      "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/main.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::use admin_mcp_clients :: *#1",
+      "sha256": "73464c2de231005b1d5da40dc33d6cbcf529baad3d886b1aa3b09d60f26a0a89",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
       "file": "gateway/src/storage/contraction.rs",
       "reasons": [
         "network-or-process-reference"
@@ -15517,9 +15547,9 @@
         "network-or-process-reference"
       ],
       "scope": "ggctl::remote::impl  AdminClient::get_json#1",
-      "sha256": "919dd904f3f34d16bb35cc015270dc214805dba8228af411f13406150619572a",
+      "sha256": "6ce951073758175afa411baae13bb7121fe96999730091f11446be51e262b17e",
       "owner": "GreenGateway maintainers: operator CLI (#242)",
-      "purpose": "Reviewed for #242 PR 5: ggctl's admin API client, its only network capability. One reqwest client, built in admin_http_client with no proxy, no redirects, no transparent retries, HTTP/1.1, platform certificate and hostname verification plus optional --ca-file trust anchors, and bounded time and response size. It talks only to the operator-named admin API base, is not linked into the gateway, and scripts/check-egress-only.sh pins its builder."
+      "purpose": "Reviewed for #242 PR 5: ggctl's admin API client, its only network capability. One reqwest client, built in admin_http_client with no proxy, no redirects, no transparent retries, HTTP/1.1, platform certificate and hostname verification plus optional --ca-file trust anchors, and bounded time and response size. It talks only to the operator-named admin API base, is not linked into the gateway, and scripts/check-egress-only.sh pins its builder. #242 MCP client templates added a form-encoded query and per-route status refusals to this idempotent GET; the client, its builder and its single destination are unchanged."
     },
     {
       "file": "ggctl/src/remote.rs",
