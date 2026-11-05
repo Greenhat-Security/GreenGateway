@@ -861,7 +861,10 @@ gateway may publish for itself.
   However often the set is fetched, the gateway reads each alias at most once
   per build, and a fetch that arrives while the set is being rebuilt for the
   same keys is answered from the previous build rather than held on the secret
-  provider.
+  provider. A build reads up to four distinct aliases at a time, each read
+  bounded by its provider's own deadline, so a set of many keys does not take
+  the sum of every provider round trip to build; an alias that cannot be read
+  leaves out only the Connections that name it.
 - After a refresh fails to read a key, the gateway does not keep publishing
   what that key held before: the material behind an alias that is not pinned to
   a version may have changed, and the gateway never uses what such an alias
