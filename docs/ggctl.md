@@ -2,7 +2,7 @@
 
 `ggctl` is GreenGateway's operator command-line tool (issue #242, [ADR-0008](adr/0008-setup-cli-and-configuration-bundles.md)). It is a separate binary: the `gateway` server keeps its name, its no-argument startup, its Docker entrypoint and its one-shot commands (`gateway migrate`, `gateway healthcheck`, `gateway import-standalone`, ...) unchanged.
 
-**Status: alpha.** This build implements `version`, `schema`, `init`, `validate`, `pin`, `convert`, `doctor`, `diff`, `ledger seed`, `ledger verify`, `ledger rollback`, `completion` and `help`, the output contract, the exit codes, secure bearer-token input and the version handshake with a running gateway. `init` writes a new [configuration bundle](configuration-bundles.md) for a deployment profile, `validate` and `doctor` check one offline with the gateway's own bundle reader, `pin` rewrites its SHA-256 pins once its files validate, `convert` converts one between document versions, and `diff` compares two bundles semantically and classifies each change's risk. `validate`, `doctor` and `diff` also take an [environment file](#environment-files) instead of a bundle (`--env`, `--against-env`), for a deployment that stays in environment mode, and run the gateway's own configuration compiler over it. The `ledger` commands seed, verify and roll back a standalone state directory's [configuration revision ledger](configuration-ledger.md) offline, under the directory's lock. `ggctl` cannot yet plan, apply, export or back up anything, it has no browser wizard (`init --web`), and it cannot yet convert an environment file (`convert --env`) or diff against a server (`diff --server`): those are later #242 slices (see the ADR's [rollout](adr/0008-setup-cli-and-configuration-bundles.md#rollout)), and a name this build does not implement is refused as an unknown command (exit 2). Nothing here changes how a gateway is configured or started: no gateway reads a bundle or starts from a ledger yet.
+**Status: alpha.** This build implements `version`, `schema`, `init`, `validate`, `pin`, `convert`, `doctor`, `diff`, `ledger seed`, `ledger verify`, `ledger rollback`, `backup create`, `backup verify`, `backup restore`, the `policy` commands (`lint`, `test`, `explain`, `replay`), `evidence verify`, `mcp-config`, `completion` and `help`, the output contract, the exit codes, secure bearer-token input and the version handshake with a running gateway. `init` writes a new [configuration bundle](configuration-bundles.md) for a deployment profile, `validate` and `doctor` check one offline with the gateway's own bundle reader, `pin` rewrites its SHA-256 pins once its files validate, `convert` converts one between document versions, and `diff` compares two bundles semantically and classifies each change's risk. `validate`, `doctor` and `diff` also take an [environment file](#environment-files) instead of a bundle (`--env`, `--against-env`), for a deployment that stays in environment mode, and run the gateway's own configuration compiler over it. The `ledger` commands seed, verify and roll back a standalone state directory's [configuration revision ledger](configuration-ledger.md) offline, under the directory's lock. The `backup` commands back up the stores beneath a standalone state directory offline, under the directory's lock, verify a backup completely, and restore one into an empty or stopped state directory, which they leave as it was on any failure ([standalone backups](standalone-backup.md)). The [policy commands](#policy-commands) ask a gateway's own policy validator and evaluator (issue #243), and [`evidence verify`](#evidence-verify) checks a policy evidence package's integrity offline. `mcp-config` writes a credential-free MCP client configuration template from a running gateway. `ggctl` cannot yet plan, apply or export anything, it has no browser wizard (`init --web`), and it cannot yet convert an environment file (`convert --env`) or diff against a server (`diff --server`): those are later #242 slices (see the ADR's [rollout](adr/0008-setup-cli-and-configuration-bundles.md#rollout)), and a name this build does not implement is refused as an unknown command (exit 2). Nothing here changes how a gateway is configured or started: no gateway reads a bundle or starts from a ledger yet.
 
 ## Building
 
@@ -31,12 +31,22 @@ ggctl diff (BUNDLE | --env FILE) (--against BUNDLE | --against-env FILE) [--chec
 ggctl ledger seed BUNDLE --state-dir DIR [--format human|json]
 ggctl ledger verify --state-dir DIR [--format human|json]
 ggctl ledger rollback REVISION --state-dir DIR [--acknowledge RISK_CODE]... [--format human|json]
+ggctl backup create --state-dir DIR --output FILE [--format human|json]
+ggctl backup verify FILE [--format human|json]
+ggctl backup restore FILE --state-dir DIR [--replace-existing-state] [--format human|json]
+ggctl policy lint FILE --server URL [REMOTE] [--warnings-as-errors] [--format human|json|sarif]
+ggctl policy test SUITE --server URL [REMOTE] [--candidate FILE | --draft ID --draft-etag ETAG] [--format human|json|junit]
+ggctl policy explain CASES --server URL [REMOTE] [--format human|json]
+ggctl policy replay --server URL [REMOTE] (--base-etag ETAG --window FROM[/TO] [--candidate FILE | --draft ID --draft-etag ETAG] [--enforce-all-shadow] [--max-records N] [--idempotency-key KEY] | --job ID) [--wait] [--format human|json]
+ggctl policy replay --server URL [REMOTE] --cancel ID [--format human|json]
+ggctl evidence verify PACKAGE [--format human|json]
+ggctl mcp-config --server URL --client generic|claude-desktop|cursor|vscode [--auth oauth|token] [--name NAME] [--ca-file PATH] [--token-stdin | --token-file PATH] [--timeout SECONDS]
 ggctl completion bash|zsh|fish|powershell
 ggctl help [COMMAND [SUBCOMMAND]]
 ggctl --help | --version
 ```
 
-`ggctl help COMMAND` and `ggctl COMMAND --help` print a command's options. `ledger` is a command family: `ggctl help ledger` and `ggctl ledger --help` list its commands, and `ggctl help ledger seed` and `ggctl ledger seed --help` print one. Help and the completion scripts are generated from the same command table the parser uses, so they cannot drift. Man pages, which ADR-0008 also generates from that table, arrive with packaging (#242 PR 18).
+`REMOTE` stands for `[--ca-file PATH] [--token-stdin | --token-file PATH] [--timeout SECONDS]`, as for `version`. `ggctl help COMMAND` and `ggctl COMMAND --help` print a command's options. `ledger`, `backup`, `policy` and `evidence` are command families: `ggctl help ledger` and `ggctl ledger --help` list a family's commands, and `ggctl help ledger seed` and `ggctl ledger seed --help` print one. Help and the completion scripts are generated from the same command table the parser uses, so they cannot drift. Man pages, which ADR-0008 also generates from that table, arrive with packaging (#242 PR 18).
 
 ### `version`
 
@@ -44,7 +54,7 @@ Prints the `ggctl` version and the document versions whose schemas it publishes.
 
 ### `schema`
 
-Without `KIND`, lists every document kind and version this `ggctl` publishes a JSON Schema (Draft 2020-12) for. With `KIND` (`GatewayBundle`, `GatewayDeployment`, `GatewayInitAnswers`, `GatewayCapabilities` or `GgctlReport`), writes that schema to standard output, byte for byte as committed under [`docs/schemas`](schemas/) with LF line endings on every platform. `--api-version` selects a document version (default: the newest published); a version with no published schema exits `3`. Printing a schema writes an artifact, so `--format` is refused there. A schema is necessary but not sufficient: the gateway's reader is authoritative.
+Without `KIND`, lists every document kind and version this `ggctl` publishes a JSON Schema (Draft 2020-12) for. With `KIND` (`GatewayBundle`, `GatewayDeployment`, `GatewayInitAnswers`, `GatewayCapabilities`, `GgctlReport`, `GatewayBackup` or `McpClientConfigs`), writes that schema to standard output, byte for byte as committed under [`docs/schemas`](schemas/) with LF line endings on every platform. `--api-version` selects a document version (default: the newest published); a version with no published schema exits `3`. Printing a schema writes an artifact, so `--format` is refused there. A schema is necessary but not sufficient: the gateway's reader is authoritative.
 
 ### `init`
 
@@ -254,9 +264,147 @@ ggctl ledger rollback rev-0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f --state-dir /var/lib/
   --acknowledge risk.admin_access_path_removed --acknowledge risk.policy_broadened
 ```
 
+### `backup create`
+
+Backs up the stores beneath the standalone state directory `--state-dir` (required) names into the new archive `--output` (required) names, as [standalone backups](standalone-backup.md#creating-a-backup) describes. `ggctl` takes the state directory's [exclusive lock](configuration-bundles.md#the-state-directory) without waiting, so the gateway must be stopped. Each store of the layout that exists is snapshotted with SQLite's `VACUUM INTO` from a read-only connection, never copied file by file, and neither the store nor its write-ahead log is written; two names for one file are snapshotted once; the ledger must pass its full verification and every snapshot SQLite's integrity check. Nothing else in the directory is read. The archive is written to a new hidden file beside `--output`, owner-only on Unix, flushed, read back with every check of `backup verify`, and only then linked to `--output`, which must not exist and is never replaced. A failure leaves nothing at `--output`.
+
+- A backup is never written to standard output: `--output -` is refused (`backup.stdout_refused`, exit `2`).
+- A backup holds no pending login, session, cache, plaintext token, secret value or key. The Connections store keeps its secrets as #240 ciphertext, and the key files under `CONNECTION_SECRETS_ROOT` that decrypt them are a separate artifact to back up separately; a backup that includes the Connections store says so (`backup.secret_keys_not_included`, information).
+- The human result names each store with its entry, tables and rows, the counts, the program and SQLite versions and, for the ledger, its revisions. `--format json` writes one `GgctlReport` whose `result` holds `created` and, once written, `backup`: the manifest's versions, the seven stores of the layout in order (`store`, `included`, `entry`, `tables`, `rows`), the counts and the `ledger`'s revision count, `desired` and `active` revisions and `restartPending`. A refusal about one store names it as `result.store` (`audit`, `discovery`, `principals`, `connections`, `service_tokens`, `policy_history` or `config_ledger`); no path is ever echoed.
+
+Exit codes: `0` written, `3` for a store that is a link, not a regular file, writable by group or other, or corrupt, a ledger that does not verify or shares its file, an unusable state directory, or one that holds no store, `5` when the state directory is locked or `--output` exists, `7` when what was written did not verify, `1` when a store or the archive could not be read or written.
+
+### `backup verify`
+
+Reads the archive `FILE` completely through the shared [archive admission rules](archive-admission.md), into a new hidden staging directory beside it that is removed afterwards, and checks everything [standalone backups](standalone-backup.md#verifying-a-backup) lists: each entry header before its data, the `GatewayBackup` manifest as a closed document of a version this `ggctl` reads, exactly the manifest's entries in its order with each one's SHA-256, the archive's own digest, and each database's rollback-journal mode, integrity check, header versions, schema digest and table rows, and the ledger's full verification and revisions. It never changes the archive and writes nothing else. `FILE` must be valid UTF-8, and it is never echoed.
+
+- The human result is the store list, as `backup create` reports it. `--format json` writes one `GgctlReport` whose `result` holds `verified` and, once verified, `backup`; a refusal about one store names it as `result.store`.
+- A refusal by the admission rules carries their own code (the `archive` family, listed in [archive admission](archive-admission.md#codes), which is its remediation anchor) and is located by the 1-based position of the entry (`location.entry`) and, for a clash, of the earlier entry (`location.conflictsWith`); an entry's name is never echoed.
+- A digest is integrity evidence, not authenticity: whoever can write an archive can write a consistent one.
+
+Exit codes: `0` verified, `7` for any integrity failure (truncation, tampering, traversal, links or special entries, duplicate or case-colliding entries, a bomb, an unsupported version, a database that fails its checks), `3` when `FILE` is a link or not a regular file, `1` when it or the staging directory could not be read or written.
+
+```sh
+ggctl backup create --state-dir /var/lib/greengateway --output /backups/greengateway.ggbk
+ggctl backup verify /backups/greengateway.ggbk
+```
+
+### `backup restore`
+
+Restores the archive `FILE` into the state directory `--state-dir` (required) names, as [standalone backups](standalone-backup.md#restoring-a-backup) describes, or leaves it as it was. `ggctl` takes the directory's [exclusive lock](configuration-bundles.md#the-state-directory) without waiting, so the gateway must be stopped. The directory must exist and be empty apart from its lock file, or, with `--replace-existing-state`, hold nothing but the layout's entries (the stores' files with their `-wal`, `-shm` and `-journal` files, `state.lock` and `restore-marker.json`), each a regular file. There is no option that overwrites anything else. It must not be a mount point.
+
+The archive is extracted into a new hidden staging directory beside `--state-dir`, named from 128 random bits and owner-only on Unix, and checked there with every check of `backup verify`, then with the restore's own: each store's SQLite application ID, owner-only modes, and a flush of every file. A [restore marker](standalone-backup.md#the-restore-marker) is written beside the stores; the next gateway start from the directory records it as `config.restore_detected` and removes it. Only then is `--state-dir` renamed aside, the staging directory renamed into its place and their parent flushed, and the replaced directory removed. Any failure removes the staging directory and leaves `--state-dir` as it was, except `restore.rollback_failed`. `FILE` must be valid UTF-8; no path is ever echoed.
+
+- The human result is the store list, as `backup create` reports it, and the restore's ID. `--format json` writes one `GgctlReport` whose `result` holds `restored` and, once restored, `restoreId`, `replaced` (whether `--replace-existing-state` replaced stores) and `backup`; when nothing was restored it holds `targetUnchanged`, which is `true` unless `restore.rollback_failed` was reported. A refusal about one store names it as `result.store`.
+- An archive problem carries the code `backup verify` reports for it, located at `FILE`; a state directory or target problem is located at `--state-dir`.
+- Restoring the Connections store says that its key files must come back from their own backup (`restore.secret_keys_required`, information).
+- Run the restore as the account the gateway runs as: the restored files belong to the account that ran `ggctl`, `0600` inside a `0700` directory on Unix.
+
+Exit codes: `0` restored, `7` when the archive does not verify (truncation, tampering, traversal, links or special entries, duplicate or case-colliding entries, a bomb, an unsupported manifest, container or ledger version, a database that fails its checks or claims another store's identity), `3` for a state directory that is not admissible, holds what the layout does not name or is a mount point, and for an archive that is a link, not a regular file, or a PostgreSQL dump, `5` when the state directory is locked, holds stores without `--replace-existing-state`, or changed while the restore ran, `1` when anything could not be read, written, flushed or renamed. The [standalone disaster-recovery runbook](deployment/standalone-disaster-recovery.md) puts the commands in order.
+
+```sh
+ggctl backup restore /backups/greengateway.ggbk --state-dir /var/lib/greengateway/state
+ggctl backup restore /backups/greengateway.ggbk --state-dir /var/lib/greengateway/state --replace-existing-state
+```
+
+### Policy commands
+
+`ggctl policy lint`, `test`, `explain` and `replay` send a policy document, a [test suite](policy-tests.md), [simulation cases](policy-simulation.md) or a [replay request](policy-replay.md#replay-jobs) to the gateway `--server` names (required), and report what its own policy validator and evaluator answered. Nothing is judged in `ggctl`, so nothing it reports can disagree with what the gateway enforces, and none of these commands stores, publishes or activates a policy: `lint`, `test` and `explain` are side-effect free, and `replay` starts, reads or cancels a bounded job that reads the gateway's audit log. They use the [remote client](#remote-server) as `version --server` does (`--ca-file`, `--token-stdin` or `--token-file`, `--timeout`); they do not read the configuration capability document, so a token needs only the policy permissions below. The bundle and ledger commands never call them.
+
+- **Documents.** `FILE`, `SUITE`, `CASES` and `--candidate FILE` are each a regular file of at most 2 MiB, the gateway's own request bound (a link to one is followed; a FIFO, device or directory is refused without being opened). They are sent as their exact bytes: a candidate policy is spliced into the request unchanged, which is what the gateway's exact-source rules for a policy v1 document need. `ggctl` checks only that a document it embeds in a request (`SUITE`, `CASES`, `--candidate`) is one JSON value in UTF-8 (`input.not_json`); `lint` sends `FILE` unexamined, and the validator reports what is wrong with it. A document grants nothing, so its mode is not checked. No path is ever echoed: a diagnostic about a document names its argument's position.
+- **Answers.** An answer is read only as the document version this `ggctl` implements (`policy-test-results.v1`, `policy-simulation-results.v1`, `policy-replay-job.v1`, and the validator's diagnostics) and only when no string in it holds a control or bidirectional formatting character, so an answer cannot write to the terminal; anything else is `policy.response_invalid` (exit `3`). `--format json` repeats the gateway's document in `result` as it answered it. A refused request is reported by its HTTP status, the stable `reason` and the structured request `diagnostics` (code, JSON Pointer, fixed message), never by the free-text `error` or `errors` members, which may quote a document.
+- **Statuses.** `401` and `403` are `remote.unauthenticated` and `remote.forbidden` (exit `8`); `400` and `422` `policy.request_refused` (`3`); `404` `policy.not_found` (`3`); `409`, `410`, `412` and `428` `policy.precondition_failed` (`5`): a stale base or draft ETag, a draft pinned to another base or an idempotency key reused for a different request, never rebased or resent; `413` `policy.request_too_large` (`3`); `408` and `429` `policy.busy` (`6`: nothing ran); `503` `remote.server_unavailable` (`6`).
+- **Permissions.** Every policy command needs `admin:policy:read`. `test`, `explain` and `replay` also need `admin:policy:simulate`, and `replay` `admin:audit:read`. A policy whose routes gate the admin API needs a route for each endpoint ahead of a catch-all for unsafe policy methods; see [the test runs](policy-tests.md#running-a-suite).
+
+#### `policy lint`
+
+Sends the policy document in `FILE` to `POST <server>/policy/validate` and reports what the validator found: whether the document is `valid`, its `schema_version`, its ADR-0004 source and semantic digests, every diagnostic with its stable code, severity (`error`, `warning` or `risk`), JSON Pointer, element ID, fixed message and remediation and the uses it blocks (`simulation`, `tests`, `publication`, `evidence`), and the resource snapshot the cross-resource checks read. The validator judges the document as the replacement of the active policy, for the caller, exactly as a policy write would be judged, and stores nothing.
+
+- `--format json` writes one `GgctlReport` whose `result` holds `valid`, `schemaVersion`, `sourceDigest`, `semanticDigest`, `diagnostics` and `resourceSnapshot` (`digest`, `complete`, `unavailable`), or a `refusal`.
+- `--format sarif` writes one SARIF 2.1.0 log: `ggctl`'s own diagnostics, then one rule per validator code and one result per diagnostic (level `error`, or `warning` for a warning or a risk), located by a logical location whose `fullyQualifiedName` is the JSON Pointer and whose `name` is the element ID. A result has no file location, because the document's path is never echoed.
+- `--warnings-as-errors` exits `3` when the validator reported any warning or risk (`validate.warnings_as_errors`).
+
+Exit codes: `0` for a valid document, `3` for an invalid one (`policy.invalid`), and the statuses above.
+
+```sh
+printf '%s' "$POLICY_TOKEN" |
+  ggctl policy lint deploy/bundle/policy.json --server https://gateway.example.test/v1/admin \
+    --token-stdin --warnings-as-errors --format sarif > policy.sarif
+```
+
+#### `policy test`
+
+Sends the `policy-tests.v1` suite in `SUITE` to `POST <server>/policy/tests/runs`, which decides every case with the evaluator live traffic uses, and reports the run. Without a candidate the suite runs against the active policy; `--candidate FILE` runs it against a complete policy document instead (the request's `policy` member), and `--draft ID --draft-etag ETAG` against one of your server-side drafts at that ETag, quotes included. Nothing is stored or activated.
+
+- The human result gives the run's status and counts, the suite digest and the policy it ran against, then each case that did not pass with its status and what did not hold; `--format json` repeats the gateway's `policy-test-results.v1` report in `result.results`, with its `status`.
+- `--format junit` writes the gateway's own JUnit XML report to standard output exactly as it answered it, once it is UTF-8 with no control character but tabs and line breaks and its `X-GreenGateway-Policy-Tests-Status` header names a status. Diagnostics go to standard error, since the report has no place for them.
+
+Exit codes: `0` when every case passed; `3` when any case failed, was left undecided or was refused (`policy.tests_not_passed`), so an incomplete or erroring run never passes; and the statuses above. A JUnit report is still written when the suite did not pass.
+
+```sh
+ggctl policy test deploy/policy-tests.v1.json --candidate deploy/bundle/policy.json \
+  --server https://gateway.example.test/v1/admin --token-file ~/.config/gg/token \
+  --format junit > policy-tests.junit.xml
+```
+
+#### `policy explain`
+
+Sends the `policy-simulation.v1` request in `CASES`, byte for byte, to `POST <server>/policy/simulations` and explains each case: for every projection, what the policy decided (`logical`), whether a denial is `enforced` or only `shadowed`, what the request would meet (`effective_action`), the stable `reason` and, where the candidate is not the base, the base's answer when it differs. The request names its own `base_etag`, candidate, trace level and projections, as the [simulation reference](policy-simulation.md#the-request) describes; a shadowed deny is reported as `deny ... shadowed would_forward`, never as an allow. `--format json` repeats the gateway's result document in `result.results`. Nothing is stored or activated, and no live state is read or charged.
+
+Exit codes: `0` when the simulation completed, `5` for a stale `base_etag` or draft, `3` when the gateway refused the request, and the statuses above.
+
+#### `policy replay`
+
+Starts a [replay job](policy-replay.md#replay-jobs), reads one or cancels one.
+
+- **Start**: `--base-etag` (the active policy's ETag, quotes included, as `GET <server>/policy` returns it) and `--window FROM[/TO]` (RFC 3339 date-times with an offset; without `TO` the window ends when the job is created) are required. The candidate is the active policy unless `--candidate FILE` or `--draft ID --draft-etag ETAG` names another; `--enforce-all-shadow` adds the projection with every shadow enforced; `--max-records N` bounds the records read (1 to 100000); `--idempotency-key KEY` names the request. `ggctl` writes the `policy-replay.v1` request and sends it once to `POST <server>/policy/replays`.
+- **Read**: `--job ID` reads `GET <server>/policy/replays/ID`. **Cancel**: `--cancel ID` sends `DELETE` to the same path, which cancels a job that has not finished or discards one that has (`discarded: true`). A job ID is `rpl_` and 32 lowercase hexadecimal digits; nothing else becomes part of a path.
+- `--wait` polls the job, at most every 5 seconds and for at most 10 minutes, until it has finished (`policy.wait_timed_out` otherwise; the job keeps running). Each poll is an idempotent read.
+- A start is never resent. When its answer is lost after the request was sent, the job may exist: `ggctl` reports `policy.outcome_unknown` (exit `1`) and sends nothing more. Rerunning the same request under the same `--idempotency-key` answers with the job it started, if any, and starts nothing; without a key, a rerun starts another job.
+- The human result names the job, its state, base ETag and freshness, candidate, window, cutoff, records and, once finished, whether its result is complete, its digest and its limitations. `--format json` writes one `GgctlReport` whose `result` holds `action` (`start`, `read` or `cancel`), the gateway's `policy-replay-job.v1` document as last read (`job`), `discarded` for a cancellation, or a `refusal`.
+
+Exit codes: `0` when the job was started, read or cancelled, or, once finished, `completed`; `3` when it finished `completed_incomplete`, which satisfies no gate (`policy.replay_incomplete`); `5` when the base or draft is stale, or the active policy changed after the finished job was pinned (`policy.replay_stale`: its result is not evidence about the live policy); `1` when it finished without a result (`policy.replay_failed`: failed, cancelled or expired), the wait ran out, or a start's answer was lost; and the statuses above. A job that has not finished leaves the exit at `0`, so use `--wait` to gate on a result.
+
+### `evidence verify`
+
+Checks a [policy evidence package](policy-evidence.md) offline: `PACKAGE` is read once, at most 4 MiB, and nothing else is read, no network request is made and no environment variable is read. The package is held to the form a gateway serves it in, with the digest code the gateway computed its manifest with:
+
+- the file is UTF-8 JSON without a byte-order mark and exactly its own RFC 8785 bytes; a re-encoded or pretty-printed file, a repeated member name or another spelling of a number is refused (`evidence.not_canonical`) even when every digest still matches, since it is not the file that was served;
+- the envelope is a `policy-evidence.v1` object of `schema_version`, `generated_at`, `manifest` and the artifacts its manifest names, and nothing else (`evidence.unlisted_member`): an extra member such as an unverified signature is refused, not ignored;
+- the manifest names `report` and, in a package that carries them, `analysis` and `report_markdown`, each at most once (`evidence.duplicate_entry`) and in that order, each with exactly the media type and schema version its name defines (`evidence.artifact_type_mismatch`); any other artifact is `evidence.unsupported_artifact`;
+- every artifact the manifest names is present (`evidence.missing_artifact`), and its ADR-0004 digest and size are the ones its entry states (`evidence.digest_mismatch`, `evidence.size_mismatch`): for a JSON artifact the semantic digest over its RFC 8785 bytes, whose own `schema_version` must be its entry's, and for the Markdown rendering the source digest over its UTF-8 bytes;
+- the report's own record of the analysis entry (`analysis.artifact`) is the manifest's (`evidence.binding_mismatch`), so the report digest binds the analysis too, and the report says it is unsigned.
+
+Packages are unsigned: signing them, and verifying a signature against an out-of-band trust root, is a later #243 slice. So a package that passes is reported as `integrity_valid` and `unsigned`, with the information diagnostic `evidence.unsigned`: it is unchanged since its manifest was computed, and nothing shows who computed it. `ggctl` never reports a package as trusted, and a report that claims a signature is refused (`evidence.signature_unsupported`). Integrity says nothing about whether the policy is safe or the gateway's history and audit sources were complete; the report's own `completeness` and `limitations` are repeated as the report states them.
+
+- The human result gives the verdict, the envelope (version, `generated_at`, size and the ADR-0004 source digest of the file), each artifact's digest, size and whether it verified, and the report's completeness.
+- `--format json` writes one `GgctlReport` whose `result` holds `verdict` (`integrity_valid`, `integrity_invalid`, or `not_verified` for a version, artifact or signature claim this `ggctl` does not verify), `signature` (always `unsigned`), `trusted` (always `false`), `package` (`schemaVersion`, `generatedAt`, `size`, `sourceDigest`), `artifacts` and, for a verified package, `report` (`completeness`, `limitations`).
+
+Exit codes: `0` integrity valid, `7` integrity failure (or a package over 4 MiB), `3` for a package or artifact version this `ggctl` does not verify or a signature claim, `2` for a `PACKAGE` that is not a regular file, `1` when it could not be read.
+
+```sh
+ggctl evidence verify policy-evidence.json --format json | jq -e '.result.verdict == "integrity_valid"'
+```
+
+### `mcp-config`
+
+Reads the gateway's MCP client configuration templates (`GET <server>/mcp/client-configs`, permission `admin:mcp:clients:read`; see [MCP client templates](mcp-clients.md)) and writes the one `--client` and `--auth` select to standard output, byte for byte as the gateway rendered it and with LF line endings: a JSON file for `generic`, `cursor` and `vscode`, and the URL line for `claude-desktop`. `--auth` is `oauth` (the default), whose template holds only the URL, or `token`, whose template reads the bearer token from the client's `GREENGATEWAY_MCP_TOKEN` environment variable; Claude Desktop has no token template, so `--client claude-desktop --auth token` is refused before anything is sent (`mcp.no_token_template`, exit `2`). `--name` chooses the JSON templates' server entry name (1 to 64 ASCII letters, digits, `-` and `_`, starting with a letter or digit; default `greengateway`) and is sent as the route's `name` parameter; a name outside that grammar is refused before anything is sent and never echoed.
+
+- The URL is the gateway's own MCP endpoint, which it computes from its `GATEWAY_PUBLIC_URL`. `ggctl` has no option to supply or change it, and `--server` is only the admin API it reads the templates from.
+- The document is read with the same `gateway-config` reader the gateway renders it with, and a template is written only when the whole document is exactly what this `ggctl` renders for the URL, name and OAuth flag it states. A template with a token, another URL or an extra member is refused whole (`mcp.client_configs_invalid`), and so is a document naming another server entry than the one asked for.
+- No template holds a credential, and the admin token from `--token-stdin` or `--token-file`, which authenticates the read, appears nowhere in the output. The handshake and `admin:config:read` are not needed.
+- `ggctl` never opens, creates or edits a client's configuration file. Where the template goes is the operator's redirect; merge it into a file that already lists other servers rather than replacing that file.
+- The template is an artifact, so there is no `--format`. Diagnostics go to standard error.
+
+Exit codes: `0` written, `3` when the gateway has no `GATEWAY_PUBLIC_URL` or one that cannot be templated (`mcp.public_url_unusable`), does not serve the route (`mcp.client_configs_unavailable`), offers no OAuth template because it advertises no authorization server (`mcp.oauth_unavailable`), or serves a document this `ggctl` does not read, `8` when the read is refused, `6` when the gateway cannot be reached, and `2` for an argument error.
+
+```sh
+printf '%s' "$ADMIN_TOKEN" | ggctl mcp-config --server https://gateway.example.test/v1/admin --token-stdin --client cursor --auth token > .cursor/mcp.json
+```
+
 ### `completion`
 
-Writes a completion script to standard output. It completes commands, a family's commands after its name (`ggctl ledger <TAB>`), options, fixed choices (risk codes for `--acknowledge`), file names for path options and directory names for a `BUNDLE` argument.
+Writes a completion script to standard output. It completes commands, a family's commands after its name (`ggctl ledger <TAB>`), options, fixed choices (risk codes for `--acknowledge`), file names for path options, document arguments and a backup archive argument, and directory names for a `BUNDLE` argument.
 
 | Shell | Install |
 | --- | --- |
@@ -276,11 +424,11 @@ Writes a completion script to standard output. It completes commands, a family's
 
 ## Output contract
 
-- **Standard output carries only what was asked for**: an artifact (a schema, a completion script, help), the human result, with `--format json` exactly one `GgctlReport` document ([schema](schemas/ggctl-report.v1alpha1.schema.json)), or with `validate --format sarif` or `diff --format sarif` exactly one SARIF 2.1.0 log.
-- **Diagnostics go to standard error** in human form. With `--format json` or `--format sarif` they are in the document instead and standard error stays empty.
+- **Standard output carries only what was asked for**: an artifact (a schema, a completion script, help, an MCP client template), the human result, with `--format json` exactly one `GgctlReport` document ([schema](schemas/ggctl-report.v1alpha1.schema.json)), with `validate`, `diff` or `policy lint --format sarif` exactly one SARIF 2.1.0 log, or with `policy test --format junit` exactly the gateway's JUnit XML report.
+- **Diagnostics go to standard error** in human form. With `--format json` or `--format sarif` they are in the document instead and standard error stays empty. A JUnit report has no place for them, so with `--format junit` they stay on standard error.
 - **An argument error found before a command runs** (an unknown option, a refused secret or insecure option, a malformed `--server`) is written to standard error only, exits `2`, and writes no report.
 - **No color, no prompts, no progress output.** `ggctl` reads no configuration file of its own and no environment variable, reads only the files and directories its arguments name, and makes no network request unless a command is given `--server`.
-- **Files are written only where a command is told to.** `init` and `convert --output` create the one directory `--output` names, and never write anything else, overwrite anything, or echo the path. `pin` replaces only `BUNDLE`'s `bundle.yaml`. The `ledger` commands write only beneath `--state-dir`: its lock file, which they create if it is missing; `ledger seed` creates the ledger and never replaces one, `ledger rollback` appends one revision to it, and `ledger verify` writes nothing in it.
+- **Files are written only where a command is told to.** `init` and `convert --output` create the one directory `--output` names, and never write anything else, overwrite anything, or echo the path. `pin` replaces only `BUNDLE`'s `bundle.yaml`. The `ledger` commands write only beneath `--state-dir`: its lock file, which they create if it is missing; `ledger seed` creates the ledger and never replaces one, `ledger rollback` appends one revision to it, and `ledger verify` writes nothing in it. `backup create` creates the archive at `--output` and nothing else that stays: in `--state-dir` it writes only the lock file, if that is missing, and the hidden working, partial and verification entries it makes beside `--output` are removed. `backup verify` writes only a hidden staging directory beside `FILE`, which it removes. `backup restore` writes only a hidden staging directory beside `--state-dir`, which becomes `--state-dir` or is removed, and the lock file in `--state-dir`, which it removes again when the restore fails and the directory had none; the replaced directory, renamed aside, is removed. `mcp-config` writes only to standard output and never opens a client's configuration file.
 
 A report always has `apiVersion: greengateway.dev/v1alpha1`, `kind: GgctlReport`, the `command`, the process `exitCode` and its stable `outcome` name, the `diagnostics`, and a command-specific `result`. Every diagnostic has a stable `code`, a `severity` (`error`, `warning` or `info`), fixed `message` text, an optional fixed `hint`, a `remediation` anchor and at most one location: when it concerns one argument, that argument's 1-based `location.argument` position; when the bundle reader found it, the bundle-relative `location.file`, a `location.pointer` built from member names the reader defines, and the 1-based `location.line` and `location.column` where the reader has them. Diagnostics are value-free by construction: they never contain an argument, token, URL, path, address, document value, server response or library error text. An unknown option is reported by its position, never by its spelling, because the spelling may be a mistyped secret. A published code never changes meaning; renaming or removing one needs a new report version.
 
@@ -288,7 +436,7 @@ A report about a bundle carries the bundle reader's own codes (the `bundle`, `sy
 
 A report about an environment file carries the [`env`](#env-diagnostics) and [`config`](#config-diagnostics) codes below. Such a diagnostic is located by `location.argument`, the position of the option naming the file, and `location.line` where it concerns one line, and carries `field`, the inventoried setting it concerns, and `rule`, the [compiler rule](#configuration-rules) that refused it, where there are any.
 
-SARIF 2.1.0 output belongs to `validate`, which ADR-0008 gives it, and to `diff`, which reports its risk codes as results. For an environment file it lists the file in `run.artifacts` by the position of the option naming it and locates a finding by that artifact's index and the line.
+SARIF 2.1.0 output belongs to `validate`, which ADR-0008 gives it, to `diff`, which reports its risk codes as results, and to `policy lint`, which reports the policy validator's diagnostics as results. For an environment file, the log lists the file in `run.artifacts` by the position of the option naming it and locates a finding by that artifact's index and the line.
 
 ## Exit codes
 
@@ -297,14 +445,14 @@ SARIF 2.1.0 output belongs to `validate`, which ADR-0008 gives it, and to `diff`
 | `0` | `success` | Success; for `diff --check`, no drift; for `doctor`, no required check failed. |
 | `1` | `failure` | Unexpected internal, I/O or transport failure, including a mutation whose outcome could not be determined. |
 | `2` | `usage` | Usage error, including a reserved command or a refused insecure option. |
-| `3` | `invalid` | Invalid, incompatible or unsupported configuration, server or document version; a failed required doctor check; any warning under `--warnings-as-errors`. |
+| `3` | `invalid` | Invalid, incompatible or unsupported configuration, server or document version; a failed required doctor check; a policy that does not lint clean, a policy test suite that did not pass or an incomplete replay; any warning under `--warnings-as-errors`. |
 | `4` | `drift` | Drift found by `diff --check`. |
-| `5` | `conflict` | Precondition conflict: missing or stale ETag, plan, acknowledgment or lock, an output directory that is not empty, or a manifest that changed while it was being pinned. |
+| `5` | `conflict` | Precondition conflict: missing or stale ETag, plan, draft, acknowledgment, idempotency key or lock, a replay whose base changed, an output directory that is not empty, or a manifest that changed while it was being pinned. |
 | `6` | `unavailable` | A dependency was unavailable and nothing was sent or committed; safe to retry. |
-| `7` | `integrity` | Backup or archive integrity or restore verification failure. |
+| `7` | `integrity` | Backup, archive or evidence package integrity failure, or restore verification failure. |
 | `8` | `denied` | Authentication or authorization refused. |
 
-When several errors apply, the one that must not be hidden wins: `1` over everything, and `6` only when nothing else went wrong, so a pipeline that retries on `6` never resends work another error left in doubt. Today `4` comes from `diff --check` and `5` only from an `init` or `convert --output` directory that is not empty, a `bundle.yaml` that changed while `pin` ran, a state directory another process holds locked (`state_dir.locked`), or a `ledger seed` into a state directory that already holds a ledger (`ledger.exists`); the ETag and plan conflicts of `5`, and `7`, belong to commands later slices add.
+When several errors apply, the one that must not be hidden wins: `1` over everything, and `6` only when nothing else went wrong, so a pipeline that retries on `6` never resends work another error left in doubt. Today `4` comes from `diff --check`; `5` from an `init` or `convert --output` directory that is not empty, a `bundle.yaml` that changed while `pin` ran, a state directory another process holds locked (`state_dir.locked`), a `ledger seed` into a state directory that already holds a ledger (`ledger.exists`), a `backup create --output` that exists, a `backup restore` target that holds stores without `--replace-existing-state` or changed while it ran, and a stale ETag, draft or idempotency key or a replay whose base changed in the policy commands; and `7` from a backup archive that does not verify or would restore a store under another store's identity, and from `evidence verify`. The plan conflicts of `5` belong to commands later slices add.
 
 ## Credentials
 
@@ -363,8 +511,10 @@ Each code below is stable. The exit column is the exit code the diagnostic produ
 | `usage.missing_argument` | 2 | A required argument is missing. |
 | `usage.invalid_value` | 2 | A value is empty, not one of the command's choices, or out of range. |
 | `usage.argument_not_utf8` | 2 | An argument is not valid UTF-8. Only a path given as its own argument may be. |
-| `usage.conflicting_options` | 2 | Two options that exclude each other were both given: `--token-stdin` and `--token-file`, `BUNDLE` and `--env`, or `--against` and `--against-env`. |
+| `usage.conflicting_options` | 2 | Two options that exclude each other were both given: `--token-stdin` and `--token-file`, `BUNDLE` and `--env`, `--against` and `--against-env`, a `--candidate` and a `--draft`, or `--job`, `--cancel` and the options that start a replay. |
 | `usage.option_requires_server` | 2 | `--ca-file`, `--token-stdin`, `--token-file` or `--timeout` was given without `--server`. |
+| `usage.server_required` | 2 | A policy command was given no `--server`; it has no offline form. |
+| `usage.missing_option` | 2 | An option the command, or another option given, needs was not given: `--draft` and `--draft-etag` go together, and starting a replay needs `--base-etag` and `--window`. |
 | `usage.format_unsupported` | 2 | `--format` was given to a command form that writes an artifact. |
 | `usage.secret_on_command_line` | 2 | An option that would carry a secret was given; use `--token-stdin` or `--token-file`. |
 | `usage.insecure_option_refused` | 2 | An option that would disable verification was given; add the CA with `--ca-file` instead. |
@@ -405,11 +555,57 @@ Each code below is stable. The exit column is the exit code the diagnostic produ
 | `remote.transport_failed` | 1 | The request failed after the connection was established. |
 | `remote.redirect_refused` | 1 | The server answered with a redirect; check the admin prefix. |
 | `remote.unauthenticated` | 8 | HTTP 401: supply a valid admin token. |
-| `remote.forbidden` | 8 | HTTP 403: the principal lacks the route's permission (`admin:config:read` for the handshake). |
+| `remote.forbidden` | 8 | HTTP 403: the principal lacks the route's permission (`admin:config:read` for the handshake, `admin:mcp:clients:read` for `mcp-config`; see [the policy commands](#policy-commands) for theirs). |
 | `remote.server_unavailable` | 6 | HTTP 503: a dependency of the server is unavailable. |
 | `remote.unexpected_status` | 1 | Any other HTTP status. |
 | `remote.response_too_large` | 1 | The response is larger than `ggctl` accepts. |
-| `remote.unexpected_content_type` | 1 | The response is not `application/json`. |
+| `remote.unexpected_content_type` | 1 | The response is not `application/json` (for `policy test --format junit`, `application/xml`). |
+
+### Input diagnostics
+
+| Code | Exit | Meaning |
+| --- | --- | --- |
+| `input.unreadable` | 1 | A document file (`FILE`, `SUITE`, `CASES`, `--candidate`, `PACKAGE`) could not be opened or read. |
+| `input.not_regular_file` | 2 | A document file is not a regular file, such as a directory, FIFO or device. |
+| `input.too_large` | 3 | A document file is larger than 2 MiB, the gateway's request bound. |
+| `input.not_json` | 3 | A document `ggctl` embeds in a request is not exactly one JSON value in UTF-8. Nothing was sent. |
+
+### Policy diagnostics
+
+| Code | Exit | Meaning |
+| --- | --- | --- |
+| `policy.invalid` | 3 | `policy lint`: the gateway's policy validator reported an error in the document. |
+| `policy.tests_not_passed` | 3 | `policy test`: a case failed, was left undecided or was refused; only a `passed` run exits `0`. |
+| `policy.replay_incomplete` | 3 | The replay job finished `completed_incomplete`: its result covers less than its window and satisfies no gate. |
+| `policy.replay_failed` | 1 | The replay job ended without a result: it failed, was cancelled or expired. |
+| `policy.replay_stale` | 5 | The active policy changed after the finished replay job was pinned: its result is not evidence about the live policy. Start a new job. |
+| `policy.wait_timed_out` | 1 | The replay job did not finish within the 10 minutes `--wait` allows; it may still be running. Read it later with `--job`. |
+| `policy.request_refused` | 3 | HTTP 400 or 422: the gateway refused the request as invalid; the result's `refusal` carries its `reason` and structured diagnostics. |
+| `policy.not_found` | 3 | HTTP 404: no policy is configured, or no draft, history version or replay job of the caller's has that ID. |
+| `policy.precondition_failed` | 5 | HTTP 409, 410, 412 or 428: a stale base or draft ETag, an expired draft, a draft pinned to another base, or an idempotency key reused for a different request. Nothing was resent or rebased. |
+| `policy.request_too_large` | 3 | HTTP 413: the request body is over the gateway's bound. |
+| `policy.busy` | 6 | HTTP 408 or 429: the gateway started nothing, because its evaluation slots were taken or the body did not arrive in time. Safe to retry. |
+| `policy.response_invalid` | 3 | The gateway's answer is not a document of the version this `ggctl` reads, or holds a control or bidirectional formatting character. |
+| `policy.outcome_unknown` | 1 | A replay start reached the gateway but its answer was lost or unreadable, so a job may have started. Nothing was resent; the hint says how to find the job. |
+
+### Evidence diagnostics
+
+| Code | Exit | Meaning |
+| --- | --- | --- |
+| `evidence.unsigned` | 0 | Information: the package's integrity verified, and it is unsigned, so nothing shows who produced it. `ggctl` never reports it as trusted. |
+| `evidence.package_too_large` | 7 | The package is larger than 4 MiB, the most a gateway serves. |
+| `evidence.malformed` | 7 | The package is not a policy evidence envelope: not a JSON object, a member missing, of the wrong type or out of order, a manifest entry with other members than its five, or a report that does not say whether it is signed. |
+| `evidence.not_canonical` | 7 | The package is not exactly its RFC 8785 bytes: whitespace, member order, a repeated member name or a number's spelling differs from the form a gateway serves. |
+| `evidence.unsupported_version` | 3 | The package is a schema version other than `policy-evidence.v1`. |
+| `evidence.unsupported_artifact` | 3 | The manifest names an artifact this `ggctl` does not verify. |
+| `evidence.artifact_type_mismatch` | 7 | An artifact's media type or schema version is not the one its name defines, or a JSON artifact states another schema version than its entry, or the Markdown rendering is not a string. |
+| `evidence.duplicate_entry` | 7 | The manifest names one artifact more than once. |
+| `evidence.missing_artifact` | 7 | The manifest names an artifact the package does not hold, or does not name the report. |
+| `evidence.unlisted_member` | 7 | The package holds a member its manifest does not list. |
+| `evidence.size_mismatch` | 7 | An artifact's size is not the one its manifest entry states. |
+| `evidence.digest_mismatch` | 7 | An artifact's ADR-0004 digest is not the one its manifest entry states: the artifact changed after the manifest was computed. |
+| `evidence.binding_mismatch` | 7 | The report's own record of an artifact (the analysis) differs from the manifest's entry for it, or names one the package does not carry. |
+| `evidence.signature_unsupported` | 3 | The report claims a signature, which this `ggctl` cannot verify. |
 
 ### Compat diagnostics
 
@@ -424,6 +620,17 @@ Each code below is stable. The exit column is the exit code the diagnostic produ
 | Code | Exit | Meaning |
 | --- | --- | --- |
 | `schema.unsupported_api_version` | 3 | No schema is published for that kind at that document version. |
+
+### Mcp diagnostics
+
+| Code | Exit | Meaning |
+| --- | --- | --- |
+| `mcp.no_token_template` | 2 | `--client claude-desktop --auth token`: Claude Desktop takes a remote server by its URL and authorizes it with OAuth, so it has no token template. Nothing was sent. |
+| `mcp.client_configs_unavailable` | 3 | HTTP 404 for the templates: a gateway older than this route, a wrong admin prefix, or no `POLICY_FILE`. |
+| `mcp.public_url_unusable` | 3 | HTTP 409: the gateway has no `GATEWAY_PUBLIC_URL`, or its MCP endpoint holds `$`, `{`, `}` or `\` or is longer than 16 KiB. Set or fix it and restart the gateway. |
+| `mcp.unsupported_version` | 3 | The template document is a version this `ggctl` does not read. |
+| `mcp.client_configs_invalid` | 3 | The template document is not exactly one this `ggctl` renders, or names another server entry than the one asked for; no template from it was written. |
+| `mcp.oauth_unavailable` | 3 | The gateway advertises no authorization server, so it offers no OAuth template; configure a JWT provider with an `issuer`, or use `--auth token`. |
 
 ### Validate diagnostics
 
@@ -579,6 +786,64 @@ The [state directory](configuration-bundles.md#the-state-directory)'s own codes,
 | `ledger.unexpected_refusal` | 1 | The revision service refused the rollback for a reason the offline path does not expect. Nothing was written; report it. |
 | `ledger.gateway_recompiles_at_start` | 0 | Information: a gateway starting from this ledger compiles its desired revision again, with the production policy and tools validators, and refuses to start if it does not compile. |
 
+### Backup diagnostics
+
+The [standalone backup](standalone-backup.md) codes. A store or `--state-dir` problem is located by the position of `--state-dir` and names the store as `result.store`; an `--output` problem by the position of `--output`; an archive problem by the position of `FILE`. When `backup create` reports any error, nothing is at `--output`. A refusal by the archive admission rules carries their own `archive` code instead ([archive admission](archive-admission.md#codes)): exit `7`, or `1` for `archive.read_failed` and `archive.write_failed`.
+
+| Code | Exit | Meaning |
+| --- | --- | --- |
+| `backup.stdout_refused` | 2 | `--output -`: a backup is never written to standard output. Name a new file. |
+| `backup.output_exists` | 5 | Something exists at `--output`, which a backup never replaces. It was left as it was. |
+| `backup.output_unusable` | 1 | The archive or its working files could not be created, written, flushed or linked into place beside `--output`, for example because its directory does not exist, is read-only, is out of space, or is on a filesystem without hard links. |
+| `backup.permissions_unavailable` | 1 | The filesystem did not keep mode `0600` on the archive (Unix). |
+| `backup.nothing_to_back_up` | 3 | The state directory holds none of the stores of the layout. Check `--state-dir`. |
+| `backup.store_link` | 3 | A store's file is a symbolic link, junction or reparse point. |
+| `backup.store_not_regular_file` | 3 | A store's name is a directory, FIFO, device or socket. |
+| `backup.store_unsafe_permissions` | 3 | A store's file is writable by group or other (Unix), who could have changed it. |
+| `backup.store_unavailable` | 1 | A store could not be opened, read or snapshotted: busy, or a rollback journal left by a crash that a read-only connection cannot roll back. Start and stop the gateway once, then back up again. |
+| `backup.store_corrupt` | 3 | A store is not a SQLite database a backup can describe, or fails SQLite's integrity check. |
+| `backup.ledger_invalid` | 3 | The configuration revision ledger does not pass its [verification](configuration-ledger.md#verification); run `ggctl ledger verify`. |
+| `backup.ledger_shared` | 3 | The configuration revision ledger is the same file as another store, which no ledger can be. |
+| `backup.archive_unreadable` | 1 | `FILE` could not be opened or read, for example because it does not exist. |
+| `backup.archive_not_regular_file` | 3 | `FILE` is a symbolic link, junction or reparse point, or not a regular file. Name the archive itself. |
+| `backup.archive_too_large` | 7 | `FILE` is longer than any backup can be. |
+| `backup.staging_unavailable` | 1 | The staging directory beside the archive could not be created, written or read. |
+| `backup.not_a_backup` | 7 | `FILE` is not a GreenGateway backup archive. |
+| `backup.postgres_unsupported` | 3 | `FILE` is a PostgreSQL custom-format dump. PostgreSQL and cluster state is backed up and restored with the [PostgreSQL runbooks](deployment/backup-and-recovery.md), never with `ggctl backup`. |
+| `backup.unsupported_archive_version` | 7 | The archive is a container version this `ggctl` does not read. |
+| `backup.manifest_missing` | 7 | The archive's first entry is not its `gateway-backup.json` manifest. |
+| `backup.manifest_invalid` | 7 | The manifest is not a valid `GatewayBackup` document: an unknown, duplicate or missing member, a value outside its grammar, or an inventory, entry list and counts that disagree. |
+| `backup.unsupported_manifest_version` | 7 | The manifest is not a `GatewayBackup` document version this `ggctl` reads. |
+| `backup.unexpected_entry` | 7 | An entry is not the next one the manifest lists. |
+| `backup.entry_missing` | 7 | The archive ends before an entry the manifest lists. |
+| `backup.archive_digest_mismatch` | 7 | The archive's end record does not hold the SHA-256 of the archive before it. |
+| `backup.checksum_mismatch` | 7 | An entry's bytes do not match the SHA-256 the manifest records; `result.store` names the store. |
+| `backup.store_integrity_failed` | 7 | An entry is not a SQLite database in rollback-journal mode that passes SQLite's integrity check. |
+| `backup.store_mismatch` | 7 | An entry's header versions, pages, schema digest or table rows are not what the manifest records. |
+| `backup.ledger_verification_failed` | 7 | The archive's ledger does not pass the ledger's verification. |
+| `backup.ledger_mismatch` | 7 | The archive's ledger verifies but does not hold the revisions the manifest names. |
+| `backup.secret_keys_not_included` | 0 | Information: the backup holds the Connections store's secrets as ciphertext only. Back up the key files under `CONNECTION_SECRETS_ROOT` separately, or they cannot be decrypted after a restore. |
+
+### Restore diagnostics
+
+The `backup restore` codes beyond the backup codes above, which it reports for an archive that does not verify. A state directory or target problem is located by the position of `--state-dir`, a store identity problem by the position of `FILE`. Every error but `restore.rollback_failed` leaves the state directory as it was, with no hidden directory beside it.
+
+| Code | Exit | Meaning |
+| --- | --- | --- |
+| `restore.target_not_empty` | 5 | The state directory holds stores and `--replace-existing-state` was not given. Restore into an empty directory, or give the flag deliberately. |
+| `restore.target_not_state_dir` | 3 | The state directory holds an entry the layout does not name, or a store's name that is not a regular file. Nothing is ever replaced that the layout does not name. |
+| `restore.target_mount_point` | 3 | The state directory is a mount point, which a rename within its parent cannot move. Keep it one level below the volume's mount point. |
+| `restore.target_unavailable` | 1 | The state directory's entries, or the directory holding it, could not be read. |
+| `restore.staging_unavailable` | 1 | The staging directory beside the state directory could not be created, written or flushed, for example because the parent is not writable by this account or is out of space. |
+| `restore.permissions_unavailable` | 1 | The filesystem did not keep the staging directory `0700` or a staged store `0600` (Unix). |
+| `restore.store_identity_mismatch` | 7 | An archive entry does not carry the SQLite application ID of the store it would restore (`GGLG` for the ledger, `0` for the gateway's stores); `result.store` names the store. |
+| `restore.target_changed` | 5 | The state directory's entries changed between the check and the switch; it was put back. Stop whatever wrote it and restore again. |
+| `restore.switch_failed` | 1 | The state directory could not be renamed aside, or the restored directory into its place; it was put back. On Windows this is what a process holding a file open beneath it causes. |
+| `restore.rollback_failed` | 1 | The restored directory could not take the state directory's name, and the state directory could not be renamed back: its content is beside it as `.NAME.ggrestore-previous-HEX`. Rename that back by hand. |
+| `restore.directory_not_flushed` | 0 | Information: the restore is in place, but the directory holding the state directory could not be flushed, so a crash before the filesystem writes it back could undo the rename. |
+| `restore.previous_not_removed` | 0 | Information: the restore is in place, but the replaced stores could not all be removed. Delete `.NAME.ggrestore-previous-HEX` beside the state directory: it holds them. |
+| `restore.secret_keys_required` | 0 | Information: the restored Connections store holds its secrets as ciphertext only. Put the key files under `CONNECTION_SECRETS_ROOT` back from their own backup before the gateway starts. |
+
 ### Output diagnostics
 
 | Code | Exit | Meaning |
@@ -598,4 +863,4 @@ The [state directory](configuration-bundles.md#the-state-directory)'s own codes,
 
 ## Platform notes
 
-`ggctl` is tested on Linux, macOS and Windows. Exit codes, stream separation, terminal detection, token-file type and size checks and the remote client behave the same on all three. The owner-only permission check on token files applies on Unix only, as do the owner, mode and path checks on `--ca-file` and `--answers` files, and so do the bundle reader's refusal of a group- or other-writable bundle directory or file ([files and the directory](configuration-bundles.md#files-and-the-directory)) and the same refusal of an environment file; on Windows the reader enforces the link, reparse-point, regular-file and name rules, and ACLs are left to the operator. Likewise `init` and `convert --output` create their directory `0700` and its files `0600` on Unix and check those modes, and `pin` writes its new `bundle.yaml` `0600` and checks it, while on Windows the new entries inherit the ACL of the directory they are created in. Shell completion is generated for bash, zsh, fish and PowerShell.
+`ggctl` is tested on Linux, macOS and Windows. Exit codes, stream separation, terminal detection, token-file and document type and size checks, the remote client and evidence verification behave the same on all three. The owner-only permission check on token files applies on Unix only, as do the owner, mode and path checks on `--ca-file` and `--answers` files, and so do the bundle reader's refusal of a group- or other-writable bundle directory or file ([files and the directory](configuration-bundles.md#files-and-the-directory)) and the same refusal of an environment file; on Windows the reader enforces the link, reparse-point, regular-file and name rules, and ACLs are left to the operator. Likewise `init` and `convert --output` create their directory `0700` and its files `0600` on Unix and check those modes, and `pin` writes its new `bundle.yaml` `0600` and checks it, and `backup create` writes its archive `0600` and its working and staging directories `0700` and checks the archive, and `backup restore` stages `0600` stores in a `0700` directory and checks both, while on Windows the new entries inherit the ACL of the directory they are created in. Shell completion is generated for bash, zsh, fish and PowerShell.

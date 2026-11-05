@@ -257,6 +257,95 @@ pub(crate) fn query_name_is_readable(name: &str) -> bool {
             .any(|fragment| name.contains(fragment))
 }
 
+impl Condition {
+    /// Whether any leaf of the tree reads a tool call's arguments: the one
+    /// leaf no serving lane captures a fact for yet, because the arguments a
+    /// leaf may read are the schema-validated ones and admission decides
+    /// before it validates them.
+    pub(crate) fn reads_tool_arguments(&self) -> bool {
+        match self {
+            Self::All(operands) | Self::Any(operands) => {
+                operands.iter().any(Self::reads_tool_arguments)
+            }
+            Self::Not(operand) => operand.reads_tool_arguments(),
+            Self::ToolArgument(_) => true,
+            Self::Organization(_)
+            | Self::SourceNetwork(_)
+            | Self::Header(_)
+            | Self::Query(_)
+            | Self::TimeWindow(_) => false,
+        }
+    }
+}
+
+/// The facts a policy's typed matchers can read, so that a serving lane
+/// captures exactly those and nothing else: nothing at all for a policy with
+/// neither identity mappings nor rule conditions, which therefore decides,
+/// allocates and binds exactly as one did before conditions were served.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FactNeeds {
+    /// An identity mapping or an `organization` leaf reads the organization
+    /// authentication verified for the principal.
+    pub(crate) organization: bool,
+    /// A `source_network` leaf reads the canonical client address.
+    pub(crate) source_ip: bool,
+    /// The header names `header` leaves read: lowercase, sorted and unique.
+    /// A lane copies these headers and no others.
+    pub(crate) headers: Vec<String>,
+    /// The query parameter names `query` leaves read, sorted and unique.
+    pub(crate) query: Vec<String>,
+    /// A `tool_argument` leaf reads the call's validated arguments.
+    pub(crate) tool_arguments: bool,
+    /// A `time_window` leaf reads the evaluation instant.
+    pub(crate) now: bool,
+}
+
+impl FactNeeds {
+    /// What the conditions of `rules`, and identity mappings when the policy
+    /// has them, read.
+    pub(crate) fn of(rules: &[super::rule::Rule], identity_mappings: bool) -> Self {
+        let mut needs = Self {
+            organization: identity_mappings,
+            ..Self::default()
+        };
+        for conditions in rules.iter().filter_map(|rule| rule.conditions.as_ref()) {
+            needs.add(conditions);
+        }
+        needs.headers.sort_unstable();
+        needs.headers.dedup();
+        needs.query.sort_unstable();
+        needs.query.dedup();
+        needs
+    }
+
+    fn add(&mut self, condition: &Condition) {
+        match condition {
+            Condition::All(operands) | Condition::Any(operands) => {
+                for operand in operands {
+                    self.add(operand);
+                }
+            }
+            Condition::Not(operand) => self.add(operand),
+            Condition::Organization(_) => self.organization = true,
+            Condition::SourceNetwork(_) => self.source_ip = true,
+            Condition::Header(leaf) => self.headers.push(leaf.name.to_ascii_lowercase()),
+            Condition::Query(leaf) => self.query.push(leaf.name.clone()),
+            Condition::ToolArgument(_) => self.tool_arguments = true,
+            Condition::TimeWindow(_) => self.now = true,
+        }
+    }
+
+    /// Whether a request fact -- anything beyond the organization, which a
+    /// lane reads from the principal -- is read at all.
+    pub(crate) fn reads_request_facts(&self) -> bool {
+        self.source_ip
+            || !self.headers.is_empty()
+            || !self.query.is_empty()
+            || self.tool_arguments
+            || self.now
+    }
+}
+
 /// Canonicalizes the issuers a condition binds, as role and rule issuers are.
 pub(crate) fn canonicalize_condition_issuers(condition: &mut Condition) {
     match condition {

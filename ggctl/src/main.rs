@@ -8,14 +8,18 @@
 //! validation, pinning, diagnosis and semantic diff with the gateway's own
 //! bundle reader and diff engine, the same offline validation, diagnosis and
 //! diff of an environment file with the gateway's own configuration compiler
-//! (`gateway-config`), and the offline commands over a standalone revision
-//! ledger (`ggctl ledger`).
+//! (`gateway-config`), the offline commands over a standalone revision
+//! ledger (`ggctl ledger`), offline backups of a standalone state directory
+//! and their restore (`ggctl backup`), the policy commands, which ask a
+//! gateway's own validator and evaluator (`ggctl policy`), and offline
+//! evidence package verification (`ggctl evidence verify`).
 //!
 //! `ggctl` reads no configuration file of its own and no environment
 //! variable, reads only the files its arguments name, never accepts a secret
 //! as an argument, and makes no network request unless a command is given
 //! `--server`. The command reference is `docs/ggctl.md`.
 
+mod backup;
 mod cli;
 mod completion;
 mod convert;
@@ -24,11 +28,15 @@ mod diagnostic;
 mod diff;
 mod doctor;
 mod env;
+mod evidence;
 mod help;
 mod init;
+mod input;
 mod ledger;
+mod mcp_config;
 mod output;
 mod pin;
+mod policy;
 mod remote;
 mod report;
 mod sarif;
@@ -142,7 +150,9 @@ mod tests {
              greengateway.dev/v1alpha1  GatewayDeployment\n\
              greengateway.dev/v1alpha1  GatewayInitAnswers\n\
              greengateway.dev/v1alpha1  GatewayCapabilities\n\
-             greengateway.dev/v1alpha1  GgctlReport\n"
+             greengateway.dev/v1alpha1  GgctlReport\n\
+             greengateway.dev/v1alpha1  GatewayBackup\n\
+             greengateway.dev/v1alpha1  McpClientConfigs\n"
         );
 
         let (exit, captured) = run_words(&[

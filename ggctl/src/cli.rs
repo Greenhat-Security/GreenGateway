@@ -3,8 +3,9 @@
 //! One static table defines every command, argument and option. Help text
 //! (`help.rs`) and shell completion (`completion.rs`) are generated from it,
 //! and the parser accepts exactly what it lists, so the three cannot drift.
-//! A command family (`ggctl ledger`) is a name whose commands are listed in
-//! the table under their full names (`ledger seed`).
+//! A command family (`ggctl ledger`, `ggctl backup`, `ggctl policy`) is a
+//! name whose commands are listed in the table under their full names
+//! (`ledger seed`, `backup create`).
 //!
 //! Before anything else the parser refuses any argument that looks like a
 //! secret-carrying or verification-disabling option, wherever it appears, so
@@ -21,13 +22,18 @@ use crate::{
 /// What an argument or option value holds; completion uses it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ValueKind {
-    /// A local file path.
+    /// A local path: a file for an option; for an argument, the bundle
+    /// directory (`BUNDLE`) or a backup archive.
     Path,
+    /// A local file read as one document.
+    File,
     /// A URL.
     Url,
     /// A whole number of seconds.
     Seconds,
-    /// A document version string.
+    /// A whole number.
+    Number,
+    /// A document version string, an identifier, an ETag or a server entry name.
     Text,
     /// One of a fixed set of words.
     Choice(&'static [&'static str]),
@@ -109,6 +115,7 @@ impl FamilySpec {
 pub(crate) const FORMAT_HUMAN: &str = "human";
 pub(crate) const FORMAT_JSON: &str = "json";
 pub(crate) const FORMAT_SARIF: &str = "sarif";
+pub(crate) const FORMAT_JUNIT: &str = "junit";
 
 pub(crate) const SHELLS: &[&str] = &["bash", "zsh", "fish", "powershell"];
 pub(crate) const SCHEMA_KINDS: &[&str] = &[
@@ -117,9 +124,16 @@ pub(crate) const SCHEMA_KINDS: &[&str] = &[
     gateway_config::documents::INIT_ANSWERS_KIND,
     gateway_config::documents::CAPABILITIES_KIND,
     gateway_config::documents::REPORT_KIND,
+    gateway_config::documents::BACKUP_KIND,
+    gateway_config::documents::MCP_CLIENT_CONFIGS_KIND,
 ];
 /// The deployment profiles, as `gateway_config::bundle::Profile` names them.
 pub(crate) const PROFILES: &[&str] = &["production", "migration", "development"];
+/// The MCP clients, as `gateway_config::mcp_client_configs::ClientKind` names them.
+pub(crate) const MCP_CLIENTS: &[&str] = &["generic", "claude-desktop", "cursor", "vscode"];
+/// How a template's client authenticates, as
+/// `gateway_config::mcp_client_configs::Auth` names it.
+pub(crate) const MCP_AUTHS: &[&str] = &["oauth", "token"];
 /// Every risk code, as `gateway_config::semantic_diff::RiskCode` names them.
 pub(crate) const RISK_CODES: &[&str] = &[
     "risk.admin_access_path_removed",
@@ -139,6 +153,7 @@ pub(crate) const RISK_CODES: &[&str] = &[
     "risk.plaintext_transport",
     "risk.policy_broadened",
     "risk.policy_default_allow",
+    "risk.policy_tests_not_required",
     "risk.private_egress_allowed",
     "risk.profile_changed",
     "risk.public_origin_changed",
@@ -163,6 +178,15 @@ const COMMAND_NAMES: &[&str] = &[
     "ledger seed",
     "ledger verify",
     "ledger rollback",
+    "backup create",
+    "backup verify",
+    "backup restore",
+    "policy lint",
+    "policy test",
+    "policy explain",
+    "policy replay",
+    "evidence verify",
+    "mcp-config",
     "completion",
     "help",
 ];
@@ -178,10 +202,23 @@ pub(crate) const HELP_TOPICS: &[&str] = &[
     "doctor",
     "diff",
     "ledger",
+    "backup",
+    "policy",
+    "evidence",
+    "mcp-config",
     "completion",
     "help",
 ];
 const LEDGER_COMMANDS: &[&str] = &["seed", "verify", "rollback"];
+const BACKUP_COMMANDS: &[&str] = &["create", "verify", "restore"];
+const POLICY_COMMANDS: &[&str] = &["lint", "test", "explain", "replay"];
+const EVIDENCE_COMMANDS: &[&str] = &["verify"];
+/// The second word of every family's commands, once each, which
+/// `ggctl help FAMILY SUBCOMMAND` accepts; the family decides which of them
+/// it has.
+const SUBCOMMANDS: &[&str] = &[
+    "seed", "verify", "rollback", "create", "restore", "lint", "test", "explain", "replay",
+];
 
 const FORMAT: OptionSpec = OptionSpec {
     name: "--format",
@@ -325,6 +362,25 @@ const IN_PLACE: OptionSpec = OptionSpec {
     repeatable: false,
     help: "convert BUNDLE where it is instead of writing --output",
 };
+const CLIENT: OptionSpec = OptionSpec {
+    name: "--client",
+    value: Some(("CLIENT", ValueKind::Choice(MCP_CLIENTS))),
+    repeatable: false,
+    help:
+        "generic, claude-desktop, cursor or vscode (required): the client whose template to write",
+};
+const AUTH: OptionSpec = OptionSpec {
+    name: "--auth",
+    value: Some(("AUTH", ValueKind::Choice(MCP_AUTHS))),
+    repeatable: false,
+    help: "oauth (default), which names only the URL, or token, which reads GREENGATEWAY_MCP_TOKEN from the client's environment",
+};
+const NAME: OptionSpec = OptionSpec {
+    name: "--name",
+    value: Some(("NAME", ValueKind::Text)),
+    repeatable: false,
+    help: "the server entry name: 1 to 64 ASCII letters, digits, - and _, starting with a letter or digit (default greengateway)",
+};
 const API_VERSION: OptionSpec = OptionSpec {
     name: "--api-version",
     value: Some(("VERSION", ValueKind::Text)),
@@ -343,21 +399,178 @@ const ACKNOWLEDGE: OptionSpec = OptionSpec {
     repeatable: true,
     help: "acknowledge one risk code of the rollback; give it once for each code, since every code must be named",
 };
+const BACKUP_OUTPUT: OptionSpec = OptionSpec {
+    name: "--output",
+    value: Some(("FILE", ValueKind::Path)),
+    repeatable: false,
+    help:
+        "the backup archive to create (required): it must not exist, and is never standard output",
+};
+const ARCHIVE: ArgumentSpec = ArgumentSpec {
+    name: "FILE",
+    kind: ValueKind::Path,
+    required: true,
+    help: "the backup archive, as ggctl backup create wrote it",
+};
+const RESTORE_STATE_DIR: OptionSpec = OptionSpec {
+    name: "--state-dir",
+    value: Some(("DIR", ValueKind::Path)),
+    repeatable: false,
+    help: "the state directory to restore into (required): an existing empty directory, or with --replace-existing-state a stopped state directory, held under its exclusive lock",
+};
+const REPLACE_EXISTING_STATE: OptionSpec = OptionSpec {
+    name: "--replace-existing-state",
+    value: None,
+    repeatable: false,
+    help: "replace the stores a stopped state directory holds; it must hold nothing but the state-directory layout's entries",
+};
 
-pub(crate) const FAMILIES: &[FamilySpec] = &[FamilySpec {
-    name: "ledger",
-    summary: "Seed, verify or roll back a standalone configuration revision ledger, offline",
-    description: &[
-        "The offline commands over the configuration revision ledger beneath a standalone \
-         state directory (docs/configuration-ledger.md). Each takes the state directory's \
-         exclusive lock first, so it runs only while no gateway or other ggctl holds it, and \
-         exits 5 when one does. None makes a network request or reads an environment \
-         variable, and none writes gateway audit events: a revision's record is its \
-         evidence.",
-    ],
-    commands: LEDGER_COMMANDS,
-    hint: "run `ggctl help ledger` for the ledger commands",
-}];
+/// `--server` for a command that has no offline form.
+const REQUIRED_SERVER: OptionSpec = OptionSpec {
+    name: "--server",
+    value: Some(("URL", ValueKind::Url)),
+    repeatable: false,
+    help: "the admin API base (required), https://HOST[:PORT]/v1<ADMIN_PREFIX>; plain http only for a loopback IP literal",
+};
+const POLICY_TEST_FORMAT: OptionSpec = OptionSpec {
+    name: "--format",
+    value: Some((
+        "FORMAT",
+        ValueKind::Choice(&[FORMAT_HUMAN, FORMAT_JSON, FORMAT_JUNIT]),
+    )),
+    repeatable: false,
+    help: "human (default), json (one GgctlReport document) or junit (the gateway's JUnit XML report) on standard output",
+};
+const CANDIDATE: OptionSpec = OptionSpec {
+    name: "--candidate",
+    value: Some(("FILE", ValueKind::File)),
+    repeatable: false,
+    help: "a complete policy document to judge instead of the active policy, sent as its exact bytes and never stored",
+};
+const DRAFT: OptionSpec = OptionSpec {
+    name: "--draft",
+    value: Some(("ID", ValueKind::Text)),
+    repeatable: false,
+    help: "one of your server-side policy drafts to judge instead of the active policy, with --draft-etag",
+};
+const DRAFT_ETAG: OptionSpec = OptionSpec {
+    name: "--draft-etag",
+    value: Some(("ETAG", ValueKind::Text)),
+    repeatable: false,
+    help:
+        "the draft's ETag, quotes included, as the drafts API returned it (required with --draft)",
+};
+const BASE_ETAG: OptionSpec = OptionSpec {
+    name: "--base-etag",
+    value: Some(("ETAG", ValueKind::Text)),
+    repeatable: false,
+    help: "the active policy's ETag, quotes included, that the replay was written against (required to start one)",
+};
+const WINDOW: OptionSpec = OptionSpec {
+    name: "--window",
+    value: Some(("FROM[/TO]", ValueKind::Text)),
+    repeatable: false,
+    help: "the audit window to replay: RFC 3339 date-times with an offset; TO defaults to when the job starts (required to start one)",
+};
+const ENFORCE_ALL_SHADOW: OptionSpec = OptionSpec {
+    name: "--enforce-all-shadow",
+    value: None,
+    repeatable: false,
+    help: "also compare with every shadow projected as enforced",
+};
+const MAX_RECORDS: OptionSpec = OptionSpec {
+    name: "--max-records",
+    value: Some(("N", ValueKind::Number)),
+    repeatable: false,
+    help: "the most audit records the job reads, 1 to 100000 (default 100000)",
+};
+const IDEMPOTENCY_KEY: OptionSpec = OptionSpec {
+    name: "--idempotency-key",
+    value: Some(("KEY", ValueKind::Text)),
+    repeatable: false,
+    help: "1 to 128 letters, digits, '.', '_', ':' or '-': the same request under the same key answers with the job it started",
+};
+const JOB: OptionSpec = OptionSpec {
+    name: "--job",
+    value: Some(("ID", ValueKind::Text)),
+    repeatable: false,
+    help: "read the replay job ID instead of starting one",
+};
+const CANCEL: OptionSpec = OptionSpec {
+    name: "--cancel",
+    value: Some(("ID", ValueKind::Text)),
+    repeatable: false,
+    help: "cancel the replay job ID, or discard it once it has finished",
+};
+const WAIT: OptionSpec = OptionSpec {
+    name: "--wait",
+    value: None,
+    repeatable: false,
+    help: "poll the job until it finishes, for at most 10 minutes",
+};
+
+pub(crate) const FAMILIES: &[FamilySpec] = &[
+    FamilySpec {
+        name: "ledger",
+        summary: "Seed, verify or roll back a standalone configuration revision ledger, offline",
+        description: &[
+            "The offline commands over the configuration revision ledger beneath a standalone \
+             state directory (docs/configuration-ledger.md). Each takes the state directory's \
+             exclusive lock first, so it runs only while no gateway or other ggctl holds it, and \
+             exits 5 when one does. None makes a network request or reads an environment \
+             variable, and none writes gateway audit events: a revision's record is its \
+             evidence.",
+        ],
+        commands: LEDGER_COMMANDS,
+        hint: "run `ggctl help ledger` for the ledger commands",
+    },
+    FamilySpec {
+        name: "backup",
+        summary: "Back up a standalone state directory, verify a backup, or restore one, offline",
+        description: &[
+            "The offline commands over standalone backups (docs/standalone-backup.md): one \
+             archive of the stores beneath a state directory, with a GatewayBackup manifest of \
+             versions, inventory, counts and checksums. A backup is sensitive recovery material, \
+             not configuration. It never holds a plaintext token, a secret value or a key: the \
+             Connections store keeps its secrets as ciphertext, and the key files under \
+             CONNECTION_SECRETS_ROOT are a separate artifact to back up separately. None of \
+             these commands makes a network request or reads an environment variable, and none \
+             writes gateway audit events; a restore leaves a marker for the next gateway start \
+             to record.",
+        ],
+        commands: BACKUP_COMMANDS,
+        hint: "run `ggctl help backup` for the backup commands",
+    },
+    FamilySpec {
+        name: "policy",
+        summary: "Lint, test, explain and replay policy with a gateway's own evaluator",
+        description: &[
+            "The policy commands send a policy document, a test suite, simulation cases or a \
+             replay request to the gateway --server names, and report what its own validator and \
+             evaluator answer (docs/policy-tests.md, docs/policy-simulation.md, \
+             docs/policy-replay.md). Nothing is judged in ggctl, so nothing can disagree with \
+             the gateway. None of them stores, publishes or activates a policy: lint, test and \
+             explain are side-effect free, and replay starts, reads or cancels a bounded job \
+             that reads the gateway's audit log.",
+            "Each needs an admin bearer token with admin:policy:read; test, explain and replay \
+             also need admin:policy:simulate, and replay admin:audit:read.",
+        ],
+        commands: POLICY_COMMANDS,
+        hint: "run `ggctl help policy` for the policy commands",
+    },
+    FamilySpec {
+        name: "evidence",
+        summary: "Verify a policy evidence package offline",
+        description: &[
+            "Checks a policy evidence package a gateway produced (docs/policy-evidence.md), \
+             with no network request: its manifest, each artifact's ADR-0004 digest, size and \
+             media type. Packages are unsigned, so a verified package is integrity_valid and \
+             unsigned, never trusted.",
+        ],
+        commands: EVIDENCE_COMMANDS,
+        hint: "run `ggctl help evidence` for the evidence commands",
+    },
+];
 
 pub(crate) const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
@@ -597,6 +810,278 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         run: crate::ledger::rollback,
     },
     CommandSpec {
+        name: "backup create",
+        summary: "Back up a stopped standalone state directory into a new archive",
+        description: &[
+            "Takes the exclusive lock of the state directory --state-dir names, so it runs only \
+             while no gateway or other ggctl holds it, and writes one archive of every store of \
+             the state-directory layout it holds to the new file --output names. Each store is \
+             snapshotted with SQLite's VACUUM INTO from a read-only connection, never copied \
+             file by file, so whatever its write-ahead log holds is included consistently and \
+             neither the store nor its log is written; two names for one file are snapshotted \
+             once. The \
+             configuration revision ledger must pass its full verification and every snapshot \
+             SQLite's integrity check. Nothing else in the directory is read: not its lock \
+             file, not a store's -wal, -shm or -journal file, not any other file.",
+            "The archive is written to a new hidden file beside --output, owner-only on Unix, \
+             flushed and read back with every check of ggctl backup verify, then linked to \
+             --output, which must not exist and is never replaced; a failure leaves nothing at \
+             --output. A backup is never written to standard output. Exits 0 when the backup \
+             was written, 3 for a store that is a link, not a regular file, writable by others \
+             or corrupt, a ledger that does not verify, or a state directory with no store, 5 \
+             when the state directory is locked or --output exists, 7 when what was written \
+             did not verify, and 1 when a store or the archive could not be read or written.",
+        ],
+        arguments: &[],
+        options: &[STATE_DIR, BACKUP_OUTPUT, FORMAT],
+        run: crate::backup::create,
+    },
+    CommandSpec {
+        name: "backup verify",
+        summary: "Verify a backup archive completely, offline",
+        description: &[
+            "Reads the archive FILE completely through the shared archive admission rules, into \
+             a new hidden staging directory beside it, owner-only on Unix and removed \
+             afterwards: every entry name, kind and size before its data is read, the \
+             GatewayBackup manifest as a closed document of a version this ggctl reads, \
+             exactly the entries the manifest lists in its order with each one's SHA-256, the \
+             archive's own digest, and then each database: rollback-journal mode, SQLite's \
+             integrity check, its header versions, schema and table rows as the manifest \
+             records them, and the ledger's full verification and revisions.",
+            "Exits 0 when the backup verifies, 7 when anything about it does not (truncation, \
+             tampering, traversal, links, duplicate or case-colliding entries, a bomb, an \
+             unsupported version or a database that fails its checks), 3 when FILE is a link or \
+             not a regular file, and 1 when it or the staging directory could not be read or \
+             written. A digest is integrity evidence, not authenticity.",
+        ],
+        arguments: &[ARCHIVE],
+        options: &[FORMAT],
+        run: crate::backup::verify,
+    },
+    CommandSpec {
+        name: "backup restore",
+        summary: "Restore a backup into an empty or stopped state directory, offline",
+        description: &[
+            "Takes the exclusive lock of the state directory --state-dir names, so it runs only \
+             while no gateway or other ggctl holds it. The directory must be empty, or with \
+             --replace-existing-state hold nothing but the state-directory layout's entries (the \
+             stores' files with their -wal, -shm and -journal files, the lock file and a restore \
+             marker), and must not be a mount point. There is no option that overwrites anything \
+             else.",
+            "The archive FILE is extracted into a new hidden staging directory beside the state \
+             directory, named at random and owner-only on Unix, and checked there with every \
+             check of ggctl backup verify, then each store's SQLite application ID, owner-only \
+             modes and a flush of every file. A restore marker, which the next gateway start \
+             records as config.restore_detected and removes, is written beside the stores. Only \
+             then is the state directory renamed aside, the staging directory renamed into its \
+             place and their parent flushed; the replaced directory is then removed. Any failure \
+             removes the staging directory and leaves the state directory as it was.",
+            "Exits 0 when restored, 7 when the archive does not verify (truncation, tampering, \
+             traversal, links, duplicate or case-colliding entries, a bomb, an unsupported \
+             version, a database that fails its checks or claims another store's identity), 3 \
+             for a state directory that is not admissible, holds what the layout does not name \
+             or is a mount point, and for an archive that is a link, not a regular file or a \
+             PostgreSQL dump, 5 when the state directory is locked, holds stores without \
+             --replace-existing-state or changed meanwhile, and 1 when anything could not be \
+             read, written or renamed.",
+        ],
+        arguments: &[ARCHIVE],
+        options: &[RESTORE_STATE_DIR, REPLACE_EXISTING_STATE, FORMAT],
+        run: crate::backup::restore,
+    },
+    CommandSpec {
+        name: "policy lint",
+        summary: "Validate a policy document with a gateway's own policy validator",
+        description: &[
+            "Sends the policy document in FILE, as its exact bytes, to the gateway's \
+             POST <server>/policy/validate (permission admin:policy:read) and reports what its \
+             validator found: every diagnostic with its stable code, severity, JSON Pointer, \
+             element ID and the uses it blocks, the document's source and semantic digests, and \
+             the resources its cross-resource checks read. The document is judged as the \
+             replacement of the active policy, for this caller, and never stored.",
+            "Exits 0 for a valid document, 3 for an invalid one (or a warning or risk with \
+             --warnings-as-errors), 2 for a FILE that is not a regular file, 8 when the token \
+             is refused, 6 when the gateway is unavailable and 1 when FILE could not be read \
+             or the request failed. --format sarif reports each diagnostic as a result located \
+             by its JSON Pointer.",
+        ],
+        arguments: &[ArgumentSpec {
+            name: "FILE",
+            kind: ValueKind::File,
+            required: true,
+            help: "the policy document to validate, at most 2 MiB",
+        }],
+        options: &[
+            REQUIRED_SERVER,
+            WARNINGS_AS_ERRORS,
+            CA_FILE,
+            TOKEN_STDIN,
+            TOKEN_FILE,
+            TIMEOUT,
+            VALIDATE_FORMAT,
+        ],
+        run: crate::policy::lint,
+    },
+    CommandSpec {
+        name: "policy test",
+        summary: "Run a policy test suite on a gateway",
+        description: &[
+            "Sends the policy-tests.v1 suite in SUITE to the gateway's \
+             POST <server>/policy/tests/runs (permissions admin:policy:read and \
+             admin:policy:simulate), which decides every case with the evaluator live traffic \
+             uses, against the active policy, a complete --candidate document sent as its exact \
+             bytes, or one of your drafts (--draft and --draft-etag). Nothing is stored or \
+             activated.",
+            "Exits 0 when every case passed and 3 when any case failed, was left undecided or \
+             was refused (policy.tests_not_passed), or when the gateway refused the suite. \
+             --format junit writes the gateway's JUnit XML report as it was answered, and \
+             diagnostics to standard error.",
+        ],
+        arguments: &[ArgumentSpec {
+            name: "SUITE",
+            kind: ValueKind::File,
+            required: true,
+            help: "the policy-tests.v1 suite, at most 2 MiB",
+        }],
+        options: &[
+            REQUIRED_SERVER,
+            CANDIDATE,
+            DRAFT,
+            DRAFT_ETAG,
+            CA_FILE,
+            TOKEN_STDIN,
+            TOKEN_FILE,
+            TIMEOUT,
+            POLICY_TEST_FORMAT,
+        ],
+        run: crate::policy::test,
+    },
+    CommandSpec {
+        name: "policy explain",
+        summary: "Explain how a gateway's policy decides hypothetical cases",
+        description: &[
+            "Sends the policy-simulation.v1 request in CASES, as its exact bytes, to the \
+             gateway's POST <server>/policy/simulations (permissions admin:policy:read and \
+             admin:policy:simulate) and reports, for each case and projection, what the policy \
+             decided, whether a denial is enforced or only shadowed, what the request would meet \
+             and the stable reason, under the candidate and the pinned base the request names. \
+             The request carries its own base_etag, candidate and trace level. Nothing is stored \
+             or activated, and no live state is read or charged.",
+            "Exits 0 when the simulation completed, 3 when the gateway refused the request and \
+             5 when its base_etag or draft is stale.",
+        ],
+        arguments: &[ArgumentSpec {
+            name: "CASES",
+            kind: ValueKind::File,
+            required: true,
+            help: "the policy-simulation.v1 request, at most 2 MiB",
+        }],
+        options: &[
+            REQUIRED_SERVER,
+            CA_FILE,
+            TOKEN_STDIN,
+            TOKEN_FILE,
+            TIMEOUT,
+            FORMAT,
+        ],
+        run: crate::policy::explain,
+    },
+    CommandSpec {
+        name: "policy replay",
+        summary: "Start, read or cancel a historical policy replay job on a gateway",
+        description: &[
+            "Starts a replay job with POST <server>/policy/replays (permissions \
+             admin:policy:read, admin:policy:simulate and admin:audit:read): the gateway decides \
+             the audit records of --window again under a candidate (the active policy, a \
+             complete --candidate document or one of your drafts) and under the active policy \
+             --base-etag pins, and reports what changed as counts. --job reads a job and \
+             --cancel cancels or discards one. --wait polls the job until it finishes. A start \
+             is never resent: when its answer is lost the job may exist, and the same request \
+             under the same --idempotency-key answers with it.",
+            "Exits 0 when the job was started, read, cancelled or, with --wait, completed; 3 \
+             when it completed incomplete, which satisfies no gate; 5 when --base-etag or the \
+             draft is stale or the active policy changed under the finished job; and 1 when it \
+             failed, was cancelled or expired, did not finish within the wait, or the answer to \
+             a start was lost.",
+        ],
+        arguments: &[],
+        options: &[
+            REQUIRED_SERVER,
+            BASE_ETAG,
+            WINDOW,
+            CANDIDATE,
+            DRAFT,
+            DRAFT_ETAG,
+            ENFORCE_ALL_SHADOW,
+            MAX_RECORDS,
+            IDEMPOTENCY_KEY,
+            JOB,
+            CANCEL,
+            WAIT,
+            CA_FILE,
+            TOKEN_STDIN,
+            TOKEN_FILE,
+            TIMEOUT,
+            FORMAT,
+        ],
+        run: crate::policy::replay,
+    },
+    CommandSpec {
+        name: "evidence verify",
+        summary: "Verify a policy evidence package's integrity offline",
+        description: &[
+            "Reads the policy evidence package in PACKAGE, at most 4 MiB, and checks it with no \
+             network request: that it is exactly the RFC 8785 bytes a gateway serves, that its \
+             envelope is a policy-evidence.v1 envelope whose manifest names each artifact once, \
+             in order, with the media type and schema version its name defines, that the \
+             package holds every artifact the manifest names and nothing else, and that each \
+             artifact's size and ADR-0004 digest are the ones its entry states.",
+            "Packages are unsigned: a package that passes is reported as integrity_valid and \
+             unsigned, which shows it is unchanged since its manifest was computed but not who \
+             computed it, and never as trusted. Exits 0 when it passes, 7 when it fails, 3 for \
+             a version or artifact this ggctl does not verify, 2 for a PACKAGE that is not a \
+             regular file and 1 when it could not be read.",
+        ],
+        arguments: &[ArgumentSpec {
+            name: "PACKAGE",
+            kind: ValueKind::File,
+            required: true,
+            help: "the package file, as the gateway served it",
+        }],
+        options: &[FORMAT],
+        run: crate::evidence::verify,
+    },
+    CommandSpec {
+        name: "mcp-config",
+        summary: "Write a credential-free MCP client configuration template from a gateway",
+        description: &[
+            "Reads the gateway's MCP client configuration templates (GET \
+             <server>/mcp/client-configs, permission admin:mcp:clients:read) and writes the one \
+             for --client and --auth to standard output exactly as served: a JSON file for \
+             generic, cursor and vscode, the URL line for claude-desktop. The URL is the gateway's \
+             own MCP endpoint, which it computes from its GATEWAY_PUBLIC_URL; ggctl has no option \
+             to supply or change it.",
+            "No template holds a credential: an oauth template names only the URL, and a token \
+             template reads the bearer token from the client's GREENGATEWAY_MCP_TOKEN environment \
+             variable. ggctl never opens, creates or edits a client's configuration file; redirect \
+             the output where it belongs. Exits 0 when written, 3 when the gateway has no usable \
+             GATEWAY_PUBLIC_URL, offers no oauth template or serves a document this ggctl does \
+             not render, 2 for claude-desktop with --auth token, and 8 when the read is refused.",
+        ],
+        arguments: &[],
+        options: &[
+            SERVER,
+            CLIENT,
+            AUTH,
+            NAME,
+            CA_FILE,
+            TOKEN_STDIN,
+            TOKEN_FILE,
+            TIMEOUT,
+        ],
+        run: crate::mcp_config::run,
+    },
+    CommandSpec {
         name: "completion",
         summary: "Write a shell completion script",
         description: &[
@@ -618,7 +1103,8 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         summary: "Print help for ggctl or one command",
         description: &[
             "Prints the help for COMMAND, or the overview without one. For a command family \
-             such as ledger, prints the family's commands, or with SUBCOMMAND that command's help.",
+             such as ledger, backup or policy, prints the family's commands, or with \
+             SUBCOMMAND that command's help.",
         ],
         arguments: &[
             ArgumentSpec {
@@ -629,7 +1115,7 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
             },
             ArgumentSpec {
                 name: "SUBCOMMAND",
-                kind: ValueKind::Choice(LEDGER_COMMANDS),
+                kind: ValueKind::Choice(SUBCOMMANDS),
                 required: false,
                 help: "a command of the COMMAND family",
             },
@@ -938,7 +1424,7 @@ fn checked_value(kind: ValueKind, value: &OsStr, position: usize) -> Result<OsSt
     if value.is_empty() {
         return Err(Diagnostic::at(Code::InvalidValue, position));
     }
-    if kind == ValueKind::Path {
+    if matches!(kind, ValueKind::Path | ValueKind::File) {
         return Ok(value.to_owned());
     }
     let Some(text) = value.to_str() else {

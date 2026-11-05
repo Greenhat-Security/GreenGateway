@@ -45,6 +45,7 @@ mod env_file_tests;
 mod environment_reads;
 #[cfg(test)]
 mod fingerprint_tests;
+mod restore;
 mod revisions;
 mod semantic_diff;
 
@@ -169,6 +170,10 @@ pub struct Config {
     pub policy_file: Option<String>,
     pub tools_file: Option<String>,
     pub policy_history_sqlite_path: Option<String>,
+    /// Whether every policy publication must first pass the stored policy
+    /// test suite (issue #243). Off by default; on, a publication with no
+    /// stored suite, or one the suite does not pass, is refused.
+    pub policy_tests_required: bool,
     pub cors_allow_origins: Vec<String>,
     pub max_body_size: usize,
     /// Longest request path admitted, in bytes; `414` beyond it. Bounded above
@@ -548,6 +553,7 @@ pub(crate) fn into_config(plan: ConfigPlan) -> Config {
         policy_file,
         tools_file,
         policy_history_sqlite_path,
+        policy_tests_required,
         tool_lease_ttl_ms,
         cluster_heartbeat_ms,
         cluster_member_stale_ms,
@@ -676,6 +682,7 @@ pub(crate) fn into_config(plan: ConfigPlan) -> Config {
         policy_file,
         tools_file,
         policy_history_sqlite_path,
+        policy_tests_required,
         cors_allow_origins,
         max_body_size,
         max_request_path_bytes,

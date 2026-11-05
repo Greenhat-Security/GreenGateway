@@ -53,7 +53,7 @@
 //!
 //! Schema presence alone never enables an operation.
 //!
-//! The registry ([`OPERATION_REQUIREMENTS`]) holds five operations. The
+//! The registry ([`OPERATION_REQUIREMENTS`]) holds six operations. The
 //! first (issue #426, PR 2) is committing a policy document in which a role
 //! carries a `description` ([`POLICY_ROLE_DESCRIPTIONS`]). A gateway built
 //! before the field refuses such a document outright -- the role's fields
@@ -75,7 +75,12 @@
 //! cluster mode refuses the whole document, so the write waits until every
 //! live member advertises [`Capability::PolicyDocumentV1`] and reads format
 //! 1, and a member that lacks it and returns later fails closed on the
-//! document rather than misreading it. No operation changes the schema: migration 25, the one step that rolls,
+//! document rather than misreading it. The sixth (issue #243) is committing
+//! a policy v1 document whose rules carry `conditions`
+//! ([`POLICY_RULE_CONDITIONS`]): a gateway that serves format 1 but not
+//! rule conditions refuses the whole document, so the write also waits
+//! until every live member advertises [`Capability::PolicyRuleConditions`].
+//! No operation changes the schema: migration 25, the one step that rolls,
 //! adds columns nothing writes yet, and the approved-extension list in
 //! `migrations.rs` is empty. Every other operation this binary performs
 //! belongs to the schema-25 contract, which every member serving schema 25
@@ -137,17 +142,24 @@ pub(crate) enum Capability {
     /// carry a `description` (issue #426, PR 2). A member without it refuses
     /// such a document, so [`POLICY_ROLE_DESCRIPTIONS`] waits for it.
     PolicyRoleDescriptions,
+    /// The member reads, validates and enforces a policy v1 document whose
+    /// direct rules carry `conditions` over the organization, the source
+    /// network, headers, query parameters and time windows (issue #243). A
+    /// member without it refuses such a document, so
+    /// [`POLICY_RULE_CONDITIONS`] waits for it.
+    PolicyRuleConditions,
 }
 
 impl Capability {
     /// Every capability, in name order.
-    pub(crate) const KNOWN: [Self; 6] = [
+    pub(crate) const KNOWN: [Self; 7] = [
         Self::DelegatedTokenPurges,
         Self::OpenApiDiscoveryCatalogs,
         Self::OpenApiSwagger2Catalogs,
         Self::OperationRequirements,
         Self::PolicyDocumentV1,
         Self::PolicyRoleDescriptions,
+        Self::PolicyRuleConditions,
     ];
 
     pub(crate) const fn as_str(self) -> &'static str {
@@ -158,6 +170,7 @@ impl Capability {
             Self::OperationRequirements => "operation_requirements",
             Self::PolicyDocumentV1 => "policy_document_v1",
             Self::PolicyRoleDescriptions => "policy_role_descriptions",
+            Self::PolicyRuleConditions => "policy_rule_conditions",
         }
     }
 
@@ -176,6 +189,7 @@ pub(crate) const BINARY_CAPABILITIES: &[Capability] = &[
     Capability::OperationRequirements,
     Capability::PolicyDocumentV1,
     Capability::PolicyRoleDescriptions,
+    Capability::PolicyRuleConditions,
 ];
 
 /// The roster column's value for a capability set: the names sorted,
@@ -255,7 +269,7 @@ pub(crate) use gate::{
     BinaryContract, ContractFence, FenceExclusion, FenceTarget, MemberAdvertisement,
     OperationAdmission, OperationRefusal, OperationRequirement, DELEGATED_TOKEN_PURGES,
     OPENAPI_DISCOVERY_CATALOGS, OPENAPI_SWAGGER2_CATALOGS, OPERATION_REQUIREMENTS,
-    POLICY_DOCUMENT_V1, POLICY_ROLE_DESCRIPTIONS,
+    POLICY_DOCUMENT_V1, POLICY_ROLE_DESCRIPTIONS, POLICY_RULE_CONDITIONS,
 };
 
 #[cfg(feature = "postgres")]
@@ -445,6 +459,34 @@ mod gate {
         activation: Activation::LiveMembers,
     };
 
+    /// Committing a policy v1 document in which any direct rule carries
+    /// `conditions` (issue #243): through the same writes as
+    /// [`POLICY_DOCUMENT_V1`], which such a commit also asks first.
+    ///
+    /// A gateway that serves format 1 but predates enforced rule conditions
+    /// validates them and refuses the whole document
+    /// (`typed_matchers_not_enforced`); none reads it without its
+    /// conditions. A running replica of that build stops compiling the
+    /// active revision and holds readiness at
+    /// `security_revision_not_compiled`, and a starting one refuses to boot.
+    /// That is failing closed, never a misreading, so live-roster agreement
+    /// is enough ([`Activation::LiveMembers`]), for the same reason as
+    /// [`POLICY_DOCUMENT_V1`]: raising the durable fence would forbid every
+    /// earlier build from rejoining even after a document without
+    /// conditions is active again. A `tool_argument` condition is still
+    /// refused by this build too, before the gate is asked. The document
+    /// lives in the policy tables, so no schema object is added, and
+    /// `minimum_schema` is 17 for the same reason as
+    /// [`POLICY_ROLE_DESCRIPTIONS`].
+    pub(crate) const POLICY_RULE_CONDITIONS: OperationRequirement = OperationRequirement {
+        operation: "policy.rule_conditions",
+        minimum_schema: 17,
+        document_format: Some(1),
+        capability: Capability::PolicyRuleConditions,
+        backfill: Backfill::NotRequired,
+        activation: Activation::LiveMembers,
+    };
+
     /// Every operation this binary gates. An operation added later
     /// registers here, advertises a new capability, and calls the gate
     /// before its write.
@@ -454,6 +496,7 @@ mod gate {
         OPENAPI_DISCOVERY_CATALOGS,
         DELEGATED_TOKEN_PURGES,
         POLICY_DOCUMENT_V1,
+        POLICY_RULE_CONDITIONS,
     ];
 
     /// What this binary serves and advertises: the left-hand side of every

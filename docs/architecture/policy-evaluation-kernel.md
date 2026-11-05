@@ -455,7 +455,7 @@ path holds no resolver to ask.
 
 `policy_replay` is the third offline caller, and the first whose inputs are
 retained records rather than authored cases. A `ReplayContext`
-(`replay-context.v1`) holds the facts the kernel reads for one HTTP request or
+(`replay-context.v2`; v1 is still read) holds the facts the kernel reads for one HTTP request or
 tool invocation, each `recorded`, absent or `not_recorded`, and the result the
 policy stage recorded at the time. `policy_replay::legacy` reads one out of a
 stored audit event and names exactly one event of each request or invocation
@@ -464,11 +464,12 @@ contexts -- one fact to one input, a `not_recorded` fact to the kernel's
 missing state -- and calls `evaluate`, `select_rate_lane`, `evaluate_tool` and
 the static egress lane. Nothing here matches a rule.
 
-Two facts need more than a one-to-one mapping. The MCP alias identity is never
-recorded and the kernel has no missing state for it, so a record whose path
-could have been an alias is evaluated under both `Contextless` and `McpAlias`
-and is decided only when the two agree; otherwise it is `indeterminate` with
-`missing_mcp_identity`. A tool invocation's principal is projected through the
+Two facts need more than a one-to-one mapping. The MCP alias identity is not
+recorded by an observation itself and the kernel has no missing state for it,
+so a record whose path could have been an alias, and whose decision facts do
+not state the routing classification, is evaluated under both `Contextless`
+and `McpAlias` and is decided only when the two agree; otherwise it is
+`indeterminate` with `missing_mcp_identity`. A tool invocation's principal is projected through the
 tool runtime's own `principal_from_tool_actor`, the function the live lane
 projects an actor with, so a client-certificate caller is anonymous in both.
 Egress destinations are evaluated with `ResolutionFact::Missing`, because no
@@ -479,8 +480,13 @@ description of them: requests driven through the real RBAC and observation
 middleware, and invocations through the real tool runtime, are captured,
 adapted and replayed under the same compiled policy, and every replayed answer
 is the live one or `indeterminate` for a stated reason. No live path writes a
-replay context; the format and the legacy records are in
-[policy-replay.md](../policy-replay.md).
+replay context. What the live HTTP and tool lanes do write, beside each
+verdict, is its versioned decision facts (`policy_decision_facts`,
+`policy-decision.v1`): the snapshot's ETag and semantic digest, computed once
+per install, the evaluator's semantics and context versions, which inputs the
+evaluator had, the routing classification, and the verdict's reason and
+element. The adapters read them into the recorded result. The format and the
+legacy records are in [policy-replay.md](../policy-replay.md).
 
 ## Replay jobs (#243, slice 13)
 
@@ -553,8 +559,15 @@ policy without its direct rules for a route, `evaluate` over the whole policy
 for a route a rule pre-empts, `select_rate_lane` for an override -- and keeps
 the claim only when an earlier element does. A witness whose facts the kernel
 refuses makes the finding `inconclusive`; any other evaluator error fails the
-analysis. The property tests in `policy_analysis::tests` decide every request
+analysis. Existential claims are asked the same way, of a witness built from
+two elements' predicates: a partial overlap through `match_direct_rules`, an
+alias override and an alias route through `evaluate` with an `McpAlias`
+target, a selected upstream through `evaluate` with and without a dispatch
+that names the host, a tool entry's refusal through `evaluate_tool`, and an
+egress CIDR through the static egress lane with witness resolution facts.
+The property tests in `policy_analysis::tests` decide every request
 of small universes through `evaluate`, `evaluate_tool`,
 `evaluate_source_request` and `select_rate_lane` in every lane, before and
-after each suggested patch. The API is in
+after each suggested patch, and find a universe request showing every proven
+existential claim. The API is in
 [policy-analysis.md](../policy-analysis.md).

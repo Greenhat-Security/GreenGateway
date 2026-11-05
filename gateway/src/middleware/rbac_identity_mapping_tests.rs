@@ -399,7 +399,7 @@ fn every_tool_lane_answers_exactly_as_the_kernel_with_the_verified_organization(
             None,
         );
         assert_eq!(
-            state.tool_visible("lookup", Some(&principal)),
+            state.tool_visible("lookup", Some(&principal), None),
             expected.effect() == PolicyEffect::Allow,
             "{label}: visibility"
         );
@@ -418,6 +418,7 @@ fn every_tool_lane_answers_exactly_as_the_kernel_with_the_verified_organization(
                 "DELETE",
                 "/upstream/items/1",
                 Some(&principal),
+                None,
             )
             .expect("the rendered rule is answered");
         assert_eq!(
@@ -442,6 +443,7 @@ fn every_tool_lane_answers_exactly_as_the_kernel_with_the_verified_organization(
         let admitted = state.evaluate_tool_authorization(
             "reports.export",
             Some(&principal),
+            None,
             |authorization| match authorization.verdict {
                 ToolInvocationVerdict::Entry { rule_decision, .. } => {
                     Some(rule_decision.map(|decision| (decision.action, decision.matched_rule_id)))
@@ -577,7 +579,7 @@ async fn an_oversized_organization_is_refused_in_mapped_role_mode_only() {
     let denied = captured_event(&capture, AUTHZ_DENIED).await;
     assert_eq!(denied.payload["reason"], json!("policy_evaluation_error"));
     assert!(!state.principal_has_permission(&principal, "data:read"));
-    assert!(!state.tool_visible("lookup", Some(&principal)));
+    assert!(!state.tool_visible("lookup", Some(&principal), None));
     assert_eq!(
         state
             .tool_policy_eligibility("reports.export", &principal)

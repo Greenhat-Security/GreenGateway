@@ -42,7 +42,10 @@
 //! `POST .../suggestions/{id}/draft` (issue #243, slice 19) is the review
 //! path for a discovery suggestion: it writes the rule the suggestion
 //! proposes into a draft, new or one the caller holds, under these same
-//! rules, and changes neither the live policy nor the suggestion.
+//! rules, and changes neither the live policy nor the suggestion. Publishing
+//! that draft with a body that binds the suggestion is the suggestion's
+//! acceptance (issue #243): the candidate and the transition commit as one,
+//! through [`commit_suggestion_acceptance`].
 //!
 //! Simulations, policy test runs, analyses and replay jobs can name a draft
 //! as their candidate (issue #243): [`draft_as_candidate`] reads it under the
@@ -482,7 +485,7 @@ fn parse_draft_candidate(source: &RawValue) -> ResponseResult<rbac::Policy> {
 
 /// The `policy.draft_publish_refused` reason for a publication the commit
 /// itself refused.
-fn commit_refusal_reason(refusal: PolicyCommitRefusal) -> &'static str {
+pub(super) fn commit_refusal_reason(refusal: PolicyCommitRefusal) -> &'static str {
     match refusal {
         PolicyCommitRefusal::CandidateInvalid => "policy_draft_candidate_invalid",
         PolicyCommitRefusal::ResourcesRefused => "policy_resources_refused",
@@ -493,6 +496,8 @@ fn commit_refusal_reason(refusal: PolicyCommitRefusal) -> &'static str {
         PolicyCommitRefusal::AuthorityEvidenceUnsupported => {
             authority_events::required::REFUSAL_REASON
         }
+        PolicyCommitRefusal::RequiredTestsFailed => POLICY_TESTS_REQUIRED_FAILED_REASON,
+        PolicyCommitRefusal::RequiredTestsUnavailable => POLICY_TESTS_UNAVAILABLE_REASON,
         PolicyCommitRefusal::Failed => "policy_commit_failed",
     }
 }
@@ -908,8 +913,109 @@ pub(super) async fn policy_draft_delete_endpoint(
     }
 }
 
+/// `POST .../policy/drafts/{id}/publish`. The body is optional: empty (or
+/// `{}`) publishes the draft alone; `suggestion` binds the publication to
+/// the acceptance of the discovery suggestion the draft holds the rule of.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyDraftPublishRequest {
+    #[serde(default)]
+    suggestion: Option<PublishedSuggestionBinding>,
+}
+
+/// The suggestion a publication accepts, and the revision it was read at.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublishedSuggestionBinding {
+    id: String,
+    revision: i64,
+}
+
+/// A suggestion binding that passed its permission and configuration
+/// checks: what it names and the engine that holds it.
+struct BoundSuggestion<'a> {
+    id: String,
+    revision: i64,
+    engine: &'a discovery::suggestions::SuggestionEngineHandle,
+}
+
+/// Where a draft candidate holds the rule a bound suggestion proposes.
+struct SuggestedRuleInCandidate {
+    position: usize,
+    rule_id: Option<String>,
+    /// The recorded operator edit the rule carries, if any.
+    operator_edit: Option<&'static str>,
+}
+
+/// The operator edit a publication may carry over a shadow proposal: the
+/// rule enforced as `deny` in the draft. Recorded in the publication's
+/// history summary and audit event.
+const OPERATOR_EDIT_SHADOW_ENFORCED_AS_DENY: &str = "shadow_enforced_as_deny";
+
+/// A rule's meaning without its identity: what two rules must agree on to
+/// decide the same requests the same way. The id is ignored, and the method
+/// and principal lists compare as sets.
+fn rule_semantics(rule: &rbac::Rule) -> rbac::Rule {
+    let mut rule = rule.clone();
+    rule.id = None;
+    for list in [
+        &mut rule.methods,
+        &mut rule.principal.roles,
+        &mut rule.principal.issuers,
+        &mut rule.principal.auth_methods,
+        &mut rule.principal.principal_ids,
+    ] {
+        list.sort();
+        list.dedup();
+    }
+    rule
+}
+
+/// Whether `candidate` holds `drafted`, the rule a suggestion's review draft
+/// takes, by meaning and under any id. A proposal drafted as `shadow` may
+/// also be held as `deny`: enforcing a deny inferred from traffic is the
+/// operator's explicit edit, and the publication records it. Every other
+/// difference means the candidate does not hold the proposal.
+fn suggested_rule_in_candidate(
+    candidate: &rbac::Policy,
+    drafted: &rbac::Rule,
+) -> Option<SuggestedRuleInCandidate> {
+    let proposed = rule_semantics(drafted);
+    let found = |wanted: &rbac::Rule, operator_edit| {
+        candidate
+            .rules
+            .iter()
+            .position(|rule| rule_semantics(rule) == *wanted)
+            .map(|position| SuggestedRuleInCandidate {
+                position,
+                rule_id: candidate.rules[position].id.clone(),
+                operator_edit,
+            })
+    };
+    if let Some(held) = found(&proposed, None) {
+        return Some(held);
+    }
+    if drafted.action != rbac::RuleAction::Shadow {
+        return None;
+    }
+    let mut enforced = proposed;
+    enforced.action = rbac::RuleAction::Deny;
+    found(&enforced, Some(OPERATOR_EDIT_SHADOW_ENFORCED_AS_DENY))
+}
+
+/// `409 suggestion_rule_absent`: the draft's candidate does not hold the
+/// rule the bound suggestion proposes, so publishing it would not accept
+/// the suggestion. Nothing was written.
+fn suggestion_rule_absent() -> Response {
+    suggestion_draft_conflict(
+        "suggestion_rule_absent",
+        "the draft does not hold the rule the bound suggestion proposes",
+    )
+}
+
 /// `POST .../policy/drafts/{id}/publish`: make the draft's candidate the
-/// live policy.
+/// live policy, and, when the body binds a suggestion, accept that
+/// suggestion with it (issue #243).
 ///
 /// Two preconditions, both required: [`POLICY_DRAFT_ETAG_HEADER`] names the
 /// draft revision being published, and `If-Match` names the live policy
@@ -924,26 +1030,42 @@ pub(super) async fn policy_draft_delete_endpoint(
 /// with another replica. Nothing is written on any refusal, the draft is
 /// kept, and the refusal is audited as `policy.draft_publish_refused`.
 ///
+/// A body `{"suggestion":{"id":...,"revision":N}}` also needs
+/// `admin:suggestions:write`, decided once the body is read and before any
+/// store is. The handler then takes the suggestion lifecycle lock before the
+/// policy write lock, as acceptance does, so pending acceptances are
+/// settled first and no dismissal or acceptance can interleave. The
+/// suggestion is checked exactly as acceptance checks it, at the bound
+/// revision (`409 suggestion_stale` when it moved), and the candidate must
+/// hold the rule it proposes by meaning, under any id; a `shadow` proposal
+/// may be held as `deny`, an operator edit the publication records
+/// (`409 suggestion_rule_absent` otherwise). The candidate and the
+/// suggestion's transition then commit as one acceptance
+/// ([`commit_suggestion_acceptance`]): one transaction in cluster mode, the
+/// durable intent sequence in standalone mode.
+///
 /// After the commit the draft is marked published, which freezes it. That
 /// second write is not in the policy transaction: if it fails, the response
 /// still reports the committed policy and carries
 /// [`POLICY_DRAFT_WARNING_HEADER`], and the draft stays open on the base it
 /// was published over. The commit moved the live ETag off that base (a
 /// candidate identical to its base changes nothing either way), so a second
-/// publication is refused as stale until the owner explicitly re-pins it.
+/// publication is refused as stale until the owner explicitly re-pins it,
+/// and a bound suggestion, already accepted, refuses a second acceptance.
 pub(super) async fn policy_draft_publish_endpoint(
-    State(state): State<PolicyAdminState>,
+    State(suggestions): State<SuggestionsAdminState>,
     Path(draft_id): Path<String>,
     request: AxumRequest,
 ) -> Response {
     record_request(POLICY_DRAFT_PUBLISH_ADMIN_ROUTE);
 
+    let state = &suggestions.policy;
     let (parts, body) = request.into_parts();
     let Some(principal) = parts.extensions.get::<auth::Principal>().cloned() else {
         return unauthorized();
     };
     let (rbac_state, store) =
-        match authorized_draft_store(&state, &principal, ADMIN_POLICY_WRITE_PERMISSION) {
+        match authorized_draft_store(state, &principal, ADMIN_POLICY_WRITE_PERMISSION) {
             Ok(context) => context,
             Err(response) => return *response,
         };
@@ -964,19 +1086,60 @@ pub(super) async fn policy_draft_publish_endpoint(
     if let Err(response) = expected_resource_snapshot(&parts.headers) {
         return *response;
     }
-    // Everything a publication acts on is named by the two preconditions;
-    // a body could only be an option this endpoint does not have.
-    match read_request_body(body, state.max_body_size).await {
-        Ok(body) if body.is_empty() => {}
-        Ok(_) => return bad_request("policy draft publication does not accept a request body"),
+    let request = match read_request_body(body, state.max_body_size).await {
+        Ok(body) if body.is_empty() => PolicyDraftPublishRequest::default(),
+        Ok(body) => match serde_json::from_slice::<PolicyDraftPublishRequest>(&body) {
+            Ok(request) => request,
+            Err(error) => {
+                return bad_request(&format!("invalid policy draft publication JSON: {error}"));
+            }
+        },
         Err(response) => return *response,
-    }
+    };
+    let bound = match request.suggestion {
+        None => None,
+        Some(binding) => {
+            let id = binding.id.trim();
+            if id.is_empty() || binding.revision < 1 {
+                return bad_request(
+                    "a suggestion binding names the suggestion id and the revision it was read at",
+                );
+            }
+            // Accepting a suggestion needs the permission its own accept
+            // route needs, on top of the policy write every publication
+            // needs.
+            if let Err(error) = authorized_suggestions_state(
+                &suggestions,
+                &principal,
+                ADMIN_SUGGESTIONS_WRITE_PERMISSION,
+            ) {
+                return suggestions_admin_authz_error_response(error);
+            }
+            let Some(engine) = suggestions.suggestion_engine.as_ref() else {
+                return suggestions_discovery_not_configured();
+            };
+            Some(BoundSuggestion {
+                id: id.to_owned(),
+                revision: binding.revision,
+                engine,
+            })
+        }
+    };
 
     let owner = policy_draft_owner(&principal);
     let context = PublicationContext {
-        state: &state,
+        state,
         parts: &parts,
         principal: &principal,
+    };
+    // A bound publication is an acceptance: the lifecycle lock first, then
+    // the policy write lane, the order acceptance takes them in.
+    let mut lifecycle = match bound {
+        Some(_) => match reconciled_suggestion_lifecycle(&suggestions).await {
+            Ok(lifecycle) => Some(lifecycle),
+            Err(response) => return *response,
+        },
+        None => None,
     };
     let policy_write_guard = rbac_state.policy_write_guard().await;
 
@@ -1005,7 +1168,7 @@ pub(super) async fn policy_draft_publish_endpoint(
         );
     }
 
-    let (live_policy, live_etag) = match authoritative_policy_and_etag(&state, rbac_state).await {
+    let (live_policy, live_etag) = match authoritative_policy_and_etag(state, rbac_state).await {
         Ok(view) => view,
         Err(response) => return *response,
     };
@@ -1032,10 +1195,40 @@ pub(super) async fn policy_draft_publish_endpoint(
         );
     }
 
+    // The bound suggestion, checked exactly as acceptance checks it, at the
+    // revision the binding names.
+    let reviewed = match bound.as_ref() {
+        None => None,
+        Some(bound) => {
+            let reviewed = reviewable_suggestion_rule(
+                bound.engine,
+                &bound.id,
+                Some(bound.revision),
+                suggestion_stale_response,
+            )
+            .await;
+            match reviewed {
+                Ok((suggestion, rule)) => {
+                    let rule = drafted_suggestion_rule(&suggestion, rule);
+                    Some((suggestion, rule))
+                }
+                Err(refusal) => {
+                    return refuse_publication(
+                        &context,
+                        &draft.summary,
+                        refusal.reason,
+                        Some(&live_etag),
+                        *refusal.response,
+                    );
+                }
+            }
+        }
+    };
+
     // The candidate was validated when it was saved, but publication is
     // judged against this binary and the resources current now.
     let validated = validate_policy_candidate(&draft.candidate).and_then(|candidate| {
-        validate_policy_write_candidate(&state, rbac_state, &live_policy, &candidate)
+        validate_policy_write_candidate(state, rbac_state, &live_policy, &candidate)
             .map(|()| candidate)
     });
     let candidate = match validated {
@@ -1051,47 +1244,135 @@ pub(super) async fn policy_draft_publish_endpoint(
         }
     };
 
-    let diff_summary = json!({
+    let mut diff_summary = json!({
         "action": "policy_draft_published",
         "draft_id": draft.summary.draft_id,
         "draft_revision": draft.summary.revision,
         "base_etag": draft.summary.base_etag,
     });
+    let accepted = match reviewed.as_ref() {
+        None => None,
+        Some((suggestion, rule)) => {
+            let Some(held) = suggested_rule_in_candidate(&candidate, rule) else {
+                return refuse_publication(
+                    &context,
+                    &draft.summary,
+                    "suggestion_rule_absent",
+                    Some(&live_etag),
+                    suggestion_rule_absent(),
+                );
+            };
+            let binding = json!({
+                "id": suggestion.id,
+                "revision": suggestion.revision,
+                "rule_id": held.rule_id,
+                "position": held.position,
+                "operator_edit": held.operator_edit,
+            });
+            if let Value::Object(fields) = &mut diff_summary {
+                fields.insert("suggestion".to_owned(), binding.clone());
+            }
+            Some((suggestion, binding))
+        }
+    };
+
     // Publishing a draft replaces the whole live document, exactly as
     // `PUT /admin/policy` does, so its change evidence names the same
     // operation; the diff summary is what records the draft it came from.
-    let commit = match commit_policy_mutation(
-        PolicyMutationCommitContext {
-            state: &state,
-            rbac_state,
-            policy_write_guard: &policy_write_guard,
-            parts: &parts,
-            principal: &principal,
-        },
-        storage::DocumentAction::PolicyPublish,
-        &live_policy,
-        &live_etag,
-        &candidate,
-        diff_summary,
-    )
-    .await
-    {
-        Ok(commit) => commit,
-        // The authority refused the commit and wrote nothing: as much a
-        // decision not to change enforcement as a refusal before it.
-        Err(PolicyMutationFailure::Refused(refusal, response)) => {
-            return refuse_publication(
-                &context,
-                &draft.summary,
-                commit_refusal_reason(refusal),
-                Some(&live_etag),
-                *response,
-            );
+    // A bound publication is the suggestion's acceptance, and commits as
+    // one.
+    let (commit, accepted_suggestion) = match (accepted.as_ref(), bound.as_ref()) {
+        (Some((suggestion, _)), Some(bound)) => {
+            let Some(lifecycle) = lifecycle.as_mut() else {
+                tracing::error!(
+                    "a bound draft publication does not hold the suggestion lifecycle lock"
+                );
+                return internal_server_error("policy draft publication failed");
+            };
+            let committed = commit_suggestion_acceptance(
+                SuggestionAcceptContext {
+                    state: &suggestions,
+                    parts: &parts,
+                    principal: &principal,
+                    rbac_state,
+                    policy_write_guard: &policy_write_guard,
+                },
+                lifecycle,
+                bound.engine,
+                SuggestionAcceptanceCandidate {
+                    origin: discovery::suggestions::SuggestionAcceptanceOrigin::DraftPublish,
+                    suggestion,
+                    before_policy: &live_policy,
+                    current_etag: &live_etag,
+                    candidate: &candidate,
+                    diff_summary,
+                },
+            )
+            .await;
+            match committed {
+                Ok(committed) => (
+                    PolicyMutationCommitResult {
+                        after_policy: committed.policy,
+                        new_etag: committed.etag,
+                        history_append_failed: committed.history_append_failed,
+                    },
+                    Some(committed.suggestion),
+                ),
+                Err(SuggestionAcceptanceFailure::Refused { reason, response }) => {
+                    return refuse_publication(
+                        &context,
+                        &draft.summary,
+                        reason,
+                        Some(&live_etag),
+                        *response,
+                    );
+                }
+                // The policy was committed, so this is not a refusal and is
+                // not recorded as one.
+                Err(SuggestionAcceptanceFailure::Incomplete(response)) => return *response,
+            }
         }
-        // Something was written before a later step failed, so this is not
-        // a refusal and is not recorded as one.
-        Err(PolicyMutationFailure::Incomplete(response)) => return *response,
+        _ => {
+            let committed = commit_policy_mutation(
+                PolicyMutationCommitContext {
+                    state,
+                    rbac_state,
+                    policy_write_guard: &policy_write_guard,
+                    parts: &parts,
+                    principal: &principal,
+                },
+                storage::DocumentAction::PolicyPublish,
+                &live_policy,
+                &live_etag,
+                &candidate,
+                diff_summary,
+            )
+            .await;
+            match committed {
+                Ok(commit) => (commit, None),
+                // The authority refused the commit and wrote nothing: as
+                // much a decision not to change enforcement as a refusal
+                // before it.
+                Err(PolicyMutationFailure::Refused(refusal, response)) => {
+                    return refuse_publication(
+                        &context,
+                        &draft.summary,
+                        commit_refusal_reason(refusal),
+                        Some(&live_etag),
+                        *response,
+                    );
+                }
+                // Something was written before a later step failed, so this
+                // is not a refusal and is not recorded as one.
+                Err(PolicyMutationFailure::Incomplete(response)) => return *response,
+            }
+        }
     };
+    if let Some(suggestion) = accepted_suggestion.as_ref() {
+        if crashes_at(&suggestion.id, AcceptanceBoundary::SuggestionAccepted) {
+            return crashed_at(AcceptanceBoundary::SuggestionAccepted);
+        }
+    }
 
     let marked = store
         .update(
@@ -1119,19 +1400,23 @@ pub(super) async fn policy_draft_publish_endpoint(
             false
         }
     };
+    let mut published = json!({
+        "draft_id": draft.summary.draft_id,
+        "draft_revision": draft.summary.revision,
+        "base_etag": draft.summary.base_etag,
+        "candidate_etag": draft.summary.candidate_etag,
+        "policy_etag": commit.new_etag,
+        "draft_state_recorded": draft_state_recorded,
+    });
+    if let (Some((_, binding)), Value::Object(fields)) = (accepted, &mut published) {
+        fields.insert("suggestion".to_owned(), binding);
+    }
     emit_policy_draft_event(
-        &state,
+        state,
         &parts,
         &principal,
         audit::event::POLICY_DRAFT_PUBLISHED,
-        json!({
-            "draft_id": draft.summary.draft_id,
-            "draft_revision": draft.summary.revision,
-            "base_etag": draft.summary.base_etag,
-            "candidate_etag": draft.summary.candidate_etag,
-            "policy_etag": commit.new_etag,
-            "draft_state_recorded": draft_state_recorded,
-        }),
+        published,
     );
 
     let mut response = (
@@ -1244,8 +1529,9 @@ fn candidate_with_suggested_rule(
 ///
 /// Nothing live changes: the policy keeps its ETag, and the suggestion keeps
 /// its state and revision. The draft is published, or not, through
-/// `POST .../policy/drafts/{id}/publish` like any other, and that does not
-/// move the suggestion. A written draft emits `policy.draft_changed` and
+/// `POST .../policy/drafts/{id}/publish` like any other; only a publication
+/// whose body binds the suggestion moves it, accepting it with the commit.
+/// A written draft emits `policy.draft_changed` and
 /// `policy.suggestion_drafted`; a refusal writes and emits nothing.
 pub(super) async fn rule_suggestion_draft_endpoint(
     State(state): State<SuggestionsAdminState>,
@@ -1320,14 +1606,25 @@ pub(super) async fn rule_suggestion_draft_endpoint(
         (None, None) => None,
     };
 
-    let (suggestion, mut rule) =
-        match reviewable_suggestion_rule(suggestion_engine, id, expected_revision).await {
-            Ok(reviewed) => reviewed,
-            Err(response) => return *response,
-        };
-    if suggestion.source_signal_id.is_some() && rule.action == rbac::RuleAction::Deny {
-        rule.action = rbac::RuleAction::Shadow;
-    }
+    // Opening reads only, but under the lifecycle lock, so it waits for an
+    // acceptance in flight and settles any an earlier request or process
+    // left pending (issue #243) before it reads the suggestion.
+    let _lifecycle = match reconciled_suggestion_lifecycle(&state).await {
+        Ok(lifecycle) => lifecycle,
+        Err(response) => return *response,
+    };
+    let (suggestion, rule) = match reviewable_suggestion_rule(
+        suggestion_engine,
+        id,
+        expected_revision,
+        suggestion_transition_refused_response,
+    )
+    .await
+    {
+        Ok(reviewed) => reviewed,
+        Err(refusal) => return *refusal.response,
+    };
+    let rule = drafted_suggestion_rule(&suggestion, rule);
 
     let (live_policy, live_etag) =
         match authoritative_policy_and_etag(&state.policy, rbac_state).await {

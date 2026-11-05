@@ -1302,6 +1302,24 @@ fn direct_draft_router(
         .expect("policy should parse");
     let rbac_state =
         middleware::rbac::RbacState::new(live_policy, Vec::new(), false, audit_log.clone());
+    let policy_state = PolicyAdminState {
+        policy_file: Some(policy_file),
+        rbac_state: Some(rbac_state),
+        history_store: None,
+        draft_store: Some(store),
+        test_suite_store: None,
+        policy_tests_required: false,
+        #[cfg(feature = "postgres")]
+        control_plane: None,
+        #[cfg(feature = "postgres")]
+        membership: None,
+        event_store: None,
+        query_store: None,
+        authority_evidence: authority_events::required::AuthorityEvidenceGate::best_effort(),
+        audit: audit_log,
+        client_ip_policy: client_ip::ClientIpPolicy::default(),
+        max_body_size: 1024 * 1024,
+    };
     Router::new()
         .route(POLICY_ADMIN_ROUTE, get(policy_get_endpoint))
         .route(
@@ -1309,27 +1327,19 @@ fn direct_draft_router(
             post(policy_draft_create_endpoint),
         )
         .route(POLICY_DRAFT_ADMIN_ROUTE, get(policy_draft_get_endpoint))
-        .route(
-            POLICY_DRAFT_PUBLISH_ADMIN_ROUTE,
-            post(policy_draft_publish_endpoint),
+        .with_state(policy_state.clone())
+        .merge(
+            Router::new()
+                .route(
+                    POLICY_DRAFT_PUBLISH_ADMIN_ROUTE,
+                    post(policy_draft_publish_endpoint),
+                )
+                .with_state(SuggestionsAdminState {
+                    suggestion_engine: None,
+                    policy: policy_state,
+                    lifecycle_guard: Arc::default(),
+                }),
         )
-        .with_state(PolicyAdminState {
-            policy_file: Some(policy_file),
-            rbac_state: Some(rbac_state),
-            history_store: None,
-            draft_store: Some(store),
-            test_suite_store: None,
-            #[cfg(feature = "postgres")]
-            control_plane: None,
-            #[cfg(feature = "postgres")]
-            membership: None,
-            event_store: None,
-            query_store: None,
-            authority_evidence: authority_events::required::AuthorityEvidenceGate::best_effort(),
-            audit: audit_log,
-            client_ip_policy: client_ip::ClientIpPolicy::default(),
-            max_body_size: 1024 * 1024,
-        })
 }
 
 /// A draft store that cannot record a publication, standing in for one that

@@ -368,6 +368,16 @@ impl Policy {
         self.roles.values().any(|role| role.description.is_some())
     }
 
+    /// Whether any direct rule carries `conditions`, which a gateway that
+    /// serves policy v1 but predates enforced rule conditions refuses.
+    /// Cluster-mode writers ask the operation gate before committing such a
+    /// document (`storage::compatibility::POLICY_RULE_CONDITIONS`), so a
+    /// build without cluster mode has no caller.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn uses_rule_conditions(&self) -> bool {
+        self.rules.iter().any(|rule| rule.conditions.is_some())
+    }
+
     /// Whether this is a policy v1 document (document format 1), which a
     /// gateway that does not serve format 1 in cluster mode refuses.
     /// Cluster-mode writers ask the operation gate before committing one
@@ -3675,6 +3685,7 @@ mod tests {
             policy_file,
             tools_file: None,
             policy_history_sqlite_path: None,
+            policy_tests_required: false,
             cors_allow_origins: Vec::new(),
             max_body_size: 1_048_576,
             max_request_path_bytes: crate::config::DEFAULT_MAX_REQUEST_PATH_BYTES,

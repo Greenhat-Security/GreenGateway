@@ -5,6 +5,8 @@ mod admin_config_app_tests;
 mod admin_connections_app_tests;
 #[path = "admin_identity_app_tests.rs"]
 mod admin_identity_app_tests;
+#[path = "admin_mcp_clients_app_tests.rs"]
+mod admin_mcp_clients_app_tests;
 #[path = "admin_observability_app_tests.rs"]
 mod admin_observability_app_tests;
 #[path = "admin_policy_app_tests.rs"]
@@ -13,6 +15,8 @@ mod admin_policy_app_tests;
 mod admin_policy_drafts_tests;
 #[path = "admin_session_app_tests.rs"]
 mod admin_session_app_tests;
+#[path = "admin_suggestion_acceptance_tests.rs"]
+mod admin_suggestion_acceptance_tests;
 #[path = "admin_suggestion_drafts_tests.rs"]
 mod admin_suggestion_drafts_tests;
 #[path = "admin_tokens_app_tests.rs"]
@@ -153,6 +157,7 @@ fn test_config(cors_allow_origins: Vec<&str>) -> config::Config {
         policy_file: None,
         tools_file: None,
         policy_history_sqlite_path: None,
+        policy_tests_required: false,
         cors_allow_origins: cors_allow_origins.into_iter().map(str::to_owned).collect(),
         max_body_size: 1_048_576,
         max_request_path_bytes: config::DEFAULT_MAX_REQUEST_PATH_BYTES,
@@ -3561,12 +3566,16 @@ mod issue_257_acceptance_grpc;
 mod issue_360_composite_acceptance;
 #[path = "tests/issue_373_oauth_bootstrap.rs"]
 mod issue_373_oauth_bootstrap;
+#[path = "tests/issue_446_acceptance.rs"]
+mod issue_446_acceptance;
 #[path = "tests/issue_463_caller_assertion_jwks.rs"]
 mod issue_463_caller_assertion_jwks;
 
 #[path = "admin_policy_test_runs_tests.rs"]
 mod admin_policy_test_runs_tests;
 
+#[path = "admin_policy_test_gate_tests.rs"]
+mod admin_policy_test_gate_tests;
 #[path = "admin_policy_tests_tests.rs"]
 mod admin_policy_tests_tests;
 

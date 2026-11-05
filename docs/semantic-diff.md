@@ -159,6 +159,7 @@ record of them, and anything no detector can classify, are `high`.
 | `risk.plaintext_transport` | high | a connection that used TLS no longer does | listener TLS, `DATABASE_TLS_MODE`, `http://` upstreams |
 | `risk.policy_broadened` | high | a policy role or tool entry grants more or restricts less | `policy.roles`, `policy.tools` |
 | `risk.policy_default_allow` | high | requests no policy rule matches are allowed, or no policy is enforced at all | `policy.default_action`, removing `POLICY_FILE` |
+| `risk.policy_tests_not_required` | high | a policy change may be activated without passing the stored policy test suite | `POLICY_TESTS_REQUIRED` moving from `true` to `false`; turning it on tightens and carries no code |
 | `risk.private_egress_allowed` | high | outbound requests may reach private or other non-global addresses | `EGRESS_DENY_PRIVATE_IPS`, `policy.egress.cidrs` |
 | `risk.profile_changed` | high | the deployment profile moved to one with fewer guarantees | `deployment.profile` |
 | `risk.public_origin_changed` | medium | the public URL the gateway advertises changed | `GATEWAY_PUBLIC_URL` |

@@ -569,8 +569,8 @@ fn state_dir_diagnostic(error: &StateDirError, state_position: usize) -> ReportD
 }
 
 /// The code for a state directory refusal: the one `gateway-config` gives
-/// it, with the exit ADR-0008 gives it.
-fn state_dir_code(error: &StateDirError) -> Code {
+/// it, with the exit ADR-0008 gives it. `ggctl backup` shares it.
+pub(crate) fn state_dir_code(error: &StateDirError) -> Code {
     match error {
         StateDirError::Missing => Code::StateDirMissing,
         StateDirError::NotDirectory => Code::StateDirNotDirectory,
