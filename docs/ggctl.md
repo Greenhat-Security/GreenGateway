@@ -13,9 +13,75 @@ cargo build --locked --release -p ggctl
 # target/release/ggctl (ggctl.exe on Windows)
 ```
 
-It is not yet part of the release artifacts or the container image; packaging, checksums, SBOM and signing for Linux, macOS and Windows come with #242 PR 18. CI builds and tests it on all three platforms.
+A `ggctl-vMAJOR.MINOR.PATCH` tag builds it for Linux, macOS and Windows with checksums, SBOMs and signed build provenance; see [release artifacts](#release-artifacts). It is not part of the container image. CI builds and tests it on all three platforms.
 
 The configuration contracts it shares with the gateway live in the `gateway-config` library crate, which both binaries link: the published document schemas, the `GatewayCapabilities` handshake document, RFC 8785 canonical JSON and the ADR-0004 digest frame, and the configuration bundle reader. Still in the gateway crate are the environment configuration compiler (`config::compile`, extracted by #433; see [its contract](architecture/configuration-compiler.md)) and the production policy and tools validators, which depend on the rest of the gateway. The bundle reader takes those validators from its caller: the gateway passes its own, and `ggctl`, which cannot link them, reports that they did not run.
+
+## Release artifacts
+
+Pushing a `ggctl-vMAJOR.MINOR.PATCH` tag runs [`.github/workflows/release-ggctl.yml`](../.github/workflows/release-ggctl.yml), which drafts a GitHub release for a maintainer to publish ([releasing ggctl](RELEASING.md#releasing-ggctl)). For `VERSION` it holds one archive per target:
+
+| Target | Archive | Built on | Runs on |
+| --- | --- | --- | --- |
+| `x86_64-unknown-linux-gnu` | `ggctl-VERSION-x86_64-unknown-linux-gnu.tar.gz` | Ubuntu 22.04 | Linux with glibc 2.35 or later |
+| `aarch64-unknown-linux-gnu` | `ggctl-VERSION-aarch64-unknown-linux-gnu.tar.gz` | Ubuntu 22.04 on Arm | Linux with glibc 2.35 or later |
+| `x86_64-apple-darwin` | `ggctl-VERSION-x86_64-apple-darwin.tar.gz` | macOS 15 on Intel | macOS 11 or later |
+| `aarch64-apple-darwin` | `ggctl-VERSION-aarch64-apple-darwin.tar.gz` | macOS 15 | macOS 11 or later |
+| `x86_64-pc-windows-msvc` | `ggctl-VERSION-x86_64-pc-windows-msvc.zip` | Windows Server 2025 | 64-bit Windows 10 or later |
+
+The Linux binaries link the system's glibc dynamically; they are not static musl binaries. They are built on Ubuntu 22.04, and the release fails if one needs a glibc symbol version newer than 2.35. The C code `ggctl` compiles in (SQLite and AWS-LC) is linked statically on every platform, and the Windows binary also links the C runtime statically, so it needs no Visual C++ redistributable. Each archive holds one directory, `ggctl-VERSION-TARGET/`, with:
+
+- `ggctl` (`ggctl.exe` on Windows) and `LICENSE`;
+- `man/man1/ggctl.1` and a `ggctl-COMMAND.1` for every command, written by that binary's `ggctl help --man` and refused at packaging unless each says everything its `ggctl help` says;
+- `completion/ggctl.bash`, `completion/_ggctl` (zsh), `completion/ggctl.fish` and `completion/ggctl.ps1`, written by that binary's `ggctl completion`.
+
+Beside the archives the release holds:
+
+| File | What it is |
+| --- | --- |
+| `ggctl-VERSION-TARGET.spdx.json` | The archive's SPDX 2.3 SBOM: the archive and the executable with their SHA-256 digests, and the Cargo packages the executable is compiled from for that target (normal and build dependencies, never dev-dependencies) with each registry package's `Cargo.lock` checksum. It is generated from Cargo's resolved metadata, not by scanning the binary. |
+| `SHA256SUMS` | The SHA-256 of every archive and SBOM, in `sha256sum` format. |
+| `ggctl-VERSION.provenance.sigstore.jsonl` | The SLSA v1 build-provenance attestation over every archive, every SBOM and `SHA256SUMS`. |
+| `ggctl-VERSION-TARGET.sbom.sigstore.jsonl` | The SPDX attestation that binds the archive to its SBOM. |
+| `ggctl-VERSION-release.json` | An index naming each archive's digest, its SBOM and the attestations that cover them. |
+
+The attestations are [GitHub artifact attestations](https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/use-artifact-attestations) signed through Sigstore by the release workflow at the tagged commit. They are also stored with the repository, so `gh attestation verify` finds them without the bundle files.
+
+Each target is built with `cargo build --locked --release` by the production compiler in `build-tools.json`, on a runner of its own platform, and then built again from an empty target directory; the release fails unless both builds package to byte-identical archives and SBOMs. That shows the build of a commit is deterministic on that runner image, not that another machine reproduces it. Before anything is published, the release job requires every archive to have its `SHA256SUMS` entry, an SBOM that names its digest and both attestations (`scripts/ggctl_release.py check`), and verifies every attestation with the GitHub CLI version pinned in `build-tools.json` and the constraints below. A pull request that can change a release runs the same builds and checks as a dry run: read-only, with no secret, nothing signed and nothing published.
+
+There is no install script, no package-manager package and no self-updater: `ggctl` never downloads or replaces itself. Upgrading is downloading and verifying the next release.
+
+### Verifying a release
+
+Download the archive for your platform and `SHA256SUMS`, then check the digest:
+
+```sh
+sha256sum --check --ignore-missing SHA256SUMS        # Linux
+shasum -a 256 --check --ignore-missing SHA256SUMS    # macOS
+```
+
+```powershell
+$archive = 'ggctl-VERSION-x86_64-pc-windows-msvc.zip'
+$expected = ((Get-Content SHA256SUMS) | Where-Object { $_.EndsWith("  $archive") }).Split(' ')[0]
+(Get-FileHash $archive -Algorithm SHA256).Hash.ToLower() -eq $expected
+```
+
+A matching checksum shows the download is the file `SHA256SUMS` names, not who built either. Verify that with the build provenance, using the GitHub CLI (`gh attestation`):
+
+```sh
+gh attestation verify ggctl-VERSION-x86_64-unknown-linux-gnu.tar.gz \
+  --repo Greenhat-Security/GreenGateway \
+  --signer-workflow Greenhat-Security/GreenGateway/.github/workflows/release-ggctl.yml \
+  --source-ref refs/tags/ggctl-vVERSION \
+  --cert-oidc-issuer https://token.actions.githubusercontent.com \
+  --deny-self-hosted-runners
+```
+
+Add `--source-digest COMMIT` when you know the tagged commit from a reviewed record. The same command with `--predicate-type https://spdx.dev/Document/v2.3` verifies the SBOM attestation; with `--format json`, its `verificationResult.statement.predicate` is the SBOM, and it must equal the downloaded `.spdx.json`. Verifying `SHA256SUMS` the same way covers every file it lists. Without network access to GitHub, pass the release's bundle with `--bundle` (`ggctl-VERSION.provenance.sigstore.jsonl` for provenance, `ggctl-VERSION-TARGET.sbom.sigstore.jsonl` for the SBOM) and trust roots obtained separately with `gh attestation trusted-root` with `--custom-trusted-root`, as [offline image verification](RELEASING.md#offline-verification) describes.
+
+A verified attestation shows that the file was built by this repository's release workflow from the tagged commit on a GitHub-hosted runner. It is not a review of the code, and the SBOM is an inventory, not a vulnerability verdict.
+
+Then extract the archive and put `ggctl` on your `PATH`. The man pages go in a `man1` directory on your `MANPATH` (for example `/usr/local/share/man/man1`), and the completion scripts where [`completion`](#completion) says.
 
 ## Commands
 
@@ -29,11 +95,11 @@ ggctl convert BUNDLE --to VERSION (--output DIR | --in-place) [--strict] [--form
 ggctl doctor BUNDLE [--format human|json]
 ggctl diff BUNDLE --against BUNDLE [--check] [--strict] [--format human|json|sarif]
 ggctl completion bash|zsh|fish|powershell
-ggctl help [COMMAND]
+ggctl help [COMMAND] [--man]
 ggctl --help | --version
 ```
 
-`ggctl help COMMAND` and `ggctl COMMAND --help` print a command's options. Help and the completion scripts are generated from the same command table the parser uses, so they cannot drift. Man pages, which ADR-0008 also generates from that table, arrive with packaging (#242 PR 18).
+`ggctl help COMMAND` and `ggctl COMMAND --help` print a command's options. `ggctl help --man` prints the same text as the ggctl(1) manual page, and `ggctl help --man COMMAND` as ggctl-COMMAND(1), in man(7) roff; the [release archives](#release-artifacts) carry these pages under `man/man1`. Help, the man pages and the completion scripts are generated from the same command table the parser uses, so they cannot drift, and the tests hold every page to the help it repeats.
 
 ### `version`
 
@@ -173,7 +239,7 @@ Exit codes: `0` when both bundles were compared, `4` with `--check` when they di
 
 ### `completion`
 
-Writes a completion script to standard output. It completes commands, options, fixed choices, file names for path options and directory names for a `BUNDLE` argument.
+Writes a completion script to standard output. It completes commands, options, fixed choices, file names for path options and directory names for a `BUNDLE` argument. The [release archives](#release-artifacts) carry the same four scripts under `completion/`.
 
 | Shell | Install |
 | --- | --- |

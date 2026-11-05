@@ -101,6 +101,24 @@ fn help_and_version_are_recognized_everywhere() {
     assert!(matches!(parsed(&["-h"]), Ok(Parsed::Help(None))));
     assert!(matches!(parsed(&["help"]), Ok(Parsed::Help(None))));
     assert!(matches!(parsed(&["--version"]), Ok(Parsed::Version)));
+    assert!(matches!(
+        parsed(&["help", "--man"]),
+        Ok(Parsed::Manual(None))
+    ));
+    for words in [
+        &["help", "--man", "validate"][..],
+        &["help", "validate", "--man"],
+    ] {
+        match parsed(words) {
+            Ok(Parsed::Manual(Some(command))) => assert_eq!(command.name, "validate"),
+            other => panic!("{words:?}: {other:?}"),
+        }
+    }
+    // `--help` wins over `--man`, as it does over every other option.
+    assert!(matches!(
+        parsed(&["help", "--man", "--help"]),
+        Ok(Parsed::Help(Some(command))) if command.name == "help"
+    ));
     for words in [
         &["help", "version"][..],
         &["version", "--help"],
@@ -158,6 +176,9 @@ fn usage_errors_name_the_position_and_never_the_argument() {
         (&["completion"], Code::MissingArgument, None),
         (&["completion", "tcsh"], Code::InvalidValue, Some(2)),
         (&["help", "frobnicate"], Code::InvalidValue, Some(2)),
+        (&["help", "--man", "--man"], Code::DuplicateOption, Some(3)),
+        (&["help", "--man=yes"], Code::UnexpectedValue, Some(2)),
+        (&["version", "--man"], Code::UnknownOption, Some(2)),
     ] {
         let diagnostic = refused(words);
         assert_eq!(diagnostic.code, code, "{words:?}");

@@ -3,10 +3,10 @@
 //! A separate binary: the `gateway` server keeps its name, its no-argument
 //! startup and its one-shot commands. It provides the command table, the
 //! output contract (human, `--format json` reports, SARIF for `validate` and
-//! `diff`), the stable exit codes, shell completion, secure bearer-token
-//! input, the version handshake with a running gateway, and offline bundle
-//! validation, pinning, diagnosis and semantic diff with the gateway's own
-//! bundle reader and diff engine (`gateway-config`).
+//! `diff`), the stable exit codes, shell completion and manual pages, secure
+//! bearer-token input, the version handshake with a running gateway, and
+//! offline bundle validation, pinning, diagnosis and semantic diff with the
+//! gateway's own bundle reader and diff engine (`gateway-config`).
 //!
 //! `ggctl` reads no configuration file and no environment variable, never
 //! accepts a secret as an argument, and makes no network request unless a
@@ -21,6 +21,7 @@ mod diff;
 mod doctor;
 mod help;
 mod init;
+mod man;
 mod output;
 mod pin;
 mod remote;
@@ -59,6 +60,7 @@ fn run(arguments: &[OsString], io: &mut Io<'_>) -> Exit {
     match cli::parse(arguments) {
         Err(diagnostic) => report::error(io, diagnostic),
         Ok(Parsed::Help(topic)) => report::artifact(io, &help::text(topic)),
+        Ok(Parsed::Manual(topic)) => report::artifact(io, &man::page(topic)),
         Ok(Parsed::Version) => {
             report::artifact(io, concat!("ggctl ", env!("CARGO_PKG_VERSION"), "\n"))
         }
@@ -113,6 +115,15 @@ mod tests {
             let (exit, captured) = run_words(words);
             assert_eq!(exit, Exit::Success, "{words:?}");
             assert!(captured.stdout().contains("Usage: ggctl"), "{words:?}");
+            assert!(captured.stderr().is_empty());
+        }
+        for (words, title) in [
+            (&["help", "--man"][..], "\n.TH GGCTL 1 "),
+            (&["help", "--man", "schema"], "\n.TH GGCTL\\-SCHEMA 1 "),
+        ] {
+            let (exit, captured) = run_words(words);
+            assert_eq!(exit, Exit::Success, "{words:?}");
+            assert!(captured.stdout().contains(title), "{words:?}");
             assert!(captured.stderr().is_empty());
         }
     }

@@ -1,8 +1,9 @@
 //! The command table and the argument parser.
 //!
 //! One static table defines every command, argument and option. Help text
-//! (`help.rs`) and shell completion (`completion.rs`) are generated from it,
-//! and the parser accepts exactly what it lists, so the three cannot drift.
+//! (`help.rs`), manual pages (`man.rs`) and shell completion
+//! (`completion.rs`) are generated from it, and the parser accepts exactly
+//! what it lists, so the four cannot drift.
 //!
 //! Before anything else the parser refuses any argument that looks like a
 //! secret-carrying or verification-disabling option, wherever it appears, so
@@ -189,6 +190,11 @@ const API_VERSION: OptionSpec = OptionSpec {
     value: Some(("VERSION", ValueKind::Text)),
     help: "the document version to print (default: the newest this ggctl publishes)",
 };
+const MAN: OptionSpec = OptionSpec {
+    name: "--man",
+    value: None,
+    help: "print the same text as a manual page in man(7) roff",
+};
 
 pub(crate) const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
@@ -360,14 +366,20 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "help",
         summary: "Print help for ggctl or one command",
-        description: &["Prints the help for COMMAND, or the overview without one."],
+        description: &[
+            "Prints the help for COMMAND, or the overview without one.",
+            "With --man, prints the same text as a manual page in man(7) roff: ggctl(1) for \
+             the overview and ggctl-COMMAND(1) for COMMAND. The release archives carry \
+             these pages under man/man1. For example: ggctl help --man validate > \
+             ggctl-validate.1",
+        ],
         arguments: &[ArgumentSpec {
             name: "COMMAND",
             kind: ValueKind::Choice(COMMAND_NAMES),
             required: false,
             help: "the command to describe",
         }],
-        options: &[],
+        options: &[MAN],
         run: crate::help::run,
     },
 ];
@@ -430,6 +442,8 @@ pub(crate) enum Parsed {
     Run(Invocation),
     /// `--help`, `-h` or `help`: the overview or one command's help.
     Help(Option<&'static CommandSpec>),
+    /// `help --man`: the same as a manual page.
+    Manual(Option<&'static CommandSpec>),
     /// `--version`.
     Version,
 }
@@ -503,6 +517,9 @@ pub(crate) fn parse(arguments: &[OsString]) -> Result<Parsed, Diagnostic> {
         let topic = invocation
             .positional(0)
             .and_then(|(_, name)| COMMANDS.iter().find(|command| command.name == name));
+        if invocation.flag("--man").is_some() {
+            return Ok(Parsed::Manual(topic));
+        }
         return Ok(Parsed::Help(topic));
     }
     Ok(Parsed::Run(invocation))

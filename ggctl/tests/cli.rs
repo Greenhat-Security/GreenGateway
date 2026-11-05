@@ -201,6 +201,52 @@ fn help_completion_and_schema_are_artifacts_on_standard_output() {
     );
 }
 
+/// The release archives ship `ggctl help --man` output as their man pages;
+/// each must cover what the binary's own help lists.
+#[test]
+fn every_command_has_a_manual_page_naming_every_option_its_help_lists() {
+    let manual = ggctl(&["help", "--man"], None);
+    assert_eq!(manual.status.code(), Some(0));
+    assert!(manual.stderr.is_empty());
+    let manual = text(&manual.stdout);
+    assert!(manual.contains("\n.TH GGCTL 1 "));
+    assert!(!manual.contains('\r'));
+
+    let overview = text(&ggctl(&["help"], None).stdout);
+    let listed = overview
+        .split("\nCommands:\n")
+        .nth(1)
+        .and_then(|rest| rest.split("\n\n").next())
+        .expect("the overview lists the commands");
+    let commands: Vec<&str> = listed
+        .lines()
+        .filter(|line| line.starts_with("  ") && !line.starts_with("   "))
+        .filter_map(|line| line.split_whitespace().next())
+        .collect();
+    assert!(commands.contains(&"validate") && commands.contains(&"help"));
+    for command in commands {
+        assert!(
+            manual.contains(&format!("\\fBggctl\\-{command}\\fR(1)")),
+            "{command}"
+        );
+        let page = ggctl(&["help", "--man", command], None);
+        assert_eq!(page.status.code(), Some(0), "{command}");
+        let page = text(&page.stdout);
+        assert!(
+            page.contains(&format!(".TH GGCTL\\-{} 1 ", command.to_ascii_uppercase())),
+            "{command}"
+        );
+        let help = text(&ggctl(&["help", command], None).stdout);
+        for option in help.lines().filter_map(|line| line.strip_prefix("  --")) {
+            let name = option.split_whitespace().next().expect("an option name");
+            assert!(
+                page.contains(&format!("\\fB\\-\\-{}\\fR", name.replace('-', "\\-"))),
+                "{command} --{name}"
+            );
+        }
+    }
+}
+
 #[test]
 fn argument_errors_exit_2_and_never_echo_the_argument() {
     for arguments in [
